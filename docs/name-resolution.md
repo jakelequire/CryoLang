@@ -14637,3 +14637,105 @@ consumer and the entry was a namespace prepended twice.
   single member of the family and it answers nothing on those inputs, but the
   step it sits in is a cascade with a further arm, so removing it is the same
   decision held for the five bare steps.
+
+### 8.107 The seam ruling is forced by the language, not chosen, and the lane gate now counts a receiver - MEASURED AND LANDED 2026-09-06
+
+8.99 left the question of what `decl_index` may expose: a public string-keyed
+type lookup, or a `Res`/`DefId` from every caller. The question is answered by
+three measurements that all point one way, and none of them is a preference.
+
+#### Privatization is not cosmetic, it is inexpressible
+
+Cryo's `private` is scoped to the declaring TYPE. `TypeUtils` is a different
+type from `DeclarationIndex` and reaches it through `ctx.decl_index`, so once
+every path converges on the funnel the five are still called across a type
+boundary and must stay public. This is the same wall 8.100 hit: a mint private
+enough to exclude codegen excludes the resolver too. No migration changes it,
+because the obstacle is the visibility model rather than the call count.
+
+#### A `DefId`-keyed entry is the same key wearing a wrapper
+
+`DefId::of_definition` takes a `SymbolStr` and the private field IS a
+`SymbolStr`, so a `DefId`-keyed lookup is representationally the lookup that
+already exists. `res.cryo` states the enforcement this buys in its own words -
+not unforgeability but a single greppable door, pinned by the same ratchets
+already running. A public `DefId` overload beside a private name-keyed one is
+therefore 8.99's rename reached from the other side.
+
+#### The callers do not hold one, and a third of them cannot
+
+Provenance of the key at all 72 raw index calls, traced from the argument back
+to its assignment. The scanner reproduces `lane-gate.py`'s LOOKUP total of 103
+and its 72 / 20 / 11 receiver split exactly, which is what makes the
+decomposition readable; the classifier was then corrected by reading, because a
+structural screen chooses what to read and does not replace it.
+
+| key provenance | calls |
+|---|---:|
+| derived from a resolution answer | **2** |
+| constructed - ambient/home-qualified, cross-module, mangled spec | ~35 |
+| a written spelling, not yet resolved | ~35 |
+
+The constructed group is the one that settles it. Those calls build a key and
+ask whether the index holds it; a `DefId` names a definition that exists, and a
+search key is precisely the absence of one. That is the B4 wall in another
+place - a `Res` cannot name a mangled instantiation, and it cannot name a
+speculative one either.
+
+#### The one move that would make it expressible, and why not to make it
+
+Merging `TypeUtils` into `DeclarationIndex` would put the funnel and the five
+on one type, where `private` could reach. `TypeUtils` holds the arena, the
+intern table, the context and the checker, so the index would acquire all four
+as dependencies and a sema-layer cascade would live inside the index. The
+boundary would become expressible by destroying the reason it exists.
+
+#### Ruling
+
+8.99's first bullet, on evidence rather than on taste: a public name-keyed
+lookup is what the tree requires, privatization would be cosmetic even if it
+were possible, and the lane gate is the real enforcement.
+
+Declined with it: moving the four passthroughs into `decl_index`. It moves the
+gate's number and changes nothing else, which is the rename 8.99 names and
+8.101 already declined twice in other clothes.
+
+What the provenance table does suggest is that the reducible group is the
+constructed keys, not the receivers - and two of its members are cascades
+measured to answer nothing (`lookup_type_by_sym` 0 of 103,837, independently
+pinned at 0 by `tests/b1-baseline.txt`; `resolve_method_owner` 709 of 148,887).
+That is the bare-step family, held elsewhere.
+
+#### What the ruling makes load-bearing, and what that required
+
+If the gate is the enforcement, its number has to mean what its heading says,
+and it did not: `LOOKUP` matched the five NAMES on any receiver. `lane-gate.py`
+now splits by the receiver that answers the call.
+
+| kind | count | what it is |
+|---|---:|---|
+| `LOOKUP` | **72** | answered by the `DeclarationIndex` - the lane surface |
+| `LOOKUP_ROUTED` | **20** | answered by a `TypeUtils` wrapper - already at the destination |
+| `LOOKUP_LOCAL` | **11** | a type's OWN same-named method over a local symbol map |
+
+72 + 20 + 11 = 103, so no call left the gate's sight; `REENTRY`, `DEFID_MINT`
+and `DEFID_UNWRAP` are unchanged at 6, 16 and 26. The receivers were enumerated
+rather than assumed: the index is reached under five different spellings
+(`ctx.decl_index`, `this.ctx.decl_index`, `di`, `this.decl_index`,
+`ctx_ptr.decl_index`) which sum to 72, and the eleven local ones are exactly
+`drop_insertion` (5), `move_check` (4) and `ir_generator` (2), with no
+`TypeUtils` among them.
+
+The three rows are asserted differently in meaning though identically in
+mechanism. `LOOKUP` should fall. `LOOKUP_ROUTED` RISES as it falls, so it is
+not a target - it is pinned because a new same-named wrapper is precisely the
+regrowth the gate exists to catch, and a destination row is where that would
+hide. `LOOKUP_LOCAL` is a FLOOR no migration can reduce, which is what makes
+"drive LOOKUP to zero" a reachable target where "drive the total to zero" never
+was.
+
+A call whose receiver cannot be placed is now a hard failure that names the
+file and line, rather than a call silently dropped from a ratchet. That path
+was exercised by a control that made it fire - an unknown receiver and a call
+on a non-dotted expression - because a failure path that has never failed is
+not known to work.

@@ -16,21 +16,35 @@ re-pins deliberately.
 
 WHAT IS PINNED
 --------------
-Two counts, each broken down per file so a failure names what moved:
+Each count is broken down per file so a failure names what moved.
 
-  * LOOKUP -- direct calls to the five per-kind lookups (`lookup_type`,
-    `lookup_func_return`, `lookup_func_type`, `lookup_global`,
-    `lookup_method_return`) outside the file that DEFINES them.
+The five per-kind lookups (`lookup_type`, `lookup_func_return`,
+`lookup_func_type`, `lookup_global`, `lookup_method_return`) are counted
+outside the file that DEFINES them, and SPLIT BY THE RECEIVER that answers
+them, because the five names are not the index's alone:
+
+  * LOOKUP -- answered by the `DeclarationIndex`.  This is the lane surface,
+    and the only one of the three that should fall.
+  * LOOKUP_ROUTED -- answered by a `TypeUtils` wrapper.  Already at the
+    destination, so it RISES as LOOKUP falls and is not a target; it is pinned
+    because a new same-named wrapper is exactly the regrowth this gate exists
+    to catch.
+  * LOOKUP_LOCAL -- a type's OWN same-named method over its own symbol map or
+    scope stack.  Not a lane site, and no migration can remove one, so it is a
+    FLOOR: driving LOOKUP to zero is reachable, driving the total to zero never
+    was.
   * REENTRY -- calls to `get_resolver()` outside the driver.  §7.2's corollary:
     name resolution is a pass, not a service, and a stage that can call back
     into the resolver will.  A resolver called from `sema` no longer has the
     writer's imports in hand, so it answers from a string -- which is the
     mechanical origin of B1.
 
-Both ratchet DOWNWARD.  An increase is the regrowth this exists to catch; a
-decrease is progress and still fails, because a silently-tolerated decrease
-leaves the old higher number as the bound and lets a later regression climb
-back to it unnoticed.  That is the same reasoning as the B1 gate, and it is the
+Every row is asserted exactly, in both directions.  For LOOKUP and REENTRY an
+increase is the regrowth this exists to catch, and a decrease is progress that
+still fails, because a silently-tolerated decrease leaves the old higher number
+as the bound and lets a later regression climb back to it unnoticed.  A row
+that is a destination or a floor has no preferred direction and is asserted for
+the same reason: an unexplained move is what the gate is for.  That is the same reasoning as the B1 gate, and it is the
 reason `--update` exists rather than a tolerance.
 
 WHY THIS GATE IS SOURCE-DERIVED AND HAS NO PER-HOST SECTIONS
@@ -43,8 +57,16 @@ would let one host's re-pin hide another's regression.  It also means this gate
 needs no compiler, no stdlib, and no successful link -- it runs on a fresh
 clone in under a second, which is what makes it usable as a pre-commit check.
 
-TWO THINGS A NAIVE GREP GETS WRONG, BOTH OBSERVED HERE
--------------------------------------------------------
+THREE THINGS A NAIVE GREP GETS WRONG, ALL OBSERVED HERE
+--------------------------------------------------------
+  * THE RECEIVER.  Matching `.lookup_type(` matches the NAME, so a call
+    already routed through `TypeUtils` counted exactly like a raw index call,
+    and a `lookup_type(&this, name)` over a local scope stack counted as one
+    too though it never touches the index.  A single total therefore could not
+    say what it was a total OF, and a migration measured against it partly
+    rewarded renaming.  The split above is what fixes that; an unplaceable
+    receiver is a hard failure, because a call this gate cannot classify is one
+    it cannot pin.
   * COMMENTED-OUT CALLS.  `instance.cryo` carries a commented `//
     ctx.get_resolver();`.  Counting it pins 9 re-entries where 8 exist, so
     deleting a real call and leaving the comment would read as progress while
@@ -85,6 +107,36 @@ LOOKUPS = (
     "lookup_method_return",
 )
 LOOKUP_RE = re.compile(r"\.(?:%s)\s*\(" % "|".join(LOOKUPS))
+# The same five names, captured WITH the receiver that answers them.
+RECEIVER_RE = re.compile(r"([A-Za-z_][A-Za-z_0-9.]*)\.(?:%s)\s*\(" % "|".join(LOOKUPS))
+
+
+def lookup_bucket(receiver):
+    """Which surface a call belongs to, decided by its RECEIVER.
+
+    The five names are not the index's alone.  `TypeUtils` carries same-named
+    wrappers, so a call already routed through the funnel matched exactly like
+    a raw index call; and `move_check`, `drop_insertion` and `ir_generator`
+    each define their own `lookup_type(&this, name)` over a local symbol map
+    or a scope stack, which has nothing to do with the `DeclarationIndex`.
+
+    A count matched on the NAME cannot separate the surface from things that
+    merely resemble it, and the consequence was not academic: one total read
+    as a migration target when a fifth of it was already at its destination
+    and a tenth of it could never move.  Splitting by receiver is what makes
+    each row mean what its heading says.
+
+    Returns None for a receiver it cannot place, which the caller treats as a
+    hard failure rather than dropping - an uncounted call is the one outcome a
+    ratchet must never produce.
+    """
+    if receiver == "di" or receiver.endswith("decl_index"):
+        return "LOOKUP"
+    if receiver == "types" or receiver.endswith(".types"):
+        return "LOOKUP_ROUTED"
+    if receiver == "this":
+        return "LOOKUP_LOCAL"
+    return None
 REENTRY_RE = re.compile(r"\bget_resolver\s*\(\s*\)")
 # The one door that turns a name into a resolution answer, and the one that
 # turns an answer back into a name.  `DefId`'s field is private, so the literal
@@ -96,7 +148,8 @@ DEFID_MINT_RE = re.compile(r"DefId::of_definition\s*\(")
 DEFID_UNWRAP_RE = re.compile(r"\.qualified_name\s*\(")
 
 # Every counted population, in the order they are rendered and compared.
-KINDS = ("LOOKUP", "REENTRY", "DEFID_MINT", "DEFID_UNWRAP")
+KINDS = ("LOOKUP", "LOOKUP_ROUTED", "LOOKUP_LOCAL",
+         "REENTRY", "DEFID_MINT", "DEFID_UNWRAP")
 
 # The file that DEFINES the five lookups.  Its own calls are not the surface.
 LOOKUP_OWNERS = {"decl_index.cryo"}
@@ -116,8 +169,9 @@ def strip_comment(line):
 
 
 def scan():
-    """Return {kind: {relpath: count}} over the compiler sources."""
+    """Return ({kind: {relpath: count}}, unplaced) over the compiler sources."""
     found = {k: {} for k in KINDS}
+    unplaced = []
     for dirpath, _dirs, files in os.walk(SRC):
         for fname in sorted(files):
             if not fname.endswith(".cryo"):
@@ -127,12 +181,25 @@ def scan():
             with open(full, "r", encoding="utf-8", errors="replace") as fh:
                 text = fh.readlines()
             tally = {k: 0 for k in KINDS}
-            for raw in text:
+            for lineno, raw in enumerate(text, 1):
                 line = strip_comment(raw)
                 if not line.strip():
                     continue
                 if fname not in LOOKUP_OWNERS:
-                    tally["LOOKUP"] += len(LOOKUP_RE.findall(line))
+                    seen = len(LOOKUP_RE.findall(line))
+                    accounted = 0
+                    for m in RECEIVER_RE.finditer(line):
+                        accounted += 1
+                        bucket = lookup_bucket(m.group(1))
+                        if bucket is None:
+                            unplaced.append((rel, lineno, m.group(1)))
+                            continue
+                        tally[bucket] += 1
+                    # A match the receiver pattern did not reach at all - a call
+                    # on something other than a dotted name. Reported once, not
+                    # once per match, so the count is of CALLS and not of checks.
+                    for _ in range(seen - accounted):
+                        unplaced.append((rel, lineno, "<no simple receiver>"))
                 if fname not in REENTRY_OWNERS:
                     tally["REENTRY"] += len(REENTRY_RE.findall(line))
                 tally["DEFID_MINT"] += len(DEFID_MINT_RE.findall(line))
@@ -140,7 +207,7 @@ def scan():
             for kind in KINDS:
                 if tally[kind]:
                     found[kind][rel] = tally[kind]
-    return found
+    return found, unplaced
 
 
 HEADER = [
@@ -148,8 +215,18 @@ HEADER = [
     "#",
     "# ASSERTED: both totals and every per-file row.",
     "#",
-    "# LOOKUP   direct calls to the five per-kind lookups outside decl_index.cryo,",
-    "#          which defines them.",
+    "# The five per-kind lookups outside decl_index.cryo, which defines them,",
+    "# split by the RECEIVER that answers them - the names are not the index's",
+    "# alone, and a name-matched total cannot say what it is a total of.",
+    "#",
+    "# LOOKUP         answered by the DeclarationIndex. The lane surface; falls.",
+    "# LOOKUP_ROUTED  answered by a TypeUtils wrapper. Already at the destination,",
+    "#                so it RISES as LOOKUP falls. Pinned because a new same-named",
+    "#                wrapper is the regrowth this gate exists to catch.",
+    "# LOOKUP_LOCAL   a type's OWN same-named method over its own symbol map or",
+    "#                scope stack. Not a lane site; no migration removes one. A",
+    "#                FLOOR, so driving LOOKUP to zero is reachable and driving",
+    "#                the total to zero never was.",
     "# REENTRY  get_resolver() outside the driver. Name resolution is a PASS, not a",
     "#          service: a resolver called from sema no longer holds the writer's",
     "#          imports, so it answers from a string. That is where B1 comes from.",
@@ -169,9 +246,11 @@ HEADER = [
     "# ALONE. The private field still buys one named door in each direction, and",
     "# these rows are what make the traffic through them countable.",
     "#",
-    "# Both ratchet DOWNWARD. An increase is regrowth; a decrease is progress and",
-    "# must still be re-pinned with `make lane-check ARGS=--update`, because a",
-    "# tolerated decrease leaves the old number as the ceiling.",
+    "# Every row is asserted exactly, both directions. For LOOKUP and REENTRY an",
+    "# increase is regrowth and a decrease is progress that must still be re-pinned",
+    "# with `make lane-check ARGS=--update`, because a tolerated decrease leaves",
+    "# the old number as the ceiling. A destination or a floor row has no preferred",
+    "# direction and is pinned so that an unexplained move fails.",
     "#",
     "# Source-derived, so there are no per-host sections: the same tree gives the",
     "# same answer everywhere, and splitting by host would let one host's re-pin",
@@ -229,7 +308,16 @@ def main():
                     help="rewrite the golden from the current measurement")
     args = ap.parse_args()
 
-    counts = scan()
+    counts, unplaced = scan()
+    if unplaced:
+        sys.stderr.write(
+            "lane-gate: %d lookup call(s) could not be placed by receiver.\n"
+            "A call this gate cannot classify is a call it cannot pin, and a\n"
+            "silently dropped one reads as progress. Extend lookup_bucket().\n"
+            % len(unplaced))
+        for rel, lineno, recv in unplaced:
+            sys.stderr.write("  %s:%d  receiver %s\n" % (rel, lineno, recv))
+        return 1
     live_totals = {k: sum(v.values()) for k, v in counts.items()}
 
     if args.update:
