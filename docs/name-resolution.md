@@ -14341,3 +14341,69 @@ remembering harder: it is that a command which edits and then measures must fail
 as one unit, so the edit's exit status cannot be discarded by a later step - and
 that a control over a stream must be shown to reject a known negative, not only
 to match a known positive, since `ENTERED` matched something real and wrong.
+
+### 8.104 The closure name was qualified twice, and the canonical key now has one derivation - FIXED 2026-09-05
+
+8.103 named `canonical_type_ref`'s ten bare-step answers: five synthesized
+closure types, twice each, every one of the shape
+
+```
+written = Main::__Closure_0     qualified key that missed = Main::Main::__Closure_0
+```
+
+#### The defect is a field with two conventions, not a missing fallback
+
+`lambda_synth.cryo` mints a closure struct's name already qualified -
+`<ns>::__Closure_N` - and `register_type_with_module` is handed exactly that
+name, so the qualified form IS the registration key and the synthesizer is
+right. What is wrong is downstream: `canonical_type_ref` assumes its argument is
+a bare leaf, because for a written declaration it always is, and qualifies it.
+For a synthesized one it therefore asks the index for `Main::Main::__Closure_0`,
+a name nothing in the program holds.
+
+So `StructDeclNode.name` carries two conventions - bare when written, qualified
+when synthesized - and the bare second lookup was absorbing the difference. That
+is the shape this project keeps finding: a fallback that makes a defect
+unobservable while leaving its cause in place. The ten were not ten names the
+index happened to hold bare; they were one mistake, recovered ten times.
+
+#### Reordering is not the fix, and neither is deleting the step
+
+Asking the index for the name as written FIRST would answer all ten, and would
+also bind a written `Foo` to whichever module registered that leaf - the
+collision the qualified-first order exists to prevent. Deleting the bare step
+would turn ten silent recoveries into ten failures without touching what
+produces them.
+
+What the two forms need is to be told apart. `QualifiedName::segment_count`
+already answers that, so `canonical_decl_key` decides it once: a name that is
+already qualified is already canonical, and only a bare leaf takes the ambient
+namespace. `canonical_type_qname`'s own fallback now derives through it too,
+which is the rule that function's comment already states for itself - a
+declaration and its bodies cannot disagree if there is one place the key comes
+from. `Resolver::contains_separator` was not used for the predicate: reaching it
+needs `get_resolver()`, and re-entering the resolver from a context helper is
+what `REENTRY` exists to prevent.
+
+#### Measured, against predictions written first
+
+Over the same 57 units, with the prediction recorded before the edit that the
+bare step's answers go to zero and its REACHED count falls by exactly ten:
+
+| | before | after |
+|---|---:|---:|
+| bare step reached | 2662 | **2652** |
+| bare step answered | **10** | **0** |
+| `CTX-BARE-HIT` audit rows | 10 | 0 |
+| impl target primitive / declared | 28904 / 0 | 28904 / 0 |
+
+The delta being exactly -10 is the part that matters. A fix that changed which
+key any other declaration is looked up under would have moved the reached count
+by more than the ten it was meant to, and a fix that missed the cause would have
+left the answers at ten. Build outcomes over the corpus are identical, 42
+succeeding and 14 failing exactly as before.
+
+`canonical_type_ref`'s bare step is now dead on its own evidence: 0 answers over
+2,652 reaches, with the one thing it was serving fixed at its source rather than
+at its symptom. It is still not deleted - that decision is held with the other
+four - but it is now held on a zero rather than on a 0.4%.

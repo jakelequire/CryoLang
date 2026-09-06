@@ -602,10 +602,30 @@ public:
     /// when the emitting module happens to be the canonical one, and the
     /// bare-name alias the monomorphizer registers for every spec
     /// (`TypeArena::add_name_alias`) is what answers otherwise.
+    /// The key a DECLARATION's name is registered under.
+    ///
+    /// A WRITTEN declaration carries a bare leaf, and the ambient namespace is
+    /// what makes it canonical.  A SYNTHESIZED one carries the qualified name
+    /// it was registered with: a closure struct is minted as
+    /// `<ns>::__Closure_N` and `register_type_with_module` is given exactly
+    /// that.  Qualifying a name that is already qualified mints a key nothing
+    /// in the program holds, so which of the two forms a name is has to be
+    /// decided rather than left for a second lookup to absorb.
+    ///
+    /// Deriving it here once is the same rule `canonical_type_qname` states for
+    /// itself - a declaration and its bodies cannot disagree if there is only
+    /// one place the key comes from.
+    canonical_decl_key(mut &this, name: SymbolStr) -> SymbolStr {
+        if (QualifiedName::segment_count(this.intern_table.resolve(name)) > 1) {
+            return name;
+        }
+        return this.qualify_symbol_sym(name);
+    }
+
     canonical_type_ref(mut &this, name: SymbolStr) -> TypeRef {
         const di: DeclarationIndex* = this.decl_index;
         const arena: TypeArena* = this.type_arena;
-        const qualified: SymbolStr = this.qualify_symbol_sym(name);
+        const qualified: SymbolStr = this.canonical_decl_key(name);
         mut tref: TypeRef = di.lookup_type(qualified);
         if (!tref.is_valid()) {
             resolve_counter::Site::CascCtxBareTry.bump();
@@ -642,7 +662,7 @@ public:
             const q: SymbolStr = arena.get_qualified_name(tref);
             if (q.is_valid()) { return q; }
         }
-        return this.qualify_symbol_sym(name);
+        return this.canonical_decl_key(name);
     }
 
 
