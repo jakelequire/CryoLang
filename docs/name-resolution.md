@@ -14198,6 +14198,10 @@ They should be read, and eventually written, as the primitive-impl path rather
 than as a fallback. Counting them as lane sites is what made the cascade
 population look twice as defective as it is.
 
+Done in 8.103: the counters are renamed to `PrimImplOwner*` and print under
+their own heading, so the row labels quoted in the table above are the
+pre-rename ones.
+
 #### What is now deletable, and what is not
 
 - **Four groups can lose their bare step with no measured behaviour change**:
@@ -14236,3 +14240,104 @@ The failing edit itself was a format mismatch: the generator wrote
 are the same width but not the same string. Insertion is now line-based and
 copies the padding from the line it inserts beside, so the format cannot be
 re-derived wrongly.
+
+### 8.103 The impl-owner arm now says what it is, and canonical_type_ref's ten are one double-qualification - MEASURED AND LANDED 2026-09-05
+
+8.102 established that the three impl-owner groups answer their second lookup
+100% for primitive targets and 0% for declared ones. They were still written and
+counted as widening cascades, which made the cascade population read as roughly
+twice as defective as it is. This makes the code say what it does.
+
+#### What changed, and why it is not a behaviour change
+
+The control flow is untouched: still a qualified lookup, then a bare one behind
+an invalidity guard. What changed is the naming and the reason given.
+
+- The counters are renamed from `CascOwner*Bare*` to `PrimImplOwner*`, and the
+  report prints them under their own heading rather than beneath "bare-leaf last
+  step of a widening cascade" - which now covers only the five groups that are
+  one.
+- The comment at each site names the rule instead of the symptom: a declared
+  target is registered under its qualified name, a primitive one is declared
+  nowhere and the index holds it under its spelling, and `implement string` has
+  no module to qualify into. The second lookup is that primitive arm.
+- The triplicated primitive/declared probe is one static,
+  `note_impl_target_kind`, beside the other impl-head static.
+
+The fallback SHAPE is kept deliberately rather than rewritten into an explicit
+dispatch on `is_primitive_spelling`. A dispatch would delete the path a declared
+target takes when its qualified key misses, and that path is what
+`PrimImplTargetDeclared` watches: the row reading zero is a live claim that
+every declared target is registered under the name it is looked up by. Turning
+the claim into an unreachable branch would retire the only thing that can
+falsify it.
+
+Verified by measurement rather than by reading: re-run over the same 57 units,
+the counts reproduce exactly - 28,904 primitive, 0 declared, and the bare-answer
+total in the cascade section still 10. A rewrite that changed behaviour would
+have moved one of them.
+
+#### `canonical_type_ref`'s ten are one defect, and deleting the step is the wrong fix
+
+8.102 could not clear this group: the bare step answers 10 times in 2,662, so it
+is small but not zero. A `path_hit` probe naming them settles what they are, and
+all ten are the same shape:
+
+```
+written = Main::__Closure_0     qualified key that missed = Main::Main::__Closure_0
+```
+
+Five synthesized closure types, twice each. The name reaching
+`canonical_type_ref` is ALREADY qualified, and `qualify_symbol_sym` qualifies it
+a second time, so the first lookup asks for `Main::Main::__Closure_0` - a name
+nothing registers - and the bare step then finds the correct one.
+
+So the bare step here is not widening a name that had no exact answer. It is
+absorbing a double-qualification, which is the failure mode this project keeps
+finding: a fallback that makes a defect unobservable while leaving its cause in
+place. Deleting the step would turn ten silent recoveries into ten failures
+without touching what produces them; qualifying an already-qualified name once
+is the fix, and then the step answers zero and can go on its own evidence.
+
+Not acted on here. Recorded so the next reader does not treat the 0.4% as a
+widening case that has to be preserved.
+
+#### Tier 2's framing should not be inherited
+
+8.101 declined the mechanical migration; this is the one-line version, because
+"tier 2 is fifty sites to route through `TypeUtils`" is the kind of statement
+that survives being wrong.
+
+`TypeUtils::lookup_type_exact` is `return this.ctx.decl_index.lookup_type(name);`.
+Routing a caller that already holds a constructed canonical key through it is
+therefore the same function on the same key: the gate's number moves and nothing
+else does. And moving a cascade step's receiver leaves the cascade while
+removing the run of `.lookup_type(` calls in one function that is currently the
+only thing making it visible.
+
+Both are §8.99's rename in different clothes - the first changes the count
+without changing the work, the second changes the count while hiding the work -
+and neither would unblock privatizing the five, which the seam blocks regardless
+of how many call sites move.
+
+#### A recurring failure mode: knowing a rule and applying it to your own command
+
+8.102 recorded two instrument defects. They are one, and it has happened before:
+a rule is written down and then not applied to the next command composed in the
+same session.
+
+The rule is "an assertion that is not the last command in a chained line is not
+an assertion". It was cited earlier in the same session, and then a Python edit
+carrying eight assertions was put on its own line above `make cryo`, with only
+`MAKE_EXIT` read afterwards. The edit failed, the build succeeded on unchanged
+sources, and the measurement that followed was of a binary that did not contain
+the instrument. The `grep -c ENTERED` check written to catch exactly that
+matched a pre-existing counter row instead and reported fourteen blocks of
+instrumentation that did not exist.
+
+A previous session hit the same gap one commit after recording the rule, which
+is what makes it a failure mode rather than a slip. What breaks it is not
+remembering harder: it is that a command which edits and then measures must fail
+as one unit, so the edit's exit status cannot be discarded by a later step - and
+that a control over a stream must be shown to reject a known negative, not only
+to match a known positive, since `ENTERED` matched something real and wrong.
