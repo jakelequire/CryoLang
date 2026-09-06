@@ -2673,6 +2673,23 @@ type struct TypeResolutionPasses {
     /// Mirrors `TypeAnnotation::trait_identity`'s walk, so this returns the
     /// node whose `res` that identity reads.  Checking any other node would
     /// be asking whether a different name resolves.
+    /// Record which of the two forms an impl target took when the qualified
+    /// key could not answer it.
+    ///
+    /// A PRIMITIVE target is declared nowhere, so the index holds it under its
+    /// spelling and there is no module to qualify it into - the bare key is the
+    /// only one that can reach it.  A DECLARED target arriving here missed its
+    /// own registration instead, which is a defect to see rather than a miss to
+    /// absorb, so the two are counted apart and the declared row is expected to
+    /// stay empty.
+    static note_impl_target_kind(ctx: CompilationContext*, target: SymbolStr) -> void {
+        if (ResBase::is_primitive_spelling(ctx.intern_table.resolve(target))) {
+            resolve_counter::Site::PrimImplTargetPrimitive.bump();
+        } else {
+            resolve_counter::Site::PrimImplTargetDeclared.bump();
+        }
+    }
+
     static trait_head_base(ann: TypeAnnotation*) -> TypeAnnotation* {
         if (ann == null) { return null; }
         return match (*ann) {
@@ -3105,19 +3122,22 @@ type struct TypeResolutionPasses {
                     // also has generic params (E0310).  Runs once per
                     // source-level impl here in the FuncSig phase.
                     runner.validate_impl_assoc_bindings(node);
-                    // Look up the owner type; try qualified first, then bare
-                    // (primitive impls like `implement string` use bare).
+                    // The owner type, by the two forms an impl target can take.
+                    // A declared target is registered under its qualified name;
+                    // a primitive one is declared nowhere, so the index holds it
+                    // under its spelling and no qualified key can reach it -
+                    // `implement string` has no module to qualify into.  The
+                    // second lookup is that primitive arm, not a widening
+                    // fallback, and a declared target reaching it is a
+                    // registration defect rather than a name needing more tries.
                     mut impl_owner: TypeRef = ctx.decl_index.lookup_type(
                         ctx.qualify_symbol_sym_home(node.target_type, node.span.file));
                     if (impl_owner.is_invalid()) {
-                        resolve_counter::Site::CascOwnerABareTry.bump();
+                        resolve_counter::Site::PrimImplOwnerAReached.bump();
                         impl_owner = ctx.decl_index.lookup_type(node.target_type);
-                        if (impl_owner.is_valid()) { resolve_counter::Site::CascOwnerABareHit.bump(); }
                         if (impl_owner.is_valid()) {
-                            if (ResBase::is_primitive_spelling(
-                                    ctx.intern_table.resolve(node.target_type))) {
-                                resolve_counter::Site::CascOwnerBarePrim.bump();
-                            } else { resolve_counter::Site::CascOwnerBareDecl.bump(); }
+                            resolve_counter::Site::PrimImplOwnerAAnswered.bump();
+                            TypeResolutionPasses::note_impl_target_kind(ctx, node.target_type);
                         }
                     }
                     runner.resolve_method_signatures(node.methods, &impl_ctx, impl_owner,
@@ -3537,17 +3557,22 @@ type struct TypeResolutionPasses {
                                 node.span, "");
                         }
                     }
+                    // The owner type, by the two forms an impl target can take.
+                    // A declared target is registered under its qualified name;
+                    // a primitive one is declared nowhere, so the index holds it
+                    // under its spelling and no qualified key can reach it -
+                    // `implement string` has no module to qualify into.  The
+                    // second lookup is that primitive arm, not a widening
+                    // fallback, and a declared target reaching it is a
+                    // registration defect rather than a name needing more tries.
                     mut impl_owner2: TypeRef = ctx.decl_index.lookup_type(
                         ctx.qualify_symbol_sym_home(node.target_type, node.span.file));
                     if (impl_owner2.is_invalid()) {
-                        resolve_counter::Site::CascOwnerBBareTry.bump();
+                        resolve_counter::Site::PrimImplOwnerBReached.bump();
                         impl_owner2 = ctx.decl_index.lookup_type(node.target_type);
-                        if (impl_owner2.is_valid()) { resolve_counter::Site::CascOwnerBBareHit.bump(); }
                         if (impl_owner2.is_valid()) {
-                            if (ResBase::is_primitive_spelling(
-                                    ctx.intern_table.resolve(node.target_type))) {
-                                resolve_counter::Site::CascOwnerBarePrim.bump();
-                            } else { resolve_counter::Site::CascOwnerBareDecl.bump(); }
+                            resolve_counter::Site::PrimImplOwnerBAnswered.bump();
+                            TypeResolutionPasses::note_impl_target_kind(ctx, node.target_type);
                         }
                     }
                     runner.resolve_method_signatures(node.methods, &impl_ctx, impl_owner2,
@@ -4363,17 +4388,19 @@ type struct TypeResolutionPasses {
                     // calls inside trait-impl method bodies (e.g.
                     // `NonNull::new(...)` as an argument to `deallocate`)
                     // had no concrete instantiation to point at.
+                    //
+                    // Two forms, as in the FuncSig phase above: a declared
+                    // target answers under its qualified name, a primitive one
+                    // only under its spelling.  The second lookup is that
+                    // primitive arm, not a widening fallback.
                     mut tgt: TypeRef = ctx.decl_index.lookup_type(
                         ctx.qualify_symbol_sym_home(node.target_type, node.span.file));
                     if (!tgt.is_valid()) {
-                        resolve_counter::Site::CascOwnerCBareTry.bump();
+                        resolve_counter::Site::PrimImplOwnerCReached.bump();
                         tgt = ctx.decl_index.lookup_type(node.target_type);
-                        if (tgt.is_valid()) { resolve_counter::Site::CascOwnerCBareHit.bump(); }
                         if (tgt.is_valid()) {
-                            if (ResBase::is_primitive_spelling(
-                                    ctx.intern_table.resolve(node.target_type))) {
-                                resolve_counter::Site::CascOwnerBarePrim.bump();
-                            } else { resolve_counter::Site::CascOwnerBareDecl.bump(); }
+                            resolve_counter::Site::PrimImplOwnerCAnswered.bump();
+                            TypeResolutionPasses::note_impl_target_kind(ctx, node.target_type);
                         }
                     }
                     if (!tgt.is_valid()) { continue; }
