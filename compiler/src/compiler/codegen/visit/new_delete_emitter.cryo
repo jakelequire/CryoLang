@@ -98,27 +98,19 @@ type struct NewDeleteEmitter {
             return;
         }
 
-        // Resolve the type name: try current module's qualified form first,
-        // then fall back to the DI's bare->qualified mapping, then the raw
-        // name (for already-qualified cases and cross-module aliases).
+        // `new T` names its type by whatever the writer spelled, which may be
+        // a bare leaf owned by another module; the widening order and the key
+        // that wins are `widen_type_home_scoped_bare`'s to state.
         const ctx_ptr: CompilationContext* = this.cg.ctx;
         const intern: InternTable* = this.cg.get_intern();
-        const di: DeclarationIndex* = this.cg.get_decl_index();
 
-        mut qualified_sym: SymbolStr = ctx_ptr.qualify_symbol_sym_home(node.type_name, node.span.file);
-        resolve_counter::Site::CascNewDelEnter.bump();
-        mut type_ref: TypeRef = di.lookup_type(qualified_sym);
-        if (type_ref.is_invalid()) {
-            qualified_sym = ctx_ptr.resolve_scoped_or(node.type_name, FILE, LINE);
-            type_ref = di.lookup_type(qualified_sym);
-        }
-        if (type_ref.is_invalid()) {
-            resolve_counter::Site::CascNewDelBareTry.bump();
-            qualified_sym = node.type_name;
-            type_ref = di.lookup_type(qualified_sym);
-            if (type_ref.is_valid()) { resolve_counter::Site::CascNewDelBareHit.bump(); }
-        }
-
+        mut qualified_sym: SymbolStr = SymbolStr::empty();
+        const type_ref: TypeRef = ctx_ptr.widen_type_home_scoped_bare(
+            node.type_name, node.span.file,
+            resolve_counter::Site::CascNewDelEnter,
+            resolve_counter::Site::CascNewDelBareTry,
+            resolve_counter::Site::CascNewDelBareHit,
+            FILE, LINE, &qualified_sym);
         const t: Type* = this.cg.lookup_type_by_id(type_ref.id);
         if (t == null) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,

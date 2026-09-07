@@ -635,6 +635,51 @@ public:
         return this.qualify_symbol_sym(name);
     }
 
+    /// Find a type by a leaf whose owning module is not known at the call
+    /// site, and report WHICH key won.
+    ///
+    /// Three keys are tried in one order and the first the index holds wins:
+    /// the module that WROTE the name, then that writer's imports, then the
+    /// leaf alone.  The third is a bare name reaching the index with no
+    /// resolver answer, so it binds in whichever module registered that leaf.
+    /// Having one copy of this is what makes deleting that step one edit.
+    ///
+    /// `origin_file` / `origin_line` are the CALLER's.  `resolve_scoped_or`
+    /// records where a scope question was asked, and a single site inside a
+    /// shared helper would report the helper as the whole population - the
+    /// same reason that function takes them rather than reading its own.
+    ///
+    /// The counter triple is the caller's for the same reason: two callers
+    /// must stay two populations, not merge into this one.
+    ///
+    /// `out_key` carries the winning key back because every caller needs it
+    /// as well as the type - one mangles a constructor symbol from it, the
+    /// other keeps it for the allocation - which is why this cannot simply
+    /// return a `TypeRef`.
+    widen_type_home_scoped_bare(mut &this, name: SymbolStr, span_file: string,
+                                enter: resolve_counter::Site,
+                                bare_try: resolve_counter::Site,
+                                bare_hit: resolve_counter::Site,
+                                origin_file: string, origin_line: i32,
+                                out_key: SymbolStr*) -> TypeRef {
+        const di: DeclarationIndex* = this.decl_index;
+        mut key: SymbolStr = this.qualify_symbol_sym_home(name, span_file);
+        enter.bump();
+        mut found: TypeRef = di.lookup_type(key);
+        if (found.is_invalid()) {
+            key = this.resolve_scoped_or(name, origin_file, origin_line);
+            found = di.lookup_type(key);
+        }
+        if (found.is_invalid()) {
+            bare_try.bump();
+            key = name;
+            found = di.lookup_type(key);
+            if (found.is_valid()) { bare_hit.bump(); }
+        }
+        *out_key = key;
+        return found;
+    }
+
     canonical_type_ref(mut &this, name: SymbolStr) -> TypeRef {
         const di: DeclarationIndex* = this.decl_index;
         const arena: TypeArena* = this.type_arena;

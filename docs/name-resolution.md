@@ -14108,6 +14108,10 @@ would put the cascade in one place where deleting the bare step is one edit, and
 it would also give the cascade a name, make a seventh caller cheap, and hide it
 from a gate that counts `.lookup_type(` rather than the primitive.
 
+8.108 TOOK it. The second half of the argument above expired when 8.107 split
+`LOOKUP` by receiver: a pattern hidden from one regex is a weak reason to keep
+two copies of a search, once the gate's rows say what they count.
+
 #### What is actually left, and why it is not this tier's shape
 
 The 20 bare-spelling sites are the only ones where something is genuinely lost,
@@ -14739,3 +14743,78 @@ file and line, rather than a call silently dropped from a ratchet. That path
 was exercised by a control that made it fire - an unknown receiver and a call
 on a non-dotted expression - because a failure path that has never failed is
 not known to work.
+
+### 8.108 The duplicated cascade is now one primitive, and the step nothing reaches is verified textually - MEASURED AND LANDED 2026-09-06
+
+8.101 left collapsing the verbatim `home -> scoped -> bare` cascade as a
+question, because it cut both ways: one place to delete the bare step from,
+against giving the cascade a name that makes a seventh caller cheap and hides
+it from a gate counting `.lookup_type(`.
+
+The second half of that no longer holds. 8.107 split `LOOKUP` by receiver, so
+the gate's rows say what they count, and `DEFID_MINT` / `DEFID_UNWRAP` already
+sit beside them as separate ratchets. Hiding a pattern from one regex is a weak
+reason to keep two copies of a search when the alternative is one place to
+measure, instrument and delete from - and the bare-step deletion held elsewhere
+becomes a single-site edit for these two groups rather than a six-site one.
+
+#### The copies were verbatim, and that is measured rather than inspected
+
+Drift between the copies would have made this a question about which one is
+right, which is not a method question. So it was checked rather than assumed:
+each copy was normalized under its own renaming - `base_qualified` / `key`,
+`node.type_name` / `name`, its own counter triple - and compared to the
+primitive's body. Both reduce to the SAME thirteen statements. The comparison
+was run against a body with one statement removed, and reported the
+difference, so an equality from it is not the equality of a check that cannot
+fail.
+
+#### Two hazards, both silent, both found by reading before writing
+
+- **`resolve_scoped_or` takes its origin from the CALLER.** Its own comment
+  says why: one location inside a shared helper "would collapse every caller
+  into itself and report the wrapper as the whole population". A primitive
+  passing its own `FILE, LINE` would have merged two scope-audit populations
+  into one, and nothing would have failed.
+- **The counter triple is the caller's**, passed as `Site` values the way
+  `spelling_type` already takes `nodef_site`. Bumping fixed sites inside the
+  primitive would have merged `CascBCtor*` and `CascNewDel*` into one number,
+  which is the same error in the other instrument.
+
+Both are the same mistake: a shared helper that answers "where did this come
+from?" with its own location. That the counters stayed at 102 and 684 rather
+than becoming 786 is what says neither was made.
+
+#### Measured, against predictions written first
+
+| | before | after |
+|---|---:|---:|
+| `CascBCtorEnter` | 102 | **102** |
+| `CascNewDelEnter` | 684 | **684** |
+| both bare steps reached / answered | 0 / 0 | **0 / 0** |
+| counter rows emitted | 285 | **285** |
+| `LOOKUP` | 72 | **69** |
+| emitted objects, compiler's own source | - | **identical** |
+
+`LOOKUP` falling by three is arithmetic, not a finding: six call sites became
+three, and a collapse that moved no call-site count would not have collapsed
+anything. `LOOKUP_ROUTED`, `LOOKUP_LOCAL`, `REENTRY`, `DEFID_MINT` and
+`DEFID_UNWRAP` are unchanged, and the three files that moved are the only three
+that moved.
+
+The codegen check is over the COMPILER'S OWN SOURCE, not `examples/`, because
+`examples/` contains no `new` and no base-constructor initialisation: it enters
+neither cascade, so it would have gone green while measuring nothing. The
+compiler's source enters them 786 times.
+
+#### What this does NOT establish
+
+**The bare third step is entered zero times across all 57 units**, before and
+after. No counter reaches it and no emitted byte depends on it, so nothing in
+the table above says its behaviour is preserved. That rests entirely on the
+textual equivalence above, and is stated here rather than left for a reader to
+infer coverage from a row of unchanged numbers.
+
+The five two-step variants and the four-step variant are NOT folded in. They
+are not verbatim, and folding things that merely resemble each other is where a
+behaviour change hides - which is the same reason the drift check came first.
