@@ -14818,3 +14818,143 @@ infer coverage from a row of unchanged numbers.
 The five two-step variants and the four-step variant are NOT folded in. They
 are not verbatim, and folding things that merely resemble each other is where a
 behaviour change hides - which is the same reason the drift check came first.
+
+### 8.109 The scope-switched regions were the sole producers of the file path they later read back: `current_module` was not saved by ordering, it was self-perpetuating - MEASURED AND FIXED 2026-09-07
+
+Carried across sessions as "sema restores `current_module` with
+`intern(source_file)` - noticed, never measured". It is the shape 8.104 and
+8.106 found twice: a field with one convention on one door and two on the
+other. The measurement then moved the defect off the door that was noticed.
+
+#### The producer side is two callers, not one
+
+`Resolver::restore_scope(name, saved)` assigns `this.current_module = name`.
+Its four callers disagreed:
+
+| caller | passed | |
+|---|---|---|
+| `name_resolution.cryo:2387` | `mod_info.namespace_name` | namespace |
+| `name_resolution.cryo:2390` | `intern(root.namespace_name)` | namespace |
+| `sema.cryo:472` | `intern(ctx.source_file)` | **file path** |
+| `monomorphizer.cryo:731` | `this.current_module` | **file path** |
+
+`set_module`, the other way in, always takes a namespace. The monomorphizer's
+is documented as a file path at `call_specializer.cryo:48`, which also keeps a
+separate `current_ns` "because import-scoped generic scope resolution keys on
+the namespace space, so it needs this, not the file path". The tree already
+knew the two were different, kept them apart in one place, and fed the wrong
+one to the resolver in another.
+
+#### Measured at both ends, because a reader-side zero alone is uncontrolled
+
+Shape decided by a predicate controlled on a known pair - a real namespace
+classifies `NS`, a real source path `PATH`. Over the same 57 units:
+
+| site | NS | PATH |
+|---|---:|---:|
+| `restore_scope` WRITE | 3,190 | **30,387** |
+| `qualified_name_of` | 909,221 | **0** |
+| `enter_scope` | 247,694 | **0** |
+| `export_symbol` | 67,497 | **0** |
+| `declare_variable` | 63,839 | **0** |
+| `declare_function` | 56,067 | **0** |
+| `declare_constant` | 50,124 | **0** |
+| `declare_type` | 10,067 | **0** |
+
+The producer row is what makes the reader zeros readable. Without it, "nothing
+reads a file path" and "no file path is ever written" are the same
+measurement, and only the second would have meant the call sites were dead.
+They were not dead: **90.5% of all `restore_scope` calls wrote a file path**.
+
+#### The inherited verdict was wrong, and its own falsifier caught it
+
+The verdict recorded here first was "inert, protected by ORDERING: every path
+that reads `current_module` re-enters a module through `set_module` before any
+reader arrives". The fix that verdict priced was to hand each site the
+namespace it already had, and the objection to taking it was that a change
+with no observable effect is not a session's to make on its own judgement.
+
+Both halves were wrong, and a third probe says why. A second instrument, at
+the ENTRY of each scope-switched region, reports what the resolver's
+`current_module` already held before the region ran - the value a genuine
+save-and-restore would hand back. It reaches 8,813 times in the monomorphizer
+and 21,574 in sema, and 8,813 + 21,574 = **30,387**, the PATH-write total
+above arrived at by an independent instrument over the same corpus.
+
+| | reaches | PRIOR `NS` | PRIOR `PATH` | PRIOR `EMPTY` |
+|---|---:|---:|---:|---:|
+| `monomorphizer` region | 8,813 | 209 | **8,604** | 0 |
+| `sema` region | 21,574 | 754 | **20,820** | 0 |
+| total | 30,387 | 963 | **29,424** | 0 |
+
+The resolver's `current_module` ALREADY HELD A FILE PATH on entry, 96.8% of
+the time. So restoring the saved value would have restored a path as well: the
+obvious fix is behaviour-identical to the defect at 29,424 of 30,387 reaches,
+and only the recorded falsifier separated them.
+
+The mechanism is that each region is re-entered in a loop, and its own exit is
+what the next entry reads:
+
+    entry : read current_module        <- the path the LAST exit wrote
+    set_module(template / entry module)
+    ...walk...
+    exit  : write a file path
+
+The two sites were **the producers of their own priors**. This is established
+by the edit rather than inferred from it: changing only those two writers took
+`PRIOR PATH` from 29,424 to **0** across the same 57 units. Had the path
+entered from any of the other seven writers of the field, zeroing these two
+could not have zeroed the observation.
+
+Ruled out by reading rather than left open:
+`compilation_context.cryo:929` passes `info.name` where the same function
+takes `info.namespace_name` four lines earlier, which reads as the same
+asymmetry - but the only construction of a `ModuleInfo` is
+`with_namespace(mod_name, file_path, mod_name)`, so `name` and
+`namespace_name` are the SAME value and it is not a producer. The two
+`set_module` calls INSIDE the regions carry namespaces for the same kind of
+reason: `entry.module_name` is concatenated as `module + "::" + name` against
+`qualified_name` in `spec_base_name`, and `template_mod` is handed to
+`ctx.swap_namespace`, which is the namespace slot by definition.
+
+#### The fix
+
+`sema.cryo` restores both cursors from the ONE value its own entry saved: the
+exit already passed `saved_namespace` to `ctx.swap_namespace`, and now passes
+it to `restore_scope` too, so the region can no longer return its two cursors
+to two different values.
+
+`monomorphizer.cryo` keeps `current_ns` beside `current_module`, which is what
+the inherited pricing assumed it already did and it did not - `set_current_ns`
+stored nothing locally and only cascaded to the call specializer. Storing it
+mirrors `set_current_module` directly above, and avoids the region's exit
+reaching through a collaborator for a value the orchestrator is handed
+directly.
+
+After the fix, over the same 57 units: `PRIOR` is `NS` **30,387**, `PATH` 0,
+`EMPTY` 0, and prior-equals-restored is **30,387 of 30,387** - the regions are
+now identity restores, handing back exactly what they found. The reach counts
+are unchanged at 8,813 and 21,574, so no control flow moved. The largest
+contributors are `std::alloc::allocator` (4,707) and `std::core::option`
+(4,011), the same two units that led the path-form table, in namespace form
+and at the same counts.
+
+Every gate unmoved, which was the prediction: `b1-check` B1=0 B4=0 106 sites
+on all three arms, `lane-check` 69/20/11/6/16/26, `roster-check` 2,106,
+`lsp-check` 0 errors.
+
+#### The EMPTY hazard, controlled
+
+`restore_scope` with an EMPTY namespace is not the same as with a path:
+`qualified_name_of` returns the BARE leaf when `source_module` is empty
+instead of building a qualified key, so "restore the saved namespace" is
+behaviour-preserving only where a namespace existed. Measured `EMPTY` 0 over
+all 30,387 reaches, before and after.
+
+That is a corpus statement, so it is not the whole control. The structural
+half is that each region now derives the restored value from ONE source: in
+sema the resolver cannot be handed an emptier namespace than `ctx` is, because
+they are handed the same variable; in mono `current_ns` is the field the call
+specializer's import-scoped resolution already depends on, so a program that
+could make it empty is one that has already lost that lookup. Neither site can
+now go empty on its own.
