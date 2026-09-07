@@ -14958,3 +14958,123 @@ they are handed the same variable; in mono `current_ns` is the field the call
 specializer's import-scoped resolution already depends on, so a program that
 could make it empty is one that has already lost that lookup. Neither site can
 now go empty on its own.
+
+### 8.110 Stage 2 has neither a table to mint against nor a target: 40% of mints precede the index, and the largest one re-mints a `DefId` it just unwrapped - MEASURED, STAGE 2 PARKED 2026-09-07
+
+8.100 left "make `DefId` a real index into a definition table populated during
+declaration" as the change that would make minting REQUIRE the table, on the
+argument that a mint which can fail is not a cast. The recurring defects this
+was meant to reach - the closure name qualified twice, the 206,678
+re-qualifications, the bare-leaf fallbacks - are all downstream of an answer
+being a string that can be operated on again, so the reasoning went from those
+defects to the representation.
+
+The reasoning does not survive its own population. Those defects live at sites
+holding a `SymbolStr`: only 1 of 132 lane lookups reads a `Res`, and only 2 of
+72 seam callers hold a resolution answer to pass. **Changing what a `DefId` is
+cannot reach a site that has not got one.** That is measuring one population
+and concluding about another, and it is why stage 2 was scoped from evidence
+that never applied to it.
+
+#### The question, and a round that was not reported
+
+Stage 2 turns on whether a mint against a real table could fail. Instrumented
+at all 16 `DefId::of_definition` sites against `DeclarationIndex` - the table
+8.100 named - over the 57 units.
+
+The first round said the 11 resolver-walk mints miss 100% and the 2 index
+reads miss 0%, the exact reverse of the prediction. It is not recorded as a
+finding because 100% and 0% in opposite directions is the shape a WRONG
+POPULATION produces, not the shape a defect produces. The competing
+explanation - the `nr*` sites run in name resolution, before `TypeDeclaration`
+populates the index - predicts the same table.
+
+#### The phase control separates them, and the artifact is most of the number
+
+Second round emits the index's population beside each verdict.
+
+| site | verdict | index population | count |
+|---|---|---|---:|
+| the 7 `nr*` sites | MISS | **empty** | 255,634 |
+| `resolver.cryo:908` | MISS | **empty** | 165,636 |
+| `resolver.cryo:908` | HIT | populated | 621,820 |
+| `resolver.cryo:908` | MISS | **populated** | **7,984** |
+| the 2 index reads + 2 synthesizers | HIT | populated | 4,600 |
+
+Every `nr*` miss is against an EMPTY index. **421,270 of 1,055,674 mints -
+39.9% - happen before `DeclarationIndex` holds a single entry.** Against a
+populated index the miss rate is 7,984 of 634,404, or 1.26%.
+
+#### The residue is two names, and they are modules
+
+The 7,984 are `compiler::codegen::llvm` (7,864) and `RayLib::RayLib` (120).
+Both are modules. `Res` has no `Module` variant, so a module symbol
+necessarily answers as `Def`, while `DeclarationIndex` holds types, functions
+and globals. The two key spaces differ by construction, and the residue is
+that difference rather than a disagreement about any definition.
+
+Neither of the three shapes predicted - not primitives, not monomorphized
+clones, not a resolver/index disagreement.
+
+**So `DeclarationIndex` is disqualified as the table.** Not because it is the
+wrong shape, but because two fifths of the mints precede its existence.
+
+#### The only other candidate has no key to look anything up by
+
+The resolver's symbol table is the remaining candidate, and it cannot serve
+either. `qualified_name_of` BUILDS its answer - `sym.source_module + "::" +
+leaf` - and says so: "the canonical form is built rather than read off".
+`Scope::find` and `Scope::insert` key on the LEAF's `SymbolStr.id`. No index
+anywhere in the resolver is keyed by qualified name.
+
+That splits the design and both halves lose the property:
+
+- `DefId::lookup(qualified) -> Option<DefId>`, the version that can fail, has
+  no table to consult. Building a qualified-name-keyed index is new
+  construction, not the re-keying stage 2 was priced as.
+- `DefId::of_symbol(sym)` takes what the resolver already holds and cannot
+  fail at all.
+
+A mint that cannot fail is a cast with extra steps.
+
+#### The largest mint is a re-mint of an answer unwrapped one frame earlier
+
+`resolve_type_qualified_name_bare_from` resolves a path and then unwraps what
+it gets:
+
+    Res::Def(q) => { return q.qualified_name(); }
+
+Its exits over the same corpus:
+
+| exit | count |
+|---|---:|
+| step 1, unwrapping a `Res::Def` | **795,317** |
+| step 1, some other `Res` | 620,402 |
+| step 2, import alias | **0** |
+| step 3, no answer | 620,402 |
+
+**Every valid answer it returns is a `DefId` turned back into a string**, and
+`name_resolution.cryo:1588` mints a new `DefId` from that string 165,533
+times. `resolver.cryo:908`, inside the `resolve_path` this calls, minted
+795,440 - the same population reached one frame down. The round trip is
+`DefId` -> `SymbolStr` -> `DefId`, and no change to what a `DefId` IS can
+remove it, because both ends already are one.
+
+The alias step is a controlled zero rather than an unreached one: step 1's
+non-`Def` count and step 3's count are both 620,402, so every call that step 1
+did not answer arrived at step 3, and step 2 answered none of 620,402
+opportunities.
+
+#### Parked
+
+Stage 2 is parked. It has no table (two fifths of mints precede the one it
+named, and the other candidate is not keyed by what it would look up), and no
+target (the population it would make unrepresentable measures zero, and the
+one defect the mints do exhibit is a round trip both of whose ends are already
+a `DefId`).
+
+What is NOT closed, recorded rather than reasoned away: 4 of the 16 mint sites
+never ran over this corpus - `name_resolution.cryo` 1486 and 1545,
+`resolver.cryo:906`, `sema.cryo:1272`. That is a `cryo build` population, and
+`cryo build` does not compile the orphan modules `cryo test` does. Their zero
+is a starved one and must not be read as dead.
