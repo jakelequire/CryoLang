@@ -295,29 +295,27 @@ type struct TypeResolver {
     /// A size that will not fold is reported rather than left pending: a
     /// pending size reaches codegen as an array descriptor with no storage
     /// behind it, and every access through it is then a wild pointer.
-    array_size_of(&this, a: ArrayAnnotation*, ctx: ResolutionContext*) -> i64 {
+    array_size_of(&this, a: ArrayAnnotation*) -> i64 {
         if (a.size != ArrayAnnotation::fixed_pending_size()) { return a.size; }
         if (a.size_expr == null) { return a.size; }
 
         // A bare constant in a size expression means what it means in the FILE
-        // the annotation was written in.  The ambient cursor is on whichever
-        // module is being walked, which for a trait default's body is the
-        // implementing type's module and not the trait's; the leaf then misses
-        // its own module's table and falls through to the program-wide bare
-        // index, which answers from any module with no import in hand.
+        // the annotation was written in, so the namespace comes from the span
+        // through the shared guard rather than from the ambient cursor.  The
+        // cursor is on whichever module is being walked, which for a trait
+        // default's body is the implementing type's module and not the trait's;
+        // substituting it would claim the module being compiled wrote the
+        // syntax.
         //
-        // An unknown file leaves the mapping invalid rather than guessing, and
-        // only then does the cursor answer - turning "written nowhere I know"
-        // into "written somewhere else" is the false-positive direction.
-        mut module_ns: SymbolStr = SymbolStr::empty();
-        if (this.module_graph != null) {
-            module_ns = this.module_graph.ns_sym_of_file(a.span.file);
-        }
-        if (!module_ns.is_valid()) {
-            if (this.intern_table != null) {
-                module_ns = this.intern_table.intern(ctx.current_module);
-            }
-        }
+        // An unknown file therefore yields the EMPTY namespace rather than a
+        // guess, and that is not a lost opportunity: `ConstEval` cannot tell
+        // "a namespace nothing declares" from "no namespace" - `bare_index_of`
+        // funnels both to the program-wide bare index - so a substituted cursor
+        // can only change the answer by making the qualified probe HIT, which
+        // is another module's constant of the same leaf and a silently wrong
+        // array length.
+        const module_ns: SymbolStr =
+            module_graph::home_ns_sym_of_file(this.module_graph, a.span.file);
 
         // No arena: a size is fixed here, and TypeLowering computes every
         // layout later, so `sizeof`/`alignof` are not yet constants.
@@ -418,7 +416,7 @@ type struct TypeResolver {
                 if (!elem.is_valid()) {
                     return TypeRef::invalid();
                 }
-                return this.arena.get_array_of(elem, this.array_size_of(a, ctx));
+                return this.arena.get_array_of(elem, this.array_size_of(a));
             }
             TypeAnnotation::Function(f) => {
                 this.resolve_function(f, ctx)

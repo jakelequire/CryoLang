@@ -15078,3 +15078,89 @@ never ran over this corpus - `name_resolution.cryo` 1486 and 1545,
 `resolver.cryo:906`, `sema.cryo:1272`. That is a `cryo build` population, and
 `cryo build` does not compile the orphan modules `cryo test` does. Their zero
 is a starved one and must not be read as dead.
+
+### 8.111 Two inherited claims: the array-size fallback is a miscompile path gated on a zero, and the scope restore it sits beside was entering a module all along - MEASURED AND FIXED 2026-09-07
+
+Both were carried as "reached N times, fires zero, two controls owed". Both
+counts were wrong, and in one case the zero was protecting something worse
+than dead code.
+
+#### `array_size_of` was hand-rolling a primitive and adding the step its doc forbids
+
+`module_graph.cryo` already exposes `home_ns_sym_of_file(graph, file)` -
+`ns_sym_of_file` guarded against a null graph - and states the EMPTY-ANSWER
+POLICY it exists to write once: the empty symbol means "the graph cannot say
+which module wrote this", and substituting the ambient cursor instead "would
+assert that the module being compiled wrote the syntax, which is the
+false-positive direction that reverted the visibility gate".
+
+`array_size_of` wrote those two lines out again and then did exactly that. Its
+two siblings in the same file call the primitive. This is the shape 8.108
+collapsed: a duplicated step with a divergent tail.
+
+Census over the 57 units, with the entry count as the control:
+
+| | count |
+|---|---:|
+| entered | 4,410 |
+| returned early, size already fixed | 4,088 |
+| **reached the fold** | **322** |
+| namespace answered by the graph | 322 |
+| **fallback fired** | **0** |
+| empty namespace reached `ConstEval` | 0 |
+
+4,088 + 322 = 4,410, so the decomposition closes and no rows were dropped.
+The inherited count was 145; it is **322**.
+
+**Owed control 1 - the LSP - discharged by running it.** The fallback's
+trigger is not a null graph: `TypeResolver` takes `module_graph` once at
+construction, and `init_type_system` is reached only from passes, which run
+after module loading in every driver. The trigger is `ns_sym_of_file` missing
+the span's file, which an editor buffer could plausibly produce. Measured by
+building `cryolsp` against the instrumented compiler library and driving a
+real session - initialize, didOpen, didChange - over a project whose CLI build
+is the positive control at 7 reaches. The LSP entered 92 times, returned early
+78, **reached 14, and the graph answered 14 of 14 with the fallback firing 0**
+- exactly twice the CLI's figures, because the session forces two analyses.
+The zero is not a starved one: the LSP demonstrably reaches the fold.
+
+**Owed control 2 - does `ConstEval` distinguish "a namespace nothing declares"
+from "no namespace" - discharged NEGATIVE.** `bare_index_of` tries
+`ns::name`, then the bare name as a qualified key, then the program-wide bare
+index. An empty namespace skips the first probe; a namespace nothing declares
+runs it and misses. Both arrive at the same bare index.
+
+That inverts what the fallback was worth. It cannot rescue a lookup, because
+the empty case already reaches everything the substituted case reaches. The
+only outcome it can change is making the QUALIFIED probe hit - under the
+cursor's namespace rather than the writer's - which binds another module's
+constant of the same leaf and gives the array a silently wrong length. It is
+not dead code; it is a miscompile path gated on a measured zero.
+
+Replaced with the primitive, and `ctx` removed from the signature: leaving an
+unused resolution context in place is an invitation to reach for the cursor
+again, and its absence is what makes "no ambient cursor here" structural
+rather than conventional.
+
+#### The scope restore beside it was entering a module, and said so
+
+`NameResolutionPass::run` used `restore_scope` where its sibling forward
+declaration used `set_module`, on the reasoning that `set_module` "would jump
+to the module's own scope, which is the same scope only while the walk has not
+entered a rib inside it - true here as far as anyone has measured, and not
+established".
+
+Established: over the 57 units the saved scope equals the module's own scope
+in **3,190 of 3,190** reaches, with no disagreement and no case where the
+module had no scope. 3,190 is also exactly the namespace-write total 8.109
+measured at `restore_scope`, so these two sites account for all of it and it
+is all this one - the second arm never runs.
+
+A destination that is a module wants `set_module`, which is the way in whose
+scope is the module's own; keeping a save-and-restore for it is a second way
+to answer one question, free to disagree with the first.
+
+The second arm keeps `restore_scope`. It is reached only when no module graph
+entry matches, and it never ran over this corpus - a `cryo build` population,
+where the guard it sits behind is not reached at all. That zero is starved and
+is not evidence the arm is dead.
