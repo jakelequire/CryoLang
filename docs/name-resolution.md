@@ -15164,3 +15164,82 @@ The second arm keeps `restore_scope`. It is reached only when no module graph
 entry matches, and it never ran over this corpus - a `cryo build` population,
 where the guard it sits behind is not reached at all. That zero is starved and
 is not evidence the arm is dead.
+
+### 8.112 Five bare steps and a dead alias tier deleted on controlled zeros, and the method-return cursor is not one of them - MEASURED AND LANDED 2026-09-08
+
+The standing rule this lands under: a resolution path measured to answer zero
+comes out, PROVIDED a control shows the zero is not starvation. The control is
+the rule; without one the path stays.
+
+#### Re-measured rather than carried, and one of the five had changed
+
+8.102 cleared FOUR groups and explicitly declined the fifth:
+`canonical_type_ref` answered 10 times in 2,662, "which is small but not
+zero, so deleting it changes what some program compiles to". 8.103 traced
+those ten to a doubled qualification and 8.104 fixed it, which PREDICTS the
+step now answers nothing - so it was measured again rather than inferred.
+
+| group | denominator | bare reached | bare answered |
+|---|---:|---:|---:|
+| `canonical_type_ref` | - | 2,652 | **0** (was 10) |
+| base-ctor key | 102 entered | 0 | 0 |
+| new/delete type | 684 entered | 0 | 0 |
+| impl target (4-step) | 14,244 entered | 0 | 0 |
+| impl param index | - | 111 | 0 |
+| primitive-impl x3 (CONTROL) | - | 33,278 | **28,904** |
+
+The primitive-impl rows are what make the zeros readable: the same instrument,
+over the same corpus, reports 28,904 answers, so the table is not measuring a
+cascade nobody entered. `of which target is a DECLARED type (must stay 0)`
+still reads 0, so the primitive explanation those three rest on continues to
+hold and they are kept.
+
+Two more came in with their own controls already measured: `_bare_from`'s
+import-alias tier answered 0 of 620,402 - established as reached rather than
+skipped because the first step's non-answer count and the third step's count
+are both exactly 620,402 - and 8.106's doubled-key family.
+
+#### What the shared primitive bought
+
+8.108 collapsed the base-ctor and new/delete cascades into
+`widen_type_home_scoped_bare` and recorded the reason: "having one copy of
+this is what makes deleting that step one edit." It has exactly two callers,
+both measured zero, so the third step came out once for both. The counter
+pair it took per caller went with it.
+
+#### The method-return cursor is NOT deletable, and the batch was wrong to include it
+
+Its doubled arm is 0 hits in 180,546. But the SAME step's plain arm answers
+**709**, so deleting the step removes 709 live answers. What is dead is the
+doubled CASE, not the step, and the only way to skip it without naming a
+special case is for `qualify_symbol_sym` to be idempotent - then
+`qualified.equals(type_sym)` holds for an already-qualified input and the
+guard declines on its own. It belongs to the producer fix, not to a deletion.
+
+The same reasoning keeps `restore_scope`'s second arm: it never runs, but only
+because a `cryo build` never reaches the guard it sits behind. A zero whose
+denominator is itself zero is starvation, and starvation is not evidence.
+
+#### The compiler is the falsifier, and the gate moved as predicted
+
+A deletion that broke the build would mean something reached a step the
+counters said nothing reached. Nothing broke.
+
+`LOOKUP` 69 -> 65, predicted before the edit and landing on the file split
+that was predicted with it: `compilation_context.cryo` 5 -> 3 and
+`type_resolution.cryo` 27 -> 25. Baseline re-pinned deliberately; the row is
+source-derived so one update holds on both hosts. `b1-check` B1=0 B4=0 106
+sites unchanged, since these rows are blank-bucketed and the gate selects only
+`B1`/`B3*`/`B4`/`!!`. Roster 2,106, lsp 0 errors, examples 14/14, selfhost
+both arms byte-identical.
+
+#### A flake, recorded as a flake
+
+`blocking_pool_a_configured_ceiling_is_enforced` failed once with "a max=2
+pool ran three jobs at once", then passed on a re-run of the SAME binary and
+tree, so it is not deterministic and not attributable to a compile-time change
+that provably answered nothing. `tests/tests/stdlib/future_blocking.cryo` has
+a recorded history of load-sensitive lying, but in two shapes that are not
+this one - a cancelled job leaving the asserted value, and a sleep-counted
+bound expiring under load. A ceiling appearing VIOLATED is a third shape and
+is not explained by either. Recorded rather than dismissed.
