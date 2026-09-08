@@ -15243,3 +15243,82 @@ a recorded history of load-sensitive lying, but in two shapes that are not
 this one - a cancelled job leaving the asserted value, and a sleep-counted
 bound expiring under load. A ceiling appearing VIOLATED is a third shape and
 is not explained by either. Recorded rather than dismissed.
+
+### 8.113 The async gate fires on a MISS, so the idempotent producer does not collide with it - it is what implements it - MEASURED AND FIXED 2026-09-08
+
+Two rulings looked incompatible: make `qualify_symbol_sym` idempotent, and do
+not let an `async` method on a monomorphized owner become a compile error. The
+impl-block path doubles 12,779 times and reaches `reject_undeclarable_async`,
+so removing the doubling was expected to make a lookup that used to MISS start
+succeeding, and the never-fired check start firing.
+
+The sign is backwards, and reading the gate says so before any measurement:
+
+    if (!qname.is_valid())        { reject; return; }
+    owner_ty = lookup_type_exact(qname);
+    if (!owner_ty.is_valid())     { reject; return; }
+
+**The check fires when the lookup MISSES**, and the doubled key is what makes
+it miss. An idempotent producer hands the lookup a key the index holds, so the
+gate is reached LESS. The two rulings are the same ruling.
+
+#### What the check protects, asked for the first time
+
+Not stale, and by its own statement rather than by inference: an `async`
+method left undeclared "reaches `lower` with no pending record, and that
+fallback declares it as a FREE function - where the body's `this` would
+silently resolve to the generated future instead of the receiver". A
+miscompile. The check stays. What the producer fix removes is the NEED to
+reject, which is the remedy that case calls for - make the case work - at no
+cost beyond the fix already ruled.
+
+#### Measured, with reached and fired counted apart
+
+| gate outcome | before | after |
+|---|---:|---:|
+| passed | 36,512 | **49,291** |
+| reached, missed, undoubled key HITS (impl block) | **12,779** | **0** |
+| reached, missed, no alias (struct/union/class) | 1,516 | 1,516 |
+| FIRED - an `E0203` actually emitted | **0** | **0** |
+
+`passed` is the control that separates "the gate does not fire" from "the gate
+is not reached": it is reached 50,807 times either way. 36,512 + 12,779 =
+49,291 exactly, so the impl-block population moved wholesale from rejected to
+passed and none of it went anywhere else.
+
+The `UNDOUBLED-HITS` column is the fix simulated before it was built: at each
+rejection the alias list's first entry already carries the undoubled name, and
+asking the index for it hit **12,779 of 12,779**. So the outcome was predicted
+at full strength rather than hoped for.
+
+#### A fourth caller, and a residue the fix does not reach
+
+`declare_async_methods` has FOUR callers, not the one the impl-block framing
+implies. Struct, union and class declarations pass an empty alias list and are
+the 1,516; they key on `qualify_binding_sym` and `qualify_symbol_sym_home`, so
+an idempotent `qualify_symbol_sym` does not touch them - which the measurement
+confirms rather than assumes, the row being unchanged at 1,516 across the fix.
+That row was the falsifier: had it moved, the fix would have been reaching
+past its own producer.
+
+An `async` method on one of those owners would still be rejected. Same
+user-visible class as the one just closed, different producer, and previously
+unenumerated.
+
+#### The fix, and where the decision now lives
+
+The already-qualified test moves into `qualify_symbol_sym` itself. It was
+already written one level up in `canonical_decl_key`, which existed precisely
+because a caller that might hold either form needed something that decides
+first; with the producer deciding, that function keeps its name at its call
+sites but is no longer a second place the key is derived. The predicate is
+`QualifiedName::segment_count`, the same one it used, so the two cannot come
+to disagree about what "already qualified" means.
+
+Nothing registers a doubled key - 8.106 measured that across the whole family -
+so declining to build one can only turn a guaranteed miss into a hit, which is
+what the table above shows it doing.
+
+Gates: `b1-check` B1=0 B4=0 106 sites on three arms, `lane-check`
+65/20/11/6/16/26, roster 2,106, lsp 0 errors, test OVERALL PASS (178, 39),
+examples 14/14, selfhost both arms byte-identical.

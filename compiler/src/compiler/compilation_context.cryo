@@ -539,20 +539,20 @@ public:
     /// the result feeds the type system (arena, registries).  Returns the leaf
     /// unchanged when no namespace is set.
     ///
-    /// `sym` is a BARE LEAF.  This prepends unconditionally, so handing it a
-    /// name that is already qualified produces `<ns>::<a::b::C>` - a key that
-    /// only matches if something registered the same doubled form, and a miss
-    /// otherwise.  The precondition is not checked here because the caller is
-    /// the only one that knows which form it holds; a caller that may hold
-    /// either wants `canonical_decl_key`, which decides that first.
+    /// An ALREADY-QUALIFIED name is returned unchanged, so this is idempotent.
+    /// Prepending to one mints `<ns>::<a::b::C>`, and nothing in the program
+    /// registers a doubled key, so that form can only miss - which makes
+    /// declining to build it the answer rather than a special case.  Deciding
+    /// it HERE, at the one place the qualifier is applied, is what stops each
+    /// caller needing to know which form it holds.
     ///
-    /// The precondition is widely violated across the tree, mostly with
-    /// already-canonical type names and mangled monomorph names. That is
-    /// recorded rather than fixed: whether each violation is absorbed by a
-    /// caller-side fallback or is producing a key that happens to match a
-    /// doubled registration is not established, and the two need different
-    /// fixes.
+    /// The separator test is `QualifiedName::segment_count`, the same
+    /// predicate the declaration key is derived with, so the two cannot come
+    /// to disagree about what "already qualified" means.
     qualify_symbol_sym(mut &this, sym: SymbolStr) -> SymbolStr {
+        if (QualifiedName::segment_count(this.intern_table.resolve(sym)) > 1) {
+            return sym;
+        }
         if (this.namespace_str.is_empty()) {
             return sym;
         }
@@ -627,11 +627,10 @@ public:
     ///
     /// Deriving it here once is the same rule `canonical_type_qname` states for
     /// itself - a declaration and its bodies cannot disagree if there is only
-    /// one place the key comes from.
+    /// one place the key comes from.  The already-qualified test now lives in
+    /// `qualify_symbol_sym` itself, so this names the concept at its call
+    /// sites without being a second place the key is decided.
     canonical_decl_key(mut &this, name: SymbolStr) -> SymbolStr {
-        if (QualifiedName::segment_count(this.intern_table.resolve(name)) > 1) {
-            return name;
-        }
         return this.qualify_symbol_sym(name);
     }
 
