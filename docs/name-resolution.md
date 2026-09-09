@@ -12910,6 +12910,13 @@ is on the other side of that boundary and needs no such thing.
 
 ### 8.91 The 271 casts do not exist, and a qualified call is not argument-checked at all - MEASURED 2026-09-04
 
+> Corrected by 8.114. The heading and the section "The defect:
+> `check_call_arity` is reachable only from a bare identifier" are wrong in
+> three ways: the discriminator is an ABBREVIATED qualifier rather than
+> qualification, a fully-qualified call being checked exactly like a bare one;
+> the branch is `ScopeResolution`, not `MemberAccess`; and arity was never
+> merely lenient - an arity-wrong call of this shape crashed the compiler.
+
 8.85 and 8.87 costed the migration as about 779 sites with **271 needing a
 cast**, on the grounds that the intrinsic takes `string` or `void*` where the
 libc twin takes `u8*`. Both halves of that are wrong, and finding out why
@@ -15322,3 +15329,261 @@ what the table above shows it doing.
 Gates: `b1-check` B1=0 B4=0 106 sites on three arms, `lane-check`
 65/20/11/6/16/26, roster 2,106, lsp 0 errors, test OVERALL PASS (178, 39),
 examples 14/14, selfhost both arms byte-identical.
+
+
+### 8.114 It is the ABBREVIATED qualifier, not the qualifier: a fully-qualified call is checked exactly like a bare one, and the leniency rested on ONE signature - MEASURED AND FIXED 2026-09-08
+
+8.91 recorded that "a qualified call receives no argument or arity check
+whatsoever", named `check_call_arity`'s single call site as the cause, and
+parked it. Every load-bearing part of that is wrong, and the isolation it used
+is what hid it: `Helper::takes_ptr(n)` carries an ABBREVIATED qualifier, so the
+one variable it changed was not the one it reported.
+
+#### The third arm the isolation never ran
+
+Same declarations, same arguments, one variable:
+
+| call shape | bare | `P91::Helper::f(...)` | `Helper::f(...)` |
+|---|---|---|---|
+| wrong argument type | E0214 | E0214 | **accepted** |
+| too few arguments | E0216 | E0216 | **compiler SEGFAULT** |
+| too many arguments | E0215 | E0215 | **codegen failure** |
+| correct call | builds | builds | builds |
+
+The fully-qualified column is the arm 8.91 did not run, and it is the control
+that says qualification is not the discriminator. The correct-call row is what
+says the accepting column is not accepting everything.
+
+`import` binds the leaf, so the form a user writes is the third column. This is
+the only column with a defect in it.
+
+#### Three lanes, and the two that check are the controls for the one that does not
+
+`check_scope_call_arg_types` is the whole surface, and `check_call_arity` -
+which takes an `IdentifierNode*` and keys on the ambient home qualifier - is
+not reachable from it and is not the tool for it:
+
+* **lane A**, the written qualifier is an exact single-overload key: full
+  arity and argument check.
+* **lane C**, the qualifier names a type: the static-method gather checks both.
+* **lane B**, the written key misses and a namespace-suffix match recovers the
+  overload: conversions applied, then `return`. No arity check, no type check.
+
+An abbreviated qualifier never keys exactly, so it always lands in lane B.
+
+#### What applying the check would cost, measured before applying it
+
+Instrumented at each lane, with the strict check SIMULATED - the same predicate
+`check_args_against_params` uses, bumping instead of emitting, and run after
+`apply_implicit_conversions_only` so an argument still incompatible is one no
+registered converter rescues. Corpus: the compiler project (its own source plus
+the stdlib, 245 modules), then the 14 examples and `ffi_c_import`, 15 counter
+blocks for 15 projects.
+
+| row | compiler corpus |
+|---|---:|
+| lane A (CONTROL) | 16,066 |
+| **lane B** | **9,959** |
+| - of which ARITY mismatch | **0** |
+| - of which a strict check would pass | 6,213 |
+| - of which a strict check would reject | 3,746 |
+| exact key OVERLOADED, also unchecked | 22 |
+| lane C (CONTROL) | 3,115 |
+
+0 + 6,213 + 3,746 = 9,959, so the decomposition closes against its own
+denominator. **The arity zero is controlled rather than starved**: it is one arm
+of an `if`/`else` whose sibling arms read 6,213 and 3,746, and all 15 example
+blocks read 0 as well. Per ARGUMENT: sign reinterpret 3,740, incompatible 10,
+const-drop 0, lossy narrowing 0. A second instrument printing one row per event
+reproduced both totals exactly.
+
+#### The 3,750 arguments are 72 source sites, and 70 of them are one signature
+
+| family | sites | shape |
+|---|---:|---|
+| sign reinterpret | 70 | `core::panic(msg, FILE, LINE)`, `u32 <- i32`, 24 stdlib files |
+| incompatible | 2 | `libc::memcpy(&result, &value, ..)` in generic `transmute`; `libc::getcwd` with `&i8` |
+
+The 70 are not 70 judgements. `LINE` was `i32` and `panic` declares
+`line: u32`; one disagreement, reached once per site.
+
+#### Neither family is valid code, which is what decides the escalation
+
+Both shapes are rejected in the BARE form by the exact diagnostics at issue -
+`&f64` into `u8*` gives "argument 1 doesn't match the parameter's declared
+type", and `LINE` into `u32` gives "reinterprets the sign of a same-width
+integer". So this is not valid code a new check would wrongly reject; it is code
+the language already rejects, surviving only because it is written with an
+abbreviated qualifier.
+
+#### Which side of the disagreement was wrong, decided by the consumers
+
+Both directions were costed rather than argued:
+
+| direction | in-tree cost |
+|---|---|
+| `panic`'s `line` -> `i32` | 2 declarations, **0** call sites |
+| `LINE` -> `u32` | 1 declaration, **83** call sites need `as i32` |
+
+The cheaper one was NOT taken. `LINE` denotes a line number; `panic` already
+declares `u32`, and so does the runtime's own funnel,
+`__cryo_panic(msg, file, line: u32)`. The 83 are one internal consumer -
+`ResolutionContext.origin_line`, the provenance field on resolution-audit rows -
+and making a public signature and an ABI declaration both signed to avoid
+casting an internal audit field is the tail wagging the dog. `LINE` is now
+`u32`, and the audit context narrows explicitly at the sites that want a signed
+line.
+
+#### The fix
+
+Lane B checks arity and argument types exactly as the exact-key lane above it
+does. The arity half could not have been the leniency the code's own note
+described - such a call never reached codegen intact - which is what the
+measured 0 says from the other direction, and it reuses the E0215/E0216 lane A
+already emits rather than inventing a code.
+
+Predicted before the edit and checked after: `too few` moves from SEGFAULT to
+E0216 and `too many` from codegen failure to E0215, while `wrong type` becomes
+E0214 and the correct call is unmoved at exit 0 - the last being the row that
+says no false positive was introduced. The corpus is the falsifier: the fixed
+compiler builds its own source and the stdlib with **zero** errors, and 16 of
+16 projects build.
+
+#### The plural exact key is a third hole, enumerated and NOT taken
+
+`overloads.length > 1` on the written key escapes both lanes - 22 reaches. The
+obvious fix is to check arity there and return, on the reasoning that only free
+and module-scoped functions are registered under a `<scope>::<member>` key, so
+a plural set names a module and the static gather can answer nothing for it.
+
+That reasoning was READ, not measured, and the ratchet refuted it: the early
+return moved `type cascade: 1 exact` by -24, which is the gather doing lookups
+for exactly those calls. Whether it ANSWERS them is still unmeasured, and until
+it is, returning early removes work whose value is unknown. The branch was
+dropped. This is the hole 8.91 did not enumerate at all, and it stays open with
+its denominator recorded.
+
+#### One ratchet row moved, and the mechanism is isolated rather than assumed
+
+`b1-check`: B1 = 0 and B4 = 0 unchanged; one row moved, `callee visibility
+checks reached` 1126 -> 1127 on `examples/09-json-config`. Its rejection
+sibling, `REJECTED: private, cross-module (E0353)`, is unchanged at 0 - the row
+is documented as bounding the rejection rather than describing it, so one more
+call reached the door and none was refused.
+
+The cause was isolated by elimination over the whole change set, each arm a
+separate build or measurement rather than a reading:
+
+| backed out | row |
+|---|---|
+| the strict check (arity kept) | still 1127 |
+| the `mem.cryo` pointer casts | still 1127 |
+| everything else is compiler-internal `as i32`, which changes no value | - |
+
+So it is `LINE`'s type: one call's argument now matches `panic`'s declared
+`u32` exactly and takes the exact-match door instead of a coercion, reaching the
+visibility check once more.
+
+All THREE windows targets moved by exactly +1 - `09-json-config` 1126 -> 1127,
+`ffi_c_import` 860 -> 861, `14-threads` 1148 -> 1149 - which is the shape a
+single stdlib call site produces once per compile, and not the shape a change
+in the scope-call lanes would produce, since the three differ enormously in how
+much lane B they enter.
+
+#### What this does NOT establish
+
+- **Nothing is shown to have miscompiled.** What is shown is that a wrong arity
+  reached codegen, where it crashed or failed. No corpus contained such a call.
+- **The 22 plural-key reaches are still unchecked**, and the gather's answer
+  rate for them is unmeasured. That is the next measurement, not a conclusion.
+- The simulation instrument was removed rather than kept, for 8.105's reason: a
+  row pinned against a drifting denominator is a backlog no gate can act on,
+  and `probe_strict_args` was a second copy of `check_args_against_params` free
+  to drift from it.
+
+#### The blocking-pool flake recurred, and is now characterised
+
+`blocking_pool_a_configured_ceiling_is_enforced` failed once during this work,
+the same test and the same shape 8.112 recorded and could not explain. It is
+still not attributable to a compile-time change, and this time it was measured
+rather than re-run once: **10 of 10 passes on the same binary in isolation**,
+against a failure inside the full suite both times it has been seen.
+
+That is sharper than "not deterministic". Both observations are under the
+suite's concurrent load and neither is reproducible without it, which points at
+the assertion's own timing assumption rather than at the pool's ceiling. A
+subsequent full `make test` on the same tree reported OVERALL PASS with unit
+2,106 / 0.
+
+Recorded, not fixed, and not silenced - the test is unchanged.
+
+### 8.115 Inline `<T: Bound>` is unenforced, but it is NOT a redundant spelling of `where`: on a type declaration it is the only bound syntax the grammar has - MEASURED, DECISION PARKED 2026-09-08
+
+Carried in as "grammar that nothing enforces; enforce-or-delete is a language
+decision", with the supporting claim that the tree writes `where` everywhere
+and holds **zero** inline constraints. The unenforcement is real and
+reproduced. The supporting claim is false, and the reason it is false is what
+prices the deletion.
+
+#### The corpus claim was stale, and the corpus argues the other way
+
+`tests/tests/projects/inline_generic_bound` exists and is run by the projects
+meta-runner. It was built precisely because the constraint loop was
+unreachable by every other corpus, and its header already records the same
+absence of enforcement, measured two ways. An inline constraint is not
+unwritten in the tree; it is written in the one place whose purpose is to
+reach the code that reads it.
+
+#### Re-measured independently, and one case is sharper than the recorded one
+
+| case | outcome |
+|---|---|
+| `<T: Describe>`, body calls `x.label()` | builds |
+| `<T>` with NO bound, body calls `x.label()` | **builds** |
+| `<T: Describe>`, unsatisfied, body calls the method | `E0358 no method named` |
+| `<T: Describe>`, unsatisfied, **body does not call it** | **builds, exit 0** |
+| `where T: Describe`, unsatisfied (CONTROL) | `E0306` |
+
+The unbounded row is what says the constraint is not load-bearing for the
+body either - the symbolic walk admits `x.label()` on a bare `T`. The last row
+is sharper than the note in the project header, which records the unsatisfied
+case as `E0358`: with a body that never calls the method there is no
+diagnostic at all, so the absence is total rather than masked by a
+method-resolution failure. The `where` row is the control that says the
+satisfaction machinery works and is simply not reached from this field.
+
+#### Enforcing: normalization at the producer, for functions
+
+`GenericParamNode.constraints` is a `TraitRef[]` and a `where` bound is a
+`TraitBound { type_parameter, trait_refs }`, so an inline constraint on a
+function is already `TraitBound { gp.name, gp.constraints }`. The field's own
+doc comment says the two syntaxes "express one concept, so they share one
+shape here". Normalizing at the producer therefore feeds every existing
+consumer - both call-site checks and the E0306 diagnostic - with no new
+mechanism and no new error code, which is the one-producer shape rather than a
+second lane to keep in step.
+
+In-tree cost is zero: the only two inline-constrained declarations are in the
+project above and both are satisfied.
+
+#### Deleting: the grammar offers no replacement on a type
+
+`where` appears in the grammar on `FunctionDecl`, `Method`, `MethodImpl` and
+`TraitMember` - every one of them function-shaped. **A type declaration has no
+`where` clause at all**, so `type struct Holder<T: Tagged>` is the only way the
+language can express a bound on a type parameter of a type. Deleting the
+production removes expressiveness that has no other spelling, rather than
+removing a redundant one.
+
+#### What either choice does NOT reach
+
+Type-level enforcement is new construction under both options, and it is not
+an inline-syntax question. `trait_bounds` is a field of `FunctionDeclNode`
+alone; the six E0306 emitters are two function-template call-site checks, an
+associated-type bound on a trait declaration, and `await`'s `Future`
+requirement. **No bound on a type declaration is checked anywhere, by either
+syntax**, because there is no other syntax and this one is unread.
+
+So the decision splits: normalizing the function case is small and closes the
+gap the entry was raised for; the type case is a missing subsystem either way.
+Parked - it changes what an existing program compiles to.
