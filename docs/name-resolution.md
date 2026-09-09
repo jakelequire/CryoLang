@@ -15965,3 +15965,87 @@ than first noted - `qualify_binding_sym` and `qualify_symbol_sym_home` are both
 used for the SAME `UnionDeclNode`, in different passes, not merely across the
 async arms. It is a naming inconsistency and worth its own entry. It is not a
 second instantiation route, and is recorded here so it is not mistaken for one.
+
+### 8.119 Handoff: the `where` extension is NOT started, and two kinds of zero are worth telling apart - 2026-09-09
+
+Short by intent. Only what a successor would otherwise have to rediscover.
+
+#### State
+
+The `where`-on-type-declarations extension is **not begun**. No parser change,
+no carrier field, no enforcement. There is nothing half-built to back out and
+no parse-only syntax in the tree. The deletion of the inline form (8.116), its
+single-diagnostic rejection (8.117) and the route measurement (8.118) are all
+landed, gated and pushed.
+
+One question gates construction and is **not** a mechanical one:
+`TypeAliasDeclNode` is one of the six carriers, and a generic type alias is
+never monomorphized, so a bound on one is checked by nothing at the
+instantiation site. There are also zero generic type aliases tree-wide, so such
+a bound would be exercised by no corpus. Either omit the alias from the carrier
+set or build its project before the enforcement code. The other five carriers
+are covered by the site as measured.
+
+#### Two kinds of zero, and the instrument that separates them
+
+This matters more than the extension. A counter reading zero is either
+
+* **not entered** - nothing reached it; or
+* **entered and never answering** - it runs and produces nothing.
+
+They license opposite actions. The first is deletable once the thing that would
+have entered it is gone; the second is *starvation* and says nothing about
+whether the lane is needed, because the population that would have exercised it
+may simply be absent.
+
+Both occur in this tree, and this session hit each. The six retired bound rows
+were the first kind: they stopped being entered when the constraint loops went,
+so their zero became deletable. A lane that is entered thousands of times and
+answers zero is the second kind, and **a call row cannot tell the two apart on
+its own**.
+
+The tree already contains the worked example of the instrument that can:
+`ParamRefSymbolic`, `ParamRefTypeRes` and `ParamRefResolver` exist for exactly
+this, and their comment states the design - a parameter carrying no constraints
+never enters the loop, so the call rows cannot distinguish "nothing reached
+this" from "what reached it carried nothing", and only a count taken OUTSIDE the
+inner loop separates a starved site from one doing nothing for everything it is
+handed. Any work on a lane that answers zero should add that third row on the
+thing being *entered* before concluding anything.
+
+#### Practical notes that cost time to learn
+
+* **A measurement can be added without touching the b1 gate.** A `Site` in the
+  blank bucket (`"   "`, as `FnBindSingle` has) is not counted among the gate's
+  pinned rows; a `B1`-flagged one is, and changes the site count. Verified both
+  ways this session.
+* **The b1 site count is now 100, not 106**, on both hosts, because six rows
+  were retired. Any figure computed against a 106-row baseline needs rebasing.
+* **`make cryo` builds with the pin**, so instrumentation added to compiler
+  source emits nothing from the build itself. Measure with `compiler/build/cryo`
+  over a **cold** corpus - `cryo build` is incremental and a warm one counts
+  nothing - and check every exit code before reading a row.
+* **Adding or removing a `Site` shifts the enum**, so it needs a clean
+  `rm -rf compiler/build` rather than an incremental build.
+* **`b1-gate.py --update` is per host** and round-trips the blocks it did not
+  measure, so a one-host re-pin leaves the other host's blocks stale and green
+  locally. Both arms, explicitly. The Linux arm drifted independently this
+  session, so this is not hypothetical.
+
+#### Two live items left behind, neither started
+
+* **`BoundedParamType` is now uninhabited** - inline constraints were its only
+  producer - while roughly twenty consumer sites remain in mangling, codegen,
+  mono, `call_resolver` and `member_resolver`. It is deliberately kept: the zero
+  was manufactured by removing the only inhabiting syntax, so it has no control.
+  It becomes deletable if the `where` extension turns out not to need it, and
+  the prior question is whether it is a second answering path for something the
+  clause already answers - a `where`-bounded parameter has always been a plain
+  `GenericParamType`, and dispatch on an abstract `T` works from the clause.
+* **The struct/union/class arms disagree about qualification**, and both
+  `qualify_binding_sym` and `qualify_symbol_sym_home` are used for the SAME
+  `UnionDeclNode` in different passes. A naming inconsistency, not a second
+  instantiation route, and unclaimed.
+
+Also unclaimed and untouched: the struct/union/class `async` producer, and the
+`blocking_pool` ceiling assertion that passes alone and fails under load.
