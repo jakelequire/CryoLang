@@ -690,6 +690,54 @@ Counter caveats, both load-bearing when reading any number it prints:
 
 ---
 
+### 7.4 A description is not evidence, and stale ones are read as current fact
+
+Normative, and the most repeated failure in this subsystem's history.
+
+Every claim ABOUT the code - a comment, a counter's label, a doc-comment step
+list, a ledger entry, an audit table - was true of some measurement at some
+moment. None of them re-runs. The code moves; the description stays, and the
+next reader takes it as a current fact because nothing about it looks old.
+
+Three instances landed in a single session (2026-09-09), and they are one
+failure mode rather than three:
+
+* A comment at the arena leaf lane said it was **load-bearing for circular
+  `ASTVisitor*` forward references**. The compiler selfhosts without the lane.
+  The claim was false, and `compiler/` - where `ASTVisitor` lives - is exactly
+  the corpus that would have shown it. Nobody re-ran it because it read as
+  settled (§8.121).
+* The `leaf_index` field comment described it as the TypeResolver's
+  cross-module lookup fallback. It had stopped being that in the same change
+  that deleted the lane, and would have told the next reader the index still
+  answers lookups.
+* A plan classified four artifacts as dead cascade lanes from their COUNTER
+  NAMES. One was a guard, one was the migration's own destination, and one was
+  starved rather than dead. Acting on it would have deleted the guard and the
+  destination (§8.120).
+
+#### The rule
+
+**A description justifies re-running the measurement, never skipping it.** When
+a comment, label or entry is what makes a change look safe or unnecessary,
+that is the moment it has to be re-measured rather than believed. Specifically:
+
+* A comment saying a path is load-bearing, unreachable, or dead is a
+  hypothesis. Instrument it before reverting on it, and before leaving it.
+* A counter's NAME does not say what its site is. Only the source says whether
+  a site is a lane that answers, a guard that passes, or a destination that
+  the migration is moving toward - and all three read as zero or near-zero in
+  a call/answer column (§8.120).
+* When a change falsifies a description, the description is part of the
+  change. Fixing it later is how the next instance is created.
+
+#### Why this is in the normative section
+
+Because the alternative is discipline, and §7's opening says what happens to
+discipline under deadline. There is no gate that fails when a comment goes out
+of date - which is precisely why the cost lands on whoever reads it next, and
+why a stale description survives longer than a stale assertion would.
+
 ## 8. Known gaps against this spec
 
 ### 8.1 Visibility is not enforced (§3.3)
