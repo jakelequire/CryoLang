@@ -1276,15 +1276,11 @@ type struct TypeResolutionPasses {
 
     /// Single source of truth for creating GenericParamType entries in the
     /// arena from an array of GenericParamNode*.  Returns parallel TypeRef[]
-    /// where refs[i] is the GenericParamType (or BoundedParamType) for
-    /// generic_params[i].
+    /// where refs[i] is the GenericParamType for generic_params[i].
     ///
-    /// When `gp.constraints` is non-empty, each constraint name is resolved
-    /// against the arena's leaf index to produce a `TraitType` TypeRef and
-    /// the param is created as a BoundedParamType. This carries trait bounds
-    /// into the type system so method dispatch (B.4) can find trait methods
-    /// from a bounded `T`. Constraints that don't resolve to a registered
-    /// trait fall back to a plain GenericParamType; better than an ICE.
+    /// A bound on the parameter does not reach the arena entry: a bound is
+    /// written in a `where` clause, which lives on the declaration rather than
+    /// on the parameter, and the consumers that need it read it from there.
     ///
     /// Used by:
     ///   - TypeResolutionRunner::bind_generic_params()
@@ -1295,26 +1291,7 @@ type struct TypeResolutionPasses {
         for (mut i: i64 = 0; i < generic_params.length; i++) {
             const gp: GenericParamNode* = generic_params[i];
             resolve_counter::Site::ParamRefTypeRes.bump();
-            mut bounds: TypeRef[] = [];
-            for (mut k: i64 = 0; k < gp.constraints.length; k++) {
-                resolve_counter::Site::LeafCallTypeResBound.bump();
-                const trait_ref: TypeRef = arena.lookup_by_leaf(gp.constraints[k].written_leaf());
-                if (trait_ref.is_valid()) {
-                    resolve_counter::Site::LeafViaTypeResBound.bump();
-                    bounds.push(trait_ref);
-                }
-            }
-            mut param_ref: TypeRef = TypeRef::invalid();
-            if (bounds.length > 0) {
-                param_ref = arena.create_bounded_param(gp.name, i as u64, bounds);
-            } else {
-                // `bounds` is empty here but still an owning Array; drop it so
-                // it is consumed on this path too (create_bounded_param consumes
-                // it on the other), keeping the move state consistent.
-                bounds.drop();
-                param_ref = arena.create_generic_param(gp.name, i as u64);
-            }
-            refs.push(param_ref);
+            refs.push(arena.create_generic_param(gp.name, i as u64));
         }
         return refs;
     }
@@ -1339,10 +1316,6 @@ type struct TypeResolutionPasses {
                                   is_source_decl: boolean,
                                   owner_mod: SymbolStr) -> void {
         if (stmt == null) { return; }
-        // Inline `<T: Bound>` constraints, stamped alongside the where-bounds
-        // below: both name a trait, and which one they name must not depend on
-        // which syntax was used to write it.
-        TypeResolutionPasses::stamp_decl_generic_constraints(stmt, ctx);
         const arena: TypeArena* = ctx.type_arena;
         // DeclarationIndex module ownership.  Normally the current module, but
         // injected specializations pass their template's defining module via
@@ -2150,75 +2123,6 @@ type struct TypeResolutionPasses {
         resolve_counter::path_hit("BOUND-STAMP-ALL", "stamp_trait_ref",
             ctx.intern_table.resolve(tr.path[tr.path.length - 1]),
             ctx.intern_table.resolve(tr.resolved_name));
-    }
-
-    /// Stamp the identity of every inline `<T: Bound>` constraint on a
-    /// declaration's own generic parameters.
-    ///
-    /// An inline constraint and a `where` bound are the same question asked
-    /// with two syntaxes, so they are answered at the same chokepoint. A
-    /// consumer that reached one and not the other would resolve a trait
-    /// differently depending on how its author happened to spell the bound.
-    static stamp_generic_constraints(params: GenericParamNode*[]*,
-                                     ctx: CompilationContext*) -> void {
-        if (params == null) { return; }
-        for (mut i: i64 = 0; i < (*params).length; i++) {
-            const gp: GenericParamNode* = (*params)[i];
-            if (gp == null) { continue; }
-            for (mut k: i64 = 0; k < gp.constraints.length; k++) {
-                TypeResolutionPasses::stamp_trait_ref(&gp.constraints[k], ctx);
-            }
-        }
-    }
-
-    /// Route a declaration to `stamp_generic_constraints` for whichever kind
-    /// it is. The kind dispatch lives here alone so a new generic-bearing
-    /// declaration has one place to be added rather than seven.
-    static stamp_decl_generic_constraints(stmt: ASTNode*,
-                                          ctx: CompilationContext*) -> void {
-        if (stmt == null) { return; }
-        match (stmt.kind) {
-            NodeKind::StructDeclaration => {
-                const n: StructDeclNode* = stmt as StructDeclNode*;
-                TypeResolutionPasses::stamp_generic_constraints(&n.generic_params, ctx);
-            }
-            NodeKind::UnionDeclaration => {
-                const n: UnionDeclNode* = stmt as UnionDeclNode*;
-                TypeResolutionPasses::stamp_generic_constraints(&n.generic_params, ctx);
-            }
-            NodeKind::ClassDeclaration => {
-                const n: ClassDeclNode* = stmt as ClassDeclNode*;
-                TypeResolutionPasses::stamp_generic_constraints(&n.generic_params, ctx);
-            }
-            NodeKind::EnumDeclaration => {
-                const n: EnumDeclNode* = stmt as EnumDeclNode*;
-                TypeResolutionPasses::stamp_generic_constraints(&n.generic_params, ctx);
-            }
-            NodeKind::TraitDeclaration => {
-                const n: TraitDeclNode* = stmt as TraitDeclNode*;
-                TypeResolutionPasses::stamp_generic_constraints(&n.generic_params, ctx);
-                for (mut i: i64 = 0; i < n.methods.length; i++) {
-                    const f: FunctionDeclNode* = n.methods[i];
-                    if (f == null) { continue; }
-                    TypeResolutionPasses::stamp_generic_constraints(&f.generic_params, ctx);
-                }
-            }
-            NodeKind::FunctionDeclaration => {
-                const n: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                TypeResolutionPasses::stamp_generic_constraints(&n.generic_params, ctx);
-            }
-            NodeKind::ImplementationBlock => {
-                const n: ImplBlockNode* = stmt as ImplBlockNode*;
-                TypeResolutionPasses::stamp_generic_constraints(&n.generic_params, ctx);
-                for (mut i: i64 = 0; i < n.methods.length; i++) {
-                    const m: MethodNode* = n.methods[i];
-                    if (m == null || m.func == null) { continue; }
-                    TypeResolutionPasses::stamp_generic_constraints(
-                        &m.func.generic_params, ctx);
-                }
-            }
-            _ => { }
-        }
     }
 
     /// Stamp every trait reference reachable from a where/bound list.

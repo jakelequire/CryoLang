@@ -228,9 +228,11 @@ MethodImpl         ::= ("virtual" | "override")? "static"?
                        ("where" WhereClause)? Block
 
 Generics           ::= "<" GenericParam ("," GenericParam)* ">"
-GenericParam       ::= Ident (":" Ident ("+" Ident)*)? ("=" Type)?
+GenericParam       ::= Ident ("=" Type)?
                        (* the optional "=" Type is a default type argument,
-                          e.g. `<A = GlobalAlloc>` *)
+                          e.g. `<A = GlobalAlloc>`.  A parameter carries no
+                          bound here: a bound is written in a WhereClause, so
+                          `<T: Bound>` is a syntax error. *)
 GenericArgs        ::= "<" Type ("," Type)* ">"
 
 

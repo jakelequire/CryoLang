@@ -1,35 +1,25 @@
-/// Inline `<T: Bound>` constraints - the syntax nothing else in the tree writes.
+/// A bound on a type parameter is written in a `where` clause. The inline form
+/// `<T: Bound>` is not syntax: a `:` in generic-parameter position is rejected
+/// by the parser, which is what this project pins.
 ///
-/// WHAT THIS PINS, AND WHAT IT DOES NOT
+/// WHY A COMPILE-FAIL PROJECT AND NOT A UNIT TEST
 ///
-/// It pins that the syntax parses, compiles and runs. It does NOT pin bound
-/// enforcement, because there is none to pin: measured two ways on this tree,
+/// The rejection happens in `parse_generic_params`, so the file cannot parse -
+/// there is no way to assert it from inside a test function in the same
+/// package. A project whose declared outcome is `compile_fail` is the only
+/// shape that can hold a file the compiler must refuse.
 ///
-///   * dropping the constraint (`<T: Tagged>` -> `<T>`) compiles just the same,
-///     so the bound is not load-bearing for the body's `x.tag()`;
-///   * instantiating with a type that does NOT implement the trait is rejected
-///     as `E0358: no method named 'tag'` - a method-resolution failure in the
-///     body, the identical error an unbounded `<T>` produces. Nothing reports a
-///     violated bound.
+/// WHAT WOULD SILENTLY UNDO THIS
 ///
-/// So an inline constraint is currently parsed, stored, resolved to a trait
-/// TypeRef, and then observed by nothing. Do not read a pass here as evidence
-/// that a bound was checked. If bound enforcement is ever implemented, the
-/// negative case belongs beside this file.
+/// Re-adding a constraint branch to `parse_generic_params` makes this file
+/// parse again. Nothing else in the tree writes the form, so no other corpus
+/// would notice; without this project the production could come back and every
+/// gate would stay green.
 ///
-/// WHY IT EXISTS ANYWAY
-///
-/// A `where` bound and an inline constraint travel through DIFFERENT AST
-/// fields: the first becomes a `TraitBound`, the second becomes
-/// `GenericParamNode.constraints`. Only the second reaches the constraint loop
-/// in `create_generic_param_types`, and the tree writes `where` everywhere -
-/// 398 where-clauses across 86 stdlib files and not one inline constraint
-/// outside a docstring, in stdlib, compiler/src, examples or tests.
-///
-/// That loop was therefore unreachable by every corpus in the repository, so a
-/// change to it - or a deletion of it - looked inert on all of them. This file
-/// is what makes it reachable. A counter over that code reads the same zero
-/// whether it is starved or dead; this project is the difference.
+/// The `where` spelling of the same bound is exercised across the stdlib and is
+/// enforced at call sites by E0306. The two are not interchangeable spellings:
+/// `where` is the only one the language has, and it accepts a qualified trait
+/// path (`where W: io::Write`), which this form never did.
 namespace InlineGenericBound::Main;
 
 type trait Tagged {
@@ -44,19 +34,12 @@ implement trait Tagged for Widget {
     tag(&this) -> i32 { return this.v; }
 }
 
-/// Reaches the constraint loop via a free function's own generic params.
+/// The rejected form. `where T: Tagged` is how this is written.
 function tag_of<T: Tagged>(x: &T) -> i32 {
     return x.tag();
 }
 
-/// And via a declaration's, which is routed to the loop by a different caller.
-type struct Holder<T: Tagged> {
-    item: T;
-}
-
 function main() -> i32 {
     mut w: Widget = Widget { v: 7 };
-    const a: i32 = tag_of<Widget>(&w);
-    mut h: Holder<Widget> = Holder<Widget> { item: Widget { v: 5 } };
-    return a - h.item.tag() - 2;
+    return tag_of<Widget>(&w) - 7;
 }

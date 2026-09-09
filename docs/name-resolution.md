@@ -11936,6 +11936,12 @@ minutes against the coverage.
 
 ### 8.84 The `written_leaf` bound sites: the accessor is the symptom, the stamp arrives too late, and the syntax has no coverage - MEASURED, DECLINED 2026-09-04
 
+> Superseded by 8.116: the inline `<T: Bound>` syntax this entry measures
+> coverage for has been deleted, and `stamp_generic_constraints` with it. The
+> reasoning about a stamp arriving after its reader still holds for the
+> where-clause path; the inline half no longer has code behind it.
+
+
 Three sites resolve a generic parameter's inline constraints by asking the
 arena's leaf index for the written leaf:
 
@@ -12556,6 +12562,13 @@ has no clean instance on this question: there is no large corpus that exercises
 generic substitution and does not contain the compiler.
 
 ### 8.89 The symbolic walk's 3,165 empty constraint lists are a syntax fact, and the type kind they feed is built nowhere in the compiler - MEASURED 2026-09-04
+
+> Superseded by 8.116: inline `<T: Bound>` is deleted, so the 3,165 empty
+> constraint lists are gone along with the field. The type kind they fed,
+> `BoundedParamType`, is deliberately KEPT and is now uninhabited - see 8.116
+> for why a zero created by removing the only inhabiting syntax is not a
+> licence to delete it.
+
 
 The finding as inherited: `symbolic_param_ref` sees 3,165 generic parameters
 carrying zero constraints on a project whose declarations demonstrably carry
@@ -15519,6 +15532,18 @@ Recorded, not fixed, and not silenced - the test is unchanged.
 
 ### 8.115 Inline `<T: Bound>` is unenforced, but it is NOT a redundant spelling of `where`: on a type declaration it is the only bound syntax the grammar has - MEASURED, DECISION PARKED 2026-09-08
 
+> Corrected by 8.116, which also records the ruling that closed it. Three
+> things here are wrong or incomplete. "Normalizing at the producer" is written
+> as one site and the field has three readers that build bounds, seven in all.
+> "Feeds every existing consumer - all six E0306 emitters" is two: only
+> `check_call_where_bounds` and `check_function_bounds_at_call` read
+> `trait_bounds`. And the deletion is priced as lost expressiveness when its
+> larger cost is that inline `constraints` is the only populated producer of
+> `BoundedParamType`. The "missing subsystem" framing of the type case is also
+> too strong - the satisfaction oracle and the instantiation chokepoint both
+> already exist.
+
+
 Carried in as "grammar that nothing enforces; enforce-or-delete is a language
 decision", with the supporting claim that the tree writes `where` everywhere
 and holds **zero** inline constraints. The unenforcement is real and
@@ -15587,3 +15612,172 @@ syntax**, because there is no other syntax and this one is unread.
 So the decision splits: normalizing the function case is small and closes the
 gap the entry was raised for; the type case is a missing subsystem either way.
 Parked - it changes what an existing program compiles to.
+
+### 8.116 Inline `<T: Bound>` deleted: the bound is unenforced by construction, the field had seven readers, and `where` on a type declaration is owed - MEASURED AND LANDED 2026-09-08
+
+Ruled by Jake: a bound is declared in a `where` clause only, inline
+`<T: Bound>` goes, and `where` is to be extended to type declarations. The
+deletion landed; the extension is owed and its enforcement half is costed
+below rather than assumed.
+
+#### The unenforcement is now a measurement, not a reading
+
+Nine one-file projects, run before any edit, each with its control. The pair
+that decides it is the first two: same trait, same unsatisfied instantiation,
+same absent method call, differing only in which syntax wrote the bound.
+
+| shape | outcome |
+|---|---|
+| inline `<T: Tagged>`, unsatisfied, body never calls | **exit 0, silent** |
+| `where T: Tagged`, unsatisfied (CONTROL) | **E0306** |
+| inline on `type struct Holder<T: Tagged>`, unsatisfied | exit 0, silent |
+| `Holder<T>`, bound removed (CONTROL) | exit 0 |
+| inline, unsatisfied, body DOES call the method | E0358, method resolution |
+| `where T: NoSuchTraitHere` | **E0306, reported** |
+| inline `<T: NoSuchTraitHere>` | **exit 0, silent** |
+| `function w<T: fmt::Display>` | **E0100, expected '>', found '::'** |
+| `where T: fmt::Display` (CONTROL) | E0306 |
+
+The last four rows are not in 8.115 and each changes something. An inline
+constraint is exempt from **name resolution** as well as satisfaction: a
+mistyped trait name is erased, because all three constraint loops discard a
+failed `lookup_by_leaf` in the name of not ICE'ing. And the inline form never
+accepted a qualified trait path, which `where` does - so the expressiveness
+asymmetry ran both ways, and the deletion gives up the weaker spelling.
+
+Two further probes settle the type side. `type struct Holder<T> where T: Tagged`
+is **E0100, expected '{', found 'where'**: the clause genuinely cannot be
+written on a type declaration. `implement<T> Holder<T> where T: Tagged` **is
+accepted** and is load-bearing - `TraitSpecializer` gates specialization on
+`impl_node.where_bounds` - yet the grammar's `ImplBlock` production does not
+list a where clause. That omission is a grammar defect, recorded here and not
+fixed here.
+
+#### The field had seven readers, and a second carrier nobody had named
+
+One writer: the parser's constraint loop, through
+`GenericParamNode::add_constraint`. Seven readers across six files - the
+inherited note named one.
+
+| reader | what it did |
+|---|---|
+| `create_generic_param_types` | built a `BoundedParamType` |
+| `symbolic_param_ref` | built a `BoundedParamType` |
+| `create_param_type` | built a `BoundedParamType` |
+| `stamp_generic_constraints` | stamped each constraint's trait identity |
+| `find_generic_method_on_receiver_bounds` | **two** loops, owner and method params |
+| `clone_generic_param` | deep-copied the list |
+| the AST dumper | printed it |
+
+Three structurally identical copies of one constraint-to-bounds loop, each
+falling back to a plain `GenericParamType` on a failed lookup. A counter comment
+beside them says "the two bound-building loops" and sits above three
+`ParamRef*` sites; the undercount is in the instrument's own documentation.
+
+A separate `type struct GenericParam { name, constraints, span }` also carried
+the syntax and **is constructed nowhere** - dead before this change, not by it,
+and removed with it. `TraitRef::from_leaf`, which existed solely to build an
+inline constraint, lost its only caller and went too.
+
+#### What the deletion does NOT take, and why
+
+Inline `constraints` was the only populated producer of `BoundedParamType`.
+Collapsing the three loops leaves `create_bounded_param` with no callers and
+the kind uninhabited, with roughly twenty live consumer sites in mangling,
+codegen, mono, `call_resolver` and `member_resolver`.
+
+Those are **kept**. Deleting them would rest on a zero this change had just
+manufactured, which is the one case the standing rule excludes: a zero needs a
+control proving it is not starvation, and no such control can exist once the
+only inhabiting syntax is gone. No gate could falsify it either, since none
+produces a `BoundedParamType` today. The ruling to extend `where` to type
+declarations is the second reason: the natural implementation of that extension
+feeds this mechanism from `trait_bounds`, so the kind is more likely owed a new
+producer than a deletion.
+
+A related question this does not settle: a `where`-bounded parameter has
+*always* been a plain `GenericParamType`, and dispatch on an abstract `T` works
+from the clause via `find_generic_method_on_receiver_bounds`. So
+`BoundedParamType` may be a second answering path for a question the clause
+already answers. That is a measurement nobody has taken, and it decides whether
+the extension should feed the kind or retire it.
+
+#### Six counter sites now answer by construction
+
+The bound rows - `LeafCall*Bound`, `LeafVia*Bound` and their symbolic-check
+siblings - have no bump site left. They are flagged `B1`, so each is a pinned
+golden row, and retiring them needs a b1 re-pin on **both** hosts. They are
+left in place reading zero, which is honest but is also a dead row pinned at
+zero beside a live denominator - the hazard the floor-row note describes.
+Retirement is owed whenever `resolve_counter` retires.
+
+#### Predicted before editing, and checked after
+
+`lane-check` unchanged was the prediction, and the first guess behind it was
+wrong: the three `lookup_by_leaf` calls looked like LOOKUP, but lane-gate counts
+only `lookup_type`, `lookup_func_return`, `lookup_func_type`, `lookup_global`
+and `lookup_method_return`. Grepping all nine deletion ranges for those five
+plus `get_resolver`, `DefId::of_definition` and `.qualified_name` returned zero
+in every range, which is why the prediction held rather than luck.
+
+Measured after: `lane-check` 65/20/11/6/16/26 unchanged - `b1-check` B1=0 B4=0,
+**106 sites** unchanged, the six dead rows still present and still zero.
+
+The tree-wide census that made this non-breaking: twelve candidate hits, of
+which **eleven are comments** and two are live code, both in the one project
+that existed to inhabit the syntax. The instrument was controlled against that
+project before being trusted, and one docstring claiming a `parse<R: Read>`
+signature was checked for an instrument hole - no such code exists.
+
+#### The project that held the syntax now defends its absence
+
+`tests/tests/projects/inline_generic_bound` could not survive as a `run`
+project. It is now `compile_fail` asserting **E0100**, the parser's refusal,
+measured rather than guessed. This keeps the project count at 39 and leaves a
+gate that notices the production being re-added - nothing else in the tree
+writes the form, so without it the production could return green.
+
+#### Owed: `where` on type declarations, and the enforcement half is the job
+
+Stated here so it cannot become a permanent absence. **Right now a bound on a
+type parameter of a type has no syntax at all.** That gap predates this change -
+the inline form was unenforced, so nothing was lost - but it is now visible.
+
+*Representing it* is bounded, and is six node kinds rather than the three or
+four it looks like. Eight AST node kinds carry `generic_params`; exactly two
+carry a bound today, `FunctionDeclNode.trait_bounds` and
+`ImplBlockNode.where_bounds`. The six needing a carrier are `StructDeclNode`,
+`ClassDeclNode`, `UnionDeclNode`, `EnumDeclNode`, `TraitDeclNode` and
+`TypeAliasDeclNode`, reached by five grammar productions, since one
+`AggregateDecl` covers struct and class. Whether a trait's own parameters and a
+type alias's should carry bounds at all is a language question, not a
+mechanical one.
+
+*Enforcing it* is the open half, and it is smaller than "a missing subsystem":
+
+- The **oracle exists and is owner-agnostic**.
+  `bounds_satisfied(bounds: &TraitBound[], subst: TypeSubstitution*)` takes a
+  bound list and a substitution, not a function node, and is already called on
+  `impl_node.where_bounds` at impl-specialization time. Satisfaction checking is
+  therefore **not** reachable only from the call path; there is already a
+  non-call-site consumer.
+- The **chokepoint exists**. `ASTSpecializer::specialize(entry, type_args, ...)`
+  has one caller, builds the `TypeSubstitution` as its first step, and its
+  `TemplateEntry` carries `param_names` - the index alignment
+  `check_function_bounds_at_call` keys on - plus `ast_node` and `node_kind`.
+  Its caller already emits diagnostics.
+- **Missing**: a reader turning a type declaration's bounds into the oracle's
+  two arguments; the emission itself, which belongs at the caller because
+  `ASTSpecializer` holds only an arena and an intern table; and a ruling on
+  deferral while a binding is still abstract, for which `contains_generic_param`
+  is the existing idiom.
+
+One link is **read and not instrumented**: that `specialize` is actually
+reached for a bounded type-declaration instantiation. A struct template with
+arguments is certainly specialized, and the cloner preserves a declaration's
+parameters, but that chain is inference. No counter sits at that site; adding
+one is a single `Site` plus a `report()` row plus one corpus run, and it should
+be the first thing the extension does.
+
+Parse-only is the outcome to refuse: it would rebuild, one layer up, the exact
+defect this entry deleted.
