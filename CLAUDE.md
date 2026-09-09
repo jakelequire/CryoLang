@@ -186,9 +186,43 @@ honest zeros here were measured over the wrong population entirely.
 
 - Bare integer literals: `1`, not `1u32` — including in synthesized code.
 - No parallel/mirrored module structures; extend the module that exists.
-- Commit messages are plain, with no trailers.
+- Commit messages are plain, with no trailers. That includes `Co-Authored-By:`,
+  which some agent harnesses append automatically - turn it off at the source
+  rather than editing it out per commit: `includeCoAuthoredBy: false` in
+  `.claude/settings.json`. **`.claude/` is gitignored**, so that file is
+  per-checkout and a fresh clone does NOT inherit it - set it again there. This
+  line is the part that travels.
 - Cryo has no `else if` in an if-**expression**; statements are fine.
 - Basic `grep` has no `\t` — use `grep -P` for tab-separated audit streams.
+
+## Commits
+
+**A ledger entry commits with the code it documents.** `docs/name-resolution.md`
+is the migration's evidence, and an entry is the record of a change - not a
+separate deliverable. Write both, commit them together.
+
+- **Never commit `docs/name-resolution.md` alone.** Not as a follow-up, not as
+  a preceding commit, not as a docs-only tidy-up. A ledger entry that lands
+  apart from its change turns a behaviour change into two half-records: the
+  commit says what moved without saying why, and the entry claims a measurement
+  with no diff to check it against.
+- **Bundle to complete-work boundaries.** Prefer fewer, larger commits. A
+  commit is one finished thing - the code, its tests, its goldens and its
+  ledger entry - not one file's worth of edits.
+- **The same goes for goldens.** A re-pinned `b1-baseline.txt` or
+  `lane-baseline.txt` rides with the change that moved the number, and the
+  message says why it moved.
+
+### The one exception
+
+**An end-of-session handoff entry may commit alone**, because by construction it
+documents no single change - it describes where the work stopped. That is the
+only case.
+
+It is not a general escape hatch. "The ledger update did not fit anywhere" is
+not this exception; it means the commit boundary was drawn in the wrong place.
+If an entry documents a change you already committed, amend that commit or fold
+the entry into the next one that touches the same area - do not land it alone.
 
 ## Environment landmines
 
