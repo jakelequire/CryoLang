@@ -10175,7 +10175,14 @@ The tree already knows. `ffi/libc.cryo` carries an import of
 
 That is REGISTRATION ORDER deciding which of two declarations a bare leaf names,
 held in place by an edge in the module graph. It is the same shape §7 describes
-and this migration exists to remove, and it is load-bearing today.
+and this migration exists to remove.
+
+> **EXPIRED, §8.122.** "Load-bearing today" was true when written and is not
+> now: `register_intrinsic_function_type` made bare-name resolution
+> order-independent in both directions, the edge was deleted, and the
+> extern-signature conflict population is empty tree-wide. This sentence is
+> instance five in §8.123 - a measurement with a date, read a month later as a
+> current fact.
 
 #### The question, and why it is not this session's
 
@@ -16356,3 +16363,163 @@ compiling. What covers that is the corpus measurement above - one project moved,
 and it moved in the predicted direction - plus the E0240 control. A plural leaf
 that some future program writes and that no in-tree corpus contains is still
 untested by construction.
+### 8.122 The libc topo-sort edge outlived its hazard by a fix nobody connected to it, and the extern-signature population is empty - MEASURED AND LANDED 2026-09-09
+
+`ffi/libc.cryo` carried an `import std::core::intrinsics;` that no code in the
+file used. Its only purpose was to force `core::intrinsics` to topo-sort first,
+so the intrinsics would claim their bare leaf names before libc's `extern "C"`
+twins. §8.65 named it as registration order deciding what a bare leaf means,
+held in place by a module-graph edge, and called it load-bearing today.
+
+It is not load-bearing. It has not been for some time.
+
+#### Order-independence already landed, in a different place
+
+`DeclarationIndex::register_intrinsic_function_type` drops every UNOWNED
+overload - an `extern "C"` twin, owner 0 - when an intrinsic claims a leaf, and
+the `register_*` guards refuse a later non-intrinsic overwrite once
+`intrinsic_names` holds the leaf. Verified in BOTH directions from source
+rather than taken from its comment:
+
+* **intrinsic first**: the extern's `ext_bare_taken` sees the slot owned and
+  never claims the bare name.
+* **extern first**: the intrinsic's `register_function` still overwrites
+  `func_returns`, because its own guard is not armed until the line after;
+  `register_intrinsic_function_type` overwrites `func_type_refs` AND drops the
+  extern's unowned overload; `register_mangled_name` overwrites the symbol.
+
+All four single-slot bindings converge on the intrinsic either way. Nothing is
+left for a topo-sort edge to decide, and the edge is deleted.
+
+#### The extern-signature population, swept
+
+The hazard the edge described - two declarations of one C symbol with
+DIFFERENT signatures, resolved by whoever registered first - is real in shape,
+so it was sized rather than assumed. A source sweep was used, not a build one,
+because discovery is import-driven and an extern block nothing imports is never
+compiled and never checked.
+
+**910 files, 58 distinct extern C symbols, 61 declarations, ZERO real
+conflicts.** Two candidates surfaced and neither is one:
+
+* `cf_dup_sym`, the deliberate conflict in
+  `tests/tests/negative/W0011_duplicate_extern_symbol.cryo`. It is the sweep's
+  CONTROL - an instrument that failed to flag it would have reported a
+  meaningless zero.
+* `main` in `runtime/core/src/entry.cryo`, declared twice under
+  `![config(no_runtime)]` and `![config(not(no_runtime))]`. Mutually exclusive,
+  never both compiled. The sweep does not evaluate config; the compiler does,
+  which is why the build reports no `W0011` for it.
+
+A first pass also flagged `_popen`, comparing the live `ffi/libc.cryo` against a
+STAGED RELEASE under `dist/` - a gitignored copy of an older stdlib, not tree
+source. An instrument that walks the filesystem sees artifacts the compiler
+never does.
+
+#### W0011 already exists, and what it does and does not cover
+
+`W0011_DUPLICATE_EXTERN_SYMBOL` reports exactly the extern-vs-extern conflict,
+suppressing on identical signatures - function types are interned structurally,
+so a byte-identical redeclaration shares the first claimant's `TypeRef` id - and
+warning only on a genuine ABI divergence. It stays deliberately silent when an
+intrinsic owns the slot, because that shadowing is intentional.
+
+So there was no third diagnostic to design here. What remains is a severity
+question and not a coverage one: a conflicting redeclaration of one C symbol is
+an ABI hazard reported as a WARNING, and which declaration wins is still decided
+by registration order. The population is empty today, which makes promoting it
+cheap and also makes it unforced. Left for a decision rather than taken.
+
+#### A correction, because the right answer was first reached for a wrong reason
+
+The edge's comment was called false here on the ground that
+`FunctionRegistry::register` in codegen is LAST-registration-wins, which would
+invert the comment's story. That reasoning was wrong: there are two tables, and
+that is not the one the comment describes. The `DeclarationIndex` bare slot is
+FIRST-wins (`type_resolution.cryo`, "Claim the BARE name only if nothing else
+owns it yet"), and the comment was accurate about it - and accurate when
+written.
+
+The comment is stale rather than mistaken: the hazard was real, a later change
+removed it elsewhere, and the edge and its rationale stayed. Reaching "delete
+the edge" from the wrong table would have been indistinguishable from reaching
+it correctly, which is the whole reason the reason has to be stated.
+### 8.123 Five stale descriptions in one session, and the expensive kind is the one holding a structural decision in place - 2026-09-09
+
+§7.4 states the rule. This entry is the evidence behind it and the severity
+grading, because "check the comment" is cheap advice that nobody follows without
+a sense of what it costs not to.
+
+#### The five
+
+1. **A comment claiming a deleted-candidate lane was load-bearing.** The arena
+   leaf lane said it was needed for circular `ASTVisitor*` forward references.
+   The compiler selfhosts without the lane, and `compiler/` is where
+   `ASTVisitor` lives (§8.121).
+2. **A field comment describing a lane that had just been removed.**
+   `leaf_index` still called itself the TypeResolver's cross-module lookup
+   fallback after it had stopped answering lookups in the same change.
+3. **Counter NAMES read as a classification.** A plan derived "four dead cascade
+   lanes" from a call/answer table. One was a guard, one was the migration's
+   destination, one was starved. Acting on it would have deleted the guard and
+   the destination (§8.120).
+4. **A stale rationale holding a module-graph edge in place.**
+   `ffi/libc.cryo` imported `core::intrinsics` purely to force topo-sort order.
+   The hazard was real when written and had since been fixed elsewhere, in
+   `register_intrinsic_function_type`. Nobody connected the fix to the edge, so
+   the edge and its justification survived the thing they existed for (§8.122).
+5. **This document.** §8.65 recorded the same edge as "load-bearing today",
+   which was true at the time and was still being read as current a session
+   later.
+
+#### The grading, which is the point
+
+These are not equally expensive.
+
+* A stale comment on a field or a lane **misleads the next reader**, and costs
+  whatever that reader does before re-measuring. Recoverable.
+* A stale label on a **counter or a metric** misleads anyone reading the
+  numbers, which is a wider audience than any one file, and it survives being
+  copied into plans and reports.
+* A stale **rationale** is the expensive one, because a rationale is what a
+  structural decision points at. An edge in the module graph, a gate, a
+  workaround, an ordering constraint - each exists because of a sentence, and
+  when the sentence stops being true the structure does not fall over. It goes
+  on working, for a reason that is no longer the reason, and every later reader
+  finds a deliberate-looking decision with a written justification.
+
+The fourth instance and the fifth are the same edge: one in the source, one in
+this ledger, both asserting a hazard that had been fixed elsewhere. Neither was
+wrong when written. That is what makes them hard - there is no error to find by
+review, only a fact that expired.
+
+#### What actually catches it
+
+Not diligence. The specific move is: **when a description is what makes a
+change look unnecessary or unsafe, that is the moment to check it against the
+mechanism** - not the moment to accept it, which is what it is written to
+invite.
+
+Three checks, in the order that costs least:
+
+* **Does the thing it describes still exist?** Deleting a lane and finding the
+  build unchanged is a cheaper answer than any argument about whether it should
+  have been needed.
+* **Which layer is it talking about?** A claim about "registration order" was
+  checked here against the wrong table - codegen's registry is last-wins, the
+  DeclarationIndex is first-wins - and produced the right conclusion for the
+  wrong reason, which is indistinguishable from a correct one unless the reason
+  is stated (§8.122).
+* **Was it ever true?** A stale rationale and a false one need different fixes.
+  A rationale that expired means finding the change that expired it, and
+  usually means something else can now be deleted too - which is exactly how
+  §8.122's edge was found.
+
+#### A note on the ledger itself
+
+This document is 120-odd entries of measurements, most of them true when taken.
+An entry naming something "load-bearing today" is a measurement with a date
+attached, and reading it a month later is reading a claim about a tree that has
+moved. Entries here should be assumed stale in proportion to how much has
+landed since - and when one is the basis for NOT doing something, that is the
+one to re-measure first.
