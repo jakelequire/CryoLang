@@ -1,59 +1,32 @@
-/// ============================ TRIPWIRE ==================================
+/// What a plural leaf means once a bare one no longer guesses.
 ///
-/// THE TWO `WRONG_` TESTS BELOW PIN BEHAVIOR docs/name-resolution.md SAYS IS
-/// WRONG. They pass only where the compiler is wrong in the particular
-/// direction they were pinned against -- see WHAT THE ANSWER DEPENDS ON.
+/// `Widget` is declared by both `Alpha` and `Omega`. A module that imports
+/// NEITHER names no type by writing it bare, and that half is now an error -
+/// it lives in tests/tests/projects/plural_leaf_gate as a `compile_fail`
+/// asserting E0155. What stays here is the other half: a module that DOES
+/// import a declarer still binds the one it imported, which §4's rib chain
+/// requires and which the rejection must not have broken.
 ///
-/// IF YOU ARE HERE BECAUSE ONE STARTED FAILING: check WHICH way before
-/// assuming a fix landed. An E0203 at the `Orphan` signatures is the intended
-/// outcome and means someone landed it. An E0200 saying `expected
-/// ...Alpha::Widget<i64>, found ...Omega::Widget<i32>` is NOT: it means the
-/// leaf index picked the other declarer, which happens on any host whose
-/// directory enumeration order differs from the one this was pinned on. That
-/// is the defect itself, not a regression, and it is measured in
-/// docs/name-resolution.md §8.2y.
+/// These two are the reason the rejection can be told apart from a blunter
+/// change. A fix that made every bare plural leaf unresolvable everywhere -
+/// rather than only where nothing binds it - passes the gate project and fails
+/// HERE. That is the whole point of keeping them.
 ///
-/// Either way: do NOT delete the assertion or relax the annotation to get back
-/// to green. For the real fix, move the case to a `compile_fail` project with
-/// the right `expect.diagnostic`, in the same change that made it an error --
-/// exactly as resolution_tripwire's visibility half was moved to
-/// tests/tests/projects/visibility_gate.
+/// ---- WHAT THIS USED TO PIN, AND WHY THE HOST MATTERED -----------------
 ///
-/// ---- WHY THIS EXISTS ALONGSIDE resolution_tripwire ---------------------
+/// Before the rejection, the bare leaf in an importing-nothing module resolved
+/// anyway, through the arena's global leaf index. `register_leaf_name` is
+/// first-registration-wins and compares no names, and registration order is
+/// depth-first module discovery seeded by the order the FILESYSTEM enumerates
+/// the directory - so which declarer won was invisible to any reader of the
+/// source, and copying a directory could change what the program compiled to.
+/// Measured with controls in docs/name-resolution.md §8.2y.
 ///
-/// That project's leaf is declared ONCE, and cascade 2c answers it from
-/// `resolve_qualified_scoped`'s single-candidate fast path, which never looks
-/// at the use site's imports. This project's leaf is declared TWICE, which
-/// skips that fast path: the multi-candidate branch finds no local candidate
-/// and no imported one, 2c correctly MISSES, and the GLOBAL LEAF INDEX
-/// (cascade step 5) answers instead.
+/// That is also why the import control below reads `Omega` rather than either:
+/// where the index picked `Alpha`, binding `Omega` here could not be luck.
+/// The index no longer answers, so the expectation is now simply what the
+/// import says, and it no longer depends on the host.
 ///
-/// That difference is why this file had to be written. On every other corpus
-/// in the tree step 5 answers ZERO times -- 2c takes every unique leaf before
-/// it is reached -- so a change that deleted the leaf index would look inert.
-/// It is starved, not dead, and only a plural leaf shows it.
-///
-/// ---- WHAT THE ANSWER DEPENDS ON ---------------------------------------
-///
-/// Not scope, and not the names either. `register_leaf_name` is FIRST
-/// REGISTRATION WINS, and registration order is depth-first module discovery
-/// seeded by the order the filesystem enumerates the directory. Measured, with
-/// controls, in docs/name-resolution.md §8.2y: renaming the declaring file,
-/// module-name sort order, and the import graph all leave the winner unmoved,
-/// while enumerating the SAME sources in a different directory order moves it.
-///
-/// So a bare name's meaning depends on something no reader of the source can
-/// see, and copying a directory can change what this program compiles to. This
-/// file's expectation names `Alpha` because that is what wins where directory
-/// enumeration is alphabetical; where it is not, `Omega` wins and the two
-/// `WRONG_` tests fail with an E0200 rather than passing.
-///
-/// An earlier revision of this comment said the pick was NAME ORDER, and cited
-/// `Alpha` beating `Omega` as evidence. `Alpha` does sort first, and it loses
-/// wherever enumeration is not alphabetical; the agreement was a coincidence of
-/// the host it was written on.
-///
-/// ========================================================================
 ![config(testing)]
 namespace ResolutionLeafIndex::LeafIndexTest;
 
@@ -61,47 +34,12 @@ import std::core::result;
 import std::test::error;
 import std::test::assert;
 
-// ---- KNOWN DEFECT: a plural leaf resolves with NOTHING in scope (§5.1) ----
-//
-// §5.1: "The first segment resolves in scope. There is no substring matching,
-// no suffix matching, and no dependence on what other modules happen to exist
-// in the program."
-//
-// `ResolutionLeafIndex::Orphan` has no `import` statement at all and names
-// `Widget` in two signatures. Two modules declare that leaf and Orphan imports
-// neither, so nothing binds it in Orphan's scope and both signatures must be an
-// unknown-type error.
-//
-// The ANNOTATION is half the assertion: naming `Alpha::Widget` here means a
-// changed bind is an E0200 at build time rather than a silent pass. `tag()` is
-// the other half -- it makes the winner observable at runtime, so the test
-// cannot be satisfied by any `Widget` that happens to round-trip a value.
-
-![test]
-function WRONG_a_static_template_resolves_a_plural_leaf_not_in_its_scope()
-        -> Result<(), TestError> {
-    mut w: ResolutionLeafIndex::Alpha::Widget<i64> =
-        ResolutionLeafIndex::Orphan::Packer::pack(11);
-    expect_eq(w.unwrap(), 11 as i64)?;
-    expect_eq(w.tag(), 1)?;
-    return Result::Ok(());
-}
-
-![test]
-function WRONG_a_free_generic_resolves_a_plural_leaf_not_in_its_scope()
-        -> Result<(), TestError> {
-    mut w: ResolutionLeafIndex::Alpha::Widget<i64> =
-        ResolutionLeafIndex::Orphan::box_up(13);
-    expect_eq(w.unwrap(), 13 as i64)?;
-    expect_eq(w.tag(), 1)?;
-    return Result::Ok(());
-}
-
 /// CONTROL. The leaf really is declared twice, by two distinct types.
-/// Without this, both `WRONG_` tests above would be satisfied by a program in
-/// which `Omega::Widget` did not exist or had collapsed into `Alpha`'s -- and
-/// then they would be pinning the unique-leaf case resolution_tripwire already
-/// covers, through a mechanism they no longer reach.
+/// Without it the import control below, and the E0155 gate in
+/// plural_leaf_gate, would both be satisfied by a program in which
+/// `Omega::Widget` did not exist or had collapsed into `Alpha`'s - and each
+/// would then be exercising the UNIQUE-leaf case, which is E0240 and a
+/// different rule.
 ![test]
 function CONTROL_the_leaf_is_declared_by_two_distinct_types()
         -> Result<(), TestError> {

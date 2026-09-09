@@ -120,7 +120,6 @@ type enum Site {
     RnDiLiteral;
     RnDiCanonical;
     RnDiBare;
-    RnLeafIndex;
     RnFailed;
 
     /// The two doors ABOVE the cascade that decide whether a primitive
@@ -165,8 +164,6 @@ type enum Site {
     McFailed;
 
     // `types/arena.cryo` global leaf index.
-    LeafCalls;
-    LeafHits;
 
     // `const_table.cryo` bare-name index for a compile-time constant.  A bare
     // `Identifier` carries no `Res` slot, so the fold cannot read a stamp for
@@ -210,8 +207,6 @@ type enum Site {
     DefaultArgNoOwner;
 
     // Leaf-index consumers, bumped on a HIT (an answer actually produced).
-    LeafViaResolveNamed;
-    LeafViaTypeUtils;
 
     /// The same two consumers, bumped on the CALL.
     ///
@@ -221,8 +216,6 @@ type enum Site {
     /// look up, the other a lookup that answers nobody - and the parent row
     /// cannot separate them either, because it aggregates both.  A leaf
     /// consumer's zero is not readable without the call beside it.
-    LeafCallResolveNamed;
-    LeafCallTypeUtils;
 
     /// One row per exit of the type-widening cascade in
     /// `sema::type_utils::lookup_type_by_sym`, which has twelve callers and
@@ -721,10 +714,7 @@ implement enum Site {
             Site::RnDiLiteral           => { "B3 " }
             Site::RnDiCanonical         => { "B3 " }
             Site::RnDiBare              => { "B3 " }
-            Site::RnLeafIndex           => { "B4*" }
             Site::RnFailed              => { "   " }
-            Site::LeafCalls             => { "B4 " }
-            Site::LeafHits              => { "B4 " }
             Site::ConstLeafCalls        => { "B1 " }
             Site::ConstLeafHits         => { "B1 " }
             Site::BareAltsCalls         => { "   " }
@@ -742,10 +732,6 @@ implement enum Site {
             Site::VisWouldReject        => { "!! " }
             Site::VisRejectUnreachable  => { "B1 " }
             Site::VisRejectNotPublic    => { "B1 " }
-            Site::LeafViaResolveNamed   => { "B1 " }
-            Site::LeafViaTypeUtils      => { "B1 " }
-            Site::LeafCallResolveNamed  => { "B1>" }
-            Site::LeafCallTypeUtils     => { "B1 " }
             Site::TypeCascadeExact      => { "B1 " }
             Site::TypeCascadeCursor     => { "B1 " }
             Site::TypeCascadeCrossMod   => { "B1 " }
@@ -915,10 +901,7 @@ implement enum Site {
             Site::RnDiLiteral           => { "3a  DI exact qualified literal" }
             Site::RnDiCanonical         => { "3b  DI canonicalized qualified" }
             Site::RnDiBare              => { "3c  DI bare name" }
-            Site::RnLeafIndex           => { "5   GLOBAL LEAF INDEX  (* in leaf hits)" }
             Site::RnFailed              => { "    resolve_named unresolved" }
-            Site::LeafCalls             => { "lookup_by_leaf calls" }
-            Site::LeafHits              => { "lookup_by_leaf hits" }
             Site::ConstLeafCalls        => { "const-table bare leaf calls" }
             Site::ConstLeafHits         => { "const-table bare leaf hits" }
             Site::BareAltsCalls         => { "lookup_qualified_alternatives calls" }
@@ -937,10 +920,6 @@ implement enum Site {
             Site::VisWouldReject        => { "  WOULD BE REJECTED once gated" }
             Site::VisRejectUnreachable  => { "    cause: namespace not reachable" }
             Site::VisRejectNotPublic    => { "    cause: candidate not public" }
-            Site::LeafViaResolveNamed   => { "  by caller: resolve_named step 5" }
-            Site::LeafViaTypeUtils      => { "  by caller: sema type_utils" }
-            Site::LeafCallResolveNamed  => { "  asked by: resolve_named step 5" }
-            Site::LeafCallTypeUtils     => { "  asked by: sema type_utils" }
             Site::TypeCascadeExact      => { "type cascade: 1 exact" }
             Site::TypeCascadeCursor     => { "type cascade: 2 ambient cursor" }
             Site::TypeCascadeCrossMod   => { "type cascade: 3 resolver re-entry" }
@@ -1163,13 +1142,6 @@ implement enum Audit {
 // and then gate a BODY-NS line on `CRYO_LEAF_AUDIT`.  That is a silent
 // mis-gating bug of exactly the kind this module exists to catch.  Each
 // emitter below names its own stream once, in one place.
-
-/// Log one name that the GLOBAL LEAF INDEX answered, with the module that
-/// asked.
-public function leaf_hit(use_site: string, name: string) -> void {
-    if (!Audit::Leaf.enabled()) { return; }
-    fmt::eprintf("LEAF-HIT\t%s\t%s\n", use_site, name);
-}
 
 /// Print one would-be-rejected resolution, so a run yields the distinct
 /// migration set.
@@ -1649,7 +1621,6 @@ public function report() -> void {
     fmt::eprintf("  B1 = fuzzy fallback        -> must reach ZERO\n");
     fmt::eprintf("  B2 = type-dependent lookup -> stays; enumerate+justify\n");
     fmt::eprintf("  B3 = authoritative lookup  -> once per path, NOT zero\n");
-    fmt::eprintf("  B4 = instantiation id      -> stays; a Res cannot name one\n");
     fmt::eprintf("\n");
     fmt::eprintf("  Sites NEST: cascade step 5 is a subset of leaf-index\n");
     fmt::eprintf("  hits, and bare_alts hits are a subset of its callers'\n");
@@ -1696,16 +1667,8 @@ public function report() -> void {
     Site::McCopyDrop.print_row();
     Site::McDerefCoercion.print_row();
     Site::McFailed.print_row();
-    Site::RnLeafIndex.print_row();
     Site::RnFailed.print_row();
 
-    fmt::eprintf("\n-- global leaf index (types/arena.cryo:1023) ----------\n");
-    Site::LeafCalls.print_row();
-    Site::LeafHits.print_row();
-    Site::LeafViaResolveNamed.print_row();
-    Site::LeafViaTypeUtils.print_row();
-    Site::LeafCallResolveNamed.print_row();
-    Site::LeafCallTypeUtils.print_row();
     Site::TypeCascadeExact.print_row();
     Site::TypeCascadeCursor.print_row();
     Site::TypeCascadeCrossMod.print_row();
@@ -1900,8 +1863,7 @@ public function report() -> void {
     // B1 counts ANSWERS PRODUCED (hits, cascade outcomes), never attempts:
     // a fallback that is called but returns nothing is not load-bearing,
     // and counting attempts would make "drive it to zero" unreachable for
-    // the wrong reason.  Cascade step 5 is deliberately NOT added - it is
-    // already inside `Site::LeafHits`, and adding both double-counts it.
+    // the wrong reason.
     //
     // `M1AgreeHits` is excluded for the same reason and is the clearest case
     // of it: `qualifier_agrees` is a CHECK.  Its `true` lets an answer another
@@ -1961,21 +1923,8 @@ public function report() -> void {
     // catching, and it would be invisible in an unasserted bucket.
     b3 = b3 + Site::BareAltsCanonFolded.count();
 
-    // B4 is instantiation identity.  A `Res` names a DECLARATION; an
-    // instantiation is minted by monomorphization afterwards and is asked for
-    // by its MANGLED name, which no source file contains and no import brings
-    // into scope - so no amount of name-layer correctness answers it.  Counting
-    // it against B1's target of zero makes that target permanently false and
-    // hides whatever real fuzzy fallback might regrow underneath it.
-    //
-    // Cascade step 5 is NOT added: it is already inside `LeafHits`, the same
-    // nesting that keeps it out of B1's sum.
-    const b4: u64 = Site::LeafHits.count();
-
-    fmt::eprintf("\n-------------------------------------------------------\n");
     fmt::eprintf("  B1 fuzzy fallback   -> ZERO           %12llu\n", b1);
     fmt::eprintf("  B2 type-dependent   -> stays (FLOOR)  %12llu\n", b2);
     fmt::eprintf("  B3 authoritative    -> once per path  %12llu\n", b3);
-    fmt::eprintf("  B4 instantiation id -> stays (FLOOR)  %12llu\n", b4);
     fmt::eprintf("=======================================================\n");
 }

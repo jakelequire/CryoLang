@@ -16166,7 +16166,10 @@ hypothesis that outlived its measurement.
   twenty bounds are themselves zero" now names two, `SpellTyIdCalls` and
   `SpellTyNewCalls`.
 
-#### What the leaf-index retirement needs before it can be written
+#### What the leaf-index retirement needed before it could be written
+
+LANDED in §8.121, as E0155 rather than the E0203 this section expected.
+Kept because it records what the question was.
 
 Blocked on a diagnostic decision, recorded so the answer can be short. A bare
 leaf borne by two or more declarations, with none of them bound in the naming
@@ -16177,3 +16180,131 @@ or a qualified path is required. The two `WRONG_` tests in
 with that diagnostic as their `expect.diagnostic`, in the same change; the two
 `CONTROL_` tests stay and must keep passing, since an importing module binding
 what it imported is specified behaviour.
+### 8.121 The global leaf index is deleted, a plural bare leaf is E0155, and B4 retires with the lane that was its only summand - LANDED 2026-09-09
+
+§5.1 says a name resolves in scope, with "no dependence on what other modules
+happen to exist in the program". The arena's global leaf index was the standing
+exception: a bare leaf nothing bound resolved to whichever module registered it
+first, and registration order is depth-first module discovery seeded by
+FILESYSTEM enumeration order (§8.2y). It is gone.
+
+#### The lane, and what it cost to be sure
+
+`lookup_by_leaf` had two callers - the type cascade's step 4 in
+`sema/type_utils`, and `resolve_named`'s step 5 in `types/resolver`. Both are
+deleted with it. `leaf_index` itself SURVIVES: it is the candidate pool for
+E0203's did-you-mean suggestion, and it is populated earlier than the
+DeclarationIndex, which is why that suggestion uses it. The index no longer
+answers a lookup; it only offers spellings to a diagnostic.
+
+The measurement ran before the diagnostic was written, and the prediction was
+recorded first: `resolution_leaf_index`'s two `WRONG_` tests fail, its two
+`CONTROL_` tests pass, nothing else moves. That is exactly what happened -
+`make test` reported 38 projects passing and that one failing, with the
+compiler still selfhosting.
+
+That build is also the disproof of a comment that had sat at the deleted step
+for a long time, claiming the lane was **load-bearing for circular forward
+references** - AST node files naming `ASTVisitor*` without importing the
+visitor. The compiler compiles itself with the lane removed. The claim was
+false, and `compiler/` is precisely the corpus that would have shown it. A
+comment is a hypothesis; this one outlived its evidence and was never re-run.
+
+#### Why a new code rather than E0154
+
+E0154 `AMBIGUOUS_CALL` already covers ambiguity and has already drifted past
+calls - `name_resolution` uses it for "`x` names both a module member and a type
+member". It was still the wrong code. **Both of its sites report two candidates
+that ARE in scope**, and tell the author to choose. The plural leaf is the
+opposite condition: nothing is in scope at all, and the name resolved only
+because an index picked a winner the source never named. Telling that author to
+pick one of the two in scope would be false; neither is.
+
+That is the distinction the resolution codes already draw - E0203 no such name
+exists, E0240 exists but not reachable, E0353 reachable but private - so the
+fourth condition, *exists in more than one place, none of them bound here*,
+takes the next slot in the `Symbol Resolution` block, which had exactly one code
+allocated in it.
+
+Rejected, and why: **E0154**, above. **E0304 AMBIGUOUS_GENERIC**, which is
+generic-argument inference and a different layer. **E0203 UNDEFINED_TYPE**,
+which says the name does not exist when the defect is that two do - and which
+was the diagnostic the deletion produced on its own, misleading enough to be
+the argument for doing this properly. **E0233 UNDEFINED_SYMBOL**, same
+objection.
+
+`E0155_AMBIGUOUS_BARE_NAME` names both declarers and says what to do:
+
+```
+error[E0155]: `Widget` is declared in more than one module, so it names no type on its own
+ note: `PluralLeafGate::Alpha::Widget` and `PluralLeafGate::Omega::Widget` both declare it
+ note: write the qualifier, or import the module you mean; a bare name resolves
+       in scope and nothing here binds it
+```
+
+#### The trap in tracking plurality, caught before it was written
+
+The leaf index is first-registration-wins and stores ONE qualified name per
+leaf, so it does not know a leaf is plural - the second registration was
+discarded. Recording it needs a second map, and `register_leaf_name` has six
+call sites: five register DECLARATIONS and the sixth registers
+SPECIALIZATIONS, under a mangled spec name that carries no module. Two modules
+instantiating one generic meet on that key, and the old step-4 comment said so.
+Tracking plurality naively there would have raised E0155 on entirely legal code.
+`declared` is therefore a parameter, false at the specialization site.
+
+#### The control that makes the gate mean something
+
+With the second declarer removed, the same program does NOT compile either - it
+reports **E0240**, "not reachable from this module", with `add
+import PluralLeafGate::Alpha;`. So the two codes split the population exactly:
+
+* unique leaf, not imported -> **E0240**, and the fix is one named import;
+* plural leaf, not imported -> **E0155**, and E0240's advice cannot be written
+  because there are two candidate imports.
+
+Without that control the gate would have been satisfied by "an orphan module
+cannot see anything", which is a different rule and was already covered.
+
+#### The test split
+
+`tests/tests/projects/plural_leaf_gate` is new: `compile_fail`, `expect
+diagnostic E0155`, holding Alpha, Omega and the orphan. Its `main` imports all
+three ON PURPOSE - discovery is import-driven, so an unreached Alpha or Omega
+leaves the leaf singular and the gate asserts nothing.
+
+`resolution_leaf_index` KEEPS its two `CONTROL_` tests and loses the `WRONG_`
+pair and `orphan.cryo`. It is not retired, because the controls still assert
+something the rejection could have broken: an importing module must still bind
+the module it imported, which §4's rib chain requires. **A change that rejected
+every bare plural leaf, rather than only one nothing binds, passes the new gate
+and fails these.** The two projects are a pair and neither is sufficient.
+
+#### B4 retires, and it is a gate change
+
+`B4_TOTAL` was literally `Site::LeafHits.count()` - the arena leaf lane was its
+only summand. B4 asked whether an instantiation, which is minted after the name
+layer and asked for by a mangled name no source contains, was still being
+answered by fuzzy lookup. The leaf index was where that happened; with the lane
+gone the bucket cannot be reached at all, so keeping it would leave an assertion
+that reads as live and can never fire - the defect §8.96 was written to remove.
+
+Retired with the lane, on Jake's ruling rather than silently: the total, the
+`B4`/`B4*` buckets, the seven stranded leaf rows, the `LEAF-HIT` audit stream,
+and B4's plumbing through `b1-gate.py` and the golden. **B1 is untouched and
+still 0.** The site count moves 89 -> 82. `ConstLeafCalls`/`ConstLeafHits` are a
+DIFFERENT lane - const_table's own leaf map - and stay.
+
+This is also the first instance of §8.66's last item arriving early: a counter
+retiring because the lane it measured is gone, needing no replacement, exactly
+as that entry predicted for the counter as a whole.
+
+#### What this does NOT establish
+
+The gate suite is a weaker net for this change than for a deletion.
+Byte-identical selfhost proves the compiler still produces the same output for
+code that already compiles; it says nothing about code that now stops
+compiling. What covers that is the corpus measurement above - one project moved,
+and it moved in the predicted direction - plus the E0240 control. A plural leaf
+that some future program writes and that no in-tree corpus contains is still
+untested by construction.

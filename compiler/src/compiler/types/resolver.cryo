@@ -1268,10 +1268,10 @@ type struct TypeResolver {
             // property of `entry`, so this is correct by construction and
             // cannot be forgotten by a new caller.
             //
-            // Without it the context carried no home module, every scoped step
-            // of the cascade missed, and the name fell through to the global
-            // leaf index - `GlobalAlloc` alone was 13,687 of 17,084 leaf-index
-            // answers.  See docs/name-resolution.md §8.2a.
+            // Without it the context carries no home module and every scoped
+            // step of the cascade misses, which now leaves the name unresolved
+            // rather than answered from a program-wide index.  The re-home is
+            // what makes the scoped steps able to answer at all.
             if (entry.module_name.is_valid()) {
                 def_ctx.set_home_module(entry.module_name, HomeOrigin::Syntax);
             } else {
@@ -1643,7 +1643,11 @@ private:
     ///   2. Primitive name check (a primitive spelling that reached Named
     ///      position carrying no TypeRef of its own)
     ///   3. DeclarationIndex, by written literal then canonicalized name
-    ///   4. Global leaf index
+    ///
+    /// There is no step past 3.  A leaf the DeclarationIndex cannot place is
+    /// unresolved, and the caller diagnoses it; resolving it from a
+    /// program-wide index would answer from what other modules happen to exist
+    /// rather than from what this one wrote.
     resolve_named(&this, name: SymbolStr, ctx: ResolutionContext*,
                   slot: ResSlot, span: SourceSpan) -> TypeRef {
         const name_str: string = this.intern_table.resolve(name);
@@ -1711,8 +1715,8 @@ private:
 
         // 2c. Home-module preference.  A BARE leaf in an annotation means that
         //     leaf as its OWN module sees it.  Every lookup below this point
-        //     goes through the ambient scope chain / leaf index, both of which
-        //     answer for whatever module the resolver cursor is currently on -
+        //     goes through the ambient scope chain, which answers for whatever
+        //     module the resolver cursor is currently on -
         //     the caller's, at any re-resolution site.  When the caller told us
         //     where the annotation actually lives, the module's own declaration
         //     of the leaf is authoritative and settles the tie before the
@@ -1894,45 +1898,6 @@ private:
                 this.rn_trace("3c-di-bare", name_str, ctx, a_bare);
                 return a_bare;
             }
-        }
-
-        mut found: TypeRef = TypeRef::invalid();
-
-        // (Steps 5b and 6 removed; both confirmed dead code:
-        //  5b: ModuleTypeRegistry alias: 0 hits across all builds.
-        //  6:  Compound-name fallback (ptr/array suffix parsing): 0 hits
-        //      after ASTTypeSubstituter fix produces correct annotation kinds.)
-
-        // 5. Leaf-index: O(1) lookup by bare leaf name.
-        //    Load-bearing for circular forward references: e.g., AST node
-        //    files reference ASTVisitor* in accept() methods but can't
-        //    import compiler::ast::visitor without creating a cycle.  Also
-        //    handles types from transitive submodule re-exports.
-        //
-        //    No length-based skip.  Step 1 already returned for any name
-        //    that's a generic-param binding (`T`, `K`, `V`, `A`, ...); the
-        //    earlier `name_len > 2` guard was a length-heuristic shortcut
-        //    that silently blocked legitimate short type names (the
-        //    visible casualty was `Rc`, which is prelude-exposed but had
-        //    its arena-leaf fallback disabled, so `Rc<T>::method(...)`
-        //    failed E0233 without an explicit `import alloc::rc;`).
-        //    Generic params are arena-registered only as part of a
-        //    template's param list and are never inserted into the leaf
-        //    index by `register_leaf_name`, so this fallback can't
-        //    misroute a stray `T` into a real type.
-        resolve_counter::Site::LeafCallResolveNamed.bump();
-        found = this.arena.lookup_by_leaf(name);
-        if (found.is_valid()) {
-            resolve_counter::Site::RnLeafIndex.bump();
-            resolve_counter::Site::LeafViaResolveNamed.bump();
-            // Which names actually need the global index, and who asks.  §2.10a
-            // justifies this fallback narrowly (circular `ASTVisitor*` refs in
-            // AST node files); the audit decides whether legalizing
-            // intra-package import cycles would really retire it.
-            resolve_counter::leaf_hit(this.intern_table.resolve(ctx.home_module),
-                                     name_str);
-            this.rn_trace("5-leaf-index", name_str, ctx, found);
-            return found;
         }
 
         // Not found; return invalid (caller should create error)
