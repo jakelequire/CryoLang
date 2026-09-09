@@ -15878,3 +15878,90 @@ The drift was read in full rather than headed, because the DRIFT block is
 per-section and a truncated read hides sections that moved. It was exactly the
 six rows, every one `was 0`, with `B1` and `B4` both still 0 and no other
 section touched. Sites per block: **106 -> 100**.
+
+### 8.118 The specializer is the only way to specialize, but not the only way an instantiation exists - and the one hole worth naming is starved, not absent - MEASURED 2026-09-09
+
+8.117 measured that the instantiation chokepoint is REACHED and said plainly
+that reached is not the same as only. This settles the second question, which
+is a different kind of claim: a second route does not pass the site being
+instrumented, so no counter there can find one. It takes an enumeration, and
+the parts that remain inferred are labelled as such.
+
+#### Closed by enumeration
+
+`ASTSpecializer::specialize` has exactly one caller, and it is fed only by the
+mono work queue. `InstantiatedType` is constructed at exactly one site, inside
+`create_instantiation`, which interns - so every instantiation in the arena is
+built on one line, and the population is complete by construction rather than
+by sampling. There is no second way to specialize an AST and no second way to
+mint an instantiation.
+
+The two populations are not the same one, though, and the path between them is
+`enqueue_from_type_ref`, whose six early returns are the only way a minted
+instantiation fails to reach the specializer.
+
+#### Composed by reason, because a total cannot say which
+
+| enqueue arm | count |
+|---|---|
+| not an instantiation (a filter, not a gap) | 11,418 |
+| base lookup failed | 0 |
+| base is a `TypeAlias` | 0 |
+| base kind not monomorphizable | 0 |
+| base not a registered template | 0 |
+| argument still abstract - deferral | 7,519 |
+| accepted, reaches the specializer | 9,940 |
+
+Every skip that fires on this corpus is the abstract-argument deferral, which
+is the rule enforcement wants anyway - the same `contains_generic_param` guard
+`check_function_bounds_at_call` already uses. No hole is observed.
+
+#### A subtraction that looked like an answer, withdrawn
+
+Before the arms were split, the mint and specialize totals were differenced to
+claim roughly 4,561 aggregate instantiations never reach the site. That
+subtraction is invalid and is withdrawn. `create_instantiation` interns, so its
+rows count DISTINCT instantiations; the enqueue rows count CALLS, and the same
+instantiation is enqueued repeatedly. Worse, deferral is not permanent: an
+instantiation skipped while its arguments are abstract is accepted later once
+they are concrete, so it appears in both columns. The two populations were
+never comparable, and the number carried a conclusion neither of them supports.
+
+#### The named hole is starved, which is not the same as absent
+
+A generic type alias is expanded during type resolution and never
+monomorphized, so a bound on one could never be seen at the specializer. That
+made `TypeAlias` the concrete hole to expect - and its row reads **0**.
+
+The zero is starvation. **There are no generic type aliases in `examples/` or
+in `stdlib/`** - not one, tree-wide. The instrument is sound: the same pattern
+fires on the non-generic aliases the stdlib does write. So the corpus is
+structurally incapable of exhibiting the case, and the row is uninformative
+rather than reassuring. The remaining three zeros are not controlled at all and
+are recorded as inferred.
+
+So the conclusion is narrower than "the site is adequate": on this corpus
+nothing is skipped except legitimately, and the one case that would be skipped
+illegitimately cannot occur in it.
+
+#### What this decides about the carrier set
+
+`TypeAliasDeclNode` is one of the six node kinds an extension of `where` to
+type declarations would need a carrier on. Putting a bound there would create
+syntax reachable by no corpus in the repository, checked at a site that by
+construction never sees it - a change that looks inert on every gate, which is
+the condition that made a dedicated project necessary for the inline bound.
+Either the alias is left out of the carrier set, or its project is built before
+the enforcement code rather than after.
+
+#### Two arms looked at directly, and what they turned out to be
+
+A union does not slip past: it is a `StructType` with `is_union` set, not a
+distinct `TypeKind`, so the `Struct` arm covers it in both the enqueue filter
+and the mint counter.
+
+The struct/union/class arms do disagree about qualification, and more widely
+than first noted - `qualify_binding_sym` and `qualify_symbol_sym_home` are both
+used for the SAME `UnionDeclNode`, in different passes, not merely across the
+async arms. It is a naming inconsistency and worth its own entry. It is not a
+second instantiation route, and is recorded here so it is not mistaken for one.
