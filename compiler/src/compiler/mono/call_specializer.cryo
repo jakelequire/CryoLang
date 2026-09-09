@@ -2591,7 +2591,11 @@ type struct MonoCallSpecializer {
                 _ => { }
             }
         }
-        // Try current module's qualified form first.
+        // Try current module's qualified form first.  There is no bare-name
+        // companion to this lookup: the registry's name index is keyed by
+        // qualified name alone, so a bare leaf can only reach a template whose
+        // qualified name IS that leaf - one declared outside any namespace,
+        // which the grammar has no way to spell.
         const name_str: string = this.intern_table.resolve(name);
         const cur_mod_str: string = this.intern_table.resolve(this.current_module);
         if (cur_mod_str.length() > 0) {
@@ -2599,14 +2603,8 @@ type struct MonoCallSpecializer {
             const q1: SymbolStr = this.intern_table.intern(q1_str);
             const e1: TemplateEntry* = registry.get_template(q1);
             if (e1 != null && e1.node_kind == NodeKind::FunctionDeclaration) {
-                this.record_m4_pre(asker, e1);
                 return e1;
             }
-        }
-        const e2: TemplateEntry* = registry.get_template(name);
-        if (e2 != null && e2.node_kind == NodeKind::FunctionDeclaration) {
-            this.record_m4_pre(asker, e2);
-            return e2;
         }
         // Linear scan by bare name, reached only by a call whose identifier
         // carries no usable stamp.  The call site's current_module is the
@@ -2648,50 +2646,9 @@ type struct MonoCallSpecializer {
         if (first != null) {
             resolve_counter::Site::M4Hits.bump();
             resolve_counter::Site::M4Single.bump();
-            this.record_m4_asker(asker, first);
         }
         return first;
     }
-
-    /// Whether the stamp reaches the same template at the two exits that sit
-    /// above the scan.  A non-zero `DIFFERS` would mean the stamp and the
-    /// spelling disagree about which template a call names, which is the one
-    /// way consulting the stamp first could rebind a call.
-    record_m4_pre(mut &this, asker: ResSlot*, chosen: TemplateEntry*) -> void {
-        resolve_counter::Site::M4PreCalls.bump();
-        if (asker == null || asker.is_pending()) {
-            resolve_counter::Site::M4PreNoStamp.bump(); return;
-        }
-        mut def_name: SymbolStr = SymbolStr::empty();
-        match (asker.require("m4-pre-probe")) {
-            Res::Def(q) => { def_name = q.qualified_name(); }
-            _           => { resolve_counter::Site::M4PreNoStamp.bump(); return; }
-        }
-        const registry: GenericRegistry* = this.generic_registry;
-        if (registry == null) { return; }
-        const via_res: TemplateEntry* = registry.get_template(def_name);
-        if (via_res == null) { resolve_counter::Site::M4PreNoStamp.bump(); return; }
-        if (via_res == chosen) { resolve_counter::Site::M4PreAgree.bump(); }
-        else { resolve_counter::Site::M4PreDiffers.bump(); }
-    }
-
-    record_m4_asker(mut &this, asker: ResSlot*, chosen: TemplateEntry*) -> void {
-        resolve_counter::Site::M4ResCalls.bump();
-        if (asker == null) { resolve_counter::Site::M4ResPending.bump(); return; }
-        if (asker.is_pending()) { resolve_counter::Site::M4ResPending.bump(); return; }
-        mut def_name: SymbolStr = SymbolStr::empty();
-        match (asker.require("m4-probe")) {
-            Res::Def(q) => { resolve_counter::Site::M4ResDef.bump(); def_name = q.qualified_name(); }
-            _           => { resolve_counter::Site::M4ResOther.bump(); return; }
-        }
-        const registry: GenericRegistry* = this.generic_registry;
-        if (registry == null) { return; }
-        const via_res: TemplateEntry* = registry.get_template(def_name);
-        if (via_res == null) { resolve_counter::Site::M4ResNoTemplate.bump(); return; }
-        if (via_res == chosen) { resolve_counter::Site::M4ResAgree.bump(); }
-        else { resolve_counter::Site::M4ResDiffers.bump(); }
-    }
-
 
     // -- Where-clause bound checking at the call site --
 

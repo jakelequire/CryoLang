@@ -16049,3 +16049,131 @@ thing being *entered* before concluding anything.
 
 Also unclaimed and untouched: the struct/union/class `async` producer, and the
 `blocking_pool` ceiling assertion that passes alone and fails under load.
+### 8.120 Three of the four "cascade lanes" were a guard, a destination and a starved step: counter-name classification cannot tell those apart - MEASURED AND LANDED 2026-09-09
+
+A plan arrived naming four cascade lanes as present-and-answering-zero and
+therefore deletable in one batch: `lookup_by_leaf`, `M1 qualifier_agrees`,
+`M2 resolve_module_qualified_symbol` and the M4 bare-name scan, ~10,600 entries
+per build between them. Only the last is old machinery. Deleting the batch would
+have removed a guard the new model requires and the new model's own destination.
+
+#### What each of the four actually is
+
+`M1 qualifier_agrees` is a **check**, not a lane. Its 5,566 of 5,566 "agree" is a
+guard passing, not a lane starving; the row that would show it working is
+`M1QualReject`, and its zero is unmeasurable by construction here, because the
+corpus spelling a contradicted qualifier is the compile_fail corpus and the
+end-of-run report prints only after a successful link. Without it the scope
+chain, which is keyed by leaf alone, lets `executor::JoinHandle` bind
+`thread::JoinHandle` in any program importing both.
+
+`M2 resolve_module_qualified_symbol` is the **destination**. It reads the stamp,
+builds `ns::member`, and declines rather than searching. It answers, via
+`M2ViaStamp`.
+
+`lookup_by_leaf` is **starved, not dead**. `leaf_index` is populated by every
+type registration, so the zero is caller-side, and cascade step 2c takes every
+UNIQUE leaf before step 5 is reached. Only a leaf declared twice reaches it, and
+`tests/tests/projects/resolution_leaf_index` is the corpus that does - reached by
+`cryo test`, never by a `cryo build` sweep. Its own header says so.
+
+The M4 scan's zero is corpus-accidental too: `TemplateEntry.name` is stored
+bare, so `cand.name.equals(leaf)` can match. It finds nothing because the 266
+calls reaching it name non-generic functions; an unstamped asker naming a generic
+free function would answer, and that hole is live.
+
+#### The one structural zero, and what licenses deleting it
+
+M4's second pre-exit asked `registry.get_template(bare_leaf)`.
+`register_template` keys `name_index` by `qualified_name` ALONE, so a bare leaf
+can only reach a template whose qualified name IS that leaf - one declared
+outside any namespace, which the grammar cannot spell. That is a zero no corpus
+can move, and it is deleted here along with `record_m4_pre` and
+`record_m4_asker`, whose entry counts §8.96 measured at 0 on all three corpora.
+The sibling exit `e1` (`current_module::leaf`) is KEPT: it is qualified, so it
+can hit, and its zero is a corpus fact rather than a keying one.
+
+Eleven `Site` rows go with them, and the b1 site count moves **100 -> 89** on
+both hosts. B1 and B4 stay 0: a probe produces no answers, so removing it moves
+no total. `lane-check` DEFID_UNWRAP falls 26 -> 24, both in `call_specializer` -
+the two `q.qualified_name()` unwraps the probes performed - and is re-pinned.
+
+#### The reusable trap
+
+**A call/answer table cannot distinguish a starving lane from a passing guard
+from an answering destination.** All three read as zero or near-zero in the
+column a reader scans, and a classification derived from counter NAMES rather
+than from the source will merge them. The separator is not another counter; it is
+one question asked of the source: can this site answer, by construction, for any
+program - or does it merely not answer for this corpus. §8.119 named the two
+kinds of zero; this is what they look like when something else is misfiled as
+one of them.
+
+#### Two metrics, and the honest numbers
+
+"Machinery deleted" and "old model still answering" are different measurements,
+and the project is much further along on the second.
+
+The audit's fourteen-artifact denominator is not reconstructible from this
+ledger, so it is not used here. Stated denominator: the **twelve** named
+artifacts of the old resolution model - the type-cascade steps 2/3/4, the leaf
+index's two callers, M4's scan and its two pre-exits, M4's tie-breaks, M5's
+suffix fallback, `lookup_scope_template_derived`, `resolve_named` steps 5b/6,
+and `resolve_counter.cryo` itself. M1 and M2 are excluded, because they are not
+old machinery; counting them inflated the denominator AND pointed demolition at
+load-bearing code.
+
+* **By source removed: 5 of 12.** Deleted so far are M4's tie-breaks, M4's bare
+  pre-exit and its two probes (here), `lookup_scope_template_derived`, and
+  `resolve_named` steps 5b/6.
+* **By answers produced: the old model is already at zero.** On
+  `examples/09-json-config` the type cascade answers **1 exact 3357, 2 ambient
+  cursor 0, 3 resolver re-entry 0, 4 leaf 0**. Every answer the cascade produces
+  comes from its exact step. `B1_TOTAL` is 0 on all six pinned targets, and B1 is
+  defined as answers produced by fuzzy fallback.
+
+So a "~50% complete" figure understates the migration in one direction and
+overstates the remaining demolition in the other. What is left in source is not
+a queue of lanes still doing the old model's work; it is six artifacts that
+answer nothing plus the counter, which §8.66 puts last by design. The risk in
+the remainder is not that deleting is slow - it is that a starved step and a
+guard look identical from a distance, and three of the six are starved rather
+than structurally dead.
+
+#### Also found, not acted on
+
+`M5 module_by_path_suffix` is entered **0 times on all six pinned blocks** - a
+zero of the NOT-ENTERED kind, with two callers. Nothing here establishes whether
+an import spelling a module by a suffix of its registered name would enter it,
+which is the question that decides it. Unclaimed.
+
+The claim at `resolver.cryo` that the leaf index is load-bearing for circular
+`ASTVisitor*` forward references is **false**: the lane answers 0 over the
+`compiler/` corpus, which is where `ASTVisitor` lives. The comment is a
+hypothesis that outlived its measurement.
+
+#### Forward pointers
+
+* **§8.2y** measured that a bare plural leaf binds by directory order. That is
+  the leaf index's only live population, and §5.1 forbids it. Retiring the lane
+  is therefore a behaviour change needing a diagnostic, not a deletion - see
+  below.
+* **§8.66** defines the migration's scope and is the source of the "lane"
+  framing. Its scope stands; its implied inventory does not. M1 is a guard the
+  new model requires and M2 is the new model, so neither is in "everything from
+  the old model goes."
+* **§8.96** measured the probe entry counts deleted here at 0; its "four of the
+  twenty bounds are themselves zero" now names two, `SpellTyIdCalls` and
+  `SpellTyNewCalls`.
+
+#### What the leaf-index retirement needs before it can be written
+
+Blocked on a diagnostic decision, recorded so the answer can be short. A bare
+leaf borne by two or more declarations, with none of them bound in the naming
+module's scope, must become an error rather than binding by directory order. It
+needs an error code and wording naming both declarers and saying that an import
+or a qualified path is required. The two `WRONG_` tests in
+`tests/tests/projects/resolution_leaf_index` move to a `compile_fail` project
+with that diagnostic as their `expect.diagnostic`, in the same change; the two
+`CONTROL_` tests stay and must keep passing, since an importing module binding
+what it imported is specified behaviour.
