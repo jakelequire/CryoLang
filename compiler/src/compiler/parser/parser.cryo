@@ -717,7 +717,7 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(true);
             for (mut i: int = 0; i < gen_params.length; i++) {
                 func.add_generic_param(gen_params[i]);
             }
@@ -977,7 +977,7 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(false);
             for (mut i: int = 0; i < gen_params.length; i++) {
                 node.add_generic_param(gen_params[i]);
             }
@@ -1008,7 +1008,7 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(false);
             for (mut i: int = 0; i < gen_params.length; i++) {
                 node.add_generic_param(gen_params[i]);
             }
@@ -1037,7 +1037,7 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(false);
             for (mut i: int = 0; i < gen_params.length; i++) {
                 node.add_generic_param(gen_params[i]);
             }
@@ -1486,7 +1486,7 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(true);
             for (mut i: int = 0; i < gen_params.length; i++) {
                 func.add_generic_param(gen_params[i]);
             }
@@ -1561,7 +1561,7 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(false);
             for (mut i: int = 0; i < gen_params.length; i++) {
                 node.add_generic_param(gen_params[i]);
             }
@@ -1661,7 +1661,7 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(false);
             for (mut i: int = 0; i < gen_params.length; i++) {
                 node.add_generic_param(gen_params[i]);
             }
@@ -1777,7 +1777,7 @@ public:
 
         // Optional generic parameters
         if (this.check(TokenType::LAngle)) {
-            const gen_params: GenericParamNode*[] = this.parse_generic_params();
+            const gen_params: GenericParamNode*[] = this.parse_generic_params(false);
             for (mut gi: int = 0; gi < gen_params.length; gi++) {
                 node.add_generic_param(gen_params[gi]);
             }
@@ -2076,7 +2076,7 @@ public:
         // for a trait impl head: `implement<T> trait Iter<T> for Range<T>`.
         mut leading_gen_params: GenericParamNode*[] = [];
         if (this.check(TokenType::LAngle)) {
-            leading_gen_params = this.parse_generic_params();
+            leading_gen_params = this.parse_generic_params(true);
         }
 
         // (G1) Optional `trait <Path>[<args>] for`: the trait-impl prefix.
@@ -2197,7 +2197,7 @@ public:
         // them from the impl's generic_params and the target's declaration.
         if (this.check(TokenType::LAngle)) {
             if (trait_ann == null) {
-                const gen_params: GenericParamNode*[] = this.parse_generic_params();
+                const gen_params: GenericParamNode*[] = this.parse_generic_params(true);
                 for (mut gi: int = 0; gi < gen_params.length; gi++) {
                     node.add_generic_param(gen_params[gi]);
                 }
@@ -2574,10 +2574,15 @@ public:
 
     /// Parse generic type parameters: <T, U, A = DefaultType>
     /// A bound is written in a `where` clause, never here, so a `:` in this
-    /// position is a syntax error rather than a constraint.
+    /// position is a syntax error.
     /// Default annotation (`= Type`) is substituted by sema when the param is
     /// omitted at instantiation time.
-    parse_generic_params() -> GenericParamNode*[] {
+    ///
+    /// `where_allowed` says whether the declaration being parsed can carry a
+    /// `where` clause at all.  Only function-shaped declarations and impl
+    /// blocks can, so on a type declaration the bound has no replacement to
+    /// suggest and the diagnostic must not name one.
+    parse_generic_params(where_allowed: boolean) -> GenericParamNode*[] {
         mut params: GenericParamNode*[] = [];
         this.advance(); // consume '<'
 
@@ -2588,6 +2593,40 @@ public:
             const name_tok: Token = this.consume(TokenType::Identifier, "type parameter name");
             const name: SymbolStr = this.intern_lexeme(name_tok);
             mut param: GenericParamNode* = new GenericParamNode(name, this.span_from_token(start));
+
+            // A `:` here is a bound, which is not this production's syntax.
+            // The bound list is consumed rather than left for the caller: the
+            // parameter list would otherwise fall over on the tokens after it
+            // and report the same single mistake two or three more times, with
+            // the useful message nowhere near the front.  `parse_trait_ref`
+            // consumes exactly what a where-clause bound does, qualified paths
+            // included, so recovery lands on the same `,`/`>`/`=` either way.
+            if (this.check(TokenType::Colon)) {
+                const colon_tok: Token = this.current();
+                this.advance();
+                mut discarded: TraitRef[] = [];
+                while (true) {
+                    discarded.push(this.parse_trait_ref());
+                    if (!this.match_tok(TokenType::Plus)) { break; }
+                }
+                const bound_span: SourceSpan = this.span_from(colon_tok);
+                mut bdiag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0101_UNEXPECTED_TOKEN,
+                    format("a trait bound cannot be written on the type parameter `%s`",
+                           name_tok.lexeme));
+                bdiag = bdiag.at(bound_span);
+                if (where_allowed) {
+                    bdiag = bdiag.with_note("a bound belongs in a `where` clause after the signature, e.g. `function f<T>(x: &T) -> i32 where T: Display`");
+                    bdiag = bdiag.suggest(Suggestion::remove(bound_span,
+                        "remove the bound here and write it in a `where` clause"));
+                } else {
+                    bdiag = bdiag.with_note("a `where` clause is accepted only on function-shaped declarations, so a bound on a type declaration's parameter currently has no syntax");
+                    bdiag = bdiag.suggest(Suggestion::remove(bound_span,
+                        "remove the bound"));
+                }
+                this.ctx.diagnostics.emit(bdiag);
+                this.error_count += 1;
+            }
 
             // Optional default type: T = DefaultType (after constraints, before , or >)
             if (this.match_tok(TokenType::Equal)) {

@@ -15615,6 +15615,13 @@ Parked - it changes what an existing program compiles to.
 
 ### 8.116 Inline `<T: Bound>` deleted: the bound is unenforced by construction, the field had seven readers, and `where` on a type declaration is owed - MEASURED AND LANDED 2026-09-08
 
+> Amended by 8.117 on two points it left open and one it got wrong. The
+> parse-failure code this entry names for the compile_fail project is now
+> `E0101`: the rejection is a single diagnostic naming `where` rather than
+> the cascade that produced the old code. And the six dead counter rows it
+> leaves pinned at zero are retired there, re-pinned on both hosts.
+
+
 Ruled by Jake: a bound is declared in a `where` clause only, inline
 `<T: Bound>` goes, and `where` is to be extended to type declarations. The
 deletion landed; the extension is owed and its enforcement half is costed
@@ -15781,3 +15788,93 @@ be the first thing the extension does.
 
 Parse-only is the outcome to refuse: it would rebuild, one layer up, the exact
 defect this entry deleted.
+
+### 8.117 The instantiation chokepoint is reached 1,513 times, the inline-bound rejection is one diagnostic, and six dead rows are retired on both hosts - MEASURED AND LANDED 2026-09-09
+
+Three pieces: the one link in 8.116's enforcement costing that was read rather
+than measured, and the two items 8.116 parked for a ruling.
+
+#### The read link, measured
+
+8.116 costed enforcement of a type-level bound at `ASTSpecializer::specialize`
+on the strength of a reading. Instrumented with three sites - one of them a
+control, so a zero in the other two could be told apart from a counter that
+never ran - and swept over 14 example projects, cold, with every `build/`
+removed first because `cryo build` is incremental and a warm corpus counts
+nothing. All 14 exit codes were checked before any row was read.
+
+| row | count |
+|---|---|
+| specializations entered (control) | 2,232 |
+| of those, a type declaration | 1,513 |
+| of those, params bindable to args | 1,513 |
+
+So the chokepoint is on the path for type instantiation, at 68% of all
+specializations. The costing stands.
+
+Three things the number does not say, the first of which is a flaw in the
+prediction rather than in the result:
+
+* **The third row is largely tautological.** `specialize` returns early unless
+  `type_args.length == entry.param_count`, and `TemplateEntry::new` sets
+  `param_count` from `param_names.length`, so alignment was already guaranteed
+  by the validation above the counter. What the row adds is only the
+  non-tautological half - `param_names.length > 0` held for all 1,513, so no
+  zero-parameter entry arrives. A prediction a wrong explanation would also
+  satisfy is not a prediction, and "100%" here is weaker than it looks.
+* **The corpus is 14 examples**, not `compiler/src` and not `tests/`.
+* **Reached is not the same as only.** This shows instantiation passes the
+  site; it does not show that nothing instantiates a type by another route. An
+  enforcement check placed here would be silently incomplete if one exists.
+  `specialize` has a single caller, but the monomorphizer was not audited for
+  other paths. That measurement belongs before the extension's construction,
+  not after it.
+
+#### The rejection is one diagnostic, and it does not promise what it cannot
+
+Deleting the production left the parser failing over the tokens after the `:`,
+reporting one mistake three times. The bound list is now consumed at the point
+the `:` is in hand, through `parse_trait_ref` - the same production a `where`
+clause uses, so a qualified path like `<T: fmt::Display>` is swallowed by the
+same recovery and lands on the same `,`/`>`/`=`. One error, and being the only
+one it is necessarily the first.
+
+The obvious message would have been wrong. Suggesting a `where` clause is
+correct on a function and sends the reader to a second parse error on a
+`type struct`, where `where` does not parse. `parse_generic_params` is shared by
+ten call sites, so it now takes `where_allowed`, split exactly as 8.116
+enumerated: true at `parse_function_declaration`, `parse_method` and both
+`parse_implementation_block` sites; false at struct, union, class, enum, trait
+and type alias. The false arm says a bound on a type declaration's parameter
+currently has no syntax, which is the truth and is the same absence 8.116
+records as owed.
+
+No new error code: `E0101_UNEXPECTED_TOKEN` with the
+`.at().with_note().suggest()` shape the `implement ... for` diagnostics already
+use. The project asserts `E0101` rather than the parse-failure code it asserted
+before.
+
+#### Six dead rows retired, on both hosts explicitly
+
+The bound rows lost their bump sites when the three constraint loops collapsed.
+Before removing them, each was checked for a remaining bump - zero for all six -
+**and the four surviving siblings were checked for still having one** - one
+each. Without that second half the zero would have been equally consistent with
+a broken grep.
+
+Each site turned out to occupy exactly four places: the enum declaration, the
+bucket, the label and the `report()` row. 24 lines for 6 sites is the
+confirmation that the four registration points are the whole surface.
+
+`b1-gate.py --update` rewrites only the block for the host it ran on and
+round-trips the rest verbatim; the baseline holds six blocks, and the three
+linux ones named the removed rows. A Windows-only re-pin would therefore have
+left three stale blocks that no local gate reads, failing only later on the
+other host. Both arms were run explicitly. The tool says so itself in the
+update line - "left untouched: linux, linux-ffi, linux-gen" - and the drift
+report repeats it: "only this host's section is re-pinned."
+
+The drift was read in full rather than headed, because the DRIFT block is
+per-section and a truncated read hides sections that moved. It was exactly the
+six rows, every one `was 0`, with `B1` and `B4` both still 0 and no other
+section touched. Sites per block: **106 -> 100**.

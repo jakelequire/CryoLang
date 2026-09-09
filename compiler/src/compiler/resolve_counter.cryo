@@ -211,24 +211,18 @@ type enum Site {
 
     // Leaf-index consumers, bumped on a HIT (an answer actually produced).
     LeafViaResolveNamed;
-    LeafViaResolverBound;
-    LeafViaSymbolicCheck;
     LeafViaTypeUtils;
-    LeafViaTypeResBound;
 
-    /// The same five consumers, bumped on the CALL.
+    /// The same two consumers, bumped on the CALL.
     ///
     /// The hit rows above sit inside `if (trait_ref.is_valid())`, so each one
     /// reads 0 both when its caller never asked and when it asked and was
     /// refused.  Those imply opposite fixes - one is a caller with nothing to
     /// look up, the other a lookup that answers nobody - and the parent row
-    /// cannot separate them either, because it aggregates all five.  A leaf
+    /// cannot separate them either, because it aggregates both.  A leaf
     /// consumer's zero is not readable without the call beside it.
     LeafCallResolveNamed;
-    LeafCallResolverBound;
-    LeafCallSymbolicCheck;
     LeafCallTypeUtils;
-    LeafCallTypeResBound;
 
     /// One row per exit of the type-widening cascade in
     /// `sema::type_utils::lookup_type_by_sym`, which has twelve callers and
@@ -263,6 +257,16 @@ type enum Site {
     ParamRefSymbolic;
     ParamRefTypeRes;
     ParamRefResolver;
+
+    // Whether a bound on a TYPE parameter could be enforced where a type is
+    // instantiated.  Entered is the control: it counts every specialization,
+    // so a zero in the two below is distinguishable from an instrument that
+    // never ran.  TypeDecl narrows to the declarations a type-level bound
+    // could sit on; Bindable adds the condition the satisfaction oracle needs,
+    // that the parameter names line up index-wise with the concrete args.
+    SpecEntered;
+    SpecTypeDecl;
+    SpecTypeDeclBindable;
 
     // Free-function bare-call binder.  Counted apart because they need
     // different fixes: D-A is a missing check, D-B is a missing input.
@@ -739,22 +743,19 @@ implement enum Site {
             Site::VisRejectUnreachable  => { "B1 " }
             Site::VisRejectNotPublic    => { "B1 " }
             Site::LeafViaResolveNamed   => { "B1 " }
-            Site::LeafViaResolverBound  => { "B1 " }
-            Site::LeafViaSymbolicCheck  => { "B1 " }
             Site::LeafViaTypeUtils      => { "B1 " }
-            Site::LeafViaTypeResBound   => { "B1 " }
             Site::LeafCallResolveNamed  => { "B1>" }
-            Site::LeafCallResolverBound => { "B1 " }
-            Site::LeafCallSymbolicCheck => { "B1 " }
             Site::LeafCallTypeUtils     => { "B1 " }
             Site::TypeCascadeExact      => { "B1 " }
             Site::TypeCascadeCursor     => { "B1 " }
             Site::TypeCascadeCrossMod   => { "B1 " }
             Site::TypeCascadeMiss       => { "B1 " }
-            Site::LeafCallTypeResBound  => { "B1 " }
             Site::ParamRefSymbolic      => { "B1>" }
             Site::ParamRefTypeRes       => { "B1>" }
             Site::ParamRefResolver      => { "B1>" }
+            Site::SpecEntered           => { "   " }
+            Site::SpecTypeDecl          => { "   " }
+            Site::SpecTypeDeclBindable  => { "   " }
             Site::FnBindSingle          => { "   " }
             Site::FnBindSingleHidden    => { "!! " }
             Site::FnBindPrivateBound    => { "!! " }
@@ -937,22 +938,19 @@ implement enum Site {
             Site::VisRejectUnreachable  => { "    cause: namespace not reachable" }
             Site::VisRejectNotPublic    => { "    cause: candidate not public" }
             Site::LeafViaResolveNamed   => { "  by caller: resolve_named step 5" }
-            Site::LeafViaResolverBound  => { "  by caller: resolver generic bound" }
-            Site::LeafViaSymbolicCheck  => { "  by caller: symbolic_checker" }
             Site::LeafViaTypeUtils      => { "  by caller: sema type_utils" }
-            Site::LeafViaTypeResBound   => { "  by caller: type_resolution bound" }
             Site::LeafCallResolveNamed  => { "  asked by: resolve_named step 5" }
-            Site::LeafCallResolverBound => { "  asked by: resolver generic bound" }
-            Site::LeafCallSymbolicCheck => { "  asked by: symbolic_checker" }
             Site::LeafCallTypeUtils     => { "  asked by: sema type_utils" }
             Site::TypeCascadeExact      => { "type cascade: 1 exact" }
             Site::TypeCascadeCursor     => { "type cascade: 2 ambient cursor" }
             Site::TypeCascadeCrossMod   => { "type cascade: 3 resolver re-entry" }
             Site::TypeCascadeMiss       => { "type cascade: 5 miss" }
-            Site::LeafCallTypeResBound  => { "  asked by: type_resolution bound" }
             Site::ParamRefSymbolic      => { "  params offered: symbolic_checker" }
             Site::ParamRefTypeRes       => { "  params offered: type_resolution" }
             Site::ParamRefResolver      => { "  params offered: resolver create_param_type" }
+            Site::SpecEntered           => { "specializations entered (control)" }
+            Site::SpecTypeDecl          => { "  of those, a type declaration" }
+            Site::SpecTypeDeclBindable  => { "  of those, params bindable to args" }
             Site::FnBindSingle          => { "single-overload pins (no scope check)" }
             Site::FnBindSingleHidden    => { "  of those, owner NOT in scope (D-A)" }
             Site::FnBindPrivateBound    => { "bound to a PRIVATE candidate  (D-B)" }
@@ -1705,15 +1703,9 @@ public function report() -> void {
     Site::LeafCalls.print_row();
     Site::LeafHits.print_row();
     Site::LeafViaResolveNamed.print_row();
-    Site::LeafViaResolverBound.print_row();
-    Site::LeafViaSymbolicCheck.print_row();
     Site::LeafViaTypeUtils.print_row();
-    Site::LeafViaTypeResBound.print_row();
     Site::LeafCallResolveNamed.print_row();
-    Site::LeafCallResolverBound.print_row();
-    Site::LeafCallSymbolicCheck.print_row();
     Site::LeafCallTypeUtils.print_row();
-    Site::LeafCallTypeResBound.print_row();
     Site::TypeCascadeExact.print_row();
     Site::TypeCascadeCursor.print_row();
     Site::TypeCascadeCrossMod.print_row();
@@ -1721,6 +1713,11 @@ public function report() -> void {
     Site::ParamRefSymbolic.print_row();
     Site::ParamRefTypeRes.print_row();
     Site::ParamRefResolver.print_row();
+
+    fmt::eprintf("\n-- type instantiation chokepoint (mono/specializer.cryo:88) --\n");
+    Site::SpecEntered.print_row();
+    Site::SpecTypeDecl.print_row();
+    Site::SpecTypeDeclBindable.print_row();
 
     fmt::eprintf("
 -- const-table bare leaf (const_table.cryo) -----------
