@@ -695,12 +695,15 @@ Counter caveats, both load-bearing when reading any number it prints:
 Normative, and the most repeated failure in this subsystem's history.
 
 Every claim ABOUT the code - a comment, a counter's label, a doc-comment step
-list, a ledger entry, an audit table - was true of some measurement at some
-moment. None of them re-runs. The code moves; the description stays, and the
-next reader takes it as a current fact because nothing about it looks old.
+list, a ledger entry, an audit table, a progress figure - was true of some
+measurement at some moment. None of them re-runs. The code moves; the
+description stays, and the next reader takes it as a current fact because
+nothing about it looks old.
 
-Three instances landed in a single session (2026-09-09), and they are one
-failure mode rather than three:
+One session produced enough instances to grade them; the list and the severity
+ordering are in §8.123, which is where a count belongs rather than here, since
+a number stated in this paragraph would itself go stale. Three of them, as the
+shape to recognise:
 
 * A comment at the arena leaf lane said it was **load-bearing for circular
   `ASTVisitor*` forward references**. The compiler selfhosts without the lane.
@@ -10184,6 +10187,10 @@ and this migration exists to remove.
 > instance five in §8.123 - a measurement with a date, read a month later as a
 > current fact.
 
+> **RULED §8.124.** The question below is answered: namespace the intrinsics
+> so a bare name always means the user's function. It is not adjudicated in the
+> resolver, which is what this section warned against.
+
 #### The question, and why it is not this session's
 
 Stamping these requires deciding what a bare `panic`, `malloc` or `strlen`
@@ -10250,6 +10257,9 @@ before step 2 is written.
 Investigated in 8.65: stampable, and blocked on a language rule about what a
 bare leaf names when an intrinsic and a real declaration both claim it. Parked
 with the evidence, not worked around.
+
+> **RULED, §8.124.** Namespaced: intrinsics move behind a path so a bare name
+> always means the user's function, and the contest is never held. Not started.
 
 #### The order
 
@@ -16444,13 +16454,13 @@ The comment is stale rather than mistaken: the hazard was real, a later change
 removed it elsewhere, and the edge and its rationale stayed. Reaching "delete
 the edge" from the wrong table would have been indistinguishable from reaching
 it correctly, which is the whole reason the reason has to be stated.
-### 8.123 Five stale descriptions in one session, and the expensive kind is the one holding a structural decision in place - 2026-09-09
+### 8.123 Six stale descriptions in one session, and the expensive kind is the one holding a structural decision in place - 2026-09-09
 
 §7.4 states the rule. This entry is the evidence behind it and the severity
 grading, because "check the comment" is cheap advice that nobody follows without
 a sense of what it costs not to.
 
-#### The five
+#### The six
 
 1. **A comment claiming a deleted-candidate lane was load-bearing.** The arena
    leaf lane said it was needed for circular `ASTVisitor*` forward references.
@@ -16471,6 +16481,12 @@ a sense of what it costs not to.
 5. **This document.** §8.65 recorded the same edge as "load-bearing today",
    which was true at the time and was still being read as current a session
    later.
+6. **A status report, twice.** Asked whether a long-running job was
+   progressing, the same figure was quoted from an earlier reading rather
+   than re-read - so "still at 652" described a moment that had passed, and
+   was indistinguishable from a hang. A fresh reading took seconds and showed
+   it had more than doubled. Not code, not a comment, and it still cost
+   someone their answer.
 
 #### The grading, which is the point
 
@@ -16492,6 +16508,13 @@ The fourth instance and the fifth are the same edge: one in the source, one in
 this ledger, both asserting a hazard that had been fixed elsewhere. Neither was
 wrong when written. That is what makes them hard - there is no error to find by
 review, only a fact that expired.
+
+The sixth is not code at all, which is the part worth keeping. A stale
+description is not a property of comments; it is what happens to any
+statement whose subject keeps moving after the statement was made. A
+progress figure, a measured count, a "this is load-bearing" - each is true
+at an instant and read as true now. The cheapest guard is the same in every
+case: re-read before repeating.
 
 #### What actually catches it
 
@@ -16523,3 +16546,87 @@ attached, and reading it a month later is reading a claim about a tree that has
 moved. Entries here should be assumed stale in proportion to how much has
 landed since - and when one is the basis for NOT doing something, that is the
 one to re-measure first.
+### 8.124 Handoff: §8.65 is RULED - intrinsics get namespaced - and the namespacing itself is not started - 2026-09-09
+
+Short by intent. What a successor would otherwise rediscover.
+
+#### The ruling
+
+§8.65 parked one question: what a bare `panic`, `malloc` or `strlen` names when
+an intrinsic declaration and a real function both declare it. Four answers were
+put to Jake - intrinsic wins, declaration wins, ambiguity error, or namespace
+the intrinsics so the contest is never held. **He chose the fourth.**
+
+Intrinsics move behind a path; a bare name always means the user's function.
+That is the Rust model, and it dissolves all nine contested leaves by
+construction rather than by a rule that picks a winner - so `panic`, `printf`,
+`free` and `realloc` stop being contested rather than being adjudicated. It also
+means no resolver branch prefers one declaration KIND over another, which §8.65
+correctly identified as the shape this migration is dismantling.
+
+**Not started.** No parser change, no registration change, no call-site edits.
+Nothing half-built to back out.
+
+#### The measurement that sizes it, and the question that gates it
+
+64 intrinsics remain after the 142 -> 64 reduction, but the cost is in the call
+sites, not the declarations: **~1,091 bare calls across 100 files**, measured
+over `stdlib` + `compiler/src` + `runtime`.
+
+`format` alone is **839** of them, and it is a genuine intrinsic - there is no
+`fmt::format`, only `format_to_string`. The other 63 account for ~252, led by
+`panic` 44, `free` 17, `malloc` 10. The spread is tree-wide, heaviest in
+`compiler/sema`, `compiler/passes` and `codegen/visit`.
+
+One question decides the size, and it is not mechanical:
+
+* **Qualify every call site** - `intrinsics::format(...)` - roughly 1,091 edits,
+  and every diagnostic in the compiler gets longer, since `format(` is how they
+  are all built.
+* **Export the intrinsics and require an explicit `import`** - roughly 100 file
+  edits instead. But intrinsics currently export **0** names, and adding
+  `export_symbol` to the intrinsic arm is precisely the experiment §8.65 ran:
+  it took the guard population to zero and ambiguated 87 leaves, breaking the
+  build on `panic`. Whether the same hazard survives once bare resolution no
+  longer reaches intrinsics is the thing to establish BEFORE choosing this.
+
+Both give the same guarantee. They differ by an order of magnitude in diff size
+and read differently at every call site forever.
+
+**There is no safe stopping point mid-change**: a half-namespaced tree does not
+compile, so this wants a fresh context and a full gate budget rather than the
+tail of a session.
+
+#### Open, and not claimed by this session
+
+* **`W0011` severity.** `W0011_DUPLICATE_EXTERN_SYMBOL` reports two extern
+  declarations of one C symbol with conflicting signatures - a genuine ABI
+  hazard - as a WARNING, and which one wins is decided by registration order.
+  The population is **empty tree-wide** (§8.122), which makes promoting it to an
+  error cheap and also unforced. Promoting would need a new error code for zero
+  observed cases. Left as a decision, not taken.
+* **`M5 module_by_path_suffix`** is entered **0 times on all six pinned
+  blocks**, with two callers - a NOT-ENTERED zero. Whether an import spelling a
+  module by a suffix of its registered name would enter it is the question that
+  decides whether it can go. Unclaimed.
+* **`BoundedParamType`** remains uninhabited with ~20 consumer sites, deliberate
+  and unchanged since §8.119.
+
+#### Where the migration actually stands
+
+Two metrics, and they disagree in a way that matters for planning.
+
+* **By source removed: 7 of 13** named old-model artifacts. Deleted: the arena
+  leaf lane and both its callers, `resolve_named` steps 5b/6,
+  `lookup_scope_template_derived`, M4's tie-breaks, M4's bare pre-exit. Present:
+  type-cascade steps 2 and 3, M4's scan, M4's pre-exit `e1`, M5, and
+  `resolve_counter` itself.
+* **By answers produced: zero.** `B1_TOTAL` is 0 on all six pinned targets, and
+  B1 is defined as answers produced by fuzzy fallback. The type cascade reads
+  `1-exact 3357, 2-cursor 0, 3-crossmod 0`.
+
+The first figure is **not robust to slicing** - M4 contributes four of the
+thirteen only because it was examined closely; counting M4 as one artifact reads
+4 of 10. Prefer `B1 = 0`, which is measured and gated and cannot be re-sliced.
+Of the six surviving artifacts, four are starved, one is never entered, and one
+is the counter that §8.66 puts last by design.
