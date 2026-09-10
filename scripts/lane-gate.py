@@ -23,8 +23,17 @@ The five per-kind lookups (`lookup_type`, `lookup_func_return`,
 outside the file that DEFINES them, and SPLIT BY THE RECEIVER that answers
 them, because the five names are not the index's alone:
 
-  * LOOKUP -- answered by the `DeclarationIndex`.  This is the lane surface,
+  * LOOKUP -- answered by the `DeclarationIndex` under one of the five.  This
+    is the lane surface,
     and the only one of the three that should fall.
+  * LOOKUP_OTHER -- answered by the `DeclarationIndex` under any other
+    `lookup_*` name.  The index answers under sixteen of them, not five, and
+    the five carried 65 of the 122 external index lookups in this tree: over
+    half the surface the gate is named for was not on it.  A caller can leave
+    a pinned row by switching to an unpinned name, and the pinned row then
+    falls, which reads as exactly the progress this gate was built to
+    distinguish from regrowth.  The name rule is mechanical (`lookup_` prefix)
+    so that what is counted is not a matter of opinion.
   * LOOKUP_ROUTED -- answered by a `TypeUtils` wrapper.  Already at the
     destination, so it RISES as LOOKUP falls and is not a target; it is pinned
     because a new same-named wrapper is exactly the regrowth this gate exists
@@ -147,14 +156,24 @@ DEFID_MINT_RE = re.compile(r"DefId::of_definition\s*\(")
 # can match, while a receiver can only be a value.
 DEFID_UNWRAP_RE = re.compile(r"\.qualified_name\s*\(")
 
+# ANY lookup on the index, so the five cannot be routed around by a sixth.
+ANY_LOOKUP_RE = re.compile(r"([A-Za-z_][A-Za-z_0-9.]*)\.(lookup_[A-Za-z_0-9]*)\s*\(")
+
 # Every counted population, in the order they are rendered and compared.
-KINDS = ("LOOKUP", "LOOKUP_ROUTED", "LOOKUP_LOCAL",
+KINDS = ("LOOKUP", "LOOKUP_OTHER", "LOOKUP_ROUTED", "LOOKUP_LOCAL",
          "REENTRY", "DEFID_MINT", "DEFID_UNWRAP")
 
 # The file that DEFINES the five lookups.  Its own calls are not the surface.
-LOOKUP_OWNERS = {"decl_index.cryo"}
+#
+# Matched on the path relative to compiler/src, not on the basename.  A
+# basename exclusion is a rule about a NAME: a second decl_index.cryo anywhere
+# in the tree would have its calls silently dropped, and a gate whose blind
+# spot can be created by naming a file is not one that can be trusted about a
+# count.  The exclusion is meant to be about one specific definition site, so
+# it names one.
+LOOKUP_OWNERS = {"compiler/decl_index.cryo"}
 # The driver legitimately owns the resolver and may ask for it.
-REENTRY_OWNERS = {"instance.cryo"}
+REENTRY_OWNERS = {"compiler/instance.cryo"}
 
 
 def strip_comment(line):
@@ -185,7 +204,7 @@ def scan():
                 line = strip_comment(raw)
                 if not line.strip():
                     continue
-                if fname not in LOOKUP_OWNERS:
+                if rel not in LOOKUP_OWNERS:
                     seen = len(LOOKUP_RE.findall(line))
                     accounted = 0
                     for m in RECEIVER_RE.finditer(line):
@@ -200,7 +219,16 @@ def scan():
                     # once per match, so the count is of CALLS and not of checks.
                     for _ in range(seen - accounted):
                         unplaced.append((rel, lineno, "<no simple receiver>"))
-                if fname not in REENTRY_OWNERS:
+                    # Every OTHER lookup_* on the index.  Mechanical rule, no
+                    # judgement about which names are "real" lookups: the index
+                    # answers under more than five names, and a migration
+                    # measured only against the five rewards moving to a sixth.
+                    for m in ANY_LOOKUP_RE.finditer(line):
+                        if m.group(2) in LOOKUPS:
+                            continue
+                        if lookup_bucket(m.group(1)) == "LOOKUP":
+                            tally["LOOKUP_OTHER"] += 1
+                if rel not in REENTRY_OWNERS:
                     tally["REENTRY"] += len(REENTRY_RE.findall(line))
                 tally["DEFID_MINT"] += len(DEFID_MINT_RE.findall(line))
                 tally["DEFID_UNWRAP"] += len(DEFID_UNWRAP_RE.findall(line))
@@ -219,7 +247,13 @@ HEADER = [
     "# split by the RECEIVER that answers them - the names are not the index's",
     "# alone, and a name-matched total cannot say what it is a total of.",
     "#",
-    "# LOOKUP         answered by the DeclarationIndex. The lane surface; falls.",
+    "# LOOKUP         answered by the DeclarationIndex, under one of the five",
+    "#                names mechanism 5 gives. The lane surface; falls.",
+    "# LOOKUP_OTHER   answered by the DeclarationIndex under ANY OTHER lookup_*",
+    "#                name. The index answers under sixteen, not five, and a",
+    "#                surface pinned at five is one a caller can leave by",
+    "#                switching names - which reads as progress on the row that",
+    "#                is watched. Same receiver rule, mechanical name rule.",
     "# LOOKUP_ROUTED  answered by a TypeUtils wrapper. Already at the destination,",
     "#                so it RISES as LOOKUP falls. Pinned because a new same-named",
     "#                wrapper is the regrowth this gate exists to catch.",
