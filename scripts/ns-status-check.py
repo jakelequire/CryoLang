@@ -70,42 +70,38 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LEDGER = os.path.join(ROOT, "docs", "name-resolution.md")
-# Overridable so the gate can be pointed at a COPY and watched to fail; a gate
-# nobody has seen refuse anything is a decoration.  The commands still run from
-# the repo root, because what they ask about is the tree, not the document.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ns_ledger                                              # noqa: E402
 
-SECTION_START = "\n## 0. Current state"
-# A row's check: a backticked command, an arrow, a bold expected value.
-ROW = re.compile(r"`([^`]+)`\s*→\s*\*\*([^*]+)\*\*")
 # Rows that say out loud they have none.  Counted so the ratio is visible: a
 # section of unverifiable claims should not read the same as a checked one.
 NO_CHECK = re.compile(r"`no check`")
 
 
 def section(path=None):
-    """§0's text, or None with a reason."""
-    path = path or LEDGER
-    if not os.path.isfile(path):
-        return None, "%s does not exist" % path
-    text = io.open(path, encoding="utf-8").read()
-    i = text.find(SECTION_START)
-    if i < 0:
-        return None, "no `## 0. Current state` heading in the ledger"
-    j = text.find("\n## ", i + len(SECTION_START))
-    if j < 0:
-        j = len(text)
-    return text[i:j], None
+    """§0's text and the file it came from, or None with a reason.
 
+    The file is DISCOVERED rather than named.  The ledger is being split - §0
+    and the spec stay put, the §8 archive moves out - and a hardcoded path
+    would have left this reading a section that was no longer there, or
+    passing over one that had moved.  scripts/ns_ledger.py owns the finding.
 
-def rows(sec):
-    """(command, expected) per checkable row, with markdown escaping undone.
-
-    A table cell escapes a pipe as `\\|` so it does not end the column, and the
-    command is meant to run with a real pipe.  Nothing else in these commands
-    is escaped.
+    `path` overrides it so the gate can be pointed at a COPY and watched to
+    fail; a gate nobody has seen refuse anything is a decoration.  The row
+    commands still run from the repo root either way, because what they ask
+    about is the tree, not the document.
     """
-    return [(c.replace("\\|", "|").strip(), e.strip()) for c, e in ROW.findall(sec)]
+    if path is None:
+        rel, _archives, problem = ns_ledger.find(ROOT)
+        if problem:
+            return None, None, problem
+        path = os.path.join(ROOT, rel)
+    if not os.path.isfile(path):
+        return None, None, "%s does not exist" % path
+    sec = ns_ledger.section_of(io.open(path, encoding="utf-8").read())
+    if not sec:
+        return None, None, "no `## 0. Current state` heading in %s" % path
+    return sec, path, None
 
 
 def answer(out):
@@ -128,9 +124,9 @@ def answer(out):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ledger", default=LEDGER,
-                    help="the document to read §0 from (default: the tracked "
-                         "ledger; a copy is how this gate gets exercised)")
+    ap.add_argument("--ledger", default=None,
+                    help="the document to read §0 from (default: whichever "
+                         "file under docs/ carries the heading)")
     ap.add_argument("--verbose", action="store_true",
                     help="print every row, not only the drifted ones")
     ap.add_argument("--min-rows", type=int, default=25,
@@ -146,12 +142,12 @@ def main():
         print("  something other than what the row says.")
         return 1
 
-    sec, why = section(args.ledger)
+    sec, path, why = section(args.ledger)
     if sec is None:
         print("ns-status-check: FAIL -- %s" % why)
         return 1
 
-    checks = rows(sec)
+    checks = ns_ledger.rows(sec)
     declared_none = len(NO_CHECK.findall(sec))
     if len(checks) < args.min_rows:
         print("ns-status-check: FAIL -- §0 carries %d checkable row(s), "
@@ -201,8 +197,10 @@ def main():
         print("  was built to replace.")
         return 1
 
-    print("ns-status-check: OK -- %d §0 row(s) match the tree "
-          "(%d row(s) declare `no check`)" % (len(checks), declared_none))
+    print("ns-status-check: OK -- %d §0 row(s) in %s match the tree "
+          "(%d row(s) declare `no check`)"
+          % (len(checks), os.path.relpath(path, ROOT).replace(os.sep, "/"),
+             declared_none))
     return 0
 
 

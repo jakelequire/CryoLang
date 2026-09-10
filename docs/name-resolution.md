@@ -5,6 +5,10 @@
 > document is right and the implementation is a defect. Each such gap is
 > listed in §8 with the phase that closes it.
 >
+> **Start at §0 (Current state).** It carries the status of every decision,
+> lane and gate, with a tree check per row. §8 is the evidence archive behind
+> it, and later entries there correct earlier ones.
+>
 > Companion roadmap: `.todo/NAME_RESOLUTION_PLAN.md`. That document sequences
 > the work; this one defines the target. Measurements cited here were taken on
 > **2026-08-03** against branch `naming-impl` with the `CRYO_RESOLVE_COUNTER`
@@ -12,7 +16,181 @@
 
 ---
 
+## 0. Current state
+
+**Read this before §8.** §8 is an append-only archive in which later entries
+correct earlier ones; it is what you open for a derivation, not what you read to
+find out what is true. This section carries **status and a pointer, never
+reasoning** — every "why" lives in the § named on the row.
+
+Rows that can be checked against the tree carry the command and its expected
+answer. **Run the check before trusting the row.** A row marked `no check` is
+worth less than one with a check, and is marked so you can tell.
+
+Checks run from the repo root. Verified at `03d64a56`; `git log --oneline
+03d64a56..HEAD` says how far this has drifted since.
+
+**Maintenance rule: this section is REPLACED, never appended to.** A second
+current-state description is the defect it exists to remove.
+
+### 0.1 Decisions
+
+`TAKEN` built · `RULED` decided, not built · `OUTSTANDING` decided, then lost ·
+`SUPERSEDED` replaced by a later ruling.
+
+| # | decision | status | check → expected | § |
+|---|---|---|---|---|
+| D1 | A `Res` stamp is AUTHORITATIVE, not advisory | TAKEN | `no check` — a convention over consumers, not a symbol | §8.39, §8.44 |
+| D2 | `Namespace::Function` folds into `Namespace::Value` | **OUTSTANDING** | `grep -cE '^\s{4}(Type\|Value\|Function);' compiler/src/compiler/resolver/namespace_kind.cryo` → **3** (2 when done) | §8.39 |
+| D3 | Modules bind in the TYPE namespace | TAKEN, then SUPERSEDED by D5 | `grep -c 'SymbolKind::Namespace' compiler/src/compiler/resolver/namespace_kind.cryo` → **1** | §8.39, §8.68 |
+| D4 | The qualifier shorthand `A::B` prefers the type | SUPERSEDED by D5 — ruled dropped, never built, then overtaken | `no check` — the thing ruled on was never in the tree | §8.66 → §8.130 |
+| D5 | **Namespaces and types share ONE namespace**; a module and a type can never carry the same name, and the collision is an ordinary redeclaration error at its declaration | **RULED, NOT STARTED** | `grep -rho 'check_module_type_collision' compiler/src \| wc -l` → **2** (0 when done) | §8.130, §8.134 |
+| D6 | Intrinsics get namespaced; a bare name always means the user's function | RULED; `format`/`printf` done, the rest not started | `grep -c '^intrinsic function ' stdlib/core/intrinsics.cryo` → **58** | §8.124, §8.126, §8.129 |
+| D7 | Imports stop globbing | migration TAKEN; the glob's DELETION not taken, but its **precondition is now met** (§8.132 + §8.134 fixed both qualifier positions) | `grep -c 'ImportStyle::Wildcard' compiler/src/compiler/resolver/name_resolution.cryo` → **1** (0 when deleted) | §8.131, §8.133, §8.134 |
+| D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
+| D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
+| D10 | A plural bare leaf is E0155, not a directory-order bind | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **3** | §8.121 |
+| D11 | Retire `resolve_counter.cryo` — LAST, after the lanes it counts | RULED, not started | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1931** | §8.66, §8.80 |
+| D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
+
+**D2 is the one to look at.** Decided in §8.39, then neither taken nor
+withdrawn across ninety-five entries: every mention of `Namespace::Function` in
+this document falls inside §8.39 itself or in D2's row above. Its check is on
+the row — the enum still has three variants.
+
+### 0.2 Machinery
+
+`LIVE` entered, answers · `STARVED` entered, answers **0** · `NOT ENTERED` **0**
+calls · `GUARD` answers nothing by design, its zero is it passing · `DELETED`
+not in the tree.
+
+**`STARVED` is not `DELETED`, and neither is `GUARD`.** Confusing these has
+caused four reversals and sent one agent to delete a guard and a destination.
+A starved lane's zero is a fact about the corpus; deleting on it needs a
+control, not the count.
+
+Counts are the pinned golden, `[host:windows]`, `examples/09-json-config`.
+Only 11 of 82 rows differ across the three pinned corpora, and all 11 are volume
+rows on `LIVE` lanes — **every zero below is zero on all three.**
+
+| artifact | status | pinned | check → expected | § |
+|---|---|---|---|---|
+| type cascade 1 — exact | LIVE | 3,391 | `grep -m1 'type cascade: 1 exact' tests/b1-baseline.txt` | §8.64, §8.120 |
+| type cascade 2 — ambient cursor | STARVED | 0 | same file, `type cascade: 2` | §8.64, §8.87 |
+| type cascade 3 — resolver re-entry | STARVED | 0 | same file, `type cascade: 3` | §8.64 |
+| type cascade 5 — miss | LIVE | 2,406 | same file, `type cascade: 5` | §8.64 |
+| 2c home-module (ambient cursor) | STARVED | 0 | same file, `2c  home-module` | §8.63, §8.87 |
+| M1 `qualifier_agrees` | **GUARD** | 5,606 calls / 5,606 agree / **0 reject** | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **5** | §8.120, §8.132 |
+| M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane** | 2,489 | `grep -m1 'M2 resolve_module_qualified_sym calls' tests/b1-baseline.txt` → **2489** | §8.120 |
+| M4 mono bare-name scan | STARVED | 266 calls / **0** hits | same file, `M4 mono bare-name` | §8.33, §8.120 |
+| M5 import suffix fallback | **NOT ENTERED** | **0 calls** | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **3** | §8.120 |
+| const-table bare leaf | STARVED | 0 calls / 0 hits | same file, `const-table bare leaf` | §8.9, §8.111 |
+| `spelling_type` new-expr / call-ident | NOT ENTERED | 0 calls | same file, `spelling_type new expr: calls` | §8.25, §8.98 |
+| `lookup_by_leaf` | **DELETED** | — | `grep -rho 'lookup_by_leaf(' compiler/src \| wc -l` → **0** | §8.121 |
+| `lookup_scope_template_derived` | **DELETED** | — | `grep -rho 'lookup_scope_template_derived' compiler/src \| wc -l` → **0** | §8.36 |
+| `set_module_with_scope` | **DELETED** | — | `grep -rho 'set_module_with_scope' compiler/src \| wc -l` → **0** | §8.70, §8.78 |
+| B4 bucket (instantiation keying) | **DELETED** | — | `grep -c 'B4' compiler/src/compiler/resolve_counter.cryo` → **0** | §8.121 |
+| arena `leaf_index` map | **LIVE, and NOT a lane** | — | `grep -rho 'leaf_index' compiler/src \| wc -l` → **8** | §8.121 |
+| `resolve_path` (§5.2's one entry point) | **LIVE, but not the entry point** — 2 call sites, both single-segment, both `Namespace::Type` | — | `grep -rho '\.resolve_path(' compiler/src --include=*.cryo \| wc -l` → **2** | §5.2, §8.5, §8.7 |
+| `canonical_type_ref`'s bare step | **STARVED** — still present, answers nothing | 2,652 reached / **0** answered | `grep -c 'lookup_by_name' compiler/src/compiler/compilation_context.cryo` → **1** (0 when deleted) | §8.103, §8.104, §8.112 |
+| `check_module_type_collision` | LIVE — D5 deletes it | — | see D5 | §8.130, §8.131 |
+| `module_owns_member` probe | LIVE — D5 deletes it | — | `grep -rho 'module_owns_member' compiler/src \| wc -l` → **3** | §8.131 |
+| `scope_owner_key` | LIVE — the static-call owner key | — | `grep -rho 'scope_owner_key' compiler/src \| wc -l` → **4** | §8.134 |
+| callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,178 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **19** | §8.1f, §8.2ag |
+| method visibility gate (E0353) | LIVE, reached; **starved of violations** | 3,677 reached / **0** rejected | same code | §8.2af, §8.2ag |
+| E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
+
+**The arena `leaf_index` map is not the deleted leaf index.** §8.121 deleted the
+LOOKUP LANE. The map survives with two consumers, neither of them resolution:
+the E0203 did-you-mean candidate pool, and E0155 plurality detection. Deleting
+the map breaks diagnostics, not a lane.
+
+### 0.3 Gates
+
+Every row's second column is what the gate **cannot** see. A gate is only
+evidence for what it covers.
+
+| gate | holds | structurally blind to |
+|---|---|---|
+| `make test` | 2,113 unit + 44 project + 178 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
+| `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
+| `make b1-check` | B1 total + every per-row bound, 3 corpora × 2 hosts | **2 of the 3 corpora are `examples/`**; the third is `tests/tests/projects/ffi_c_import`. The compiler's own source is NOT a corpus, and `tests/` at large is swept by none of them. |
+| `make lane-check` | 7 buckets of call sites in `compiler/src`, as a golden | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
+| `make selfhost-check` | stage-3 == stage-4 byte identity, both arms | **Stability, not correctness.** It proves the compiler still emits the same bytes for code that already compiles; it says nothing about code that now STOPS compiling. |
+| `make lsp-check` | `tools/CryoLSP` compiles against **the compiler under test** | Compilation only — no language-server behaviour is exercised. |
+| `make examples` | smoke-builds every `examples/` project | Build only; no program is run and no output is compared. |
+| `make examples-golden` | example stdout vs committed goldens | **Linux only.** Refuses on Windows (exit 1) rather than reporting success. |
+| `make valgrind-check` | invalid free/read/write and definite leaks | **Linux only**, same refusal. |
+| `make incremental-check` | per-module incremental == clean build | Byte identity only. |
+| `make api-index-check` | `docs/stdlib-api.txt` is not stale | Staleness only; says nothing about the API's shape. |
+| `make vendor-check` | every constant shape survives `cryo vendor` | Constants only. |
+| CI | the gates above, on ubuntu | **Fires only on `main` or `workflow_dispatch`. A branch gets NO automatic CI.** The `windows-native` job exists but its own comment calls it partially validated and not a required check; `windows-smoke` is a cross-build on ubuntu, so no native-Windows run is load-bearing. |
+
+**What `b1-check` counts.** Three buckets, not four: **B1** fuzzy fallback,
+target **zero**, pinned 0 on all six arms; **B2** type-dependent dispatch, a
+permanent FLOOR (it needs a receiver type, so the name layer cannot answer it);
+**B3** authoritative, target *once per path*, not zero. B4 retired with the leaf
+index — see §7.3. B1 and B3 answer the same question and are a quality axis; B2
+is a different question and does not converge on B3. §7.3 is normative for this.
+
+Checks for this section, one per line so each can be copied whole:
+
+* `grep -c '^\[' tests/lane-baseline.txt` → **7**
+* `grep -c '^\[host:' tests/b1-baseline.txt` → **6**
+* `grep -c '^project ' tests/test-roster.txt` → **44**
+* `grep -c '^negative ' tests/test-roster.txt` → **178**
+* `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
+* `grep -n 'branches:' .github/workflows/ci.yml` → `main` only, both hooks
+
+### 0.4 What no gate covers
+
+* **The Win64 `va_list` rule.** No gate can perform it; §8.129 gives the check
+  and how to run it by hand.
+* **A behaviour change that only makes code STOP compiling.** `selfhost-check`
+  cannot see it by construction; the corpus measurement in the landing entry is
+  what covers it each time.
+* **`tests/` as a resolution corpus.** Reached by `cryo test`, which no b1 or
+  lane golden reads. §8.13 and the b1 gate's own header say so.
+* **The LSP's behaviour.** `lsp-check` compiles it; nothing runs it.
+
+### 0.5 What this section is not
+
+It is not evidence. Every row is a claim whose derivation is in the § it names,
+and where a row and its § disagree, **the tree decides** — run the check and fix
+the row. It does not list open defects; §8's later entries and their head
+blockquotes carry those.
+
+---
+
 ## 1. The root cause
+
+> **STATUS: this diagnosis is HISTORICAL. The gate landed, and the four
+> programs below are now rejected.** The section is kept because every rule in
+> this document follows from it and the reasoning is what makes them make
+> sense — but it is written in the present tense about a compiler that no
+> longer exists, and it is the first thing a new reader meets.
+>
+> * **"Visibility in Cryo is a tie-breaker among collisions, not a gate" is no
+>   longer true.** The single-candidate fast path now consults visibility and
+>   imports and returns `ScopeResolution::NotReachable(c0)` when the use site
+>   cannot see the candidate. Landed in §8.1f after §8.1e built and reverted
+>   it; the last three doors closed in §8.2ag; §7.1's table is all-YES and each
+>   row is pinned by a corpus entry that exists. Check:
+>   `grep -c 'NotReachable' compiler/src/compiler/decl_index.cryo` → **4**.
+> * **The citation is dead.** `decl_index.cryo:1345` — `resolve_qualified_scoped`
+>   now begins at **:1445**. Locate it by name.
+> * **A stale comment sits inside the fixed code, and it cites this section.**
+>   The single-candidate branch opens with `AUDIT ONLY - behavior deliberately
+>   unchanged`, describing the pre-gate behaviour, while thirty-five lines
+>   below it the gate returns `NotReachable` under a comment that says so.
+>   Check: `grep -c 'AUDIT ONLY - behavior deliberately unchanged' compiler/src/compiler/decl_index.cryo`
+>   → **1**. That is a defect in `compiler/src`, not in this document, and it is
+>   §7.4's failure mode in its most expensive form: the stale description sits
+>   directly above the code that falsifies it.
+>
+> What DOES survive: the causal chain. Universal visibility is why resolution
+> had to guess, and guessing is what grew the cascade. That is why the cascade
+> deletions are downstream of the gate and not independent of it.
 
 Cryo resolves names in six independent subsystems that do not share an answer.
 The roadmap (§2.1–§2.10) catalogues them. This section states why they exist,
@@ -97,6 +275,19 @@ Visibility is not advisory in either direction: `private` on an item means
 
 ### 3.2 The export set
 
+> **INCOMPLETE: `export` re-exports are not covered by the definition below.**
+> "Nothing else about a module is nameable from outside it" was true when
+> written. §8.4 landed `export`, which records a VISIBILITY edge on
+> `ModuleInfo.reexports`; the loader closes over it, and
+> `DeclarationIndex::ns_imports` then answers re-exported names. So a module's
+> *visible* set can include names it did not declare. Check:
+> `grep -rho 'reexport_closure' compiler/src --include=*.cryo \| wc -l` → **3**.
+>
+> §8.2ae is the other half and cuts the opposite way: **`public module` grants
+> NO visibility** — measured four ways — so a `public module` edge is not an
+> export edge and must not be followed. §8.63 separately found a lane that
+> ignored `private` entirely, now closed.
+
 A module's **export set** is exactly its declarations not marked `private`.
 Nothing else about a module is nameable from outside it. There is no path —
 index, alias, fallback, or otherwise — by which a module-private declaration
@@ -109,6 +300,15 @@ an export set the author never stated.
 
 ### 3.3 Enforcement is a gate
 
+> **STATUS: ENFORCED.** The pointer below sends the reader to §8.1, whose title
+> is "Visibility is not enforced (§3.3)" — that title is stale. The gate landed
+> in §8.1f, after §8.1e built and reverted it, and the last three doors closed
+> in §8.2ag. Both gates are LIVE and reached on the pinned corpora (1,178 callee
+> checks, 3,677 method checks) with **0** rejections, which is a corpus that
+> compiles rather than a gate that cannot fire. Check:
+> `grep -rho 'E0353' compiler/src --include=*.cryo \| wc -l` → **19**. §0 §0.2
+> carries the rows.
+
 Visibility is checked **when a candidate is proposed**, not when candidates
 collide. A single candidate that is not visible at the use site is
 `Res::Err` with a diagnostic, never `Unique`.
@@ -119,6 +319,18 @@ collide. A single candidate that is not visible at the use site is
 ---
 
 ## 4. Scope and the rib chain
+
+> **STATUS: the chain exists, and rule 4 is now mostly true.** §8.2m records
+> that the rib chain **did not exist** when this section was written and builds
+> it; read that entry for the three failure modes one flat map produced, not for
+> the status.
+>
+> Rule 4 says "no global leaf index, no program-wide uniqueness, no namespace
+> substring matching". The global leaf index is **deleted** (§8.121); the
+> suffix lane survives unentered (see §5.1 above). But the sentence below rule 4
+> — "Rule 4 is what deletes the six lookup systems" — has not happened: the
+> per-kind lookups are still pinned in seven `lane-check` buckets, and §8.107
+> RULED that they stay public rather than being privatized. See §7.2 mechanism 5.
 
 A use site resolves a bare name against a **rib chain**, in this precedence
 order:
@@ -150,6 +362,19 @@ today's intended behavior.
 
 ### 5.1 Meaning
 
+> **STATUS: largely true now, and it was not when §8 started.** The rule is
+> normative and unchanged; what follows is where the tree stands against it.
+>
+> * **The lane that broke it is gone.** A bare plural leaf used to bind by
+>   DIRECTORY ORDER through the global leaf index (§8.2y). That lane is deleted
+>   and the case is now `E0155` (§8.121, §0 D10).
+> * **Suffix matching machinery still exists, unentered.** `module_by_path_suffix`
+>   (M5) is in the tree and is pinned at **0 calls** on all six golden arms — a
+>   NOT-ENTERED zero, which says nothing about whether it would answer. Check:
+>   `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **3**.
+> * §8.2j measured a bare name resolving with NOTHING in scope; §8.2ad and
+>   §8.121 are what closed that. Read §8.2j for the mechanism, not the status.
+
 **The first segment resolves in scope; the remainder is rooted.**
 
 The first segment resolves as a bare name through the rib chain (§4). Every
@@ -162,6 +387,33 @@ other modules happen to exist in the program. A path that does not resolve is
 an error with a suggestion, not an invitation to search.
 
 ### 5.2 One entry point
+
+> **STATUS: the SIGNATURE is built; the "one entry point" is not.** This is the
+> most-cited section in §8 and the most misread, so the three parts are
+> separated here.
+>
+> * **`ns` as a parameter — BUILT.** `Resolver::resolve_path(segments, ns,
+>   scope) -> Res` exists with exactly this shape, `ns: Namespace` and
+>   `scope: ScopeID`. §8.5's title says "§5.2 was never implemented"; §8.7 built
+>   it **the same day**, so read §8.5 for its lane inventory and not for its
+>   status. The enum lives in `resolver/namespace_kind.cryo` (§8.7 calls it
+>   `namespace.cryo`; renamed in §8.130). Check:
+>   `grep -rho 'resolve_path(&this' compiler/src --include=*.cryo \| wc -l` → **1**.
+> * **"All path resolution goes through one function" — NOT TRUE.**
+>   `resolve_path` has exactly **two** call sites, and both push a SINGLE
+>   segment in `Namespace::Type` — a projection helper in `resolver.cryo` and
+>   the base-class name in `name_resolution.cryo`. No multi-segment path goes
+>   through it. The per-kind lookups it was to replace are still pinned by
+>   `lane-check` in seven buckets. Checks:
+>   `grep -rho '\.resolve_path(' compiler/src --include=*.cryo \| wc -l` → **2**;
+>   `grep -c '^\[' tests/lane-baseline.txt` → **7**.
+> * **"There is no ambient cursor" — ASPIRATIONAL.** The machinery is present
+>   (`HomeOrigin`, `current_module`) and answers **0** on the pinned corpora, so
+>   it is starved rather than absent (§0, §8.19, §8.105, §8.109). Check:
+>   `grep -rho 'HomeOrigin' compiler/src --include=*.cryo \| wc -l` → **139**.
+> * **The citation below is dead.** `types/resolver.cryo:1387` is now a
+>   primitive-type match arm, and the "26,473 answers" figure belongs to a step
+>   that no longer sits there. Locate steps by name, never by line.
 
 All path resolution goes through one function:
 
@@ -181,6 +433,20 @@ resolve_path(segments, ns, scope) -> Res
 
 ### 5.3 Type-relative paths
 
+> **STATUS: BUILT — and §8.6's "unimplemented" is stale.** §8.6 records that
+> `Res::TypeRelative` carries no payload, so the type layer is handed a bare
+> name and must re-search. It carries one now: `TypeRelative(ResBase, u32)` —
+> the base the walk ended on, plus the count of trailing segments — and
+> consumers read both (`const_table.cryo`, `call_resolver.cryo`). Check:
+> `grep -c 'TypeRelative(ResBase, u32)' compiler/src/compiler/resolver/res.cryo`
+> → **1**.
+>
+> One caveat, from §8.39: `resolve_path` itself cannot yet produce a non-zero
+> trailing count, because both its callers pass a one-element array. The payload
+> is populated by `name_resolution.cryo` instead. So the SHAPE this section
+> requires exists and is used; the entry point named in §5.2 is not what fills
+> it.
+
 `T::Assoc`, `This::Item`, `Self::new` are **not** path resolution. The base
 resolves via `resolve_path`; the remainder needs `T`'s bound and is finished in
 sema (§6.2). `resolve_path` records the base `Res` plus a count of unresolved
@@ -196,6 +462,20 @@ as `Res`/`PartialRes` vs `TypeckResults::type_dependent_defs`; Go as
 here; it is not a stylistic choice.
 
 ### 6.1 `Res` — path to definition
+
+> **STATUS: accurate in meaning, behind in notation on two variants.** The tree
+> is ahead of the listing below, not behind it.
+>
+> * **`Def` carries a `DefId`, not a `SymbolStr`.** `DefId` is a newtype whose
+>   one private field is the canonical qualified name, so this section's
+>   REASONING is unchanged and correct — only the spelling moved. §8.100 and
+>   §8.107 are where that wrapper is scoped and ruled on.
+> * **`TypeRelative` carries a payload**: `TypeRelative(ResBase, u32)`. See §5.3
+>   above.
+> * `ResSlot = Pending | Answered(Res)` matches the tree exactly.
+>
+> Check: `grep -c 'TypeRelative(ResBase, u32)' compiler/src/compiler/resolver/res.cryo`
+> → **1**.
 
 Produced by the resolver, before types exist.
 
@@ -258,6 +538,19 @@ Two invariants:
 
 ### 6.2 `TypeDependentRes` — node to definition
 
+> **THE RULE HOLDS; THE NAME IS SPEC-ONLY.** `TypeDependentRes` appears
+> **nowhere** in `compiler/src` — it is a name this document uses for the
+> second answer, not a type in the tree. Check:
+> `grep -rho 'TypeDependentRes' compiler/src --include=*.cryo \| wc -l` → **0**.
+> The counter's `B2` bucket is what measures this population (§7.3), and §8.3
+> enumerates the method-call cascade behind it — reported there as 50 outcomes
+> and measured at **54,908**.
+>
+> The citation `sema/call_resolver.cryo:1862` is dead; the "provided by
+> multiple traits implemented for this type" diagnostic is at **:2506**. Nothing
+> about the rule changes — dispatch needs the receiver's type and is
+> permanently sema's — only where to look.
+
 Produced by sema, once the receiver type is known. Covers method calls, trait
 selection, associated-item projection, and overload selection.
 
@@ -268,6 +561,30 @@ implemented for this type") is permanently sema's, by design. Rust reports the
 same condition from typeck (E0034), never from its resolver.
 
 ### 6.3 Storage
+
+> **STATUS: the inventory is right; EVERY line anchor in it is dead.** The node
+> kinds and the slots below are all in the tree — `scope_res`, `base_res` and
+> `qualified_trait_name` are live fields — but the `file:line` column has
+> drifted wholesale and points at unrelated code. Measured, current homes,
+> found with `grep -rn 'type \(class\|struct\) <Name>' compiler/src`:
+>
+> | node | table says | actually |
+> |---|---|---|
+> | `IdentifierNode` | `expression.cryo:104` | `:93` |
+> | `ScopeResolutionNode` | `expression.cryo:789` | `:878` |
+> | `NamedAnnotation` | `_module.cryo:456` | `:502` |
+> | `NewExprNode` | `expression.cryo:436` | `:451` |
+> | `SizeofExprNode` / `AlignofExprNode` | `:483`, `:506` | `:519`, `:555` |
+> | `CallExprNode` | `expression.cryo:398` | `:344` |
+> | `ImportDeclNode` | `declaration.cryo:575` | `:590` |
+> | `ClassDeclNode` | `declaration.cryo:854` | `:853` |
+> | `ImplBlockNode` | `declaration.cryo:1152` | `:1143` |
+>
+> **Do not re-pin these numbers** — they will drift again. Locate a node by its
+> type name; that is what §7.4's rule about `file:line` citations is for, and
+> this table is the largest instance of it in the document. The nodes are
+> declared `type class`, not `type struct`, which is itself a trap: a grep for
+> the wrong keyword returns a confident zero for nine of the ten.
 
 **The answer lives on the node.** A resolution slot on the AST node is exact
 and cannot desynchronize. The current `ResolutionMap` is keyed by a packed span
@@ -426,6 +743,39 @@ The resolver's own enforcement still cannot depend on the feature it is
 implementing, so the mechanisms below are what carry the remaining work.
 
 ### 7.2 The five mechanisms
+
+> **STATUS: three of the five stand as written; mechanisms 3 and 5 have moved.**
+> The mechanisms are normative and are not restated here — only where the tree
+> and later rulings have gone past the text below.
+>
+> * **Mechanism 3 — the gate is wider than its own note says.** The "WIRED"
+>   blockquote describes "a fixed external target (`examples/09-json-config`)".
+>   It now runs **three** targets — `examples/09-json-config`,
+>   `tests/tests/projects/ffi_c_import` and `examples/14-threads` — across two
+>   hosts, so the golden carries six blocks. B1 is **0** on all six, so the
+>   ratchet has reached the target this mechanism names. **B4 is retired
+>   entirely** (§8.121, and see §7.3). Check:
+>   `grep -c '^\[host:' tests/b1-baseline.txt` → **6**.
+> * **Mechanism 3's citation is dead.** `instance.cryo:2647` is not where
+>   `report()` is called; the calls are in `CLI/commands.cryo`. The surrounding
+>   claim — that the report sits on the success path after link, so every
+>   measurement needs a successful link — is still true. Check:
+>   `grep -rho 'resolve_counter::report' compiler/src --include=*.cryo \| wc -l`
+>   → **5**.
+> * **Mechanism 5's second lock was RULED AGAINST - §8.107.** "The per-kind
+>   lookups are non-public ... become thin non-public wrappers over the
+>   primitive" is not the target any more. Privatizing them is **inexpressible**
+>   in Cryo — visibility is scoped to the declaring TYPE, so a private lookup
+>   excludes the resolver too — and a `DefId`-keyed entry is the same key
+>   wearing a wrapper. The ruling keeps the lookups PUBLIC and makes the third
+>   lock, the surface ratchet, the whole enforcement. Do not implement the
+>   second lock; §0 D12 carries the ruling.
+> * **Mechanism 5's third lock pins seven numbers, not two.** `lane-check`'s
+>   buckets are `LOOKUP`, `LOOKUP_OTHER`, `LOOKUP_ROUTED`, `LOOKUP_LOCAL`,
+>   `REENTRY`, `DEFID_MINT` and `DEFID_UNWRAP` — split by RECEIVER since §8.107,
+>   because a count matched on the NAME cannot separate the index's surface from
+>   things that merely resemble it. Check:
+>   `grep -c '^\[' tests/lane-baseline.txt` → **7**.
 
 1. **`Res` is an enum, and `match` is exhaustive.** Adding or changing a
    variant forces every consumer to handle it (E0405). This is the primary
@@ -593,6 +943,16 @@ two-bucket model in the roadmap (§3.2 rule 2) was measured wrong on
 | **B3** | authoritative — answers from scope/imports | **once per path**, not zero |
 | **B4** | what the global leaf index answers — instantiation identity | **0**; the `(res, generic_args)` pair names the slot without a mangled key (§8.20) |
 
+> **B4 IS RETIRED, NOT MERELY ZERO - §8.121.** The bucket, its `B4`/`B4*`
+> flags, the seven stranded leaf rows, the `LEAF-HIT` audit stream and B4's
+> plumbing through `b1-gate.py` and the golden are all gone, on Jake's ruling,
+> because the arena leaf lane that was its only summand was deleted. **There
+> are three buckets now, not four.** The correction further down this section
+> says "B4 is now 0" and predates the retirement; read it for the mechanism,
+> not the status. Check: `grep -c 'B4' compiler/src/compiler/resolve_counter.cryo`
+> -> **0**; the only surviving mentions in `scripts/b1-gate.py` and
+> `tests/b1-baseline.txt` are one comment each recording that it retired.
+
 **These are not one quality ladder, and reading them as one is the common
 mistake.** B1 and B3 answer the SAME question — *what does this written name
 refer to?* — one by guessing from a string and one from the writer's imports,
@@ -733,6 +1093,16 @@ that is the moment it has to be re-measured rather than believed. Specifically:
   a call/answer column (§8.120).
 * When a change falsifies a description, the description is part of the
   change. Fixing it later is how the next instance is created.
+* **A correction rots at the same rate as what it corrects.** A pointer that
+  locates its subject by `file:line` is a description like any other, and the
+  line moves. Name the SYMBOL — a function, a field, a diagnostic code, a
+  golden row — so the reader can grep for it and find either the thing or its
+  absence. This document has already lost several such citations: §5.2's
+  `types/resolver.cryo:1387`, §7.2's `instance.cryo:2647`, §8.2u's five
+  `call_resolver.cryo` sites and §8.106's `sema.cryo` pair all now point at
+  unrelated code, and one correction written to fix a stale description
+  repeated the defect by quoting the line numbers out of the entry it was
+  correcting.
 
 #### Why this is in the normative section
 
@@ -14602,6 +14972,14 @@ re-derived wrongly.
 
 ### 8.103 The impl-owner arm now says what it is, and canonical_type_ref's ten are one double-qualification - MEASURED AND LANDED 2026-09-05
 
+> **THE ITEM THIS ENTRY PARKED IS DONE - §8.104, re-measured in §8.112.** Below,
+> the doubled-qualification fix is "not acted on here", recorded so a later
+> reader would not treat the 0.4% as a widening case to preserve. §8.104 took
+> it, and §8.112 then re-measured rather than inferring: the bare step in
+> `canonical_type_ref` answers **0 of 2,652**, where this entry left it at 10 of
+> 2,662. The diagnosis here — one double-qualification, not a fallback worth
+> keeping — is what held.
+
 8.102 established that the three impl-owner groups answer their second lookup
 100% for primitive targets and 0% for declared ones. They were still written and
 counted as widening cascades, which made the cascade population read as roughly
@@ -14703,6 +15081,26 @@ to match a known positive, since `ENTERED` matched something real and wrong.
 
 ### 8.104 The closure name was qualified twice, and the canonical key now has one derivation - FIXED 2026-09-05
 
+> **THE RULE IS RIGHT; ITS SCOPE READS WIDER THAN IT WAS - §8.105 and §8.106.**
+> This entry fixed the defect at one producer and one consumer. Both counts were
+> low.
+>
+> * **A second producer.** `lambda_synth` is named here as what mints the
+>   qualified `StructDeclNode.name`. `async_lower` does the same thing for an
+>   async future's state-machine struct, and both add the declaration to the AST
+>   root, so both reach sema's struct visit (§8.106).
+> * **Two more consumers, neither fixed here.** `canonical_type_ref` is the one
+>   this entry fixed, and it had a bare fallback quietly absorbing the
+>   difference. The other two do not (§8.106): one qualifies the field and calls
+>   `lookup_type_exact`, which is one index lookup and nothing else; the other
+>   reaches `declare_async_methods`. Named by function rather than by line —
+>   §8.106's `sema.cryo` coordinates have since drifted and no longer point at
+>   either site.
+> * **The family is far wider than this field.** §8.105 measured **206,678**
+>   already-qualified names handed to the ambient qualifier — every path that
+>   asks the ambient namespace to qualify something already qualified, not just
+>   the two conventions on `StructDeclNode.name` this entry was chasing.
+
 8.103 named `canonical_type_ref`'s ten bare-step answers: five synthesized
 closure types, twice each, every one of the shape
 
@@ -14768,6 +15166,15 @@ at its symptom. It is still not deleted - that decision is held with the other
 four - but it is now held on a zero rather than on a 0.4%.
 
 ### 8.105 canonical_type_ref was not the only consumer that assumed a bare leaf: the ambient qualifier is handed an already-qualified name 206,678 times - MEASURED 2026-09-05
+
+> **THE COUNT STANDS; THE NOMINATION IT MAKES IS WRONG - §8.106.** The 206,678
+> figure and this entry's own warning — that a count of category errors at the
+> PRODUCER is not a count of defects at the CONSUMER — are the durable parts.
+> The entry then nominates `passes/specialization.cryo` as the case to examine
+> first, and the census found it never receives an already-qualified name, with
+> **no doubled key registered anywhere**. That correction is stated at the very
+> end of this entry too; it is repeated here because the nomination sits near
+> the top and is what a reader acts on.
 
 8.104 fixed one consumer that qualified an already-qualified name. The question
 that leaves is whether it was the only one, since another consumer making the
@@ -15316,6 +15723,13 @@ now go empty on its own.
 
 ### 8.110 Stage 2 has neither a table to mint against nor a target: 40% of mints precede the index, and the largest one re-mints a `DefId` it just unwrapped - MEASURED, STAGE 2 PARKED 2026-09-07
 
+> **STILL PARKED, and "stage 2" means two different things in this tree.** Here
+> it is the `DefId` re-keying stage of §8.45's plan. Everywhere the build is
+> discussed — `$(STAGE2)` in the Makefile, "stage 2" in `selfhost-check` and in
+> §8.134's measurement tables — it is the second compiler built in the bootstrap
+> chain, and the two are unrelated. Grepping the ledger for "stage 2" returns
+> both. Nothing after this entry unparks the re-keying stage.
+
 8.100 left "make `DefId` a real index into a definition table populated during
 declaration" as the change that would make minting REQUIRE the table, on the
 argument that a mint which can fail is not a cast. The recurring defects this
@@ -15521,6 +15935,13 @@ where the guard it sits behind is not reached at all. That zero is starved and
 is not evidence the arm is dead.
 
 ### 8.112 Five bare steps and a dead alias tier deleted on controlled zeros, and the method-return cursor is not one of them - MEASURED AND LANDED 2026-09-08
+
+> **THE FLAKE THIS ENTRY COULD NOT EXPLAIN IS CHARACTERISED IN §8.114.**
+> `blocking_pool_a_configured_ceiling_is_enforced` recurred there and was
+> measured rather than re-run once: **10 of 10 passes on the same binary in
+> isolation**, against a failure inside the full suite both times it has been
+> seen. Still not attributable to a compile-time change, but "fails only under
+> the suite's concurrent load" is sharper than "not deterministic".
 
 The standing rule this lands under: a resolution path measured to answer zero
 comes out, PROVIDED a control shows the zero is not starvation. The control is
@@ -16858,6 +17279,27 @@ landed since - and when one is the basis for NOT doing something, that is the
 one to re-measure first.
 ### 8.124 Handoff: §8.65 is RULED - intrinsics get namespaced - and the namespacing itself is not started - 2026-09-09
 
+> **THE RULING STANDS; EVERY NUMBER BELOW IS STALE, AND ONE PREMISE WAS FALSE.**
+> Three corrections, two from later entries and one from the tree.
+>
+> * **`format` was never an intrinsic - §8.126.** This entry sizes the work on
+>   "`format` alone is 839 of them, and it is a genuine intrinsic - there is no
+>   `fmt::format`, only `format_to_string`." The second clause is a fact about
+>   the STDLIB and the first is a claim about `IntrinsicKind::from_name`, where
+>   `format` has never appeared; the two were read as one. Taken at its word,
+>   the work would have begun by hunting a lowering to preserve, and there is
+>   none.
+> * **The remaining bare-call surface is 113, not ~252 - §8.129.** The larger
+>   figure counted `intrinsics::`-qualified calls that the `format`/`printf`
+>   migration has since consumed. Shape matters more than size here: roughly 60
+>   of the 113 are atomics **inside `stdlib/sync/atomic.cryo`**, the wrapper
+>   they exist to implement, so a sweep would move calls out of the modules
+>   written to contain them.
+> * **"64 intrinsics remain" is now 58.** Check:
+>   `grep -c '^intrinsic function ' stdlib/core/intrinsics.cryo` → **58**.
+>
+> §8.129 is the current handoff for this migration; start there, not here.
+
 Short by intent. What a successor would otherwise rediscover.
 
 #### The ruling
@@ -16988,6 +17430,25 @@ simply already empty.
 
 #### What the `format` / `printf` move inherits, and the hazard in it
 
+> **THIS WORK IS DONE, and the hazard it predicted was demonstrated - §8.126,
+> §8.127, §8.128, §8.129.** Three corrections to what is below.
+>
+> * **"`fmt::format` does NOT exist" is stale.** It was written in §8.126 and is
+>   in the tree now. Check: `grep -n 'function format(' stdlib/fmt/_module.cryo`
+>   → one hit, at line 81.
+> * **The sizing figures are stale twice over.** "839 of ~1,091, the rest ~252"
+>   became **113** remaining bare calls once the migration consumed the
+>   `intrinsics::`-qualified ones (§8.129), and `format` was never an intrinsic
+>   at all (§8.126), so its 839 were never part of an intrinsic surface.
+> * **The hazard was right, and stating it as a prediction is why.** §8.128
+>   demonstrated it end-to-end rather than arguing it. But §8.129 sharpens the
+>   MECHANISM: this entry predicts an OVERLOAD-BINDING problem (a bare `printf`
+>   binding libc's `(u8*, ...)` twin), which is real but one layer above the
+>   edge — for the `v*` half the displacement is also what routed the call
+>   through the ABI seam at all, so removing it changes not merely which
+>   overload answers but **whether the argument arrives**. §8.129 is the current
+>   handoff for what remains.
+
 The ruling is explicit qualification with nothing added to the prelude:
 `fmt::format`, and the `printf` family as `fmt::printf`. Two measured facts
 shape the work.
@@ -17087,6 +17548,15 @@ call written against it read one slot off. The disposition changed; the
 mechanism above did not.
 
 #### What the printf hazard actually is
+
+> **CORRECTED BY §8.129 - this was an inference about callers dressed as a
+> measurement about correctness.** §8.129: "I called `vsnprintf` a *dormant
+> hazard, not a live defect* in §8.126 on the grounds that nothing called it.
+> The first call written against it read one slot off." **"No callers" bounds
+> the blast radius; it says nothing about whether the code is right** — and
+> §8.127 demonstrated the defect end-to-end the same day. The two corrections
+> already noted in the body below (§8.127 superseding the typing, §8.128 finding
+> the 27 was the wrong number) are this entry's own.
 
 §8.125 predicted it as a binding problem: remove the intrinsics and a bare
 `printf` may bind libc's `(u8*, ...)` twin instead of fmt's `(string, args...)`.
@@ -18070,6 +18540,36 @@ new compiler still builds the compiler.
 
 ### 8.133 Handoff: the qualifier answers correctly in annotation position and not in call position, and the glob deletion waits on both - 2026-09-10
 
+> **THE BLOCKER DOES NOT EXIST, AND THE PROPOSED FIX WAS BUILT AND FAILED -
+> §8.134.** Both halves of this handoff's "what to do next" are answered, and
+> neither the way it expected. The CALL-POSITION defect it describes is fixed.
+>
+> * **"The 10.5% with no stamp" is not a population.** Measured at that
+>   consumer, `ResSlot::Pending` is **0** — 45,876 calls on `compiler/src`,
+>   42,182 on `tests/` — controlled four ways in one run, including inverting
+>   the instrument so every row printed `PENDING`. Whatever that bucket was, it
+>   was not an unstamped node, so the one probe this entry names as the next
+>   action has been run and clears the way it was blocking.
+> * **The "generic args OR past monomorphization" discriminator was BUILT and
+>   FAILED.** `post_mono_verify` is not a flag on a light pass; it is a second
+>   full sema run that re-resolves every scope call from scratch, so it restores
+>   the defect the first run just fixed. §8.134 records this and three more
+>   shapes that failed, and lands a different fix — `scope_owner_key`, which
+>   reads the refusal instead of the echoed spelling.
+>
+> **What that does to the glob, stated exactly.** This entry's precondition for
+> deleting the glob is "the qualifier answering deterministically in BOTH
+> positions". Annotation position was fixed in §8.132 and call position in
+> §8.134, so **the precondition is met**. The deletion itself is NOT taken: the
+> `ImportStyle::Wildcard` branch is still live in
+> `compiler/src/compiler/resolver/name_resolution.cryo`, and the two hunks this
+> entry names are still the work. Check:
+> `grep -c 'ImportStyle::Wildcard' compiler/src/compiler/resolver/name_resolution.cryo`
+> → **1** (0 when deleted).
+>
+> Read this entry for the reproducer, the two-hunk deletion and the position
+> framing, all of which stand. Do not start from its next-action list.
+
 Four changes landed and pushed to `naming-impl`, which is at `1623324e` and
 GREEN. `main` is untouched at `d8ecf517`. There are no other branches: a side
 branch existed for part of this session and is deleted local and remote, its
@@ -18660,3 +19160,102 @@ code failure at all, but a second worker's run holding `cryo-tests-test.exe`.
 Deleting the file and re-running was clean. That is the third time in one
 session a shared-tree race presented as a result: a vanished project, a moved
 HEAD mid-run, and now a locked hoist target.
+
+### 8.136 A correction to §8.135: `public` is the DEFAULT, so the visibility half of that entry is wrong - 2026-09-10
+
+§8.135 says `Type`, `ASTNode`, `BaseASTVisitor`, `ParserBase` and `ExprParser`
+"were all declared **non-public** and subclassed from other modules anyway",
+and calls their non-publicness "already fiction". **That is false.** At top
+level `public` is the DEFAULT:
+
+    /// `public` (the default at top level) vs `private`. Drives cross-module
+    /// visibility: a `private` type is only nameable within its own module.
+    is_public:        boolean;
+
+`StructDeclNode`, `ClassDeclNode` and `EnumDeclNode` all initialise
+`is_public = true`, and the resolver exports on that flag. So every one of
+those five was already public, the `public` keyword §8.135 added was a
+semantic no-op, and **the explicit imports alone were the fix.** The five
+keywords are removed here, because a redundant modifier defended by a false
+premise is worse than none.
+
+#### The instrument error, which is the part worth keeping
+
+The claim came from `grep -c "^public type "`, which counts the KEYWORD and not
+the visibility. Run over `stdlib` it reports **0 public of 348**, and that zero
+reads as a spectacular finding - no type in the standard library is public -
+when it is only a fact about how the source is written. `Array`, `Arc`,
+`Allocator`, `Result` are all public; none of them says so.
+
+**The predicate for a language question has to be the one the compiler uses.**
+The compiler's is `is_public`, whose default is set in the AST constructor, and
+nothing about the spelling of a declaration reveals it. A zero that would be
+extraordinary if true is the moment to go and read the mechanism, and here the
+answer was one comment away in the node that owns the field.
+
+This is the same shape as §8.132's `qualifier_agrees` reading and §8.134's
+`10.5%`: an accurate count over the wrong population, believed because the
+number itself was not in doubt.
+
+#### The switch is still deferred, and the real blocker is a MISATTRIBUTED diagnostic
+
+§8.135 deferred it on the `tests/` import population being large and the tree
+being shared. The population is real, but the blocker is neither of those.
+
+An error-driven migration cannot work while the diagnostic names the wrong
+name. Eleven lines, under the switch:
+
+```cryo
+![config(testing)]
+namespace Tp::T;
+import std::core::result::{ Result };   // explicit
+import std::test::error;                 // plain - binds nothing now
+import std::test::assert;                // plain - binds nothing now
+![test]
+function trivial() -> Result<(), TestError> { return expect_eq(1, 1); }
+```
+
+`cryo test` reports exactly one error: **`cannot find type Result`**. `Result`
+is right there in a braced import. The name that cannot be found is
+`TestError`, the generic ARGUMENT - and the diagnostic labels the failure with
+the generic HEAD. Make all three imports explicit and the fixture passes.
+
+That is why the fixpoint stuck. The tool read the error, added an import for
+`Result` - which was already imported and already fine - and the same error
+came back. Two iterations, `0 file edit(s)`, 53 errors standing. **The
+migration is fine; the instrument it was driven by was pointing at the wrong
+name**, and a tool that trusts a diagnostic inherits every misattribution in
+it.
+
+So the switch's remaining work is what §8.135 said - explicit imports across
+`tests/` - and it cannot be automated from `E0203` until the diagnostic names
+the argument it failed on. Doing it from the error stream as it stands
+produces exactly the churn observed: imports added for names that were never
+missing.
+
+**Bisected, with the build verified green each time** (an earlier attempt read
+a stale binary because its `make cryo` had failed, and that reading is
+withdrawn): the plain-form change alone is sufficient to surface this - case
+(b) restored, fixture still fails. It is not case (b), and it is not the
+explicit-glob path.
+
+#### The migration tool guessed, and it cost a broken build
+
+`scripts/migrate-imports-from-errors.py` wrote four bogus imports into
+`compiler/src/main.cryo` - `import ReexportCycle::Alpha::{ Ay };` among them -
+and `make cryo` then died with `module discovery failed`. Two defects, both
+fixed here:
+
+* **A basename is not a file.** Around twenty projects carry a `src/main.cryo`,
+  so the diagnostic path `src/main.cryo` matched several candidates.
+* **Content verification used a SUBSTRING test.** `name in line` let an
+  unrelated line satisfy the check, and the tool then edited *every* candidate
+  that "matched" rather than refusing.
+
+It now matches on a word boundary and **refuses when more than one file still
+matches**, reporting the path instead of editing. A migration that guesses is
+worse than one that stops and says where, and this is the second time in this
+migration's life that a tool's silence was mistaken for a clean result - §8.135
+records the first, where `0 file edit(s)` meant "I could not find the files"
+while 53 errors stood. Both now print the population beside the edit count, so
+a zero has to be read with its denominator.

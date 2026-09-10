@@ -28,7 +28,7 @@ import os
 import re
 import sys
 
-ROOTS = ["compiler/src", "stdlib", "tools/CryoLSP/src"]
+ROOTS = ["compiler/src", "stdlib", "tools/CryoLSP/src", "tests"]
 
 ERR = re.compile(
     r"cannot find type `(?P<name>[A-Za-z_][A-Za-z0-9_]*)` in this scope"
@@ -38,6 +38,9 @@ DECL = re.compile(
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)", re.M)
 NAMESPACE = re.compile(r"^namespace\s+([A-Za-z_][A-Za-z0-9_:]*)\s*;", re.M)
 IMPORT_LINE = re.compile(r"^import\s+[^;]+;", re.M)
+# `cryo test` streams a project's diagnostics and THEN its result line, so the
+# project a diagnostic belongs to is the one named by the NEXT marker after it.
+PROJ_MARK = re.compile(r"^  (?P<name>[A-Za-z0-9_]+) \.\.\. \[", re.M)
 
 
 def cryo_files():
@@ -59,8 +62,16 @@ def write(path, text):
         f.write(text)
 
 
+def project_of(path):
+    """The test project a path belongs to, or None for compiler/stdlib."""
+    marker = "tests/tests/projects/"
+    if path.startswith(marker):
+        return path[len(marker):].split("/")[0]
+    return None
+
+
 def build_index():
-    """leaf name -> set of declaring namespaces."""
+    """leaf name -> set of (declaring namespace, declaring project)."""
     index = {}
     for path in cryo_files():
         text = read(path)
@@ -68,18 +79,82 @@ def build_index():
         if not m:
             continue
         ns = m.group(1)
+        proj = project_of(path)
         for d in DECL.finditer(text):
-            index.setdefault(d.group("name"), set()).add(ns)
+            index.setdefault(d.group("name"), set()).add((ns, proj))
     return index
 
 
-def resolve_repo_path(p):
-    """A diagnostic path is relative to the project dir it was built in."""
-    p = p.replace("\\", "/")
-    for cand in (p, "compiler/" + p, os.path.relpath(p).replace("\\", "/")):
+def visible_owners(decl, use_path):
+    """The declaring namespaces the erroring file's compilation can see.
+
+    Each test project is its own compilation, so a leaf declared by three
+    different projects is not ambiguous - only one of them is in scope. An
+    index over the whole tree cannot see that, and refusing on it would report
+    an ambiguity the compiler never has.
+    """
+    here = project_of(use_path)
+    return set(ns for ns, proj in decl if proj is None or proj == here)
+
+
+_SUFFIX_INDEX = None
+
+
+def suffix_index():
+    """Every .cryo path in the tree, for suffix matching."""
+    global _SUFFIX_INDEX
+    if _SUFFIX_INDEX is None:
+        _SUFFIX_INDEX = list(cryo_files())
+    return _SUFFIX_INDEX
+
+
+def resolve_repo_path(p, name, line):
+    """The ONE repo file a diagnostic path names, verified by content.
+
+    `cryo build` runs in a project dir and `cryo test` runs each project in
+    ITS OWN dir, so a diagnostic path is relative to a directory this script
+    cannot know.  The direct candidates cover the common cases; anything else
+    is matched by PATH SUFFIX against the tree, which is unambiguous for a
+    path of two or more segments and is refused when it is not.
+
+    Returning None for a file that exists is what stalled this loop once: the
+    tool printed `0 file edit(s)` while 18 projects were failing, because "no
+    edit is available" and "I could not find the file" read identically unless
+    the population is counted separately.  `main` counts it.
+    """
+    p = p.replace(chr(92), "/")
+    while p.startswith("./"):
+        p = p[2:]
+    for cand in (p, "compiler/" + p, "tests/" + p):
         if os.path.isfile(cand):
-            return cand
-    return None
+            return [cand]
+    hits = [f for f in suffix_index() if f.endswith("/" + p) or f == p]
+    if len(hits) <= 1:
+        return hits
+    # Several files carry this basename (test projects reuse them), and the
+    # log's own ordering cannot say which: `cryo test` streams a project's
+    # diagnostics around its result line, so reading the nearest marker
+    # attributes them to a project that passed. Ask the FILES instead - a
+    # candidate owns the diagnostic only if it really uses that name on that
+    # line. Every candidate that does needs the same import, so all of them
+    # are returned rather than one being picked.
+    word = re.compile(r"" + re.escape(name) + r"")
+    owning = []
+    for f in hits:
+        try:
+            lines = read(f).splitlines()
+        except OSError:
+            continue
+        if 0 < line <= len(lines) and word.search(lines[line - 1]):
+            owning.append(f)
+    # More than one file still matches, so the diagnostic does not say which.
+    # REFUSE. Editing all of them wrote four bogus imports into
+    # `compiler/src/main.cryo` once, because ~20 projects carry a
+    # `src/main.cryo` and a substring test let an unrelated line match. A
+    # migration that guesses is worse than one that stops and says where.
+    if len(owning) == 1:
+        return owning
+    return []
 
 
 def main():
@@ -97,28 +172,38 @@ def main():
     wanted = {}     # repo path -> set of import lines
     ambiguous = []
     unknown = []
+    marks = [(mm.start(), mm.group("name")) for mm in PROJ_MARK.finditer(log)]
+
+    def project_at(pos):
+        for at, nm in marks:
+            if at > pos:
+                return nm
+        return None
+
+    seen = 0
     for m in ERR.finditer(log):
+        seen += 1
         name = m.group("name")
-        path = resolve_repo_path(m.group("path"))
-        if path is None:
-            unknown.append((name, m.group("path"), "path not found"))
+        paths = resolve_repo_path(m.group("path"), name, int(m.group("line")))
+        if not paths:
+            unknown.append((name, m.group("path"), "no file uses that name there"))
             continue
-        owners = index.get(name)
-        if not owners:
-            unknown.append((name, path, "no declaring module found"))
+        decl = index.get(name)
+        if not decl:
+            unknown.append((name, paths[0], "no declaring module found"))
             continue
-        text = read(path)
-        ns_m = NAMESPACE.search(text)
-        here = ns_m.group(1) if ns_m else None
-        owners = set(o for o in owners if o != here)
-        if not owners:
-            continue                       # declared in this very module
-        if len(owners) > 1:
-            ambiguous.append((name, path, sorted(owners)))
-            continue
-        owner = owners.pop()
-        wanted.setdefault(path, set()).add(
-            "import %s::{ %s };" % (owner, name))
+        for path in paths:
+            text = read(path)
+            ns_m = NAMESPACE.search(text)
+            here = ns_m.group(1) if ns_m else None
+            owners = set(o for o in visible_owners(decl, path) if o != here)
+            if not owners:
+                continue                   # declared in this very module
+            if len(owners) > 1:
+                ambiguous.append((name, path, sorted(owners)))
+                continue
+            wanted.setdefault(path, set()).add(
+                "import %s::{ %s };" % (owners.pop(), name))
 
     edits = 0
     for path in sorted(wanted):
@@ -161,6 +246,11 @@ def main():
         for a, b, why in unknown:
             print("  %s (%s): %s" % (a, b, why))
 
+    # The control on a zero: "nothing to fix" and "I could not read the log"
+    # both print `0 file edit(s)` unless the population is stated beside it.
+    print("")
+    print("parsed %d unresolved-type error(s); %d unlocatable, %d ambiguous"
+          % (seen, len(unknown), len(ambiguous)))
     print("\n%d file edit(s) %s" % (edits, "applied" if apply else "(dry run)"))
     return 0
 
