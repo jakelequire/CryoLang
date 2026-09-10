@@ -53,6 +53,7 @@ USAGE
 """
 
 import os
+import io
 import re
 import shutil
 import subprocess
@@ -88,6 +89,36 @@ GENERATED_MUST_CONTAIN = [
     "VC_KIND_SOME = 7;",
     "function vc_touch(",
 ]
+
+
+def header_constants():
+    """Every constant name the fixture header publishes.
+
+    The gate consumes a list it keeps in THIS file, and the header is a
+    separate committed file whose whole point is to grow - it exists to carry
+    "one shape per way the importer can arrive at a value", so adding a shape
+    is the expected edit.  A `#define` added there and not added here is a
+    shape nothing consumes: the fixture looks like coverage, the gate still
+    reports the number of constants IT knows about, and the constant it was
+    written for is checked by nobody.  Same asymmetry the examples goldens had.
+
+    Function-like macros are excluded by the `(` immediately after the name -
+    they are spelled the same and are not constants.
+    """
+    header = os.path.join(FIXTURE, "include", "vendor_consts.h")
+    if not os.path.isfile(header):
+        return None
+    text = io.open(header, encoding="utf-8", errors="replace").read()
+    # `(?![\w(])` and not `(?!\()`: with the bare lookahead the name group gives
+    # back its last character so the lookahead can succeed, and VC_MAKE_VERSION
+    # is reported as VC_MAKE_VERSIO - a name nothing on the consuming side
+    # matches, which would have failed this gate on a header nobody touched.
+    # Caught by running the fixture header, whose answer is known, through the
+    # pattern before trusting it.
+    names = set(re.findall(r"^#define\s+([A-Za-z_]\w*)(?![\w(])", text, re.M))
+    names |= set(re.findall(r"^static\s+const\b[^;=]*?([A-Za-z_]\w*)\s*=",
+                            text, re.M))
+    return names
 
 
 def die(msg, *details):
@@ -142,6 +173,24 @@ def main():
         die("compiler not found at %s (run `make cryo` first)" % cryo)
     if not os.path.isdir(FIXTURE):
         die("fixture missing at %s" % FIXTURE)
+
+    published = header_constants()
+    if published is None:
+        die("fixture header missing; the gate would consume a list of names "
+            "with nothing behind it")
+    consumed = set(n for n, _ in INT_CONSTS) | {FLOAT_CONST[0], STRING_CONST[0]}
+    unconsumed = sorted(published - consumed)
+    if unconsumed:
+        die("the fixture header publishes constant(s) this gate never consumes: "
+            + ", ".join(unconsumed),
+            "A shape in the header that no assertion reads is a shape nothing",
+            "checks - the fixture looks like coverage while the gate reports",
+            "only the names it already knew.  Add it to INT_CONSTS (or the",
+            "float/string pair) with the value the header says it has.")
+    phantom = sorted(consumed - published)
+    if phantom:
+        die("this gate consumes constant(s) the header does not publish: "
+            + ", ".join(phantom))
 
     tmp = tempfile.mkdtemp(prefix="cryo-vendor-consts-")
     try:
