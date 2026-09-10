@@ -213,16 +213,22 @@ separate deliverable. Write both, commit them together.
   `lane-baseline.txt` rides with the change that moved the number, and the
   message says why it moved.
 
-### The one exception
+### No exceptions, including the handoff
 
-**An end-of-session handoff entry may commit alone**, because by construction it
-documents no single change - it describes where the work stopped. That is the
-only case.
+**A `docs/name-resolution.md` change never lands in a commit of its own.** There
+is no case - not a follow-up, not a docs-only tidy-up, and **not an end-of-session
+handoff**. A handoff entry goes into the session's FINAL WORK COMMIT.
 
-It is not a general escape hatch. "The ledger update did not fit anywhere" is
-not this exception; it means the commit boundary was drawn in the wrong place.
-If an entry documents a change you already committed, amend that commit or fold
-the entry into the next one that touches the same area - do not land it alone.
+That means writing it **before** the last gate pass, so it is staged with the
+code rather than appended after it. Doing so takes foresight at the end of a
+session, and that is the point: an entry written while the work is still open is
+a record of what the work did, and an entry written after the last commit has
+landed is a record of nothing a diff can check.
+
+"The ledger update did not fit anywhere" is not a reason to land one alone; it
+means the commit boundary was drawn in the wrong place. If an entry documents a
+change already committed, amend that commit or fold the entry into the next one
+touching the same area.
 
 ## Environment landmines
 

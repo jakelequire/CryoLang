@@ -9092,6 +9092,13 @@ the TYPE, and the module segment is elided. That elision is the convenience
 The second is the one 8.39 currently records. Neither is taken until Jake
 answers, and the 76 modules are the blast radius either way.
 
+> **The implementation answered a THIRD way, §8.130.** `check_module_type_collision`
+> keeps the shorthand and refuses at DECLARATION the case where both owners
+> declare the member - not enumerated here, and not recorded anywhere in this
+> document until §8.130. The 76 modules are also no longer the blast radius:
+> after §8.74 and the CryoLSP rename, **two** files in the tree carry the shape,
+> and both exist to test it.
+
 #### What is NOT blocked on it
 
 The rest of decision 3 - modules declared as `Symbol`s and bound in the type
@@ -10232,6 +10239,14 @@ own change with its own verification rather than folded into anything else.
 The argument that decided it is the one §8.56 already stated: keep the shorthand
 and a qualifier's meaning depends on a lookup rather than on syntax, which is
 the shape the old cascade grew from.
+
+> **SUPERSEDED, §8.130.** This was never built - the resolver still probes both
+> owners and lets whichever declares the member answer, and
+> `module_owns_member` and `check_module_type_collision` both landed four days
+> BEFORE this entry implementing the opposite. It is also no longer the target:
+> modules and types now share ONE namespace, so the qualifier has a single
+> possible owner by construction and there is no shorthand left to keep or
+> drop. This entry's two-way framing is superseded, not merely unexecuted.
 
 #### Modules bind in the type namespace
 
@@ -17210,3 +17225,183 @@ moves `b1` even when nothing about resolution changed. Routing their printf to
 `fmt::` added `std::fmt` to projects that did not import it - 64 modules compiled
 where `libc::printf` compiles 61. `[host:*-ffi]` measures the one corpus routed
 to `libc::` and is the only section that did not move, on either host.
+
+### 8.130 The qualifier shorthand is decided three ways, one of them unrecorded, and the corpus that exercised it is down to the two tests that test it - MEASURED AND LANDED 2026-09-10
+
+§8.66 records the shorthand as dropped. The resolver keeps it. What the tree
+actually does is a third answer neither §8.56 nor §8.66 enumerated, and it
+appears nowhere else in this document.
+
+#### The rule as built, in three places
+
+**Use site, resolver.** `stamp_module_scope`
+(`resolver/name_resolution.cryo`): when the scope segment binds in the writer's
+scope as a type AND exactly one visible module carries the spelling, the
+module's export set is asked whether it owns the member. It does, the module
+answers; it does not, the type answers. Module probed first.
+
+**Use site, codegen.** `ir_generator.cryo`'s `ScopeResolutionNode` visit runs an
+independent three-probe cascade for the value position - the bare combined
+spelling, then the stamped module namespace, then the DI type map - and
+restates the both-owners rule in its own comment. The stamp is one probe of
+three there, not the answer.
+
+**Declaration site.** `check_module_type_collision` refuses with E0154 when the
+module and its same-leaf type BOTH declare a member. Its own comment states the
+reasoning: eliminating a candidate that cannot answer is not choosing between
+two that can, so only the case where both can is refused, and it is refused at
+declaration because a use-site gate legitimizes the declaration for as long as
+nobody writes the path.
+
+Together: **keep the shorthand, and forbid the declaration that would make it
+ambiguous.** That is §8.56's option 1 plus a guard, and §8.56 offered only
+"keep it" and "drop it, matching Rust".
+
+#### It is unrecorded, and it predates the ruling that contradicts it
+
+`check_module_type_collision` and its `MODTYPE-COLLIDE` census row return **zero
+hits across this document**. The only trace of the mechanism anywhere in the
+ledger is §8.121 citing the diagnostic in passing, as a reason NOT to reuse
+E0154 for the plural-leaf condition. The refusal also has **no test**: the two
+`E0154_*` negative cases cover the bare call and the trait method.
+
+The order is the part worth keeping:
+
+| | |
+|---|---|
+| `7e88106b` | the `module_owns_member` probe |
+| `4a06c28d` | `check_module_type_collision` |
+| **§8.66** | **the shorthand is dropped, "as in Rust"** |
+
+The ruling did not fail to be executed. It was written against a tree that had
+already answered the question differently four days earlier, and neither half
+knew about the other. A ledger entry that states a decision is not evidence the
+decision is what the code does.
+
+> **§8.56 and §8.66 are both incomplete on this.** §8.56 poses a two-way choice
+> that the implementation answered a third way; §8.66 rules on that two-way
+> choice. Neither describes `check_module_type_collision`.
+>
+> **RULED after this was measured, and past all of them.** Namespaces and types
+> share a single namespace, so a module and a type can never carry the same
+> name, and the collision is an ordinary redeclaration error at the point of
+> declaration - Rust's model, where `mod x` beside `struct x` is E0428 and no
+> module-vs-type adjudication rule exists because two owners can never share a
+> name. That is a fifth position: three were enumerated across §8.56 and §8.66,
+> a fourth was built in the tree unrecorded, and none of them is this one. The
+> implementation, and the population it has to move, are the next entry's.
+
+#### What the corpus can still see - measured
+
+The §8.74 rename removed the collision from `compiler/src`, and `stdlib` was
+already snake_case. Instrument controlled against a known positive and a known
+negative before it ran:
+
+| | before | after |
+|---|---:|---:|
+| modules carrying a namespace declaration | 907 | 907 |
+| namespace leaf spelled like a type declared in the same file | 7 | **3** |
+| tree-wide spellings naming both a module and some type | 19 | **11** |
+| of the same-file collisions, in `compiler/src` or `stdlib` | 0 | **0** |
+| module and type sharing a FULLY-QUALIFIED name | 0 | **0** |
+
+Zero in `compiler/src` and `stdlib` is structural, not incidental:
+`Resolver::ns_written_as` compares case-sensitively, every namespace there is
+snake_case and every type name is PascalCase, so no spelling can be both.
+
+The three survivors are `tests/lang/static_method_value.cryo`,
+`tests/projects/module_type_name_collision` - both of which exist to hold the
+shape - and `tests/projects/namespace_gate_methods`, where `type trait Handler`
+sits in `namespace NamespaceGateMethods::Handler` incidentally.
+**Nothing outside `tests/` carries the collision at all.**
+
+The first count of this taken in the session said 6 and 2. It omitted `type
+trait` from the declaration forms, so `Handler` was invisible to it - a leaf
+that was not a keyword, not a struct, and not looked for. The corrected
+instrument was controlled by requiring it to find a trait and the old one to
+miss it, which is the only reason the gap was visible as anything but a total. That is
+also why neither `b1-check` nor `lane-check` can see a change to this rule -
+they compile `examples/` and two test projects, none of which contain a
+collision - and why `lsp-check` was the only gate that could.
+
+#### The rename: `tools/CryoLSP` was the last PascalCase namespace tree
+
+28 namespaces, all PascalCase, four of them spelled like a type declared in the
+same file. Renamed whole-path to snake_case, matching what `compiler/src` and
+`stdlib` already are. Checked against `TokenType::from_keyword` rather than by
+eye - §8.74 hit two names that lex as keywords; **none of these 25 leaves does**.
+
+The rewrite separates §8.74's four meanings of `Leaf::` by an explicit member
+list rather than by a pattern, because `Server::` carries two of them in ONE
+tree: `Server::LineIndex` is the module's submodule and `Server::new` is the
+type's own static. All 22 bare-leaf occurrences were enumerated and classified
+before anything was edited - **15 module, 7 type** - and the seven are the
+sites that stop being contested, since after the rename the spelling names only
+the type.
+
+| substitution class | n |
+|---|---:|
+| full `Lsp::...` paths | 193 |
+| bare module paths (`Server::LineIndex`, `Protocol::Conv`) | 3 |
+| module-only leaves in qualifier position | 12 |
+| `namespace Lsp;` | 1 |
+| `public module X;` declarations | 23 |
+| **total** | **232** |
+
+#### Controls
+
+**28 files changed, +232 / -232** - exactly symmetric, which is what a pure
+rename looks like, and the same control §8.74 used. Nothing outside
+`tools/CryoLSP/src/`. Zero `Lsp::` residue.
+
+`lsp-check` before and after, same numbers both times:
+
+    compiled 266 module(s) (24 local, 81 std, 161 dep), 0 errors, 477 warning(s)
+
+The population is the load-bearing half. Discovery is import-driven, so a
+namespace renamed out of step with the import that names it does not fail - the
+file simply stops being compiled, and a smaller build reports success. An
+unchanged 24/81/161 is what says no file dropped out; 0 errors alone would not.
+
+Line endings were preserved byte-for-byte. The tree is not uniformly LF, and had
+the rewriter normalized them the diff would have been whole files rather than
+232 lines - which is also the control that would have caught it.
+
+`b1-check` and `lane-check` were run as null controls and are null: B1=0 on all
+three arms at 82 sites, LOOKUP 65 / REENTRY 6 unchanged against their goldens.
+Nothing they compile was edited, so movement would have been a defect rather
+than a result.
+
+#### Three stale descriptions, all naming a collision the rename removed
+
+* `ir_generator.cryo` gave its worked example as "`compiler::bindgen::importer`
+  and `type Importer`" - leaf `importer`, type `Importer`, and matching is
+  case-sensitive, so that pair has not been a collision since §8.74. Corrected
+  to state the shape without citing a dead instance.
+* `tests/lang/static_method_value.cryo`'s header cited the same pair in its
+  pre-rename PascalCase spelling and claimed that breaking the shape "fails the
+  SELF-HOST build one stage later". It cannot: no module in `compiler/src` is
+  spelled like a type it declares. The file is now one of only two things
+  covering the shape, which is the more useful thing for it to say.
+* `tools/CryoLSP/cryoconfig` described the C-header import engine as
+  `Compiler::Bindgen`.
+
+#### A dead config key, left alone deliberately
+
+`tools/CryoLSP/cryoconfig` declares `compiler = { path = "...", alias = "Compiler" }`.
+It is the **only** cryoconfig in the tree using a dependency alias, and
+`dep.alias` has **one writer** (`project_config.cryo`) and **no readers** - the
+key is parsed and discarded. That is why the stale PascalCase spelling in it
+survived §8.74 without breaking anything.
+
+Not removed: whether a parsed-but-unimplemented config key is deprecated or
+unfinished is not answerable from the call sites, and it changes what the
+compiler accepts. Recorded instead.
+
+#### A chosen population, named because it is chosen
+
+`tools/CryoLSP/AUDIT.md` and `.todo/NAME_RESOLUTION_PLAN.md` still spell the old
+namespaces and were deliberately not rewritten. Both are point-in-time records,
+and AUDIT.md's occurrences are inside a fenced block quoting compiler output
+verbatim. Rewriting a quoted diagnostic would falsify the record, and rewriting
+only the prose around it would leave the document disagreeing with itself.
