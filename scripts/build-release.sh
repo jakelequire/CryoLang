@@ -33,10 +33,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="${ROOT}/dist"
 PLATFORM="${1:-}"
+ALLOW_UNSMOKED=0
+shift || true
+for arg in "$@"; do
+    case "$arg" in
+        --allow-unsmoked) ALLOW_UNSMOKED=1 ;;
+        *) echo "build-release.sh: unknown argument $arg" >&2; exit 2 ;;
+    esac
+done
 
 case "$PLATFORM" in
     linux|windows) ;;
-    *) echo "usage: build-release.sh <linux|windows>" >&2; exit 1 ;;
+    *) echo "usage: build-release.sh <linux|windows> [--allow-unsmoked]" >&2; exit 1 ;;
 esac
 
 # Single source of truth for the version.
@@ -112,6 +120,43 @@ stage_runtime_tiers() {
         || { echo "error: freestanding core tier missing for ${triple}" >&2; exit 1; }
 }
 
+smoke_stage() {
+    # $1 = staging dir, $2 = exe name, $3 = 1 when the artifact is foreign here.
+    #
+    # Nothing executed a release artifact before it was published: the tag
+    # workflow builds the archive, uploads it and attaches it, and the verify
+    # job beside it exercises a DIFFERENT binary built by a different link.
+    # The one place an artifact is run at all asks it for `--version`, which is
+    # whether it starts and not whether it works.
+    #
+    # This compiles a hello-world with the staged tree and runs it, before the
+    # archive is packaged, so a tree that cannot compile is never wrapped up.
+    local stage="$1" exe="$2" foreign="$3"
+    local runner=()
+    if [ "$foreign" = 1 ]; then
+        if command -v wine >/dev/null 2>&1; then
+            runner=(wine)
+        elif [ "$ALLOW_UNSMOKED" = 1 ]; then
+            echo "[build-release] NOT SMOKED: ${exe} cannot run on this host and"                  "no wine is installed (--allow-unsmoked).  The archive is being"                  "packaged without ever having compiled anything." >&2
+            return 0
+        else
+            echo "error: cannot run ${exe} here to smoke the archive (no wine)." >&2
+            echo "  Install wine, build on the target OS, or pass --allow-unsmoked" >&2
+            echo "  and accept that the archive ships unexercised." >&2
+            exit 1
+        fi
+    fi
+    bash "${ROOT}/scripts/release-smoke.sh" "$stage" "$exe" "${runner[@]}"
+}
+
+host_is() {   # $1 = linux|windows
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        Linux)                     [ "$1" = linux ] ;;
+        MINGW*|MSYS*|CYGWIN*)      [ "$1" = windows ] ;;
+        *)                         false ;;
+    esac
+}
+
 stage_third_party_licenses() {
     # libLLVM is redistributed (statically linked into the Linux cryo, shipped
     # as LLVM-C.dll on Windows). Its Apache-2.0-with-LLVM-exceptions license
@@ -160,6 +205,8 @@ build_linux() {
     stage_common "$stage"
     stage_runtime_tiers "$stage" "x86_64-unknown-linux-gnu"
 
+    if host_is linux; then smoke_stage "$stage" "cryo" 0; else smoke_stage "$stage" "cryo" 1; fi
+
     local archive="${DIST}/cryo-${VER}-linux-x86_64.tar.gz"
     ( cd "$DIST" && tar -czf "$archive" "cryo-${VER}-linux-x86_64" )
     ( cd "$DIST" && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256" )
@@ -194,6 +241,8 @@ build_windows() {
     stage_third_party_licenses "$stage"
     stage_runtime_tiers "$stage" "x86_64-pc-windows-gnu"
     echo "$VER" > "${stage}/VERSION"
+
+    if host_is windows; then smoke_stage "$stage" "cryo.exe" 0; else smoke_stage "$stage" "cryo.exe" 1; fi
 
     local archive="${DIST}/cryo-${VER}-windows-x86_64.zip"
     rm -f "$archive"
