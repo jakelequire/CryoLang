@@ -27,6 +27,9 @@ make test-census         # the same run, with the suite COUNTS asserted
 make roster-check        # roster golden: 2113 unit + 44 projects + 178 negative
 make b1-check            # name-resolution fallback ratchet
 make lane-check          # resolution-lane surface ratchet; needs NO build
+make ns-status-check     # run every check docs/name-resolution.md §0 carries
+make check-fast          # lane + §0 + pin, ~10s, no build. Run before committing.
+make install-hooks       # point git at scripts/git-hooks (ONCE per checkout)
 make lsp-check           # compile tools/CryoLSP with the compiler under test
 make vendor-check        # every constant shape survives `cryo vendor`
 make api-index-check     # docs/stdlib-api.txt is not stale
@@ -37,6 +40,30 @@ make examples-golden     # build AND run them, diff stdout (POSIX only)
 make incremental-check   # incremental build == clean build, per module
 make selfhost-check      # byte-identity fixed point, BOTH OS, ~17 min
 ```
+
+### CI fires on `main` only, so on a branch the enforcement is LOCAL
+
+That is deliberate - the commit rate here would otherwise spend real money on
+Actions minutes - and it has a consequence worth stating: **everything in
+`.github/` is a merge gate, not a branch gate.** Between now and the merge, the
+only things that run are what a person or an agent runs.
+
+So:
+
+- **`make check-fast`** before committing. Lane surface, §0, pin integrity;
+  about ten seconds, no compiler, no stdlib, no link. A ten-second gate
+  everybody runs beats a twenty-minute one nobody does.
+- **`make install-hooks`**, once per checkout. `.git/hooks` is per-checkout and
+  a fresh clone inherits nothing, the same trap `.claude/settings.json` carries.
+  It installs a `commit-msg` hook that refuses three things: a
+  `docs/name-resolution.md` that lands alone, a §8 entry marked
+  LANDED/FIXED/RULED that does not move §0 in the same commit, and a §0 whose
+  expected values change while nothing outside `docs/` does. The last one is
+  what stops §0 being re-pinned into agreement with itself.
+  Waive the second, visibly, with a `no-section-0: <reason>` line in the commit
+  message; `git log --grep=no-section-0` is the audit.
+  `python scripts/ns-guard-selftest.py` drives all three through a throwaway
+  repository and shows them refuse and allow.
 
 ### What a green gate does NOT tell you
 
@@ -65,6 +92,12 @@ not done. The remaining limits are here so nobody rediscovers them:
   E0236 is one; its negative test can assert the code alone.
 - **`selfhost-check` proves stability, not correctness.** Stage 3 builds
   stage 4, so a miscompile that reproduces itself is invisible to it.
+- **§0's row checks catch a NUMBER that moved and nothing else.** Not a
+  decision that never got a row (§8.39's second decision survived ninety-five
+  entries that way), not a row whose count is right and whose status word is
+  wrong, not a gate's blind spot changing - nobody would have grepped
+  `lsp-check` off the pin; that came from reading the Makefile. The commit
+  hook covers the missing-row half. Neither replaces reading it.
 - **`make lsp-check` builds with the stage-2 compiler**, which is what makes
   it a gate; `make lsp` builds with the pin and certifies nothing about the
   compiler being built.

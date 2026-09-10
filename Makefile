@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census roster-check b1-check lane-check lsp-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census roster-check b1-check lane-check ns-status-check check-fast install-hooks lsp-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -185,6 +185,9 @@ help:
 	@echo "  make test-list         List the discovered test cases without running them"
 	@echo "  make b1-check          Pin the B1 fuzzy-fallback bucket against its golden"
 	@echo "  make lane-check        Pin the resolution-lane surface against its golden"
+	@echo "  make ns-status-check   Run every check docs/name-resolution.md §0 carries"
+	@echo "  make check-fast        lane-check + ns-status-check + verify-pin (~10s, no build)"
+	@echo "  make install-hooks     Point git at the tracked hooks (run once per checkout)"
 	@echo "  make lsp-check         Compile tools/CryoLSP against current source"
 	@echo "                         (installs nothing; the only gate that builds it)"
 	@echo "  make vendor-check      Check every constant shape survives cryo vendor"
@@ -572,6 +575,40 @@ endif
 lane-check:
 	@$(PYTHON) scripts/lane-gate.py $(ARGS)
 
+# ---- name-resolution status gate ---------------------------------------
+# Run every check §0 of docs/name-resolution.md carries and fail on drift.
+#
+# §0 exists so an incoming agent reads 143 lines instead of re-deriving truth
+# from 16,000 append-only ones.  Nothing about a status section breaks when it
+# goes stale, which is exactly how the archive it replaces got that way, so the
+# rows are executable and this runs them.
+#
+# No compiler, no stdlib, no link: it greps the tree, in about seven seconds on
+# a cold cache.  That matters more than usual here - CI fires on `main` only, so
+# on a migration branch the enforcement point is somebody running this.
+ns-status-check:
+	@$(PYTHON) scripts/ns-status-check.py $(ARGS)
+
+# ---- everything that needs no build ------------------------------------
+# The pre-commit sweep.  Every gate here is source- or document-derived, so the
+# whole thing runs in about ten seconds on a fresh clone with nothing built.
+# A ten-second gate everybody runs is worth more than a twenty-minute one
+# nobody does, which is the same argument that moved lane-check ahead of
+# `make cryo` in CI.
+check-fast: lane-check ns-status-check verify-pin
+	@echo "check-fast: OK (lane surface, section 0, pin integrity)"
+
+# ---- git hooks ---------------------------------------------------------
+# Point git at the tracked hook directory.  Hooks live in scripts/git-hooks so
+# they are versioned with the rules they enforce; .git/hooks is per-checkout and
+# a fresh clone inherits nothing, which is the same trap `.claude/settings.json`
+# already carries in CLAUDE.md.  Run this once per checkout.
+install-hooks:
+	@git config core.hooksPath scripts/git-hooks
+	@echo "install-hooks: core.hooksPath -> scripts/git-hooks"
+	@echo "  commit-msg: refuses a ledger-only commit, a §8 LANDED/FIXED/RULED"
+	@echo "  entry that does not move §0, and a §0 re-pinned on its own."
+
 # ---- language-server compile gate --------------------------------------
 # The LSP links the compiler as a LIBRARY (tools/CryoLSP/cryoconfig ->
 # path = "../../compiler"), so it sees every AST, NodeKind and public-signature
@@ -755,8 +792,20 @@ runtime-tiers-win: $(PIN)
 # Accept that deliberately with `ARGS=--allow-skipped-arm` (the spelling
 # selfhost-check uses); `FREESTANDING_LINUX_ONLY=1` still selects the skip, it
 # just no longer hides it.
+#
+# Not host-branched until now, and on a Windows host that meant it could not be
+# invoked at all: it depended on `compiler/build/cryo`, which a Windows build
+# never produces, and its recipe is sh syntax under a cmd shell.  A gate with no
+# local invocation on half the supported hosts is a gate only CI runs - and CI
+# fires on `main` alone.  It now refuses out loud there instead, the same way
+# examples-golden and valgrind-check do.
+ifeq ($(HOST_OS),windows)
+verify-freestanding:
+	@$(PYTHON) scripts/gate-unavailable.py verify-freestanding "the acceptance script is bash and links ELF objects natively; run it from WSL."
+else
 verify-freestanding: $(STAGE2)
 	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash runtime/verify-freestanding.sh $(ARGS)
+endif
 
 # ---- release packaging -------------------------------------------------
 # Build distributable archives under dist/.  `release` does the host
