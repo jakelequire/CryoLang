@@ -1,10 +1,43 @@
 #!/usr/bin/env python3
-"""Assert the discovered unit-test roster matches the committed golden.
+"""Assert the discovered test roster matches the committed golden.
 
 CI never asserted a test COUNT: a compiler change that silently broke
 `![test]` discovery (dropping files, modules, or the whole tests/ tree)
 stayed green, because "0 of 0 tests failed" is a pass.  This gate pins the
-full sorted roster from `cryo test --list` against tests/test-roster.txt.
+full sorted roster against tests/test-roster.txt.
+
+THREE suites, one golden
+------------------------
+`cryo test` runs three suites and `cryo test --list` enumerates ONE of them:
+the `--list` path returns before the compile-fail and project suites are
+reached.  A roster built from `--list` alone therefore pinned 2,113 unit tests
+and none of the 44 projects or 178 negative files - the majority of the corpus,
+carrying every module-system, visibility and resolution gate, was unpinned, and
+a deleted project or negative file was a silent no-op.
+
+The other two suites are enumerated HERE instead, from the filesystem, by the
+same rules their runners use:
+
+  * projects  - `tests/tests/projects/*/`, each pinned with the FINGERPRINT of
+    its `test.json`: the fixture, the polarity, and how many assertions it
+    makes.  So a project deleted, or an assertion quietly dropped from one,
+    shows up as roster drift rather than as nothing at all.
+  * negative  - `tests/tests/negative/*.cryo` (flat, non-recursive - the runner
+    does not descend), pinned with the error code its `![config(negative,...)]`
+    declares and its count of `//~` annotations.  Losing an annotation weakens
+    a file from "this diagnostic, on this line, and no others" to "this code
+    appears somewhere", which is a change worth seeing.
+
+Both are pure filesystem reads: no host runs a different population, so unlike
+the unit roster these sections need no OS waiver.
+
+Two things are HARD FAILURES rather than golden entries, because pinning them
+would grandfather the very silence they cause:
+
+  * a directory under projects/ with no `test.json` - the runner skips it
+    without a word, and a skipped project prints exactly what a passing one
+    prints (nothing);
+  * a negative file with no `![config(negative, <code>)]` directive.
 
 Usage:
     python scripts/roster-check.py <path-to-cryo> [--update]
@@ -41,6 +74,7 @@ to catch.
 
 Exit codes: 0 roster matches (or golden updated); 1 mismatch or failure.
 """
+import json
 import os
 import re
 import subprocess
@@ -49,6 +83,8 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS_DIR = os.path.join(ROOT, "tests")
 TESTS_SRC = os.path.join(TESTS_DIR, "tests")
+PROJECTS_DIR = os.path.join(TESTS_SRC, "projects")
+NEGATIVE_DIR = os.path.join(TESTS_SRC, "negative")
 GOLDEN = os.path.join(TESTS_DIR, "test-roster.txt")
 
 HOST_TARGET = (
@@ -151,11 +187,135 @@ def leaf_name(entry):
 
 
 def golden_entries():
-    """The committed golden, filtered exactly as `roster()` filters --list."""
+    """Every committed golden entry, whitespace-normalized."""
     if not os.path.exists(GOLDEN):
         return []
     with open(GOLDEN, "r") as f:
-        return sorted(set(ln.strip() for ln in f if ": test" in ln))
+        return sorted(set(ln.strip() for ln in f if ln.strip()))
+
+
+# --- the two suites `cryo test --list` does not reach ----------------------
+
+def _read(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def project_entries():
+    """One pinned line per test project, plus the hard failures found.
+
+    The line carries a FINGERPRINT of test.json rather than just the name:
+    the fixture (`collect`/`build`/`run`), whether the run must fail, the
+    declared requirements, and how many assertions the `expect` block makes.
+    A name-only line would pin existence and nothing else, and the way these
+    projects rot is not deletion - it is an `output_contains` entry going
+    missing, which leaves the project running, passing, and checking less.
+
+    A project directory with no `test.json` is returned as an ERROR, not as a
+    line: the runner skips it in silence, and a skipped project is
+    indistinguishable from a passing one in the output.  Pinning that state
+    would preserve it.
+    """
+    entries, errors = [], []
+    if not os.path.isdir(PROJECTS_DIR):
+        return entries, ["projects directory %s does not exist" % PROJECTS_DIR]
+    for name in sorted(os.listdir(PROJECTS_DIR)):
+        d = os.path.join(PROJECTS_DIR, name)
+        if not os.path.isdir(d):
+            continue
+        marker = os.path.join(d, "test.json")
+        if not os.path.isfile(marker):
+            errors.append(
+                "project %s has no test.json; `cryo test` skips the whole "
+                "directory without a word, reporting the same green and the "
+                "same count as before it existed" % name)
+            continue
+        try:
+            spec = json.loads(_read(marker))
+        except ValueError as e:
+            errors.append("project %s has a malformed test.json (%s)" % (name, e))
+            continue
+        outcome = spec.get("outcome", "collect")
+        expect = spec.get("expect", {}) or {}
+        # `compile_fail` is the build fixture plus the failing polarity, and
+        # `diagnostic` is `fails` plus an error[<code>] marker; count what the
+        # runner will actually check, not what the file happens to spell.
+        fails = bool(expect.get("fails", False)) or outcome == "compile_fail"             or "diagnostic" in expect
+        asserts = 0
+        if "exit_code" in expect:
+            asserts += 1
+        if "stdout_contains" in expect:
+            asserts += 1
+        if "diagnostic" in expect:
+            asserts += 1
+        asserts += len(expect.get("output_contains", []) or [])
+        asserts += len(expect.get("output_excludes", []) or [])
+        reqs = ",".join(spec.get("requires", []) or []) or "-"
+        entries.append(
+            "project %s: outcome=%s fails=%d asserts=%d requires=%s ignore=%d"
+            % (name, outcome, int(fails), asserts, reqs,
+               int(bool(spec.get("ignore", False)))))
+    return entries, errors
+
+
+def _negative_code(content):
+    """The code `Executor::neg_code_from` would read out of this file.
+
+    Same rule, deliberately: first `config(negative`, skip the comma and any
+    spaces, then the token up to `)`, `,`, ` ` or `]`.  A different rule here
+    would pin a population the runner does not have.
+    """
+    i = content.find("config(negative")
+    if i < 0:
+        return ""
+    j = i + len("config(negative")
+    while j < len(content) and content[j] in ", ":
+        j += 1
+    out = []
+    while j < len(content) and content[j] not in "),  ]" and len(out) < 23:
+        out.append(content[j])
+        j += 1
+    return "".join(out)
+
+
+def negative_entries():
+    """One pinned line per compile-fail file, plus the hard failures found.
+
+    FLAT, not recursive: `run_negative_suite` calls readdir on
+    tests/tests/negative once and filters on the `.cryo` extension, so a file
+    in a subdirectory there is never run.  Enumerating recursively would pin a
+    larger population than the one that executes, which is the failure this
+    gate exists to prevent rather than commit.
+
+    `annotations` is the count of `//~` lines.  With none, the suite asserts
+    only that `error[<code>]` appears somewhere in the output - the code can
+    come from a different line, a different symbol, or a cascade.  With them it
+    also asserts each message and its line, and that nothing else was reported.
+    Pinning the count makes a file being weakened from the second to the first
+    visible.
+    """
+    entries, errors = [], []
+    if not os.path.isdir(NEGATIVE_DIR):
+        return entries, ["negative directory %s does not exist" % NEGATIVE_DIR]
+    for name in sorted(os.listdir(NEGATIVE_DIR)):
+        path = os.path.join(NEGATIVE_DIR, name)
+        if not os.path.isfile(path) or not name.endswith(".cryo"):
+            continue
+        content = _read(path)
+        code = _negative_code(content)
+        if not code:
+            errors.append(
+                "negative %s carries no ![config(negative, <code>)] directive; "
+                "the suite counts it as a failure but nothing pins that it "
+                "still exists" % name)
+            continue
+        anns = sum(1 for ln in content.splitlines() if "//~" in ln)
+        entries.append("negative %s: %s annotations=%d" % (name, code, anns))
+    return entries, errors
+
+
+def is_unit(entry):
+    return entry.endswith(": test") or ": test" in entry
 
 
 def main(argv):
@@ -165,7 +325,24 @@ def main(argv):
     if len(argv) != 1 or (update and merge):
         sys.stderr.write(__doc__)
         return 2
-    entries = roster(argv[0])
+
+    # The two suites `--list` cannot reach are enumerated first and their hard
+    # failures reported BEFORE the compiler runs: a missing test.json costs
+    # nothing to detect and there is no reason to spend a `cryo test --list` to
+    # find out about it.  These are refusals, not drift -- --update does not
+    # silence them, because writing them into the golden is what preserves the
+    # silence they cause.
+    proj, proj_errs = project_entries()
+    neg, neg_errs = negative_entries()
+    for msg in proj_errs + neg_errs:
+        sys.stderr.write("roster-check: REFUSED  %s\n" % msg)
+    if proj_errs or neg_errs:
+        sys.stderr.write(
+            "roster-check: %d unrunnable test(s) found; fix them rather than "
+            "pinning them.\n" % (len(proj_errs) + len(neg_errs)))
+        return 1
+
+    entries = sorted(set(roster(argv[0])) | set(proj) | set(neg))
 
     if merge:
         want = golden_entries()
@@ -207,6 +384,11 @@ def main(argv):
     gated = gated_tests()
 
     def other_platform(ln):
+        # Unit entries only.  The project and negative sections are read off
+        # the filesystem, so every host enumerates the same population and an
+        # absence there is a deletion, never a gate.
+        if not is_unit(ln):
+            return False
         g = gated.get(leaf_name(ln))
         return g is not None and g != HOST_TARGET
 
@@ -216,8 +398,10 @@ def main(argv):
         print("roster-check: gated   %s (not built on %s)" % (ln, HOST_TARGET))
 
     if not missing and not extra:
-        print("roster-check: OK (%d tests, %d gated to another platform)"
-              % (len(entries), len(waived)))
+        print("roster-check: OK (%d entries: %d unit, %d project, %d negative; "
+              "%d gated to another platform)"
+              % (len(entries), len(entries) - len(proj) - len(neg),
+                 len(proj), len(neg), len(waived)))
         return 0
     for ln in missing:
         sys.stderr.write("roster-check: MISSING  %s\n" % ln)
