@@ -33,13 +33,23 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROWS = 26          # at or above ns-status-check's --min-rows floor
 
 
-def ledger(rows, extra_entries=""):
-    """A miniature ledger: a §0 whose rows check `data.txt`, plus a §8."""
+def ledger(rows, extra_entries="", archive_decl=None):
+    """A miniature ledger: a §0 whose rows check `data.txt`, plus a §8.
+
+    With `archive_decl` the §8 section is left OUT and the document declares
+    where it went instead - the shape the real ledger takes once the archive is
+    split off.  With `archive_decl=""` the entries are gone and nothing is
+    declared, which is the state where the checks have been blinded.
+    """
     lines = [
         "# Name Resolution - fixture",
         "",
         "## 0. Current state",
         "",
+    ]
+    if archive_decl:
+        lines += ["<!-- ns-archive: %s -->" % archive_decl, ""]
+    lines += [
         "### 0.1 Decisions",
         "",
         "| # | decision | status | check -> expected |",
@@ -49,8 +59,14 @@ def ledger(rows, extra_entries=""):
         want = rows.get(i, 1)
         lines.append("| D%d | fixture row %d | TAKEN | `grep -c 'ROW%d;' data.txt` "
                      "→ **%d** |" % (i, i, i, want))
-    lines += ["", "## 8. Archive", "", extra_entries, ""]
+    if archive_decl is None:
+        lines += ["", "## 8. Archive", "", extra_entries, ""]
     return "\n".join(lines) + "\n"
+
+
+def archive(entries):
+    """The §8 archive as its own document."""
+    return "# Name Resolution - archive\n\n## 8. Archive\n\n" + entries + "\n"
 
 
 def data(counts):
@@ -86,12 +102,14 @@ class Repo(object):
         return r.returncode, r.stdout
 
 
-def build(path):
+def build(path, split=False):
+    """The fixture repo.  `split` puts §0 and the archive in DIFFERENT files,
+    which is the layout the real ledger is moving to."""
     repo = Repo(path)
     repo.git("init", "-q")
     repo.git("config", "user.email", "selftest@example.invalid")
     repo.git("config", "user.name", "selftest")
-    for name in ("ns-commit-guard.py", "ns-status-check.py"):
+    for name in ("ns-commit-guard.py", "ns-status-check.py", "ns_ledger.py"):
         os.makedirs(os.path.join(path, "scripts"), exist_ok=True)
         shutil.copy2(os.path.join(ROOT, "scripts", name),
                      os.path.join(path, "scripts", name))
@@ -102,8 +120,13 @@ def build(path):
     repo.git("config", "core.hooksPath", "scripts/git-hooks")
     repo.write("data.txt", data({}))
     repo.write("src/thing.txt", "one\n")
-    repo.write("docs/name-resolution.md",
-               ledger({}, "### 8.100 A first entry - MEASURED AND FIXED 2026-01-01\n"))
+    if split:
+        repo.write("docs/name-resolution.md",
+                   ledger({}, archive_decl="docs/ns-archive.md"))
+        repo.write("docs/ns-archive.md", archive("### 8.100 A first entry - MEASURED AND FIXED 2026-01-01\n"))
+    else:
+        repo.write("docs/name-resolution.md",
+                   ledger({}, "### 8.100 A first entry - MEASURED AND FIXED 2026-01-01\n"))
     repo.git("add", "-A")
     repo.git("commit", "-qm", "fixture")
     return repo
@@ -112,9 +135,9 @@ def build(path):
 CASES = []
 
 
-def case(name, expect_refused):
+def case(name, expect_refused, split=False):
     def deco(fn):
-        CASES.append((name, expect_refused, fn))
+        CASES.append((name, expect_refused, fn, split))
         return fn
     return deco
 
@@ -186,6 +209,50 @@ def _(repo):
     return repo.guard("Grow row 7 and say so in §0\n")
 
 
+# --- the split shape: §0 in one file, the archive in another ------------
+# Written before the split lands, because the rule going inert when the file
+# moves is exactly what a hardcoded path would have caused - and it would have
+# looked installed the whole time.
+
+@case("SPLIT: a LANDED entry in the archive file, §0 unmoved", True, split=True)
+def _(repo):
+    repo.write("src/thing.txt", "two\n")
+    repo.write("docs/ns-archive.md", archive("### 8.100 A first entry - MEASURED AND FIXED 2026-01-01\n"
+                                             "\n### 8.201 Split-shape entry - MEASURED AND LANDED 2026-02-01\n"))
+    repo.git("add", "-A")
+    return repo.guard("Land the split-shape thing\n")
+
+
+@case("SPLIT: the same, with §0 moved too", False, split=True)
+def _(repo):
+    repo.write("data.txt", data({7: 3}))
+    repo.write("docs/name-resolution.md",
+               ledger({7: 3}, archive_decl="docs/ns-archive.md"))
+    repo.write("docs/ns-archive.md", archive("### 8.100 A first entry - MEASURED AND FIXED 2026-01-01\n"
+                                             "\n### 8.201 Split-shape entry - MEASURED AND LANDED 2026-02-01\n"))
+    repo.git("add", "-A")
+    return repo.guard("Grow row 7, record it, and say so in §0\n")
+
+
+@case("SPLIT: the archive file landing on its own", True, split=True)
+def _(repo):
+    repo.write("docs/ns-archive.md", archive("### 8.100 A first entry - MEASURED AND FIXED 2026-01-01\n"
+                                             "\nprose added alone\n"))
+    repo.git("add", "docs/ns-archive.md")
+    return repo.guard("Tidy the archive\n")
+
+
+@case("SPLIT: entries gone and no archive declared", True, split=True)
+def _(repo):
+    # The archive moved and §0 says nothing about where.  This is the state a
+    # hardcoded path would have SILENTLY accepted; a commit touching the
+    # documents is refused until §0 declares where its entries went.
+    repo.write("docs/name-resolution.md", ledger({}, archive_decl=""))
+    repo.git("rm", "-q", "docs/ns-archive.md")
+    repo.git("add", "-A")
+    return repo.guard("Move the archive and forget to say where\n")
+
+
 def hook_case(repo):
     """The whole chain: git -> commit-msg shim -> guard, on a real commit.
 
@@ -206,11 +273,12 @@ def hook_case(repo):
 
 def main():
     failures = []
-    for name, expect_refused, fn in CASES + [
-            ("through the installed hook, on a real commit", True, hook_case)]:
+    for name, expect_refused, fn, split in CASES + [
+            ("through the installed hook, on a real commit", True,
+             hook_case, False)]:
         tmp = tempfile.mkdtemp(prefix="ns-guard-")
         try:
-            repo = build(tmp)
+            repo = build(tmp, split=split)
             code, out = fn(repo)
             refused = code != 0
             ok = refused == expect_refused

@@ -14,13 +14,23 @@ It is a `commit-msg` hook rather than `pre-commit` because the escape hatch
 belongs in the message: a bypass that leaves no trace is a bypass nobody can
 audit, and `--no-verify` leaves none.
 
+NO FILE IS NAMED HERE
+---------------------
+The ledger is being split: §0 and the spec stay put, the §8 archive moves out
+and may become one file or several.  A hardcoded path would have left rule 2
+reading a document with no entries in it - installed, silent, doing nothing,
+which is the failure this suite has already paid to learn once.  §0 is found
+by its heading and the archive by the declaration §0 carries; see
+scripts/ns_ledger.py.  The self-test drives the split layout, so the move is
+covered before it happens.
+
 WHAT IT ENFORCES
 ----------------
-1. `docs/name-resolution.md` never lands alone.  Already the rule in
-   CLAUDE.md, unenforced until now: a ledger entry that lands apart from its
-   change turns a behaviour change into two half-records - the commit says what
-   moved without saying why, and the entry claims a measurement with no diff to
-   check it against.
+1. No ledger file ever lands alone - the §0 document or any archive file.
+   Already the rule in CLAUDE.md, unenforced until now: a ledger entry that
+   lands apart from its change turns a behaviour change into two
+   half-records - the commit says what moved without saying why, and the
+   entry claims a measurement with no diff to check it against.
 
 2. A §8 entry whose heading says LANDED, FIXED or RULED must move §0 in the
    same commit.  The mechanical row checks catch a number that drifted; they
@@ -66,16 +76,15 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LEDGER_REL = "docs/name-resolution.md"
-SECTION_START = "\n## 0. Current state"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ns_ledger                                              # noqa: E402
 
-# `### 8.134 ... - MEASURED AND FIXED 2026-09-10`.  The status words are the
-# ones the archive actually uses for a change that HAPPENED; DEFERRED,
-# PREPARED and a bare handoff are not among them on purpose - they record
-# something that did not land, and there is nothing for §0 to say yet.
-ENTRY = re.compile(r"^\+###\s+8\.\S+\s+.*\b(LANDED|FIXED|RULED)\b", re.M)
+# No file is named here.  The ledger is being split - §0 and the spec stay
+# where they are, the §8 archive moves out and may become several files - and a
+# hardcoded path would have left the LANDED rule reading a file with no entries
+# in it: installed, silent, and doing nothing.  scripts/ns_ledger.py finds §0
+# by its heading and the archive by the declaration §0 carries.
 WAIVER = re.compile(r"^\s*no-section-0:\s*(\S.*)$", re.M | re.I)
-ROW = re.compile(r"`([^`]+)`\s*→\s*\*\*([^*]+)\*\*")
 
 
 def git(*args):
@@ -84,12 +93,7 @@ def git(*args):
     return r.returncode, r.stdout.decode("utf-8", "replace")
 
 
-def section_of(text):
-    i = text.find(SECTION_START)
-    if i < 0:
-        return ""
-    j = text.find("\n## ", i + len(SECTION_START))
-    return text[i:j if j >= 0 else len(text)]
+section_of = ns_ledger.section_of
 
 
 def blob(rev, path):
@@ -133,13 +137,36 @@ def main():
     except OSError:
         message = ""
 
-    ledger_staged = LEDGER_REL in files
+    section0, archives, problem = ns_ledger.find(ROOT)
+    if problem:
+        # The layout cannot be read, so rules 2-4 cannot run.  Ordinary commits
+        # still go through - blocking every commit over a documents problem is
+        # how a hook gets uninstalled - but they are TOLD, and any commit that
+        # touches the documents is refused until the layout is legible again.
+        # Discovery reads the working tree, so the commit that fixes the layout
+        # fixes discovery with it and there is nothing to deadlock on.
+        print("ns-commit-guard: CANNOT SEE THE LEDGER -- %s" % problem)
+        if any(f.startswith("docs/") and f.endswith(".md") for f in files):
+            return refuse(
+                "the ledger layout cannot be read, and this commit edits it.",
+                "Rules 2-4 are blind until §0 and its archive can be found, and",
+                "a commit that touches the documents while they are unreadable",
+                "is the one that could exploit that.  The message above says",
+                "what is missing.")
+        print("  (rules 2-4 did NOT run for this commit)")
+        return 0
+
+    ledger_files = set([section0]) | set(archives)
+    staged_ledger = [f for f in files if f in ledger_files]
     non_docs = [f for f in files if not f.startswith("docs/")]
 
-    # --- 1. the ledger never lands alone ---------------------------------
-    if ledger_staged and len(files) == 1:
+    # --- 1. no ledger file ever lands alone ------------------------------
+    # The whole set, not one path: after the split an archive-only commit is
+    # the same defect the ledger-only commit was, and the rule should not have
+    # to be rewritten to say so.
+    if staged_ledger and len(files) == len(staged_ledger):
         return refuse(
-            "%s is the only file in it." % LEDGER_REL,
+            "it contains nothing but ledger file(s): %s." % ", ".join(staged_ledger),
             "A ledger entry is the record of a change, not a deliverable.  On",
             "its own the commit says what moved without saying why, and the",
             "entry claims a measurement with no diff to check it against.",
@@ -150,14 +177,20 @@ def main():
             "the wrong place.")
 
     have_head = git("rev-parse", "--verify", "HEAD")[0] == 0
-    old_ledger = blob("HEAD", LEDGER_REL) if have_head else ""
-    new_ledger = blob("", LEDGER_REL) if ledger_staged else old_ledger
+    old_ledger = blob("HEAD", section0) if have_head else ""
+    new_ledger = blob("", section0) if section0 in files else old_ledger
     old_sec, new_sec = section_of(old_ledger), section_of(new_ledger)
     section_moved = old_sec != new_sec
 
     # --- 2. a LANDED / FIXED / RULED entry must move §0 -------------------
-    code, diff = git("diff", "--cached", "-U0", "--", LEDGER_REL)
-    landed = ENTRY.findall(diff) if code == 0 else []
+    # Over every archive file, which is why the set is discovered rather than
+    # named: §0 and the entries need not share a file, and after the split they
+    # will not.
+    landed = []
+    for path in sorted(archives):
+        code, diff = git("diff", "--cached", "-U0", "--", path)
+        if code == 0:
+            landed.extend(ns_ledger.ENTRY_RE.findall(diff))
     if landed and not section_moved:
         waiver = WAIVER.search(message)
         if not waiver:
@@ -185,8 +218,8 @@ def main():
 
     # --- 3. §0's numbers may not be re-pinned on their own ----------------
     if section_moved and not non_docs:
-        old_rows = dict((c, e) for c, e in ROW.findall(old_sec))
-        new_rows = dict((c, e) for c, e in ROW.findall(new_sec))
+        old_rows = dict(ns_ledger.rows(old_sec))
+        new_rows = dict(ns_ledger.rows(new_sec))
         repinned = sorted(c for c in set(old_rows) & set(new_rows)
                           if old_rows[c] != new_rows[c])
         if repinned:

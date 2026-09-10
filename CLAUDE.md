@@ -55,11 +55,19 @@ So:
   everybody runs beats a twenty-minute one nobody does.
 - **`make install-hooks`**, once per checkout. `.git/hooks` is per-checkout and
   a fresh clone inherits nothing, the same trap `.claude/settings.json` carries.
-  It installs a `commit-msg` hook that refuses three things: a
-  `docs/name-resolution.md` that lands alone, a §8 entry marked
-  LANDED/FIXED/RULED that does not move §0 in the same commit, and a §0 whose
-  expected values change while nothing outside `docs/` does. The last one is
-  what stops §0 being re-pinned into agreement with itself.
+  It installs a `commit-msg` hook that refuses three things: a ledger file
+  that lands alone, a §8 entry marked LANDED/FIXED/RULED that does not move
+  §0 in the same commit, and a §0 whose expected values change while nothing
+  outside `docs/` does. The last one is what stops §0 being re-pinned into
+  agreement with itself.
+- **Neither check names a ledger file.** §0 is found by its `## 0. Current
+  state` heading, and the archive by a directive §0 carries:
+  `<!-- ns-archive: docs/<glob>.md -->`, repeatable, relative to the repo
+  root. Undeclared, the archive is the §0 document itself - which holds while
+  that document still carries entry headings, and is REFUSED once it does
+  not, because that is the state where the archive has moved somewhere the
+  checks cannot see. Splitting the archive needs the directive and nothing
+  else.
   Waive the second, visibly, with a `no-section-0: <reason>` line in the commit
   message; `git log --grep=no-section-0` is the audit.
   `python scripts/ns-guard-selftest.py` drives all three through a throwaway
