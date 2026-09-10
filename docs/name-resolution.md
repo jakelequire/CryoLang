@@ -16794,6 +16794,11 @@ against `format`'s 833, while `fmt::printf` and `fmt::eprintf` are ALREADY
 qualified at 711 and 162 sites respectively. It is a signature-and-ABI change
 wearing a rename's clothes. Not taken here.
 
+**Taken in §8.128, where the 27 turned out to be the wrong number.** It is the
+BARE count, and removing a declaration also breaks every call that names its
+module: the surface is 144. The sentence above is right that edit volume says
+nothing about cost, and then quotes an edit volume that was not the surface.
+
 #### A correction to §8.124
 
 §8.124 sizes this work with "`format` alone is 839 of them, and it is a genuine
@@ -16933,3 +16938,99 @@ result that says the retyping is a source-level correction to how a call site is
 SELECTED, not a change to what is emitted for the calls that were already right.
 Had a counter moved, the displacement would not have been total and the printf
 move would have inherited a second problem.
+
+### 8.128 The printf family leaves the intrinsic set, and the hazard it was predicted to have is demonstrated end-to-end - MEASURED AND LANDED 2026-09-10
+
+`printf`, `snprintf`, `fprintf`, `vprintf` and `vfprintf` are no longer
+intrinsic declarations. `printf` is `fmt::printf`; the four with no `fmt` twin
+are `libc::` calls, because inventing `fmt::fprintf`/`fmt::snprintf` would add
+public API whose only content is a forward to the extern already there.
+
+`Vprintf` and `Vfprintf` were the only two of the five that codegen actually
+lowered, and both are gone with their kinds, their arity entries, their emitters
+and their two `get_or_decl_*` declarations. The rest were declarations only.
+
+#### The §8.125 hazard, demonstrated rather than argued
+
+The prediction was that removing the intrinsics stops libc's extern twins from
+being displaced. §8.127 established the sharper form: for the `v*` half, the
+displacement is also what routed the call through the ABI seam. Both halves are
+now shown directly, on Win64, with the intrinsic gone and `libc::vprintf`
+reverted to `void*` for one build:
+
+```
+fmt::printf   a=364902680 b=fmt::printf   a=%d b=%s c=%.2f x=%x
+```
+
+- `%s` printed the format string's own pointer.
+- `fmt::eprintf` in the same program stayed CORRECT, because it forwards through
+  `vfprintf`, which was still typed `va_list`. The two differ by nothing except
+  which extern they reach.
+- The compiler built in that state announced `Compiled -> <garbage>`, because its
+  own progress line goes through `fmt::printf`.
+
+So the order mattered: had this change landed before §8.127, the compiler would
+have shipped garbage output with an exit code of 0 and a green suite, since
+nothing in `tests/` compares the compiler's own stdout. With the retyping in
+place first, all seven paths - `fmt::printf`, `fmt::eprintf`, `fmt::format`,
+`libc::printf`, `libc::fprintf`, and forwarded `vsnprintf`/`vfprintf` - print
+correctly on Win64.
+
+#### The surface was 144, not 27
+
+Reported to the maintainer as 27 while seeking the go-ahead. That was the BARE
+count and it was right; it was the wrong number to answer "how big is this",
+because removing a declaration also breaks every call that names its module.
+`intrinsics::printf` (111), `intrinsics::snprintf` (5) and `intrinsics::vfprintf`
+(1) die with it. **144 sites, 44 files**, and only three of them outside
+`examples/` and `tests/`.
+
+Destination was decided by what a file may depend on, never by its name:
+
+| where | to | because |
+|---|---|---|
+| everything ordinary | `fmt::printf` | the ruling |
+| `stdlib/alloc/heap.cryo` | `libc::printf` | `std::fmt` imports `alloc::allocator`, so fmt here closes an import cycle - a dependency the `format` move created |
+| `tests/tests/projects/**` | `libc::printf` | placeholder mains in resolution gates; `std::fmt`'s module tree would enlarge the population those gates measure |
+
+#### The b1 gate moved, and the golden carries its own control
+
+B1 stayed `0`. Six DENOMINATOR rows rose on `[host:windows]` and
+`[host:windows-gen]` - method visibility checks +172, `resolve_module_qualified_sym`
++89, the type cascade's exact and miss arms +34/+72.
+
+The cause is not a resolution change. Two of the gate's three corpora are
+`examples/09-json-config` and `examples/14-threads`, and routing their printf to
+`fmt::` pulls `std::fmt` into projects that did not import it. Measured on one
+corpus, same compiler, only the destination differing: **`fmt::printf` compiles
+64 modules where `libc::printf` compiles 61.**
+
+The golden proves it without a separate experiment, and proves it twice.
+`[host:windows-ffi]` and `[host:linux-ffi]` both measure
+`tests/tests/projects/ffi_c_import`, the one gate corpus routed to `libc::printf`
+by the table above - and they are the ONLY two of the six sections that did not
+move at all. The four measuring a corpus that gained a module tree each moved by
+exactly seven rows. Two hosts, measured independently, agreeing on which corpus
+was insulated and which were not.
+
+Re-pinned on BOTH hosts, since `--update` speaks only for the host it ran on and
+a Windows-only re-pin leaves Linux to drift silently at whoever runs it next.
+Verified by comparing the sections themselves rather than the diff: the tool
+reorders blocks and reflows its own header, so a 48-line diff was seven real
+rows per changed section and nothing else.
+
+#### Two process notes, because the second one nearly cost a measurement
+
+**No prediction was written before this edit.** One was written before §8.127's,
+which is exactly why that change's null result meant something: "no gate moves"
+was a claim that could have failed. Here the gate moved and the explanation was
+assembled afterwards, which is the weaker order even when the explanation is
+right and measured.
+
+**`docs/stdlib-api.txt` never covered the intrinsic surface.** Removing five
+declarations changed it by zero lines, and `api-index-check` stayed green. That
+zero was checked before it was believed - `atomic_fence`, `ptr_diff` and
+`dirent_name` are absent from the index too, so intrinsics are outside its
+population by construction. The index could not have caught this change, in
+either direction, and it could not have caught the `format` intrinsic's removal
+either.
