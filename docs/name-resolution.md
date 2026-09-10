@@ -16630,3 +16630,85 @@ thirteen only because it was examined closely; counting M4 as one artifact reads
 4 of 10. Prefer `B1 = 0`, which is measured and gated and cannot be re-sliced.
 Of the six surviving artifacts, four are starved, one is never entered, and one
 is the counter that §8.66 puts last by design.
+### 8.125 Handoff: the extern sweep, the C-linkage fix that has no population, and what the `format` move inherits - 2026-09-09
+
+Three threads a successor would otherwise re-derive. The first two are finished
+and only need reading; the third is a warning for work that has not started.
+
+#### The `extern "C"` signature sweep: DONE, and empty
+
+Measured by SOURCE rather than by build, because discovery is import-driven and
+an extern block nothing imports is never compiled and so never checked.
+
+**910 files, 58 distinct extern C symbols, 61 declarations, ZERO real
+conflicts.** Full detail in §8.122. The two apparent hits are both non-hits:
+`cf_dup_sym`, the deliberate conflict in the `W0011` negative test - which is
+the sweep's CONTROL, since an instrument that missed it would report a
+meaningless zero - and `main` in `runtime/core/src/entry.cryo`, declared twice
+under mutually exclusive `no_runtime` config gates.
+
+A first pass also flagged `_popen` by comparing the live `ffi/libc.cryo` against
+a STAGED RELEASE under `dist/`, which is gitignored. An instrument walking the
+filesystem sees artifacts the compiler never does; exclude `dist/`.
+
+#### The C-linkage conflict fix: do NOT build it
+
+The proposal was to make a second registration of a bare C-linkage name under a
+conflicting signature an error rather than an order-dependent silent pick.
+**Its population is empty, and it was empty before any of this started.**
+
+`W0011_DUPLICATE_EXTERN_SYMBOL` already reports exactly that condition. It
+suppresses on structurally-identical signatures - function types are interned
+structurally, so a byte-identical redeclaration shares the first claimant's
+`TypeRef` id - and stays deliberately silent when an intrinsic or a regular
+function owns the slot, because that shadowing is intentional. So the condition
+is not silent and there is no third diagnostic to design.
+
+What remains is a SEVERITY question only: a genuine ABI hazard is reported as a
+warning, and which declaration wins is still decided by registration order.
+Promoting it would cost a new error code for zero observed cases. Left as a
+decision, deliberately not taken.
+
+**Does namespacing the intrinsics subsume it? No - the populations are
+disjoint.** Live `stdlib/core/intrinsics.cryo` contains **zero `extern "C"`
+blocks**; intrinsics use the `intrinsic function` form. The sweep's population
+therefore never contained an intrinsic, and namespacing cannot change it by a
+single declaration. Extern-vs-extern survives namespacing untouched - it is
+simply already empty.
+
+#### What the `format` / `printf` move inherits, and the hazard in it
+
+The ruling is explicit qualification with nothing added to the prelude:
+`fmt::format`, and the `printf` family as `fmt::printf`. Two measured facts
+shape the work.
+
+**`fmt::printf` ALREADY EXISTS** (`stdlib/fmt/_module.cryo`), taking
+`(fmt: string, args...) -> i32`. **`fmt::format` does NOT** - `stdlib/fmt` has
+only `format_to_string` and `format_debug_to_string`. So one of the two
+destinations must be written and the other must not be duplicated. A
+near-duplicate is worse than an imperfect call.
+
+**Size:** `format` alone is **839** bare call sites of the ~1,091 across 100
+files; the rest of the intrinsic surface accounts for ~252, led by `panic` 44,
+`free` 17, `malloc` 10.
+
+**The hazard, stated as a prediction to test rather than as a measurement.**
+Today a bare `printf` does not reach `ffi::libc`'s `extern "C"` twin, and the
+mechanism is `DeclarationIndex::register_intrinsic_function_type`: when an
+intrinsic claims a leaf it DROPS every UNOWNED overload - owner 0, which is what
+an extern twin is - while OWNED same-leaf regular functions such as
+`fmt::printf` keep their entries and coexist by owner identity.
+
+Remove `printf`, `fprintf`, `snprintf`, `vprintf` and `vfprintf` from the
+intrinsic set and nothing displaces libc's unowned twins any more. A bare
+`printf` may then bind `libc::printf`, whose Cryo signature is `(u8*, ...)`
+rather than `(string, args...)`. **Check this before assuming the move is
+mechanical**; it is the same class of defect the topo-sort edge was originally
+written to prevent, and that edge is now deleted (§8.122) because the intrinsic
+displacement made it redundant. Removing the displacement for these leaves
+removes the reason the edge was safe to delete FOR THEM. `malloc`, `free` and
+`realloc` stay intrinsics and are unaffected.
+
+Three of the nine contested leaves - `printf`, `fprintf`, `snprintf`, plus
+`vprintf`/`vfprintf` - stop being contested by this move, for the good reason:
+the intrinsic declaration goes away, so no contest is held.
