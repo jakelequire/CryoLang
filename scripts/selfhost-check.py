@@ -92,6 +92,34 @@ def target_triple(exe, runner=None, env=None) -> str:
         sys.exit("selfhost-check: `version --triple` returned nothing from "
                  f"{exe}; the pinned compiler predates it.")
     return out
+def stage_answers(exe, runner=None, env=None):
+    """What a stage compiler says when RUN, or None if it cannot be.
+
+    Every other use of a stage is as the input to a byte comparison, and
+    stage-4 is only ever linked - never executed.  So a stage-4 that cannot
+    start (a bad link, a shared library it can no longer find, a faulting
+    entry) leaves the IR byte-identical and the gate green.  Byte identity is
+    a claim about what stage-3 EMITTED; that the artifact runs is a different
+    claim, and nothing here was making it.
+
+    Compared against stage-3's answer rather than a fixed string: the two are
+    supposed to be the same compiler, so a difference is as much a finding as
+    a refusal to start, and neither needs this script to know a version.
+    """
+    exe = Path(exe)
+    if not exe.exists():
+        return None
+    cmd = (list(runner) if runner else []) + [str(exe), "--version"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                           timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip()
+
+
 STAGE3 = ROOT / "compiler" / "build" / "self" / "s3" / "cryo"      # stage-2 -> stage-3
 STAGE4 = ROOT / "compiler" / "build" / "self" / "s4" / "cryo"      # stage-3 -> stage-4
 S3_LL  = ROOT / "compiler" / "build" / "self" / "s3" / "cryo.ll"
@@ -512,6 +540,7 @@ WIN_S3_EXE = ROOT / "compiler" / "build" / "self" / "win-s3" / "cryo.exe"
 # _compare_ir_trees globs across buckets so it doesn't matter which.
 WIN_S3_IR  = ROOT / "compiler" / "build" / "self" / "win-s3"
 WIN_S4_IR  = ROOT / "compiler" / "build" / "self" / "win-s4"
+WIN_S4_EXE = ROOT / "compiler" / "build" / "self" / "win-s4" / "cryo.exe"
 
 
 def make_windows_stages(runner: list, env: dict) -> list:
@@ -663,11 +692,31 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
         result = ("fail", "windows IR could not be compared")
     elif ok:
         nmods, total = detail
-        print(f"  {C.GREEN}{C.BOLD}✓ FIXED POINT OK{C.RESET}  "
-              f"windows stage-3 and stage-4 produce byte-identical IR")
-        print(f"  {C.DIM}modules:{C.RESET} {nmods}")
-        print(f"  {C.DIM}IR size:{C.RESET} {total:,} bytes")
-        result = ("ok", f"{nmods} modules byte-identical")
+        # Stage-4 has never been run on this arm - and could not have been:
+        # cryo.exe loads LLVM-C.dll and libclang.dll from its own directory,
+        # and the staging call was made for stage-2 and stage-3 only, because
+        # those are the ones a later stage builds with.  Byte-identical IR
+        # says what stage-3 emitted; it says nothing about whether the
+        # artifact it emitted starts.
+        _drop_llvm_dll_beside(WIN_S4_EXE)
+        s3_says = stage_answers(WIN_S3_EXE, runner, env)
+        s4_says = stage_answers(WIN_S4_EXE, runner, env)
+        if s4_says is None:
+            print(f"  {C.RED}{C.BOLD}✗ FIXED POINT BROKEN{C.RESET}  "
+                  f"windows stage-4 IR matches stage-3 but the stage-4 "
+                  f"binary does not run")
+            result = ("fail", "windows stage-4 binary does not run")
+        elif s3_says != s4_says:
+            print(f"  {C.RED}{C.BOLD}✗ FIXED POINT BROKEN{C.RESET}  "
+                  f"windows stage-3 says {s3_says!r}, stage-4 says {s4_says!r}")
+            result = ("fail", "windows stage-3 and stage-4 disagree when run")
+        else:
+            print(f"  {C.GREEN}{C.BOLD}✓ FIXED POINT OK{C.RESET}  "
+                  f"windows stage-3 and stage-4 produce byte-identical IR")
+            print(f"  {C.DIM}modules:{C.RESET} {nmods}")
+            print(f"  {C.DIM}IR size:{C.RESET} {total:,} bytes")
+            print(f"  {C.DIM}stage-4 runs:{C.RESET} {s4_says}")
+            result = ("ok", f"{nmods} modules byte-identical")
     else:
         print(f"  {C.RED}{C.BOLD}✗ FIXED POINT BROKEN{C.RESET}  first differing module: {detail}")
         result = ("fail", f"first differing module: {detail}")
@@ -942,11 +991,24 @@ def main():
             result_ok = False
         elif tree_ok:
             nmods, total_bytes = tree_detail
-            print(f"  {C.GREEN}{C.BOLD}✓ FIXED POINT OK{C.RESET}  stage-3 and stage-4 produce byte-identical IR")
-            print(f"  {C.DIM}IR md5:{C.RESET}  {md5}  {C.DIM}(cryo.ll, {len(s3):,} bytes){C.RESET}")
-            print(f"  {C.DIM}modules:{C.RESET} {nmods}")
-            print(f"  {C.DIM}IR size:{C.RESET} {total_bytes:,} bytes")
-            result_ok = True
+            s3_says = stage_answers(STAGE3)
+            s4_says = stage_answers(STAGE4)
+            if s4_says is None:
+                print(f"  {C.RED}{C.BOLD}✗ FIXED POINT BROKEN{C.RESET}  "
+                      f"stage-4 IR matches stage-3 but the stage-4 binary "
+                      f"does not run")
+                result_ok = False
+            elif s3_says != s4_says:
+                print(f"  {C.RED}{C.BOLD}✗ FIXED POINT BROKEN{C.RESET}  "
+                      f"stage-3 says {s3_says!r}, stage-4 says {s4_says!r}")
+                result_ok = False
+            else:
+                print(f"  {C.GREEN}{C.BOLD}✓ FIXED POINT OK{C.RESET}  stage-3 and stage-4 produce byte-identical IR")
+                print(f"  {C.DIM}IR md5:{C.RESET}  {md5}  {C.DIM}(cryo.ll, {len(s3):,} bytes){C.RESET}")
+                print(f"  {C.DIM}modules:{C.RESET} {nmods}")
+                print(f"  {C.DIM}IR size:{C.RESET} {total_bytes:,} bytes")
+                print(f"  {C.DIM}stage-4 runs:{C.RESET} {s4_says}")
+                result_ok = True
         else:
             print(f"  {C.RED}{C.BOLD}✗ FIXED POINT BROKEN{C.RESET}  "
                   f"linked cryo.ll matches but per-module IR differs; "
