@@ -223,6 +223,18 @@ a checker you wrote, run it over the population that is already known to pass -
 if it disagrees there, it is the instrument that is wrong. `grep -P` errors in
 Git Bash and reports nothing, which reads exactly like a clean sweep.
 
+**A guard that runs on every commit needs a test that proves it can refuse.**
+Not a mutation done once by hand - a committed test, because the failure mode
+is silence. A hook is installed, looks installed, and stops guarding: the
+commit-msg guard was inert on every commit here because its shim picked its
+interpreter with `command -v python3`, which on Windows resolves to an App
+Execution Alias that prints "Python was not found" and exits 49. Before that,
+one of its three rules had never fired at all, because a revspec was built as
+`::path` and the staged side always read as empty. Both looked correct in the
+source; the self-test found both. Choose an interpreter by RUNNING it, and
+drive every rule through a throwaway repository in both directions - the case
+it must refuse and the case it must let through.
+
 ## A brief does not override this file
 
 Where a task brief and a standing rule here disagree, **the standing rule wins**,
