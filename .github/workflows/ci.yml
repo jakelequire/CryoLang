@@ -120,11 +120,16 @@ jobs:
       - name: Freestanding runtime acceptance (linux arm; windows needs wine)
         run: make verify-freestanding ARGS=--allow-skipped-arm
 
-      - name: Run the test suite (tests/ via cryo test)
-        run: make test
+      # `make test-census`, not `make test`.  The runner reports a zero the
+      # same way it reports success - silently - so an exit code cannot tell a
+      # suite that ran the whole corpus from one that ran none of it.  The
+      # census streams the same output and then reconciles what ran against
+      # the roster golden roster-check pinned two steps ago.
+      - name: Run the test suite, with the suite counts asserted
+        run: make test-census
 
       - name: Run the test suite at -O0 (catch opt-level-dependent miscompiles)
-        run: make test ARGS="--opt-level=0"
+        run: make test-census ARGS="--opt-level=0"
 
       # docs/name-resolution.md §7.2 mechanism 3. The resolution cascade grew
       # for years because nobody could see it growing; this makes a regrown
@@ -285,6 +290,7 @@ jobs:
     name: windows native (build + test on windows-latest)
     runs-on: windows-latest
     # Independent of the Linux `build` job (different host); runs in parallel.
+    #
     # NOTE (partially validated): this job was authored without a Windows runner
     # to test against and still needs iteration before it is made a required
     # check. Settled so far: the toolchain now comes from the runner's MSYS2
@@ -294,6 +300,20 @@ jobs:
     # LLVM-C import-lib synthesis tool names passed to fetch-windows-llvm.sh.
     # The cross-build `windows-smoke` job above stays as the always-green
     # Windows gate until this one is proven.
+    #
+    # WHAT IS DELIBERATELY NOT HERE, and why - so the next person does not have
+    # to re-derive it:
+    #   lane-check, api-index-check  source-derived and host-independent. The
+    #                                same tree gives the same answer, so a
+    #                                second host adds cost and no signal.
+    #   verify-freestanding          a bash script, and this job drives make
+    #                                through cmd. Its Windows arm runs from a
+    #                                developer's WSL, not from here.
+    #   lsp-check, examples          real Windows coverage, but both are a full
+    #                                build for a surface the Linux job already
+    #                                covers at source level. Add them when this
+    #                                job is trusted enough to be required.
+    #   vendor-check                 needs libclang on the runner; not staged.
     timeout-minutes: 60
     defaults:
       run:
@@ -404,12 +424,34 @@ jobs:
           ./compiler/build/cryo.exe --version
           ./compiler/build/cryo.exe --help
 
-      - name: Run the test suite (tests/ via cryo test)
+      - name: Run the test suite, with the suite counts asserted
         env:
           CRYO_CC: gcc
-        run: make test
+        run: make test-census
 
       - name: Run the test suite at -O0 (catch opt-level-dependent miscompiles)
         env:
           CRYO_CC: gcc
-        run: make test ARGS="--opt-level=0"
+        run: make test-census ARGS="--opt-level=0"
+
+      # The two gates that can ONLY be checked here.
+      #
+      # b1-baseline.txt carries six sections - three per host - and b1-gate
+      # asserts the sections for the host it runs on.  CI ran it on Linux and
+      # nowhere else, so half the golden was pinned by nothing: the three
+      # [host:windows*] sections could drift, or be re-pinned by hand, with no
+      # run anywhere able to notice.  A `--update` on either host rewrites only
+      # its own sections, which is what makes the other half go quietly stale.
+      #
+      # roster-check waives a golden entry gated to another OS, so the Windows
+      # entries are excused on Linux by design.  Only a Windows run asserts
+      # that Windows discovery still finds them.
+      - name: Assert the discovered test roster matches the committed golden
+        env:
+          CRYO_CC: gcc
+        run: make roster-check
+
+      - name: Assert the B1 bucket matches its golden (the windows sections)
+        env:
+          CRYO_CC: gcc
+        run: make b1-check

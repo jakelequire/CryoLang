@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list roster-check b1-check lane-check lsp-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census roster-check b1-check lane-check lsp-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -181,6 +181,7 @@ help:
 	@echo "                         Windows host: native cryo.exe pre-check + the"
 	@echo "                         Linux 6-stage chain via WSL."
 	@echo "  make test              Run the repo-level test suite (tests/) via cryo test"
+	@echo "  make test-census       Same run, with the suite COUNTS asserted"
 	@echo "  make test-list         List the discovered test cases without running them"
 	@echo "  make b1-check          Pin the B1 fuzzy-fallback bucket against its golden"
 	@echo "  make lane-check        Pin the resolution-lane surface against its golden"
@@ -497,6 +498,9 @@ test-list: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
 roster-check: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
 	@python scripts/roster-check.py "$(STAGE2_EXE_WIN)" $(ARGS)
 
+test-census: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A) runtime-tiers
+	@$(PYTHON) scripts/test-census.py --cryo "$(STAGE2_EXE)" $(ARGS)
+
 b1-check: $(STAGE2_EXE) $(LIBCRYO_A) runtime-tiers
 	@python scripts/b1-gate.py "$(STAGE2_EXE_WIN)" $(ARGS)
 
@@ -514,6 +518,15 @@ test-list: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 # ("0 of 0 failed" is a pass).  Re-pin deliberately with ARGS=--update.
 roster-check: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 	@python3 scripts/roster-check.py "$(STAGE2)" $(ARGS)
+
+# `make test` with the counts asserted.  The runner reports a zero the same way
+# it reports success - silently - so an exit code cannot tell a suite that ran
+# everything from one that ran nothing.  This runs the same suite, streams the
+# same output, and then reconciles what ran against the roster golden.  Use it
+# wherever the run is being taken as evidence; `make test` stays for the
+# working loop, where a pattern filter is the point.
+test-census: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
+	@python3 scripts/test-census.py --cryo "$(STAGE2)" $(ARGS)
 
 # Golden-file gate on the B1 "fuzzy fallback" bucket (docs/name-resolution.md
 # §7.2 mechanism 3).  The nine-step resolution cascade grew for years because
