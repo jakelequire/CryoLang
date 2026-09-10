@@ -251,6 +251,12 @@ touching the same area.
   clone.
 - Copy the compiler out of the build tree before running it as an instrument,
   or it hits `ETXTBSY` overwriting itself.
+- **Build artifacts do not switch branches with you.** `stdlib/.bin/<triple>/`
+  and `compiler/build/` are gitignored, so they survive a `git checkout` and
+  still hold whatever the *other* branch's sources produced. `make cryo`
+  rebuilds them from wherever you were standing. After switching branches, run
+  `make stdlib && make cryo` before believing any result — a stale archive
+  reads exactly like a regression, and a green run over it means nothing.
 - Module discovery is **import-driven**: a file nothing imports is never
   compiled, so a test project can silently exercise nothing.
 - cryoconfig keys are `project_name` / `entry_point` / `source_dir`.
