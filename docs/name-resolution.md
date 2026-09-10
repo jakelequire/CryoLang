@@ -880,6 +880,24 @@ import paths.
 
 ### 8.1c Function visibility, wired — and the second binder it exposed (2026-08-04)
 
+> **BOTH CONCLUSIONS WRONG - §8.1d - and the door count was wrong too - §8.1e.**
+> The wiring landed; the reasoning built on top of it did not survive.
+>
+> * **§8.1d.** The two conclusions this entry drew from D-A ("503 events, 19
+>   pairs, all compiler-synthesized") are both wrong. In particular the
+>   third-door evidence does not exist: this entry reasoned that 8 modules call
+>   `find_best_candidate` bare while none imports `Compiler::Diag::EditDistance`,
+>   so some further path must type such a call. Re-checked against the tree there
+>   are **6 files with 7 bare calls, and all 6 import `EditDistance`** - five
+>   through multi-line brace lists the scan could not see. What this entry called
+>   a cheaper independent path is the ambient cursor inside the binder it said
+>   the cursor was not in.
+> * **§8.1e.** There is not ONE door to a cross-module `private` call, as
+>   described here, but **three** - a written qualified path (never audited at
+>   all), the bare binder's single-overload fast path, and the classifier.
+> * **§8.1f** landed the gate and records that the fix was real "just not in the
+>   direction §8.1c guessed".
+
 §8.1b's caveat said the measured "0 rejected for non-public" meant *visibility
 is largely never recorded*, and listed wiring it as step 3. Wiring it produced
 a more interesting result than the count it was meant to fix.
@@ -3194,6 +3212,23 @@ it carried no construction-site column. §8.2u builds it.
 
 ### 8.2u The gate's rejections are 88% the caller's cursor — MEASURED 2026-08-07
 
+> **A SNAPSHOT, and its coordinates are stale.** The classification here - that
+> almost no would-be rejection is a name its use site actually wrote - is the
+> durable part. Two cautions before reusing the figures:
+>
+> * **The site coordinates cannot be followed.** The five
+>   `sema/call_resolver.cryo` line numbers cited below (`:3741`, `:3548`, `:220`,
+>   `:3454`, `:4964`) are from 2026-08-07. That file has been rewritten
+>   repeatedly since - §8.114 alone reworked the abbreviated-qualifier check in
+>   it - so the numbers point at whatever now occupies those lines. Locate the
+>   sites by what they do, not by where they were.
+> * **The cursor has since been measured at a different scale and re-diagnosed.**
+>   §8.105 measures the ambient qualifier being handed an already-qualified name
+>   **206,678** times; §8.109 finds `current_module` was not preserved by
+>   ordering but was **self-perpetuating**, and overturns the verdict inherited
+>   about it. Neither re-runs THIS entry's instrument, so nothing here is
+>   asserted to be refuted - but do not treat these percentages as current.
+
 `resolve_qualified_scoped` now takes `origin_file`, `origin_line` and `origin`
 alongside `use_site_ns`, on the reasoning that made `home_origin` required: a
 namespace is only as good as the caller's claim about it, and the claim is not
@@ -4731,6 +4766,25 @@ fire on two deliberate sema probes. Hanging it on the annotation node instead
 is `NamedAnnotation`'s row of §6.3, still unfilled.
 
 ### 8.2ak The annotation stamp lands write-only: 87% covered, and the hard case is 4 names — MEASURED 2026-08-11
+
+> **PREMISE FALSIFIED by §8.38; the conclusion was later REINSTATED by §8.26.**
+> Read both before using anything here.
+>
+> * **The import-cycle account is wrong.** This entry classified 106 of its 333
+>   unstamped annotations as an ordering casualty - "the export table is filled
+>   in module processing order, so a module whose declarer has not been walked
+>   yet cannot be answered" - and made that the question gating any `Pending`
+>   ICE. §8.38 shows the resolver does not fill its export table during the walk
+>   that reads it, and has not since `c5e7c434`, **the day after this entry was
+>   written**. The population it names does not exist.
+> * **The primitive conclusion survives.** §8.2al appeared to overturn this
+>   entry's reading of written primitives; §8.26 measured §8.2al's population as
+>   gone, superseded it, and explicitly reinstated this entry's conclusion,
+>   which is implemented as `Res::PrimTy`.
+>
+> §8.39 names this entry as its example of the cost: a plausible structural
+> story attached to a real measurement rode three weeks of handoffs before
+> anyone checked the mechanism.
 
 `NamedAnnotation` now carries `res: Res`, filled by `NameResolver::stamp_annotation`
 walking the annotation tree from every visitor that holds one. **Nothing reads
@@ -7272,6 +7326,17 @@ figures here exceed the ones in 8.27 for populations that did not change.
 
 ### 8.29 The codegen impl-target cascade cannot read the stamp - MEASURED, NOT MIGRATED 2026-09-01
 
+> **CORRECTED, §8.30: the ratchet does not move, and this entry was wrong to
+> expect it to.** A handoff written beside this one said de-duplicating the
+> block would move `lane-check` and need a re-pin. It does not. `lane-gate.py`
+> counts calls to the five per-kind lookups, and this entry had already removed
+> the only one in the block when it deleted the declaration-index step; the four
+> lines left contain none. Measured before and after: LOOKUP 127 (20 files),
+> REENTRY 6 (5 files), unchanged, no re-pin. The general point is §7.2's - the
+> ratchet pins a NAMED SURFACE, not "code that looks like resolution", so
+> predicting it will move because a call site changes file is predicting from
+> the shape of the change rather than from what the gate measures.
+
 Two sites re-derive an impl block's target NAME rather than its type:
 `codegen/ops/declaration_emitter.cryo` and `codegen/visit/decl_visit_emitter.cryo`.
 They are verbatim mirrors, and one says so in a comment. Each is a five-way
@@ -7898,6 +7963,30 @@ and the stamp is answered 33322 of 33323 times on the compiler's own source.
 There is no ordering blocker left for those sites to be gated on.
 
 ### 8.39 Three decisions: the stamp is authoritative, Function folds into Value, modules bind in the type namespace 2026-09-02
+
+> **STATUS of the three, checked against the tree rather than against later
+> entries.** They have not travelled together and should not be read as one
+> settled block.
+>
+> 1. **The stamp is authoritative - HOLDS,** and is applied as the deciding
+>    rule in §8.41 and §8.44.
+> 2. **`Namespace::Function` folds into `Namespace::Value` - NOT DONE.**
+>    `compiler/src/compiler/resolver/namespace_kind.cryo` still declares three
+>    variants, and `Namespace::Function` still carries its own `accepts` arm
+>    over `Function`/`Method`/`Intrinsic`. Nothing in §8.40-§8.133 records this
+>    being taken or withdrawn; it is simply outstanding.
+> 3. **Modules bind in the type namespace - DONE, then SUPERSEDED.** Built in
+>    §8.68, and `Namespace::Type` accepts `SymbolKind::Namespace` in the tree
+>    today. But the rule this entry records for the resulting contest - "module
+>    wins in qualifier position" - is no longer the target. **§8.130 carries
+>    Jake's ruling: namespaces and types share a SINGLE namespace, so a module
+>    and a type can never carry the same name, and the collision is an ordinary
+>    redeclaration error at the point of declaration.** There is no
+>    adjudication rule left to state.
+>
+> §8.55 separately removed a justification this entry leaned on: the collision
+> backlog it was partly chosen to clear is **empty** (Shape B, 0 of 319), and
+> §8.55 traces how that wrong cause propagated into here.
 
 #### 1. A `Res` stamp is AUTHORITATIVE, not advisory
 
@@ -8825,6 +8914,16 @@ At 86.8% coverage a retarget can only be that hybrid - unless the residual
 collapse 2c; not collapse 2c behind a fallback.
 
 ### 8.52 The remaining unstamped annotations were never offered to the stamper - MEASURED 2026-09-02
+
+> **THE READING IS WRONG FOR 92% OF THE RESIDUE - §8.59.** This entry concluded
+> the residue is minted AFTER the pass, on the strength of `STAMP-DECLINE`
+> being 0. §8.59 measured the offer stream and found it is §8.51's defect class
+> instead: written syntax the pass could visit and does not - five of the six
+> visitors walk past type syntax that has a span, a slot, and a file the pass is
+> standing in. **A zero decline count says only that the stamper refused
+> nothing; it cannot separate "refused" from "never presented",** and that is
+> the reusable half. §8.58 records four predictions falsified on the way, and
+> §8.59 and §8.60 carry the fix.
 
 8.51 closed the largest stamping gap and left 13.2%. Two hypotheses about the
 residue were formed and both were wrong before anything was changed, which is
@@ -10050,6 +10149,22 @@ reach it, which is what makes it testable rather than assumed.
 
 ### 8.64 What the cascade is now: two steps and a 101-row tail - MEASURED 2026-09-03
 
+> **TWO ZEROS HERE ARE CORPUS FACTS, NOT STRUCTURAL ONES - §8.87 and §8.88.**
+> Both were written as "by construction", which is exactly the phrasing that
+> stops anyone re-measuring.
+>
+> * **`2c-home-cursor` - §8.87.** This entry says there is "no longer a path by
+>   which the ambient cursor supplies the module". `HomeOrigin::Cursor` is
+>   written at two live sites, `mono/ast_resolver.cryo` and `sema/sema.cryo`.
+>   The path exists; the corpora do not exercise it.
+> * **The primitive step - §8.88.** This entry recorded `resolve_named`'s
+>   primitive step at 0 on every corpus and gave a reason for it. §8.88 measured
+>   the step as starved by **two** different mechanisms and found this entry
+>   named the smaller one; its account of the substituter's mints all carrying a
+>   valid `pre_resolved` is why the number predicted here and the number
+>   measured there differ. The deletion this entry pointed toward is DECLINED in
+>   §8.88.
+
 With 2c reading the stamp, `resolve_named`'s answers were re-taken over all 57
 corpora. This is the payoff figure for the migration, and it is taken over every
 corpus rather than the one this work is developed against.
@@ -10216,6 +10331,34 @@ section.
 
 ### 8.66 Scope and sequence: the old model goes entirely 2026-09-03
 
+> **STATUS: the scope stands; the inventory, the ordering and the closing
+> paragraph do not.** Four corrections, each measured elsewhere in this
+> document and re-checked against the tree before being pointed at here.
+>
+> * **"Everything from the old model goes" is not the inventory - §8.120.** M1
+>   is a guard the new model requires and M2 *is* the new model, so neither
+>   belongs in what goes. Counting M1/M2 in inflated the denominator AND
+>   pointed demolition at load-bearing code. Use §8.120's NAMED list of
+>   artifacts, not its total - see the correction on that entry.
+> * **The order below is wrong about item 3 - §8.67, whose reason is itself
+>   corrected by §8.74.** The sequence §8.67 argued for is what happened: the
+>   qualifier change landed in §8.74, AFTER decision 3's step 4 (§8.73), not
+>   second. Decision 3's steps 1-4 have all landed - §8.67, §8.68, §8.70,
+>   §8.73, §8.74. **Do not carry §8.67's reason for the ordering.** It rested
+>   on "there is no spelling of the module, then the type that resolves today";
+>   §8.74 measured **110** such spellings in code and showed with a negative
+>   control that a plain `import` DOES make a module's own leaf usable as a
+>   qualifier for its free functions. The order is right, the argument for it
+>   is not.
+> * **The last item has already arrived once, early - §8.121.** B4 retired with
+>   the leaf index, needing no replacement, because the lane that was its only
+>   summand was gone. So "B1/B4 catch a fuzzy fallback or an instantiation key
+>   returning" now reads B1 alone: in the tree `B4` survives in
+>   `scripts/b1-gate.py` and `tests/b1-baseline.txt` only as a comment recording
+>   that it retired, and in `resolve_counter.cryo` not at all.
+> * **Retiring the counter does not retire `lane-check` - §8.80.** See the
+>   blockquote under "Why the counter is last" below.
+
 Three questions parked across §8.47, §8.56 and §8.57 are answered, and the scope
 of the migration is settled with them. Recorded here because the sequence that
 follows is not derivable from any measurement in this document, and because the
@@ -10286,6 +10429,27 @@ with the evidence, not worked around.
 
 #### Why the counter is last, and what it costs
 
+> **CORRECTED, §8.80, and re-measured here.** Three things in the paragraph
+> below are wrong or stale.
+>
+> * **`lane-check` does not die with the counter.** `scripts/lane-gate.py` is a
+>   source scanner: it regex-matches call sites under `compiler/src` and reads
+>   no counter, needs no compiler, no stdlib and no link. `tests/lane-baseline.txt`
+>   contains **zero** rows from `resolve_counter.cryo`, and both `LOOKUP` and
+>   `REENTRY` are its buckets, not the counter's. Deleting the counter leaves
+>   the ratchet against a new lookup lane appearing untouched. The guarantee
+>   that actually needs replacing is `b1-check`'s alone - that gate does parse
+>   the counter's report.
+> * **The line count is stale.** 1,615 when written; **1,931** today. Read it
+>   off the file, not off this sentence.
+> * **The reason given is the weaker one.** §8.80 supplies the better one: the
+>   call-volume half of the counter's guarantee is transitional by construction.
+>   Once the lanes it counts are deleted, every row goes structurally zero and a
+>   golden of zeroes asserts nothing. The counter cannot be retired before the
+>   lanes, and needs no replacement for its readings after them. What outlives
+>   the lanes is the other half - the ABSENCE of answers - and §8.80 shows that
+>   absence has two failure modes needing two different instruments.
+
 `resolve_counter.cryo` is 1,615 lines, and retiring it retires `lane-check` and
 `b1-check` with it. Those two ratchets are what made every deletion in this
 project safe: `LOOKUP` and `REENTRY` catch a per-kind lookup or a resolver
@@ -10303,6 +10467,23 @@ Named here so it arrives as the planned final item rather than as a surprise at
 the end.
 
 ### 8.67 Decision 3 step 1: a module has an identity - MEASURED 2026-09-03
+
+> **TWO CLAIMS FALSIFIED, §8.74, both re-measured with a negative control.** The
+> ORDERING this entry argued for is what happened - the qualifier change landed
+> in §8.74, after step 4 (§8.73) - but do not carry the reasons given for it.
+>
+> * **"There is no spelling of the module, then the type that resolves today"** -
+>   there are **110** in code. `CLI::Runner::new(...)` is module, then type,
+>   then method, sixteen times.
+> * **"A plain `import` binds a module's exports and never the module's own
+>   name"** - measured on scratch projects with a negative control:
+>   `import Scratch::my_mod;` then `my_mod::add(1, 2)` compiles AND RUNS;
+>   removing only the import gives `error[E0233]`. A module's own leaf IS usable
+>   as a qualifier for its free functions.
+>
+> §8.74 notes both were generalised from a single module. The second one
+> mattered: had it been true, the rename would have left those call sites with
+> no valid spelling at all.
 
 8.57 scoped decision 3 in five steps and said plainly that nothing in it was
 built. Step 1 is built here, alone and verified alone, because the plan is
@@ -10444,6 +10625,19 @@ and 38 projects.
 
 ### 8.69 Decision 3 step 3: the duplicate module scopes are a dead save path - MEASURED, NOT TAKEN 2026-09-03
 
+> **SUPERSEDED, §8.70: the workaround was the defect.** Both of the routes this
+> entry measured dead were attempts to make save/restore of module scopes WORK.
+> §8.70 discards the premise instead: a module scope is not a rib. Ribs - bodies,
+> blocks, generic parameter lists - are transient and a stack is right for them;
+> a module scope is a persistent node built once, keyed by identity, and alive
+> for the whole compilation, so nothing is ever unset and there is nothing to
+> save or restore. The save/restore machinery is deleted there, and
+> `ModuleGraph.module_scope_buf`/`_cap` - which this entry found had zero
+> callers - go with it.
+>
+> The measurements below stand; read them as evidence for that conclusion rather
+> than for the step this entry declined to take.
+
 Step 3 is "give the module symbol its scope, so `find_module_scope`'s multimap
 and its tie-break can be replaced by identity". Two implementations were
 predicted and both measured wrong. What they bought is the shape of the real
@@ -10527,6 +10721,23 @@ because the two dead predictions cost a build each and the next attempt should
 not repeat them.
 
 ### 8.70 A module scope is not a rib: one scope per module, and the save/restore machinery deleted - MEASURED AND FIXED 2026-09-03
+
+> **THE RULE STANDS; ONE COUNT IN IT DOES NOT - §8.71 and §8.78.** This entry
+> said four of the six `set_module_with_scope` callers are free collapses.
+> §8.71 corrected that to none. **§8.78 measured and found both readings wrong**,
+> and records why: each came from the SHAPE of the call sites rather than from
+> their guards. The six are two different operations, not one - `enter module m`
+> and a genuine save/restore - and §8.78 splits them and gives the two halves
+> two names.
+>
+> §8.78 also credits this entry with something it did not claim: `find_module_scope`
+> became a single map read that returns 0 for a module nobody entered and creates
+> nothing, **in this same commit**. That closed §8.71's stated API gap a day
+> before §8.71 declared it open, and nobody noticed.
+>
+> §8.87 separately found two comments in `resolver.cryo` still asserting the
+> model this entry replaced, sitting directly above the docstring that
+> contradicts them; both are corrected there.
 
 8.69 recorded two dead predictions about the duplicate module scopes, and both
 were attempts to make save/restore work. The workaround was the defect.
@@ -10675,6 +10886,19 @@ emitted rows only under `CRYO_PATH_AUDIT`.
 
 ### 8.71 What decision 3 step 4 actually costs, and why the leftover call sites are not free - MEASURED 2026-09-03
 
+> **CORRECTED TWICE, §8.73 and §8.78.**
+>
+> * **§8.73** corrects this entry's sizing and its account of the seam, both
+>   from reading the calls rather than counting them - and notes that this
+>   entry's own closing line names the failure it then repeated.
+> * **§8.78** finds this entry's API gap was **already closed by §8.70, and
+>   nobody noticed**. This entry ended "collapsing needs a way to ask whether a
+>   module was entered"; that ask was available with the guard KEPT rather than
+>   removed. §8.78 also records that §8.70 called four of six sites free
+>   collapses and this entry corrected that to none - and that both were wrong.
+> * **§8.77** records the "leave it to the caller" outcome this entry predicted
+>   for `home_module` as one it was wrong about.
+
 8.57 step 4 is one line - "re-key the five string callers onto the symbol" - and
 it reads like a five-site edit. Measured before starting it, it is not, and the
 call sites 8.70 described as collapsible are not collapsible either. Both are
@@ -10724,6 +10948,20 @@ their shape rather than from their guards. The count of callers is not a
 description of them.
 
 ### 8.72 `import` binds a type's leaf, so the qualifier change is a rename and not a path rewrite - MEASURED 2026-09-03
+
+> **THE FINDING HOLDS, THE SIZING DOES NOT - §8.74.** Re-measured there:
+>
+> | | this entry said | measured |
+> |---|---:|---:|
+> | `namespace` declarations colliding with a type they declare | 75 | **76** |
+> | `import`/`export` lines naming one | 282 across 114 files | **496 across 138 files** |
+> | module-qualified free-fn/const call sites | not measured | **132 across 13 files** |
+>
+> The third row changes the shape of the work. "The call sites do not move" is
+> true of `Leaf::Member` where `Leaf` is a TYPE; ten of the 76 modules also
+> declare FREE functions, which are called through the MODULE's leaf, and
+> **those move**. §8.74 is where the change actually landed, and it takes all
+> 165 `compiler/src` namespaces rather than the 76 that collide.
 
 8.56 framed dropping the qualifier shorthand as source-breaking across 3,018
 call sites, and 8.67 measured that no alternative spelling of "the module, then
@@ -14245,6 +14483,23 @@ and 11 are not lane sites at all.
 
 ### 8.102 The bare-leaf step is dead in five of eight cascades and is not a fallback in the other three - MEASURED 2026-09-05
 
+> **THE DECLINED FIFTH GROUP IS NOW ZERO, and the two instrument defects are
+> one - §8.103 and §8.112.**
+>
+> * **`canonical_type_ref` no longer answers.** This entry declined it at 10 in
+>   2,662, "small but not zero, so deleting it changes what some program
+>   compiles to". §8.103 traced those ten to a **doubled qualification** - not a
+>   widening case to be preserved - and §8.104 fixed it; §8.112 then re-measured
+>   rather than inferring, and the step answers **0 of 2,652**. Deleting the
+>   step was the wrong fix throughout; qualifying an already-qualified name once
+>   was the right one.
+> * **The two instrument defects are one - §8.103.** Both are the same failure:
+>   "an assertion that is not the last command in a chained line is not an
+>   assertion", cited earlier in the same session and then not applied to the
+>   next command composed in it. The edit failed silently, the build succeeded
+>   on unchanged sources, and the measurement that followed was taken on a
+>   binary that did not contain the instrument.
+
 8.101 found the raw index surface is half cascade, and that the bare-leaf last
 step - a written name reaching the index with no resolver answer - is the actual
 defect rather than the receiver. Whether it can be deleted is a question about
@@ -16191,6 +16446,30 @@ one of them.
 
 #### Two metrics, and the honest numbers
 
+> **THE DENOMINATOR BELOW IS NOT RECONSTRUCTIBLE EITHER, and the numerator is
+> now stale.** This is the paragraph a reader is most likely to quote for "how
+> far along is the migration", so both halves are corrected here rather than
+> left to be rediscovered.
+>
+> * **"Twelve" does not follow from its own list.** The list reads: type-cascade
+>   steps 2/3/4, the leaf index's two callers, M4's scan and its two pre-exits,
+>   M4's tie-breaks, M5's suffix fallback, `lookup_scope_template_derived`,
+>   `resolve_named` steps 5b/6, and `resolve_counter.cryo`. Counted as separate
+>   artifacts that is **14**; counted by the phrase-units the sentence is built
+>   from it is **9**; treating `resolve_named` 5b/6 as one item gives **13**. No
+>   grouping tried yields 12. That is the same defect this entry raises against
+>   the audit's fourteen one paragraph earlier - and 14 is, notably, the number
+>   it rejected. Use the named list, never the total.
+> * **"5 of 12 by source removed" predates §8.121.** The global leaf index and
+>   its callers were deleted there, so at least one more of the named artifacts
+>   is gone. Verified in the tree: `lookup_by_leaf` no longer exists as a
+>   function - the only surviving mention is a stale doc comment at
+>   `resolve_counter.cryo:1075` that still describes it as live.
+> * **"`lookup_by_leaf` is starved, not dead" is now moot** - see §8.121, which
+>   deleted the lane and made a plural bare leaf E0155. The classification was
+>   correct when written and the entry is kept for that reasoning, not for the
+>   lane's status.
+
 "Machinery deleted" and "old model still answering" are different measurements,
 and the project is much further along on the second.
 
@@ -16233,6 +16512,22 @@ The claim at `resolver.cryo` that the leaf index is load-bearing for circular
 hypothesis that outlived its measurement.
 
 #### Forward pointers
+
+> **ATTRIBUTION CORRECTED.** The quoted sentence "four of the twenty bounds are
+> themselves zero" is **§8.98's**, not §8.96's - it sits under §8.98's "How much
+> it covers, and the second form it needs". §8.96 is the entry that measured the
+> probe entry counts, which is the first half of the bullet and is correct.
+>
+> The substance checks out. `M4PreCalls` and `M4ResCalls` no longer exist in
+> `resolve_counter.cryo` at all; `SpellTyIdCalls` and `SpellTyNewCalls` do, and
+> their rows - `spelling_type call ident: calls` and `spelling_type new expr:
+> calls` - are pinned at 0 on all six arms of `tests/b1-baseline.txt`. So the
+> four are now two, as this bullet says.
+>
+> Note when re-checking this: the golden keys rows by their PRINTED LABEL, not
+> by the `Site::` identifier. Grepping the golden for `SpellTyIdCalls` returns
+> zero and means nothing - it is the wrong population, which is the trap §8.132
+> states as a general rule.
 
 * **§8.2y** measured that a bare plural leaf binds by directory order. That is
   the leaf index's only live population, and §5.1 forbids it. Retiring the lane
@@ -17442,7 +17737,7 @@ result; the migration is kept because it is measured, not because it works.
 
 #### Five positions, and the one taken
 
-Â§8.56 posed two (keep the shorthand, or drop it). Â§8.66 ruled on that pair.
+§8.56 posed two (keep the shorthand, or drop it). §8.66 ruled on that pair.
 The tree had already built a third nobody wrote down - keep it, and refuse the
 ambiguous declaration at the point of declaration. A fourth was available and
 declined: ban a module holding a same-leaf type, whose population is three
@@ -17615,6 +17910,22 @@ says why. That is a guard standing where a destination is needed.
 
 #### A correction to §8.131
 
+> **ATTRIBUTION CORRECTED - §8.131 does not contain this sentence.** The words
+> "never finds anything - it only vetoes" appear nowhere in §8.131, and nowhere
+> in this document except in the quotation below. Checked against the last
+> fifteen commits touching this file: the phrase enters the tree in `b98d1e5d`,
+> which is the commit that ADDED §8.132. §8.131 discusses the qualifier path's
+> registration-order dependence and says nothing about `qualifier_agrees`.
+>
+> The nearest things actually written down are **§8.2ai** - "`qualifier_agrees`
+> produces no answer: its `true` lets stand a binding ... already made" - and
+> **§8.120** - "a check, not a lane ... a guard passing, not a lane starving".
+> Read the correction below as landing on those, or on a reading formed in
+> conversation, rather than on §8.131.
+>
+> **The correction's substance is unaffected and stands.** The population trap
+> it names is the valuable part, and it is independent of who said the sentence.
+
 §8.131 says the written qualifier "never finds anything - it only vetoes", on
 48,457 `qualifier_agrees` calls with zero rejections. The sentence is true of
 the branch those calls come from, and that branch was the WRONG POPULATION to
@@ -17756,3 +18067,475 @@ the leaf either way.
 failing projects only, so a passing project prints nothing at all. `lane-check` unchanged. `lsp-check` 266 modules, 0 errors.
 `cryo-fix` compiles `compiler/` itself - 164 local, 81 std, 0 errors - so the
 new compiler still builds the compiler.
+
+### 8.133 Handoff: the qualifier answers correctly in annotation position and not in call position, and the glob deletion waits on both - 2026-09-10
+
+Four changes landed and pushed to `naming-impl`, which is at `1623324e` and
+GREEN. `main` is untouched at `d8ecf517`. There are no other branches: a side
+branch existed for part of this session and is deleted local and remote, its
+content landed here first.
+
+| commit | what |
+|---|---|
+| `1aeadca8` | `tools/CryoLSP` renamed to snake_case namespaces - the last PascalCase tree |
+| `c130bc10` | `CLAUDE.md`: gitignored build artifacts do not switch branch or host with you |
+| `b98d1e5d` | **a qualified type ANNOTATION is resolved by its qualifier**, §8.132 |
+| `1623324e` | the 6,587-import migration and its generators; globbing kept ON |
+
+`make test` OVERALL PASS - unit ok, 178 compile-fail, 41 projects. `lane-check`
+unchanged. `lsp-check` 266 modules, 0 errors. `b1` re-pinned on BOTH hosts.
+
+#### The job: the qualifier answers in one position and not the other
+
+`b98d1e5d` fixed the ANNOTATION position. The CALL position has the same
+symptom and is not fixed:
+
+| written | annotation | static call |
+|---|---|---|
+| `a::Widget` (first-registered module) | resolves | resolves |
+| `b::Widget` (second) | **fixed** | **E0233** `no matching static method, variant, or type` |
+
+**Is it the same defect?** Same shape, different mechanism, and the distinction
+decides the fix. In both, the name layer computes the right answer and a later
+consumer ignores it. In the annotation case the consumer read the stamp only
+when the spelling had no `::`, so widening one condition fixed it. In the call
+case the consumer never reads the stamp at all: `resolve_scope_call` builds the
+owner key from the WRITTEN STRING, via `resolve_scoped_or_at`. So it is not the
+same edit one layer over - it is a consumer that has no stamp-reading path yet.
+
+There are **three** sites doing it, not one, and they must be handled together
+or they will disagree: `sema/call_resolver.cryo` `resolve_scope_call`,
+`find_static_method_template`, and `check_scope_call_arg_types`.
+
+#### The measurement, and the one population that blocks the obvious fix
+
+Probe on `resolve_scope_call`, one row per non-generic scope call, recording the
+written segment, `resolve_scoped_or_at`'s answer, and the node's `Res`. Over
+`compiler/src`, 42,937 rows:
+
+| | share | meaning |
+|---|---:|---|
+| `TypeRelative`, agree | 55.6% | stamp and string name the same type - switching changes nothing |
+| `Res::Def`, differ | 31.4% | MODULE scopes (`mem`, `fmt`). They fall through to `try_resolve_module_function`, which uses `scope` and not the key, so they are unaffected |
+| **no stamp at all** | **10.5%** | **the blocker - see below** |
+| `TypeRelative`, differ | 2.4% | holds the bug AND the constraint together |
+
+That last bucket is the interesting one. It contains `thread::Scope` ->
+`std::thread::Scope`, where the string path returns **the written abbreviation
+unchanged** - the defect, because a lookup that echoes its input makes refusal
+indistinguishable from success. It also contains `6Result$Lh_h$G` -> `Result`,
+where the STRING is right and the STAMP is wrong: registries key a specialized
+method under its mangled instantiation, and a `Res` names the definition for
+every instantiation of it. Sixteen rows, and using the stamp there would not
+error - it would bind the unspecialized method. A silent wrong bind.
+
+**The discriminator is available and principled.** Sema state carries
+`post_mono_verify`. The rule is: if the scope has generic args OR we are past
+monomorphization, the key is an instantiation and the type layer owns it;
+otherwise the segment names a definition and the stamp owns it. That is
+selection on a property of the node and the phase - not a name-shape test, and
+not a fallback chain.
+
+**What stopped it: the 10.5% with no stamp.** Today those get a working key from
+the string path. Switching leaves them with nothing, and it is not known whether
+they reach the static-method lookup or fall through harmlessly. The failure mode
+if that guess is wrong is a silent wrong bind on a 45,000-call path.
+
+**So the next action is one probe, not a change:** for the rows where the stamp
+is Pending, does `try_resolve_static_method` currently ANSWER with the string
+key? If it does not, they fall through and the switch is safe. If it does, they
+need their own answer before anything moves.
+
+#### The reproducer, which lived in a scratch directory and is written out here
+
+Four files. Build it out of tree with `CRYO_STDLIB` set, using
+`compiler/build/cryo.exe` - never the pin, which cannot show a change you just
+made.
+
+`cryoconfig`: `project_name = "repro"`, `source_dir = "src"`,
+`entry_point = "src/main.cryo"`, `output_dir = "build"`.
+
+```cryo
+// src/a.cryo
+namespace repro::a;
+public type struct Widget {
+    ax: i32;
+    static make(v: i32) -> Widget { return Widget { ax: v }; }
+}
+```
+```cryo
+// src/b.cryo   - same leaf, different field and width
+namespace repro::b;
+public type struct Widget {
+    by: i64;
+    static make(v: i64) -> Widget { return Widget { by: v }; }
+}
+```
+```cryo
+// src/main.cryo
+namespace repro;
+import repro::a;
+import repro::b;
+function main() -> i32 {
+    mut wa: a::Widget = a::Widget { ax: 3 };      // fixed by b98d1e5d
+    mut wb: b::Widget = b::Widget { by: 4 };      // fixed by b98d1e5d
+    mut sa: a::Widget = a::Widget::make(5);       // resolves today
+    mut sb: b::Widget = b::Widget::make(6);       // E0233 today - THE TARGET
+    return wa.ax + (wb.by as i32) + sa.ax + (sb.by as i32) - 18;
+}
+```
+
+The fields differ, so a cross-binding cannot compile; the return is zero, so a
+binding that type-checks against the wrong owner fails on the exit code. Delete
+the `sb` line and it compiles today - that is the control.
+
+The ANNOTATION half of this is already a committed test,
+`tests/projects/qualified_type_selects_module`. The call half is deliberately
+NOT in it: a red assertion for an unfixed defect is not a regression guard, and
+this tree bans expect-fail. Add the static-call cases to that project as part of
+the fix.
+
+#### The glob deletion: landed as imports, NOT as behaviour
+
+`1623324e` landed 6,587 explicit imports across 619 files, generated from
+measured demand by `scripts/migrate-glob-imports.py` and
+`scripts/restore-plain-imports.py`. It did NOT land the behaviour change.
+
+Two hunks in `NameResolver::process_import`
+(`compiler/src/compiler/resolver/name_resolution.cryo`), both deletions:
+
+1. the `ImportStyle::Wildcard` branch - stop binding the module's export set and
+   its re-export closure, so `import P;` makes `P` a qualifier and binds nothing;
+2. the Specific branch's case (b) - a braced SUB-MODULE binds as a qualifier
+   only, since the loader already recorded its visibility edge.
+
+The imports are inert while globbing is on - they name what was already bound -
+so they cost nothing sitting there, and the deletion is two hunks when it is
+time. §8.131 has the full text and the measurement.
+
+**The precondition is not "the tree is green".** It is the qualifier answering
+deterministically in BOTH positions. Delete the glob before the call position is
+fixed and every qualified call in the tree fails at once, and the static-call
+defect is then re-diagnosed under 6,587 imports of noise. That sequencing is the
+whole reason this is split.
+
+One measured fact for whoever re-applies it: `import M;` and `import M::{ X };`
+are NOT interchangeable. Replacing the plain form with the braced one made
+`mpsc::Sender` unresolvable and restoring it alongside compiled clean, so a file
+needing both a qualifier and a name needs both lines. The migration already
+writes them that way.
+
+#### Three deletions, parked, and why
+
+`check_module_type_collision`, the both-owners probe in `ir_generator`'s
+`ScopeResolutionNode` visit, and `module_owns_member` in `stamp_module_scope`.
+All three exist to adjudicate a qualifier with two possible owners. They are
+downstream of a qualifier that answers the same question the same way twice, and
+it does not yet - the call position still resolves by leaf.
+
+Deleting them now would be building on sand, and one of them has a trap: the
+zero-rejection count on `qualifier_agrees` is STARVED, not absent. See the
+correction in §8.132; it rejects the moment two modules share a type leaf, which
+is exactly what made `b::Widget` fail.
+
+Enumerate readers AND callers before removing any of them. This session
+mis-scoped a caller and drew a wrong conclusion from a counter as a result.
+
+#### `insert_import` ordering: enumerated, in §8.132
+
+Done, not owed. `insert_import` is last-import-wins and this session removed one
+consumer's dependence on it, not the defect. `Resolver::lookup` is reachable only
+through a `Resolver*`, which makes the count outside the resolver package exact:
+**one**. Full table in §8.132 - the notable entry is `sema/type_utils.cryo:374`,
+the type cascade's `3-CROSSMOD` step, which walks the scope chain applying **no
+qualifier check at all**.
+
+**A read on the size, since it is judgement rather than measurement.** The
+surface looks small and the appearance is partly an artifact. Three call sites
+and a handful of mark-readers is genuinely few, and the module-qualifier path
+now has one destination. But every one of those sites is on a hot path, and the
+reason the count is low is that most consumers reach the scope THROUGH the two
+qualified-name entry points rather than directly - so the surface is narrow at
+the API and wide in effect. The honest expectation is that fixing the call
+position removes most of the remaining exposure, and that what is left after
+that is the non-strict `resolve_type_qualified_name` with no veto, which should
+be looked at on its own terms rather than assumed harmless.
+
+#### Not started: Jake's single-namespace ruling
+
+Namespaces and types share ONE namespace, so a module and a type can never carry
+the same name, and the collision is an ordinary redeclaration error at the point
+of declaration - Rust's model, where `mod x` beside `struct x` is E0428.
+
+**The tell, and it is the whole design constraint:** the correct implementation
+makes `check_module_type_collision` **deletable**, not extended. Adding logic to
+a dedicated module/type collision check means the third option has been built
+harder instead of the ruling being built.
+
+Measured populations, both structural rather than incidental: a module and a
+type sharing a FULLY-QUALIFIED name is **0** across 894 namespaces; a module
+holding a same-leaf type is **3**, all under `tests/`. Reuse `E0207_REDEFINED_TYPE`
+- it is live, tested, and its message is already "type `x` is defined multiple
+times" against Rust E0428's "the name `x` is defined multiple times". A NEW code
+for this case would itself be evidence it stayed a special case. §8.130 has the
+survey and what was rejected.
+
+#### What went wrong, mine included
+
+**I predicted thousands of errors from disabling the glob and got six.** The
+build ABORTS at name resolution, so sema never runs: an error count measures the
+first failing pass, not the demand. The demand needed a counter and turned out
+to be 151,510 lookups over 6,587 distinct pairs.
+
+**I read 48,457 agreements out of 48,457 as an inert guard. It was a starved
+one, and the reading had TWO layers of error.** The population was wrong -
+`qualifier_agrees` has exactly ONE caller, the branch taken when no module
+carries the written prefix, so its counter could not describe paths where the
+head does name a module. And the interpretation was wrong - zero rejections
+measured a corpus with no two modules sharing a type leaf, not a guard that
+cannot fire. The first error hid the second. **Enumerate callers, not only
+readers, when the question is what a number MEANS.**
+
+**A probe reported "68% of `TypeRelative` scopes have no name on the stamp",
+which was measuring itself.** `Res::def_id()` returns `DefId::invalid()` for
+`TypeRelative`; it only unwraps `Res::Def`. Caught because the zero was
+implausible - `Widget::make` on an imported type must stamp a Def base. The
+corrected instrument reads the base's `name()` and gives 55.6% AGREE. Two
+measurements were published from the broken form before the third caught it.
+
+**A test project was added and silently skipped, and the suite reported PASS.**
+A project under `tests/projects/` runs only if it carries a `test.json`. The
+first full run said `projects: 40 passed` - the same 40, green, with the new
+project never compiled. The COUNT moving is the evidence, not the green;
+`cryo test` echoes only failing projects, so a skipped project and a passing one
+print exactly the same thing. Now in `CLAUDE.md`.
+
+**The migration existed only as a diff, produced by tooling that existed only in
+a session scratch directory.** The generator was uncommitted, its input
+population had been reverted and was on no branch, and 6,587 edits lived as one
+branch's diff. Every part looked reproducible and none of it was. Both
+generators are now committed with the edits they made, and the rule is in
+`CLAUDE.md`.
+
+**Two instructions overrode standing rules in `CLAUDE.md` and neither was
+flagged** - an exception to commit granularity, and a side branch for red work.
+Both were followed. The rule that a brief does not override this file is now
+written down, with both instances named. Where a brief and this file disagree,
+raise it; the answer may well be "do it anyway", which is a decision rather than
+a drift.
+
+**One correction that is a caution rather than an error.** `b98d1e5d` moved
+`qualifier_agrees` by 23 on the compiler corpus against a prediction of a large
+fall. The fix is right; the prediction assumed the corpus could show the
+difference, and it cannot - `compiler/src` has no two modules sharing a type
+leaf, so the leaf lane was already landing on the right type. **A corpus that
+cannot produce the case cannot measure the fix.** The nine-line reproducer
+settled in minutes what a whole-tree count had pointed the wrong way on.
+
+### 8.134 A static-method call was keyed by its written spelling, because the scope map's refusal arrived as the spelling echoed back - MEASURED AND FIXED 2026-09-10
+
+`b::Widget::make` was `E0233`. `a::Widget::make` beside it resolved. Both
+modules declare `Widget`, both are imported, and the program is legal - the
+call-position twin of §8.132, and NOT the same edit one layer over.
+
+#### What was actually wrong
+
+The annotation consumer had a stamp-reading path that was wrongly gated, so
+widening one condition fixed it. The call consumer had none: `resolve_scope_call`
+built the owner key from the written string through `resolve_scoped_or_at`, and
+so did `check_scope_call_arg_types` (a prologue duplicated verbatim, comment
+included) and rung 1 of `find_static_method_template`.
+
+The root is one layer below all three. `resolve_scoped_or_at` is
+`resolve_scoped_at(..).resolved_or(bare)`, and `ScopeResolution::resolved_or`
+hands back its INPUT for `NotFound` and `Ambiguous`. So a refusal is returned in
+the same shape as a success, and the lookup keyed by the result cannot tell them
+apart:
+
+    written b::Widget  ->  key   b::Widget          (echoed; the map refused)
+    stamp                        repro::b::Widget   (correct, and discarded)
+
+Keyed on the echo, the static-method lookup widens the bare leaf and answers
+from whichever module registered `Widget` first. That is why one spelling
+resolved and the other named nothing at all. The `_or` form's own doc comment
+says it is for use at non-authoritative call sites such as codegen, and that
+authoritative sites call `resolve_scoped` and diagnose themselves - these three
+are authoritative sites using the non-authoritative wrapper.
+
+#### The fix: ask the scope map, and read the refusal
+
+One primitive, `scope_owner_key`, replacing the duplicated prologue and rung 1.
+It takes the undamaged `ScopeResolution` and passes an INVALID symbol as the
+decline value, so a refusal stays a refusal:
+
+* the scope map answers (`Unique` / `SameModule` / `NotReachable`) -> its
+  answer. That is also the mangled specialization it resolves to after
+  monomorphization, which is the form the registries hold a specialization's
+  methods under.
+* it declines -> the node's `Res`. `TypeRelative(base)` gives the base's own
+  registration key; a `GenericParam` base gives the SPELLING, because a type
+  parameter names no declaration and so can never be a key - reached when
+  monomorphization has substituted a concrete type into a clone's spelling
+  while the clone still carries the template's stamp.
+* a module qualifier is not a type-owner claim and none is manufactured; the
+  module lane answers from the scope.
+
+**There is no phase test, and that is the sign it is right.** Four other shapes
+were tried and are recorded below, because each failed for a reason worth
+keeping.
+
+#### Measurement
+
+Probe on both consumers, one row per exit so the row count equals the call
+count. `compiler/src` is 45,876 scope calls, `tests/` 42,182:
+
+| | before | after |
+|---|---:|---:|
+| `SM-NONE` (reached no static-method answer) | 26,783 | **26,783** |
+| `SM-OWNER` | 17,090 | **17,092** |
+| `SM-SMT` / `SM-PAIR` / `SM-BASE` | 1,187 / 482 / 334 | unchanged |
+
+`SM-NONE` identical is the load-bearing row: no call that answered stopped
+answering. The `+2` on `SM-OWNER` was NOT predicted, and is fully accounted for -
+the corpus IS the compiler, the fix adds one `SymbolStr::empty()` call to it, and
+sema runs twice, so one new source-level scope call is two rows. **Editing the
+compiler moves the compiler corpus**, the same trap as a `b1` corpus that is an
+`examples/` project.
+
+The intended bind moved in BOTH phases, and it is the row §8.133 named:
+
+    thread::Scope::new_with_stack   key thread::Scope  ->  std::thread::Scope
+
+#### The unstamped population §8.133 called the blocker does not exist
+
+§8.133 deferred this change on "the 10.5% with no stamp" and said the next
+action was one probe. Measured at this consumer, `ResSlot::Pending` is **0** -
+45,876 calls on `compiler/src`, 42,182 on `tests/`. Controlled four ways inside
+one binary, one run:
+
+* `is_pending()` is proven LIVE in that same run - 1,882 at impl heads, 3,758
+  at the codegen impl-target site.
+* A `Pending` slot reached through `require` yields `Res::Err`, and `Err` rows
+  are **0** as well - an independent read of the same fact.
+* The tree's own pre-existing `RES-PENDING` emitters read 0 over both corpora.
+* **The instrument was inverted and rebuilt**, and every row then printed
+  `PENDING`. The branch demonstrably reaches the output, so the zero is the
+  tree's and not the probe's. That control was declined once on the strength of
+  the three reads above, and paying for it is what makes the zero publishable:
+  three instrument failures have occurred in this chain, one of them a probe
+  measuring itself.
+
+Whatever §8.133's bucket was, it was not an unstamped node.
+
+#### Four shapes that failed, and why each was worth trying
+
+**1. "Generic args OR past monomorphization" - §8.133's own discriminator.
+BUILT, FAILED.** The reproducer still ended `E0233`. `post_mono_verify` is not a
+flag on a light verification pass, it is a SECOND FULL SEMA RUN over the whole
+AST which re-resolves every scope call from scratch, so handing that run the
+string key restores the defect the first run had just fixed. And measured, the
+post-mono population has no single owner: on `compiler/src` 325 rows need the
+written text (a mangled specialization), 3 need it for a substituted clone, and
+4 need the stamp. **Phase cannot separate populations that share a phase.**
+
+**2. "The node's `resolved_type` is the fresher answer post-mono." REJECTED
+before building** - on a `ScopeResolutionNode`, `resolved_type` is the method's
+RETURN type, not its owner.
+
+**3. "A segment already registered under its own spelling is a key; one that is
+not is a spelling." BUILT, FAILED** with three `E0200`s in the stdlib. A bare
+generic base (`Array`) is exact-valid in the index and is still the wrong owner,
+which is the hazard `scope_qualifier_type` already documents: a leaf-keyed
+lookup answers from any module in the program with no import in hand.
+
+**4. "A mono clone arrives unresolved, so provenance separates them." KILLED BY
+MEASUREMENT rather than by a build.** Post-mono there are no first-resolution
+rows at all - every answering row is `PINNED` (9,933 + 325 + 4) or `TYPED`
+(1,506), so the 325 mangled rows and the 4 needing the stamp have IDENTICAL
+provenance. That measurement is what pointed at the echo: once provenance was
+out, the only thing still separating the two populations was whether the scope
+map had answered at all.
+
+#### `find_static_method_template`'s ladder: rungs 2 and 3 answer zero
+
+Rung-labelled in the same build. Over `compiler/src`, rung 1 answers 1,187 and
+rungs 2 and 3 answer **0**. Not deleted here: a zero over one corpus is a fact
+about that corpus, and `tests/` has not been cut the same way. Recorded so the
+deletion can land with evidence instead of on the assumption that rung 1 now
+covers everything.
+
+#### Coverage and its control
+
+Added to `tests/tests/projects/qualified_type_selects_module` beside the
+annotation cases, covering BOTH spellings deliberately: a test that writes only
+`A::Widget::make` passes with the defect present, because the first-registered
+module answers from the leaf either way.
+
+The control is the load-bearing half. The nine-line reproducer fails `E0233` on
+the pre-fix compiler and, after the fix, compiles and **exits 0** - its fields
+and widths differ per owner, and its return sums to zero only if every bind
+reached the right one.
+
+#### Gates, and a ratchet that was already red before this
+
+`make test` **OVERALL PASS** on a settled tree - unit 2,113, compile-fail 178,
+**projects 41 passed / 0 failed** (41 plus three environment SKIPs accounts for
+all 44 project directories). `make lane-check` **OK**, unchanged.
+
+**`make b1-check` is RED, and it was red before this change.** It is left red
+and named rather than re-pinned.
+
+The mechanism is measured, not guessed. Every sema counter on the
+`[host:windows]` corpus (`examples/09-json-config`) is up by roughly half -
+`qualifier_agrees` 5,606 -> 9,206, `type cascade: 1 exact` 3,391 -> 5,196,
+`method visibility checks reached` 3,677 -> 5,600. Three different compilers
+were run over the same corpus on the same host:
+
+| compiler | `qualifier_agrees` |
+|---|---:|
+| golden `tests/b1-baseline.txt` | 5,606 |
+| the PIN, `bin/cryo.exe` | 9,207 |
+| stage 2 WITHOUT this change | 9,206 |
+| stage 2 WITH this change | 9,206 |
+
+**The golden matches no compiler in the tree**, so it is not describing a
+compiler behaviour at all. The golden was last written by `b98d1e5d`, and the
+very next commit, `1623324e`, added **690 `import` lines across 115 stdlib
+files**. `examples/09-json-config` compiles the stdlib, so the import migration
+raised every resolution counter on that corpus and the baseline was never
+re-pinned for it. §8.133 records the branch as GREEN at `1623324e`; on this
+gate it was not.
+
+**This change moves ZERO b1 rows** - the CHANGED list is byte-identical with
+and without it, which is what the prediction said and is the only reason the
+drift can be attributed elsewhere with confidence. The 1-count difference
+between the pin and stage 2 is the pin being an older compiler, not a corpus
+difference.
+
+Not re-pinned here, for three reasons worth stating because re-pinning would
+have been the faster move. The drift is not this change's, so folding it into
+this commit would make the commit claim a measurement it did not cause.
+`--update` pins only the host it runs on, so a Windows-only re-pin would leave
+the Linux arm silently stale - the same trap §8.132 names. And a re-pin rides
+with the change that moved the number, which is `1623324e` and already landed.
+The honest repair is a re-pin of BOTH arms whose message says the import
+migration moved it.
+
+#### A trap for whoever runs the gates next
+
+`make test` here was first run while ANOTHER agent committed to this branch,
+and the tree moved underneath it. **The rule that no source may be edited
+during a gate run extends to a second worker on the same branch**, and the
+failure is not loud: that run reported `OVERALL PASS` with **40** projects
+where §8.132 recorded 41, and a passing project prints nothing, so the missing
+one was invisible in the summary. `reexport_chain` was the absent project, and
+it was absent for no reason of its own - both the pre-fix and post-fix
+compilers build it and it exits 9 as its `test.json` expects, checked directly.
+Re-run on a settled tree it reports **41 passed, 0 failed**, and 41 plus the
+three environment SKIPs accounts for all 44 directories.
+
+So the number to trust is 41, and the lesson is about the instrument rather
+than the tree: a concurrent commit cost a project's worth of coverage while the
+gate still said PASS. A count that moves DOWN is the only thing that showed it,
+which is the same reason §8.132 records that the count moving up is what says a
+new project ran at all.

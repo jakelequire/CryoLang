@@ -44,7 +44,7 @@ import compiler::diag::{ diagnostic, ErrorCode, source_span, suggestion };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::decl_index;
-import compiler::decl_index::{ DeclarationIndex };
+import compiler::decl_index::{ DeclarationIndex, ScopeResolution };
 import compiler::module_graph;
 import compiler::module_graph::{ ModuleInfo };
 import compiler::resolve_counter;
@@ -58,7 +58,7 @@ import std::fmt;
 import compiler::resolver::resolver;
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::res;
-import compiler::resolver::res::{ Res, ResSlot };
+import compiler::resolver::res::{ Res, ResBase, ResSlot };
 import compiler::ast::declaration::{
     ClassDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
     StructDeclNode, UnionDeclNode, VarDeclNode
@@ -3852,6 +3852,55 @@ type struct CallResolver {
         this.ctx.emit_diagnostic(diag);
     }
 
+    /// The canonical name the scope segment's owner is registered under.
+    ///
+    /// Two authorities, and which one holds the answer is asked, not guessed.
+    /// The scope map answers for a segment it can resolve - including the
+    /// mangled specialization it resolves to after monomorphization, which is
+    /// the form the registries hold a specialization's methods under.  It
+    /// DECLINES for a qualified spelling, and there the stamp holds the answer.
+    /// The distinction is lost by `resolve_scoped_or_at`, which hands back its
+    /// input on a decline, so a refusal is indistinguishable from success and
+    /// the lookup keyed by it widens the bare leaf instead - answering from
+    /// whichever module registered the name first.  That is how, of two modules
+    /// declaring one leaf, the first resolves and the second cannot be named.
+    ///
+    /// A MODULE qualifier is not a type-owner claim, and this does not
+    /// manufacture one: the module lane answers from the scope itself.
+    scope_owner_key(&this, scope: ScopeResolutionNode*) -> SymbolStr {
+        // A segment carrying generic args is refined to its specialization by
+        // the caller, which owns the args this cannot see.
+        if (scope.scope_generic_args.length > 0) {
+            return this.ctx.resolve_scoped_or_at(scope.scope_name, scope.span.file,
+                                                 FILE, LINE as i32);
+        }
+        // An INVALID symbol as the decline value, so a refusal stays a refusal
+        // instead of arriving as the input echoed back.
+        const q: SymbolStr = this.ctx
+            .resolve_scoped_at(scope.scope_name, scope.span.file, FILE, LINE as i32)
+            .resolved_or(SymbolStr::empty());
+        if (q.is_valid()) { return q; }
+        return match (scope.require_scope_res("scope-call owner key")) {
+            Res::TypeRelative(b, _) => {
+                match (b) {
+                    // A type parameter names no declaration, so it can never be
+                    // a registration key.  Reached when monomorphization has
+                    // substituted a concrete type into the spelling while the
+                    // clone still carries the template's stamp; the spelling is
+                    // then the only thing that names the owner.
+                    ResBase::GenericParam(_) => { scope.scope_name }
+                    // The base's own registration key: a type's qualified name,
+                    // and for a primitive the spelling it is registered under,
+                    // since a primitive owns members while declaring nothing.
+                    _                        => { b.name() }
+                }
+            }
+            // A module qualifier is not a type-owner claim, and this does not
+            // manufacture one; the module lane answers from the scope itself.
+            _                       => { scope.scope_name }
+        };
+    }
+
     resolve_scope_call(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*) -> TypeRef {
         // A bare scope that resolves to two or more import-visible same-leaf
         // types is a hard ambiguity: the author must qualify it.  Reported once,
@@ -3864,14 +3913,7 @@ type struct CallResolver {
                                                   FILE, LINE as i32)) {
             this.report_scope_ambiguity(scope);
         }
-        // The owner key the static-method lookups below are keyed by, which is
-        // an INSTANTIATION and not a definition: a specialized scope segment
-        // arrives already mangled (`6Result$Lu_N$L...`), and the registries hold
-        // its methods under that form.  The node's `Res` deliberately cannot
-        // answer this - it names the definition (`Result`) for every
-        // instantiation of it - so the identity comes from the type layer.
-        mut lookup_sym: SymbolStr =
-            this.ctx.resolve_scoped_or_at(scope.scope_name, scope.span.file, FILE, LINE as i32);
+        mut lookup_sym: SymbolStr = this.scope_owner_key(scope);
         if (scope.scope_generic_args.length > 0) {
             const spec_sym: SymbolStr = this.resolve_generic_scope_name(
                 scope.scope_name, scope.scope_generic_args, scope.span,
@@ -4203,8 +4245,7 @@ type struct CallResolver {
         const member_str: string = this.intern.resolve(scope.member_name);
         mut entry: TemplateEntry* = null;
         if (this.ctx.decl_index != null) {
-            const q: SymbolStr =
-                this.ctx.resolve_scoped_or_at(scope.scope_name, scope.span.file, FILE, LINE as i32);
+            const q: SymbolStr = this.scope_owner_key(scope);
             if (q.is_valid()) {
                 const qstr: string = this.intern.resolve(q) + "::" + member_str;
                 entry = this.ctx.generic_registry.get_template(this.intern.intern(qstr));
@@ -5545,14 +5586,7 @@ type struct CallResolver {
     check_scope_call_arg_types(mut &this, visitor: ASTVisitor*, scope: ScopeResolutionNode*,
                                call: CallExprNode*) -> void {
         if (this.ctx.decl_index == null) { return; }
-        // The owner key the static-method lookups below are keyed by, which is
-        // an INSTANTIATION and not a definition: a specialized scope segment
-        // arrives already mangled (`6Result$Lu_N$L...`), and the registries hold
-        // its methods under that form.  The node's `Res` deliberately cannot
-        // answer this - it names the definition (`Result`) for every
-        // instantiation of it - so the identity comes from the type layer.
-        mut lookup_sym: SymbolStr =
-            this.ctx.resolve_scoped_or_at(scope.scope_name, scope.span.file, FILE, LINE as i32);
+        mut lookup_sym: SymbolStr = this.scope_owner_key(scope);
         if (scope.scope_generic_args.length > 0) {
             const spec_sym: SymbolStr = this.resolve_generic_scope_name(
                 scope.scope_name, scope.scope_generic_args, scope.span,
