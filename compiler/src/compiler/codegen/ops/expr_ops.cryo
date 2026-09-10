@@ -36,6 +36,7 @@ import compiler::lex;
 import std::collections::pair;
 import compiler::types::generic;
 import std::ffi::libc;
+import std::fmt;
 
 
 type struct ExprOps {
@@ -488,7 +489,7 @@ type struct ExprOps {
         if (!current_bb.is_valid()) {
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0607_VARIABLE_GENERATION_ERROR,
-                format("codegen: local variable '%s': builder has no insert block", var_name));
+                fmt::format("codegen: local variable '%s': builder has no insert block", var_name));
             d = d.at(site_span);
             d = d.with_note("the codegen builder must have an insert block active when a local is declared; this usually means a statement was visited outside of any function body");
             this.diag.emit(d);
@@ -497,7 +498,7 @@ type struct ExprOps {
         const current_fn: LValue = current_bb.get_parent();
         if (!current_fn.is_valid()) {
             this.diag.emit_error_at_span(ErrorCode::E0607_VARIABLE_GENERATION_ERROR,
-                format("codegen: local variable '%s': insert block has no parent function", var_name),
+                fmt::format("codegen: local variable '%s': insert block has no parent function", var_name),
                 site_span);
             return;
         }
@@ -2280,7 +2281,7 @@ type struct ExprOps {
                 this.intern_str("compiler::codegen::ast_arena::cryo_ast_arena_alloc"));
             if (!arena_fn.is_valid()) {
                 this.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                    format("codegen: %s: AST arena allocator not declared", what), span);
+                    fmt::format("codegen: %s: AST arena allocator not declared", what), span);
                 return LValue::null();
             }
             const arena_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(arena_fn.raw) };
@@ -2319,13 +2320,13 @@ type struct ExprOps {
         const malloc_fn: LValue = this.resolver.resolve_function(this.intern_str("malloc"));
         if (!malloc_fn.is_valid()) {
             this.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                format("codegen: %s: 'malloc' not declared", what), span);
+                fmt::format("codegen: %s: 'malloc' not declared", what), span);
             return LValue::null();
         }
         const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
         if (!malloc_ty.is_valid()) {
             this.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
-                format("codegen: %s: failed to retrieve malloc function type", what), span);
+                fmt::format("codegen: %s: failed to retrieve malloc function type", what), span);
             return LValue::null();
         }
         mut malloc_args: Pair<LValue, TypeRef>[] = [];
@@ -2456,9 +2457,14 @@ type struct ExprOps {
     ///
     /// Forwarding the bucket to a `v*printf`-style callee that takes
     /// `va_list` by value still needs an ABI-aware load on Win64; see
-    /// `AbiClassifier::forward_va_list`.  The format runtime helper
-    /// (`emit_format_runtime`) is the only built-in forwarder today;
-    /// user-code forwarding would need to consult the same seam.
+    /// `AbiClassifier::forward_va_list`.  A user-code call reaches that seam
+    /// through `CallEmitter::va_forward_fn_type`, which fires only when the
+    /// callee's own parameter is typed `va_list`.  An `extern "C"` binding
+    /// that types the parameter `void*` instead compiles and links, and hands
+    /// the callee the alloca's address rather than the `char*` inside it, so
+    /// every variadic read lands one indirection off - on Win64 only, silently,
+    /// with an exit code of 0.  The `vprintf`/`vfprintf` intrinsic lowerings
+    /// bypass this by consulting the seam themselves.
     emit_va_start_for_variadic(mut &this, fn_val: LValue, args_name: SymbolStr) -> void {
         if (!args_name.is_valid()) {
             this.current_variadic_arg_id = 0;

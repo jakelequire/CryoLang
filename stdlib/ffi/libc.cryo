@@ -784,13 +784,31 @@ extern "C" {
     function sscanf(s: u8*, fmt: u8*, ...)                  -> i32;
 
     // va_list-taking variants. `va` must be the `args` identifier of an
-    // enclosing variadic function; Cryo lowers that bucket to the C
-    // `va_list` (a pointer) at the call boundary, so it is typed `void*`
-    // here. These back the printf-style `print`/`println` in `std::fmt`
-    // and any code that forwards a raw variadic list to libc.
+    // enclosing variadic function.
+    //
+    // Such a parameter MUST be typed `va_list`, not `void*`. The two are
+    // pointer-shaped alike and both compile, but they lower differently on
+    // Win64, where a `va_list` is a bare `char*` held in the caller's alloca:
+    // the callee wants that `char*` BY VALUE, and only a parameter the callee's
+    // signature types as `va_list` makes the call site load it out. A `void*`
+    // parameter passes the alloca's own address, so the callee reads every
+    // variadic argument one indirection off - silently, with an exit code of 0.
+    // SysV-amd64 is insensitive to the difference, so a Linux-only test of a
+    // `void*` binding passes.
+    //
+    // `vprintf` and `vfprintf` survive their `void*` typing only because the
+    // same-named `core::intrinsics` declarations displace these extern twins
+    // and lower the call through the ABI seam directly; `vsnprintf` survives
+    // because nothing calls it. Retype all three when that displacement goes.
     function vprintf(fmt: u8*, va: void*)                       -> i32;
     function vfprintf(stream: void*, fmt: u8*, va: void*)       -> i32;
     function vsnprintf(buf: u8*, size: u64, fmt: u8*, va: void*) -> i32;
+
+    // Heap-allocating formatter: writes a `malloc`'d NUL-terminated result
+    // through `ret` and returns its length, or a negative value on failure
+    // (where `*ret` is undefined). Backs `fmt::format`. GNU/BSD, and mingw-w64
+    // supplies it on Windows.
+    function vasprintf(ret: u8**, fmt: u8*, va: va_list)        -> i32;
 }
 
 // In-memory output stream: `open_memstream(char **bufp, size_t *sizep)`.

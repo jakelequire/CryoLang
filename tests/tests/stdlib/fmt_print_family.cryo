@@ -1,4 +1,5 @@
-///! Coverage for the `std::fmt` print family: `printf`/`eprintf` (C-variadic),
+///! Coverage for the `std::fmt` print family: `format` (C-variadic into a
+///! fresh string), `printf`/`eprintf` (C-variadic),
 ///! `print`/`println` (Display-based, take an owned `String`), the implicit
 ///! `string -> String` conversion at a `println("literal")` call site, and
 ///! f-string interpolation across many value shapes.
@@ -255,4 +256,74 @@ function utf8_string_length_and_print() -> Result<(), TestError> {
     const len_ok: boolean = s.length() == 5;        // c,a,f,0xC3,0xA9
     fmt::println(s);
     return expect(len_ok, Str::new("\"café\" should be 5 UTF-8 bytes"));
+}
+
+// ---------------------------------------------------------------------------
+// format: printf-style into a freshly allocated string.
+// ---------------------------------------------------------------------------
+
+function expect_format(got: string, want: string) -> Result<(), TestError> {
+    return expect(Str::new(got).equals(&Str::new(want)), Str::new(want));
+}
+
+![test]
+function format_specifier_coverage() -> Result<(), TestError> {
+    match (expect_format(fmt::format("i=%d", -7), "i=-7")) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_format(fmt::format("s=%s", "abc"), "s=abc")) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_format(fmt::format("x=%x", 255u32), "x=ff")) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_format(fmt::format("f=%.2f", 3.14159), "f=3.14");
+}
+
+// A conversion whose argument is read out of the variadic bucket by the callee
+// rather than by us: the whole point of forwarding the bucket rather than
+// re-packing it. A `va_list` passed one indirection off reads garbage here and
+// still exits 0, so the assertion is on the CONTENT, never on a return code.
+![test]
+function format_mixed_widths_and_classes() -> Result<(), TestError> {
+    return expect_format(
+        fmt::format("%s|%d|%lld|%.1f|%c", "a", 1, 9000000000, 2.5, 65),
+        "a|1|9000000000|2.5|A");
+}
+
+![test]
+function format_empty_result() -> Result<(), TestError> {
+    return expect_format(fmt::format("%s", ""), "");
+}
+
+// No conversions and no variadic arguments: the bucket is empty and `va_start`
+// still has to produce a readable va_list. Nothing in the tree writes this
+// shape, so it has no coverage anywhere else.
+![test]
+function format_no_varargs() -> Result<(), TestError> {
+    return expect_format(fmt::format("no substitutions here"),
+                         "no substitutions here");
+}
+
+// The result is sized from the formatted length, so a result longer than any
+// fixed scratch buffer must come back whole rather than truncated.
+![test]
+function format_long_result() -> Result<(), TestError> {
+    const s: string = fmt::format("%s%s%s%s%s%s%s%s%s%s",
+        "0123456789", "0123456789", "0123456789", "0123456789", "0123456789",
+        "0123456789", "0123456789", "0123456789", "0123456789", "0123456789");
+    return expect(Str::new(s).length() == 100,
+                  Str::new("100-char format result should not truncate"));
+}
+
+// Each call owns its buffer. A shared or reused one shows the earlier call's
+// content, which reads as a pass if only the last result is checked.
+![test]
+function format_results_are_independent() -> Result<(), TestError> {
+    const a: string = fmt::format("a=%d", 1);
+    const b: string = fmt::format("b=%d", 2);
+    match (expect_format(a, "a=1")) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_format(b, "b=2");
 }

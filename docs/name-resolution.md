@@ -16712,3 +16712,158 @@ removes the reason the edge was safe to delete FOR THEM. `malloc`, `free` and
 Three of the nine contested leaves - `printf`, `fprintf`, `snprintf`, plus
 `vprintf`/`vfprintf` - stop being contested by this move, for the good reason:
 the intrinsic declaration goes away, so no contest is held.
+
+### 8.126 `format` was never an intrinsic, and moving it to `fmt::format` measured a Win64 `va_list` rule that was written down nowhere - MEASURED AND LANDED 2026-09-09
+
+`format` is absent from `IntrinsicKind::from_name` entirely. Nothing lowered it.
+The `intrinsic` keyword was supplying a DEFINITION - `emit_format_runtime` built
+a `linkonce_odr ptr @format(ptr, ...)` body into every module - and every step of
+that body was ordinary library work: `va_start`, `vasprintf`, copy the result
+into `alloc::allocator::alloc`, free the libc temp. The keyword was being used as
+a linkage mechanism, not a lowering one, which is why it left no trace in the
+kind table.
+
+It is now `fmt::format`, an ordinary variadic stdlib function, qualified at every
+call site. Nothing was added to the prelude.
+
+#### The rule the move had to discover: a `va_list` parameter must be TYPED `va_list`
+
+The library body needs `vasprintf`, whose third parameter is a `va_list`. Its
+siblings in `ffi/libc.cryo` type that parameter `void*`, with a comment saying
+Cryo lowers the `args` bucket to a pointer at the call boundary. The comment
+describes SysV. It is wrong on Win64, and the failure is silent.
+
+`CallEmitter::va_forward_fn_type` is what routes a user-code call through
+`AbiClassifier::forward_va_list`, and it fires only when the callee's own
+parameter carries `TypeKind::VaList`. On Win64 a `va_list` IS a bare `char*`
+living in the caller's alloca, and the callee wants that `char*` by value; only
+the `va_list`-typed parameter makes the call site load it out. A `void*`
+parameter compiles, links, and hands over the alloca's ADDRESS, so every variadic
+read lands one indirection off. SysV-amd64 is insensitive to the difference,
+so a Linux-only test of a `void*` binding passes.
+
+Measured natively on Win64 with one probe and its control, same program both
+times, only the parameter's written type differing:
+
+| `vasprintf(ret, fmt, va)` declared as | Win64 result |
+|---|---|
+| `va: va_list` | `a=42 b=hi c=7` |
+| `va: void*` | `a=-1585448168 b=H<garbage> c=-1455641698`, **exit 0** |
+
+The control is the load-bearing half: had the `void*` form also printed the right
+values, the `va_list` typing would have been cargo, and this table would say so.
+
+The same break was then run through the whole tree rather than a probe, to check
+that something in the suite would actually catch it. It does not merely fail a
+test: retyping the parameter `void*` and rebuilding produces a **compiler that
+cannot find `cryoconfig` in its own directory**, because every path it formats is
+garbage. A defect of this shape is not subtle once the stdlib depends on it -
+but it is invisible on SysV, and nothing before this change put a `va_list`
+parameter anywhere a Cryo call site could reach.
+
+**Why the existing `void*` siblings survive, which is not the same as being
+correct.** `vprintf` and `vfprintf` are also declared as INTRINSICS, and
+`register_intrinsic_function_type` drops the unowned extern twins; the intrinsic
+lowerings then consult `forward_va_list` themselves rather than going through
+`va_forward_fn_type`. `vsnprintf` has no intrinsic and survives only because
+nothing in the tree calls it - a dormant hazard, not a live defect. All three
+are left as they are, with the mechanism recorded at the declarations, because
+retyping them belongs to the printf decision that owns the same population.
+
+#### What the printf hazard actually is
+
+§8.125 predicted it as a binding problem: remove the intrinsics and a bare
+`printf` may bind libc's `(u8*, ...)` twin instead of fmt's `(string, args...)`.
+**Tested, and it holds - but the sharp edge is one layer down and worse.** For
+the `v*` half of the family the displacement is not only what decides which
+overload answers, it is what routes the call through the ABI seam at all. Take
+`vprintf`/`vfprintf` out of the intrinsic set and `fmt::printf` and
+`fmt::eprintf` fall onto the extern path against a `void*` binding - the exact
+configuration measured above as silent Win64 garbage with an exit code of 0.
+
+So the printf half is not the same shape of job as the `format` half, and its
+edit volume says nothing about its cost: the bare-call surface is **27 sites**
+(`printf` 22, `fprintf` 5; `snprintf`, `vprintf`, `vfprintf` are already zero)
+against `format`'s 833, while `fmt::printf` and `fmt::eprintf` are ALREADY
+qualified at 711 and 162 sites respectively. It is a signature-and-ABI change
+wearing a rename's clothes. Not taken here.
+
+#### A correction to §8.124
+
+§8.124 sizes this work with "`format` alone is 839 of them, and it is a genuine
+intrinsic - there is no `fmt::format`, only `format_to_string`." The second half
+is the evidence for the first, and it does not support it: "no library twin
+exists" is a statement about the STDLIB, and "is a genuine intrinsic" is a
+statement about `IntrinsicKind::from_name`, where `format` has never appeared.
+The two were read as one fact. Had the entry been taken at its word, this work
+would have started by looking for the lowering to preserve, and there is none -
+the only thing to preserve was a body that any library function can hold.
+
+The absence of a twin was true and was the real constraint: one destination had
+to be written. That part cost what it said it would.
+
+#### Sizes, and two instrument defects the controls caught
+
+**833 bare `format(` call sites across 81 files**, 824 of them in
+`compiler/src`; 55 of those files needed an `import std::fmt;` added.
+`docs/stdlib-api.txt` gained exactly two declarations, `fmt::format` and
+`libc::vasprintf`, and nothing else moved.
+
+§8.125 reported 839. The difference is exactly the six `ErrorCode::format()`
+METHOD calls - `diag/_module.cryo` declares a method with that leaf - which the
+earlier count did not separate from bare calls.
+
+The rewrite was scripted against a comment- and string-stripped view of each
+file, and the selection was controlled against a file of known positives and
+negatives before it ran. That control caught two defects, neither of which
+looked wrong as a total:
+
+* A struct-literal field separator was read as a scope qualifier, so
+  `Rec { detail: format(...) }` was classified as already-qualified. **13 real
+  call sites** would have been silently left bare.
+* A method declared inside an `implement` block carries no `function` keyword,
+  so `format(&this) -> string` was classified as a CALL and rewritten to
+  `fmt::format(&this) -> string`. The compiler caught this one; the point is
+  that the instrument did not, and a class of false positive that the parser
+  happens to reject is only luckily visible.
+
+The residue that neither control could have caught is worth naming: the
+population was `compiler/src stdlib runtime tools tests examples`, and
+`legacy/bootstrap` - which holds four more bare `format(` calls and a second
+`format` method declaration - is outside it. That is correct here (nothing
+builds `legacy/`), but it is a chosen population, not the whole tree.
+
+#### Coverage, which `format` did not have
+
+As a compiler-emitted body `format` had no direct test: `native_alloc_gate`
+exercised it only as one of the allocations it routes through the native heap.
+Six tests were added to `tests/stdlib/fmt_print_family.cryo`, the module's own
+file - specifier coverage, mixed widths and argument classes, an empty result, a
+result longer than any fixed buffer, two results not aliasing each other, and a
+call with no variadic arguments at all - and the roster golden merged from 2106
+to 2112. The mixed-classes one is the va_list forwarder's guard, and it asserts
+on CONTENT: the failure mode it exists for returns garbage and exits 0. The
+no-varargs one covers a shape with a MEASURED ZERO in the tree - the compiler
+never writes `format("literal")` with nothing to substitute, so nothing else
+would catch an empty bucket regressing.
+
+#### Deletions, enumerated before they were made
+
+`emit_format_runtime` was the sole caller of three helpers and the last caller
+of a fourth, so all four went with it: `get_or_decl_vasprintf`,
+`get_or_decl_memcpy`, `get_or_decl_free`, and `attach_runtime_comdat` - the last
+because the panic funnel had already stopped being emitted per-module, which
+made `format` the only remaining runtime helper. `get_or_decl_va_start` and
+`get_or_decl_va_end` each retain exactly one caller (`expr_ops`) and stay.
+222 lines of codegen removed; no per-module runtime helper is emitted any more.
+
+Four comments referenced the deleted machinery and were corrected rather than
+deleted, the `expr_ops` one gaining the `va_list` rule above, which had no
+written home anywhere in the tree.
+
+**A symbol that survives the change, and why it is not a leak.** A binary built
+against the CURRENT pin still contains one `T format`: `stdlib/.bin/<triple>/`
+is built BY the pin, and the pin still emits the `linkonce_odr` body into all
+154 of its objects. Every object the new compiler emits defines none - the zero
+was read over that population, not over the linked binary, where it would have
+been a false alarm. The archive's copies clear at the next repin.
