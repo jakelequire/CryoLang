@@ -28,6 +28,19 @@ import os
 import shutil
 import subprocess
 import sys
+
+# The check / cross glyphs this prints are above cp1252's range, so on a
+# Windows console (PowerShell and cmd default to a legacy code page) the first
+# scenario result raises UnicodeEncodeError and takes the run down mid-matrix -
+# after the builds, before the verdict.  A gate that cannot finish on a host is
+# a gate that host does not have.  selfhost-check.py already does this; so does
+# this one now.  No-op on POSIX, where the streams are UTF-8 already.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -144,11 +157,41 @@ def main():
 
     print(f"== incremental-check: {project} (cryo={cryo}) ==")
 
-    # Cold path: a fresh clean --no-incremental build is the reference; a
-    # from-scratch incremental build must match it.
-    print("\n[scenario] cold cache (first incremental build == clean)")
+    # CONTROL, before any scenario: is a link on this host byte-reproducible
+    # AT ALL?  Every assertion below compares two binaries, so a toolchain
+    # that stamps something into the artifact makes all of them read DIFFER
+    # whatever the compiler did - and the run then blames incremental
+    # compilation for the linker.  A Windows PE carries a link timestamp, so
+    # on that host every scenario fails today and the gate has never been
+    # able to say anything; measured here, two clean builds of one unchanged
+    # source gave different md5s.
+    #
+    # The second clean build IS the reference, so the control costs one build
+    # and not two.
+    print("\n[control] two clean builds of unchanged source must agree")
+    clean_tree(project)
+    ctl = build_and_snapshot("control-clean", "--no-incremental")
     clean_tree(project)
     ref = build_and_snapshot("cold-clean", "--no-incremental")
+    if ctl is None or ref is None:
+        print("incremental-check: FAIL -- the control build produced no binary,"
+              " so nothing below could be measured against anything.")
+        return 1
+    with open(ctl, "rb") as fa, open(ref, "rb") as fb:
+        reproducible = fa.read() == fb.read()
+    print(f"  control: {'BYTE-IDENTICAL ✓' if reproducible else 'DIFFER ✗'}")
+    if not reproducible:
+        print("incremental-check: FAIL -- this host does not link reproducibly.")
+        print("  Two clean --no-incremental builds of unchanged source produced")
+        print("  different bytes, so every scenario below would read DIFFER no")
+        print("  matter what incremental compilation did.  On Windows this is the")
+        print("  PE link timestamp.  Nothing can be measured until what is being")
+        print("  compared is something the toolchain reproduces.")
+        return 1
+
+    # Cold path: that clean --no-incremental build is the reference; a
+    # from-scratch incremental build must match it.
+    print("\n[scenario] cold cache (first incremental build == clean)")
     clean_tree(project)
     cold_inc = build_and_snapshot("cold-incr")
     assert_identical(ref, cold_inc, "cold-cache")
@@ -168,12 +211,27 @@ def main():
         ("generic-comment",  "compiler/types/generic_registry.cryo", "append"),
     ]
     edits = []
+    missing = []
     for name, rel, kind in candidates:
         p = os.path.join(src, rel)
         if os.path.exists(p):
             edits.append(Edit(name, p, kind))
         else:
-            print(f"  (skip {name}: {rel} not found)")
+            missing.append((name, rel))
+    # A missing edit target is a REFUSAL, not a note.  The matrix is three
+    # hardcoded paths and a rename takes one out of it silently: the scenario
+    # never runs, nothing else changes, and the run still ends "all scenarios
+    # BYTE-IDENTICAL".  Renaming modules is most of what happens in this tree,
+    # so a matrix quietly emptying is not hypothetical - and an empty matrix
+    # reports exactly what a full one reports.
+    if missing:
+        print("\nincremental-check: FAIL -- edit target(s) no longer exist:")
+        for name, rel in missing:
+            print(f"  {name}: src/{rel}")
+        print("  The scenario cannot run, and a matrix that shrank in silence")
+        print("  certifies less each time a file moves.  Point it at whatever")
+        print("  file replaced this one.")
+        return 1
 
     for e in edits:
         print(f"\n[scenario] edit: {e.name} ({e.kind})")
@@ -200,7 +258,8 @@ def main():
     if failures:
         print(f"FAILED scenarios: {', '.join(failures)}")
         return 1
-    print("all scenarios BYTE-IDENTICAL ✓")
+    print(f"all scenarios BYTE-IDENTICAL ✓  "
+          f"(no-change + {len(edits)} edit(s) + flag change)")
     return 0
 
 
