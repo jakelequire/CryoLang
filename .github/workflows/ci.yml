@@ -44,6 +44,15 @@ jobs:
       - name: Verify the committed pins match their sidecars (sha256)
         run: make verify-pin
 
+      # docs/name-resolution.md §7.2 mechanism 5. Privatizing the per-kind
+      # lookups cannot stop a NEW public wrapper being added beside them, and
+      # deleting one cannot stop a helper being reintroduced under another
+      # name; only a ratchet catches that. Source-derived - no compiler, no
+      # stdlib, no link - so it runs here, ahead of the twenty minutes of
+      # build that used to stand in front of it.
+      - name: Assert the resolution-lane surface matches its golden
+        run: make lane-check
+
       - name: Build cryo (stdlib + self-hosted compiler via pinned bin/cryo)
         run: make cryo
 
@@ -87,6 +96,21 @@ jobs:
             echo "cryolsp hung or crashed on EOF (exit $code)"; exit 1
           fi
 
+      # AHEAD of the test suite, deliberately.  This is the gate that catches a
+      # broken test roster, and a broken roster is precisely what makes `make
+      # test` report green: "0 of 0 failed" is a pass, a project missing its
+      # marker is skipped in silence, and a passing project prints nothing at
+      # all.  Behind `make test` it could only ever confirm a run that had
+      # already succeeded.
+      - name: Assert the discovered test roster matches the committed golden
+        run: make roster-check
+
+      # A stale docs/stdlib-api.txt is worse than no index, because it is what
+      # everyone greps before writing a helper - and nothing here was checking
+      # it.
+      - name: Assert the stdlib API index is not stale
+        run: make api-index-check
+
       # The only gate that builds runtime/ with the compiler under test.
       # runtime/ is a separate freestanding workspace nothing else here
       # compiles, and it rotted silently once already.  The Windows arm needs
@@ -102,23 +126,12 @@ jobs:
       - name: Run the test suite at -O0 (catch opt-level-dependent miscompiles)
         run: make test ARGS="--opt-level=0"
 
-      - name: Assert the discovered test roster matches the committed golden
-        run: make roster-check
-
       # docs/name-resolution.md §7.2 mechanism 3. The resolution cascade grew
       # for years because nobody could see it growing; this makes a regrown
       # fuzzy fallback fail the build instead of waiting for the next
       # hand-taken snapshot. Ratchet, not `== 0` -- see scripts/b1-gate.py.
       - name: Assert the B1 fuzzy-fallback bucket matches its golden
         run: make b1-check
-
-      # docs/name-resolution.md §7.2 mechanism 5. Privatizing the per-kind
-      # lookups cannot stop a NEW public wrapper being added beside them, and
-      # deleting one cannot stop a helper being reintroduced under another
-      # name; only a ratchet catches that. Source-derived, so it needs no
-      # build artifacts of its own.
-      - name: Assert the resolution-lane surface matches its golden
-        run: make lane-check
 
       # The importer binds a C constant and the serializer writes it; when the
       # two disagree on an AST shape the constant disappears with the generator
