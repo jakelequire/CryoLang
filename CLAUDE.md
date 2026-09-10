@@ -140,6 +140,35 @@ wrong reason is indistinguishable from a correct one unless you said in advance
 what the right reason looks like. If a number moves and you did not predict it,
 that is a finding to explain, not a bonus.
 
+## A gate is not fixed until a mutation that used to pass now fails
+
+Touching a gate - adding one, widening one, tightening an assertion - is not
+done when the gate passes. **Break something the old gate accepted, and show
+the new one refusing it.** Then restore.
+
+State it as a pair, because only the pair is evidence:
+
+- the OLD gate over the broken tree, reporting OK,
+- the NEW gate over the same broken tree, reporting the failure.
+
+Without the first half you have shown that a gate fails on a broken tree,
+which was never in doubt. Without the second you have shown nothing at all.
+Both halves go in the commit message, named concretely: *"the old gate printed
+`OK (2113 tests)` over a tree with a project's marker deleted"* is checkable;
+*"now catches missing markers"* is a claim.
+
+This is the same discipline as predicting the measurement, applied to the
+instrument rather than to the code, and it is the only way to tell a gate that
+covers more from a gate that merely runs more. Every hole in this suite that
+was ever found was found by tripping over it - which is what a gate reporting
+green over real breakage looks like from the outside.
+
+**Run a control on the instrument too.** Before believing a count, put a case
+you KNOW should appear through the same grep, regex or parser. Before believing
+a checker you wrote, run it over the population that is already known to pass -
+if it disagrees there, it is the instrument that is wrong. `grep -P` errors in
+Git Bash and reports nothing, which reads exactly like a clean sweep.
+
 ## A brief does not override this file
 
 Where a task brief and a standing rule here disagree, **the standing rule wins**,
