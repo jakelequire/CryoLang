@@ -25,24 +25,33 @@ namespace compiler::sema::sema;
 
 import compiler::diag;
 import compiler::diag::{
-    diagnostic, suggestion, source_span, edit_distance, snapshot
+    diagnostic, edit_distance, ErrorCode, snapshot, source_span, suggestion
 };
 import compiler::decl_index;
 import compiler::const_table;
+import compiler::const_table::{ ConstEval };
 import compiler::resolve_counter;
 import compiler::ast;
-import compiler::ast::{ node, expression, statement, declaration, pattern, visitor, node_locator, cloner };
+import compiler::ast::{
+    cloner, declaration, expression, GenericAnnotation, ImplTraitAnnotation, LiteralKind,
+    NamedAnnotation, node, node_locator, NodeKind, pattern, PatternBinding, PatternElement,
+    statement, TraitRef, TypeAnnotation, visitor
+};
 import compiler::passes::pass_id;
+import compiler::passes::pass_id::{ PassResult, Provision };
 import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
 import compiler::lex;
+import compiler::lex::{ Token, TokenType };
 import compiler::module_graph;
 import compiler::types;
 import compiler::types::{
-    type_ref, type_base, user_defined, compound, generic, arena,
-    checker, ownership, resolver, generic_registry, substitution, trait_checker
+    arena, checker, compound, generic, generic_registry, ownership, RefMutability,
+    resolver, substitution, trait_checker, type_base, type_ref, TypeKind, user_defined
 };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name, resolver };
 import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, Res, ResSlot };
 import compiler::sema::{
     state, helpers, scope_manager, type_utils, literal_resolver, diagnostics,
     dispatch, symbolic_checker, method_binding, pattern_resolver,
@@ -50,10 +59,79 @@ import compiler::sema::{
 };
 import std::core::{ option, mem };
 import std::collections::hashmap;
+import std::collections::hashmap::{ HashMap, HashMapIter };
 import std::fmt;
 import utils::logger;
+import utils::logger::{ cdebug };
 import compiler::diag::sink;
+import compiler::diag::sink::{ DiagnosticSink };
 import compiler::passes::type_resolution;
+import compiler::passes::type_resolution::{ TypeResolutionPasses };
+import compiler::ast::cloner::{ ASTCloner };
+import compiler::ast::declaration::{
+    AssocTypeDeclNode, ClassDeclNode, DestructureBinding, DestructureDeclNode,
+    EnumDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
+    StructDeclNode, TraitDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::ast::expression::{
+    AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
+    CallExprNode, CastExprNode, DeleteExprNode, ExpressionNode, FieldInit, IdentifierNode,
+    IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
+    ScopeResolutionNode, SizeofExprNode, StaticMatchExprNode, StructLiteralNode,
+    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExprNode, UnaryExprNode,
+    YieldExprNode
+};
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node_locator::{ annotation_span };
+import compiler::ast::pattern::{
+    EnumPatternNode, MatchArmNode, PatternNode, StaticMatchArmNode
+};
+import compiler::ast::statement::{
+    AsmBlockStmtNode, AsmOperand, BlockStmtNode, BreakStmtNode, ContinueStmtNode,
+    DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode,
+    MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode, UnsafeBlockStmtNode,
+    WhileStmtNode
+};
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::edit_distance::{ find_best_candidate };
+import compiler::diag::snapshot::{ DiagnosticSnapshot };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::diag::suggestion::{ Applicability, Suggestion };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::resolver::{ Resolver };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::sema::async_lower::{ AsyncLower, AsyncOwner };
+import compiler::sema::call_resolver::{ CallResolver };
+import compiler::sema::diagnostics::{ Diagnostics };
+import compiler::sema::dispatch::{ SemaDispatch };
+import compiler::sema::helpers::{
+    is_constant_numeric_expr, is_narrow_float_type, is_numeric_literal_expr,
+    is_wide_int_type, is_zero_int_literal, sema_i32_max_mag, try_fold_const_i64
+};
+import compiler::sema::lambda_synth::{ LambdaSynth };
+import compiler::sema::literal_resolver::{ LiteralResolver };
+import compiler::sema::member_resolver::{ MemberResolver };
+import compiler::sema::method_binding::{ MethodBinding };
+import compiler::sema::pattern_resolver::{ PatternResolver };
+import compiler::sema::scope_manager::{ ScopeManager };
+import compiler::sema::state::{ SemaState };
+import compiler::sema::symbolic_checker::{ SymbolicChecker };
+import compiler::sema::type_utils::{ TypeUtils };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::checker::{ TypeChecker, TypeCheckResult, TypeCompatibility };
+import compiler::types::compound::{ ArrayType, PointerType, ReferenceType, TupleType };
+import compiler::types::generic::{ BoundedParamType, InstantiatedType };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::ownership::{ OwnershipQuery };
+import compiler::types::resolver::{ HomeOrigin, ResolutionContext };
+import compiler::types::trait_checker::{ TraitChecker };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{
+    ClassType, EnumType, EnumVariantInfo, FieldInfo, MethodInfo, StructType, TraitType
+};
+import std::core::mem::{ swap };
+import std::core::option::{ Option };
 
 
 /// Operator -> (trait leaf, method) overloading map. `valid == false` means

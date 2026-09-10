@@ -16,13 +16,15 @@
 namespace compiler::codegen::ops::expr_ops;
 
 import compiler::codegen;
-import compiler::codegen::{ llvm_types, type_map, abi };
+import compiler::codegen::{ abi, llvm, llvm_types, type_map };
 import compiler::codegen::state::{ value_table, function_registry, diag_sink };
 import compiler::codegen::ops::ir_flow_emitter;
+import compiler::codegen::ops::ir_flow_emitter::{ IRFlowEmitter };
 import compiler::codegen::ops::{ symbol_resolver, intrinsic_emitter };
 import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
 import compiler::diag;
-import compiler::diag::{ diagnostic, source_span };
+import compiler::diag::{ diagnostic, ErrorCode, source_span };
 // AST access is otherwise avoided here (see the module doc), but the shared
 // `--panic=unwind` cleanup landing pad must replay drop-call statements via
 // `accept(visitor)`, which needs the node + visitor types.  This is a downward
@@ -30,13 +32,41 @@ import compiler::diag::{ diagnostic, source_span };
 import compiler::ast;
 import compiler::ast::{ node, visitor, statement };
 import compiler::types;
-import compiler::types::{ type_ref, type_base, arena, compound, user_defined };
+import compiler::types::{
+    arena, compound, FloatKind, IntegerKind, type_base, type_ref, TypeKind, user_defined
+};
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::lex;
+import compiler::lex::{ TokenType };
 import std::collections::pair;
+import std::collections::pair::{ Pair };
 import compiler::types::generic;
+import compiler::types::generic::{ InstantiatedType };
 import std::ffi::libc;
 import std::fmt;
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::statement::{ StatementNode };
+import compiler::ast::visitor::{ ASTVisitor };
+import compiler::codegen::abi::{ AbiClassifier, SignaturePlan };
+import compiler::codegen::llvm_types::{
+    LBasicBlock, LBuilder, LIntPredicate, LModule, LRealPredicate, LType, LTypeKind,
+    LValue
+};
+import compiler::codegen::ops::intrinsic_emitter::{ IntrinsicEmitter };
+import compiler::codegen::ops::symbol_resolver::{ SymbolResolver };
+import compiler::codegen::state::diag_sink::{ DiagSink };
+import compiler::codegen::state::function_registry::{ FunctionRegistry };
+import compiler::codegen::state::value_table::{ ValueTable };
+import compiler::codegen::type_map::{ TypeMapper };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{ ArrayType, PointerType, ReferenceType };
+import compiler::types::type_base::{ FloatType, IntType, Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{ EnumType };
 
 
 type struct ExprOps {

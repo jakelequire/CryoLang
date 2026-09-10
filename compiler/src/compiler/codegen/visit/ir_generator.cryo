@@ -8,33 +8,87 @@
 namespace compiler::codegen::visit::ir_generator;
 
 import compiler::codegen;
-import compiler::codegen::{ llvm_types, type_map, context, util };
+import compiler::codegen::{ context, llvm, llvm_types, type_map, util };
 import compiler::codegen::state::visitor_state;
+import compiler::codegen::state::visitor_state::{ VisitorState };
 import compiler::codegen::ops::{ ir_flow_emitter, intrinsics_codegen };
 import compiler::codegen::visit::{
     expr_dispatch, pattern_emitter, lambda_emitter, array_lit_emitter, enum_variant_emitter,
     call_emitter, new_delete_emitter, binary_unary_emitter, place_emitter, decl_visit_emitter
 };
 import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
 import compiler::decl_index;
 import compiler::module_graph;
 import compiler::diag;
-import compiler::diag::{ diagnostic, source_span };
+import compiler::diag::{ diagnostic, ErrorCode, source_span };
 import compiler::types;
 import compiler::types::{
-    type_ref, type_base, arena, compound, user_defined, generic, generic_registry, ownership, resolver
+    arena, compound, generic, generic_registry, ownership, resolver, type_base, type_ref,
+    TypeKind, user_defined
 };
 import compiler::ast;
-import compiler::ast::{ node, visitor, expression, statement, declaration, pattern };
+import compiler::ast::{
+    declaration, expression, LiteralKind, node, NodeKind, pattern, statement,
+    TypeAnnotation, visitor
+};
 import compiler::lex;
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name };
 import compiler::resolver::res;
 import compiler::resolve_counter;
 import utils::logger;
+import utils::logger::{ cdebug };
 import std::collections::pair;
 import std::fmt::float;
 import std::ffi::libc;
 import std::fmt;
+import compiler::ast::declaration::{
+    ClassDeclNode, DestructureBinding, DestructureDeclNode, FunctionDeclNode,
+    ImplBlockNode, StructDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::ast::expression::{
+    AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
+    CallExprNode, CastExprNode, DeleteExprNode, ExpressionNode, FieldInit, IdentifierNode,
+    IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode, MemberAccessNode, NewExprNode,
+    ScopeResolutionNode, SizeofExprNode, StaticMatchExprNode, StructLiteralNode,
+    TernaryExprNode, TryExprNode, TupleLiteralNode, TypeofExprNode, UnaryExprNode,
+    YieldExprNode
+};
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::pattern::{ MatchArmNode };
+import compiler::ast::statement::{
+    AsmBlockStmtNode, AsmConstraintKind, AsmDialect, AsmOpDir, AsmOperand, AsmPiece,
+    BlockStmtNode, BreakStmtNode, ContinueStmtNode, DeclStmtNode, DoWhileStmtNode,
+    ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode, MatchStmtNode, ReturnStmtNode,
+    StatementNode, StaticMatchStmtNode, UnsafeBlockStmtNode, WhileStmtNode
+};
+import compiler::codegen::context::{ CodegenContext };
+import compiler::codegen::llvm_types::{
+    LBasicBlock, LContext, LTargetMachine, LType, LTypeKind, LValue
+};
+import compiler::codegen::ops::ir_flow_emitter::{ ForBlocks, IfBlocks, LoopBlocks };
+import compiler::codegen::util::{ CodegenUtil };
+import compiler::codegen::visit::array_lit_emitter::{ ArrayLitEmitter };
+import compiler::codegen::visit::call_emitter::{ CallEmitter };
+import compiler::codegen::visit::decl_visit_emitter::{ DeclVisitEmitter };
+import compiler::codegen::visit::expr_dispatch::{ ExprDispatch };
+import compiler::codegen::visit::lambda_emitter::{ LambdaEmitter };
+import compiler::codegen::visit::new_delete_emitter::{ NewDeleteEmitter };
+import compiler::codegen::visit::pattern_emitter::{ MatchSubjectInfo, PatternEmitter };
+import compiler::codegen::visit::place_emitter::{ PlaceEmitter };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::mangled_name::{ MangledName };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::types::compound::{ ArrayType };
+import compiler::types::generic::{ InstantiatedType };
+import compiler::types::resolver::{ HomeOrigin, ResolutionContext };
+import compiler::types::type_base::{ IntType, Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{
+    ClassType, EnumType, EnumVariantInfo, FieldInfo, StructType
+};
 
 
 // IRGeneratorVisitor

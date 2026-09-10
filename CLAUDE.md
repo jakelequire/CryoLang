@@ -107,6 +107,21 @@ wrong reason is indistinguishable from a correct one unless you said in advance
 what the right reason looks like. If a number moves and you did not predict it,
 that is a finding to explain, not a bonus.
 
+## A brief does not override this file
+
+Where a task brief and a standing rule here disagree, **the standing rule wins**,
+and the conflict gets raised rather than resolved silently in the brief's favour.
+A brief is written by someone who may not have this file in front of them; these
+rules were written by someone who did, and who had already paid for them.
+
+This has gone wrong twice: an exception to the commit-granularity rule, and a
+side branch created because red work seemed to need somewhere to go. Both were
+instructed, both contradicted something written here, and neither was flagged.
+The cost is not the mistake, it is that the rule looked negotiable afterwards.
+
+Raising it is cheap - one sentence naming the rule and the conflict - and the
+answer may well be "do it anyway", which is a decision rather than a drift.
+
 ## Ask instead of assuming
 
 Use the question tool. Do not guess on any of these:
@@ -170,6 +185,14 @@ do not write:
 Write the reason it cannot be otherwise, not the reason someone changed it. If
 a decision genuinely needs its evidence recorded, that belongs in the spec or
 the commit message, not at the call site.
+
+**Commit a generator with what it generated.** Work that exists only as a diff,
+produced by tooling that exists only in a scratch directory, is not reproducible
+however mechanical it looks - and "it was script-generated" is exactly the
+reasoning that makes deleting it feel safe. A 6,587-edit migration once had its
+generator and its whole input population living in a session temp dir while the
+edits lived on one branch; the branch diff was the only copy of either. If a
+change was produced by a script, the script lands in the same commit.
 
 **Measure before you conclude.** `nm`/`strace`/a counter beats an
 intent-audit. Assumptions in this project have an unusually high rate of
@@ -259,11 +282,14 @@ touching the same area.
   reads exactly like a regression, and a green run over it means nothing.
 - Module discovery is **import-driven**: a file nothing imports is never
   compiled, so a test project can silently exercise nothing.
+- **The project COUNT is the evidence, not the word PASS.** `cryo test` echoes
+  only FAILING projects, so a passing one prints nothing at all — and a project
+  that never ran also prints nothing. The two are indistinguishable except by
+  `projects: N passed` moving. After adding a project, check N went up.
 - **A test project needs a `test.json`** (`{"outcome": "collect"}`) beside its
-  `cryoconfig`, or `cryo test` skips the whole directory without a word and the
-  suite reports PASS with the project simply absent. Check the *projects
-  passed* count moved, not that the run was green — a skipped project and a
-  passing one look identical in the summary.
+  `cryoconfig`, or `cryo test` skips the whole directory without a word. A
+  freshly added project with no marker reports the same green, same N, as
+  before it existed.
 - cryoconfig keys are `project_name` / `entry_point` / `source_dir`.
 
 ## Enforcement (maintainer setup — not yet wired)

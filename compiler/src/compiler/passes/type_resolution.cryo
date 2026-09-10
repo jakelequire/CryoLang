@@ -16,26 +16,78 @@ namespace compiler::passes::type_resolution;
 
 import compiler::diag;
 import compiler::diag::{
-    diagnostic, suggestion, source_span, edit_distance, snapshot
+    diagnostic, edit_distance, ErrorCode, snapshot, source_span, suggestion
 };
 import compiler::decl_index;
+import compiler::decl_index::{ ScopeResolution };
 import compiler::module_graph;
+import compiler::module_graph::{ ModuleGraph, ModuleInfo };
 import compiler::resolve_counter;
 import compiler::ast;
-import compiler::ast::{ node, declaration, statement, expression, pattern, cloner };
+import compiler::ast::{
+    cloner, declaration, expression, GenericAnnotation, NamedAnnotation, node, NodeKind,
+    pattern, statement, TraitBound, TraitRef, TypeAnnotation, Visibility
+};
 import compiler::passes::pass_id;
+import compiler::passes::pass_id::{ PassResult };
 import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
 import compiler::types;
 import compiler::types::{
-    type_ref, type_base, user_defined, compound, generic, arena, registry, resolver, generic_registry, ownership
+    arena, compound, generic, generic_registry, ownership, registry, resolver, type_base,
+    type_ref, TypeKind, user_defined
 };
 import compiler::resolver::{ intern_table, symbol_id, symbol_str, symbol, resolver };
 import compiler::resolver::res;
+import compiler::resolver::res::{ ResBase, ResSlot };
 import std::core::mem;
 import utils::logger;
+import utils::logger::{ cdebug, LOG_DEBUG, LogComponent };
 import std::collections::pair;
+import std::collections::pair::{ Pair };
 import std::ffi::libc;
 import std::fmt;
+import compiler::ast::cloner::{ ASTCloner };
+import compiler::ast::declaration::{
+    AssocTypeDeclNode, ClassDeclNode, DeclarationNode, DestructureDeclNode, EnumDeclNode,
+    EnumVariantNode, ExternBlockNode, FieldDeclNode, FunctionDeclNode, GenericParamNode,
+    ImplBlockNode, IntrinsicConstDeclNode, IntrinsicDeclNode, MethodNode, StructDeclNode,
+    TraitDeclNode, TypeAliasDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::ast::expression::{
+    AlignofExprNode, ArrayAccessNode, BinaryExprNode, CallExprNode, CastExprNode,
+    ExpressionNode, IdentifierNode, IfExprNode, LambdaExprNode, MatchExprNode,
+    MemberAccessNode, ScopeResolutionNode, SizeofExprNode, StaticMatchExprNode,
+    TernaryExprNode, TryExprNode, UnaryExprNode
+};
+import compiler::ast::node::{ ASTNode, ProgramNode, StaticAssertItem };
+import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
+import compiler::ast::statement::{
+    BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode,
+    LoopStmtNode, MatchStmtNode, ReturnStmtNode, StaticMatchStmtNode, UnsafeBlockStmtNode,
+    WhileStmtNode
+};
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::edit_distance::{ find_best_candidate };
+import compiler::diag::snapshot::{ DiagnosticSnapshot };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::diag::suggestion::{ Suggestion };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::resolver::{ Resolver };
+import compiler::resolver::symbol::{ Symbol, SymbolKind };
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::ownership::{ OwnershipQuery };
+import compiler::types::registry::{ ModuleTypeRegistry, TypeVisibility };
+import compiler::types::resolver::{ HomeOrigin, ResolutionContext, TypeResolver };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{
+    ClassType, EnumType, EnumVariantInfo, FieldInfo, MethodInfo, StructType, TraitType,
+    TypeAliasType
+};
 
 
 // TypeResolutionRunner: holds shared resolution state for pass methods

@@ -34,13 +34,19 @@ import compiler::types::{
 };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name };
 import compiler::ast;
-import compiler::ast::{ node, visitor, expression, statement, declaration };
+import compiler::ast::{
+    ArgBinding, declaration, expression, LiteralKind, NamedAnnotation, node, NodeKind,
+    statement, TraitBound, TraitRef, TypeAnnotation, visitor
+};
 import compiler::ast::node_locator;
 import compiler::diag;
-import compiler::diag::{ diagnostic, suggestion, source_span };
+import compiler::diag::{ diagnostic, ErrorCode, source_span, suggestion };
 import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
 import compiler::decl_index;
+import compiler::decl_index::{ DeclarationIndex };
 import compiler::module_graph;
+import compiler::module_graph::{ ModuleInfo };
 import compiler::resolve_counter;
 import compiler::lex;
 import compiler::sema::{
@@ -50,7 +56,59 @@ import compiler::sema::{
 import std::core::{ slice, option };
 import std::fmt;
 import compiler::resolver::resolver;
+import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::res;
+import compiler::resolver::res::{ Res, ResSlot };
+import compiler::ast::declaration::{
+    ClassDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
+    StructDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::ast::expression::{
+    BinaryExprNode, CallExprNode, ExpressionNode, IdentifierNode, LiteralNode,
+    MemberAccessNode, ScopeResolutionNode, UnaryExprNode
+};
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::visitor::{ ASTVisitor };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::diag::suggestion::{ Applicability, Suggestion };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::mangled_name::{ MangledName, ReceiverKind };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::sema::diagnostics::{ Diagnostics };
+import compiler::sema::dispatch::{ SemaDispatch };
+import compiler::sema::helpers::{
+    is_adoptable_numeric_type, is_constant_numeric_expr, is_narrow_float_type,
+    is_negative_numeric_literal_expr, is_numeric_literal_expr, is_wide_int_type,
+    sema_copy_type_refs, sema_expr_has_numeric_suffix
+};
+import compiler::sema::lambda_synth::{ LambdaSynth };
+import compiler::sema::literal_resolver::{ LiteralResolver };
+import compiler::sema::member_resolver::{ MemberResolver };
+import compiler::sema::method_binding::{ MethodBinding };
+import compiler::sema::scope_manager::{ ScopeManager };
+import compiler::sema::state::{ SemaState };
+import compiler::sema::symbolic_checker::{ SymbolicChecker };
+import compiler::sema::type_utils::{ TypeUtils };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::checker::{ TypeChecker, TypeCompatibility };
+import compiler::types::compound::{
+    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType
+};
+import compiler::types::generic::{ BoundedParamType, GenericParamType, InstantiatedType };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::inference::{ InferCtx };
+import compiler::types::ownership::{ OwnershipQuery };
+import compiler::types::resolver::{ HomeOrigin, ResolutionContext };
+import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::trait_checker::{ TraitChecker };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{
+    ClassType, EnumType, EnumVariantInfo, MethodInfo, StructType, TraitType, TypeAliasType
+};
+import std::core::slice::{ Slice };
 
 // Format-argument categories for the `printf`/`eprintf` directive checker.
 // A `%` conversion expects one of these; each variadic argument's resolved

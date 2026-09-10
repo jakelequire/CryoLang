@@ -17,22 +17,67 @@
 namespace compiler::mono::call_specializer;
 
 import compiler::ast;
-import compiler::ast::{ node, declaration, statement, expression, pattern };
+import compiler::ast::{
+    declaration, expression, node, NodeKind, pattern, statement, TraitBound, TraitRef,
+    TypeAnnotation
+};
 import compiler::types::{
     generic, user_defined, compound, type_base, arena, type_ref, substitution, resolver, generic_registry, ownership, TypeKind, RefMutability
 };
 import compiler::diag;
-import compiler::diag::{ sink, diagnostic, source_span };
+import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
 import compiler::decl_index;
+import compiler::decl_index::{ DeclarationIndex };
 import compiler::resolver::{ intern_table, symbol_str, qualified_name, mangled_name };
 import compiler::resolver::{ res, ResSlot };
 import compiler::mono::{ state, trait_specializer, ast_resolver };
 import compiler::module_graph;
+import compiler::module_graph::{ ModuleGraph };
 import compiler::resolve_counter;
 import std::alloc::allocator;
 import compiler::ast::cloner;
+import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::substituter;
+import compiler::ast::substituter::{ ASTTypeSubstituter };
 import std::fmt;
+import compiler::ast::declaration::{
+    ClassDeclNode, DeclarationNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
+    MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::ast::expression::{
+    ArrayAccessNode, ArrayLiteralNode, BinaryExprNode, CallExprNode, CastExprNode,
+    ExpressionNode, IdentifierNode, IfExprNode, MatchExprNode, MemberAccessNode,
+    ScopeResolutionNode, StaticMatchExprNode, StructLiteralNode, TryExprNode,
+    UnaryExprNode
+};
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
+import compiler::ast::statement::{
+    BlockStmtNode, DeclStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode,
+    MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode, UnsafeBlockStmtNode,
+    WhileStmtNode
+};
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::sink::{ DiagnosticSink };
+import compiler::mono::ast_resolver::{ MonoAstResolver };
+import compiler::mono::state::{ MonoState, SpecializationEntry };
+import compiler::mono::trait_specializer::{ MonoTraitSpecializer };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::mangled_name::{ MangledName };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::res::{ Res, ResSlot };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{
+    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+};
+import compiler::types::generic::{ InstantiatedType };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::resolver::{ HomeOrigin, ResolutionContext, TypeResolver };
+import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{ ClassType, FieldInfo, StructType };
 
 
 type struct MonoCallSpecializer {

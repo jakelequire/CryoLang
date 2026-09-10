@@ -17406,6 +17406,173 @@ and AUDIT.md's occurrences are inside a fenced block quoting compiler output
 verbatim. Rewriting a quoted diagnostic would falsify the record, and rewriting
 only the prose around it would leave the document disagreeing with itself.
 
+### 8.131 Imports stop globbing, and the qualifier path underneath turns out to be order-dependent - MIGRATION LANDED, GLOB DELETION DEFERRED 2026-09-10
+
+> **What landed, and what did not.** The 6,587 explicit imports across 619 files
+> are landed. The two-hunk glob deletion in `process_import` is NOT: leaving it
+> on makes every gate red, and the qualifier defect it exposes has to be fixed
+> in BOTH the annotation and the static-call position first, or the migration is
+> re-diagnosed under noise. §8.132 fixed the annotation half; the static-call
+> half is measured and open. The explicit imports are inert while the glob is
+> on - they name what was already bound - so landing them costs nothing and the
+> deletion is a two-hunk change when the qualifier is ready.
+>
+> **A failure mode this project had not hit before.** Until this landed, the
+> 6,587 edits existed only as one branch's diff, the generator that produced
+> them existed only in a session scratch directory, and the probe that produced
+> the generator's INPUT had been reverted and was on no branch. Every part of it
+> looked reproducible - the edit is mechanical, the demand was measured, the
+> script was trivial - and none of it was. "It was script-generated" is the
+> reasoning that makes deleting such a branch feel safe, and it is wrong
+> whenever the script is not committed. Anything generated lands with its
+> generator, in the same commit.
+>
+> `scripts/migrate-glob-imports.py` and `scripts/restore-plain-imports.py` are
+> the generator, committed so the edit is reproducible rather than existing only
+> as one branch's diff. Its input is the `GLOB-USE` audit stream described
+> below, which is re-derivable by re-running the probe.
+
+Ruled: namespaces and types share one namespace, and the Rust-faithful route to
+it is that a path naming a MODULE binds no names. `import P;` makes `P` a
+qualifier; `import P::{ T };` binds `T`. This is that change, its measured
+population, and the defect it uncovered.
+
+**The tree is RED and the work is not landed.** The diagnosis below is the
+result; the migration is kept because it is measured, not because it works.
+
+#### Five positions, and the one taken
+
+Â§8.56 posed two (keep the shorthand, or drop it). Â§8.66 ruled on that pair.
+The tree had already built a third nobody wrote down - keep it, and refuse the
+ambiguous declaration at the point of declaration. A fourth was available and
+declined: ban a module holding a same-leaf type, whose population is three
+files, all of them tests.
+
+The one taken is none of those: **a module path binds nothing.** Rust has no
+module-vs-type adjudication rule not because the names cannot collide but
+because `use p::l;` binds the module and nothing else, so a qualifier has one
+possible owner by construction. Cryo's `import P;` bound P's whole export set
+AND made `P` a qualifier - two jobs in one statement, and the reason `L::member`
+had to be settled by asking which owner happened to declare `member`.
+
+#### What the three existing forms do, read from the code
+
+Recorded because it was mis-stated twice from the docs.
+
+* **`import P;`** binds names into the importing module's own scope through
+  `declare_import`, and `process_import` never calls `export_symbol` on any of
+  them - so the binding does NOT leak to that module's own importers. It
+  separately carries a visibility edge, which is what makes `P::x` resolve.
+* **`export P;`** parses to the SAME AST node as import, names a MODULE PATH
+  and never a symbol, and records `add_reexport` + `add_imported_namespace`:
+  an importer of this module sees P as if it had imported it. **Module
+  granularity only** - the loader's item loop ends by noting that an item which
+  is a declaration "is reached through the path's own edge", so `export A::{ X };`
+  re-exports all of A. Nothing in the tree writes a braced export.
+* **`public module X;`** is "deliberately NEITHER a dependency edge NOR a
+  visibility edge". It does discovery, and it makes the set readable back -
+  which is how `stdlib/prelude.cryo` is the single source of truth for the
+  prelude.
+
+Mapped to Rust: `public module` covers `mod x;`, `import P::{ T };` covers
+`use path::T;` (and is provably local, never exported), and `export P;` covers
+`pub use` only at MODULE granularity. **The one uncovered role is per-item
+re-export.** It needs no keyword - `export P::{ T };` already parses - and it
+has zero in-tree demand, so it is named here and not built.
+
+**No `use` keyword.** `import` already occupies that role, and deleting the
+glob moves it closer to `use`, not further. A fourth form for a role the
+language has three of is the duplication this migration exists to remove.
+
+#### The population, measured on the demand rather than on the errors
+
+A prediction worth keeping because it was wrong: disabling the glob was
+predicted to produce thousands of errors. It produced **six** - all base-class
+annotations - because the build ABORTS AT NAME RESOLUTION and sema never runs.
+An error count measures the first failing pass, not the demand.
+
+The demand needs a counter. One row per lookup that resolves to an import-bound
+symbol, emitted from `Resolver::lookup`, with the population line as the control
+that the corpus was fully compiled:
+
+| corpus | glob-resolved lookups | distinct (module, name) |
+|---|---:|---:|
+| `compiler/src` | 34,484 | 3,711 |
+| `tests/` | - | 1,583 |
+| `stdlib` | 7,457 | 844 |
+| `tools/CryoLSP` | 40,973 | 422 |
+| examples + other | ~2,000 each | 27 |
+| **total** | **151,510** | **6,587** |
+
+`runtime/` reads zero because it was never probed. That is unmeasured, not zero.
+
+**The shape matters more than the total: user code is nearly free.** Of
+`examples/09-json-config`'s 2,611 rows, 2,516 are the stdlib resolving itself
+and **eight** are the project's own. The cost falls almost entirely on the two
+codebases we own.
+
+#### Two things the migration established
+
+**`import M;` and `import M::{ X };` are not interchangeable.** The first was
+replaced by the second wherever names were needed, and `mpsc::Sender` stopped
+resolving; restoring the plain line alongside compiled clean. The loader does
+push a braced import's base path, so the two ought to carry the same edge and
+do not. A file that needs both a qualifier and a name needs both lines - which
+is also how Rust writes it.
+
+**A probe on `Resolver::lookup` sees one resolution path, not all of them.**
+Type annotations resolve through the type layer, so the migration was
+incomplete by construction and the build was always going to be the remaining
+instrument.
+
+#### The defect the glob was hiding
+
+After the migration `stdlib` fell from a total break to **four** errors, all of
+the form `syscall::X` with the caret on the QUALIFIER, not the type. Then:
+
+* Adding `import std::sys::syscall::{ SECURITY_ATTRIBUTES, STARTUPINFOA,
+  PROCESS_INFORMATION };` to `process/command.cryo` took it to **one**.
+* Adding `import std::sys::syscall::{ SYSTEM_INFO_PARTIAL };` to three OTHER
+  files took it to **six** - including `mpsc::Sender` and
+  `syscall::SECURITY_ATTRIBUTES`, both of which had just been fixed and whose
+  import lines were verified still present.
+
+**The failing set is not a function of the file being compiled.** It moved when
+unrelated files gained an import line. That is registration-order dependence in
+module-qualifier resolution, and it is the same class this migration exists to
+remove - a name whose meaning depends on what else the program happened to
+register first.
+
+The glob was masking it: with every public name bound bare in every importing
+scope, the qualifier path was rarely the one that had to answer. Removing the
+glob makes it load-bearing everywhere at once.
+
+#### What was ruled out, and how
+
+* **The glob was binding these types.** No - `SECURITY_ATTRIBUTES` and
+  `STARTUPINFOA` are not public, and the Wildcard branch filtered on
+  `is_public()`. They were never glob-bound.
+* **The specific import binds them through case (a).** No -
+  `lookup_in_module` checks `sym.visibility.is_public()`, so a non-public name
+  cannot be offered. Which leaves no explanation for why adding that import
+  changed anything, and is the reason this is written down rather than swept.
+* **The edits were lost between runs.** No - both import lines were re-read
+  from disk after the regression and are present.
+
+#### What not to do next
+
+**Do not add imports until the errors stop moving.** Applying 6,587 of them
+against an order-dependent resolver produces a tree that compiles for reasons
+nobody can state, which is the failure mode this document exists to prevent.
+The qualifier path is the root and it is where the next session starts:
+`stamp_module_scope` answers from `modules_written_as` + `ns_imports`, and one
+of those two is answering differently depending on registration order.
+
+The deletions this ruling makes possible - `check_module_type_collision`, the
+both-owners probe in `ir_generator`, and `module_owns_member` - are NOT taken
+here. They are downstream of a qualifier that answers the same question the
+same way twice, and it does not yet.
+
 ### 8.132 A qualified type name was answered correctly and then thrown away, because the type layer read the stamp only for bare leaves - MEASURED AND FIXED 2026-09-10
 
 `b::Widget` did not compile. `a::Widget` beside it did. Both modules declare
@@ -17461,6 +17628,26 @@ evidence the CORPUS holds no two modules sharing a type leaf. The guard rejects
 the moment one does, which is exactly what made `b::Widget` fail: starved, not
 absent. Deleting it on the zero would have removed live protection.
 
+**The general rule, which has now cost this project time in three separate
+places: a zero measured over a corpus that cannot produce the case is not
+evidence about the mechanism.** It is evidence about the corpus. §8.120 hit it
+classifying lanes by counter name, §8.127 hit it on Win64 where SysV cannot
+express the failure, and this entry hit it on a guard whose triggering shape no
+in-tree program contains. In each the number was accurate and the inference from
+it was not. Before reading anything into a zero, state what would have to be
+true for the case to be REPRESENTED at all, and if the corpus cannot represent
+it, construct one that can - a nine-line reproducer settled this in minutes
+after a whole-tree count had pointed the wrong way for a day.
+
+**And this one had two layers, which is why it survived a careful reading.** The
+population was wrong AND the interpretation was wrong, and the first hid the
+second: `qualifier_agrees` was read as "the qualifier path", when it has exactly
+ONE caller - the branch taken when no module carries the written prefix. Its
+counter could not have said anything about paths where the head does name a
+module, because those never reach it. Enumerating READERS of a value is not
+enough when the question is what a number means; enumerate its CALLERS, because
+a counter describes the path that reaches it and nothing else.
+
 #### The measurement, which conserves
 
 | | before | after |
@@ -17513,10 +17700,30 @@ does not.
 
 #### The ordering defect survives
 
-`insert_import` is still last-import-wins for every other consumer of the scope
-- bare names, call resolution, expressions. This removes one consumer's
-dependence on registration order. It does not make the order-dependence dead,
-and nothing here should be read as saying it is.
+`insert_import` is still last-import-wins for every other consumer of the scope.
+This removes one consumer's dependence on registration order. It does not make
+the order-dependence dead, and nothing here should be read as saying it is.
+
+Enumerated while the mechanism was fresh, so the remaining surface is a list
+rather than a belief. `Resolver::lookup` is reachable only through a `Resolver*`,
+which makes the count outside the resolver package exact - **one**:
+
+| consumer | what it does |
+|---|---|
+| `passes/type_resolution.cryo:1257` | `name_resolver.lookup(fn_name, current_scope)` |
+| `sema/type_utils.cryo:374` | `resolve_cross_module_name` -> the NON-strict `resolve_type_qualified_name`, the cascade's `3-CROSSMOD` step. It resolves through the scope chain and applies **no qualifier check at all** - the strict form's veto is not in this path |
+| `types/resolver.cryo:1634` | `resolve_type_qualified_name_from(home, name)` |
+
+Plus the readers of the ambiguity MARK that `insert_import` sets when two
+imports of one name come from different modules - `compilation_context.cryo`
+(six sites), `decl_index.cryo:55` and `:71`, `sema/call_resolver.cryo:3805`,
+`types/resolver.cryo:1838`. Those read the conflict rather than depend on which
+side won it.
+
+Everything else is inside `compiler/src/compiler/resolver/`, where the pass that
+builds the scope legitimately walks it. A grep for `.lookup(` returns some 460
+hits across 46 files and almost all of them are a same-named method on another
+type; the qualifier is what makes the question answerable.
 
 #### Coverage, and its control
 

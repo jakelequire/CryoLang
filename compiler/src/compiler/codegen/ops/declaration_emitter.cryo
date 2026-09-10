@@ -16,26 +16,67 @@
 namespace compiler::codegen::ops::declaration_emitter;
 
 import compiler::codegen;
-import compiler::codegen::{ llvm_types, type_map, abi, util };
+import compiler::codegen::{ abi, llvm, llvm_types, type_map, util };
 import compiler::codegen::state::{ value_table, function_registry, global_registry, string_cache, diag_sink };
 import compiler::codegen::ops::{ ir_flow_emitter, symbol_resolver, intrinsic_emitter, expr_ops };
 import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
 import compiler::const_table;
+import compiler::const_table::{ ConstEval };
 import compiler::resolve_counter;
 import compiler::decl_index;
+import compiler::decl_index::{ DeclarationIndex };
 import compiler::diag;
-import compiler::diag::{ diagnostic, source_span };
+import compiler::diag::{ diagnostic, ErrorCode, source_span };
 import compiler::types;
-import compiler::types::{ type_ref, type_base, arena, compound, user_defined, generic, ownership };
+import compiler::types::{
+    arena, compound, generic, ownership, type_base, type_ref, TypeKind, user_defined
+};
 import compiler::ast;
-import compiler::ast::{ node, declaration };
+import compiler::ast::{ declaration, LiteralKind, node, NodeKind };
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
 import std::collections::pair;
+import std::collections::pair::{ Pair };
 import std::fmt::float;
 import compiler::ast::expression;
+import compiler::ast::expression::{
+    ArrayLiteralNode, BinaryExprNode, CastExprNode, ExpressionNode, LiteralNode,
+    ScopeResolutionNode, StructLiteralNode, UnaryExprNode
+};
 import compiler::types::generic_registry;
+import compiler::types::generic_registry::{ GenericRegistry };
 import std::ffi::libc;
 import std::fmt;
+import compiler::ast::declaration::{
+    ClassDeclNode, EnumDeclNode, ExternBlockNode, FunctionDeclNode, ImplBlockNode,
+    IntrinsicDeclNode, MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::codegen::abi::{ AbiAttr, AbiClassifier, ArgClass, ParamPlan, SignaturePlan };
+import compiler::codegen::llvm_types::{
+    LBasicBlock, LBuilder, LContext, LLinkage, LModule, LType, LTypeKind, LValue
+};
+import compiler::codegen::ops::expr_ops::{ ExprOps };
+import compiler::codegen::ops::ir_flow_emitter::{ IRFlowEmitter };
+import compiler::codegen::ops::symbol_resolver::{ SymbolResolver };
+import compiler::codegen::state::diag_sink::{ DiagSink };
+import compiler::codegen::state::global_registry::{ GlobalRegistry };
+import compiler::codegen::state::string_cache::{ StringCache };
+import compiler::codegen::state::value_table::{ ValueTable };
+import compiler::codegen::type_map::{ TypeMapper };
+import compiler::codegen::util::{ CodegenUtil, VTableSlot };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::mangled_name::{ MangledName, ReceiverKind };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{ FunctionType };
+import compiler::types::generic::{ InstantiatedType };
+import compiler::types::type_base::{ IntType, Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{
+    ClassType, EnumType, EnumVariantInfo, MethodInfo, StructType
+};
 
 
 type struct DeclarationEmitter {
