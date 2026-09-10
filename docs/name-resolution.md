@@ -17405,3 +17405,147 @@ namespaces and were deliberately not rewritten. Both are point-in-time records,
 and AUDIT.md's occurrences are inside a fenced block quoting compiler output
 verbatim. Rewriting a quoted diagnostic would falsify the record, and rewriting
 only the prose around it would leave the document disagreeing with itself.
+
+### 8.132 A qualified type name was answered correctly and then thrown away, because the type layer read the stamp only for bare leaves - MEASURED AND FIXED 2026-09-10
+
+`b::Widget` did not compile. `a::Widget` beside it did. Both modules declare
+`Widget`, both are imported, and the program is legal.
+
+#### What was actually wrong
+
+The name layer resolves a qualified annotation correctly. It resolves the head
+to a module and looks the leaf up inside it, and it records the answer:
+
+    PATH-HIT  ANN-ROOTED  repro  b::Widget  repro::b::Widget
+
+That is the canonical name, and it is right. The build still failed, because
+the type layer did not read it. `TypeResolver::resolve_named` takes the
+annotation's own `ResSlot` and consults it at step 2c under this condition:
+
+```cryo
+&& !this.name_resolver.contains_separator(name_str)   // bare leaves ONLY
+```
+
+with a comment asserting that "a written qualifier is handled authoritatively
+by 3a". It is not. Step 3a matches the DeclarationIndex on the name as
+WRITTEN - `b::Widget` - and the store holds `repro::b::Widget`, so it misses,
+and the cascade falls through to steps that resolve the LEAF through the ambient
+scope chain and then check the written qualifier against the result.
+
+So the one spelling for which the stamp is the authoritative answer was the one
+spelling excluded from reading it. The condition now covers every spelling; the
+gate below it, which asks whether the writing module can reach a leaf, stays on
+bare leaves, because a qualified path names its own module and reachability of
+the leaf is not the question being asked.
+
+#### Why leaf-then-check cannot be the answering path
+
+Checking the qualifier after resolving the leaf can REFUSE a wrong answer. It
+cannot PRODUCE the right one. With two modules exporting one leaf, the scope
+binds whichever registered last - `insert_import` is last-import-wins - so one
+spelling resolves and the other resolves to nothing at all, and no diagnostic
+says why. That is a guard standing where a destination is needed.
+
+#### A correction to §8.131
+
+§8.131 says the written qualifier "never finds anything - it only vetoes", on
+48,457 `qualifier_agrees` calls with zero rejections. The sentence is true of
+the branch those calls come from, and that branch was the WRONG POPULATION to
+read it over. `qualifier_agrees` has one caller: the annotation path taken when
+NO module carries the written prefix. Those 48,457 names never had a
+module-rooted answer available, so their qualifier could not have found
+anything - the count says nothing about paths where the head does name a module.
+
+The zero rejections were also mis-read as evidence the guard was inert. They are
+evidence the CORPUS holds no two modules sharing a type leaf. The guard rejects
+the moment one does, which is exactly what made `b::Widget` fail: starved, not
+absent. Deleting it on the zero would have removed live protection.
+
+#### The measurement, which conserves
+
+| | before | after |
+|---|---:|---:|
+| 2c home-module (syntax provenance) | 61,088 | **61,111** |
+| `qualifier_agrees` calls | 48,457 | **48,434** |
+| `CHECK rejected the leaf answer` | 0 | 0 |
+| leaf unresolved, CHECK not asked | 9,102 | 9,102 |
+
++23 and -23: twenty-three names moved off the leaf-and-veto path onto the
+stamp, and nothing else moved.
+
+`b1-check` moved in exactly one bucket on exactly one corpus per host, and both
+hosts are re-pinned here: `windows-gen` 4577 -> 4566 and `linux-gen` 4576 ->
+4566, `qualifier_agrees` calls and agreed together. `windows`, `windows-ffi`,
+`linux` and `linux-ffi` did not move at all. `--update` pins only the host it
+runs on, so the Linux arm was run separately rather than assumed to mirror the
+Windows one - and it did not mirror it, the two started one apart and converge.
+
+That per-host comparison is also the control on running the Linux arm under WSL
+over `/mnt/c`, where readdir order is the Windows one: had the filesystem axis
+perturbed anything, rows other than these two would have moved. None did.
+
+**A prediction that was wrong.** A large fall in `qualifier_agrees` was
+predicted and it fell by 23. The reason is that `compiler/src` contains no two
+modules sharing a type leaf, so the leaf lane was already landing on the right
+type: the fix changes WHICH LANE ANSWERS without changing WHAT IT ANSWERS,
+except where the two disagreed. A corpus with no collisions cannot show the
+difference, which is the same reason the ratchets read green through this.
+
+The 9,102 did not move at all - zero converted, against a prediction of "fewer
+than half". That counter lives in the name layer's strict path, which this did
+not touch, so the sharper sub-prediction (a conversion can only come from a name
+containing `::`) went untested rather than confirmed.
+
+#### The same defect one layer over, measured and NOT fixed
+
+The static-method call path resolves leaf-first too, and this change does not
+reach it:
+
+| written | annotation | static call |
+|---|---|---|
+| `a::Widget` (first registered) | resolves | resolves |
+| `b::Widget` (second) | **fixed** | **E0233** `no matching static method, variant, or type` |
+
+`ScopeResolutionNode` and `call_resolver` own that path. It is left failing and
+named rather than worked around, and the test below is scoped to the property
+this change actually delivers rather than shipping a red assertion for one it
+does not.
+
+#### The ordering defect survives
+
+`insert_import` is still last-import-wins for every other consumer of the scope
+- bare names, call resolution, expressions. This removes one consumer's
+dependence on registration order. It does not make the order-dependence dead,
+and nothing here should be read as saying it is.
+
+#### Coverage, and its control
+
+`tests/projects/qualified_type_selects_module` - two modules declaring one leaf,
+both imported, plus a non-public type reached through its qualifier. Fields and
+widths differ, so a cross-binding cannot compile and a wrong owner fails on
+content.
+
+The control is the load-bearing half: the same three tests run against the
+compiler WITHOUT this change fail with `cannot find type B::Widget`, twice. A
+test that passes after a fix is not evidence until it has been shown to fail
+before it.
+
+**And it very nearly measured nothing at all.** A project under
+`tests/projects/` is run only if it carries a `test.json`; without one, `cryo
+test` skips the directory silently and the suite prints PASS with the project
+absent. The first full run after adding it reported `projects: 40 passed` -
+the same 40 as before, green, with the new project never compiled. What caught
+it was checking that the COUNT moved rather than that the run was green: a
+skipped project and a passing one are indistinguishable in the summary line.
+
+Both spellings are covered deliberately. A test that only writes `A::Widget`
+passes with the defect present, because the first-registered module answers from
+the leaf either way.
+
+#### Gates
+
+`make test` OVERALL PASS - unit ok, 178 compile-fail, **41 projects**, up from
+40, which is the only thing that says the new one ran: `cryo test` echoes
+failing projects only, so a passing project prints nothing at all. `lane-check` unchanged. `lsp-check` 266 modules, 0 errors.
+`cryo-fix` compiles `compiler/` itself - 164 local, 81 std, 0 errors - so the
+new compiler still builds the compiler.

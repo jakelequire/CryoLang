@@ -259,6 +259,11 @@ touching the same area.
   reads exactly like a regression, and a green run over it means nothing.
 - Module discovery is **import-driven**: a file nothing imports is never
   compiled, so a test project can silently exercise nothing.
+- **A test project needs a `test.json`** (`{"outcome": "collect"}`) beside its
+  `cryoconfig`, or `cryo test` skips the whole directory without a word and the
+  suite reports PASS with the project simply absent. Check the *projects
+  passed* count moved, not that the run was green — a skipped project and a
+  passing one look identical in the summary.
 - cryoconfig keys are `project_name` / `entry_point` / `source_dir`.
 
 ## Enforcement (maintainer setup — not yet wired)
