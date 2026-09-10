@@ -1,31 +1,31 @@
 ///! Name-Resolution Instrumentation Counter
 ///!
-///! Phase 0 instrumentation for the name-resolution unification effort
-///! (`.todo/NAME_RESOLUTION_PLAN.md`).  Pure measurement: every entry point
-///! here only bumps a counter, so enabling or disabling it cannot change
-///! what the compiler resolves.
+///! Pure measurement: every entry point here only bumps a counter, so
+///! enabling or disabling it cannot change what the compiler resolves.
 ///!
-///! **Not scaffolding.**  `docs/name-resolution.md` §7.2 mechanism 3 makes
-///! `B1 == 0` a permanent gate: the cascade grew for years because nobody
-///! could see it growing, and deleting the meter after fixing the leak is how
-///! the leak comes back.  Individual SITES are disposable - a site whose
-///! fallback has been deleted has nothing left to count - but the module is
-///! not.
+///! **This module is being retired, and a site earns its place by being
+///! asserted.**  A row `tests/b1-baseline.txt` pins is a tripwire on a lane
+///! that can regrow, and the reason the cascade grew for years is that
+///! nobody could see it growing.  A row nothing pins is a note about a
+///! measurement already taken, and a note is cheaper to re-derive with a
+///! reproducer than to carry as a global increment on every build.  Adding
+///! an unasserted site to answer a question is how this module reached
+///! three hundred of them; take the measurement, then take the site out.
 ///!
-///! The plan's §3.2 rule 2 splits resolution into two answers, and the
-///! counter mirrors that split into two BUCKETS:
+///! Rows carry a BUCKET, which is what says how the gate reads them:
 ///!
 ///!   B1 - path re-derivation.  A stage recomputing, from a string, an
-///!        answer the resolver already produced.  Every B1 site must read
-///!        ZERO before Phase 5 deletes the fallback that feeds it.
+///!        answer the resolver already produced.  Target ZERO; every one is
+///!        pinned, and a `>` suffix pins only that the lane is still
+///!        entered.
 ///!   B2 - type-dependent lookup.  Resolution that genuinely needs a
 ///!        receiver type (method/trait selection, associated-item
-///!        projection).  Expected to stay nonzero forever; enumerated and
-///!        justified rather than eliminated.
-///!
-///! Bucket labels here are the plan's current reading and are expected to
-///! be revised once `docs/name-resolution.md` settles them.  The counter
-///! records SITES; the bucket is only a report-time annotation.
+///!        projection).  A floor, not a target.
+///!   B3 - authoritative resolution.  Target is once per path, not zero, so
+///!        these are context unless marked `*`.
+///!   !! - correct only at zero.  Each is pinned beside a row that BOUNDS
+///!        it, because a count taken inside a guard reaches zero equally by
+///!        never being refused and by never being reached.
 ///!
 ///! Counting is unconditional - a global array increment is cheaper than
 ///! the branch that would guard it, and always-on counting removes any
@@ -78,10 +78,6 @@ mut g_reported: boolean = false;
 /// Nothing here is hand-maintained, so it cannot rot the way the capacity did.
 mut g_tally_dropped: u64 = 0;
 
-/// Suspend depth.  Non-zero means "a measurement is currently re-running
-/// production lookups; record nothing".
-mut g_suspend: i32 = 0;
-
 /// Per-stream tri-state env cache: 0 unknown, 1 on, 2 off.  Indexed by
 /// `Audit`.  Cached because these hooks run inside the hottest lookup in the
 /// compiler and an `env::var` per call would dominate the measurement.
@@ -121,29 +117,6 @@ type enum Site {
     RnDiLiteral;
     RnDiCanonical;
     RnDiBare;
-    RnFailed;
-
-    /// The two doors ABOVE the cascade that decide whether a primitive
-    /// spelling ever reaches `RnPrimitive`.
-    ///
-    /// `RnPrimitive` exists for a `Named` annotation spelled as a primitive,
-    /// and reads 0.  A step that answers 0 is either dead or starved, and
-    /// which one it is depends entirely on what happens upstream of it: an
-    /// annotation rewritten to a `Primitive` node never enters the cascade at
-    /// all, and one carrying a valid `pre_resolved` returns from the type
-    /// layer before the cascade is entered.  Those are different mechanisms
-    /// with the same tally, so both are counted.
-    ///
-    /// `AnnPreResolvedPrim` asks the SAME predicate `RnPrimitive` does -
-    /// `resolve_primitive` - rather than the substituter's
-    /// `is_primitive_spelling`.  The two sets differ (`int`, `uint`, `float`,
-    /// `double`, `va_list` are in one and not the other), and the whole
-    /// question is which spellings the short-circuit swallows, so asking the
-    /// other predicate here would measure a different population than the one
-    /// the answer is applied to.
-    AnnPrimitiveNode;
-    AnnPreResolvedHit;
-    AnnPreResolvedPrim;
 
     // `sema/call_resolver.cryo` resolve_method_call.  B2's bulk: dispatch that
     // genuinely needs the receiver's type, and cannot move into the resolver
@@ -163,8 +136,6 @@ type enum Site {
     McCopyDrop;
     McDerefCoercion;
     McFailed;
-
-    // `types/arena.cryo` global leaf index.
 
     // `const_table.cryo` bare-name index for a compile-time constant.  A bare
     // `Identifier` carries no `Res` slot, so the fold cannot read a stamp for
@@ -191,12 +162,9 @@ type enum Site {
     // Where the SCOPE-call lane's use site came from (`Pair` in `Pair::new`).
     // The rows above say what a gate would reject; these say whose namespace it
     // would have been judged against, which is the half that decides whether a
-    // rejection is a defect in the source or an artifact of the caller.  Diff is
-    // the one to read: it counts the scope names whose writing module and
-    // ambient cursor disagree, i.e. exactly the set the cursor was mis-judging.
+    // rejection is a defect in the source or an artifact of the caller.
     ScopeUseSyntax;
     ScopeUseCursor;
-    ScopeUseDiff;
 
     // A default type argument expanded with no owning module on its template,
     // so it resolved against the caller instead of the file it was written in.
@@ -206,17 +174,6 @@ type enum Site {
     // default was ever expanded".
     DefaultArgExpanded;
     DefaultArgNoOwner;
-
-    // Leaf-index consumers, bumped on a HIT (an answer actually produced).
-
-    /// The same two consumers, bumped on the CALL.
-    ///
-    /// The hit rows above sit inside `if (trait_ref.is_valid())`, so each one
-    /// reads 0 both when its caller never asked and when it asked and was
-    /// refused.  Those imply opposite fixes - one is a caller with nothing to
-    /// look up, the other a lookup that answers nobody - and the parent row
-    /// cannot separate them either, because it aggregates both.  A leaf
-    /// consumer's zero is not readable without the call beside it.
 
     /// One row per exit of the type-widening cascade in
     /// `sema::type_utils::lookup_type_by_sym`, which has twelve callers and
@@ -252,16 +209,6 @@ type enum Site {
     ParamRefTypeRes;
     ParamRefResolver;
 
-    // Whether a bound on a TYPE parameter could be enforced where a type is
-    // instantiated.  Entered is the control: it counts every specialization,
-    // so a zero in the two below is distinguishable from an instrument that
-    // never ran.  TypeDecl narrows to the declarations a type-level bound
-    // could sit on; Bindable adds the condition the satisfaction oracle needs,
-    // that the parameter names line up index-wise with the concrete args.
-    SpecEntered;
-    SpecTypeDecl;
-    SpecTypeDeclBindable;
-
     // Instantiations as they are MINTED, which is a different population from
     // the one specialization sees.  `create_instantiation` interns, so New
     // counts distinct instantiations and Hit is the control saying the site is
@@ -273,18 +220,6 @@ type enum Site {
     InstMintNew;
     InstMintAgg;
     InstMintAggSymbolic;
-
-    // Why a minted instantiation never reaches the specializer.  The mint and
-    // specialize rows give the SIZE of the gap between them and cannot give its
-    // composition: an abstract type argument is a legitimate deferral, while a
-    // generic alias is a hole.  One row per early return separates them.
-    EnqSkipNotInst;
-    EnqSkipBaseNull;
-    EnqSkipTypeAlias;
-    EnqSkipBaseKind;
-    EnqSkipNotTemplate;
-    EnqSkipAbstractArg;
-    EnqAccepted;
 
     // Free-function bare-call binder.  Counted apart because they need
     // different fixes: D-A is a missing check, D-B is a missing input.
@@ -354,7 +289,6 @@ type enum Site {
     // getting wrong.  Read Diff, not Cursor: a large Cursor with a zero Diff
     // means the cursor was right every time, which is the null result.
     BodyNsOwner;
-    BodyNsSyntax;
     BodyNsCursor;
     BodyNsDiff;
 
@@ -473,7 +407,6 @@ type enum Site {
     /// because a divergence measured over `Seen` says nothing about whether
     /// anything downstream read it.
     ImplHeadSeen;
-    ImplHeadUnstamped;
     ImplHeadAsync;
     ImplHeadAsyncUnstamped;
 
@@ -483,7 +416,6 @@ type enum Site {
     /// still stands behind it.  Only `Cursor` guesses - it qualifies a bare
     /// leaf with whatever module the compiler is standing in - so it is the
     /// one that has to be zero before the copy can go.
-    CgImplTargetSeen;
     CgImplTargetUnstamped;
 
     /// What `res` says on the nodes with no `qualified_target_name` - the
@@ -494,7 +426,6 @@ type enum Site {
     /// `Pending`, which is why the spelling is still the carrier.
     CgImplTargetUnResDef;
     CgImplTargetUnResPrim;
-    CgImplTargetUnResPend;
     CgImplTargetUnResOther;
 
     /// Whether M4's bare-leaf template scan answered.
@@ -504,31 +435,6 @@ type enum Site {
     /// `Hits` is what the fallback total sums and `Single` is what says why
     /// it answered.
     M4Single;
-    /// The BARE-leaf last step of a hand-written widening cascade: whether it
-    /// is REACHED, and whether it ANSWERS.  A bare name reaching the index with
-    /// no resolver answer binds in whichever module registered that leaf, so
-    /// these say whether deleting the step would change any program.
-    ///
-    /// Reached and answered are separate because a zero reaches zero two ways:
-    /// the earlier steps always answered, or the step ran and never helped.
-    /// Only the second licenses deleting it on evidence rather than on hope.
-    CascBCtorEnter;
-    CascNewDelEnter;
-    CascImplTgtEnter;
-    PrimImplTargetPrimitive;
-    PrimImplTargetDeclared;
-    PrimImplOwnerAReached;
-    PrimImplOwnerAAnswered;
-    PrimImplOwnerBReached;
-    PrimImplOwnerBAnswered;
-    PrimImplOwnerCReached;
-    PrimImplOwnerCAnswered;
-
-    /// Answered from the stamp the calling identifier carries, without a scan.
-    /// The registry is keyed canonically and the stamp names a declaration
-    /// canonically, so this is the two meeting directly; the leaf scan below
-    /// it can only ever approximate the same answer from a spelling.
-    M4ViaRes;
 
     /// How many candidates the leaf scan actually found, which is the question
     /// the four exits below it answer between them.  The exits cannot state
@@ -555,14 +461,12 @@ type enum Site {
     /// first-match ladder as the bare scan and, unlike it, no instrumentation
     /// at all - so nothing said whether the ladder ever decided anything.
     ///
-    /// `ViaRes` is the stamp answering directly.  The scan rows beneath it are
-    /// the tripwire: the stamp was measured to reach the same entry on every
-    /// call the scan could answer, so a non-zero `ScanOne` means it has stopped
-    /// covering a population it used to, and `ScanPlural` means a suffix has
-    /// become ambiguous.
+    /// The stamp answers first and the scan rows are the tripwire behind it:
+    /// the stamp was measured to reach the same entry on every call the scan
+    /// could answer, so a non-zero `ScanOne` means it has stopped covering a
+    /// population it used to, and `ScanPlural` means a suffix has become
+    /// ambiguous.
     SfCalls;
-    SfViaRes;
-    SfScanNone;
     SfScanOne;
     SfScanPlural;
 
@@ -613,14 +517,10 @@ type enum Site {
     /// unanswered slot, and the attribution is unsound.
     SpellTyImplCalls;
 
-    /// Which branch the impl head took, over the SAME population
-    /// `SpellTyImplCalls` counts.  `Other` is the branch that answers
-    /// nothing, and it must stay zero: a variant arriving there names
-    /// something that is not a declaration, so the impl block would be
-    /// typed invalid with no key left to try.
-    SpellTyImplResDef;
-    SpellTyImplResPrim;
-    SpellTyImplResPend;
+    /// The impl head's branch that answers NOTHING, over the same population
+    /// `SpellTyImplCalls` counts.  It must stay zero: a variant arriving
+    /// there names something that is not a declaration, so the impl block
+    /// would be typed invalid with no key left to try.
     SpellTyImplResOther;
 
     SpellTyLitCalls;
@@ -636,7 +536,6 @@ type enum Site {
     M4ScanNone;
     M4ScanOne;
     M4ScanPlural;
-
 }
 
 implement enum Site {
@@ -645,7 +544,6 @@ implement enum Site {
     /// Out-of-range is ignored rather than trapping: instrumentation must
     /// never be able to abort a build.
     bump(&this) -> void {
-        if (g_suspend > 0) { return; }
         const i: i64 = this as i64;
         if (i < 0 || i >= TALLY_CAP) {
             g_tally_dropped = g_tally_dropped + 1;
@@ -706,16 +604,12 @@ implement enum Site {
             Site::McDerefCoercion       => { "B2 " }
             Site::McFailed              => { "   " }
             Site::RnPrimitive           => { "B3 " }
-            Site::AnnPrimitiveNode      => { "   " }
-            Site::AnnPreResolvedHit     => { "   " }
-            Site::AnnPreResolvedPrim    => { "   " }
             Site::RnHomeModule          => { "B1 " }
             Site::RnHomeModuleSyntax    => { "B3 " }
             Site::RnAmbiguous           => { "B1 " }
             Site::RnDiLiteral           => { "B3 " }
             Site::RnDiCanonical         => { "B3 " }
             Site::RnDiBare              => { "B3 " }
-            Site::RnFailed              => { "   " }
             Site::ConstLeafCalls        => { "B1 " }
             Site::ConstLeafHits         => { "B1 " }
             Site::BareAltsCalls         => { "   " }
@@ -726,7 +620,6 @@ implement enum Site {
             Site::BareAltsViaAmbigDiag  => { "B1 " }
             Site::ScopeUseSyntax        => { "B1>" }
             Site::ScopeUseCursor        => { "B1 " }
-            Site::ScopeUseDiff          => { "   " }
             Site::DefaultArgExpanded    => { "B1 " }
             Site::DefaultArgNoOwner     => { "!! " }
             Site::VisFastpath           => { "B1>" }
@@ -740,20 +633,10 @@ implement enum Site {
             Site::ParamRefSymbolic      => { "B1>" }
             Site::ParamRefTypeRes       => { "B1>" }
             Site::ParamRefResolver      => { "B1>" }
-            Site::EnqSkipNotInst        => { "   " }
-            Site::EnqSkipBaseNull       => { "   " }
-            Site::EnqSkipTypeAlias      => { "   " }
-            Site::EnqSkipBaseKind       => { "   " }
-            Site::EnqSkipNotTemplate    => { "   " }
-            Site::EnqSkipAbstractArg    => { "   " }
-            Site::EnqAccepted           => { "   " }
             Site::InstMintHit           => { "   " }
             Site::InstMintNew           => { "   " }
             Site::InstMintAgg           => { "   " }
             Site::InstMintAggSymbolic   => { "   " }
-            Site::SpecEntered           => { "   " }
-            Site::SpecTypeDecl          => { "   " }
-            Site::SpecTypeDeclBindable  => { "   " }
             Site::FnBindSingle          => { "   " }
             Site::FnBindSingleHidden    => { "!! " }
             Site::FnBindPrivateBound    => { "!! " }
@@ -774,7 +657,6 @@ implement enum Site {
             Site::MethodVisMember       => { "   " }
             Site::MethodVisStatic       => { "   " }
             Site::BodyNsOwner           => { "B1>" }
-            Site::BodyNsSyntax          => { "   " }
             Site::BodyNsCursor          => { "B1 " }
             Site::BodyNsDiff            => { "B1 " }
             Site::M1AgreeCalls          => { "B1 " }
@@ -812,33 +694,16 @@ implement enum Site {
             Site::M2StampMemberMiss     => { "!! " }
             Site::BareAltsCanonFolded   => { "B3*" }
             Site::ImplHeadSeen          => { "   " }
-            Site::ImplHeadUnstamped     => { "   " }
             Site::ImplHeadAsync         => { "B1 " }
             Site::ImplHeadAsyncUnstamped => { "!! " }
-            Site::CgImplTargetSeen      => { "   " }
             Site::CgImplTargetUnstamped => { "B1>" }
             Site::CgImplTargetUnResDef  => { "!! " }
             Site::CgImplTargetUnResPrim => { "B1 " }
-            Site::CgImplTargetUnResPend => { "   " }
             Site::CgImplTargetUnResOther => { "!! " }
             Site::M4Single              => { "B1 " }
-            Site::CascBCtorEnter         => { "   " }
-            Site::CascNewDelEnter        => { "   " }
-            Site::CascImplTgtEnter       => { "   " }
-            Site::PrimImplTargetPrimitive      => { "   " }
-            Site::PrimImplTargetDeclared      => { "   " }
-            Site::PrimImplOwnerAReached      => { "   " }
-            Site::PrimImplOwnerAAnswered      => { "   " }
-            Site::PrimImplOwnerBReached      => { "   " }
-            Site::PrimImplOwnerBAnswered      => { "   " }
-            Site::PrimImplOwnerCReached      => { "   " }
-            Site::PrimImplOwnerCAnswered      => { "   " }
-            Site::M4ViaRes              => { "   " }
             Site::SfCalls               => { "   " }
-            Site::SfScanNone            => { "   " }
             Site::SfScanOne             => { "!! " }
             Site::SfScanPlural          => { "!! " }
-            Site::SfViaRes              => { "   " }
             Site::SpellTyPending        => { "B1 " }
             Site::SpellTyNoDef          => { "B1 " }
             Site::SpellTyHit            => { "B1>" }
@@ -853,9 +718,6 @@ implement enum Site {
             Site::ImplResStamped        => { "   " }
             Site::ImplResDeclined       => { "B1 " }
             Site::SpellTyImplCalls      => { "B1>" }
-            Site::SpellTyImplResDef     => { "   " }
-            Site::SpellTyImplResPrim    => { "   " }
-            Site::SpellTyImplResPend    => { "   " }
             Site::SpellTyImplResOther   => { "B1 " }
             Site::SpellTyLitCalls       => { "B1>" }
             Site::SpellTyLitFbHit       => { "B1 " }
@@ -893,16 +755,12 @@ implement enum Site {
             Site::McDerefCoercion       => { "m10 deref coercion, retry on pointee" }
             Site::McFailed              => { "method-call unresolved" }
             Site::RnPrimitive           => { "2   primitive name" }
-            Site::AnnPrimitiveNode      => { "  upstream: Primitive node, no cascade" }
-            Site::AnnPreResolvedHit     => { "  upstream: pre_resolved short-circuit" }
-            Site::AnnPreResolvedPrim    => { "    of which spelled as a primitive" }
             Site::RnHomeModule          => { "2c  home-module (ambient cursor)" }
             Site::RnHomeModuleSyntax    => { "2c* home-module (syntax provenance)" }
             Site::RnAmbiguous           => { "2b  ambiguity -> E0203" }
             Site::RnDiLiteral           => { "3a  DI exact qualified literal" }
             Site::RnDiCanonical         => { "3b  DI canonicalized qualified" }
             Site::RnDiBare              => { "3c  DI bare name" }
-            Site::RnFailed              => { "    resolve_named unresolved" }
             Site::ConstLeafCalls        => { "const-table bare leaf calls" }
             Site::ConstLeafHits         => { "const-table bare leaf hits" }
             Site::BareAltsCalls         => { "lookup_qualified_alternatives calls" }
@@ -914,7 +772,6 @@ implement enum Site {
             Site::BareAltsViaAmbigDiag  => { "  by caller: sema ambiguity diag" }
             Site::ScopeUseSyntax        => { "scope use site from the SYNTAX's own module" }
             Site::ScopeUseCursor        => { "  scope: fell back to the cursor" }
-            Site::ScopeUseDiff          => { "  scope: syntax != cursor (mis-judged)" }
             Site::DefaultArgExpanded    => { "default args expanded" }
             Site::DefaultArgNoOwner     => { "default arg expanded with NO owning module" }
             Site::VisFastpath           => { "single-candidate fast path taken" }
@@ -928,20 +785,10 @@ implement enum Site {
             Site::ParamRefSymbolic      => { "  params offered: symbolic_checker" }
             Site::ParamRefTypeRes       => { "  params offered: type_resolution" }
             Site::ParamRefResolver      => { "  params offered: resolver create_param_type" }
-            Site::EnqSkipNotInst        => { "enqueue skip: not an instantiation" }
-            Site::EnqSkipBaseNull       => { "enqueue skip: base lookup failed" }
-            Site::EnqSkipTypeAlias      => { "enqueue skip: base is a TypeAlias" }
-            Site::EnqSkipBaseKind       => { "enqueue skip: base kind not mono'able" }
-            Site::EnqSkipNotTemplate    => { "enqueue skip: base not a registered template" }
-            Site::EnqSkipAbstractArg    => { "enqueue skip: arg still abstract (deferral)" }
-            Site::EnqAccepted           => { "enqueue accepted -> specializer" }
             Site::InstMintHit           => { "instantiations interned (control)" }
             Site::InstMintNew           => { "instantiations newly minted" }
             Site::InstMintAgg           => { "  of those, an aggregate base" }
             Site::InstMintAggSymbolic   => { "    of those, symbolic (never mono'd)" }
-            Site::SpecEntered           => { "specializations entered (control)" }
-            Site::SpecTypeDecl          => { "  of those, a type declaration" }
-            Site::SpecTypeDeclBindable  => { "  of those, params bindable to args" }
             Site::FnBindSingle          => { "single-overload pins (no scope check)" }
             Site::FnBindSingleHidden    => { "  of those, owner NOT in scope (D-A)" }
             Site::FnBindPrivateBound    => { "bound to a PRIVATE candidate  (D-B)" }
@@ -962,7 +809,6 @@ implement enum Site {
             Site::MethodVisMember       => { "  lane: receiver member access" }
             Site::MethodVisStatic       => { "  lane: static `Type::method()` call" }
             Site::BodyNsOwner           => { "body annots: owner type's module" }
-            Site::BodyNsSyntax          => { "body annots: the body's OWN file" }
             Site::BodyNsCursor          => { "  body-ns: fell back to the cursor" }
             Site::BodyNsDiff            => { "  body-ns: syntax != cursor (mis-judged)" }
             Site::M1AgreeCalls          => { "M1 CHECK qualifier_agrees calls" }
@@ -999,21 +845,16 @@ implement enum Site {
             Site::SynthScopeResStamped  => { "synthesized scope Res stamped" }
             Site::SynthScopeResNoName   => { "  type named no declaration" }
             Site::ImplHeadSeen          => { "impl heads seen by the async walk" }
-            Site::ImplHeadUnstamped     => { "  NO canonical target stamp" }
             Site::ImplHeadAsync         => { "  owns an `async` method (consumed)" }
             Site::ImplHeadAsyncUnstamped => { "    of those, unstamped" }
-            Site::CgImplTargetSeen      => { "codegen impl targets asked for" }
             Site::CgImplTargetUnstamped => { "  NO stamp: re-derived here" }
             Site::CgImplTargetUnResDef  => { "  re-derived, yet res: Def" }
             Site::CgImplTargetUnResPrim => { "  re-derived, res: PrimTy" }
-            Site::CgImplTargetUnResPend => { "  re-derived, res: Pending" }
             Site::CgImplTargetUnResOther => { "  re-derived, res: OTHER" }
             Site::M4Single              => { "  M4 by: one candidate for the leaf" }
             Site::SfCalls               => { "scoped template scan calls" }
-            Site::SfScanNone            => { "  scoped scan found: no candidate" }
             Site::SfScanOne             => { "  scoped scan found: exactly one" }
             Site::SfScanPlural          => { "  scoped scan found: PLURAL (tie-break pop)" }
-            Site::SfViaRes              => { "  scoped: answered from the scope stamp" }
             Site::SpellTyPending        => { "spelling_type: slot not answered" }
             Site::SpellTyNoDef          => { "spelling_type: answer names no def" }
             Site::SpellTyHit            => { "spelling_type: def found" }
@@ -1028,9 +869,6 @@ implement enum Site {
             Site::ImplResStamped        => { "  of those, res stamped" }
             Site::ImplResDeclined       => { "  of those, stamp declined" }
             Site::SpellTyImplCalls      => { "spelling_type impl head: calls" }
-            Site::SpellTyImplResDef     => { "  impl head slot: Def" }
-            Site::SpellTyImplResPrim    => { "  impl head slot: PrimTy" }
-            Site::SpellTyImplResPend    => { "  impl head slot: Pending" }
             Site::SpellTyImplResOther   => { "  impl head slot: OTHER" }
             Site::SpellTyLitCalls       => { "spelling_type struct literal: calls" }
             Site::SpellTyLitFbHit       => { "spelling_type struct literal: fallback found" }
@@ -1044,18 +882,6 @@ implement enum Site {
             Site::M4ScanNone            => { "  M4 scan found: no candidate" }
             Site::M4ScanOne             => { "  M4 scan found: exactly one" }
             Site::M4ScanPlural          => { "  M4 scan found: PLURAL (tie-break pop)" }
-            Site::CascBCtorEnter         => { "cascade ENTERED: base-ctor key" }
-            Site::CascNewDelEnter        => { "cascade ENTERED: new/delete type" }
-            Site::CascImplTgtEnter       => { "cascade ENTERED: impl target (4-step)" }
-            Site::PrimImplTargetPrimitive      => { "  of which target is a PRIMITIVE spelling" }
-            Site::PrimImplTargetDeclared      => { "  of which target is a DECLARED type (must stay 0)" }
-            Site::PrimImplOwnerAReached      => { "primitive arm reached: impl owner signatures" }
-            Site::PrimImplOwnerAAnswered      => { "  answered" }
-            Site::PrimImplOwnerBReached      => { "primitive arm reached: impl owner second pass" }
-            Site::PrimImplOwnerBAnswered      => { "  answered" }
-            Site::PrimImplOwnerCReached      => { "primitive arm reached: impl owner trait bodies" }
-            Site::PrimImplOwnerCAnswered      => { "  answered" }
-            Site::M4ViaRes              => { "answered from the callee's stamp" }
         };
     }
 
@@ -1064,25 +890,6 @@ implement enum Site {
         fmt::eprintf("  %-3s %-46s %12llu\n",
                      this.bucket(), this.label(), this.count());
     }
-}
-
-// ---- Suspension --------------------------------------------------------
-
-/// Stop recording until the matching `resume`.
-///
-/// An instrument that re-runs a production lookup to compare answers would
-/// otherwise be counted as if the compiler had really taken that path -
-/// `lookup_by_leaf` bumps the leaf sites, and `resolve_type_qualified_name`
-/// emits M1 path-audit events.  Both sit underneath the divergence probe, so
-/// without this the probe would inflate the exact numbers it exists to put in
-/// context.
-///
-/// Counted, not a flag, so nesting is safe.  `Audit::enabled` honors it too,
-/// so a suspended region emits no audit lines either.
-public function suspend() -> void { g_suspend = g_suspend + 1; }
-
-public function resume() -> void {
-    if (g_suspend > 0) { g_suspend = g_suspend - 1; }
 }
 
 // ---- Audit streams -----------------------------------------------------
@@ -1094,11 +901,8 @@ public function resume() -> void {
 /// recompile.
 ///
 /// `CRYO_RESOLVE_COUNTER` is deliberately NOT a variant here.  It gates a
-/// summary printed once at exit rather than per-event lines, and it must not
-/// be suppressed by `suspend` - folding it in would mean a probe region could
-/// silently swallow the report.
+/// summary printed once at exit rather than per-event lines.
 type enum Audit {
-    Leaf;
     Visibility;
     Path;
     Scope;
@@ -1110,7 +914,6 @@ implement enum Audit {
     /// The environment variable that switches this stream on.
     var_name(&this) -> string {
         return match (this) {
-            Audit::Leaf       => { "CRYO_LEAF_AUDIT" }
             Audit::Visibility => { "CRYO_VIS_AUDIT" }
             Audit::Path       => { "CRYO_PATH_AUDIT" }
             Audit::Scope      => { "CRYO_SCOPE_PROBE" }
@@ -1123,7 +926,6 @@ implement enum Audit {
     /// strings an audit line needs - interning a namespace is not free, and
     /// these sites sit in the resolution hot path.
     enabled(&this) -> boolean {
-        if (g_suspend > 0) { return false; }
         const i: i64 = this as i64;
         if (i < 0 || i >= AUDIT_CAP) { return false; }
         if (g_audit_state[i] == 0) {
@@ -1139,8 +941,8 @@ implement enum Audit {
 // ---- Audit emitters ----------------------------------------------------
 //
 // Free functions rather than methods on `Audit`, deliberately.  A method would
-// be callable on any variant - `Audit::Leaf.body_ns_diff(...)` would compile
-// and then gate a BODY-NS line on `CRYO_LEAF_AUDIT`.  That is a silent
+// be callable on any variant - `Audit::Path.body_ns_diff(...)` would compile
+// and then gate a BODY-NS line on `CRYO_PATH_AUDIT`.  That is a silent
 // mis-gating bug of exactly the kind this module exists to catch.  Each
 // emitter below names its own stream once, in one place.
 
@@ -1302,23 +1104,6 @@ public function callee_door(door: string, leaf: string, answered: string,
                  door, leaf, answered, owners, owner_list);
 }
 
-/// Log the SPELLING of a primitive-named annotation the type layer answered
-/// from its carried `TypeRef` rather than from the name cascade.
-///
-/// The tally beside this says how many there are; it cannot say what they are,
-/// and the two readings imply different things about the cascade's primitive
-/// step.  A canonical spelling here means a pointer or array rewrite put one
-/// back into `Named` position after the substituter had already decided
-/// primitives become `Primitive` nodes; an alias spelling means the
-/// substituter's primitive predicate does not recognise it and the whole
-/// annotation took the user-type branch.  One is structural and appears in any
-/// program using `T*`, the other follows how the source happens to spell its
-/// integers.
-public function pre_resolved_prim(spelling: string) -> void {
-    if (!Audit::Named.enabled()) { return; }
-    fmt::eprintf("PRERESOLVED-PRIM\t%s\n", spelling);
-}
-
 /// Log one annotation node minted with an unanswered slot, and whether it was
 /// given a `TypeRef` to stand in for that answer.
 ///
@@ -1360,33 +1145,6 @@ public function stamp_decline(spelling: string, scope: string,
                               file: string, line: i32) -> void {
     if (!Audit::Named.enabled()) { return; }
     fmt::eprintf("STAMP-DECLINE\t%s\t%s\t%s:%d\n", spelling, scope, file, line);
-}
-
-/// Log one module-scope lookup, with how many scopes carry that module NAME.
-///
-/// A module is reached by its name string rather than by identity, and several
-/// scopes may carry one name because the resolver builds them at more than one
-/// pipeline stage.  The lookup then picks the most populated, which is a
-/// heuristic standing in for identity: the count is what says whether it is
-/// deciding anything, and a lookup that always sees one scope is a heuristic
-/// that has never had to choose.
-/// `missing` counts names a LOSING candidate holds that the winner does not,
-/// and `example` names the first - the pair is what separates "the winner is
-/// the most complete stage of one module", where the tie-break is merely
-/// fragile, from "the winner is a different set", where a name the program
-/// wrote is unreachable through this lookup.
-/// `loser_syms` and `loser_nonempty` are the control on a zero `missing`: a
-/// winner is a superset of nothing at all whenever its rivals are empty, so
-/// without them "the tie-break never mis-picks" cannot be told apart from "the
-/// tie-break was never choosing between populated scopes".
-public function module_scope_pick(module_name: string, candidates: i32,
-                                  chosen_symbols: i32, missing: i32,
-                                  example: string, loser_syms: i32,
-                                  loser_nonempty: i32) -> void {
-    if (!Audit::Scope.enabled()) { return; }
-    fmt::eprintf("MOD-SCOPE\t%s\t%d\t%d\t%d\t%s\t%d\t%d\n",
-                 module_name, candidates, chosen_symbols, missing, example,
-                 loser_syms, loser_nonempty);
 }
 
 /// Log a `set_home_module` call that supplied an EMPTY module while naming a
@@ -1591,17 +1349,8 @@ public function mono_home(kind: string, file: string, entity_ns: string,
 
 // ---- Reporting ---------------------------------------------------------
 
-/// Drop every tally back to zero.  Exists so a driver that compiles more
-/// than one unit in a process can attribute counts per unit.
-public function reset() -> void {
-    for (mut i: i64 = 0; i < TALLY_CAP; i++) {
-        g_tally[i] = 0;
-    }
-    g_tally_dropped = 0;
-}
-
 /// Whether `CRYO_RESOLVE_COUNTER` is set in the environment.
-public function enabled() -> boolean {
+function enabled() -> boolean {
     match (env::var(Str::new("CRYO_RESOLVE_COUNTER"))) {
         Option::Some(_) => { return true;  }
         Option::None    => { return false; }
@@ -1623,10 +1372,9 @@ public function report() -> void {
     fmt::eprintf("  B2 = type-dependent lookup -> stays; enumerate+justify\n");
     fmt::eprintf("  B3 = authoritative lookup  -> once per path, NOT zero\n");
     fmt::eprintf("\n");
-    fmt::eprintf("  Sites NEST: cascade step 5 is a subset of leaf-index\n");
-    fmt::eprintf("  hits, and bare_alts hits are a subset of its callers'\n");
-    fmt::eprintf("  calls.  Totals are taken over a DISJOINT selection and\n");
-    fmt::eprintf("  count site events, not distinct resolutions.\n");
+    fmt::eprintf("  Sites NEST: bare_alts hits are a subset of its\n");
+    fmt::eprintf("  callers' calls.  Totals are taken over a DISJOINT\n");
+    fmt::eprintf("  selection and count site events, not resolutions.\n");
     fmt::eprintf("\n");
 
     // Printed FIRST, and loudly: every row below is unreadable while this is
@@ -1642,14 +1390,11 @@ public function report() -> void {
         fmt::eprintf("\n");
     }
 
-    fmt::eprintf("-- resolve_named cascade (types/resolver.cryo:1324) ----\n");
+    fmt::eprintf("-- resolve_named cascade (types/resolver.cryo) --------\n");
     Site::RnCalls.print_row();
     Site::RnGenericBinding.print_row();
     Site::RnAssocProjection.print_row();
     Site::RnPrimitive.print_row();
-    Site::AnnPrimitiveNode.print_row();
-    Site::AnnPreResolvedHit.print_row();
-    Site::AnnPreResolvedPrim.print_row();
     Site::RnHomeModule.print_row();
     Site::RnHomeModuleSyntax.print_row();
     Site::RnAmbiguous.print_row();
@@ -1668,7 +1413,6 @@ public function report() -> void {
     Site::McCopyDrop.print_row();
     Site::McDerefCoercion.print_row();
     Site::McFailed.print_row();
-    Site::RnFailed.print_row();
 
     Site::TypeCascadeExact.print_row();
     Site::TypeCascadeCursor.print_row();
@@ -1678,21 +1422,11 @@ public function report() -> void {
     Site::ParamRefTypeRes.print_row();
     Site::ParamRefResolver.print_row();
 
-    fmt::eprintf("\n-- type instantiation chokepoint (mono/specializer.cryo:88) --\n");
-    Site::EnqSkipNotInst.print_row();
-    Site::EnqSkipBaseNull.print_row();
-    Site::EnqSkipTypeAlias.print_row();
-    Site::EnqSkipBaseKind.print_row();
-    Site::EnqSkipNotTemplate.print_row();
-    Site::EnqSkipAbstractArg.print_row();
-    Site::EnqAccepted.print_row();
+    fmt::eprintf("\n-- instantiations as the arena mints them -------------\n");
     Site::InstMintHit.print_row();
     Site::InstMintNew.print_row();
     Site::InstMintAgg.print_row();
     Site::InstMintAggSymbolic.print_row();
-    Site::SpecEntered.print_row();
-    Site::SpecTypeDecl.print_row();
-    Site::SpecTypeDeclBindable.print_row();
 
     fmt::eprintf("
 -- const-table bare leaf (const_table.cryo) -----------
@@ -1700,7 +1434,7 @@ public function report() -> void {
     Site::ConstLeafCalls.print_row();
     Site::ConstLeafHits.print_row();
 
-    fmt::eprintf("\n-- DeclarationIndex bare_alts (decl_index.cryo:1405) --\n");
+    fmt::eprintf("\n-- DeclarationIndex bare_alts (decl_index.cryo) -------\n");
     Site::BareAltsCalls.print_row();
     Site::BareAltsHits.print_row();
     Site::BareAltsMulti.print_row();
@@ -1712,7 +1446,6 @@ public function report() -> void {
     fmt::eprintf("\n-- visibility gate blast radius (spec §8.1) -----------\n");
     Site::ScopeUseSyntax.print_row();
     Site::ScopeUseCursor.print_row();
-    Site::ScopeUseDiff.print_row();
     Site::DefaultArgExpanded.print_row();
     Site::DefaultArgNoOwner.print_row();
     Site::VisFastpath.print_row();
@@ -1748,7 +1481,6 @@ public function report() -> void {
 
     fmt::eprintf("\n-- body annotation provenance (spec §8, task #7) ------\n");
     Site::BodyNsOwner.print_row();
-    Site::BodyNsSyntax.print_row();
     Site::BodyNsCursor.print_row();
     Site::BodyNsDiff.print_row();
 
@@ -1783,21 +1515,16 @@ public function report() -> void {
 -- impl-head target stamp, at the async declare walk ---
 ");
     Site::ImplHeadSeen.print_row();
-    Site::ImplHeadUnstamped.print_row();
     Site::ImplHeadAsync.print_row();
     Site::ImplHeadAsyncUnstamped.print_row();
-    Site::CgImplTargetSeen.print_row();
     Site::CgImplTargetUnstamped.print_row();
     Site::CgImplTargetUnResDef.print_row();
     Site::CgImplTargetUnResPrim.print_row();
-    Site::CgImplTargetUnResPend.print_row();
     Site::CgImplTargetUnResOther.print_row();
     Site::M4Single.print_row();
     Site::SfCalls.print_row();
-    Site::SfScanNone.print_row();
     Site::SfScanOne.print_row();
     Site::SfScanPlural.print_row();
-    Site::SfViaRes.print_row();
     Site::SpellTyPending.print_row();
     Site::SpellTyNoDef.print_row();
     Site::SpellTyHit.print_row();
@@ -1812,9 +1539,6 @@ public function report() -> void {
     Site::ImplResStamped.print_row();
     Site::ImplResDeclined.print_row();
     Site::SpellTyImplCalls.print_row();
-    Site::SpellTyImplResDef.print_row();
-    Site::SpellTyImplResPrim.print_row();
-    Site::SpellTyImplResPend.print_row();
     Site::SpellTyImplResOther.print_row();
     Site::SpellTyLitCalls.print_row();
     Site::SpellTyLitFbHit.print_row();
@@ -1828,7 +1552,6 @@ public function report() -> void {
     Site::M4ScanNone.print_row();
     Site::M4ScanOne.print_row();
     Site::M4ScanPlural.print_row();
-    Site::M4ViaRes.print_row();
 
     fmt::eprintf("\n-- annotation Res, stamped on the node -----------------\n");
     Site::AnnResSeen.print_row();
@@ -1843,21 +1566,10 @@ public function report() -> void {
     fmt::eprintf("
 -- bare-leaf last step of a genuine widening cascade ----
 ");
-    Site::CascBCtorEnter.print_row();
-    Site::CascNewDelEnter.print_row();
-    Site::CascImplTgtEnter.print_row();
-    Site::PrimImplTargetPrimitive.print_row();
-    Site::PrimImplTargetDeclared.print_row();
 
     fmt::eprintf("
 -- primitive arm of the impl-owner two-case dispatch ---
 ");
-    Site::PrimImplOwnerAReached.print_row();
-    Site::PrimImplOwnerAAnswered.print_row();
-    Site::PrimImplOwnerBReached.print_row();
-    Site::PrimImplOwnerBAnswered.print_row();
-    Site::PrimImplOwnerCReached.print_row();
-    Site::PrimImplOwnerCAnswered.print_row();
 
     // Bucket totals, over DISJOINT selections.
     //
