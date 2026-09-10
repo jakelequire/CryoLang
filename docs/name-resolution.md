@@ -17034,3 +17034,179 @@ zero was checked before it was believed - `atomic_fence`, `ptr_diff` and
 population by construction. The index could not have caught this change, in
 either direction, and it could not have caught the `format` intrinsic's removal
 either.
+
+### 8.129 Handoff: the format/printf migration is complete, the Win64 check a gate cannot perform, and the intrinsic surface that is left is genuinely intrinsic - 2026-09-10
+
+Three changes landed and pushed, each green on its own and each revertible
+without the others. Nothing is mid-flight.
+
+| commit | what |
+|---|---|
+| `af6d6d40` | `format` becomes `fmt::format`; `emit_format_runtime` and 222 lines of codegen deleted |
+| `b1c87d1b` | the three `libc` `va_list` parameters retyped `va_list`; `vsnprintf` fixed on Win64 |
+| `18cba0f3` | `printf`/`snprintf`/`fprintf`/`vprintf`/`vfprintf` leave the intrinsic set |
+
+**Not done, and deliberately not started: `make pin`.** Authorised, and the only
+thing waiting on it is cosmetic - a pin-built `stdlib/.bin/<triple>/libcryo.a`
+still carries 154 copies of the old `linkonce_odr @format`, so a linked binary
+shows one `T format` that nothing calls. Every object the current compiler emits
+has none. Take the repin when convenient; it is not a prerequisite for anything.
+
+#### The check no gate can perform, and exactly how to run it
+
+**This is the part worth reading before touching anything variadic.** A
+mistyped `va_list` parameter produces correct-looking runs: the program prints,
+returns a plausible count, and exits 0. `make test` passes. `selfhost-check`
+passes - it compares stage 3 against stage 4, both built by the SAME compiler,
+so a compiler that formats garbage is still a fixed point. Nothing in `tests/`
+compares the compiler's own stdout.
+
+The check is to compile a variadic forwarder NATIVELY on Windows and read the
+characters:
+
+```cryo
+namespace probe;
+import std::fmt;
+import std::ffi::libc;
+
+function fwd(buf: u8*, size: u64, fmt: string, args...) -> i32 {
+    return libc::vsnprintf(buf, size, fmt, args);   // or vprintf / vfprintf
+}
+
+function main() -> i32 {
+    mut b: u8[64] = [];
+    const n: i32 = fwd(&b[0], 64, "a=%d b=%s c=%d", 42, "hi", 7);
+    fmt::printf("[%s] n=%d\n", &b[0], n);
+    return 0;
+}
+```
+
+Correct: `[a=42 b=hi c=7] n=13`. Broken: `[a=1761605240 b=a=%d b=%s c=%d c=64]
+n=34`, exit 0. The tells are that `%s` prints the FORMAT STRING's own pointer
+and a later `%d` prints an earlier PARAMETER (there, the `size` argument) -
+both symptoms of reading one slot off the intended va_list.
+
+Run it out of tree with `CRYO_STDLIB` set, and use `compiler/build/cryo.exe`, not
+the pin - the pin cannot show you a change you just made. Do NOT substitute a
+SysV run: SysV-amd64 passes a mistyped binding correctly and tells you nothing.
+
+#### The mechanism, which the tree described one layer off
+
+`CallEmitter::va_forward_fn_type` is the only thing that routes a USER-CODE call
+through `AbiClassifier::forward_va_list`, and it fires solely when the callee's
+own parameter carries `TypeKind::VaList`. `void*` compiles, links, and passes the
+alloca's ADDRESS where Win64 wants the `char*` inside it.
+
+Three descriptions in the tree pointed away from this:
+
+* `ffi/libc.cryo` said the bucket "lowers to a `va_list` (a pointer) at the call
+  boundary, so it is typed `void*` here". True on SysV, false on Win64, and
+  written as if ABI-independent.
+* `expr_ops.cryo` said the format runtime was "the only built-in forwarder today;
+  user-code forwarding would need to consult the same seam" - which reads as
+  unfinished work, when `va_forward_fn_type` had been consulting it for some time
+  under a condition nobody wrote down.
+* §8.125 predicted the printf hazard as an OVERLOAD-BINDING problem: a bare
+  `printf` binding libc's `(u8*, ...)` twin. Real, but one layer above the sharp
+  edge. For the `v*` half the displacement is also what routed the call through
+  the ABI seam at all, so removing it does not merely change which overload
+  answers - it changes whether the argument arrives.
+
+#### What is left is genuinely intrinsic - measured, not judged
+
+The question this migration kept implying is whether the rest of the intrinsic
+set is more `format` (a library function wearing the keyword) or more real.
+Classified against `IntrinsicKind::from_name` and the leaf-name lowering in
+`call_emitter`:
+
+**58 declarations remain. 54 are lowered through `from_name`. One
+(`try_catch`) is lowered by leaf name in `call_emitter`. THREE are lowered
+nowhere at all: `malloc`, `realloc`, `free`** - and those are held deliberately,
+for a resolution reason rather than a lowering one, because deleting them hands
+the bare leaf to `alloc::heap::free`, which reads a segment header off a libc
+pointer and aborts.
+
+So the `format` class is exhausted. It had exactly four members and three of them
+are blocked on a decision that has nothing to do with formatting.
+
+The remaining bare-call surface is **113**, not the ~252 §8.124 quotes - that
+figure counted `intrinsics::`-qualified calls this work has since consumed. Its
+shape matters more than its size: `panic` 32 (all in `stdlib/future/*` and
+`stdlib/core/_module.cryo`), `free`/`malloc`/`realloc` 16, `dirent_name` 4, and
+roughly 60 atomics **all inside `stdlib/sync/atomic.cryo`**, which is the wrapper
+they exist to implement. Almost none of it is scattered caller code of the kind
+`format` had 824 of across `compiler/src`. A sweep would be moving calls out of
+the modules written to contain them.
+
+#### What went wrong, mine included
+
+**I reported a scope figure that was wrong by 5x, and it was quoted back to me
+as the basis for a go-ahead.** "27 bare sites" was an accurate BARE count and the
+wrong answer to "how big is this", because removing a declaration also breaks
+every call naming its module: `intrinsics::printf` (111), `intrinsics::snprintf`
+(5), `intrinsics::vfprintf` (1). The real surface was 144. The bare/qualified
+split is the natural thing to measure and the wrong thing to report when the
+declaration itself is going away.
+
+**I skipped the prediction step on the change that needed it.** A prediction was
+written before the retyping - "no gate moves, because the other two are displaced
+and both `VaList` and `Pointer` lower to `ptr`" - and holding made that null
+result mean something. No prediction was written before the printf move, `b1`
+drifted, and the explanation was assembled afterwards. It is right and it is
+measured, and it is still the weaker order: an explanation that arrives after the
+number cannot be falsified by it.
+
+**I called `vsnprintf` a "dormant hazard, not a live defect" in §8.126 on the
+grounds that nothing called it.** That is an inference about callers dressed as a
+measurement about correctness. The first call written against it read one slot
+off. "No callers" bounds the blast radius; it says nothing about whether the code
+is right.
+
+**Two instrument defects, both caught only by controls, neither visible as a
+total.** A struct-literal field separator read as a scope qualifier (`detail:
+format(...)` classified as already-qualified - 13 real sites would have been
+silently left bare); and a method declared in an `implement` block, which carries
+no `function` keyword, classified as a CALL. A third - `[ \t]*$` not matching
+before a `\r` - would have mis-anchored inserted imports on every CRLF file, and
+surfaced only because the script raised instead of falling back. The tree is not
+uniformly LF and a rewriter that assumes it is will corrupt the files it touches
+least visibly.
+
+**An invalid control I published and then withdrew.** Testing whether the stale
+`@format` came from the pin-built archive, the archive was moved aside and the
+link FAILED, so `nm` found no symbol - and "no symbol" was briefly read as the
+control succeeding. It was measuring the absence of an executable. The honest
+evidence was elsewhere: zero `format` definitions across all 60 objects the new
+compiler emitted.
+
+#### What I would do next, and what I rejected
+
+1. **`make pin`.** Clears the 154 stale `@format` copies and rebases the pin on
+   all three changes at once.
+2. **Leave the intrinsic surface alone.** On the measurement above, the next
+   sweep would move `panic` and the atomics out of the stdlib modules that exist
+   to wrap them - motion without a defect behind it. `malloc`/`realloc`/`free`
+   are a resolution question (§8.93) and should be taken as one.
+3. **Consider W0013 for `format`.** `check_printf_call` keys on the leaves
+   `printf` and `eprintf` only, so `fmt::format("%d", "str")` is unchecked - and
+   was unchecked as an intrinsic too. It is now an ordinary function with a
+   literal format string, which is the shape the checker already handles. Not
+   done here: it is a diagnostic-surface change, not part of the move.
+
+**Rejected: creating `fmt::fprintf` / `fmt::snprintf`.** It would have made the
+family read uniformly as `fmt::`, at the cost of three public API names whose
+whole content is a forward to the extern beside them. A near-duplicate is worse
+than an imperfect call.
+
+**Rejected: routing the b1 gate corpora to `libc::printf` to avoid re-pinning.**
+It holds the measured population fixed, but only by making two of fourteen
+examples unrepresentative of the surface the ruling establishes - and it would be
+a name-based special case, hiding a real consequence of the change instead of
+recording it.
+
+**One thing worth knowing about the gate corpora:** two of the three are
+`examples/`, so an edit to `examples/09-json-config` or `examples/14-threads`
+moves `b1` even when nothing about resolution changed. Routing their printf to
+`fmt::` added `std::fmt` to projects that did not import it - 64 modules compiled
+where `libc::printf` compiles 61. `[host:*-ffi]` measures the one corpus routed
+to `libc::` and is the only section that did not move, on either host.
