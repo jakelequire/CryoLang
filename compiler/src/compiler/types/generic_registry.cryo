@@ -554,6 +554,40 @@ type struct GenericRegistry {
         return null;
     }
 
+    /// How precisely `impl_node`'s target matches the receiver identified by
+    /// `qname` (its canonical qualified name) and `bare` (its leaf).
+    ///
+    ///   2 - the impl's stamped identity IS this receiver.  Two modules can
+    ///       each declare a `Cell` and each implement one trait for it; the
+    ///       identity is the only thing that tells those two impls apart.
+    ///   1 - the impl names the receiver by leaf alone.  An impl with no
+    ///       stamped identity is a monomorphized clone, whose rewritten
+    ///       `target_type` is the only carrier of which specialization it is
+    ///       for; a stamped one that reaches here targets a primitive, whose
+    ///       receiver carries no qualified name to compare against.
+    ///   0 - not this receiver.
+    ///
+    /// A caller takes a 2 the moment it sees one, and a 1 only once the whole
+    /// table has failed to yield a 2, so a leaf match can never outrank an
+    /// identity.  That ordering is the whole point: `trait_impls` is appended
+    /// to in module-collection order, so a scan that stops at the first leaf
+    /// match binds whichever same-leaf impl the graph happened to reach first,
+    /// and changing an `import` line in an unrelated file changes the answer.
+    ///
+    /// The ranking never REMOVES a match - rank > 0 is exactly the set a bare
+    /// scan accepted - so the only binding it can change is one where two
+    /// stamped identities disagreed, which is the one that was wrong.
+    static impl_target_rank(impl_node: ImplBlockNode*, qname: SymbolStr,
+                            bare: SymbolStr) -> i32 {
+        if (impl_node == null) { return 0; }
+        if (qname.is_valid()) {
+            if (impl_node.qualified_target_name.equals(qname)) { return 2; }
+            if (impl_node.target_type.equals(qname)) { return 2; }
+        }
+        if (bare.is_valid() && impl_node.target_type.equals(bare)) { return 1; }
+        return 0;
+    }
+
     /// Pack a `(trait_name, target_name)` pair into a single u64 key. Both
     /// SymbolStr ids fit in the lower/upper 32-bit halves so collisions are
     /// only possible when two pairs alias both ids, which is practically zero.

@@ -50,7 +50,7 @@ current-state description is the defect it exists to remove.
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
 | D10 | A plural bare leaf is E0155, not a directory-order bind | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **3** | §8.121 |
-| D11 | Retire `resolve_counter.cryo` — LAST, after the lanes it counts | RULED, not started | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1931** | §8.66, §8.80 |
+| D11 | Retire `resolve_counter.cryo` — LAST, after the lanes it counts | RULED, not started | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1643** | §8.66, §8.80 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
 
 **D2 is the one to look at.** Decided in §8.39, then neither taken nor
@@ -112,7 +112,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,113 unit + 44 project + 178 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
+| `make test` | 2,113 unit + 45 project + 178 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make b1-check` | B1 total + every per-row bound, 3 corpora × 2 hosts | **2 of the 3 corpora are `examples/`**; the third is `tests/tests/projects/ffi_c_import`. The compiler's own source is NOT a corpus, and `tests/` at large is swept by none of them. |
 | `make lane-check` | 7 buckets of call sites in `compiler/src`, as a golden | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
@@ -137,7 +137,7 @@ Checks for this section, one per line so each can be copied whole:
 
 * `grep -c '^\[' tests/lane-baseline.txt` → **7**
 * `grep -c '^\[host:' tests/b1-baseline.txt` → **6**
-* `grep -c '^project ' tests/test-roster.txt` → **44**
+* `grep -c '^project ' tests/test-roster.txt` → **45**
 * `grep -c '^negative ' tests/test-roster.txt` → **178**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -n 'branches:' .github/workflows/ci.yml` → `main` only, both hooks
@@ -19259,3 +19259,79 @@ migration's life that a tool's silence was mistaken for a clean result - §8.135
 records the first, where `0 file edit(s)` meant "I could not find the files"
 while 53 errors stood. Both now print the population beside the edit count, so
 a zero has to be read with its denominator.
+
+### 8.137 A trait-impl scan asked for the leaf first and the identity second, so import order in an unrelated file decided whether the program compiled - MEASURED AND FIXED 2026-09-10
+
+Three scans in `sema/method_binding.cryo` walked `GenericRegistry.trait_impls`
+looking for the impl that targets a receiver, under this predicate:
+
+```cryo
+const matches_target: boolean =
+    impl_node.target_type.equals(bare)
+    || (qname.is_valid() && impl_node.qualified_target_name.equals(qname))
+    || (qname.is_valid() && impl_node.target_type.equals(qname));
+```
+
+`target_type` is the parser-captured bare leaf and stays bare on a source
+impl, so the first clause matches **every** same-leaf impl and no later clause
+is ever reached. The table is appended to in module-collection order, and
+collection order is import order.
+
+#### The victim, with three controls
+
+`tests/tests/projects/trait_impl_target_leaf_collision`. Two modules each
+declare `type struct Cell`; `Alpha` implements `Feed<int>` for it and `Omega`
+implements `Feed<double>`. `Feed` has a generic default `twice<B>` whose
+return is `T`, so the impl the scan picks is what supplies `T`.
+
+| tree | result |
+|---|---|
+| as committed (`import Alpha;` then `import Omega;`) | **`error[E0200]: expected i32, found f64`** at `a.twice(0)` |
+| Omega's type renamed to `Dell`, nothing else changed | compiles, `11` and `2.5` |
+| the two `import` lines **inverted**, every other byte identical | compiles, `11` and `2.5` |
+
+All three under the pinned `bin/cryo`, so it is pre-existing. The second
+control says the shared leaf is the variable; the third says which impl a call
+binds to depends on a line in a file that declares neither type.
+
+#### The fix: rank, not a second lookup
+
+`GenericRegistry::impl_target_rank` gives 2 for an impl whose stamped identity
+IS the receiver, 1 for one that matches the leaf alone, 0 otherwise. A caller
+takes a 2 immediately and a 1 only after the whole table has failed to yield
+one. Rank > 0 is **exactly** the set the old disjunction accepted, so no
+binding can be lost; the only one that changes is where two stamped identities
+disagreed.
+
+Rank 1 is not a fallback lane, it is the answer for a receiver that has no
+identity to compare: an impl with no `qualified_target_name` is a monomorphized
+clone (`ASTCloner` withholds the stamp deliberately, so a specialization is not
+bound back to its template) whose rewritten `target_type` is already qualified,
+and a stamped impl reaching that branch targets a primitive.
+
+`mono/call_specializer.cryo` had already met this bug from the other side and
+fixed it locally, twice, as an explicit qualified-first pass - its comments name
+"two modules can each define a same-leaf `struct UpTo`" and the E0636 that
+followed. Those two loops should adopt `impl_target_rank` rather than keep their
+own copy of the policy; they are behaviourally correct today, which is why they
+are not touched here.
+
+#### A correction to what this defect was believed to be
+
+§0 and the surviving notes place this at `generic_registry.cryo`'s
+`register_trait_impl`, whose bare `(trait leaf, target leaf)` map is
+last-write-wins, and cite a reproducer in which import order picks a method
+**body**. That reproducer's mechanism was `register_trait_decl`, and it is
+**fixed** - the table is keyed on the canonical identity now and says so in its
+own comment. Re-run of that shape (two same-leaf `Render` traits with different
+default bodies, one imported directly and one reached transitively): the
+directly-imported trait's body runs, which is correct.
+
+What survives is not the map's overwrite but the **scans**, and the observable
+is a wrong `T`, not a wrong body. Two same-leaf targets each get their own
+qualified entry in `trait_impls`; only a consumer that reads the table by leaf
+conflates them, and `method_binding` was the consumer that did.
+
+The trait half of the key stays a leaf, and re-keying it remains wrong for the
+reason already recorded: `OperatorTraitMap` names fourteen operator traits by
+string literal and dispatches through these tables.

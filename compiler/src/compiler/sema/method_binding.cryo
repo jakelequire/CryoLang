@@ -1005,30 +1005,37 @@ type struct MethodBinding {
 
     /// Search the trait impls for `owner_ref` for a method named `method_name`
     /// whose own generic-param count matches `n_generic_args`; writes the owning
-    /// impl block through `out_impl`.  First match wins.
+    /// impl block through `out_impl`.
+    ///
+    /// An impl whose stamped identity IS the receiver wins outright; one that
+    /// matches the leaf alone answers only when no such impl exists.  See
+    /// `GenericRegistry::impl_target_rank` for why the order matters.
     find_method_in_trait_impls(&this, owner_ref: TypeRef, method_name: SymbolStr,
                                n_generic_args: i64, out_impl: ImplBlockNode**) -> MethodNode* {
         if (this.ctx.generic_registry == null) { return null; }
         const qname: SymbolStr = this.arena.get_qualified_name(owner_ref);
         const bare: SymbolStr = this.bare_leaf_of_qualified(qname);
+        mut leaf_m: MethodNode* = null;
+        mut leaf_impl: ImplBlockNode* = null;
         for (mut i: i64 = 0; i < this.ctx.generic_registry.trait_impls.length; i++) {
             const impl_node: ImplBlockNode* = this.ctx.generic_registry.trait_impls[i].second;
-            if (impl_node == null) { continue; }
-            const matches_target: boolean =
-                impl_node.target_type.equals(bare)
-                || (qname.is_valid() && impl_node.qualified_target_name.equals(qname))
-                || (qname.is_valid() && impl_node.target_type.equals(qname));
-            if (!matches_target) { continue; }
+            const rank: i32 = GenericRegistry::impl_target_rank(impl_node, qname, bare);
+            if (rank == 0) { continue; }
             for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
                 const m: MethodNode* = impl_node.methods[k];
                 if (m == null || m.func == null) { continue; }
                 if (!m.func.name.equals(method_name)) { continue; }
                 if (m.func.generic_params.length != n_generic_args) { continue; }
-                *out_impl = impl_node;
-                return m;
+                if (rank == 2) {
+                    *out_impl = impl_node;
+                    return m;
+                }
+                if (leaf_m == null) { leaf_m = m; leaf_impl = impl_node; }
+                break;
             }
         }
-        return null;
+        if (leaf_m != null) { *out_impl = leaf_impl; }
+        return leaf_m;
     }
 
     /// First method named `name` in `methods` that has its OWN generic params.
@@ -1074,27 +1081,29 @@ type struct MethodBinding {
     }
 
     /// Like `find_method_in_trait_impls` but matches by name + has-own-generics
-    /// (the inferred no-turbofish path solves `<U>` from arguments).
+    /// (the inferred no-turbofish path solves `<U>` from arguments).  Same
+    /// identity-before-leaf ordering, for the same reason.
     find_generic_method_in_trait_impls(&this, owner_ref: TypeRef, method_name: SymbolStr,
                                        out_impl: ImplBlockNode**) -> MethodNode* {
         if (this.ctx.generic_registry == null) { return null; }
         const qname: SymbolStr = this.arena.get_qualified_name(owner_ref);
         const bare: SymbolStr = this.bare_leaf_of_qualified(qname);
+        mut leaf_m: MethodNode* = null;
+        mut leaf_impl: ImplBlockNode* = null;
         for (mut i: i64 = 0; i < this.ctx.generic_registry.trait_impls.length; i++) {
             const impl_node: ImplBlockNode* = this.ctx.generic_registry.trait_impls[i].second;
-            if (impl_node == null) { continue; }
-            const matches_target: boolean =
-                impl_node.target_type.equals(bare)
-                || (qname.is_valid() && impl_node.qualified_target_name.equals(qname))
-                || (qname.is_valid() && impl_node.target_type.equals(qname));
-            if (!matches_target) { continue; }
+            const rank: i32 = GenericRegistry::impl_target_rank(impl_node, qname, bare);
+            if (rank == 0) { continue; }
             const m: MethodNode* = this.find_generic_method_in(&impl_node.methods, method_name);
-            if (m != null) {
+            if (m == null) { continue; }
+            if (rank == 2) {
                 *out_impl = impl_node;
                 return m;
             }
+            if (leaf_m == null) { leaf_m = m; leaf_impl = impl_node; }
         }
-        return null;
+        if (leaf_m != null) { *out_impl = leaf_impl; }
+        return leaf_m;
     }
 
     /// Abstract-receiver method lookup (symbolic walk only): `value.fmt(f)` where
@@ -1946,24 +1955,33 @@ type struct MethodBinding {
             subject_ref
         };
         const qname: SymbolStr = this.arena.get_qualified_name(qname_src);
+        // Identity before leaf, as in `find_method_in_trait_impls`: the impl
+        // supplies the type args this projection substitutes, so a same-leaf
+        // impl from another module reduces `Item` against the wrong ones.
+        mut leaf_impl: ImplBlockNode* = null;
+        mut leaf_method: MethodNode* = null;
         for (mut i: i64 = 0; i < this.ctx.generic_registry.trait_impls.length; i++) {
             const impl_node: ImplBlockNode* = this.ctx.generic_registry.trait_impls[i].second;
-            if (impl_node == null) { continue; }
-            const matches_target: boolean =
-                impl_node.target_type.equals(base_name)
-                || (qname.is_valid() && impl_node.qualified_target_name.equals(qname))
-                || (qname.is_valid() && impl_node.target_type.equals(qname));
-            if (!matches_target) { continue; }
+            const rank: i32 = GenericRegistry::impl_target_rank(impl_node, qname, base_name);
+            if (rank == 0) { continue; }
             for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
                 const m: MethodNode* = impl_node.methods[k];
                 if (m == null || m.func == null) { continue; }
-                if (m.func.name.equals(method_name)) {
+                if (!m.func.name.equals(method_name)) { continue; }
+                if (rank == 2) {
                     found_impl = impl_node;
                     found_method = m;
-                    break;
+                } else if (leaf_method == null) {
+                    leaf_impl = impl_node;
+                    leaf_method = m;
                 }
+                break;
             }
             if (found_method != null) { break; }
+        }
+        if (found_method == null && leaf_method != null) {
+            found_impl = leaf_impl;
+            found_method = leaf_method;
         }
         if (found_method == null || found_impl == null) { return TypeRef::invalid(); }
         const ret_ann: TypeAnnotation* = found_method.func.return_type_annotation;
