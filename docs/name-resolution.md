@@ -18539,3 +18539,124 @@ than the tree: a concurrent commit cost a project's worth of coverage while the
 gate still said PASS. A count that moves DOWN is the only thing that showed it,
 which is the same reason §8.132 records that the count moving up is what says a
 new project ran at all.
+
+### 8.135 The glob deletion is not two hunks, and the base classes it exposes were never public - PREPARED, SWITCH DEFERRED 2026-09-10
+
+The annotation and call positions both answer from the qualifier now (§8.132,
+§8.134), which was the stated precondition. This entry is what the switch
+actually costs, measured by applying it, plus the part of that cost that is
+landed here.
+
+#### `ImportStyle::Wildcard` had FOUR producers, and only one is a glob
+
+§8.131 and §8.133 both describe this as deleting the `Wildcard` branch of
+`process_import` plus the Specific branch's case (b). **That is wrong, and it
+breaks the prelude in a way no test names.**
+
+| producer | what it is | correct treatment |
+|---|---|---|
+| `parser.cryo:1940` | plain `import M;` | becomes its own style, binds nothing |
+| `parser.cryo:1904` | explicit `import M::*;` | stays a glob; §8.131 kept it legal, and its blast radius is the one file that wrote it |
+| `pass_registry.cryo:1089` | injected `std::fmt::interp` for f-strings | stays a glob |
+| `pass_registry.cryo:1119` | injected `std::prelude` | stays a glob |
+
+So it is not a deletion: **the plain form stops BEING a wildcard.** Deleting
+the branch unbinds the prelude and the f-string runtime from every module at
+once, and since a wildcard that binds no names is indistinguishable from a
+module that exports none, that has no diagnostic of its own - it presents as
+thousands of unrelated unresolved names.
+
+The prelude staying a glob is not a grudging exception. Rust injects
+`std::prelude::rust_2021::*`, a real glob, for the same reason: the prelude's
+contents are data, so no name list can be written for it. The ruling removes a
+module path doing two jobs; an injected prelude was never a module path anyone
+wrote. The plain form needs its OWN `ImportStyle` variant rather than a flag on
+`Wildcard`, because sharing a variant is exactly why the one place that decides
+whether names get bound could not tell a module path from a glob.
+
+#### Applied, and what it exposed
+
+The switch was applied, built, and driven to a clean compile of `compiler/` and
+`stdlib` - 164 local and 81 std modules - before being backed out. Two findings
+came out of that, and the first is the reason this entry exists.
+
+**A base-class annotation is not name-resolved, and the bases were not public.**
+The population that failed first is base-class annotations, the same six
+§8.131 predicted, all in one file. **Six was the first failing MODULE, not the
+demand** - the build aborts at name resolution, so one run reports one module;
+`generic.cryo` has identical imports and would have added four more. The tree
+holds **103 base-class annotations across 18 files**, and the cross-module ones
+are the ones that fail, since a same-module base is in scope by declaration.
+
+Underneath that: `Type`, `ASTNode`, `BaseASTVisitor`, `ParserBase` and
+`ExprParser` were all declared **non-public** and subclassed from other modules
+anyway. A braced import cannot offer a non-public name - `lookup_in_module`
+checks `is_public()` - and the `Wildcard` branch filtered on `is_public()` too,
+so these were never import-bound by either form. They were reached through the
+type layer's leaf/cursor tier, which consults neither the importing file's
+imports nor the base's own visibility. **Their non-publicness was already
+fiction; the glob was what made it unobservable.** They are `public` here, which
+is what the cross-module use had been asserting all along.
+
+**The remaining demand is in `tests/`, and it is uniform.** With `compiler/` and
+`stdlib` clean, `make test` goes to 23 projects passed / 18 failed and 5
+compile-fail failures, and every one is the same shape - a fixture writing
+`import std::collections::hashmap;` and then a bare `HashMap`. §8.131 measured
+`tests/` at **1,583 distinct (module, name) pairs**, so this is the largest
+single population left and it is mechanical.
+
+#### What landed here, and why the switch did not
+
+Landed: the 19 explicit imports and 5 visibility widenings that the switch
+requires, and both generators. **All of it is inert under globbing** - an
+explicit import names what the glob already bound, and `public` only widens - so
+it costs nothing sitting there and the switch becomes a three-hunk change plus
+the `tests/` population. This is deliberately the shape `1623324e` used for the
+6,587 imports, and for the same reason.
+
+Not landed: the switch itself, because its remaining precondition is `1,583`
+import insertions across `tests/`, and `tests/` was concurrently owned by
+another worker who was editing the same negative-test fixtures. Two workers
+inserting into one fixture set is how a migration loses its own diff, which
+§8.131 has already paid for once.
+
+#### Driven by the compiler, not by a second guess at resolution
+
+The migration's demand was measured from `Resolver::lookup`, which sees one
+resolution path; a type ANNOTATION resolves through the type layer, so that
+measurement could not see annotation demand and was incomplete by construction.
+§8.131 says so, and this is the bill. Re-deriving resolution in a script is how
+the first measurement went wrong, so the remaining imports were taken from the
+compiler's OWN diagnostics as a fixpoint:
+
+    build -> parse `cannot find type X in this scope` -> add the one import
+    naming X's declaring module -> build again
+
+Five iterations - 6, 3, 3, 4 errors, then clean. `scripts/migrate-base-class-imports.py`
+and `scripts/migrate-imports-from-errors.py` are committed with what they
+produced, and both are idempotent: a re-run over the finished tree edits
+nothing, which is the check that they converged rather than stopped.
+
+A leaf declared by more than one module is REFUSED by the second tool rather
+than resolved to one of them. A name with two owners is what this ruling exists
+to make unwriteable, and choosing an owner inside a migration script would put
+the defect back under a layer of automation. None were hit.
+
+#### Gates
+
+`make test` **OVERALL PASS** with these imports in place - unit 2,113,
+compile-fail 178, **projects 41 passed / 0 failed**, i.e. unchanged, which is
+what "inert" has to mean to be worth landing separately. `lane-check` OK.
+`b1-check` stays RED for the reason §8.134 measured, which is `1623324e` and
+not this.
+
+Line endings were checked rather than assumed: every one of the 19 touched
+files is uniformly CRLF after the rewrite. A rewriter that assumes LF corrupts
+the files it touches least visibly, and this tree is not uniformly LF.
+
+One more concurrency note for the gate log. A `make test` in this window died
+on `error[E0900]: failed to hoist executable ... (copy exited with 1)` - not a
+code failure at all, but a second worker's run holding `cryo-tests-test.exe`.
+Deleting the file and re-running was clean. That is the third time in one
+session a shared-tree race presented as a result: a vanished project, a moved
+HEAD mid-run, and now a locked hoist target.
