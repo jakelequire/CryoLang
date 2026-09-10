@@ -110,12 +110,33 @@ jobs:
   # ---------------------------------------------------------------------------
   # Verify - re-run the correctness suite on the tagged commit itself, so a tag
   # pushed to a commit that never went green on main (or a flaky/skipped CI run)
-  # cannot publish a miscompiled binary. Mirrors the CI build job's gates.
+  # cannot publish a miscompiled binary.
+  #
+  # This said it mirrored the CI build job's gates and did not: it ran the
+  # suite and the output goldens, where CI runs thirteen gates.  A tag can be
+  # pushed to any commit and CI fires only on main or a manual dispatch, so for
+  # a tag off main this job is the ONLY correctness gate standing in front of
+  # `publish` - and it is the one place where a green turns into bytes other
+  # people download.  It now carries the gates that say something about the
+  # ARTIFACT: the roster, the suite with its counts asserted, the runtime tiers
+  # the archive actually ships, and the examples.
+  #
+  # Deliberately NOT here:
+  #   b1-check, lane-check   migration ratchets. They pin how far a refactor
+  #                          has got, not whether this build is correct, and a
+  #                          release blocked on bookkeeping is a release that
+  #                          gets cut by hand instead.
+  #   lsp-check              tools/CryoLSP is not in the release archive.
+  #   api-index-check        docs/stdlib-api.txt is not in it either.
+  # Both exclusions are decisions rather than oversights; reverse them if
+  # either starts shipping.
   # ---------------------------------------------------------------------------
   test:
     name: verify suite on the tagged commit
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Raised from 30 for the added gates: the suite runs twice, plus the
+    # runtime tiers and the examples.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -134,11 +155,29 @@ jobs:
       - name: Build cryo (stdlib + self-hosted compiler via pinned bin/cryo)
         run: make cryo
 
-      - name: Run the test suite (default -O2)
-        run: make test
+      # The roster first, then the suite with its counts asserted.  `make test`
+      # passes on an exit code, and a suite that ran nothing exits 0 printing
+      # OVERALL PASS - so on a tag it could publish a release over a corpus
+      # that never executed.  Of every place in this repo to take a green on
+      # faith, this is the worst one.
+      - name: Assert the discovered test roster matches the committed golden
+        run: make roster-check
 
-      - name: Run the test suite at -O0
-        run: make test ARGS="--opt-level=0"
+      - name: Run the test suite (default -O2), with the suite counts asserted
+        run: make test-census
+
+      - name: Run the test suite at -O0, with the suite counts asserted
+        run: make test-census ARGS="--opt-level=0"
+
+      # The release archive SHIPS the runtime tier archives (build-release.sh
+      # stage_runtime_tiers), and this is the only gate that builds runtime/
+      # with the compiler under test.  The windows arm needs wine, which this
+      # runner has not got, so the skip is stated rather than hidden in a zero.
+      - name: Freestanding runtime acceptance (linux arm; windows needs wine)
+        run: make verify-freestanding ARGS=--allow-skipped-arm
+
+      - name: Build the example projects (examples/*/ smoke gate)
+        run: make examples
 
       - name: Check example program output against goldens
         run: make examples-golden
