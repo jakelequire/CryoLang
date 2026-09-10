@@ -57,6 +57,10 @@ filesystem enumeration order differences across OSes cannot break it.
                the other platform's entries -- and the gate then passes,
                because the golden it just wrote is what this host found.
                Use --update only when deliberately REMOVING tests.
+               It no longer drops the other platform's entries: a golden
+               entry whose test is still `![target]`-gated elsewhere in
+               the source is KEPT, and one whose test is actually gone
+               is not.
 
     --merge    add newly discovered tests to the golden without dropping
                entries this host cannot see.  This is the right mode when
@@ -363,9 +367,28 @@ def main(argv):
         return 0
 
     if update:
+        # KEEP the golden entries whose test is gated to another OS.  They are
+        # absent here by design, not deleted, and rewriting the golden from one
+        # host used to drop them - after which the gate passed, because the
+        # golden it had just written was exactly what this host found.  The
+        # docstring warned about it; nothing enforced the warning.
+        #
+        # Not a second mode bolted on: the waiver is read from the SOURCE, so a
+        # test genuinely deleted stops being gated-to-another-OS the moment its
+        # `![target(...)]` goes with it, and this drops it.  What survives is
+        # only a test that still exists and cannot run here.
+        gated = gated_tests()
+        keep = [ln for ln in golden_entries()
+                if is_unit(ln)
+                and gated.get(leaf_name(ln)) not in (None, HOST_TARGET)
+                and ln not in set(entries)]
+        merged = sorted(set(entries) | set(keep))
         with open(GOLDEN, "w", newline="\n") as f:
-            f.write("\n".join(entries) + "\n")
-        print("roster-check: wrote %d entries to %s" % (len(entries), GOLDEN))
+            f.write("\n".join(merged) + "\n")
+        print("roster-check: wrote %d entries to %s" % (len(merged), GOLDEN))
+        for ln in keep:
+            print("  kept  %s (gated to %s; absent here by design)"
+                  % (ln, gated.get(leaf_name(ln))))
         return 0
 
     if not os.path.exists(GOLDEN):

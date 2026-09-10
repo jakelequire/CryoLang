@@ -78,7 +78,11 @@ not done. The remaining limits are here so nobody rediscovers them:
 - **`cryo test --list` enumerates the UNIT suite only** - it returns before
   the compile-fail and project suites. `roster-check` therefore enumerates
   those two from the filesystem itself. Adding a project or a negative file
-  means re-pinning the golden (`--merge`, never `--update`, when ADDING).
+  means re-pinning the golden (`--merge` when ADDING; `--update` only when
+  deliberately REMOVING). `--update` no longer deletes the other host's
+  OS-gated entries - it keeps a golden entry whose test is still
+  `![target]`-gated elsewhere in the SOURCE, and drops one whose test is
+  actually gone.
 - **`outcome: "collect"` ignores every `expect` field.** `dispatch_project`
   checks the child's exit code and nothing else, so a `collect` project whose
   `![test]` discovery broke runs zero tests, exits 0, and passes. Writing
@@ -109,6 +113,13 @@ not done. The remaining limits are here so nobody rediscovers them:
   Six sections, three each. `--update` rewrites the ones it measured and
   leaves the rest, which is what lets the other host's half go stale.
   CI covers Linux; the Windows half is checked only by `windows-native`.
+- **Nothing runs the release ARCHIVE.** The verify job exercises a different
+  binary by a different link (`make cryo` is not `--release-static`), and
+  `windows-smoke` asks the artifact for `--version` - whether it starts,
+  not whether it works. `scripts/release-smoke.sh` now compiles and runs a
+  hello-world with the staged tree before it is packaged, and it FAILS
+  today: the shipped Windows archive has no `stdlib/.bin/libcryo.a` and
+  the compiler puts one on the link line.
 - **A tag off `main` gets `release.yml`'s verify job and nothing else** - CI
   fires only on `main` or a manual dispatch. That job is the last gate before
   a published artifact; keep it in step with what the archive ships.
