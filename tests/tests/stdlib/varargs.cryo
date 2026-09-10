@@ -129,3 +129,26 @@ function mixed_types_dispatch_to_distinct_specs() -> Result<(), TestError> {
     const ok: i64 = read_mixed(40 as i64, 1.5, msg, 7);
     return expect(ok == 4, Str::new("VaArgs mixed-type readout mismatch (per-type next<T> dispatch)"));
 }
+
+// Forward the raw bucket to a hand-written `extern "C"` va_list consumer.
+//
+// The existing coverage for va_list forwarding (`c_import_va_list_vsnprintf`)
+// goes through a BINDGEN-IMPORTED callee, whose parameter takes its `va_list`
+// type from the C header and so is always typed correctly. This one goes
+// through `stdlib/ffi/libc.cryo`, where the type is written by hand - the
+// population where a `void*` parameter silently hands the callee the alloca's
+// address instead of the `char*` in it, reading every argument one indirection
+// off on Win64 while SysV is unaffected.
+function fwd_vsnprintf(buf: u8*, size: u64, fmt: string, args...) -> i32 {
+    return libc::vsnprintf(buf, size, fmt, args);
+}
+
+![test]
+function libc_vsnprintf_forwards_the_bucket() -> Result<(), TestError> {
+    mut buf: u8[64];
+    const n: i32 = fwd_vsnprintf(&buf[0], 64 as u64, "a=%d b=%s c=%d", 42, "hi", 7);
+    const view: Str = Str::from_raw(&buf[0], n as u64);
+    const want: Str = Str::new("a=42 b=hi c=7");
+    return expect(view.equals(&want),
+        Str::new("libc::vsnprintf via forwarded args should be 'a=42 b=hi c=7'"));
+}

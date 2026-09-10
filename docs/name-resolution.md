@@ -16770,6 +16770,12 @@ nothing in the tree calls it - a dormant hazard, not a live defect. All three
 are left as they are, with the mechanism recorded at the declarations, because
 retyping them belongs to the printf decision that owns the same population.
 
+**Superseded by §8.127 the same day.** All three are now typed `va_list`. The
+paragraph above is also wrong about `vsnprintf`: "dormant hazard, not a live
+defect" was inferred from having no callers rather than measured, and the first
+call written against it read one slot off. The disposition changed; the
+mechanism above did not.
+
 #### What the printf hazard actually is
 
 §8.125 predicted it as a binding problem: remove the intrinsics and a bare
@@ -16867,3 +16873,63 @@ is built BY the pin, and the pin still emits the `linkonce_odr` body into all
 154 of its objects. Every object the new compiler emits defines none - the zero
 was read over that population, not over the linked binary, where it would have
 been a false alarm. The archive's copies clear at the next repin.
+
+### 8.127 `libc::vsnprintf` was reaching its callee one indirection off on Win64, and the test that should have caught it was measuring the other population - MEASURED AND LANDED 2026-09-09
+
+§8.126 established that an `extern "C"` parameter receiving a variadic bucket
+must be TYPED `va_list`, because `CallEmitter::va_forward_fn_type` consults
+`AbiClassifier::forward_va_list` only for a parameter carrying
+`TypeKind::VaList`. It left `ffi/libc.cryo`'s three `void*`-typed bindings alone
+and called them "safe only by accident". That was too generous by one.
+
+**`libc::vsnprintf` was not safe. It was broken, and had been.** Measured on
+Win64 before any change, forwarding an `args` bucket straight through:
+
+```
+before:  vsnprintf n=34  [a=1761605240 b=a=%d b=%s c=%d c=64]
+after:   vsnprintf n=13  [a=42 b=hi c=7]
+```
+
+The `%s` picked up the format string's own pointer and the second `%d` picked up
+`64` - the `size` argument - which is what reading one slot off the intended
+va_list looks like. It returned a plausible `n` and exited 0 both times.
+
+`vprintf` and `vfprintf` genuinely were shielded: their `core::intrinsics` twins
+displace the extern declarations and consult the seam directly, so their typing
+was unobservable. All three are now typed `va_list`, ahead of and separate from
+the printf-family move, so the ABI correction is revertible on its own.
+
+#### Why an existing va_list test passed throughout
+
+`c_import_va_list_vsnprintf` (`tests/lang/c_import_libclang.cryo`) exercises
+exactly this - a bucket forwarded into a C `vsnprintf`-alike, through a second
+call, driving format-string processing. It passes, and passed while
+`libc::vsnprintf` was broken.
+
+It routes through a BINDGEN-IMPORTED callee. An imported C function takes its
+`va_list` parameter type from the header, so it is typed correctly by
+construction. The population that can be wrong is the one where a human writes
+the type - `ffi/libc.cryo` - and no test reached it.
+
+This is the recurring shape here - a corpus that cannot contain the thing it is
+being read as evidence about, as with the tripwire corpora that hold no C
+imports. A test that passes over the wrong population is not weaker evidence
+than no test; it is worse, because its green reads as coverage of the case it
+never touches. The new test
+(`libc_vsnprintf_forwards_the_bucket`, in `tests/stdlib/varargs.cryo`) forwards
+through the hand-written binding specifically, and was confirmed to FAIL when
+`vsnprintf` alone is reverted to `void*` - and to be the only test that does.
+
+#### The prediction, and what it bought
+
+Written before editing: the probe flips to correct output; **no gate moves**,
+because the other two bindings are displaced by intrinsics and because both
+`VaList` and `Pointer` lower to `ptr` (`type_map.cryo`), leaving every LLVM
+signature identical; `docs/stdlib-api.txt` changes exactly three lines.
+
+All of it held - B1 `0 / 82 sites` on all three lanes, `lane-check` counters
+identical to the digit, byte-identical selfhost on both arms - which is the
+result that says the retyping is a source-level correction to how a call site is
+SELECTED, not a change to what is emitted for the calls that were already right.
+Had a counter moved, the displacement would not have been total and the printf
+move would have inherited a second problem.
