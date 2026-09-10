@@ -46,7 +46,7 @@ current-state description is the defect it exists to remove.
 | D4 | The qualifier shorthand `A::B` prefers the type | SUPERSEDED by D5 — ruled dropped, never built, then overtaken | `no check` — the thing ruled on was never in the tree | §8.66 → §8.130 |
 | D5 | **Namespaces and types share ONE namespace**; a module and a type can never carry the same name, and the collision is an ordinary redeclaration error at its declaration | **RULED, NOT STARTED** | `grep -rho 'check_module_type_collision' compiler/src \| wc -l` → **2** (0 when done) | §8.130, §8.134 |
 | D6 | Intrinsics get namespaced; a bare name always means the user's function | RULED; `format`/`printf` done, the rest not started | `grep -c '^intrinsic function ' stdlib/core/intrinsics.cryo` → **58** | §8.124, §8.126, §8.129 |
-| D7 | Imports stop globbing | migration TAKEN; the glob's DELETION not taken, but its **precondition is now met** (§8.132 + §8.134 fixed both qualifier positions) | `grep -c 'ImportStyle::Wildcard' compiler/src/compiler/resolver/name_resolution.cryo` → **1** (0 when deleted) | §8.131, §8.133, §8.134 |
+| D7 | Imports stop globbing | **TAKEN** — a plain `import M;` is `ImportStyle::Module` and binds no names. Three globs remain BY DESIGN and the old row's expected `0` was unreachable: the explicit `M::*`, and the two the compiler injects (the prelude, the f-string runtime) | `grep -rho 'ImportStyle::Wildcard,' compiler/src --include=*.cryo \| wc -l` → **3** | §8.131, §8.135, §8.138 |
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
 | D10 | A plural bare leaf is E0155, not a directory-order bind | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **3** | §8.121 |
@@ -19335,3 +19335,137 @@ conflates them, and `method_binding` was the consumer that did.
 The trait half of the key stays a leaf, and re-keying it remains wrong for the
 reason already recorded: `OperatorTraitMap` names fourteen operator traits by
 string literal and dispatches through these tables.
+
+### 8.138 The glob is gone: a plain `import M;` binds nothing, and the demand it left was 105 files rather than the 1,583 predicted - MEASURED AND LANDED 2026-09-10
+
+D7 is taken. §8.135 established the switch is not a deletion but a
+re-classification, and named the three globs that must survive; this is that
+change plus the imports it needs.
+
+#### The switch, in four hunks
+
+| file | change |
+|---|---|
+| `AST/_module.cryo` | `ImportStyle` gains `Module` |
+| `parser.cryo` | the plain form parses as `Module`, not `Wildcard` |
+| `name_resolution.cryo` | the `Wildcard` branch's `else` becomes `else if Specific`, so `Module` falls out of both |
+| `pass_registry.cryo` | the prelude short-circuit tests the STYLE, not just the path |
+
+The fourth is the one no test names. `AutoImport` skipped injecting the prelude
+when the file already carried an `import std::prelude`, on the path alone.
+Under the new rule a plain one of those binds nothing, so the check would have
+handed such a file no prelude at all - and a wildcard that binds no names is
+indistinguishable from a module that exports none, so it has no diagnostic of
+its own and presents as unrelated unresolved names. No file in the tree writes
+that import today; the hunk closes the trap rather than a live failure.
+
+`ImportStyle::Wildcard` now has exactly three producers, which is D7's new §0
+check: `parser.cryo`'s explicit `M::*`, and `pass_registry`'s injected
+`std::fmt::interp` and `std::prelude`. The old row expected that count to
+reach **0**, which the correct design makes unreachable; the row is fixed here,
+in the commit that moves the code, rather than left to read as owed work.
+
+#### The remaining demand was 105 files, not 1,583
+
+§8.131 measured `tests/` at 1,583 distinct (module, name) pairs and §8.135
+carried that number forward as the blocker. Over the whole tree the real figure
+is **105 files**: 59 in `stdlib`, 44 in `tests`, 1 in `examples`, 1 in
+`compiler`. Two reasons, and both were already in the tree:
+
+* the prelude offers 650 names, and the large `tests/` populations
+  (`std::core::result` 233 plain imports, `std::core::option` 210,
+  `std::collections::array` 41) are all prelude modules, so those imports were
+  binding nothing new even under the glob;
+* `1623324e`'s 6,587 explicit imports already covered `tests/` - the fixtures
+  carry the braced form beside the plain one.
+
+`tools/` (28 modules, 310 plain imports) and `runtime/` need **nothing**, which
+is worth stating because neither was covered by §8.135's compile and `lsp-check`
+is the only gate that would have caught `tools/`.
+
+#### The demand is an UPPER BOUND, which is why it needs no resolution model
+
+`scripts/migrate-plain-imports.py` computes, per file and per plainly-imported
+module, the names that module OFFERS which the file MENTIONS as a bare name.
+That is a superset of what the file needs and it models no resolution at all,
+which is the point: §8.131's measurement came from `Resolver::lookup` and could
+not see annotation demand, and §8.136's came from the `E0203` stream, which
+names the generic HEAD when an ARGUMENT is what failed. Both were incomplete by
+construction. An extra import is inert; the only thing the bound must not do is
+assign a name that two modules declare, so a contested name is REFUSED and
+reported.
+
+Exactly one name was contested tree-wide, and it is the fixture that exists to
+be ambiguous: `tests/tests/negative/E0154_ambiguous_bare_call.cryo` imports
+`std::alloc::heap` and `std::alloc::allocator` so that bare `alloc` has two
+equally-near candidates. It is written by hand as two braced imports, which is
+the same program said explicitly.
+
+**"Bare name" is doing the work.** Counting every identifier reports 160 rows
+over `compiler/`; dropping the positions an import cannot answer - after `.`,
+after `::`, a `name:` binding site, a method head, an enum variant, a `args...`
+bucket, a match arm's pattern binds - takes it to 1. A free function whose name
+merely collides with a field is how an inert insertion becomes a contested one.
+
+#### Controls, both directions
+
+`compiler/` is the negative control: §8.135 drove the switch to a clean compile
+over those 165 modules, so a correct instrument reports approximately nothing
+there. It reports **one** row, and that row is real - `async_lower.cryo` matches
+`Res::TypeRelative(ResBase::Def(q), _)` while importing only
+`{ DefId, Res, ResSlot }`.
+
+The positive control is the same file with an insertion removed: the tool names
+`stdlib/sync/mutex.cryo` and its five `pthread_mutex_*` when the braced import
+is deleted, and is silent when it is restored. A second `--apply` over the
+finished tree edits nothing, which is the check that it converged rather than
+stopped - §8.136 records a tool whose `0 file edit(s)` meant "I could not find
+the files".
+
+#### Two instrument defects the controls found
+
+**A `/*` inside a `//` comment swallowed the rest of the file.** The scan
+checked for an unterminated block comment BEFORE stripping line comments, so
+`// Check for // and /* patterns` opened a block comment that ran until the
+next `*/`. Brace depth then desynchronised and every local `const c: char =`
+inside a method body read as a top-level export - which is how
+`compiler::lex` came to offer `c`, `kind`, `len`, `start` and `text`.
+**`scripts/api-index.py`'s `scan_file` has the same ordering and is not fixed
+here**; whether it changes `docs/stdlib-api.txt` was not measured.
+
+**`legacy/` declares 41 of the live tree's namespaces.** Nothing builds it, but
+it is tracked, so a scan over `git ls-files` makes one namespace offer the union
+of two libraries. That produced 55 refusals naming real `stdlib` files -
+`std::core::intrinsics` and `std::ffi::libc` both "declaring" `pthread_join`,
+when `intrinsics.cryo` declares no such thing. A refusal count is exactly the
+shape that reads as a finding.
+
+#### What a green build will and will not tell us
+
+The Specific branch's case (b) treats a name it cannot find in the module as a
+SUBMODULE, wildcard-imports that submodule's exports, and says nothing when no
+such module exists either. **A braced import naming a symbol that does not
+exist therefore binds nothing, silently** - the same failure mode the glob had.
+Every insertion here is a name the module was measured to offer, so this is not
+a live defect in these edits, but it is why the build is the check and the tool
+is not: a wrong name in a brace has no diagnostic of its own. Not fixed here;
+turning it into an error would change what compiles, which is not this task.
+
+Case (b) itself is untouched and remains a glob under another spelling -
+`import compiler::resolver::{ symbol_id, symbol_str, ... }` names seven
+SUBMODULES and globs each. That is what `1623324e` converted the compiler's own
+plain imports into, so removing it is its own migration and its own entry.
+
+#### Predicted measurements, to check against the build
+
+* `make test` project and unit counts **unchanged**. Every insertion names a
+  name the glob already bound, so nothing enters or leaves scope before the
+  switch; after it, the same set is reached by a different mechanism.
+* `b1-check` may DRIFT on `examples/09-json-config`, which is a b1 corpus and
+  gains `import std::core::convert::{ TryFrom };`. A name that arrives
+  import-bound instead of through the type layer moves which lane answers. A
+  re-pin rides with this change if it moves; a move nobody predicted would be
+  the finding.
+* `lane-check` **unchanged** - it counts call sites in `compiler/src`, and the
+  switch adds none.
+* `lsp-check` unchanged: `tools/` needs no import.
