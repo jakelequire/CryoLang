@@ -52,7 +52,7 @@ def fail(msg):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cryo", required=True,
-                    help="compiler binary to build the LSP with (the pin)")
+                    help="compiler binary to build the LSP with (the compiler under test)")
     ap.add_argument("--build-dir", default="build/gate",
                     help="build directory, relative to tools/CryoLSP; must be a "
                          "path nothing runs a server from")
@@ -77,9 +77,16 @@ def main():
             return fail("could not clear %s; a warm build compiles nothing and "
                         "reports success" % out_dir)
 
+    # Pin the in-tree stdlib.  The gate builds with the compiler UNDER TEST,
+    # which resolves the stdlib relative to its own location and so cannot find
+    # it from tools/CryoLSP; pinning it also makes the result independent of
+    # which binary runs the build, the same reason the examples gate does it.
+    env = dict(os.environ)
+    env["CRYO_STDLIB"] = os.path.join(ROOT, "stdlib")
+
     r = subprocess.run([cryo, "build", "--build-dir=%s" % args.build_dir],
                        cwd=PROJECT, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT)
+                       stderr=subprocess.STDOUT, env=env)
     out = r.stdout.decode("utf-8", "replace")
     lines = out.splitlines()
 

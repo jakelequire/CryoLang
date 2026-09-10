@@ -573,15 +573,22 @@ lane-check:
 # ignored gate is not a gate.  This one builds into its own directory and
 # installs nothing, so a held pin cannot reach it.
 #
-# Built with the PIN, like `make lsp` and for the same reason: the compiler
-# LIBRARY is rebuilt from current source either way, so requiring the stage-2
-# BINARY would drag a full self-host in front of the gate for no coverage.
+# Built with the COMPILER UNDER TEST, not the pin.  Rebuilding the compiler
+# LIBRARY from current source is only half the surface: the other half is the
+# checking the compiler BINARY performs on it, and the pin performs an older
+# one.  A build with the pin therefore certifies the LSP against a compiler
+# nobody will ship - and it did: the pin compiled tools/CryoLSP clean for 19
+# commits after a signedness change had already made it uncompilable by the
+# compiler being built.  The gate must run the checker it is gating.
+#
+# This costs a stage-2 build when one is not already present.  That is the
+# price of the coverage, and CI pays nothing extra: `make cryo` runs first.
 ifeq ($(HOST_OS),windows)
-lsp-check:
-	@$(PYTHON) scripts/lsp-gate.py --cryo "$(PIN_EXE)" $(ARGS)
+lsp-check: $(STAGE2_EXE) $(LIBCRYO_A)
+	@$(PYTHON) scripts/lsp-gate.py --cryo "$(STAGE2_EXE)" $(ARGS)
 else
-lsp-check: $(PIN) $(LIBCRYO_A)
-	@$(PYTHON) scripts/lsp-gate.py --cryo "$(PIN)" $(ARGS)
+lsp-check: $(STAGE2) $(LIBCRYO_A)
+	@$(PYTHON) scripts/lsp-gate.py --cryo "$(STAGE2)" $(ARGS)
 endif
 
 # ---- stdlib API index --------------------------------------------------
