@@ -21,14 +21,47 @@ api-index-check` fails if it is stale.
 ## Commands
 
 ```bash
-make cryo             # build the self-hosted compiler (compiler/build/cryo)
-make test             # unit + compile-fail + project suites
-make b1-check         # name-resolution fallback ratchet
-make roster-check     # unit-test roster golden
-make examples         # smoke-build every examples/ project
-make lsp-check        # compile tools/CryoLSP; no other gate does
-make selfhost-check   # byte-identity fixed point, BOTH OS, ~17 min
+make cryo                # build the self-hosted compiler (compiler/build/cryo)
+make test                # unit + compile-fail + project suites
+make roster-check        # roster golden: 2113 unit + 44 projects + 178 negative
+make b1-check            # name-resolution fallback ratchet
+make lane-check          # resolution-lane surface ratchet; needs NO build
+make lsp-check           # compile tools/CryoLSP with the compiler under test
+make vendor-check        # every constant shape survives `cryo vendor`
+make api-index-check     # docs/stdlib-api.txt is not stale
+make verify-pin          # both pins match their sidecars AND each other
+make verify-freestanding # runtime/ tiers built by the compiler under test
+make examples            # smoke-build every examples/ project (floor: 14)
+make examples-golden     # build AND run them, diff stdout (POSIX only)
+make incremental-check   # incremental build == clean build, per module
+make selfhost-check      # byte-identity fixed point, BOTH OS, ~17 min
 ```
+
+### What a green gate does NOT tell you
+
+Most of these were, at some point, reporting success for work they had
+not done. The remaining limits are here so nobody rediscovers them:
+
+- **`cryo test --list` enumerates the UNIT suite only** - it returns before
+  the compile-fail and project suites. `roster-check` therefore enumerates
+  those two from the filesystem itself. Adding a project or a negative file
+  means re-pinning the golden (`--merge`, never `--update`, when ADDING).
+- **`outcome: "collect"` ignores every `expect` field.** `dispatch_project`
+  checks the child's exit code and nothing else, so a `collect` project whose
+  `![test]` discovery broke runs zero tests, exits 0, and passes. Writing
+  assertions into such a `test.json` does not make them run. 11 projects use
+  this fixture.
+- **A compile-fail file with no `//~` annotation asserts a code and nothing
+  else** - not the line, not the symbol, not the absence of a cascade. Write
+  the annotations; `scripts/annotate-negative-tests.py` generates them from a
+  real run and refuses to keep one that does not verify.
+- **A diagnostic emitted with no `-->` span cannot be pinned to anything.**
+  E0236 is one; its negative test can assert the code alone.
+- **`selfhost-check` proves stability, not correctness.** Stage 3 builds
+  stage 4, so a miscompile that reproduces itself is invisible to it.
+- **`make lsp-check` builds with the stage-2 compiler**, which is what makes
+  it a gate; `make lsp` builds with the pin and certifies nothing about the
+  compiler being built.
 
 Read the log's **own summary line**, not a chained exit code — `make test;
 echo $?; tail log` reports `tail`'s status.
