@@ -14,7 +14,7 @@ which exit non-zero rather than reporting success:
 
   * the compiler binary is missing               -> cannot sweep
   * no examples/*/cryoconfig was discovered      -> swept nothing
-  * fewer projects than --min                    -> swept less than expected
+  * fewer projects than --min (the shipped 14)   -> swept less than expected
 
 and the summary line states the population, so a reader sees "14 projects"
 instead of inferring it from an exit code.
@@ -38,7 +38,12 @@ def discover(examples_dir):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cryo", required=True, help="compiler binary to sweep with")
-    ap.add_argument("--min", type=int, default=1,
+    # A floor of 1 is not a floor.  It refuses only the total collapse of
+    # discovery, and passes a sweep that found one project out of fourteen -
+    # which is the shape of every real failure here (a rename, a moved
+    # directory, a cryoconfig that stopped parsing), not the shape of an empty
+    # examples/.  Pinned to the shipped set; raise it when examples are added.
+    ap.add_argument("--min", type=int, default=14,
                     help="fail if fewer than this many projects are discovered")
     ap.add_argument("--stdlib", default=os.path.join(ROOT, "stdlib"))
     args = ap.parse_args()

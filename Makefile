@@ -736,11 +736,14 @@ runtime-tiers-win: $(PIN)
 # how it silently rotted once: the tiers still built, but codegen had moved on
 # and the panic tier no longer linked.  This target is what makes that loud.
 #
-# The script skips the Windows half when the mingw toolchain or wine is
-# unavailable, so it is meaningful on a bare Linux box too.  Set
-# `FREESTANDING_LINUX_ONLY=1` to skip the Windows half deliberately.
+# A skipped arm FAILS.  The Windows half needs mingw + wine, and where those
+# are absent the script used to return 0 having run half of itself and print
+# OK - so a bare Linux box could be quoted as evidence the Windows tiers link.
+# Accept that deliberately with `ARGS=--allow-skipped-arm` (the spelling
+# selfhost-check uses); `FREESTANDING_LINUX_ONLY=1` still selects the skip, it
+# just no longer hides it.
 verify-freestanding: $(STAGE2)
-	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash runtime/verify-freestanding.sh
+	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash runtime/verify-freestanding.sh $(ARGS)
 
 # ---- release packaging -------------------------------------------------
 # Build distributable archives under dist/.  `release` does the host

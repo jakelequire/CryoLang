@@ -13,6 +13,15 @@ For each pin it:
      which is what a *release* pin must look like (see M12 - pins built from a
      dirty worktree are not reproducible from any commit).
 
+Then, across the pins, it asserts THE PAIR AGREES: both sidecars must name the
+same `git-commit`.  Checking each pin against its own sidecar cannot see the
+failure the pins actually have, because a half-finished re-pin regenerates each
+sidecar beside the binary it just wrote - so the ELF can come from one commit
+and the PE from another with both halves verifying.  `make pin` refreshes both
+from one tree in one run; a pair that disagrees means one of them did not
+finish, and nothing downstream can tell, because each OS only ever loads its
+own half.
+
 A pin whose binary is absent is skipped with a note (a Linux-only checkout
 may not carry bin/cryo.exe); a binary present without a sidecar, or a
 sidecar without a binary, is an error.
@@ -57,6 +66,33 @@ def parse_sidecar(sidecar: Path) -> dict:
             key, _, val = line.partition(":")
             fields[key.strip()] = val.strip()
     return fields
+
+
+def verify_pair(pins) -> bool:
+    """Assert every present pin was built from the same commit.
+
+    Silent when fewer than two pins carry a sidecar: a Linux-only checkout has
+    nothing to compare, and a gate that invents a failure there gets switched
+    off.  Two present pins that disagree is always a defect.
+    """
+    seen = {}
+    for pin in pins:
+        sidecar = sidecar_path(pin)
+        if not pin.exists() or not sidecar.exists():
+            continue
+        seen[pin.name] = parse_sidecar(sidecar).get("git-commit", "") or "<absent>"
+    if len(seen) < 2:
+        return True
+    commits = set(seen.values())
+    if len(commits) == 1 and "<absent>" not in commits:
+        print(f"  [ ok ] pair: both pins built from {list(commits)[0][:12]}")
+        return True
+    print("  [FAIL] the pins disagree on the commit they were built from:")
+    for name, commit in sorted(seen.items()):
+        print(f"           {name:<12} {commit}")
+    print("           a re-pin refreshes both from one tree; one of these did")
+    print("           not finish, and each half still matches its own sidecar")
+    return False
 
 
 def verify_one(pin: Path, require_clean: bool) -> tuple[bool, bool]:
@@ -113,6 +149,8 @@ def main() -> int:
         checked, ok = verify_one(pin, args.require_clean)
         any_checked = any_checked or checked
         all_ok = all_ok and ok
+
+    all_ok = verify_pair(pins) and all_ok
 
     if not any_checked:
         print("ERROR: no pins found to verify", file=sys.stderr)
