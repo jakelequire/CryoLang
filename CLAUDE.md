@@ -23,6 +23,7 @@ api-index-check` fails if it is stale.
 ```bash
 make cryo                # build the self-hosted compiler (compiler/build/cryo)
 make test                # unit + compile-fail + project suites
+make test-census         # the same run, with the suite COUNTS asserted
 make roster-check        # roster golden: 2113 unit + 44 projects + 178 negative
 make b1-check            # name-resolution fallback ratchet
 make lane-check          # resolution-lane surface ratchet; needs NO build
@@ -42,6 +43,11 @@ make selfhost-check      # byte-identity fixed point, BOTH OS, ~17 min
 Most of these were, at some point, reporting success for work they had
 not done. The remaining limits are here so nobody rediscovers them:
 
+- **`make test` passes on an exit code.** A suite that ran nothing prints no
+  header, no summary and no explanation, and exits 0 with `OVERALL PASS`.
+  Use `make test-census` wherever the run is being taken as evidence; it
+  reconciles what ran against the roster golden. `make test` stays for the
+  working loop, where a pattern filter is the point.
 - **`cryo test --list` enumerates the UNIT suite only** - it returns before
   the compile-fail and project suites. `roster-check` therefore enumerates
   those two from the filesystem itself. Adding a project or a negative file
@@ -62,6 +68,21 @@ not done. The remaining limits are here so nobody rediscovers them:
 - **`make lsp-check` builds with the stage-2 compiler**, which is what makes
   it a gate; `make lsp` builds with the pin and certifies nothing about the
   compiler being built.
+- **`incremental-check` compares BINARIES, so it needs a reproducible link.**
+  A Windows PE carries a link timestamp - two clean builds of one unchanged
+  source differ - so the gate refuses on this host rather than reporting a
+  matrix of failures that blame incremental compilation for the linker.
+- **`b1-baseline.txt` is per host and only the host you run on is asserted.**
+  Six sections, three each. `--update` rewrites the ones it measured and
+  leaves the rest, which is what lets the other host's half go stale.
+  CI covers Linux; the Windows half is checked only by `windows-native`.
+- **A tag off `main` gets `release.yml`'s verify job and nothing else** - CI
+  fires only on `main` or a manual dispatch. That job is the last gate before
+  a published artifact; keep it in step with what the archive ships.
+- **The `cxx` requirement probe leaks the shell's stderr into the test
+  output.** On Windows `ffi_cpp_link`'s line reads `... The system cannot find
+  the path specified.` and its real verdict lands on the next line. Any parser
+  over `cryo test` output has to tolerate that. Compiler-side; unfixed.
 
 Read the log's **own summary line**, not a chained exit code — `make test;
 echo $?; tail log` reports `tail`'s status.
