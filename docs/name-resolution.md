@@ -21022,3 +21022,10 @@ Zero is the exit condition. The next commit deletes the widening call, the
 key it won with, and `NewShadow` from `emit_new`; `widen_type_home_scoped_bare`
 itself survives one more consumer, `emit_base_ctor_call`, which is the next
 shadow.
+
+**Deleted.** `emit_new` now reads sema's answer alone and takes the mangling
+key from the type; the widening call, its key and `NewShadow` are gone. Over
+the shadow build and this one: 0 of 1,126 example objects and 0 of 2,126
+test objects differ, `lsp-check` 266 modules, `make test` 2,113 / 179 / 43 -
+which is what zero disagreements predicted. `widen_type_home_scoped_bare`
+has one caller left, `emit_base_ctor_call`.
