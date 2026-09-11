@@ -681,18 +681,24 @@ type struct DeclarationEmitter {
         }
     }
 
-    /// The arena's canonical type, and the name its methods register under.
-    ///
-    /// Both derive from `CompilationContext`, which is also what the body
-    /// emitter asks, so a declaration and its bodies cannot disagree.
-    canonical_type_ref(mut &this, name: SymbolStr) -> TypeRef {
-        const ctx_ptr: CompilationContext* = this.ctx;
-        return ctx_ptr.canonical_type_ref(name);
-    }
-
-    canonical_type_qname(mut &this, name: SymbolStr) -> SymbolStr {
-        const ctx_ptr: CompilationContext* = this.ctx;
-        return ctx_ptr.canonical_type_qname(name);
+    /// The name a TYPE declaration's methods register under, from the
+    /// declaration itself: a specialization's clone carries the template's
+    /// namespace in `source_module` and is registered as
+    /// `<that>::<identifier>`; a written declaration is registered under the
+    /// module that wrote it.  The same rule `fn_qualified_name` states for a
+    /// function, and the one `register_decl_in_index` registers by.
+    type_decl_qualified_name(&this, source_module: string, span_file: string,
+                             name: SymbolStr) -> SymbolStr {
+        const i: InternTable* = this.get_intern();
+        // A SYNTHESIZED declaration - a closure struct - carries the qualified
+        // name it was registered with; prefixing it again would mint a key
+        // nothing holds.
+        if (QualifiedName::segment_count(i.resolve(name)) > 1) { return name; }
+        if (source_module != "") {
+            return i.intern(source_module + "::" + i.resolve(name));
+        }
+        const c: CompilationContext* = this.ctx;
+        return c.qualify_symbol_sym_home(name, span_file);
     }
 
     /// Declare methods defined inline within a struct declaration.
@@ -703,7 +709,7 @@ type struct DeclarationEmitter {
         if (node.methods.length == 0) {
             return;
         }
-        const qualified: SymbolStr = this.canonical_type_qname(node.name);
+        const qualified: SymbolStr = this.type_decl_qualified_name(node.source_module, node.span.file, node.name);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.declare_method(node.methods[i], qualified);
         }
@@ -718,7 +724,7 @@ type struct DeclarationEmitter {
         if (node.methods.length == 0) {
             return;
         }
-        const qualified: SymbolStr = this.canonical_type_qname(node.name);
+        const qualified: SymbolStr = this.type_decl_qualified_name(node.source_module, node.span.file, node.name);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.declare_method(node.methods[i], qualified);
         }
@@ -729,8 +735,9 @@ type struct DeclarationEmitter {
         if (node.generic_params.length > 0) {
             return;
         }
-        const di_ref: TypeRef = this.canonical_type_ref(node.name);
-        const qualified: SymbolStr = this.canonical_type_qname(node.name);
+        const qualified: SymbolStr = this.type_decl_qualified_name(node.source_module, node.span.file, node.name);
+        const di: DeclarationIndex* = this.get_decl_index();
+        const di_ref: TypeRef = di.lookup_type(qualified);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.declare_method(node.methods[i], qualified);
         }

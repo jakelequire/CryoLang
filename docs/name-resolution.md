@@ -50,7 +50,7 @@ current-state description is the defect it exists to remove.
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
 | D10 | A plural leaf is E0155, not a directory-order bind — and a leaf two children of one FACADE declare is the same defect reached by a qualified path, in a call as in an annotation | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **5** | §8.121, §8.144, §8.151 |
-| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1588** | §8.66, §8.80, §8.139 |
+| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1578** | §8.66, §8.80, §8.139 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
 | D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **576** | §8.145, §8.146, §8.147, §8.148, §8.150 |
@@ -80,8 +80,8 @@ three, and its row carries the count. Read each zero off its own row.
 | artifact | status | pinned | check → expected | § |
 |---|---|---|---|---|
 | type cascade (`lookup_type_by_sym`, 4 steps) | **DELETED** — `lookup_type_exact`, one step; the audit stream and its four counter rows went with it | — | `grep -rho 'lookup_type_by_sym' compiler/src --include=*.cryo \| wc -l` → **0** | §8.154 |
-| 2c home-module (ambient cursor) | STARVED | 0 | same file, `2c  home-module` | §8.63, §8.87 |
-| M1 `qualifier_agrees` | **GUARD** | 2,566 calls / 2,566 agree / **0 reject** | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **5** | §8.120, §8.132 |
+| 2c home-module (ambient cursor) | STARVED | 0 | `grep -m1 '2c  home-module' tests/b1-baseline.txt` | §8.63, §8.87 |
+| M1 `qualifier_agrees` | **GUARD — NOT ENTERED on every b1 arm** since §8.156; its one caller left is the C-import alias branch of the annotation stamp | 0 calls / 0 agree / **0 reject** | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **5** | §8.120, §8.132 |
 | M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane** | 3,760 | `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M2 resolve_module_qualified_sym calls/{print;exit}' tests/b1-baseline.txt` → **3760** | §8.120 |
 | M4 mono bare-name scan | STARVED | 432 calls / **0** hits | same file, `M4 mono bare-name` | §8.33, §8.120 |
 | M5 import suffix fallback | **STARVED** — all entries are the sub-module caller | **3 calls / 0 hits** | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **3** | §8.120 |
@@ -93,7 +93,7 @@ three, and its row carries the count. Read each zero off its own row.
 | B4 bucket (instantiation keying) | **DELETED** | — | `grep -c 'B4' compiler/src/compiler/resolve_counter.cryo` → **0** | §8.121 |
 | arena `leaf_index` map | **LIVE, and NOT a lane** | — | `grep -rho 'leaf_index' compiler/src \| wc -l` → **8** | §8.121 |
 | `resolve_path` (§5.2's one entry point) | **LIVE, but not the entry point** — 2 call sites, both single-segment, both `Namespace::Type` | — | `grep -rho '\.resolve_path(' compiler/src --include=*.cryo \| wc -l` → **2** | §5.2, §8.5, §8.7 |
-| `canonical_type_ref`'s bare step | **STARVED** — still present, answers nothing | 2,652 reached / **0** answered | `grep -c 'lookup_by_name' compiler/src/compiler/compilation_context.cryo` → **1** (0 when deleted) | §8.103, §8.104, §8.112 |
+| `canonical_type_ref` and its arena bare step | **DELETED** — a declaration's key comes from the declaration (`source_module`, else the writer's module) | — | `grep -c 'lookup_by_name' compiler/src/compiler/compilation_context.cryo` → **0** | §8.103, §8.112, §8.156 |
 | `resolve_cross_module_name` (sema's resolver re-entry by spelling) | **DELETED** — its four readers went under shadow mode | — | `grep -rho 'resolve_cross_module_name' compiler/src \| wc -l` → **0** | §8.155 |
 | `check_module_type_collision` | LIVE — D5 deletes it | — | see D5 | §8.130, §8.131 |
 | `module_owns_member` probe | LIVE — D5 deletes it | — | `grep -rho 'module_owns_member' compiler/src \| wc -l` → **3** | §8.131 |
@@ -21142,3 +21142,60 @@ Objects over the shadow build and this one: 0 of 1,126 examples, 0 of 2,126
 tests; `make test` 2,113 / 179 / 43. lane: REENTRY 6 -> 5 - the
 `get_resolver()` in `type_utils` was that re-entry. Tally: 6 shadowed, 6 at
 zero, 6 deleted, 3 artifacts gone.
+
+### 8.156 Round four: the annotation lane at 0, a constructor call at 0, and the declaration-key cursor - whose one disagreement is the OLD model naming the wrong module's `Weak<i32>` - 2026-09-11
+
+Four consumers shadowed together, and one instrument defect found on the way.
+
+**The instrument defect first.** `make lsp-check` captures the compiler's
+output and prints a one-line summary on success, so every "0 on lsp-check"
+in §8.152-8.155 measured nothing over the compiler's own source. Re-measured
+by building `tools/CryoLSP` directly with stage-2 and capturing stderr: the
+four shadow commits (`781c03d6`, `6beb34ff`, `6d084415`, `3bedc7f3`) replayed
+in the worktree each read 0 over the 266 modules, and the same pipe carried
+3,758 lines for a live consumer, so it reports. The six deletions stand on a
+genuine zero; the readings below are all direct.
+
+| consumer | new answer | old answer | lines |
+|---|---|---|---|
+| annotation lane `resolve_named` 3b/3c (+ 2c under a cursor home) | the stamp | `canonical_type_name` (home walk, then cursor), then the index's bare slot | **0** |
+| `call_emitter` stack construction `ClassName(args)` | `node.resolved_type` | bare index slot, then cursor scope map | **0** |
+| declaration key for a struct/union/class emitter (`canonical_impl_target`, `declare_*_methods`) | `source_module::name`, or the writer's module - `fn_qualified_name`'s rule | `canonical_type_qname`: cursor prefix, then the arena's bare alias map | 84, then **2** |
+| `canonical_type_ref`'s arena bare step | - | `TypeArena::lookup_by_name` | 3,758 - every one a specialization identifier, the same split as §8.154 |
+
+The 84 were closure structs, synthesized with an already-qualified name the
+cursor key passes through and the new rule prefixed again; the rule now keeps
+`canonical_decl_key`'s already-qualified test. **The 2 that remain are the old
+model wrong.** `Weak<i32>` is declared by `std::alloc::arc` AND
+`std::alloc::rc`, so both specializations mint the identifier
+`4Weak$Li_N$...`; for the clone written in `rc.cryo` the declaration says
+`std::alloc::rc::4Weak$...` and the arena's bare alias map says
+`std::alloc::arc::4Weak$...` - the other module's specialization, whichever
+registered the alias. `tests/stdlib/rc.cryo` carries a comment routing its
+`Weak` tests around a `Weak<i32>` link failure in this area. This also
+withdraws §8.154's "unique by construction": a specialization identifier is
+unique only per template module, and the module prefix `spec_qualified_name`
+adds is what separates same-leaf templates.
+
+Deleted on those readings: the annotation lane's 3b and 3c with
+`canonical_type_name`, `home_scope_of`, `rn_seam_probe`, the two context rows;
+`Resolver::resolve_type_qualified_name` and `_from` (no caller left - the
+strict form keeps its one new-model caller); the constructor call's two
+lookups; `canonical_impl_target`, `DeclarationEmitter::canonical_type_ref/
+qname`, `CompilationContext::canonical_type_ref/canonical_type_qname` and with
+them the arena bare-leaf step §0 had carried as STARVED. `qualifier_agrees`
+reads 0 calls on every b1 arm now: the annotation lane's 3b was its last
+driver there.
+
+**Deleted, measured.** Objects over the previous build and this one: 0 of
+1,126 examples; the suite moved exactly ONE object, `std/alloc/allocator.o`,
+where the injected `Weak<i32>` specialization lives - the disagreement above,
+resolved the declaration's way - and `make test` is 2,113 / 179 / 43. b1 both
+hosts: M1 `qualifier_agrees` 2,566 -> 0 calls. lane: LOOKUP 57 -> 53,
+DEFID_UNWRAP 26 -> 25. Tally: 9 consumers shadowed (`emit_new`, base
+constructor, `lookup_type_by_sym`, `resolve_method_owner`,
+`scope_is_generic_template`, `find_static_method_template`, the annotation
+lane, the constructor call, the declaration key), 9 at zero, 9 old paths
+deleted, 6 artifacts gone (`widen_type_home_scoped_bare`, `lookup_type_by_sym`,
+`resolve_cross_module_name`, `canonical_type_name`,
+`resolve_type_qualified_name` + `_from`, `canonical_type_ref`/`_qname`).

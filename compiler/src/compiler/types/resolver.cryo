@@ -1542,79 +1542,6 @@ private:
                                   name_str, answer);
     }
 
-    /// Record one annotation at the string seam: the canonical name the string
-    /// path produced beside the name the node's own stamp carries.
-    ///
-    /// The two are compared as NAMES rather than by looking each one up.  The
-    /// index lookup is a deterministic function of the name handed to it, so
-    /// equal names reach one type without a second lookup having to prove it -
-    /// and a second lookup here would add a per-kind call site to the very
-    /// surface the lane ratchet pins, making the instrument indistinguishable
-    /// from the regrowth that ratchet exists to catch.
-    ///
-    /// The comparison over-reports: two names that alias one target are
-    /// distinct here and identical after the alias walk, so a `DIFFERENT` row
-    /// is a candidate to adjudicate, not a defect already established.
-    ///
-    /// `slot` is read for diagnosis, never to decide - nothing below branches
-    /// on it, and `require` is deliberately not called, because a `Pending`
-    /// annotation is a fact this probe exists to count rather than an internal
-    /// bug to report.
-    rn_seam_probe(&this, step: string, name_str: string, qualified: SymbolStr,
-                  slot: ResSlot, ctx: ResolutionContext*,
-                  span: SourceSpan) -> void {
-        if (!resolve_counter::Audit::Named.enabled()) { return; }
-
-        mut incumbent: string = "<none>";
-        if (qualified.is_valid()) {
-            incumbent = this.intern_table.resolve(qualified);
-        }
-
-        mut stamped:      string  = "<pending>";
-        mut stamp_is_def: boolean = false;
-        match (slot) {
-            ResSlot::Answered(r) => {
-                match (r) {
-                    Res::Def(q) => {
-                        stamped = this.intern_table.resolve(q.qualified_name());
-                        stamp_is_def = true;
-                    }
-                    _ => { stamped = r.to_string(); }
-                }
-            }
-            _ => { }
-        }
-
-        mut verdict: string = "NEITHER";
-        if (stamp_is_def) {
-            if (qualified.is_valid()) {
-                verdict = "DIFFERENT";
-                if (stamped.eq(incumbent)) { verdict = "SAME"; }
-            } else {
-                verdict = "STAMP-ONLY";
-            }
-        } else {
-            if (qualified.is_valid()) { verdict = "INCUMBENT-ONLY"; }
-        }
-
-        mut home: string = "<none>";
-        if (ctx != null && ctx.home_module.is_valid()) {
-            home = this.intern_table.resolve(ctx.home_module);
-        }
-
-        // The span is carried so the row can be subtracted from the offer
-        // stream by site.  An absent file is not evidence of synthesis: a
-        // synthesizer borrows the span it rewrites, so it points at the
-        // original syntax.
-        mut site_file: string = "<nospan>";
-        if (span.file.length() > 0) { site_file = span.file; }
-
-        resolve_counter::rn_stamp_seam(step, verdict, home, name_str, incumbent,
-                                      stamped, site_file,
-                                      span.start_line as i32,
-                                      span.start_col as i32);
-    }
-
     /// The module the annotation was written in, or the empty symbol when the
     /// context is absent or names none.
     home_module_sym(&this, ctx: ResolutionContext*) -> SymbolStr {
@@ -1622,47 +1549,20 @@ private:
         return ctx.home_module;
     }
 
-    /// Scope of the module the annotation was written in, or an invalid scope
-    /// when the context does not name one (or it has no scope of its own).
-    home_scope_of(&this, ctx: ResolutionContext*) -> ScopeID {
-        if (!this.home_module_sym(ctx).is_valid() || this.name_resolver == null) {
-            return ScopeID::invalid();
-        }
-        const sid: u64 = this.name_resolver.find_module_scope(ctx.home_module);
-        if (sid == 0) { return ScopeID::invalid(); }
-        return ScopeID { id: sid };
-    }
-
-    /// Canonical `<module>::<leaf>` for `name`, resolved as the annotation's OWN
-    /// module sees it whenever the context says which module that is.
-    ///
-    /// This is the step that stops annotation resolution depending on where the
-    /// compiler happens to be standing.  The ambient scope chain is consulted
-    /// only when the context cannot say - a site that has not yet been taught
-    /// its home module, which then behaves exactly as it did before.
-    canonical_type_name(&this, name: SymbolStr, ctx: ResolutionContext*) -> SymbolStr {
-        if (this.name_resolver == null) { return SymbolStr::empty(); }
-        const home: ScopeID = this.home_scope_of(ctx);
-        if (home.is_valid()) {
-            const via_home: SymbolStr =
-                this.name_resolver.resolve_type_qualified_name_from(home, name);
-            if (via_home.is_valid()) { return via_home; }
-        }
-        return this.name_resolver.resolve_type_qualified_name(name);
-    }
-
     /// Resolve a named type (user-defined or generic binding).
     ///
-    /// Fallback chain:
+    /// In order:
     ///   1. Generic bindings (T -> i32 from enclosing generic context)
     ///   2. Primitive name check (a primitive spelling that reached Named
     ///      position carrying no TypeRef of its own)
-    ///   3. DeclarationIndex, by written literal then canonicalized name
+    ///   2c. The name layer's stamp on the node - what the written spelling
+    ///      names, decided where its imports were in hand
+    ///   3. A qualified spelling registered under exactly that name
     ///
-    /// There is no step past 3.  A leaf the DeclarationIndex cannot place is
-    /// unresolved, and the caller diagnoses it; resolving it from a
-    /// program-wide index would answer from what other modules happen to exist
-    /// rather than from what this one wrote.
+    /// There is no step past 3.  A leaf the stamp does not answer is
+    /// unresolved, and the caller diagnoses it; resolving it from the index's
+    /// bare slot or from the scope chain at the cursor would answer from what
+    /// other modules happen to exist rather than from what this one wrote.
     resolve_named(&this, name: SymbolStr, ctx: ResolutionContext*,
                   slot: ResSlot, span: SourceSpan) -> TypeRef {
         const name_str: string = this.intern_table.resolve(name);
@@ -1875,57 +1775,23 @@ private:
             return TypeRef::invalid();
         }
 
-        // 3. DeclarationIndex lookup (canonical post-population path).
-        //    After TypeResolution (order 9) populates the index, this is the
-        //    primary lookup path.  Falls through to arena for types not yet
-        //    registered (e.g., during early resolution phases).
-        //    TypeAlias types are transparent; callers of `resolve_named`
-        //    should never see them in `resolved_type` fields, so the helper
-        //    `follow_alias` unwraps to the alias target before returning.
-        if (this.decl_index != null) {
-            // 3a. Exact qualified literal first.  When `name` is already
-            //     qualified (contains "::"), an exact match against its
-            //     registered name is authoritative.  The canonicalizer below
-            //     (`resolve_type_qualified_name`) resolves only the *leaf*
-            //     segment through the scope chain and discards the prefix, so
-            //     for two same-leaf types in different modules
-            //     (`ModA::Widget` vs `ModB::Widget`) it would bind to
-            //     whichever leaf the scope finds first.  Only fall through to
-            //     leaf canonicalization when the literal isn't registered
-            //     (e.g. a partially-qualified path that still needs expansion
-            //     to the full arena name).
-            if (this.name_resolver != null
-                    && this.name_resolver.contains_separator(name_str)) {
-                const di_literal: TypeRef = this.decl_index.lookup_type(name);
-                if (di_literal.is_valid()) {
-                    resolve_counter::Site::RnDiLiteral.bump();
-                    const a_lit: TypeRef = this.follow_alias(di_literal);
-                    this.rn_trace("3a-di-literal", name_str, ctx, a_lit);
-                    return a_lit;
-                }
-            }
-            // Try qualified name first, canonicalized against the annotation's
-            // own module when the context names one.
-            if (this.name_resolver != null) {
-                const qualified: SymbolStr = this.canonical_type_name(name, ctx);
-                this.rn_seam_probe("3b", name_str, qualified, slot, ctx, span);
-                if (qualified.is_valid()) {
-                    const di_found: TypeRef = this.decl_index.lookup_type(qualified);
-                    if (di_found.is_valid()) {
-                        resolve_counter::Site::RnDiCanonical.bump();
-                        const a_can: TypeRef = this.follow_alias(di_found);
-                        this.rn_trace("3b-di-canonical", name_str, ctx, a_can);
-                        return a_can;
-                    }
-                }
-            }
-            // Try bare name
-            const di_bare: TypeRef = this.decl_index.lookup_type(name);
-            if (di_bare.is_valid()) {
-                resolve_counter::Site::RnDiBare.bump();
-                const a_bare: TypeRef = this.follow_alias(di_bare);
-                this.rn_trace("3c-di-bare", name_str, ctx, a_bare);
-                return a_bare;
+        // 3. A QUALIFIED spelling registered under exactly that name - a
+        //    specialization's identifier, a synthesized declaration's key.
+        //    A bare leaf has no step here: it is answered by the stamp above
+        //    or not at all, because the index's bare slot is single-slot
+        //    last-write-wins across every module declaring that leaf, and
+        //    canonicalizing a leaf through the scope chain from wherever the
+        //    compiler is standing answers from the walk rather than from the
+        //    source.  Both read zero over the corpus once the stamp reached
+        //    every written annotation, and were deleted.
+        if (this.decl_index != null && this.name_resolver != null
+                && this.name_resolver.contains_separator(name_str)) {
+            const di_literal: TypeRef = this.decl_index.lookup_type(name);
+            if (di_literal.is_valid()) {
+                resolve_counter::Site::RnDiLiteral.bump();
+                const a_lit: TypeRef = this.follow_alias(di_literal);
+                this.rn_trace("3a-di-literal", name_str, ctx, a_lit);
+                return a_lit;
             }
         }
 
