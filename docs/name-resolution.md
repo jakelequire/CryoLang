@@ -53,7 +53,7 @@ current-state description is the defect it exists to remove.
 | D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1649** | §8.66, §8.80, §8.139 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **2** | §8.138, §8.144 |
-| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — 1 module of 574 through; verified by the object baseline at zero changed | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **579** | §8.145 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS, HELD** — 1 module of 574 through and verified at zero objects changed. `stdlib`'s 7,122 sites are measured but NOT landed: six positions take no path (§8.146) and two failures are unattributed | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **579** | §8.145, §8.146 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
 
 **D2 is the one to look at.** Decided in §8.39, then neither taken nor
@@ -20378,3 +20378,82 @@ Zero objects changed proves the emitted code is unchanged. It does not prove
 the SOURCE still says what it meant - a name qualified to the wrong module that
 happens to resolve to the same declaration is invisible to it, which is why the
 refusal in §8.144 matters and why the suite runs too.
+
+### 8.146 The stdlib sweep at 7,000 sites: six positions a path cannot be written in, and two defects that are not the generator's - MEASURED, SWEEP HELD 2026-09-10
+
+`stdlib` is 114 files and **7,122 rewritten sites**. It is NOT landed. This
+records what the batch found, because the findings are the point of running a
+batch before running fifty thousand.
+
+#### Six positions where a qualified name cannot be written
+
+Each was found by building, not by reading the grammar, and each is now a
+carve-out in `qualify-imports.py` that keeps the braced import and reports it.
+
+| position | example |
+|---|---|
+| impl trait target | `implement trait W for struct stdio::Stdout` |
+| inherent impl target | `implement struct buf::BufStream<S>` |
+| base class / base trait | `type class D : M::Base` |
+| base constructor call | `) : M::Base(args)` |
+| enum variant DECLARATION | `array::Array(Array<JsonValue>);` |
+| any KEYWORD segment | `default::Default`, `string::String` |
+
+The declaration heads are a parser limitation: those sites read one identifier.
+They are **not** widened here. The impl target is keyed `(leaf, target)` by
+three trait-lookup consumers and re-keying those is explicitly ruled against, so
+it is not a change to make in passing.
+
+**The keyword row is the one that needs a ruling.** A segment lexed as a keyword
+cannot be written at any depth - `std::core::default::Default` fails exactly as
+`default::Default` does. PRIMITIVES are the dangerous half: `string` is a type,
+so `mut &string::String` parses `&string` as a COMPLETE type and chokes on the
+leftover `::`. It parses far enough to look right in some positions and fails in
+others, so it cannot be settled by trying one. Three module segments in the tree
+are affected - `default`, `float`, `string` - and `std::collections::string`
+supplies `String`, which is ~1,087 sites. **Under Jake's ruling a module that
+cannot be named is a hole**, and the fix is a lexer/parser change: accept a
+keyword as a path segment after `::`. That is his call, not mine.
+
+Both sets are read from the compiler's own tables - the lexer's keyword list and
+`is_primitive_spelling` - rather than listed in the script, because a list of
+names in a migration is a special case waiting to go stale.
+
+#### Two generator defects, both from reading the build output
+
+`metadata::metadata::metadata(from)`. The source already wrote
+`metadata::metadata(from)` - `std::fs::metadata` declares a free function
+`metadata` - and the rewriter treated the leading segment as a bare use. It
+skips a name PRECEDED by `::` and did not skip one that is itself a qualifier
+HEAD. A head that this file imports as a module is the module; a head that is
+not is a type, and a type still needs its qualifier.
+
+A payload-carrying enum variant declaration is shaped exactly like a call
+statement, so `Array(Array<JsonValue>);` had its variant NAME rewritten. Enum
+bodies are now tracked by brace depth: the leading name on a line inside one is
+the variant being declared, and the payload beside it is still qualified.
+
+#### Two failures that are NOT the generator, and are not root-caused
+
+**`str::Str::from_raw` - E0233.** Three-segment static calls work: the sweep
+produced **839** of them across 99 distinct spellings and `str::Str::new(` alone
+is used 235 times. This one does not. Ruled out, each by reproduction rather
+than by reading: the plain module import is present in the file; the same call
+compiles outside stdlib; it compiles as a function ARGUMENT; it compiles inside
+a trait DEFAULT BODY whose implementor does not import the module; and it
+compiles with `std::core::slice` imported alongside, which was the best guess
+since four types declare a `from_raw`. Three hypotheses were spent before
+stopping, which is the rule here.
+
+**`combinator::Futures::timeout` - E0200**, in `net/http/server.cryo`: expected
+`Result<Result<Request, IoError>, Elapsed>`, found `Result<O, Elapsed>`. A
+generic output parameter is not being substituted. It was invisible until the
+first failure was held back, because the build stops at the first failing
+module - so a batch reports ONE defect at a time and a clean-looking log after a
+fix means only that the next one is further down.
+
+The sweep is held for these two. Landing 7,122 sites over a stdlib that does not
+build would be a green-looking tree whose failures nobody could attribute, and
+the object criterion cannot even be read over a partial build: the run that
+stopped early reported 252 objects of 406 and "0 changed", which is what an
+uncompleted build looks like when it is mistaken for a clean one.

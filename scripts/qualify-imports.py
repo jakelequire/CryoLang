@@ -56,6 +56,43 @@ BRACE_HEAD = mig.BRACE_HEAD_RE
 PLAIN = mig.PLAIN_IMPORT_RE
 
 
+def unusable_segments():
+    """Module-path segments that cannot be WRITTEN in a qualified path.
+
+    A path segment is lexed as a keyword or as an identifier, and a keyword
+    segment cannot be written. `default::Default` fails immediately, at any
+    depth - `std::core::default::Default` fails the same way.
+
+    PRIMITIVES ARE INCLUDED and they are the dangerous half. `string` is a type,
+    so `mut &string::String` parses `&string` as a COMPLETE type and then chokes
+    on the `::` left over. It parses far enough to look fine in some positions
+    and fails in others, which is why this cannot be settled by trying one and
+    seeing.
+
+    Both sets are read from the compiler rather than listed here: a list of
+    names in a migration script is a special case waiting to go stale, and this
+    one would go stale the first time a keyword is added.
+    """
+    kw = set(re.findall(r'"([a-z_][a-z0-9_]*)"', _read_src(
+        "compiler/src/compiler/lex/_module.cryo")))
+    prim = set(re.findall(r'"([a-z0-9_()]+)"', _primitive_block()))
+    return kw | prim
+
+
+def _read_src(rel):
+    with io.open(os.path.join(ROOT, rel), encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def _primitive_block():
+    src = _read_src("compiler/src/compiler/resolver/res.cryo")
+    i = src.find("is_primitive_spelling")
+    return src[i:i + 2000] if i >= 0 else ""
+
+
+UNUSABLE = unusable_segments()
+
+
 def mask(src):
     """Each line with comments and string bodies replaced by spaces, LENGTH
     PRESERVED, so an offset in the mask is the same offset in the source."""
@@ -131,18 +168,87 @@ def brace_blocks(masked):
     return out
 
 
-def rewrite_positions(code):
+# Positions the PARSER reads as a single identifier, so a path cannot be
+# written there however well it resolves. Each is a name in a declaration HEAD:
+# an impl's target type, a base class, a base trait, a base-constructor call.
+#
+# They are skipped rather than fixed. Widening them is a parser change, and the
+# impl target is keyed `(leaf, target)` by three trait-lookup consumers -
+# re-keying those is explicitly ruled against, so it is not a change to make in
+# passing during a migration.
+UNWRITABLE_POS = [
+    # An impl's target, with or without the type keyword: `for struct X` and
+    # `for X` are both written. Anchored on `implement` so a `for (` loop
+    # cannot match.
+    re.compile(r"\bimplement\b.*\bfor\s+(?:struct\s+|enum\s+|class\s+|union\s+)?"
+               r"([A-Za-z_]\w*)"),
+    # An INHERENT impl names its target straight after `implement`, with no
+    # `trait ... for` in between.
+    re.compile(r"^\s*implement\s*(?:<[^>]*>)?\s*"
+               r"(?:struct|enum|class|union)\s+([A-Za-z_]\w*)"),
+    re.compile(r"^\s*(?:public\s+|private\s+)?type\s+(?:class|trait|struct)\s+"
+               r"[A-Za-z_]\w*\s*(?:<[^{]*>)?\s*:\s*([A-Za-z_]\w*)"),
+    re.compile(r"\)\s*:\s*([A-Za-z_]\w*)\s*\("),
+]
+
+
+def enum_body_lines(masked):
+    """Line indices inside a `type enum` body.
+
+    A variant DECLARATION with a payload - `Array(Array<JsonValue>);` - looks
+    exactly like a call statement, so the leading name cannot be told from a use
+    by its shape. Inside an enum body it is always the variant being declared;
+    the payload beside it is a real type and is still qualified."""
+    out = set()
+    depth = 0
+    enum_at = None
+    for i, code in enumerate(masked):
+        if enum_at is None and re.match(
+                r"^\s*(?:public\s+|private\s+)?type\s+enum\s", code):
+            enum_at = depth
+        if enum_at is not None and depth >= enum_at:
+            out.add(i)
+        depth += code.count("{") - code.count("}")
+        if enum_at is not None and depth <= enum_at:
+            enum_at = None
+    return out
+
+
+def rewrite_positions(code, in_enum=False, module_names=frozenset()):
     """Offsets in `code` of identifiers used as BARE names.
 
     The same rule `migrate-plain-imports.free_idents` applies, reported as
-    positions rather than as a set so each occurrence can be edited."""
+    positions rather than as a set so each occurrence can be edited, minus the
+    declaration-head positions the parser will not accept a path in."""
     used, bound = mig.free_idents(code)
+    blocked = []
+    for rx in UNWRITABLE_POS:
+        for m in rx.finditer(code):
+            blocked.append(m.span(1))
     spots = []
+    first = True
     for m in IDENT.finditer(code):
+        s, e = m.span()
+        if in_enum and first:
+            # The leading name on a line in an enum body is the variant being
+            # DECLARED, not a use. Its payload beside it is a real type and is
+            # still qualified.
+            first = False
+            continue
+        first = False
         if m.group(0) not in used:
             continue
-        s, e = m.span()
         if s > 0 and code[s - 1] in ".:":
+            continue
+        # A name that is already the HEAD of a qualified path, and which this
+        # file imports as a MODULE, is the module - not a bare use to qualify.
+        # `std::fs::metadata` declares a free function `metadata`, so the
+        # source's own `metadata::metadata(from)` became
+        # `metadata::metadata::metadata(from)`. A head that is NOT a module
+        # spelling is a type, and a type still needs its qualifier.
+        if code[e:e + 2] == "::" and m.group(0) in module_names:
+            continue
+        if any(bs <= s < be for bs, be in blocked):
             continue
         spots.append((s, e, m.group(0)))
     return spots, bound
@@ -176,6 +282,16 @@ def plan(world, path):
         if m:
             leaves[m.group(3).split("::")[-1]].add(m.group(3))
 
+    # A name used in a declaration HEAD cannot be qualified there, so it keeps
+    # its braced import and stays bare EVERYWHERE in the file. Qualifying its
+    # other uses while the head stayed bare would leave the head unresolved once
+    # the import went.
+    head_only = set()
+    for code in masked:
+        for rx in UNWRITABLE_POS:
+            for m in rx.finditer(code):
+                head_only.add(m.group(1))
+
     qualify = {}      # name -> qualifier
     drop = set()      # names removed from the import list, left bare
     keep = {}         # module path -> names that stay (submodules, unoffered)
@@ -186,7 +302,16 @@ def plan(world, path):
         # A spelling two of this file's module paths share cannot be the
         # qualifier; the full written path is unambiguous by construction.
         qual = leaf if len(leaves[leaf]) == 1 else written
+        blocked = [g for g in qual.split("::") if g in UNUSABLE]
         for name in names:
+            if blocked:
+                # The module cannot be NAMED in a path, so its symbols keep the
+                # braced form. That is a hole in "qualify, don't import" rather
+                # than a preference, and it is reported rather than absorbed.
+                keep.setdefault(written, []).append(name)
+                notes.append("unwritable qualifier `%s` (keyword segment %s): %s"
+                             % (qual, blocked[0], name))
+                continue
             if target is None:
                 keep.setdefault(written, []).append(name)
                 notes.append("module unresolved: %s" % written)
@@ -195,6 +320,10 @@ def plan(world, path):
             if name not in offered:
                 # A submodule item, or a name the module does not offer at all.
                 keep.setdefault(written, []).append(name)
+                continue
+            if name in head_only:
+                keep.setdefault(written, []).append(name)
+                notes.append("declaration head takes no path: %s" % name)
                 continue
             if name in prelude:
                 drop.add(name)
@@ -209,7 +338,8 @@ def plan(world, path):
                 keep.setdefault(written, []).append(name)
                 continue
             qualify[name] = qual
-    return src, raw, masked, blocks, qualify, drop, keep, notes
+    return (src, raw, masked, blocks, qualify, drop, keep, notes,
+            set(leaves.keys()))
 
 
 def apply_to(path, planned, keep_lines=False):
@@ -222,8 +352,10 @@ def apply_to(path, planned, keep_lines=False):
     object baseline exists to give. Padded, a pure requalification is
     byte-identical, and the delivered form then differs from the verified one by
     blank lines only."""
-    src, raw, masked, blocks, qualify, drop, keep, _notes = planned
+    (src, raw, masked, blocks, qualify, drop, keep, _notes,
+     module_names) = planned
     eol = "\r\n" if "\r\n" in src else "\n"
+    enum_lines = enum_body_lines(masked)
     import_lines = set()
     for _w, _n, a, b in blocks:
         for k in range(a, b + 1):
@@ -236,7 +368,8 @@ def apply_to(path, planned, keep_lines=False):
         if i in import_lines:
             out.append(text)
             continue
-        spots, _bound = rewrite_positions(masked[i])
+        spots, _bound = rewrite_positions(masked[i], i in enum_lines,
+                                          module_names)
         edits = [(s, e, qualify[n]) for s, e, n in spots if n in qualify]
         if edits:
             for s, e, q in sorted(edits, reverse=True):
@@ -295,7 +428,7 @@ def main(argv):
         planned = plan(world, path)
         if planned is None:
             continue
-        _s, _r, _m, _b, qualify, drop, keep, notes = planned
+        _s, _r, _m, _b, qualify, drop, keep, notes, _mn = planned
         if not qualify and not drop:
             continue
         if do_apply:
