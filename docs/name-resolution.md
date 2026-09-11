@@ -53,6 +53,7 @@ current-state description is the defect it exists to remove.
 | D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1649** | §8.66, §8.80, §8.139 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **2** | §8.138, §8.144 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — 1 module of 574 through; verified by the object baseline at zero changed | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **579** | §8.145 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
 
 **D2 is the one to look at.** Decided in §8.39, then neither taken nor
@@ -20305,3 +20306,75 @@ is to re-run the retained link by hand:
 
 The `.rsp` is retained for exactly this. Anyone who reads E0900 as "the linker
 is unhappy" and goes looking in the build system will lose the time twice.
+
+### 8.145 Requalification is byte-identical, and the only thing that moved an object was the line the import used to occupy - FIRST MODULE LANDED 2026-09-10
+
+Jake ruled qualification over symbol imports: `import M;` plus `M::Thing`, not
+`import M::{ Thing };` plus bare `Thing`. This is the first module through it,
+and the point of doing one first was to find a systematic error at site one
+rather than at site fifty thousand. It found two.
+
+#### The instrument had to be rebuilt before it could say anything
+
+The main checkout reports **1,183** objects against the baseline's 406 - it has
+built both hosts, so `compiler/build` holds the other target's objects and
+`stdlib/.bin` carries a second triple. `scripts/obj-hash.sh` names that exact
+number in its own header as the thing that makes a checkout useless as an
+instrument. The measurement runs in the detached one-target worktree, which
+reports 406.
+
+Re-taken at HEAD, because four commits had moved compiler source since
+`5a53ede3`. The drift was **9 of 406 objects**, and every one is a file those
+commits edited - `expr_parser`, `name_resolution`, `new_delete_emitter`,
+`type_resolution`, and the three stdlib files whose intrinsic imports were
+removed. **Nothing else moved.** That is worth stating on its own: the two
+rulings changed the compiler, and what the compiler EMITS for code that already
+compiled did not change at all.
+
+#### A pure requalification changes nothing, and that is now measured
+
+`stdlib/io/error.cryo`: `import std::collections::str::{ Str };` deleted,
+`Str` becomes `str::Str` at both use sites. Rebuilt, the diff was **2 objects**
+- both of them `std/io/error.o`, the file that was edited.
+
+Not churn, and not a meaning change either. Five bytes differ, the symbol tables
+are IDENTICAL, and one of the five is `'a'` -> `` '`' `` - a decrement by one.
+The file lost a line when the import was deleted, and an object carries line
+information.
+
+Two controls settle it. The same source built twice differs by **zero** bytes,
+so object output is deterministic and the five bytes are real. And the same
+qualification applied with the import line BLANKED rather than removed - so the
+line count is unchanged - gives **zero** differing bytes and zero changed
+objects across all 406.
+
+So: **requalification is byte-identical. Deleting the import line is what moves
+the object, and it moves only line information.**
+
+`qualify-imports.py` gains `--keep-lines` for exactly this. It is a
+VERIFICATION mode, not a delivery mode: the sweep is verified padded, where the
+criterion is an exact zero, and delivered unpadded, where the two differ by
+blank lines only. Without it the line shift swamps the only signal the baseline
+exists to give, and "12 objects changed" would have to be argued about instead
+of read.
+
+#### Two defects in the generator, both caught by looking at the output
+
+The qualifier came out as the fully-qualified `std::collections::str::Str`
+rather than `str::Str`. The collision test counted OCCURRENCES of a path's last
+segment, and a file that imports one module both plainly and in braces names it
+twice - so every such file, which is most of them after `1623324e`, fell back to
+the long form. Distinct module paths is the test.
+
+The rewriter takes its positions from a LENGTH-PRESERVING mask rather than from
+the stripped line the demand scan uses. `strip_noise` collapses strings and
+truncates at `//`, so an offset in it is not an offset in the source; applying
+one to the other edits the wrong column of any line carrying a string or a
+trailing comment.
+
+#### What the criterion does and does not cover
+
+Zero objects changed proves the emitted code is unchanged. It does not prove
+the SOURCE still says what it meant - a name qualified to the wrong module that
+happens to resolve to the same declaration is invisible to it, which is why the
+refusal in §8.144 matters and why the suite runs too.
