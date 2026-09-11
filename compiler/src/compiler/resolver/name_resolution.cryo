@@ -1519,7 +1519,20 @@ public:
                 this.resolver.intern_table.intern(head),
                 this.resolver.current_scope);
             if (head_sym.is_valid()) {
-                const hs: Symbol = this.resolver.get_symbol(head_sym);
+                mut hs: Symbol = this.resolver.get_symbol(head_sym);
+                // An import binds a NAME; it does not say what kind of thing
+                // the name is. The declaration it points at does, and it is
+                // reached by the same canonical `module::name` the stamp would
+                // record. Reading the binding's own kind instead answers
+                // `Import` for every imported type, so `Enum::Variant` walked
+                // straight past the type-relative answer and was left for a
+                // later stage to re-derive from the written spelling.
+                if (hs.kind == SymbolKind::Import && hs.source_module != "") {
+                    const decl: SymbolID = this.resolver.lookup_in_module(
+                        this.resolver.intern_table.intern(hs.source_module),
+                        hs.name);
+                    if (decl.is_valid()) { hs = this.resolver.get_symbol(decl); }
+                }
                 if (hs.kind == SymbolKind::GenericParam
                         || hs.kind == SymbolKind::Type) {
                     // The head is resolved and nothing after it is, so the
@@ -1729,19 +1742,72 @@ public:
     }
 
     override visit(node: NewExprNode*) -> void {
-        // Resolve type name
+        // `new <path>` denotes one of two things and the parser decides
+        // neither: a TYPE to allocate, or a VARIANT of an enum.  One question
+        // separates them, and it is the question every path already asks.
+        //
+        // `TypeRelative` means the name layer walked to a type and a type owns
+        // the rest of the path - which for `new` is exactly `Enum::Variant`.
+        // Any other answer means the whole path names one definition, so it is
+        // the type being allocated.  There is no second lookup and no ordering
+        // to get wrong: the single answer carries which case this is.
+        // A `new` path is a TYPE path, optionally followed by one VARIANT
+        // segment, and the parser decides neither half.
+        //
+        // Classification first, from what the WHOLE path resolves to.
+        // `TypeRelative` means the name layer walked to a type and a type owns
+        // the tail - which for `new` is exactly `Enum::Variant`. When the whole
+        // path answers nothing, the same question is asked of the type path it
+        // contains, one segment shorter: that is what `Mod::Enum::Variant` is.
+        // Any other answer means the whole path names the type being allocated.
+        const written: string = this.resolver.intern_table.resolve(node.type_name);
+        mut do_split: boolean = false;
+        match (this.type_spelling_res(node.type_name, node.span)) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::TypeRelative(_, _) => { do_split = true; }
+                    _                       => { }
+                }
+            }
+            _ => {
+                if (this.resolver.contains_separator(written)) {
+                    const parent_sym: SymbolStr = this.resolver.intern_table.intern(
+                        QualifiedName::parent_of(written));
+                    match (this.type_spelling_res(parent_sym, node.span)) {
+                        ResSlot::Answered(pr) => {
+                            match (pr) {
+                                Res::Def(_) => { do_split = true; }
+                                _           => { }
+                            }
+                        }
+                        _ => { }
+                    }
+                }
+            }
+        }
+        if (do_split) {
+            node.set_variant_name(this.resolver.intern_table.intern(
+                QualifiedName::leaf_of(written)));
+            node.type_name = this.resolver.intern_table.intern(
+                QualifiedName::parent_of(written));
+        }
+
+        // The node is stamped from the path it actually names - the type,
+        // after any variant segment has been taken off it.  Stamping the
+        // classification answer instead records the enum by a `Def` that
+        // carries no generic arguments, and `new Option<i64>::Some(41)` then
+        // resolves to `Option` rather than `Option<i64>`.
+        match (this.type_spelling_res(node.type_name, node.span)) {
+            ResSlot::Answered(r2) => { node.set_res(r2); }
+            _                     => { }
+        }
+
+        // Resolve type name.  After the split above, so a variant path records
+        // the ENUM rather than a leaf no scope binds.
         const type_sym: SymbolID = this.resolver.lookup(
             node.type_name, this.resolver.current_scope);
         if (type_sym.is_valid()) {
             this.resolver.record_resolution(node.span, type_sym);
-        }
-        // The expression names a TYPE, and its spelling may be qualified, so it
-        // is the annotation's question rather than the single-segment scope
-        // lookup a bare value name gets - `type_sym` above answers whether the
-        // leaf binds here, which is not the same thing.
-        match (this.type_spelling_res(node.type_name, node.span)) {
-            ResSlot::Answered(r) => { node.set_res(r); }
-            _                    => { }
         }
 
         this.stamp_annotation_list(&node.generic_args);

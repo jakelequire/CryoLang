@@ -1609,6 +1609,22 @@ public:
     }
 
     /// Parse a new expression: new Type(args) or new Type[size]
+    /// Consume `::segment` pairs and append them to `path`.
+    ///
+    /// A keyword is accepted as a segment because `new Enum::new` is legal -
+    /// a variant may be spelled with one.
+    append_path_segments(&this, path: string) -> string {
+        mut out: string = path;
+        while (this.check(TokenType::ColonColon)
+               && (this.peek_at(1).kind == TokenType::Identifier
+                   || this.peek_at(1).kind.is_keyword())) {
+            this.advance();
+            const seg_tok: Token = this.advance();
+            out = fmt::format("%s::%s", out, seg_tok.lexeme);
+        }
+        return out;
+    }
+
     parse_new_expression() -> ExpressionNode* {
         const start: Token = this.advance(); // consume 'new'
         // The target type is usually a user-defined name (Identifier), but
@@ -1623,7 +1639,15 @@ public:
         } else {
             type_tok = this.consume(TokenType::Identifier, "type name");
         }
-        const type_name: SymbolStr = this.intern_lexeme(type_tok);
+        // The WHOLE path is recorded and nothing is decided here.  `new A::B`
+        // can name a type `B` in module `A` or variant `B` of enum `A`, and
+        // the two are told apart by what the path resolves to, not by how it
+        // is spelled - the same rule every other path in the language follows.
+        // Deciding at the parser is what made `new Lib::Widget` take `Lib` as
+        // the type and fail in codegen.
+        mut path: string = type_tok.lexeme;
+        path = this.append_path_segments(path);
+        mut type_name: SymbolStr = this.ctx.intern(path);
         mut node: NewExprNode* = new NewExprNode(type_name, this.span_from_token(start));
 
         // Optional generic args on the type: new Type<T>(...)
@@ -1635,40 +1659,13 @@ public:
             node.set_generic_args(scope_gen_args);
         }
 
-        // Enum variant construction: new EnumType::Variant(args)
-        // The '::' means this is a heap-allocated enum variant, not a struct.
-        // Consume the ::Variant(args) and store the variant name + arguments
-        // on the NewExprNode.  Codegen reads variant_name to dispatch to
-        // build_enum_variant; without it, the class-`new` path would just
-        // malloc and return uninitialized memory, leaving every callsite
-        // with a TypeAnnotation pointer whose tag/payload bytes look like
-        // glibc bin-head pointers.
-        if (this.check(TokenType::ColonColon)) {
-            this.advance(); // consume '::'
-            // Consume the variant name (identifier or keyword like 'new')
-            if (this.check(TokenType::Identifier) || this.current().kind.is_keyword()) {
-                const variant_tok: Token = this.advance();
-                node.set_variant_name(this.intern_lexeme(variant_tok));
-            }
-            // Parse call arguments: new Enum::Variant(payload)
-            if (this.check(TokenType::LParen)) {
-                this.advance();
-                if (!this.check(TokenType::RParen)) {
-                    while (true) {
-                        const arg: ExpressionNode* = this.parse_expression();
-                        if (arg != null) {
-                            node.add_argument(arg);
-                        }
-                        if (!this.match_tok(TokenType::Comma)) {
-                            break;
-                        }
-                    }
-                }
-                this.consume(TokenType::RParen, "')'");
-            }
-            node.span = this.span_from(start);
-            return node;
-        }
+        // Generic arguments bind to the TYPE, so a variant segment can follow
+        // them: `new Option<i64>::Some(41)`.  The path is continued here for
+        // the same reason it is not decided at all - the segments are recorded
+        // and the split is resolution's.
+        path = this.append_path_segments(path);
+        type_name = this.ctx.intern(path);
+        node.type_name = type_name;
 
         if (this.check(TokenType::LParen)) {
             // Constructor call: new Type(args)

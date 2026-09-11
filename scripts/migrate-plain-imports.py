@@ -75,10 +75,16 @@ DECL_RES = [
     re.compile(r"^\s*(?:(public|private)\s+)?type\s+(?:struct|enum|class|union|trait)\s+"
                r"([A-Za-z_]\w*)"),
     re.compile(r"^\s*(?:(public|private)\s+)?trait\s+([A-Za-z_]\w*)"),
-    re.compile(r"^\s*(?:(public|private)\s+)?(?:intrinsic\s+)?function\s+([A-Za-z_]\w*)"),
+    re.compile(r"^\s*(?:(public|private)\s+)?function\s+([A-Za-z_]\w*)"),
     re.compile(r"^\s*(?:(public|private)\s+)?(?:intrinsic\s+)?(?:const|static)\s+"
                r"([A-Za-z_]\w*)\s*:"),
 ]
+# `intrinsic function` is DECLARED and never EXPORTED -- `forward_declare_node`
+# calls `declare` for it and not `export_symbol` -- so no import of any form can
+# bind one, and a braced import naming one falls into the sub-module branch and
+# silently binds nothing. Counting them as offered is what put 23 such items in
+# the tree; they are not demand and this scan must not see them.
+INTRINSIC_FN_RE = re.compile(r"^\s*(?:(?:public|private)\s+)?intrinsic\s+function\s")
 EXTERN_FN_RE = re.compile(r"^\s*(?:(public|private)\s+)?function\s+([A-Za-z_]\w*)")
 # A method declared in a type body, and an enum variant: both introduce the
 # name rather than use it.
@@ -264,6 +270,8 @@ def scan(path):
                             code.split("{", 1)[1].split("}", 1)[0])))
                 if in_brace_import:
                     continue
+            elif INTRINSIC_FN_RE.match(code):
+                pass
             else:
                 for rx in DECL_RES:
                     m = rx.match(code)

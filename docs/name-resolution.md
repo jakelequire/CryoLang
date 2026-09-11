@@ -51,6 +51,7 @@ current-state description is the defect it exists to remove.
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
 | D10 | A plural bare leaf is E0155, not a directory-order bind | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **3** | §8.121 |
 | D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1649** | §8.66, §8.80, §8.139 |
+| D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
 
 **D2 is the one to look at.** Decided in §8.39, then neither taken nor
@@ -20082,3 +20083,117 @@ paths, §6.1-6.3 the two answers, §7.1-7.4 enforcement - twenty subsections.
 That is a list of *where to look*, not a finding. Earlier summaries have quoted
 a count of fourteen; that number has no derivation in this document and should
 not be inherited as one.
+
+### 8.143 `new` stops deciding what its path means, and an imported type was binding as `Import` rather than as a type - RULED AND LANDED 2026-09-10
+
+Jake ruled option A on `new M::Type`: parse the whole path, decide at
+resolution. Rust never disambiguates a path at parse time, and D5 already
+implies it - under one shared namespace a module and a type cannot share a
+name, so a path names one thing and resolution is deterministic.
+
+#### What was ambiguous
+
+`new A::B` was already spoken for: heap-allocate variant `B` of enum `A`.
+`parse_new_expression` consumed ONE identifier and treated `::` as the variant
+marker, so `new Lib::Widget()` took `Lib` as the type and died in codegen with
+`target type 'Lib' not found`, and `new Lib::Widget { n: 3 }` did not parse at
+all. Nothing else in the language had this problem - annotations, generic
+arguments, static calls, casts, trait bounds and impl heads all took `M::Type`
+already.
+
+#### Three parts, and the middle one is the finding
+
+The parser records the path and decides nothing. `append_path_segments` runs
+BOTH before and after the generic-argument parse, because a variant segment may
+follow them: `new Option<i64>::Some(41)`.
+
+Name resolution classifies from the answer `type_spelling_res` already gives.
+`TypeRelative` means the name layer walked to a type and a type owns the tail,
+which for `new` is exactly `Enum::Variant`; any other answer means the whole
+path names the type being allocated. When the whole path answers nothing, the
+same question is asked of the path one segment shorter - that is
+`Mod::Enum::Variant`, and its answer names the enum.
+
+Codegen was re-widening the written spelling and throwing the stamp away, the
+identical shape §8.132 fixed for annotations. It reads the stamped definition
+where there is one; the widening below it now serves only spellings the name
+layer left unstamped.
+
+**An imported type binds as `SymbolKind::Import`, not `Type`.** The head test in
+`type_spelling_res` read the BINDING's kind, and an import binds a name without
+saying what kind of thing the name is. So every `Enum::Variant` whose enum was
+imported walked past the type-relative answer and was left for a later stage to
+re-derive from the spelling. It now follows the import to the declaration,
+which is where the kind lives, reached by the same canonical `module::name` the
+stamp records. This was not a `new`-only defect; it suppressed the stamp
+wherever a qualified path's head was an imported type.
+
+**That is the THIRD instance of one pattern**, and it is worth naming as a
+pattern rather than as three bugs. §8.132: the type layer read the stamp only
+for bare leaves, so a qualified annotation was answered and discarded. §8.134: a
+static call was keyed by its written spelling because the scope map's refusal
+arrived as the spelling echoed back. Here: the head test read the binding's kind
+rather than the declaration's, so the answer was never produced at all. In each
+the name layer either had the answer or could have had it, and a consumer
+re-derived from the spelling instead.
+
+Three consumers, one shape. Whether a fourth exists is now a question worth
+GOING to look for - the search is "a consumer that takes a written name where a
+`Res` is already on the node" - rather than one to wait to trip over. The
+codegen hunk in this entry was found that way and not by a failing test.
+
+#### Verified by value
+
+`new Lib::Widget { n: 3 }` then `area()` returns **6**, so the field really
+holds 3 rather than the allocation being zeroed - the failure mode this project
+has paid for is a wrong body with exit 0, so the assertion is the value.
+`new Lib::Widget()`, `new Color::Green` (the case that had to keep working) and
+`new Lib::Color::Blue` (new capability, and what the tree's 66
+`new Enum::Variant` sites become once they are qualified) all build and run.
+
+#### Two wrong turns, both caught by a control rather than by reading the code
+
+Stamping the node with the enum's `Def` taken from the CLASSIFICATION answer
+drops generic arguments: `new Option<i64>::Some(41)` resolved to `Option`. The
+node is stamped from the path it actually names, after the variant segment has
+been taken off it.
+
+`new GenericType<Args>()` fails with E0200. It fails **identically on the
+pre-change compiler, and identically bare and qualified** - so it is neither
+this change nor qualification, and it is written down rather than chased. The
+form appears nowhere in the tree.
+
+#### Codegen and sema DISAGREE about what a `new` names, and the ratchet found it
+
+The codegen hunk went in twice. The first version read the stamp, turned it
+back into a string with `.qualified_name()`, and widened that - which
+`lane-check` refused, DEFID_UNWRAP 24 -> 25. The ratchet is right: that is the
+door turning a resolution answer back into a name, and a fix that adds one is
+not a fix. Sema already holds the answer as a `TypeRef`, so the second version
+reads `resolved_type` and takes its pointee, crossing nothing.
+
+That version linked clean over the compiler and the four reproducers, and
+**failed the suite**: `undefined reference to 'C$vt$0'` out of
+`tests/tests/lang/classes.cryo`. For a class with virtual methods the two
+answers are not the same type, and the vtable global is named from whichever
+one codegen used - so taking sema's answer emitted a reference to a vtable
+nothing defines. No reproducer found this and no gate but the suite would have.
+
+The stamp is therefore consulted only where the widening DECLINES. That is not
+a preference between two answers and it is not the fix: **two answers to one
+question is the defect**, and it is now the next thing to correct here, with
+`classes.cryo` as a standing reproducer for it. Ordering it this way keeps every
+site the widening already placed byte-identical, which is what the object-hash
+baseline requires of a change that is not meant to move code.
+
+#### What this says about the requalification ahead
+
+A qualified name reaches a STRICTLY LARGER set than a braced import does.
+`intrinsic` and `extern` declarations are declared and never exported, so no
+import of any form can bind one - that is the whole of the M5-SUBMOD population
+§8.141 measured - yet the tree already compiles **134 distinct `libc::fn(...)`
+calls and 40 `intrinsics::...` uses**. The qualifier resolves through the module
+scope rather than through the export set, which is why it answers for names an
+import cannot offer. Requalification therefore removes a hazard rather than
+adding one, and the 23 intrinsic brace items `9698575d` inserted - which could
+never have bound - are removed here.

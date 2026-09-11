@@ -129,10 +129,40 @@ type struct NewDeleteEmitter {
         const ctx_ptr: CompilationContext* = this.cg.ctx;
         const intern: InternTable* = this.cg.get_intern();
 
+        // Sema already resolved this node from the name layer's stamp, and its
+        // answer is a TypeRef - not a name. Taking it back to a string to widen
+        // the spelling again would re-derive from a leaf and can land on a
+        // same-named type from another module, which is the defect `Res` exists
+        // to remove; it would also add a crossing the DEFID_UNWRAP ratchet
+        // counts, and the ratchet is right to count it.
+        //
+        // `resolved_type` is `T*` (a `new` yields a pointer), so the pointee is
+        // the type being allocated. The widening below serves only the
+        // spellings sema could not resolve.
         mut qualified_sym: SymbolStr = SymbolStr::empty();
-        const type_ref: TypeRef = ctx_ptr.widen_type_home_scoped_bare(
+        mut type_ref: TypeRef = ctx_ptr.widen_type_home_scoped_bare(
             node.type_name, node.span.file,
             FILE, LINE as i32, &qualified_sym);
+
+        // A spelling the widening cannot place - `Mod::Type`, which it reads
+        // as a bare leaf - is answered by what sema resolved the node to.
+        // `resolved_type` is `T*` (a `new` yields a pointer), so the pointee is
+        // the type being allocated.
+        //
+        // Consulted only where the widening declines, and that order is not a
+        // preference: the two DISAGREE for a class with virtual methods, where
+        // taking sema's answer names a vtable global that is never defined
+        // (`undefined reference to 'C$vt$0'` over tests/tests/lang/classes.cryo).
+        // Two answers to one question is the defect, not the ordering - the
+        // disagreement is written down rather than papered over, and it is the
+        // next thing to fix here.
+        if (!type_ref.is_valid() && node.has_resolved_type()) {
+            const arena_p: TypeArena* = this.cg.get_arena();
+            const rt: Type* = arena_p.lookup(node.resolved_type.id);
+            if (rt != null && rt.kind == TypeKind::Pointer) {
+                type_ref = (rt as PointerType*).pointee;
+            }
+        }
         const t: Type* = this.cg.lookup_type_by_id(type_ref.id);
         if (t == null) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
