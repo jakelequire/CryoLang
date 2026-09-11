@@ -19790,3 +19790,117 @@ rows.
   `compiler/src`, which does not move, so the **status word rots silently**.
   That is the same blind spot as D11's status half: a row check catches a
   number that moved and cannot catch a word that should have.
+
+### 8.141 Handoff from the build agent: the worktree recipe, the object-hash lever, and what the gates do not say - 2026-09-10
+
+The three-worker arrangement served one checkout through a single builder so
+that concurrent builds could not wipe each other's trees. It is ending; one
+worker takes its own builds back. What follows is the operational knowledge
+that lived only in that agent's context.
+
+**Build an authoritative tree in a detached worktree.** Workers edit the main
+checkout continuously, so a result from it is provisional: a `make roster-check`
+here rebuilt `compiler/build/cryo.exe` from sources a worker was part-way
+through editing, and the binary that came out was nobody's commit. A worktree
+detached at a commit is immune, and detached at a commit is not a new branch:
+
+    git worktree add --detach ../CryoLang-head <commit>
+
+Two things it does not inherit, both gitignored: `bin/LLVM-C.dll` and
+`bin/libclang.dll`, without which the built compiler cannot start; and
+`.toolchains/llvm-win`, whose import libraries the link needs. **Copy them.**
+`CRYO_WIN_LLVM_PREFIX` does NOT help - only `scripts/fetch-windows-llvm.sh`
+reads it, while the Makefile hardcodes `$(ROOT)/.toolchains/llvm-win/lib` as a
+relative path on the link line. Copy rather than link: a junction into a
+worktree has already had its target deleted by `worktree remove --force`.
+
+For the Linux arm, build on the WSL-native filesystem, not `/mnt/c`. Two
+reasons: git cannot resolve a Windows gitdir from Linux, so a `/mnt/c`
+worktree has no working git at all; and readdir order there is not the order
+CI sees, which is a difference this project has already been bitten by. Make
+the second worktree from inside WSL at a `$HOME` path.
+
+**Always say which tree a number came from.** Provisional from a dirty
+checkout is worth reporting, labelled; a number whose provenance is unstated
+is worth nothing.
+
+**The object-hash lever, for the requalification sweep.** `scripts/obj-hash.sh`
+and `tests/obj-baseline-windows.txt` land with this entry. Hash the `.o` files,
+never the binary: a Windows PE carries a link timestamp, so two builds of one
+unchanged source differ as binaries and agree as objects. **A pure
+requalification must change ZERO objects.** Any object that moves is either a
+generator defect or a site where the bare name resolved to something other
+than the qualified one, and the second is the case worth finding.
+
+The instrument was validated before being trusted: two clean builds of
+identical source produced 406 of 406 identical hashes, and after a probe was
+inserted and reverted the rebuild matched the baseline 406 of 406 again. It
+has the resolution to isolate one change - across `9698575d..334ac8c7` exactly
+one object moved, `resolve_counter.o`, the only file with a real code change.
+The two import-list edits in that range, `BaseASTVisitor` in the resolver and
+`Debug, Display` in `stdlib/fmt/interp.cryo`, produced byte-identical objects.
+That is the sweep's premise holding on a small sample, and it is a sample of
+import lines rather than of use sites, which is what the sweep rewrites.
+
+Retake the baseline at whatever commit immediately precedes the sweep, and
+run it over a tree built for ONE target - a checkout that has built both hosts
+reports 1183 objects against the real 406, because the other host's objects
+and a second triple are still sitting there.
+
+**M5 is entered and answers nothing.** It moved from NOT ENTERED to 25 calls
+at `9698575d`, on both hosts. All 25 are the sub-module caller, and all 25
+bind `exports=0`: the branch takes a braced import naming something the module
+does not offer, looks for a submodule by that name, finds none, and binds
+nothing without a word. The 25 are `intrinsic` declarations
+(`std::core::intrinsics::atomic_*`, `ptr_diff`) and three `std::ffi::libc`
+extern members - **`intrinsic` and `extern` declarations are not "offered" by
+their module**. They sit in stdlib, at `stdlib/sync/atomic.cryo`,
+`stdlib/core/primitives.cryo`, `stdlib/sync/once.cryo` and
+`stdlib/future/executor.cryo`. Nothing fails today only because the names
+arrive another way; each is a hard failure the moment that route goes. A
+generator that emits braced imports needs to treat those two declaration
+kinds as offerable or it will write more of these and see nothing wrong.
+
+Both figures were measured with a probe at the call, not inferred: the counter
+said 25 and the probe emitted exactly 25 rows, twice. `path_hit` fires only on
+a HIT, so a starved lane emits nothing and the audit stream cannot split it -
+probe the entry when the question is which caller.
+
+**The b1 golden is per host and has no `--merge`.** `b1-gate.py --update`
+rewrites the arms it measured and leaves the others, so a one-arm re-pin
+leaves the other host stale and still passes. Re-pin each arm on its own host,
+merge the sections, then re-run the gate from BOTH sides over the merged file;
+only that pair is evidence. The writer also reorders the sections, emitting
+the updated host last, so read the file by section name and never by line
+number.
+
+That reorder is what broke §0's M2 row, now fixed here. The row asked
+`grep -m1`, which answers from whichever section comes first; after a
+windows-only update it silently read linux's 2489 while windows had become
+3760, and `ns-status-check` reported 27 of 27 matching. A row that is green
+while asserting the wrong host is worse than one that is red. It now anchors
+to the windows section by name, and carries no `$`, because `$NF` does not
+survive the checker's argv round-trip to bash on Windows - it printed the
+whole line there and the field on Linux, and passed on both only because the
+checker reads the last token.
+
+**The numbers pinned here are a waypoint.** They roughly doubled - type
+cascade 1 exact 3391 to 5196, M1 5606 to 8826 - because explicit imports made
+the qualified path load-bearing where the glob used to answer. The corpus is
+the mover and not the compiler: this tree's compiler reproduces the OLD golden
+exactly over the pre-migration corpus, on both hosts. The requalification will
+move the same rows again, hard. **Do not read that drift as a regression.**
+
+**Three instrument failures in one session, all silent, all caught by a
+control.** `grep -P` errors in Git Bash and reports nothing, which reads as a
+clean sweep; a broken `sed` made an object hash run measure zero files and
+report success; and an awk over an empty pipe printed "linux untouched,
+correct" from no input at all. Every one of them looked like good news. Put a
+case you know should appear through the same grep, regex or parser before
+believing any count, and print the population size next to the count.
+
+**`make test` is not the only thing that moves.** A counter deletion is not a
+statement deletion: removing a `bump()` that was the sole body of a branch
+merged the zero case into `else`, and a row pinned at 0 read 591 while every
+suite stayed green. §8.139 records the rule. The b1 golden saw it; nothing
+else did.
