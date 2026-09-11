@@ -339,6 +339,25 @@ class World:
     def resolve(self, home, written):
         return resolve_ns(self.by_norm, home, written)
 
+    def reexported_modules(self, ns, seen=frozenset()):
+        """Every MODULE `ns` passes on through whole-module `export` edges,
+        transitively. An importer of `ns` can spell each of these by its leaf
+        (`import std::future;` makes `traits` name `std::future::traits`), so
+        they are module spellings in that importer's scope exactly as its own
+        imports are. A brace-list export grants names, not a module."""
+        out = set()
+        if ns in seen:
+            return out
+        for written, only in self.ns_reexports.get(ns, ()):
+            if only is not None:
+                continue
+            target = self.resolve(ns, written)
+            if target is None or target in out:
+                continue
+            out.add(target)
+            out |= self.reexported_modules(target, seen | {ns})
+        return out
+
     def offers(self, ns, seen=frozenset()):
         """Every name a module offers, mapped to the module that DECLARED it:
         its own public declarations plus, through its `export` /

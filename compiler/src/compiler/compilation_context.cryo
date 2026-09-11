@@ -78,6 +78,25 @@ implement enum OutputKind {
     }
 }
 
+/// What one file can see under a module spelling.
+///
+/// `visible` and `matched` are kept apart because they answer different
+/// questions: nothing carries this spelling at all, versus something does and
+/// the writer cannot reach it.  Collapsing them would report the second as the
+/// first, which is the difference between "no such name" and "add an import".
+type struct ModuleSpellingMatch {
+    /// The single visible module, when `visible == 1`.
+    found:   SymbolStr;
+    /// A second visible module, for naming the ambiguity.
+    other:   SymbolStr;
+    /// Any module carrying the spelling, reachable or not.
+    any:     SymbolStr;
+    /// How many carry it AND are reachable from the writing file.
+    visible: i64;
+    /// How many carry it at all.
+    matched: i64;
+}
+
 type struct CompilationContext {
 public:
     // -- Configuration (set at creation, read-only thereafter) --
@@ -529,6 +548,55 @@ public:
         resolve_counter::Site::ScopeUseSyntax.bump();
         return this.decl_index.resolve_qualified_scoped(
             bare, syn, this.intern_table, origin_file, origin_line, "Syntax");
+    }
+
+    /// Which modules a spelling names, as one file can see them.
+    ///
+    /// Asked of a whole scope segment to decide what that segment names, of a
+    /// segment's PREFIX to walk a module-rooted path, and by the type layer to
+    /// say WHY a qualified annotation resolved to nothing; one implementation
+    /// because all of those are the same question about the same relation,
+    /// and two copies of a reachability rule are two rules as soon as either
+    /// is edited.
+    modules_written_as(&this, spelling: string,
+                       use_ns: SymbolStr) -> ModuleSpellingMatch {
+        mut r: ModuleSpellingMatch = ModuleSpellingMatch {
+            found:   SymbolStr::empty(),
+            other:   SymbolStr::empty(),
+            any:     SymbolStr::empty(),
+            visible: 0,
+            matched: 0,
+        };
+        if (this.module_graph == null || this.decl_index == null) { return r; }
+        const count: i64 = this.module_graph.module_count() as i64;
+        for (mut i: i64 = 0; i < count; i++) {
+            const cand: ModuleInfo* = this.module_graph.get_module(i);
+            const cand_ns: SymbolStr = cand.namespace_name;
+            if (!cand_ns.is_valid()) { continue; }
+            const cand_str: string = this.intern_table.resolve(cand_ns);
+            if (!Resolver::ns_written_as(cand_str, spelling)) { continue; }
+            r.matched = r.matched + 1;
+            if (r.matched == 1) { r.any = cand_ns; }
+            // The same reachability relation same-leaf resolution uses: the
+            // module's own namespace, anything it imports (the registered set
+            // is already closed over re-exports), or the prelude.
+            //
+            // `cand_str.eq(spelling)` is the fully-qualified spelling: a package
+            // root is addressable without an import, so a path that names a
+            // module's WHOLE namespace needs nothing brought into scope.  Only
+            // the whole one - an abbreviation like `core::option` is a proper
+            // suffix, its first segment is an interior segment binding nothing,
+            // and it stays unreachable here.
+            const reachable: boolean = cand_ns.id == use_ns.id
+                || cand_str.eq(spelling)
+                || this.decl_index.is_prelude_ns(cand_ns)
+                || this.decl_index.ns_imports(use_ns, cand_ns);
+            if (!reachable) { continue; }
+            r.visible = r.visible + 1;
+            if (r.visible == 1) { r.found = cand_ns; }
+            if (r.visible == 2) { r.other = cand_ns; }
+        }
+        return r;
     }
 
     /// `resolve_scoped_at(..).resolved_or(bare)` - the syntax-scoped twin of

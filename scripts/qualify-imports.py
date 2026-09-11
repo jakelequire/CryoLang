@@ -226,16 +226,19 @@ def rewrite_positions(code, in_enum=False, module_names=frozenset()):
         for m in rx.finditer(code):
             blocked.append(m.span(1))
     spots = []
-    first = True
     for m in IDENT.finditer(code):
         s, e = m.span()
-        if in_enum and first:
-            # The leading name on a line in an enum body is the variant being
-            # DECLARED, not a use. Its payload beside it is a real type and is
-            # still qualified.
-            first = False
-            continue
-        first = False
+        # An enum body holds only variant declarations, so a name that OPENS
+        # one - first on its line, or first after the `{` or the `;` that ends
+        # the previous variant - is the variant being DECLARED, not a use.
+        # Its payload beside it is a real type and is still qualified.  A body
+        # written on one line (`{ A = 4; E = 8; }`) declares every variant
+        # after the first mid-line, which is why this is not "first on the
+        # line".
+        if in_enum:
+            before = code[:s].rstrip()
+            if before == "" or before.endswith(("{", ";")):
+                continue
         if m.group(0) not in used:
             continue
         if s > 0 and code[s - 1] in ".:":
@@ -279,12 +282,23 @@ def plan(world, path):
     # `std::fmt::error` importing `std::io::error` cannot use `error` as a
     # qualifier: it names both, and the shorter form resolves to neither.
     leaves[ns.split("::")[-1]].add(ns)
-    for written, _n, _a, _b in blocks:
-        leaves[written.split("::")[-1]].add(written)
+    imported = [written for written, _n, _a, _b in blocks]
     for line in masked:
         m = PLAIN.match(line)
         if m:
-            leaves[m.group(3).split("::")[-1]].add(m.group(3))
+            imported.append(m.group(3))
+    for written in imported:
+        leaves[written.split("::")[-1]].add(written)
+        # An import reaches what the module re-exports, and a re-exported
+        # MODULE is a spelling in this file's scope too: `import std::future;`
+        # beside `import std::io::traits;` makes `traits` name both, and the
+        # compiler refuses the short form rather than picking. Counted from
+        # the world, since nothing in this file's text says so.
+        target = world.resolve(ns, written)
+        if target is None:
+            continue
+        for sub in world.reexported_modules(target):
+            leaves[sub.split("::")[-1]].add(sub)
 
     # A name used in a declaration HEAD cannot be qualified there, so it keeps
     # its braced import and stays bare EVERYWHERE in the file. Qualifying its

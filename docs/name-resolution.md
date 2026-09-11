@@ -49,10 +49,10 @@ current-state description is the defect it exists to remove.
 | D7 | Imports stop globbing | **TAKEN** — a plain `import M;` is `ImportStyle::Module` and binds no names. Three globs remain BY DESIGN and the old row's expected `0` was unreachable: the explicit `M::*`, and the two the compiler injects (the prelude, the f-string runtime) | `grep -rho 'ImportStyle::Wildcard,' compiler/src --include=*.cryo \| wc -l` → **3** | §8.131, §8.135, §8.138 |
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
-| D10 | A plural leaf is E0155, not a directory-order bind — and a leaf two children of one FACADE declare is the same defect reached by a qualified path | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **4** | §8.121, §8.144 |
+| D10 | A plural leaf is E0155, not a directory-order bind — and a leaf two children of one FACADE declare is the same defect reached by a qualified path, in a call as in an annotation | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **5** | §8.121, §8.144, §8.151 |
 | D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1649** | §8.66, §8.80, §8.139 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
-| D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **2** | §8.138, §8.144 |
+| D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
 | D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **576** | §8.145, §8.146, §8.147, §8.148, §8.150 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
 
@@ -79,13 +79,13 @@ three, and its row carries the count. Read each zero off its own row.
 
 | artifact | status | pinned | check → expected | § |
 |---|---|---|---|---|
-| type cascade 1 — exact | LIVE | 5,196 | `grep -m1 'type cascade: 1 exact' tests/b1-baseline.txt` | §8.64, §8.120 |
+| type cascade 1 — exact | LIVE | 5,265 | `grep -m1 'type cascade: 1 exact' tests/b1-baseline.txt` | §8.64, §8.120 |
 | type cascade 2 — ambient cursor | STARVED | 0 | same file, `type cascade: 2` | §8.64, §8.87 |
 | type cascade 3 — resolver re-entry | STARVED | 0 | same file, `type cascade: 3` | §8.64 |
 | type cascade 5 — miss | LIVE | 3,614 | same file, `type cascade: 5` | §8.64 |
 | 2c home-module (ambient cursor) | STARVED | 0 | same file, `2c  home-module` | §8.63, §8.87 |
 | M1 `qualifier_agrees` | **GUARD** | 8,821 calls / 8,821 agree / **0 reject** | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **5** | §8.120, §8.132 |
-| M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane** | 3,762 | `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M2 resolve_module_qualified_sym calls/{print;exit}' tests/b1-baseline.txt` → **3762** | §8.120 |
+| M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane** | 3,760 | `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M2 resolve_module_qualified_sym calls/{print;exit}' tests/b1-baseline.txt` → **3760** | §8.120 |
 | M4 mono bare-name scan | STARVED | 432 calls / **0** hits | same file, `M4 mono bare-name` | §8.33, §8.120 |
 | M5 import suffix fallback | **STARVED** — all entries are the sub-module caller | **3 calls / 0 hits** | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **3** | §8.120 |
 | const-table bare leaf | STARVED | 0 calls / 0 hits | same file, `const-table bare leaf` | §8.9, §8.111 |
@@ -99,8 +99,8 @@ three, and its row carries the count. Read each zero off its own row.
 | `canonical_type_ref`'s bare step | **STARVED** — still present, answers nothing | 2,652 reached / **0** answered | `grep -c 'lookup_by_name' compiler/src/compiler/compilation_context.cryo` → **1** (0 when deleted) | §8.103, §8.104, §8.112 |
 | `check_module_type_collision` | LIVE — D5 deletes it | — | see D5 | §8.130, §8.131 |
 | `module_owns_member` probe | LIVE — D5 deletes it | — | `grep -rho 'module_owns_member' compiler/src \| wc -l` → **3** | §8.131 |
-| `scope_owner_key` | LIVE — the static-call owner key | — | `grep -rho 'scope_owner_key' compiler/src \| wc -l` → **4** | §8.134 |
-| static-call owner TEMPLATE by spelling (`resolve_scope_owner_template`'s as-is → scope map → cross-module cascade) | **DELETED** — the owner template is read off the segment's stamp, in sema and in mono | — | `grep -c 'resolve_scoped_or_at' compiler/src/compiler/sema/call_resolver.cryo` → **3** (was 7) | §8.150 |
+| `scope_owner_key` | LIVE — the static-call owner key; the callee-type and template-method probes read it too | — | `grep -rho 'scope_owner_key' compiler/src \| wc -l` → **6** | §8.134, §8.151 |
+| static-call owner TEMPLATE by spelling (`resolve_scope_owner_template`'s as-is → scope map → cross-module cascade) | **DELETED** — the owner template is read off the segment's stamp, in sema and in mono | — | `grep -c 'resolve_scoped_or_at' compiler/src/compiler/sema/call_resolver.cryo` → **2** (was 7) | §8.150, §8.151 |
 | callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **19** | §8.1f, §8.2ag |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
@@ -117,7 +117,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,113 unit + 45 project + 178 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
+| `make test` | 2,113 unit + 46 project + 179 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make b1-check` | B1 total + every per-row bound, 3 corpora × 2 hosts | **2 of the 3 corpora are `examples/`**; the third is `tests/tests/projects/ffi_c_import`. The compiler's own source is NOT a corpus, and `tests/` at large is swept by none of them. |
 | `make lane-check` | 7 buckets of call sites in `compiler/src`, as a golden | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
@@ -143,8 +143,8 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^\[' tests/lane-baseline.txt` → **7**
 * `grep -c '^\[host:' tests/b1-baseline.txt` → **6**
 * `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M5 import suffix fallback hits/{print;exit}' tests/b1-baseline.txt` → **0** — M5 is STARVED, and this is the number that says so; the row's own check counts call SITES, which do not move when a lane starts answering
-* `grep -c '^project ' tests/test-roster.txt` → **45**
-* `grep -c '^negative ' tests/test-roster.txt` → **178**
+* `grep -c '^project ' tests/test-roster.txt` → **46**
+* `grep -c '^negative ' tests/test-roster.txt` → **179**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -n 'branches:' .github/workflows/ci.yml` → `main` only, both hooks
 
@@ -20917,3 +20917,69 @@ non-template owner, for which the deleted cascade missed as-is, was declined
 by the scope map, and fell to the cross-module lane, twice. Re-pinned on both
 hosts, Linux built under WSL; the twenty-four moved rows are the same four
 rows on each of the six arms and nothing else.
+
+### 8.151 Three more spelling-keyed doors, found by sweeping `tests/`; the sweep itself is STOPPED - FIXED / HELD 2026-09-11
+
+The `examples/` and `tests/` sweep was run to the padded-verification step
+(examples: 0 of 1,126 objects changed, four times over; tests: 248 of 286
+files, the 38 fixtures whose SUBJECT is the import form left as written) and
+then stopped on a ruling from Jake: the old model is to become a shadow of the
+new one and be deleted consumer by consumer, not swept around. Nothing from
+the sweep is delivered. What is delivered is what the sweep found, each fixed
+at the root and pinned:
+
+* **A `where` bound's trait path was keyed by its spelling.**
+  `stamp_trait_ref` set `resolved_name` from `resolve_scoped_or_at`, which
+  echoes a relatively qualified spelling, so `F: traits::Future<i64>` was
+  registered under `traits::Future`, no lookup under it answered, and every
+  method dispatched through the bound typed as `void` (its own comment called
+  this RESIDUAL). The name layer's `stamp_trait_bounds` now stamps the trait
+  path through `type_spelling_res`, like every other written type spelling;
+  the type layer's `stamp_trait_ref` finds every ref already answered and was
+  entered zero times on the reproducer. Its deletion waits on that zero over
+  the whole suite. DEFID_UNWRAP 23 -> 24 for the one door where the identity
+  becomes the AST field's text; re-pinned.
+* **A `Module::function` call through a FACADE named a function the facade
+  never declared.** The scope stamp recorded the module the segment SPELLS;
+  sema appended the member and `std::test::expect_eq` matched nothing, while
+  the type lane had followed re-exports since §8.144. `stamp_module_scope`
+  now asks `module_offering` and records the DECLARING module; two children
+  offering one member is refused with E0155, as for a type.
+  `reexport_basic` gains `src/qualified.cryo` (exit 18 -> 33) and its stale
+  header claiming a qualifier cannot reach a re-export is gone;
+  `reexport_plural_function` pins the refusal.
+* **The template-method fallback in `try_resolve_static_method` keyed on the
+  spelling** - the "one door over" §8.150 named - so
+  `hashmap::HashMap<i64,T>::new()` inside a generic body reached nothing,
+  where the bare form was rescued by leaf widening. Keyed on the owner now.
+  Passing the owner on to the pin is load-bearing: `scope_is_generic_template`
+  is still spelling-keyed, reads `Deque::Slot` as non-generic, and pins a name
+  nothing defines (E0636 at codegen, caught by the suite when the written
+  spelling was tried). That function and `try_resolve_generic_return`'s
+  expected-type branch are the doors still open.
+* **`lookup_callee_function_type` keyed on the echo** for a scope callee, so a
+  qualified type static's arguments went unclassified and the module lane was
+  asked about a `TypeRelative` stamp (M2 +30 on `09-json-config` under the
+  sweep, back to golden with the fix). Owner key now; the two fully-qualified
+  `std::json::value` sites explain the remaining M2 -2.
+* **An ambiguous module PREFIX in an annotation was reported as "cannot
+  find".** `import std::future;` offers `traits` through a re-export and
+  `import std::io::traits;` offers it directly; the resolver declined silently
+  and the type layer said E0203. `modules_written_as` moved to
+  `CompilationContext` so the type layer's `emit_undefined_type` asks the one
+  predicate and says what the scope lane says: E0154, naming both.
+  `negative/E0154_ambiguous_module_prefix_annotation.cryo` pins it.
+
+Generator traps found and fixed: a one-line enum body (`{ A = 4; E = 8; }`)
+had every variant after the first rewritten as a use - a variant is whatever
+follows `{` or `;`, not the line's first name; and the collision set did not
+see module spellings an import reaches through re-exports (`traits` above).
+Also: `git stash` re-filters a CRLF file to LF under `eol=lf`, which reads
+exactly like the generator having stripped CRs.
+
+b1 re-pinned both hosts: `type cascade: 1 exact` +69 is the visibility gate
+reaching a canonical owner through the exact step for the 69 generic-owner
+static calls that now pin through `owner_key` (44 `String`, 13 `Array`, 7
+`Slice`, ...); M2 -2 as above. `make test` 2,113 / 179 / 43. The sweep's
+remaining state - `qualify-imports.py` with both trap fixes, the include list
+being the tree minus the 38 fixtures - is recorded here and nowhere else.

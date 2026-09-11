@@ -31,7 +31,7 @@ import compiler::ast::{
 import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ PassResult };
 import compiler::compilation_context;
-import compiler::compilation_context::{ CompilationContext };
+import compiler::compilation_context::{ CompilationContext, ModuleSpellingMatch };
 import compiler::module_graph;
 import compiler::module_graph::{ ModuleInfo };
 import compiler::resolve_counter;
@@ -72,25 +72,6 @@ import compiler::resolver::symbol::{ Symbol, SymbolKind };
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::symbol_str::{ SymbolStr };
 
-
-/// What one file can see under a module spelling.
-///
-/// `visible` and `matched` are kept apart because they answer different
-/// questions: nothing carries this spelling at all, versus something does and
-/// the writer cannot reach it.  Collapsing them would report the second as the
-/// first, which is the difference between "no such name" and "add an import".
-type struct ModuleSpellingMatch {
-    /// The single visible module, when `visible == 1`.
-    found:   SymbolStr;
-    /// A second visible module, for naming the ambiguity.
-    other:   SymbolStr;
-    /// Any module carrying the spelling, reachable or not.
-    any:     SymbolStr;
-    /// How many carry it AND are reachable from the writing file.
-    visible: i64;
-    /// How many carry it at all.
-    matched: i64;
-}
 
 type class NameResolver : BaseASTVisitor {
 public:
@@ -1035,52 +1016,6 @@ public:
         // TypeResolution (needs type info to find the TypeBody scope).
     }
 
-    /// Which modules a spelling names, as one file can see them.
-    ///
-    /// Asked of a whole scope segment to decide what that segment names, and of
-    /// a segment's PREFIX to walk a module-rooted path; one implementation
-    /// because both are the same question about the same relation, and two
-    /// copies of a reachability rule are two rules as soon as either is edited.
-    modules_written_as(&this, spelling: string,
-                       use_ns: SymbolStr) -> ModuleSpellingMatch {
-        mut r: ModuleSpellingMatch = ModuleSpellingMatch {
-            found:   SymbolStr::empty(),
-            other:   SymbolStr::empty(),
-            any:     SymbolStr::empty(),
-            visible: 0,
-            matched: 0,
-        };
-        const count: i64 = this.ctx.module_graph.module_count() as i64;
-        for (mut i: i64 = 0; i < count; i++) {
-            const cand: ModuleInfo* = this.ctx.module_graph.get_module(i);
-            const cand_ns: SymbolStr = cand.namespace_name;
-            if (!cand_ns.is_valid()) { continue; }
-            const cand_str: string = this.resolver.intern_table.resolve(cand_ns);
-            if (!Resolver::ns_written_as(cand_str, spelling)) { continue; }
-            r.matched = r.matched + 1;
-            if (r.matched == 1) { r.any = cand_ns; }
-            // The same reachability relation same-leaf resolution uses: the
-            // module's own namespace, anything it imports (the registered set
-            // is already closed over re-exports), or the prelude.
-            //
-            // `cand_str.eq(spelling)` is the fully-qualified spelling: a package
-            // root is addressable without an import, so a path that names a
-            // module's WHOLE namespace needs nothing brought into scope.  Only
-            // the whole one - an abbreviation like `core::option` is a proper
-            // suffix, its first segment is an interior segment binding nothing,
-            // and it stays unreachable here.
-            const reachable: boolean = cand_ns.id == use_ns.id
-                || cand_str.eq(spelling)
-                || this.ctx.decl_index.is_prelude_ns(cand_ns)
-                || this.ctx.decl_index.ns_imports(use_ns, cand_ns);
-            if (!reachable) { continue; }
-            r.visible = r.visible + 1;
-            if (r.visible == 1) { r.found = cand_ns; }
-            if (r.visible == 2) { r.other = cand_ns; }
-        }
-        return r;
-    }
-
     /// The type named by a scope segment that is itself a module-rooted path,
     /// or an invalid id when the segment is not one.
     ///
@@ -1103,7 +1038,7 @@ public:
 
         // A spelling two reachable modules share names neither of them, so the
         // walk stops rather than picking one.
-        const head: ModuleSpellingMatch = this.modules_written_as(prefix, use_ns);
+        const head: ModuleSpellingMatch = this.ctx.modules_written_as(prefix, use_ns);
         if (head.visible != 1) { return SymbolID::invalid(); }
 
         // The segment after the head resolves inside what the head named - the
@@ -1213,7 +1148,7 @@ public:
             }
         }
 
-        const m: ModuleSpellingMatch = this.modules_written_as(written, use_ns);
+        const m: ModuleSpellingMatch = this.ctx.modules_written_as(written, use_ns);
 
         // A segment that binds in the writer's scope as a TYPE names that type,
         // unless a module spelled the same way owns the very next segment.
@@ -1272,11 +1207,47 @@ public:
         const matched: i64 = m.matched;
 
         if (visible == 1) {
-            node.set_scope_res(Res::Def(DefId::of_definition(found)));
+            // The module the segment names offers the member either from its
+            // own declarations or through its `export` edges, and a path
+            // through a facade names the same item the declaring module's
+            // path names - one item, many spellings.  The stamp records the
+            // module that DECLARES the member, because that is the namespace
+            // the member is registered under and the one every consumer of
+            // this stamp appends the member to; recording the facade would
+            // make `test::expect_eq` name a function `std::test` never
+            // declared.  A member two of the facade's children declare is
+            // refused, as it is everywhere else.
+            mut owner: SymbolStr = found;
+            mut offered: i64 = 0;
+            const hit: SymbolID = this.module_offering(found, node.member_name, &offered);
+            if (offered > 1) {
+                resolve_counter::Site::ScopeResAmbiguous.bump();
+                const leaf_str: string = this.resolver.intern_table.resolve(node.member_name);
+                mut d: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0155_AMBIGUOUS_BARE_NAME,
+                    fmt::format("`%s` is offered by `%s` from more than one module, so it names nothing",
+                        leaf_str, written));
+                d = d.at_with_label(node.span, "ambiguous through this path");
+                d = d.with_note(
+                    "name the declaring module instead; a re-export offers what its children offer, and two of them offer this");
+                this.ctx.emit_diagnostic(d);
+                node.set_scope_res(Res::Err);
+                return;
+            }
+            if (offered == 1) {
+                const hs: Symbol = this.resolver.get_symbol(hit);
+                const declared_in: string = QualifiedName::parent_of(
+                    this.resolver.intern_table.resolve(
+                        this.resolver.qualified_name_of(&hs)));
+                if (declared_in.length() > 0) {
+                    owner = this.resolver.intern_table.intern(declared_in);
+                }
+            }
+            node.set_scope_res(Res::Def(DefId::of_definition(owner)));
             resolve_counter::Site::ScopeResStamped.bump();
             resolve_counter::scope_res_stamped(
                 this.resolver.intern_table.resolve(use_ns), written,
-                this.resolver.intern_table.resolve(found));
+                this.resolver.intern_table.resolve(owner));
             return;
         }
         if (visible > 1) {
@@ -1379,18 +1350,50 @@ public:
 
     /// Stamp the written types in a `where` clause.
     ///
-    /// A bound spells types twice over - the projection it constrains, and the
-    /// arguments of each trait it names - and both are ordinary written syntax
-    /// in the file holding the clause.  The trait PATH is not stamped here: a
-    /// bound names a trait, whose identity `TraitRef.resolved_name` carries.
+    /// A bound spells types three times over - the projection it constrains,
+    /// the trait it names, and the arguments of that trait - and all three are
+    /// ordinary written syntax in the file holding the clause.
     stamp_trait_bounds(&this, bounds: &TraitBound[]) -> void {
         for (mut i: i64 = 0; i < bounds.length; i++) {
             const b: TraitBound* = &bounds[i];
             this.stamp_annotation(b.subject_type);
             for (mut j: i64 = 0; j < b.trait_refs.length; j++) {
                 const tref: TraitRef* = &b.trait_refs[j];
+                this.stamp_trait_ref_identity(tref);
                 this.stamp_annotation_list(&tref.type_args);
             }
+        }
+    }
+
+    /// Record which trait a bound names, under the canonical name the trait
+    /// registries are keyed by.
+    ///
+    /// The path is a type spelling like any other and is answered the same
+    /// way: a bare leaf in the writer's scope, a qualified path rooted at the
+    /// module its head names.  Answering it here is what lets a bound be
+    /// written as `traits::Future<i64>`: the scope map alone canonicalizes a
+    /// bare leaf and hands a qualified spelling back as written, and a bound
+    /// keyed by its spelling reaches no registered trait, so every method
+    /// dispatched through it came back untyped.
+    ///
+    /// Only a definition is an identity.  A type parameter or a spelling this
+    /// pass cannot place leaves the field empty, and `TraitRef::identity`
+    /// then falls back to the written leaf and says so on its audit row.
+    stamp_trait_ref_identity(&this, tref: TraitRef*) -> void {
+        if (tref == null || tref.path.length == 0) { return; }
+        if (tref.resolved_name.is_valid()) { return; }
+        mut written: string = this.resolver.intern_table.resolve(tref.path[0]);
+        for (mut i: i64 = 1; i < tref.path.length; i++) {
+            written = written + "::" + this.resolver.intern_table.resolve(tref.path[i]);
+        }
+        match (this.type_spelling_res(this.resolver.intern_table.intern(written), tref.span)) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(q) => { tref.resolved_name = q.qualified_name(); }
+                    _           => { }
+                }
+            }
+            _ => { }
         }
     }
 
@@ -1572,7 +1575,7 @@ public:
             if (q_ns.is_valid()) {
                 const q_prefix: string = QualifiedName::parent_of(written);
                 const q_mods: ModuleSpellingMatch =
-                    this.modules_written_as(q_prefix, q_ns);
+                    this.ctx.modules_written_as(q_prefix, q_ns);
                 if (q_mods.matched > 0) {
                     // A module carries the written prefix, so the module lane
                     // owns this path: it answers, or the path is refused.  It

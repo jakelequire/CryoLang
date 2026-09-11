@@ -358,8 +358,12 @@ type struct CallResolver {
             const bare_sym: SymbolStr = this.intern.intern(bare_combined);
             const bare_ft: TypeRef = this.types.lookup_func_type_exact(bare_sym);
             if (bare_ft.is_valid()) { return bare_ft; }
-            const resolved_scope: SymbolStr =
-                this.ctx.resolve_scoped_or_at(sr.scope_name, sr.span.file, FILE, LINE as i32);
+            // The owner a TYPE scope names, under its registered name, whatever
+            // the source spelled - a bare leaf, or a module-qualified path the
+            // scope map declines.  A MODULE scope comes back as written and
+            // misses here, which is right: `mem::swap` is the module lane's
+            // to answer, and it is asked next.
+            const resolved_scope: SymbolStr = this.scope_owner_key(sr);
             if (resolved_scope.is_valid()) {
                 const q_combined: string = fmt::format("%s::%s",
                     this.intern.resolve(resolved_scope), this.intern.resolve(sr.member_name));
@@ -4168,12 +4172,21 @@ type struct CallResolver {
                 }
             }
         }
-        if (lookup_sym.id != scope.scope_name.id) {
-            const base_ret: TypeRef = this.types.lookup_method_return(scope.scope_name, scope.member_name);
+        // The TEMPLATE's own method, when the specialization the scope names
+        // is not materialized yet - pre-mono, or inside a generic body where
+        // the arguments still mention the enclosing parameters.  Keyed by the
+        // owner the segment names, not by its spelling: the spelling reaches
+        // the template only when it is the bare leaf, by a widening a
+        // module-qualified path cannot take.
+        const owner_key: SymbolStr = this.scope_owner_key(scope);
+        if (owner_key.is_valid() && lookup_sym.id != owner_key.id) {
+            const base_ret: TypeRef = this.types.lookup_method_return(owner_key, scope.member_name);
             if (base_ret.is_valid()) {
                 const resolved: TypeRef = this.try_resolve_generic_return(base_ret, scope.scope_name, scope.member_name, scope);
                 scope.set_resolved_type(resolved);
-                this.pin_scope_callee_combined(call, scope, scope.scope_name, scope.member_name);
+                // The owner, not the spelling: the pin stands down for a
+                // generic owner, and it recognizes one by its registered name.
+                this.pin_scope_callee_combined(call, scope, owner_key, scope.member_name);
                 return resolved;
             }
         }

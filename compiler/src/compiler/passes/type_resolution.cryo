@@ -31,7 +31,7 @@ import compiler::ast::{
 import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ PassResult };
 import compiler::compilation_context;
-import compiler::compilation_context::{ CompilationContext };
+import compiler::compilation_context::{ CompilationContext, ModuleSpellingMatch };
 import compiler::types;
 import compiler::types::{
     arena, compound, generic, generic_registry, ownership, registry, resolver, type_base,
@@ -709,6 +709,31 @@ type struct TypeResolutionRunner {
             const q_leaf: string = QualifiedName::leaf_of(ty_name);
             const q_prefix: string = QualifiedName::parent_of(ty_name);
             const graph: ModuleGraph* = this.ctx.module_graph;
+            // A PREFIX two reachable modules spell names neither of them, so
+            // the resolver declined to root the path - the same refusal a
+            // scope segment gets, reported the same way.  `import std::future;`
+            // offers `traits` through a re-export and `import std::io::traits;`
+            // offers it directly, and `traits::Transfer` is then not "not
+            // found": it is found twice.  Asked of the module that WROTE the
+            // annotation, through the one predicate the resolver used.
+            const q_ns: SymbolStr = this.ctx.module_ns_sym_of_file(named.span.file);
+            if (q_ns.is_valid()) {
+                const heads: ModuleSpellingMatch =
+                    this.ctx.modules_written_as(q_prefix, q_ns);
+                if (heads.visible > 1) {
+                    mut hamb: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0154_AMBIGUOUS_CALL,
+                        fmt::format("`%s` names more than one module in scope", q_prefix));
+                    hamb = hamb.at_with_label(named.span, "ambiguous module path");
+                    hamb = hamb.with_note(fmt::format("it could be `%s` or `%s`",
+                                                intern.resolve(heads.found),
+                                                intern.resolve(heads.other)));
+                    hamb = hamb.with_note(
+                        "write the path out in full to say which one is meant");
+                    this.ctx.emit_diagnostic(hamb);
+                    return;
+                }
+            }
             mut facade: SymbolStr = SymbolStr::empty();
             mut facades: i64 = 0;
             for (mut mi: u32 = 0; mi < graph.modules.length; mi++) {
