@@ -1724,30 +1724,20 @@ type struct TypeResolutionPasses {
                         // site reads the stamped value, so definition and
                         // call-site symbols always agree regardless of which
                         // form resolution produced.
-                        mut ot_trait: SymbolStr =
-                            ctx.resolve_scoped_or(ot_trait_leaf, FILE, LINE as i32);
-                        if (!ot_trait.is_valid()) { ot_trait = ot_trait_leaf; }
-                        // SHADOW.  The head's trait annotation carries the
-                        // name layer's answer; the cursor scope map is the old
-                        // one.  Old decides; disagreements print; zero over the
-                        // corpus deletes the cursor read.
-                        mut ot_new: SymbolStr = SymbolStr::empty();
+                        // The trait the head names, off the head annotation's
+                        // stamp: the canonical name the trait registries key
+                        // by, decided where the impl's imports were in hand.
+                        // A head the name layer could not place keeps its leaf,
+                        // which is the search key it always was.
+                        mut ot_trait: SymbolStr = ot_trait_leaf;
                         match (TypeResolutionPasses::head_named_slot(node.trait_annotation)) {
                             ResSlot::Answered(tr_res) => {
                                 match (tr_res) {
-                                    Res::Def(tq) => { ot_new = tq.qualified_name(); }
+                                    Res::Def(tq) => { ot_trait = tq.qualified_name(); }
                                     _            => { }
                                 }
                             }
                             _ => { }
-                        }
-                        if (!ot_new.equals(ot_trait)) {
-                            fmt::eprintf("SHADOW-IMPLTRAIT\t%s\t%s\told=%s\tnew=%s\t%s\n",
-                                if (ot_new.is_valid()) { "differs" } else { "new-missing" },
-                                ctx.intern_table.resolve(ot_trait_leaf),
-                                ctx.intern_table.resolve(ot_trait),
-                                if (ot_new.is_valid()) { ctx.intern_table.resolve(ot_new) } else { "-" },
-                                node.span.to_string());
                         }
                         // Carry the same answer on the block itself: a caller
                         // asking WHICH trait this impl provides must not have to
@@ -1761,62 +1751,23 @@ type struct TypeResolutionPasses {
                         }
                     }
                 }
-                // Resolve the impl's target type to its CANONICAL qualified
-                // name. Resolution order:
-                //   1. Already-qualified target: use as-is.
-                //   2. Bare target that IS a known type in DI (primitives
-                //      like `i8`, types in this module): keep bare.
-                //   3. Bare target with a bare->qualified mapping (cross-
-                //      module impl on a user type, e.g. `implement trait
-                //      FmtWrite for struct Stdout` in fmt::write where
-                //      Stdout lives in io::stdio): use the mapped form.
-                //   4. Otherwise: qualify with the CURRENT module.
-                //
-                // Without (3), naive current-module qualify produces
-                // `fmt::write::Stdout`: a name no other module knows;
-                // declare_method's `lookup_type` misses, the body is
-                // silently dropped, and the linker reports the result as
-                // `undefined reference`.
-                mut canonical_target: SymbolStr = SymbolStr::empty();
+                // The impl's target under the name it is registered by, off
+                // the head's stamp: a declaration's canonical name; a
+                // primitive's own spelling; and a monomorphized clone, which
+                // carries no stamp, spells the qualified name already.  The
+                // spelling cascade that stood here - as-is, bare index slot,
+                // cursor scope map, current module - agreed with the stamp on
+                // every impl in the corpus and was deleted.
                 const target_str_full: string = ctx.intern_table.resolve(node.target_type);
-                if (target_str_full.contains("::")) {
-                    canonical_target = node.target_type;
-                } else if (ctx.decl_index.lookup_type(node.target_type).is_valid()) {
-                    canonical_target = node.target_type;
-                } else {
-                    const resolved: SymbolStr = ctx.resolve_scoped_or(node.target_type, FILE, LINE as i32);
-                    if (!resolved.equals(node.target_type)) {
-                        canonical_target = resolved;
-                    } else {
-                        canonical_target = ctx.qualify_symbol_sym_home(node.target_type, node.span.file);
-                    }
-                }
-                // SHADOW.  The head's stamp names the target: a declaration
-                // under its canonical name, a primitive by its own spelling
-                // (the key a primitive impl registers by), and a monomorphized
-                // clone carries no stamp because its spelling is already the
-                // qualified name.  The four-step spelling cascade
-                // above is the old answer; it decides, disagreements print,
-                // zero over the corpus deletes it.
-                mut tgt_new: SymbolStr = SymbolStr::empty();
+                mut canonical_target: SymbolStr = node.target_type;
                 match (node.res) {
                     ResSlot::Answered(tres) => {
                         match (tres) {
-                            Res::Def(tq)    => { tgt_new = tq.qualified_name(); }
-                            Res::PrimTy(_)  => { tgt_new = node.target_type; }
-                            _               => { }
+                            Res::Def(tq) => { canonical_target = tq.qualified_name(); }
+                            _            => { }
                         }
                     }
-                    _ => {
-                        if (target_str_full.contains("::")) { tgt_new = node.target_type; }
-                    }
-                }
-                if (!tgt_new.equals(canonical_target)) {
-                    fmt::eprintf("SHADOW-IMPLTGT\t%s\t%s\told=%s\tnew=%s\t%s\n",
-                        if (tgt_new.is_valid()) { "differs" } else { "new-missing" },
-                        target_str_full, ctx.intern_table.resolve(canonical_target),
-                        if (tgt_new.is_valid()) { ctx.intern_table.resolve(tgt_new) } else { "-" },
-                        node.span.to_string());
+                    _ => { }
                 }
                 if (!node.qualified_target_name.is_valid()) {
                     node.qualified_target_name = canonical_target;

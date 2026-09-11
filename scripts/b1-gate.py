@@ -670,7 +670,8 @@ def main():
         if w is None:
             sys.stderr.write("  NEW SITE   %-40s %d\n" % (label, g))
         elif g is None:
-            sys.stderr.write("  GONE       %-40s was %d\n" % (label, w))
+            # A floor row carries `>0`, a string; format it as one.
+            sys.stderr.write("  GONE       %-40s was %s\n" % (label, w))
         else:
             sys.stderr.write("  %-10s %-40s %d -> %d (%+d)\n"
                              % ("CHANGED", label, w, g, g - w))

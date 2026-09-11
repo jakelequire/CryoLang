@@ -2240,50 +2240,6 @@ public:
         return found;
     }
 
-    /// The module whose REGISTERED NAME ends with `path`, or empty when none
-    /// does.  An import may spell a suffix of a module's registered name
-    /// (`core::option` for `std::core::option`), so a direct graph lookup can
-    /// miss a module that is present.
-    ///
-    /// The suffix must land on a segment boundary, so `ture` does not name
-    /// `std::future`.  `Resolver::ns_written_as` states that same rule, but
-    /// over a module's NAMESPACE and checking both characters of the `::`
-    /// where this checks one; the two are not interchangeable until someone
-    /// decides which relation import resolution is entitled to, so this does
-    /// not call it.
-    ///
-    /// `kind` names the audit row: the caller knows whether it is resolving an
-    /// import head or a sub-module, and the row cannot say so on its own.
-    module_by_path_suffix(&this, path: string, kind: string) -> SymbolStr {
-        resolve_counter::Site::M5Calls.bump();
-        const count: i64 = this.ctx.module_graph.module_count() as i64;
-        const path_len: i64 = path.length() as i64;
-        for (mut k: i64 = 0; k < count; k++) {
-            const candidate: ModuleInfo* = this.ctx.module_graph.get_module(k);
-            const cand_name: string = this.resolver.intern_table.resolve(candidate.name);
-            const cand_len: i64 = cand_name.length() as i64;
-            if (cand_len < path_len) { continue; }
-            const suffix: string = cand_name + (cand_len - path_len);
-            if (!suffix.eq(path)) { continue; }
-            if (cand_len == path_len || cand_name[cand_len - path_len - 2] == ':') {
-                resolve_counter::Site::M5Hits.bump();
-                resolve_counter::path_hit(
-                    kind,
-                    this.resolver.intern_table.resolve(this.resolver.current_module),
-                    path, cand_name);
-                // SHADOW: the graph's exact lookup by registered name is the
-                // new model's whole answer; a suffix match answering here is
-                // the old one.  Printed unconditionally; zero over the corpus
-                // deletes this probe and both its callers' fallback branches.
-                fmt::eprintf("SHADOW-M5\t%s\t%s\t%s\t%s\n", kind,
-                    this.resolver.intern_table.resolve(this.resolver.current_module),
-                    path, cand_name);
-                return candidate.name;
-            }
-        }
-        return SymbolStr::empty();
-    }
-
     /// Binds what an `import` - or an `export` - names into the current scope.
     ///
     /// An export is deliberately NOT branched on here.  It grants an importer
@@ -2316,22 +2272,10 @@ public:
         // NOTE: Access module_graph directly through this.ctx rather than a local
         // pointer; method-call and field-access resolution through the receiver
         // chain is more reliable than through a local pointer alias.
-        const graph_idx: i64 = this.ctx.module_graph.find_module_index(module_sym);
-        if (graph_idx < 0) {
-            // The raw import path didn't match; try resolving through the
-            // module graph's file path lookup.  The ImportResolution pass
-            // may have stored the resolved path; search all modules for one
-            // whose import-path suffix matches.
-            const suffix_match: SymbolStr =
-                this.module_by_path_suffix(module_path, "M5-IMPORT");
-            if (suffix_match.is_valid()) {
-                module_sym = suffix_match;
-                LOG_DEBUG(LogComponent::General,
-                    "[NameResolver] resolved import '%s' -> '%s'",
-                    module_path,
-                    this.resolver.intern_table.resolve(module_sym));
-            }
-        }
+        // An import path names a module by its registered name; a path the
+        // graph does not hold binds nothing, and the use site reports it.
+        // The suffix match that stood here answered zero imports over the
+        // corpus and was deleted.
 
         const exports: SymbolID[] = this.resolver.get_exports(module_sym);
 
@@ -2447,15 +2391,7 @@ public:
                     // (b) sub-module: "<resolved_module>::<name>"
                     const name_str: string = this.resolver.intern_table.resolve(name);
                     const sub_path: string = fmt::format("%s::%s", resolved_module, name_str);
-                    mut sub_sym: SymbolStr = this.resolver.intern_table.intern(sub_path);
-                    // Direct graph lookup first, then suffix-match fallback
-                    // (mirrors the module_sym resolution at the top of process_import).
-                    const sub_idx: i64 = this.ctx.module_graph.find_module_index(sub_sym);
-                    if (sub_idx < 0) {
-                        const sub_match: SymbolStr =
-                            this.module_by_path_suffix(sub_path, "M5-SUBMOD");
-                        if (sub_match.is_valid()) { sub_sym = sub_match; }
-                    }
+                    const sub_sym: SymbolStr = this.resolver.intern_table.intern(sub_path);
                     // Import all public exports from the resolved sub-module.
                     const sub_exports: SymbolID[] = this.resolver.get_exports(sub_sym);
                     const sub_resolved: string = this.resolver.intern_table.resolve(sub_sym);

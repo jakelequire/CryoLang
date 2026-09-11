@@ -2654,74 +2654,12 @@ type struct MonoCallSpecializer {
                 _ => { }
             }
         }
-        // Try current module's qualified form first.  There is no bare-name
-        // companion to this lookup: the registry's name index is keyed by
-        // qualified name alone, so a bare leaf can only reach a template whose
-        // qualified name IS that leaf - one declared outside any namespace,
-        // which the grammar has no way to spell.
-        const name_str: string = this.intern_table.resolve(name);
-        const cur_mod_str: string = this.intern_table.resolve(this.current_module);
-        if (cur_mod_str.length() > 0) {
-            const q1_str: string = cur_mod_str + "::" + name_str;
-            const q1: SymbolStr = this.intern_table.intern(q1_str);
-            const e1: TemplateEntry* = registry.get_template(q1);
-            if (e1 != null && e1.node_kind == NodeKind::FunctionDeclaration) {
-                fmt::eprintf("SHADOW-M4\tcurrent-module\t%s\t%s\t%s\n",
-                    name_str, q1_str,
-                    if (asker == null) { "no-slot" } else { if (asker.is_pending()) { "pending" } else { "answered" } });
-                return e1;
-            }
-        }
-        // Linear scan by bare name, reached only by a call whose identifier
-        // carries no usable stamp.  The call site's current_module is the
-        // CONSUMING module, not where the function was defined, so two modules
-        // declaring a same-leaf generic free function (`net::ws::frame::read_frame`
-        // vs `net::http2::frame::read_frame`) are indistinguishable here.  All
-        // this scan can establish is whether exactly ONE template bears the
-        // leaf; deciding between several is not something a spelling can do.
-        resolve_counter::Site::M4Calls.bump();
-        const total: i64 = registry.template_count();
-        mut first: TemplateEntry* = null;
-        mut match_count: i64 = 0;
-        for (mut i: i64 = 0; i < total; i++) {
-            const cand: TemplateEntry* = &registry.entries[i];
-            if (cand == null) { continue; }
-            if (cand.node_kind != NodeKind::FunctionDeclaration) { continue; }
-            if (!cand.name.equals(name)) { continue; }
-            if (first == null) { first = cand; }
-            match_count = match_count + 1;
-        }
-        // What the scan found.  The exit below records only that it answered,
-        // so on its own it cannot separate a scan that matched nothing from
-        // one whose candidates were refused as ambiguous.  `Plural` is the
-        // population that would regain an answer if a discriminator were ever
-        // reintroduced here.
-        if (match_count == 0) {
-            resolve_counter::Site::M4ScanNone.bump();
-        } else if (match_count == 1) {
-            resolve_counter::Site::M4ScanOne.bump();
-        } else {
-            resolve_counter::Site::M4ScanPlural.bump();
-        }
-        // A leaf naming more than one template is not a question a spelling
-        // can answer.  Call arity, longest shared module prefix and scan order
-        // each select whichever candidate the registry happened to hold first,
-        // which is not a property the source states; the stamp consulted above
-        // names the declaration exactly, and is the only path that can.
-        if (match_count > 1) { return null; }
-        if (first != null) {
-            resolve_counter::Site::M4Hits.bump();
-            resolve_counter::Site::M4Single.bump();
-            // SHADOW: the stamp above and the current-module key are the new
-            // model's whole answer; the scan answering here is the old one.
-            // Printed unconditionally; zero over the corpus deletes the scan
-            // and the current-module step with it.
-            fmt::eprintf("SHADOW-M4\tscan-one\t%s\t%s\t%s\n",
-                this.intern_table.resolve(name),
-                this.intern_table.resolve(first.qualified_name),
-                if (asker == null) { "no-slot" } else { if (asker.is_pending()) { "pending" } else { "answered" } });
-        }
-        return first;
+        // A callee whose identifier carries no usable stamp names no template
+        // this pass can find: the current module's key and a scan of every
+        // template by leaf both answered from where the compiler was standing
+        // rather than from what the source wrote, read zero over the corpus,
+        // and were deleted.
+        return null;
     }
 
     // -- Where-clause bound checking at the call site --

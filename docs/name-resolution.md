@@ -50,7 +50,7 @@ current-state description is the defect it exists to remove.
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
 | D10 | A plural leaf is E0155, not a directory-order bind — and a leaf two children of one FACADE declare is the same defect reached by a qualified path, in a call as in an annotation | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **5** | §8.121, §8.144, §8.151 |
-| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1578** | §8.66, §8.80, §8.139 |
+| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1544** | §8.66, §8.80, §8.139 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
 | D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **576** | §8.145, §8.146, §8.147, §8.148, §8.150 |
@@ -83,8 +83,8 @@ three, and its row carries the count. Read each zero off its own row.
 | 2c home-module (ambient cursor) | STARVED | 0 | `grep -m1 '2c  home-module' tests/b1-baseline.txt` | §8.63, §8.87 |
 | M1 `qualifier_agrees` | **GUARD — NOT ENTERED on every b1 arm** since §8.156; its one caller left is the C-import alias branch of the annotation stamp | 0 calls / 0 agree / **0 reject** | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **5** | §8.120, §8.132 |
 | M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane** | 3,760 | `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M2 resolve_module_qualified_sym calls/{print;exit}' tests/b1-baseline.txt` → **3760** | §8.120 |
-| M4 mono bare-name scan | STARVED | 432 calls / **0** hits | same file, `M4 mono bare-name` | §8.33, §8.120 |
-| M5 import suffix fallback | **STARVED** — all entries are the sub-module caller | **3 calls / 0 hits** | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **3** | §8.120 |
+| M4 mono bare-name scan | **DELETED** — with the current-module key before it; a callee with no usable stamp names no template | — | `grep -c 'M4Calls' compiler/src/compiler/resolve_counter.cryo` → **0** | §8.33, §8.120, §8.157 |
+| M5 import suffix fallback | **DELETED** — an import path names a module by its registered name or binds nothing | — | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **0** | §8.120, §8.157 |
 | const-table bare leaf | STARVED | 0 calls / 0 hits | same file, `const-table bare leaf` | §8.9, §8.111 |
 | `spelling_type` new-expr / call-ident | NOT ENTERED | 0 calls | same file, `spelling_type new expr: calls` | §8.25, §8.98 |
 | `lookup_by_leaf` | **DELETED** | — | `grep -rho 'lookup_by_leaf(' compiler/src \| wc -l` → **0** | §8.121 |
@@ -140,7 +140,6 @@ Checks for this section, one per line so each can be copied whole:
 
 * `grep -c '^\[' tests/lane-baseline.txt` → **7**
 * `grep -c '^\[host:' tests/b1-baseline.txt` → **6**
-* `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M5 import suffix fallback hits/{print;exit}' tests/b1-baseline.txt` → **0** — M5 is STARVED, and this is the number that says so; the row's own check counts call SITES, which do not move when a lane starts answering
 * `grep -c '^project ' tests/test-roster.txt` → **46**
 * `grep -c '^negative ' tests/test-roster.txt` → **179**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
@@ -21216,3 +21215,14 @@ registers under its bare spelling. The comment is corrected; no user-type
 target disagreed. Controls: `IMPLTGT` read 9,945 before the rule fix;
 `IMPLTRAIT` inverted fires 331 on `09-json-config`; a print at M4's scan
 entry fires 432 there (the golden's own count) and at M5's exact-hit 930.
+
+**Deleted.** The impl target and trait keys come from the head's stamps;
+`module_by_path_suffix` and both callers' fallback branches are gone, and
+`find_function_template_for_call` answers from the stamp or not at all - the
+current-module key and the scan are gone with their eight counter rows
+(`b1-gate.py` crashed formatting a GONE floor row as `%d`; fixed). Objects
+over the shadow build and this one: 0 of 1,126 examples, 0 of 2,126 tests;
+`make test` 2,113 / 179 / 43. b1 both hosts: 78 -> 70 sites. lane: LOOKUP
+53 -> 52, DEFID_UNWRAP 25 -> 27 (the two impl-head keys becoming the node's
+text). Tally: 13 consumers shadowed, 13 at zero, 13 old paths deleted, 8
+artifacts gone (+ `module_by_path_suffix`, M4's scan).
