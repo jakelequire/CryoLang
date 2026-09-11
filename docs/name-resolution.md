@@ -99,7 +99,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `module_owns_member` probe | LIVE — D5 deletes it | — | `grep -rho 'module_owns_member' compiler/src \| wc -l` → **3** | §8.131 |
 | `scope_owner_key` | LIVE — the static-call owner key; the callee-type and template-method probes read it too | — | `grep -rho 'scope_owner_key' compiler/src \| wc -l` → **6** | §8.134, §8.151 |
 | static-call owner TEMPLATE by spelling (`resolve_scope_owner_template`'s as-is → scope map → cross-module cascade) | **DELETED** — the owner template is read off the segment's stamp, in sema and in mono | — | `grep -c 'resolve_scoped_or_at' compiler/src/compiler/sema/call_resolver.cryo` → **2** (was 7) | §8.150, §8.151 |
-| codegen static-call ladder (`call_emitter`: spec-by-return-type → `scope::member` → bare member) | **SHADOWED, at 0** — sema's / mono's pin answers every static call; 495 → 0 in §8.160, deletion next | 0 | `grep -c 'SHADOW-CGCALL' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **1** (0 when deleted) | §8.158, §8.160 |
+| codegen static-call ladder (`call_emitter`: spec-by-return-type → `scope::member` → bare member, and the enum variant's scope-name probe) | **DELETED** — sema's / mono's pin answers every static call; 495 → 0 in §8.160; `call_emitter` reads no `resolve_scoped_or` | — | `grep -c 'resolve_scoped_or' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0** | §8.158, §8.160, §8.161 |
 | callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **19** | §8.1f, §8.2ag |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
@@ -21540,3 +21540,20 @@ correct rule with an incomplete registry behind it; the `namespace::name`
 form is the remaining gap. Mono still pins the generic-owner static call
 rather than sema - the pin is minted where the instantiation is, which is
 the rule for every generic callee, so that is by design and not a residue.
+
+### 8.161 Consumer 14 deleted: codegen's static-call ladder, and the enum variant's scope-name probe with it - 2026-09-11
+
+`call_emitter`'s ScopeResolution branch binds a static call from
+`node.resolved_callee` and nothing else: the spec-by-return-type lookup, the
+`scope::member` combined lookup and the bare-member lookup are gone (165
+lines), and with them the branch's `resolve_scoped_or_at` - its last reader
+there was the enum-variant path's "the scope name might resolve to a type
+directly", shadowed for one corpus run at 0 and controlled by printing at
+the exact-hit exit instead (5,888 lines on the LSP build alone). An
+unpinned static call that names no variant is now E0636 at the call, which
+is what §8.158 asked for: the front end's miss reported as the front end's.
+
+Objects against `889a9ab5`: 0 of 3,252 changed. Suite green.
+`.resolve_scoped_or[_at]` call sites: 6 (was 7). lane: LOOKUP 52 → 51,
+the enum probe's `di.lookup_type(resolved_scope)` - a type asked for by
+spelling; re-pinned.

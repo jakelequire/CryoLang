@@ -496,160 +496,27 @@ type struct CallEmitter {
                 }
             }
 
-            // Sema-pinned callee: set by the monomorphizer's body walk
-            // for generic free-function calls (`mem::offset(p, n)`,
-            // `Layout::array<T>(n)`) AND by sema's `try_resolve_*` static-
-            // method / module-function / cimport-function paths.  Routes
-            // through `resolve_function_by_mangled`, identical to the
-            // Identifier branch.  The fallback chain below still runs for
-            // call shapes sema doesn't yet pin (the spec-first lookup
-            // based on `node.resolved_type`, enum-variant constructors).
+            // Sema's pin is the whole answer for a static call: written by
+            // sema's static-method / module-function / C-import paths, or by
+            // the specialization walk for a generic callee or a generic
+            // owner.  It routes through `resolve_function_by_mangled`,
+            // exactly as the Identifier branch does.  A call with no pin that
+            // names no enum variant below is a call the front end never
+            // bound, and it is reported as one rather than bound here by a
+            // name derived from the spelling or the return type.
             if (node.resolved_callee.is_valid()) {
                 callee_val = this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
             }
-            // SHADOW.  Sema's pin is the new model's whole answer for a
-            // static call; every step below binds by a name codegen derives
-            // itself.  A call bound below prints unconditionally, with
-            // whether a pin existed and missed or none was written.
-            const sr_pinned: boolean = callee_val.is_valid();
-            const sr_had_pin: boolean = node.resolved_callee.is_valid();
 
-            // Resolve the scope name (e.g., "LValue") to its qualified form
-            // (e.g., "compiler::codegen::llvm_types::LValue") via the DI mapping.
-            // Judged against the module that WROTE the path, not the module
-            // codegen happens to be emitting: a generic body is emitted with
-            // the cursor on the module owning the receiver, so the cursor
-            // names a module that never wrote this name.
-            const resolved_scope: SymbolStr =
-                this.cg.ctx.resolve_scoped_or_at(sr.scope_name, sr.span.file, FILE, LINE as i32);
-            const scope_str: string = intern.resolve(resolved_scope);
-            const sr_arity: u32 = node.arguments.length as u32;
-
-            // Spec-first: when `node.resolved_type` is a generic instantiation,
-            // the call resolves to the spec'd method (e.g.
-            // `Map<string, Argument>::new`), not the bare template (`Map::new`).
-            // The bare template is also registered in the DI when the source
-            // contains `type struct Map<K,V> { static new() ... }`; the inner
-            // `Map` return type resolves to the bare struct, and a bare-mangled
-            // declaration ends up in the function table.  Without trying the
-            // spec name first, the bare-name lookup at the next step finds
-            // that template and emits a call to a symbol nobody defines.
-            mut conc_ref0: TypeRef = node.resolved_type;
-            mut conc_t0: Type* = this.cg.lookup_type_by_id(conc_ref0.id);
-            mut fc0: i32 = 0;
-            while (conc_t0 != null && conc_t0.kind == TypeKind::InstantiatedType && fc0 < 5) {
-                const ci0: InstantiatedType* = conc_t0 as InstantiatedType*;
-                if (ci0.has_resolved_type()) {
-                    conc_ref0 = ci0.resolved_type;
-                    conc_t0 = this.cg.lookup_type_by_id(conc_ref0.id);
-                } else { break; }
-                fc0 += 1;
-            }
-            if (conc_t0 != null) {
-                mut conc_name0: string = "";
-                if (conc_t0.kind == TypeKind::Struct) {
-                    const cst0: StructType* = conc_t0 as StructType*;
-                    conc_name0 = intern.resolve(cst0.qualified_name);
-                } else if (conc_t0.kind == TypeKind::Class) {
-                    const cct0: ClassType* = conc_t0 as ClassType*;
-                    conc_name0 = intern.resolve(cct0.qualified_name);
-                } else if (conc_t0.kind == TypeKind::Enum) {
-                    const cet0: EnumType* = conc_t0 as EnumType*;
-                    conc_name0 = intern.resolve(cet0.qualified_name);
-                } else if (conc_t0.kind == TypeKind::InstantiatedType) {
-                    // Unresolved InstantiatedType: sema's expected_type
-                    // fallback returned a generic instantiation that the
-                    // monomorphizer hadn't yet pinned to its spec struct
-                    // when codegen ran. Compute the deterministic spec
-                    // mangled name from `(generic_base, type_args)` and
-                    // try to find the registered spec method directly.
-                    const ci_unres: InstantiatedType* = conc_t0 as InstantiatedType*;
-                    const base_qname: SymbolStr = this.cg.get_arena().get_qualified_name(
-                        ci_unres.generic_base);
-                    if (base_qname.is_valid()) {
-                        const base_qn: QualifiedName = QualifiedName::from_symbol(base_qname);
-                        const spec_sym: SymbolStr = MangledName::specialized_identifier(
-                            this.cg.get_intern(), this.cg.get_arena(), base_qn,
-                            ci_unres.type_args);
-                        if (spec_sym.is_valid()) {
-                            conc_name0 = intern.resolve(spec_sym);
-                        }
-                    }
-                }
-                // Don't overwrite a callee_val that the resolved_callee path
-                // already produced; the monomorphizer's pin is authoritative
-                // for spec'd generic free-function callees, and rebuilding the
-                // lookup key from `node.resolved_type` (the call's return type)
-                // collapses spec'd static methods like `Layout::array<Point>`
-                // to the bare-template `Layout::array` symbol.
-                if (!callee_val.is_valid() && conc_name0.length() > 0) {
-                    const member_str0: string = intern.resolve(sr.member_name);
-                    const conc_combined0: string = fmt::format("%s::%s", conc_name0, member_str0);
-                    const conc_sym0: SymbolStr = intern.intern(conc_combined0);
-                    callee_val = this.cg.resolver.resolve_function_with_arity(conc_sym0, sr_arity);
-                    if (!callee_val.is_valid()) {
-                        callee_val = this.cg.resolver.resolve_function(conc_sym0);
-                    }
-                }
-            }
-
-            // Post-substitution combined-key lookup: in spec'd function
-            // bodies, AST substituter rewrites `sr.scope_name` from
-            // `String` to the bare-leaf spec form (`6String$L...$G`).
-            // Sema's pin was on the pre-substitution template form
-            // (`String::method`) and the substituter doesn't update
-            // `resolved_callee`, so when codegen lands on this branch the
-            // pinned symbol is for a function that only exists at
-            // template time.  `di.resolve_qualified(sr.scope_name)` maps
-            // the bare-leaf spec back to its fully-qualified arena name
-            // (registered by specialization.cryo), and the combined
-            // `<qualified>::<method>` lookup finds the spec's LLVM
-            // symbol.  Sema upstreams the non-spec case via pinned
-            // `resolved_callee`; this branch covers the spec-context
-            // lookups until AST cloning clears stale callee pins.
-            if (!callee_val.is_valid()) {
-                const combined: string = fmt::format("%s::%s", scope_str, intern.resolve(sr.member_name));
-                const sym: SymbolStr = intern.intern(combined);
-                callee_val = this.cg.resolver.resolve_function_with_arity(sym, sr_arity);
-                if (!callee_val.is_valid()) {
-                    callee_val = this.cg.resolver.resolve_function(sym);
-                }
-            }
-
-            // Fallback 1: try the bare member name.  Extern "C" functions
-            // (e.g., llvm::LLVMGetTypeKind) are registered under their
-            // unqualified C name, not the scope-qualified form.
-            // Use arity-aware lookup first to discriminate between overloads
-            // that share a bare name (e.g., the `read` intrinsic vs the free
-            // `std::fs::file::read(path: string)`, both reachable under bare
-            // "read" via type_resolution's bare-alias registration).
-            if (!callee_val.is_valid()) {
-                callee_val = this.cg.resolver.resolve_function_with_arity(sr.member_name, sr_arity);
-                if (!callee_val.is_valid()) {
-                    callee_val = this.cg.resolver.resolve_function(sr.member_name);
-                }
-            }
-            if (!sr_pinned && callee_val.is_valid()) {
-                const sr_cur_fn: LValue = this.get_current_function();
-                const sr_in: string = if (sr_cur_fn.is_valid()) {
-                    llvm::LLVMGetValueName(sr_cur_fn.raw) as string
-                } else { "?" };
-                fmt::eprintf("SHADOW-CGCALL\t%s\t%s::%s\t%s\tin=%s\tmod=%s\n",
-                    if (sr_had_pin) { "pin-missed" } else { "no-pin" },
-                    intern.resolve(sr.scope_name), intern.resolve(sr.member_name),
-                    node.span.to_string(), sr_in, this.cg.ctx.source_file);
-            }
-
-            // If the function wasn't found, check if this is an enum variant
-            // constructor (e.g., Option::Some, Result::Ok).  Enum constructors
-            // are not registered as functions; synthesize the value inline.
-            // Use node.resolved_type (the sema-resolved result type of the call)
-            // to find the concrete monomorphized enum, not the scope name
-            // (which may still be the generic "Option" template name).
+            // No pin: an enum variant constructor (`Option::Some`,
+            // `Result::Ok`).  Variants are not registered as functions; the
+            // value is synthesized inline.  The enum is the one sema
+            // resolved the call TO (`node.resolved_type`, through any chain
+            // of instantiations), never the one the scope segment spells: a
+            // generic variant's spelling names the template.
             if (!callee_val.is_valid()) {
                 mut real_ref: TypeRef = node.resolved_type;
                 mut real_t: Type* = this.cg.lookup_type_by_id(real_ref.id);
-                // Follow InstantiatedType chain (may be multiple levels deep).
                 mut follow_count: i32 = 0;
                 while (real_t != null && real_t.kind == TypeKind::InstantiatedType && follow_count < 5) {
                     const inst: InstantiatedType* = real_t as InstantiatedType*;
@@ -660,24 +527,6 @@ type struct CallEmitter {
                         break;
                     }
                     follow_count += 1;
-                }
-                // Also try: the scope name might resolve to a type directly
-                // (for cases where resolved_type isn't set on the call node).
-                if (real_t == null || (real_t.kind != TypeKind::Enum && real_t.kind != TypeKind::Struct)) {
-                    const scope_ref: TypeRef = di.lookup_type(resolved_scope);
-                    if (scope_ref.is_valid()) {
-                        real_ref = scope_ref;
-                        real_t = this.cg.lookup_type_by_id(real_ref.id);
-                        mut sc: i32 = 0;
-                        while (real_t != null && real_t.kind == TypeKind::InstantiatedType && sc < 5) {
-                            const sinst: InstantiatedType* = real_t as InstantiatedType*;
-                            if (sinst.has_resolved_type()) {
-                                real_ref = sinst.resolved_type;
-                                real_t = this.cg.lookup_type_by_id(real_ref.id);
-                            } else { break; }
-                            sc += 1;
-                        }
-                    }
                 }
                 if (real_t != null && real_t.kind == TypeKind::Enum) {
                     const et: EnumType* = real_t as EnumType*;
