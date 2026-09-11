@@ -1107,11 +1107,20 @@ public:
         if (head.visible != 1) { return SymbolID::invalid(); }
 
         // The segment after the head resolves inside what the head named - the
-        // module's EXPORT set, which is precisely what a module offers another
-        // file.  A private declaration is not a candidate here, so a path can
-        // never reach one by being spelled out in full.
-        return this.resolver.lookup_in_module(
-            head.found, this.resolver.intern_table.intern(leaf));
+        // module's OFFERED set, which is its own exports plus what its `export`
+        // edges pass on.  A private declaration is not a candidate, so a path
+        // can never reach one by being spelled out in full.
+        //
+        // The re-export half is what makes a facade path a real path: one item
+        // has many valid spellings and `Aggregate::Widget` is one of them, even
+        // though `Inner` declared it.  It is NOT a weaker alias - the same
+        // refusal applies as anywhere else, so a name two of the facade's
+        // children declare is ambiguous here and resolves to neither.
+        mut offered: i64 = 0;
+        const hit: SymbolID = this.module_offering(
+            head.found, this.resolver.intern_table.intern(leaf), &offered);
+        if (offered != 1) { return SymbolID::invalid(); }
+        return hit;
     }
 
     /// Record which MODULE the scope segment of `Ns::member` names, as the file
@@ -2177,6 +2186,55 @@ public:
             }
         }
         return SymbolStr::empty();
+    }
+
+    /// The declaration module `m` OFFERS under `name`, or invalid.
+    ///
+    /// A module offers its own exports plus everything its `export` edges pass
+    /// on.  One item may have many valid paths - `std::collections::HashMap` is
+    /// a re-export and nobody writes the declaring module - so a facade path is
+    /// a first-class path and not a weaker alias.  What stays canonical is the
+    /// IDENTITY the path reaches, which is why two routes to one declaration
+    /// count once and two declarations count twice.
+    ///
+    /// The closure must answer EXACTLY ONCE.  `std::alloc` re-exports both
+    /// `arc` and `rc`, so `alloc::Weak` reaches two declarations and therefore
+    /// names neither; returning whichever the walk met first would make the
+    /// answer depend on the order the graph happened to be built in, which is
+    /// the property this migration exists to delete.  102 names in the tree are
+    /// plural this way and none is written today.
+    ///
+    /// `hits` separates "no such name here" from "that name is ambiguous here",
+    /// because those call for different diagnostics and a bare invalid cannot
+    /// tell them apart.
+    module_offering(&this, m: SymbolStr, name: SymbolStr, hits: i64*) -> SymbolID {
+        *hits = 0;
+        // A module that DECLARES the name offers that one.  A re-export cannot
+        // displace a declaration, so this is not a first-of-several choice.
+        const own: SymbolID = this.resolver.lookup_in_module(m, name);
+        if (own.is_valid()) {
+            *hits = 1;
+            return own;
+        }
+        const via: SymbolStr[] = this.ctx.module_graph.reexport_closure(m);
+        mut found: SymbolID = SymbolID::invalid();
+        mut seen: SymbolStr = SymbolStr::empty();
+        for (mut i: i64 = 0; i < via.length; i++) {
+            const cand: SymbolID = this.resolver.lookup_in_module(via[i], name);
+            if (!cand.is_valid()) { continue; }
+            const cs: Symbol = this.resolver.get_symbol(cand);
+            const q: SymbolStr = this.resolver.qualified_name_of(&cs);
+            if (seen.is_valid()) {
+                // Same declaration reached by a second route is one item, not
+                // two candidates.
+                if (!q.equals(seen)) { *hits = *hits + 1; }
+                continue;
+            }
+            seen = q;
+            found = cand;
+            *hits = 1;
+        }
+        return found;
     }
 
     /// The module whose REGISTERED NAME ends with `path`, or empty when none

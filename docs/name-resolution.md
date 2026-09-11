@@ -52,6 +52,7 @@ current-state description is the defect it exists to remove.
 | D10 | A plural bare leaf is E0155, not a directory-order bind | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **3** | §8.121 |
 | D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1649** | §8.66, §8.80, §8.139 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
+| D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **2** | §8.138, §8.144 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
 
 **D2 is the one to look at.** Decided in §8.39, then neither taken nor
@@ -20197,3 +20198,80 @@ scope rather than through the export set, which is why it answers for names an
 import cannot offer. Requalification therefore removes a hazard rather than
 adding one, and the 23 intrinsic brace items `9698575d` inserted - which could
 never have bound - are removed here.
+
+### 8.144 A facade path is a real path: the qualifier follows `export`, and a name two children declare is refused rather than picked - RULED AND LANDED 2026-09-10
+
+§8.138 recorded that a qualified path could not reach a re-exported name, so
+`Aggregate::Widget` was refused while a braced import of the same name worked.
+Under "qualify, don't import" that makes `export` unusable, which is a semantics
+question rather than a fixture question. Jake ruled the Rust model.
+
+**Path and identity are different things.** One item has many valid paths -
+`std::collections::HashMap` is a re-export and nobody writes
+`std::collections::hash::map` - and the facade path is first-class, not a weaker
+alias. What stays canonical is the IDENTITY the path reaches.
+
+#### Where it does NOT go, and why that matters
+
+The obvious change is to `qualifier_agrees`, which compares the written prefix
+against the DECLARING module. That would have been wrong. It runs *after* the
+leaf has been looked up in the scope chain, so it VALIDATES a pick rather than
+making one; widening it to accept a facade prefix lets an arbitrary pick pass
+whenever the facade re-exports two modules that both declare the leaf. That is
+reintroducing the lane this migration exists to delete, wearing the ruling as
+justification.
+
+It goes in `walk_module_rooted_type`, which is already deterministic: it refuses
+outright when two reachable modules share the written prefix, and then asks THAT
+module for the leaf. The only change needed there is what "asks that module"
+means - its own exports, or its offered set.
+
+`module_offering` is that question. Own exports first, since a re-export cannot
+displace a declaration; otherwise the re-export closure, counting DISTINCT
+declarations so two routes to one item count once and two items count twice. It
+answers only when exactly one declaration answers.
+
+#### Measured before it was written
+
+* **102** names reach a facade from two different declarers - `std::alloc`
+  offers `Weak` from both `arc` and `rc`; `std` offers `min`, `max` and `clamp`
+  from both `core::cmp` and `math`.
+* **0** of them are named by any import in the tree.
+* The control on that zero: **1,646** braced items name a facade module at all,
+  and **30** of those reach a name the facade re-exports rather than declares.
+  The population is live, so the zero is a fact about plurality and not about an
+  empty corpus.
+
+So the refusal forecloses a latent registration-order defect rather than
+breaking anything. `reexport_offering`, which still serves the Specific import
+branch, returns the FIRST closure module that answers - a pick by walk order.
+That is the same defect one layer over, and it is now the obvious next deletion.
+
+#### The pair, because a rule that only ever says yes is not a rule
+
+One program, one line different. Two modules under a facade, one declaring
+`Thing`, the other declaring `Other`: `Facade::Thing` compiles and returns **1**,
+Left's value. Rename `Other` to `Thing` so both declare it: `Facade::Thing` is
+**refused**. And through two `export` hops with no braced import at all,
+`Top::Widget::of(9)` builds and exits **9**.
+
+The old compiler refuses both halves, which is why it is NOT the control here -
+it cannot follow a re-export at any arity, so its refusal says nothing about
+plurality. The control is the one-declarer arm of the same tree.
+
+**Owed:** the refusal surfaces as `E0203 cannot find type`, which is wrong in
+kind - the name IS found, twice. `module_offering` reports `hits` precisely so a
+caller can tell the two apart; `walk_module_rooted_type` currently discards it.
+Plumbing the count out to a distinct diagnostic is owed, not done.
+
+#### `error[E0900]: linker invocation failed` hides the diagnostic
+
+Unrelated to the ruling, learned in this session and worth the line. That error
+prints the gcc command line and gcc's exit status, and NOT gcc's message. The
+real failure was `undefined reference to 'C$vt$0'`, and the only way to see it
+is to re-run the retained link by hand:
+
+    cd tests && gcc -o <exe> @<exe>.rsp <the rest of the line as printed>
+
+The `.rsp` is retained for exactly this. Anyone who reads E0900 as "the linker
+is unhappy" and goes looking in the build system will lose the time twice.
