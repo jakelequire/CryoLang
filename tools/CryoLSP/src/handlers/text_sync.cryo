@@ -16,37 +16,25 @@
 namespace lsp::handlers::text_sync;
 
 import std::core::option;
-import std::core::option::{ Option };
 import std::collections::str;
-import std::collections::str::{ Str };
 import std::collections::string;
 import std::collections::string::{ String };
 import std::collections::array;
-import std::collections::array::{ Array };
 import std::io::stdio;
-import std::io::stdio::{ Stdout };
 import std::json::value;
-import std::json::value::{ JsonNumber, JsonValue };
 
 import lsp::server::docs;
-import lsp::server::docs::{ Docs, Document };
 import lsp::server::session;
-import lsp::server::session::{ CompilerSession, SessionMap };
 import lsp::server::diag_render_cache;
-import lsp::server::diag_render_cache::{ DiagRenderCache };
 import lsp::handlers::diagnostics;
-import lsp::handlers::diagnostics::{ DiagnosticPublisher };
 import lsp::handlers::inactive_regions;
-import lsp::handlers::inactive_regions::{ InactiveRegionsPublisher };
 import lsp::protocol::jsonrpc;
-import lsp::protocol::jsonrpc::{ JsonRpcCodec };
 import lsp::protocol::framing;
-import lsp::protocol::framing::{ FrameCodec };
 
 
-public function did_open(docs: mut &Docs, sessions: mut &SessionMap,
-                          params: &JsonValue) -> void {
-    match (params.get(Str::from("textDocument"))) {
+public function did_open(docs: mut &docs::Docs, sessions: mut &session::SessionMap,
+                          params: &value::JsonValue) -> void {
+    match (params.get(str::Str::from("textDocument"))) {
         Option::Some(td) => {
             const uri:     String = TextFields::clone_string_field_or_empty(td, "uri");
             const version: i32    = TextFields::i32_field_or(td, "version", 1 as i32);
@@ -62,7 +50,7 @@ public function did_open(docs: mut &Docs, sessions: mut &SessionMap,
             // per didOpen.
             sessions.mark_dirty(uri.as_str());
 
-            mut doc: Document = Document::new(uri, text, version);
+            mut doc: docs::Document = docs::Document::new(uri, text, version);
             docs.insert(doc);
         }
         Option::None => { }
@@ -70,9 +58,9 @@ public function did_open(docs: mut &Docs, sessions: mut &SessionMap,
 }
 
 
-public function did_change(docs: mut &Docs, sessions: mut &SessionMap,
-                            params: &JsonValue) -> void {
-    match (params.get(Str::from("textDocument"))) {
+public function did_change(docs: mut &docs::Docs, sessions: mut &session::SessionMap,
+                            params: &value::JsonValue) -> void {
+    match (params.get(str::Str::from("textDocument"))) {
         Option::Some(td) => {
             const uri:     String = TextFields::clone_string_field_or_empty(td, "uri");
             const version: i32    = TextFields::i32_field_or(td, "version", 1 as i32);
@@ -80,7 +68,7 @@ public function did_change(docs: mut &Docs, sessions: mut &SessionMap,
             // Pull the LAST entry of `contentChanges` - for full-sync
             // clients there's exactly one; for incremental clients
             // taking this approach loses partial edits (TODO when v2).
-            const new_text: String = match (params.get(Str::from("contentChanges"))) {
+            const new_text: String = match (params.get(str::Str::from("contentChanges"))) {
                 Option::Some(changes) => { TextFields::last_change_text(changes) }
                 Option::None          => { String::new() }
             };
@@ -105,7 +93,7 @@ public function did_change(docs: mut &Docs, sessions: mut &SessionMap,
                 Option::None => {
                     // didChange before didOpen - accept it anyway by
                     // creating the doc.
-                    mut fresh: Document = Document::new(
+                    mut fresh: docs::Document = docs::Document::new(
                         String::from_str(uri.as_str()),
                         new_text,
                         version);
@@ -126,16 +114,16 @@ public function did_change(docs: mut &Docs, sessions: mut &SessionMap,
 /// routed through `ensure_fresh`, so a document already recompiled by an
 /// interleaved request (hover/completion) isn't compiled twice - it just
 /// gets its diagnostics published.
-public function flush_pending(docs: &Docs, sessions: mut &SessionMap,
-                               writer: mut &Stdout, cache: DiagRenderCache*,
+public function flush_pending(docs: &docs::Docs, sessions: mut &session::SessionMap,
+                               writer: mut &stdio::Stdout, cache: diag_render_cache::DiagRenderCache*,
                                outbound: mut &OutboundRequests) -> void {
     mut uris: Array<String> = sessions.take_pending();
     const n: u64 = uris.length();
     for (mut i: u64 = 0; i < n; i++) {
         match (uris.get_ref(i)) {
             Option::Some(uri_ptr) => {
-                const uri: Str = uri_ptr.as_str();
-                const session: CompilerSession* = sessions.ensure_fresh(docs, uri);
+                const uri: str::Str = uri_ptr.as_str();
+                const session: session::CompilerSession* = sessions.ensure_fresh(docs, uri);
                 if (session != null && session.context() != null) {
                     // The version `ensure_fresh` compiled from - the client
                     // needs it to tell a fresh result from one that raced a
@@ -144,9 +132,9 @@ public function flush_pending(docs: &Docs, sessions: mut &SessionMap,
                         Option::Some(doc) => { doc.version }
                         Option::None      => { -1 }
                     };
-                    DiagnosticPublisher::publish_for(writer, uri,
+                    diagnostics::DiagnosticPublisher::publish_for(writer, uri,
                                               session.context(), cache);
-                    InactiveRegionsPublisher::publish_for(writer, uri,
+                    inactive_regions::InactiveRegionsPublisher::publish_for(writer, uri,
                                               session.context(), version);
                     outbound.send_semantic_tokens_refresh(writer);
                 }
@@ -158,9 +146,9 @@ public function flush_pending(docs: &Docs, sessions: mut &SessionMap,
 }
 
 
-public function did_close(docs: mut &Docs, sessions: mut &SessionMap,
-                           writer: mut &Stdout, params: &JsonValue) -> void {
-    match (params.get(Str::from("textDocument"))) {
+public function did_close(docs: mut &docs::Docs, sessions: mut &session::SessionMap,
+                           writer: mut &stdio::Stdout, params: &value::JsonValue) -> void {
+    match (params.get(str::Str::from("textDocument"))) {
         Option::Some(td) => {
             const uri: String = TextFields::clone_string_field_or_empty(td, "uri");
             docs.remove(uri.as_str());
@@ -169,8 +157,8 @@ public function did_close(docs: mut &Docs, sessions: mut &SessionMap,
             // flush doesn't resurrect a session for a closed document.
             sessions.clear_pending_for(uri.as_str());
             // Clear stale squiggles + dimming in the editor.
-            DiagnosticPublisher::publish_empty(writer, uri.as_str());
-            InactiveRegionsPublisher::publish_empty(writer, uri.as_str());
+            diagnostics::DiagnosticPublisher::publish_empty(writer, uri.as_str());
+            inactive_regions::InactiveRegionsPublisher::publish_empty(writer, uri.as_str());
             mut u: String = uri;  u.drop();
         }
         Option::None => { }
@@ -183,10 +171,10 @@ public function did_close(docs: mut &Docs, sessions: mut &SessionMap,
 
 type struct TextFields {
 
-    static clone_string_field_or_empty(obj: &JsonValue, key: string) -> String {
-        match (obj.get(Str::from(key))) {
+    static clone_string_field_or_empty(obj: &value::JsonValue, key: string) -> String {
+        match (obj.get(str::Str::from(key))) {
             Option::Some(v) => {
-                match (v.as<Str>()) {
+                match (v.as<str::Str>()) {
                     Option::Some(s) => { return String::from_str(s); }
                     Option::None    => { return String::new(); }
                 }
@@ -195,15 +183,15 @@ type struct TextFields {
         }
     }
 
-    static i32_field_or(obj: &JsonValue, key: string, fallback: i32) -> i32 {
-        match (obj.get(Str::from(key))) {
+    static i32_field_or(obj: &value::JsonValue, key: string, fallback: i32) -> i32 {
+        match (obj.get(str::Str::from(key))) {
             Option::Some(v) => {
                 match (v) {
-                    JsonValue::Number(n) => {
+                    value::JsonValue::Number(n) => {
                         match (n) {
-                            JsonNumber::Int(i)   => { return i as i32; }
-                            JsonNumber::UInt(u)  => { return u as i32; }
-                            JsonNumber::Float(f) => { return f as i32; }
+                            value::JsonNumber::Int(i)   => { return i as i32; }
+                            value::JsonNumber::UInt(u)  => { return u as i32; }
+                            value::JsonNumber::Float(f) => { return f as i32; }
                         }
                     }
                     _ => { return fallback; }
@@ -216,9 +204,9 @@ type struct TextFields {
     /// Pull the `text` field out of the LAST change entry.  Treats every
     /// change as a whole-document replacement; `range`-bearing entries are
     /// silently overridden by whichever entry sits last in the array.
-    static last_change_text(changes: &JsonValue) -> String {
+    static last_change_text(changes: &value::JsonValue) -> String {
         match (changes) {
-            JsonValue::Array(arr) => {
+            value::JsonValue::Array(arr) => {
                 if (arr.length() == 0) { return String::new(); }
                 // JsonValue owns resources (not Copy): borrow the last element in
                 // place with get_ref rather than copying it out with get.
@@ -264,13 +252,13 @@ type struct OutboundRequests {
     /// the identifiers they were meant to colour, and VS Code renders the
     /// stale span colours on top of TextMate, producing the "broken-up,
     /// overlapping" highlighting the user reports.
-    send_semantic_tokens_refresh(mut &this, writer: mut &Stdout) -> void {
+    send_semantic_tokens_refresh(mut &this, writer: mut &stdio::Stdout) -> void {
         const id: i64 = this.next_id();
-        mut body: String = JsonRpcCodec::encode_request(
+        mut body: String = jsonrpc::JsonRpcCodec::encode_request(
             id,
-            Str::from("workspace/semanticTokens/refresh"),
-            JsonValue::Null);
-        match (FrameCodec::write_message(writer, body.as_str())) {
+            str::Str::from("workspace/semanticTokens/refresh"),
+            value::JsonValue::Null);
+        match (framing::FrameCodec::write_message(writer, body.as_str())) {
             Result::Ok(_)  => { }
             Result::Err(_) => { }
         }

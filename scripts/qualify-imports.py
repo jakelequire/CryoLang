@@ -192,6 +192,11 @@ UNWRITABLE_POS = [
 ]
 
 
+# `Name<...>::` -- a generic type's static call with EXPLICIT arguments, which
+# cannot be qualified yet. The argument-free form resolves.
+GENERIC_STATIC_RE = re.compile(r"([A-Za-z_]\w*)\s*<[^<>()]*>\s*::")
+
+
 def enum_body_lines(masked):
     """Line indices inside a `type enum` body.
 
@@ -263,7 +268,7 @@ def plan(world, path):
     if ns is None:
         return None
     no_prelude = ns.startswith("std::") or "![no_std]" in src
-    prelude = set() if no_prelude else set(world.offers("std::prelude"))
+    prelude = {} if no_prelude else world.offers("std::prelude")
     own = world.per_file[path][1]
 
     blocks = brace_blocks(masked)
@@ -295,6 +300,15 @@ def plan(world, path):
         for rx in UNWRITABLE_POS:
             for m in rx.finditer(code):
                 head_only.add(m.group(1))
+        # A qualified GENERIC type's static call does not resolve:
+        # `hashmap::HashMap<i64, i64>::new()` is E0233 while the bare form and
+        # the qualified NON-generic form both work. Bisected to the glob
+        # deletion - the name was reaching a bare lane the glob fed, not the
+        # qualifier - so it is a gap the migration exposed rather than one it
+        # created, and it is open. Until it closes, a name used this way keeps
+        # its braced import.
+        for m in GENERIC_STATIC_RE.finditer(code):
+            head_only.add(m.group(1))
 
     qualify = {}      # name -> qualifier
     drop = set()      # names removed from the import list, left bare
@@ -329,7 +343,11 @@ def plan(world, path):
                 keep.setdefault(written, []).append(name)
                 notes.append("declaration head takes no path: %s" % name)
                 continue
-            if name in prelude:
+            if name in prelude and prelude.get(name) == offered[name]:
+                # Prelude-covered only when it is the SAME declaration. A braced
+                # import of a different `Range` SHADOWS the prelude's, and
+                # dropping it silently re-binds every use to
+                # `std::core::ops::Range` - a meaning change with no diagnostic.
                 drop.add(name)
                 continue
             if name in own:
@@ -342,8 +360,11 @@ def plan(world, path):
                 keep.setdefault(written, []).append(name)
                 continue
             qualify[name] = qual
-    return (src, raw, masked, blocks, qualify, drop, keep, notes,
-            set(leaves.keys()))
+    segs = set()
+    for paths in leaves.values():
+        for p2 in paths:
+            segs.update(p2.split("::"))
+    return (src, raw, masked, blocks, qualify, drop, keep, notes, segs)
 
 
 def apply_to(path, planned, keep_lines=False):

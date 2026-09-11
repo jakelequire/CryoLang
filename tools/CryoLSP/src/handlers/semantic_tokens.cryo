@@ -31,64 +31,32 @@
 namespace lsp::handlers::semantic_tokens;
 
 import std::core::option;
-import std::core::option::{ Option };
 import std::core::drop;
-import std::core::drop::{ Drop };
 import std::collections::str;
-import std::collections::str::{ Str };
 import std::collections::string;
 import std::collections::string::{ String };
 import std::collections::array;
 import std::collections::array::{ Array };
 import std::json::value;
-import std::json::value::{ JsonValue };
 
 import compiler::compilation_context;
-import compiler::compilation_context::{ CompilationContext };
 import compiler::ast;
-import compiler::ast::{ NodeKind, TypeAnnotation };
 import compiler::ast::node;
-import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::expression;
-import compiler::ast::expression::{
-    ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode, CallExprNode,
-    CastExprNode, DeleteExprNode, ExpressionNode, FieldInit, IdentifierNode, IfExprNode,
-    LambdaExprNode, MatchExprNode, MemberAccessNode, NewExprNode, ScopeResolutionNode,
-    StructLiteralNode, TernaryExprNode, TryExprNode, TupleLiteralNode, UnaryExprNode,
-    YieldExprNode
-};
 import compiler::ast::statement;
-import compiler::ast::statement::{
-    AsmBlockStmtNode, AsmDialect, AsmOperand, BlockStmtNode, DeclStmtNode, DoWhileStmtNode,
-    ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode, MatchStmtNode, ReturnStmtNode,
-    UnsafeBlockStmtNode, WhileStmtNode
-};
 import compiler::ast::declaration;
-import compiler::ast::declaration::{
-    ClassDeclNode, EnumDeclNode, EnumVariantNode, ExternBlockNode, FieldDeclNode,
-    FunctionDeclNode, ImplBlockNode, ImportDeclNode, MethodNode, ModuleDeclNode,
-    StructDeclNode, TraitDeclNode, TypeAliasDeclNode, VarDeclNode
-};
 import compiler::ast::pattern;
-import compiler::ast::pattern::{ MatchArmNode };
 import compiler::diag::source_span;
-import compiler::diag::source_span::{ SourceSpan };
 import compiler::module_graph;
 import compiler::resolver::symbol_str;
-import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::intern_table;
-import compiler::resolver::intern_table::{ InternTable };
 
 import lsp::server::docs;
-import lsp::server::docs::{ Docs };
 import lsp::server::session;
-import lsp::server::session::{ CompilerSession, SessionMap };
 import lsp::server::line_index;
-import lsp::server::line_index::{ LineIndex };
 import lsp::protocol::semantic_tokens;
-import lsp::protocol::semantic_tokens::{ SemanticToken, SemanticTokensCodec };
+import lsp::protocol::semantic_tokens::{ SemanticToken };
 import lsp::protocol::conv;
-import lsp::protocol::conv::{ UriPath };
 import std::ffi::libc;
 
 
@@ -129,12 +97,12 @@ import std::ffi::libc;
 //   - `tokens`: the collector the walk pushes into.
 
 type struct SemanticTokenizer {
-    sym_this:         SymbolStr;
-    sym_amp_this:     SymbolStr;
-    sym_mut_this:     SymbolStr;
-    sym_amp_mut_this: SymbolStr;
-    intern:           InternTable*;
-    line_index:       LineIndex*;
+    sym_this:         symbol_str::SymbolStr;
+    sym_amp_this:     symbol_str::SymbolStr;
+    sym_mut_this:     symbol_str::SymbolStr;
+    sym_amp_mut_this: symbol_str::SymbolStr;
+    intern:           intern_table::InternTable*;
+    line_index:       line_index::LineIndex*;
     doc_text:         string;
     doc_text_length:  u64;
     doc_file:         string;
@@ -145,13 +113,13 @@ type struct SemanticTokenizer {
     /// editor buffer's line index + text for span validation.  Repopulated
     /// each request because the InternTable is per-CompilationContext and a
     /// recompile recreates it.
-    static new(intern: InternTable*, docs: &Docs, uri: Str,
+    static new(intern: intern_table::InternTable*, docs: &docs::Docs, uri: str::Str,
                doc_file: string) -> SemanticTokenizer {
         mut t: SemanticTokenizer = SemanticTokenizer {
-            sym_this:         SymbolStr::empty(),
-            sym_amp_this:     SymbolStr::empty(),
-            sym_mut_this:     SymbolStr::empty(),
-            sym_amp_mut_this: SymbolStr::empty(),
+            sym_this:         symbol_str::SymbolStr::empty(),
+            sym_amp_this:     symbol_str::SymbolStr::empty(),
+            sym_mut_this:     symbol_str::SymbolStr::empty(),
+            sym_amp_mut_this: symbol_str::SymbolStr::empty(),
             intern:           intern,
             line_index:       null,
             doc_text:         "",
@@ -181,143 +149,143 @@ type struct SemanticTokenizer {
 
     // Walker - recurses through declarations + statements + expressions
 
-    walk_program(mut &this, prog: ProgramNode*) -> void {
+    walk_program(mut &this, prog: node::ProgramNode*) -> void {
         if (prog == null) { return; }
         for (mut i: i64 = 0; i < prog.statements.length; i++) {
             this.st_walk_node(prog.statements[i]);
         }
     }
 
-    st_walk_node(mut &this, node: ASTNode*) -> void {
+    st_walk_node(mut &this, node: node::ASTNode*) -> void {
         if (node == null) { return; }
 
         // Declarations
-        if (node.kind == NodeKind::FunctionDeclaration) {
-            this.walk_function_decl(node as FunctionDeclNode*);
+        if (node.kind == ast::NodeKind::FunctionDeclaration) {
+            this.walk_function_decl(node as declaration::FunctionDeclNode*);
             return;
         }
-        if (node.kind == NodeKind::MethodDeclaration) {
-            this.walk_method_decl(node as MethodNode*);
+        if (node.kind == ast::NodeKind::MethodDeclaration) {
+            this.walk_method_decl(node as declaration::MethodNode*);
             return;
         }
-        if (node.kind == NodeKind::StructDeclaration) {
-            this.walk_struct_decl(node as StructDeclNode*);
+        if (node.kind == ast::NodeKind::StructDeclaration) {
+            this.walk_struct_decl(node as declaration::StructDeclNode*);
             return;
         }
-        if (node.kind == NodeKind::ClassDeclaration) {
-            this.walk_class_decl(node as ClassDeclNode*);
+        if (node.kind == ast::NodeKind::ClassDeclaration) {
+            this.walk_class_decl(node as declaration::ClassDeclNode*);
             return;
         }
-        if (node.kind == NodeKind::EnumDeclaration) {
-            this.walk_enum_decl(node as EnumDeclNode*);
+        if (node.kind == ast::NodeKind::EnumDeclaration) {
+            this.walk_enum_decl(node as declaration::EnumDeclNode*);
             return;
         }
-        if (node.kind == NodeKind::TraitDeclaration) {
-            this.walk_trait_decl(node as TraitDeclNode*);
+        if (node.kind == ast::NodeKind::TraitDeclaration) {
+            this.walk_trait_decl(node as declaration::TraitDeclNode*);
             return;
         }
-        if (node.kind == NodeKind::TypeAliasDeclaration) {
-            this.walk_typealias_decl(node as TypeAliasDeclNode*);
+        if (node.kind == ast::NodeKind::TypeAliasDeclaration) {
+            this.walk_typealias_decl(node as declaration::TypeAliasDeclNode*);
             return;
         }
-        if (node.kind == NodeKind::ImplementationBlock) {
-            this.walk_impl_block(node as ImplBlockNode*);
+        if (node.kind == ast::NodeKind::ImplementationBlock) {
+            this.walk_impl_block(node as declaration::ImplBlockNode*);
             return;
         }
-        if (node.kind == NodeKind::ExternBlock) {
-            this.walk_extern_block(node as ExternBlockNode*);
+        if (node.kind == ast::NodeKind::ExternBlock) {
+            this.walk_extern_block(node as declaration::ExternBlockNode*);
             return;
         }
-        if (node.kind == NodeKind::VariableDeclaration) {
-            this.walk_var_decl(node as VarDeclNode*, false);
+        if (node.kind == ast::NodeKind::VariableDeclaration) {
+            this.walk_var_decl(node as declaration::VarDeclNode*, false);
             return;
         }
-        if (node.kind == NodeKind::FieldDeclaration) {
-            this.walk_field_decl(node as FieldDeclNode*);
+        if (node.kind == ast::NodeKind::FieldDeclaration) {
+            this.walk_field_decl(node as declaration::FieldDeclNode*);
             return;
         }
-        if (node.kind == NodeKind::EnumVariant) {
-            this.walk_enum_variant(node as EnumVariantNode*);
+        if (node.kind == ast::NodeKind::EnumVariant) {
+            this.walk_enum_variant(node as declaration::EnumVariantNode*);
             return;
         }
-        if (node.kind == NodeKind::ImportDeclaration) {
-            this.walk_import_decl(node as ImportDeclNode*);
+        if (node.kind == ast::NodeKind::ImportDeclaration) {
+            this.walk_import_decl(node as declaration::ImportDeclNode*);
             return;
         }
-        if (node.kind == NodeKind::ModuleDeclaration) {
-            this.walk_module_decl(node as ModuleDeclNode*);
+        if (node.kind == ast::NodeKind::ModuleDeclaration) {
+            this.walk_module_decl(node as declaration::ModuleDeclNode*);
             return;
         }
-        if (node.kind == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = node as DeclStmtNode*;
-            this.st_walk_node(ds.declaration as ASTNode*);
+        if (node.kind == ast::NodeKind::DeclarationStatement) {
+            const ds: statement::DeclStmtNode* = node as statement::DeclStmtNode*;
+            this.st_walk_node(ds.declaration as node::ASTNode*);
             return;
         }
 
         // Statements
-        if (node.kind == NodeKind::BlockStatement) {
-            const blk: BlockStmtNode* = node as BlockStmtNode*;
+        if (node.kind == ast::NodeKind::BlockStatement) {
+            const blk: statement::BlockStmtNode* = node as statement::BlockStmtNode*;
             for (mut i: i64 = 0; i < blk.statements.length; i++) {
-                this.st_walk_node(blk.statements[i] as ASTNode*);
+                this.st_walk_node(blk.statements[i] as node::ASTNode*);
             }
             return;
         }
-        if (node.kind == NodeKind::UnsafeBlockStatement) {
-            const us: UnsafeBlockStmtNode* = node as UnsafeBlockStmtNode*;
-            this.st_walk_node(us.block as ASTNode*);
+        if (node.kind == ast::NodeKind::UnsafeBlockStatement) {
+            const us: statement::UnsafeBlockStmtNode* = node as statement::UnsafeBlockStmtNode*;
+            this.st_walk_node(us.block as node::ASTNode*);
             return;
         }
-        if (node.kind == NodeKind::AsmBlockStatement) {
-            this.walk_asm_block(node as AsmBlockStmtNode*);
+        if (node.kind == ast::NodeKind::AsmBlockStatement) {
+            this.walk_asm_block(node as statement::AsmBlockStmtNode*);
             return;
         }
-        if (node.kind == NodeKind::ReturnStatement) {
-            const rs: ReturnStmtNode* = node as ReturnStmtNode*;
+        if (node.kind == ast::NodeKind::ReturnStatement) {
+            const rs: statement::ReturnStmtNode* = node as statement::ReturnStmtNode*;
             this.walk_expr(rs.expression);
             return;
         }
-        if (node.kind == NodeKind::IfStatement) {
-            const is: IfStmtNode* = node as IfStmtNode*;
+        if (node.kind == ast::NodeKind::IfStatement) {
+            const is: statement::IfStmtNode* = node as statement::IfStmtNode*;
             this.walk_expr(is.condition);
-            this.st_walk_node(is.then_stmt as ASTNode*);
-            this.st_walk_node(is.else_stmt as ASTNode*);
+            this.st_walk_node(is.then_stmt as node::ASTNode*);
+            this.st_walk_node(is.else_stmt as node::ASTNode*);
             return;
         }
-        if (node.kind == NodeKind::WhileStatement) {
-            const ws: WhileStmtNode* = node as WhileStmtNode*;
+        if (node.kind == ast::NodeKind::WhileStatement) {
+            const ws: statement::WhileStmtNode* = node as statement::WhileStmtNode*;
             this.walk_expr(ws.condition);
-            this.st_walk_node(ws.body as ASTNode*);
+            this.st_walk_node(ws.body as node::ASTNode*);
             return;
         }
-        if (node.kind == NodeKind::DoWhileStatement) {
-            const ds: DoWhileStmtNode* = node as DoWhileStmtNode*;
-            this.st_walk_node(ds.body as ASTNode*);
+        if (node.kind == ast::NodeKind::DoWhileStatement) {
+            const ds: statement::DoWhileStmtNode* = node as statement::DoWhileStmtNode*;
+            this.st_walk_node(ds.body as node::ASTNode*);
             this.walk_expr(ds.condition);
             return;
         }
-        if (node.kind == NodeKind::ForStatement) {
-            const fs: ForStmtNode* = node as ForStmtNode*;
+        if (node.kind == ast::NodeKind::ForStatement) {
+            const fs: statement::ForStmtNode* = node as statement::ForStmtNode*;
             this.st_walk_node(fs.init);
             this.walk_expr(fs.condition);
             this.walk_expr(fs.update);
-            this.st_walk_node(fs.body as ASTNode*);
+            this.st_walk_node(fs.body as node::ASTNode*);
             return;
         }
-        if (node.kind == NodeKind::LoopStatement) {
-            const ls: LoopStmtNode* = node as LoopStmtNode*;
-            this.st_walk_node(ls.body as ASTNode*);
+        if (node.kind == ast::NodeKind::LoopStatement) {
+            const ls: statement::LoopStmtNode* = node as statement::LoopStmtNode*;
+            this.st_walk_node(ls.body as node::ASTNode*);
             return;
         }
-        if (node.kind == NodeKind::MatchStatement) {
-            const ms: MatchStmtNode* = node as MatchStmtNode*;
+        if (node.kind == ast::NodeKind::MatchStatement) {
+            const ms: statement::MatchStmtNode* = node as statement::MatchStmtNode*;
             this.walk_expr(ms.subject);
             for (mut i: i64 = 0; i < ms.arms.length; i++) {
                 this.walk_match_arm(ms.arms[i]);
             }
             return;
         }
-        if (node.kind == NodeKind::ExpressionStatement) {
-            const es: ExprStmtNode* = node as ExprStmtNode*;
+        if (node.kind == ast::NodeKind::ExpressionStatement) {
+            const es: statement::ExprStmtNode* = node as statement::ExprStmtNode*;
             this.walk_expr(es.expression);
             return;
         }
@@ -325,13 +293,13 @@ type struct SemanticTokenizer {
         // Expressions reaching the top-level walker (rare - usually they
         // come in via walk_expr from a containing statement).  Forward to
         // the expression walker.
-        this.walk_expr(node as ExpressionNode*);
+        this.walk_expr(node as expression::ExpressionNode*);
     }
 
 
     // Declaration walkers
 
-    walk_function_decl(mut &this, f: FunctionDeclNode*) -> void {
+    walk_function_decl(mut &this, f: declaration::FunctionDeclNode*) -> void {
         if (f == null) { return; }
         if (f.has_name_span()) {
             this.emit_span(f.name_span, lsp::protocol::semantic_tokens::TYPE_FUNCTION,
@@ -344,12 +312,12 @@ type struct SemanticTokenizer {
         // Return-type annotation
         this.walk_type_annotation(f.return_type_annotation);
         // Body
-        this.st_walk_node(f.body as ASTNode*);
+        this.st_walk_node(f.body as node::ASTNode*);
     }
 
-    walk_method_decl(mut &this, m: MethodNode*) -> void {
+    walk_method_decl(mut &this, m: declaration::MethodNode*) -> void {
         if (m == null || m.func == null) { return; }
-        const f: FunctionDeclNode* = m.func;
+        const f: declaration::FunctionDeclNode* = m.func;
         if (f.has_name_span()) {
             // The method name span - this is where `from` / `new` / `delete`
             // are coloured `method` instead of `keyword`, because we know
@@ -367,7 +335,7 @@ type struct SemanticTokenizer {
             this.walk_var_decl(f.parameters[i], true);
         }
         this.walk_type_annotation(f.return_type_annotation);
-        this.st_walk_node(f.body as ASTNode*);
+        this.st_walk_node(f.body as node::ASTNode*);
     }
 
     /// True when `name` resolves to a compiler-synthesized closure struct
@@ -379,7 +347,7 @@ type struct SemanticTokenizer {
     /// across the whole `move (...) -> ... { ... }` expression, and dedup_overlapping
     /// then drops the real narrow tokens in favour of that wide one - flooding the
     /// line with a single colour.  Skip the subtree entirely.
-    is_synthesized_closure_name(&this, name: SymbolStr) -> boolean {
+    is_synthesized_closure_name(&this, name: symbol_str::SymbolStr) -> boolean {
         if (this.intern == null || !name.is_valid()) { return false; }
         const hay: string = this.intern.resolve(name);
         if (hay == null) { return false; }
@@ -397,7 +365,7 @@ type struct SemanticTokenizer {
         return false;
     }
 
-    walk_struct_decl(mut &this, s: StructDeclNode*) -> void {
+    walk_struct_decl(mut &this, s: declaration::StructDeclNode*) -> void {
         if (s == null) { return; }
         // Compiler-synthesized closure structs aren't user source; their nodes
         // carry the lambda's span and would flood the line (see helper above).
@@ -414,7 +382,7 @@ type struct SemanticTokenizer {
         }
     }
 
-    walk_class_decl(mut &this, c: ClassDeclNode*) -> void {
+    walk_class_decl(mut &this, c: declaration::ClassDeclNode*) -> void {
         if (c == null) { return; }
         if (c.has_name_span()) {
             this.emit_span(c.name_span, lsp::protocol::semantic_tokens::TYPE_CLASS,
@@ -428,7 +396,7 @@ type struct SemanticTokenizer {
         }
     }
 
-    walk_enum_decl(mut &this, e: EnumDeclNode*) -> void {
+    walk_enum_decl(mut &this, e: declaration::EnumDeclNode*) -> void {
         if (e == null) { return; }
         if (e.has_name_span()) {
             this.emit_span(e.name_span, lsp::protocol::semantic_tokens::TYPE_ENUM,
@@ -439,7 +407,7 @@ type struct SemanticTokenizer {
         }
     }
 
-    walk_trait_decl(mut &this, t: TraitDeclNode*) -> void {
+    walk_trait_decl(mut &this, t: declaration::TraitDeclNode*) -> void {
         if (t == null) { return; }
         if (t.has_name_span()) {
             this.emit_span(t.name_span, lsp::protocol::semantic_tokens::TYPE_INTERFACE,
@@ -448,7 +416,7 @@ type struct SemanticTokenizer {
         for (mut i: i64 = 0; i < t.methods.length; i++) {
             // Trait methods are FunctionDeclNode in the AST but represent
             // methods semantically - colour them as methods.
-            const fn: FunctionDeclNode* = t.methods[i];
+            const fn: declaration::FunctionDeclNode* = t.methods[i];
             if (fn != null && fn.has_name_span()) {
                 this.emit_span(fn.name_span,
                                lsp::protocol::semantic_tokens::TYPE_METHOD,
@@ -459,12 +427,12 @@ type struct SemanticTokenizer {
                     this.walk_var_decl(fn.parameters[j], true);
                 }
                 this.walk_type_annotation(fn.return_type_annotation);
-                this.st_walk_node(fn.body as ASTNode*);
+                this.st_walk_node(fn.body as node::ASTNode*);
             }
         }
     }
 
-    walk_typealias_decl(mut &this, t: TypeAliasDeclNode*) -> void {
+    walk_typealias_decl(mut &this, t: declaration::TypeAliasDeclNode*) -> void {
         if (t == null) { return; }
         if (t.has_name_span()) {
             this.emit_span(t.name_span, lsp::protocol::semantic_tokens::TYPE_TYPE,
@@ -473,7 +441,7 @@ type struct SemanticTokenizer {
         this.walk_type_annotation(t.target_annotation);
     }
 
-    walk_impl_block(mut &this, b: ImplBlockNode*) -> void {
+    walk_impl_block(mut &this, b: declaration::ImplBlockNode*) -> void {
         if (b == null) { return; }
         if (b.target_type_span.has_location()) {
             this.emit_span(b.target_type_span,
@@ -496,10 +464,10 @@ type struct SemanticTokenizer {
     /// `as Alias` identifier have no per-name span on the node, so they're left
     /// to the TextMate grammar (their lexemes are user identifiers / types, not
     /// keywords, so no mis-colouring results).
-    walk_import_decl(mut &this, imp: ImportDeclNode*) -> void {
+    walk_import_decl(mut &this, imp: declaration::ImportDeclNode*) -> void {
         if (imp == null) { return; }
         for (mut i: i64 = 0; i < imp.path_segment_spans.length; i++) {
-            const sp: SourceSpan = imp.path_segment_spans[i];
+            const sp: source_span::SourceSpan = imp.path_segment_spans[i];
             if (sp.has_location()) {
                 this.emit_span(sp,
                                lsp::protocol::semantic_tokens::TYPE_NAMESPACE,
@@ -511,10 +479,10 @@ type struct SemanticTokenizer {
     /// `namespace X::Y::default;` / `public module A::B;` - same segment-level
     /// `namespace` overlay as `walk_import_decl`, so a keyword-lexeme segment in
     /// a namespace/module declaration doesn't render as a keyword.
-    walk_module_decl(mut &this, m: ModuleDeclNode*) -> void {
+    walk_module_decl(mut &this, m: declaration::ModuleDeclNode*) -> void {
         if (m == null) { return; }
         for (mut i: i64 = 0; i < m.path_segment_spans.length; i++) {
-            const sp: SourceSpan = m.path_segment_spans[i];
+            const sp: source_span::SourceSpan = m.path_segment_spans[i];
             if (sp.has_location()) {
                 this.emit_span(sp,
                                lsp::protocol::semantic_tokens::TYPE_NAMESPACE,
@@ -523,14 +491,14 @@ type struct SemanticTokenizer {
         }
     }
 
-    walk_extern_block(mut &this, e: ExternBlockNode*) -> void {
+    walk_extern_block(mut &this, e: declaration::ExternBlockNode*) -> void {
         if (e == null) { return; }
         for (mut i: i64 = 0; i < e.functions.length; i++) {
             this.walk_function_decl(e.functions[i]);
         }
     }
 
-    walk_var_decl(mut &this, v: VarDeclNode*, is_parameter: boolean) -> void {
+    walk_var_decl(mut &this, v: declaration::VarDeclNode*, is_parameter: boolean) -> void {
         if (v == null) { return; }
         const is_receiver: boolean = this.is_receiver_name(v.name);
         // Receiver parameters (`&this`, `mut &this`, `this`, ...) keep the
@@ -564,7 +532,7 @@ type struct SemanticTokenizer {
     /// parser stamps for the implicit-self argument:
     /// `this`, `&this`, `mut &this`, `&mut this`.  Symbol comparison is
     /// O(1) because the SymbolStrs were pre-interned in the constructor.
-    is_receiver_name(&this, name: SymbolStr) -> boolean {
+    is_receiver_name(&this, name: symbol_str::SymbolStr) -> boolean {
         if (!name.is_valid()) { return false; }
         if (this.sym_this.is_valid()         && name.equals(this.sym_this))         { return true; }
         if (this.sym_amp_this.is_valid()     && name.equals(this.sym_amp_this))     { return true; }
@@ -573,7 +541,7 @@ type struct SemanticTokenizer {
         return false;
     }
 
-    walk_field_decl(mut &this, f: FieldDeclNode*) -> void {
+    walk_field_decl(mut &this, f: declaration::FieldDeclNode*) -> void {
         if (f == null) { return; }
         if (f.has_name_span()) {
             this.emit_span(f.name_span, lsp::protocol::semantic_tokens::TYPE_PROPERTY,
@@ -583,14 +551,14 @@ type struct SemanticTokenizer {
         this.walk_expr(f.default_value);
     }
 
-    walk_field_type_annotation(mut &this, f: FieldDeclNode*) -> void {
+    walk_field_type_annotation(mut &this, f: declaration::FieldDeclNode*) -> void {
         // FieldDeclNode owns a `type_annotation: TypeAnnotation*`; walk it
         // via the shared TypeAnnotation walker so generic args inside the
         // annotation also receive type tokens.
         this.walk_type_annotation(f.type_annotation);
     }
 
-    walk_enum_variant(mut &this, v: EnumVariantNode*) -> void {
+    walk_enum_variant(mut &this, v: declaration::EnumVariantNode*) -> void {
         if (v == null) { return; }
         if (v.has_name_span()) {
             this.emit_span(v.name_span,
@@ -605,11 +573,11 @@ type struct SemanticTokenizer {
 
     // Expression walker
 
-    walk_expr(mut &this, e: ExpressionNode*) -> void {
+    walk_expr(mut &this, e: expression::ExpressionNode*) -> void {
         if (e == null) { return; }
 
-        if (e.kind == NodeKind::Identifier) {
-            const id: IdentifierNode* = e as IdentifierNode*;
+        if (e.kind == ast::NodeKind::Identifier) {
+            const id: expression::IdentifierNode* = e as expression::IdentifierNode*;
             // `this` in expression position is parsed as an IdentifierNode
             // (expr_parser.cryo:317) with name "this".  Skip the
             // `variable` overlay so the TextMate grammar's keyword colour
@@ -622,120 +590,120 @@ type struct SemanticTokenizer {
             }
             return;
         }
-        if (e.kind == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = e as BinaryExprNode*;
+        if (e.kind == ast::NodeKind::BinaryExpression) {
+            const b: expression::BinaryExprNode* = e as expression::BinaryExprNode*;
             this.walk_expr(b.left);
             this.walk_expr(b.right);
             return;
         }
-        if (e.kind == NodeKind::UnaryExpression) {
-            const u: UnaryExprNode* = e as UnaryExprNode*;
+        if (e.kind == ast::NodeKind::UnaryExpression) {
+            const u: expression::UnaryExprNode* = e as expression::UnaryExprNode*;
             this.walk_expr(u.operand);
             return;
         }
-        if (e.kind == NodeKind::TernaryExpression) {
-            const t: TernaryExprNode* = e as TernaryExprNode*;
+        if (e.kind == ast::NodeKind::TernaryExpression) {
+            const t: expression::TernaryExprNode* = e as expression::TernaryExprNode*;
             this.walk_expr(t.condition);
             this.walk_expr(t.true_expr);
             this.walk_expr(t.false_expr);
             return;
         }
-        if (e.kind == NodeKind::IfExpression) {
-            const ie: IfExprNode* = e as IfExprNode*;
+        if (e.kind == ast::NodeKind::IfExpression) {
+            const ie: expression::IfExprNode* = e as expression::IfExprNode*;
             this.walk_expr(ie.condition);
             this.walk_expr(ie.then_expr);
             this.walk_expr(ie.else_expr);
             return;
         }
-        if (e.kind == NodeKind::MatchExpression) {
-            const me: MatchExprNode* = e as MatchExprNode*;
+        if (e.kind == ast::NodeKind::MatchExpression) {
+            const me: expression::MatchExprNode* = e as expression::MatchExprNode*;
             this.walk_expr(me.subject);
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 this.walk_match_arm(me.arms[i]);
             }
             return;
         }
-        if (e.kind == NodeKind::CallExpression) {
-            this.walk_call_expr(e as CallExprNode*);
+        if (e.kind == ast::NodeKind::CallExpression) {
+            this.walk_call_expr(e as expression::CallExprNode*);
             return;
         }
-        if (e.kind == NodeKind::NewExpression) {
-            this.walk_new_expr(e as NewExprNode*);
+        if (e.kind == ast::NodeKind::NewExpression) {
+            this.walk_new_expr(e as expression::NewExprNode*);
             return;
         }
-        if (e.kind == NodeKind::CastExpression) {
+        if (e.kind == ast::NodeKind::CastExpression) {
             // `expr as Type` - walk the operand and paint the target type
             // name.  Without this the operand's identifiers get no semantic
             // token and fall back to the TextMate grammar.
-            const ce: CastExprNode* = e as CastExprNode*;
+            const ce: expression::CastExprNode* = e as expression::CastExprNode*;
             this.walk_expr(ce.expression);
             this.walk_type_annotation(ce.target_annotation);
             return;
         }
-        if (e.kind == NodeKind::TryExpression) {
+        if (e.kind == ast::NodeKind::TryExpression) {
             // `expr?` - descend into the operand.  Missing this branch left
             // every identifier under a `?` (e.g. the `INITIAL_BUCKETS` arg in
             // `this.resize_buckets(INITIAL_BUCKETS)?`) with no semantic token,
             // so the TextMate grammar's uppercase-as-type rule mis-painted
             // constants green.
-            const te: TryExprNode* = e as TryExprNode*;
+            const te: expression::TryExprNode* = e as expression::TryExprNode*;
             this.walk_expr(te.operand);
             return;
         }
-        if (e.kind == NodeKind::AwaitExpression) {
-            const ae: AwaitExprNode* = e as AwaitExprNode*;
+        if (e.kind == ast::NodeKind::AwaitExpression) {
+            const ae: expression::AwaitExprNode* = e as expression::AwaitExprNode*;
             this.walk_expr(ae.operand);
             return;
         }
-        if (e.kind == NodeKind::YieldExpression) {
-            const ye: YieldExprNode* = e as YieldExprNode*;
+        if (e.kind == ast::NodeKind::YieldExpression) {
+            const ye: expression::YieldExprNode* = e as expression::YieldExprNode*;
             this.walk_expr(ye.operand);
             return;
         }
-        if (e.kind == NodeKind::StructLiteral) {
-            this.walk_struct_literal(e as StructLiteralNode*);
+        if (e.kind == ast::NodeKind::StructLiteral) {
+            this.walk_struct_literal(e as expression::StructLiteralNode*);
             return;
         }
-        if (e.kind == NodeKind::ArrayLiteral) {
-            const a: ArrayLiteralNode* = e as ArrayLiteralNode*;
+        if (e.kind == ast::NodeKind::ArrayLiteral) {
+            const a: expression::ArrayLiteralNode* = e as expression::ArrayLiteralNode*;
             for (mut i: i64 = 0; i < a.elements.length; i++) {
                 this.walk_expr(a.elements[i]);
             }
             this.walk_expr(a.repeat_count_expr);
             return;
         }
-        if (e.kind == NodeKind::TupleLiteral) {
-            const t: TupleLiteralNode* = e as TupleLiteralNode*;
+        if (e.kind == ast::NodeKind::TupleLiteral) {
+            const t: expression::TupleLiteralNode* = e as expression::TupleLiteralNode*;
             for (mut i: i64 = 0; i < t.elements.length; i++) {
                 this.walk_expr(t.elements[i]);
             }
             return;
         }
-        if (e.kind == NodeKind::LambdaExpression) {
-            const l: LambdaExprNode* = e as LambdaExprNode*;
+        if (e.kind == ast::NodeKind::LambdaExpression) {
+            const l: expression::LambdaExprNode* = e as expression::LambdaExprNode*;
             for (mut i: i64 = 0; i < l.parameters.length; i++) {
                 this.walk_var_decl(l.parameters[i], true);
             }
             this.walk_type_annotation(l.return_type_ann);
-            this.st_walk_node(l.body as ASTNode*);
+            this.st_walk_node(l.body as node::ASTNode*);
             return;
         }
-        if (e.kind == NodeKind::ArrayAccess) {
-            const aa: ArrayAccessNode* = e as ArrayAccessNode*;
+        if (e.kind == ast::NodeKind::ArrayAccess) {
+            const aa: expression::ArrayAccessNode* = e as expression::ArrayAccessNode*;
             this.walk_expr(aa.array);
             this.walk_expr(aa.index);
             return;
         }
-        if (e.kind == NodeKind::MemberAccess) {
-            this.walk_member_access(e as MemberAccessNode*, false);
+        if (e.kind == ast::NodeKind::MemberAccess) {
+            this.walk_member_access(e as expression::MemberAccessNode*, false);
             return;
         }
-        if (e.kind == NodeKind::ScopeResolution) {
-            this.walk_scope_resolution(e as ScopeResolutionNode*, false);
+        if (e.kind == ast::NodeKind::ScopeResolution) {
+            this.walk_scope_resolution(e as expression::ScopeResolutionNode*, false);
             return;
         }
-        if (e.kind == NodeKind::DeleteExpression) {
-            const de: DeleteExprNode* = e as DeleteExprNode*;
+        if (e.kind == ast::NodeKind::DeleteExpression) {
+            const de: expression::DeleteExprNode* = e as expression::DeleteExprNode*;
             this.walk_expr(de.operand);
             return;
         }
@@ -754,10 +722,10 @@ type struct SemanticTokenizer {
     /// outermost call by callee name and skip the entire subtree, leaving the
     /// f-string to the TextMate grammar's interpolation rule (which colours the
     /// literal parts as a string and the `{...}` holes as embedded code).
-    is_fstring_runtime_call(&this, c: CallExprNode*) -> boolean {
+    is_fstring_runtime_call(&this, c: expression::CallExprNode*) -> boolean {
         if (c == null || c.callee == null || this.intern == null) { return false; }
-        if (c.callee.kind != NodeKind::Identifier) { return false; }
-        const id: IdentifierNode* = c.callee as IdentifierNode*;
+        if (c.callee.kind != ast::NodeKind::Identifier) { return false; }
+        const id: expression::IdentifierNode* = c.callee as expression::IdentifierNode*;
         if (!id.name.is_valid()) { return false; }
         const name: string = this.intern.resolve(id.name);
         if (name == null) { return false; }
@@ -767,7 +735,7 @@ type struct SemanticTokenizer {
             || libc::strcmp(name, "fmt_append_debug") == 0;
     }
 
-    walk_call_expr(mut &this, c: CallExprNode*) -> void {
+    walk_call_expr(mut &this, c: expression::CallExprNode*) -> void {
         if (c == null) { return; }
         // f-string desugar: skip the whole subtree (see helper above).  The
         // TextMate grammar handles f-string colouring.
@@ -791,8 +759,8 @@ type struct SemanticTokenizer {
         // callee name should be `function` or `method`, not `variable` or
         // `property`.
         if (c.callee != null) {
-            if (c.callee.kind == NodeKind::Identifier) {
-                const id: IdentifierNode* = c.callee as IdentifierNode*;
+            if (c.callee.kind == ast::NodeKind::Identifier) {
+                const id: expression::IdentifierNode* = c.callee as expression::IdentifierNode*;
                 // Don't overlay `function` on a bare `this` call site -
                 // the AST shape `this(args)` is unusual but parses
                 // legally and would otherwise paint over the keyword.
@@ -801,10 +769,10 @@ type struct SemanticTokenizer {
                                    lsp::protocol::semantic_tokens::TYPE_FUNCTION,
                                    lsp::protocol::semantic_tokens::MOD_NONE);
                 }
-            } else if (c.callee.kind == NodeKind::MemberAccess) {
-                this.walk_member_access(c.callee as MemberAccessNode*, true);
-            } else if (c.callee.kind == NodeKind::ScopeResolution) {
-                this.walk_scope_resolution(c.callee as ScopeResolutionNode*, true);
+            } else if (c.callee.kind == ast::NodeKind::MemberAccess) {
+                this.walk_member_access(c.callee as expression::MemberAccessNode*, true);
+            } else if (c.callee.kind == ast::NodeKind::ScopeResolution) {
+                this.walk_scope_resolution(c.callee as expression::ScopeResolutionNode*, true);
             } else {
                 this.walk_expr(c.callee);
             }
@@ -817,7 +785,7 @@ type struct SemanticTokenizer {
         }
     }
 
-    walk_new_expr(mut &this, n: NewExprNode*) -> void {
+    walk_new_expr(mut &this, n: expression::NewExprNode*) -> void {
         if (n == null) { return; }
         // NewExprNode doesn't carry a separate span for the type name;
         // the full `new TypeName(...)` span starts at `new`.  Skip
@@ -835,13 +803,13 @@ type struct SemanticTokenizer {
         }
     }
 
-    walk_struct_literal(mut &this, s: StructLiteralNode*) -> void {
+    walk_struct_literal(mut &this, s: expression::StructLiteralNode*) -> void {
         if (s == null) { return; }
         for (mut i: i64 = 0; i < s.generic_args.length; i++) {
             this.walk_type_annotation(s.generic_args[i]);
         }
         for (mut i: i64 = 0; i < s.field_inits.length; i++) {
-            const fi: FieldInit = s.field_inits[i];
+            const fi: expression::FieldInit = s.field_inits[i];
             // FieldInit's span covers the whole `name: value` source range.
             // Emitting `property` over that range overlaps the value tokens
             // (numbers, strings, etc.), and the LSP semantic-tokens client
@@ -854,7 +822,7 @@ type struct SemanticTokenizer {
                 const name_str: string = this.intern.resolve(fi.field_name);
                 const name_len: u32 = libc::strlen(name_str) as u32;
                 if (name_len > 0 as u32) {
-                    const name_span: SourceSpan = SourceSpan::new(
+                    const name_span: source_span::SourceSpan = source_span::SourceSpan::new(
                         fi.span.file,
                         fi.span.start_line,
                         fi.span.start_col,
@@ -869,7 +837,7 @@ type struct SemanticTokenizer {
         }
     }
 
-    walk_member_access(mut &this, m: MemberAccessNode*, is_callee: boolean) -> void {
+    walk_member_access(mut &this, m: expression::MemberAccessNode*, is_callee: boolean) -> void {
         if (m == null) { return; }
         this.walk_expr(m.object);
         if (m.member_span.has_location()) {
@@ -886,7 +854,7 @@ type struct SemanticTokenizer {
         }
     }
 
-    walk_scope_resolution(mut &this, s: ScopeResolutionNode*, is_callee: boolean) -> void {
+    walk_scope_resolution(mut &this, s: expression::ScopeResolutionNode*, is_callee: boolean) -> void {
         if (s == null) { return; }
         // ScopeResolutionNode doesn't store separate spans for `scope_name`
         // and `member_name`; only the combined `span` over `Scope::Member`.
@@ -900,7 +868,7 @@ type struct SemanticTokenizer {
             const scope_str: string = this.intern.resolve(s.scope_name);
             const scope_len: u32 = libc::strlen(scope_str) as u32;
             if (scope_len > 0 as u32 && !s.scope_name.is_empty()) {
-                const scope_span: SourceSpan = SourceSpan::new(
+                const scope_span: source_span::SourceSpan = source_span::SourceSpan::new(
                     s.span.file,
                     s.span.start_line,
                     s.span.start_col,
@@ -929,7 +897,7 @@ type struct SemanticTokenizer {
                 } else {
                     lsp::protocol::semantic_tokens::TYPE_ENUM_MEMBER
                 };
-                const member_span: SourceSpan = SourceSpan::new(
+                const member_span: source_span::SourceSpan = source_span::SourceSpan::new(
                     s.span.file,
                     s.span.end_line,
                     s.span.end_col - member_len,
@@ -948,70 +916,70 @@ type struct SemanticTokenizer {
         }
     }
 
-    walk_match_arm(mut &this, arm: MatchArmNode*) -> void {
+    walk_match_arm(mut &this, arm: pattern::MatchArmNode*) -> void {
         if (arm == null) { return; }
-        this.st_walk_node(arm.body as ASTNode*);
+        this.st_walk_node(arm.body as node::ASTNode*);
     }
 
 
     // Type-annotation walker - emits `type` tokens for named annotations
 
-    walk_type_annotation(mut &this, ann: TypeAnnotation*) -> void {
+    walk_type_annotation(mut &this, ann: ast::TypeAnnotation*) -> void {
         if (ann == null) { return; }
         match (*ann) {
-            TypeAnnotation::Primitive(p) => {
+            ast::TypeAnnotation::Primitive(p) => {
                 // Primitives (`i32`, `bool`, ...) are TextMate-coloured as
                 // types already; emitting again here would double-paint.
                 // Skip.
             }
-            TypeAnnotation::Named(n) => {
+            ast::TypeAnnotation::Named(n) => {
                 if (n.span.has_location()) {
                     this.emit_span(n.span,
                                    lsp::protocol::semantic_tokens::TYPE_TYPE,
                                    lsp::protocol::semantic_tokens::MOD_NONE);
                 }
             }
-            TypeAnnotation::Pointer(p) => {
+            ast::TypeAnnotation::Pointer(p) => {
                 this.walk_type_annotation(p.inner);
             }
-            TypeAnnotation::Reference(r) => {
+            ast::TypeAnnotation::Reference(r) => {
                 this.walk_type_annotation(r.inner);
             }
-            TypeAnnotation::Array(a) => {
+            ast::TypeAnnotation::Array(a) => {
                 this.walk_type_annotation(a.element);
             }
-            TypeAnnotation::Function(f) => {
+            ast::TypeAnnotation::Function(f) => {
                 for (mut i: i64 = 0; i < f.parameters.length; i++) {
                     this.walk_type_annotation(f.parameters[i]);
                 }
                 this.walk_type_annotation(f.return_type);
             }
-            TypeAnnotation::Tuple(t) => {
+            ast::TypeAnnotation::Tuple(t) => {
                 for (mut i: i64 = 0; i < t.elements.length; i++) {
                     this.walk_type_annotation(t.elements[i]);
                 }
             }
-            TypeAnnotation::Generic(g) => {
+            ast::TypeAnnotation::Generic(g) => {
                 this.walk_type_annotation(g.base);
                 for (mut i: i64 = 0; i < g.args.length; i++) {
                     this.walk_type_annotation(g.args[i]);
                 }
             }
-            TypeAnnotation::ThisType(_) => {
+            ast::TypeAnnotation::ThisType(_) => {
                 // The `This` placeholder is highlighted by the TextMate
                 // `keyword.other.cryo` rule.  No override needed.
             }
-            TypeAnnotation::Typeof(t) => {
+            ast::TypeAnnotation::Typeof(t) => {
                 // `typeof(expr)` wraps an expression, not a nested type
                 // annotation, so there is nothing to recurse into here; the
                 // operand is highlighted by the expression walker.
             }
-            TypeAnnotation::ImplTrait(i) => {
+            ast::TypeAnnotation::ImplTrait(i) => {
                 for (mut j: i64 = 0; j < i.bounds.length; j++) {
                     this.walk_type_annotation(i.bounds[j]);
                 }
             }
-            TypeAnnotation::Projection(p) => { /* TODO */ }
+            ast::TypeAnnotation::Projection(p) => { /* TODO */ }
         }
     }
 
@@ -1030,7 +998,7 @@ type struct SemanticTokenizer {
     /// out of a parse failure or a lagged recompile, which would otherwise
     /// paint at the wrong place after the user inserts a newline or shrinks
     /// a line.
-    emit_span(mut &this, span: SourceSpan, type_id: u32, modifiers: u32) -> void {
+    emit_span(mut &this, span: source_span::SourceSpan, type_id: u32, modifiers: u32) -> void {
         if (!span.has_location()) { return; }
         if (span.start_line == 0 as u32) { return; }
         // Reject spans whose source file isn't the one we're currently
@@ -1133,17 +1101,17 @@ type struct SemanticTokenizer {
         this.tokens.push(SemanticToken::new(line0, start_char, length, type_id, modifiers));
     }
 
-    walk_asm_block(mut &this, node: AsmBlockStmtNode*) -> void {
+    walk_asm_block(mut &this, node: statement::AsmBlockStmtNode*) -> void {
         if (node == null) { return; }
         // `${expr}` operands are real Cryo code - colour (and hover) them
         // through the normal expression walker.
         for (mut oi: i64 = 0; oi < node.operands.length; oi++) {
-            const op: AsmOperand* = node.operands[oi];
+            const op: statement::AsmOperand* = node.operands[oi];
             if (op != null) { this.walk_expr(op.expr); }
         }
         // Body colouring re-scans the source; it needs the live buffer.
         if (this.line_index == null || this.doc_text == "") { return; }
-        const span: SourceSpan = node.span;
+        const span: source_span::SourceSpan = node.span;
         if (!span.has_location()) { return; }
         if (span.start_line == 0 as u32) { return; }
         // Same cross-file guard as emit_span: monomorphization can graft
@@ -1153,8 +1121,8 @@ type struct SemanticTokenizer {
             return;
         }
         const intel: boolean = match (node.dialect) {
-            AsmDialect::Intel => { true }
-            AsmDialect::ATT   => { false }
+            statement::AsmDialect::Intel => { true }
+            statement::AsmDialect::ATT   => { false }
         };
         mut ln: u32 = span.start_line - 1 as u32;                 // 0-based
         const last: u32 = if (span.end_line >= span.start_line) {
@@ -1580,13 +1548,13 @@ type struct SemanticTokenizer {
     /// operand as the sole argument.  So the tell-tale shape is: exactly one
     /// argument whose span is co-located with the callee's span.  A genuine
     /// user call `f(x)` never has its callee and argument at the same span.
-    static is_synthetic_conversion(c: CallExprNode*) -> boolean {
+    static is_synthetic_conversion(c: expression::CallExprNode*) -> boolean {
         if (c == null || c.callee == null) { return false; }
         if (c.arguments.length != 1)       { return false; }
-        const arg: ExpressionNode* = c.arguments[0];
+        const arg: expression::ExpressionNode* = c.arguments[0];
         if (arg == null)                   { return false; }
-        const cs: SourceSpan = c.callee.span;
-        const as_: SourceSpan = arg.span;
+        const cs: source_span::SourceSpan = c.callee.span;
+        const as_: source_span::SourceSpan = arg.span;
         if (!cs.has_location() || !as_.has_location()) { return false; }
         return cs.start_line == as_.start_line
             && cs.start_col  == as_.start_col
@@ -1666,33 +1634,33 @@ implement trait Clone for struct SemanticToken {
 
 // Entry point
 
-public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
-                                        params: &JsonValue) -> JsonValue {
+public function handle_semantic_tokens(docs: &docs::Docs, sessions: mut &session::SessionMap,
+                                        params: &value::JsonValue) -> value::JsonValue {
     // -- Extract URI from textDocument.uri ----------------------------
-    const td_opt: Option<JsonValue*> = params.get(Str::from("textDocument"));
-    if (!td_opt.is_some()) { return SemanticTokensCodec::empty_response(); }
-    const td: JsonValue* = td_opt.unwrap_or(null);
-    if (td == null) { return SemanticTokensCodec::empty_response(); }
+    const td_opt: Option<value::JsonValue*> = params.get(str::Str::from("textDocument"));
+    if (!td_opt.is_some()) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
+    const td: value::JsonValue* = td_opt.unwrap_or(null);
+    if (td == null) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
 
-    const uri_opt: Option<JsonValue*> = td.get(Str::from("uri"));
-    if (!uri_opt.is_some()) { return SemanticTokensCodec::empty_response(); }
-    const uri_val: JsonValue* = uri_opt.unwrap_or(null);
-    if (uri_val == null) { return SemanticTokensCodec::empty_response(); }
+    const uri_opt: Option<value::JsonValue*> = td.get(str::Str::from("uri"));
+    if (!uri_opt.is_some()) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
+    const uri_val: value::JsonValue* = uri_opt.unwrap_or(null);
+    if (uri_val == null) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
 
-    const uri_str_opt: Option<Str> = uri_val.as<Str>();
-    if (!uri_str_opt.is_some()) { return SemanticTokensCodec::empty_response(); }
-    const uri: Str = uri_str_opt.unwrap_or(Str::from(""));
+    const uri_str_opt: Option<str::Str> = uri_val.as<str::Str>();
+    if (!uri_str_opt.is_some()) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
+    const uri: str::Str = uri_str_opt.unwrap_or(str::Str::from(""));
 
     // -- Resolve session -> CompilationContext -> ProgramNode -----------
     // Recompile-if-stale (see hover.cryo) so we never tokenize against a
     // ctx whose shared-arena AST was recycled by another doc's compile.
-    const session: CompilerSession* = sessions.ensure_fresh(docs, uri);
-    if (session == null) { return SemanticTokensCodec::empty_response(); }
-    const ctx: CompilationContext* = session.context();
-    if (ctx == null) { return SemanticTokensCodec::empty_response(); }
+    const session: session::CompilerSession* = sessions.ensure_fresh(docs, uri);
+    if (session == null) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
+    const ctx: compilation_context::CompilationContext* = session.context();
+    if (ctx == null) { return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
 
-    mut fs_path_owned: String = UriPath::uri_to_fs_path(uri);
-    const fs_path: Str = fs_path_owned.as_str();
+    mut fs_path_owned: String = conv::UriPath::uri_to_fs_path(uri);
+    const fs_path: str::Str = fs_path_owned.as_str();
     mut path_buf: String = String::with_capacity(fs_path.length() + 1);
     path_buf.push(fs_path);
     path_buf.push_byte(0 as u8);
@@ -1702,10 +1670,10 @@ public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
     const path_cstr: string = path_buf.as_ptr() as string;
 
     const mod_idx: i64 = ctx.module_graph.find_module_by_path(path_cstr);
-    if (mod_idx < 0) { path_buf.drop(); return SemanticTokensCodec::empty_response(); }
+    if (mod_idx < 0) { path_buf.drop(); return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
 
-    const ast: ProgramNode* = ctx.module_graph.get_module_ast(mod_idx as u32);
-    if (ast == null) { path_buf.drop(); return SemanticTokensCodec::empty_response(); }
+    const ast: node::ProgramNode* = ctx.module_graph.get_module_ast(mod_idx as u32);
+    if (ast == null) { path_buf.drop(); return lsp::protocol::semantic_tokens::SemanticTokensCodec::empty_response(); }
 
     // -- Build the per-request tokenizer and walk the AST -------------
     // path_cstr backs the tokenizer's doc_file for the duration of the
@@ -1729,8 +1697,8 @@ public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
     tokenizer.dedup_overlapping();
 
     // -- Encode as wire `data: number[]` and wrap as response ---------
-    const data: JsonValue = SemanticTokensCodec::encode_tokens(&tokenizer.tokens);
-    const resp: JsonValue = SemanticTokensCodec::response_json(data);
+    const data: value::JsonValue = lsp::protocol::semantic_tokens::SemanticTokensCodec::encode_tokens(&tokenizer.tokens);
+    const resp: value::JsonValue = lsp::protocol::semantic_tokens::SemanticTokensCodec::response_json(data);
     // path_buf backed the tokenizer's doc_file for the duration of the
     // walk; release it now that token emission is done.  The tokenizer
     // (and its owned token array) is auto-dropped at function return.

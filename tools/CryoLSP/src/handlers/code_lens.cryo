@@ -17,42 +17,26 @@
 namespace lsp::handlers::code_lens;
 
 import std::core::option;
-import std::core::option::{ Option };
 import std::collections::str;
-import std::collections::str::{ Str };
 import std::collections::string;
 import std::collections::string::{ String };
 import std::collections::array;
 import std::collections::array::{ Array };
 import std::json::value;
-import std::json::value::{ JsonObject, JsonValue };
 
 import compiler::compilation_context;
-import compiler::compilation_context::{ CompilationContext };
 import compiler::diag::diagnostic;
-import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span;
-import compiler::diag::source_span::{ SourceSpan };
 import compiler::ast;
-import compiler::ast::{ NodeKind };
 import compiler::ast::node;
-import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::declaration;
-import compiler::ast::declaration::{
-    ClassDeclNode, EnumDeclNode, StructDeclNode, TraitDeclNode, UnionDeclNode
-};
 import compiler::ast::node_locator;
-import compiler::ast::node_locator::{ find_impls_of_trait, find_impls_of_type, NodeLocator };
 import compiler::resolver::symbol_str;
-import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::module_graph;
 
 import lsp::server::session;
-import lsp::server::session::{ CompilerSession, SessionMap };
 import lsp::server::docs;
-import lsp::server::docs::{ Docs };
 import lsp::protocol::conv;
-import lsp::protocol::conv::{ DiagnosticConverter, UriPath };
 import std::fmt;
 
 
@@ -60,39 +44,39 @@ import std::fmt;
 /// array to put in the response's `result` field.  An empty array
 /// (no session, no compile, no diagnostics for this URI) is a valid
 /// non-result.
-public function handle_code_lens(docs: &Docs, sessions: mut &SessionMap,
-                                  params: &JsonValue) -> JsonValue {
-    mut lenses: Array<JsonValue> = Array<JsonValue>::new();
+public function handle_code_lens(docs: &docs::Docs, sessions: mut &session::SessionMap,
+                                  params: &value::JsonValue) -> value::JsonValue {
+    mut lenses: Array<value::JsonValue> = Array<value::JsonValue>::new();
 
     // params.textDocument.uri  -> the document we're lensing
     const uri: String = CodeLensBuilder::uri_from_params(params);
     if (uri.length() == 0) {
-        return JsonValue::Array(lenses);
+        return value::JsonValue::Array(lenses);
     }
 
     // Recompile-if-stale (see hover.cryo) so the diagnostic sink we read
     // below isn't backed by shared-arena memory recycled by another
     // document's compile.
-    const session: CompilerSession* = sessions.ensure_fresh(docs, uri.as_str());
+    const session: session::CompilerSession* = sessions.ensure_fresh(docs, uri.as_str());
     if (session == null) {
-        return JsonValue::Array(lenses);
+        return value::JsonValue::Array(lenses);
     }
-    const ctx: CompilationContext* = session.context();
+    const ctx: compilation_context::CompilationContext* = session.context();
     if (ctx == null) {
-        return JsonValue::Array(lenses);
+        return value::JsonValue::Array(lenses);
     }
 
     // Filter to diagnostics whose span belongs to this URI - the
     // session's sink may carry cross-module diagnostics from compile
     // dependencies, and emitting a lens against the wrong file would
     // surface it on whatever line happens to share coordinates here.
-    mut fs_path_owned: String = UriPath::uri_to_fs_path(uri.as_str());
-    const fs_path: Str = fs_path_owned.as_str();
-    const diags: &Diagnostic[] = &ctx.diagnostics.diagnostics;
+    mut fs_path_owned: String = conv::UriPath::uri_to_fs_path(uri.as_str());
+    const fs_path: str::Str = fs_path_owned.as_str();
+    const diags: &diagnostic::Diagnostic[] = &ctx.diagnostics.diagnostics;
     for (mut i: i64 = 0; i < diags.length; i++) {
-        if (!DiagnosticConverter::diag_is_for_path(&diags[i], fs_path)) { continue; }
+        if (!conv::DiagnosticConverter::diag_is_for_path(&diags[i], fs_path)) { continue; }
         if (!diags[i].span.has_location())               { continue; }
-        mut id: String = DiagnosticConverter::build_diag_id(&diags[i]);
+        mut id: String = conv::DiagnosticConverter::build_diag_id(&diags[i]);
         lenses.push(CodeLensBuilder::build_lens(&diags[i], id.as_str()));
         id.drop();
     }
@@ -104,7 +88,7 @@ public function handle_code_lens(docs: &Docs, sessions: mut &SessionMap,
     // implementation (client command `cryo.showImplementations`).
     ImplLensBuilder::append_impl_lenses(&lenses, ctx, uri.as_str());
 
-    return JsonValue::Array(lenses);
+    return value::JsonValue::Array(lenses);
 }
 
 
@@ -120,39 +104,39 @@ type struct ImplLensBuilder {
     /// Append one lens per implementable declaration in `uri`'s module.
     /// No-op when the module isn't in the graph (single-file fallback for
     /// a URI outside the project) or carries no type/trait decls.
-    static append_impl_lenses(lenses: mut &Array<JsonValue>,
-                               ctx: CompilationContext*, uri: Str) -> void {
+    static append_impl_lenses(lenses: mut &Array<value::JsonValue>,
+                               ctx: compilation_context::CompilationContext*, uri: str::Str) -> void {
         if (ctx == null || ctx.module_graph == null) { return; }
-        const ast: ProgramNode* = ImplLensBuilder::module_ast_for_uri(ctx, uri);
+        const ast: node::ProgramNode* = ImplLensBuilder::module_ast_for_uri(ctx, uri);
         if (ast == null) { return; }
 
         for (mut si: i64 = 0; si < ast.statements.length; si++) {
-            const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+            const stmt: node::ASTNode* = node_locator::NodeLocator::unwrap_decl_stmt(ast.statements[si]);
             if (stmt == null) { continue; }
 
             // Classify: which decls get a lens, and by name vs by trait.
-            mut name: SymbolStr = SymbolStr::empty();
+            mut name: symbol_str::SymbolStr = symbol_str::SymbolStr::empty();
             mut is_trait: boolean = false;
             mut wanted: boolean = true;
             match (stmt.kind) {
-                NodeKind::StructDeclaration => {
-                    const d: StructDeclNode* = stmt as StructDeclNode*;
+                ast::NodeKind::StructDeclaration => {
+                    const d: declaration::StructDeclNode* = stmt as declaration::StructDeclNode*;
                     name = d.name;
                 }
-                NodeKind::ClassDeclaration => {
-                    const d: ClassDeclNode* = stmt as ClassDeclNode*;
+                ast::NodeKind::ClassDeclaration => {
+                    const d: declaration::ClassDeclNode* = stmt as declaration::ClassDeclNode*;
                     name = d.name;
                 }
-                NodeKind::EnumDeclaration => {
-                    const d: EnumDeclNode* = stmt as EnumDeclNode*;
+                ast::NodeKind::EnumDeclaration => {
+                    const d: declaration::EnumDeclNode* = stmt as declaration::EnumDeclNode*;
                     name = d.name;
                 }
-                NodeKind::UnionDeclaration => {
-                    const d: UnionDeclNode* = stmt as UnionDeclNode*;
+                ast::NodeKind::UnionDeclaration => {
+                    const d: declaration::UnionDeclNode* = stmt as declaration::UnionDeclNode*;
                     name = d.name;
                 }
-                NodeKind::TraitDeclaration => {
-                    const d: TraitDeclNode* = stmt as TraitDeclNode*;
+                ast::NodeKind::TraitDeclaration => {
+                    const d: declaration::TraitDeclNode* = stmt as declaration::TraitDeclNode*;
                     name = d.name;
                     is_trait = true;
                 }
@@ -163,15 +147,15 @@ type struct ImplLensBuilder {
             // `find_impls_of_*` returns an owning array; auto-dropped at
             // the end of this iteration (its SourceSpans are non-owning
             // views into AST-owned strings, so nothing else frees).
-            mut spans: SourceSpan[] = [];
+            mut spans: source_span::SourceSpan[] = [];
             if (is_trait) {
-                spans = find_impls_of_trait(ctx.module_graph, ctx.intern_table, name);
+                spans = node_locator::find_impls_of_trait(ctx.module_graph, ctx.intern_table, name);
             } else {
-                spans = find_impls_of_type(ctx.module_graph, ctx.intern_table, name);
+                spans = node_locator::find_impls_of_type(ctx.module_graph, ctx.intern_table, name);
             }
             if (spans.length == 0) { continue; }
 
-            const name_span: SourceSpan = node_locator::name_span_of(stmt);
+            const name_span: source_span::SourceSpan = node_locator::name_span_of(stmt);
             if (!name_span.has_location()) { continue; }
 
             lenses.push(ImplLensBuilder::build_impl_lens(uri, name_span, &spans));
@@ -182,9 +166,9 @@ type struct ImplLensBuilder {
     /// isn't loaded in the graph.  Mirrors the NUL-terminated path dance
     /// in `definition.cryo` (`find_module_by_path` wants a C string, but
     /// `Str` isn't NUL-terminated).
-    static module_ast_for_uri(ctx: CompilationContext*, uri: Str) -> ProgramNode* {
-        mut fs_path_owned: String = UriPath::uri_to_fs_path(uri);
-        const fs_path: Str = fs_path_owned.as_str();
+    static module_ast_for_uri(ctx: compilation_context::CompilationContext*, uri: str::Str) -> node::ProgramNode* {
+        mut fs_path_owned: String = conv::UriPath::uri_to_fs_path(uri);
+        const fs_path: str::Str = fs_path_owned.as_str();
         mut path_buf: String = String::with_capacity(fs_path.length() + 1);
         path_buf.push(fs_path);
         path_buf.push_byte(0 as u8);
@@ -203,21 +187,21 @@ type struct ImplLensBuilder {
     /// name span; the command fires `cryo.showImplementations` with
     /// `[anchorUri, anchorPosition, locations]` so the client extension
     /// can hand them to VS Code's `editor.action.showReferences` peek.
-    static build_impl_lens(uri: Str, name_span: SourceSpan,
-                            spans: &SourceSpan[]) -> JsonValue {
+    static build_impl_lens(uri: str::Str, name_span: source_span::SourceSpan,
+                            spans: &source_span::SourceSpan[]) -> value::JsonValue {
         const count: i64 = spans.length;
 
         // command.arguments[2] = [ Location, ... ]
-        mut locs: Array<JsonValue> = Array<JsonValue>::with_capacity(count as u64);
+        mut locs: Array<value::JsonValue> = Array<value::JsonValue>::with_capacity(count as u64);
         for (mut i: i64 = 0; i < spans.length; i++) {
             locs.push(ImplLensBuilder::location_json(spans[i]));
         }
 
         // command.arguments = [ anchorUri, anchorPosition, locations ]
-        mut args: Array<JsonValue> = Array<JsonValue>::with_capacity(3);
-        args.push(JsonValue::from(uri));
+        mut args: Array<value::JsonValue> = Array<value::JsonValue>::with_capacity(3);
+        args.push(value::JsonValue::from(uri));
         args.push(ImplLensBuilder::position_json(name_span));
-        args.push(JsonValue::Array(locs));
+        args.push(value::JsonValue::Array(locs));
 
         const title: string = if (count == 1) {
             "1 implementation"
@@ -225,33 +209,33 @@ type struct ImplLensBuilder {
             fmt::format("%d implementations", count as i32)
         };
 
-        mut cmd: JsonObject = JsonObject::new();
-        cmd.put("title", JsonValue::from(title));
-        cmd.put("command", JsonValue::from("cryo.showImplementations"));
-        cmd.put("arguments", JsonValue::Array(args));
+        mut cmd: value::JsonObject = value::JsonObject::new();
+        cmd.put("title", value::JsonValue::from(title));
+        cmd.put("command", value::JsonValue::from("cryo.showImplementations"));
+        cmd.put("arguments", value::JsonValue::Array(args));
 
-        mut lens: JsonObject = JsonObject::new();
-        lens.put("range", DiagnosticConverter::range_json_from_span(name_span));
-        lens.put("command", JsonValue::Object(cmd));
-        return JsonValue::Object(lens);
+        mut lens: value::JsonObject = value::JsonObject::new();
+        lens.put("range", conv::DiagnosticConverter::range_json_from_span(name_span));
+        lens.put("command", value::JsonValue::Object(cmd));
+        return value::JsonValue::Object(lens);
     }
 
     /// LSP `Location` JSON (`{ uri, range }`) for an implementation site.
-    static location_json(span: SourceSpan) -> JsonValue {
-        mut loc: JsonObject = JsonObject::new();
-        loc.put("uri",   JsonValue::String(UriPath::uri_string_from_fs_path(span.file)));
-        loc.put("range", DiagnosticConverter::range_json_from_span(span));
-        return JsonValue::Object(loc);
+    static location_json(span: source_span::SourceSpan) -> value::JsonValue {
+        mut loc: value::JsonObject = value::JsonObject::new();
+        loc.put("uri",   value::JsonValue::String(conv::UriPath::uri_string_from_fs_path(span.file)));
+        loc.put("range", conv::DiagnosticConverter::range_json_from_span(span));
+        return value::JsonValue::Object(loc);
     }
 
     /// LSP `Position` JSON at the 0-based start of `span` - the anchor the
     /// reference peek opens over.
-    static position_json(span: SourceSpan) -> JsonValue {
+    static position_json(span: source_span::SourceSpan) -> value::JsonValue {
         mut sl: u32 = 0;
         mut sc: u32 = 0;
         if (span.start_line > 0) { sl = span.start_line - 1; }
         if (span.start_col  > 0) { sc = span.start_col  - 1; }
-        return DiagnosticConverter::pos_json(sl, sc);
+        return conv::DiagnosticConverter::pos_json(sl, sc);
     }
 }
 
@@ -263,12 +247,12 @@ type struct CodeLensBuilder {
     /// Extract `params.textDocument.uri` as an owned `String`.  Returns
     /// an empty string when the field is missing or wrong-typed - the
     /// caller then short-circuits to an empty lens array.
-    static uri_from_params(params: &JsonValue) -> String {
-        match (params.get(Str::from("textDocument"))) {
+    static uri_from_params(params: &value::JsonValue) -> String {
+        match (params.get(str::Str::from("textDocument"))) {
             Option::Some(td) => {
-                match (td.get(Str::from("uri"))) {
+                match (td.get(str::Str::from("uri"))) {
                     Option::Some(uri_v) => {
-                        match (uri_v.as<Str>()) {
+                        match (uri_v.as<str::Str>()) {
                             Option::Some(s) => { return String::from_str(s); }
                             Option::None    => { return String::new(); }
                         }
@@ -284,22 +268,22 @@ type struct CodeLensBuilder {
     /// `range` is the diagnostic's primary span; the `command` fires
     /// the client-side `cryo.openRenderedDiagnostic` with the
     /// diagnostic id as a single argument.
-    static build_lens(diag: &Diagnostic, id: Str) -> JsonValue {
+    static build_lens(diag: &diagnostic::Diagnostic, id: str::Str) -> value::JsonValue {
         const title:  string = "Show full diagnostic";
         const cmd_id: string = "cryo.openRenderedDiagnostic";
 
         // command.arguments = ["<diagId>"]
-        mut args: Array<JsonValue> = Array<JsonValue>::with_capacity(1);
-        args.push(JsonValue::from(id));
+        mut args: Array<value::JsonValue> = Array<value::JsonValue>::with_capacity(1);
+        args.push(value::JsonValue::from(id));
 
-        mut cmd: JsonObject = JsonObject::new();
-        cmd.put("title", JsonValue::from(title));
-        cmd.put("command", JsonValue::from(cmd_id));
-        cmd.put("arguments", JsonValue::Array(args));
+        mut cmd: value::JsonObject = value::JsonObject::new();
+        cmd.put("title", value::JsonValue::from(title));
+        cmd.put("command", value::JsonValue::from(cmd_id));
+        cmd.put("arguments", value::JsonValue::Array(args));
 
-        mut lens: JsonObject = JsonObject::new();
-        lens.put("range", DiagnosticConverter::range_json_from_span(diag.span));
-        lens.put("command", JsonValue::Object(cmd));
-        return JsonValue::Object(lens);
+        mut lens: value::JsonObject = value::JsonObject::new();
+        lens.put("range", conv::DiagnosticConverter::range_json_from_span(diag.span));
+        lens.put("command", value::JsonValue::Object(cmd));
+        return value::JsonValue::Object(lens);
     }
 }

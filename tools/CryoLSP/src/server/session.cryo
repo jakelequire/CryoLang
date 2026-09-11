@@ -29,13 +29,10 @@
 namespace lsp::server::session;
 
 import std::core::option;
-import std::core::option::{ Option };
 import std::core::result;
 import std::core::drop;
-import std::core::drop::{ Drop };
 import std::core::intrinsics;
 import std::collections::str;
-import std::collections::str::{ Str };
 import std::collections::string;
 import std::collections::string::{ String };
 import std::collections::array;
@@ -44,20 +41,14 @@ import std::collections::hashmap;
 import std::collections::hashmap::{ HashMap };
 
 import std::alloc::arena;
-import std::alloc::arena::{ Arena };
 
 import compiler::compile_mode;
-import compiler::compile_mode::{ CompileMode };
 import compiler::compilation_context;
-import compiler::compilation_context::{ CompilationContext };
 import compiler::instance;
-import compiler::instance::{ CompilationResult, CompilerConfig, CompilerInstance };
 import compiler::codegen::ast_arena;
 
 import lsp::protocol::conv;
-import lsp::protocol::conv::{ UriPath };
 import lsp::server::docs;
-import lsp::server::docs::{ Docs };
 import std::ffi::libc;
 
 
@@ -81,11 +72,11 @@ import std::ffi::libc;
 
 
 type struct CompilerSession {
-    instance:    CompilerInstance;
+    instance:    instance::CompilerInstance;
     /// Heap-allocated CompilationContext - null until the first
     /// `recompile()`.  Replaced (and the old one leaked) on every
     /// subsequent recompile.
-    ctx:         CompilationContext*;
+    ctx:         compilation_context::CompilationContext*;
     /// NUL-terminated copy of the absolute file path, keep-alive for
     /// `ctx` and used as the LSP override path when a project is
     /// detected.
@@ -104,7 +95,7 @@ type struct CompilerSession {
     /// call; owned by the session and reclaimed on `evict()` / `drop()`.
     /// `null` until the first `recompile()`, and again after an LRU
     /// eviction (which nulls `ctx` too, so the next request recompiles).
-    arena:       Arena*;
+    arena:       arena::Arena*;
     /// Set when the editor buffer changed since `ctx` was last built, so
     /// a compile is owed.  The per-keystroke recompile is coalesced: edits
     /// only flip this flag (and enqueue the URI in `SessionMap::pending`);
@@ -115,7 +106,7 @@ type struct CompilerSession {
 
     static new() -> CompilerSession {
         return CompilerSession {
-            instance:        CompilerInstance::new(CompilerConfig::default()),
+            instance:        instance::CompilerInstance::new(instance::CompilerConfig::default()),
             ctx:             null,
             path_buf:        String::new(),
             content_buf:     String::new(),
@@ -152,7 +143,7 @@ type struct CompilerSession {
     /// Borrow the current `CompilationContext`.  Returns `null` if no
     /// `recompile()` has run yet - handlers should bail in that case
     /// since there's no AST / resolver / type arena to walk.
-    context(&this) -> CompilationContext* {
+    context(&this) -> compilation_context::CompilationContext* {
         return this.ctx;
     }
 
@@ -160,11 +151,11 @@ type struct CompilerSession {
     /// a fresh CompilationContext, finds the project's cryoconfig,
     /// and either drives the whole-project compile (preferred) or
     /// falls back to single-file mode if no cryoconfig is reachable.
-    recompile(mut &this, uri: Str, content: Str) -> CompilationResult {
+    recompile(mut &this, uri: str::Str, content: str::Str) -> instance::CompilationResult {
         // Editor-side `uri` is `file://<absolute-path>` (percent-encoded);
         // decode + normalize to a real filesystem path the loader accepts.
-        mut fs_path_owned: String = UriPath::uri_to_fs_path(uri);
-        const fs_path: Str = fs_path_owned.as_str();
+        mut fs_path_owned: String = conv::UriPath::uri_to_fs_path(uri);
+        const fs_path: str::Str = fs_path_owned.as_str();
 
         // Replace backing buffers.  The previous `ctx` (if any) holds
         // raw `string` pointers into the OLD buffers, but we leak the
@@ -205,8 +196,8 @@ type struct CompilerSession {
         // routing is still OFF here, so the `Box<Arena>` and the buffers above
         // stay in libc and are safe to free explicitly).
         if (this.arena == null) {
-            const arena_box: Box<Arena> = Box<Arena>::new(
-                Arena::with_chunk_size(8u64 * 1024u64 * 1024u64));
+            const arena_box: Box<arena::Arena> = Box<arena::Arena>::new(
+                arena::Arena::with_chunk_size(8u64 * 1024u64 * 1024u64));
             this.arena = arena_box.leak();
         }
         // Make THIS session's arena the current AST + container arena, then
@@ -226,9 +217,9 @@ type struct CompilerSession {
 
         // Allocate a fresh CompilationContext on the heap with mode=Lsp.  With
         // routing active this - and the whole context - lands in `this.arena`.
-        const ctx_box: Box<CompilationContext> =
-            Box<CompilationContext>::new(
-                CompilationContext::new(CompileMode::Lsp, path_cstr));
+        const ctx_box: Box<compilation_context::CompilationContext> =
+            Box<compilation_context::CompilationContext>::new(
+                compilation_context::CompilationContext::new(compile_mode::CompileMode::Lsp, path_cstr));
         this.ctx = ctx_box.leak();
         // `ctx` now reflects `content`; clear the pending-edit flag.
         this.needs_recompile = false;
@@ -238,7 +229,7 @@ type struct CompilerSession {
             // user gets lex / parse / AST-validation / name-resolution
             // diagnostics; later passes can't run because cross-file
             // types are invalid.
-            mut r_sf: CompilationResult = this.instance.compile_for_lsp_content_into(
+            mut r_sf: instance::CompilationResult = this.instance.compile_for_lsp_content_into(
                 this.ctx, path_cstr, content_cstr);
             // Compile done: turn routing OFF so handler-side allocations between
             // now and the next recompile use libc (and are freed as usual),
@@ -249,7 +240,7 @@ type struct CompilerSession {
         }
 
         const config_cstr: string = this.config_buf.as_ptr() as string;
-        mut r_proj: CompilationResult = this.instance.compile_for_lsp_project_into(
+        mut r_proj: instance::CompilationResult = this.instance.compile_for_lsp_project_into(
             this.ctx, config_cstr, path_cstr, content_cstr);
         ast_arena::cryo_alloc_arena_set_active(false);
         return r_proj;
@@ -290,7 +281,7 @@ type struct SessionMap {
     /// `ensure_fresh` after a session's `ctx` is confirmed live (whether it
     /// was just compiled or already cached).  The current `uri` is always the
     /// most-recent entry, so it is never the one evicted here.
-    touch_live(mut &this, uri: Str) -> void {
+    touch_live(mut &this, uri: str::Str) -> void {
         this.forget_live(uri);                       // dedup: drop any prior entry
         this.live_order.push(String::from_str(uri));
         // Evict from the front (oldest) while over the cap.  `remove` returns
@@ -311,7 +302,7 @@ type struct SessionMap {
     /// Drop `uri` from the live-order list if present (linear scan; the list
     /// is at most `MAX_LIVE_CTX` long).  Does NOT release the context - used
     /// both as the dedup step in `touch_live` and on close/removal.
-    forget_live(mut &this, uri: Str) -> void {
+    forget_live(mut &this, uri: str::Str) -> void {
         const n: u64 = this.live_order.length();
         for (mut i: u64 = 0; i < n; i++) {
             match (this.live_order.get_ref(i)) {
@@ -336,7 +327,7 @@ type struct SessionMap {
     /// `needs_recompile` flag (creating the session if needed) and
     /// enqueue the URI for the next flush.  Does NOT compile - that is
     /// deferred so a burst of keystrokes collapses to a single compile.
-    mark_dirty(mut &this, uri: Str) -> void {
+    mark_dirty(mut &this, uri: str::Str) -> void {
         const session: CompilerSession* = this.get_or_create(uri);
         if (session != null) { session.needs_recompile = true; }
         if (!this.pending_contains(uri)) {
@@ -345,7 +336,7 @@ type struct SessionMap {
     }
 
     /// Whether `uri` is already queued (linear scan; `pending` is tiny).
-    pending_contains(&this, uri: Str) -> boolean {
+    pending_contains(&this, uri: str::Str) -> boolean {
         for (mut i: u64 = 0; i < this.pending.length(); i++) {
             match (this.pending.get_ref(i)) {
                 Option::Some(p) => {
@@ -367,7 +358,7 @@ type struct SessionMap {
 
     /// Drop `uri` from the pending set (used on didClose so a flush
     /// doesn't try to compile a document that's been closed).
-    clear_pending_for(mut &this, uri: Str) -> void {
+    clear_pending_for(mut &this, uri: str::Str) -> void {
         mut kept: Array<String> = Array<String>::new();
         const n: u64 = this.pending.length();
         for (mut i: u64 = 0; i < n; i++) {
@@ -388,7 +379,7 @@ type struct SessionMap {
     /// Insert a fresh session for `uri`.  If one already exists it is
     /// dropped.  Use `get_or_create` for the common case where you
     /// want to recompile an already-open document.
-    insert(mut &this, uri: Str, session: CompilerSession) -> void {
+    insert(mut &this, uri: str::Str, session: CompilerSession) -> void {
         const key: String = String::from_str(uri);
         match (this.by_uri.insert(key, session)) {
             Option::Some(prev) => { mut p: CompilerSession = prev; p.drop(); }
@@ -396,7 +387,7 @@ type struct SessionMap {
         }
     }
 
-    get(&this, uri: Str) -> Option<CompilerSession*> {
+    get(&this, uri: str::Str) -> Option<CompilerSession*> {
         const key: String = String::from_str(uri);
         const result: Option<CompilerSession*> = this.by_uri.get_ref(&key);
         mut owned: String = key;
@@ -407,7 +398,7 @@ type struct SessionMap {
     /// Return a borrow of the session at `uri`, creating one if
     /// absent.  The created session has `ctx == null`; the caller is
     /// expected to call `recompile()` next.
-    get_or_create(mut &this, uri: Str) -> CompilerSession* {
+    get_or_create(mut &this, uri: str::Str) -> CompilerSession* {
         match (this.get(uri)) {
             Option::Some(p) => { return p; }
             Option::None    => { }
@@ -434,7 +425,7 @@ type struct SessionMap {
     /// Returns `null` only if the session can't be created.  A non-null
     /// return may still have a null `context()` when no buffer is open
     /// for `uri` to recompile from - callers already null-check ctx.
-    ensure_fresh(mut &this, docs: &Docs, uri: Str) -> CompilerSession* {
+    ensure_fresh(mut &this, docs: &docs::Docs, uri: str::Str) -> CompilerSession* {
         const session: CompilerSession* = this.get_or_create(uri);
         if (session == null) { return null; }
 
@@ -465,7 +456,7 @@ type struct SessionMap {
         return session;
     }
 
-    remove(mut &this, uri: Str) -> boolean {
+    remove(mut &this, uri: str::Str) -> boolean {
         this.forget_live(uri);                       // drop any live-order entry
         const key: String = String::from_str(uri);
         match (this.by_uri.remove(&key)) {
@@ -509,7 +500,7 @@ type struct PathFinder {
 /// project (`.../tools/CryoLSP/build/bin/cryolsp`), so the
 /// binary-relative search the CLI driver uses doesn't reach the
 /// in-repo stdlib.  Walking up from the source file does.
-static discover_stdlib_root(fs_path: Str) -> String {
+static discover_stdlib_root(fs_path: str::Str) -> String {
     mut dir: String = PathFinder::lsp_parent_dir(fs_path);
     loop {
         if (dir.length() == 0) { dir.drop(); return String::new(); }
@@ -552,7 +543,7 @@ static discover_stdlib_root(fs_path: Str) -> String {
 /// finds
 ///   /home/.../CryoLang/compiler/cryoconfig
 /// even though /home/.../CryoLang has no cryoconfig at the root.
-static discover_project_cryoconfig(fs_path: Str) -> String {
+static discover_project_cryoconfig(fs_path: str::Str) -> String {
     // Start from the file's directory.
     mut dir: String = PathFinder::lsp_parent_dir(fs_path);
     loop {
@@ -587,7 +578,7 @@ static discover_project_cryoconfig(fs_path: Str) -> String {
 /// onwards is dropped.  `lsp_parent_dir("/foo/bar")` -> `"/foo"`,
 /// `lsp_parent_dir("/foo")` -> `""` (we treat `"/"`'s parent as empty so
 /// the discover_project_cryoconfig loop terminates).
-static lsp_parent_dir(path: Str) -> String {
+static lsp_parent_dir(path: str::Str) -> String {
     const len: u64 = path.length();
     if (len == 0) { return String::new(); }
     const ptr: u8* = path.as_ptr();
@@ -610,7 +601,7 @@ static lsp_parent_dir(path: Str) -> String {
 /// for `String.as_ptr() as string`.  The reported `length()` excludes
 /// the trailing NUL, but the byte sits in the buffer immediately past
 /// the last logical byte.
-static build_cstring_buffer(s: Str) -> String {
+static build_cstring_buffer(s: str::Str) -> String {
     mut out: String = String::with_capacity(s.length() + 1);
     out.push(s);
     out.push_byte(0 as u8);

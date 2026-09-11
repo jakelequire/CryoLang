@@ -25,105 +25,76 @@
 namespace lsp::handlers::definition;
 
 import std::core::option;
-import std::core::option::{ Option };
 import std::collections::str;
-import std::collections::str::{ Str };
 import std::collections::string;
 import std::collections::string::{ String };
 import std::json::value;
-import std::json::value::{ JsonNumber, JsonValue };
 
 import compiler::compilation_context;
-import compiler::compilation_context::{ CompilationContext };
 import compiler::ast;
-import compiler::ast::{ NamedAnnotation, NodeKind, TypeAnnotation };
 import compiler::ast::node;
-import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::expression;
-import compiler::ast::expression::{ IdentifierNode, MemberAccessNode, ScopeResolutionNode };
 import compiler::ast::declaration;
-import compiler::ast::declaration::{
-    FieldDeclNode, FunctionDeclNode, ImplBlockNode, ImportDeclNode, MethodNode,
-    ModuleDeclNode, TypeAliasDeclNode, VarDeclNode
-};
 import compiler::ast::node_locator;
 import compiler::diag::source_span;
-import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::resolver;
 import compiler::resolver::symbol;
-import compiler::resolver::symbol::{ Symbol };
 import compiler::resolver::symbol_id;
-import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::symbol_str;
-import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::intern_table;
-import compiler::resolver::intern_table::{ InternTable };
 import compiler::types::type_ref;
-import compiler::types::type_ref::{ TypeRef };
 import compiler::types::arena;
-import compiler::types::arena::{ TypeArena };
 import compiler::types;
-import compiler::types::{ TypeKind };
 import compiler::types::type_base;
-import compiler::types::type_base::{ Type };
 import compiler::types::compound;
-import compiler::types::compound::{ PointerType, ReferenceType };
 import compiler::types::generic;
-import compiler::types::generic::{ InstantiatedType };
 import compiler::module_graph;
-import compiler::module_graph::{ ModuleGraph, ModuleInfo };
 import std::fs::metadata;
-import std::fs::metadata::{ metadata };
 import std::fs::path;
-import std::fs::path::{ Path };
 
 import lsp::server::docs;
-import lsp::server::docs::{ Docs };
 import lsp::server::session;
-import lsp::server::session::{ CompilerSession, SessionMap };
 import lsp::protocol::lsp;
-import lsp::protocol::lsp::{ Location, Position, Range };
 import lsp::protocol::conv;
-import lsp::protocol::conv::{ UriPath };
 import std::ffi::libc;
 import std::fmt;
 
 
-public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
-                                   params: &JsonValue) -> JsonValue {
+public function handle_definition(docs: &docs::Docs, sessions: mut &session::SessionMap,
+                                   params: &value::JsonValue) -> value::JsonValue {
     // -- Extract URI + 0-based (line, character) ----------------------
-    const td_opt: Option<JsonValue*> = params.get(Str::from("textDocument"));
-    if (!td_opt.is_some()) { return JsonValue::Null; }
-    const td: JsonValue* = td_opt.unwrap_or(null);
-    if (td == null) { return JsonValue::Null; }
+    const td_opt: Option<value::JsonValue*> = params.get(str::Str::from("textDocument"));
+    if (!td_opt.is_some()) { return value::JsonValue::Null; }
+    const td: value::JsonValue* = td_opt.unwrap_or(null);
+    if (td == null) { return value::JsonValue::Null; }
 
-    const uri_opt: Option<JsonValue*> = td.get(Str::from("uri"));
-    if (!uri_opt.is_some()) { return JsonValue::Null; }
-    const uri_val: JsonValue* = uri_opt.unwrap_or(null);
-    if (uri_val == null) { return JsonValue::Null; }
+    const uri_opt: Option<value::JsonValue*> = td.get(str::Str::from("uri"));
+    if (!uri_opt.is_some()) { return value::JsonValue::Null; }
+    const uri_val: value::JsonValue* = uri_opt.unwrap_or(null);
+    if (uri_val == null) { return value::JsonValue::Null; }
 
-    const uri_str_opt: Option<Str> = uri_val.as<Str>();
-    if (!uri_str_opt.is_some()) { return JsonValue::Null; }
-    const uri: Str = uri_str_opt.unwrap_or(Str::from(""));
+    const uri_str_opt: Option<str::Str> = uri_val.as<str::Str>();
+    if (!uri_str_opt.is_some()) { return value::JsonValue::Null; }
+    const uri: str::Str = uri_str_opt.unwrap_or(str::Str::from(""));
 
-    const pos_opt: Option<JsonValue*> = params.get(Str::from("position"));
-    if (!pos_opt.is_some()) { return JsonValue::Null; }
-    const pos: JsonValue* = pos_opt.unwrap_or(null);
-    if (pos == null) { return JsonValue::Null; }
+    const pos_opt: Option<value::JsonValue*> = params.get(str::Str::from("position"));
+    if (!pos_opt.is_some()) { return value::JsonValue::Null; }
+    const pos: value::JsonValue* = pos_opt.unwrap_or(null);
+    if (pos == null) { return value::JsonValue::Null; }
     const line:      u32 = DefinitionEngine::json_u32_field(pos, "line");
     const character: u32 = DefinitionEngine::json_u32_field(pos, "character");
 
     // -- Find the session + module + AST for this URI -----------------
     // See hover.cryo: recompile-if-stale to avoid walking a ctx whose
     // shared-arena memory was recycled by another document's compile.
-    const session: CompilerSession* = sessions.ensure_fresh(docs, uri);
-    if (session == null) { return JsonValue::Null; }
-    const ctx: CompilationContext* = session.context();
-    if (ctx == null) { return JsonValue::Null; }
+    const session: session::CompilerSession* = sessions.ensure_fresh(docs, uri);
+    if (session == null) { return value::JsonValue::Null; }
+    const ctx: compilation_context::CompilationContext* = session.context();
+    if (ctx == null) { return value::JsonValue::Null; }
     mut eng: DefinitionEngine = DefinitionEngine::new(ctx);
 
-    mut fs_path_owned: String = UriPath::uri_to_fs_path(uri);
-    const fs_path: Str = fs_path_owned.as_str();
+    mut fs_path_owned: String = conv::UriPath::uri_to_fs_path(uri);
+    const fs_path: str::Str = fs_path_owned.as_str();
     mut path_buf: String = String::with_capacity(fs_path.length() + 1);
     path_buf.push(fs_path);
     path_buf.push_byte(0 as u8);
@@ -134,25 +105,25 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
 
     const mod_idx: i64 = ctx.module_graph.find_module_by_path(path_cstr);
     path_buf.drop();
-    if (mod_idx < 0) { return JsonValue::Null; }
+    if (mod_idx < 0) { return value::JsonValue::Null; }
 
-    const ast: ProgramNode* = ctx.module_graph.get_module_ast(mod_idx as u32);
-    if (ast == null) { return JsonValue::Null; }
+    const ast: node::ProgramNode* = ctx.module_graph.get_module_ast(mod_idx as u32);
+    if (ast == null) { return value::JsonValue::Null; }
 
     // -- Walk to the innermost node -----------------------------------
     // Compiler spans are 1-based; LSP positions are 0-based.
     const cursor_line: u32 = line + 1 as u32;
     const cursor_char: u32 = character + 1 as u32;
-    const node: ASTNode* = node_locator::find_innermost_node_at(
+    const node: node::ASTNode* = node_locator::find_innermost_node_at(
         ast, cursor_line, cursor_char);
-    if (node == null) { return JsonValue::Null; }
+    if (node == null) { return value::JsonValue::Null; }
 
     // -- Dispatch -----------------------------------------------------
-    const name_span: SourceSpan = node_locator::name_span_of(node);
+    const name_span: source_span::SourceSpan = node_locator::name_span_of(node);
     const on_decl_name: boolean =
         node_locator::span_contains(name_span, cursor_line, cursor_char);
 
-    mut target_span: SourceSpan = SourceSpan::none();
+    mut target_span: source_span::SourceSpan = source_span::SourceSpan::none();
 
     // 1. Cursor on a declaration's own name -> return that name span.
     //    "Go to definition" on the definition itself is a no-op jump
@@ -170,12 +141,12 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     //      .cryo for most imports), derive the candidate
     //      `_module.cryo` / `lib.cryo` from a loaded descendant's
     //      file path and jump to file start when it exists on disk.
-    if (!target_span.has_location() && node.kind == NodeKind::ImportDeclaration) {
-        const imp: ImportDeclNode* = node as ImportDeclNode*;
+    if (!target_span.has_location() && node.kind == ast::NodeKind::ImportDeclaration) {
+        const imp: declaration::ImportDeclNode* = node as declaration::ImportDeclNode*;
         const seg_idx: i64 = DefinitionEngine::import_segment_at(imp, cursor_line, cursor_char);
         if (seg_idx >= 0 && ctx.intern_table != null) {
             const literal: string = eng.build_import_segment_path(imp, seg_idx);
-            const result: JsonValue = eng.jump_to_namespace(literal);
+            const result: value::JsonValue = eng.jump_to_namespace(literal);
             if (!result.is_null()) { return result; }
         }
     }
@@ -184,12 +155,12 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     //      `namespace std::net::socket_addr;`) and qualified
     //      `public module ...;` decls.  Both lower into the same
     //      `ModuleDeclNode`, so they share the dispatch.
-    if (!target_span.has_location() && node.kind == NodeKind::ModuleDeclaration) {
-        const md: ModuleDeclNode* = node as ModuleDeclNode*;
+    if (!target_span.has_location() && node.kind == ast::NodeKind::ModuleDeclaration) {
+        const md: declaration::ModuleDeclNode* = node as declaration::ModuleDeclNode*;
         const seg_idx: i64 = DefinitionEngine::module_decl_segment_at(md, cursor_line, cursor_char);
         if (seg_idx >= 0 && ctx.intern_table != null) {
             const literal: string = eng.build_module_decl_path(md, seg_idx);
-            const result: JsonValue = eng.jump_to_namespace(literal);
+            const result: value::JsonValue = eng.jump_to_namespace(literal);
             if (!result.is_null()) { return result; }
         }
     }
@@ -203,13 +174,13 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     //          -> jump to the target type's declaration
     //      The locator stops at ImplBlockNode for impl-head positions
     //      (it only descends into methods), so dispatch routes here.
-    if (!target_span.has_location() && node.kind == NodeKind::ImplementationBlock) {
-        const impl_blk: ImplBlockNode* = node as ImplBlockNode*;
+    if (!target_span.has_location() && node.kind == ast::NodeKind::ImplementationBlock) {
+        const impl_blk: declaration::ImplBlockNode* = node as declaration::ImplBlockNode*;
         if (impl_blk.trait_annotation != null) {
-            const named: NamedAnnotation* = node_locator::find_named_annotation_at(
+            const named: ast::NamedAnnotation* = node_locator::find_named_annotation_at(
                 impl_blk.trait_annotation, cursor_line, cursor_char);
             if (named != null) {
-                const decl: ASTNode* = node_locator::find_type_decl_in_modules(
+                const decl: node::ASTNode* = node_locator::find_type_decl_in_modules(
                     ctx.module_graph, ctx.intern_table, named.name);
                 if (decl != null) {
                     target_span = node_locator::name_span_of(decl);
@@ -220,7 +191,7 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
                 && impl_blk.target_type_span.has_location()
                 && node_locator::span_contains(impl_blk.target_type_span,
                                               cursor_line, cursor_char)) {
-            const decl: ASTNode* = node_locator::find_type_decl_in_modules(
+            const decl: node::ASTNode* = node_locator::find_type_decl_in_modules(
                 ctx.module_graph, ctx.intern_table, impl_blk.target_type);
             if (decl != null) {
                 target_span = node_locator::name_span_of(decl);
@@ -230,14 +201,14 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
 
     // 2. `Foo::bar` - try method on `Foo`, then a free function `bar`.
     //    Mirrors hover's resolution; falls through when neither hits.
-    if (!target_span.has_location() && node.kind == NodeKind::ScopeResolution) {
-        const sr: ScopeResolutionNode* = node as ScopeResolutionNode*;
-        const m: MethodNode* = node_locator::find_method_in_modules(
+    if (!target_span.has_location() && node.kind == ast::NodeKind::ScopeResolution) {
+        const sr: expression::ScopeResolutionNode* = node as expression::ScopeResolutionNode*;
+        const m: declaration::MethodNode* = node_locator::find_method_in_modules(
             ctx.module_graph, ctx.intern_table, sr.scope_name, sr.member_name);
         if (m != null && m.func != null) {
             target_span = m.func.name_span;
         } else {
-            const f: FunctionDeclNode* = node_locator::find_function_in_modules(
+            const f: declaration::FunctionDeclNode* = node_locator::find_function_in_modules(
                 ctx.module_graph, sr.member_name);
             if (f != null) {
                 target_span = f.name_span;
@@ -245,7 +216,7 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
                 // Last resort: jump to the type/module named on the
                 // scope side - useful for `Foo::Bar` where `Bar` is
                 // a nested type or a constant on `Foo`.
-                const td: ASTNode* = node_locator::find_type_decl_in_modules(
+                const td: node::ASTNode* = node_locator::find_type_decl_in_modules(
                     ctx.module_graph, ctx.intern_table, sr.scope_name);
                 if (td != null) {
                     target_span = node_locator::name_span_of(td);
@@ -268,34 +239,34 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     //        bare `obj.member` prefers a field of the same name.
     //      - Each path falls through to the other on miss - function-
     //        pointer fields and bare method references both exist.
-    if (!target_span.has_location() && node.kind == NodeKind::MemberAccess) {
-        const ma: MemberAccessNode* = node as MemberAccessNode*;
+    if (!target_span.has_location() && node.kind == ast::NodeKind::MemberAccess) {
+        const ma: expression::MemberAccessNode* = node as expression::MemberAccessNode*;
         if (ma.object != null && ctx.decl_index != null) {
-            const recv_ty: TypeRef = eng.unwrap_to_carrier(ma.object.resolved_type);
+            const recv_ty: type_ref::TypeRef = eng.unwrap_to_carrier(ma.object.resolved_type);
             if (recv_ty.is_valid()) {
-                const type_sym: SymbolStr = ctx.decl_index.lookup_type_name(recv_ty);
+                const type_sym: symbol_str::SymbolStr = ctx.decl_index.lookup_type_name(recv_ty);
                 if (type_sym.is_valid()) {
                     const is_call: boolean = node_locator::is_member_access_callee(
                         ctx.module_graph, ma);
                     if (is_call) {
-                        const m: MethodNode* = node_locator::find_method_in_modules(
+                        const m: declaration::MethodNode* = node_locator::find_method_in_modules(
                             ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                         if (m != null && m.func != null) {
                             target_span = m.func.name_span;
                         } else {
-                            const fld: FieldDeclNode* = node_locator::find_field_in_modules(
+                            const fld: declaration::FieldDeclNode* = node_locator::find_field_in_modules(
                                 ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                             if (fld != null) {
-                                target_span = node_locator::name_span_of(fld as ASTNode*);
+                                target_span = node_locator::name_span_of(fld as node::ASTNode*);
                             }
                         }
                     } else {
-                        const fld: FieldDeclNode* = node_locator::find_field_in_modules(
+                        const fld: declaration::FieldDeclNode* = node_locator::find_field_in_modules(
                             ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                         if (fld != null) {
-                            target_span = node_locator::name_span_of(fld as ASTNode*);
+                            target_span = node_locator::name_span_of(fld as node::ASTNode*);
                         } else {
-                            const m: MethodNode* = node_locator::find_method_in_modules(
+                            const m: declaration::MethodNode* = node_locator::find_method_in_modules(
                                 ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                             if (m != null && m.func != null) {
                                 target_span = m.func.name_span;
@@ -324,20 +295,20 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     //    file's AST to find the decl node at that span and use its
     //    narrower `name_span` so the editor highlights just the name
     //    on jump.
-    if (!target_span.has_location() && node.kind == NodeKind::Identifier) {
-        const id_node: IdentifierNode* = node as IdentifierNode*;
+    if (!target_span.has_location() && node.kind == ast::NodeKind::Identifier) {
+        const id_node: expression::IdentifierNode* = node as expression::IdentifierNode*;
 
         // `this` -> enclosing method's owner type.
         if (id_node.name.is_valid()
                 && ctx.intern_table != null
                 && id_node.span.has_location()) {
-            const this_sym: SymbolStr = ctx.intern_table.intern("this");
+            const this_sym: symbol_str::SymbolStr = ctx.intern_table.intern("this");
             if (id_node.name.equals(this_sym)) {
-                const owner: SymbolStr = node_locator::find_enclosing_method_owner(
+                const owner: symbol_str::SymbolStr = node_locator::find_enclosing_method_owner(
                     ctx.module_graph, id_node.span.file,
                     id_node.span.start_line, id_node.span.start_col);
                 if (owner.is_valid()) {
-                    const decl: ASTNode* = node_locator::find_type_decl_in_modules(
+                    const decl: node::ASTNode* = node_locator::find_type_decl_in_modules(
                         ctx.module_graph, ctx.intern_table, owner);
                     if (decl != null) {
                         target_span = node_locator::name_span_of(decl);
@@ -348,9 +319,9 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
 
         // Regular identifier path: resolver span -> symbol -> decl.
         if (!target_span.has_location() && ctx.resolver != null) {
-            const sym_id: SymbolID = ctx.resolver.resolve(id_node.span);
+            const sym_id: symbol_id::SymbolID = ctx.resolver.resolve(id_node.span);
             if (sym_id.is_valid()) {
-                const sym: Symbol = ctx.resolver.get_symbol(sym_id);
+                const sym: symbol::Symbol = ctx.resolver.get_symbol(sym_id);
                 if (sym.declaring_span.has_location()) {
                     target_span = eng.narrow_to_name_span(sym.declaring_span);
                 }
@@ -364,12 +335,12 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     //    Find the innermost named segment under the cursor, then
     //    look up its declaring struct/class/enum/trait/typealias.
     if (!target_span.has_location()) {
-        const ann: TypeAnnotation* = DefinitionEngine::annotation_for_node(node);
+        const ann: ast::TypeAnnotation* = DefinitionEngine::annotation_for_node(node);
         if (ann != null) {
-            const named: NamedAnnotation* = node_locator::find_named_annotation_at(
+            const named: ast::NamedAnnotation* = node_locator::find_named_annotation_at(
                 ann, cursor_line, cursor_char);
             if (named != null) {
-                const decl: ASTNode* = node_locator::find_type_decl_in_modules(
+                const decl: node::ASTNode* = node_locator::find_type_decl_in_modules(
                     ctx.module_graph, ctx.intern_table, named.name);
                 if (decl != null) {
                     target_span = node_locator::name_span_of(decl);
@@ -378,9 +349,9 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
         }
     }
 
-    if (!target_span.has_location()) { return JsonValue::Null; }
-    if (target_span.file == "")       { return JsonValue::Null; }
-    if (libc::strlen(target_span.file) == 0 as u64) { return JsonValue::Null; }
+    if (!target_span.has_location()) { return value::JsonValue::Null; }
+    if (target_span.file == "")       { return value::JsonValue::Null; }
+    if (libc::strlen(target_span.file) == 0 as u64) { return value::JsonValue::Null; }
 
     return DefinitionEngine::build_location_json(target_span);
 }
@@ -393,11 +364,11 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
 // span/URI/JSON utilities are `static` methods.
 
 type struct DefinitionEngine {
-    graph:  ModuleGraph*;
-    intern: InternTable*;
-    arena:  TypeArena*;
+    graph:  module_graph::ModuleGraph*;
+    intern: intern_table::InternTable*;
+    arena:  arena::TypeArena*;
 
-    static new(ctx: CompilationContext*) -> DefinitionEngine {
+    static new(ctx: compilation_context::CompilationContext*) -> DefinitionEngine {
         return DefinitionEngine {
             graph:  ctx.module_graph,
             intern: ctx.intern_table,
@@ -409,7 +380,7 @@ type struct DefinitionEngine {
     // Import / namespace segment resolution
 
     /// Build the `::`-joined namespace path for `imp.path_segments[0..=index]`.
-    build_import_segment_path(&this, imp: ImportDeclNode*, index: i64) -> string {
+    build_import_segment_path(&this, imp: declaration::ImportDeclNode*, index: i64) -> string {
         mut path: string = "";
         for (mut i: i64 = 0; i <= index; i++) {
             if (i > 0) { path = path + "::"; }
@@ -419,7 +390,7 @@ type struct DefinitionEngine {
     }
 
     /// `::`-joined namespace path for `md.path_segments[0..=index]`.
-    build_module_decl_path(&this, md: ModuleDeclNode*, index: i64) -> string {
+    build_module_decl_path(&this, md: declaration::ModuleDeclNode*, index: i64) -> string {
         mut path: string = "";
         for (mut i: i64 = 0; i <= index; i++) {
             if (i > 0) { path = path + "::"; }
@@ -435,15 +406,15 @@ type struct DefinitionEngine {
     /// otherwise falls back to deriving the file path from a loaded
     /// descendant + checking disk.  Returns `JsonValue::Null` when no
     /// target found, so callers can chain.
-    jump_to_namespace(&this, literal: string) -> JsonValue {
+    jump_to_namespace(&this, literal: string) -> value::JsonValue {
         const std_path: string = "std::" + literal;
 
-        mut prog: ProgramNode* = node_locator::find_program_by_namespace(this.graph, literal);
+        mut prog: node::ProgramNode* = node_locator::find_program_by_namespace(this.graph, literal);
         if (prog == null) {
             prog = node_locator::find_program_by_namespace(this.graph, std_path);
         }
         if (prog != null) {
-            const span: SourceSpan = DefinitionEngine::first_namespace_decl_span(prog);
+            const span: source_span::SourceSpan = DefinitionEngine::first_namespace_decl_span(prog);
             if (span.has_location() && libc::strlen(span.file) > 0 as u64) {
                 return DefinitionEngine::build_location_json(span);
             }
@@ -456,7 +427,7 @@ type struct DefinitionEngine {
         if (libc::strlen(disk_path) > 0 as u64) {
             return DefinitionEngine::build_file_start_location(disk_path);
         }
-        return JsonValue::Null;
+        return value::JsonValue::Null;
     }
 
     /// When `target_path` (e.g. `"std::core"`) isn't itself loaded into
@@ -470,7 +441,7 @@ type struct DefinitionEngine {
         if (target_len == 0) { return ""; }
         const n: u32 = this.graph.module_count();
         for (mut mi: u32 = 0; mi < n; mi++) {
-            const ast: ProgramNode* = this.graph.get_module_ast(mi);
+            const ast: node::ProgramNode* = this.graph.get_module_ast(mi);
             if (ast == null) { continue; }
             const ns: string = ast.namespace_name;
             const ns_len: i64 = libc::strlen(ns) as i64;
@@ -498,14 +469,14 @@ type struct DefinitionEngine {
                 }
             }
 
-            const info: ModuleInfo* = this.graph.get_module(mi as i64);
+            const info: module_graph::ModuleInfo* = this.graph.get_module(mi as i64);
             const dir: string = DefinitionEngine::drop_path_components(info.file_path, extras);
             if (libc::strlen(dir) == 0 as u64) { continue; }
 
             const cand_module: string = fmt::format("%s/_module.cryo", dir);
-            if (metadata::exists(Path::from(cand_module))) { return cand_module; }
+            if (metadata::exists(path::Path::from(cand_module))) { return cand_module; }
             const cand_lib: string = fmt::format("%s/lib.cryo", dir);
-            if (metadata::exists(Path::from(cand_lib)))    { return cand_lib; }
+            if (metadata::exists(path::Path::from(cand_lib)))    { return cand_lib; }
         }
         return "";
     }
@@ -516,21 +487,21 @@ type struct DefinitionEngine {
     /// decl can be located - e.g. synthetic spans from sema.  Used so
     /// jumps from identifier use sites land on the name rather than
     /// underlining the whole decl line.
-    narrow_to_name_span(&this, decl_span: SourceSpan) -> SourceSpan {
+    narrow_to_name_span(&this, decl_span: source_span::SourceSpan) -> source_span::SourceSpan {
         if (this.graph == null) { return decl_span; }
         if (decl_span.file == "")           { return decl_span; }
         if (libc::strlen(decl_span.file) == 0 as u64) { return decl_span; }
 
         const mod_idx: i64 = this.graph.find_module_by_path(decl_span.file);
         if (mod_idx < 0) { return decl_span; }
-        const ast: ProgramNode* = this.graph.get_module_ast(mod_idx as u32);
+        const ast: node::ProgramNode* = this.graph.get_module_ast(mod_idx as u32);
         if (ast == null) { return decl_span; }
 
-        const decl: ASTNode* = node_locator::find_innermost_node_at(
+        const decl: node::ASTNode* = node_locator::find_innermost_node_at(
             ast, decl_span.start_line, decl_span.start_col);
         if (decl == null) { return decl_span; }
 
-        const name_span: SourceSpan = node_locator::name_span_of(decl);
+        const name_span: source_span::SourceSpan = node_locator::name_span_of(decl);
         if (name_span.has_location()) { return name_span; }
         return decl_span;
     }
@@ -544,22 +515,22 @@ type struct DefinitionEngine {
     /// first.  Caps the chain at 6 hops as a safety net against
     /// malformed type arenas - a self-referential pointer would otherwise
     /// loop forever.
-    unwrap_to_carrier(&this, ty: TypeRef) -> TypeRef {
+    unwrap_to_carrier(&this, ty: type_ref::TypeRef) -> type_ref::TypeRef {
         if (this.arena == null) { return ty; }
-        mut cur: TypeRef = ty;
+        mut cur: type_ref::TypeRef = ty;
         mut hops: i64 = 0;
         while (hops < 6) {
             if (!cur.is_valid()) { return cur; }
-            const t: Type* = this.arena.lookup(cur.id);
+            const t: type_base::Type* = this.arena.lookup(cur.id);
             if (t == null) { return cur; }
-            if (t.kind == TypeKind::Reference) {
-                const rt: ReferenceType* = t as ReferenceType*;
+            if (t.kind == types::TypeKind::Reference) {
+                const rt: compound::ReferenceType* = t as compound::ReferenceType*;
                 cur = rt.referent;
-            } else if (t.kind == TypeKind::Pointer) {
-                const pt: PointerType* = t as PointerType*;
+            } else if (t.kind == types::TypeKind::Pointer) {
+                const pt: compound::PointerType* = t as compound::PointerType*;
                 cur = pt.pointee;
-            } else if (t.kind == TypeKind::InstantiatedType) {
-                const it: InstantiatedType* = t as InstantiatedType*;
+            } else if (t.kind == types::TypeKind::InstantiatedType) {
+                const it: generic::InstantiatedType* = t as generic::InstantiatedType*;
                 cur = it.generic_base;
             } else {
                 return cur;
@@ -574,7 +545,7 @@ type struct DefinitionEngine {
 
     /// Index into `imp.path_segments` whose span contains the cursor,
     /// or -1 when the cursor is on `import`, `;`, or a `::` separator.
-    static import_segment_at(imp: ImportDeclNode*, line: u32, ch: u32) -> i64 {
+    static import_segment_at(imp: declaration::ImportDeclNode*, line: u32, ch: u32) -> i64 {
         if (imp == null) { return -1 as i64; }
         for (mut i: i64 = 0; i < imp.path_segment_spans.length; i++) {
             if (node_locator::span_contains(imp.path_segment_spans[i], line, ch)) {
@@ -587,7 +558,7 @@ type struct DefinitionEngine {
     /// Index of the `ModuleDeclNode` segment whose span covers the
     /// cursor.  Mirrors `import_segment_at` for `namespace X::Y;` and
     /// `public module X::Y;` decls.
-    static module_decl_segment_at(md: ModuleDeclNode*, line: u32, ch: u32) -> i64 {
+    static module_decl_segment_at(md: declaration::ModuleDeclNode*, line: u32, ch: u32) -> i64 {
         if (md == null) { return -1 as i64; }
         for (mut i: i64 = 0; i < md.path_segment_spans.length; i++) {
             if (node_locator::span_contains(md.path_segment_spans[i], line, ch)) {
@@ -603,16 +574,16 @@ type struct DefinitionEngine {
     /// decls).  Falls back to `SourceSpan::none()` when there's no
     /// namespace statement - keeps the caller's `has_location` filter
     /// from shipping a bad jump.
-    static first_namespace_decl_span(prog: ProgramNode*) -> SourceSpan {
-        if (prog == null) { return SourceSpan::none(); }
+    static first_namespace_decl_span(prog: node::ProgramNode*) -> source_span::SourceSpan {
+        if (prog == null) { return source_span::SourceSpan::none(); }
         for (mut i: i64 = 0; i < prog.statements.length; i++) {
-            const s: ASTNode* = prog.statements[i];
+            const s: node::ASTNode* = prog.statements[i];
             if (s == null) { continue; }
-            if (s.kind == NodeKind::Directive) { continue; }
-            if (s.kind == NodeKind::ModuleDeclaration) { return s.span; }
-            return SourceSpan::none();
+            if (s.kind == ast::NodeKind::Directive) { continue; }
+            if (s.kind == ast::NodeKind::ModuleDeclaration) { return s.span; }
+            return source_span::SourceSpan::none();
         }
-        return SourceSpan::none();
+        return source_span::SourceSpan::none();
     }
 
     /// Drop the last `n` `/`-delimited components from `path`.  Returns
@@ -640,14 +611,14 @@ type struct DefinitionEngine {
     /// (line 0, col 0 - no useful sub-range).  Used when the target
     /// file isn't loaded so we can't pinpoint its namespace decl, but
     /// can still get the user to the right file.
-    static build_file_start_location(fs_path: string) -> JsonValue {
+    static build_file_start_location(fs_path: string) -> value::JsonValue {
         // Shared builder handles the Windows `file:///C:/...` drive form.
-        mut uri_buf: String = UriPath::uri_string_from_fs_path(fs_path);
+        mut uri_buf: String = conv::UriPath::uri_string_from_fs_path(fs_path);
 
-        const range: Range = lsp::protocol::lsp::Range::new(Position::new(0, 0), Position::new(0, 0));
-        const loc: Location = Location { uri: uri_buf, range: range };
-        const result: JsonValue = loc.to_json();
-        mut l: Location = loc;
+        const range: lsp::Range = lsp::protocol::lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0));
+        const loc: lsp::Location = lsp::Location { uri: uri_buf, range: range };
+        const result: value::JsonValue = loc.to_json();
+        mut l: lsp::Location = loc;
         l.drop();
         return result;
     }
@@ -657,27 +628,27 @@ type struct DefinitionEngine {
     /// cursor sits on.  Decls that don't carry an annotation here
     /// (struct/class/enum bodies, free expressions) return `null` and
     /// the caller falls through to a `null` reply.
-    static annotation_for_node(node: ASTNode*) -> TypeAnnotation* {
+    static annotation_for_node(node: node::ASTNode*) -> ast::TypeAnnotation* {
         if (node == null) { return null; }
-        if (node.kind == NodeKind::FunctionDeclaration) {
-            const f: FunctionDeclNode* = node as FunctionDeclNode*;
+        if (node.kind == ast::NodeKind::FunctionDeclaration) {
+            const f: declaration::FunctionDeclNode* = node as declaration::FunctionDeclNode*;
             return f.return_type_annotation;
         }
-        if (node.kind == NodeKind::MethodDeclaration) {
-            const m: MethodNode* = node as MethodNode*;
+        if (node.kind == ast::NodeKind::MethodDeclaration) {
+            const m: declaration::MethodNode* = node as declaration::MethodNode*;
             if (m.func == null) { return null; }
             return m.func.return_type_annotation;
         }
-        if (node.kind == NodeKind::VariableDeclaration) {
-            const v: VarDeclNode* = node as VarDeclNode*;
+        if (node.kind == ast::NodeKind::VariableDeclaration) {
+            const v: declaration::VarDeclNode* = node as declaration::VarDeclNode*;
             return v.type_annotation;
         }
-        if (node.kind == NodeKind::FieldDeclaration) {
-            const fld: FieldDeclNode* = node as FieldDeclNode*;
+        if (node.kind == ast::NodeKind::FieldDeclaration) {
+            const fld: declaration::FieldDeclNode* = node as declaration::FieldDeclNode*;
             return fld.type_annotation;
         }
-        if (node.kind == NodeKind::TypeAliasDeclaration) {
-            const ta: TypeAliasDeclNode* = node as TypeAliasDeclNode*;
+        if (node.kind == ast::NodeKind::TypeAliasDeclaration) {
+            const ta: declaration::TypeAliasDeclNode* = node as declaration::TypeAliasDeclNode*;
             return ta.target_annotation;
         }
         return null;
@@ -687,15 +658,15 @@ type struct DefinitionEngine {
     /// field carries the absolute filesystem path (the parser stamps
     /// every span with the source it came from).  Reconstructs the URI
     /// by prepending `file://` - the inverse of `uri_to_fs_path`.
-    static build_location_json(span: SourceSpan) -> JsonValue {
+    static build_location_json(span: source_span::SourceSpan) -> value::JsonValue {
         // Reconstruct the URI via the shared builder so Windows drive paths
         // get the `file:///C:/...` form (see UriPath::uri_string_from_fs_path).
-        mut uri_buf: String = UriPath::uri_string_from_fs_path(span.file);
+        mut uri_buf: String = conv::UriPath::uri_string_from_fs_path(span.file);
 
-        const range: Range = DefinitionEngine::range_from_span(span);
-        const loc: Location = Location { uri: uri_buf, range: range };
-        const result: JsonValue = loc.to_json();
-        mut l: Location = loc;
+        const range: lsp::Range = DefinitionEngine::range_from_span(span);
+        const loc: lsp::Location = lsp::Location { uri: uri_buf, range: range };
+        const result: value::JsonValue = loc.to_json();
+        mut l: lsp::Location = loc;
         l.drop();
         return result;
     }
@@ -703,18 +674,18 @@ type struct DefinitionEngine {
     /// Read an integer field (`line` / `character`) from a JSON Position.
     /// Negative or non-integer values clamp to 0 - the LSP spec says
     /// positions must be non-negative, but malformed clients exist.
-    static json_u32_field(obj: &JsonValue, key: string) -> u32 {
-        match (obj.get(Str::from(key))) {
+    static json_u32_field(obj: &value::JsonValue, key: string) -> u32 {
+        match (obj.get(str::Str::from(key))) {
             Option::Some(v) => {
                 match (v) {
-                    JsonValue::Number(n) => {
+                    value::JsonValue::Number(n) => {
                         match (n) {
-                            JsonNumber::Int(i)   => {
+                            value::JsonNumber::Int(i)   => {
                                 if (i < 0) { return 0 as u32; }
                                 return i as u32;
                             }
-                            JsonNumber::UInt(u)  => { return u as u32; }
-                            JsonNumber::Float(f) => {
+                            value::JsonNumber::UInt(u)  => { return u as u32; }
+                            value::JsonNumber::Float(f) => {
                                 if (f < 0.0) { return 0 as u32; }
                                 return f as u32;
                             }
@@ -728,7 +699,7 @@ type struct DefinitionEngine {
     }
 
     /// Convert a 1-based compiler `SourceSpan` to a 0-based LSP `Range`.
-    static range_from_span(span: SourceSpan) -> Range {
+    static range_from_span(span: source_span::SourceSpan) -> lsp::Range {
         mut sl: u32 = 0;
         mut sc: u32 = 0;
         mut el: u32 = 0;
@@ -737,6 +708,6 @@ type struct DefinitionEngine {
         if (span.start_col  > 0) { sc = span.start_col  - 1; }
         if (span.end_line   > 0) { el = span.end_line   - 1; }
         if (span.end_col    > 0) { ec = span.end_col    - 1; }
-        return lsp::protocol::lsp::Range::new(Position::new(sl, sc), Position::new(el, ec));
+        return lsp::protocol::lsp::Range::new(lsp::Position::new(sl, sc), lsp::Position::new(el, ec));
     }
 }

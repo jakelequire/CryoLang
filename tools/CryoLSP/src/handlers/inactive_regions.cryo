@@ -16,29 +16,20 @@
 namespace lsp::handlers::inactive_regions;
 
 import std::core::result;
-import std::core::result::{ Result };
 import std::collections::str;
-import std::collections::str::{ Str };
 import std::collections::string;
 import std::collections::string::{ String };
 import std::collections::array;
 import std::collections::array::{ Array };
 import std::io::stdio;
-import std::io::stdio::{ Stdout };
 import std::json::value;
-import std::json::value::{ JsonObject, JsonValue };
 
 import compiler::compilation_context;
-import compiler::compilation_context::{ CompilationContext };
 import compiler::diag::source_span;
-import compiler::diag::source_span::{ SourceSpan };
 
 import lsp::protocol::framing;
-import lsp::protocol::framing::{ FrameCodec };
 import lsp::protocol::jsonrpc;
-import lsp::protocol::jsonrpc::{ JsonRpcCodec };
 import lsp::protocol::conv;
-import lsp::protocol::conv::{ DiagnosticConverter, UriPath };
 import std::ffi::libc;
 
 
@@ -59,8 +50,8 @@ type struct InactiveRegionsPublisher {
     /// the update rather than mis-painting.  A compile takes long enough on a
     /// real project for several keystrokes to land while it runs, so this is
     /// the normal case during typing, not a rare race.
-    static publish_for(writer: mut &Stdout, uri: Str,
-                       ctx: CompilationContext*, version: i32) -> void {
+    static publish_for(writer: mut &stdio::Stdout, uri: str::Str,
+                       ctx: compilation_context::CompilationContext*, version: i32) -> void {
         if (ctx == null) {
             InactiveRegionsPublisher::publish_empty(writer, uri);
             return;
@@ -70,56 +61,56 @@ type struct InactiveRegionsPublisher {
         // but each notification is per-URI on the wire - filter to this file
         // so a buffer showing `main.cryo` isn't dimmed at positions belonging
         // to a sibling module.
-        mut fs_path_owned: String = UriPath::uri_to_fs_path(uri);
-        const fs_path: Str = fs_path_owned.as_str();
+        mut fs_path_owned: String = conv::UriPath::uri_to_fs_path(uri);
+        const fs_path: str::Str = fs_path_owned.as_str();
 
-        mut arr: Array<JsonValue> =
-            Array<JsonValue>::with_capacity(ctx.inactive_spans.length as u64);
+        mut arr: Array<value::JsonValue> =
+            Array<value::JsonValue>::with_capacity(ctx.inactive_spans.length as u64);
         for (mut i: i64 = 0; i < ctx.inactive_spans.length; i++) {
-            const span: SourceSpan = ctx.inactive_spans[i];
+            const span: source_span::SourceSpan = ctx.inactive_spans[i];
             if (InactiveRegionsPublisher::span_is_for_path(span, fs_path)) {
-                arr.push(DiagnosticConverter::range_json_from_span(span));
+                arr.push(conv::DiagnosticConverter::range_json_from_span(span));
             }
         }
         fs_path_owned.drop();
 
-        mut params: JsonObject = JsonObject::new();
-        params.put("uri", JsonValue::from(uri));
+        mut params: value::JsonObject = value::JsonObject::new();
+        params.put("uri", value::JsonValue::from(uri));
         if (version >= 0) {
-            params.put("version", JsonValue::int_value(version as i64));
+            params.put("version", value::JsonValue::int_value(version as i64));
         }
-        params.put("regions", JsonValue::Array(arr));
-        InactiveRegionsPublisher::send_notification(writer, JsonValue::Object(params));
+        params.put("regions", value::JsonValue::Array(arr));
+        InactiveRegionsPublisher::send_notification(writer, value::JsonValue::Object(params));
     }
 
     /// Publish an empty region array for `uri` - clears any prior dimming
     /// (used on didClose, or when there's no context to consult).  Sent
     /// unversioned: "nothing is inactive here" is true of every version of
     /// the document, so the client should never hold it back as stale.
-    static publish_empty(writer: mut &Stdout, uri: Str) -> void {
-        mut params: JsonObject = JsonObject::new();
-        params.put("uri", JsonValue::from(uri));
-        params.put("regions", JsonValue::Array(Array<JsonValue>::with_capacity(0)));
-        InactiveRegionsPublisher::send_notification(writer, JsonValue::Object(params));
+    static publish_empty(writer: mut &stdio::Stdout, uri: str::Str) -> void {
+        mut params: value::JsonObject = value::JsonObject::new();
+        params.put("uri", value::JsonValue::from(uri));
+        params.put("regions", value::JsonValue::Array(Array<value::JsonValue>::with_capacity(0)));
+        InactiveRegionsPublisher::send_notification(writer, value::JsonValue::Object(params));
     }
 
     /// True when a stripped span belongs to `fs_path`.  Spanless entries
     /// (`span.file == ""`) are dropped - `note_inactive` already skips
     /// location-less spans, so this is belt-and-suspenders.
-    static span_is_for_path(span: SourceSpan, fs_path: Str) -> boolean {
+    static span_is_for_path(span: source_span::SourceSpan, fs_path: str::Str) -> boolean {
         const span_file: string = span.file;
         if (span_file == "") { return false; }
         if (libc::strlen(span_file) == 0 as u64) { return false; }
-        return fs_path.equals(&Str::from(span_file));
+        return fs_path.equals(&str::Str::from(span_file));
     }
 
     /// Encode + frame + write a `cryo/inactiveRegions` notification.  Write
     /// failures are swallowed (stdout is the wire; logging there corrupts it),
     /// consistent with DiagnosticPublisher.
-    static send_notification(writer: mut &Stdout, params: JsonValue) -> void {
-        mut body: String = JsonRpcCodec::encode_notification(
-            Str::from("cryo/inactiveRegions"), params);
-        match (FrameCodec::write_message(writer, body.as_str())) {
+    static send_notification(writer: mut &stdio::Stdout, params: value::JsonValue) -> void {
+        mut body: String = jsonrpc::JsonRpcCodec::encode_notification(
+            str::Str::from("cryo/inactiveRegions"), params);
+        match (framing::FrameCodec::write_message(writer, body.as_str())) {
             Result::Ok(_)  => { }
             Result::Err(_) => { }
         }

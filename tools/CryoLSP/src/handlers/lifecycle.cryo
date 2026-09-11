@@ -10,31 +10,26 @@
 namespace lsp::handlers::lifecycle;
 
 import std::core::option;
-import std::core::option::{ Option };
 import std::collections::str;
-import std::collections::str::{ Str };
 import std::collections::string;
 import std::collections::string::{ String };
 import std::collections::array;
 import std::collections::array::{ Array };
 import std::json::value;
-import std::json::value::{ JsonObject, JsonValue };
 
 import lsp::server::state;
-import lsp::server::state::{ ServerState };
 import lsp::protocol::semantic_tokens;
-import lsp::protocol::semantic_tokens::{ SemanticTokensCodec };
 
 
 /// Handle an `initialize` request.  Mutates `state` and returns the
 /// JSON value to put into the response's `result` field.
-public function handle_initialize(state: mut &ServerState, params: &JsonValue) -> JsonValue {
+public function handle_initialize(state: mut &state::ServerState, params: &value::JsonValue) -> value::JsonValue {
     // Stash the workspace root if present.  Either `rootUri` (older
     // spec) or `workspaceFolders[0].uri` (newer) is acceptable; we
     // accept the former since most clients still send it.
-    match (params.get(Str::from("rootUri"))) {
+    match (params.get(str::Str::from("rootUri"))) {
         Option::Some(uri_v) => {
-            match (uri_v.as<Str>()) {
+            match (uri_v.as<str::Str>()) {
                 Option::Some(uri) => {
                     state.root_uri.drop();
                     state.root_uri = String::from_str(uri);
@@ -61,9 +56,9 @@ public function handle_initialize(state: mut &ServerState, params: &JsonValue) -
 /// Handle a `shutdown` request.  Per LSP spec the response body is
 /// `null`; the client sends `exit` next, which the server loop
 /// catches at the top of its dispatch path.
-public function handle_shutdown(state: mut &ServerState) -> JsonValue {
+public function handle_shutdown(state: mut &state::ServerState) -> value::JsonValue {
     state.shutdown_requested = true;
-    return JsonValue::Null;
+    return value::JsonValue::Null;
 }
 
 
@@ -74,21 +69,21 @@ type struct LspCapabilities {
     /// True when the client's `initialize` params advertise support for the
     /// `utf-8` position encoding (`capabilities.general.positionEncodings`
     /// contains the string `"utf-8"`).  Missing/wrong-typed fields => false.
-    static client_offers_utf8(params: &JsonValue) -> boolean {
-        match (params.get(Str::from("capabilities"))) {
+    static client_offers_utf8(params: &value::JsonValue) -> boolean {
+        match (params.get(str::Str::from("capabilities"))) {
             Option::Some(caps) => {
-                match (caps.get(Str::from("general"))) {
+                match (caps.get(str::Str::from("general"))) {
                     Option::Some(general) => {
-                        match (general.get(Str::from("positionEncodings"))) {
+                        match (general.get(str::Str::from("positionEncodings"))) {
                             Option::Some(encs) => {
                                 match (encs) {
-                                    JsonValue::Array(arr) => {
+                                    value::JsonValue::Array(arr) => {
                                         for (mut i: u64 = 0; i < arr.length(); i++) {
                                             match (arr.get_ref(i)) {
                                                 Option::Some(e) => {
-                                                    match (e.as<Str>()) {
+                                                    match (e.as<str::Str>()) {
                                                         Option::Some(s) => {
-                                                            if (s.equals(&Str::from("utf-8"))) {
+                                                            if (s.equals(&str::Str::from("utf-8"))) {
                                                                 return true;
                                                             }
                                                         }
@@ -116,15 +111,15 @@ type struct LspCapabilities {
     /// Build the `InitializeResult` payload.  Only what we actually
     /// support today - adding a feature should grow this object, not a
     /// separate registration step.
-    static build_initialize_result(advertise_utf8: boolean) -> JsonValue {
-        mut caps: JsonObject = JsonObject::new();
+    static build_initialize_result(advertise_utf8: boolean) -> value::JsonValue {
+        mut caps: value::JsonObject = value::JsonObject::new();
 
         // positionEncoding: only advertised when the client offered `utf-8`
         // (see `client_offers_utf8`).  Advertising it unconditionally would
         // break clients that speak only UTF-16, so the field is omitted in
         // that case and the connection falls back to the UTF-16 default.
         if (advertise_utf8) {
-            caps.put("positionEncoding", JsonValue::from("utf-8"));
+            caps.put("positionEncoding", value::JsonValue::from("utf-8"));
         }
 
         // textDocumentSync: 1 = Full.  `did_change` treats the last
@@ -135,26 +130,26 @@ type struct LspCapabilities {
         // the symptom users see as "save twice for the LSP to catch
         // up".  Move to Incremental (with proper range application)
         // when keystroke-by-keystroke recompile cost is the bottleneck.
-        caps.put("textDocumentSync", JsonValue::int_value(1 as i64));
+        caps.put("textDocumentSync", value::JsonValue::int_value(1 as i64));
 
-        caps.put("hoverProvider", JsonValue::Bool(true));
-        caps.put("definitionProvider", JsonValue::Bool(true));
+        caps.put("hoverProvider", value::JsonValue::Bool(true));
+        caps.put("definitionProvider", value::JsonValue::Bool(true));
 
         // Completion: trigger on `.` and `:` (member access + scope
         // resolution).  Both are entered in Phase C; advertised here so
         // editors enable the keystroke handler.
-        mut completion: JsonObject = JsonObject::new();
-        mut triggers: Array<JsonValue> = Array<JsonValue>::with_capacity(2);
-        triggers.push(JsonValue::from("."));
-        triggers.push(JsonValue::from(":"));
-        completion.put("triggerCharacters", JsonValue::Array(triggers));
-        caps.put("completionProvider", JsonValue::Object(completion));
+        mut completion: value::JsonObject = value::JsonObject::new();
+        mut triggers: Array<value::JsonValue> = Array<value::JsonValue>::with_capacity(2);
+        triggers.push(value::JsonValue::from("."));
+        triggers.push(value::JsonValue::from(":"));
+        completion.put("triggerCharacters", value::JsonValue::Array(triggers));
+        caps.put("completionProvider", value::JsonValue::Object(completion));
 
         // Semantic tokens: full-document only.  Legend (token types +
         // modifiers) lives in `lsp::protocol::semantic_tokens`; the indexes
         // emitted by the handler must match the order declared there.
         caps.put("semanticTokensProvider",
-                 SemanticTokensCodec::provider_capability());
+                 semantic_tokens::SemanticTokensCodec::provider_capability());
 
         // Code actions: every diagnostic gets a "Show full Cryo
         // diagnostic" lightbulb item; clicking it fires the
@@ -162,30 +157,30 @@ type struct LspCapabilities {
         // a `cryo-diagnostic:` virtual document containing the rendered
         // report.  Boolean form advertises support without a kind
         // filter - the handler decides per-diagnostic whether to emit.
-        caps.put("codeActionProvider", JsonValue::Bool(true));
+        caps.put("codeActionProvider", value::JsonValue::Bool(true));
 
         // Code lenses: render an inline "Show full diagnostic" link
         // above every diagnostic line.  Same destination as the code
         // action, just always visible - no Ctrl+. needed.
         // `resolveProvider: false` keeps the lens fully populated up
         // front; no separate `codeLens/resolve` round-trip.
-        mut code_lens: JsonObject = JsonObject::new();
-        code_lens.put("resolveProvider", JsonValue::Bool(false));
-        caps.put("codeLensProvider", JsonValue::Object(code_lens));
+        mut code_lens: value::JsonObject = value::JsonObject::new();
+        code_lens.put("resolveProvider", value::JsonValue::Bool(false));
+        caps.put("codeLensProvider", value::JsonValue::Object(code_lens));
 
-        mut result: JsonObject = JsonObject::new();
-        result.put("capabilities", JsonValue::Object(caps));
+        mut result: value::JsonObject = value::JsonObject::new();
+        result.put("capabilities", value::JsonValue::Object(caps));
 
         // serverInfo block. The version is not decoration: CryoAnalyzer
         // compares it against its own and warns when they differ, which is
         // how a stale `cryolsp` picked up from $PATH ahead of a freshly
         // built one gets noticed. It must therefore track the release
         // version, in step with `tools/CryoAnalyzer/package.json`.
-        mut info: JsonObject = JsonObject::new();
-        info.put("name", JsonValue::from("cryolsp"));
-        info.put("version", JsonValue::from("1.0.0"));
-        result.put("serverInfo", JsonValue::Object(info));
+        mut info: value::JsonObject = value::JsonObject::new();
+        info.put("name", value::JsonValue::from("cryolsp"));
+        info.put("version", value::JsonValue::from("1.0.0"));
+        result.put("serverInfo", value::JsonValue::Object(info));
 
-        return JsonValue::Object(result);
+        return value::JsonValue::Object(result);
     }
 }

@@ -53,7 +53,7 @@ current-state description is the defect it exists to remove.
 | D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1649** | §8.66, §8.80, §8.139 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **2** | §8.138, §8.144 |
-| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS, HELD** — 1 module of 574 through and verified at zero objects changed. `stdlib`'s 7,122 sites are measured but NOT landed: six positions take no path (§8.146) and two failures are unattributed | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **579** | §8.145, §8.146 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) and on `mod::Type<Args>::static()` resolving (§8.148) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **576** | §8.145, §8.146, §8.147, §8.148 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
 
 **D2 is the one to look at.** Decided in §8.39, then neither taken nor
@@ -20511,3 +20511,69 @@ Two failures are still open and are now measured against the RIGHT compiler:
 the imported module and the file's OWN namespace. The collision test counted
 only imported paths. A file's own namespace leaf is a module spelling in scope
 and now counts.
+
+### 8.148 `tools` landed; a prelude-shadowing import was being DROPPED, and a qualified generic static call has no answering path since the glob went - MEASURED AND LANDED 2026-09-10
+
+`tools/CryoLSP` is 24 files and 351 names through the requalification, gated
+by `lsp-check` - 266 modules, 0 errors - since its objects are outside the
+baseline. Two findings on the way, one of them a meaning change the generator
+would have shipped silently.
+
+#### The generator dropped a shadowing import
+
+`keyword_docs.cryo` imported `Range` from `lsp::protocol` and the prelude also
+offers a `Range`, from `std::core::ops`. The generator's rule was "a prelude
+name needs no import - drop it and leave the use bare". So the braced import
+went, the annotation `const range: Range` stayed bare, **and it re-bound to the
+prelude's `Range`**. The initializer beside it was qualified to the LSP's, and
+the two disagreed:
+
+    expected `std::core::ops::Range`, found `lsp::protocol::lsp::Range`
+
+Only a name that happens to be BOTH shadowed and used as an annotation on the
+same line as a qualified initializer produces a diagnostic. A shadowed name used
+consistently would compile and mean the wrong thing. The rule is now: a prelude
+name is dropped only when the braced import's declaring module IS the prelude's
+declarer. A different declaration of the same name shadows the prelude and is
+qualified like anything else.
+
+This is the class of defect the object criterion exists to catch, and `tools`
+is outside the baseline. It was caught by `lsp-check` seeing the ONE line where
+the two halves disagreed, which is luck rather than method.
+
+#### `mod::Type<Args>::static()` does not resolve, and the glob was hiding it
+
+`hashmap::HashMap<i64, i64>::new()` is E0233. The bare form
+`HashMap<i64, i64>::new()` resolves, the qualified argument-free form
+`hashmap::HashMap::new()` resolves, and the qualified non-generic form
+`str::Str::new(..)` resolves. Only qualified-with-explicit-arguments fails.
+
+Bisected across five builds, each tested on the same snippet:
+
+| commit | result |
+|---|---|
+| `3831f8a4` (before the glob deletion) | compiles |
+| `9698575d` .. `bd0c8580` | E0233 |
+| `94a42262` with ruling 1's parser reverted | E0233 |
+| `94a42262` with ruling 1's import-following hunk reverted | E0233 |
+
+So it is not either ruling, and the first assumption - that it was - cost two
+of those builds. **The glob deletion exposed it.** Under the glob `HashMap` was
+bound bare in every importing scope, and the "qualified" call was reaching that
+bare binding; the qualifier itself never answered this shape. That is precisely
+the class the migration exists to surface, and it blocks the sweep everywhere,
+since every `Type<T>::static()` in the tree becomes exactly this. Open, and
+next. Until it resolves the generator keeps the braced import for any name used
+as `Name<...>::`.
+
+#### Two smaller generator defects
+
+A qualifier head that is an imported path's PREFIX rather than its leaf -
+`lsp::Range`, where `lsp` opens `lsp::protocol` - was re-prefixed to
+`lsp::protocol::lsp::Range`. The head check now knows every segment of every
+imported path, not only the last.
+
+And a control byte: the pattern for `Name<...>::` was written through a shell
+heredoc, `\b` became a literal backspace, and the regex matched nothing while
+looking correct in every listing. `cat -A` showed it as `^H`. Three edits were
+made to a file that already had the right text before the byte was looked at.
