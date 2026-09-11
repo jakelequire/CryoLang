@@ -20577,3 +20577,208 @@ And a control byte: the pattern for `Name<...>::` was written through a shell
 heredoc, `\b` became a literal backspace, and the regex matched nothing while
 looking correct in every listing. `cat -A` showed it as `^H`. Three edits were
 made to a file that already had the right text before the byte was looked at.
+
+### 8.149 Handoff: the requalification sweep - state, method, every trap the generator hit, and one bisected resolver gap - 2026-09-10
+
+Written for a stranger. Nothing the previous agent remembers survives this.
+
+#### Tree state
+
+Everything is committed and pushed; the last work commit is the one carrying
+this entry. Both checkouts are clean and coherent: the main checkout at HEAD,
+and the detached one-target worktree `C:/Programming/apps/CryoLang-head` at
+`4757b85c`, two commits behind, with no local edits. No area is half-applied.
+
+#### THE BISECT - do not redo it
+
+**Shape:** `mod::GenericType<Args>::static_method(...)`. Reproducer, verbatim:
+
+```cryo
+namespace Main;
+import std::collections::hashmap;
+function main() -> int {
+    mut m: hashmap::HashMap<i64,i64> = hashmap::HashMap<i64,i64>::new();
+    return 0;
+}
+```
+
+Fails `error[E0233]: cannot find 'hashmap::HashMap::new': no matching static
+method, variant, or type`. Three neighbours all COMPILE with the same compiler:
+bare `HashMap<i64,i64>::new()` (braced import), qualified argument-free
+`hashmap::HashMap::new()`, and qualified non-generic `str::Str::new("x")`.
+Only qualified-with-explicit-arguments fails.
+
+| build | result |
+|---|---|
+| `3831f8a4` (the commit before the glob deletion) | compiles |
+| `9698575d` (glob deletion) onward, incl. `bd0c8580` | E0233 |
+| `94a42262` (D13) with its `expr_parser.cryo` reverted to `bd0c8580` | E0233 |
+| `94a42262` with the import-following hunk in `type_spelling_res` reverted | E0233 |
+
+So it is NOT D13, NOT D14, NOT the diagnostic commit, and not the other
+workers' commits in between: **the glob deletion exposed it.** Under the glob,
+`HashMap` was bound bare in every importing scope and the "qualified" call was
+reaching that bare binding; the qualifier itself never answered this shape. It
+is a latent gap the glob masked, not a regression anyone wrote. It blocks the
+sweep everywhere - every `Type<T>::static()` in the tree becomes exactly this -
+and `qualify-imports.py` keeps the braced import for any name used as
+`Name<...>::` until it is fixed. Where to look: the static-call scope path in
+`call_resolver.cryo` / `stamp_module_scope`, for how a scope segment that
+carries generic arguments is keyed when its head is a MODULE. The assumption
+that this was one of the rulings cost two of the five builds.
+
+#### The generator: every trap, with its shape
+
+`scripts/qualify-imports.py`. Each of these was hit by a real batch and is now
+handled; each is a thing a rewritten generator hits again.
+
+1. **A prelude name that SHADOWS the prelude was dropped.** `keyword_docs.cryo`
+   imports `Range` from `lsp::protocol`; the prelude offers `Range` from
+   `std::core::ops`. "A prelude name needs no import" dropped the braced
+   import, left `const range: Range` bare, and re-bound it to the prelude's -
+   a silent meaning change. It surfaced ONLY because the initializer on the
+   same line was qualified to the LSP's and E0200 fired. A shadowed name used
+   consistently compiles and means the wrong thing. Rule now: drop only when
+   the braced import's declaring module IS the prelude's declarer. `tools` is
+   outside the object baseline, so this was luck, not method.
+2. **Enum variant DECLARATION with a payload** - `Array(Array<JsonValue>);` -
+   is shaped like a call statement, and its variant NAME was rewritten to
+   `array::Array(...)`. Enum bodies are tracked by brace depth; the leading
+   name on a line inside one is the variant, the payload is still qualified.
+3. **Already-qualified source was qualified again**:
+   `metadata::metadata(from)` -> `metadata::metadata::metadata(from)`, because
+   `std::fs::metadata` declares a free function `metadata`. The rewriter
+   skipped a name PRECEDED by `::` and not one that is itself a qualifier
+   head. A head that is any segment of an imported path is a module and is
+   left alone; a head that is not is a type and still gets its qualifier.
+   (A first version knew only path LEAVES, so `lsp::Range` - `lsp` being a
+   prefix of `lsp::protocol` - became `lsp::protocol::lsp::Range`.)
+4. **A KEYWORD segment cannot be written in a path**, at any depth:
+   `default::Default` and `std::core::default::Default` both fail. Primitives
+   are the dangerous half: `string` is a type, so `mut &string::String` parses
+   `&string` as a COMPLETE type and chokes on the leftover `::` - it looks fine
+   in some positions and fails in others, so it cannot be settled by trying
+   one. Three module segments affected: `default`, `float`, `string`;
+   `std::collections::string` supplies `String`, ~1,087 sites. Both sets are
+   read from the lexer's keyword table and `is_primitive_spelling`. Closing
+   the hole is a lexer change and needs Jake.
+5. **The file's OWN namespace leaf is a qualifier collision**: `std::fmt::error`
+   importing `std::io::error` cannot use `error`. The collision test counted
+   only imported paths.
+6. **The collision test counted OCCURRENCES, not distinct paths.** A file that
+   imports one module plainly AND in braces - most files after `1623324e` -
+   names it twice, and every such file fell back to the fully-qualified form.
+7. **Positions must come from a LENGTH-PRESERVING mask.** `strip_noise`
+   collapses strings and truncates at `//`, so an offset in it is not an
+   offset in the source; applying one to the other edits the wrong column of
+   any line with a string or a trailing comment.
+8. **Six declaration-head positions take one identifier and no path**: impl
+   trait target (`for struct X` and `for X`), inherent impl target
+   (`implement struct X`), base class / base trait, base-constructor call, and
+   the enum variant above. Carved out, not widened - the impl target is keyed
+   `(leaf, target)` by three trait-lookup consumers and re-keying is ruled
+   against. A name in any of these keeps its braced import file-wide.
+9. **A literal control byte in a regex.** `\b` written through a shell
+   heredoc became ASCII 8; the pattern matched nothing and looked correct in
+   every listing until `cat -A` showed `^H`. Three edits went into a file that
+   already had the right text before the byte was looked at.
+
+Standing operational traps hit this session: a `make test` launched with `&`
+died at once and `tail -f` blocked thirty minutes on a log that never grew -
+run builds in the foreground under `timeout` and read make's exit code;
+`error[E0900]: linker invocation failed` prints the command line and NOT gcc's
+message, re-run the retained `.rsp` link by hand; stderr sent to `/dev/null`
+hid a `NameError` and the run looked like success; and the build stops at the
+FIRST failing module, so a batch reports one defect at a time and a clean log
+after a fix means only that the next one is further down.
+
+#### Sweep state
+
+| area | state |
+|---|---|
+| `stdlib/io/error.cryo` | landed, 0 of 406 objects changed |
+| `compiler/src/utils`, `compiler/src/CLI` | landed, 0 of 406 changed |
+| `tools/` | landed, `lsp-check` 266 modules / 0 errors (outside the baseline) |
+| `stdlib` (rest) | HELD - see below |
+| `compiler` (rest) | untouched; wait on the re-pin |
+| `tests/`, `examples/` | untouched; NOT pin-bound, can proceed now |
+
+Corrected figures, superseding §8.135's: **50,731 sites / 574 files / 8,262
+braced items**; prelude **84** names, not 650 (that number predated the
+`legacy/` exclusion and the intrinsic correction). D15's row carries the
+file-count check; it moved with batch 1 and was updated only at `d4dad49b` -
+it is correct at HEAD (576) but was wrong for one commit, and that is owed to
+the record rather than hidden.
+
+**`stdlib` is held on two failures**, measured against the CURRENT compiler
+(`PIN_EXE=compiler/build/cryo.exe`), since §8.147 established the pin builds
+stdlib and the pin predates every ruling:
+
+* `atomic::Atomic<u64>::new(1)` in `alloc/arc.cryo` - E0233. This is the
+  bisected gap above, same shape.
+* `combinator::Futures::timeout(...)` in `net/http/server.cryo` - E0200,
+  expected `Result<Result<Request, IoError>, Elapsed>`, found
+  `Result<O, Elapsed>`: a generic output parameter not substituted. Not
+  root-caused; it was hidden behind the first failure until that was held
+  back.
+
+A third, `str::Str::from_raw`, was §8.146's "unattributed" one and is the pin:
+the same tree compiles it under the current compiler (§8.147).
+
+#### The method, in enough detail to reuse
+
+* **Criterion: ZERO objects changed.** `tests/obj-baseline-windows.txt`, taken
+  at `8b49e4b0`, 406 objects, generated by `scripts/obj-hash.sh`. Any commit
+  that touches compiler source invalidates it; re-take immediately before the
+  measurement, never at the start of a session.
+* **Measure in the one-target worktree**, `C:/Programming/apps/CryoLang-head`.
+  The main checkout has built both hosts and reports **1,183** objects against
+  406 - `obj-hash.sh`'s own header names that number as the thing that makes
+  a checkout useless as an instrument. Copy `qualify-imports.py` and
+  `migrate-plain-imports.py` into its `scripts/` (they are newer than its
+  commit), and delete them before `git checkout` there.
+* **Verify padded, deliver unpadded.** Objects carry line information, so
+  deleting an import line shifts every line below it and moves the object for
+  that reason alone - five bytes, identical symbols, one of them a decrement
+  by one. `--keep-lines` pads each import block back to its height; verified
+  that way a pure requalification is byte-identical. Deliver without it.
+* **Replay from the baseline commit.** Each verification checks out the
+  baseline commit in the worktree and applies EVERY delivered pathspec padded,
+  then builds `stdlib`, `cryo`, `runtime-tiers`, then `obj-hash.sh` and
+  `comm -13` against the baseline. A build that stops early reports a short
+  object list and "0 changed"; the count must be 406 before the zero means
+  anything.
+* **`stdlib`/`compiler` are built by the PIN.** Grade them with
+  `PIN_EXE=<current compiler>` or re-pin first. The generator prints a warning
+  when `--apply` targets either.
+
+#### Two judgement calls
+
+**Batch size.** Stay area-by-area for `stdlib` and `compiler`: every batch so
+far found something, and the build stops at the first failing module, so a
+large batch hides its second defect behind its first. `tests/` and `examples/`
+are the exception - they are not pin-bound, their names are the same
+(`TestError`, `expect_eq`, `Str`) hundreds of times over, and the suite is the
+gate. Those can go in two batches: `examples/` (10 files) as the control, then
+all of `tests/`.
+
+**Is `stdlib` hard incidentally or structurally?** Structurally, on three
+counts. It gets no prelude, so `Result` and `Option` - 2,461 of its 7,127 sites
+- must be qualified there and nowhere else. It is the module that DECLARES the
+things the rest of the tree only uses, so it is where every declaration-head
+position (impl targets, base classes, variant declarations) concentrates. And
+it is built by the pin, so it can use nothing newer than the pin. `stdlib`
+being the hard case is what the sweep looks like when the code being swept is
+also the code the compiler bootstraps from. Sweeping it last, after a re-pin,
+is the right order for that reason and not only for convenience.
+
+#### Next, in order
+
+1. Fix `mod::GenericType<Args>::static()` (the bisected gap; blocks
+   everything).
+2. `make pin` - about twenty minutes, from a CLEAN tree, and a stopped run
+   leaves a mismatched pair `verify-pin` still calls OK.
+3. Re-take the object baseline at the new HEAD.
+4. `examples/`, then `tests/`, on the current pin if 2 has not happened.
+5. `stdlib`, then the rest of `compiler`, area by area.
+6. Jake's rulings owed: keyword segments as path segments (trap 4).

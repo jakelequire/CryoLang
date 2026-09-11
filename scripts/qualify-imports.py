@@ -448,8 +448,18 @@ def main(argv):
               file=sys.stderr)
         return 2
     world = mig.World(mig.tracked_files([]))
+    targets = mig.tracked_files(specs)
+    # `stdlib` and `compiler` are built by the PIN, not by the compiler under
+    # test, so a sweep there is graded by a compiler that predates every ruling
+    # this tool depends on. Said out loud rather than discovered again: the
+    # first attempt lost a full stdlib batch to it.
+    if do_apply and any(p.startswith(("stdlib/", "compiler/")) for p in targets):
+        print("WARNING: stdlib/ and compiler/ are compiled by bin/cryo (the pin)."
+              " A failure there may be the pin's age, not the code - re-pin"
+              " first, or grade the build with PIN_EXE=<current compiler>.",
+              file=sys.stderr)
     total_sites = 0
-    for path in mig.tracked_files(specs):
+    for path in targets:
         planned = plan(world, path)
         if planned is None:
             continue
