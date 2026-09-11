@@ -50,7 +50,7 @@ current-state description is the defect it exists to remove.
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
 | D10 | A plural bare leaf is E0155, not a directory-order bind | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **3** | §8.121 |
-| D11 | Retire `resolve_counter.cryo` — LAST, after the lanes it counts | RULED, not started | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1643** | §8.66, §8.80 |
+| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1649** | §8.66, §8.80, §8.139 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
 
 **D2 is the one to look at.** Decided in §8.39, then neither taken nor
@@ -19469,3 +19469,183 @@ plain imports into, so removing it is its own migration and its own entry.
 * `lane-check` **unchanged** - it counts call sites in `compiler/src`, and the
   switch adds none.
 * `lsp-check` unchanged: `tools/` needs no import.
+
+### 8.139 The counter's unasserted rows are notes, not tripwires - 36 RETIRED, and a `bump()` in branch position is not a statement 2026-09-10
+
+`resolve_counter.cryo` had reached 1,931 lines and 179 report rows. §8.80
+ordered its retirement LAST, after the lanes it counts; that ordering is
+**withdrawn**. Nothing about an unasserted row depends on the lane beneath it
+settling, and every row is a global-array increment every release build pays:
+`bump()` is unconditional and only the REPORT is gated on
+`CRYO_RESOLVE_COUNTER`.
+
+#### The scoping, reconciled
+
+Two prior counts disagreed - 184 emitted / 83 asserted / 102 unasserted against
+179 / 82 / 97. The second is right. The check is mechanical: `print_row` calls
+in `report()`, `Site::` arms in `bucket()`, rows in the golden.
+
+| bucket | emitted | asserted |
+|---|---|---|
+| B1 | 47 | 47 |
+| B1> floor | 14 | 14 |
+| `!!` | 19 | 19 |
+| B3* | 2 | 2 |
+| B3 | 14 | 0 |
+| B2 | 10 | 0 |
+| unbucketed | 73 | 0 |
+| **total** | **179** | **82** |
+
+82 rows plus `B1_TOTAL` is exactly the 83 lines each `[host:*]` section of
+`tests/b1-baseline.txt` carries. The golden's header names the buckets it
+asserts and honours it precisely - zero unasserted rows in any bucket it
+promises to assert - so the 97 are the rows it openly calls context.
+
+#### A `bump()` is not always in a statement position
+
+This is the entry's transferable half. Deleting a `bump()` line is a null edit
+only when the line is one statement among others. Where the bump is the SOLE
+body of a branch, the line IS the branch:
+
+```cryo
+if (match_count == 0) { SfScanNone.bump(); }
+else if (match_count == 1) { SfScanOne.bump(); }
+else { SfScanPlural.bump(); }
+```
+
+Removing the first arm merged the zero case into the `else`, so `SfScanPlural`
+- a row pinned at 0 and named "PLURAL (tie-break pop)" - began counting "found
+nothing" as "found several". A compiler built from that edit read **591** on
+the current corpus and **366** on the pre-migration one. The condition is now
+`match_count > 1`, which is exactly the population the bare `else` had once
+`== 0` and `== 1` were excluded, so both rows count what their names say.
+
+Nothing in the counter could have caught this: the row was not wrong, the
+control flow was.
+
+#### The classifier, and its own control
+
+`scripts/retire-counter-sites.py --audit` classifies every bump by the shape it
+sits in - **BRANCH** (sole body of an if/else chain; deleting merges cases),
+**ARM** (sole body of a match arm; the arm must stay), **IF** (lone `if`, no
+else; drop the whole thing), **PLAIN**. It exits 1 when any BRANCH is present,
+so it runs as a pre-edit gate.
+
+**It failed its own control first, and that is why it is trustworthy now.** Run
+over the tree that produced the defect it called `SfScanNone` **PLAIN**:
+`} else if (c) {` closes one branch and opens the next on one line, so a
+per-line brace sum never returns to zero and the whole chain read as a single
+block. The rewrite scans a character stream with string literals and comments
+masked. The pair, over the same tree:
+
+* the old classifier reported `SfScanNone` PLAIN;
+* the new one reports it BRANCH, while still reporting `SfViaRes` and
+  `M4ViaRes` - the two clean removals in the same hunk - PLAIN.
+
+Reading its output found two more gaps, both under-reporting the DANGEROUS
+class: a multi-line condition lost the `if`/`else` that names the branch kind
+(the header now runs back to the previous statement boundary), and a one-line
+arm `_ => { X.bump(); }` was scanned from column 0, walking past the arm into
+the enclosing `match` (the scan now starts at the bump's own column).
+
+#### The 36, audited against the tree before the edit
+
+| shape | n | how each was handled |
+|---|---|---|
+| BRANCH | 3 | `SfScanNone` - the defect above. `PrimImplTargetPrimitive`/`Declared` - both arms of `note_impl_target_kind`, deleted together with the `if/else`, the function and all three call sites, so no sibling survives to absorb a merged case. |
+| ARM | 1 | `CgImplTargetUnResPend` - kept as an empty arm. |
+| IF | 3 | `ImplHeadUnstamped`, `ScopeUseDiff`, `SpecTypeDeclBindable` - lone `if`, no else, whole `if` dropped; each condition checked to be a pure read. |
+| PLAIN | 27 | line deletions. |
+| not a direct bump | 2 | `CascBCtorEnter`/`CascNewDelEnter`, passed as a `Site` value and removed with the parameter. |
+
+It was three BRANCH sites, not one. Two of them came out correct because of
+HOW they were deleted - the whole construct, not a line - rather than because
+anyone checked. Recorded that way deliberately: an outcome that is right by
+accident and an outcome that is right by inspection are the same colour from
+the outside, and only one of them is repeatable.
+
+#### Dead by enumeration, not by reading comments
+
+* `suspend()` / `resume()` had **no caller anywhere**. Their docstring
+  justified them by a divergence probe that re-ran production lookups; the
+  probe is gone. `g_suspend` went with them, and with it a branch at the top of
+  `bump()` that every counted resolution executed, and one in
+  `Audit::enabled()`.
+* `module_scope_pick()`, `reset()`, `pre_resolved_prim()` - likewise dead.
+* **`Audit::Leaf` / `CRYO_LEAF_AUDIT` is a whole stream with no emitter** -
+  declared, documented, switchable by env var, and incapable of printing
+  anything.
+* `enabled()` loses `public`; its only caller is `report()` in the same file.
+* `note_impl_target_kind` existed solely to feed two rows.
+* Four files lose their `resolve_counter` import entirely, and
+  `CompilationContext::widen_type_home_scoped_bare` loses its
+  `enter: resolve_counter::Site` parameter.
+
+#### A stale rationale, withdrawn
+
+The module docstring read **"Not scaffolding... Individual SITES are disposable
+but the module is not."** That is §7.4's shape exactly: a rationale written
+before a decision and still holding it in place afterwards. D11 rules the
+module retires. The header now says a site earns its place by being ASSERTED,
+and that an unasserted site added to answer a question should come out once the
+question is answered - which is how the file reached 179 rows.
+
+#### Measured
+
+| | before | after |
+|---|---|---|
+| `resolve_counter.cryo` lines | 1,931 | 1,643 |
+
+(1,649 as committed: this entry added a six-line pointer to the pre-edit
+audit, which D11's row counts.)
+| `Site` variants / report rows | 179 | 143 |
+| **asserted rows** | **82** | **82** |
+| `Site::` references outside the module | 182 | 147 |
+| files importing `resolve_counter` | 33 | 29 |
+
+`tests/b1-baseline.txt` untouched; its 82 rows still map one-to-one onto what
+the report emits, checked as sets. `make lane-check` unchanged, all seven
+buckets - the control saying no lookup lane moved.
+
+#### What is left, and who can reach it
+
+61 unasserted rows remain, not the ~83 an intermediate note gave: 37 context,
+10 B2, 14 B3. B3's 14 are held pending a ruling on whether they become
+asserted. B2's 10 move as one block - nine of them bump in `call_resolver.cryo`
+and the B2 TOTAL is the sum of exactly those plus `RnAssocProjection`, so
+taking one leaves a total that is no longer a total of anything.
+
+Four context rows are held because each is the **only** row bounding an
+asserted zero, and removing one would make a starved lane and a dead one read
+identically:
+
+| kept | bounds |
+|---|---|
+| `RnCalls` | `2c home-module` and `2b ambiguity`, both pinned 0 |
+| `ImplHeadSeen` | `ImplHeadAsyncUnstamped` (violation row, 0), whose own denominator `ImplHeadAsync` is also 0 |
+| `SfCalls` | `SfScanOne` / `SfScanPlural`, both violation rows |
+| `FnBindSingle` | `FnBindSingleHidden`, a violation row |
+
+Of the 47 non-B3 rows, **6 sit in files this work owns** and four of those are
+the table above. The rest need `sema/call_resolver.cryo` (22 rows),
+`resolver/name_resolution.cryo` (10), `types/arena.cryo` (4) and
+`decl_index.cryo` (3). Eleven of them are reached only through a `Site`-typed
+parameter - `door:` in the two visibility gates, `nodef_site:` in
+`TypeUtils::spelling_type` - whose `label()` also feeds `vis_gate_reject`, so
+each is a signature change rather than a line deletion.
+
+#### Handed forward: the shapes a later batch must not delete naively
+
+`--audit` over the whole tree reports **12 BRANCH and 4 ARM** sites still live.
+They are asserted rows and stay, but they carry the shape that caused the
+defect above, and several are the same construct in the same file:
+
+* BRANCH: `VisRejectUnreachable`/`VisRejectNotPublic` (`decl_index.cryo`),
+  `SfScanOne`/`SfScanPlural` and `M4ScanNone`/`M4ScanOne`/`M4ScanPlural`
+  (`mono/call_specializer.cryo`), `ScopeResTypeScope`
+  (`resolver/name_resolution.cryo`), `SpellTyLitFbHit`/`SpellTyLitFbMiss` and
+  `SpellTyNewFbHit`/`SpellTyNewFbMiss` (`sema/sema.cryo`).
+* ARM: the three `CgImplTargetUnRes*` arms (`AST/declaration.cryo`) and
+  `ImplResDeclined` (`resolver/name_resolution.cryo`).
+
+Run `--audit` before editing, not after.
