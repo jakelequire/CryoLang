@@ -3867,13 +3867,13 @@ type struct CallResolver {
     ///
     /// A MODULE qualifier is not a type-owner claim, and this does not
     /// manufacture one: the module lane answers from the scope itself.
+    ///
+    /// A segment carrying generic arguments is keyed the same way: this names
+    /// the owner the arguments apply to, and the caller refines that owner to
+    /// its specialization.  Echoing the spelling for that case keyed the
+    /// specialization on whatever the source wrote (`hashmap::HashMap`), a
+    /// name no registry holds.
     scope_owner_key(&this, scope: ScopeResolutionNode*) -> SymbolStr {
-        // A segment carrying generic args is refined to its specialization by
-        // the caller, which owns the args this cannot see.
-        if (scope.scope_generic_args.length > 0) {
-            return this.ctx.resolve_scoped_or_at(scope.scope_name, scope.span.file,
-                                                 FILE, LINE as i32);
-        }
         // An INVALID symbol as the decline value, so a refusal stays a refusal
         // instead of arriving as the input echoed back.
         const q: SymbolStr = this.ctx
@@ -3998,45 +3998,21 @@ type struct CallResolver {
         return false;
     }
 
-    /// Resolve a static-call scope name to its generic OWNER template.  Tries
-    /// the scope name as-is (already-qualified or a spec), then its import-scoped
-    /// qualified form (`resolve_scoped_or_at`), which recovers a same-leaf stdlib
-    /// generic (`Pair` -> `std::collections::pair::Pair`) that a bare
-    /// `get_template` would miss.  Returns null when no generic type-owner
-    /// template matches; callers then member-check by walking the returned
-    /// template's methods, so a match that lacks the static member resolves to
-    /// nothing.
+    /// The generic OWNER template a static call's scope segment names, or
+    /// null when it names none.
     ///
-    /// `span_file` is the file of the node the scope was WRITTEN in, which the
-    /// scope name alone cannot supply: a `SymbolStr` carries no provenance, so
-    /// without it the import-scoped step falls back to the ambient cursor and
-    /// judges the name against whichever module the walk is standing in.
-    resolve_scope_owner_template(&this, scope_sym: SymbolStr,
-                                 span_file: string) -> TemplateEntry* {
-        if (this.ctx.generic_registry == null) { return null; }
-        mut tmpl: TemplateEntry* = this.ctx.generic_registry.get_template(scope_sym);
-        if (tmpl == null && this.ctx.decl_index != null) {
-            const q: SymbolStr =
-                this.ctx.resolve_scoped_or_at(scope_sym, span_file, FILE, LINE as i32);
-            if (q.is_valid() && !q.equals(scope_sym)) {
-                tmpl = this.ctx.generic_registry.get_template(q);
-            }
-        }
-        // Module-qualified scope path (`future::Ready`): the import-scoped
-        // `resolve_scoped_or_at` only canonicalizes a BARE leaf, so a `module::Type`
-        // scope misses its template. Resolve it the way a type annotation does -
-        // leaf-canonicalized through the name resolver - which maps `future::Ready`
-        // to its registered generic template `std::future::ready::Ready`. Without
-        // this, an owner-generic static ctor written module-qualified
-        // (`future::Ready<i32>::new`) reaches mono with no owner-arg stash and
-        // codegen cannot resolve the never-emitted spec (E0636).
-        if (tmpl == null) {
-            const cross: SymbolStr = this.types.resolve_cross_module_name(scope_sym);
-            if (cross.is_valid() && !cross.equals(scope_sym)) {
-                tmpl = this.ctx.generic_registry.get_template(cross);
-            }
-        }
-        return tmpl;
+    /// Read off the segment's stamp: a template is a declaration, and the
+    /// stamp names the declaration under the canonical name the registry is
+    /// keyed by, accounting for the imports of the module that WROTE the
+    /// segment.  A spelling cannot: a bare leaf reaches no registry key, and
+    /// a module-qualified path (`hashmap::HashMap`) is any whole-segment
+    /// suffix of the canonical one.  A segment already spelled as a
+    /// specialization carries its template's stamp and so still names the
+    /// template here, which is the question this answers; the specialization's
+    /// own registry key is a different question, and the owner key answers it.
+    resolve_scope_owner_template(&this, scope: ScopeResolutionNode*) -> TemplateEntry* {
+        return this.lookup_scope_template(
+            scope.require_scope_res("static-call owner template"));
     }
 
     pin_scope_callee_combined(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*, scope_sym: SymbolStr, member_sym: SymbolStr) -> void {
@@ -4402,7 +4378,7 @@ type struct CallResolver {
             return TypeRef::invalid();
         }
         mut tmpl: TemplateEntry* =
-            this.resolve_scope_owner_template(scope.scope_name, scope.span.file);
+            this.resolve_scope_owner_template(scope);
         if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
         if (tmpl.param_type_ids.length == 0) { return TypeRef::invalid(); }
 
@@ -4587,7 +4563,7 @@ type struct CallResolver {
         if (call.resolved_type_args.length > 0) { return; }
         if (this.ctx.generic_registry == null) { return; }
         mut tmpl: TemplateEntry* =
-            this.resolve_scope_owner_template(scope.scope_name, scope.span.file);
+            this.resolve_scope_owner_template(scope);
         if (tmpl == null || tmpl.ast_node == null) { return; }
         if (tmpl.param_type_ids.length == 0) { return; }
         const empty_methods: MethodNode*[] = [];
@@ -4616,7 +4592,7 @@ type struct CallResolver {
                                               call: CallExprNode*) -> TypeRef {
         if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
         mut tmpl: TemplateEntry* =
-            this.resolve_scope_owner_template(scope.scope_name, scope.span.file);
+            this.resolve_scope_owner_template(scope);
         if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
         if (tmpl.param_type_ids.length == 0) { return TypeRef::invalid(); }
         const empty_methods: MethodNode*[] = [];
@@ -5330,14 +5306,18 @@ type struct CallResolver {
     /// which kind asked.
     lookup_scope_template(&this, r: Res) -> TemplateEntry* {
         if (this.ctx.generic_registry == null) { return null; }
-        mut def: SymbolStr = SymbolStr::empty();
-        match (r) {
-            Res::TypeRelative(b, _) => { def = b.name(); }
-            Res::Def(q)             => { def = q.qualified_name(); }
-            _ => {}
-        }
-        if (!def.is_valid()) { return null; }
-        return this.ctx.generic_registry.get_template(def);
+        return match (r) {
+            Res::TypeRelative(b, _) => {
+                match (b) {
+                    ResBase::Def(d) => { this.ctx.generic_registry.template_of(d) }
+                    // A primitive or a type parameter declares nothing, so
+                    // there is no template for it to be.
+                    _               => { null }
+                }
+            }
+            Res::Def(q) => { this.ctx.generic_registry.template_of(q) }
+            _           => { null }
+        };
     }
 
     /// The same question asked of a node whose stamp the name layer is allowed
@@ -5390,9 +5370,18 @@ type struct CallResolver {
     /// question left to ask.  Null when the name is not a template's, which is
     /// not a failure - the spec name is still built, with no defaults to
     /// expand.
+    ///
+    /// When the template is known, the specialization's base is ITS
+    /// `spec_base_name` - the base the specializer registers the
+    /// instantiation under - and not the spelling.  A specialization has one
+    /// identity however its template was written: `HashMap<i64,i64>` and
+    /// `hashmap::HashMap<i64,i64>` are the same registration, and a base
+    /// taken from the spelling names it only when the spelling is the bare
+    /// leaf.  `base_name` is the base only for a name no template answers.
     resolve_generic_scope_name(&this, base_name: SymbolStr, generic_args: &TypeAnnotation*[],
                                use_span: SourceSpan, tmpl: TemplateEntry*) -> SymbolStr {
         if (this.ctx.type_resolver == null) { return SymbolStr::empty(); }
+        const base: SymbolStr = if (tmpl != null) { tmpl.spec_base_name(this.intern) } else { base_name };
         const scope_ns: SymbolStr = this.syntax_module_of(use_span);
         mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE as i32, this.ctx.source_file, "", SymbolStr::empty(), HomeOrigin::Unset);
         res_ctx.set_home_module(scope_ns, HomeOrigin::Syntax);
@@ -5414,7 +5403,7 @@ type struct CallResolver {
         if (tmpl != null && arg_refs.length < tmpl.param_count) {
             arg_refs = this.ctx.type_resolver.expand_default_type_args(tmpl, arg_refs, &res_ctx);
         }
-        const base_qname: QualifiedName = QualifiedName::from_symbol(base_name);
+        const base_qname: QualifiedName = QualifiedName::from_symbol(base);
         return MangledName::specialized_identifier(this.intern, this.arena, base_qname, arg_refs);
     }
 
@@ -5506,8 +5495,7 @@ type struct CallResolver {
         // `Result<Thing, GlobalAlloc>` instead of `Result<Arc<Thing, GlobalAlloc>, E>`
         // (it fired only because the arg counts coincidentally matched).
         if (scope != null && scope.scope_generic_args.length > 0) {
-            mut tmpl: TemplateEntry* =
-                this.resolve_scope_owner_template(scope_name, scope.span.file);
+            mut tmpl: TemplateEntry* = this.resolve_scope_owner_template(scope);
             if (tmpl != null && tmpl.param_type_ids.length >= scope.scope_generic_args.length) {
                 mut resolved_args: TypeRef[] = [];
                 mut all_valid: boolean = true;

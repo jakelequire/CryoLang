@@ -53,7 +53,7 @@ current-state description is the defect it exists to remove.
 | D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1649** | §8.66, §8.80, §8.139 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **2** | §8.138, §8.144 |
-| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) and on `mod::Type<Args>::static()` resolving (§8.148) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **576** | §8.145, §8.146, §8.147, §8.148 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **576** | §8.145, §8.146, §8.147, §8.148, §8.150 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
 
 **D2 is the one to look at.** Decided in §8.39, then neither taken nor
@@ -84,10 +84,10 @@ three, and its row carries the count. Read each zero off its own row.
 | type cascade 3 — resolver re-entry | STARVED | 0 | same file, `type cascade: 3` | §8.64 |
 | type cascade 5 — miss | LIVE | 3,614 | same file, `type cascade: 5` | §8.64 |
 | 2c home-module (ambient cursor) | STARVED | 0 | same file, `2c  home-module` | §8.63, §8.87 |
-| M1 `qualifier_agrees` | **GUARD** | 8,826 calls / 8,826 agree / **0 reject** | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **5** | §8.120, §8.132 |
-| M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane** | 3,760 | `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M2 resolve_module_qualified_sym calls/{print;exit}' tests/b1-baseline.txt` → **3760** | §8.120 |
+| M1 `qualifier_agrees` | **GUARD** | 8,821 calls / 8,821 agree / **0 reject** | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **5** | §8.120, §8.132 |
+| M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane** | 3,762 | `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M2 resolve_module_qualified_sym calls/{print;exit}' tests/b1-baseline.txt` → **3762** | §8.120 |
 | M4 mono bare-name scan | STARVED | 432 calls / **0** hits | same file, `M4 mono bare-name` | §8.33, §8.120 |
-| M5 import suffix fallback | **STARVED** — all entries are the sub-module caller | **25 calls / 0 hits** | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **3** | §8.120 |
+| M5 import suffix fallback | **STARVED** — all entries are the sub-module caller | **3 calls / 0 hits** | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **3** | §8.120 |
 | const-table bare leaf | STARVED | 0 calls / 0 hits | same file, `const-table bare leaf` | §8.9, §8.111 |
 | `spelling_type` new-expr / call-ident | NOT ENTERED | 0 calls | same file, `spelling_type new expr: calls` | §8.25, §8.98 |
 | `lookup_by_leaf` | **DELETED** | — | `grep -rho 'lookup_by_leaf(' compiler/src \| wc -l` → **0** | §8.121 |
@@ -100,6 +100,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `check_module_type_collision` | LIVE — D5 deletes it | — | see D5 | §8.130, §8.131 |
 | `module_owns_member` probe | LIVE — D5 deletes it | — | `grep -rho 'module_owns_member' compiler/src \| wc -l` → **3** | §8.131 |
 | `scope_owner_key` | LIVE — the static-call owner key | — | `grep -rho 'scope_owner_key' compiler/src \| wc -l` → **4** | §8.134 |
+| static-call owner TEMPLATE by spelling (`resolve_scope_owner_template`'s as-is → scope map → cross-module cascade) | **DELETED** — the owner template is read off the segment's stamp, in sema and in mono | — | `grep -c 'resolve_scoped_or_at' compiler/src/compiler/sema/call_resolver.cryo` → **3** (was 7) | §8.150 |
 | callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **19** | §8.1f, §8.2ag |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
@@ -20782,3 +20783,137 @@ is the right order for that reason and not only for convenience.
 4. `examples/`, then `tests/`, on the current pin if 2 has not happened.
 5. `stdlib`, then the rest of `compiler`, area by area.
 6. Jake's rulings owed: keyword segments as path segments (trap 4).
+
+### 8.150 `mod::GenericType<Args>::static()` resolves: the owner's template and the specialization's key were both derived from the SPELLING, and a module-qualified spelling reaches neither - FIXED 2026-09-10
+
+§8.148 bisected `hashmap::HashMap<i64, i64>::new()` to the glob deletion and
+left it open. The reproducer is §8.149's, verbatim, and it now compiles and
+runs, as does `atomic::Atomic<u64>::new(1)` - the first of the two failures the
+`stdlib` sweep is held on - and the same shape inside a generic body.
+
+#### What the probe showed
+
+Six `path_hit` rows placed through `resolve_scope_call`, one per step, over the
+reproducer and its two compiling neighbours. For the failing spelling:
+
+| step | answer |
+|---|---|
+| `scope_owner_key` | `hashmap::HashMap` - the input echoed back |
+| `resolve_generic_scope_name` | `7hashmap.7HashMap$Ll_l_N$...` - a spec name mangled off the spelling |
+| `resolve_method_owner(spec)` | nothing |
+| the `(base, args)` pair | a type, pre-mono, with no registered name |
+| `lookup_method_return(scope_name)` | nothing |
+| `resolve_static_method_return_via_template` | nothing |
+
+The bare neighbour `HashMap<i64, i64>::new()` produced the SAME first four
+rows - its spec name was `7HashMap$...`, also mangled off the spelling - and
+was rescued at the fifth: `lookup_method_return("HashMap")` widens the bare
+leaf through `qualify_symbol_sym` and finds the template's method. A
+module-qualified spelling cannot be widened that way, so it fell through to the
+sixth, where `resolve_scope_owner_template` asked the registry for the spelling
+as-is, then for its scope-map answer (which declines a qualified spelling), then
+for its cross-module answer (the starved ambient lane), and got nothing three
+times. Meanwhile the segment's stamp - written by the resolver, before any of
+this - said `TypeRelative(Def(std::collections::hashmap::HashMap))`, which is
+the registry's key. Nothing in the ladder read it.
+
+Under the glob, `HashMap` was bound bare in every importing scope, so the
+widening at step five answered the qualified spelling too. That is the whole of
+what the glob was masking: not a resolution, a rescue.
+
+#### The specialization's key
+
+`MangledName::specialized_identifier` is documented as the one way to name a
+specialization, and the specializer feeds it `entry.spec_base_name` - the bare
+leaf, for a type template (`module_disambig` is set for free functions only).
+Sema fed it the WRITTEN spelling. The two agree only when the spelling is the
+bare leaf, so `HashMap<i64,i64>` reached the registration and
+`hashmap::HashMap<i64,i64>` did not, for one instantiation. Every caller of
+`resolve_generic_scope_name` already passes the template it looked up from its
+own node's stamp - one of the five already passed `tmpl.spec_base_name` as the
+base by hand - so the base now comes from the template whenever there is one,
+and from the spelling only for a name no template answers, which mints no key
+anything holds either way.
+
+#### What changed
+
+* `scope_owner_key` had a second answering path for a segment carrying
+  generic arguments: `resolve_scoped_or_at`, which echoes its input on a
+  decline - the failure mode the function's own doc comment names for the
+  no-arguments case. One path now, for every segment.
+* `resolve_scope_owner_template` is the stamp read (`lookup_scope_template`,
+  which already existed) and takes the node; its three-step spelling cascade
+  is gone, and with it two of `call_resolver.cryo`'s three
+  `resolve_cross_module_name` readers.
+* Mono had the same shape twice. `specialize_free_call` decided TYPE versus
+  MODULE by asking the declaration index for the spelling and then for its
+  scope-map answer, so `hashmap::HashMap` read as a module alias and went
+  looking for a free function; it now reads `TypeRelative` off the stamp.
+  `specialize_static_method_on_generic_owner` found its template by
+  `get_template(scope.scope_name)` then the scope map; it now reads the stamp
+  through `scope_owner_template_from_stamp`, the sibling of the module-side
+  `scoped_template_from_stamp` that already existed beside it.
+* `GenericRegistry::template_of(DefId)` - the registry is keyed by canonical
+  name and a `DefId` is one, so the unwrap lives there once instead of at each
+  stamp reader. Three readers route through it; `DEFID_UNWRAP` goes 24 -> 23
+  and `LOOKUP` 65 -> 63 (the two `lookup_type` probes in mono). Re-pinned.
+* `qualify-imports.py` no longer holds the braced import for a name used as
+  `Name<...>::`.
+
+`try_resolve_generic_return` still mangles a spec name off `scope_name` for
+its expected-type branch, and `scope_is_generic_template` and
+`find_static_method_template` still widen a spelling through
+`resolve_scoped_or` (the CURSOR, not the syntax) and `resolve_cross_module_name`.
+Neither was in the reproducer's path; both are the same defect one door over.
+
+#### Gates
+
+`make test` 2,113 unit / 178 compile-fail / 42 projects (the 3 missing carry
+`requires=`: `cxx`, `os:linux`, `vendor:RayLib`). `lsp-check` 266 modules, 0
+errors. All 14 `examples/` by hand (`make examples` is a no-op on this host).
+`selfhost-check` FIXED POINT OK on both arms. `roster-check` OK.
+
+The regression tests extend `tests/tests/projects/module_qualified_static_call`
+- the defect is the generic-owner case of exactly that project's shape - with
+a generic `Slot<T>` in the same module and seven tests: the annotation-driven
+form as the control, explicit owner arguments, the void / primitive / other-type
+return axis the project already uses, a generic static on the generic owner,
+and the call inside a generic body. The pair: a clean build of `4d942b78`
+refuses six of the seven with ``E0233: cannot find `Deque::Slot::make` `` - the
+reproducer's own diagnostic - and passes the control; this tree passes 13 of 13.
+The new file is written qualified (`error::TestError`, `assert::expect_eq`), so
+D15's file count does not move.
+
+**A trap in the control.** The one-target worktree's `compiler/build/cryo.exe`
+(20:41, 75 KB larger than a HEAD build) compiles the reproducer. It is a trial
+build the previous session left behind, not HEAD, and reading it as "HEAD
+passes" would have unmade the bisect. A clean rebuild of `4d942b78` reproduces
+the E0233 and is byte-for-byte the size of the binary this session started
+with. A binary is not a commit; build the control.
+
+A pre-existing limitation found while writing the tests, not touched: a generic
+static whose return names the owner with the METHOD's parameter
+(`static wrap<U>(u: U) -> Slot<U>` on `Slot<T>`) fails E0200 inside its own
+body, bare or qualified, on `4d942b78` and here alike.
+
+#### The b1 golden had drifted before this change
+
+`b1-check` reported four rows moved. Run with the clean `4d942b78` build as the
+control, three of them move identically: `M5 import suffix fallback calls`
+25 -> 3 (all six arms, `-gen` 49 -> 27), `M2 resolve_module_qualified_sym calls`
++2, `M1 qualifier_agrees calls` -3. Measured in the worktree at `94a42262`, M5
+is already 3 while M1 and M2 sit at their golden values; at `4e606e61` all
+three still do. So M5 moved with `94a42262` - its second half, "stop an
+imported type binding as a kind", is an import-processing change in
+`name_resolution.cryo`, and the golden was pinned one commit before it - and
+M1/M2 moved with the `io/error` batch (`9d4e2374`), the only later change to
+what every program compiles. Neither commit re-pinned; the gate was red at
+HEAD before this session began and nobody had run it.
+
+This change's own movement is M1 -2, on the `09-json-config` arm alone. The
+`M1-AGREE` stream names both: `std::json::value` naming
+`std::collections::str::Str` in a static call - a fully-qualified,
+non-template owner, for which the deleted cascade missed as-is, was declined
+by the scope map, and fell to the cross-module lane, twice. Re-pinned on both
+hosts, Linux built under WSL; the twenty-four moved rows are the same four
+rows on each of the six arms and nothing else.

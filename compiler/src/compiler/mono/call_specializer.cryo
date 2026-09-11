@@ -65,7 +65,7 @@ import compiler::mono::trait_specializer::{ MonoTraitSpecializer };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
-import compiler::resolver::res::{ Res, ResSlot };
+import compiler::resolver::res::{ Res, ResBase, ResSlot };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{
@@ -658,14 +658,18 @@ type struct MonoCallSpecializer {
                 }
             }
             if (entry == null && this.decl_index != null) {
-                const scope_as_type: TypeRef = this.decl_index.lookup_type(callee_scope);
-                const qscope_as_type: TypeRef =
-                    if (qualified_scope.equals(callee_scope)) {
-                        scope_as_type
-                    } else {
-                        this.decl_index.lookup_type(qualified_scope)
+                // Whether the scope names a TYPE or a MODULE is what the
+                // segment's stamp records: `TypeRelative` is the claim that a
+                // type owns the member.  An index asked by spelling cannot
+                // separate the two once a leaf names both, and a
+                // module-qualified type (`hashmap::HashMap`) is a spelling the
+                // index does not hold at all.
+                const scope_names_type: boolean =
+                    match (callee_scope_slot.require("specialize_free_call scope")) {
+                        Res::TypeRelative(_, _) => { true }
+                        _                       => { false }
                     };
-                if (!scope_as_type.is_valid() && !qscope_as_type.is_valid()) {
+                if (!scope_names_type) {
                     // Scope-qualified call to a non-type (module-alias) scope:
                     // only accept a free-function template that lives in that module.
                     entry = this.find_scoped_function_template(
@@ -1394,15 +1398,11 @@ type struct MonoCallSpecializer {
         if (call.resolved_callee.is_valid()) { return false; }
         const registry: GenericRegistry* = this.generic_registry;
         if (registry == null) { return false; }
-        mut entry: TemplateEntry* = registry.get_template(scope.scope_name);
-        if (entry == null && this.decl_index != null) {
-            // The owner scope was written at `scope`, so it is judged there.
-            const q: SymbolStr = this.resolve_scope_at_span(
-                scope.scope_name, (scope as ASTNode*).span.file, FILE, LINE as i32);
-            if (q.is_valid() && !q.equals(scope.scope_name)) {
-                entry = registry.get_template(q);
-            }
-        }
+        // The owner is the declaration the scope segment's stamp names, under
+        // the canonical name the registry is keyed by.  The spelling is any
+        // whole-segment suffix of that name, and reaches the registry only when
+        // it happens to be the whole of it.
+        const entry: TemplateEntry* = this.scope_owner_template_from_stamp(scope);
         if (entry == null) { return false; }
         if (entry.node_kind != NodeKind::StructDeclaration
                 && entry.node_kind != NodeKind::UnionDeclaration
@@ -2602,6 +2602,29 @@ type struct MonoCallSpecializer {
         return null;
     }
 
+    /// The generic OWNER template a scope segment's stamp names, or null when
+    /// the segment names no type declaration (a module, a primitive, a type
+    /// parameter) or the declaration is not a template.
+    ///
+    /// Sibling of `scoped_template_from_stamp`, which reads the same slot for
+    /// the MODULE answer.  A segment already spelled as a specialization
+    /// carries its template's stamp, so it names the template here too; the
+    /// registry holds no template under a specialization's name, which is
+    /// the answer a lookup by that spelling gave.
+    scope_owner_template_from_stamp(&this, scope: ScopeResolutionNode*) -> TemplateEntry* {
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null || scope == null) { return null; }
+        return match (scope.require_scope_res("scope_owner_template_from_stamp")) {
+            Res::TypeRelative(b, _) => {
+                match (b) {
+                    ResBase::Def(d) => { registry.template_of(d) }
+                    _               => { null }
+                }
+            }
+            _ => { null }
+        };
+    }
+
     /// Look up a free-function template for an unqualified call.
     /// `asker` is the slot of the identifier that named the callee, or null
     /// when the caller holds no node to read.  It is consulted FIRST and
@@ -2622,7 +2645,7 @@ type struct MonoCallSpecializer {
         if (asker != null && !asker.is_pending()) {
             match (asker.require("find_function_template_for_call")) {
                 Res::Def(q) => {
-                    const via_res: TemplateEntry* = registry.get_template(q.qualified_name());
+                    const via_res: TemplateEntry* = registry.template_of(q);
                     if (via_res != null
                             && via_res.node_kind == NodeKind::FunctionDeclaration) {
                         return via_res;

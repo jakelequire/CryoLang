@@ -192,11 +192,6 @@ UNWRITABLE_POS = [
 ]
 
 
-# `Name<...>::` -- a generic type's static call with EXPLICIT arguments, which
-# cannot be qualified yet. The argument-free form resolves.
-GENERIC_STATIC_RE = re.compile(r"([A-Za-z_]\w*)\s*<[^<>()]*>\s*::")
-
-
 def enum_body_lines(masked):
     """Line indices inside a `type enum` body.
 
@@ -300,15 +295,6 @@ def plan(world, path):
         for rx in UNWRITABLE_POS:
             for m in rx.finditer(code):
                 head_only.add(m.group(1))
-        # A qualified GENERIC type's static call does not resolve:
-        # `hashmap::HashMap<i64, i64>::new()` is E0233 while the bare form and
-        # the qualified NON-generic form both work. Bisected to the glob
-        # deletion - the name was reaching a bare lane the glob fed, not the
-        # qualifier - so it is a gap the migration exposed rather than one it
-        # created, and it is open. Until it closes, a name used this way keeps
-        # its braced import.
-        for m in GENERIC_STATIC_RE.finditer(code):
-            head_only.add(m.group(1))
 
     qualify = {}      # name -> qualifier
     drop = set()      # names removed from the import list, left bare
