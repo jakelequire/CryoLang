@@ -21226,3 +21226,46 @@ over the shadow build and this one: 0 of 1,126 examples, 0 of 2,126 tests;
 53 -> 52, DEFID_UNWRAP 25 -> 27 (the two impl-head keys becoming the node's
 text). Tally: 13 consumers shadowed, 13 at zero, 13 old paths deleted, 8
 artifacts gone (+ `module_by_path_suffix`, M4's scan).
+
+### 8.158 Round six: codegen still binds 495 static calls by a name it derives itself - the first concrete list of what the new model cannot do yet - MEASURED, OPEN 2026-09-11
+
+`call_emitter`'s static-call branch: sema's pin (`resolved_callee`) first,
+then a ladder codegen walks on its own - the specialization named by the
+call's `resolved_type`, `scope::member` through the scope map, the BARE
+member name alone, then enum-variant synthesis. Under shadow the pin is the
+new model's whole answer; a call bound by the ladder prints, with whether a
+pin existed and missed or none was written. Whole corpus, direct:
+
+| class | emissions | distinct source sites |
+|---|---|---|
+| `no-pin` | 489 | 13 |
+| `pin-missed` | 6 | 6 |
+
+**The 489 are one shape**: a static call on a GENERIC owner whose type
+arguments are not written but inferred - from the arguments
+(`Slice::from_raw(this.ptr, this.length)` in `Array<T>::as_slice`, 306
+emissions) or from the expected type (`RawBuffer::new()` in `String<A>::new`,
+`TakeIter::new(this, n)` in `Iterator`'s defaults, `HashMap::new()` in
+`HashSet<T>`) - written INSIDE another template's body. Sema's owner stash is
+empty or symbolic there, mono's `specialize_static_method_on_generic_owner`
+therefore pins nothing, and codegen binds the call from `resolved_type` -
+which works only because in all 13 sites the return type IS the owner
+(`-> Slice<T>`, `-> RawBuffer<u8, A>`). A call of this shape returning
+anything else has no path to a symbol; `tests/projects/module_qualified_
+static_call` pins that exact axis on a non-generic owner, and this is the
+generic-owner half of it, still open. The fix is in sema/mono, not codegen:
+a static call's owner arguments inside a generic body must be stashed
+symbolically and concretized on the clone walk, the way a free generic call's
+already are (`specialize_free_call` runs every stashed arg through
+`concretize_stashed_arg`).
+
+**The 6 `pin-missed`** are every `probe::bindgen_probe_*` call in
+`tests/lang/c_import_libclang.cryo`: sema pins a symbol for a C-imported
+function that `resolve_function_by_mangled` does not hold, and the ladder's
+module-lane step finds it under another name. Two spellings of one extern
+symbol; the pin should carry the one codegen declares.
+
+Neither is deleted on this reading - the consumer is not at zero. The
+ladder's bare-member step (`resolve_function(sr.member_name)`, binding a
+static call by method name alone across the whole program) is the step to
+watch as the two classes close.
