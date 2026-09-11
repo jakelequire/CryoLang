@@ -5417,7 +5417,17 @@ type struct CallResolver {
             arg_refs = this.ctx.type_resolver.expand_default_type_args(tmpl, arg_refs, &res_ctx);
         }
         const base_qname: QualifiedName = QualifiedName::from_symbol(base);
-        return MangledName::specialized_identifier(this.intern, this.arena, base_qname, arg_refs);
+        const spec: SymbolStr =
+            MangledName::specialized_identifier(this.intern, this.arena, base_qname, arg_refs);
+        // A TYPE's specialization is registered under the template's module,
+        // and that registration is what every consumer of this name looks up
+        // - a method, an overload set, the type itself.  A FUNCTION template's
+        // specialization is a different registry, keyed by the bare identifier
+        // mono pins, and stays as minted.
+        if (tmpl != null && tmpl.node_kind != NodeKind::FunctionDeclaration) {
+            return tmpl.spec_qualified_name(this.intern, spec);
+        }
+        return spec;
     }
 
     /// The TYPE a generic scope denotes, from the pair rather than from a name:
@@ -5546,11 +5556,16 @@ type struct CallResolver {
         const exp_base: TypeRef = this.types.view_generic_base(exp_ref);
         if (!exp_base.is_valid()) { return ret; }
         if (ret_inst.generic_base.id != exp_base.id) { return ret; }
-        const exp_args: TypeRef[] = this.types.view_type_args_copy(exp_ref);
-        const scope_qname: QualifiedName = QualifiedName::from_symbol(scope_name);
-        const spec_sym: SymbolStr = MangledName::specialized_identifier(this.intern, this.arena, scope_qname, exp_args);
-        const spec_ret: TypeRef = this.types.lookup_method_return(spec_sym, member_name);
-        if (spec_ret.is_valid()) { return spec_ret; }
+        // The expected type IS the instantiation, so the name its methods are
+        // registered under is read off it; before it is materialized it has
+        // none, and the expected type itself is the answer.  Minting the name
+        // from the written scope reached the registration only through the
+        // ambient namespace.
+        const spec_qn: SymbolStr = this.ctx.decl_index.lookup_type_name(exp_ref);
+        if (spec_qn.is_valid()) {
+            const spec_ret: TypeRef = this.types.lookup_method_return(spec_qn, member_name);
+            if (spec_ret.is_valid()) { return spec_ret; }
+        }
         return this.state.expected_type;
     }
 

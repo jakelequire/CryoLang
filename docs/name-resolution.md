@@ -21065,3 +21065,45 @@ left. Objects over the shadow build and this one: 0 of 1,126 examples, 0 of
 cascade's two index probes); DEFID_UNWRAP 24 -> 26 (the new index primitive,
 and the constructor symbol's text). Tally: 2 consumers shadowed, 2 at zero,
 2 old paths deleted, 1 artifact gone.
+
+### 8.154 Third and fourth consumers: the two name-keyed sema cascades. 792 -> 0, and the 790 were ONE defect - a specialization identifier minted bare - 2026-09-11
+
+`lookup_type_by_sym` (exact -> ambient cursor -> cross-module) and
+`resolve_method_owner` (as-is -> ambient cursor -> cross-module), both in
+`type_utils.cryo`, 13 and 19 callers, no node in hand. Under shadow the new
+model there is the exact/as-is step alone; the two widening exits print
+`SHADOW-TYSYM` / `SHADOW-MOWNER` unconditionally with the site, the name and
+the answer. First reading, whole corpus (`lsp-check` 266 modules, unit suite,
+46 projects one at a time, 14 examples):
+
+| cascade | step 2 (cursor) | step 3 (cross-module) |
+|---|---|---|
+| `lookup_type_by_sym` | 2 | 0 |
+| `resolve_method_owner` | **790** | 0 |
+
+Both instruments are proved live by those readings; no inversion needed.
+
+**The 790 were 99 distinct names and every one was a mangled specialization
+identifier** - `6String$LN$...`, `5Array$Lh_N$...` - asked with `new`,
+`from_str`, `with_capacity`. Sema mints that identifier
+(`resolve_generic_scope_name`), but the specializer registers the
+specialization under `<template's module>::<identifier>`, so the bare
+identifier reached its registration only when the ambient cursor happened to
+be parked on the template's module - which mono arranges while re-typing a
+clone. Not a resolution question: one specialization, two names.
+`TemplateEntry::spec_qualified_name` now derives the registered name from the
+template (mono's four private copies of that derivation are the same rule),
+and `resolve_generic_scope_name` returns it for a TYPE template; a FUNCTION
+template's identifier stays as minted, because mono pins that registry by the
+bare form. The last three were `try_resolve_generic_return`'s expected-type
+branch minting a name off the written scope; the expected type IS the
+instantiation, so its registered name is read off it. Second reading: 0 and 0
+for `resolve_method_owner`; `lookup_type_by_sym` still 2.
+
+**The 2 are the D5 collision fixture** (`tests/lang/static_method_value.cryo`):
+`StaticMethodValue::tally` names a module and a type sharing one leaf, the
+stamp says MODULE because the module owns `tally`, and
+`sema/resolve_scope_resolution` then asks the cursor for the type anyway -
+consumed only to conclude "not a static method" before the module-function
+path answers. An answer the stamp already refused, and not load-bearing; the
+deletion that follows is checked against that fixture.
