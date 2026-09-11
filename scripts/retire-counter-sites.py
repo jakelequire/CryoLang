@@ -25,6 +25,26 @@ nothing" as "found several".  A `bump()` that is the SOLE statement of a
 branch is a branch, not a statement: removing it needs the branch kept as an
 empty body, or the condition rewritten so it still excludes the other cases.
 
+THIS CLASSIFIER HAS BEEN WRONG THREE TIMES.  Read that as a warning about
+trusting it, not as a claim that it is finished:
+
+  1. It reported the very site above as PLAIN.  `} else if (c) {` closes one
+     branch and opens the next on ONE line, so a per-line brace sum never
+     returns to zero and the whole chain read as a single block.  Fixed by
+     scanning a character stream with string literals and comments masked.
+  2. A multi-line condition lost the `if` / `else` that names the branch kind,
+     because the header was taken as the line the `{` sits on.  The header now
+     runs back to the previous statement boundary.
+  3. A one-line arm `_ => { X.bump(); }` was scanned from column 0, walking
+     straight past the arm into the enclosing `match`.  The scan now starts at
+     the bump's own column.
+
+All three UNDER-reported: they turned a dangerous shape into a safe-looking
+one, which is the only direction that matters.  Before believing an audit,
+run it over a tree where a known BRANCH site exists and confirm it says
+BRANCH -- `git show <rev>:<file>` into a scratch copy is enough.  A classifier
+that has not been shown refusing is not evidence.
+
 Usage:
     python3 scripts/retire-counter-sites.py SITE [SITE ...]
     python3 scripts/retire-counter-sites.py --audit [SITE ...]

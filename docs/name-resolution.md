@@ -19650,3 +19650,143 @@ defect above, and several are the same construct in the same file:
   `ImplResDeclined` (`resolver/name_resolution.cryo`).
 
 Run `--audit` before editing, not after.
+
+### 8.140 Handoff: the counter retirement is 36 of 97 rows in, and the tool that makes the rest safe is `--audit` - 2026-09-10
+
+This closes the second worker's thread on D11. §8.139 is the work; this is what
+a successor needs that is not derivable from the diff.
+
+#### The tool, and the reason it exists
+
+`scripts/retire-counter-sites.py` is committed, with the edits it made.
+
+```
+python3 scripts/retire-counter-sites.py --audit [SITE ...]   # classify, BEFORE editing
+python3 scripts/retire-counter-sites.py SITE [SITE ...]      # remove the 4 counter-side lines
+python3 scripts/retire-counter-sites.py --check SITE [...]   # prove no reference survives
+```
+
+`--audit` with no SITE audits the whole tree. It exits **1** while any BRANCH
+shape is present, so it runs as a pre-edit gate rather than a report. Four
+classes:
+
+| class | meaning | what the edit must do |
+|---|---|---|
+| **BRANCH** | sole body of an if/else CHAIN | deleting the line MERGES that case into a sibling. Keep the branch, or rewrite the condition so it still excludes the others. |
+| **ARM** | sole body of a match arm | the arm must stay - an empty body, not a deletion, or exhaustiveness breaks. |
+| **IF** | sole body of a lone `if`, no else | drop the whole `if`; check the condition is a pure read first. |
+| **PLAIN** | one statement among others | delete the line. |
+
+A site reached only through a `Site`-typed parameter never appears as
+`Site::X.bump()` and cannot be classified from the call; `--audit` names those
+separately rather than letting their absence read as safety.
+
+#### Why a shape classifier at all
+
+A `bump()` is not always in a statement position. Removing one from
+`if (match_count == 0) { ... }` did not drop a counter, it merged the zero case
+into the `else`, and `SfScanPlural` - pinned at 0, named "PLURAL (tie-break
+pop)" - began counting "found nothing" as "found several", reading **591** on a
+compiler built from it. Nothing in the counter could have caught that: the row
+was not wrong, the control flow was, and every gate this repo has stayed green.
+
+#### The classifier has been wrong three times
+
+Recorded because the next person should distrust it in the right direction.
+All three UNDER-reported - they turned a dangerous shape into a safe-looking
+one:
+
+1. It called the site above **PLAIN**. `} else if (c) {` closes one branch and
+   opens the next on one line, so a per-line brace sum never returns to zero
+   and the whole chain read as one block. Now scans a character stream with
+   string literals and comments masked.
+2. A multi-line condition lost the `if`/`else` that names the branch kind. The
+   header now runs back to the previous statement boundary.
+3. A one-line arm `_ => { X.bump(); }` was scanned from column 0, walking past
+   the arm into the enclosing `match`. The scan now starts at the bump's column.
+
+The control that catches all three: run it over a tree where a known BRANCH
+site exists (`git show <rev>:<file>` into a scratch copy) and confirm it says
+BRANCH. The pair that licensed trusting it - old classifier PLAIN over the tree
+that produced the defect, new classifier BRANCH over the same tree, both still
+reporting the two genuinely clean removals in the same hunk as PLAIN.
+
+#### A correction worth repeating
+
+The first report of that defect said one BRANCH site. The audit found **three**.
+The other two - `PrimImplTargetPrimitive` / `PrimImplTargetDeclared` - came out
+correct because of HOW they were deleted (the whole `if/else`, the function and
+all three call sites together) rather than because anyone had checked. Stated
+that way deliberately: an outcome right by accident and an outcome right by
+inspection look identical from outside, and only one of them repeats.
+
+#### Handed forward: 12 BRANCH and 4 ARM sites still live
+
+These are asserted rows and stay. They are listed because they carry the shape
+above, and three of them are the same construct in the same file as the one
+that broke:
+
+**BRANCH**
+* `VisRejectUnreachable` / `VisRejectNotPublic` - `decl_index.cryo`
+* `SfScanOne` / `SfScanPlural` - `mono/call_specializer.cryo`
+* `M4ScanNone` / `M4ScanOne` / `M4ScanPlural` - `mono/call_specializer.cryo`
+* `ScopeResTypeScope` - `resolver/name_resolution.cryo`
+* `SpellTyLitFbHit` / `SpellTyLitFbMiss` - `sema/sema.cryo`
+* `SpellTyNewFbHit` / `SpellTyNewFbMiss` - `sema/sema.cryo`
+
+**ARM**
+* the three `CgImplTargetUnRes*` arms - `AST/declaration.cryo`
+* `ImplResDeclined` - `resolver/name_resolution.cryo`
+
+#### Where the retirement stands
+
+36 of 97 unasserted rows retired. **61 left**: 37 context, 10 B2, 14 B3.
+
+Standing constraints, none of them this thread's to lift:
+
+* **B3's 14 rows are held pending Jake** - whether they move from context to
+  asserted is his ruling, not a cleanup decision.
+* **`tests/b1-baseline.txt` is untouched**, and the **82 asserted rows are off
+  limits**. Their labels still map one-to-one onto what the report emits;
+  that set equality is the cheapest check that a retirement batch changed
+  nothing the gate reads.
+* **Four context rows are held** because each is the only row bounding an
+  asserted zero. Removing one makes a starved lane and a dead one read
+  identically: `RnCalls` (bounds `2c home-module` and `2b ambiguity`),
+  `ImplHeadSeen`, `SfCalls`, `FnBindSingle`.
+
+The remaining 47 non-B3 rows are mostly out of reach of any one file:
+`sema/call_resolver.cryo` (22), `resolver/name_resolution.cryo` (10),
+`types/arena.cryo` (4), `decl_index.cryo` (3). The `call_resolver` batch is
+pre-audited clean - no BRANCH, 3 lone-ifs (`FnBindUseDiff`, `McOwnerSymbolic`,
+`McOwnerTemplate`), 16 plain deletions, 11 reached only through a parameter.
+B2's 10 move as one block: nine bump in `call_resolver.cryo` and the B2 TOTAL
+sums exactly those plus `RnAssocProjection`, so a partial take leaves a total
+that is no longer a total of anything.
+
+#### One open question, deliberately not decided here
+
+`door: resolve_counter::Site` on both visibility gates is **not only a tally**.
+`vis_gate_reject(door.label(), ...)` feeds the report label into the audit
+stream as the "which door fired" field, and by that emitter's own docstring it
+is the only door attribution available on a compile-fail path, because the
+report prints only after a successful link. Deleting those 8 rows would
+silently drop it.
+
+The proposal, unruled: change the parameter to `door: string`. Audit output
+identical - those labels are already strings when printed - 8 counter rows go,
+and two visibility gates stop depending on the counter at all. Same shape as
+`widen_type_home_scoped_bare`'s `enter` parameter, which was instrumentation
+that had leaked into a production signature. `nodef_site` in
+`TypeUtils::spelling_type` needs no such care: pure tally, goes with its three
+rows.
+
+#### Two §0 rows to watch
+
+* **D11's count moves whenever this file does**, including from a comment. The
+  §0 guard refused a commit of this very thread for that, correctly.
+* **`M5 module_by_path_suffix` has gone 0 calls to 25, 0 hits** - §0.2's
+  canonical `NOT ENTERED` row is now STARVED. Its check counts occurrences in
+  `compiler/src`, which does not move, so the **status word rots silently**.
+  That is the same blind spot as D11's status half: a row check catches a
+  number that moved and cannot catch a word that should have.
