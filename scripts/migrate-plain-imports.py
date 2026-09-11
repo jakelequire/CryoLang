@@ -229,20 +229,41 @@ def scan(path):
                 ns = m.group(1)
                 depth += code.count("{") - code.count("}")
                 continue
+        # An import block is recognised BEFORE depth is consulted, and its
+        # braces are not counted. A multi-line `import M::{` opens a brace, so
+        # its closing `};` arrives at depth 1; a scan that only looks at depth
+        # 0 never clears the flag, and from there every declaration in the file
+        # reads as another line of the import list.
+        if in_brace_import:
+            in_brace_import = "}" not in code
+            continue
         is_import = False
         if depth == 0:
             m = REEXPORT_MODULE_RE.match(code)
+            pm = PLAIN_IMPORT_RE.match(code)
+            bm = BRACE_HEAD_RE.match(code)
             if m:
-                reexports.append(m.group(1))
+                reexports.append((m.group(1), None))
                 is_import = True
-            elif PLAIN_IMPORT_RE.match(code):
+            elif pm:
                 is_import = True
-            elif BRACE_HEAD_RE.match(code):
+                # `export M;` is a re-export edge, not just an import. It is
+                # the OTHER half of the re-export graph -- `public module M;`
+                # is the half the stdlib facades use, and reading only that
+                # one leaves every `export`-built facade offering nothing.
+                if pm.group(2) == "export":
+                    reexports.append((pm.group(3), None))
+            elif bm:
                 is_import = True
                 in_brace_import = "}" not in code
-            elif in_brace_import:
-                is_import = True
-                in_brace_import = "}" not in code
+                if code.lstrip().startswith("export"):
+                    # `export M::{ A, B };` grants exactly A and B, so the
+                    # names are carried rather than the whole module.
+                    reexports.append(
+                        (bm.group(2), IDENT_RE.findall(
+                            code.split("{", 1)[1].split("}", 1)[0])))
+                if in_brace_import:
+                    continue
             else:
                 for rx in DECL_RES:
                     m = rx.match(code)
@@ -302,8 +323,9 @@ class World:
             self.ns_decls[ns] |= declared
             self.ns_files[ns].append(path)
             self.by_norm.setdefault(norm(ns), ns)
-            for rx in reexports:
-                self.ns_reexports[ns].add(rx)
+            for written, only in reexports:
+                self.ns_reexports[ns].add(
+                    (written, tuple(sorted(only)) if only else None))
         self._offers = {}
 
     def resolve(self, home, written):
@@ -324,11 +346,14 @@ class World:
         if ns in seen:
             return {}
         out = {n: ns for n in self.ns_decls.get(ns, ())}
-        for written in self.ns_reexports.get(ns, ()):
+        for written, only in self.ns_reexports.get(ns, ()):
             target = self.resolve(ns, written)
-            if target:
-                for name, owner in self.offers(target, seen | {ns}).items():
-                    out.setdefault(name, owner)
+            if target is None:
+                continue
+            for name, owner in self.offers(target, seen | {ns}).items():
+                if only is not None and name not in only:
+                    continue
+                out.setdefault(name, owner)
         if not seen:
             self._offers[ns] = out
         return out
