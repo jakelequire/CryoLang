@@ -21117,3 +21117,21 @@ a specialization's registered name hits as-is). lane: LOOKUP 61 -> 57,
 LOOKUP_OTHER 57 -> 58 (`lookup_type_name(exp_ref)`, keyed by the type itself).
 `resolve_cross_module_name` has two callers left, both static-call template
 lookups. Tally: 4 shadowed, 4 at zero, 4 deleted, 2 artifacts gone.
+
+### 8.155 Fifth and sixth consumers: the static-call template lookups, 0 and 0; `resolve_cross_module_name` deleted - 2026-09-11
+
+`scope_is_generic_template` (a seven-step spelling cascade behind the pin
+decision: template by name, by the cursor scope map, by the resolver
+re-entry, `Owner::method` by each of those, then an instantiation check) and
+`find_static_method_template` (owner key, then the written spelling, then
+the resolver re-entry). Both callers of the first now hand it a registered
+name, so under shadow the new model is the exact lookups and the
+widening exits print `SHADOW-GENTMPL` / `SHADOW-SMTMPL`. Whole corpus: 0
+and 0. Instrument control: a print at the exact-owner exit for one build,
+3,800 lines over `09-json-config`; restored.
+
+Deleted on that zero: every widening step of both, and with them
+`TypeUtils::resolve_cross_module_name`, whose four readers are now gone -
+sema no longer re-enters the resolver by spelling anywhere.
+`Resolver::resolve_type_qualified_name` keeps one caller, the annotation
+lane's `canonical_type_name`, which is the next shadow.

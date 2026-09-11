@@ -3956,33 +3956,17 @@ type struct CallResolver {
     /// sema pinning the template form would shadow mono's spec pin).
     scope_is_generic_template(&this, scope_sym: SymbolStr, member_sym: SymbolStr) -> boolean {
         if (this.ctx.generic_registry == null) { return false; }
+        // `scope_sym` is a registered name - the owner that won resolution, or
+        // a specialization's registered name - so the template and the
+        // `Owner::method` static-method template are exact lookups, and an
+        // instantiation is one too.
         const scope_entry: TemplateEntry* = this.ctx.generic_registry.get_template(scope_sym);
         if (scope_entry != null) { return true; }
-        if (this.ctx.decl_index != null) {
-            const qscope: SymbolStr = this.ctx.resolve_scoped_or(scope_sym, FILE, LINE as i32);
-            if (qscope.is_valid() && !qscope.equals(scope_sym)) {
-                if (this.ctx.generic_registry.get_template(qscope) != null) { return true; }
-            }
-        }
-        // Module-qualified scope (`future::Ready`): leaf-canonicalize so a
-        // `module::Type` path finds its generic template, mirroring
-        // `resolve_scope_owner_template`'s cross-module fallback. Keeps the callee
-        // UNPINNED for mono to specialize instead of pinning the bare template name.
-        const xscope: SymbolStr = this.types.resolve_cross_module_name(scope_sym);
-        if (xscope.is_valid() && !xscope.equals(scope_sym)
-                && this.ctx.generic_registry.get_template(xscope) != null) { return true; }
+        const scope_str: string = this.intern.resolve(scope_sym);
+        const member_str: string = this.intern.resolve(member_sym);
         if (member_sym.is_valid()) {
-            const scope_str: string = this.intern.resolve(scope_sym);
-            const member_str: string = this.intern.resolve(member_sym);
             const csym: SymbolStr = this.intern.intern(fmt::format("%s::%s", scope_str, member_str));
             if (this.ctx.generic_registry.get_template(csym) != null) { return true; }
-            if (this.ctx.decl_index != null) {
-                const qscope2: SymbolStr = this.ctx.resolve_scoped_or(scope_sym, FILE, LINE as i32);
-                if (qscope2.is_valid() && !qscope2.equals(scope_sym)) {
-                    const qcsym: SymbolStr = this.intern.intern(fmt::format("%s::%s", this.intern.resolve(qscope2), member_str));
-                    if (this.ctx.generic_registry.get_template(qcsym) != null) { return true; }
-                }
-            }
         }
         if (this.ctx.decl_index != null) {
             const type_ref: TypeRef = this.types.lookup_type_exact(scope_sym);
@@ -3990,6 +3974,36 @@ type struct CallResolver {
                 const t: Type* = this.arena.lookup(type_ref.id);
                 if (t != null && t.kind == TypeKind::InstantiatedType) { return true; }
             }
+        }
+        // SHADOW.  The spelling widened - the ambient-cursor scope map and the
+        // resolver re-entry, on the owner and on `Owner::method` - is the old
+        // answer to the same question.  Each exit that answers where the exact
+        // lookups did not prints unconditionally; zero over the corpus deletes
+        // every step below.
+        if (this.ctx.decl_index != null) {
+            const qscope: SymbolStr = this.ctx.resolve_scoped_or(scope_sym, FILE, LINE as i32);
+            if (qscope.is_valid() && !qscope.equals(scope_sym)) {
+                if (this.ctx.generic_registry.get_template(qscope) != null) {
+                    fmt::eprintf("SHADOW-GENTMPL\tcursor-owner\t%s\t%s\t%s\n",
+                        scope_str, member_str, this.intern.resolve(qscope));
+                    return true;
+                }
+                if (member_sym.is_valid()) {
+                    const qcsym: SymbolStr = this.intern.intern(fmt::format("%s::%s", this.intern.resolve(qscope), member_str));
+                    if (this.ctx.generic_registry.get_template(qcsym) != null) {
+                        fmt::eprintf("SHADOW-GENTMPL\tcursor-method\t%s\t%s\t%s\n",
+                            scope_str, member_str, this.intern.resolve(qcsym));
+                        return true;
+                    }
+                }
+            }
+        }
+        const xscope: SymbolStr = this.types.resolve_cross_module_name(scope_sym);
+        if (xscope.is_valid() && !xscope.equals(scope_sym)
+                && this.ctx.generic_registry.get_template(xscope) != null) {
+            fmt::eprintf("SHADOW-GENTMPL\tcross-owner\t%s\t%s\t%s\n",
+                scope_str, member_str, this.intern.resolve(xscope));
+            return true;
         }
         // A same-leaf generic template is now recovered directly by the
         // import-scoped `resolve_scoped_or` probes above (a static call
@@ -4240,15 +4254,24 @@ type struct CallResolver {
                 entry = this.ctx.generic_registry.get_template(this.intern.intern(qstr));
             }
         }
+        // SHADOW.  The written spelling and its cross-module widening are the
+        // old answers to the same question; each prints where it answers and
+        // the owner key did not.  Zero over the corpus deletes both.
         if (entry == null) {
             const bstr: string = this.intern.resolve(scope.scope_name) + "::" + member_str;
             entry = this.ctx.generic_registry.get_template(this.intern.intern(bstr));
+            if (entry != null) {
+                fmt::eprintf("SHADOW-SMTMPL\tspelling\t%s\t%s\n", bstr, scope.span.to_string());
+            }
         }
         if (entry == null) {
             const cross: SymbolStr = this.types.resolve_cross_module_name(scope.scope_name);
             if (cross.is_valid() && !cross.equals(scope.scope_name)) {
                 const cstr: string = this.intern.resolve(cross) + "::" + member_str;
                 entry = this.ctx.generic_registry.get_template(this.intern.intern(cstr));
+                if (entry != null) {
+                    fmt::eprintf("SHADOW-SMTMPL\tcross\t%s\t%s\n", cstr, scope.span.to_string());
+                }
             }
         }
         return entry;
