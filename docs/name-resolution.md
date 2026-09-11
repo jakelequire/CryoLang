@@ -21199,3 +21199,20 @@ lane, the constructor call, the declaration key), 9 at zero, 9 old paths
 deleted, 6 artifacts gone (`widen_type_home_scoped_bare`, `lookup_type_by_sym`,
 `resolve_cross_module_name`, `canonical_type_name`,
 `resolve_type_qualified_name` + `_from`, `canonical_type_ref`/`_qname`).
+
+### 8.157 Round five: the impl head's target and trait, M4's scan, M5's suffix probe - all 0 - 2026-09-11
+
+| consumer | new answer | old answer | lines |
+|---|---|---|---|
+| impl target key (`type_resolution`, into `qualified_target_name`) | the head's `res`: a declaration's canonical name, a primitive's own spelling, a clone's already-qualified spelling | as-is / bare index slot / cursor scope map / current module | 9,945, then **0** |
+| impl trait identity (`qualified_trait_name`, `origin_trait`) | the head annotation's stamp | cursor scope map on the leaf | **0** |
+| M4 - mono's template scan by bare leaf, and the current-module key before it | the identifier's stamp | linear scan of every template | **0** |
+| M5 - the import suffix probe, both callers | the graph's exact lookup by registered name | suffix match over every module | **0** |
+
+The 9,945 were every primitive impl target: the new rule had qualified a
+primitive by the writer's module, which `ImplBlockNode`'s own doc comment
+claimed (`std::core::hash::i32`) and the registration never did - a primitive
+registers under its bare spelling. The comment is corrected; no user-type
+target disagreed. Controls: `IMPLTGT` read 9,945 before the rule fix;
+`IMPLTRAIT` inverted fires 331 on `09-json-config`; a print at M4's scan
+entry fires 432 there (the golden's own count) and at M5's exact-hit 930.

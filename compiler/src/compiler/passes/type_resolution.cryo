@@ -39,7 +39,7 @@ import compiler::types::{
 };
 import compiler::resolver::{ intern_table, symbol_id, symbol_str, symbol, resolver };
 import compiler::resolver::res;
-import compiler::resolver::res::{ ResSlot };
+import compiler::resolver::res::{ Res, ResSlot };
 import std::core::mem;
 import utils::logger;
 import utils::logger::{ cdebug, LOG_DEBUG, LogComponent };
@@ -1727,6 +1727,28 @@ type struct TypeResolutionPasses {
                         mut ot_trait: SymbolStr =
                             ctx.resolve_scoped_or(ot_trait_leaf, FILE, LINE as i32);
                         if (!ot_trait.is_valid()) { ot_trait = ot_trait_leaf; }
+                        // SHADOW.  The head's trait annotation carries the
+                        // name layer's answer; the cursor scope map is the old
+                        // one.  Old decides; disagreements print; zero over the
+                        // corpus deletes the cursor read.
+                        mut ot_new: SymbolStr = SymbolStr::empty();
+                        match (TypeResolutionPasses::head_named_slot(node.trait_annotation)) {
+                            ResSlot::Answered(tr_res) => {
+                                match (tr_res) {
+                                    Res::Def(tq) => { ot_new = tq.qualified_name(); }
+                                    _            => { }
+                                }
+                            }
+                            _ => { }
+                        }
+                        if (!ot_new.equals(ot_trait)) {
+                            fmt::eprintf("SHADOW-IMPLTRAIT\t%s\t%s\told=%s\tnew=%s\t%s\n",
+                                if (ot_new.is_valid()) { "differs" } else { "new-missing" },
+                                ctx.intern_table.resolve(ot_trait_leaf),
+                                ctx.intern_table.resolve(ot_trait),
+                                if (ot_new.is_valid()) { ctx.intern_table.resolve(ot_new) } else { "-" },
+                                node.span.to_string());
+                        }
                         // Carry the same answer on the block itself: a caller
                         // asking WHICH trait this impl provides must not have to
                         // re-derive it from the registry's bare leaf key.
@@ -1768,6 +1790,33 @@ type struct TypeResolutionPasses {
                     } else {
                         canonical_target = ctx.qualify_symbol_sym_home(node.target_type, node.span.file);
                     }
+                }
+                // SHADOW.  The head's stamp names the target: a declaration
+                // under its canonical name, a primitive by its own spelling
+                // (the key a primitive impl registers by), and a monomorphized
+                // clone carries no stamp because its spelling is already the
+                // qualified name.  The four-step spelling cascade
+                // above is the old answer; it decides, disagreements print,
+                // zero over the corpus deletes it.
+                mut tgt_new: SymbolStr = SymbolStr::empty();
+                match (node.res) {
+                    ResSlot::Answered(tres) => {
+                        match (tres) {
+                            Res::Def(tq)    => { tgt_new = tq.qualified_name(); }
+                            Res::PrimTy(_)  => { tgt_new = node.target_type; }
+                            _               => { }
+                        }
+                    }
+                    _ => {
+                        if (target_str_full.contains("::")) { tgt_new = node.target_type; }
+                    }
+                }
+                if (!tgt_new.equals(canonical_target)) {
+                    fmt::eprintf("SHADOW-IMPLTGT\t%s\t%s\told=%s\tnew=%s\t%s\n",
+                        if (tgt_new.is_valid()) { "differs" } else { "new-missing" },
+                        target_str_full, ctx.intern_table.resolve(canonical_target),
+                        if (tgt_new.is_valid()) { ctx.intern_table.resolve(tgt_new) } else { "-" },
+                        node.span.to_string());
                 }
                 if (!node.qualified_target_name.is_valid()) {
                     node.qualified_target_name = canonical_target;
@@ -2323,6 +2372,19 @@ type struct TypeResolutionPasses {
     /// Walk a trait_annotation to its leaf identifier: the bare trait name.
     /// Mirrors `specialization::extract_root_name` but is duplicated here
     /// to keep type_resolution.cryo self-contained.
+    /// The stamp on the head's Named annotation, walking the same wrappers
+    /// `extract_trait_leaf` walks; `Pending` when there is none.
+    static head_named_slot(ann: TypeAnnotation*) -> ResSlot {
+        if (ann == null) { return ResSlot::Pending; }
+        return match (*ann) {
+            TypeAnnotation::Named(n) => { n.res }
+            TypeAnnotation::Generic(g) => { TypeResolutionPasses::head_named_slot(g.base) }
+            TypeAnnotation::Reference(r) => { TypeResolutionPasses::head_named_slot(r.inner) }
+            TypeAnnotation::Pointer(p) => { TypeResolutionPasses::head_named_slot(p.inner) }
+            _ => { ResSlot::Pending }
+        };
+    }
+
     static extract_trait_leaf(ann: TypeAnnotation*) -> SymbolStr {
         if (ann == null) { return SymbolStr::empty(); }
         return match (*ann) {
