@@ -21029,3 +21029,29 @@ the shadow build and this one: 0 of 1,126 example objects and 0 of 2,126
 test objects differ, `lsp-check` 266 modules, `make test` 2,113 / 179 / 43 -
 which is what zero disagreements predicted. `widen_type_home_scoped_bare`
 has one caller left, `emit_base_ctor_call`.
+
+### 8.153 Second consumer: `emit_base_ctor_call`, 0 disagreements; `widen_type_home_scoped_bare` deleted - the first whole old-model artifact to fall under shadow mode - 2026-09-11
+
+`: Base(args)` on a derived-class constructor. NEW is the enclosing class's
+stamped `base_res` (the class node hands its slot to `generate_method_body`;
+a struct, union or `implement` block hands null); OLD is
+`widen_type_home_scoped_bare` on the written base name, this function's last
+caller. `BaseCtorShadow::compare`, same three classes as §8.152, printed
+unconditionally. Population: 33 textual sites, 23 of them in the compiler's
+own source.
+
+| corpus | lines |
+|---|---|
+| `lsp-check` (266 modules) | 0 |
+| unit suite build | 0 |
+| 46 projects, built one at a time | 0 |
+| 14 examples | 0 |
+
+Instrument control: inverted for one build, 1 line for the 1 delegating
+constructor in the scratch program; restored, none.
+
+Deleted on that zero: the shadow, the widening call in the constructor path,
+and `widen_type_home_scoped_bare` itself - the three-key spelling cascade
+(writer's module, writer's imports, bare leaf) that `emit_new` and the base
+constructor were the only readers of. The base-constructor key is the stamped
+base's canonical name, which is also what the constructor is registered under.
