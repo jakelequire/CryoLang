@@ -74,6 +74,7 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag::suggestion::{ Suggestion };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::resolver::{ Resolver };
+import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::symbol_str::{ SymbolStr };
@@ -693,6 +694,63 @@ type struct TypeResolutionRunner {
                 "write the qualifier, or import the module you mean; a bare name resolves in scope and nothing here binds it");
             this.ctx.emit_diagnostic(amb);
             return;
+        }
+
+        // The same defect reached by a QUALIFIED path. A facade offers what its
+        // `export` edges pass on, so two of its children declaring one leaf
+        // makes `Facade::Leaf` name neither - and `walk_module_rooted_type`
+        // refuses it for exactly that reason. Saying "cannot find" would be
+        // false in the same way the bare case above is: it is found twice.
+        //
+        // Asked from the declarers already indexed by leaf, narrowed to the
+        // ones the written prefix can reach. The closure is the graph's own, so
+        // this cannot drift from what the resolver counted when it refused.
+        if (ty_name.contains("::")) {
+            const q_leaf: string = QualifiedName::leaf_of(ty_name);
+            const q_prefix: string = QualifiedName::parent_of(ty_name);
+            const graph: ModuleGraph* = this.ctx.module_graph;
+            mut facade: SymbolStr = SymbolStr::empty();
+            mut facades: i64 = 0;
+            for (mut mi: u32 = 0; mi < graph.modules.length; mi++) {
+                const cand: ModuleInfo* = &graph.modules[mi];
+                if (Resolver::ns_written_as(intern.resolve(cand.name), q_prefix)) {
+                    facade = cand.name;
+                    facades = facades + 1;
+                }
+            }
+            if (facades == 1) {
+                const reach: SymbolStr[] = graph.reexport_closure(facade);
+                const decls: SymbolStr[] =
+                    this.arena.leaf_declarers(intern.intern(q_leaf));
+                mut via: string[] = [];
+                for (mut di: i64 = 0; di < decls.length; di++) {
+                    // `leaf_declarers` answers with fully-qualified TYPE names
+                    // (`Amb::Left::Thing`), so the module is its parent. The
+                    // closure holds module namespaces and the two never
+                    // compare equal otherwise.
+                    const decl_ns: string =
+                        QualifiedName::parent_of(intern.resolve(decls[di]));
+                    const decl_sym: SymbolStr = intern.intern(decl_ns);
+                    mut ok: boolean = decl_sym.id == facade.id;
+                    for (mut ri: i64 = 0; ri < reach.length; ri++) {
+                        if (reach[ri].id == decl_sym.id) { ok = true; }
+                    }
+                    if (ok) { via.push(intern.resolve(decls[di])); }
+                }
+                if (via.length >= 2) {
+                    mut qamb: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0155_AMBIGUOUS_BARE_NAME,
+                        fmt::format("`%s` is offered by `%s` from more than one module, so it names no type",
+                               q_leaf, q_prefix));
+                    qamb = qamb.at_with_label(named.span, "ambiguous through this path");
+                    qamb = qamb.with_note(fmt::format("`%s` and `%s` both declare it, and `%s` re-exports both",
+                                               via[0], via[1], q_prefix));
+                    qamb = qamb.with_note(
+                        "name the declaring module instead; a re-export offers what its children offer, and two of them offer this");
+                    this.ctx.emit_diagnostic(qamb);
+                    return;
+                }
+            }
         }
 
         mut diag: Diagnostic = Diagnostic::error(

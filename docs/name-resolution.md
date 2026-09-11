@@ -49,7 +49,7 @@ current-state description is the defect it exists to remove.
 | D7 | Imports stop globbing | **TAKEN** — a plain `import M;` is `ImportStyle::Module` and binds no names. Three globs remain BY DESIGN and the old row's expected `0` was unreachable: the explicit `M::*`, and the two the compiler injects (the prelude, the f-string runtime) | `grep -rho 'ImportStyle::Wildcard,' compiler/src --include=*.cryo \| wc -l` → **3** | §8.131, §8.135, §8.138 |
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
-| D10 | A plural bare leaf is E0155, not a directory-order bind | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **3** | §8.121 |
+| D10 | A plural leaf is E0155, not a directory-order bind — and a leaf two children of one FACADE declare is the same defect reached by a qualified path | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **4** | §8.121, §8.144 |
 | D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1649** | §8.66, §8.80, §8.139 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **2** | §8.138, §8.144 |
@@ -20259,10 +20259,40 @@ The old compiler refuses both halves, which is why it is NOT the control here -
 it cannot follow a re-export at any arity, so its refusal says nothing about
 plurality. The control is the one-declarer arm of the same tree.
 
-**Owed:** the refusal surfaces as `E0203 cannot find type`, which is wrong in
-kind - the name IS found, twice. `module_offering` reports `hits` precisely so a
-caller can tell the two apart; `walk_module_rooted_type` currently discards it.
-Plumbing the count out to a distinct diagnostic is owed, not done.
+**The refusal's diagnostic is fixed here too.** It surfaced as
+`E0203 cannot find type`, which is wrong in kind - the name IS found, twice, and
+a reader would go looking for a missing declaration. `type_resolution` already
+had the bare-name version of this check, asking `leaf_declarers` before the
+not-found diagnostic; it simply never matched a qualified path, because the
+written name is the whole path and the index is keyed by leaf. It now splits the
+path, narrows the declarers to the ones the written prefix can REACH through the
+graph's own `reexport_closure`, and reports E0155 when two survive:
+
+    error[E0155]: `Thing` is offered by `Facade` from more than one module, ...
+     note: `Amb::Left::Thing` and `Amb::Right::Thing` both declare it, and
+           `Facade` re-exports both
+
+E0155 is reused rather than a code minted: its own definition says "two
+declarations claim it... distinct from E0203, which says no such name exists",
+which is this case exactly.
+
+The first version of that check compared the declarers against module
+namespaces and never fired. `leaf_declarers` answers with fully-qualified TYPE
+names - `Amb::Left::Thing`, not `Amb::Left` - so the module is its PARENT, and
+the two never compare equal. It was found by asking the BARE case the same
+question: the bare check reported both declarers, which proved the index held
+them and moved the fault to the narrowing rather than the data.
+
+#### An object baseline is only meaningful against the commit it was taken at
+
+Twice in one day a baseline was nearly read against the wrong commit - the build
+agent caught `fba193a4` against `9698575d`, and this worker caught `5a53ede3`
+against two later compiler-source commits. State it as a rule rather than
+rediscovering it a third time: **`tests/obj-baseline-windows.txt` is a statement
+about ONE commit, and any commit that changes compiler source invalidates it.**
+The sweep's criterion is zero objects changed, so a baseline carrying unrelated
+compiler drift buries the only signal it exists to give. Re-take it immediately
+before the measurement, never at the start of a session.
 
 #### `error[E0900]: linker invocation failed` hides the diagnostic
 
