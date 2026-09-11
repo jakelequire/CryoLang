@@ -3952,8 +3952,10 @@ type struct CallResolver {
         return TypeRef::invalid();
     }
 
-    /// GATED (R2): true when the scope/method resolves to a generic template (so
-    /// sema pinning the template form would shadow mono's spec pin).
+    /// True when `scope_sym` - a registered name: the owner that won
+    /// resolution, or a specialization's registered name - is a generic
+    /// template, owns the static-method template `Owner::method`, or is an
+    /// instantiation.  Sema then leaves the callee unpinned for mono.
     scope_is_generic_template(&this, scope_sym: SymbolStr, member_sym: SymbolStr) -> boolean {
         if (this.ctx.generic_registry == null) { return false; }
         // `scope_sym` is a registered name - the owner that won resolution, or
@@ -3975,44 +3977,6 @@ type struct CallResolver {
                 if (t != null && t.kind == TypeKind::InstantiatedType) { return true; }
             }
         }
-        // SHADOW.  The spelling widened - the ambient-cursor scope map and the
-        // resolver re-entry, on the owner and on `Owner::method` - is the old
-        // answer to the same question.  Each exit that answers where the exact
-        // lookups did not prints unconditionally; zero over the corpus deletes
-        // every step below.
-        if (this.ctx.decl_index != null) {
-            const qscope: SymbolStr = this.ctx.resolve_scoped_or(scope_sym, FILE, LINE as i32);
-            if (qscope.is_valid() && !qscope.equals(scope_sym)) {
-                if (this.ctx.generic_registry.get_template(qscope) != null) {
-                    fmt::eprintf("SHADOW-GENTMPL\tcursor-owner\t%s\t%s\t%s\n",
-                        scope_str, member_str, this.intern.resolve(qscope));
-                    return true;
-                }
-                if (member_sym.is_valid()) {
-                    const qcsym: SymbolStr = this.intern.intern(fmt::format("%s::%s", this.intern.resolve(qscope), member_str));
-                    if (this.ctx.generic_registry.get_template(qcsym) != null) {
-                        fmt::eprintf("SHADOW-GENTMPL\tcursor-method\t%s\t%s\t%s\n",
-                            scope_str, member_str, this.intern.resolve(qcsym));
-                        return true;
-                    }
-                }
-            }
-        }
-        const xscope: SymbolStr = this.types.resolve_cross_module_name(scope_sym);
-        if (xscope.is_valid() && !xscope.equals(scope_sym)
-                && this.ctx.generic_registry.get_template(xscope) != null) {
-            fmt::eprintf("SHADOW-GENTMPL\tcross-owner\t%s\t%s\t%s\n",
-                scope_str, member_str, this.intern.resolve(xscope));
-            return true;
-        }
-        // A same-leaf generic template is now recovered directly by the
-        // import-scoped `resolve_scoped_or` probes above (a static call
-        // `Pair::new` resolves `Pair` to the imported `std::collections::pair::Pair`
-        // and finds its template), so the former bare-leaf template scan is no
-        // longer needed.  A LOCAL non-generic type that shadows a same-leaf
-        // stdlib generic without importing it correctly resolves to the local
-        // type here (not generic), and importing both is a hard ambiguity
-        // (E0154) rather than a silent pick.
         return false;
     }
 
@@ -4236,13 +4200,11 @@ type struct CallResolver {
         };
     }
 
-    /// Find the function template a `Owner::method` scope-resolution call names,
+    /// The function template a `Owner::method` scope-resolution call names,
     /// for a GENERIC static method on a NON-generic owner (registered by
-    /// `register_static_method_templates`, keyed `Owner::method`).  Tries the
-    /// import-scoped qualified owner, the written scope name, then the cross-module
-    /// leaf-canonical form - the same ladder `resolve_scope_owner_template` uses -
-    /// so a same-leaf or module-qualified owner still resolves.  Returns null when
-    /// no such template is registered.
+    /// `register_static_method_templates`, keyed `Owner::method` under the
+    /// owner's registered name).  The owner is the one the scope segment
+    /// names; null when no such template is registered.
     find_static_method_template(&this, scope: ScopeResolutionNode*) -> TemplateEntry* {
         if (this.ctx.generic_registry == null) { return null; }
         const member_str: string = this.intern.resolve(scope.member_name);
@@ -4252,26 +4214,6 @@ type struct CallResolver {
             if (q.is_valid()) {
                 const qstr: string = this.intern.resolve(q) + "::" + member_str;
                 entry = this.ctx.generic_registry.get_template(this.intern.intern(qstr));
-            }
-        }
-        // SHADOW.  The written spelling and its cross-module widening are the
-        // old answers to the same question; each prints where it answers and
-        // the owner key did not.  Zero over the corpus deletes both.
-        if (entry == null) {
-            const bstr: string = this.intern.resolve(scope.scope_name) + "::" + member_str;
-            entry = this.ctx.generic_registry.get_template(this.intern.intern(bstr));
-            if (entry != null) {
-                fmt::eprintf("SHADOW-SMTMPL\tspelling\t%s\t%s\n", bstr, scope.span.to_string());
-            }
-        }
-        if (entry == null) {
-            const cross: SymbolStr = this.types.resolve_cross_module_name(scope.scope_name);
-            if (cross.is_valid() && !cross.equals(scope.scope_name)) {
-                const cstr: string = this.intern.resolve(cross) + "::" + member_str;
-                entry = this.ctx.generic_registry.get_template(this.intern.intern(cstr));
-                if (entry != null) {
-                    fmt::eprintf("SHADOW-SMTMPL\tcross\t%s\t%s\n", cstr, scope.span.to_string());
-                }
             }
         }
         return entry;

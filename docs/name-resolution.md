@@ -94,6 +94,7 @@ three, and its row carries the count. Read each zero off its own row.
 | arena `leaf_index` map | **LIVE, and NOT a lane** | — | `grep -rho 'leaf_index' compiler/src \| wc -l` → **8** | §8.121 |
 | `resolve_path` (§5.2's one entry point) | **LIVE, but not the entry point** — 2 call sites, both single-segment, both `Namespace::Type` | — | `grep -rho '\.resolve_path(' compiler/src --include=*.cryo \| wc -l` → **2** | §5.2, §8.5, §8.7 |
 | `canonical_type_ref`'s bare step | **STARVED** — still present, answers nothing | 2,652 reached / **0** answered | `grep -c 'lookup_by_name' compiler/src/compiler/compilation_context.cryo` → **1** (0 when deleted) | §8.103, §8.104, §8.112 |
+| `resolve_cross_module_name` (sema's resolver re-entry by spelling) | **DELETED** — its four readers went under shadow mode | — | `grep -rho 'resolve_cross_module_name' compiler/src \| wc -l` → **0** | §8.155 |
 | `check_module_type_collision` | LIVE — D5 deletes it | — | see D5 | §8.130, §8.131 |
 | `module_owns_member` probe | LIVE — D5 deletes it | — | `grep -rho 'module_owns_member' compiler/src \| wc -l` → **3** | §8.131 |
 | `scope_owner_key` | LIVE — the static-call owner key; the callee-type and template-method probes read it too | — | `grep -rho 'scope_owner_key' compiler/src \| wc -l` → **6** | §8.134, §8.151 |
@@ -21135,3 +21136,9 @@ Deleted on that zero: every widening step of both, and with them
 sema no longer re-enters the resolver by spelling anywhere.
 `Resolver::resolve_type_qualified_name` keeps one caller, the annotation
 lane's `canonical_type_name`, which is the next shadow.
+
+**Deleted.** Both lookups are exact; `resolve_cross_module_name` is gone.
+Objects over the shadow build and this one: 0 of 1,126 examples, 0 of 2,126
+tests; `make test` 2,113 / 179 / 43. lane: REENTRY 6 -> 5 - the
+`get_resolver()` in `type_utils` was that re-entry. Tally: 6 shadowed, 6 at
+zero, 6 deleted, 3 artifacts gone.
