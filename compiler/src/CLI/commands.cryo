@@ -3,46 +3,34 @@ namespace cli::commands;
 import std::fmt;
 import std::env;
 import std::io::stdio;
-import compiler::{ instance, compilation_context, project_config };
-import compiler::codegen::{ passes, llvm_types };
+import compiler::{ compilation_context, instance, project_config };
+import compiler::codegen::{ llvm_types, passes };
 import compiler::deps::dep_resolver;
-import compiler::deps::dep_resolver::{ DepResolver, ResolveMode, ResolveOutcome };
 import compiler::resolver::demangler;
-import compiler::resolver::demangler::{ Demangler };
 import compiler::vendor::registry;
-import compiler::vendor::registry::{
-    VendorCacheItem, VendorEntry, VendorLink, VendorLock, VendorRegistry
-};
 import compiler::bindgen::generator;
-import compiler::bindgen::generator::{ VendorGenerator };
 import utils;
 import utils::logger;
-import utils::logger::{ cdebug, Logger };
 import std::collections::string;
 import std::collections::string::{ String };
 import std::collections::str;
-import std::collections::str::{ Str };
 import std::fs::file;
 import std::fs::path;
-import std::fs::path::{ Path };
 import std::fs::metadata;
-import std::fs::metadata::{ metadata };
 import std::fs::dir;
 import std::process::exec;
 import std::process;
 import std::json::parser;
 import std::json::value;
-import std::json::value::{ JsonValue };
 import std::json::serializer;
 import cli;
-import cli::{ ArgumentParser, ParsedArgs, Runner };
 import compiler::resolve_counter;
 import std::ffi::libc;
-import compiler::codegen::llvm_types::{ LTargetMachine };
-import compiler::codegen::passes::{ CodegenPasses };
-import compiler::compilation_context::{ OutputKind };
-import compiler::instance::{ CompilationResult, CompilerConfig, CompilerInstance };
-import compiler::project_config::{ PanicStrategy, ProjectConfig };
+import compiler::codegen::llvm_types;
+import compiler::codegen::passes;
+import compiler::compilation_context;
+import compiler::instance;
+import compiler::project_config;
 
 // Test-output framing (ASCII only). 80-column rules; kept in sync with the
 // unit runner's framing in stdlib/test/runner.cryo so the two suites read
@@ -204,14 +192,14 @@ function host_os_name() -> string {
 /// to the current directory; the negative suite ran Linux-only before this.
 ![target(windows)]
 function neg_tmp_path() -> string {
-    match (env::var(Str::new("TEMP"))) {
+    match (env::var(str::Str::new("TEMP"))) {
         Option::Some(v) => {
             mut s: String = v;
             return fmt::format("%s\\cryo_negtest_%d.out", s.as_cstr() as string, process::id());
         }
         Option::None => {}
     }
-    match (env::var(Str::new("TMP"))) {
+    match (env::var(str::Str::new("TMP"))) {
         Option::Some(v) => {
             mut s: String = v;
             return fmt::format("%s\\cryo_negtest_%d.out", s.as_cstr() as string, process::id());
@@ -224,7 +212,7 @@ function neg_tmp_path() -> string {
 /// POSIX: honor `$TMPDIR`, else `/tmp`.
 ![target(unix)]
 function neg_tmp_path() -> string {
-    match (env::var(Str::new("TMPDIR"))) {
+    match (env::var(str::Str::new("TMPDIR"))) {
         Option::Some(v) => {
             mut s: String = v;
             return fmt::format("%s/cryo_negtest_%d.out", s.as_cstr() as string, process::id());
@@ -467,7 +455,7 @@ implement enum FlagKind {
     /// `-q`, `-o`), so `cryo help --debug`, `cryo help debug` and
     /// `cryo help -h` all land on the right entry.
     static resolve(topic: string) -> FlagKind {
-        const name: string = ArgumentParser::normalize_flag_name(topic);
+        const name: string = cli::ArgumentParser::normalize_flag_name(topic);
         return match (name) {
             "help"      | "h" => { FlagKind::Help }
             "version"   | "v" => { FlagKind::Version }
@@ -580,7 +568,7 @@ implement enum FlagKind {
 
 type struct Executor {
     /// Registers all built-in commands with the Runner.
-    static register_commands(runner: Runner*) -> void {
+    static register_commands(runner: cli::Runner*) -> void {
         const help: CommandKind = CommandKind::Help;
         runner.add_command(cli::Command::new(help.name(), help.description(), help.usage()));
 
@@ -632,7 +620,7 @@ type struct Executor {
     ///                       the release profile when none is given
     /// `--release` wins over `--dev` wins over `--profile=` when several are
     /// passed. Leaving all unset keeps the cryoconfig `[profile] default`.
-    static apply_profile_flags(config: CompilerConfig*, args: &ParsedArgs) -> void {
+    static apply_profile_flags(config: instance::CompilerConfig*, args: &cli::ParsedArgs) -> void {
         if (args.has_flag("release")) {
             config.profile_override = "release";
         } else if (args.has_flag("dev")) {
@@ -663,7 +651,7 @@ type struct Executor {
     /// Internal child entry for the multi-process object emitter.  Positional
     /// args: `<manifest> <worker_idx> <worker_count>`.  Delegates to the
     /// codegen worker, which reads the manifest and emits this worker's slice.
-    static cmd_emit_obj(args: ParsedArgs) -> int {
+    static cmd_emit_obj(args: cli::ParsedArgs) -> int {
         if (args.positional_count() < 3) {
             fmt::eprintf("__emit-obj: usage: __emit-obj <manifest> <worker_idx> <worker_count>\n");
             return 1;
@@ -671,7 +659,7 @@ type struct Executor {
         const manifest: string = args.positional_at(0);
         const widx:  u32 = args.positional_at(1).parse_c_uint() as u32;
         const wcount: u32 = args.positional_at(2).parse_c_uint() as u32;
-        return CodegenPasses::run_emit_worker(manifest, widx, wcount) as int;
+        return passes::CodegenPasses::run_emit_worker(manifest, widx, wcount) as int;
     }
 
     /// Resolves a command name string to a CommandKind.
@@ -694,13 +682,13 @@ type struct Executor {
     }
 
     /// Entry point from Runner: resolves the name and dispatches.
-    static dispatch(cmd_name: string, runner: Runner*, args: ParsedArgs) -> int {
+    static dispatch(cmd_name: string, runner: cli::Runner*, args: cli::ParsedArgs) -> int {
         const kind: CommandKind = Executor::resolve(cmd_name);
         return Executor::execute(kind, runner, args);
     }
 
     /// Executes a command by its kind.
-    static execute(kind: CommandKind, runner: Runner*, args: ParsedArgs) -> int {
+    static execute(kind: CommandKind, runner: cli::Runner*, args: cli::ParsedArgs) -> int {
         match (kind) {
             CommandKind::Help    => { runner.print_help();    return 0; }
             CommandKind::Version => {
@@ -860,7 +848,7 @@ type struct Executor {
     /// project-name prompt; pressing Enter at any prompt accepts the
     /// default in brackets, so `cryo init hello && (echo; echo; echo)` is
     /// effectively non-interactive.
-    static cmd_init(args: ParsedArgs) -> int {
+    static cmd_init(args: cli::ParsedArgs) -> int {
         const has_positional: boolean = args.positional_count() > 0;
         const target_dir: string = if (has_positional) {
             args.input_file()
@@ -1099,12 +1087,12 @@ type struct Executor {
     /// - `cryo build [dir]`:       find the cryoconfig in `dir` (default: `.`)
     ///                              and run a full project build.
     /// - `cryo build`:             same as above with dir = `.`.
-    static cmd_build(args: ParsedArgs) -> int {
+    static cmd_build(args: cli::ParsedArgs) -> int {
         if (args.has_flag("debug")) {
-            Logger::enable_debug();
+            logger::Logger::enable_debug();
         }
 
-        cdebug("[Build] Starting build process.\n");
+        logger::cdebug("[Build] Starting build process.\n");
 
         const file: string = args.input_file();
 
@@ -1125,7 +1113,7 @@ type struct Executor {
 
         // Project build: find cryoconfig in the given dir (or ".").
         const dir: string = if (file.length() > 0) { file } else { "." };
-        const config_path: string = ProjectConfig::find_cryoconfig(dir);
+        const config_path: string = project_config::ProjectConfig::find_cryoconfig(dir);
         if (config_path.length() == 0) {
             if (file.length() > 0) {
                 fmt::eprintf("Error: '%s' is not a .cryo file and no cryoconfig was found in that directory.\n", file);
@@ -1137,11 +1125,11 @@ type struct Executor {
             return 1;
         }
 
-        cdebug("[Build] Found cryoconfig: %s\n", config_path);
+        logger::cdebug("[Build] Found cryoconfig: %s\n", config_path);
 
-        mut config: CompilerConfig = CompilerConfig::default();
+        mut config: instance::CompilerConfig = instance::CompilerConfig::default();
         if (args.has_flag("debug")) {
-            config = CompilerConfig::debug_config();
+            config = instance::CompilerConfig::debug_config();
         }
         if (args.has_flag("ast")) {
             config.show_ast = true;
@@ -1177,7 +1165,7 @@ type struct Executor {
         // Never changes the emitted bytes, only build speed.
         if (args.has_arg("codegen-threads")) {
             config.codegen_threads_override =
-                ProjectConfig::parse_codegen_threads(
+                project_config::ProjectConfig::parse_codegen_threads(
                     args.get_value("codegen-threads")) as i32;
         }
         // `-g` / `--debug-info`: emit DWARF source-line debug info.
@@ -1198,13 +1186,13 @@ type struct Executor {
         // `unwind` emits invoke/landingpad cleanup edges + `__cryo_personality_v0`
         // and links the `panic/unwind` runtime tier; `abort` opts back out.
         if (args.has_arg("panic")) {
-            config.panic = PanicStrategy::from_string(args.get_value("panic"));
+            config.panic = project_config::PanicStrategy::from_string(args.get_value("panic"));
         }
         Executor::apply_profile_flags(&config, &args);
 
-        mut compiler: CompilerInstance = CompilerInstance::new(config);
-        cdebug("[Build] Compiling project from config: %s\n", config_path);
-        const result: CompilationResult = compiler.compile_project(config_path);
+        mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
+        logger::cdebug("[Build] Compiling project from config: %s\n", config_path);
+        const result: instance::CompilationResult = compiler.compile_project(config_path);
 
         // The instance reports on its success path only, so a failed build
         // would otherwise contribute nothing - and a project that is meant
@@ -1229,12 +1217,12 @@ type struct Executor {
     /// binary.  Returns the binary's exit code.  Library / stdlib targets
     /// have no entry point and produce no executable, so `run` rejects
     /// them with a clear error rather than silently doing nothing.
-    static cmd_run(args: ParsedArgs) -> int {
+    static cmd_run(args: cli::ParsedArgs) -> int {
         if (args.has_flag("debug")) {
-            Logger::enable_debug();
+            logger::Logger::enable_debug();
         }
 
-        cdebug("[Run] Building project before execution.\n");
+        logger::cdebug("[Run] Building project before execution.\n");
 
         // Find cryoconfig in CWD (or explicit positional dir).
         const dir: string = if (args.positional_count() > 0) {
@@ -1242,16 +1230,16 @@ type struct Executor {
         } else {
             "."
         };
-        const config_path: string = ProjectConfig::find_cryoconfig(dir);
+        const config_path: string = project_config::ProjectConfig::find_cryoconfig(dir);
         if (config_path == "") {
             fmt::eprintf("Error: No cryoconfig found in '%s' or parent directories.\n", dir);
             fmt::eprintf("Usage: cryo run [flags]   (run from a directory containing a cryoconfig)\n");
             return 1;
         }
 
-        mut config: CompilerConfig = CompilerConfig::default();
+        mut config: instance::CompilerConfig = instance::CompilerConfig::default();
         if (args.has_flag("debug")) {
-            config = CompilerConfig::debug_config();
+            config = instance::CompilerConfig::debug_config();
         }
         if (args.has_flag("ast")) {
             config.show_ast = true;
@@ -1270,8 +1258,8 @@ type struct Executor {
         }
         Executor::apply_profile_flags(&config, &args);
 
-        mut compiler: CompilerInstance = CompilerInstance::new(config);
-        const result: CompilationResult = compiler.compile_project(config_path);
+        mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
+        const result: instance::CompilationResult = compiler.compile_project(config_path);
 
         // The instance reports on its success path only, so a failed build
         // would otherwise contribute nothing - and a project that is meant
@@ -1291,7 +1279,7 @@ type struct Executor {
             return 1;
         }
 
-        cdebug("[Run] %s\n", result.output_path);
+        logger::cdebug("[Run] %s\n", result.output_path);
         // Flush so the [Run] header appears before the child binary's
         // output (under --debug); otherwise the libc line buffer can
         // interleave them.
@@ -1318,23 +1306,23 @@ type struct Executor {
     /// plus the test-runner flags forwarded to the produced binary:
     /// optional positional pattern, `--ignored`, `--list`, `--exact`,
     /// `-q` / `--quiet`.
-    static cmd_test(args: ParsedArgs) -> int {
+    static cmd_test(args: cli::ParsedArgs) -> int {
         if (args.has_flag("debug")) {
-            Logger::enable_debug();
+            logger::Logger::enable_debug();
         }
 
-        cdebug("[Test] Building test binary.\n");
+        logger::cdebug("[Test] Building test binary.\n");
 
-        const config_path: string = ProjectConfig::find_cryoconfig(".");
+        const config_path: string = project_config::ProjectConfig::find_cryoconfig(".");
         if (config_path == "") {
             fmt::eprintf("Error: No cryoconfig found in '.' or parent directories.\n");
             fmt::eprintf("Usage: cryo test [pattern] [flags]   (run from a Cryo project)\n");
             return 1;
         }
 
-        mut config: CompilerConfig = CompilerConfig::default();
+        mut config: instance::CompilerConfig = instance::CompilerConfig::default();
         if (args.has_flag("debug")) {
-            config = CompilerConfig::debug_config();
+            config = instance::CompilerConfig::debug_config();
         }
         if (args.has_arg("build-dir")) {
             config.output_dir_override = args.get_value("build-dir");
@@ -1348,8 +1336,8 @@ type struct Executor {
         Executor::apply_profile_flags(&config, &args);
         config.test_mode = true;
 
-        mut compiler: CompilerInstance = CompilerInstance::new(config);
-        const result: CompilationResult = compiler.compile_project(config_path);
+        mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
+        const result: instance::CompilationResult = compiler.compile_project(config_path);
 
         // The instance reports on its success path only, so a failed build
         // would otherwise contribute nothing - and a project that is meant
@@ -1399,7 +1387,7 @@ type struct Executor {
             col_choice = args.get_value("color");
         }
         if (fmt_choice.length() == 0 || col_choice.length() == 0) {
-            const proj_cfg: ProjectConfig = ProjectConfig::parse(config_path);
+            const proj_cfg: project_config::ProjectConfig = project_config::ProjectConfig::parse(config_path);
             if (fmt_choice.length() == 0 && proj_cfg.test_format.length() > 0) {
                 fmt_choice = proj_cfg.test_format;
             }
@@ -1425,13 +1413,13 @@ type struct Executor {
         }
         mut stdlib_abs: string = "";
         if (result.stdlib_root.length() > 0) {
-            match (dir::canonicalize(Path::from(result.stdlib_root))) {
+            match (dir::canonicalize(path::Path::from(result.stdlib_root))) {
                 Result::Ok(pb)  => { stdlib_abs = pb.into_raw(); }
                 Result::Err(_)  => { stdlib_abs = result.stdlib_root; }
             }
         }
 
-        cdebug("[Test] %s\n", cmd);
+        logger::cdebug("[Test] %s\n", cmd);
         // Flush parent stdio before spawning so the [Test] header lands
         // before the child's output under --debug.  Same precaution as
         // `cmd_run`.
@@ -1539,7 +1527,7 @@ type struct Executor {
 
     /// Read a file's full contents, or "" if it can't be opened.
     static read_file_or_empty(path: string) -> string {
-        match (file::read_to_string(Path::from(path))) {
+        match (file::read_to_string(path::Path::from(path))) {
             Result::Ok(s)  => { return s.into_raw(); }
             Result::Err(_) => { return ""; }
         }
@@ -1832,7 +1820,7 @@ type struct Executor {
         if (col_choice == "always") { return true;  }
         if (col_choice == "never")  { return false; }
         // "auto" or "" (default): NO_COLOR > isatty.
-        match (env::var(Str::new("NO_COLOR"))) {
+        match (env::var(str::Str::new("NO_COLOR"))) {
             Option::Some(_) => { return false; }
             Option::None => {}
         }
@@ -2026,7 +2014,7 @@ type struct Executor {
             entry = libc::readdir(dp);
         }
         libc::closedir(dp);
-        dir::remove_file(Path::from(tmp));
+        dir::remove_file(path::Path::from(tmp));
 
         // Compact: close out the single in-flight line with the tally.
         if (is_compact && ran > 0) {
@@ -2058,7 +2046,7 @@ type struct Executor {
     /// Copy a borrowed `Str` into an owned NUL-terminated C string. The copy
     /// outlives the `JsonValue` it was read from (which we drop right after
     /// parsing), so the dispatch logic can keep using it.
-    static dup_cstr(s: Str) -> string {
+    static dup_cstr(s: str::Str) -> string {
         mut owned: String = String::from_str(s);
         return owned.into_raw();
     }
@@ -2098,11 +2086,11 @@ type struct Executor {
     /// True when a single `requires` token holds (see `proj_first_unmet_requirement`).
     static proj_requirement_met(req: string) -> boolean {
         if (req == "display") {
-            match (env::var(Str::new("DISPLAY"))) {
+            match (env::var(str::Str::new("DISPLAY"))) {
                 Option::Some(v) => { mut s: String = v; if (s.length() > 0) { return true; } }
                 Option::None => {}
             }
-            match (env::var(Str::new("WAYLAND_DISPLAY"))) {
+            match (env::var(str::Str::new("WAYLAND_DISPLAY"))) {
                 Option::Some(v) => { mut s: String = v; return s.length() > 0; }
                 Option::None => {}
             }
@@ -2110,12 +2098,12 @@ type struct Executor {
         }
         if (req.starts_with("vendor:")) {
             const lib: string = req + 7;   // strip "vendor:"
-            const reg: VendorRegistry = VendorRegistry::load_global();
+            const reg: registry::VendorRegistry = registry::VendorRegistry::load_global();
             const idx: i64 = reg.find_index(lib);
             if (idx < 0) { return false; }
             const f: string = reg.entries[idx].cache_file_for(
-                VendorRegistry::normalize_triple(""));
-            return f.length() > 0 && metadata::exists(Path::from(f));
+                registry::VendorRegistry::normalize_triple(""));
+            return f.length() > 0 && metadata::exists(path::Path::from(f));
         }
         if (req.starts_with("os:")) {
             // The project's sources hard-use one platform's surface (e.g.
@@ -2145,7 +2133,7 @@ type struct Executor {
     /// Parse a project's `test.json` into a `ProjSpec`. Returns `None` if the
     /// file is malformed (the caller reports that as a failing project).
     static parse_test_json(content: string) -> Option<ProjSpec> {
-        mut root: JsonValue = match (parser::parse(Str::from(content))) {
+        mut root: value::JsonValue = match (parser::parse(str::Str::from(content))) {
             Result::Ok(v)      => { v }
             Result::Err(mut e) => { e.drop(); return Option::None; }
         };
@@ -2157,12 +2145,12 @@ type struct Executor {
         // Outcome selects the FIXTURE: collect (default) / build / run.
         // `compile_fail` is a recognized alias for `build` + `fails`, so the
         // pre-orthogonal spelling keeps working.
-        const build_str: Str = Str::new("build");
-        const cf_str:    Str = Str::new("compile_fail");
-        const run_str:   Str = Str::new("run");
-        match (root.get(Str::new("outcome"))) {
+        const build_str: str::Str = str::Str::new("build");
+        const cf_str:    str::Str = str::Str::new("compile_fail");
+        const run_str:   str::Str = str::Str::new("run");
+        match (root.get(str::Str::new("outcome"))) {
             Option::Some(vp) => {
-                match (vp.as<Str>()) {
+                match (vp.as<str::Str>()) {
                     Option::Some(os) => {
                         if (os.equals(&build_str))    { spec.outcome = 1; }
                         else if (os.equals(&cf_str))  { spec.outcome = 1; spec.fails = true; }
@@ -2173,7 +2161,7 @@ type struct Executor {
             }
             Option::None => { }
         }
-        match (root.get(Str::new("ignore"))) {
+        match (root.get(str::Str::new("ignore"))) {
             Option::Some(vp) => {
                 match (vp.as<boolean>()) {
                     Option::Some(b) => { spec.ignore = b; }
@@ -2182,13 +2170,13 @@ type struct Executor {
             }
             Option::None => { }
         }
-        match (root.get(Str::new("requires"))) {
+        match (root.get(str::Str::new("requires"))) {
             Option::Some(rp) => {
                 const n: u64 = rp.length();
                 for (mut i: u64 = 0; i < n; i++) {
                     match (rp.at(i)) {
                         Option::Some(ep) => {
-                            match (ep.as<Str>()) {
+                            match (ep.as<str::Str>()) {
                                 Option::Some(es) => { spec.requires.push(Executor::dup_cstr(es)); }
                                 Option::None     => { }
                             }
@@ -2199,9 +2187,9 @@ type struct Executor {
             }
             Option::None => { }
         }
-        match (root.get(Str::new("expect"))) {
+        match (root.get(str::Str::new("expect"))) {
             Option::Some(ep) => {
-                match (ep.get(Str::new("exit_code"))) {
+                match (ep.get(str::Str::new("exit_code"))) {
                     Option::Some(xp) => {
                         match (xp.as<i64>()) {
                             Option::Some(n) => { spec.exit_code = n; }
@@ -2210,7 +2198,7 @@ type struct Executor {
                     }
                     Option::None => { }
                 }
-                match (ep.get(Str::new("fails"))) {
+                match (ep.get(str::Str::new("fails"))) {
                     Option::Some(fp) => {
                         match (fp.as<boolean>()) {
                             Option::Some(b) => { spec.fails = b; }
@@ -2222,9 +2210,9 @@ type struct Executor {
                 // `diagnostic` is sugar for a failing build that must emit a
                 // specific error code: it sets `fails` and appends the
                 // `error[<code>]` marker to `output_contains`.
-                match (ep.get(Str::new("diagnostic"))) {
+                match (ep.get(str::Str::new("diagnostic"))) {
                     Option::Some(dp) => {
-                        match (dp.as<Str>()) {
+                        match (dp.as<str::Str>()) {
                             Option::Some(ds) => {
                                 const dcode: string = Executor::dup_cstr(ds);
                                 spec.fails = true;
@@ -2235,22 +2223,22 @@ type struct Executor {
                     }
                     Option::None => { }
                 }
-                match (ep.get(Str::new("stdout_contains"))) {
+                match (ep.get(str::Str::new("stdout_contains"))) {
                     Option::Some(sp) => {
-                        match (sp.as<Str>()) {
+                        match (sp.as<str::Str>()) {
                             Option::Some(ss) => { spec.stdout_sub = Executor::dup_cstr(ss); }
                             Option::None     => { }
                         }
                     }
                     Option::None => { }
                 }
-                match (ep.get(Str::new("output_contains"))) {
+                match (ep.get(str::Str::new("output_contains"))) {
                     Option::Some(ap) => {
                         const n: u64 = ap.length();
                         for (mut i: u64 = 0; i < n; i++) {
                             match (ap.at(i)) {
                                 Option::Some(iv) => {
-                                    match (iv.as<Str>()) {
+                                    match (iv.as<str::Str>()) {
                                         Option::Some(is) => { spec.output_contains.push(Executor::dup_cstr(is)); }
                                         Option::None     => { }
                                     }
@@ -2261,13 +2249,13 @@ type struct Executor {
                     }
                     Option::None => { }
                 }
-                match (ep.get(Str::new("output_excludes"))) {
+                match (ep.get(str::Str::new("output_excludes"))) {
                     Option::Some(ap) => {
                         const n: u64 = ap.length();
                         for (mut i: u64 = 0; i < n; i++) {
                             match (ap.at(i)) {
                                 Option::Some(iv) => {
-                                    match (iv.as<Str>()) {
+                                    match (iv.as<str::Str>()) {
                                         Option::Some(is) => { spec.output_excludes.push(Executor::dup_cstr(is)); }
                                         Option::None     => { }
                                     }
@@ -2315,7 +2303,7 @@ type struct Executor {
             if (pn != "." && pn != ".."
                 && (pattern == "" || pn.contains(pattern))) {
                 const tj: string = Executor::proj_marker_path(projects_dir, pn);
-                if (metadata::exists(Path::from(tj))) { to_run += 1; }
+                if (metadata::exists(path::Path::from(tj))) { to_run += 1; }
             }
             pre_entry = libc::readdir(pre_dp);
         }
@@ -2355,7 +2343,7 @@ type struct Executor {
                 entry = libc::readdir(dp); continue;
             }
             const tj: string = Executor::proj_marker_path(projects_dir, name);
-            if (!metadata::exists(Path::from(tj))) { entry = libc::readdir(dp); continue; }
+            if (!metadata::exists(path::Path::from(tj))) { entry = libc::readdir(dp); continue; }
 
             if (is_pretty) {
                 fmt::printf("  %s ... ", name);
@@ -2425,7 +2413,7 @@ type struct Executor {
             entry = libc::readdir(dp);
         }
         libc::closedir(dp);
-        dir::remove_file(Path::from(tmp));
+        dir::remove_file(path::Path::from(tmp));
 
         if (is_compact && ran > 0) {
             fmt::printf("   %d ok", ran - failures);
@@ -2552,9 +2540,9 @@ type struct Executor {
     }
 
     /// `cryo check <file>`: frontend + semantic analysis, no codegen.
-    static cmd_check(args: ParsedArgs) -> int {
+    static cmd_check(args: cli::ParsedArgs) -> int {
         if (args.has_flag("debug")) {
-            Logger::enable_debug();
+            logger::Logger::enable_debug();
         }
 
         const file: string = args.input_file();
@@ -2563,9 +2551,9 @@ type struct Executor {
             return 1;
         }
 
-        mut config: CompilerConfig = CompilerConfig::default();
+        mut config: instance::CompilerConfig = instance::CompilerConfig::default();
         if (args.has_flag("debug")) {
-            config = CompilerConfig::debug_config();
+            config = instance::CompilerConfig::debug_config();
         }
         if (args.has_flag("ast")) {
             config.show_ast = true;
@@ -2577,8 +2565,8 @@ type struct Executor {
             config.target_triple_override = args.get_value("target");
         }
 
-        mut compiler: CompilerInstance = CompilerInstance::new(config);
-        const result: CompilationResult = compiler.compile_for_check(file);
+        mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
+        const result: instance::CompilationResult = compiler.compile_for_check(file);
         // The driver reports only on its success path, so a failed check would
         // otherwise contribute nothing - and a corpus of deliberately failing
         // files is where names that do not resolve actually live.
@@ -2601,9 +2589,9 @@ type struct Executor {
     }
 
     /// `cryo raw <file>`: compile without stdlib or prelude.
-    static cmd_raw(args: ParsedArgs) -> int {
+    static cmd_raw(args: cli::ParsedArgs) -> int {
         if (args.has_flag("debug")) {
-            Logger::enable_debug();
+            logger::Logger::enable_debug();
         }
 
         const file: string = args.input_file();
@@ -2612,16 +2600,16 @@ type struct Executor {
             return 1;
         }
 
-        mut config: CompilerConfig = CompilerConfig::default();
+        mut config: instance::CompilerConfig = instance::CompilerConfig::default();
         if (args.has_flag("debug")) {
-            config = CompilerConfig::debug_config();
+            config = instance::CompilerConfig::debug_config();
         }
         if (args.has_flag("ast")) {
             config.show_ast = true;
         }
 
-        mut compiler: CompilerInstance = CompilerInstance::new(config);
-        const result: CompilationResult = compiler.compile_raw(file);
+        mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
+        const result: instance::CompilationResult = compiler.compile_raw(file);
 
         if (result.success) {
             fmt::printf("Compilation succeeded.\n");
@@ -2641,7 +2629,7 @@ type struct Executor {
     /// variable expansions even inside double quotes; by the time argv
     /// reaches us, every `$<letter>` segment is gone.  Use single quotes
     /// (`'C$...$Rv'`) or pipe the symbol on stdin to avoid it.
-    static cmd_demangle(args: ParsedArgs) -> int {
+    static cmd_demangle(args: cli::ParsedArgs) -> int {
         // Positional form: demangle the single argument.
         if (args.positional_count() > 0) {
             const sym: string = args.input_file();
@@ -2684,7 +2672,7 @@ type struct Executor {
     /// when the input looks like a shell-expanded mangled name (starts
     /// with `C` but no `$` follows (typical when bash ate the `$` tokens).
     static print_demangled(sym: string) -> void {
-        const pretty: string = Demangler::demangle(sym);
+        const pretty: string = demangler::Demangler::demangle(sym);
         fmt::printf("\n%s\n", pretty);
         if (Executor::looks_shell_expanded(sym)) {
             fmt::printf("(hint: input has no `$` tokens; looks like the shell expanded them.\n");
@@ -2723,10 +2711,10 @@ type struct Executor {
     /// payloads here, so the rejection reason rides alongside the kind.
     /// `is_rejected = true` means the extension is one we explicitly
     /// refuse (e.g. `.a` archive); the caller should print an error.
-    static infer_output_kind(path: string, mut rejected: boolean*) -> OutputKind {
+    static infer_output_kind(path: string, mut rejected: boolean*) -> compilation_context::OutputKind {
         *rejected = false;
         const len: i64 = path.length() as i64;
-        if (len == 0) { return OutputKind::Exe; }
+        if (len == 0) { return compilation_context::OutputKind::Exe; }
         // Find last '/' and last '.' so we only look at the basename's
         // extension.
         mut last_slash: i64 = -1;
@@ -2738,33 +2726,33 @@ type struct Executor {
         }
         if (last_dot < 0 || last_dot == last_slash + 1) {
             // No extension, or hidden file like `.foo` with no real ext
-            return OutputKind::Exe;
+            return compilation_context::OutputKind::Exe;
         }
         const ext: string = path + ((last_dot + 1) as i64);
-        if (ext == "o")   { return OutputKind::Object; }
-        if (ext == "asm") { return OutputKind::Asm; }
-        if (ext == "s")   { return OutputKind::Asm; }
-        if (ext == "ll")  { return OutputKind::IRText; }
-        if (ext == "a")   { *rejected = true; return OutputKind::None; }
+        if (ext == "o")   { return compilation_context::OutputKind::Object; }
+        if (ext == "asm") { return compilation_context::OutputKind::Asm; }
+        if (ext == "s")   { return compilation_context::OutputKind::Asm; }
+        if (ext == "ll")  { return compilation_context::OutputKind::IRText; }
+        if (ext == "a")   { *rejected = true; return compilation_context::OutputKind::None; }
         // Unknown extension: caller may want an executable named like
         // `foo.bin` or `tool.exe`.  Treat as Exe; the link step writes
         // the bytes regardless of suffix.
-        return OutputKind::Exe;
+        return compilation_context::OutputKind::Exe;
     }
 
     /// Compiles a single file directly from a path.
     /// Routes through CompilerInstance for proper phase management.
-    static compile_file(file_path: string, args: ParsedArgs) -> int {
+    static compile_file(file_path: string, args: cli::ParsedArgs) -> int {
         if (args.has_flag("debug")) {
-            Logger::enable_debug();
+            logger::Logger::enable_debug();
         }
 
-        cdebug("[Compile] Compiling file: %s\n", file_path);
+        logger::cdebug("[Compile] Compiling file: %s\n", file_path);
 
-        mut config: CompilerConfig = CompilerConfig::default();
+        mut config: instance::CompilerConfig = instance::CompilerConfig::default();
 
         if (args.has_flag("debug")) {
-            config = CompilerConfig::debug_config();
+            config = instance::CompilerConfig::debug_config();
         }
         if (args.has_flag("ast")) {
             config.show_ast = true;
@@ -2796,7 +2784,7 @@ type struct Executor {
         // Never changes the emitted bytes, only build speed.
         if (args.has_arg("codegen-threads")) {
             config.codegen_threads_override =
-                ProjectConfig::parse_codegen_threads(
+                project_config::ProjectConfig::parse_codegen_threads(
                     args.get_value("codegen-threads")) as i32;
         }
         // `-g` / `--debug-info`: emit DWARF source-line debug info.
@@ -2813,7 +2801,7 @@ type struct Executor {
         }
         // `--panic=<abort|unwind>`: exception strategy (default unwind).
         if (args.has_arg("panic")) {
-            config.panic = PanicStrategy::from_string(args.get_value("panic"));
+            config.panic = project_config::PanicStrategy::from_string(args.get_value("panic"));
         }
 
         // `-o PATH` / `--output PATH`: single-file output redirect.
@@ -2832,7 +2820,7 @@ type struct Executor {
         if (args.has_arg("output")) { out_path = args.get_value("output"); }
         if (out_path.length() > 0) {
             mut rejected: boolean = false;
-            const kind: OutputKind = Executor::infer_output_kind(out_path, &rejected);
+            const kind: compilation_context::OutputKind = Executor::infer_output_kind(out_path, &rejected);
             if (rejected) {
                 fmt::eprintf("Error: unsupported output extension for '%s'\n", out_path);
                 fmt::printf("  supported: .o (object), .asm/.s (assembly), .ll (LLVM IR text), no-extension (executable)\n");
@@ -2842,8 +2830,8 @@ type struct Executor {
             config.output_kind          = kind;
         }
 
-        mut compiler: CompilerInstance = CompilerInstance::new(config);
-        const result: CompilationResult = compiler.compile_file(file_path);
+        mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
+        const result: instance::CompilationResult = compiler.compile_file(file_path);
 
         if (result.success) {
             if (result.output_path.length() > 0) {
@@ -2862,31 +2850,31 @@ type struct Executor {
     /// `cryo fetch`: resolve every dep against its remote, materialize
     /// missing checkouts, and write `cryoconfig.lock`.  Reuses existing
     /// lockfile entries when the cryoconfig spec is unchanged.
-    static cmd_fetch(args: ParsedArgs) -> int {
-        return Executor::run_dep_resolve(args, ResolveMode::Fetch);
+    static cmd_fetch(args: cli::ParsedArgs) -> int {
+        return Executor::run_dep_resolve(args, dep_resolver::ResolveMode::Fetch);
     }
 
     /// `cryo update`: like `fetch`, but ignores the existing lockfile
     /// and re-resolves every git dep from scratch.  Used to bump pinned
     /// SHAs to the latest tag/branch tip.
-    static cmd_update(args: ParsedArgs) -> int {
-        return Executor::run_dep_resolve(args, ResolveMode::Update);
+    static cmd_update(args: cli::ParsedArgs) -> int {
+        return Executor::run_dep_resolve(args, dep_resolver::ResolveMode::Update);
     }
 
     /// Shared implementation for `cryo fetch` and `cryo update`.
-    static run_dep_resolve(args: ParsedArgs, mode: ResolveMode) -> int {
+    static run_dep_resolve(args: cli::ParsedArgs, mode: dep_resolver::ResolveMode) -> int {
         if (args.has_flag("debug")) {
-            Logger::enable_debug();
+            logger::Logger::enable_debug();
         }
 
-        const config_path: string = ProjectConfig::find_cryoconfig(".");
+        const config_path: string = project_config::ProjectConfig::find_cryoconfig(".");
         if (config_path.length() == 0) {
             fmt::eprintf("Error: no cryoconfig found in this directory.\n");
             fmt::eprintf("       run `cryo init` first to scaffold a project.\n");
             return 1;
         }
 
-        mut config: ProjectConfig = ProjectConfig::parse(config_path);
+        mut config: project_config::ProjectConfig = project_config::ProjectConfig::parse(config_path);
         if (config.error_count > 0) {
             fmt::eprintf("cryoconfig has %lld schema error(s); fix them before fetching.\n",
                 config.error_count);
@@ -2900,7 +2888,7 @@ type struct Executor {
 
         const lock_path: string = fmt::format("%s/cryoconfig.lock",
             config.project_root);
-        const outcome: ResolveOutcome = DepResolver::resolve(
+        const outcome: dep_resolver::ResolveOutcome = dep_resolver::DepResolver::resolve(
             &config, mode, lock_path);
         if (outcome.failed) {
             fmt::printf("Dependency resolution failed.\n");
@@ -2908,7 +2896,7 @@ type struct Executor {
         }
 
         const verb: string = match (mode) {
-            ResolveMode::Update => { "Updated" }
+            dep_resolver::ResolveMode::Update => { "Updated" }
             _                   => { "Fetched" }
         };
         fmt::printf("%s %lld dependency entr%s; lockfile written to %s\n",
@@ -2921,8 +2909,8 @@ type struct Executor {
 
     /// `cryo vendor <path>|list|remove <name>|clean|rebuild [name]`: manage the
     /// per-machine registry of vendored C libraries.
-    static cmd_vendor(args: ParsedArgs) -> int {
-        if (args.has_flag("debug")) { Logger::enable_debug(); }
+    static cmd_vendor(args: cli::ParsedArgs) -> int {
+        if (args.has_flag("debug")) { logger::Logger::enable_debug(); }
 
         const sub: string = args.input_file();
         if (sub == "") {
@@ -2955,11 +2943,11 @@ type struct Executor {
     /// always regenerates; a bare `cryo vendor <path>` passes `false`, so an
     /// unchanged (headers + triple + libclang + generator) provenance is a
     /// cache hit and libclang is not re-run.
-    static vendor_register(path: string, args: &ParsedArgs, force: boolean) -> int {
+    static vendor_register(path: string, args: &cli::ParsedArgs, force: boolean) -> int {
         // Resolve to an absolute path (the registry stores absolute roots so
         // `import vendor::Name` works from any project directory).
         mut abs: string = "";
-        match (dir::canonicalize(Path::from(path))) {
+        match (dir::canonicalize(path::Path::from(path))) {
             Result::Ok(pb)  => { abs = pb.into_raw(); }
             Result::Err(_)  => {
                 fmt::eprintf("Error: cannot resolve vendor path '%s' (does it exist?).\n", path);
@@ -2968,21 +2956,21 @@ type struct Executor {
         }
 
         const manifest_path: string = fmt::format("%s/cryo-vendor.json", abs);
-        if (!metadata::exists(Path::from(manifest_path))) {
+        if (!metadata::exists(path::Path::from(manifest_path))) {
             fmt::eprintf("Error: no cryo-vendor.json manifest found at %s\n", manifest_path);
             fmt::eprintf("       a vendored library needs a manifest declaring its name,\n");
             fmt::eprintf("       headers, link libraries, and (Stage 1) a bindings_file.\n");
             return 1;
         }
         mut content: string = "";
-        match (file::read_to_string(Path::from(manifest_path))) {
+        match (file::read_to_string(path::Path::from(manifest_path))) {
             Result::Ok(s)  => { content = s.into_raw(); }
             Result::Err(_) => {
                 fmt::eprintf("Error: cannot read %s\n", manifest_path);
                 return 1;
             }
         }
-        mut root: JsonValue = match (parser::parse(Str::from(content))) {
+        mut root: value::JsonValue = match (parser::parse(str::Str::from(content))) {
             Result::Ok(v)      => { v }
             Result::Err(mut e) => {
                 e.drop();
@@ -2992,32 +2980,32 @@ type struct Executor {
         };
 
         const key: string = Executor::to_lower(Executor::path_basename(abs));
-        const name: string = VendorRegistry::jstr(&root, "name", Executor::derive_namespace(key));
+        const name: string = registry::VendorRegistry::jstr(&root, "name", Executor::derive_namespace(key));
 
-        mut entry: VendorEntry = VendorEntry {
+        mut entry: registry::VendorEntry = registry::VendorEntry {
             key:            key,
             name:           name,
             source_path:    abs,
-            binding_source: VendorRegistry::jstr(&root, "binding_source", "manual"),
-            headers:        VendorRegistry::jstrs(&root, "headers"),
-            include_dirs:   VendorRegistry::jstrs(&root, "include_dirs"),
-            defines:        VendorRegistry::jstrs(&root, "defines"),
-            language:       VendorRegistry::jstr(&root, "language", ""),
-            std:            VendorRegistry::jstr(&root, "std", ""),
-            link:           VendorLink::empty(),
+            binding_source: registry::VendorRegistry::jstr(&root, "binding_source", "manual"),
+            headers:        registry::VendorRegistry::jstrs(&root, "headers"),
+            include_dirs:   registry::VendorRegistry::jstrs(&root, "include_dirs"),
+            defines:        registry::VendorRegistry::jstrs(&root, "defines"),
+            language:       registry::VendorRegistry::jstr(&root, "language", ""),
+            std:            registry::VendorRegistry::jstr(&root, "std", ""),
+            link:           registry::VendorLink::empty(),
             cache:          [],
         };
-        match (root.get(Str::new("link"))) {
-            Option::Some(lp) => { entry.link = VendorRegistry::read_link(lp); }
+        match (root.get(str::Str::new("link"))) {
+            Option::Some(lp) => { entry.link = registry::VendorRegistry::read_link(lp); }
             Option::None     => { }
         }
 
         const triple: string = if (args.has_arg("target")) { args.get_value("target") } else { "" };
-        const norm_triple: string = VendorRegistry::normalize_triple(triple);
-        const bindings_file: string = VendorRegistry::jstr(&root, "bindings_file", "");
+        const norm_triple: string = registry::VendorRegistry::normalize_triple(triple);
+        const bindings_file: string = registry::VendorRegistry::jstr(&root, "bindings_file", "");
         root.drop();
 
-        const cache_dir: string = VendorRegistry::cache_dir_for(key, triple);
+        const cache_dir: string = registry::VendorRegistry::cache_dir_for(key, triple);
         const dest: string = fmt::format("%s/%s.cryo", cache_dir, name);
         mut produced: boolean = false;
 
@@ -3026,21 +3014,21 @@ type struct Executor {
         // so a concurrent writer can't drop the entry this one adds.  Held
         // across generation too (so two racers don't both run libclang for the
         // same lib); best-effort, so it must be released on EVERY return below.
-        mut lock: VendorLock = VendorLock::acquire();
+        mut lock: registry::VendorLock = registry::VendorLock::acquire();
 
         // Load the on-disk registry up front: it carries any cache entries for
         // OTHER triples (so they coexist after this re-register) and the prior
         // provenance key for THIS triple (for the cache-hit check).
         // `string` fields are non-owning pointers into leaked buffers, so the
         // carried-over items stay valid after the old entry is replaced.
-        mut reg: VendorRegistry = VendorRegistry::load_global();
+        mut reg: registry::VendorRegistry = registry::VendorRegistry::load_global();
         mut prev_key:  string = "";
         mut prev_file: string = "";
         const prev_idx: i64 = reg.find_index(key);
         if (prev_idx >= 0) {
             for (mut c: i64 = 0; c < reg.entries[prev_idx].cache.length; c++) {
                 const ct: string = reg.entries[prev_idx].cache[c].triple;
-                entry.cache.push(VendorCacheItem {
+                entry.cache.push(registry::VendorCacheItem {
                     triple: ct,
                     file:   reg.entries[prev_idx].cache[c].file,
                     key:    reg.entries[prev_idx].cache[c].key,
@@ -3056,7 +3044,7 @@ type struct Executor {
             // Escape hatch: copy pre-written bindings verbatim into the cache.
             // (No provenance key: a hand-supplied file is always re-copied.)
             const src: string = fmt::format("%s/%s", abs, bindings_file);
-            if (!metadata::exists(Path::from(src))) {
+            if (!metadata::exists(path::Path::from(src))) {
                 lock.release();
                 fmt::eprintf("Error: bindings_file '%s' not found at %s\n", bindings_file, src);
                 return 1;
@@ -3078,12 +3066,12 @@ type struct Executor {
                 fmt::eprintf("Error: manifest declares no \"headers\" to generate bindings from.\n");
                 return 1;
             }
-            const prov_key: string = VendorGenerator::provenance_key(
+            const prov_key: string = generator::VendorGenerator::provenance_key(
                 abs, &entry.headers, &entry.include_dirs, &entry.defines,
                 norm_triple, prev_file, entry.lang_arg());
             const hit: boolean = !force
                 && prev_key != "" && prev_key == prov_key
-                && prev_file != "" && metadata::exists(Path::from(prev_file));
+                && prev_file != "" && metadata::exists(path::Path::from(prev_file));
             if (hit) {
                 fmt::printf("Bindings for '%s' are up to date for triple '%s' (cache hit).\n",
                     name, norm_triple);
@@ -3095,7 +3083,7 @@ type struct Executor {
                 fmt::printf("Generating bindings for '%s' from %lld header(s) via libclang...\n",
                     name, entry.headers.length as i64);
                 mut inputs: string[] = [];
-                const src_text: string = VendorGenerator::generate(
+                const src_text: string = generator::VendorGenerator::generate(
                     name, abs, &entry.headers, &entry.include_dirs, &entry.defines, &inputs,
                     entry.lang_arg(), entry.std);
                 if (src_text == "") {
@@ -3114,12 +3102,12 @@ type struct Executor {
                 // Record the include graph next to the bindings so a later cache
                 // check folds every transitively-included header, not just the
                 // entry header (see VendorGenerator::provenance_key).
-                VendorGenerator::write_depfile(dest, &inputs);
+                generator::VendorGenerator::write_depfile(dest, &inputs);
                 // Store the key computed FROM the just-written depfile (not the
                 // pre-generation `prov_key`, which folded the previous graph), so
                 // the next unchanged check folds the same `dest.deps` and hits
                 // without a spurious one-time regeneration.
-                const store_key: string = VendorGenerator::provenance_key(
+                const store_key: string = generator::VendorGenerator::provenance_key(
                     abs, &entry.headers, &entry.include_dirs, &entry.defines,
                     norm_triple, dest, entry.lang_arg());
                 entry.set_cache(norm_triple, dest, store_key);
@@ -3143,7 +3131,7 @@ type struct Executor {
         lock.release();
         if (!saved) {
             fmt::eprintf("Error: failed to write the vendor registry at %s\n",
-                VendorRegistry::registry_path());
+                registry::VendorRegistry::registry_path());
             return 1;
         }
 
@@ -3201,7 +3189,7 @@ type struct Executor {
     /// separator that fits so each row still holds whole path segments; a
     /// single segment longer than the column breaks at the column edge.
     static vendor_box_field(label: string, value: string) -> void {
-        const text: Str = Str::new(value);
+        const text: str::Str = str::Str::new(value);
         const n: u64 = text.length();
         mut start: u64 = 0;
         mut first: boolean = true;
@@ -3212,10 +3200,10 @@ type struct Executor {
             if (end >= n) {
                 end = n;
             } else {
-                const cut: i64 = Path::last_separator(text.sub_bytes(start, end), 0);
+                const cut: i64 = path::Path::last_separator(text.sub_bytes(start, end), 0);
                 if (cut > 0) { end = start + (cut as u64) + 1; }
             }
-            const chunk: Str = text.sub_bytes(start, end);
+            const chunk: str::Str = text.sub_bytes(start, end);
             mut shown: String = String::from_str(chunk);
             mut head: string = "";
             if (first) { head = label; }
@@ -3230,7 +3218,7 @@ type struct Executor {
     }
 
     /// How an entry's bindings were produced, for its `bindings` row.
-    static vendor_binding_kind(entry: &VendorEntry) -> string {
+    static vendor_binding_kind(entry: &registry::VendorEntry) -> string {
         if (entry.binding_source == "manual") { return "pre-written"; }
         if (entry.binding_source == "headers"
                 || entry.binding_source == "cxx-headers") {
@@ -3243,7 +3231,7 @@ type struct Executor {
     /// The target triples an entry has cached bindings for.  The files sit at
     /// `<cache>/<key>/<triple>/<Name>.cryo`, so the listing prints the cache
     /// root once and names only the triples here.
-    static vendor_cached_targets(entry: &VendorEntry) -> string {
+    static vendor_cached_targets(entry: &registry::VendorEntry) -> string {
         if (entry.cache.length == 0) { return "none cached"; }
         mut out: String = String::new();
         for (mut c: i64 = 0; c < entry.cache.length; c++) {
@@ -3256,14 +3244,14 @@ type struct Executor {
     /// Registry indices ordered by library key.  Insertion order is whatever
     /// sequence the machine happened to register in; sorting is what makes two
     /// runs of `list` comparable to each other.  The stored order is untouched.
-    static vendor_key_order(reg: &VendorRegistry) -> i64[] {
+    static vendor_key_order(reg: &registry::VendorRegistry) -> i64[] {
         mut order: i64[] = [];
         for (mut i: i64 = 0; i < reg.entries.length; i++) { order.push(i); }
         for (mut a: i64 = 0; a + 1 < order.length; a++) {
             mut low: i64 = a;
             for (mut b: i64 = a + 1; b < order.length; b++) {
-                const cand: Str = Str::new(reg.entries[order[b]].key);
-                const best: Str = Str::new(reg.entries[order[low]].key);
+                const cand: str::Str = str::Str::new(reg.entries[order[b]].key);
+                const best: str::Str = str::Str::new(reg.entries[order[low]].key);
                 if (cand < best) { low = b; }
             }
             if (low != a) {
@@ -3277,7 +3265,7 @@ type struct Executor {
 
     /// `cryo vendor list`: print the registered libraries.
     static vendor_list() -> int {
-        const reg: VendorRegistry = VendorRegistry::load_global();
+        const reg: registry::VendorRegistry = registry::VendorRegistry::load_global();
         if (reg.entries.length == 0) {
             fmt::printf("No vendor libraries registered.\n");
             fmt::printf("Register one with: cryo vendor <path-to-c-project>\n");
@@ -3286,12 +3274,12 @@ type struct Executor {
         const order: i64[] = Executor::vendor_key_order(&reg);
         fmt::printf("Registered vendor libraries (%lld)\n", reg.entries.length as i64);
         fmt::printf("Bindings cache: %s\n\n",
-            exec_path(VendorRegistry::vendor_root()));
+            exec_path(registry::VendorRegistry::vendor_root()));
         mut missing: i64 = 0;
         for (mut oi: i64 = 0; oi < order.length; oi++) {
             const i: i64 = order[oi];
             const gone: boolean =
-                !metadata::exists(Path::from(reg.entries[i].source_path));
+                !metadata::exists(path::Path::from(reg.entries[i].source_path));
             mut title: string = reg.entries[i].key;
             if (gone) {
                 missing++;
@@ -3322,8 +3310,8 @@ type struct Executor {
     /// under the cache stay on disk, and re-registering the library reuses
     /// them.
     static vendor_clean() -> int {
-        mut lock: VendorLock = VendorLock::acquire();
-        mut reg: VendorRegistry = VendorRegistry::load_global();
+        mut lock: registry::VendorLock = registry::VendorLock::acquire();
+        mut reg: registry::VendorRegistry = registry::VendorRegistry::load_global();
         if (reg.entries.length == 0) {
             lock.release();
             fmt::printf("No vendor libraries registered.\n");
@@ -3339,7 +3327,7 @@ type struct Executor {
         mut doomed: string[] = [];
         mut paths:  string[] = [];
         for (mut i: i64 = total - 1; i >= 0; i--) {
-            if (!metadata::exists(Path::from(reg.entries[i].source_path))) {
+            if (!metadata::exists(path::Path::from(reg.entries[i].source_path))) {
                 doomed.push(reg.entries[i].key);
                 paths.push(reg.entries[i].source_path);
                 reg.remove_at(i);
@@ -3377,8 +3365,8 @@ type struct Executor {
             fmt::eprintf("Error: cryo vendor remove needs a library name.\n");
             return 1;
         }
-        mut lock: VendorLock = VendorLock::acquire();
-        mut reg: VendorRegistry = VendorRegistry::load_global();
+        mut lock: registry::VendorLock = registry::VendorLock::acquire();
+        mut reg: registry::VendorRegistry = registry::VendorRegistry::load_global();
         if (!reg.remove(name)) {
             lock.release();
             fmt::eprintf("No vendor library named '%s' is registered.\n", name);
@@ -3396,8 +3384,8 @@ type struct Executor {
 
     /// `cryo vendor rebuild [name]`: regenerate bindings from a library's
     /// recorded source path.  With no name, rebuilds every registered library.
-    static vendor_rebuild(name: string, args: ParsedArgs) -> int {
-        const reg: VendorRegistry = VendorRegistry::load_global();
+    static vendor_rebuild(name: string, args: cli::ParsedArgs) -> int {
+        const reg: registry::VendorRegistry = registry::VendorRegistry::load_global();
         if (reg.entries.length == 0) {
             fmt::printf("No vendor libraries registered.\n");
             return 0;
@@ -3406,11 +3394,11 @@ type struct Executor {
         for (mut i: i64 = 0; i < reg.entries.length; i++) {
             if (name != ""
                     && reg.entries[i].key != name
-                    && !VendorRegistry::ieq(reg.entries[i].name, name)) {
+                    && !registry::VendorRegistry::ieq(reg.entries[i].name, name)) {
                 continue;
             }
             const src: string = reg.entries[i].source_path;
-            if (!metadata::exists(Path::from(src))) {
+            if (!metadata::exists(path::Path::from(src))) {
                 fmt::eprintf("Error: source path for '%s' is gone: %s\n",
                     reg.entries[i].key, src);
                 failures += 1;
@@ -3452,7 +3440,7 @@ type struct Executor {
     /// vendor cache with hand-written bindings.
     static copy_text_file(src: string, dest: string) -> boolean {
         mut text: string = "";
-        match (file::read_to_string(Path::from(src))) {
+        match (file::read_to_string(path::Path::from(src))) {
             Result::Ok(s)  => { text = s.into_raw(); }
             Result::Err(_) => { return false; }
         }
