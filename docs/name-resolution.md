@@ -71,19 +71,20 @@ control, not the count.
 
 Counts are the pinned golden, `[host:windows]`, `examples/09-json-config`.
 Only 11 of 82 rows differ across the three pinned corpora, and all 11 are volume
-rows on `LIVE` lanes — **every zero below is zero on all three.**
+rows on `LIVE` lanes. **Not every zero below is still zero:** M5 entered on all
+three, and its row carries the count. Read each zero off its own row.
 
 | artifact | status | pinned | check → expected | § |
 |---|---|---|---|---|
-| type cascade 1 — exact | LIVE | 3,391 | `grep -m1 'type cascade: 1 exact' tests/b1-baseline.txt` | §8.64, §8.120 |
+| type cascade 1 — exact | LIVE | 5,196 | `grep -m1 'type cascade: 1 exact' tests/b1-baseline.txt` | §8.64, §8.120 |
 | type cascade 2 — ambient cursor | STARVED | 0 | same file, `type cascade: 2` | §8.64, §8.87 |
 | type cascade 3 — resolver re-entry | STARVED | 0 | same file, `type cascade: 3` | §8.64 |
-| type cascade 5 — miss | LIVE | 2,406 | same file, `type cascade: 5` | §8.64 |
+| type cascade 5 — miss | LIVE | 3,614 | same file, `type cascade: 5` | §8.64 |
 | 2c home-module (ambient cursor) | STARVED | 0 | same file, `2c  home-module` | §8.63, §8.87 |
-| M1 `qualifier_agrees` | **GUARD** | 5,606 calls / 5,606 agree / **0 reject** | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **5** | §8.120, §8.132 |
-| M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane** | 2,489 | `grep -m1 'M2 resolve_module_qualified_sym calls' tests/b1-baseline.txt` → **2489** | §8.120 |
-| M4 mono bare-name scan | STARVED | 266 calls / **0** hits | same file, `M4 mono bare-name` | §8.33, §8.120 |
-| M5 import suffix fallback | **NOT ENTERED** | **0 calls** | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **3** | §8.120 |
+| M1 `qualifier_agrees` | **GUARD** | 8,826 calls / 8,826 agree / **0 reject** | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **5** | §8.120, §8.132 |
+| M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane** | 3,760 | `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M2 resolve_module_qualified_sym calls/{print;exit}' tests/b1-baseline.txt` → **3760** | §8.120 |
+| M4 mono bare-name scan | STARVED | 432 calls / **0** hits | same file, `M4 mono bare-name` | §8.33, §8.120 |
+| M5 import suffix fallback | **STARVED** — all entries are the sub-module caller | **25 calls / 0 hits** | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **3** | §8.120 |
 | const-table bare leaf | STARVED | 0 calls / 0 hits | same file, `const-table bare leaf` | §8.9, §8.111 |
 | `spelling_type` new-expr / call-ident | NOT ENTERED | 0 calls | same file, `spelling_type new expr: calls` | §8.25, §8.98 |
 | `lookup_by_leaf` | **DELETED** | — | `grep -rho 'lookup_by_leaf(' compiler/src \| wc -l` → **0** | §8.121 |
@@ -96,8 +97,8 @@ rows on `LIVE` lanes — **every zero below is zero on all three.**
 | `check_module_type_collision` | LIVE — D5 deletes it | — | see D5 | §8.130, §8.131 |
 | `module_owns_member` probe | LIVE — D5 deletes it | — | `grep -rho 'module_owns_member' compiler/src \| wc -l` → **3** | §8.131 |
 | `scope_owner_key` | LIVE — the static-call owner key | — | `grep -rho 'scope_owner_key' compiler/src \| wc -l` → **4** | §8.134 |
-| callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,178 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **19** | §8.1f, §8.2ag |
-| method visibility gate (E0353) | LIVE, reached; **starved of violations** | 3,677 reached / **0** rejected | same code | §8.2af, §8.2ag |
+| callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **19** | §8.1f, §8.2ag |
+| method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
 
 **The arena `leaf_index` map is not the deleted leaf index.** §8.121 deleted the
