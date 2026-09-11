@@ -20457,3 +20457,57 @@ build would be a green-looking tree whose failures nobody could attribute, and
 the object criterion cannot even be read over a partial build: the run that
 stopped early reported 252 objects of 406 and "0 changed", which is what an
 uncompleted build looks like when it is mistaken for a clean one.
+
+### 8.147 The sweep was being graded by a compiler from before the rulings: `stdlib` and `compiler` are built by the PIN - MEASURED 2026-09-10
+
+§8.146 recorded two stdlib failures as "not root-caused". One of them now has a
+cause, and it is not in the tree at all.
+
+**`bin/cryo` builds both `stdlib` and `compiler`.** The Makefile says so in its
+own header - the pinned binaries bootstrap every other target - and the pin is
+`06d8f3d8`, built **2026-08-27**. Every ruling and fix in this migration since
+then is absent from it. So a sweep of stdlib or compiler source is graded by a
+compiler that predates:
+
+* §8.134's static-call owner key,
+* §8.143's `new M::Type` (D13),
+* §8.144's facade paths (D14).
+
+The consequence is structural, not incidental: **compiler and stdlib source
+cannot use a feature newer than the pin**, and a failure there may be the pin's
+age rather than the code's fault. `bootstrap-feature-ordering` is the standing
+note for this and it applies here in full.
+
+#### The control
+
+The identical swept tree, same files, two compilers:
+
+* built by the PIN - `error[E0233]: cannot find 'str::Str::from_raw'`;
+* built by `compiler/build/cryo.exe`, which carries every fix - **that error is
+  gone.**
+
+§8.146's first unattributed failure is therefore the pin, and its careful
+rule-outs - the import is present, it compiles outside stdlib, as an argument,
+in a trait default body, with `core::slice` alongside - were all correct and all
+looking in the wrong tree. The reproducers used the CURRENT compiler while the
+build used the pin, which is exactly the mismatch that made the result look
+inexplicable.
+
+#### What this changes about the order
+
+**Re-pin, then sweep `stdlib` and `compiler`.** Sweeping first produces source
+the bootstrap cannot compile, and grades every batch against a compiler missing
+the rulings the sweep depends on. `tests/`, `tools/` and `examples/` are not
+affected the same way - `make test` and `lsp-check` exercise the compiler under
+test - so those areas can proceed on the current pin.
+
+Two failures are still open and are now measured against the RIGHT compiler:
+`atomic::Atomic<u64>::new(1)` (E0233, a qualified generic type's static) and
+§8.146's `combinator::Futures::timeout` (E0200). Neither is a pin artifact.
+
+#### A generator defect fixed here
+
+`std::fmt::error` imports `std::io::error`, so the qualifier `error` names both
+the imported module and the file's OWN namespace. The collision test counted
+only imported paths. A file's own namespace leaf is a module spelling in scope
+and now counts.

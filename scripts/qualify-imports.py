@@ -275,6 +275,10 @@ def plan(world, path):
     # and in braces names one module twice, which is not a collision -- counting
     # occurrences made every such file fall back to the fully-qualified form.
     leaves = collections.defaultdict(set)
+    # The file's OWN namespace leaf is a module spelling in scope too.
+    # `std::fmt::error` importing `std::io::error` cannot use `error` as a
+    # qualifier: it names both, and the shorter form resolves to neither.
+    leaves[ns.split("::")[-1]].add(ns)
     for written, _n, _a, _b in blocks:
         leaves[written.split("::")[-1]].add(written)
     for line in masked:
