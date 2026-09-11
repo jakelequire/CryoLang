@@ -99,6 +99,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `module_owns_member` probe | LIVE — D5 deletes it | — | `grep -rho 'module_owns_member' compiler/src \| wc -l` → **3** | §8.131 |
 | `scope_owner_key` | LIVE — the static-call owner key; the callee-type and template-method probes read it too | — | `grep -rho 'scope_owner_key' compiler/src \| wc -l` → **6** | §8.134, §8.151 |
 | static-call owner TEMPLATE by spelling (`resolve_scope_owner_template`'s as-is → scope map → cross-module cascade) | **DELETED** — the owner template is read off the segment's stamp, in sema and in mono | — | `grep -c 'resolve_scoped_or_at' compiler/src/compiler/sema/call_resolver.cryo` → **2** (was 7) | §8.150, §8.151 |
+| codegen static-call ladder (`call_emitter`: spec-by-return-type → `scope::member` → bare member) | **SHADOWED, at 0** — sema's / mono's pin answers every static call; 495 → 0 in §8.160, deletion next | 0 | `grep -c 'SHADOW-CGCALL' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **1** (0 when deleted) | §8.158, §8.160 |
 | callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **19** | §8.1f, §8.2ag |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
@@ -21269,3 +21270,273 @@ Neither is deleted on this reading - the consumer is not at zero. The
 ladder's bare-member step (`resolve_function(sr.member_name)`, binding a
 static call by method name alone across the whole program) is the step to
 watch as the two classes close.
+
+### 8.159 Handoff: shadow mode - the method, the tally, what is left, and every trap - 2026-09-11
+
+Written for a stranger. Uncommitted by rule (no code rides with it); the next
+agent commits it with their first work.
+
+#### Tree state
+
+`naming-impl` at `4de31985` == origin, clean. Pin at `ad8238a3` (both hosts
+built from `db5af63c`; `make verify-pin` OK). `compiler/build/cryo.exe` is a
+clean build of HEAD. The one-target worktree `C:/Programming/apps/CryoLang-head`
+is at `4757b85c` with its build dir deleted - **never read a binary off it
+without rebuilding; it held a trial build that unmade a bisect once.** The
+requalification sweep (§8.145-8.151) is STOPPED by ruling; do not resume it.
+
+#### The ruling (Jake, relayed 2026-09-11)
+
+The old model was never deleted, only demoted to a fallback behind the stamp,
+and a fallback hides the new model's incompleteness. So: the new model answers
+on EVERY call; the old one answers beside it; disagreements are printed with
+the case attached; a consumer's old path is deleted OUTRIGHT at zero. No
+`resolve_counter` rows, no environment gate - the instrument dies with the
+path it shadows.
+
+#### The method, to re-run without me
+
+1. In the consumer, compute NEW (the stamp / `resolved_type` /
+   `resolved_callee` / the declaration's own key) on every call. Compute OLD
+   (the spelling path) beside it. OLD still DECIDES while it answers, so the
+   shadow build is byte-identical. `fmt::eprintf` one tab-separated line per
+   disagreement, unconditionally: `SHADOW-<TAG> <class> <name> old=.. new=..
+   <span>`. Classes: `type-differs` / `key-differs` / `new-missing`. OLD
+   missing where NEW answers is NOT a disagreement (new already alone).
+2. **Control the instrument before believing a zero**: for ONE build make the
+   same function print where it must (invert the comparison, or print at the
+   exact-hit exit), see the lines, restore. A zero from an instrument that
+   cannot report non-zero is worthless; four instrument defects here have
+   read as clean sweeps, one of them this session (`make lsp-check`).
+3. Corpus, all stderr captured directly (`scratchpad/corpus2.sh` did this):
+   - `tools/CryoLSP` built DIRECTLY: `cd tools/CryoLSP && CRYO_STDLIB=<root>/stdlib
+     CRYO_CC=gcc <root>/compiler/build/cryo.exe build --build-dir=build/gate-direct
+     > lsp.log 2>&1` = the compiler's own source, 266 modules. **`make
+     lsp-check` swallows the compiler's stderr and prints a summary - it
+     measures nothing.**
+   - the `make test` log (unit suite build).
+   - **every project under `tests/tests/projects/*/` built one at a time**
+     with `cryo build`, because `cryo test` swallows a passing project's stderr.
+   - each `examples/*/` built.
+4. Land the shadow + its number in one commit, the deletion in the next, so
+   the measurement has a diff behind it.
+5. Deleting a zero path must change **0 objects**: hash every `.o` under
+   `examples/*/build` (1,126) and `tests/**/build` (2,126) built by the shadow
+   compiler and by the deletion compiler; `comm -3`. Sort both sides with
+   `LC_ALL=C` or `comm` lies. Rebuild-twice control is 0.
+6. Re-pin `lane-check` (`--update`) and `b1-check` on BOTH hosts (Linux under
+   WSL: `PATH=/usr/lib/llvm-20/bin:$PATH make cryo; python3 scripts/b1-gate.py
+   compiler/build/cryo --update`; a Windows-side `--update` leaves Linux
+   drifted). Name every moved row's mechanism first. Update §0 rows by hand.
+
+#### Tally: 14 shadowed, 13 at zero, 13 old paths deleted, 8 artifacts gone
+
+| # | consumer | commit (shadow / delete) | result |
+|---|---|---|---|
+| 1 | `emit_new` type + mangling key | `781c03d6` / `1c98c601` | 0; 0 objects moved |
+| 2 | `emit_base_ctor_call` | `6beb34ff` / `ca9cc50c` | 0; `widen_type_home_scoped_bare` DELETED |
+| 3-4 | `lookup_type_by_sym`, `resolve_method_owner` widening | `6d084415` / `58e52b03` | 790 -> 0 after registering a specialization under ONE name (`TemplateEntry::spec_qualified_name`); both cascades DELETED |
+| 5-6 | `scope_is_generic_template`, `find_static_method_template` | `3bedc7f3` / `308f6287` | 0; `resolve_cross_module_name` DELETED |
+| 7-9 | annotation lane 3b/3c, ctor call, declaration key | `415679a7` | 0 / 0 / 2 - the 2 were the OLD model naming `arc::Weak<i32>` for `rc::Weak<i32>`; deletion moved exactly one object (`allocator.o`). `resolve_type_qualified_name`(+`_from`), `canonical_type_ref/qname` DELETED |
+| 10-13 | impl target + trait keys, M4 scan, M5 suffix probe | `0d68c4fd` / `6ca4ce41` | 0 (9,945 before fixing MY rule for primitives); `module_by_path_suffix`, M4 scan DELETED |
+| 14 | codegen static-call ladder (`call_emitter`) | `4de31985` | **495, OPEN** - see §8.158 |
+
+b1: 82 -> 70 sites; `qualifier_agrees` (M1) 8,821 -> 0 calls. lane: LOOKUP
+65 -> 52, REENTRY 6 -> 5.
+
+#### What is left, and my read
+
+* **#14, 495 lines, two shapes (§8.158).** 489: a static call on a generic
+  owner with INFERRED args inside another template's body
+  (`Slice::from_raw(this.ptr, this.length)` in `Array<T>`, `RawBuffer::new()`
+  in `String<A>`, the `Iterator` defaults, `HashSet`'s `HashMap::new()`);
+  mono never pins, codegen rescues from `resolved_type` only because the
+  return type IS the owner. Fix in sema/mono: stash the owner args
+  symbolically and concretize on the clone walk like `specialize_free_call`
+  does. 6: `probe::bindgen_probe_*` C-imported functions pinned under a name
+  codegen does not declare. Then delete the ladder, especially
+  `resolve_function(sr.member_name)`.
+* `ir_generator.cryo` `visit(ScopeResolutionNode)` - a scope path used as a
+  VALUE (`Type::static` as a fn pointer): bare combined, stamped ns, cursor
+  scope map. Sema records NO pin on the node for the value form; the new
+  model needs one first (sema's `lookup_scope_value_function` computes it).
+* `call_emitter.cryo:518` and `member_resolver.cryo:845`,
+  `call_resolver.cryo:2867` (`enforce_value_ref_visibility`), `sema.cryo:1347`,
+  `type_resolution.cryo:1841` (impl trait target ref, 3 probes) - remaining
+  `resolve_scoped_or[_at]` readers; each has a node or a stamped key nearby.
+* `qualify_symbol_sym` (the ambient cursor): 12 readers; most mint a WRITTEN
+  declaration's key (registration, correct by construction). The lookups:
+  `lambda_synth.cryo:524/577` (bare callee then cursor; new = `ident.res`, but
+  `find_top_level_function` scans by the fn's WRITTEN name so the new key
+  needs `fn_qualified_name`'s rule), `specialization.cryo:103`,
+  `directive_processing.cryo:1166/1745`.
+* `lookup_scope_variant_payload_types` fallback `lookup_type_exact(scope_name)`
+  after the stamp; `check_scope_call_arg_types` two lookups (call_resolver
+  ~5700); `enforce_static_method_visibility`'s spelling lookup.
+* The method-call side of codegen (`pin_method_resolved_callee`, F17: "binds
+  unpinned method calls by name+arity") - not yet shadowed; likely the
+  largest population.
+* D5 (`check_module_type_collision`, `module_owns_member`): RULED, not built.
+  `tests/lang/static_method_value.cryo` and `projects/module_type_name_collision`
+  pin the CURRENT collision behaviour; building D5 flips them - Jake's call.
+* `resolve_type_qualified_name_strict_from` + `qualifier_agrees`: one caller
+  left (the C-import alias branch of the annotation stamp); 0 calls on b1.
+* Type-layer `stamp_trait_ref` fallback (bounds): entered 0 times on the
+  reproducer after §8.151; not yet measured over the corpus.
+* Owed to Jake, unchanged: keyword segments as path segments (§8.149 trap 4).
+
+#### Traps, in the order they cost time
+
+* `make lsp-check` prints only a summary: no stderr instrument can be read
+  through it. Build the LSP directly (above).
+* `cryo test` swallows a passing project's stderr: build projects one by one.
+* The Bash tool's heredoc collapses doubled backslashes - a Python script
+  with escaped `n`/`t` written through a heredoc silently mismatches. Write
+  scripts with the Write tool; the `.py`/`.sh` files in this session's
+  `scratchpad/` (shadow.py, tydel.py, r4del.py, r5del.py, cgshadow.py,
+  corpus2.sh, objcmp.sh, replay.sh) are the generators used.
+* `git stash pop` under `eol=lf` re-filters a CRLF working file to LF; it
+  reads exactly like a tool stripping CRs. `git ls-files --eol` first.
+* A specialization identifier (`4Weak$Li_N$...`) is unique only per template
+  MODULE; two same-leaf templates mint the same one. Always key by
+  `spec_qualified_name` (module-prefixed). `spec_base_name` folds the module
+  only for FREE FUNCTIONS.
+* A primitive impl target registers under its bare spelling; `ImplBlockNode`'s
+  doc claimed the writer's module (fixed).
+* `b1-gate.py` floor rows carry `>0`; the GONE line used `%d` (fixed).
+* `objcmp.sh` stashes `compiler/src` for its first half: never edit compiler
+  sources while it runs; it exceeds the 10-minute tool cap, run it in the
+  background and wait on `OBJCMP_DONE`.
+* `scope_is_generic_template` is spelling-keyed: hand it a REGISTERED name.
+  Passing the written `Deque::Slot` made it pin a name nothing defines
+  (E0636) - the suite caught it.
+
+### 8.160 Consumer 14 at zero: the 495 were six defects, one of them in codegen's registry - FIXED 2026-09-11
+
+§8.158 read the static-call ladder at 495 binds without a pin. Every one is
+now pinned; the ladder printed 0 over the whole corpus (LSP direct, 266
+modules; the unit suite; 46 projects one by one; 14 examples). The ladder
+itself is deleted in the commit after this one, with the object-hash control.
+
+**The 489 (`no-pin`) were five defects, found one under the next.**
+
+1. **Sema refused a symbolic owner stash.** `stash_static_owner_bindings`
+   and every one of its five sources threw away a binding that mentioned any
+   generic parameter, so a static call on a generic owner INSIDE a generic
+   body (`Slice::from_raw(this.ptr, n)` in `Array<T>`, binding `Slice`'s
+   param to `Array`'s `T`) stashed nothing, and mono's
+   `specialize_static_method_on_generic_owner` had nothing to concretize. A
+   free generic call's stash has always been symbolic and concretized by the
+   clone walk (`concretize_stashed_arg`); the static-owner stash now is too.
+   The rule is NOT "any parameter": a binding may name only a parameter the
+   clone's substitution maps - the enclosing body's - and
+   `SymbolicChecker::symbolic_type_concretizable` is that test. It exists
+   because the first, unrestricted version regressed one site that had been
+   pinned: `Slice::from_raw(this.buffer.ptr(), n)` in `String<A>` binds from
+   an argument typed `T*` - `RawBuffer`'s `T`, never substituted for the
+   receiver `RawBuffer<u8, A>` - and a stash naming a foreign parameter is
+   unmappable, so the source that held it must refuse and let the next one
+   (the expected type, `Slice<u8>`) answer, exactly as the concrete-only rule
+   used to make it. Parameters are canonical by name in the arena, so the
+   test is by name, with the same blind spot every reader of a symbolic
+   type has.
+2. **A struct literal of the owner inside its own body had no field expected
+   types.** `String { buffer: RawBuffer::new(), .. }` in `String<A>::new`:
+   the arena type of a template carries no fields, so `resolve_struct_literal`
+   found none and the field's value walked with no expected type - and
+   `RawBuffer::new()`'s only source for its owner arguments IS the expected
+   type. The literal now reads the field's abstract type off the template's
+   AST through `symbolic_resolve_owner_field`, the same reader `this.<field>`
+   uses. Seven sites (three in `String<A>`, four in `HashSet<T>`) closed.
+3. **A self-returning trait default was never typed by sema, and was walked
+   eagerly by mono.** `take(this, n) -> TakeIter<This>` is cloned into every
+   impl at type resolution and flagged `is_self_returning_default`; sema
+   skipped the flagged clone in both `visit_methods` and
+   `symbolic_check_owner_methods`, so the lazy per-call-site clone mono makes
+   from it carried no stash, and only the post-mono sema pass typed it - too
+   late for any pin. The clone is now walked symbolically (no-demand), the
+   way a generic body is, and the stash it leaves (`[Counter]`, or
+   `[TakeIter<I>]` with `I` in scope) is what the lazy clone's substituter
+   concretizes. That alone built an infinite tower
+   (`FilterIter<EnumerateIter<FilterIter<...>>>`, the LSP build segfaulted
+   and the unit suite ran out of memory): mono's `walk_methods` and
+   `walk_spec_methods` walked the flagged clones too, and a flagged body
+   with a stash pins AND ENQUEUES the adapter over its owner, whose impl
+   carries the same default. Codegen already skips those bodies
+   (`declaration_emitter`, `decl_visit_emitter`); mono's eager walks now
+   skip them by the same predicate (`body_is_lazy`), and the lazy clone is
+   walked when it is made, as before. That closed the concrete-owner impls
+   (`Counter`, `UpTo`) and left every generic one (`Range<T>`,
+   `TakeIter<I>`): the stash there is `[Range<T>]`, and the lazy clone's
+   substituter - the one carrying `T -> i32` from the receiver - skipped
+   the body, because `ASTTypeSubstituter` skips a flagged function and the
+   clone was unflagged only AFTER it ran, by each of its three callers. The
+   skip guards a base-to-spec rename that a lazy clone's substituter is not
+   built with. `specialize_method` now clears the flags on the clone before
+   substituting; the three post-hoc clears are gone. Six sites stayed
+   after that, every one an impl with a where-DERIVED parameter
+   (`implement<I, A> Iterator<A> for TakeIter<I> where I: Iterator<A>`):
+   `A` is no parameter of the owner, so the receiver's arguments bind
+   nothing for it and the stash stayed `TakeIter<Range<i32>, A>`. The
+   spec'd impl caches the derived bindings, and `specialize_method` already
+   resolved the clone's SIGNATURE with them; its body substitution now
+   carries them too - and the impl's own target-argument names
+   (`implement<X> .. for Range<X>`), which the receiver's arguments bind
+   by position. Carrying `A` exposed the last one: the stash was
+   `TakeIter<I, A>`, TWO arguments for a one-parameter owner, because
+   `symbolic_owner_instance` built the walk's `this` from the IMPL's
+   parameter list rather than from its written target; the impl's list
+   can carry a where-clause parameter the owner has no slot for. Harmless
+   while nothing consumed the instance; substituted, it was
+   `arg count mismatch for TakeIter: expected 1, got 2` (E0900) across the
+   suite. The instance is now the impl's target as written, resolved with
+   the impl's parameters bound. 30 sites closed.
+
+`This` is a `GenericParam` the trait walk binds as the receiver type;
+`symbolic_type_concretizable` counts it in scope when it IS
+`state.this_type`, which is the trait-default walk and nothing else.
+
+**The 6 (`pin-missed`) were one defect in codegen's registry.** Type
+resolution registers a C-imported function under three keys (bare,
+namespace-qualified, `alias::name`), sema pins `alias::name`, and
+`declare_extern_block` registered the LLVM function under the bare key only.
+`resolve_function_by_mangled` asks the registry, then the LLVM module, then
+the reverse mangled index, then `resolve_function` - which REFUSES to declare
+an extern for a function the current module owns, on the premise that the
+registry holds it. The registry now holds the `alias::name` key too, so the
+pin answers on its first step. The `namespace::name` key is not registered
+in codegen; no in-module call of that form appeared in the corpus, and the
+shadow would have printed one.
+
+**Measurements**, whole corpus each time: 495 → 226 (stash symbolic, first
+version) → 30 after the concretizable rule and the owner literal → 15 after
+the lazy-default walk → 6 after the clone's substituter reached its body →
+0 after that substitution carried the impl's derived parameters. `pin-missed` 6 → 0 on the first build. Suite green at
+every step (`projects: 43 passed`, the Windows count; 179 compile-fail).
+
+**Objects.** Against HEAD's compiler, 3 of 3,252 objects changed
+(`examples/13-closures/Main.o`, `tests/.../Lambdas.o`, `MoveLambda.o`).
+Disassembled, each differs ONLY in symbol names: `apply__cl_7101` became
+`apply__cl_7096`, every closure-argument specialization shifted by exactly
+five, and with the number normalized the three are byte-identical.
+`mint_closure_spec_name` names the specialization by the closure struct's
+ARENA TYPE ID, and this build mints five fewer arena types before those
+structs exist - the five impls with a where-clause parameter no longer mint
+a malformed self-instantiation each. The pins changed no emitted code. A
+symbol named by an allocator counter is its own defect (any change to
+arena traffic renames it, which is what a golden over objects cannot
+tolerate); not taken here.
+
+**Ratchets.** `b1-check`: `default args expanded` 531 → 519 on
+`examples/09-json-config` (180 → 175 ffi, 522 → 508 gen): the row bumps in
+`expand_default_type_args`, which `compute_static_owner_bindings` reaches
+only after the argument and expected-type sources fail, and those now answer
+inside generic bodies. B3 context up ~2,500 per arm: the 26 self-returning
+default clones are now walked, and each walk resolves its names
+authoritatively. Re-pinned on both hosts. `lane-check`: unchanged.
+
+**Not done here.** Codegen's `resolve_function` refusing an owned symbol is a
+correct rule with an incomplete registry behind it; the `namespace::name`
+form is the remaining gap. Mono still pins the generic-owner static call
+rather than sema - the pin is minted where the instantiation is, which is
+the rule for every generic callee, so that is by design and not a residue.

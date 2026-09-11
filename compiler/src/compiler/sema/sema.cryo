@@ -779,7 +779,18 @@ public:
                 }
                 continue;
             }
-            if (method.func.is_self_returning_default) { continue; }
+            // A self-returning trait default (`take -> TakeIter<This>`) is
+            // instantiated lazily, per call site, so its body is typed the way
+            // a generic body is: symbolically, demanding no instantiation.
+            // An eager walk would demand the adapter over this owner, whose
+            // own impl carries the same default, without end.  The walk still
+            // has to happen: what it leaves on the body - the callee stashes
+            // above all - is what the lazy specialization's clone carries.
+            if (method.func.is_self_returning_default) {
+                const lazy_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
+                this.symbolic_check_body(method.func, lazy_this, owner_type);
+                continue;
+            }
             const method_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
             const saved_owner: TypeRef = this.state.current_owner_type;
             this.state.current_owner_type = owner_type;
@@ -930,7 +941,6 @@ public:
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null || method.func.body == null) { continue; }
-            if (method.func.is_self_returning_default) { continue; }
             const sym_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
             // A method on a GENERIC owner reaches sema only here, whether or not
             // it has generic parameters of its own — so this is where an `async`
@@ -2962,6 +2972,16 @@ public:
                 if (struct_t.kind == TypeKind::Struct) { finfo = (struct_t as StructType*).get_field(field_init.field_name); }
                 else { finfo = (struct_t as ClassType*).get_field(field_init.field_name); }
                 if (finfo != null && finfo.field_type.is_valid()) { field_type = finfo.field_type; }
+            }
+            // A literal of the generic OWNER inside its own body (`String {
+            // buffer: RawBuffer::new(), .. }` in `String<A>::new`): the arena
+            // type of a template holds no fields, so the field's abstract type
+            // is read off the template's AST, as `this.<field>` reads it.  The
+            // value then has an expected type to bind its own owner arguments
+            // from; without one a generic-owner static call in the field
+            // position stashes nothing and is never pinned.
+            if (!field_type.is_valid() && value_expr != null) {
+                field_type = this.symbolic.symbolic_resolve_owner_field(struct_ref, field_init.field_name);
             }
             if (field_type.is_valid()) { this.state.expected_type = field_type; }
             else { this.state.expected_type = TypeRef::invalid(); }

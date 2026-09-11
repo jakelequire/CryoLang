@@ -41,16 +41,16 @@ import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::sema::{ state, type_utils };
 import compiler::ast::declaration::{
-    ClassDeclNode, FieldDeclNode, FunctionDeclNode, GenericParamNode, MethodNode,
+    ClassDeclNode, FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
     StructDeclNode, UnionDeclNode
 };
 import compiler::sema::state::{ SemaState };
 import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
-import compiler::types::compound::{ OptionalType, PointerType, ReferenceType };
-import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
+import compiler::types::compound::{ ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType };
+import compiler::types::generic::{ AssocProjectionType, BoundedParamType, GenericParamType, InstantiatedType };
 import compiler::types::generic_registry::{ TemplateEntry };
-import compiler::types::resolver::{ ResolutionContext };
+import compiler::types::resolver::{ HomeOrigin, ResolutionContext };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 
@@ -113,11 +113,35 @@ type struct SymbolicChecker {
     /// self-instantiation `Owner<P0, P1, ...>` with each param abstract, so a free
     /// call can recover an owner-only param from the receiver.  Returns
     /// `owner_type` unchanged when it is not a bare generic owner with params.
+    ///
+    /// Inside an `implement` block the instance is the block's TARGET as
+    /// written (`TakeIter<I>` for `implement<I, A> Iterator<A> for TakeIter<I>
+    /// where I: Iterator<A>`), resolved with the block's parameters bound.
+    /// The block's parameter list is not the owner's: a where-clause can add
+    /// a parameter the owner has no slot for, and an instance built from that
+    /// list carries one argument too many - unmakeable once a specialization
+    /// substitutes it.
     symbolic_owner_instance(mut &this, owner_type: TypeRef) -> TypeRef {
         if (!owner_type.is_valid()) { return owner_type; }
         if (this.state.symbolic_owner_param_nodes.length == 0) { return owner_type; }
         const t: Type* = this.arena.lookup(owner_type.id);
         if (t == null || t.kind == TypeKind::InstantiatedType) { return owner_type; }
+        const impl_node: ImplBlockNode* = this.state.symbolic_impl_node;
+        if (impl_node != null && impl_node.target_args.length > 0
+                && this.ctx.type_resolver != null) {
+            mut rc: ResolutionContext = ResolutionContext::new(
+                FILE, LINE as i32, this.ctx.source_file, "", SymbolStr::empty(), HomeOrigin::Unset);
+            this.symbolic_bind_params(&rc);
+            mut targs: TypeRef[] = [];
+            for (mut i: i64 = 0; i < impl_node.target_args.length; i++) {
+                const ta: TypeRef = this.ctx.type_resolver.resolve(impl_node.target_args[i], &rc);
+                if (!ta.is_valid()) { targs.drop(); return owner_type; }
+                targs.push(ta);
+            }
+            const target_inst: TypeRef = this.arena.create_instantiation(owner_type, &targs);
+            targs.drop();
+            return target_inst;
+        }
         mut args: TypeRef[] = [];
         for (mut i: i64 = 0; i < this.state.symbolic_owner_param_nodes.length; i++) {
             const p: GenericParamNode* = this.state.symbolic_owner_param_nodes[i];
@@ -293,6 +317,76 @@ type struct SymbolicChecker {
             return this.type_has_unresolved_projection((t as OptionalType*).wrapped);
         }
         return false;
+    }
+
+    /// True when the specialization walk can make `ty` concrete: every generic
+    /// parameter it mentions is a parameter of the body under symbolic check,
+    /// which is exactly the set a clone's substitution maps.  Outside a
+    /// symbolic walk no parameter is in scope, so only a concrete type
+    /// qualifies.
+    ///
+    /// A parameter of ANOTHER template reaches a body only by leaking out of
+    /// an answer that was never substituted (`this.buffer.ptr()` typed as the
+    /// buffer template's `T*` rather than `u8*`), and a substitution for this
+    /// body has no entry for it.  Parameters are canonical by NAME, so the
+    /// test is by name; a foreign parameter spelled like one in scope is
+    /// indistinguishable here, as it is to every other reader of a symbolic
+    /// type.  An associated projection over an in-scope parameter passes:
+    /// the walk reduces it once its base is concrete.
+    ///
+    /// A trait's default body is walked with `This` as its receiver type, a
+    /// placeholder parameter the impl's specialization binds to the
+    /// implementing type; it is in scope for exactly that walk, where it IS
+    /// the receiver type.
+    symbolic_type_concretizable(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return false; }
+        if (t.kind == TypeKind::GenericParam) {
+            if (this.state.this_type.is_valid() && this.state.this_type.id == ty.id) { return true; }
+            return this.symbolic_name_is_generic_param((t as GenericParamType*).param_name);
+        }
+        if (t.kind == TypeKind::BoundedParam) {
+            return this.symbolic_name_is_generic_param((t as BoundedParamType*).param_name);
+        }
+        if (t.kind == TypeKind::AssocProjection) {
+            return this.symbolic_type_concretizable((t as AssocProjectionType*).base);
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.symbolic_type_concretizable((t as PointerType*).pointee);
+        }
+        if (t.kind == TypeKind::Reference) {
+            return this.symbolic_type_concretizable((t as ReferenceType*).referent);
+        }
+        if (t.kind == TypeKind::Array) {
+            return this.symbolic_type_concretizable((t as ArrayType*).element);
+        }
+        if (t.kind == TypeKind::Optional) {
+            return this.symbolic_type_concretizable((t as OptionalType*).wrapped);
+        }
+        if (t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = t as TupleType*;
+            for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                if (!this.symbolic_type_concretizable(tup.elements[i])) { return false; }
+            }
+            return true;
+        }
+        if (t.kind == TypeKind::Function) {
+            const func: FunctionType* = t as FunctionType*;
+            if (!this.symbolic_type_concretizable(func.return_type)) { return false; }
+            for (mut i: i64 = 0; i < func.param_types.length; i++) {
+                if (!this.symbolic_type_concretizable(func.param_types[i])) { return false; }
+            }
+            return true;
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                if (!this.symbolic_type_concretizable(inst.type_args[i])) { return false; }
+            }
+            return true;
+        }
+        return true;
     }
 
     /// During a symbolic walk, a concrete-only check against a type that still

@@ -4620,7 +4620,7 @@ type struct CallResolver {
 
     /// Infer a generic static-constructor's owner type args by unifying its params
     /// against the call args.  Returns the owner bindings (declaration order,
-    /// all-concrete) or `[]` if any param stays unbound/abstract.
+    /// all-bound) or `[]` if any param stays unbound.
     ///
     /// `allow_literal_default` gates Pass 2 - the GUESS that pins a still-unbound
     /// owner param from a polymorphic literal's default type (`0` -> i32, the
@@ -4680,8 +4680,7 @@ type struct CallResolver {
         mut bindings: TypeRef[] = [];
         for (mut i: i64 = 0; i < ictx.bindings.length; i++) { bindings.push(ictx.bindings[i]); }
         for (mut i: i64 = 0; i < bindings.length; i++) {
-            if (!bindings[i].is_valid()) { return []; }
-            if (this.types.contains_generic_param(bindings[i])) { return []; }
+            if (!this.symbolic.symbolic_type_concretizable(bindings[i])) { return []; }
         }
         return bindings;
     }
@@ -4691,7 +4690,7 @@ type struct CallResolver {
     /// the case the args can't (owner param appears only in the return type) AND
     /// the owner nested inside the return (`-> Result<Array<T,A>, E>`), which the
     /// narrow base-equality expected-type source can't.  Returns a length-`want`
-    /// all-concrete binding set (declaration order) or `[]`.
+    /// all-bound binding set (declaration order) or `[]`.
     infer_static_owner_bindings_from_expected(mut &this, tmpl: TemplateEntry*,
                                               method: MethodNode*) -> TypeRef[] {
         if (method == null || method.func == null) { return []; }
@@ -4704,19 +4703,18 @@ type struct CallResolver {
         mut pids: u64[] = [];
         for (mut i: i64 = 0; i < tmpl.param_type_ids.length; i++) { pids.push(tmpl.param_type_ids[i]); }
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
-        // formal = abstract (carries owner params), actual = concrete expected.
+        // formal = abstract (carries owner params), actual = the expected type.
         if (!ictx.unify(abstract_ret, this.state.expected_type)) { return []; }
         mut bindings: TypeRef[] = [];
         for (mut i: i64 = 0; i < ictx.bindings.length; i++) { bindings.push(ictx.bindings[i]); }
         for (mut i: i64 = 0; i < bindings.length; i++) {
-            if (!bindings[i].is_valid()) { return []; }
-            if (this.types.contains_generic_param(bindings[i])) { return []; }
+            if (!this.symbolic.symbolic_type_concretizable(bindings[i])) { return []; }
         }
         return bindings;
     }
 
     /// Bind the LEADING owner params the call args + expected return determine and
-    /// return that contiguous, all-concrete PREFIX (stopping at the first param a
+    /// return that contiguous, all-bound PREFIX (stopping at the first param a
     /// source leaves unbound).  Unlike `infer_static_owner_bindings_from_args` /
     /// `_from_expected` (all-or-nothing), a prefix lets a trailing DEFAULTED owner
     /// param be backfilled from its declared default when it appears in neither the
@@ -4751,19 +4749,19 @@ type struct CallResolver {
                 ictx.unify(abstract_ret, this.state.expected_type);
             }
         }
-        // Contiguous bound prefix: stop at the first unbound / still-abstract param
-        // so `expand_default_type_args` backfills the trailing defaulted params.
+        // Contiguous bound prefix: stop at the first param no source bound so
+        // `expand_default_type_args` backfills the trailing defaulted params.
         mut prefix: TypeRef[] = [];
         for (mut i: i64 = 0; i < ictx.bindings.length; i++) {
             const b: TypeRef = ictx.bindings[i];
-            if (!b.is_valid() || this.types.contains_generic_param(b)) { break; }
+            if (!this.symbolic.symbolic_type_concretizable(b)) { break; }
             prefix.push(b);
         }
         return prefix;
     }
 
     /// Compute a generic static-method call's owner type args (declaration order,
-    /// all-concrete) from the highest-priority available source.  Priority:
+    /// all-bound) from the highest-priority available source.  Priority:
     /// explicit scope turbofish (authoritative) -> inferred-from-args -> expected
     /// type.  The turbofish leads: when the programmer pinned the owner args, no
     /// inference should run (a non-constraining arg must not override them).  Each
@@ -4802,7 +4800,7 @@ type struct CallResolver {
         }
 
         // 1. Inferred from CONCRETE argument types (no literal-default guess yet).
-        // Returns a length-`want` all-concrete set or `[]`.
+        // Returns a length-`want` all-bound set or `[]`.
         const ib: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, method, call, false);
         if (ib.length == want) { return ib; }
 
@@ -4828,7 +4826,7 @@ type struct CallResolver {
             const exp_ref_s: TypeRef = this.state.expected_type;
             if (this.types.view_generic_base(exp_ref_s).id == tmpl.base_type.id
                     && this.types.view_type_arg_count(exp_ref_s) == want
-                    && !this.types.contains_generic_param(exp_ref_s)) {
+                    && this.symbolic.symbolic_type_concretizable(exp_ref_s)) {
                 return this.types.view_type_args_copy(exp_ref_s);
             }
         }
@@ -4858,7 +4856,7 @@ type struct CallResolver {
                 if (filled.length == want) {
                     mut all_ok: boolean = true;
                     for (mut i: i64 = 0; i < filled.length; i++) {
-                        if (!filled[i].is_valid() || this.types.contains_generic_param(filled[i])) { all_ok = false; break; }
+                        if (!this.symbolic.symbolic_type_concretizable(filled[i])) { all_ok = false; break; }
                     }
                     if (all_ok) { return filled; }
                 }
@@ -4927,7 +4925,18 @@ type struct CallResolver {
     /// Stash a generic static-method call's owner type args on the call node so the
     /// monomorphizer specializes the owner WITHOUT re-deriving them - sema is the
     /// sole source of truth (mono-after-sema).  Best-effort: stashes only a
-    /// length-matched, all-concrete set; otherwise leaves the stash empty.
+    /// length-matched set every source could concretize; otherwise leaves the
+    /// stash empty.
+    ///
+    /// A binding may mention the ENCLOSING template's parameters
+    /// (`Slice::from_raw(this.ptr, n)` inside `Array<T>` binds `Slice`'s
+    /// param to `Array`'s `T`): the stash is symbolic there, exactly as a
+    /// free generic call's is, and the specialization walk concretizes it
+    /// through the clone's substitution.  Refusing a symbolic stash leaves
+    /// the call with no owner at all once cloned, and codegen then has only
+    /// the call's return type to bind it by.  Each source refuses a binding
+    /// that names any OTHER template's parameter
+    /// (`symbolic_type_concretizable`), so the next source answers instead.
     stash_static_owner_bindings(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*,
                                 tmpl: TemplateEntry*, method: MethodNode*) -> void {
         if (call == null || scope == null || tmpl == null) { return; }
@@ -4940,7 +4949,6 @@ type struct CallResolver {
         if (binds.length != want) { return; }
         for (mut i: i64 = 0; i < binds.length; i++) {
             if (!binds[i].is_valid()) { return; }
-            if (this.types.contains_generic_param(binds[i])) { return; }
         }
         call.set_resolved_type_args(binds);
     }
