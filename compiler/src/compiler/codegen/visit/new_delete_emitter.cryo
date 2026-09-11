@@ -61,6 +61,52 @@ import compiler::types::user_defined::{ ClassType, EnumType, EnumVariantInfo, St
 import compiler::codegen::visit::enum_variant_emitter::{ EnumVariantEmitter };
 
 
+/// The shadow of the spelling path in `NewDeleteEmitter::emit_new`, and
+/// nothing else.
+///
+/// Two answers to "which type does `new T` allocate" exist there: sema's,
+/// read off the node, and the spelling's, widened by
+/// `CompilationContext::widen_type_home_scoped_bare`.  Both are computed on
+/// every `new` and compared here; every disagreement is printed with the
+/// case attached, unconditionally - there is no environment gate, because a
+/// gate is how an audit stream outlives the question it was asked.  The exit
+/// condition is ZERO lines over the corpus, and at zero the spelling call,
+/// this struct and its one caller are deleted together.
+///
+/// Three disagreements are told apart because they call for different fixes:
+/// the new answer is MISSING where the old one is not (the stamp did not reach
+/// this node), the two name DIFFERENT TYPES, or they name one type under two
+/// KEYS - the key being what the vtable global and the constructor symbol are
+/// mangled from, which is how `new` of a virtual class through a spelling the
+/// widening could not place referenced a vtable nothing defined.  An old
+/// answer that is missing where the new one is not is not a disagreement: it
+/// is the new model already carrying the case alone.
+type struct NewShadow {
+    static compare(intern: InternTable*, arena: TypeArena*, written: SymbolStr,
+                   old_ref: TypeRef, old_key: SymbolStr,
+                   new_ref: TypeRef, span: source_span::SourceSpan) -> void {
+        if (!old_ref.is_valid()) { return; }
+        const written_str: string = intern.resolve(written);
+        const where: string = span.to_string();
+        if (!new_ref.is_valid()) {
+            fmt::eprintf("SHADOW-NEW\tnew-missing\t%s\told=%s\t%s\n",
+                written_str, intern.resolve(arena.get_qualified_name(old_ref)), where);
+            return;
+        }
+        if (old_ref.id != new_ref.id) {
+            fmt::eprintf("SHADOW-NEW\ttype-differs\t%s\told=%s\tnew=%s\t%s\n",
+                written_str, intern.resolve(arena.get_qualified_name(old_ref)),
+                intern.resolve(arena.get_qualified_name(new_ref)), where);
+            return;
+        }
+        const new_key: SymbolStr = arena.get_qualified_name(new_ref);
+        if (!old_key.equals(new_key)) {
+            fmt::eprintf("SHADOW-NEW\tkey-differs\t%s\told=%s\tnew=%s\t%s\n",
+                written_str, intern.resolve(old_key), intern.resolve(new_key), where);
+        }
+    }
+}
+
 type struct NewDeleteEmitter {
     cg:           CodegenContext*;
     state:        VisitorState*;
@@ -123,45 +169,42 @@ type struct NewDeleteEmitter {
             return;
         }
 
-        // `new T` names its type by whatever the writer spelled, which may be
-        // a bare leaf owned by another module; the widening order and the key
-        // that wins are `widen_type_home_scoped_bare`'s to state.
         const ctx_ptr: CompilationContext* = this.cg.ctx;
         const intern: InternTable* = this.cg.get_intern();
+        const arena_p: TypeArena* = this.cg.get_arena();
 
-        // Sema already resolved this node from the name layer's stamp, and its
-        // answer is a TypeRef - not a name. Taking it back to a string to widen
-        // the spelling again would re-derive from a leaf and can land on a
-        // same-named type from another module, which is the defect `Res` exists
-        // to remove; it would also add a crossing the DEFID_UNWRAP ratchet
-        // counts, and the ratchet is right to count it.
-        //
-        // `resolved_type` is `T*` (a `new` yields a pointer), so the pointee is
-        // the type being allocated. The widening below serves only the
-        // spellings sema could not resolve.
-        mut qualified_sym: SymbolStr = SymbolStr::empty();
-        mut type_ref: TypeRef = ctx_ptr.widen_type_home_scoped_bare(
-            node.type_name, node.span.file,
-            FILE, LINE as i32, &qualified_sym);
-
-        // A spelling the widening cannot place - `Mod::Type`, which it reads
-        // as a bare leaf - is answered by what sema resolved the node to.
-        // `resolved_type` is `T*` (a `new` yields a pointer), so the pointee is
-        // the type being allocated.
-        //
-        // Consulted only where the widening declines, and that order is not a
-        // preference: the two DISAGREE for a class with virtual methods, where
-        // taking sema's answer names a vtable global that is never defined
-        // (`undefined reference to 'C$vt$0'` over tests/tests/lang/classes.cryo).
-        // Two answers to one question is the defect, not the ordering - the
-        // disagreement is written down rather than papered over, and it is the
-        // next thing to fix here.
-        if (!type_ref.is_valid() && node.has_resolved_type()) {
-            const arena_p: TypeArena* = this.cg.get_arena();
+        // What `new T` allocates is what sema resolved the node to, read off
+        // the node: `resolved_type` is `T*` (a `new` yields a pointer), so the
+        // pointee is the type.  The name the allocation needs - for the vtable
+        // global and the constructor symbol - is that TYPE's own registered
+        // name, the same name the owning module defines the vtable under.
+        // Computed on every `new`, whatever else answers.
+        mut new_ref: TypeRef = TypeRef::invalid();
+        if (node.has_resolved_type()) {
             const rt: Type* = arena_p.lookup(node.resolved_type.id);
             if (rt != null && rt.kind == TypeKind::Pointer) {
-                type_ref = (rt as PointerType*).pointee;
+                new_ref = (rt as PointerType*).pointee;
             }
+        }
+
+        // SHADOW.  The spelling widened is the old answer to the same
+        // question; it runs beside the new one and is compared, never
+        // consulted instead of it.  It still decides while it answers, so the
+        // build stays what it was until the comparison reads zero over the
+        // corpus - and at zero this call, `widen_type_home_scoped_bare`'s
+        // `new` caller, and `NewShadow` go together.
+        mut old_key: SymbolStr = SymbolStr::empty();
+        const old_ref: TypeRef = ctx_ptr.widen_type_home_scoped_bare(
+            node.type_name, node.span.file,
+            FILE, LINE as i32, &old_key);
+        NewShadow::compare(intern, arena_p, node.type_name, old_ref, old_key,
+                           new_ref, node.span);
+
+        mut type_ref: TypeRef = new_ref;
+        mut qualified_sym: SymbolStr = arena_p.get_qualified_name(new_ref);
+        if (old_ref.is_valid()) {
+            type_ref = old_ref;
+            qualified_sym = old_key;
         }
         const t: Type* = this.cg.lookup_type_by_id(type_ref.id);
         if (t == null) {

@@ -20983,3 +20983,42 @@ static calls that now pin through `owner_key` (44 `String`, 13 `Array`, 7
 `Slice`, ...); M2 -2 as above. `make test` 2,113 / 179 / 43. The sweep's
 remaining state - `qualify-imports.py` with both trap fixes, the include list
 being the tree minus the 38 fixtures - is recorded here and nowhere else.
+
+### 8.152 Shadow mode: the first consumer measured - `emit_new`, 0 disagreements over the corpus - MEASURED 2026-09-11
+
+Ruled by Jake, relayed today: the old model stops being a fallback and
+becomes a shadow. The new model answers on every call; the old one answers
+beside it; every disagreement is printed with the case attached; the exit
+condition for a consumer is ZERO over the corpus, at which point its old path
+and the comparison are deleted together. Not an audit stream: no environment
+gate, no `resolve_counter` row, nothing that can outlive the question.
+
+First consumer: `NewDeleteEmitter::emit_new`, whose own comment said its two
+paths disagree for a class with a vtable. NEW is sema's `resolved_type`
+pointee plus that type's own registered name; OLD is
+`widen_type_home_scoped_bare` and the key it won with. Both run on every
+`new`; `NewShadow::compare` prints `type-differs`, `key-differs` (the key is
+what the vtable global and constructor symbol are mangled from) or
+`new-missing`; an old answer missing where the new one is present is the new
+model already alone and is not a line. The old answer still DECIDES while it
+answers, so this build is byte-for-byte the previous one.
+
+| corpus | units | lines |
+|---|---|---|
+| `lsp-check` (stage-2 over compiler + tools + their std) | 266 modules | 0 |
+| unit suite build | 2,113 tests | 0 |
+| every test project, built one at a time - `cryo test` swallows a passing project's stderr | 46 | 0 |
+| `examples/` | 14 | 0 |
+
+740 textual `new T` sites in the tree. Instrument controls: with the type
+comparison inverted for one build, one line per agreeing `new` (2 of 2 in a
+scratch program with a virtual class, a struct, and a qualified `new
+str::Str {..}`, the last being the old model declining); restored, the same
+program prints nothing and runs. The "C$vt$0" of the old comment was never a
+type disagreement: it was the key left EMPTY when the widening was skipped,
+which the key comparison covers.
+
+Zero is the exit condition. The next commit deletes the widening call, the
+key it won with, and `NewShadow` from `emit_new`; `widen_type_home_scoped_bare`
+itself survives one more consumer, `emit_base_ctor_call`, which is the next
+shadow.
