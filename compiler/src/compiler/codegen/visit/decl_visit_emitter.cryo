@@ -52,43 +52,6 @@ import compiler::types::generic_registry::{ GenericRegistry };
 import compiler::types::type_ref::{ TypeRef };
 
 
-/// The shadow of the spelling path in `DeclVisitEmitter::emit_base_ctor_call`,
-/// and nothing else.
-///
-/// Two answers to "which class does `: Base(args)` delegate to" exist there:
-/// the enclosing class's stamped base, and the spelling widened by
-/// `CompilationContext::widen_type_home_scoped_bare`.  Both are computed on
-/// every base-constructor call and compared here; every disagreement is
-/// printed with the case attached, unconditionally.  The exit condition is
-/// ZERO lines over the corpus, and at zero the spelling call, this struct and
-/// `widen_type_home_scoped_bare` itself - this being its last caller - are
-/// deleted together.  An old answer missing where the new one is present is
-/// not a disagreement: it is the new model already carrying the case alone.
-type struct BaseCtorShadow {
-    static compare(intern: InternTable*, written: SymbolStr,
-                   old_type: TypeRef, old_key: SymbolStr,
-                   new_type: TypeRef, new_key: SymbolStr,
-                   span: source_span::SourceSpan) -> void {
-        if (!old_type.is_valid()) { return; }
-        const written_str: string = intern.resolve(written);
-        const where: string = span.to_string();
-        if (!new_type.is_valid()) {
-            fmt::eprintf("SHADOW-BCTOR\tnew-missing\t%s\told=%s\t%s\n",
-                written_str, intern.resolve(old_key), where);
-            return;
-        }
-        if (old_type.id != new_type.id) {
-            fmt::eprintf("SHADOW-BCTOR\ttype-differs\t%s\told=%s\tnew=%s\t%s\n",
-                written_str, intern.resolve(old_key), intern.resolve(new_key), where);
-            return;
-        }
-        if (!old_key.equals(new_key)) {
-            fmt::eprintf("SHADOW-BCTOR\tkey-differs\t%s\told=%s\tnew=%s\t%s\n",
-                written_str, intern.resolve(old_key), intern.resolve(new_key), where);
-        }
-    }
-}
-
 type struct DeclVisitEmitter {
     cg:       CodegenContext*;
     state:    VisitorState*;
@@ -341,37 +304,17 @@ type struct DeclVisitEmitter {
 
         // The base the constructor delegates to is the class's base, which
         // the name layer stamped on the class declaration under the canonical
-        // name the base's type and constructor are registered by.  Computed
-        // on every base-constructor call, whatever else answers.
-        mut new_key: SymbolStr = SymbolStr::empty();
-        mut new_type: TypeRef = TypeRef::invalid();
+        // name the base's type and constructor are registered by.  The
+        // written base name is not consulted: it is the same spelling the
+        // class declaration wrote, and that one was already answered where
+        // its imports were in hand.
+        mut base_qualified: SymbolStr = SymbolStr::empty();
+        mut base_type: TypeRef = TypeRef::invalid();
         if (base != null) {
-            match (base.require("base-constructor call")) {
-                Res::Def(q) => {
-                    new_key = q.qualified_name();
-                    new_type = ctx_ptr.decl_index.lookup_type(new_key);
-                }
-                _ => { }
-            }
-        }
-
-        // SHADOW.  The spelling widened is the old answer to the same
-        // question; it runs beside the new one and is compared, and still
-        // decides while it answers.  At zero over the corpus this call - the
-        // last caller of `widen_type_home_scoped_bare` - and `BaseCtorShadow`
-        // go together with that function.
-        mut old_key: SymbolStr = SymbolStr::empty();
-        const old_type: TypeRef = ctx_ptr.widen_type_home_scoped_bare(
-            node.base_ctor_name, node.span.file,
-            FILE, LINE as i32, &old_key);
-        BaseCtorShadow::compare(intern, node.base_ctor_name, old_type, old_key,
-                                new_type, new_key, node.span);
-
-        mut base_qualified: SymbolStr = new_key;
-        mut base_type: TypeRef = new_type;
-        if (old_type.is_valid()) {
-            base_qualified = old_key;
-            base_type = old_type;
+            const r: Res = base.require("base-constructor call");
+            base_type = ctx_ptr.decl_index.type_of_res(r);
+            // The constructor symbol is text built from the base's name.
+            base_qualified = r.def_id().qualified_name();
         }
         if (base_type.is_invalid()) { cdebug("[BCTOR-BAIL] type invalid\n"); return; }
 

@@ -21055,3 +21055,13 @@ and `widen_type_home_scoped_bare` itself - the three-key spelling cascade
 (writer's module, writer's imports, bare leaf) that `emit_new` and the base
 constructor were the only readers of. The base-constructor key is the stamped
 base's canonical name, which is also what the constructor is registered under.
+
+**Deleted.** The base-constructor path reads the class's stamped base through
+`DeclarationIndex::type_of_res` (the sibling of `func_type_of_res`, added so a
+`Res` is not turned back into a name to key a lookup), and
+`widen_type_home_scoped_bare` is gone from `CompilationContext` - no caller
+left. Objects over the shadow build and this one: 0 of 1,126 examples, 0 of
+2,126 tests; `make test` 2,113 / 179 / 43. lane: LOOKUP 63 -> 61 (the
+cascade's two index probes); DEFID_UNWRAP 24 -> 26 (the new index primitive,
+and the constructor symbol's text). Tally: 2 consumers shadowed, 2 at zero,
+2 old paths deleted, 1 artifact gone.
