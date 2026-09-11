@@ -19904,3 +19904,169 @@ statement deletion: removing a `bump()` that was the sole body of a branch
 merged the zero case into `else`, and a row pinned at 0 read 591 while every
 suite stayed green. §8.139 records the rule. The b1 golden saw it; nothing
 else did.
+### 8.142 Handoff: the leaf-keyed registries after the trait-impl fix, a correction to how that defect was described, and the ledger split when it comes - 2026-09-10
+
+Written by the agent that landed `92453202`. It carries one session's work and
+the corrections that session produced; where it reports something it did not
+verify, it says so, because the alternative is a description that reads as
+measured and was not.
+
+#### 1. Correct the framing before acting on it
+
+The standing description of this defect - repeated in §0's pointers and in the
+brief every agent on these files has been given - says: *`generic_registry`
+keys trait impls on a bare `(trait leaf, target leaf)` pair, latest wins,
+import order picks the method BODY, exit 0, no diagnostic, and a reproducer
+exists in the archive.*
+
+**Three of those are no longer true.**
+
+* The reproducer's mechanism was `register_trait_decl`, and it is **fixed** -
+  that table is keyed on the canonical identity and says so in its own comment.
+  Re-ran its shape (two same-leaf `Render` traits with different default
+  bodies, one imported directly, one reached transitively): the correct body
+  runs.
+* The **target** half of `register_trait_impl`'s key is already canonical for
+  source impls - `type_resolution` re-registers under `canonical_target`. The
+  surviving bare registration is `specialization.cryo`'s, at
+  DeclarationCollection, where no import-resolved name exists yet and its own
+  NOTE says so.
+* The observable was a wrong **`T`**, not a wrong body.
+
+What was actually live: three scans in `sema/method_binding.cryo` walked
+`trait_impls` under a disjunction whose FIRST clause was
+`impl_node.target_type.equals(bare)`. `target_type` is the parser-captured leaf
+and stays bare on a source impl, so that clause matched every same-leaf impl
+and the two qualified clauses beside it were **unreachable**. §8.137 has the
+reproducer and its three controls. `GenericRegistry::impl_target_rank` fixed
+it.
+
+**The transferable lesson, and it cost most of a session.** A leaf and a
+qualified identity are both `SymbolStr`. *A map keyed on `SymbolStr.id` tells
+you nothing about which one it holds* - only reading every caller does. Four
+straight attempts to reproduce this defect produced correct programs, because
+the paths being probed were qualified on both sides. Budget for that before
+taking any "keyed on a bare leaf" claim in this document as a starting point.
+
+#### 2. Where the leaf-keyed registries stand
+
+**Done** (`92453202`): trait-impl target matching ranks identity above leaf, in
+one shared primitive, with a committed regression project.
+
+**`types/arena.cryo` - `create_bounded_param`.** Read, not fixed. The brief
+calls it "bounds cached by bare name, first-creation wins, with a circular doc
+comment defending it". The circularity is real and verbatim - *"the checker
+already compares BoundedParams by name alone, so this is consistent"* - but
+**the diagnosis needs one correction before anyone acts on it.** Its neighbour
+`create_generic_param` carries a genuine argument for the name key: a name can
+never be bound twice along one substitution path, because names are unique
+within a template and Cryo has no nested binder that shadows. That argument is
+sound and it covers `create_bounded_param`'s key too.
+
+What it does **not** cover is the payload. One cache slot per name carries
+`bounds` and `param_index`, and those are **per binder**: two templates each
+declaring `T`, one `T: Ord` and one `T: Display`, share one entry and the first
+minted wins. So this is not "re-key it" - the key is defensible. It is *a
+per-binder value stored under a per-name key*, and the fix is either to split
+the payload out or to key the bounded variant by binder while leaving the bare
+leaf alone. Note the warning already in `create_generic_param`: re-adding
+`index`/`bounds` to **that** key reintroduces a divergence.
+
+**`decl_index.cryo` - four single-slot maps.** Cited at 372 / 409 / 744 / 792;
+all four verified live at those lines, none investigated further.
+
+* `register_method` packs `(type_sym, method_sym)` with **no arity**. Overloads
+  collapse whatever the names are qualified to - structurally true, no
+  measurement needed.
+* `register_function`, `register_function_type`, `register_global` key on
+  `name.id`. Whether these collide depends entirely on whether callers pass
+  qualified names, **which nobody has measured** - and per §1 above, that is
+  exactly where this work has gone wrong before. `register_function_type`'s own
+  comment already says "single-slot map (last wins)" and points at parallel
+  overload arrays for when every overload matters.
+
+**`codegen/state/function_registry.cryo`** - not opened this session. Described
+as the last chance to bind the wrong symbol.
+
+**Left undone deliberately.** `mono/call_specializer.cryo` met the same
+trait-impl bug from the other side and fixed it locally, twice, with its own
+qualified-first two-pass. It is behaviourally correct today, so it was not
+touched - but it now holds a second copy of a policy that lives in
+`impl_target_rank`, and the two will drift. Adopting the primitive there is
+small and worth doing.
+
+**Still ruled out, do not retry.** Re-keying the TRAIT half of the impl tables:
+`OperatorTraitMap` names fourteen operator traits by string literal and
+dispatches through them.
+
+#### 3. A guard blind spot, and the rule that replaces it
+
+`ns-commit-guard` rule 4 ("a moved §0 must still agree with the tree") runs
+`ns-status-check` over the **working tree**, and only when the commit stages §0
+itself. Both halves bite:
+
+* A commit that **moves a number** §0 pins, without staging the ledger, goes
+  straight through. That is how D11's row stood at 1931 against a tree of 1643
+  - repaired in `92453202`, which names the commit that moved it.
+* A commit that **does stage** §0 is refused while *anyone else's* uncommitted
+  edit has any row drifted. With several agents in one checkout that is a
+  standing block, and rules 2 and 3 have the `no-section-0:` waiver while rule
+  4 has none.
+
+Nobody owns the guard scripts now, so the rule is manual and belongs in
+`CLAUDE.md`, where it has been added: **if your change moves a number §0 pins,
+update that row by hand in the same commit.** `make ns-status-check` tells you
+which rows moved; it takes no build.
+
+#### 4. §0 is the thing to keep true
+
+§0 carries status and a pointer, never reasoning, and is REPLACED rather than
+appended to. Its rows are checkable claims and `make ns-status-check` runs all
+of them (27 checkable, 5 declaring `no check`) with no compiler. A row that is
+wrong is worse than a row that is absent, because §0 is what an incoming agent
+reads instead of re-deriving the truth from 19,000 lines of archive. Whoever is
+left on these files inherits it.
+
+#### 5. The ledger split - approved, deferred, and already unblocked
+
+Jake has approved splitting this document: **§0 and the normative spec stay in
+`docs/name-resolution.md`; the §8 archive moves out.** It is not happening now
+- demolition takes priority - so this records it well enough to execute cold.
+
+**The mechanical blocker is already gone.** `3831f8a4` stopped both checks
+naming a file. `scripts/ns_ledger.py` finds §0 by its `## 0. Current state`
+heading across `docs/**/*.md` (exactly one file, or it refuses), and finds the
+archive by a directive §0 carries - an HTML comment reading `ns-archive:`
+followed by a path - repeatable, the value a glob relative to the repo root, so
+a split into several files needs no code change. Undeclared, the archive is the
+§0 document itself: true today, and true only while that document still holds
+entry headings. A §0 document declaring no archive AND holding no entries is
+**REFUSED**, which is precisely the state the split passes through. So:
+
+1. Move §8 (currently from its `## 8.` heading to end of file) into the new
+   file or files.
+2. **In the same commit**, add the `ns-archive` directive to §0. Out of order,
+   the guard refuses - by design.
+3. Rewrite this document's header blockquote: it currently says "Start at §0
+   (Current state) ... §8 is the evidence archive behind it", and must name
+   where the archive now lives.
+4. Sweep the references. `docs/name-resolution.md` is named in `CLAUDE.md`'s
+   spec table, `Makefile`, `.github/workflows/ci.yml`, `scripts/b1-gate.py`,
+   `scripts/lane-gate.py`, `scripts/ns-status-check.py`, `scripts/ns_ledger.py`
+   (docstring only), `scripts/ns-guard-selftest.py`, `.todo/`, `HANDOFF.md`,
+   and eight `compiler/src` and `stdlib` source comments. Most point at the
+   spec and stay correct; the ones citing a §8 entry need the new path.
+5. `python scripts/ns-guard-selftest.py` drives all three guard rules through a
+   throwaway repository and is the check that the split did not silence them.
+   Run it after, not before.
+
+#### 6. Outstanding, and NOT enumerated by anyone
+
+§1-§7 are normative and parts of them describe behaviour that was never built;
+several §8 entries say so in passing. **No one has enumerated which.** For
+whoever does, the sections are §1 root cause (marked HISTORICAL in its own
+header), §2 scope, §3.1-3.3 visibility, §4 scope and the rib chain, §5.1-5.3
+paths, §6.1-6.3 the two answers, §7.1-7.4 enforcement - twenty subsections.
+That is a list of *where to look*, not a finding. Earlier summaries have quoted
+a count of fourteen; that number has no derivation in this document and should
+not be inherited as one.

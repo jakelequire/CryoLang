@@ -72,6 +72,17 @@ So:
   message; `git log --grep=no-section-0` is the audit.
   `python scripts/ns-guard-selftest.py` drives all three through a throwaway
   repository and shows them refuse and allow.
+- **If your change moves a number §0 pins, update that row BY HAND in the same
+  commit.** The guard cannot do it for you: its third rule runs
+  `ns-status-check` only when the commit STAGES §0, so a commit that moves a
+  pinned number without touching the ledger goes straight through and leaves
+  the row wrong at HEAD. D11's `resolve_counter.cryo` line count stood at 1931
+  against a tree of 1643 that way. `make ns-status-check` names every drifted
+  row and needs no build.
+  The same rule bites from the other side in a SHARED checkout: a commit that
+  does stage §0 is refused while anyone else's uncommitted edit has any row
+  drifted, and that refusal has no waiver. Land §0 changes when the tree is
+  yours.
 
 ### What a green gate does NOT tell you
 
