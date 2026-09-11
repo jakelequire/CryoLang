@@ -181,27 +181,6 @@ type enum Site {
     DefaultArgExpanded;
     DefaultArgNoOwner;
 
-    /// One row per exit of the type-widening cascade in
-    /// `sema::type_utils::lookup_type_by_sym`, which has twelve callers and
-    /// four widening steps.
-    ///
-    /// The cascade already reports every exit through `cascade_outcome`, but
-    /// that emitter returns unless `CRYO_PATH_AUDIT` is set, so an ordinary
-    /// build tallies nothing for four of its five exits and the gate cannot
-    /// see the lane at all.  These make the exits countable without an audit
-    /// stream, which is what lets them be pinned.
-    ///
-    /// Cursor and CrossMod are the widening answers - step 2 reads the
-    /// ambient cursor, step 3 re-enters the resolver - and both are the shape
-    /// B1 exists to drive to zero.  Exact and Miss are not answers to gate but
-    /// the denominator that makes a zero readable: a widening row falling to
-    /// zero because its callers stopped asking looks identical to one falling
-    /// to zero because the widening stopped, and only the totals beside it
-    /// separate those.
-    TypeCascadeExact;
-    TypeCascadeCursor;
-    TypeCascadeCrossMod;
-    TypeCascadeMiss;
 
     /// Generic parameters offered to the two bound-building loops, counted
     /// before their constraint list is consulted.
@@ -632,10 +611,6 @@ implement enum Site {
             Site::VisWouldReject        => { "!! " }
             Site::VisRejectUnreachable  => { "B1 " }
             Site::VisRejectNotPublic    => { "B1 " }
-            Site::TypeCascadeExact      => { "B1 " }
-            Site::TypeCascadeCursor     => { "B1 " }
-            Site::TypeCascadeCrossMod   => { "B1 " }
-            Site::TypeCascadeMiss       => { "B1 " }
             Site::ParamRefSymbolic      => { "B1>" }
             Site::ParamRefTypeRes       => { "B1>" }
             Site::ParamRefResolver      => { "B1>" }
@@ -784,10 +759,6 @@ implement enum Site {
             Site::VisWouldReject        => { "  WOULD BE REJECTED once gated" }
             Site::VisRejectUnreachable  => { "    cause: namespace not reachable" }
             Site::VisRejectNotPublic    => { "    cause: candidate not public" }
-            Site::TypeCascadeExact      => { "type cascade: 1 exact" }
-            Site::TypeCascadeCursor     => { "type cascade: 2 ambient cursor" }
-            Site::TypeCascadeCrossMod   => { "type cascade: 3 resolver re-entry" }
-            Site::TypeCascadeMiss       => { "type cascade: 5 miss" }
             Site::ParamRefSymbolic      => { "  params offered: symbolic_checker" }
             Site::ParamRefTypeRes       => { "  params offered: type_resolution" }
             Site::ParamRefResolver      => { "  params offered: resolver create_param_type" }
@@ -1198,34 +1169,6 @@ public function path_hit(kind: string, use_site: string,
     if (!Audit::Path.enabled()) { return; }
     fmt::eprintf("PATH-HIT\t%s\t%s\t%s\t%s\n", kind, use_site, written, resolved);
 }
-/// Log one OUTCOME of the type cascade in `sema/type_utils.cryo`, naming the
-/// step that answered and the call site that asked.
-///
-/// The cascade answers one question - "what type does this name mean?" - in
-/// four ways, and only the last of them is tallied.  A tally could say how
-/// many names the last step served; it cannot say whether the three before it
-/// were widening a name that had no exact answer or overriding one that did,
-/// and that difference is what decides whether a step can be deleted.
-///
-/// Emitted once per CALL, on every exit including the one that answers
-/// nothing.  Every call leaves through exactly one of them, so the row count
-/// equals the call count - which is the control that says whether rows are
-/// being dropped.  A step tally with no such identity cannot tell a genuine
-/// zero from a stream that was never reached.
-///
-/// `site` is threaded from the caller rather than recovered from a stack the
-/// compiler does not keep: the migration this sizes is per-call-site, and a
-/// name alone cannot say which caller needs a scope.  `control` is what the
-/// EXACT lookup would have answered in the same place, and it is meaningful
-/// only where the exact lookup has not already run - the steps where it has
-/// say so rather than re-asking a question whose answer is fixed.
-public function type_cascade(site: string, step: string, asked: string,
-                             answered_as: string, control: string) -> void {
-    if (!Audit::Path.enabled()) { return; }
-    fmt::eprintf("TYPE-CASCADE\t%s\t%s\t%s\t%s\t%s\n",
-                 site, step, asked, answered_as, control);
-}
-
 /// Log one module-scope segment that was NOT stamped although some module
 /// spells it, naming which of the two refusals fired.
 ///
@@ -1420,10 +1363,6 @@ public function report() -> void {
     Site::McDerefCoercion.print_row();
     Site::McFailed.print_row();
 
-    Site::TypeCascadeExact.print_row();
-    Site::TypeCascadeCursor.print_row();
-    Site::TypeCascadeCrossMod.print_row();
-    Site::TypeCascadeMiss.print_row();
     Site::ParamRefSymbolic.print_row();
     Site::ParamRefTypeRes.print_row();
     Site::ParamRefResolver.print_row();

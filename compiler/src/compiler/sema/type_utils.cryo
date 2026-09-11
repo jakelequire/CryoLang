@@ -178,32 +178,26 @@ type struct TypeUtils {
         return this.ctx.type_resolver.canonicalize_default_generic_type(ty);
     }
 
-    // widen: bare -> qualified -> cross-module cascade.
     lookup_method_return_raw(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
         mut ret: TypeRef = TypeRef::invalid();
         this.resolve_method_owner(type_sym, method_sym, &ret);
         return ret;
     }
 
-    /// The name `method_sym` is REGISTERED under for an owner segment spelled
-    /// `type_sym`, or an invalid symbol when no owner carries the method.
+    /// The name `method_sym` is registered under for the owner `type_sym`, or
+    /// an invalid symbol when that owner carries no such method.
     ///
-    /// The spelling a call site writes is not a registry key: a scope segment
-    /// may be a bare leaf, the writer's own module-qualified form, or a
-    /// module-relative path (`Deque::Gadget`), while the registries hold one
-    /// canonical name per declaration.  Widening is therefore part of asking
-    /// the question, and the answer is WHICH name carried the method - not just
-    /// that some name did.
+    /// `type_sym` is a registered name - a canonical owner from a stamp, a
+    /// specialization's registered name, a type's own qualified name - and
+    /// the registries hold one canonical name per declaration, so the lookup
+    /// is exact.  A spelling is not a key here: the callers that once passed
+    /// one now read the owner off the node, and the two widening steps that
+    /// covered for them (the ambient cursor, the resolver re-entry) answered
+    /// zero times over the corpus once the specialization identifier was
+    /// registered under one name.
     ///
-    /// Every consumer keys off this one answer.  A caller that recovers the
-    /// return type here and then rebuilds a symbol from the written spelling is
-    /// naming a declaration that does not exist, and the failure surfaces a
-    /// whole stage later as an unresolvable callee.
-    ///
-    /// A winning probe has already fetched the return type it validated, so
-    /// `out_ret` (when non-null) hands that value back: asking the registry
-    /// again under the owner just returned would re-derive what this call
-    /// already proved.  It is left untouched when no owner carries the method.
+    /// `out_ret` (when non-null) hands back the return type the lookup
+    /// fetched, so a caller does not ask the registry twice for one answer.
     resolve_method_owner(&this, type_sym: SymbolStr, method_sym: SymbolStr,
                          out_ret: TypeRef*) -> SymbolStr {
         // As-is (already-qualified names from monomorphized types).
@@ -211,36 +205,6 @@ type struct TypeUtils {
         if (as_is.is_valid()) {
             if (out_ret != null) { *out_ret = as_is; }
             return type_sym;
-        }
-        // Module-qualified (local/same-module types registered under qualified names).
-        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(type_sym);
-        if (!qualified.equals(type_sym)) {
-            const q_ret: TypeRef = this.ctx.decl_index.lookup_method_return(qualified, method_sym);
-            if (q_ret.is_valid()) {
-                if (out_ret != null) { *out_ret = q_ret; }
-                // SHADOW: the as-is lookup is the new model's whole answer,
-                // and this exit is the old one answering where it did not.
-                // Printed unconditionally; zero over the corpus deletes this
-                // step and the next.
-                fmt::eprintf("SHADOW-MOWNER\t2-CURSOR\t%s\t%s\t%s\n",
-                    this.intern.resolve(type_sym), this.intern.resolve(method_sym),
-                    this.intern.resolve(qualified));
-                return qualified;
-            }
-        }
-        // Cross-module: resolve the type's original module via the scope chain.
-        // This is the only probe that answers a written path whose own leading
-        // segments name a module, since the import-scoped index is keyed by leaf.
-        const cross_sym: SymbolStr = this.resolve_cross_module_name(type_sym);
-        if (cross_sym.is_valid()) {
-            const c_ret: TypeRef = this.ctx.decl_index.lookup_method_return(cross_sym, method_sym);
-            if (c_ret.is_valid()) {
-                if (out_ret != null) { *out_ret = c_ret; }
-                fmt::eprintf("SHADOW-MOWNER\t3-CROSSMOD\t%s\t%s\t%s\n",
-                    this.intern.resolve(type_sym), this.intern.resolve(method_sym),
-                    this.intern.resolve(cross_sym));
-                return cross_sym;
-            }
         }
         return SymbolStr::empty();
     }
@@ -321,84 +285,6 @@ type struct TypeUtils {
                 this.intern.resolve(q), scope.span.to_string());
         }
         return ty;
-    }
-
-    // widen: direct -> qualified -> cross-module -> arena-leaf cascade.
-    //
-    // The EXACT lookup runs first, so the ambient cursor can only widen a name
-    // no declaration carries as written - it cannot displace one that is
-    // already registered.  That ordering is what keeps the cursor out of
-    // binding decisions: a step able to override an exact match is choosing
-    // between two declarations, and the module a cursor happens to be standing
-    // in is not a sound basis for that choice.
-    //
-    // `site` names the caller.  One question is answered four ways here, and
-    // the change that removes the widening is per-call-site - a caller holding
-    // a stamped node can read an answer, one holding a bare name cannot - so a
-    // tally that cannot say WHICH caller needed a step cannot size that work.
-    lookup_type_by_sym(&this, name: SymbolStr, site: string) -> TypeRef {
-        // Already-qualified names (specialized impl target_type) + cross-module aliases.
-        const direct: TypeRef = this.lookup_type_exact(name);
-        if (direct.is_valid()) {
-            resolve_counter::Site::TypeCascadeExact.bump();
-            this.cascade_outcome(site, "1-EXACT", name, name, "SELF");
-            return direct;
-        }
-        // The current module's qualified name.  Reached only when nothing is
-        // registered under the written spelling, so this widens, never rebinds.
-        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(name);
-        if (!qualified.equals(name)) {
-            const q_ty: TypeRef = this.ctx.decl_index.lookup_type(qualified);
-            if (q_ty.is_valid()) {
-                resolve_counter::Site::TypeCascadeCursor.bump();
-                this.cascade_outcome(site, "2-CURSOR", name, qualified,
-                                     "PRIOR-NONE");
-                // SHADOW: the exact lookup is the new model's whole answer,
-                // and this exit is the old one answering where it did not.
-                // Printed unconditionally; zero over the corpus deletes this
-                // step and the next.
-                fmt::eprintf("SHADOW-TYSYM\t2-CURSOR\t%s\t%s\t%s\n", site,
-                    this.intern.resolve(name), this.intern.resolve(qualified));
-                return q_ty;
-            }
-        }
-        // Cross-module via scope chain.
-        const cross_sym: SymbolStr = this.resolve_cross_module_name(name);
-        if (cross_sym.is_valid()) {
-            const cross_ty: TypeRef = this.ctx.decl_index.lookup_type(cross_sym);
-            if (cross_ty.is_valid()) {
-                resolve_counter::Site::TypeCascadeCrossMod.bump();
-                this.cascade_outcome(site, "3-CROSSMOD", name, cross_sym,
-                                     "PRIOR-NONE");
-                fmt::eprintf("SHADOW-TYSYM\t3-CROSSMOD\t%s\t%s\t%s\n", site,
-                    this.intern.resolve(name), this.intern.resolve(cross_sym));
-                return cross_ty;
-            }
-        }
-        resolve_counter::Site::TypeCascadeMiss.bump();
-        this.cascade_outcome(site, "5-MISS", name, SymbolStr::empty(),
-                             "PRIOR-NONE");
-        return TypeRef::invalid();
-    }
-
-    /// One outcome of the cascade above, named at the event.
-    ///
-    /// Every call leaves through exactly one exit and each of them reports
-    /// here, so the row count equals the call count.  That identity is the
-    /// control: without it a step reading zero cannot be told apart from a
-    /// stream nothing ever reached, which is the reading error this whole
-    /// measurement exists to avoid.
-    ///
-    /// Every step after the first reports `PRIOR-NONE`: the exact lookup has
-    /// already answered nothing by the time they run, so re-asking it would
-    /// record a fixed answer as though it were evidence.
-    cascade_outcome(&this, site: string, step: string, name: SymbolStr,
-                    answered_as: SymbolStr, control: string) -> void {
-        if (!resolve_counter::Audit::Path.enabled()) { return; }
-        mut answer: string = "-";
-        if (answered_as.is_valid()) { answer = this.intern.resolve(answered_as); }
-        resolve_counter::type_cascade(site, step, this.intern.resolve(name),
-                                     answer, control);
     }
 
     /// Resolve a bare name to its original module-qualified form via the

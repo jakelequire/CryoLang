@@ -50,7 +50,7 @@ current-state description is the defect it exists to remove.
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
 | D10 | A plural leaf is E0155, not a directory-order bind — and a leaf two children of one FACADE declare is the same defect reached by a qualified path, in a call as in an annotation | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **5** | §8.121, §8.144, §8.151 |
-| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1649** | §8.66, §8.80, §8.139 |
+| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1588** | §8.66, §8.80, §8.139 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
 | D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **576** | §8.145, §8.146, §8.147, §8.148, §8.150 |
@@ -79,12 +79,9 @@ three, and its row carries the count. Read each zero off its own row.
 
 | artifact | status | pinned | check → expected | § |
 |---|---|---|---|---|
-| type cascade 1 — exact | LIVE | 5,265 | `grep -m1 'type cascade: 1 exact' tests/b1-baseline.txt` | §8.64, §8.120 |
-| type cascade 2 — ambient cursor | STARVED | 0 | same file, `type cascade: 2` | §8.64, §8.87 |
-| type cascade 3 — resolver re-entry | STARVED | 0 | same file, `type cascade: 3` | §8.64 |
-| type cascade 5 — miss | LIVE | 3,614 | same file, `type cascade: 5` | §8.64 |
+| type cascade (`lookup_type_by_sym`, 4 steps) | **DELETED** — `lookup_type_exact`, one step; the audit stream and its four counter rows went with it | — | `grep -rho 'lookup_type_by_sym' compiler/src --include=*.cryo \| wc -l` → **0** | §8.154 |
 | 2c home-module (ambient cursor) | STARVED | 0 | same file, `2c  home-module` | §8.63, §8.87 |
-| M1 `qualifier_agrees` | **GUARD** | 8,821 calls / 8,821 agree / **0 reject** | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **5** | §8.120, §8.132 |
+| M1 `qualifier_agrees` | **GUARD** | 2,566 calls / 2,566 agree / **0 reject** | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **5** | §8.120, §8.132 |
 | M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane** | 3,760 | `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M2 resolve_module_qualified_sym calls/{print;exit}' tests/b1-baseline.txt` → **3760** | §8.120 |
 | M4 mono bare-name scan | STARVED | 432 calls / **0** hits | same file, `M4 mono bare-name` | §8.33, §8.120 |
 | M5 import suffix fallback | **STARVED** — all entries are the sub-module caller | **3 calls / 0 hits** | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **3** | §8.120 |
@@ -21107,3 +21104,16 @@ stamp says MODULE because the module owns `tally`, and
 consumed only to conclude "not a static method" before the module-function
 path answers. An answer the stamp already refused, and not load-bearing; the
 deletion that follows is checked against that fixture.
+
+**Deleted.** `lookup_type_by_sym` is gone (12 callers read `lookup_type_exact`),
+`resolve_method_owner` is the as-is lookup, and the `TYPE-CASCADE` audit
+stream with its four counter rows went with them. Objects over the shadow
+build and this one: 0 of 1,126 examples, 0 of 2,126 tests; `make test`
+2,113 / 179 / 43 - the D5 fixture included. b1, both hosts: the four rows
+GONE; M1 `qualifier_agrees` calls 8,821 -> 2,566 (the resolver re-entry the
+two cascades were driving, answering nothing); `default args expanded`
+603 -> 531 (the pair branch in `try_resolve_static_method` runs less now that
+a specialization's registered name hits as-is). lane: LOOKUP 61 -> 57,
+LOOKUP_OTHER 57 -> 58 (`lookup_type_name(exp_ref)`, keyed by the type itself).
+`resolve_cross_module_name` has two callers left, both static-call template
+lookups. Tally: 4 shadowed, 4 at zero, 4 deleted, 2 artifacts gone.
