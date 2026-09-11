@@ -129,7 +129,7 @@ def main():
                          "file under docs/ carries the heading)")
     ap.add_argument("--verbose", action="store_true",
                     help="print every row, not only the drifted ones")
-    ap.add_argument("--min-rows", type=int, default=25,
+    ap.add_argument("--min-rows", type=int, default=28,
                     help="fail if §0 carries fewer checkable rows than this; "
                          "a row losing its check is drift too, and an empty "
                          "extraction otherwise reports as a clean sweep")

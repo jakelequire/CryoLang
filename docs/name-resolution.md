@@ -138,6 +138,7 @@ Checks for this section, one per line so each can be copied whole:
 
 * `grep -c '^\[' tests/lane-baseline.txt` → **7**
 * `grep -c '^\[host:' tests/b1-baseline.txt` → **6**
+* `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M5 import suffix fallback hits/{print;exit}' tests/b1-baseline.txt` → **0** — M5 is STARVED, and this is the number that says so; the row's own check counts call SITES, which do not move when a lane starts answering
 * `grep -c '^project ' tests/test-roster.txt` → **45**
 * `grep -c '^negative ' tests/test-roster.txt` → **178**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
@@ -19898,6 +19899,17 @@ report success; and an awk over an empty pipe printed "linux untouched,
 correct" from no input at all. Every one of them looked like good news. Put a
 case you know should appear through the same grep, regex or parser before
 believing any count, and print the population size next to the count.
+
+**A `door:` parameter is evidence, not a tally.** `call_resolver.cryo` passes
+`door: resolve_counter::Site` and `resolve_counter.cryo` takes a `door` string
+in `vis_gate_reject` and `callee_door`; eight sites carry one. It names WHICH
+caller reached a site, which is the question a count cannot answer - the M5
+split here needed exactly that and had to add a probe to get it, because
+`path_hit` fires only on a hit and a starved lane emits nothing. Whoever
+retires the remaining counter rows should not read these as dead weight
+travelling with a bump that is going away. Recorded from the worker that
+retired the first 36 rows; not independently verified here beyond the eight
+call sites.
 
 **`make test` is not the only thing that moves.** A counter deletion is not a
 statement deletion: removing a `bump()` that was the sole body of a branch
