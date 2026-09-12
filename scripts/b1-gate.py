@@ -668,7 +668,7 @@ def main():
         if w == g:
             continue
         if w is None:
-            sys.stderr.write("  NEW SITE   %-40s %d\n" % (label, g))
+            sys.stderr.write("  NEW SITE   %-40s %s\n" % (label, g))
         elif g is None:
             # A floor row carries `>0`, a string; format it as one.
             sys.stderr.write("  GONE       %-40s was %s\n" % (label, w))

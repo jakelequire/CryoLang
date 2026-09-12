@@ -44,13 +44,13 @@ current-state description is the defect it exists to remove.
 | D2 | `Namespace::Function` folds into `Namespace::Value` | **OUTSTANDING** | `grep -cE '^\s{4}(Type\|Value\|Function);' compiler/src/compiler/resolver/namespace_kind.cryo` → **3** (2 when done) | §8.39 |
 | D3 | Modules bind in the TYPE namespace | TAKEN, then SUPERSEDED by D5 | `grep -c 'SymbolKind::Namespace' compiler/src/compiler/resolver/namespace_kind.cryo` → **1** | §8.39, §8.68 |
 | D4 | The qualifier shorthand `A::B` prefers the type | SUPERSEDED by D5 — ruled dropped, never built, then overtaken | `no check` — the thing ruled on was never in the tree | §8.66 → §8.130 |
-| D5 | **Namespaces and types share ONE namespace**; a module and a type can never carry the same name, and the collision is an ordinary redeclaration error at its declaration | **RULED, NOT STARTED** | `grep -rho 'check_module_type_collision' compiler/src \| wc -l` → **2** (0 when done) | §8.130, §8.134 |
+| D5 | **Namespaces and types share ONE namespace**; a module and a type can never carry the same name, and the collision is an ordinary redeclaration error at its declaration | **RULED, NOT STARTED** — and now the one thing holding `scope_owner_key`'s cursor lane (§8.170): `module_type_name_collision` pins the pre-D5 shape | `grep -rho 'check_module_type_collision' compiler/src \| wc -l` → **2** (0 when done) | §8.130, §8.134 |
 | D6 | Intrinsics get namespaced; a bare name always means the user's function | RULED; `format`/`printf` done, the rest not started | `grep -c '^intrinsic function ' stdlib/core/intrinsics.cryo` → **58** | §8.124, §8.126, §8.129 |
 | D7 | Imports stop globbing | **TAKEN** — a plain `import M;` is `ImportStyle::Module` and binds no names. Three globs remain BY DESIGN and the old row's expected `0` was unreachable: the explicit `M::*`, and the two the compiler injects (the prelude, the f-string runtime) | `grep -rho 'ImportStyle::Wildcard,' compiler/src --include=*.cryo \| wc -l` → **3** | §8.131, §8.135, §8.138 |
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
 | D10 | A plural leaf is E0155, not a directory-order bind — and a leaf two children of one FACADE declare is the same defect reached by a qualified path, in a call as in an annotation | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **5** | §8.121, §8.144, §8.151 |
-| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1544** | §8.66, §8.80, §8.139 |
+| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); of the asserted rows, one whose only site was deleted went with it in §8.170 (`b1-baseline.txt` re-pinned on both hosts, 70 → 69 rows per arm) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1539** | §8.66, §8.80, §8.139 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
 | D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **577** | §8.145, §8.146, §8.147, §8.148, §8.150 |
@@ -97,16 +97,15 @@ three, and its row carries the count. Read each zero off its own row.
 | `resolve_cross_module_name` (sema's resolver re-entry by spelling) | **DELETED** — its four readers went under shadow mode | — | `grep -rho 'resolve_cross_module_name' compiler/src \| wc -l` → **0** | §8.155 |
 | `check_module_type_collision` | LIVE — D5 deletes it | — | see D5 | §8.130, §8.131 |
 | `module_owns_member` probe | LIVE — D5 deletes it | — | `grep -rho 'module_owns_member' compiler/src \| wc -l` → **3** | §8.131 |
-| `scope_owner_key` | LIVE — the static-call owner key; the callee-type and template-method probes read it too | — | `grep -rho 'scope_owner_key' compiler/src \| wc -l` → **6** | §8.134, §8.151 |
-| static-call owner TEMPLATE by spelling (`resolve_scope_owner_template`'s as-is → scope map → cross-module cascade) | **DELETED** — the owner template is read off the segment's stamp, in sema and in mono | — | `grep -c 'resolve_scoped_or_at' compiler/src/compiler/sema/call_resolver.cryo` → **1** (was 7; the value-form reader went in §8.167) | §8.150, §8.151 |
+| static-call owner TEMPLATE by spelling (`resolve_scope_owner_template`'s as-is → scope map → cross-module cascade) | **DELETED** — the owner template is read off the segment's stamp, in sema and in mono | — | `grep -c '\.resolve_scoped_at(' compiler/src/compiler/sema/call_resolver.cryo` → **1** (was 7 at §8.150; the one left is D5's, §8.170) | §8.150, §8.151 |
 | codegen static-call ladder (`call_emitter`: spec-by-return-type → `scope::member` → bare member, and the enum variant's scope-name probe) | **DELETED** — sema's / mono's pin answers every static call; 495 → 0 in §8.160; `call_emitter` reads no `resolve_scoped_or` | — | `grep -c 'resolve_scoped_or' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0** | §8.158, §8.160, §8.161 |
 | codegen method-call ladder (`call_emitter` MemberAccess branch: `<type name>::method`, `<qualified_name>::method`) | **DELETED** - a method call binds from sema's / mono's pin and nothing else; 336,761 → 0 in §8.164, cut in §8.165 with 0 objects moved | — | `grep -c 'lookup_array_type_name' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0** | §8.163, §8.164, §8.165 |
 | codegen scope-value ladder (`ir_generator` `visit(ScopeResolutionNode)`: three function lookups by spelling, three global lookups, the module-leaf global lane `resolve_global_in_scope` → `find_global_in_scope` → `namespace_leaf_is`) | **DELETED** - a path in value position binds from sema's pin (`ScopeResolutionNode::resolved_callee`), `resolved_type`, or the stamp's namespace + member leaf; shadow 0 first build, controlled at 301, 0/0 objects | — | `grep -c 'resolve_scoped_or' compiler/src/compiler/codegen/visit/ir_generator.cryo` → **0**; `grep -rho 'find_global_in_scope' compiler/src \| wc -l` → **0** | §8.166 |
 | codegen identifier-value lookups (`codegen_identifier`: `resolve_global(node.name)` by the bare leaf, `resolve_function(node.name)` after the generic pin) and sema's bare `lookup_func_type_exact(ident.name)` + cursor-keyed `enforce_value_ref_visibility` | **DELETED** - a bare value binds from the stamp (global: its namespace and leaf, exact) or the pin (`IdentifierNode::resolved_callee`, now written for every function value); shadow 293 → the fix IS the deletion (a clone read another module's same-leaf global), 4 wrong-function binds found only by the object comparison | — | `grep -c 'resolve_function(node.name)' compiler/src/compiler/codegen/visit/ir_generator.cryo` → **0**; `grep -c 'resolve_global(node.name)' compiler/src/compiler/codegen/visit/ir_generator.cryo` → **0** | §8.167 |
 | name-layer visibility gates: a specific import naming a private declaration (E0353, `visibility_import_gate`), and a spelled-out path reaching one through the module-rooted walk (E0503 for a type, E0353 otherwise; `visibility_type_mask`) | LIVE, reached | — | `grep -c 'private_declaration' compiler/src/compiler/resolver/name_resolution.cryo` → **2** | §8.167, §8.168 |
 | sema type-name visibility gate (`check_type_name_visibility` / `check_annotation_visibility`, keyed by `resolve_scoped_or_at` over the WRITTEN spelling, so every relative path defaulted to public) | **DELETED** - the name layer refuses a private type where the path proposes it | — | `grep -c 'check_type_name_visibility' compiler/src/compiler/sema/member_resolver.cryo` → **0** | §8.168 |
-| `resolve_scoped_or` / `resolve_scoped_or_at` / `scope_is_ambiguous` (the resolved-or-echo wrappers: a refusal came back as the input) | **DELETED** - 7 readers at §8.161, 0 at §8.169, then the definitions | — | `grep -rho 'resolve_scoped_or' compiler/src --include=*.cryo \| wc -l` → **1** (a doc comment on `scope_owner_key` naming what it replaced) | §8.161, §8.166, §8.167, §8.168, §8.169 |
-| `resolve_scoped` / `resolve_scoped_at` / `scope_is_ambiguous_at` (the cursor-scoped leaf resolution itself) | LIVE - 2 readers, `scope_owner_key` and the E0154 check in `resolve_scope_call` | — | `grep -cE 'resolve_scoped_at|scope_is_ambiguous_at' compiler/src/compiler/sema/call_resolver.cryo` → **2** | §8.150, §8.169 |
+| `CompilationContext::resolve_scoped` family (the cursor's leaf-keyed scope map, asked from sema) | `_or`, `_or_at`, `scope_is_ambiguous`, `_at` **DELETED** (7 readers at §8.161); `resolve_scoped` / `resolve_scoped_at` **HELD** with ONE reader, the D5 residue below | — | `grep -c 'resolve_scoped' compiler/src/compiler/compilation_context.cryo` → **4** | §8.161, §8.166-§8.170 |
+| `scope_owner_key` | LIVE - the static-call owner key: the substituter's `spec_owner` (a clone's specialization, by arena id), then the cursor lane, then the stamp. The cursor lane is measured at 1,974,585 answers and serves ONE shape, D5's module/type collision (`module_type_name_collision`'s `Buffer::make`); it goes with D5 | — | `grep -c '\.resolve_scoped_at(' compiler/src/compiler/sema/call_resolver.cryo` → **1** | §8.134, §8.151, §8.170 |
 | type-resolution bound stamping (`stamp_trait_ref` and its three walkers, the cursor fallback for a bound the resolver did not stamp) | **DELETED** - the name layer stamps every owner, associated-type bounds included | — | `grep -c 'stamp_trait' compiler/src/compiler/passes/type_resolution.cryo` → **0** | §8.169 |
 | callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **21** (the name layer's two: the import gate, the rooted walk) | §8.1f, §8.2ag |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
@@ -22447,3 +22446,150 @@ its four functions; + `resolve_scoped_or` / `_at` / `scope_is_ambiguous`).
 * The Bash tool's heredoc collapsed `\\t` and `\\n` inside a Python
   triple-quoted string again (a real tab and a real newline landed in a
   Cryo string literal and compiled). Write tool, every time.
+
+### 8.170 Consumer 21: `scope_owner_key` measured, the sema E0154 check deleted, and the one program shape the cursor lane still serves - D5's collision - 2026-09-12
+
+The last two readers of `CompilationContext::resolve_scoped_at` /
+`scope_is_ambiguous_at`, both in `resolve_scope_call`. One is deleted; the
+other is HELD, and this entry says exactly what holds it.
+
+#### `scope_owner_key`
+
+The static-call owner key had two authorities in order: the cursor scope
+map (`resolve_scoped_at` over the written segment, declining to an invalid
+symbol), then the stamp. Its own comment named the one thing the map
+answered that the stamp could not: a monomorphized clone, whose scope
+segment the substituter had rewritten to the bare mangled specialization
+name (`6Result$Lj_j$G`), which the map qualifies to the registered
+`std::core::result::6Result$Lj_j$G`.
+
+Shadowed, cursor against stamp, one line per answer the map gave, whole
+corpus (five halves): **1,974,585 answers, 136,779 differing** -
+
+* **135,894** mangled clones, exactly the case the comment named: stamp
+  `TR-Def=std::core::result::Result` (the template - a `Res` names a
+  definition, and a clone's syntax is the template's), cursor the
+  specialization's registered name.
+* **825** module scopes (`metadata::metadata(from)`, `sha1::…`,
+  `handshake::…`) and **60** C-import aliases (`probe::bindgen_probe_add3`)
+  where the map's leaf-keyed answer was a same-leaf FUNCTION in an
+  unrelated module: `std::fs::metadata::metadata` for the module
+  `std::fs::metadata`; `CryoTests::Tests::Stdlib::FutureBlocking::handshake`,
+  a test's function, for the module `std::net::ws::handshake`;
+  `NestedMatchConditionalMove::probe` for `c_import_libclang.cryo`'s alias.
+  Wrong every time, and harmless only because nothing downstream finds a
+  type under a function's name and the module lane answers from the stamp
+  regardless.
+
+The clone case is the annotation case over again: `NamedAnnotation` already
+carries `pre_resolved`, the specialization's arena id, beside the spelling
+the substituter minted. `ScopeResolutionNode` now carries `spec_owner`, set
+by the substituter's self-reference collapse from the same `spec_typeref`
+and copied by the cloner; `scope_owner_key` reads it through the arena's
+registered name (`lookup_type_name`, an identity query) before anything
+else. Rebuilt and re-shadowed: 135,894 → **0**; the 885 module/alias lines
+remain and are the old model being wrong.
+
+#### What the cursor lane still serves - and the corpus half that hid it
+
+With the lane deleted the tree built, the LSP built, and one project
+failed at runtime: `module_type_name_collision`, `tests/collision_test.cryo`,
+`const b: Buffer::Buffer = Buffer::make(9);`. `namespace Gpu::Buffer;`
+declares `type struct Buffer`, the test imports the MODULE, and `Buffer::make`
+- `make` is the type's static, not the module's - reaches the type only
+because the map resolves the leaf `Buffer` to it. The stamp says the
+segment names the module, which is what the writer's scope holds; under
+D5 (§8.130, §8.134: a module and a type never share a name, and the
+collision is a redeclaration error) the program is refused at
+`type struct Buffer` and the question never arises. The project's own
+comment pins the pre-D5 answer deliberately ("the fix cannot be 'the
+module always wins'").
+
+The shadow did not print it: a `collect` project's `tests/` files are
+compiled only by `cryo test`, whose parent swallows a passing child's
+stderr, so no corpus run had read a line from them - the SIXTH half, after
+§8.169's fifth. `corpus2.sh` now runs `cryo test` in every project that
+has a `tests/` directory and keeps its stderr.
+
+The lane is **HELD**, not deleted: it is now the ONLY reader of
+`resolve_scoped_at`, sits between `spec_owner` and the stamp with its
+comment naming the one shape and the measurement, and goes the moment D5
+refuses the collision at its declaration - or Jake rules the project's
+pinned shape dropped. Deciding either is not this migration's to take.
+
+#### The E0154 check
+
+`resolve_scope_call` asked `scope_is_ambiguous_at` before resolving and
+reported "`X` is ambiguous: it names a type in more than one module in
+scope". Shadowed by printing every true answer: **0** over five halves. The
+name layer refuses an ambiguous segment where it stamps it -
+`resolution_ambiguous_module`'s `Text::tag()` is E0154 from
+`stamp_module_scope` ("names more than one module in scope") and aborts
+before sema runs, and a plural bare type leaf is E0155 (§8.121, §8.144).
+The check, `report_scope_ambiguity` and `scope_is_ambiguous_at` are
+deleted; the `BareAltsViaAmbigDiag` row (pinned 0 on all six arms) is
+retired with its only bump site, `b1-baseline` re-pinned on both hosts
+(WSL for linux) and parsed per section: that one row gone on every arm,
+every other row reproduced. `resolve_counter.cryo` 1544 → 1539 (D11).
+`scripts/b1-gate.py`'s `NEW SITE` line formatted a floor row's `>0` with
+`%d` and crashed the non-update run; `%s`, as its `GONE` twin already had.
+
+#### Objects, gates
+
+`6e900b48` vs this tree: **0 of 1,126** in `examples/`, **0 of 2,126** in `tests/`. Suite green, 44 projects; the LSP builds
+directly; lane golden unmoved.
+
+**Tally: 22 shadowed, 22 at zero, 22 old paths deleted, 15 artifacts gone**
+(+ the E0154 check with `report_scope_ambiguity` and `scope_is_ambiguous_at`).
+`scope_owner_key`'s cursor lane is shadowed, at zero except for the D5
+shape, and HELD.
+
+#### Handoff - session ending here, next agent's list in order
+
+Landed this session: §8.166-§8.170 (`282d92b7`, `3e50430b`, `b54be850`,
+`6e900b48`, this commit). The shadow scripts and the object-comparison
+tooling are now in `scripts/objcmp/` (README there); no baseline is
+tracked yet - pinning one is the first thing to do, over `tests/` and
+`examples/`, not `compiler/build`.
+
+1. **`selfhost-check` has NOT run this session or the last several** -
+   ~25 commits of compiler change since its last recorded run. The object
+   comparison is not a substitute. Run it detached (see the memory note on
+   its timeout), both arms, before anything else.
+2. **`select_method`'s trait filter keys on `leaf_segment`** (three sites
+   in `call_resolver`, added in `fd10049d`): two same-leaf traits on one
+   receiver conflate. Latent in-tree (`where_bound_leaf_collision` never
+   calls through it). Reproducer first, then key on the trait's identity.
+3. **The `PrimTy` arm in `scope_qualifier_type`** (Jake approved): the
+   function declines for `ResBase::PrimTy`, so three callers re-derive the
+   primitive from its spelling - `sema:3302` (`new` rung 2, `new int[100]`),
+   `sema:3209` (`resolve_scope_resolution`, `u8::MAX`), the written-qualifier
+   path of `call_resolver:2919`. `sema:706` reads `PrimTy` correctly already;
+   follow it. Not a fallback - a missing match arm: add it, confirm the three
+   spelling steps are unreachable, delete them; `sema:3307` (`resolve_primitive`)
+   goes with them.
+4. **Four delete-nows** (the spelling step cannot answer on a build that
+   links): `call_resolver:580` variant payload; `call_resolver:5690` rung 3
+   (keep rung 2, identity-keyed); `sema:3307`; `call_resolver:3048` E0202
+   tail (delete the lookup, keep the diagnostic).
+5. `const_table.cryo`'s retirement condition is met (`IdentifierNode.res`
+   exists; both `fold_named` callers hold the node).
+6. The callee door ladder `call_resolver:342-352` (STAMP → HOME → BARE) -
+   shadow it; a local function-pointer variable shadowing a same-leaf
+   global binds the global today. No golden row covers it.
+7. `tests/tests/projects/const_cross_module` as a b1 corpus: it enters the
+   const-table bare-leaf lane and will turn the gate red truthfully; land it
+   deliberately. And the `-ffi` corpus has never held a C import (`cryo
+   build` never discovers a project's `tests/`).
+8. §0's three `spelling_type new expr` rows say NOT ENTERED with 0 calls;
+   that is a corpus fact (no pinned b1 corpus contains a `new` expression;
+   `compiler/src` has 568), not a lane fact. Say so on the rows.
+9. D5 for Jake: `module_type_name_collision` holds `scope_owner_key`'s
+   cursor lane (above); §8.167's extern-function visibility default is a
+   language decision to confirm.
+
+Traps this session, beyond the addendum's: the Bash tool's heredoc collapses
+`\t`/`\n` in Python sources too (three times) - Write tool for anything with
+an escape; `--reuse-message=HEAD` after a refused commit reuses the
+PREVIOUS commit's message; a `sed` with `\n` in the pattern silently matches
+nothing; the corpus has SIX halves, not four.

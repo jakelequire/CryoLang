@@ -3850,48 +3850,37 @@ type struct CallResolver {
     /// Emit E0154 for a bare scope name that resolves to multiple import-visible
     /// same-leaf types.  Lists every registered qualified candidate so the
     /// author can pick one; the fix is always to write the fully-qualified name.
-    report_scope_ambiguity(mut &this, scope: ScopeResolutionNode*) -> void {
-        resolve_counter::Site::BareAltsViaAmbigDiag.bump();
-        const alts: SymbolStr[] = this.ctx.decl_index.lookup_qualified_alternatives(scope.scope_name);
-        mut cand_list: string = "";
-        for (mut i: i64 = 0; i < alts.length; i++) {
-            if (i > 0) { cand_list = cand_list + ", "; }
-            cand_list = cand_list + this.intern.resolve(alts[i]);
-        }
-        mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0154_AMBIGUOUS_CALL,
-            fmt::format("`%s` is ambiguous: it names a type in more than one module in scope",
-                this.intern.resolve(scope.scope_name)));
-        diag = diag.at_with_label(scope.span,
-            fmt::format("candidates: %s", cand_list));
-        diag = diag.with_note("disambiguate with the fully-qualified name, e.g. `Module::Type::method(...)`");
-        this.ctx.emit_diagnostic(diag);
-    }
-
     /// The canonical name the scope segment's owner is registered under.
     ///
-    /// Two authorities, and which one holds the answer is asked, not guessed.
-    /// The scope map answers for a segment it can resolve - including the
-    /// mangled specialization it resolves to after monomorphization, which is
-    /// the form the registries hold a specialization's methods under.  It
-    /// DECLINES for a qualified spelling, and there the stamp holds the answer.
-    /// The distinction is lost by `resolve_scoped_or_at`, which hands back its
-    /// input on a decline, so a refusal is indistinguishable from success and
-    /// the lookup keyed by it widens the bare leaf instead - answering from
-    /// whichever module registered the name first.  That is how, of two modules
-    /// declaring one leaf, the first resolves and the second cannot be named.
+    /// A substituter that collapsed a template's self-reference recorded the
+    /// SPECIALIZATION on the node, and the registries hold a specialization's
+    /// methods under its registered name; that is asked first, by arena id.
+    /// Everything else is the stamp: a type's qualified name; for a primitive
+    /// the spelling it is registered under, since a primitive owns members
+    /// while declaring nothing.  A type parameter names no declaration, so it
+    /// can never be a registration key: reached when monomorphization has
+    /// substituted a concrete type into the spelling while the clone still
+    /// carries the template's stamp, and the spelling is then the only thing
+    /// that names the owner.  A MODULE qualifier is not a type-owner claim,
+    /// and this does not manufacture one: the module lane answers from the
+    /// scope itself.
     ///
-    /// A MODULE qualifier is not a type-owner claim, and this does not
-    /// manufacture one: the module lane answers from the scope itself.
-    ///
-    /// A segment carrying generic arguments is keyed the same way: this names
-    /// the owner the arguments apply to, and the caller refines that owner to
-    /// its specialization.  Echoing the spelling for that case keyed the
-    /// specialization on whatever the source wrote (`hashmap::HashMap`), a
-    /// name no registry holds.
+    /// The cursor scope map between the two serves ONE program shape, and it
+    /// is one the namespace rule forbids: a module and a type sharing a name
+    /// (`namespace Gpu::Buffer;` declaring `type struct Buffer`), where
+    /// `Buffer::make()` written against the module reaches the type only
+    /// because the map resolves the leaf to it.  Measured over every corpus
+    /// half with the stamp answering beside it: 1,974,585 answers, and the
+    /// map differed from the stamp on 885 module and C-import-alias segments -
+    /// answering a same-leaf FUNCTION in an unrelated module every time,
+    /// which nothing downstream can bind - and on that shape.  It stays until
+    /// the collision is refused at its declaration, and it is the only reader
+    /// `CompilationContext::resolve_scoped_at` has.
     scope_owner_key(&this, scope: ScopeResolutionNode*) -> SymbolStr {
-        // An INVALID symbol as the decline value, so a refusal stays a refusal
-        // instead of arriving as the input echoed back.
+        if (scope.spec_owner.is_valid()) {
+            const spec_q: SymbolStr = this.ctx.decl_index.lookup_type_name(scope.spec_owner);
+            if (spec_q.is_valid()) { return spec_q; }
+        }
         const q: SymbolStr = this.ctx
             .resolve_scoped_at(scope.scope_name, scope.span.file, FILE, LINE as i32)
             .resolved_or(SymbolStr::empty());
@@ -3899,36 +3888,15 @@ type struct CallResolver {
         return match (scope.require_scope_res("scope-call owner key")) {
             Res::TypeRelative(b, _) => {
                 match (b) {
-                    // A type parameter names no declaration, so it can never be
-                    // a registration key.  Reached when monomorphization has
-                    // substituted a concrete type into the spelling while the
-                    // clone still carries the template's stamp; the spelling is
-                    // then the only thing that names the owner.
                     ResBase::GenericParam(_) => { scope.scope_name }
-                    // The base's own registration key: a type's qualified name,
-                    // and for a primitive the spelling it is registered under,
-                    // since a primitive owns members while declaring nothing.
                     _                        => { b.name() }
                 }
             }
-            // A module qualifier is not a type-owner claim, and this does not
-            // manufacture one; the module lane answers from the scope itself.
             _                       => { scope.scope_name }
         };
     }
 
     resolve_scope_call(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*) -> TypeRef {
-        // A bare scope that resolves to two or more import-visible same-leaf
-        // types is a hard ambiguity: the author must qualify it.  Reported once,
-        // in a real (non-symbolic) pass, only for a non-generic scope (a generic
-        // scope carries its own args-driven resolution).  Reporting does not
-        // stop resolution: it proceeds with the bare form so a single, clean
-        // E0154 is emitted rather than a cascade of downstream misresolutions.
-        if (scope.scope_generic_args.length == 0 && !this.state.in_symbolic_check
-                && this.ctx.scope_is_ambiguous_at(scope.scope_name, scope.span.file,
-                                                  FILE, LINE as i32)) {
-            this.report_scope_ambiguity(scope);
-        }
         mut lookup_sym: SymbolStr = this.scope_owner_key(scope);
         if (scope.scope_generic_args.length > 0) {
             const spec_sym: SymbolStr = this.resolve_generic_scope_name(
