@@ -70,6 +70,8 @@ import compiler::module_loader::{ ModuleLoader };
 import compiler::passes::pass_id::{ PassID, PassResult, Provision, ProvisionSet };
 import compiler::passes::pass_registry::{ PassRegistry };
 import compiler::passes::specialization::{ SpecializationPasses };
+import compiler::mono::dispatch_annotator;
+import compiler::mono::dispatch_annotator::{ MonoDispatchAnnotator };
 import compiler::project_config::{
     BinTarget, LibTarget, PanicStrategy, ProjectConfig, TargetType
 };
@@ -3169,6 +3171,22 @@ type struct CompilerInstance {
             initial6a.mark(Provision::StructFieldsSynced);
             initial6a.mark(Provision::DirectivesProcessed);
             pipeline.validate_with_initial(initial6a);
+        }
+
+        // Bound-directed dispatch (`Display::fmt` vs `Debug::fmt`) is stamped
+        // on the TEMPLATE bodies, and a specialization inherits it through the
+        // cloner - so every module must be stamped before the first module is
+        // monomorphized.  A template's impl blocks are cloned whenever ANY
+        // module demands an instantiation, and a demand from a module earlier
+        // in the order than the impl's own would otherwise clone an unstamped
+        // body: `Debug for Array<T>` lives in `fmt::display`, and
+        // `collections::array` demands `Array<u8>` long before that module's
+        // turn.
+        mut annotator: MonoDispatchAnnotator = MonoDispatchAnnotator::null();
+        annotator.wire(ctx.type_arena, ctx.intern_table);
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
+            annotator.annotate_bound_dispatch_in_module(ctx.artifacts.ast.root);
         }
 
         for (mut i: u32 = 0; i < n; i++) {

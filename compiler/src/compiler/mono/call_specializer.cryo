@@ -1193,6 +1193,14 @@ type struct MonoCallSpecializer {
                 && impl_node.qualified_target_name.is_valid()) {
             pin_target = impl_node.qualified_target_name;
         }
+        // A primitive receiver has no qualified name at all; its impl blocks
+        // are declared under the target the block itself carries (`i32`), so
+        // that is the symbol's owner.  Left empty, no symbol is pinned and
+        // codegen binds `i32::fmt` by name - to whichever of `Display::fmt` /
+        // `Debug::fmt` the index registered first.
+        if (!pin_target.is_valid() && is_primitive_kind && impl_node != null) {
+            pin_target = impl_node.codegen_target_name();
+        }
         const spec_sym: SymbolStr = this.mangled_symbol_for_spec_method(
             spec_method, pin_target);
         if (this.state.method_spec_seen(spec_sym)) {
@@ -1359,6 +1367,22 @@ type struct MonoCallSpecializer {
         if (orig == null || orig.func == null || impl_node == null) { return false; }
         if (orig.func.generic_params.length > 0) { return false; }
         // Reuse an already-instantiated sibling rather than minting a duplicate.
+        // The pin is the symbol codegen declares the instantiation under: the
+        // impl block's target and the instantiated signature, exactly as
+        // `declare_impl_block` mangles it.  The target is the receiver's
+        // qualified name, except for an inherent block, which registers under
+        // its own stamped target (a primitive's bare spelling).
+        mut pin_target: SymbolStr = this.arena.get_qualified_name(recv_type);
+        if (!impl_node.is_trait_impl() && impl_node.qualified_target_name.is_valid()) {
+            pin_target = impl_node.qualified_target_name;
+        }
+        const lazy_recv: Type* = this.arena.lookup(recv_type.id);
+        if (!pin_target.is_valid() && lazy_recv != null
+                && (lazy_recv.kind == TypeKind::Int || lazy_recv.kind == TypeKind::Float
+                    || lazy_recv.kind == TypeKind::Bool || lazy_recv.kind == TypeKind::Char
+                    || lazy_recv.kind == TypeKind::String)) {
+            pin_target = impl_node.codegen_target_name();
+        }
         for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
             const m: MethodNode* = impl_node.methods[k];
             if (m == null || m.func == null) { continue; }
@@ -1368,6 +1392,7 @@ type struct MonoCallSpecializer {
                     && !m.func.is_lazy_self_growing
                     && m.func.generic_params.length == 0) {
                 call.set_resolved_method(m as ASTNode*);
+                call.set_resolved_callee(this.mangled_symbol_for_spec_method(m, pin_target));
                 return true;
             }
         }
@@ -1378,6 +1403,7 @@ type struct MonoCallSpecializer {
         if (spec_method == null || spec_method.func == null) { return false; }
         impl_node.methods.push(spec_method);
         call.set_resolved_method(spec_method as ASTNode*);
+        call.set_resolved_callee(this.mangled_symbol_for_spec_method(spec_method, pin_target));
         this.register_spec_method_in_di(spec_method, recv_type, impl_node);
         if (spec_method.func.body != null) {
             const _empty: string = "";

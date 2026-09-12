@@ -113,6 +113,16 @@ type struct SymbolResolver {
     /// success, null otherwise.
     declare_extern_function_overload(mut &this, fn_name: SymbolStr,
                                      func_type_ref: TypeRef) -> LValue {
+        return this.declare_extern_function_as(fn_name, func_type_ref, SymbolStr::empty());
+    }
+
+    /// Declare the cross-module extern for `fn_name` at `func_type_ref`'s
+    /// signature.  `symbol` names the LLVM function when the caller holds the
+    /// exact symbol (a pin); otherwise it is the one the index registered for
+    /// this (name, type) pair, then the name's single-slot alias, then a
+    /// fresh free-function mangle.
+    declare_extern_function_as(mut &this, fn_name: SymbolStr,
+                               func_type_ref: TypeRef, symbol: SymbolStr) -> LValue {
         const arena: TypeArena* = this.ctx.type_arena;
         const ft_ptr: Type* = arena.lookup(func_type_ref.id);
         if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { return LValue::null(); }
@@ -124,10 +134,10 @@ type struct SymbolResolver {
         const intern: InternTable* = this.ctx.intern_table;
         const di: DeclarationIndex* = this.ctx.decl_index;
 
-        // Prefer the overload-specific mangled name registered for this
-        // exact (fn_name, func_type_ref) pair.  Fall back to the
-        // single-slot alias only when no overload entry exists.
-        mut mangled_sym: SymbolStr = di.lookup_overload_mangled(fn_name, func_type_ref);
+        mut mangled_sym: SymbolStr = symbol;
+        if (!mangled_sym.is_valid()) {
+            mangled_sym = di.lookup_overload_mangled(fn_name, func_type_ref);
+        }
         if (!mangled_sym.is_valid()) {
             mangled_sym = di.lookup_mangled_name(fn_name);
         }
@@ -167,6 +177,7 @@ type struct SymbolResolver {
         }
         this.functions.register(fn_name, fn_val);
         this.functions.register_with_arity(fn_name, ft.param_types.length as u32, fn_val);
+        if (symbol.is_valid()) { this.functions.register(symbol, fn_val); }
         return fn_val;
     }
 
@@ -300,12 +311,17 @@ type struct SymbolResolver {
         // under both its qualified and bare combined names); try each in order
         // and return the first that yields a valid extern, exactly as the
         // former scan did.
+        // The extern is declared under the PINNED symbol: the position gives
+        // the signature, never the name.  Re-deriving the name from the
+        // overload's (key, type) pair would hand back whichever overload of
+        // that type registered first - `Display::fmt<W>` and `Debug::fmt<W>`
+        // on one receiver share a type and differ only in the symbol.
         match (di.mangled_to_overload_pos.get_ref(&pinned.id)) {
             Option::Some(positions) => {
                 for (mut k: i64 = 0; k < (*positions).length; k++) {
                     const pos: u32 = (*positions)[k];
                     const qual: SymbolStr = SymbolStr::from_id(di.overload_func_keys[pos as i64]);
-                    v = this.declare_extern_function_overload(qual, di.overload_func_types[pos as i64]);
+                    v = this.declare_extern_function_as(qual, di.overload_func_types[pos as i64], pinned);
                     if (v.is_valid()) { return v; }
                 }
             }

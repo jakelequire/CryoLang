@@ -515,6 +515,12 @@ type struct CallResolver {
                 const m: MethodInfo* = &st.methods[i];
                 if (m.name.equals(member.member) && m.param_types.length == arg_count) { found.push(m); }
             }
+        } else if (base_t.kind == TypeKind::Enum) {
+            const et: EnumType* = base_t as EnumType*;
+            for (mut i: i64 = 0; i < et.methods.length; i++) {
+                const m: MethodInfo* = &et.methods[i];
+                if (m.name.equals(member.member) && m.param_types.length == arg_count) { found.push(m); }
+            }
         } else if (base_t.kind == TypeKind::BoundedParam) {
             const bp: BoundedParamType* = base_t as BoundedParamType*;
             for (mut bi: i64 = 0; bi < bp.bounds.length; bi++) {
@@ -2192,7 +2198,7 @@ type struct CallResolver {
     /// nodes through the converter so the converted value - not the raw source - 
     /// reaches the pinned overload.
     ///
-    /// Overload selection (`resolve_method_overload` / `match_methods_on_impl_block`)
+    /// Overload selection (`bind_method_on_receiver` / `bind_on_impl_block`)
     /// is free to *accept* a candidate on the strength of `has_implicit_converter`,
     /// but it pins by the candidate's parameter types and leaves the argument node
     /// untouched.  For a builtin coercion (`can_implicit_convert` / an int literal
@@ -3069,22 +3075,6 @@ type struct CallResolver {
 
     // -- Method overload selection (pins resolved_method / resolved_callee) --
 
-    pin_method_resolved_callee(mut &this, call: CallExprNode*, owner_t: Type*, m: MethodInfo*) -> void {
-        if (owner_t == null || m == null) { return; }
-        if (m.ast_node == null) { return; }
-        mut owner_str: string = "";
-        if (owner_t.kind == TypeKind::Class) {
-            owner_str = this.intern.resolve((owner_t as ClassType*).qualified_name);
-        } else if (owner_t.kind == TypeKind::Struct) {
-            owner_str = this.intern.resolve((owner_t as StructType*).qualified_name);
-        } else if (owner_t.kind == TypeKind::Enum) {
-            owner_str = this.intern.resolve((owner_t as EnumType*).qualified_name);
-        } else {
-            return;
-        }
-        this.pin_method_callee_from_qname(call, owner_str, m.ast_node as MethodNode*, m.is_static);
-    }
-
     pin_method_callee_from_qname(mut &this, call: CallExprNode*, owner_qname_str: string,
                                  mn: MethodNode*, is_static: boolean) -> void {
         if (mn == null || mn.func == null) { return; }
@@ -3112,13 +3102,33 @@ type struct CallResolver {
     }
 
     /// Tag `call.resolved_method` + pin `resolved_callee` for an instance method
-    /// call.  Three-pass: exact arena-id, then implicit-convert (most-specific
-    /// first), then `![implicit]` converter; finally trait-impl methods.
-    /// GATED (R2): leaves both unset on no-match so codegen can fall back.
+    /// call.  Candidates are the receiver's own methods (walking a class's
+    /// base chain), then the inherent blocks of a primitive, then its trait
+    /// impls; each set is tried at every binding tier before the next set is
+    /// consulted.  Leaves both unset on no match.
     resolve_method_overload(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
                             member: MemberAccessNode*) -> void {
         const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
         if (!obj_type.is_valid()) { return; }
+        this.bind_method_on_receiver(visitor, call, member, obj_type);
+    }
+
+    /// Overload selection against a receiver whose type is already in hand.
+    /// A call another pass synthesizes (a scope-exit `.drop()`, drop glue's
+    /// `.field.drop()`) carries its receiver's type on the node but sits in
+    /// no scope the identifier could be re-resolved from, so it enters here
+    /// and is bound exactly as a written call is.
+    bind_method_on_receiver(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
+                            member: MemberAccessNode*, obj_type: TypeRef) -> void {
+        // A call that is already bound stays bound.  Mono binds a generic
+        // method call to the specialization it minted - a clone with no
+        // generic parameters left, under the `$MG` symbol - and selecting
+        // again here can only find the TEMPLATE, which a parameterless method
+        // (`v.as<Str>()`) matches exactly; that would displace the
+        // specialization as `resolved_method` while the pin stays, and the
+        // call's return type would fall to the name-keyed lookup, which
+        // answers with whichever sibling specialization registered last.
+        if (call.resolved_callee.is_valid() && call.resolved_method != null) { return; }
         mut base_t: Type* = this.arena.lookup(obj_type.id);
         mut unwrap_depth: i32 = 0;
         while (base_t != null && unwrap_depth < 5) {
@@ -3130,6 +3140,16 @@ type struct CallResolver {
                 const inst: InstantiatedType* = base_t as InstantiatedType*;
                 if (!inst.has_resolved_type()) { break; }
                 base_t = this.arena.lookup(inst.resolved_type.id);
+            } else if (base_t.kind == TypeKind::Array
+                    && (base_t as ArrayType*).is_dynamic()) {
+                // A dynamic `T[]` has no method set of its own: it is laid
+                // out as, and dispatches through, the `Array<T>`
+                // specialization registered for its element.  A fixed
+                // `T[N]` owns nothing and has no methods.
+                const arr_owner: TypeRef = this.ctx.decl_index.lookup_array_type(
+                    (base_t as ArrayType*).element);
+                if (!arr_owner.is_valid()) { break; }
+                base_t = this.arena.lookup(arr_owner.id);
             } else {
                 break;
             }
@@ -3138,14 +3158,30 @@ type struct CallResolver {
 
         mut methods_ref: Slice<MethodInfo> = Slice<MethodInfo>::from_raw(null, 0);
         mut start_cls: ClassType* = null;
+        mut owner_str: string = "";
         match (base_t.kind) {
-            TypeKind::Class => { start_cls = base_t as ClassType*; methods_ref = start_cls.methods.as_slice(); }
-            TypeKind::Struct => { methods_ref = (base_t as StructType*).methods.as_slice(); }
-            TypeKind::Enum => { methods_ref = (base_t as EnumType*).methods.as_slice(); }
+            TypeKind::Class => {
+                start_cls = base_t as ClassType*;
+                methods_ref = start_cls.methods.as_slice();
+                owner_str = this.intern.resolve(start_cls.qualified_name);
+            }
+            TypeKind::Struct => {
+                methods_ref = (base_t as StructType*).methods.as_slice();
+                owner_str = this.intern.resolve((base_t as StructType*).qualified_name);
+            }
+            TypeKind::Enum => {
+                methods_ref = (base_t as EnumType*).methods.as_slice();
+                owner_str = this.intern.resolve((base_t as EnumType*).qualified_name);
+            }
             TypeKind::Int | TypeKind::Float | TypeKind::Bool
-            | TypeKind::Char | TypeKind::String | TypeKind::Unit => { }
+            | TypeKind::Char | TypeKind::String | TypeKind::Unit => {
+                // A primitive has no qualified name; its spelling is its
+                // whole identity, and the key its impl blocks register under.
+                owner_str = base_t.display_name();
+            }
             _ => { return; }
         }
+        if (owner_str.length() == 0) { return; }
 
         mut arg_types: TypeRef[] = [];
         for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
@@ -3155,153 +3191,53 @@ type struct CallResolver {
             arg_types.push(arg_expr.resolved_type);
         }
 
-        // Bound-directed dispatch: honor a pre-pinned disambiguating trait.
-        if (member.resolved_trait.is_valid() && base_t != null && call.resolved_method != null) {
-            const rm: MethodNode* = call.resolved_method as MethodNode*;
-            if (rm != null && rm.func != null && rm.func.origin_trait.is_valid()) {
-                mut owner_str: string = "";
-                match (base_t.kind) {
-                    TypeKind::Class  => { owner_str = this.intern.resolve((base_t as ClassType*).qualified_name); }
-                    TypeKind::Struct => { owner_str = this.intern.resolve((base_t as StructType*).qualified_name); }
-                    TypeKind::Enum   => { owner_str = this.intern.resolve((base_t as EnumType*).qualified_name); }
-                    TypeKind::Int | TypeKind::Float | TypeKind::Bool
-                    | TypeKind::Char | TypeKind::String | TypeKind::Unit => { owner_str = base_t.display_name(); }
-                    _ => {}
-                }
-                if (owner_str.length() > 0) {
-                    this.pin_method_callee_from_qname(call, owner_str, rm, rm.is_static);
-                    return;
-                }
-            }
+        // Bound-directed dispatch.  A node stamped with the trait its call
+        // names (`fst.fmt(f)` inside `Display for Pair`, or on a parameter
+        // bounded by one trait) selects that trait's method ahead of any
+        // other: `Display::fmt` and `Debug::fmt` share a name, a signature
+        // and a receiver, so nothing but the stamp can tell them apart.  It
+        // is a ranking, not a restriction - `x.drop()` inside `Drop::drop`
+        // is stamped `Drop` and binds an inherent `drop` when that is what
+        // the receiver has.  Compared by leaf: the stamp is the trait as
+        // written, a method's `origin_trait` its qualified name.
+        const want_trait: SymbolStr = OwnershipQuery::leaf_segment(this.intern, member.resolved_trait);
+        if (want_trait.is_valid()) {
+            if (this.select_method(visitor, call, member, base_t, start_cls, methods_ref,
+                    owner_str, &arg_types, want_trait)) { return; }
         }
+        this.select_method(visitor, call, member, base_t, start_cls, methods_ref,
+            owner_str, &arg_types, SymbolStr::empty());
+    }
 
-        // Pass 1: exact arena-id match (leaf -> root).
-        mut walk: ClassType* = start_cls;
-        mut depth: i32 = 0;
-        mut cur_methods: Slice<MethodInfo> = methods_ref;
-        mut owner_t: Type* = base_t;
-        while (depth < 16) {
-            for (mut mi: u64 = 0; mi < cur_methods.length; mi++) {
-                const m: MethodInfo* = cur_methods.get_ref(mi).unwrap();
-                if (!m.name.equals(member.member)) { continue; }
-                if (m.param_types.length != arg_types.length) { continue; }
-                mut exact: boolean = true;
-                for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
-                    if (m.param_types[pi].id != arg_types[pi].id) { exact = false; break; }
-                }
-                if (exact) {
-                    call.set_resolved_method(m.ast_node as ASTNode*);
-                    this.pin_method_resolved_callee(call, owner_t, m);
-                    return;
-                }
-            }
-            if (walk == null) { break; }
-            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-            const parent_t: Type* = this.arena.lookup(walk.base_class.id);
-            if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
-            walk = parent_t as ClassType*;
-            cur_methods = walk.methods.as_slice();
-            owner_t = parent_t;
-            depth += 1;
-        }
-
-        // Pass 2: implicit-convert (2a exact pointee, 2b subclass) + take-address.
-        for (mut sub_pass: i32 = 0; sub_pass < 2; sub_pass++) {
-            const allow_subclass: boolean = (sub_pass == 1);
-            walk = start_cls;
-            depth = 0;
-            cur_methods = methods_ref;
-            owner_t = base_t;
+    /// One pass of selection over every candidate set, each tier before the
+    /// next set: the receiver's own methods (a class's base chain, leaf to
+    /// root, is one set - the most-derived declaration wins at a tier before
+    /// a base's is tried at the same tier), then a primitive's inherent
+    /// blocks, then the trait impls in registration order.  With
+    /// `only_trait`, only that trait's methods are candidates.  Returns true
+    /// when the call was bound.
+    select_method(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+                  base_t: Type*, start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
+                  owner_str: string, arg_types: &TypeRef[], only_trait: SymbolStr) -> boolean {
+        for (mut tier: i32 = 0; tier <= 3; tier++) {
+            if (tier == 3 && this.state.in_implicit_conversion) { break; }
+            mut walk: ClassType* = start_cls;
+            mut depth: i32 = 0;
+            mut cur_methods: Slice<MethodInfo> = methods_ref;
+            mut cur_owner: string = owner_str;
             while (depth < 16) {
                 for (mut mi: u64 = 0; mi < cur_methods.length; mi++) {
                     const m: MethodInfo* = cur_methods.get_ref(mi).unwrap();
                     if (!m.name.equals(member.member)) { continue; }
-                    if (m.param_types.length != arg_types.length) { continue; }
-                    mut compat: boolean = true;
-                    for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
-                        mut allow_implicit: boolean = true;
-                        if (!allow_subclass) {
-                            const at: Type* = this.arena.lookup(arg_types[pi].id);
-                            const ppt: Type* = this.arena.lookup(m.param_types[pi].id);
-                            if (at != null && ppt != null
-                                    && at.kind == TypeKind::Pointer && ppt.kind == TypeKind::Pointer) {
-                                if ((at as PointerType*).pointee.id != (ppt as PointerType*).pointee.id) {
-                                    allow_implicit = false;
-                                }
-                            }
-                        }
-                        if (allow_implicit && this.checker.can_implicit_convert(arg_types[pi], m.param_types[pi])) {
-                            continue;
-                        }
-                        if (pi < call.arguments.length && call.arguments[pi] != null
-                                && this.literals.int_literal_fits_target(call.arguments[pi], m.param_types[pi])) {
-                            continue;
-                        }
-                        const pt: Type* = this.arena.lookup(m.param_types[pi].id);
-                        if (pt != null) {
-                            mut pointee: TypeRef = TypeRef::invalid();
-                            if (pt.kind == TypeKind::Pointer) { pointee = (pt as PointerType*).pointee; }
-                            else if (pt.kind == TypeKind::Reference) { pointee = (pt as ReferenceType*).referent; }
-                            if (pointee.is_valid() && pointee.id == arg_types[pi].id) { continue; }
-                            const at: Type* = this.arena.lookup(arg_types[pi].id);
-                            if (at != null && pointee.is_valid()) {
-                                mut arg_pointee: TypeRef = TypeRef::invalid();
-                                if (at.kind == TypeKind::Pointer) { arg_pointee = (at as PointerType*).pointee; }
-                                else if (at.kind == TypeKind::Reference) { arg_pointee = (at as ReferenceType*).referent; }
-                                if (arg_pointee.is_valid() && arg_pointee.id == pointee.id) { continue; }
-                                if (allow_subclass && arg_pointee.is_valid()
-                                        && this.checker.is_subclass_of(arg_pointee, pointee)) { continue; }
-                            }
-                            if (allow_subclass && pointee.is_valid()
-                                    && this.checker.is_subclass_of(arg_types[pi], pointee)) { continue; }
-                        }
-                        compat = false;
-                        break;
-                    }
-                    if (compat) {
-                        call.set_resolved_method(m.ast_node as ASTNode*);
-                        this.pin_method_resolved_callee(call, owner_t, m);
-                        return;
-                    }
-                }
-                if (walk == null) { break; }
-                if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-                const parent_t: Type* = this.arena.lookup(walk.base_class.id);
-                if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
-                walk = parent_t as ClassType*;
-                cur_methods = walk.methods.as_slice();
-                owner_t = parent_t;
-                depth += 1;
-            }
-        }
-
-        // Pass 3: converter-aware match (lowest priority).
-        if (!call.resolved_callee.is_valid() && !this.state.in_implicit_conversion) {
-            walk = start_cls;
-            depth = 0;
-            cur_methods = methods_ref;
-            owner_t = base_t;
-            while (depth < 16) {
-                for (mut mi: u64 = 0; mi < cur_methods.length; mi++) {
-                    const m: MethodInfo* = cur_methods.get_ref(mi).unwrap();
-                    if (!m.name.equals(member.member)) { continue; }
-                    if (m.param_types.length != arg_types.length) { continue; }
-                    mut ok: boolean = true;
-                    for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
-                        if (m.param_types[pi].id == arg_types[pi].id) { continue; }
-                        if (this.checker.can_implicit_convert(arg_types[pi], m.param_types[pi])) { continue; }
-                        if (pi < call.arguments.length && call.arguments[pi] != null
-                                && this.literals.int_literal_fits_target(call.arguments[pi], m.param_types[pi])) { continue; }
-                        if (this.has_implicit_converter(arg_types[pi], m.param_types[pi])) { continue; }
-                        ok = false;
-                        break;
-                    }
-                    if (ok) {
+                    if (only_trait.is_valid() && !this.method_provided_by(m.ast_node as MethodNode*, only_trait)) { continue; }
+                    if (!this.args_bind_to_params(call, arg_types, m.param_types.as_slice(),
+                            this.method_type_is_variadic(m.function_type), tier)) { continue; }
+                    if (tier == 3) {
                         this.apply_overload_converter_args(visitor, call, m.param_types.as_slice());
-                        call.set_resolved_method(m.ast_node as ASTNode*);
-                        this.pin_method_resolved_callee(call, owner_t, m);
-                        return;
                     }
+                    call.set_resolved_method(m.ast_node as ASTNode*);
+                    this.pin_method_callee_from_qname(call, cur_owner, m.ast_node as MethodNode*, m.is_static);
+                    return true;
                 }
                 if (walk == null) { break; }
                 if (!walk.has_base || !walk.base_class.is_valid()) { break; }
@@ -3309,48 +3245,54 @@ type struct CallResolver {
                 if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
                 walk = parent_t as ClassType*;
                 cur_methods = walk.methods.as_slice();
-                owner_t = parent_t;
+                cur_owner = this.intern.resolve(walk.qualified_name);
                 depth += 1;
             }
         }
 
-        this.try_match_trait_impl_method(visitor, call, member, base_t, arg_types);
-    }
+        if (this.ctx.generic_registry == null) { return false; }
+        const owner_sym: SymbolStr = this.intern.intern(owner_str);
 
-    try_match_trait_impl_method(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
-                                base_t: Type*, arg_types: TypeRef[]) -> void {
-        if (call.resolved_callee.is_valid()) { return; }
-        if (this.ctx.generic_registry == null) { return; }
-        if (base_t == null) { return; }
-        mut target_name: SymbolStr = SymbolStr::empty();
-        mut target_str:  string    = "";
-        match (base_t.kind) {
-            TypeKind::Class  => { target_name = (base_t as ClassType*).qualified_name; }
-            TypeKind::Struct => { target_name = (base_t as StructType*).qualified_name; }
-            TypeKind::Enum   => { target_name = (base_t as EnumType*).qualified_name; }
-            TypeKind::Int | TypeKind::Float | TypeKind::Bool
-            | TypeKind::Char | TypeKind::String | TypeKind::Unit => {
-                target_str  = base_t.display_name();
-                target_name = this.intern.intern(target_str);
+        // A primitive's inherent methods: the `implement string { }` blocks the
+        // registry indexes under its spelling.  A declared type's blocks were
+        // folded into its method set above.
+        if (!only_trait.is_valid() && start_cls == null
+                && base_t.kind != TypeKind::Struct && base_t.kind != TypeKind::Enum) {
+            const blocks: ImplBlockNode*[] = this.ctx.generic_registry.inherent_impl_blocks(owner_sym);
+            for (mut bi: i64 = 0; bi < blocks.length; bi++) {
+                if (this.bind_on_impl_block(visitor, call, member, blocks[bi], owner_str, arg_types)) { return true; }
             }
-            _ => { return; }
         }
-        if (!target_name.is_valid()) { return; }
-        if (target_str.length() == 0) { target_str = this.intern.resolve(target_name); }
-        if (target_str.length() == 0) { return; }
-        const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(target_name);
+
+        // Trait impls on the receiver, in registration order.
+        const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(owner_sym);
         for (mut ti: i64 = 0; ti < traits.length; ti++) {
-            const block: ImplBlockNode* = this.ctx.generic_registry.lookup_trait_impl(traits[ti], target_name);
+            if (only_trait.is_valid()
+                    && !OwnershipQuery::leaf_segment(this.intern, traits[ti]).equals(only_trait)) { continue; }
+            const block: ImplBlockNode* = this.ctx.generic_registry.lookup_trait_impl(traits[ti], owner_sym);
             if (block == null) { continue; }
-            if (this.match_methods_on_impl_block(visitor, call, member, block, target_str, arg_types)) { return; }
+            if (this.bind_on_impl_block(visitor, call, member, block, owner_str, arg_types)) { return true; }
         }
+        return false;
     }
 
-    match_methods_on_impl_block(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
-                                block: ImplBlockNode*, owner_str: string, arg_types: &TypeRef[]) -> boolean {
+    /// Whether `mn` is the named trait's method (by leaf), i.e. sits in an
+    /// `implement trait T for ..` block for `T`.
+    method_provided_by(&this, mn: MethodNode*, trait_leaf: SymbolStr) -> boolean {
+        if (mn == null || mn.func == null || !mn.func.origin_trait.is_valid()) { return false; }
+        return OwnershipQuery::leaf_segment(this.intern, mn.func.origin_trait).equals(trait_leaf);
+    }
+
+    /// Select among one impl block's methods, every tier in turn.  Returns
+    /// true when the call was bound.
+    bind_on_impl_block(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+                       block: ImplBlockNode*, owner_str: string, arg_types: &TypeRef[]) -> boolean {
         if (block == null) { return false; }
         const this_amp: SymbolStr = this.intern.intern("&this");
         const this_val: SymbolStr = this.intern.intern("this");
+        // A self-returning default (an iterator adapter's `take`) is a
+        // template the block carries until a concrete sibling is minted;
+        // once one exists the template is not a candidate.
         mut has_concrete_sibling: boolean = false;
         for (mut ci: i64 = 0; ci < block.methods.length; ci++) {
             const cm: MethodNode* = block.methods[ci];
@@ -3360,10 +3302,8 @@ type struct CallResolver {
                 break;
             }
         }
-        for (mut sub_pass: i32 = 0; sub_pass < 3; sub_pass++) {
-            const allow_implicit:  boolean = (sub_pass >= 1);
-            const allow_converter: boolean = (sub_pass == 2) && !this.state.in_implicit_conversion;
-            if (sub_pass == 2 && this.state.in_implicit_conversion) { break; }
+        for (mut tier: i32 = 0; tier <= 3; tier++) {
+            if (tier == 3 && this.state.in_implicit_conversion) { break; }
             for (mut mi: i64 = 0; mi < block.methods.length; mi++) {
                 const mn: MethodNode* = block.methods[mi];
                 if (mn == null || mn.func == null) { continue; }
@@ -3378,23 +3318,90 @@ type struct CallResolver {
                     if (pp.name.equals(this_val)) { continue; }
                     params.push(pp.resolved_type);
                 }
-                if (params.length != arg_types.length) { continue; }
-                mut compat: boolean = true;
-                for (mut pi: i64 = 0; pi < params.length; pi++) {
-                    if (params[pi].id == arg_types[pi].id) { continue; }
-                    if (allow_implicit && this.checker.can_implicit_convert(arg_types[pi], params[pi])) { continue; }
-                    if (allow_converter && this.has_implicit_converter(arg_types[pi], params[pi])) { continue; }
-                    compat = false;
-                    break;
-                }
-                if (compat) {
+                if (!this.args_bind_to_params(call, arg_types, params.as_slice(), fn_node.is_variadic, tier)) { continue; }
+                if (tier == 3) {
                     this.apply_overload_converter_args(visitor, call, params.as_slice());
-                    call.set_resolved_method(mn as ASTNode*);
-                    this.pin_method_callee_from_qname(call, owner_str, mn, mn.is_static);
-                    return true;
                 }
+                call.set_resolved_method(mn as ASTNode*);
+                this.pin_method_callee_from_qname(call, owner_str, mn, mn.is_static);
+                return true;
             }
         }
+        return false;
+    }
+
+    /// Whether every argument binds to its parameter at `tier`; the one rule
+    /// for every candidate set, so a method is selected the same way whether
+    /// it is declared inline, in an inherent block or in a trait impl.  A
+    /// variadic method binds its declared parameters and takes any tail.
+    ///   0  the same arena type;
+    ///   1  an implicit conversion (but never between pointers to different
+    ///      pointees), an integer literal that fits, an auto-ref of `T` to
+    ///      `&T` / `T*`, or `&T` for `T*` and back;
+    ///   2  tier 1, with pointer conversions and an upcast to a base class;
+    ///   3  tier 2, or an `![implicit]` converter the caller then applies.
+    args_bind_to_params(&this, call: CallExprNode*, arg_types: &TypeRef[],
+                        params: Slice<TypeRef>, variadic: boolean, tier: i32) -> boolean {
+        mut fixed: i64 = params.length as i64;
+        if (variadic) {
+            // A named pack (`args...`) is a parameter with no type; it takes
+            // the tail and binds nothing itself.
+            if (fixed > 0 && !params.get((fixed - 1) as u64).unwrap().is_valid()) { fixed -= 1; }
+            if (arg_types.length < fixed) { return false; }
+        } else if (fixed != arg_types.length) {
+            return false;
+        }
+        for (mut pi: i64 = 0; pi < fixed; pi++) {
+            const param: TypeRef = params.get(pi as u64).unwrap();
+            if (!this.arg_binds_to_param(call, pi, arg_types[pi], param, tier)) { return false; }
+        }
+        return true;
+    }
+
+    arg_binds_to_param(&this, call: CallExprNode*, ai: i64, arg: TypeRef, param: TypeRef,
+                       tier: i32) -> boolean {
+        if (arg.id == param.id) { return true; }
+        if (tier == 0) { return false; }
+        const at: Type* = this.arena.lookup(arg.id);
+        const pt: Type* = this.arena.lookup(param.id);
+        mut allow_implicit: boolean = true;
+        if (tier == 1 && at != null && pt != null
+                && at.kind == TypeKind::Pointer && pt.kind == TypeKind::Pointer
+                && (at as PointerType*).pointee.id != (pt as PointerType*).pointee.id) {
+            allow_implicit = false;
+        }
+        if (allow_implicit && this.checker.can_implicit_convert(arg, param)) { return true; }
+        if (ai < call.arguments.length && call.arguments[ai] != null
+                && this.literals.int_literal_fits_target(call.arguments[ai], param)) {
+            return true;
+        }
+        // The unit value is spelled `()`, which the parser records as the
+        // null literal `void`; it binds to a unit parameter (`HashSet`'s
+        // `HashMap<T, ()>::insert(value, ())`).
+        if (pt != null && pt.kind == TypeKind::Unit
+                && ai < call.arguments.length && call.arguments[ai] != null
+                && call.arguments[ai].kind == NodeKind::Literal) {
+            const lit: LiteralNode* = call.arguments[ai] as LiteralNode*;
+            if (lit.literal_kind == LiteralKind::Null && lit.value == "void") { return true; }
+        }
+        if (pt != null) {
+            mut pointee: TypeRef = TypeRef::invalid();
+            if (pt.kind == TypeKind::Pointer) { pointee = (pt as PointerType*).pointee; }
+            else if (pt.kind == TypeKind::Reference) { pointee = (pt as ReferenceType*).referent; }
+            if (pointee.is_valid()) {
+                if (pointee.id == arg.id) { return true; }
+                if (at != null) {
+                    mut arg_pointee: TypeRef = TypeRef::invalid();
+                    if (at.kind == TypeKind::Pointer) { arg_pointee = (at as PointerType*).pointee; }
+                    else if (at.kind == TypeKind::Reference) { arg_pointee = (at as ReferenceType*).referent; }
+                    if (arg_pointee.is_valid() && arg_pointee.id == pointee.id) { return true; }
+                    if (tier >= 2 && arg_pointee.is_valid()
+                            && this.checker.is_subclass_of(arg_pointee, pointee)) { return true; }
+                }
+                if (tier >= 2 && this.checker.is_subclass_of(arg, pointee)) { return true; }
+            }
+        }
+        if (tier >= 3 && this.has_implicit_converter(arg, param)) { return true; }
         return false;
     }
 
@@ -4015,7 +4022,7 @@ type struct CallResolver {
         const sym: SymbolStr = this.intern.intern(fmt::format("%s::%s", scope_str, member_str));
         if (this.try_pin_static_method_overload(call, sym)) { return; }
         // Single-overload static method: pin the MANGLED symbol, consistent with
-        // instance methods (`pin_method_resolved_callee`) and the multi-overload
+        // instance methods (`bind_method_on_receiver`) and the multi-overload
         // static path above.  The bare combined name is neither a codegen
         // function-registry key nor an LLVM symbol, so codegen's
         // `resolve_function_by_mangled` would synthesize a phantom extern named

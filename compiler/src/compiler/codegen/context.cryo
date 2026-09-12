@@ -36,6 +36,10 @@ import compiler::codegen::state::value_table::{ ValueTable };
 import compiler::codegen::type_map::{ TypeMapper };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::ast::expression;
+import compiler::ast::expression::{ CallExprNode };
+import compiler::sema::sema;
+import compiler::sema::sema::{ SemaVisitor };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::type_base::{ IntType, Type };
 import compiler::types::type_ref::{ TypeRef };
@@ -99,6 +103,12 @@ type struct CodegenContext {
     // -- Diagnostic routing + stripped-functions set --
     diag: DiagSink;
 
+    /// Sema's overload selection, for the calls drop glue builds: a
+    /// `.field.drop()` codegen synthesizes is resolved by the same walk as a
+    /// written call, so the emitter reads its pin and never derives a callee
+    /// from the receiver type.  Built on first use.
+    synth_binder: SemaVisitor*;
+
     /// Create a new codegen context for a module.
     static new(ctx: CompilationContext*, module_name: string) -> CodegenContext {
         const mod: LModule = LModule::create(module_name);
@@ -132,7 +142,17 @@ type struct CodegenContext {
 
             ctx:  ctx,
             diag: DiagSink::new(ctx),
+            synth_binder: null,
         };
+    }
+
+    /// Resolve a method call this module's codegen synthesized (see
+    /// `synth_binder`).
+    bind_synthesized_method_call(mut &this, call: CallExprNode*) -> void {
+        if (this.synth_binder == null) {
+            this.synth_binder = SemaVisitor::synthesized_binder(this.ctx);
+        }
+        this.synth_binder.bind_synthesized_method_call(call);
     }
 
     /// Two-phase init step 2: wire up back-pointers on sub-components.

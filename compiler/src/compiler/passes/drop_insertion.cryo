@@ -95,6 +95,8 @@ import compiler::types::generic_registry::{ GenericRegistry };
 import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
+import compiler::sema::sema;
+import compiler::sema::sema::{ SemaVisitor };
 
 
 type struct DropInserter {
@@ -102,6 +104,11 @@ type struct DropInserter {
     arena:    TypeArena*;
     registry: GenericRegistry*;
     intern:   InternTable*;
+
+    /// Sema's overload selection, for the calls this pass builds: a
+    /// synthesized `.drop()` is resolved by the same walk as a written one,
+    /// so codegen reads its pin and never derives a callee from the type.
+    sema:     SemaVisitor*;
 
     /// Cached `drop` symbol id, used when matching method calls and
     /// synthesizing new ones.
@@ -345,6 +352,7 @@ type struct DropInserter {
             arena:           ctx.type_arena,
             registry:        ctx.generic_registry,
             intern:          ctx.get_intern_table(),
+            sema:            SemaVisitor::synthesized_binder(ctx),
             drop_sym:        ctx.get_intern_table().intern("drop"),
             types_keys:      [],
             types_refs:      [],
@@ -2315,6 +2323,7 @@ type struct DropInserter {
             field_access as ExpressionNode*, this.drop_sym, span, span);
         const call: CallExprNode* = new CallExprNode(
             drop_access as ExpressionNode*, span);
+        this.sema.bind_synthesized_method_call(call);
         const stmt: ExprStmtNode* = new ExprStmtNode(call as ExpressionNode*, span);
         return stmt as StatementNode*;
     }
@@ -2979,6 +2988,7 @@ type struct DropInserter {
             place, this.drop_sym, span, span);
         const call: CallExprNode* = new CallExprNode(
             drop_access as ExpressionNode*, span);
+        this.sema.bind_synthesized_method_call(call);
         const stmt: ExprStmtNode* = new ExprStmtNode(call as ExpressionNode*, span);
         return stmt as StatementNode*;
     }
@@ -3303,7 +3313,7 @@ type struct DropInserter {
         if (slen > 0) {
             const vlen: i64 = lit.value.length() as i64;
             if (vlen <= slen) { return -1; }
-            text = lit.value.substr(0, (vlen - slen) as u64);
+            text = lit.value.substr(0, (vlen - slen) as i64);
         }
         mut v: u64 = 0;
         if (!ConstantTable::parse_int_literal(text, &v)) { return -1; }
@@ -3675,6 +3685,7 @@ type struct DropInserter {
         const member: MemberAccessNode* = new MemberAccessNode(
             ident as ExpressionNode*, this.drop_sym, span, span);
         const call: CallExprNode* = new CallExprNode(member as ExpressionNode*, span);
+        this.sema.bind_synthesized_method_call(call);
         const stmt: ExprStmtNode* = new ExprStmtNode(call as ExpressionNode*, span);
         return stmt as StatementNode*;
     }

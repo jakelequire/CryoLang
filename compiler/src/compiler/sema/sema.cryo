@@ -283,6 +283,32 @@ public:
                         &this.lambda, &this.scopes, &this.dispatch);
     }
 
+    /// A wired visitor for a pass that synthesizes calls after sema has run
+    /// (drop insertion, codegen's drop glue).  Leaked to a stable address the
+    /// way `run_sema` does, because the collaborators hold back-pointers.
+    static synthesized_binder(ctx: CompilationContext*) -> SemaVisitor* {
+        const _box_v: Box<SemaVisitor> = Box<SemaVisitor>::new(SemaVisitor::build(ctx));
+        const v: SemaVisitor* = _box_v.leak();
+        v.wire();
+        return v;
+    }
+
+    /// Bind a method call another pass built.  The receiver already carries
+    /// its type - the synthesizer put it there - so the walk starts at
+    /// overload selection and pins `resolved_method` / `resolved_callee` the
+    /// way it would for the same call written in source.  A receiver with no
+    /// method of that name is left unpinned, which is what the caller's
+    /// `.drop()` on a type without a user drop relies on.
+    bind_synthesized_method_call(mut &this, call: CallExprNode*) -> void {
+        if (call == null || call.callee == null) { return; }
+        if (call.callee.kind != NodeKind::MemberAccess) { return; }
+        const member: MemberAccessNode* = call.callee as MemberAccessNode*;
+        if (member.object == null) { return; }
+        const recv: TypeRef = member.object.resolved_type;
+        if (!recv.is_valid()) { return; }
+        this.calls.bind_method_on_receiver(this as ASTVisitor*, call, member, recv);
+    }
+
     /// A fresh trait checker over the shared arena + registry (a 4-pointer view).
     trait_checker(&this) -> TraitChecker {
         return TraitChecker::new(this.arena, this.ctx.generic_registry,
@@ -1745,9 +1771,14 @@ public:
     /// Build `receiver.method(&rhs)` (or `receiver.method()` when `rhs` is
     /// null).  The `&rhs` is a compiler-synthesized address-of, matching the
     /// `<=>` desugar so it is exempt from the "no address-of a literal" check.
+    /// The call names the operator's TRAIT method - `==` is `Eq::equals`, not
+    /// an inherent `equals` the receiver may also declare - so the node
+    /// carries the trait, the way a bound-directed call does.
     build_operator_call(mut &this, receiver: ExpressionNode*, method: SymbolStr,
-                        rhs: ExpressionNode*, op_tok: Token, span: SourceSpan) -> ExpressionNode* {
+                        trait_leaf: SymbolStr, rhs: ExpressionNode*, op_tok: Token,
+                        span: SourceSpan) -> ExpressionNode* {
         const member: MemberAccessNode* = new MemberAccessNode(receiver, method, span, span);
+        member.set_resolved_trait(trait_leaf);
         mut call: CallExprNode* = new CallExprNode(member as ExpressionNode*, span);
         if (rhs != null) {
             // The trait method takes `rhs: &Rhs`.  When the operand is already a
@@ -1846,7 +1877,7 @@ public:
         if (!overloads) { return null; }
         const method_sym: SymbolStr = this.intern.intern(map.method);
         mut desugared: ExpressionNode* =
-            this.build_operator_call(receiver, method_sym, rhs, op_tok, span);
+            this.build_operator_call(receiver, method_sym, trait_leaf, rhs, op_tok, span);
         // Relational operators: wrap the `compare` call in an `Ordering`
         // predicate - `a < b` -> `a.compare(&b).is_lt()`.
         if (map.ord_pred != "") {
@@ -1927,7 +1958,7 @@ public:
         if (impl_block == null) { return null; }
         const method_sym: SymbolStr = this.intern.intern(map.method);
         mut desugared: ExpressionNode* =
-            this.build_operator_call(lhs_expr, method_sym, rhs_expr, op_tok, span);
+            this.build_operator_call(lhs_expr, method_sym, trait_leaf, rhs_expr, op_tok, span);
         const rty: TypeRef = this.resolve_expr(desugared);
         if (!rty.is_valid()) { return null; }
         return desugared;
@@ -1997,7 +2028,12 @@ public:
         // into a trait-method call, return its type without re-running
         // `check_binary_op` (which would re-reject the user-typed operands and
         // emit a spurious E0229 the second time around).
-        if (bin.desugared_call != null) { return bin.desugared_call.resolved_type; }
+        // Post-mono the desugar is a clone the substituter left unbound: walk
+        // it again (see `resolve_array_access`).
+        if (bin.desugared_call != null) {
+            if (this.state.post_mono_verify) { return this.resolve_expr(bin.desugared_call); }
+            return bin.desugared_call.resolved_type;
+        }
         const left_is_lit:  boolean = is_numeric_literal_expr(bin.left);
         const right_is_lit: boolean = is_numeric_literal_expr(bin.right);
         // A negated or folded constant (`-1.0`, `16.0 / 9.0`) is as
@@ -2259,16 +2295,21 @@ public:
     resolve_unary(mut &this, unary: UnaryExprNode*) -> TypeRef {
         // Idempotent (see resolve_binary): a prior resolution may have rewritten
         // `-x` into `x.neg()`; return its type rather than re-rejecting.
-        if (unary.desugared_call != null) { return unary.desugared_call.resolved_type; }
+        if (unary.desugared_call != null) {
+            if (this.state.post_mono_verify) { return this.resolve_expr(unary.desugared_call); }
+            return unary.desugared_call.resolved_type;
+        }
         // Address-of resolved against an expected `&T`: a numeric-literal
         // operand must adopt the referent width (`&3` bound to `&i64` -> `&i64`,
         // not `&i32`; otherwise codegen spills a too-narrow temp and the
-        // callee's `*rhs` reads uninitialised high bytes). The operand was
-        // already typed (default width) during the pre-desugar binary
-        // resolution, so `resolve_expr` short-circuits any expected-type hint - 
-        // re-run the literal resolver directly (which re-adopts the width AND
-        // bound-checks it), then restamp the node. Only polymorphic numeric
-        // literals are touched; a real place keeps its own type.
+        // callee's `*rhs` reads uninitialised high bytes). The literal is
+        // resolved under the REFERENT as its expected type - the reference
+        // itself is not a type an integer literal adopts - and that answer is
+        // the operand's type: resolving the operand again under the reference
+        // would default the width back (the post-mono walk does resolve
+        // again, so the first answer has to be the one kept). Only polymorphic
+        // numeric literals are touched; a real place keeps its own type.
+        mut operand_type: TypeRef = TypeRef::invalid();
         if (unary.op.lexeme == "&" && unary.operand != null
             && unary.operand.kind == NodeKind::Literal
             && this.state.expected_type.is_valid()) {
@@ -2285,11 +2326,14 @@ public:
                     this.state.expected_type = ref_ty0;
                     const lit_ty0: TypeRef = this.literals.resolve_literal(lit0);
                     this.state.expected_type = saved_exp0;
-                    if (lit_ty0.is_valid()) { unary.operand.set_resolved_type(lit_ty0); }
+                    if (lit_ty0.is_valid()) {
+                        unary.operand.set_resolved_type(lit_ty0);
+                        operand_type = lit_ty0;
+                    }
                 }
             }
         }
-        const operand_type: TypeRef = this.resolve_expr(unary.operand);
+        if (!operand_type.is_valid()) { operand_type = this.resolve_expr(unary.operand); }
         if (!operand_type.is_valid()) { return TypeRef::invalid(); }
         if (unary.op.lexeme == "&" && !unary.is_synthetic && unary.operand != null
             && unary.operand.kind == NodeKind::Literal) {
@@ -3561,8 +3605,9 @@ public:
             }
             NodeKind::LoopStatement => {
                 const ls: LoopStmtNode* = stmt as LoopStmtNode*;
-                if (!this.block_contains_break(ls.body)) { return true; }
-                return this.block_always_returns(ls.body);
+                const loop_body: BlockStmtNode* = ls.body as BlockStmtNode*;
+                if (!this.block_contains_break(loop_body)) { return true; }
+                return this.block_always_returns(loop_body);
             }
             NodeKind::DoWhileStatement => { return this.stmt_always_returns((stmt as DoWhileStmtNode*).body); }
             NodeKind::ExpressionStatement => { return this.expr_is_divergent((stmt as ExprStmtNode*).expression); }

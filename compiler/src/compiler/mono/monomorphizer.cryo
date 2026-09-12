@@ -39,7 +39,7 @@ import compiler::resolver::{
 import compiler::module_graph;
 import compiler::module_graph::{ ModuleGraph };
 import compiler::mono::{
-    state, specializer, dispatch_annotator, trait_specializer,
+    state, specializer, trait_specializer,
     type_populator, ast_resolver, call_specializer
 };
 import std::collections::hashmap;
@@ -52,7 +52,6 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::mono::ast_resolver::{ MonoAstResolver };
 import compiler::mono::call_specializer::{ MonoCallSpecializer };
-import compiler::mono::dispatch_annotator::{ MonoDispatchAnnotator };
 import compiler::mono::specializer::{ ASTSpecializer, SpecializationResult };
 import compiler::mono::state::{ MonomorphRequest, MonoState, SpecializationEntry };
 import compiler::mono::trait_specializer::{ MonoTraitSpecializer };
@@ -96,7 +95,6 @@ type struct Monomorphizer {
     state:             MonoState;
 
     // -- Collaborators (owned by value; wired after the orchestrator is stable) --
-    dispatch_annotator: MonoDispatchAnnotator;  // bound-directed fmt dispatch (pre-mono AST pass)
     trait_spec:         MonoTraitSpecializer;    // trait-impl conditional inst + bounds + assoc-proj
     type_populator:     MonoTypePopulator;       // spec'd AST -> concrete arena types
     ast_resolver:       MonoAstResolver;         // post-clone re-resolution + static-match arm pruning
@@ -137,7 +135,6 @@ type struct Monomorphizer {
             trait_checker:         TraitChecker::new(arena, generic_registry,
                                                      intern_table, diagnostics),
             state:                 MonoState::null(),
-            dispatch_annotator:    MonoDispatchAnnotator::null(),
             trait_spec:            MonoTraitSpecializer::null(),
             type_populator:        MonoTypePopulator::null(),
             ast_resolver:          MonoAstResolver::null(),
@@ -156,7 +153,6 @@ type struct Monomorphizer {
     wire(mut &this) -> void {
         this.state.wire(this.arena, this.generic_registry, this.intern_table,
                         this.type_resolver);
-        this.dispatch_annotator.wire(this.arena, this.intern_table);
         this.trait_spec.wire(this.arena, this.generic_registry, this.intern_table,
                              this.diagnostics, this.type_resolver, &this.trait_checker);
         this.type_populator.wire(this.arena, this.intern_table);
@@ -238,12 +234,6 @@ type struct Monomorphizer {
             return SymbolStr::empty();
         }
         return this.state.spec_owner_modules[i];
-    }
-
-    /// Bound-directed dispatch annotation (Display::fmt vs Debug::fmt).  Runs over
-    /// EVERY decl before mono clones any template.  See MonoDispatchAnnotator.
-    annotate_bound_dispatch_in_module(mut &this, root: ProgramNode*) -> void {
-        this.dispatch_annotator.annotate_bound_dispatch_in_module(root);
     }
 
     /// Consume sema's `resolved_type_args` stash across a module's call sites,
@@ -704,7 +694,7 @@ type struct Monomorphizer {
                 this.arena.swap_wrapper_to_concrete(concrete_type, qualified_spec_sym,
                     entry.module_name, target_kind, is_union_kind, display_name);
             }
-            this.type_populator.populate_concrete_type(concrete_type, result.specialized_ast, entry.node_kind, &subst, entry);
+            this.type_populator.populate_concrete_type(concrete_type, result.specialized_ast, entry.node_kind, &subst, entry, &walk_impls);
 
             if (!swap_path) {
                 const inst_t: Type* = this.arena.lookup(request.generic_type.id);

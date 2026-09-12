@@ -100,7 +100,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `scope_owner_key` | LIVE — the static-call owner key; the callee-type and template-method probes read it too | — | `grep -rho 'scope_owner_key' compiler/src \| wc -l` → **6** | §8.134, §8.151 |
 | static-call owner TEMPLATE by spelling (`resolve_scope_owner_template`'s as-is → scope map → cross-module cascade) | **DELETED** — the owner template is read off the segment's stamp, in sema and in mono | — | `grep -c 'resolve_scoped_or_at' compiler/src/compiler/sema/call_resolver.cryo` → **2** (was 7) | §8.150, §8.151 |
 | codegen static-call ladder (`call_emitter`: spec-by-return-type → `scope::member` → bare member, and the enum variant's scope-name probe) | **DELETED** — sema's / mono's pin answers every static call; 495 → 0 in §8.160; `call_emitter` reads no `resolve_scoped_or` | — | `grep -c 'resolve_scoped_or' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0** | §8.158, §8.160, §8.161 |
-| codegen method-call ladder (`call_emitter` MemberAccess branch: `<type name>::method`, `<qualified_name>::method`) | **SHADOWED, LIVE** - 336,761 binds over the corpus without sema's pin; the fix order is in §8.163 | — | `grep -c 'SHADOW-CGMETHOD' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **1** | §8.162, §8.163 |
+| codegen method-call ladder (`call_emitter` MemberAccess branch: `<type name>::method`, `<qualified_name>::method`) | **SHADOWED, AT ZERO** - 336,761 → 0 over the corpus (§8.164); not yet deleted | — | `grep -c 'SHADOW-CGMETHOD' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **1** | §8.162, §8.163, §8.164 |
 | callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **19** | §8.1f, §8.2ag |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
@@ -21756,3 +21756,141 @@ through the `Array<T>` specialization the DI already maps its element to;
 (3) impl-block methods reach `EnumType.methods`; (4) inherent impls on
 primitives. Each is predicted to move its row and nothing else; a row that
 moves without its fix is a finding.
+
+### 8.164 F17 at zero: 336,761 → 0 over the corpus, nine layers deep - LANDED 2026-09-11
+
+Every layer below was measured on the LSP half first (69,588 at the start),
+and the whole corpus - LSP direct, unit suite compiled directly with `cryo
+test --list`, 46 projects one by one, 14 examples - at the end. Each row
+names the mechanism, the change, and what the number did.
+
+| # | mechanism | change | LSP |
+|---|---|---|---|
+| 1 | nine `.drop()` synthesizers (3 in `DropInserter`, 6 in codegen's glue and `delete`) built a call nobody resolved | each asks sema's overload selection for its call: `SemaVisitor::bind_synthesized_method_call`, reached through a wired visitor `DropInsertionPass` builds and `CodegenContext` builds on first use. `resolve_method_overload` split so the receiver-typed half (`bind_method_on_receiver`) is the entry | 69,588 → 52,975 (named drops 16,618 → 4; the 4 were an enum, row 3) |
+| 2 | a `T[]` receiver has no method set; sema returned on `TypeKind::Array` | overload selection resolves a dynamic array through the `Array<T>` specialization the DI maps its element to - the map now holds the specialization's `TypeRef` (`lookup_array_type`) rather than its name, and `lookup_array_type_name` derives the name from it | → 2,045 |
+| 3 | `implement enum E { }` methods never reached `EnumType.methods`: `type_resolution`'s impl-block arm added to struct/class only, and mono's populator mirrored only a specialization's inline methods | the arm adds to enums; `populate_impl_block_methods` mirrors every impl block onto the specialization (struct, class and enum), through one `method_info_of` in place of three copies | → 54, with rows 4-5 |
+| 4 | a primitive's inherent `implement string { }` block reached no candidate set | `GenericRegistry::inherent_impl_blocks(name)`; a primitive receiver selects from those before its trait impls, under its spelling | (row 3) |
+| 5 | the impl-block matcher and the inherent passes answered "does this argument list bind" with different rules - no literal fit and no auto-ref for a trait method, so `x.to_hex_padded_str(16)` and `a.equals(b)` on `u8` went unbound | one tiered predicate, `args_bind_to_params` / `arg_binds_to_param`: 0 identity, 1 implicit-convert / literal fit / auto-ref / ref-ptr, 2 pointer convert and upcast, 3 `![implicit]` converter. Both candidate sets walk the tiers in order; `pin_method_resolved_callee` and `try_match_trait_impl_method` are gone | → 29 |
+| 6 | 29 calls in `compiler/src` hand `substr(i64, i64)` a `u64` and `substring(u32, u32)` an `i64` - refused by the checker and by `docs/cryo.md` ("no implicit numeric conversions; write `as`"), bound by codegen on arity alone | the cast at each site. Plus two base-to-derived pointer passes (`block_contains_break(ls.body)` with a `StatementNode*` for `BlockStmtNode*`; `prune_static_match_in_stmt(fs.init)` with an `ASTNode*`) made explicit | → 0 |
+| 7 | a named variadic pack (`log(&this, fmt: string, args...)`) is a parameter with no type, so the arity test failed every call | a variadic candidate binds its typed parameters and takes the tail | suite |
+| 8 | the unit value is spelled `()`, which the parser records as the null literal `void` (typed `void*`), so `HashMap<T, ()>::insert(v, ())` never bound | that literal binds to a unit parameter | suite |
+| 9 | mono's lazy instantiation of a self-returning / self-growing default (`enumerate`, `as_ref`) set `resolved_method` and never `resolved_callee`; an operator-overload desugar (`a[i]`, `*p`, `a != b`) resolved once at construction and was returned as-is post-mono, its cloned call left unbound by the substituter | the lazy path pins the instantiation's symbol the way `specialize_method_call` does; post-mono, `resolve_array_access` / `resolve_binary` / `resolve_unary` walk the desugar again | suite 42 → 0 |
+
+Whole corpus at the end: LSP **0**, suite **0**, 46 projects + 14 examples
+**0** (the one non-zero project exit is `native_syscalls_gate`, a
+`requires: os:linux` fixture). The instrument reported 42 on the suite one
+build earlier and 336,761 two commits earlier over the same populations.
+
+#### Found under the layers (each was invisible until the row above it moved)
+
+* **A bound call must stay bound.** With enum methods in the arena,
+  `v.as<Str>()` on `JsonValue` broke the LSP with five E0214: post-mono
+  selection found the parameterless TEMPLATE `as<T>` and displaced mono's
+  specialization as `resolved_method` while the `$MG` pin stayed; the
+  concrete-return override at `resolve_call` (gated on
+  `generic_params == 0`) then stopped firing and the name-keyed
+  `lookup_method_return` answered with whichever sibling registered last -
+  `Option<i64>`. `bind_method_on_receiver` now returns when
+  `resolved_callee` and `resolved_method` are both set. Latent for any
+  parameterless generic method on a struct.
+* **`lookup_method_param_types` had no Enum arm**, so no enum method's
+  parameter types ever reached its arguments as expected types;
+  `w.unwrap_or(Option::None)` on `Option<Option<i32>>` failed E0214 the
+  moment the argument check could see the method. Same omission, next
+  consumer.
+* **The dispatch annotator ran per module, after modules before it had
+  already cloned its templates.** `Debug for Array<T>` lives in
+  `fmt::display`; `collections::array` demands `Array<u8>` long before that
+  module's turn, so every clone of `p.fmt(f)` carried no `resolved_trait`
+  (probed: 62 clones of one node, all before the one stamping). With
+  `Option<i32>`'s two `fmt`s finally in one candidate set this surfaced as
+  E0154 in the unit suite. Now `CompilerInstance::monomorphize` stamps every
+  module before the first mono turn; the per-module call and the
+  `Monomorphizer` field are gone. **Before this, that call was bound by
+  codegen to whichever of `Display::fmt` / `Debug::fmt` `declare_method`
+  registered first under `Option<i32>::fmt`** - the object comparison below
+  is where that shows.
+* `type_resolution.cryo`'s `seen_fn_types: u32[]` received `fsig.id: u64`;
+  sema found no `push(u64)` on `Array<u32>`, codegen bound it by arity. Now
+  `u64[]`.
+* A `loop` body may be a bare statement (`parse_statement_or_block`), and
+  `stmt_always_returns` reads it as a `BlockStmtNode*` regardless; the cast
+  in row 6 keeps that behaviour and this line records it. Not taken.
+
+#### Not this consumer's, recorded
+
+* `check_method_call_arg_types` never diagnosed the 29 ill-typed integer
+  calls or the two pointer downcasts - its candidate walk covers the arena
+  sets and trait impls, but for a primitive receiver only the trait impls.
+  The argument checker is a separate consumer.
+* `docs/cryo.md` says there are no implicit numeric conversions;
+  `TypeChecker::width_lattice` accepts same-signedness widening. The code
+  disagrees with the spec; nothing here changed it.
+* Sema's method-call RETURN type still comes from the name-keyed
+  `lookup_method_return` (`resolve_method_call`); the pin is identity-based,
+  the return is not. The concrete-return override is what keeps them
+  agreeing for generic methods.
+
+#### The object comparison: what the shadow cannot see
+
+A shadow prints when codegen's fallback binds; it says nothing about a pin
+that binds a DIFFERENT symbol than the fallback would have. The object hash
+is the instrument for that, and it earned its keep four times before the
+suite's IR matched on every point that should match.
+
+* **The `*` desugar's literal lost its width on the post-mono re-walk**
+  (`OperatorOverloading::add_sub_mul` read `4294967299` for `3`).
+  `resolve_unary` restamps `&3` at the referent width and then resolves the
+  operand again; pre-mono that second resolution short-circuits on the
+  existing type, post-mono it re-types the literal under the REFERENCE (which
+  an integer literal does not adopt) and defaults it to `i32`, so codegen
+  spilled four bytes and `*rhs` read eight. The first answer is now the
+  operand's type. Exercised for the first time by row 9's re-walk.
+* **A pin was thrown away at the module boundary.**
+  `resolve_function_by_mangled(pinned)` for a symbol defined elsewhere finds
+  the index position and then `declare_extern_function_overload` re-derives
+  the extern's NAME from the overload's (key, function type) - and
+  `Display::fmt<W>` and `Debug::fmt<W>` on one receiver share a type, so the
+  extern was whichever registered first. `Display for Pair<i32,i32>` called
+  `Debug::fmt` for its elements under a correct `Display` pin. The extern
+  is now declared under the pinned symbol (`declare_extern_function_as`);
+  the position supplies the signature and never the name.
+* **A primitive receiver's generic trait-method spec had no pin and no
+  dedup key.** `specialize_method_call`'s `pin_target` is the receiver's
+  qualified name, which `i32` does not have, so `spec_sym` came out empty:
+  the call stayed unpinned (codegen by name), and `method_spec_seen("")`
+  was never true, so every call re-minted `i32::fmt<String>` /
+  `u32::hash<H>` and pushed another body - HEAD's `display.ll` and
+  `hash.ll` carry 151 and 79 lines of `; No predecessors!` duplicate
+  bodies. The target is now the impl block's own (`codegen_target_name`),
+  for primitive receivers only: on an unresolved instantiation the same
+  fallback pinned a template symbol (`TakeIter-4fold`) that nothing
+  defines.
+* **The operator desugar never named its trait.** `a == b` on `Str` built
+  `a.equals(&b)` with no `resolved_trait`, so selection ranked `Str`'s
+  inherent `equals` ahead of `Eq::equals`. `build_operator_call` stamps
+  the operator's trait; the stamp is a RANKING in `bind_method_on_receiver`
+  (`select_method` with the trait first, then unrestricted) because
+  `x.drop()` inside `Drop::drop` is stamped `Drop` and must still bind an
+  inherent `drop`. Bound-directed dispatch used to require a
+  `resolved_method` the substituter had already cleared on every clone.
+
+Suite IR, HEAD vs tree, 363 modules: 43 differ, every difference one of
+four kinds - (1) a `Debug` body now calls `Debug::fmt` where HEAD called
+`Display::fmt` (every such call, checked by enclosing definition: `Debug`
+bodies call `Debug`, `Display` bodies call `Display`); (2) a written
+`a.equals(&b)` / `f.stream_position()` on a type with an inherent method
+AND a same-named trait method (`Str`'s two identical `equals`, `File`'s
+inherent beside the `Seek` default) binds the inherent one - HEAD bound
+whichever the index registered first; (3) `hash.ll` -79 / `display.ll`
+-151, the duplicate bodies above; (4) `OptionalSugar`'s `Option::None`
+argument stored with `Option<i32>`'s layout (`{ i32, [1 x i32] }`) rather
+than the bare base's. Objects over the whole `tests/` build (2,126): 80
+moved, the modules above and every project's copy of `str` and the test
+`runner`; examples (1,126): 57 moved - each example's `str`, `method`,
+`router`, `server`, and `08-game-of-life`'s `Main` (four `Str::equals`),
+all kind (2). Suite green at runtime throughout: 2,113 unit, 179
+negative, 43 projects.
+
+Tally: 15 shadowed, 15 at zero, 14 deleted, 9 artifacts gone. The
+deletion is the next commit, with its own object control.

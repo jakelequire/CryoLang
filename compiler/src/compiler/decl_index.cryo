@@ -168,7 +168,7 @@ type struct DeclarationIndex {
     // Array element TypeRef.id -> concrete Array_<T> qualified name SymbolStr.id.
     // Populated by the specialization pass so codegen can resolve T[].method()
     // to the monomorphized Array_T struct without name reconstruction.
-    array_elem_to_type:  HashMap<u64, u32>;
+    array_elem_to_type:  HashMap<u64, TypeRef>;
 
     // Implicit-conversion registry: Packed(arg_type_id, return_type_id) ->
     // Packed(type_name_id << 32 | method_name_id).  Populated in
@@ -325,7 +325,7 @@ type struct DeclarationIndex {
             type_map:            HashMap<u32, TypeRef>::new(),
             global_vars:         HashMap<u32, TypeRef>::new(),
             type_reverse:        HashMap<u64, u32>::new(),
-            array_elem_to_type:  HashMap<u64, u32>::new(),
+            array_elem_to_type:  HashMap<u64, TypeRef>::new(),
             implicit_converters: HashMap<u64, u64>::new(),
             generic_converter_methods: [],
             module_funcs:        [],
@@ -757,19 +757,26 @@ type struct DeclarationIndex {
         this.type_reverse.insert(ty.id, qualified_name.id);
     }
 
-    /// Register a mapping from an array element TypeRef to the concrete
-    /// Array_<T> struct's qualified name.  Called by the specialization
-    /// pass after monomorphizing Array<T>.
-    register_array_element_type(mut &this, element: TypeRef, array_struct_name: SymbolStr) -> void {
-        this.array_elem_to_type.insert(element.id, array_struct_name.id);
+    /// Register the concrete `Array<T>` specialization a dynamic `T[]`
+    /// dispatches through, keyed by its element type: an `ArrayType` is not
+    /// canonical (many TypeRefs describe one `T[]`) but its element is.
+    /// Called by the specialization pass after monomorphizing `Array<T>`.
+    register_array_element_type(mut &this, element: TypeRef, array_struct: TypeRef) -> void {
+        this.array_elem_to_type.insert(element.id, array_struct);
     }
 
-    /// Look up the concrete Array_<T> struct name for a given element type.
-    lookup_array_type_name(&this, element: TypeRef) -> SymbolStr {
+    /// The concrete `Array<T>` specialization for a given element type; the
+    /// owner a method call on `T[]` resolves against.
+    lookup_array_type(&this, element: TypeRef) -> TypeRef {
         return match (this.array_elem_to_type.get(&element.id)) {
-            Option::Some(val) => { SymbolStr::from_id(val) }
-            Option::None      => { SymbolStr::empty() }
+            Option::Some(val) => { val }
+            Option::None      => { TypeRef::invalid() }
         };
+    }
+
+    /// The registered name of that specialization.
+    lookup_array_type_name(&this, element: TypeRef) -> SymbolStr {
+        return this.lookup_type_name(this.lookup_array_type(element));
     }
 
     /// Register a reverse-only mapping (TypeRef -> qualified name) without
