@@ -1503,8 +1503,6 @@ type struct TypeResolutionPasses {
                     ctx.decl_index.set_decl_visibility(qualified_sym, node.is_public);
                 }
                 ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table, arena);
-                TypeResolutionPasses::stamp_member_method_bounds(
-                    &node.methods, ctx);
             }
             NodeKind::UnionDeclaration => {
                 const node: UnionDeclNode* = stmt as UnionDeclNode*;
@@ -1521,8 +1519,6 @@ type struct TypeResolutionPasses {
                     ctx.decl_index.set_decl_visibility(qualified_sym, node.is_public);
                 }
                 ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table, arena);
-                TypeResolutionPasses::stamp_member_method_bounds(
-                    &node.methods, ctx);
             }
             NodeKind::ClassDeclaration => {
                 const node: ClassDeclNode* = stmt as ClassDeclNode*;
@@ -1539,8 +1535,6 @@ type struct TypeResolutionPasses {
                     ctx.decl_index.set_decl_visibility(qualified_sym, node.is_public);
                 }
                 ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table, arena);
-                TypeResolutionPasses::stamp_member_method_bounds(
-                    &node.methods, ctx);
             }
             NodeKind::EnumDeclaration => {
                 const node: EnumDeclNode* = stmt as EnumDeclNode*;
@@ -1576,8 +1570,6 @@ type struct TypeResolutionPasses {
                 for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
                     const tfunc: FunctionDeclNode* = node.methods[mi];
                     if (tfunc == null) { continue; }
-                    TypeResolutionPasses::stamp_trait_bounds(
-                        &tfunc.trait_bounds, ctx);
                     if (!tfunc.has_resolved_return_type()) { continue; }
                     ctx.decl_index.register_method(qualified_sym, tfunc.name,
                         tfunc.resolved_return_type);
@@ -1586,19 +1578,9 @@ type struct TypeResolutionPasses {
                             tfunc.resolved_return_type);
                     }
                 }
-                // An associated type's declaration-site bounds name traits the
-                // same way a where clause does.
-                for (mut ai: i64 = 0; ai < node.assoc_types.length; ai++) {
-                    if (node.assoc_types[ai] == null) { continue; }
-                    TypeResolutionPasses::stamp_trait_refs(
-                        &node.assoc_types[ai].bounds, ctx);
-                }
             }
             NodeKind::FunctionDeclaration => {
                 const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                // Outside the return-type guard: a bound names a trait whether
-                // or not this function's own signature resolved.
-                TypeResolutionPasses::stamp_trait_bounds(&func.trait_bounds, ctx);
                 if (func.resolved_return_type.is_valid()) {
                     // Collect resolved param types from AST
                     mut param_types: TypeRef[] = [];
@@ -1694,12 +1676,6 @@ type struct TypeResolutionPasses {
                 if (node.source_module == "") {
                     node.set_source_module(ctx.source_file);
                 }
-                // Bound identity, for trait impls and inherent impls alike:
-                // an inherent impl's where clause names traits too, and the
-                // bound checker asks which trait it named.
-                TypeResolutionPasses::stamp_trait_bounds(&node.where_bounds, ctx);
-                TypeResolutionPasses::stamp_member_method_bounds(
-                    &node.methods, ctx);
                 // Stamp each trait-impl method with its trait's leaf name so
                 // every mangling site can disambiguate it from a same-named
                 // method of another trait implemented for the same type.
@@ -1834,15 +1810,11 @@ type struct TypeResolutionPasses {
                         // below cover cross-module impls whose target is not in
                         // the defining namespace.
                         if (trait_root.is_valid()) {
-                            mut tgt_ref: TypeRef = ctx.decl_index.lookup_type(
-                                ctx.qualify_symbol_sym_home(node.target_type, node.span.file));
-                            if (!tgt_ref.is_valid()) {
-                                tgt_ref = ctx.decl_index.lookup_type(
-                                    ctx.resolve_scoped_or(canonical_target, FILE, LINE as i32));
-                            }
-                            if (!tgt_ref.is_valid()) {
-                                tgt_ref = ctx.decl_index.lookup_type(canonical_target);
-                            }
+                            // The target is the canonical name the stamp gave
+                            // above - a declaration's qualified name, a
+                            // primitive's spelling, or a clone's already-qualified
+                            // one - and the index holds it under exactly that.
+                            const tgt_ref: TypeRef = ctx.decl_index.lookup_type(canonical_target);
                             if (tgt_ref.is_valid()) {
                                 const qual_id: u64 =
                                     OwnershipQuery::named_qualified_id(
@@ -2241,83 +2213,6 @@ type struct TypeResolutionPasses {
             }
             _ => { false }
         };
-    }
-
-    /// Resolve one trait reference to its canonical identity and carry the
-    /// answer on the node.
-    ///
-    /// Judged against the module whose source text contains the bound, not the
-    /// module the compiler is standing in: a bound means what it means where it
-    /// was written, and a generic body is re-typed with the cursor parked on
-    /// the receiver's module.
-    ///
-    /// A multi-segment path is joined and resolved as a single name, so an
-    /// already-qualified spelling passes through unchanged - scoped resolution
-    /// returns its input when no bare->qualified mapping exists. RESIDUAL: a
-    /// RELATIVELY qualified spelling (`alpha::Render` where the declaration is
-    /// `leaf_key::alpha::Render`) has no such mapping either, so it keys by
-    /// what was written and reads as distinct from the same trait's other
-    /// spellings. That is the false-NEGATIVE direction (a missed collision),
-    /// never a false positive, and it is the residual the impl head carries
-    /// for the same reason.
-    static stamp_trait_ref(tr: TraitRef*, ctx: CompilationContext*) -> void {
-        if (tr == null || tr.path.length == 0) { return; }
-        // Already answered, either by an earlier visit or by a clone carrying
-        // its template's identity. Re-resolving would re-judge the name
-        // against whichever module the specializer is standing in.
-        if (tr.resolved_name.is_valid()) { return; }
-        mut written: SymbolStr = tr.path[0];
-        if (tr.path.length > 1) {
-            mut joined: string = ctx.intern_table.resolve(tr.path[0]);
-            for (mut i: i64 = 1; i < tr.path.length; i++) {
-                joined = joined + "::" + ctx.intern_table.resolve(tr.path[i]);
-            }
-            written = ctx.intern(joined);
-        }
-        tr.resolved_name = ctx.resolve_scoped_or_at(
-            written, tr.span.file, FILE, LINE as i32);
-        resolve_counter::path_hit("BOUND-STAMP-ALL", "stamp_trait_ref",
-            ctx.intern_table.resolve(tr.path[tr.path.length - 1]),
-            ctx.intern_table.resolve(tr.resolved_name));
-    }
-
-    /// Stamp every trait reference reachable from a where/bound list.
-    static stamp_trait_bounds(bounds: TraitBound[]*,
-                              ctx: CompilationContext*) -> void {
-        if (bounds == null) { return; }
-        for (mut i: i64 = 0; i < (*bounds).length; i++) {
-            for (mut j: i64 = 0; j < (*bounds)[i].trait_refs.length; j++) {
-                TypeResolutionPasses::stamp_trait_ref(
-                    &(*bounds)[i].trait_refs[j], ctx);
-            }
-        }
-    }
-
-    /// Stamp a bare trait-reference list (an associated type's bounds).
-    static stamp_trait_refs(refs: TraitRef[]*,
-                            ctx: CompilationContext*) -> void {
-        if (refs == null) { return; }
-        for (mut i: i64 = 0; i < (*refs).length; i++) {
-            TypeResolutionPasses::stamp_trait_ref(&(*refs)[i], ctx);
-        }
-    }
-
-    /// Stamp the where-clause bounds of every method declared in a member
-    /// list.
-    ///
-    /// A `where` clause means the same thing wherever the method is written,
-    /// so every owner of a member list has to reach this. An owner that does
-    /// not leaves its methods' `TraitRef.resolved_name` empty, and
-    /// `TraitRef::identity()` then falls back to the written leaf - which
-    /// type-checks, and answers only while that leaf is unique program-wide.
-    static stamp_member_method_bounds(methods: MethodNode*[]*,
-                                      ctx: CompilationContext*) -> void {
-        if (methods == null) { return; }
-        for (mut i: i64 = 0; i < (*methods).length; i++) {
-            const m: MethodNode* = (*methods)[i];
-            if (m == null || m.func == null) { continue; }
-            TypeResolutionPasses::stamp_trait_bounds(&m.func.trait_bounds, ctx);
-        }
     }
 
     /// Walk a trait_annotation to its leaf identifier: the bare trait name.

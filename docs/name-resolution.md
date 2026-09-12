@@ -105,7 +105,9 @@ three, and its row carries the count. Read each zero off its own row.
 | codegen identifier-value lookups (`codegen_identifier`: `resolve_global(node.name)` by the bare leaf, `resolve_function(node.name)` after the generic pin) and sema's bare `lookup_func_type_exact(ident.name)` + cursor-keyed `enforce_value_ref_visibility` | **DELETED** - a bare value binds from the stamp (global: its namespace and leaf, exact) or the pin (`IdentifierNode::resolved_callee`, now written for every function value); shadow 293 → the fix IS the deletion (a clone read another module's same-leaf global), 4 wrong-function binds found only by the object comparison | — | `grep -c 'resolve_function(node.name)' compiler/src/compiler/codegen/visit/ir_generator.cryo` → **0**; `grep -c 'resolve_global(node.name)' compiler/src/compiler/codegen/visit/ir_generator.cryo` → **0** | §8.167 |
 | name-layer visibility gates: a specific import naming a private declaration (E0353, `visibility_import_gate`), and a spelled-out path reaching one through the module-rooted walk (E0503 for a type, E0353 otherwise; `visibility_type_mask`) | LIVE, reached | — | `grep -c 'private_declaration' compiler/src/compiler/resolver/name_resolution.cryo` → **2** | §8.167, §8.168 |
 | sema type-name visibility gate (`check_type_name_visibility` / `check_annotation_visibility`, keyed by `resolve_scoped_or_at` over the WRITTEN spelling, so every relative path defaulted to public) | **DELETED** - the name layer refuses a private type where the path proposes it | — | `grep -c 'check_type_name_visibility' compiler/src/compiler/sema/member_resolver.cryo` → **0** | §8.168 |
-| `.resolve_scoped_or[_at]` readers outside `compilation_context` | LIVE - 2 left, both in `type_resolution` (the impl-trait target probe, `stamp_trait_ref`) | — | `grep -rn 'ctx.resolve_scoped_or' compiler/src --include=*.cryo \| wc -l` → **2** (was 7 at §8.161) | §8.161, §8.166, §8.167, §8.168 |
+| `resolve_scoped_or` / `resolve_scoped_or_at` / `scope_is_ambiguous` (the resolved-or-echo wrappers: a refusal came back as the input) | **DELETED** - 7 readers at §8.161, 0 at §8.169, then the definitions | — | `grep -rho 'resolve_scoped_or' compiler/src --include=*.cryo \| wc -l` → **1** (a doc comment on `scope_owner_key` naming what it replaced) | §8.161, §8.166, §8.167, §8.168, §8.169 |
+| `resolve_scoped` / `resolve_scoped_at` / `scope_is_ambiguous_at` (the cursor-scoped leaf resolution itself) | LIVE - 2 readers, `scope_owner_key` and the E0154 check in `resolve_scope_call` | — | `grep -cE 'resolve_scoped_at|scope_is_ambiguous_at' compiler/src/compiler/sema/call_resolver.cryo` → **2** | §8.150, §8.169 |
+| type-resolution bound stamping (`stamp_trait_ref` and its three walkers, the cursor fallback for a bound the resolver did not stamp) | **DELETED** - the name layer stamps every owner, associated-type bounds included | — | `grep -c 'stamp_trait' compiler/src/compiler/passes/type_resolution.cryo` → **0** | §8.169 |
 | callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **21** (the name layer's two: the import gate, the rooted walk) | §8.1f, §8.2ag |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
@@ -22374,3 +22376,74 @@ golden unmoved. `.resolve_scoped_or[_at]` readers **4 → 2**, both in
   ONE module and nothing is offered under the leaf; a facade whose child
   declares the leaf privately is offered nothing and says nothing, the
   same silence §8.167 noted for `import M::{ absent }`.
+
+### 8.169 Consumers 19 and 20 deleted: the impl-target probe cascade and the bound-stamping fallback; `resolve_scoped_or[_at]` has no reader and is gone - 2026-09-12
+
+The last two readers, both in `type_resolution`.
+
+#### The impl-trait target (`:1841`)
+
+For a trait impl's precise (type-identity) registration the target `TypeRef`
+was found by three probes in order: the target spelled and qualified by the
+impl's HOME module, the cursor's resolution of the canonical target, and
+the canonical target itself - where "canonical" is what the impl head's
+stamp gave a few lines above (a declaration's qualified name, a
+primitive's spelling, a clone's already-qualified one). Shadowed against
+the third probe alone, over the corpus: **0**. Inverted for one build the
+LSP prints 337 impls, 127 answered by the home probe and 210 by the cursor
+probe, every one agreeing with the canonical lookup. The first two probes
+are deleted; `lookup_type(canonical_target)` is the lookup. lane: LOOKUP
+51 → 49.
+
+#### The bound-stamping fallback (`:2277`), and a corpus half nobody captured
+
+`stamp_trait_ref` stamped a `TraitRef`'s `resolved_name` by
+`resolve_scoped_or_at` over the joined spelling - unless the name resolver
+had already stamped it, which it does for function bounds and impl where
+clauses (the name layer's `stamp_trait_bounds`, §8.151). Shadowed by printing every fallback
+firing: **0** over the four halves - and **1** over a fifth. The
+compile-fail suite runs each file as a child whose output the runner
+redirects to a temp file, so no `corpus2.sh` run had ever read a shadow
+line from it; `tests/negative/E0306_assoc_decl_bound.cryo` writes `type
+Item: Copy;`, the tree's one associated-type bound, and the resolver's
+trait-declaration visit did not stamp associated-type bounds. The
+fallback canonicalized it to `std::core::marker::Copy`. The resolver now
+stamps them (`visit(TraitDeclNode*)`, `stamp_trait_ref_identity` over
+`assoc_types[].bounds`); `corpus2.sh` runs the 179 negatives the way the
+runner does and keeps their stderr; the fallback is at **0 over five
+halves**, and `TraitRef::identity()`'s own audit (`CRYO_TRAIT_AUDIT`,
+`TRAITREF-UNSTAMPED`) prints 0 over the LSP build beside 140,175 live
+sibling rows.
+
+Deleted: `stamp_trait_ref`, `stamp_trait_bounds`, `stamp_trait_refs`,
+`stamp_member_method_bounds` and their eight call sites - §8.2an's fifth
+owner is stamped by the resolver's method visit, as the other four are.
+The type-resolution pass stamps no bound; the name layer stamps every one.
+
+#### `resolve_scoped_or`, `resolve_scoped_or_at`, `scope_is_ambiguous`: no reader
+
+Seven readers at §8.161, zero now. The three "resolved-or-echo" wrappers
+are deleted from `CompilationContext` - the shape the whole family had
+in common was that a refusal came back as the input, so a lookup keyed by
+it widened to the bare leaf. `resolve_scoped` / `resolve_scoped_at` /
+`scope_is_ambiguous_at` stay, with two readers: `scope_owner_key` (the
+static-call owner key, §8.150) and the E0154 check beside it in
+`resolve_scope_call`. That is the next consumer.
+
+#### Objects, gates
+
+`b54be850` vs this tree: **0 of 1,126** in `examples/`, **0 of 2,126** in `tests/`. Suite green, 44 projects; the LSP builds
+directly.
+
+**Tally: 21 shadowed, 21 at zero, 21 old paths deleted, 14 artifacts gone**
+(+ the impl-target cascade's two probes; + the bound-stamping fallback with
+its four functions; + `resolve_scoped_or` / `_at` / `scope_is_ambiguous`).
+
+#### Traps
+
+* A shadow's corpus is FIVE halves, not four: the compile-fail suite's
+  stderr goes to a temp file per child. `corpus2.sh` now covers it; the
+  §8.165 addendum's list is short by one.
+* The Bash tool's heredoc collapsed `\\t` and `\\n` inside a Python
+  triple-quoted string again (a real tab and a real newline landed in a
+  Cryo string literal and compiled). Write tool, every time.
