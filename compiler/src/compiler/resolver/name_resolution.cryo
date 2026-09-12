@@ -1030,7 +1030,7 @@ public:
     /// binds in the writer's scope or spells a module path, never both, and
     /// which of the two it is has already been decided when this runs.
     walk_module_rooted_type(&this, written: string,
-                            use_ns: SymbolStr) -> SymbolID {
+                            use_ns: SymbolStr, span: SourceSpan) -> SymbolID {
         const prefix: string = QualifiedName::parent_of(written);
         if (prefix.length() == 0) { return SymbolID::invalid(); }
         const leaf: string = QualifiedName::leaf_of(written);
@@ -1052,10 +1052,39 @@ public:
         // refusal applies as anywhere else, so a name two of the facade's
         // children declare is ambiguous here and resolves to neither.
         mut offered: i64 = 0;
-        const hit: SymbolID = this.module_offering(
-            head.found, this.resolver.intern_table.intern(leaf), &offered);
-        if (offered != 1) { return SymbolID::invalid(); }
-        return hit;
+        const leaf_sym: SymbolStr = this.resolver.intern_table.intern(leaf);
+        const hit: SymbolID = this.module_offering(head.found, leaf_sym, &offered);
+        if (offered == 1) { return hit; }
+        // Offered by nothing, and declared by the head as `private`: the path
+        // names a declaration the writer may not see.  Visibility is checked
+        // where the candidate is proposed, and this walk is where a spelled-out
+        // path proposes one, so the refusal is reported here rather than left
+        // as a name that appears not to exist - or, worse, re-derived by a
+        // later stage from the spelling, which is registered under exactly
+        // this name and would answer it.
+        if (offered == 0) {
+            const hidden: SymbolID = this.resolver.private_declaration(head.found, leaf_sym);
+            if (hidden.is_valid()) {
+                const hs: Symbol = this.resolver.get_symbol(hidden);
+                const owner: string = this.resolver.intern_table.resolve(head.found);
+                if (hs.kind == SymbolKind::Type || hs.kind == SymbolKind::TypeAlias) {
+                    mut d: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0503_PRIVATE_SYMBOL_ACCESS,
+                        fmt::format("type `%s` is private to module `%s`", leaf, owner));
+                    d = d.at_with_label(span,
+                        fmt::format("`%s` cannot be named outside its module `%s`", leaf, owner));
+                    this.ctx.emit_diagnostic(d);
+                } else {
+                    mut d: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0353_PRIVATE_ACCESS,
+                        fmt::format("`%s::%s` is private and cannot be named from `%s`",
+                            owner, leaf, this.resolver.intern_table.resolve(use_ns)));
+                    d = d.at_with_label(span, "private declaration named by this path");
+                    this.ctx.emit_diagnostic(d);
+                }
+            }
+        }
+        return SymbolID::invalid();
     }
 
     /// Record which MODULE the scope segment of `Ns::member` names, as the file
@@ -1139,7 +1168,7 @@ public:
             base = ResBase::PrimTy(node.scope_name);
             have_base = true;
         } else {
-            const rooted: SymbolID = this.walk_module_rooted_type(written, use_ns);
+            const rooted: SymbolID = this.walk_module_rooted_type(written, use_ns, node.scope_span);
             if (rooted.is_valid()) {
                 const rs: Symbol = this.resolver.get_symbol(rooted);
                 base = ResBase::Def(DefId::of_definition(this.resolver.qualified_name_of(&rs)));
@@ -1585,7 +1614,7 @@ public:
                     // the writer cannot reach - recording a name the source may
                     // not legally spell as though it were fine.
                     const q_rooted: SymbolID =
-                        this.walk_module_rooted_type(written, q_ns);
+                        this.walk_module_rooted_type(written, q_ns, span);
                     if (q_rooted.is_valid()) {
                         const q_sym: Symbol = this.resolver.get_symbol(q_rooted);
                         const q_def: SymbolStr =
@@ -2387,7 +2416,8 @@ public:
                         id, name, this.resolver.current_scope,
                         node.span, offered_src);
                     this.resolver.declare_import(import_sym);
-                } else if (!node.is_export && this.resolver.declares_private(module_sym, name)) {
+                } else if (!node.is_export
+                           && this.resolver.private_declaration(module_sym, name).is_valid()) {
                     // The module declares the name and marks it `private`.
                     // Visibility is a gate at the point a candidate is
                     // proposed, and the import is where this one is: binding

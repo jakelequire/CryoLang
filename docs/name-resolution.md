@@ -103,8 +103,10 @@ three, and its row carries the count. Read each zero off its own row.
 | codegen method-call ladder (`call_emitter` MemberAccess branch: `<type name>::method`, `<qualified_name>::method`) | **DELETED** - a method call binds from sema's / mono's pin and nothing else; 336,761 → 0 in §8.164, cut in §8.165 with 0 objects moved | — | `grep -c 'lookup_array_type_name' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0** | §8.163, §8.164, §8.165 |
 | codegen scope-value ladder (`ir_generator` `visit(ScopeResolutionNode)`: three function lookups by spelling, three global lookups, the module-leaf global lane `resolve_global_in_scope` → `find_global_in_scope` → `namespace_leaf_is`) | **DELETED** - a path in value position binds from sema's pin (`ScopeResolutionNode::resolved_callee`), `resolved_type`, or the stamp's namespace + member leaf; shadow 0 first build, controlled at 301, 0/0 objects | — | `grep -c 'resolve_scoped_or' compiler/src/compiler/codegen/visit/ir_generator.cryo` → **0**; `grep -rho 'find_global_in_scope' compiler/src \| wc -l` → **0** | §8.166 |
 | codegen identifier-value lookups (`codegen_identifier`: `resolve_global(node.name)` by the bare leaf, `resolve_function(node.name)` after the generic pin) and sema's bare `lookup_func_type_exact(ident.name)` + cursor-keyed `enforce_value_ref_visibility` | **DELETED** - a bare value binds from the stamp (global: its namespace and leaf, exact) or the pin (`IdentifierNode::resolved_callee`, now written for every function value); shadow 293 → the fix IS the deletion (a clone read another module's same-leaf global), 4 wrong-function binds found only by the object comparison | — | `grep -c 'resolve_function(node.name)' compiler/src/compiler/codegen/visit/ir_generator.cryo` → **0**; `grep -c 'resolve_global(node.name)' compiler/src/compiler/codegen/visit/ir_generator.cryo` → **0** | §8.167 |
-| import-site visibility gate (E0353 on `import M::{ x }` where `M` declares `x` private) | LIVE, reached; `visibility_import_gate` pins the refusal | — | `grep -c 'declares_private' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.167 |
-| callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **20** (the 20th is the import-site gate, §8.167) | §8.1f, §8.2ag |
+| name-layer visibility gates: a specific import naming a private declaration (E0353, `visibility_import_gate`), and a spelled-out path reaching one through the module-rooted walk (E0503 for a type, E0353 otherwise; `visibility_type_mask`) | LIVE, reached | — | `grep -c 'private_declaration' compiler/src/compiler/resolver/name_resolution.cryo` → **2** | §8.167, §8.168 |
+| sema type-name visibility gate (`check_type_name_visibility` / `check_annotation_visibility`, keyed by `resolve_scoped_or_at` over the WRITTEN spelling, so every relative path defaulted to public) | **DELETED** - the name layer refuses a private type where the path proposes it | — | `grep -c 'check_type_name_visibility' compiler/src/compiler/sema/member_resolver.cryo` → **0** | §8.168 |
+| `.resolve_scoped_or[_at]` readers outside `compilation_context` | LIVE - 2 left, both in `type_resolution` (the impl-trait target probe, `stamp_trait_ref`) | — | `grep -rn 'ctx.resolve_scoped_or' compiler/src --include=*.cryo \| wc -l` → **2** (was 7 at §8.161) | §8.161, §8.166, §8.167, §8.168 |
+| callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **21** (the name layer's two: the import gate, the rooted walk) | §8.1f, §8.2ag |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
 
@@ -22289,3 +22291,86 @@ builds directly; `b1-check` unmoved on all three arms.
   name being nameable; not taken.
 * `global_extern_symbol` / `is_global_thread_local`: still leaf-keyed
   (§8.166).
+
+### 8.168 Consumers 17 and 18 deleted: sema's type-name visibility gate moves to the name layer; the `Slice` lowering names its target - 2026-09-12
+
+Two of the four `.resolve_scoped_or[_at]` readers left after §8.167.
+
+#### The type-name gate (`member_resolver:853`)
+
+`check_type_name_visibility(name, span)` - reached from a struct literal's
+type, a variable's annotation, and a function's signature through
+`check_annotation_visibility` - resolved the WRITTEN spelling through
+`resolve_scoped_or_at` and judged that: `namespace_of(q)` split the string
+at its last `::`, `is_candidate_public(q)` answered from a map keyed by
+canonical names with `true` for anything absent. A relative path
+(`stdio::Stderr`, `error::IoError`) resolved to itself, so its owner was
+`stdio` and its verdict "public" by default: the gate could reject only a
+bare leaf the cursor resolved or a path written out in full.
+
+Shadowed against the stamp (`NamedAnnotation::res`, `StructLiteralNode::res`),
+verdict against verdict, whole corpus: 1,511 lines. 1,427 SAME-VERDICT
+`public`/`public` - the relative paths above, now judged by their real
+owner and public in fact; 6 `own`/`own`; 31 `no-owner` → `own` and 16
+`no-owner` → `public` (the old key gave no verdict, the new gives a
+non-rejecting one); 29 `own` → `no-def`, all async-lowered future types
+named in synthesized signatures whose slot no pass stamped (own module
+either way, and a synthesizer's omission for `async_lower` to own); and
+**2 REJECT → no-def**: `visibility_type_mask`'s fully-qualified
+`VisibilityTypeMask::Vault::Hidden`, the one E0503 the corpus pins. The
+name layer had refused to stamp it - `walk_module_rooted_type` answers from
+the module's offered set, which a private declaration is not in - and said
+nothing, leaving the spelling for sema to re-derive; without sema's gate
+the type resolver would have re-derived it from the spelling, which is
+registered under exactly that name, and compiled it.
+
+So the gate moves to where §3.3 puts it: the walk that proposes the
+candidate. `walk_module_rooted_type`, having found the head module and
+nothing offered under the leaf, asks `Resolver::private_declaration` (the
+§8.167 helper, now returning the symbol) and refuses with the declaration
+in hand - E0503 with §8.2ag's wording for a type or alias, E0353 for any
+other kind - and stays unstamped. All three spellings of the private type
+are refused there: the annotation, the literal, and (added to the project)
+the scope segment of `Vault::Hidden::kind()`. Sema's gate, its annotation
+walker and its three callers are deleted; nothing they could reject is
+reachable past the name layer, since a bare private name binds in no other
+module (§8.167's import gate) and a qualified one is refused here.
+
+#### The `Slice` lowering (`sema.cryo:1383`)
+
+`const x = [a, b, c]` with a fixed array initializer lowers to
+`Slice::from_raw(&x[0], N)` in sema, after resolution, so the synthesizer
+owes the node its `Res`. It derived one by `resolve_scoped_or("Slice")`
+against the cursor - the bare spelling, from whatever module the pass was
+standing in. The referent is the stdlib `Slice` and nothing else: the
+prelude carries `core::slice` precisely so this lowering can name it, and
+a module's own `Slice` is not what `[a, b, c]` means. Stamped as
+`std::core::slice::Slice` outright, the same way the injected prelude and
+f-string runtime are named. Shadow: 0 over the corpus, the comparison
+inverted for one build reaches the lowering twice (`for_in.cryo`), both
+agreeing.
+
+#### Objects, gates
+
+`3e50430b` vs this tree: **0 of 1,126** in `examples/`, **0 of 2,126** in
+`tests/` (diagnostic-only changes and a stamp that resolves to the same
+definition). Suite green, 44 projects; the LSP builds directly; lane
+golden unmoved. `.resolve_scoped_or[_at]` readers **4 → 2**, both in
+`type_resolution` (`:1841`, the impl-trait target probe; `:2277`,
+`stamp_trait_ref`).
+
+**Tally: 19 shadowed, 19 at zero, 19 old paths deleted, 12 artifacts gone**
+(+ the sema type-name gate: `check_type_name_visibility`,
+`check_annotation_visibility`).
+
+#### Carried
+
+* 29 synthesized annotations in async-lowered signatures carry no stamp
+  (`gf_identity$Future_0` and kin, `async_generic_function.cryo`,
+  `async_trait_method.cryo`). They resolve by spelling in the type
+  resolver's own lanes; `async_lower` should stamp them as it stamps the
+  future's literal.
+* The rooted walk refuses a private declaration only when the head names
+  ONE module and nothing is offered under the leaf; a facade whose child
+  declares the leaf privately is offered nothing and says nothing, the
+  same silence §8.167 noted for `import M::{ absent }`.
