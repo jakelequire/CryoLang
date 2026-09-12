@@ -101,6 +101,7 @@ three, and its row carries the count. Read each zero off its own row.
 | static-call owner TEMPLATE by spelling (`resolve_scope_owner_template`'s as-is → scope map → cross-module cascade) | **DELETED** — the owner template is read off the segment's stamp, in sema and in mono | — | `grep -c 'resolve_scoped_or_at' compiler/src/compiler/sema/call_resolver.cryo` → **2** (was 7) | §8.150, §8.151 |
 | codegen static-call ladder (`call_emitter`: spec-by-return-type → `scope::member` → bare member, and the enum variant's scope-name probe) | **DELETED** — sema's / mono's pin answers every static call; 495 → 0 in §8.160; `call_emitter` reads no `resolve_scoped_or` | — | `grep -c 'resolve_scoped_or' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0** | §8.158, §8.160, §8.161 |
 | codegen method-call ladder (`call_emitter` MemberAccess branch: `<type name>::method`, `<qualified_name>::method`) | **DELETED** - a method call binds from sema's / mono's pin and nothing else; 336,761 → 0 in §8.164, cut in §8.165 with 0 objects moved | — | `grep -c 'lookup_array_type_name' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0** | §8.163, §8.164, §8.165 |
+| codegen scope-value ladder (`ir_generator` `visit(ScopeResolutionNode)`: three function lookups by spelling, three global lookups, the module-leaf global lane `resolve_global_in_scope` → `find_global_in_scope` → `namespace_leaf_is`) | **DELETED** - a path in value position binds from sema's pin (`ScopeResolutionNode::resolved_callee`), `resolved_type`, or the stamp's namespace + member leaf; shadow 0 first build, controlled at 301, 0/0 objects | — | `grep -c 'resolve_scoped_or' compiler/src/compiler/codegen/visit/ir_generator.cryo` → **0**; `grep -rho 'find_global_in_scope' compiler/src \| wc -l` → **0** | §8.166 |
 | callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **19** | §8.1f, §8.2ag |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
@@ -21998,3 +21999,145 @@ that fails before and passes after outweighs a green suite.
   spelling lookup. Re-pinned with the reason in `fd10049d`.
 * `cryo test --list` compiles the whole unit suite with codegen (~4 min)
   and is the fastest suite-half measurement; `make test` for the runtime.
+
+#### Addendum to 8.165 (uncommitted by rule; commits with the next agent's first work)
+
+**The method, cold.** For one consumer:
+
+1. Shadow it: leave the old path answering, print one line per answer the
+   new model did not give (`SHADOW-<name>\t<class>\t<site>\tin=<fn>\tmod=<file>`),
+   with the enclosing function and module on every line from the start.
+2. Control the instrument before believing a zero: invert the comparison
+   for one build and confirm it fires; a shadow that has printed non-zero
+   over the same population is its own control.
+3. Corpus, all four halves, every time: the LSP built DIRECTLY (`cd
+   tools/CryoLSP && cryo build --build-dir=build/gate-direct`; `make
+   lsp-check` swallows stderr), the unit suite compiled directly (`cd tests
+   && cryo test <no-match> --list`, ~4 min, codegen included), all 46
+   projects one by one (`cryo test` swallows a passing project's stderr),
+   14 examples. Scripts: a `corpus2.sh` / `lsp-only.sh` / `projex.sh`
+   shape, in a scratchpad.
+4. Fix layer by layer, predicting which row moves; a row that moves
+   unpredicted is a finding to explain before the next build.
+5. At zero: object hash of the whole `tests/` and `examples/` builds, HEAD
+   vs tree (`obj-hash.sh`'s idea, over the test and example trees; sort,
+   `comm -3`, count). For every moved object, diff its IR (`--emit-llvm`)
+   and name the call that changed and why. **A moved object is a defect
+   found or a behaviour changed, never churn; and the object comparison
+   finds defects the shadow cannot - a pin that binds a DIFFERENT symbol
+   than the fallback would have prints nothing.** Four of F17's ten came
+   only from it. Run it BEFORE the fix commit, not just at the deletion.
+6. Delete the old path; object hash fix-tree vs deletion-tree must be 0/0.
+7. Land: shadow commit with its number; fix commit with the layers and the
+   object explanation; deletion commit with the 0/0. Each ledger entry rides
+   with its code. Re-pin `lane-baseline` in the same commit that moved it.
+
+**Traps this session, including my own wrong turns:**
+
+* `make check-fast 2>&1 | tail -1` reports `tail`'s exit; a red
+  `lane-check` went through and the deletion commit landed with the golden
+  unmoved (`7429f791` is the repair). Read the gate's own summary line.
+* The Bash tool's heredoc collapses `\n` to a real newline even inside a
+  quoted heredoc; a multi-line string literal is legal Cryo, so the probe
+  compiled. Hit twice. Scripts with escapes go through the Write tool.
+* Attributing a moved call to its enclosing function by diff line number
+  against the OTHER tree's file misattributes; use the tree the line came
+  from, or match on the `define` preceding the call in that file.
+* A `codegen_target_name()` fallback for a pin target is right for a
+  primitive receiver and wrong for an unresolved instantiation (it pinned
+  a template symbol nothing defines - a link error). Guard by receiver kind.
+* The 42-line suite residue was read as "async poll bodies"; it was the
+  `!=` operator desugar around `as_str()`. Name the mechanism by the node,
+  not by the function it sits in.
+
+### 8.166 Consumer 15 deleted: codegen's scope-value ladder - a path in value position binds from sema's pin, the stamp, or `resolved_type` - 2026-09-12
+
+`ir_generator`'s `visit(ScopeResolutionNode*)` - `Type::static` or
+`Module::fn` taken as a function pointer, `Enum::Variant`, `Module::CONST` -
+walked seven lookups by spelling: three for a function (the bare
+`scope::member`, the stamp's namespace + member, and the cursor-resolved
+scope + member through `resolve_scoped_or_at`), the enum variant, and three
+for a global (the bare combined, a module whose namespace ENDS in the
+written leaf via `resolve_global_in_scope`, and the bare member leaf - the
+last-write-wins one that once read `std::math`'s `E` as `Key::E`).
+
+Now: a function is sema's pin, routed through `resolve_function_by_mangled`
+as a call's is; a variant is `resolved_type` (unchanged); a global is the
+stamp's module and the member leaf, exact (`resolve_global_in_namespace` /
+`find_global_in_namespace`), or - for an `extern module` alias, which is not
+a Cryo module and which no stamp can name - the alias-qualified key the
+import engine registered it under, the same key space sema's
+`lookup_global_exact(q_sym)` reads. Nothing is looked up by the written
+qualifier, and nothing retries under another key.
+
+#### The pin
+
+`ScopeResolutionNode::resolved_callee`, the slot `IdentifierNode` and
+`CallExprNode` already carry. Sema writes it in `resolve_scope_resolution`'s
+two function branches: a static method through
+`pin_scope_value_static_method` - the owner's REGISTERED name read off the
+`TypeRef` sema resolved (`lookup_type_name`), the overload identified by the
+`function_type` id sema already selected (`lookup_overload_mangled`), the
+combined name when no mangled entry exists, exactly as
+`pin_scope_callee_combined` does for the call form - and a module function
+in `lookup_scope_value_function`, the qualified symbol
+`resolve_module_qualified_symbol` answered (a function TEMPLATE pins
+nothing; nothing selects an instantiation for a value). The cloner copies
+the slot; the substituter clears it for the reason it clears a call's, and
+sema's walk over the clone writes it again.
+
+#### Shadow, control, objects
+
+One build with both models answering and every disagreement printed
+(`SHADOW-SRVAL <class> <old step> <path> <span> old= new= pin= in= mod=`,
+classes FN-OLD-ONLY / FN-NEW-ONLY / FN-DIFF / ENUM-BUT-NEW-FN / GL-OLD-ONLY /
+GL-NEW-ONLY / GL-DIFF, LLVM value identity as the comparison):
+
+* whole corpus - LSP built directly, unit suite under `make test`, 43
+  projects one by one (the 46 less the three `os:linux` fixtures on this
+  host), 14 examples: **0 lines**.
+* control - the comparison inverted for one build, so agreeing pairs print:
+  **301 on the LSP alone** (10 FN, all through the cursor-scope step; 291
+  GL: 214 through the module-leaf step, 77 through the bare combined). The
+  instrument reports non-zero; the zero above is a measurement.
+* objects, `7429f791` vs the shadow tree: **0 of 1,126** in `examples/`,
+  **0 of 2,126** in `tests/`. Shadow tree vs the deletion tree: **0 / 0** over the same 3,252; the LSP builds directly.
+  Suite green at runtime on both.
+
+No layer under it: the pin agreed with the spelling ladder at every site
+the corpus reaches, first build. That is the first consumer here to do so,
+and the reason is that sema already computed every answer for its own
+E0201 gate (§8.2ag's `lookup_scope_value_function`) - the value form was
+resolved twice, once to diagnose and once to emit, and only the second copy
+was by spelling.
+
+#### Gone
+
+The visit's three function lookups and three global lookups; the module-leaf
+global lane whole - `SymbolResolver::resolve_global_in_scope`,
+`DeclarationIndex::find_global_in_scope`, `namespace_leaf_is` - one reader
+chain, enumerated; `ir_generator`'s `resolve_scoped_or_at` - `.resolve_scoped_or[_at]`
+readers **6 → 5**, and codegen now reads none. `lane-baseline`: LOOKUP_OTHER
+57 → 59 (`call_resolver` 35 → 37), the pin helper's two reads - a
+`TypeRef` → registered-name reverse map and an overload keyed by that name
+and a function-type id - which the gate's name rule counts as spelling
+lookups and which key on nothing written. Re-pinned here.
+
+**Tally: 16 shadowed, 16 at zero, 16 old paths deleted, 11 artifacts gone**
+(+ the module-leaf global lane).
+
+#### Carried, not fixed here
+
+* `global_extern_symbol(name)` and `is_global_thread_local(name)` are keyed
+  by the bare leaf, first registration wins; `resolve_global` and the new
+  `resolve_global_in_namespace` both read them. Two modules declaring one
+  leaf where one is `![thread_local]` or imported would read each other's
+  flag. Pre-existing; the per-module list that answers the type and the
+  namespace is the right key.
+* A generic free function taken as a value through a path (`Mod::f<T>` not
+  invoked) pins nothing and yields no value; the identifier form has mono's
+  `specialize_fn_value_ref`. The corpus holds none (FN-OLD-ONLY was 0).
+* The identifier twin: `codegen_identifier` still binds a bare function
+  value by `resolve_function(node.name)` after the generic pin, and sema's
+  `enforce_value_ref_visibility` resolves the same name through
+  `resolve_scoped_or_at` (reader 1 of the 5 left). New = `ident.res`.

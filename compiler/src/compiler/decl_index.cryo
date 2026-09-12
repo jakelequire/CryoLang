@@ -831,55 +831,20 @@ type struct DeclarationIndex {
         this.module_global_types.push(ty);
     }
 
-    /// The global `name` as declared by the module whose namespace's LAST
-    /// segment is `scope_leaf` — the module a qualified `scope_leaf::name`
-    /// actually names. `*out_ns` receives that module's namespace so codegen can
-    /// mangle the reference to the matching definition.
-    ///
-    /// A qualified reference must never be answered from the bare-name map:
-    /// that map is keyed by leaf and is last-write-wins across every module
-    /// declaring it, so `syscall::FIONBIO` would silently resolve to
-    /// `libc::FIONBIO` — a different value AND a different type.
-    ///
-    /// Returns an invalid TypeRef when no module matches, or when more than one
-    /// does (two namespaces ending in the same segment). Ambiguity is left to
-    /// the caller's existing behaviour rather than guessed at, which keeps this
-    /// lookup strictly additive.
-    find_global_in_scope(&this, name: SymbolStr, scope_leaf: SymbolStr,
-                         intern: InternTable*, out_ns: SymbolStr*,
-                         out_module: SymbolStr*) -> TypeRef {
-        const leaf: string = intern.resolve(scope_leaf);
-        if (leaf == "") { return TypeRef::invalid(); }
-        mut found: TypeRef = TypeRef::invalid();
-        mut hits: i64 = 0;
+    /// The global `name` declared by the module whose namespace IS `ns` - the
+    /// module a qualified path's stamp names - with that module recorded in
+    /// `*out_module`.  Exact: the stamp carries the canonical namespace, so
+    /// there is no suffix to match and no second module that could answer.
+    find_global_in_namespace(&this, name: SymbolStr, ns: SymbolStr,
+                             out_module: SymbolStr*) -> TypeRef {
+        if (!ns.is_valid()) { return TypeRef::invalid(); }
         for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
             if (this.module_global_keys[i] != name.id) { continue; }
-            const ns_sym: SymbolStr = SymbolStr::from_id(this.module_global_namespaces[i]);
-            if (!ns_sym.is_valid()) { continue; }
-            const ns: string = intern.resolve(ns_sym);
-            if (ns == "") { continue; }
-            if (!DeclarationIndex::namespace_leaf_is(ns, leaf)) { continue; }
-            hits = hits + 1;
-            if (hits > 1) { return TypeRef::invalid(); }
-            found = this.module_global_types[i];
-            *out_ns = ns_sym;
+            if (this.module_global_namespaces[i] != ns.id) { continue; }
             *out_module = SymbolStr::from_id(this.module_global_modules[i]);
+            return this.module_global_types[i];
         }
-        if (hits != 1) { return TypeRef::invalid(); }
-        return found;
-    }
-
-    /// True when `ns`'s last `::` segment equals `leaf` (or `ns` IS `leaf`) —
-    /// how a one-segment scope qualifier names a module. Mirrors the
-    /// module-suffix match `CallResolver` uses for abbreviated namespaces.
-    static namespace_leaf_is(ns: string, leaf: string) -> boolean {
-        const ns_len: i64 = ns.length() as i64;
-        const leaf_len: i64 = leaf.length() as i64;
-        if (ns_len == leaf_len) { return ns.eq(leaf); }
-        if (ns_len <= leaf_len + 1) { return false; }
-        const suffix_start: i64 = ns_len - leaf_len;
-        if (ns[suffix_start - 1] != ':' || ns[suffix_start - 2] != ':') { return false; }
-        return (ns + suffix_start) == leaf;
+        return TypeRef::invalid();
     }
 
     /// Whether a registered global is `![thread_local]`. Used by

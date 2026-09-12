@@ -417,32 +417,23 @@ type struct SymbolResolver {
         return g_val;
     }
 
-    /// Look up the global `name` as declared by the module named by
-    /// `scope_leaf`, for a qualified `scope_leaf::name` reference.
-    ///
-    /// `resolve_global` keys everything — the DI lookup, the namespace it
-    /// mangles with, and its cache — on the BARE leaf, which is last-write-wins
-    /// across every module declaring that leaf. Globals are NOT unique by leaf
-    /// at link time (that is exactly why they are mangled `C$<ns>.<name>`), so a
-    /// qualified reference resolved that way can bind to another module's
-    /// definition: a different address, a different value, a different type.
-    /// Returns null when no single module matches, or when the match is the
-    /// current module, leaving the caller its existing in-module path.
-    resolve_global_in_scope(mut &this, name: SymbolStr, scope_leaf: SymbolStr) -> LValue {
+    /// The global `name` as declared by the module whose namespace is `ns` -
+    /// the module a qualified reference's stamp names.  In-module, it is the
+    /// value `codegen_global_var` registered under the bare leaf; cross-module,
+    /// an extern declared under the same mangling the defining module emits,
+    /// cached under the namespace-qualified key.  Null when that module
+    /// declares no such global: the answer is then that nothing does, not a
+    /// licence to ask another module.
+    resolve_global_in_namespace(mut &this, name: SymbolStr, ns: SymbolStr) -> LValue {
         const intern: InternTable* = this.ctx.intern_table;
         const di: DeclarationIndex* = this.ctx.decl_index;
-
-        mut def_ns: SymbolStr = SymbolStr::empty();
         mut def_module: SymbolStr = SymbolStr::empty();
-        const g_type_ref: TypeRef = di.find_global_in_scope(name, scope_leaf, intern,
-                                                            &def_ns, &def_module);
+        const g_type_ref: TypeRef = di.find_global_in_namespace(name, ns, &def_module);
         if (g_type_ref.is_invalid()) { return LValue::null(); }
-        if (this.owned_by_current_module(def_module)) { return LValue::null(); }
+        if (this.owned_by_current_module(def_module)) { return this.globals.get(name); }
 
-        // Cache under the namespace-qualified key: the bare key belongs to
-        // whichever module `resolve_global` happened to bind first.
         const cache_key: SymbolStr = intern.intern(
-            fmt::format("%s::%s", intern.resolve(def_ns), intern.resolve(name)));
+            fmt::format("%s::%s", intern.resolve(ns), intern.resolve(name)));
         const cached: LValue = this.globals.get(cache_key);
         if (cached.is_valid()) { return cached; }
 
@@ -453,7 +444,7 @@ type struct SymbolResolver {
         const mangled: string = if (ext_sym.is_valid()) {
             intern.resolve(ext_sym)
         } else {
-            MangledName::for_global(intern, def_ns, name).resolve(intern)
+            MangledName::for_global(intern, ns, name).resolve(intern)
         };
         mut g_val: LValue = this.llvm_module.get_named_global(mangled);
         if (!g_val.is_valid()) {

@@ -2890,6 +2890,16 @@ type struct CallResolver {
         if (!ft.is_valid()) { return TypeRef::invalid(); }
         this.enforce_callee_visibility(q_sym, this.call_use_site_ns(scope.span),
             scope.span, resolve_counter::Site::FnBindVisValueQual);
+        // The pin is the qualified name, as the call form's is: a free
+        // function's registry key is its qualified name.  A function TEMPLATE
+        // is not pinned - the value names an instantiation the template's
+        // name does not, and nothing yet selects one for a value.
+        mut is_fn_template: boolean = false;
+        if (this.ctx.generic_registry != null) {
+            const tmpl: TemplateEntry* = this.ctx.generic_registry.get_template(q_sym);
+            if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) { is_fn_template = true; }
+        }
+        if (!is_fn_template && !scope.resolved_callee.is_valid()) { scope.set_resolved_callee(q_sym); }
         return ft;
     }
 
@@ -4043,6 +4053,30 @@ type struct CallResolver {
             }
         }
         call.set_resolved_callee(sym);
+    }
+
+    /// Pin the static method a `Type::method` VALUE names, by the symbol
+    /// codegen's registry is keyed by - the same one the CALL form of this path
+    /// pins (`pin_scope_callee_combined`), so a method taken as a value and the
+    /// same method called cannot address two symbols.
+    ///
+    /// The overload is the one whose function type sema already selected, not
+    /// the first registered under the name: `MethodInfo::function_type` and the
+    /// index's entry are interned through the same `get_function`, so the id
+    /// identifies it.  The owner key is the type's REGISTERED name, read off
+    /// the type sema resolved rather than off the spelling, which may be any
+    /// path that reaches it.  A method with no mangled entry yet pins the
+    /// combined name, as the call form does.
+    pin_scope_value_static_method(mut &this, scope: ScopeResolutionNode*, owner: TypeRef,
+                                  method_ft: TypeRef) -> void {
+        if (scope.resolved_callee.is_valid()) { return; }
+        if (this.ctx.decl_index == null) { return; }
+        const owner_sym: SymbolStr = this.ctx.decl_index.lookup_type_name(owner);
+        if (!owner_sym.is_valid()) { return; }
+        const sym: SymbolStr = this.intern.intern(fmt::format("%s::%s",
+            this.intern.resolve(owner_sym), this.intern.resolve(scope.member_name)));
+        const mg: SymbolStr = this.ctx.decl_index.lookup_overload_mangled(sym, method_ft);
+        scope.set_resolved_callee(if (mg.is_valid()) { mg } else { sym });
     }
 
     try_pin_static_method_overload(mut &this, call: CallExprNode*, combined_sym: SymbolStr) -> boolean {

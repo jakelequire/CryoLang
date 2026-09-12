@@ -1594,40 +1594,23 @@ public:
         this.lambda.emit(this, node);
     }
 
+    /// A qualified path in VALUE position: a function taken as a value, an
+    /// enum variant, or a global.  Each answers from what sema recorded on the
+    /// node - the pin, `resolved_type`, the qualifier's stamp - and nothing is
+    /// looked up by the spelling.  A path sema pinned nothing for and that
+    /// names no variant or global yields no value, which is the front end's
+    /// miss reported as the front end's (sema already diagnosed it).
     override visit(mut &this, node: ScopeResolutionNode*) -> void {
-        const intern: InternTable* = this.cg.get_intern();
-
-        // 1. Simple combined lookup (bare scope_name::member_name)
-        const scope_str_bare: string = this.cg.resolve(node.scope_name);
-        const member_str: string     = this.cg.resolve(node.member_name);
-        const combined_bare: string  = fmt::format("%s::%s", scope_str_bare, member_str);
-        const sym_bare: SymbolStr    = this.cg.intern_str(combined_bare);
-
-        mut fn_val: LValue = this.cg.resolver.resolve_function(sym_bare);
-        if (fn_val.is_valid()) {
-            this.state.last_value    = fn_val;
-            this.state.last_is_lvalue = false;
-            return;
+        // 1. A function: sema's pin, routed as a call's pin is.
+        if (node.resolved_callee.is_valid()) {
+            const fn_val: LValue = this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
+            if (fn_val.is_valid()) {
+                this.state.last_value    = fn_val;
+                this.state.last_is_lvalue = false;
+                return;
+            }
         }
 
-        // 2. Qualified scope lookup.
-        //
-        // One written segment can name a MODULE and a TYPE at once - a file
-        // whose namespace leaf is spelled like a type it declares - and the
-        // member may belong to either: a module's free function, or a type's
-        // static.
-        // The segment alone therefore does not say where to look, and only the
-        // member's own existence settles it, so both owners are probed and
-        // whichever declares the member answers.  The module goes first, which
-        // is the language's rule for a qualifier position.
-        //
-        // The module's canonical namespace comes from the stamp the resolver
-        // wrote on the node.  It cannot be re-derived here: the lookup that
-        // serves the type case hands its input back unchanged when it fails, so
-        // `Helper` answering `Helper` is indistinguishable from a refusal, and
-        // the probe - now equal to the bare spelling already tried above - is
-        // skipped. A function used as a VALUE then leaves its slot unwritten
-        // rather than diagnosed.
         // Named at the event: the delayed-bug tally says HOW MANY nodes arrived
         // unclaimed and only a per-node line says WHICH, and the two call for
         // different fixes - one synthesizer to correct, or a whole construct
@@ -1637,92 +1620,33 @@ public:
                 "RES-PENDING", this.cg.resolve(node.scope_name),
                 this.cg.resolve(node.member_name), node.span.to_string());
         }
+
+        // 2. An enum variant (`Option::None`, `Key::E`), from sema's
+        // `resolved_type`: it names the enum this path denotes, through any
+        // chain of instantiations, and a member it has no variant for is not
+        // an enum reference at all.
+        if (this.try_emit_enum_variant(node)) { return; }
+
+        // 3. A global.  The qualifier's stamp names the module, and the
+        // global is that module's, under the member leaf - two modules may
+        // each declare the same leaf with different values and types
+        // (`libc::FIONBIO` is a Linux ioctl number, `syscall::FIONBIO` the
+        // Winsock one), which is why the leaf alone can never answer.  An
+        // `extern module` alias is not a Cryo module and no stamp can name
+        // it: the import engine registers each of its constants under the
+        // alias-qualified key (`cit::FLAG_A`), a distinct key space rather
+        // than a second guess at the one above.
         const stamped_ns: SymbolStr =
             node.require_scope_res("codegen: scope-resolution value")
                 .def_id().qualified_name();
-        if (stamped_ns.is_valid()) {
-            const combined_mod: string = fmt::format("%s::%s",
-                intern.resolve(stamped_ns), member_str);
-            const sym_mod: SymbolStr = intern.intern(combined_mod);
-            if (!sym_mod.equals(sym_bare)) {
-                fn_val = this.cg.functions.get(sym_mod);
-                if (!fn_val.is_valid()) {
-                    fn_val = this.cg.resolver.resolve_function(sym_mod);
-                }
-                if (fn_val.is_valid()) {
-                    this.state.last_value    = fn_val;
-                    this.state.last_is_lvalue = false;
-                    return;
-                }
-            }
-        }
-
-        // Static methods are registered under their fully-qualified owner name
-        // (e.g. `MyNS::Handler::greet_static`).  Resolve the scope name through
-        // the DI type map, judged against the module that WROTE the path rather
-        // than the one being emitted.
-        const resolved_scope: SymbolStr =
-            this.cg.ctx.resolve_scoped_or_at(node.scope_name, node.span.file, FILE, LINE as i32);
-        const scope_str_qual: string    = intern.resolve(resolved_scope);
-        const combined_qual: string     = fmt::format("%s::%s", scope_str_qual, member_str);
-        const sym_qual: SymbolStr       = intern.intern(combined_qual);
-
-        if (!sym_qual.equals(sym_bare)) {
-            fn_val = this.cg.functions.get(sym_qual);
-            if (!fn_val.is_valid()) {
-                fn_val = this.cg.resolver.resolve_function(sym_qual);
-            }
-            if (fn_val.is_valid()) {
-                this.state.last_value    = fn_val;
-                this.state.last_is_lvalue = false;
-                return;
-            }
-        }
-
-        // 3. Enum variant reference (`Option::None`, `Key::E`).
-        //
-        // Ahead of the global lookups below, and that order is the whole point:
-        // a member of a TYPE is not a global, so the tables that answer for
-        // module-level storage must not be asked first.  The last of those
-        // probes matches on the member's BARE leaf, which any module in the
-        // program can satisfy - `Key::E` was answered by `std::math`'s `E`, and
-        // because a global resolves as an lvalue the enum's own width was then
-        // applied to that global's storage, reading a truncation of a f64 bit
-        // pattern as the discriminant with nothing diagnosed.
-        //
-        // Sema's `resolved_type` is what decides, not the written qualifier: it
-        // names the enum this path denotes, and a member it has no variant for
-        // is not an enum reference at all, so this declines to the lookups
-        // below rather than shadowing them.
-        if (this.try_emit_enum_variant(node)) { return; }
-
-        // 4. Global variable lookups
-        const global: LValue = this.cg.resolver.resolve_global(sym_bare);
+        const global: LValue = if (stamped_ns.is_valid()) {
+            this.cg.resolver.resolve_global_in_namespace(node.member_name, stamped_ns)
+        } else {
+            this.cg.resolver.resolve_global(this.cg.intern_str(fmt::format("%s::%s",
+                this.cg.resolve(node.scope_name), this.cg.resolve(node.member_name))))
+        };
         if (global.is_valid()) {
             this.state.last_value    = global;
-            this.state.last_is_lvalue = true;
-            return;
-        }
-        // The scope names a MODULE: resolve the global that module declares
-        // before trying the bare leaf below. Two modules may each declare the
-        // same leaf with different values and types (`libc::FIONBIO` is a Linux
-        // ioctl number, `syscall::FIONBIO` the Winsock one), and the bare lookup
-        // cannot tell them apart.
-        const scoped_global: LValue =
-            this.cg.resolver.resolve_global_in_scope(node.member_name, node.scope_name);
-        if (scoped_global.is_valid()) {
-            this.state.last_value    = scoped_global;
-            this.state.last_is_lvalue = true;
-            return;
-        }
-        // Bare-name global lookup. Top-level `const X: T = ...` declarations
-        // register globals under their bare name (e.g. `O_RDWR`); when
-        // referenced as `libc::O_RDWR` from another module the combined-
-        // name lookup misses, so also try the bare member name. Reached only
-        // when no single module matched the scope above.
-        const bare_global: LValue = this.cg.resolver.resolve_global(node.member_name);
-        if (bare_global.is_valid()) {
-            this.state.last_value    = bare_global;
             this.state.last_is_lvalue = true;
             return;
         }
