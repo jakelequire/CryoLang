@@ -545,16 +545,12 @@ type struct CallEmitter {
                 }
             }
         } else if (node.callee.kind == NodeKind::MemberAccess) {
-            // Member access: sema's `resolve_method_overload` pins the
-            // mangled LLVM callee on `resolved_callee` for inherent
-            // class/struct/enum methods AND for trait-impl methods on
-            // non-generic receivers.  Codegen detects the function-
-            // pointer-field shortcut, picks up virtual-dispatch state for
-            // class receivers, then routes the pinned symbol through
-            // `resolve_function_by_mangled`.  The post-specialization
-            // fallback at the bottom covers methods on spec'd receivers
-            // (InstantiatedType, where sema runs before monomorphization
-            // and the receiver's concrete spec name doesn't exist yet).
+            // Member access: sema's overload selection (or mono's, for a
+            // specialization) pins the mangled LLVM callee on
+            // `resolved_callee`.  Codegen detects the function-pointer-field
+            // shortcut, picks up virtual-dispatch state for class receivers,
+            // then routes the pinned symbol through
+            // `resolve_function_by_mangled`.
             const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
             const di: DeclarationIndex* = this.cg.get_decl_index();
             const method_str: string = intern.resolve(ma.member);
@@ -659,26 +655,6 @@ type struct CallEmitter {
                 t = this.cg.lookup_type_by_id(obj_ref.id);
             }
 
-            // Use DI type_reverse to get the type's registered name,
-            // then look up "QualifiedType::method" in the function map.
-            // For ArrayType, use the element-type -> Array_<T> mapping
-            // since ArrayType TypeRefs are not canonical.  Only used by
-            // the post-specialization fallback below (when sema's pin
-            // was empty or its symbol isn't in the LLVM module).
-            mut type_sym: SymbolStr = di.lookup_type_name(obj_ref);
-            if (!type_sym.is_valid() && t != null && t.kind == TypeKind::Array) {
-                const arr_t: ArrayType* = t as ArrayType*;
-                // Only dynamic arrays share the `Array_<T>` method registry -
-                // fixed-size `T[N]` has no methods of its own and must not be
-                // dispatched to `Array<T>::method` (e.g. `Array<T>::drop` would
-                // try to free a stack address).  Leaving type_sym empty for
-                // T[N] lets `.drop()` fall through to the drop-glue fallback,
-                // which synthesizes per-element drops.
-                if (arr_t.is_dynamic()) {
-                    type_sym = di.lookup_array_type_name(arr_t.element);
-                }
-            }
-
             // Check for virtual dispatch: if the STATIC receiver type is a
             // class with virtual methods and sema has resolved this call
             // to a specific method declaration, dispatch indirectly through
@@ -720,19 +696,9 @@ type struct CallEmitter {
                 }
             }
 
-            // Instance-method calls prepend `&this` at the call site, so the
-            // LLVM arity is user-args + 1.  This matches declare_method's
-            // `total_params` registration key.
-            const ma_arity: u32 = (node.arguments.length + 1) as u32;
-
-            // Trust sema: `resolved_callee` is the mangled LLVM symbol
-            // chosen by `resolve_method_overload` for inherent methods on
-            // classes / structs / enums (including the base-class walk
-            // for inheritance) AND for trait-impl methods on non-generic
-            // receivers (e.g. `String::write_bytes` from `implement trait
-            // FmtWrite for String`, or primitive trait impls like
-            // `Eq for i16`).  Routes through `resolve_function_by_mangled`,
-            // identical to the Identifier branch.
+            // `resolved_callee` is the mangled LLVM symbol selection chose;
+            // routed through `resolve_function_by_mangled`, identical to the
+            // Identifier branch.
             if (node.resolved_callee.is_valid()) {
                 callee_val = this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
                 // Method-spec-args ($MG) reconciliation.  A generic INHERENT method
@@ -744,9 +710,7 @@ type struct CallEmitter {
                 // already-monomorphized generic method after mono ran (e.g.
                 // `String<GlobalAlloc>`'s `FmtWrite::write_str` calling
                 // `this.try_push<Str>`, reached via the injected owner-module spec).
-                // The base symbol then misses the emitted `$MG` definition, and the
-                // name+arity fallback below would pick a WRONG sibling spec
-                // (try_push<Str> -> try_push<i32>, corrupting all formatting).  The
+                // The base symbol then misses the emitted `$MG` definition.  The
                 // call still carries its concrete method type-args on
                 // `resolved_type_args`; reconstruct the `$MG` symbol from them and
                 // retry.  No-op for non-generic calls (empty args) and for symbols
@@ -761,84 +725,9 @@ type struct CallEmitter {
                 }
             }
 
-            // SHADOW.  Sema's pin (with the `$MG` reconciliation above) is
-            // the new model's whole answer for a method call; the two
-            // lookups below bind by a name codegen derives from the receiver
-            // type.  A call bound below prints unconditionally, with whether
-            // a pin existed and missed or none was written, and whether sema
-            // resolved a method node for it at all.
-            const ma_pinned: boolean = callee_val.is_valid();
-            const ma_had_pin: boolean = node.resolved_callee.is_valid();
-            mut ma_step: string = "";
-
-            // Post-specialization fallback: when the receiver is a
-            // monomorphized InstantiatedType (e.g. `Array<u8, GlobalAlloc>`
-            // inside a spec'd `String<GlobalAlloc>::with_capacity`), sema's
-            // pin uses the TEMPLATE's mangled symbol, which doesn't exist
-            // in the LLVM module (only specs are emitted).  Re-resolve via
-            // the post-substitution receiver type name registered in the
-            // DI: `lookup_type_name(obj_ref)` returns the spec's qname
-            // (e.g. `Array_u8_GlobalAlloc`) and the combined
-            // `<spec_qname>::<method>` lookup finds the spec'd LLVM symbol.
-            //
-            // Long-term: move this into a post-monomorphization re-pin
-            // pass that updates `resolved_callee` after AST substitution.
-            // Until then this branch handles the spec'd-receiver case.
-            if (!callee_val.is_valid() && type_sym.is_valid()) {
-                ma_step = "type-sym";
-                const type_str: string = intern.resolve(type_sym);
-                const combined: string = fmt::format("%s::%s", type_str, method_str);
-                const sym: SymbolStr = intern.intern(combined);
-                callee_val = this.cg.resolver.resolve_function_with_arity(sym, ma_arity);
-                if (!callee_val.is_valid()) {
-                    callee_val = this.cg.resolver.resolve_function(sym);
-                }
-            }
-            if (!callee_val.is_valid() && t != null) {
-                mut type_str: string = "";
-                if (t.kind == TypeKind::Struct) {
-                    const st: StructType* = t as StructType*;
-                    type_str = intern.resolve(st.qualified_name);
-                } else if (t.kind == TypeKind::Class) {
-                    const ct: ClassType* = t as ClassType*;
-                    type_str = intern.resolve(ct.qualified_name);
-                } else if (t.kind == TypeKind::Enum) {
-                    const et: EnumType* = t as EnumType*;
-                    type_str = intern.resolve(et.qualified_name);
-                } else if (t.kind == TypeKind::Int
-                        || t.kind == TypeKind::Float
-                        || t.kind == TypeKind::Bool
-                        || t.kind == TypeKind::Char
-                        || t.kind == TypeKind::String
-                        || t.kind == TypeKind::Unit) {
-                    // Primitives have no `qualified_name`; the trait-
-                    // impl registry keys on the bare display name.
-                    type_str = t.display_name();
-                }
-                if (type_str.length() > 0) {
-                    ma_step = "qualified-name";
-                    const combined: string = fmt::format("%s::%s", type_str, method_str);
-                    const sym: SymbolStr = intern.intern(combined);
-                    callee_val = this.cg.resolver.resolve_function_with_arity(sym, ma_arity);
-                    if (!callee_val.is_valid()) {
-                        callee_val = this.cg.resolver.resolve_function(sym);
-                    }
-                }
-            }
-            if (!ma_pinned && callee_val.is_valid()) {
-                const ma_cur_fn: LValue = this.get_current_function();
-                const ma_in: string = if (ma_cur_fn.is_valid()) {
-                    llvm::LLVMGetValueName(ma_cur_fn.raw) as string
-                } else { "?" };
-                const ma_recv: string = if (obj_ref.is_valid()) {
-                    this.cg.get_arena().resolve_display_name(obj_ref.id)
-                } else { "?" };
-                fmt::eprintf("SHADOW-CGMETHOD\t%s\t%s\t%s\t%s::%s\t%s\tin=%s\tmod=%s\n",
-                    if (ma_had_pin) { "pin-missed" } else { "no-pin" },
-                    ma_step,
-                    if (node.resolved_method != null) { "method-node" } else { "no-method-node" },
-                    ma_recv, method_str, node.span.to_string(), ma_in, this.cg.ctx.source_file);
-            }
+            // Sema's pin is the whole answer for a method call.  A call
+            // with no pin has no method: a `.drop()` on a type without a
+            // user drop, which the Copy no-op and the drop glue below take.
 
         } else {
             callee_val = this.dispatch.codegen_rvalue(visitor,node.callee);

@@ -100,7 +100,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `scope_owner_key` | LIVE — the static-call owner key; the callee-type and template-method probes read it too | — | `grep -rho 'scope_owner_key' compiler/src \| wc -l` → **6** | §8.134, §8.151 |
 | static-call owner TEMPLATE by spelling (`resolve_scope_owner_template`'s as-is → scope map → cross-module cascade) | **DELETED** — the owner template is read off the segment's stamp, in sema and in mono | — | `grep -c 'resolve_scoped_or_at' compiler/src/compiler/sema/call_resolver.cryo` → **2** (was 7) | §8.150, §8.151 |
 | codegen static-call ladder (`call_emitter`: spec-by-return-type → `scope::member` → bare member, and the enum variant's scope-name probe) | **DELETED** — sema's / mono's pin answers every static call; 495 → 0 in §8.160; `call_emitter` reads no `resolve_scoped_or` | — | `grep -c 'resolve_scoped_or' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0** | §8.158, §8.160, §8.161 |
-| codegen method-call ladder (`call_emitter` MemberAccess branch: `<type name>::method`, `<qualified_name>::method`) | **SHADOWED, AT ZERO** - 336,761 → 0 over the corpus (§8.164); not yet deleted | — | `grep -c 'SHADOW-CGMETHOD' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **1** | §8.162, §8.163, §8.164 |
+| codegen method-call ladder (`call_emitter` MemberAccess branch: `<type name>::method`, `<qualified_name>::method`) | **DELETED** - a method call binds from sema's / mono's pin and nothing else; 336,761 → 0 in §8.164, cut in §8.165 with 0 objects moved | — | `grep -c 'lookup_array_type_name' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0** | §8.163, §8.164, §8.165 |
 | callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **19** | §8.1f, §8.2ag |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
@@ -21894,3 +21894,107 @@ negative, 43 projects.
 
 Tally: 15 shadowed, 15 at zero, 14 deleted, 9 artifacts gone. The
 deletion is the next commit, with its own object control.
+
+### 8.165 F17 deleted; handoff - 2026-09-12
+
+#### The deletion
+
+`call_emitter`'s MemberAccess branch binds from `resolved_callee` (with the
+`$MG` reconciliation) and nothing else. Gone: the receiver-name derivation
+(`di.lookup_type_name(obj_ref)` / `lookup_array_type_name`), the
+`<type name>::method` and `<qualified_name>::method` lookups by name and
+arity, `ma_arity`, and the shadow. 121 lines. A call with no pin has no
+method - a `.drop()` on a type without a user drop - and takes the Copy
+no-op or the drop glue, exactly as before. `lookup_array_type_name` keeps
+its one reader, sema's `lookup_type_sym` (the name-keyed return-type path,
+§8.164's last bullet).
+
+Control, fix tree (`fd10049d`) vs deletion tree: **0 of 2,126** objects
+moved in `tests/`, **0 of 1,126** in `examples/`, by the same
+`tests-hash.sh` / `ex-hash.sh` that measured §8.164's moves; the LSP
+builds directly; suite green at runtime. The shadow was at zero over every population
+before the cut, and the instrument had reported 42, 29, 54 and 336,761 over
+the same populations on the way down.
+
+**Tally: 15 shadowed, 15 at zero, 15 old paths deleted, 10 artifacts gone**
+(+ codegen's method-call ladder; `pin_method_resolved_callee`,
+`try_match_trait_impl_method` and `match_methods_on_impl_block` went in
+§8.164 as the matcher became one).
+
+#### F17, whole, for the next reader
+
+Nine layers (§8.164's table) and ten defects under them - six found by the
+shadow (a bound call must stay bound; no Enum arm in
+`lookup_method_param_types`; the annotator's cross-module ordering;
+`seen_fn_types: u32[]`; the bare-statement `loop` body; the 29 + 2
+ill-typed calls in `compiler/src`) and four found only by the object
+comparison (the `*` desugar literal's width; the extern re-derived by
+(name, type) at the module boundary; a primitive receiver's spec with no
+pin target and no dedup key; the operator desugar naming no trait).
+Consumer 14 hid six; this one hid ten.
+
+What is still name-keyed on the method-call path, in order of size:
+1. `resolve_method_call`'s RETURN type (`lookup_type_sym` +
+   `lookup_method_return`, DI `method_returns` by (type name, method
+   name)). The pin is by identity; the return is by name, and the
+   concrete-return override at `resolve_call` (`generic_params == 0`) is
+   what keeps them agreeing for generic methods. Shadow it against the
+   pinned method's `resolved_return_type` substituted for the receiver.
+2. `check_method_call_arg_types` walks its own candidate sets (arena
+   methods + trait impls; for a primitive, trait impls only), so it never
+   diagnosed the 31 ill-typed calls the fallback let through. Its candidate
+   walk should be `select_method`'s.
+3. `OwnershipQuery` keys `Drop`/`Copy` on bare leaves with a precise
+   qualified-name path layered on top (`type_has_drop_impl`).
+
+#### Remaining consumers (§8.162's order, unchanged)
+
+1. `ir_generator.cryo` `visit(ScopeResolutionNode)` value form - needs a
+   sema pin slot first.
+2. The six `.resolve_scoped_or[_at]` readers.
+3. `qualify_symbol_sym` lookups (`lambda_synth`, `specialization.cryo:103`,
+   `directive_processing`).
+4. `lookup_scope_variant_payload_types` fallback,
+   `check_scope_call_arg_types`, `enforce_static_method_visibility`.
+
+Carried from consumer 14, still open: the `namespace::name` C-import key in
+codegen; the by-name canonical `GenericParam` hazard; the arena-id closure
+symbol; `selfhost-check` not run this session either (the object control
+was).
+
+#### Queued ruling from Jake, NOT started: primitive type names stop being keywords
+
+`string`, `default`, `float` are reserved, so `&string::String` parses
+`string` as a primitive; that blocks ~1,087 `String` sites and the 42
+requalification carve-outs. Of three options (rename the modules; a keyword
+before `::`; stop reserving) Jake took the third: the Rust model, where
+`str`/`u32`/`bool` are prelude types and `std::str` the module coexists
+with `str` the type under no special rule - the D5 shape, a collision made
+impossible rather than adjudicated. Scope before building and report:
+(a) enumerate the keywords that are actually primitive type names - not
+just the three that bit; (b) `default` may be a genuine keyword (a clause /
+trait default) rather than a type name and then needs its own answer;
+(c) whether the change REMOVES special-casing (a primitive becomes a
+prelude type instead of a lexer case) or adds machinery - the latter
+undercuts the reason for the choice and is a finding to report before
+building; (d) what breaks: shadowing, declarations using the words as
+identifiers, diagnostics keyed on the token. Verify by object hash where
+behaviour must not change; parse behaviour WILL change, so a reproducer
+that fails before and passes after outweighs a green suite.
+
+#### Traps, this session
+
+* The Bash tool's heredoc collapses `\\n` to a real newline INSIDE a quoted
+  heredoc too; a multi-line string literal is legal Cryo, so the probe
+  compiled and nobody noticed until `grep` showed the break. Scripts with
+  escapes go through the Write tool, always.
+* `make api-index-check` is red at `fd10049d`'s parent already
+  (`docs/stdlib-api.txt` stale); nothing here touched `stdlib`.
+* `native_syscalls_gate` is `requires: os:linux`; its exit 1 on Windows is
+  not a regression.
+* `lane-baseline` moved LOOKUP_OTHER 58 → 59 for
+  `decl_index.lookup_array_type` - an identity query (element `TypeRef` →
+  specialization `TypeRef`) the gate's `lookup_` name rule counts as a
+  spelling lookup. Re-pinned with the reason in `fd10049d`.
+* `cryo test --list` compiles the whole unit suite with codegen (~4 min)
+  and is the fastest suite-half measurement; `make test` for the runtime.
