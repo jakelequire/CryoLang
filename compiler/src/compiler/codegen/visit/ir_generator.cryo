@@ -1075,39 +1075,40 @@ public:
             this.state.last_is_lvalue = true;
             return;
         }
-
-        // Try global.
-        const global: LValue = this.cg.resolver.resolve_global(node.name);
-        if (global.is_valid()) {
-            this.state.last_value = global;
-            this.state.last_is_lvalue = true;
-            return;
+        // Neither a local nor a parameter: the stamp names the definition
+        // canonically.  A global is that name's namespace and leaf - two
+        // modules may each declare the same leaf with different values and
+        // types, and a specialized clone emitted into a third module reads
+        // whichever one a leaf-keyed lookup happened to cache first.  A
+        // function is sema's or mono's pin, routed as a call's is.  A name
+        // with neither yields no value; sema has already reported it.
+        const def_q: SymbolStr = match (node.res) {
+            ResSlot::Answered(r) => { r.def_id().qualified_name() }
+            _                    => { SymbolStr::empty() }
+        };
+        if (def_q.is_valid()) {
+            const q_str: string = this.cg.resolve(def_q);
+            const ns_str: string = QualifiedName::parent_of(q_str);
+            const ns_sym: SymbolStr = if (ns_str.length() > 0) { this.cg.intern_str(ns_str) } else { SymbolStr::empty() };
+            const global: LValue = this.cg.resolver.resolve_global_in_namespace(
+                this.cg.intern_str(QualifiedName::leaf_of(q_str)), ns_sym);
+            if (global.is_valid()) {
+                this.state.last_value    = global;
+                this.state.last_is_lvalue = true;
+                return;
+            }
         }
 
-        // Generic function-reference value (`tramp<i32>` used as a value):
-        // the monomorphizer pinned the specialized symbol on `resolved_callee`.
-        // Reference the monomorphized function directly instead of the bare
-        // template (which codegen skips), so taking its address yields the
-        // concrete instantiation's function pointer.
         if (node.resolved_callee.is_valid()) {
-            const spec_fn: LValue =
-                this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
-            if (spec_fn.is_valid()) {
-                this.state.last_value = spec_fn;
+            const func: LValue = this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
+            if (func.is_valid()) {
+                this.state.last_value    = func;
                 this.state.last_is_lvalue = false;
                 return;
             }
         }
 
-        // Try function (for function references / first-class functions).
-        const func: LValue = this.cg.resolver.resolve_function(node.name);
-        if (func.is_valid()) {
-            this.state.last_value = func;
-            this.state.last_is_lvalue = false;
-            return;
-        }
-
-        this.state.last_value = LValue::null();
+        this.state.last_value    = LValue::null();
         this.state.last_is_lvalue = false;
     }
 

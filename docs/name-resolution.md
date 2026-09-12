@@ -53,7 +53,7 @@ current-state description is the defect it exists to remove.
 | D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); the 82 asserted rows and `tests/b1-baseline.txt` untouched | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1544** | §8.66, §8.80, §8.139 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
-| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **576** | §8.145, §8.146, §8.147, §8.148, §8.150 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **577** | §8.145, §8.146, §8.147, §8.148, §8.150 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
 
 **D2 is the one to look at.** Decided in §8.39, then neither taken nor
@@ -98,11 +98,13 @@ three, and its row carries the count. Read each zero off its own row.
 | `check_module_type_collision` | LIVE — D5 deletes it | — | see D5 | §8.130, §8.131 |
 | `module_owns_member` probe | LIVE — D5 deletes it | — | `grep -rho 'module_owns_member' compiler/src \| wc -l` → **3** | §8.131 |
 | `scope_owner_key` | LIVE — the static-call owner key; the callee-type and template-method probes read it too | — | `grep -rho 'scope_owner_key' compiler/src \| wc -l` → **6** | §8.134, §8.151 |
-| static-call owner TEMPLATE by spelling (`resolve_scope_owner_template`'s as-is → scope map → cross-module cascade) | **DELETED** — the owner template is read off the segment's stamp, in sema and in mono | — | `grep -c 'resolve_scoped_or_at' compiler/src/compiler/sema/call_resolver.cryo` → **2** (was 7) | §8.150, §8.151 |
+| static-call owner TEMPLATE by spelling (`resolve_scope_owner_template`'s as-is → scope map → cross-module cascade) | **DELETED** — the owner template is read off the segment's stamp, in sema and in mono | — | `grep -c 'resolve_scoped_or_at' compiler/src/compiler/sema/call_resolver.cryo` → **1** (was 7; the value-form reader went in §8.167) | §8.150, §8.151 |
 | codegen static-call ladder (`call_emitter`: spec-by-return-type → `scope::member` → bare member, and the enum variant's scope-name probe) | **DELETED** — sema's / mono's pin answers every static call; 495 → 0 in §8.160; `call_emitter` reads no `resolve_scoped_or` | — | `grep -c 'resolve_scoped_or' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0** | §8.158, §8.160, §8.161 |
 | codegen method-call ladder (`call_emitter` MemberAccess branch: `<type name>::method`, `<qualified_name>::method`) | **DELETED** - a method call binds from sema's / mono's pin and nothing else; 336,761 → 0 in §8.164, cut in §8.165 with 0 objects moved | — | `grep -c 'lookup_array_type_name' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0** | §8.163, §8.164, §8.165 |
 | codegen scope-value ladder (`ir_generator` `visit(ScopeResolutionNode)`: three function lookups by spelling, three global lookups, the module-leaf global lane `resolve_global_in_scope` → `find_global_in_scope` → `namespace_leaf_is`) | **DELETED** - a path in value position binds from sema's pin (`ScopeResolutionNode::resolved_callee`), `resolved_type`, or the stamp's namespace + member leaf; shadow 0 first build, controlled at 301, 0/0 objects | — | `grep -c 'resolve_scoped_or' compiler/src/compiler/codegen/visit/ir_generator.cryo` → **0**; `grep -rho 'find_global_in_scope' compiler/src \| wc -l` → **0** | §8.166 |
-| callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **19** | §8.1f, §8.2ag |
+| codegen identifier-value lookups (`codegen_identifier`: `resolve_global(node.name)` by the bare leaf, `resolve_function(node.name)` after the generic pin) and sema's bare `lookup_func_type_exact(ident.name)` + cursor-keyed `enforce_value_ref_visibility` | **DELETED** - a bare value binds from the stamp (global: its namespace and leaf, exact) or the pin (`IdentifierNode::resolved_callee`, now written for every function value); shadow 293 → the fix IS the deletion (a clone read another module's same-leaf global), 4 wrong-function binds found only by the object comparison | — | `grep -c 'resolve_function(node.name)' compiler/src/compiler/codegen/visit/ir_generator.cryo` → **0**; `grep -c 'resolve_global(node.name)' compiler/src/compiler/codegen/visit/ir_generator.cryo` → **0** | §8.167 |
+| import-site visibility gate (E0353 on `import M::{ x }` where `M` declares `x` private) | LIVE, reached; `visibility_import_gate` pins the refusal | — | `grep -c 'declares_private' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.167 |
+| callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **20** (the 20th is the import-site gate, §8.167) | §8.1f, §8.2ag |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
 
@@ -118,7 +120,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,113 unit + 46 project + 179 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
+| `make test` | 2,113 unit + 47 project + 179 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make b1-check` | B1 total + every per-row bound, 3 corpora × 2 hosts | **2 of the 3 corpora are `examples/`**; the third is `tests/tests/projects/ffi_c_import`. The compiler's own source is NOT a corpus, and `tests/` at large is swept by none of them. |
 | `make lane-check` | 7 buckets of call sites in `compiler/src`, as a golden | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
@@ -143,7 +145,7 @@ Checks for this section, one per line so each can be copied whole:
 
 * `grep -c '^\[' tests/lane-baseline.txt` → **7**
 * `grep -c '^\[host:' tests/b1-baseline.txt` → **6**
-* `grep -c '^project ' tests/test-roster.txt` → **46**
+* `grep -c '^project ' tests/test-roster.txt` → **47**
 * `grep -c '^negative ' tests/test-roster.txt` → **179**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -n 'branches:' .github/workflows/ci.yml` → `main` only, both hooks
@@ -22141,3 +22143,149 @@ lookups and which key on nothing written. Re-pinned here.
   value by `resolve_function(node.name)` after the generic pin, and sema's
   `enforce_value_ref_visibility` resolves the same name through
   `resolve_scoped_or_at` (reader 1 of the 5 left). New = `ident.res`.
+
+### 8.167 Consumer 16 deleted: the bare identifier in value position - a global by its leaf, a function by its leaf, and the visibility key by the cursor - 2026-09-12
+
+The twin of §8.166. `codegen_identifier` bound a bare name that is neither
+local nor parameter by two spelling lookups: `resolve_global(node.name)` -
+the DI's per-module list and the codegen cache both keyed by the BARE leaf,
+first registration and first cache fill winning - and, after mono's generic
+pin, `resolve_function(node.name)`. Sema's `resolve_identifier` typed the
+same value through `lookup_func_type_exact(ident.name)`, the bare slot, and
+gated it through `enforce_value_ref_visibility`, whose key came from
+`resolve_scoped_or_at` - reader 1 of the five `.resolve_scoped_or[_at]`
+readers left after §8.166.
+
+Now: the stamp. A global is the stamp's namespace and leaf, exact
+(`resolve_global_in_namespace`, the lookup §8.166 introduced for the
+qualified form); a function is sema's pin - `IdentifierNode::resolved_callee`,
+the slot mono already writes for a turbofished value, now written by
+`resolve_identifier` with the stamp's canonical name for every other
+function value (a template pins nothing, as in §8.166) - and sema types
+and gates it by that name. Codegen reads no spelling; sema's value branch
+reads none; `enforce_value_ref_visibility` takes the name it is handed.
+
+#### What the shadow found
+
+One build, both models answering, LLVM value identity in codegen and
+`TypeRef` / symbol identity in sema, every disagreement printed. Whole
+corpus - LSP direct, unit suite, projects one by one, 14 examples:
+
+* **293 `GL-DIFF`**, three globals, one mechanism. A specialized clone
+  emitted into a consuming module reads its template's bare global through
+  a leaf-keyed lookup, and the leaf is shared: `Array<T>::reserve_grow`
+  (124 clones) read `std::collections::string::INITIAL_CAPACITY` (8) for
+  `array`'s (4); `String<A>::push_one_byte` and three siblings (41 clones
+  each) read `array`'s 4 for `string`'s 8; `BufReader<S>::read_line` read
+  `std::io::traits::BYTE_LF` for `std::io::buf`'s. Which module won was
+  whichever the emitting module's cache filled first, so the two
+  collections' growth constants were swapped per module. Every clone
+  carries the stamp of the module that WROTE the name, and that is the
+  answer. The corpus ran with the wrong capacities and no test noticed; the
+  object comparison at deletion is what shows the blast radius.
+* **2 `FT-OLD-ONLY` / 2 `Q-OLD-ONLY`**, one site: `visibility_value_gate`'s
+  door 5b, a bare private `latched` from another module, unimported. The
+  bare slot found it; the stamp has nothing, because a private declaration
+  is offered to no importer. Under the new model the name is simply not in
+  scope, and sema reports E0201 - the door's assertion now.
+* **0 in the codegen function class**, controlled by inverting its
+  comparison for one build: 13 agreeing pairs print on the LSP alone.
+
+#### Found under it: every `extern "C"` function was private to the name layer
+
+Moving the door led to `import std::ffi::libc::{ getrandom }` in
+`stdlib/random/secure.cryo`, which the corpus had been compiling with the
+import binding NOTHING. `FunctionDeclNode` defaults `is_public` to false
+and `parse_extern_function` never set it, so every function in an
+`extern "C" { }` block was declared private and exported by no module. All
+14 specific libc imports in the tree bound nothing, and every call or value
+of a libc function resolved through the DI's bare slot - the `BARE` door of
+`lookup_callee_function_type`, never `STAMP`. Fixed at the parser: an
+imported function takes the top-level default, public unless `private`
+opts it out (the keyword is now accepted before `function` in an extern
+block). Predicted and observed: the corpus builds, those calls take the
+stamp door, no object moves (the `TypeRef` is the same registration).
+
+#### The gate it needed: a specific import naming a private declaration
+
+With the door test's `latched` imported explicitly, the import bound
+nothing and said nothing, and the use reported "cannot find value" for a
+name that exists. §3.3 says a candidate that is not visible is an error
+where it is proposed; an import is where a bare name's candidate is
+proposed. `NameResolver::process_import` now refuses a specific import
+naming a declaration the module marks `private` - E0353, the existing
+private-access code, worded "is private and cannot be imported into" -
+through `Resolver::declares_private`, which reads the declaring module's
+own scope (the export list holds only what is public, by construction). An
+`export` naming a private declaration is exempt: E0241 owns that and is
+reported once the graph is whole (`reexport_private` pins it, and tripped
+when the exemption was missing). Pinned by the new project
+`visibility_import_gate`: over the tree before this commit its import
+compiled silently and the program returned 7; the gate refuses it, and the
+public control beside it binds without a word. The same project carries an
+`extern "C"` pair - `labs` imported silently (the public default), `private
+function llabs` refused - which is the fails-before / passes-after for the
+parser change: before it, `private` in an extern block was a parse error
+and `labs` was unimportable. `visibility_value_gate`'s
+door 5b keeps its shape (bare, unimported, private) and asserts what the
+name layer now says of it.
+
+#### Found only by the object comparison: a bare function value bound to another module's function
+
+`282d92b7` vs the shadow tree, predicted 0: **0 of 1,126** in `examples/`,
+**8 of 2,126** in `tests/` - four modules, IR diffed. In each, a bare
+function named as a value - `const f: (u64) -> u64 = bump;`, `.map(dbl)`,
+`.fold(0, add_i32)`, `.any(is_even)` - was bound on its FIRST use in the
+module to a function of the same leaf in a different module
+(`AsyncPointerAcrossAwait::bump(Counter*) -> void` for
+`FnPointerCasts::bump(u64) -> u64`; `IterAdaptersOnUserStruct::dbl` and
+`::is_even`; `ImplTraitAssocBindingSpec::add_i32`), declared as a
+cross-module extern and stored as the value; later uses in the same module
+bound correctly. `resolve_function(bare)`: the in-module registry is keyed
+by qualified name so the bare key misses, the DI's bare slot names whichever
+module registered the leaf first, that module is not the current one, and
+an extern for its function is declared. `fn_value_casts_to_u64` only asked
+the address to be non-zero, and the three callbacks have identical bodies
+in both modules, which is why no test failed. The shadow printed nothing
+for these: in the shadow tree both ladders read sema's pin first, so old
+and new agreed with each other and both differed from HEAD. The
+comparison HEAD vs fix tree is what caught it, as §8.165's addendum says it
+would; the two other moved modules were the instrument's own extern
+declarations for the new global answer.
+
+#### Objects
+
+Shadow tree vs the deletion tree: **14 of 1,126** in `examples/`, **29 of
+2,126** in `tests/` - every one of them `std/alloc/allocator` (one per
+build: 14 examples, 28 `tests/` builds) plus `Tests/Stdlib/IoBuf`, which
+are exactly the two emitting modules the shadow's suite-half GL-DIFF lines
+named. IR of the two, shadow tree vs deletion tree, over all 363 files:
+`allocator` has four loads, in `String<GlobalAlloc>::as_cstr` / `reserve`
+/ `push_view_bytes` / `push_one_byte`, of `string::INITIAL_CAPACITY` where
+`array`'s was loaded; `IoBuf` has one load of `io::buf::BYTE_LF` where
+`io::traits`'s was; nothing else differs. Deletion tree vs `282d92b7`: 14
+and 33 - the same plus the four wrong-function modules above. Suite green
+at runtime on the deletion tree, 44 projects (43 + the new one); the LSP
+builds directly; `b1-check` unmoved on all three arms.
+
+#### Gone
+
+`codegen_identifier`'s two leaf lookups; sema's bare `lookup_func_type_exact
+(ident.name)` for a value; `enforce_value_ref_visibility`'s
+`resolve_scoped_or_at` - readers **5 → 4** (`member_resolver:853`,
+`sema.cryo:1383`, `type_resolution:1841`, `:2277`). lane-baseline: DEFID_UNWRAP 27 → 29 (`ir_generator` 1 → 2, `sema` 1 → 2): the stamp's name split into the (namespace, leaf) pair the per-module global list is keyed by, and written as the pin symbol codegen's registry is keyed by. Both are keys the consumer is built on, derived from the `DefId` and from nothing written; re-pinned here.
+
+**Tally: 17 shadowed, 17 at zero, 17 old paths deleted, 11 artifacts gone.**
+
+#### Carried
+
+* An import naming something the module neither declares nor holds as a
+  sub-module still binds nothing in silence (`import M::{ typo }`). The
+  private case is gated; the absent case is not, and it is the same
+  silence.
+* A refused private import leaves the name unbound, so the use site adds
+  E0201 after the import's E0353 - two diagnostics for one mistake. Binding
+  it anyway would make the second an E0353 too, at the cost of a private
+  name being nameable; not taken.
+* `global_extern_symbol` / `is_global_thread_local`: still leaf-keyed
+  (§8.166).

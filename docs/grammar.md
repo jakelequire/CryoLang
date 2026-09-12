@@ -88,7 +88,9 @@ ExternDecl         ::= "extern" "function" Ident
                        "(" ParamList? ")" ("->" Type)? ";"
                      | "extern" StringLit "{" ExternItem* "}"
 ExternItem         ::= ExternFn | ExternGlobal
-ExternFn           ::= "function" Ident
+(*  An imported function is a top-level declaration of its module and
+    takes the top-level default: public unless `private` opts it out. *)
+ExternFn           ::= "private"? "function" Ident
                        "(" ParamList? ")" ("->" Type)? ";"
 
 (*  An imported global: storage the linked library owns.  The type is

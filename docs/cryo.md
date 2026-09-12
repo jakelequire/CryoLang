@@ -2773,6 +2773,12 @@ extern function exit(code: int) -> void;
 
 It is the programmer's responsibility to ensure the Cryo signature matches the C signature; the compiler cannot verify this across the language boundary.
 
+A function declared in an `extern` block is a top-level declaration of the
+module that holds the block, with the top-level visibility default: it is
+public - importable as `import ffi::libc::{ puts }` and nameable as
+`libc::puts` - unless written `private function`, which keeps it to that
+module.
+
 An `extern` block also declares **imported globals** — variables whose storage
 belongs to the library being linked:
 

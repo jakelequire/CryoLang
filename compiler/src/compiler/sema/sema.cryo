@@ -1745,9 +1745,32 @@ public:
         const name_str: string = this.intern.resolve(ident.name);
         if (name_str.eq("FILE")) { return this.arena.get_string(); }
         if (name_str.eq("LINE")) { return this.arena.get_u32(); }
-        const func_ty: TypeRef = this.types.lookup_func_type_exact(ident.name);
+        // A function named as a value.  The stamp is the writer's own answer
+        // and a canonical name, so the index either holds it or the name is
+        // not a function; the bare leaf would answer from whichever module
+        // registered it last, and for a name no import offers - a private
+        // declaration elsewhere - from a module the writer cannot see.
+        const def_q: SymbolStr = match (ident.res) {
+            ResSlot::Answered(r) => { r.def_id().qualified_name() }
+            _                    => { SymbolStr::empty() }
+        };
+        const func_ty: TypeRef = if (def_q.is_valid()) {
+            this.types.lookup_func_type_exact(def_q)
+        } else { TypeRef::invalid() };
         if (func_ty.is_valid()) {
-            this.calls.enforce_value_ref_visibility(ident.name, ident.span);
+            this.calls.enforce_value_ref_visibility(def_q, ident.span);
+            // The pin, as the scope form's: the qualified name codegen's
+            // registry is keyed by.  A TEMPLATE pins nothing - mono selects
+            // the instantiation for a turbofished value and refuses to when a
+            // pin is already there.
+            if (!ident.resolved_callee.is_valid() && !this.state.in_symbolic_check) {
+                mut is_tmpl: boolean = false;
+                if (this.ctx.generic_registry != null) {
+                    const tm: TemplateEntry* = this.ctx.generic_registry.get_template(def_q);
+                    if (tm != null && tm.node_kind == NodeKind::FunctionDeclaration) { is_tmpl = true; }
+                }
+                if (!is_tmpl) { ident.set_resolved_callee(def_q); }
+            }
             return func_ty;
         }
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0201_UNDEFINED_VARIABLE,
