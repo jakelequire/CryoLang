@@ -761,6 +761,16 @@ type struct CallEmitter {
                 }
             }
 
+            // SHADOW.  Sema's pin (with the `$MG` reconciliation above) is
+            // the new model's whole answer for a method call; the two
+            // lookups below bind by a name codegen derives from the receiver
+            // type.  A call bound below prints unconditionally, with whether
+            // a pin existed and missed or none was written, and whether sema
+            // resolved a method node for it at all.
+            const ma_pinned: boolean = callee_val.is_valid();
+            const ma_had_pin: boolean = node.resolved_callee.is_valid();
+            mut ma_step: string = "";
+
             // Post-specialization fallback: when the receiver is a
             // monomorphized InstantiatedType (e.g. `Array<u8, GlobalAlloc>`
             // inside a spec'd `String<GlobalAlloc>::with_capacity`), sema's
@@ -775,6 +785,7 @@ type struct CallEmitter {
             // pass that updates `resolved_callee` after AST substitution.
             // Until then this branch handles the spec'd-receiver case.
             if (!callee_val.is_valid() && type_sym.is_valid()) {
+                ma_step = "type-sym";
                 const type_str: string = intern.resolve(type_sym);
                 const combined: string = fmt::format("%s::%s", type_str, method_str);
                 const sym: SymbolStr = intern.intern(combined);
@@ -805,6 +816,7 @@ type struct CallEmitter {
                     type_str = t.display_name();
                 }
                 if (type_str.length() > 0) {
+                    ma_step = "qualified-name";
                     const combined: string = fmt::format("%s::%s", type_str, method_str);
                     const sym: SymbolStr = intern.intern(combined);
                     callee_val = this.cg.resolver.resolve_function_with_arity(sym, ma_arity);
@@ -812,6 +824,20 @@ type struct CallEmitter {
                         callee_val = this.cg.resolver.resolve_function(sym);
                     }
                 }
+            }
+            if (!ma_pinned && callee_val.is_valid()) {
+                const ma_cur_fn: LValue = this.get_current_function();
+                const ma_in: string = if (ma_cur_fn.is_valid()) {
+                    llvm::LLVMGetValueName(ma_cur_fn.raw) as string
+                } else { "?" };
+                const ma_recv: string = if (obj_ref.is_valid()) {
+                    this.cg.get_arena().resolve_display_name(obj_ref.id)
+                } else { "?" };
+                fmt::eprintf("SHADOW-CGMETHOD\t%s\t%s\t%s\t%s::%s\t%s\tin=%s\tmod=%s\n",
+                    if (ma_had_pin) { "pin-missed" } else { "no-pin" },
+                    ma_step,
+                    if (node.resolved_method != null) { "method-node" } else { "no-method-node" },
+                    ma_recv, method_str, node.span.to_string(), ma_in, this.cg.ctx.source_file);
             }
 
         } else {

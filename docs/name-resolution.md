@@ -100,6 +100,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `scope_owner_key` | LIVE — the static-call owner key; the callee-type and template-method probes read it too | — | `grep -rho 'scope_owner_key' compiler/src \| wc -l` → **6** | §8.134, §8.151 |
 | static-call owner TEMPLATE by spelling (`resolve_scope_owner_template`'s as-is → scope map → cross-module cascade) | **DELETED** — the owner template is read off the segment's stamp, in sema and in mono | — | `grep -c 'resolve_scoped_or_at' compiler/src/compiler/sema/call_resolver.cryo` → **2** (was 7) | §8.150, §8.151 |
 | codegen static-call ladder (`call_emitter`: spec-by-return-type → `scope::member` → bare member, and the enum variant's scope-name probe) | **DELETED** — sema's / mono's pin answers every static call; 495 → 0 in §8.160; `call_emitter` reads no `resolve_scoped_or` | — | `grep -c 'resolve_scoped_or' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0** | §8.158, §8.160, §8.161 |
+| codegen method-call ladder (`call_emitter` MemberAccess branch: `<type name>::method`, `<qualified_name>::method`) | **SHADOWED, LIVE** - 336,761 binds over the corpus without sema's pin; the fix order is in §8.163 | — | `grep -c 'SHADOW-CGMETHOD' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **1** | §8.162, §8.163 |
 | callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **19** | §8.1f, §8.2ag |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
@@ -21557,3 +21558,201 @@ Objects against `889a9ab5`: 0 of 3,252 changed. Suite green.
 `.resolve_scoped_or[_at]` call sites: 6 (was 7). lane: LOOKUP 52 → 51,
 the enum probe's `di.lookup_type(resolved_scope)` - a type asked for by
 spelling; re-pinned.
+
+### 8.162 Handoff: consumer 14 at zero and deleted; F17 enumerated at 69,588 - 2026-09-11
+
+Written for a stranger. Uncommitted by rule (no code rides with it); the
+next agent commits it with their first work.
+
+#### Tree state
+
+`naming-impl` at `a09778ed` == origin, clean. `compiler/build/cryo.exe` is a
+clean build of HEAD (the F17 shadow build was deleted and rebuilt). Pin at
+`ad8238a3` unchanged. The b1 golden is re-pinned on BOTH hosts (the Linux
+half under WSL); the lane golden is re-pinned (LOOKUP 51).
+
+#### Tally: 14 shadowed, 14 at zero, 14 old paths deleted, 9 artifacts gone
+
+Since §8.159: consumer 14 (codegen's static-call ladder) went 495 → 0 and
+was deleted (`889a9ab5` fix, `a09778ed` deletion). `.resolve_scoped_or`
+call sites 7 → 6 (`call_emitter` reads none).
+
+#### Consumer 14, in full (§8.158, §8.160, §8.161)
+
+Shape: a static call on a GENERIC owner with INFERRED owner arguments,
+written inside another template's body (`Slice::from_raw(this.ptr, n)` in
+`Array<T>`, `RawBuffer::new()` in `String<A>`, `TakeIter::new(this, n)` in
+`Iterator`'s defaults). 489 of that shape, plus 6 `probe::bindgen_probe_*`
+C-import calls pinned under a key codegen's registry did not hold.
+
+What changed (all six are in `889a9ab5`; each was found under the previous):
+
+1. `stash_static_owner_bindings` and its five sources refused any binding
+   mentioning a generic parameter. Now a binding naming the ENCLOSING
+   body's parameters is stashed (like a free generic call's) and the clone
+   walk concretizes it. `SymbolicChecker::symbolic_type_concretizable` is
+   the rule: refuse a binding naming any OTHER template's parameter (it
+   leaks from an unsubstituted method return - `this.buffer.ptr()` typed
+   as `RawBuffer`'s `T*`) so the next source (expected type) answers.
+   Parameters are canonical by NAME in the arena, so a foreign `T` spelled
+   like an in-scope `T` is indistinguishable - a latent hazard every reader
+   of a symbolic type shares.
+2. A struct literal of the owner inside its own body (`String { buffer:
+   RawBuffer::new() }`) had no field expected types: the template's arena
+   type has no fields. `resolve_struct_literal` reads them off the template
+   AST (`symbolic_resolve_owner_field`).
+3. Self-returning trait defaults (`is_self_returning_default`) were skipped
+   by sema and walked eagerly by mono. Sema now walks the impl's flagged
+   clone symbolically (no-demand); mono's `walk_methods`/`walk_spec_methods`
+   skip flagged bodies (`body_is_lazy`) - walking them WITH a stash built an
+   infinite adapter tower (LSP segfault, suite OOM).
+4. `specialize_method` clears the lazy flags on the clone BEFORE the
+   substituter runs (it skips flagged bodies), and binds the impl's
+   where-derived parameters (`A` in `implement<I, A> Iterator<A> for
+   TakeIter<I>`) and the impl's target-argument names into the body
+   substitution, alongside the owner's parameters.
+5. `symbolic_owner_instance` built the walk's `this` from the IMPL's
+   parameter list, producing `TakeIter<I, A>` for a one-parameter owner
+   (E0900 arg-count mismatch once substituted). It now resolves the impl's
+   written target args.
+6. `declare_extern_block` registers a C import under `alias::name` (the key
+   sema pins; `resolve_function` refuses to declare an extern for a symbol
+   the module owns, so the registry must hold it).
+
+Measured, whole corpus (LSP direct 266 modules, unit suite, 46 projects one
+by one, 14 examples): 495 → 226 → 30 → 15 → 6 → 0; `pin-missed` 6 → 0.
+Objects: the FIX moved 3 of 3,252 (closure-spec symbols embed an arena type
+id, shifted by five; normalized, byte-identical - `mint_closure_spec_name`
+names a symbol by an allocator counter, a defect not taken). The DELETION
+moved **0 of 3,252**. Suite green throughout (`projects: 43 passed` is the
+Windows count). The enum-variant path's scope-name probe was shadowed at 0
+and controlled by printing at its `resolved_type` exit (5,888 lines on the
+LSP build) before deletion.
+
+Still wrong or unverified: (a) codegen registers a C import under
+`alias::name` but not under `namespace::name`; an in-module call of that
+form would miss its pin (none in the corpus). (b) the by-name canonical
+GenericParam hazard in (1). (c) `mint_closure_spec_name`'s arena-id symbol.
+(d) `selfhost-check` was not run this session; the object-hash control is
+the stronger instrument and was.
+
+#### F17 - codegen's method-call binding - ENUMERATED, NOT LANDED
+
+The shadow (backed out of the tree, not committed): in `call_emitter`'s
+MemberAccess branch, record `callee_val.is_valid()` after the pin and its
+`$MG` reconciliation, and after the two fallbacks (`type_sym::method` via
+`di.lookup_type_name(obj_ref)`, then `t.qualified_name::method`) print
+`SHADOW-CGMETHOD <pin-missed|no-pin> <step> <method-node|no-method-node>
+<recv>::<method> <span> in=<fn> mod=<module>` when a fallback bound it. LSP
+build alone: **69,588**, every one `no-pin` + `type-sym` + no method node
+(4 had a method node). Three populations:
+
+* **66,292 (95%) synthesized `.drop()` calls** (`DropInserter::make_drop_call`
+  builds `Call(MemberAccess(Ident, "drop"))` with `resolved_type` on the
+  identifier and NO pin; DropInsertion runs after sema). Codegen binds
+  `<type name>::drop` from the receiver type. The new-model fix is the
+  synthesizer pinning the callee from the TYPE (the type's `drop`
+  `MethodInfo` → `pin_method_callee_from_qname`'s mangling); non-generic
+  struct types carry `methods` in the arena, templates do not
+  (type_resolution: `if (node.is_generic()) continue`), spec'd types and
+  `T[]` arrays (`lookup_array_type_name`) need their own route. Largest
+  single bucket on the board.
+* **2,566 calls inside specialized clones** (`u8::equals` in
+  `Option<u8>::equals`, `push` on spec'd arrays): the template's walk pinned
+  nothing (receiver abstract) and mono's clone walk does not re-pin method
+  calls on primitive/array receivers.
+* **730 in plain bodies on primitive / array / enum receivers**
+  (`this.length()` inside `implement string`, `u32[]::push`,
+  `Site::print_row`): `pin_method_resolved_callee` returns for any owner
+  that is not Class/Struct/Enum, so sema never pins a primitive or array
+  method.
+
+The full-corpus run was interrupted after the LSP half; the unit suite and
+projects are unmeasured. Re-apply the shadow (the description above is the
+whole of it), run the corpus, land the shadow with its number, then take
+the drop synthesizer first.
+
+#### Remaining consumers, my read on order
+
+1. **F17 (above)** - largest, enumerated, first fix named.
+2. `ir_generator.cryo` `visit(ScopeResolutionNode)` value form: seven
+   spelling lookups (bare combined, stamped ns, `resolve_scoped_or_at`,
+   enum variant, three globals). Needs a sema pin first: `ScopeResolutionNode`
+   has no `resolved_callee`; sema's `resolve_scope_resolution` knows the
+   answer in four branches (static method type, module function via
+   `lookup_scope_value_function`, enum via `resolved_type`, global via the
+   stamp / cimport bare key). Add the slot, write it in sema, shadow codegen.
+3. The remaining `.resolve_scoped_or[_at]` readers (6): `ir_generator:1665`
+   (above), `member_resolver:845` (`check_type_name_visibility` - new =
+   the literal's / annotation's stamp), `call_resolver:2867`
+   (`enforce_value_ref_visibility` - new = `ident.res`), `sema.cryo:1347`
+   (synthesized `Slice::from_raw`), `type_resolution:1841` and `:2277`.
+4. `qualify_symbol_sym` lookups (§8.159's list unchanged): `lambda_synth
+   :524/577`, `specialization.cryo:103`, `directive_processing:1166/1745`.
+5. `lookup_scope_variant_payload_types` fallback, `check_scope_call_arg_types`,
+   `enforce_static_method_visibility` spelling lookup - unchanged.
+
+#### Traps, this session
+
+* **The Bash tool's heredoc collapses a doubled backslash** (hit it twice
+  more, once writing a probe that then carried literal tabs, once trying to
+  write this entry). Any script with escapes goes through the Write tool;
+  a `count()==0` control first.
+* `make test` DEPENDS on the compiler sources: editing a compiler source
+  between a build and the corpus run's `make test` rebuilds the compiler
+  mid-run, confounding the measurement. Edit nothing until `CORPUS_DONE`.
+* `objcmp.sh` and `headobjs.sh` stash `compiler/src`; docs edits are safe
+  during them, source edits are not.
+* A residue that is "1 per build" is one clone, not one module: the
+  `String<GlobalAlloc>` lines were 44 across 44 BUILDS, misread as 44
+  modules; that cost a probe cycle. Print the emitting module and the
+  enclosing function on every shadow line from the start (`in=` via
+  `LLVMGetValueName(get_current_function().raw)`, `mod=` via
+  `ctx.source_file`).
+* A symbolic walk that DEMANDS nothing can still be turned into a tower by
+  mono consuming what it leaves behind; the fix was in mono's eager walk,
+  not in sema.
+* `make b1-check ARGS=--update` reorders the host sections; diff per
+  section, not the file.
+* WSL b1 re-pin: `wsl.exe -- bash <script>` with `MSYS_NO_PATHCONV=1`,
+  `PATH=/usr/lib/llvm-20/bin:$PATH`; then `rm -rf compiler/build tests/build`
+  and rebuild Windows before believing anything.
+* The shadow method itself: land the shadow commit BEFORE fixing; I
+  measured, fixed and landed in one commit for consumer 14 because the
+  predecessor had landed the shadow, and that was right - but for F17 the
+  shadow is unlanded and its number lives only here. Land it first.
+
+### 8.163 F17 shadowed: codegen binds 336,761 method calls by a name it derives from the receiver type - MEASURED, OPEN 2026-09-11
+
+The shadow is exactly §8.162's: in `call_emitter`'s MemberAccess branch, the
+new model's answer is sema's `resolved_callee` (after the `$MG`
+reconciliation); a call the two receiver-name lookups below it bind prints
+`SHADOW-CGMETHOD`. Whole corpus, direct (LSP 266 modules, unit suite, 46
+projects one by one, 14 examples): **336,761** lines, every one `no-pin` +
+`type-sym`, 9,961 distinct spans. The LSP half is 69,588, byte-for-byte the
+predecessor's count. 74 carry a `resolved_method` with no pin; the rest have
+neither.
+
+| population | lines | mechanism |
+|---|---|---|
+| synthesized `.drop()`, named receiver | 266,365 | `DropInserter` (3 builders) and codegen's own drop glue (6 builders: field, tuple, fixed-array, enum-payload, arg-temp, `delete`) build `Call(MemberAccess(recv, drop))` with `resolved_type` on the receiver and NO pin; both run after sema |
+| synthesized `.drop()`, `T[]` receiver | 51,649 | the same builders; sema's overload selection returns on `TypeKind::Array` so even a written call on `T[]` has no pin |
+| written call, enum receiver | 11,152 | `type_resolution`'s impl-block arm adds `MethodInfo` to `StructType`/`ClassType` only - an `implement enum E { }` method is never in `EnumType.methods`, so `resolve_method_overload` sees an empty set (`Ordering::is_lt`, `Option<T>::is_some`, `Poll<T>::is_ready`, `Site::print_row`) |
+| written call, primitive receiver | 5,950 | `implement string { length }`, `implement u64 { }`: a primitive has no arena method set and `try_match_trait_impl_method` sees only trait impls |
+| written call, `T[]` receiver | 1,645 | as the drop row: `push`/`pop`/`length` on `u32[]` |
+
+So "95% one cause" holds in count but not in mechanism: a synthesized drop is
+unpinned for two reasons (nobody asks, AND for arrays sema could not answer),
+and fixing the synthesizer alone leaves the array half. The by-name lookup
+this consumer reads - `di.lookup_type_name(obj_ref)` / `lookup_array_type_name`
+→ `"<qname>::<method>"` → `resolve_function_with_arity` - is the same key
+codegen's `declare_method` registers, which is why every one of these binds
+correctly today; the defect is that sema's answer is missing, not that
+codegen's is wrong. Not deleted: the consumer is not at zero.
+
+The order the mechanisms suggest: (1) every synthesizer asks sema's overload
+selection for its call, the way a written call is asked; (2) `T[]` resolves
+through the `Array<T>` specialization the DI already maps its element to;
+(3) impl-block methods reach `EnumType.methods`; (4) inherent impls on
+primitives. Each is predicted to move its row and nothing else; a row that
+moves without its fix is a finding.
