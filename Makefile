@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census roster-check b1-check lane-check ns-status-check check-fast install-hooks lsp-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census roster-check b1-check lane-check ns-status-check check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -200,6 +200,9 @@ help:
 	@echo "                         hosted); every link needs the panic tier"
 	@echo "  make verify-freestanding  Build runtime/ tiers + run the freestanding"
 	@echo "                         acceptance check (entry, panic, alloc, backtrace)"
+	@echo "  make cross-check       Compile runtime/, stdlib/, compiler/, tools/CryoLSP"
+	@echo "                         for the OTHER OS's triple, objects only: the gated"
+	@echo "                         half this host never resolves (ARGS=--triple=...)"
 	@echo "  make cryo-exe          Cross-build cryo.exe (x86_64-pc-windows-gnu)"
 	@echo "  make install           Symlink bin/cryo + stdlib system-wide (sudo)"
 	@echo "  make uninstall         Remove the install.sh symlinks"
@@ -639,6 +642,27 @@ lsp-check: $(STAGE2_EXE) $(LIBCRYO_A)
 else
 lsp-check: $(STAGE2) $(LIBCRYO_A)
 	@$(PYTHON) scripts/lsp-gate.py --cryo "$(STAGE2)" $(ARGS)
+endif
+
+# ---- the other OS's config-gated half ----------------------------------
+# Config gating prunes `![config(linux)]` from a Windows build before name
+# resolution sees it, and `![config(windows)]` from a Linux one, so every
+# host-native gate measures a tree with the other OS's half cut out.  This
+# compiles runtime/, stdlib/, compiler/ and tools/CryoLSP for the other OS with
+# `--target`, which selects that OS's gates and stops at object files - no
+# cross toolchain, no link, no WSL.  A declaration that stops resolving on
+# the other OS is refused here, on this host, in about a minute.
+#
+# Built with the COMPILER UNDER TEST for the same reason `lsp-check` is:
+# the checking is the surface being gated, and the pin performs an older one.
+# Objects only: nothing links and nothing runs, so a link-time or runtime
+# defect on the other OS is still `verify-freestanding` / CI's to find.
+ifeq ($(HOST_OS),windows)
+cross-check: $(STAGE2_EXE)
+	@$(PYTHON) scripts/cross-check.py --cryo "$(STAGE2_EXE)" $(ARGS)
+else
+cross-check: $(STAGE2)
+	@$(PYTHON) scripts/cross-check.py --cryo "$(STAGE2)" $(ARGS)
 endif
 
 # ---- stdlib API index --------------------------------------------------

@@ -27,7 +27,7 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at the commit carrying §8.177; `git log
+Checks run from the repo root. Verified at the commit carrying §8.178; `git log
 --oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
@@ -109,6 +109,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `resolve_path` (§5.2's one entry point) | **LIVE, but not the entry point** — 2 call sites, both single-segment, both `Namespace::Type` | — | `grep -rho '\.resolve_path(' compiler/src --include=*.cryo \| wc -l` → **2** | §5.2, §8.5, §8.7 |
 | `canonical_type_ref` and its arena bare step | **DELETED** — a declaration's key comes from the declaration (`source_module`, else the writer's module) | — | `grep -c 'lookup_by_name' compiler/src/compiler/compilation_context.cryo` → **0** | §8.103, §8.112, §8.156 |
 | `resolve_cross_module_name` (sema's resolver re-entry by spelling) | **DELETED** — its four readers went under shadow mode | — | `grep -rho 'resolve_cross_module_name' compiler/src \| wc -l` → **0** | §8.155 |
+| intrinsic symbol's placeholder module (`Symbol::intrinsic` writing `source_module: "<intrinsic>"`, so a same-module bare intrinsic call stamped a `Def` no index key matched) | **DELETED** — the symbol carries its declaring module like every other declaration; the one such call in the tree (`runtime/backtrace`'s `frame_address`, Linux-gated) compiles, `verify-freestanding` green | — | `grep -c '"<intrinsic>"' compiler/src/compiler/resolver/symbol.cryo` → **0**; `grep -c 'intr_mod' compiler/src/compiler/resolver/name_resolution.cryo` → **2** | §8.178 |
 | `check_module_type_collision` | LIVE — D5 deletes it | — | see D5 | §8.130, §8.131 |
 | `module_owns_member` probe | LIVE — D5 deletes it | — | `grep -rho 'module_owns_member' compiler/src \| wc -l` → **3** | §8.131 |
 | static-call owner TEMPLATE by spelling (`resolve_scope_owner_template`'s as-is → scope map → cross-module cascade) | **DELETED** — the owner template is read off the segment's stamp, in sema and in mono | — | `grep -c '\.resolve_scoped_at(' compiler/src/compiler/sema/call_resolver.cryo` → **1** (was 7 at §8.150; the one left is D5's, §8.170) | §8.150, §8.151 |
@@ -143,6 +144,7 @@ evidence for what it covers.
 | `make lane-check` | 7 buckets of call sites in `compiler/src`, as a golden | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
 | `make selfhost-check` | stage-3 == stage-4 byte identity, both arms | **Stability, not correctness.** It proves the compiler still emits the same bytes for code that already compiles; it says nothing about code that now STOPS compiling. |
 | `make lsp-check` | `tools/CryoLSP` compiles against **the compiler under test** | Compilation only — no language-server behaviour is exercised. |
+| `make cross-check` | `runtime/`, `stdlib/`, `compiler/`, `tools/CryoLSP` compile to OBJECTS for the other OS's triple with the compiler under test — the config-gated half every host-native gate prunes before name resolution (326 attributes in the stdlib, 23 in the runtime, 11 in the compiler, 6 in the LSP) | Objects only: nothing links, nothing runs. `tests/` and `examples/` are not built. |
 | `make examples` | smoke-builds every `examples/` project | Build only; no program is run and no output is compared. |
 | `make examples-golden` | example stdout vs committed goldens | **Linux only.** Refuses on Windows (exit 1) rather than reporting success. |
 | `make valgrind-check` | invalid free/read/write and definite leaks | **Linux only**, same refusal. |
@@ -165,6 +167,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^project ' tests/test-roster.txt` → **48**
 * `grep -c '^negative ' tests/test-roster.txt` → **179**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
+* `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
 * `grep -n 'branches:' .github/workflows/ci.yml` → `main` only, both hooks
 
 ### 0.4 What no gate covers
@@ -177,6 +180,9 @@ Checks for this section, one per line so each can be copied whole:
 * **`tests/` as a resolution corpus.** Reached by `cryo test`, which no b1 or
   lane golden reads. §8.13 and the b1 gate's own header say so.
 * **The LSP's behaviour.** `lsp-check` compiles it; nothing runs it.
+* **The other OS past the object file.** `cross-check` name-resolves and
+  compiles the other OS's gated half on this host; whether it LINKS or RUNS
+  there is `verify-freestanding` (WSL) and CI's, and CI fires on `main` alone.
 
 ### 0.5 What this section is not
 
@@ -7924,6 +7930,128 @@ loop; `objcmp.sh` stashes `compiler/src`, so a `grep` over the tree during
 its first half reads HEAD; a shadow keyed on `bound == asked` hides every
 family whose one symbol IS its name (`malloc`), which is why the codegen
 rule is one SYMBOL, not one signature.
+
+### 8.178 An intrinsic symbol carries its declaring module; `verify-freestanding` green; `cross-check`, the other OS's half on this host - 2026-09-13
+
+§8.177's item 0, closed at its cause, and the gate that would have caught
+it the day it landed.
+
+#### The cause, read rather than instrumented
+
+The handoff proposed instrumenting `callee_family` for the bare
+`frame_address(0)` in the Linux `backtrace` tier: is `ident.res` `Def` or
+`Pending`, and what does `intrinsic_owner_of` answer.  Reading the writer
+answered it without a probe, and the probe would have read a false zero
+on the wrong function.  `Symbol::intrinsic` set `source_module` to the
+placeholder string `"<intrinsic>"` - `Symbol::constant`, two constructors
+below, takes the declaring module as `mod_str` - so `bare_name_res`
+stamped the call `Def("<intrinsic>::frame_address")`, a canonical name
+nothing is registered under: the index holds the intrinsic's signature
+under `CryoRt::Backtrace::frame_address` (`qualify_symbol_sym_home` of
+the leaf and the declaring file, `type_resolution.cryo`'s intrinsic arm)
+and under the bare leaf.  `callee_family` reads the `Answered` stamp, so
+the `Pending` arm - the one door to `intrinsic_owner_of` - was never
+taken; the family had no overloads; E0202.  Before §8.173 the bare
+binder's HOME step re-derived the key from the leaf and the cursor and
+rescued it; that step was deleted with the rest of the ladder, and the
+placeholder was exposed.  It dates from the resolver's first commit (2026-02-28).
+
+The fix is the declaring module in the symbol, and nothing in sema: a
+same-module intrinsic is an ordinary `Def` whose key is the index's, and
+the pin it produces is the intrinsic's own symbol (`frame_address`, C
+linkage), which `callee_is_intrinsic` reads as the intrinsic and lowers
+inline - the object shows `fp = %rbp`, no undefined `frame_address`.
+Routing it through `Pending` → `intrinsic_owner_of` instead would have
+widened §8.93's hold, the wrong side of that fence.
+
+Population: one.  `runtime/backtrace/src/lib.cryo:45` is the only
+`intrinsic function` declared outside `stdlib/core/intrinsics.cryo`, and
+`intrinsics.cryo` calls none of its own bare (its mentions are comments).
+Predicted 0 objects moved on both populations; measured examples **0 of
+1,126**, tests **0 of 2,182**, suite green (2,116 unit, 179 negative, 45
+projects), LSP builds directly, b1 unmoved (B1 0, 56 rows), lane golden
+unmoved.  `cd runtime && cryo build --target=x86_64-pc-linux-gnu`: E0202
+at `lib.cryo:62` before, `Project compilation succeeded` after, all five
+freestanding tiers.
+
+#### The gate: `make cross-check`
+
+Every "zero disagreements over the corpus" since §8.152 was measured on a
+Windows host, over a tree with the Linux half pruned by config gating
+before name resolution saw it: **326 `![target(linux)]` /
+`![target(unix)]` attributes across 32 stdlib files, 23 across 6 runtime
+files, 11 across 7 compiler files, 6 across 4 LSP files**, and no gate on
+this host name-resolved any of them.  CI covers Linux and fires on `main`
+alone, which is how the tier stayed red.
+
+`cryo build --target=<triple>` selects the other OS's gates and compiles
+every module through name resolution, sema and codegen to object files;
+the link is skipped, so no cross toolchain and no WSL.
+`scripts/cross-check.py` runs it over `runtime/`, `stdlib/`, `compiler/`
+and `tools/CryoLSP`, cold (build directories removed and re-created
+first - the driver creates the build directory but not its parent, and a
+missing parent reads as `codegen failed for module ...: no such file`),
+reads exit codes, and refuses a build that reported no population or a
+total under 350 modules.  The default triple is the OS the host is not:
+`x86_64-pc-linux-gnu` here, `x86_64-pc-windows-gnu` on Linux (the `pc`
+vendor is what `cryo version --triple` reports on both, and the
+per-triple directories the tree carries spell it so).  Built with the
+compiler under test, for `lsp-check`'s reason.  About 80 seconds on this
+host: runtime 10 modules in 5 tiers, stdlib 154, compiler 245, LSP 266.
+
+The pair, on the tree this entry fixes:
+
+* **HEAD's compiler** (`a7c842df`, copied out of the build tree) under
+  the gate: `cross-check: FAIL -- runtime: build exited 1`, `E0202:
+  cannot find function frame_address`, `backtrace/src/lib.cryo:62:19`.
+  Every host gate over the same tree was green.
+* **This tree's compiler**: `cross-check: OK -- x86_64-pc-linux-gnu: ...;
+  0 errors`.
+
+And the control on the instrument's reach into the stdlib, since the
+runtime alone would not show that: `libc::setenv` renamed to
+`libc::setenv_nope` inside the `![target(unix)]` `set_var` in
+`stdlib/env/_module.cryo`.  The host stdlib build over the mutation:
+`Project compilation succeeded`, exit 0 - the function is pruned before
+the name is looked up.  `make cross-check` over the same tree: `FAIL --
+stdlib: build exited 1`, `E0233: cannot find libc::setenv_nope`,
+`./env/_module.cryo:134:21`.  Restored.  The Linux-host arm was
+exercised once through WSL with the Linux pin: runtime and stdlib
+compile for `x86_64-pc-windows-gnu`, 164 modules.
+
+What it cannot see: nothing links and nothing runs, so a symbol the other
+OS's libc lacks, or a wrong object, is still `verify-freestanding`'s and
+CI's to find.  `tests/` and `examples/` are host-native projects and are
+not built; their gated surface is the stdlib's, which is built whole.
+
+#### Owed by §8.177: the predicate's latent case
+
+`callee_is_intrinsic` treats a pin equal to the bare leaf as the
+intrinsic.  An `extern "C"` function is pinned to its C symbol, which IS
+its leaf, so an extern declared under a pure-magic intrinsic name - one
+`IntrinsicKind::is_name` knows and no `intrinsic function` declares,
+`bswap32`, the casts - would inline as the intrinsic instead of being
+called.  Measured empty: 51 pure-magic names (105 in the table, 58
+declared in `intrinsics.cryo` plus `frame_address`) against 986 distinct
+extern-block function names over 92 blocks, intersection ∅; the same
+scan lists `malloc` / `free` / `realloc` when widened to declared names,
+so it sees a hit.  Latent, not live.  Recorded so nobody rediscovers it
+by declaring `bswap32` in an extern block; the fix when it is live is a
+pin that carries the declaration's identity rather than a symbol a leaf
+can equal.
+
+**Tally unchanged: 33 shadowed, 33 old paths deleted, 32 at zero and one
+at §8.93's allocator residue; 30 artifacts gone.**  This entry deletes no
+lane; it removes a placeholder and adds a gate.
+
+#### What this leaves
+
+The handoff's items 1-4 stand as §8.177 wrote them: the impl head's
+HOME → BARE lookup in `type_resolution.cryo` (3 sites, §0.2's row), then
+`qualify_symbol_sym_home` (48 sites), `Resolver::lookup_prelude`'s
+two-export tie, `codegen_target_name`'s rewritten spelling.  Parked for
+Jake, unchanged: D5, the keyword ruling (§8.165), the extern-visibility
+default (§8.167, normative in `docs/cryo.md` §18.1 and never confirmed).
 
 ---
 

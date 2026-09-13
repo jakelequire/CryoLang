@@ -31,6 +31,7 @@ make ns-status-check     # run every check docs/name-resolution.md §0 carries
 make check-fast          # lane + §0 + pin, ~10s, no build. Run before committing.
 make install-hooks       # point git at scripts/git-hooks (ONCE per checkout)
 make lsp-check           # compile tools/CryoLSP with the compiler under test
+make cross-check         # runtime/stdlib/compiler/LSP for the OTHER OS, objects only, ~80s
 make vendor-check        # every constant shape survives `cryo vendor`
 make api-index-check     # docs/stdlib-api.txt is not stale
 make verify-pin          # both pins match their sidecars AND each other
