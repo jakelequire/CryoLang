@@ -27,7 +27,7 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at the commit carrying §8.179; `git log
+Checks run from the repo root. Verified at the commit carrying §8.180; `git log
 --oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
@@ -53,7 +53,7 @@ current-state description is the defect it exists to remove.
 | D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 41 of the 97 unasserted rows retired, 56 left (32 context, 10 B2, 14 B3); of the asserted rows, fourteen whose only sites were deleted went with them (one in §8.170, five in §8.171, two in §8.173, six in §8.174; `b1-baseline.txt` re-pinned on both hosts each time, 62 → 56 rows per arm at §8.174) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1404** | §8.66, §8.80, §8.139, §8.174 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
-| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **577** | §8.145, §8.146, §8.147, §8.148, §8.150 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' | wc -l` → **578**\| wc -l` → **577** | §8.145, §8.146, §8.147, §8.148, §8.150 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
 
 **D2 is the one to look at.** Decided in §8.39, then neither taken nor
@@ -93,7 +93,8 @@ three, and its row carries the count. Read each zero off its own row.
 | free-call template search by leaf and arity (`find_fn_template_for_call`'s registry scan, its cursor-module tie-break, `Resolver::resolve_function_source_module`) | **DELETED** - `lookup_scope_template(ident.res)` plus the arity gate; a local is never a template, which is what fixes a local fn-pointer bound to a same-leaf generic global (returned 5 for 10); shadow 12 → 0 | — | `grep -rho 'resolve_function_source_module' compiler/src \| wc -l` → **0** | §8.172 |
 | bare-callee family (`check_call_arity`, `try_pin_overload_mangled_callee`'s HOME → BARE key with its import-scoped candidate tiers and E0154, `resolve_direct_call`'s leaf-keyed `check_fnbind_candidate`, the two spelling-keyed local checks) | **DELETED** - one key, `callee_family`: the stamp's canonical name (`Def`), the local's own type (`Local`), or `intrinsic_owner_of` for a `Pending` leaf an intrinsic owns (§8.93's hold, the ONE bare path left); shadow 3,343 → 0 over six halves once `panic` (3,318, D6 landing) and the two refused privates (E0202 now, the §8.167 shape) are named; `FNVIS` 0: no `Def`-stamped bare callee is another module's private; E0353 doors 2-4 and the `FNBIND-VIOLATION` stream went with it | — | `grep -c 'bare_candidate_scope' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -c 'callee_family(&this' compiler/src/compiler/sema/call_resolver.cryo` → **1** | §8.173 |
 | impl head's spelling carrier (`impl_target_type`'s unanswered arm: `lookup_type_exact(node.target_type)`, the monomorphizer's rewritten spelling; and the HOME → BARE pair `lookup_type(qualify_symbol_sym_home(target))`, then `lookup_type(target)`, at three sites in `type_resolution.cryo`) | **DELETED** in sema (§8.174) and in type resolution (§8.179): every site reads `ImplBlockNode.res` — `Def` → the index under the canonical name, `PrimTy` → under the spelling, unanswered → `spec_owner`; sema's shadow 1,466 → 0 (async-lowered `Future` heads, stamped by their synthesizer now); type resolution's 91,910 lines all a superset (16,930 cross-module heads the pair left INVALID, 74,977 primitives agreeing on type), 0 objects moved, no clone reaches those sites | — | `grep -c 'node.spec_owner' compiler/src/compiler/sema/sema.cryo` → **1**; `grep -c 'lookup_type_exact(node.target_type)' compiler/src/compiler/sema/sema.cryo` → **0**; `grep -c 'lookup_type(node.target_type)' compiler/src/compiler/passes/type_resolution.cryo` → **0**; `grep -c 'runner.impl_owner(node)' compiler/src/compiler/passes/type_resolution.cryo` → **3** (the two FuncSig sites and `run_struct_field_sync`) | §8.174, §8.175, §8.179 |
-| `qualify_symbol_sym_home` (the writer's module prefixed to a spelling, guessing a canonical name) | LIVE — 43 sites, 19 of them in `type_resolution.cryo`, 6 in `sema.cryo`, 4 each in `async_lower`, `specialization`, `pass_registry`, 3 in `declaration_emitter`; a surface, not a lane: each site is a stamp the name layer already carries or should, and goes as its consumer does (5 went with the impl head's pair in §8.179) | — | `grep -rho 'qualify_symbol_sym_home' compiler/src --include=*.cryo \| wc -l` → **43** | §8.175, §8.179 |
+| `qualify_symbol_sym_home` (the writer's module prefixed to a spelling, guessing a canonical name) | LIVE — 39 sites (the definition counted), 17 of them in `type_resolution.cryo`, 5 in `sema.cryo`, 4 each in `async_lower`, `pass_registry`, 3 each in `specialization`, `declaration_emitter`, 1 each in `directive_processing`, `lambda_synth`; a surface, not a lane: each site is a stamp the name layer already carries or should, and goes as its consumer does (5 went with the impl head's pair in §8.179, 4 with its registration key in §8.180; the one in sema's `visit(ImplBlockNode)` waits on the defaulted-template ruling) | — | `grep -rho 'qualify_symbol_sym_home' compiler/src --include=*.cryo \| wc -l` → **39** | §8.175, §8.179, §8.180 |
+| impl head's registration key by writer module (stage-3 template attach keyed `qualify_symbol_sym_home(target)`, type resolution's re-attach guarded by "canonical ≠ that key", the legacy method alias registering every impl method under `<writer module>::<target>::<method>` as a family, sema's `impl_generic_params` fallback) | **DELETED** — `ImplBlockNode::target_key` (the stamp's name, a primitive's spelling, the clone's recorded name) keys stage 3 and sema; type resolution attaches unconditionally and `register_impl_block` refuses a block it holds (stage 3 runs before a later module's template exists: `Display for String` found no `String` template there in 621 of 624 heads); the alias's one reader, codegen's string `+` lowering, asks for `string::append`. 132,699 shadow lines, all cross-module heads; the alias's probe read a FALSE zero (it watched `method_returns`, the reader asked the function family) and the corpus has no `string + string` — `tests/lang/string_concat.cryo` pins it now | — | `grep -c 'target_key()' compiler/src/compiler/passes/specialization.cryo` → **1**; `grep -c 'register_methods_with_module_aliased' compiler/src/compiler/passes/type_resolution.cryo` → **1**; `grep -c '"string::append"' compiler/src/compiler/codegen/ops/expr_ops.cryo` → **1**; `grep -c 'impl_blocks\[i\] == block' compiler/src/compiler/types/generic_registry.cryo` → **1** | §8.180 |
 | struct-literal rungs 3 and 5 (`resolve_generic_scope_name(lit.struct_type, ..)`, `lookup_type_exact(lit.struct_type)`) | **DELETED** — rung 5: 2 lines over six halves, both C-imported literals whose stamp M1 had missed (above), 0 once stamped; rung 3: 0 over six halves including the `cryo test` half its comment named, and the instrument fires on a forced case; their two rows retired | — | `grep -c 'lookup_type_exact(lit.struct_type)' compiler/src/compiler/sema/sema.cryo` → **0** | §8.174 |
 | static-call unmangled tail (`pin_scope_callee_combined` pinning the bare `Owner::method` when the family selected no signature) | **DELETED** — 2 lines over six halves, one site: `T::try_from(this)` with `this` a value and the parameter `&T`; the static matcher admits the call site's auto-ref in a second pass and pins the symbol; a family that selects nothing stays unpinned | — | `grep -c 'select_static_overload' compiler/src/compiler/sema/call_resolver.cryo` → **3** | §8.174 |
 | unmangled pin family (`pin_scope_callee_qsym`'s qualified names, mono's `combined_sym` and spec-name pins) read by codegen's by-name lane (`resolve_function_by_mangled` → `resolve_function` → `resolve_function_with_arity`, and the vtable, prologue and constructor callers asking by name) | **DELETED** — 56,486 lines over six halves, every name pin a single-symbol family; the one plural (`BaseASTVisitor::visit`, 68 signatures, 5 vtable slots) bound its own signature by luck of registration order. `resolve_symbol` and `resolve_family` replace it: a name resolves only when its family names ONE symbol, several is E0900. The name pins themselves stay (written before their symbol exists); codegen no longer chooses among signatures for them | — | `grep -c 'resolve_function_with_arity' compiler/src/compiler/codegen/ops/symbol_resolver.cryo` → **0**; `grep -rho 'register_with_arity' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'resolve_family(' compiler/src --include=*.cryo \| wc -l` → **6** | §8.174, §8.175 |
@@ -138,7 +139,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,116 unit + 48 project + 179 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
+| `make test` | 2,119 unit + 48 project + 179 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make b1-check` | B1 total + every per-row bound, 3 corpora × 2 hosts | **2 of the 3 corpora are `examples/`**; the third is `tests/tests/projects/ffi_c_import`. The compiler's own source is NOT a corpus, and `tests/` at large is swept by none of them. |
 | `make lane-check` | 7 buckets of call sites in `compiler/src`, as a golden | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
@@ -8166,6 +8167,140 @@ pair in type resolution).
 rewritten spelling.  Parked for Jake, unchanged: D5, the keyword ruling
 (§8.165) - which now also holds `implement int` -, the extern-visibility
 default (§8.167).
+
+### 8.180 Consumer 35: the impl head's registration key off the stamp - `target_key`; the legacy method alias deleted with its one reader repointed - 2026-09-13
+
+Five of `qualify_symbol_sym_home`'s sites asked the same question the
+three §8.179 deleted did - "what name is this impl block's target
+registered under" - by prefixing the writer's module to the spelling:
+TemplateRegistration's stage-3 attach (`specialization.cryo`), the
+re-attach guard and the legacy method alias in `register_decl_in_index`
+(`type_resolution.cryo`), and sema's two template lookups
+(`impl_generic_params`, `visit(ImplBlockNode)`).  `ImplBlockNode` already
+carried the reader as `codegen_target_name`; it is `target_key` now -
+the stamp's `Def` name, a primitive's spelling, else the
+`qualified_target_name` the monomorphizer records for a clone, else the
+spelling - and `codegen_target_name` answers through it with its b1
+counters intact (0 disagreements between the two over six halves).
+
+#### Measured
+
+Shadow at all five sites plus the equivalence, 132,699 lines over the
+six halves, 0 failing halves, every line a cross-module head:
+
+* **Stage 3, 46,486**: the writer-module key named a template in **0**
+  of them (`tmpl_old=1` never printed), so that registration was a
+  no-op for every cross-module head; 2,504 have a template under the
+  stamp's key (`Display`/`Debug` for `Option`, `Result`, `Array`,
+  `HashMap`, `HashSet`, `Pair` in `fmt/display`; the 17 inherent
+  `implement BufStream` blocks in `net/http`, `http2`, `ws`) and were
+  attached only by type resolution's re-attach.
+* **Re-attach, 42,917**: old predicate "canonical ≠ writer-module key"
+  true, stamped head - so the guard's real meaning was "stage 3
+  cannot have attached this".  0 lines where an UNSTAMPED head (a
+  clone) disagreed: clones attach under both.
+* **Legacy alias, 42,918 registrations**: `method_returns` keyed by the
+  writer-module name.  The probe on `lookup_method_return` read **0**
+  over six halves - **and that zero was false**: the alias also
+  registers `<alias>::method` as a FUNCTION FAMILY (`register_function`,
+  `register_function_type`, the mangled name), which the probe did not
+  watch.  Its one reader is codegen's string `+` lowering, which asked
+  `resolve_function("std::core::primitives::string::append")` - the
+  writer-module qualification of a primitive impl's method, exactly the
+  key the alias minted.  Found by the LSP build failing (`<null
+  operand!>` at `table.intern("C$vt$" + path)`) after the corpus had
+  reported 0 movers: **no test and no example concatenates two `string`
+  values**, so a `+` that lowered to a null operand - a segfaulting
+  binary for `"hello, " + p` - passed 2,116 unit tests, 179 negatives,
+  45 projects and 14 examples.  `tests/lang/string_concat.cryo` (3
+  tests) now pins it; on the tree before the repoint the test build
+  refuses with E0633 (`sc_suffix` left a block unterminated), on the
+  tree after, 3 pass.  The lowering asks for `string::append` now - a
+  primitive is declared nowhere, so its spelling is its key - and the
+  alias is deleted.
+* **`impl_generic_params`, 0**: `qualified_target_name` was always set
+  there.
+* **`visit(ImplBlockNode)`, 378** - and this one does NOT land, below.
+
+Control: one build with the verdict inverted printed the agreeing
+population (the LSP alone: 691 → the complement), and the `String`
+template's presence at each site was read off the lines rather than
+assumed - absent at stage 3 in 621 of 624 heads, present at type
+resolution in 576 of 576.
+
+#### Why the re-attach could not be "stamped heads skip"
+
+The first cut attached at type resolution only heads stage 3 never saw
+(unstamped clones).  It compiled, the pin built it, and the tree's
+compiler then failed every example with `E0358: no method fmt on
+String<GlobalAlloc>`.  Stage 3 runs before the target's template exists
+whenever the declaring module comes later in pass order: `fmt::display`'s
+`Display for String` finds no `String` template at TemplateRegistration
+and every one at TypeResolution.  So the offer that always lands is type
+resolution's, stage 3's is opportunistic, and whether the first took is a
+fact of the ENTRY - `register_impl_block` now refuses a block it already
+holds, and type resolution attaches unconditionally.  Two offers, one
+registration, no name computed to guess between them.
+
+#### What does not land: `visit(ImplBlockNode)`'s template lookup
+
+The stamp's key finds a template for `implement trait FmtWrite for
+String` and `Debug for String` (`fmt/write.cryo:91`, `fmt/display.cryo:503`)
+where the writer-module key did not, and the branch it selects walks
+the bodies SYMBOLICALLY over the template's parameters and returns.  The
+writer-module miss had been sending those heads down the CONCRETE path -
+the default instantiation `String<GlobalAlloc>` - which is where their
+`this.try_push`, `this.as_str()` and the expanded default `write_char`'s
+`this.write_str` / `Str::from_raw` were visibility-gated: b1's `method
+visibility checks reached` falls 5,600 → 5,592 on the windows arm under
+the stamp (4 sites × 2), `default args expanded` rises 519 → 521, and
+nothing re-walks those bodies.  The same-module head of the same shape
+(`implement trait Sink for struct Buf`, `Buf<A = Tag>`) has taken the
+symbolic branch all along.  So the tree today gives a bare impl on a
+template whose parameters all default TWO meanings, chosen by the module
+the impl was written in, and `docs/cryo.md` §12 says what a bare
+`Array<int>` ANNOTATION means (`GlobalAlloc` filled) and nothing about a
+bare impl HEAD.  A spec question; the site keeps its writer-module lookup
+and its `qualify_symbol_sym_home`, and the question goes to Jake with
+the numbers above.  §0.2's row counts it.
+
+#### Objects, gates
+
+Predicted 0 and measured 0 twice - once with the `visit(ImplBlockNode)`
+change in (examples 0 of 1,126, tests 0 of 2,183) and once without.
+Both zeros are explained: the registry ends up holding the same blocks
+under the same keys, sema's `impl_generic_params` answered from
+`qualified_target_name` already, the legacy key's one reader is
+repointed to a key that names the same symbol, and the corpus does not
+contain a `string + string` - the first zero was measured over a
+compiler that miscompiled the operator.  Suite green (2,119 unit, 179
+negative, 45 projects); roster merged (+3); lsp-check, cross-check,
+b1-check (unmoved with the sema site left alone), lane golden unmoved.
+
+`qualify_symbol_sym_home` 43 → 39 (`type_resolution.cryo` 19 → 17,
+`specialization.cryo` 4 → 3, `sema.cryo` 6 → 5).
+
+**Tally: 35 shadowed, 35 old paths deleted, 34 at zero and one at §8.93's
+allocator residue; 33 artifacts gone** (+ the stage-3/re-attach guard
+pair, the legacy method alias).
+
+#### What this leaves
+
+* `qualify_symbol_sym_home`, 39: 17 in `type_resolution.cryo` (the
+  declaration-key sites: a struct, enum, trait, function or intrinsic
+  computing its OWN canonical name at registration - the same derivation
+  the name layer performs when it declares the symbol; and `:1421`, a
+  callee at a call, which is a `Res` the identifier carries), 5 in
+  `sema.cryo` (one of them the head above), 4 each in `async_lower`,
+  `pass_registry`, 3 in `specialization`, 3 in `declaration_emitter`, 1
+  each in `directive_processing`, `lambda_synth`.
+* `Resolver::lookup_prelude`'s two-export tie; `codegen_target_name`'s
+  rewritten spelling for a clone (now `target_key`'s last two arms).
+
+Parked for Jake: D5; the keyword ruling (§8.165); the extern-visibility
+default (§8.167); **and now the bare impl head on a template whose
+parameters all default** - concrete default instantiation or generic
+over the template - which decides `visit(ImplBlockNode)`'s lookup.
 
 ---
 

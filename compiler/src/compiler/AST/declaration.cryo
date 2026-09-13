@@ -1273,30 +1273,46 @@ public:
     /// no call site mangles and `declare_method` cannot look up, so the bodies
     /// are dropped silently and the linker reports them undefined.
     ///
-    /// A block TypeResolution never registered - one a synthesizer built -
-    /// carries its stamp, and the stamp's name is the key the type was
-    /// registered under.  An unstamped block is a monomorphized clone: the
-    /// cloner withholds `qualified_target_name` and `res` together, because a
-    /// specialization rebinds WHICH type the head is for and neither stamp
-    /// can name an instantiation; the monomorphizer's rewritten spelling is
-    /// the carrier here, already qualified (`spec_owner` carries the same
+    /// The name the target is registered under, and so the key every
+    /// registry keyed by a type's name answers to: the stamp's canonical name
+    /// for a declared type, a primitive's own spelling (a primitive is
+    /// declared nowhere, so its spelling is its key).  A head the name layer
+    /// did not stamp is a monomorphized clone or a synthesized block: the
+    /// cloner withholds `res` because a specialization is not a definition
+    /// and no `Res` can name one, and the monomorphizer's rewritten spelling
+    /// - already qualified, and recorded in `qualified_target_name` where the
+    /// clone is registered - is the carrier (`spec_owner` carries the same
     /// fact as an arena id, for a reader with an arena to resolve it).
-    codegen_target_name(&this) -> SymbolStr {
-        if (this.qualified_target_name.is_valid()) {
-            return this.qualified_target_name;
-        }
-        resolve_counter::Site::CgImplTargetUnstamped.bump();
+    target_key(&this) -> SymbolStr {
         match (this.res) {
             ResSlot::Answered(r) => {
                 match (r) {
                     Res::Def(d)    => { return d.qualified_name(); }
-                    Res::PrimTy(_) => { resolve_counter::Site::CgImplTargetUnResPrim.bump(); }
-                    _              => { resolve_counter::Site::CgImplTargetUnResOther.bump(); }
+                    Res::PrimTy(n) => { return n; }
+                    _              => { }
                 }
             }
             _ => { }
         }
+        if (this.qualified_target_name.is_valid()) { return this.qualified_target_name; }
         return this.target_type;
+    }
+
+    codegen_target_name(&this) -> SymbolStr {
+        if (!this.qualified_target_name.is_valid()) {
+            resolve_counter::Site::CgImplTargetUnstamped.bump();
+            match (this.res) {
+                ResSlot::Answered(r) => {
+                    match (r) {
+                        Res::Def(_)    => { }
+                        Res::PrimTy(_) => { resolve_counter::Site::CgImplTargetUnResPrim.bump(); }
+                        _              => { resolve_counter::Site::CgImplTargetUnResOther.bump(); }
+                    }
+                }
+                _ => { }
+            }
+        }
+        return this.target_key();
     }
 
 

@@ -1797,24 +1797,16 @@ type struct TypeResolutionPasses {
                 // entirely; the bare-name key never lines up with the
                 // canonical receiver.
                 if (ctx.generic_registry != null && canonical_target.is_valid()) {
-                    // Attach this impl block to the template entry under
-                    // the canonical target.  Stage-3 registration uses
-                    // `ctx.qualify_symbol_sym(node.target_type)` which
-                    // qualifies with the impl's *own* namespace; wrong
-                    // for cross-module impls (e.g. `implement trait
-                    // FmtWrite for struct String` declared in
-                    // `std::fmt::write` qualifies as
-                    // `std::fmt::write::String`, no template by that
-                    // name, the impl is silently never attached).
-                    // Without the attachment, monomorphization doesn't
-                    // carry the impl into spec'd types, so the spec
-                    // misses the trait method entirely at sema time.
-                    const legacy_qual_for_attach: SymbolStr =
-                        ctx.qualify_symbol_sym_home(node.target_type, node.span.file);
-                    if (!canonical_target.equals(legacy_qual_for_attach)) {
-                        ctx.generic_registry.register_impl_block(
-                            canonical_target, node);
-                    }
+                    // Attach the block to its target's template under the
+                    // same key TemplateRegistration used.  That pass runs
+                    // before the template exists whenever the target's
+                    // module comes later in pass order (`fmt::display`'s
+                    // `Display for String` sees no `String` template there),
+                    // so this is the offer that always lands; a clone
+                    // injected after TemplateRegistration is attached here
+                    // alone.  The registry refuses a block it already holds.
+                    ctx.generic_registry.register_impl_block(
+                        canonical_target, node);
                     if (node.is_trait_impl()) {
                         const trait_root: SymbolStr =
                             TypeResolutionPasses::extract_trait_leaf(
@@ -1916,21 +1908,11 @@ type struct TypeResolutionPasses {
                             node.span);
                     }
                 }
-                // Register methods under EVERY form a call site might use:
-                //   * canonical_target: what method dispatch resolves to
-                //     after going through the bare->qualified table.
-                //   * ctx.qualify_symbol_sym(target_type): the legacy
-                //     "current module + ::target" form.  Several codegen
-                //     sites (notably `expr_codegen`'s string `+` lowering
-                //     for `string::append`) hardcode this form, so we
-                //     have to keep it functional even when the canonical
-                //     resolution would have picked the bare key.
-                //   * node.target_type: the bare user-written form, so
-                //     primitive impls (`implement string { append(...) }`)
-                //     resolve under both `string::append` and
-                //     `std::core::primitives::string::append` no matter
-                //     which form the lookup uses.
-                const legacy_qualified: SymbolStr = ctx.qualify_symbol_sym_home(node.target_type, node.span.file);
+                // Register methods under the canonical qualified target
+                // name, and under the bare written form as well when the
+                // two differ, so a primitive impl (`implement string {
+                // append(...) }`) answers under `string::append` as under
+                // its canonical key.
                 if (canonical_target.equals(node.target_type)) {
                     ctx.decl_index.register_methods_with_module(
                         canonical_target, node.methods, module_sym,
@@ -1938,26 +1920,6 @@ type struct TypeResolutionPasses {
                 } else {
                     ctx.decl_index.register_methods_with_module_aliased(
                         canonical_target, node.target_type, node.methods,
-                        module_sym, ctx.intern_table, arena);
-                }
-                if (!legacy_qualified.equals(canonical_target)
-                        && !legacy_qualified.equals(node.target_type)) {
-                    // Route through the aliased helper so the
-                    // legacy_qualified combined key shares the SAME
-                    // mangled symbol as the canonical registration.
-                    // Calling the un-aliased form here would recompute
-                    // the mangle from `legacy_qualified` (the FQN) and
-                    // produce a different mangled name than the one
-                    // `declare_method` emits; fine in DI but unresolved
-                    // at link time, since no module emits the
-                    // separately-mangled form.  Concrete case: `implement
-                    // string` in primitives.cryo emits the bare-form
-                    // symbol `C$6string-6append`, so the FQN combined
-                    // key (`std::core::primitives::string::append`) must
-                    // map to that same bare mangle, not to a fresh
-                    // `C$3std.4core.10primitives.6string-6append`.
-                    ctx.decl_index.register_methods_with_module_aliased(
-                        canonical_target, legacy_qualified, node.methods,
                         module_sym, ctx.intern_table, arena);
                 }
             }
