@@ -241,17 +241,13 @@ type struct DeclarationIndex {
 
     // Leaf-name SymbolStr.id of every `intrinsic function` declaration (the
     // compiler-lowered ones in `core::intrinsics`: memcpy, ptr_diff, panic,
-    // atomic_*, ...).  Codegen's inline-intrinsic dispatcher matches a call's
-    // leaf name against `IntrinsicKind::is_name`, which is broader than this
-    // set (it also covers pure-magic forms like `rotl32`/`bswap32` that have
-    // NO declaration).  This set lets codegen tell a genuine intrinsic call
-    // from a user/stdlib function that merely shares an intrinsic's leaf name:
-    // a pinned `resolved_callee` whose leaf is NOT in here is a real function
-    // and must NOT be silently replaced by inline IR.  See
-    // `is_intrinsic_decl_name`.  The value is the intrinsic's qualified
-    // name: an intrinsic is declared and never exported, so no import binds
-    // its leaf and this record is the only thing that names the declaration
-    // a bare allocator call reaches (`intrinsic_owner_of`).
+    // atomic_*, ...) -> the intrinsic's qualified name.  An intrinsic is
+    // declared and never exported, so no import binds its leaf and this
+    // record is the only thing that names the declaration a bare allocator
+    // call reaches (`intrinsic_owner_of`); codegen reads the qualified name
+    // to tell a pin to the intrinsic from a pin to a function sharing its
+    // leaf (`callee_is_intrinsic`).  The leaf's single-slot bindings are
+    // durable from registration on (the `register_*` guards below).
     intrinsic_names:     HashMap<u32, u32>;
 
     // Bare C symbol -> owning module/file (intern id) for symbols claimed by an
@@ -475,10 +471,8 @@ type struct DeclarationIndex {
     /// form registered separately stays available regardless.
     register_intrinsic_function_type(mut &this, name: SymbolStr, func_type_ref: TypeRef,
                                      owner: SymbolStr) -> void {
-        // Record the leaf name as a genuine intrinsic declaration so codegen
-        // can distinguish it from a user function that shares the leaf name
-        // (see `is_intrinsic_decl_name` and the inline-dispatch guards in
-        // call_emitter).  From this point on the leaf's single-slot bindings
+        // Record the leaf as an intrinsic declaration, with the declaration
+        // it names.  From this point on the leaf's single-slot bindings
         // (func_type_refs / func_returns / mangled_names) are durable: the
         // intrinsic-durability guards in the register_* methods refuse
         // non-intrinsic overwrites, so a later same-leaf regular function
@@ -516,16 +510,6 @@ type struct DeclarationIndex {
         }
         positions.push(new_pos);
         this.overload_index.insert(name.id, positions);
-    }
-
-    /// True if `name`'s leaf was declared as a compiler `intrinsic function`
-    /// (see `register_intrinsic_function_type`).  Codegen uses this to avoid
-    /// silently lowering a user/stdlib function to inline IR just because its
-    /// leaf name collides with an entry in `IntrinsicKind::is_name`: a call
-    /// with a pinned `resolved_callee` whose leaf is NOT a declared intrinsic
-    /// is a real function and must be emitted as a normal call.
-    is_intrinsic_decl_name(&this, name: SymbolStr) -> boolean {
-        return this.intrinsic_names.contains_key(&name.id);
     }
 
     /// The qualified name of the `intrinsic function` declared under the leaf

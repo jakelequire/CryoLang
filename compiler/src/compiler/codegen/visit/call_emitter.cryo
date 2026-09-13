@@ -199,20 +199,7 @@ type struct CallEmitter {
             // fail with `undefined reference`.  Run the inline dispatcher
             // up front to avoid that path.
             const intr_name_str: string = intern.resolve(id.name);
-            // `IntrinsicKind::is_name` matches by leaf name only, and that set
-            // is broader than the actual intrinsic declarations: it also covers
-            // pure-magic forms (`rotl32`, `bswap32`, casts, ...) that are NOT
-            // declared anywhere. Without the `user_shadow` guard a user/stdlib
-            // function sharing an intrinsic's leaf name (e.g. sha1's `rotl32`)
-            // would be silently replaced by inline IR and its body never run.
-            // A pinned `resolved_callee` whose leaf is NOT a declared
-            // `intrinsic function` is a real function: fall through to the
-            // normal-call path below. Genuine intrinsics either have no
-            // resolved_callee (pure-magic) or are declared intrinsics
-            // (is_intrinsic_decl_name true), so both still inline here.
-            const intr_user_shadow: boolean = node.resolved_callee.is_valid()
-                && !this.cg.get_decl_index().is_intrinsic_decl_name(id.name);
-            if (IntrinsicKind::is_name(intr_name_str) && !intr_user_shadow) {
+            if (IntrinsicKind::is_name(intr_name_str) && this.callee_is_intrinsic(node, id.name)) {
                 // `intr_args` is scoped to this branch: it is built and moved
                 // into try_emit unconditionally here, so nothing is left
                 // conditionally moved past the if.
@@ -436,7 +423,6 @@ type struct CallEmitter {
             // Resolve the scope name through the DI type map to get the
             // qualified type name, then build the combined key.
             const sr: ScopeResolutionNode* = node.callee as ScopeResolutionNode*;
-            const di: DeclarationIndex* = this.cg.get_decl_index();
 
             // `intrinsics::try_catch(body, data)` - the catch_unwind primitive.
             // See the Identifier-branch twin for why this is special-lowered.
@@ -456,15 +442,7 @@ type struct CallEmitter {
             // causing the linker to look for a real `ptr_diff` symbol that
             // doesn't exist (intrinsics are lowered inline, never linked).
             const sr_leaf_str: string = intern.resolve(sr.member_name);
-            // Same guard as the Identifier branch: a qualified call whose leaf
-            // collides with an intrinsic name (e.g. `mymod::rotl32`) but
-            // resolves to a real, non-intrinsic function must NOT be replaced
-            // by inline IR. Genuine `intrinsics::<name>` calls are either
-            // pure-magic (no resolved_callee) or declared intrinsics
-            // (is_intrinsic_decl_name true), so they still inline.
-            const sr_user_shadow: boolean = node.resolved_callee.is_valid()
-                && !di.is_intrinsic_decl_name(sr.member_name);
-            if (IntrinsicKind::is_name(sr_leaf_str) && !sr_user_shadow) {
+            if (IntrinsicKind::is_name(sr_leaf_str) && this.callee_is_intrinsic(node, sr.member_name)) {
                 mut sr_args: LValue[] = [];
                 for (mut sai: i64 = 0; sai < node.arguments.length; sai++) {
                     sr_args.push(this.dispatch.codegen_rvalue(visitor,node.arguments[sai]));
@@ -1220,6 +1198,24 @@ type struct CallEmitter {
     /// the hosted raising funnel applies; the plain-call fast-path (empty
     /// schedule / abort mode / freestanding trap) stays byte-identical through
     /// `emit_panic_call`.
+    /// Whether a call whose leaf `IntrinsicKind::is_name` knows names the
+    /// INTRINSIC, and so lowers inline, or a function that shares the leaf,
+    /// and so is called.  The pin decides: an intrinsic is declared under
+    /// its leaf as its own symbol and under its qualified name, so a pin
+    /// equal to either is the intrinsic and any other pin - the exported
+    /// `std::core::panic` wrapper, a user's `rotl32` - is a real function
+    /// with a body, whatever its leaf.  An unpinned callee is a pure-magic
+    /// form (`bswap32`, the casts) no declaration carries, or a `no_std`
+    /// bare allocator call the name layer left unanswered; both inline.
+    /// A leaf test in front of the pin inlined every `core::panic(...)` in
+    /// the stdlib against a spelling that named the wrapper.
+    callee_is_intrinsic(&this, node: CallExprNode*, leaf: SymbolStr) -> boolean {
+        if (!node.resolved_callee.is_valid()) { return true; }
+        if (node.resolved_callee.equals(leaf)) { return true; }
+        const owner: SymbolStr = this.cg.get_decl_index().intrinsic_owner_of(leaf);
+        return owner.is_valid() && node.resolved_callee.equals(owner);
+    }
+
     emit_panic_unwind(mut &this, visitor: ASTVisitor*, node: CallExprNode*,
                       msg: LValue, file: LValue, line: LValue) -> void {
         const cur_fn: LValue = this.get_current_function();

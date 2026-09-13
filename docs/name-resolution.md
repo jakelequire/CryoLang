@@ -27,7 +27,7 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at the commit carrying §8.176; `git log
+Checks run from the repo root. Verified at the commit carrying §8.177; `git log
 --oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
@@ -45,7 +45,7 @@ current-state description is the defect it exists to remove.
 | D3 | Modules bind in the TYPE namespace | TAKEN, then SUPERSEDED by D5 | `grep -c 'SymbolKind::Namespace' compiler/src/compiler/resolver/namespace_kind.cryo` → **1** | §8.39, §8.68 |
 | D4 | The qualifier shorthand `A::B` prefers the type | SUPERSEDED by D5 — ruled dropped, never built, then overtaken | `no check` — the thing ruled on was never in the tree | §8.66 → §8.130 |
 | D5 | **Namespaces and types share ONE namespace**; a module and a type can never carry the same name, and the collision is an ordinary redeclaration error at its declaration | **RULED, NOT STARTED** — and now the one thing holding `scope_owner_key`'s cursor lane (§8.170): `module_type_name_collision` pins the pre-D5 shape | `grep -rho 'check_module_type_collision' compiler/src \| wc -l` → **2** (0 when done) | §8.130, §8.134 |
-| D6 | Intrinsics get namespaced; a bare name always means the user's function | RULED; `format`/`printf` done; every other intrinsic the tree calls is behind `intrinsics::` since §8.172 - the bare surface left is the allocator leaf `malloc`/`free`/`realloc`, held by §8.93, reached since §8.173 by ONE path (`intrinsic_owner_of`, a `Pending` callee's family) and by nothing else. **Codegen's inline dispatch is keyed by the callee's LEAF and runs before the pin is read**, so a bare `panic` pinned to the `std::core::panic` wrapper still lowers to the intrinsic (§8.173) - D6's remainder is in codegen | `grep -c '^intrinsic function ' stdlib/core/intrinsics.cryo` → **58**; `grep -c 'intrinsic_owner_of' compiler/src/compiler/sema/call_resolver.cryo` → **1**; `python scripts/qualify-intrinsic-calls.py stdlib/sync/atomic.cryo --names @stdlib/core/intrinsics.cryo` → `0 rewritten` | §8.124, §8.126, §8.129, §8.172, §8.173 |
+| D6 | Intrinsics get namespaced; a bare name always means the user's function | **TAKEN in sema and in codegen** - `format`/`printf` done; every other intrinsic the tree calls is behind `intrinsics::` since §8.172; the bare surface left is the allocator leaf `malloc`/`free`/`realloc`, held by §8.93, reached since §8.173 by ONE path (`intrinsic_owner_of`, a `Pending` callee's family) and by nothing else. Codegen's inline dispatch reads the PIN since §8.177 (`callee_is_intrinsic`): a pin equal to the intrinsic's own symbol or qualified name inlines, any other pin is called - so the 85 `core::panic(...)` and 31 bare `panic(...)` sites call the `std::core::panic` wrapper, one frame more, approved by Jake with the cost stated | `grep -c '^intrinsic function ' stdlib/core/intrinsics.cryo` → **58**; `grep -c 'intrinsic_owner_of' compiler/src/compiler/sema/call_resolver.cryo` → **1**; `grep -c 'callee_is_intrinsic' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **3**; `grep -rho 'is_intrinsic_decl_name' compiler/src --include=*.cryo \| wc -l` → **0**; `python scripts/qualify-intrinsic-calls.py stdlib/sync/atomic.cryo --names @stdlib/core/intrinsics.cryo` → `0 rewritten` | §8.124, §8.126, §8.129, §8.172, §8.173, §8.177 |
 | D7 | Imports stop globbing | **TAKEN** — a plain `import M;` is `ImportStyle::Module` and binds no names. Three globs remain BY DESIGN and the old row's expected `0` was unreachable: the explicit `M::*`, and the two the compiler injects (the prelude, the f-string runtime) | `grep -rho 'ImportStyle::Wildcard,' compiler/src --include=*.cryo \| wc -l` → **3** | §8.131, §8.135, §8.138 |
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
@@ -7746,6 +7746,184 @@ shape is the stdlib itself, which every half compiles.
 
 **Tally: 32 shadowed, 32 old paths deleted, 31 at zero and one at §8.93's
 allocator residue; 29 artifacts gone** (+ the `$MG` reconstruction).
+
+### 8.177 Consumer 33: codegen's intrinsic dispatch reads the pin, not the leaf; D6 lands in codegen - 2026-09-13
+
+§8.173's finding, closed.  `call_emitter` decided whether a call was an
+intrinsic by its LEAF - `IntrinsicKind::is_name(leaf)`, guarded by
+`is_intrinsic_decl_name(leaf)`, another leaf test - before it read
+`resolved_callee`.  A pin naming a function that shares an intrinsic's
+leaf was therefore never read, and the call lowered inline as the
+intrinsic.  D6's ruling held in sema (every bare `panic` stamped to the
+`std::core::panic` wrapper) and not in codegen; §8.173 recorded the 3,318
+`panic` disagreements as explained by D6 landing.  They were explained.
+They were not closed.
+
+#### Measured
+
+Shadow, old decision kept, new one computed beside it, one line per
+disagreement with the leaf, the pin and the span.  **26,190 over the six
+halves, 0 failing halves, every line leaf `panic`, every line OLD-INLINE**:
+a call pinned to the wrapper, lowered as the intrinsic.  116 distinct
+source sites:
+
+* **85 write `core::panic(...)` - module-qualified, to the wrapper, by
+  the writer's own hand** (`option.cryo` 69/86/98, `result.cryo`,
+  `array.cryo`, `primitives.cryo`, `string.cryo`, `thread`, `rwlock`,
+  `io/buf`, ...; 25,056 lines, one per instantiation of the generic
+  bodies they sit in).  Pinned `std::core::panic` by `pin_scope_callee_qsym`.
+  This is not the D6 case at all: nothing about a bare name.  The source
+  named a module and codegen overrode it by leaf - the wrong-function bind
+  this migration has deleted at every other site since §8.158, here
+  overriding an explicit spelling.
+* **31 write bare `panic(...)`** stamped `Def(std::core::panic)` and
+  pinned to the wrapper's symbol - `stdlib/future/*`, and `assert`,
+  `unreachable`, `todo` in `core/_module.cryo` (1,134 lines; the audit
+  counted 34 sites, 31 of which the corpus compiles).  D6's case.
+* 2 in a test (`match_binding_alias.cryo`).
+
+The LSP alone: 3,672 (3,652 qualified, 20 bare).
+
+#### The new model
+
+`callee_is_intrinsic(node, leaf)`: an intrinsic is declared under its
+leaf as its own symbol and under its qualified name, so a pin equal to
+either IS the intrinsic and lowers inline; any other pin is a function
+with a body and is called, whatever its leaf.  An unpinned callee is a
+pure-magic form no declaration carries (`bswap32`, the casts), or a bare
+allocator call in a `no_std` program the name layer left unanswered -
+both inline, as before.  `is_intrinsic_decl_name` had no reader left and
+is deleted; the `"panic"` literal that selects `emit_panic_unwind` stays,
+because it is inside the inline branch and now reached only when the
+callee is the intrinsic - the wrapper's own body, and `no_std`.
+
+**§8.93 is narrowed to nothing new.**  A `no_std` bare `panic` / `malloc`
+has no wrapper to stamp to and no pin; it inlines through the unpinned
+arm exactly as it did, by `intrinsic_owner_of`'s family.  The runtime
+tiers call no bare `panic` (they have `report_panic`).
+
+#### What changes at runtime, and that Jake approved it knowing so
+
+Every hosted panic through the 116 sites now calls `std::core::panic`,
+which calls `intrinsics::panic`, which is `__cryo_panic`: **one extra
+stack frame**.  Message, file and line are the caller's arguments and are
+byte-identical; exit codes and output are unchanged; a symbolized
+backtrace shows the wrapper's frame.  Under `--panic=unwind` the drop
+route is preserved: the normal call path emits `invoke` + cleanup landing
+pad under exactly the condition `emit_panic_unwind` tests, and the IR
+below shows the pads identical.  **Jake approved this on 2026-09-13 with
+the frame cost stated**, persuaded by the 85 qualified sites: a language
+decision made in sema terms, extended into codegen knowingly - not an
+unreviewed behaviour change.
+
+#### The IR, characterised
+
+`irdiff` over the unit suite (363 modules): 129 differ.  Normalising SSA
+and label numbering, the call target (`__cryo_panic` -> the wrapper's
+symbol) and the block names (`panic.lpad` / `panic.cont` ->
+`invoke.lpad` / `invoke.cont`, the normal path's), the residual across
+all 129 is **one added `declare` of the wrapper per module** (126; the
+other 3 already held it).  203 panic sites in the sample carry live
+droppable locals and move from `emit_panic_unwind`'s pad to the normal
+path's, with identical contents.  Nothing else moved.
+
+#### Objects, gates
+
+Predicted before the run, from the IR sample's 129 of 363: a third to
+two fifths of both populations, each by the shape above.  Measured:
+examples **464 of 1,126** (41%), tests **697 of 2,182** (32%), the
+stdlib dependency objects every build carries.  Suite green (2,116 unit,
+179 negative, 45 projects); LSP builds directly; lane golden unmoved.
+
+**`verify-freestanding` is RED, and was before this session.**  Run from
+WSL (the Windows host refuses it): 20 of 21 checks pass, every Windows
+arm included; the Linux `backtrace` tier does not compile - `E0202:
+cannot find function frame_address in this scope` at
+`runtime/backtrace/src/lib.cryo:62`, a BARE call of an `intrinsic
+function` the same `no_std` module declares at line 45.  Reproduces on
+this host with `cd runtime && cryo build --target=x86_64-pc-linux-gnu`,
+and reproduces with this session's every change stashed, so it is HEAD's.
+Sema's bare-callee path (`callee_family` -> `intrinsic_owner_of`) is the
+suspect - a local intrinsic declaration in a module the stdlib's
+`core::intrinsics` never reaches - and it is the first item of the
+handoff below.  No gate on this host runs the Linux tiers, and CI fires
+on `main` alone, which is how it stayed unseen.
+
+**Tally: 33 shadowed, 33 old paths deleted, 32 at zero and one at §8.93's
+allocator residue; 30 artifacts gone** (+ the leaf-keyed intrinsic guard,
+`is_intrinsic_decl_name`).
+
+#### What this leaves - the handoff
+
+In order:
+
+0. **`verify-freestanding` red on HEAD** (above): the Linux `backtrace`
+   tier's bare `frame_address(0)`.  Instrument `callee_family` for that
+   call - is `ident.res` `Def` or `Pending`, and what does
+   `intrinsic_owner_of` answer for a leaf declared in the calling module
+   - before touching anything; §8.93's allocator hold is the same path
+   and must stay open.  Bisect against §8.173's commit (`ee3a1159`) if
+   the instrument does not settle it.
+1. **The impl head's HOME -> BARE lookup in `type_resolution.cryo`**, three
+   sites (`lookup_type(qualify_symbol_sym_home(node.target_type, ..))`,
+   then `lookup_type(node.target_type)`; the row in §0.2 carries the
+   check, 3 -> 0).  Name resolution runs before type resolution and stamps
+   `ImplBlockNode.res` (`visit(ImplBlockNode)` in `name_resolution.cryo`),
+   so each site can read the stamp as sema's `impl_target_type` does:
+   `Def(q)` -> `lookup_type(q)`, `PrimTy(n)` -> `lookup_type(n)`, an
+   unanswered slot -> `node.spec_owner` (a clone).  Shadow the pair
+   against the stamp first: the two sites in the FuncSig phases see
+   mono-injected clones with rewritten spellings, and the `spec_owner`
+   arm is what answers those.  `visit(ImplBlockNode)` in `sema.cryo`
+   (~726) qualifies the target by HOME for the template registry too, and
+   the stamp's `Def(q)` is that key.
+2. **`qualify_symbol_sym_home`, 48 sites** (§0.2 row): 24 in
+   `type_resolution.cryo`, 6 in `sema.cryo`, 4 each in `async_lower`,
+   `specialization`, `pass_registry`, 3 in `declaration_emitter`.  Each
+   is a stamp the name layer carries or should; enumerate readers and
+   callers before touching one, and expect the async-lowered heads (the
+   population §8.174 found) to be the writers that need a stamp added.
+3. `Resolver::lookup_prelude` leaves a name two prelude modules export
+   UNANSWERED, not refused; not reached by the corpus.
+4. `codegen_target_name` reads the rewritten spelling for a CLONE (a node
+   method with no arena); a reader with an arena could read
+   `arena.get_qualified_name(spec_owner)`.
+
+Load-bearing and not the next agent's:
+
+* **§8.93's allocator hold.**  A bare `malloc` / `free` / `realloc` in a
+  file importing nothing compiles only through `intrinsic_owner_of`, the
+  `Pending` arm of `callee_family`, and inlines through the unpinned arm
+  of `callee_is_intrinsic`.  Narrow, never delete, while the hold stands.
+* **Closure specializations carry a program-wide counter in their mangled
+  symbol** (`apply__cl_7096`): adding a test earlier in suite order
+  renames every later closure object.  Separate the axes before reading
+  an object mover after a TEST edit as a miscompile (§8.172).
+* **The by-name lane's zero was unexercised, not correct** (§8.175): a
+  deletion on a zero needs the mutation pair, and the pair is the habit -
+  mutate the front end to produce the population the corpus lacks, show
+  HEAD silently wrong and the tree refusing.
+
+Parked for Jake:
+
+* **D5** (module / type collision; holds `scope_owner_key`'s cursor lane,
+  §8.170).
+* **The keyword ruling** (§8.165): primitive type names stop being
+  keywords; `new int[100]` stamps Pending.
+* **The extern-visibility default** (§8.167): `extern "C"` public unless
+  marked `private`, set by a worker, **never confirmed by Jake - and now
+  written into `docs/cryo.md` §18.1 as normative spec text.**  A language
+  decision is in the spec unratified; it needs Jake's yes or a revert of
+  the spec text, and until then the row is a claim, not a rule.
+
+Traps this session, for the next one: the heredoc collapse did NOT bite -
+every script and edit went through a written file - but a stray `python -`
+with no script hung a tool call on stdin; a background job does NOT wake
+the agent when it finishes - block on it in the foreground with a bounded
+loop; `objcmp.sh` stashes `compiler/src`, so a `grep` over the tree during
+its first half reads HEAD; a shadow keyed on `bound == asked` hides every
+family whose one symbol IS its name (`malloc`), which is why the codegen
+rule is one SYMBOL, not one signature.
 
 ---
 
