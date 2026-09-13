@@ -5,12 +5,14 @@
 /// would be `O(modules x functions x overloads)` per compiled module,
 /// crippling for stdlib-heavy programs with many generic specializations.
 ///
-/// Instead, codegen calls `resolve_function` / `resolve_function_with_arity`
-/// / `resolve_global` at each cross-module reference.  The helpers:
-///   1. Fast-path: check the context's own function/global registry.
-///   2. Slow-path: look up the signature in `DeclarationIndex`, emit an
-///      `external` declaration in the current LLVM module, register it,
-///      and return the handle.
+/// Instead, codegen resolves each cross-module reference on demand:
+///   1. the function this module already holds under the SYMBOL;
+///   2. else an `external` declaration emitted from the `DeclarationIndex`
+///      entry registered under that symbol, then held.
+///
+/// A callee reaches here as the symbol the front end pinned, or - for the
+/// pins written before the symbol existed - as a FAMILY name that must name
+/// one symbol.  Nothing here chooses among a family's signatures.
 ///
 /// This mirrors what LLVM itself does via `Module::getOrInsertFunction`.
 ///
@@ -22,6 +24,8 @@ namespace compiler::codegen::ops::symbol_resolver;
 
 import compiler::codegen;
 import compiler::codegen::{ llvm_types, type_map, abi };
+import compiler::diag::{ ErrorCode, source_span };
+import compiler::diag::source_span::{ SourceSpan };
 import compiler::codegen::state::{ function_registry, global_registry };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
@@ -106,23 +110,28 @@ type struct SymbolResolver {
 
     // Cross-module extern declaration
 
-    /// Declare an extern function for a single (name, func_type_ref) pair,
-    /// and register it under both the bare name and the (name, arity)
-    /// composite key.  If an LLVM symbol with the same mangled name
-    /// already exists in this module, reuse it.  Returns the LValue on
-    /// success, null otherwise.
-    declare_extern_function_overload(mut &this, fn_name: SymbolStr,
-                                     func_type_ref: TypeRef) -> LValue {
-        return this.declare_extern_function_as(fn_name, func_type_ref, SymbolStr::empty());
+    /// The LLVM symbol of signature `ft` of family `name`: the entry's own
+    /// registered symbol, else the family's single slot (an `extern "C"`
+    /// family registers no per-signature symbol; its slot is the C name),
+    /// else the mangling of the pair itself.
+    family_symbol(&this, name: SymbolStr, ft: TypeRef) -> SymbolStr {
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        mut sym: SymbolStr = di.lookup_overload_mangled(name, ft);
+        if (!sym.is_valid()) { sym = di.lookup_mangled_name(name); }
+        if (sym.is_valid()) { return sym; }
+        const arena: TypeArena* = this.ctx.type_arena;
+        const ft_ptr: Type* = arena.lookup(ft.id);
+        if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { return SymbolStr::empty(); }
+        const f: FunctionType* = ft_ptr as FunctionType*;
+        return MangledName::for_free_function(
+            this.ctx.intern_table, arena, QualifiedName::from_symbol(name),
+            f.param_types, f.return_type, f.is_variadic).value;
     }
 
-    /// Declare the cross-module extern for `fn_name` at `func_type_ref`'s
-    /// signature.  `symbol` names the LLVM function when the caller holds the
-    /// exact symbol (a pin); otherwise it is the one the index registered for
-    /// this (name, type) pair, then the name's single-slot alias, then a
-    /// fresh free-function mangle.
-    declare_extern_function_as(mut &this, fn_name: SymbolStr,
-                               func_type_ref: TypeRef, symbol: SymbolStr) -> LValue {
+    /// Declare the cross-module extern `symbol` at `func_type_ref`'s
+    /// signature and register it under that symbol.  An LLVM function already
+    /// so named is reused.  Null when the signature cannot be lowered.
+    declare_extern_function_as(mut &this, func_type_ref: TypeRef, symbol: SymbolStr) -> LValue {
         const arena: TypeArena* = this.ctx.type_arena;
         const ft_ptr: Type* = arena.lookup(func_type_ref.id);
         if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { return LValue::null(); }
@@ -131,27 +140,9 @@ type struct SymbolResolver {
         const fn_type: LType = this.build_function_ltype(ft);
         if (!fn_type.is_valid()) { return LValue::null(); }
 
-        const intern: InternTable* = this.ctx.intern_table;
-        const di: DeclarationIndex* = this.ctx.decl_index;
-
-        mut mangled_sym: SymbolStr = symbol;
-        if (!mangled_sym.is_valid()) {
-            mangled_sym = di.lookup_overload_mangled(fn_name, func_type_ref);
-        }
-        if (!mangled_sym.is_valid()) {
-            mangled_sym = di.lookup_mangled_name(fn_name);
-        }
-        if (!mangled_sym.is_valid()) {
-            const ext_qname: QualifiedName = QualifiedName::from_symbol(fn_name);
-            mangled_sym = MangledName::for_free_function(
-                intern, arena, ext_qname, ft.param_types,
-                ft.return_type, ft.is_variadic).value;
-        }
-        const ir_name: string = intern.resolve(mangled_sym);
-
+        const ir_name: string = this.ctx.intern_table.resolve(symbol);
         mut fn_val: LValue = this.llvm_module.get_named_function(ir_name);
-        const created_now: boolean = !fn_val.is_valid();
-        if (created_now) {
+        if (!fn_val.is_valid()) {
             fn_val = this.llvm_module.add_function(ir_name, fn_type);
             // Cross-module extern must carry the same `sret(%T)` /
             // `byval(%T)` attributes the defining module attached;
@@ -175,45 +166,14 @@ type struct SymbolResolver {
                 }
             }
         }
-        this.functions.register(fn_name, fn_val);
-        this.functions.register_with_arity(fn_name, ft.param_types.length as u32, fn_val);
-        if (symbol.is_valid()) { this.functions.register(symbol, fn_val); }
+        this.functions.register(symbol, fn_val);
         return fn_val;
     }
 
-    /// Return-type-only fallback: declare a no-arg function for names
-    /// that have no full signature in DeclarationIndex but do have a
-    /// return type.
-    declare_extern_function_return_only(mut &this, fn_name: SymbolStr) -> LValue {
-        const intern: InternTable* = this.ctx.intern_table;
-        const di: DeclarationIndex* = this.ctx.decl_index;
-        const arena: TypeArena* = this.ctx.type_arena;
-        const ret_ref: TypeRef = di.lookup_func_return(fn_name);
-        if (ret_ref.is_invalid()) { return LValue::null(); }
 
-        const ret_ty: LType = this.type_mapper.map_type(ret_ref);
-        if (!ret_ty.is_valid()) { return LValue::null(); }
-
-        const fn_type: LType = LType::function_type(ret_ty, null, 0, false);
-        mut fb_mangled: SymbolStr = di.lookup_mangled_name(fn_name);
-        if (!fb_mangled.is_valid()) {
-            const fb_qname: QualifiedName = QualifiedName::from_symbol(fn_name);
-            const empty_params: TypeRef[] = [];
-            fb_mangled = MangledName::for_free_function(
-                intern, arena, fb_qname, empty_params, ret_ref, false).value;
-        }
-        const ir_name: string = intern.resolve(fb_mangled);
-        mut fn_val: LValue = this.llvm_module.get_named_function(ir_name);
-        if (!fn_val.is_valid()) {
-            fn_val = this.llvm_module.add_function(ir_name, fn_type);
-        }
-        this.functions.register(fn_name, fn_val);
-        return fn_val;
-    }
-
-    /// Returns true if `name` is defined in the module currently being
-    /// compiled.  Used by the resolve_* helpers to avoid turning a stale
-    /// local lookup into a stub extern declaration.
+    /// Returns true if `mod_sym` is the module currently being compiled.  A
+    /// global the module itself defines is read from its own registry; an
+    /// extern declared for it would clobber the definition.
     owned_by_current_module(&this, mod_sym: SymbolStr) -> boolean {
         if (!mod_sym.is_valid()) { return false; }
         const current: SymbolStr = this.ctx.intern_table.intern(this.ctx.source_file);
@@ -221,150 +181,98 @@ type struct SymbolResolver {
     }
 
 
-    // Function / global resolution (cached lookup + lazy extern)
+    // Function / global resolution (held symbol + lazy extern)
 
-    /// Look up a function by name, declaring a cross-module extern on
-    /// demand when this module hasn't seen it yet.  Returns null when the
-    /// name is unknown to the DeclarationIndex OR when the symbol is
-    /// owned by the current module (the caller should be using the value
-    /// that declare_* put in the map, not a freshly declared extern that
-    /// would clobber the body).
-    resolve_function(mut &this, name: SymbolStr) -> LValue {
-        const cached: LValue = this.functions.get(name);
+    /// The function this module already holds under `sym`: one the declare
+    /// passes registered (a definition, a pinned extern, a `![symbol]`-bound
+    /// body under its Cryo symbol), else an LLVM function so named.
+    held_symbol(&this, sym: SymbolStr) -> LValue {
+        const cached: LValue = this.functions.get(sym);
         if (cached.is_valid()) { return cached; }
-
-        const di: DeclarationIndex* = this.ctx.decl_index;
-        if (this.owned_by_current_module(di.get_function_module(name))) {
-            return LValue::null();
-        }
-
-        const arena: TypeArena* = this.ctx.type_arena;
-        const overloads: TypeRef[] = di.lookup_func_type_overloads(name);
-        // Two-pass declaration: prefer concrete overloads (no
-        // GenericParam anywhere in the signature) over template entries
-        // left in DI by sema-time registration of generic methods.
-        // Without this, the template's `Reference(GenericParam)`-typed
-        // signature is the first overload to succeed
-        // (build_function_ltype lowers `Reference(_)` to opaque `ptr`
-        // regardless), so the cross-module extern gets declared under
-        // the template's `1H`-placeholder mangled name and the call site
-        // never links to the spec.  Pass 1: concrete overloads.  Pass 2:
-        // any remaining (template) overloads, only as a fallback when no
-        // concrete overload was registered for the name.
-        mut first: LValue = LValue::null();
-        for (mut i: i64 = 0; i < overloads.length; i++) {
-            const ft_ptr: Type* = arena.lookup(overloads[i].id);
-            if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { continue; }
-            const ft: FunctionType* = ft_ptr as FunctionType*;
-            if (SymbolResolver::function_type_has_generic_params(arena, ft)) { continue; }
-            const v: LValue = this.declare_extern_function_overload(name, overloads[i]);
-            if (!first.is_valid() && v.is_valid()) { first = v; }
-        }
-        if (!first.is_valid()) {
-            for (mut i: i64 = 0; i < overloads.length; i++) {
-                const v: LValue = this.declare_extern_function_overload(name, overloads[i]);
-                if (!first.is_valid() && v.is_valid()) { first = v; }
-            }
-        }
-        if (first.is_valid()) { return first; }
-
-        return this.declare_extern_function_return_only(name);
+        return this.llvm_module.get_named_function(this.ctx.intern_table.resolve(sym));
     }
 
-    /// Resolve a function from a sema-pinned symbol.
-    resolve_function_by_mangled(mut &this, pinned: SymbolStr) -> LValue {
-        if (!pinned.is_valid()) { return LValue::null(); }
-
-        // Consult the in-module registry FIRST, keyed on the mangled symbol -
-        // exactly as `resolve_function` does for the by-name path.  For a normal
-        // in-module definition this returns the same `fn_val` that
-        // `get_named_function(pinned_str)` would (its LLVM symbol IS the mangled
-        // name), so IR is byte-unchanged.  It differs only for a method declared
-        // with `![symbol("sym")]` (the C++ binding generator): there the LLVM
-        // symbol is the C++ mangled name, but `declare_method` registered the
-        // fn_val under the Cryo mangled key, so the call correctly targets the
-        // overridden symbol instead of synthesizing a phantom Cryo-named extern.
-        const cached: LValue = this.functions.get(pinned);
-        if (cached.is_valid()) { return cached; }
-
-        const intern: InternTable* = this.ctx.intern_table;
-        const pinned_str: string = intern.resolve(pinned);
-        mut v: LValue = this.llvm_module.get_named_function(pinned_str);
+    /// A function by SYMBOL.  Held by this module, else declared extern from
+    /// the index entry registered under that symbol: the entry gives the
+    /// signature and the symbol stays the caller's - re-deriving it from the
+    /// entry's (name, type) would hand back whichever entry of that type
+    /// registered first, and `Display::fmt<W>` and `Debug::fmt<W>` on one
+    /// receiver share a type and differ only in the symbol.  Several entries
+    /// can share one symbol (a trait-impl method under its qualified and its
+    /// bare combined name); the first whose signature lowers is declared.
+    /// Null for a symbol neither this module nor the index knows.
+    resolve_symbol(mut &this, sym: SymbolStr) -> LValue {
+        mut v: LValue = this.held_symbol(sym);
         if (v.is_valid()) { return v; }
-
         const di: DeclarationIndex* = this.ctx.decl_index;
-        // Reverse index (mangled id -> overload position) replaces a linear
-        // scan of every registered overload.  Normally a current-module-owned
-        // symbol is resolved above by `get_named_function`. If that missed it,
-        // the definition was emitted in a DIFFERENT module than the one DI
-        // records as its owner - this happens for a monomorphized self-
-        // returning combinator spec (`it.copied()`), which is injected onto a
-        // specialized impl block emitted during module 0's codegen while DI
-        // ownership stays with the consuming module. The local lookup having
-        // already failed proves no in-module definition exists, so declaring a
-        // cross-module extern is sound: it links to the out-of-module
-        // definition instead of failing with a spurious "no method" at the
-        // call site.
-        // Reverse index (mangled id -> overload positions, in registration
-        // order) replaces a linear scan of every registered overload.  Several
-        // positions can share one mangled id (a trait-impl method registered
-        // under both its qualified and bare combined names); try each in order
-        // and return the first that yields a valid extern, exactly as the
-        // former scan did.
-        // The extern is declared under the PINNED symbol: the position gives
-        // the signature, never the name.  Re-deriving the name from the
-        // overload's (key, type) pair would hand back whichever overload of
-        // that type registered first - `Display::fmt<W>` and `Debug::fmt<W>`
-        // on one receiver share a type and differ only in the symbol.
-        match (di.mangled_to_overload_pos.get_ref(&pinned.id)) {
+        match (di.mangled_to_overload_pos.get_ref(&sym.id)) {
             Option::Some(positions) => {
                 for (mut k: i64 = 0; k < (*positions).length; k++) {
                     const pos: u32 = (*positions)[k];
-                    const qual: SymbolStr = SymbolStr::from_id(di.overload_func_keys[pos as i64]);
-                    v = this.declare_extern_function_as(qual, di.overload_func_types[pos as i64], pinned);
+                    v = this.declare_extern_function_as(di.overload_func_types[pos as i64], sym);
                     if (v.is_valid()) { return v; }
                 }
             }
             Option::None => { }
         }
-
-        return this.resolve_function(pinned);
+        return LValue::null();
     }
 
-    /// Look up an overloaded function by (name, user-arg-count),
-    /// declaring a cross-module extern on demand.
-    resolve_function_with_arity(mut &this, name: SymbolStr,
-                                arity: u32) -> LValue {
-        const cached: LValue = this.functions.get_with_arity(name, arity);
-        if (cached.is_valid()) { return cached; }
-
+    /// A function by its FAMILY name - the canonical name every signature of
+    /// one declaration is registered under - when the family names ONE
+    /// symbol, among its signatures of `arity` when one is given.  A
+    /// signature carrying a generic parameter is a template and names none;
+    /// two declarations under one leaf that are the same C symbol are one
+    /// function.  A family naming several symbols is not resolvable by
+    /// name: the arguments select among them, that selection is the front
+    /// end's pin, and a name reaching here for such a family is an internal
+    /// error, never a choice made here.
+    resolve_family(mut &this, name: SymbolStr, arity: i64) -> LValue {
         const di: DeclarationIndex* = this.ctx.decl_index;
-        if (this.owned_by_current_module(di.get_function_module(name))) {
-            return LValue::null();
-        }
-
         const arena: TypeArena* = this.ctx.type_arena;
         const overloads: TypeRef[] = di.lookup_func_type_overloads(name);
-        // Two-pass: concrete overloads first, then templates as
-        // fallback.  See `resolve_function` for the rationale.
+        mut sym: SymbolStr = SymbolStr::empty();
+        mut ft: TypeRef = TypeRef::invalid();
         for (mut i: i64 = 0; i < overloads.length; i++) {
-            const ft_ptr: Type* = arena.lookup(overloads[i].id);
-            if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { continue; }
-            const ft: FunctionType* = ft_ptr as FunctionType*;
-            if (ft.param_types.length as u32 != arity) { continue; }
-            if (SymbolResolver::function_type_has_generic_params(arena, ft)) { continue; }
-            const v: LValue = this.declare_extern_function_overload(name, overloads[i]);
-            if (v.is_valid()) { return v; }
+            const t: Type* = arena.lookup(overloads[i].id);
+            if (t == null || t.kind != TypeKind::Function) { continue; }
+            const f: FunctionType* = t as FunctionType*;
+            if (arity >= 0 && f.param_types.length != arity) { continue; }
+            if (SymbolResolver::function_type_has_generic_params(arena, f)) { continue; }
+            const s: SymbolStr = this.family_symbol(name, overloads[i]);
+            if (!s.is_valid()) { continue; }
+            if (sym.is_valid() && !s.equals(sym)) {
+                this.ctx.emit_error_at(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                    fmt::format("codegen: `%s` names several functions and the call was not pinned to one of them",
+                                this.ctx.intern_table.resolve(name)),
+                    SourceSpan::none());
+                return LValue::null();
+            }
+            sym = s;
+            ft = overloads[i];
         }
-        for (mut i: i64 = 0; i < overloads.length; i++) {
-            const ft_ptr: Type* = arena.lookup(overloads[i].id);
-            if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { continue; }
-            const ft: FunctionType* = ft_ptr as FunctionType*;
-            if (ft.param_types.length as u32 != arity) { continue; }
-            const v: LValue = this.declare_extern_function_overload(name, overloads[i]);
-            if (v.is_valid()) { return v; }
-        }
-        return LValue::null();
+        if (!sym.is_valid()) { return LValue::null(); }
+        const held: LValue = this.held_symbol(sym);
+        if (held.is_valid()) { return held; }
+        return this.declare_extern_function_as(ft, sym);
+    }
+
+    /// A function by canonical name, for the calls codegen synthesizes
+    /// itself (the allocator shims, `string::append`, `std::env::set_args`).
+    resolve_function(mut &this, name: SymbolStr) -> LValue {
+        return this.resolve_family(name, -1);
+    }
+
+    /// A pinned callee.  A pin is a symbol and resolves as one; a pin that is
+    /// a family name instead - a module-qualified call, a static on a
+    /// specialization, a specialization's own name, each written before its
+    /// symbol exists to be pinned - resolves through the family, which must
+    /// name one symbol.
+    resolve_function_by_mangled(mut &this, pinned: SymbolStr) -> LValue {
+        if (!pinned.is_valid()) { return LValue::null(); }
+        const v: LValue = this.resolve_symbol(pinned);
+        if (v.is_valid()) { return v; }
+        return this.resolve_family(pinned, -1);
     }
 
     /// Look up a global by name, declaring a cross-module extern on demand.

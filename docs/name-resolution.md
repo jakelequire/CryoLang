@@ -27,7 +27,7 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at the commit carrying §8.173; `git log
+Checks run from the repo root. Verified at the commit carrying §8.175; `git log
 --oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
@@ -92,10 +92,11 @@ three, and its row carries the count. Read each zero off its own row.
 | callee door ladder (`lookup_callee_function_type`'s identifier branch: a `lookup_local` by spelling ahead of the stamp, then STAMP → HOME → BARE) | **DELETED** - the identifier branch is the stamp: `Local` → the local's type when callable, `Def` → `func_type_of_res`, else no hint; shadow 5,327 → 16, every line a `Pending` stamp (intrinsics through BARE, unresolved match guards and `main$async` through HOME, an unimported `swap`); the 12 left are §8.93's allocator leaf and `visibility_gate`'s refused privates; the `CALLEE-DOOR` audit stream went with it | — | `grep -c 'CALLEE-DOOR' compiler/src/compiler/resolve_counter.cryo` → **0**; `grep -c 'lookup_func_type_exact(ident.name)' compiler/src/compiler/sema/call_resolver.cryo` → **0** | §8.172 |
 | free-call template search by leaf and arity (`find_fn_template_for_call`'s registry scan, its cursor-module tie-break, `Resolver::resolve_function_source_module`) | **DELETED** - `lookup_scope_template(ident.res)` plus the arity gate; a local is never a template, which is what fixes a local fn-pointer bound to a same-leaf generic global (returned 5 for 10); shadow 12 → 0 | — | `grep -rho 'resolve_function_source_module' compiler/src \| wc -l` → **0** | §8.172 |
 | bare-callee family (`check_call_arity`, `try_pin_overload_mangled_callee`'s HOME → BARE key with its import-scoped candidate tiers and E0154, `resolve_direct_call`'s leaf-keyed `check_fnbind_candidate`, the two spelling-keyed local checks) | **DELETED** - one key, `callee_family`: the stamp's canonical name (`Def`), the local's own type (`Local`), or `intrinsic_owner_of` for a `Pending` leaf an intrinsic owns (§8.93's hold, the ONE bare path left); shadow 3,343 → 0 over six halves once `panic` (3,318, D6 landing) and the two refused privates (E0202 now, the §8.167 shape) are named; `FNVIS` 0: no `Def`-stamped bare callee is another module's private; E0353 doors 2-4 and the `FNBIND-VIOLATION` stream went with it | — | `grep -c 'bare_candidate_scope' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -c 'callee_family(&this' compiler/src/compiler/sema/call_resolver.cryo` → **1** | §8.173 |
-| impl head's spelling carrier (`impl_target_type`'s unanswered arm: `lookup_type_exact(node.target_type)`, the monomorphizer's rewritten spelling) | **DELETED** — the arm reads `ImplBlockNode.spec_owner`, the instantiation's arena id, written where the clone's methods are placed; shadow 1,466 → 0, every line an async-lowered `Future` impl head no resolver walked, stamped by its synthesizer now; `codegen_target_name` reads that stamp too, and the `!!` row that flagged an unread `Def` there is retired | — | `grep -c 'node.spec_owner' compiler/src/compiler/sema/sema.cryo` → **1**; `grep -c 'lookup_type_exact(node.target_type)' compiler/src/compiler/sema/sema.cryo` → **0** | §8.174 |
+| impl head's spelling carrier (`impl_target_type`'s unanswered arm: `lookup_type_exact(node.target_type)`, the monomorphizer's rewritten spelling) | **DELETED in sema**; the same HOME → BARE shape (`lookup_type(qualify_symbol_sym_home(target))`, then `lookup_type(target)`) stands **3 times in `type_resolution.cryo`**, where `ImplBlockNode.res` is already stamped and unread — the arm in sema reads `ImplBlockNode.spec_owner`, the instantiation's arena id, written where the clone's methods are placed; shadow 1,466 → 0, every line an async-lowered `Future` impl head no resolver walked, stamped by its synthesizer now; `codegen_target_name` reads that stamp too, and the `!!` row that flagged an unread `Def` there is retired | — | `grep -c 'node.spec_owner' compiler/src/compiler/sema/sema.cryo` → **1**; `grep -c 'lookup_type_exact(node.target_type)' compiler/src/compiler/sema/sema.cryo` → **0**; `grep -c 'lookup_type(node.target_type)' compiler/src/compiler/passes/type_resolution.cryo` → **3** (0 when done) | §8.174, §8.175 |
+| `qualify_symbol_sym_home` (the writer's module prefixed to a spelling, guessing a canonical name) | LIVE — 48 sites, 24 of them in `type_resolution.cryo`, 6 in `sema.cryo`; a surface, not a lane: each site is a stamp the name layer already carries or should, and goes as its consumer does | — | `grep -rho 'qualify_symbol_sym_home' compiler/src --include=*.cryo \| wc -l` → **48** | §8.175 |
 | struct-literal rungs 3 and 5 (`resolve_generic_scope_name(lit.struct_type, ..)`, `lookup_type_exact(lit.struct_type)`) | **DELETED** — rung 5: 2 lines over six halves, both C-imported literals whose stamp M1 had missed (above), 0 once stamped; rung 3: 0 over six halves including the `cryo test` half its comment named, and the instrument fires on a forced case; their two rows retired | — | `grep -c 'lookup_type_exact(lit.struct_type)' compiler/src/compiler/sema/sema.cryo` → **0** | §8.174 |
 | static-call unmangled tail (`pin_scope_callee_combined` pinning the bare `Owner::method` when the family selected no signature) | **DELETED** — 2 lines over six halves, one site: `T::try_from(this)` with `this` a value and the parameter `&T`; the static matcher admits the call site's auto-ref in a second pass and pins the symbol; a family that selects nothing stays unpinned | — | `grep -c 'select_static_overload' compiler/src/compiler/sema/call_resolver.cryo` → **3** | §8.174 |
-| unmangled pin family (`pin_scope_callee_qsym`'s qualified names, mono's `combined_sym` pins) read by codegen's by-name lane (`resolve_function_by_mangled` → `resolve_function` → `resolve_function_with_arity`, same-arity overloads by REGISTRATION ORDER) | LIVE — **measured 25,592 pins over six halves, 1,424 distinct names** (LSP alone 4,518 / 892: 518 module functions, 374 statics on specializations). Canonical keys, not spellings, but the overload choice is codegen's. Next | — | `grep -c 'resolve_function_with_arity' compiler/src/compiler/codegen/ops/symbol_resolver.cryo` → **2** | §8.174 |
+| unmangled pin family (`pin_scope_callee_qsym`'s qualified names, mono's `combined_sym` and spec-name pins) read by codegen's by-name lane (`resolve_function_by_mangled` → `resolve_function` → `resolve_function_with_arity`, and the vtable, prologue and constructor callers asking by name) | **DELETED** — 56,486 lines over six halves, every name pin a single-symbol family; the one plural (`BaseASTVisitor::visit`, 68 signatures, 5 vtable slots) bound its own signature by luck of registration order. `resolve_symbol` and `resolve_family` replace it: a name resolves only when its family names ONE symbol, several is E0900. The name pins themselves stay (written before their symbol exists); codegen no longer chooses among signatures for them | — | `grep -c 'resolve_function_with_arity' compiler/src/compiler/codegen/ops/symbol_resolver.cryo` → **0**; `grep -rho 'register_with_arity' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'resolve_family(' compiler/src --include=*.cryo \| wc -l` → **6** | §8.174, §8.175 |
 | import tie refusal (`visit(IdentifierNode)`: a bare name whose bound symbol is an `Import` and whose leaf two imports bind from different modules) | LIVE - E0154 at the USE, stamp `Res::Err`; the tie is recorded by `Scope::insert_import` (which kept the first import and was read only for type names before) and cleared by a same-module declaration; the prelude is a separate rib and never ties | — | `grep -c 'is_ambiguous(node.name)' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.173 |
 | match-guard resolution (`NameResolution::visit(MatchArmNode)` visits `node.guard`) | LIVE - a guard is resolved in the arm's scope between the patterns and the body; unvisited, a module constant in a guard was E0201 and a callee in one bound by spelling | — | `grep -c 'node.guard.accept' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.172 |
 | scope-qualifier spelling ladder (`lookup_type_exact(scope.scope_name)` beneath `scope_qualifier_type`: `u8::MAX`, the variant payload, the static visibility gate, the static argument check's rung 3) | **DELETED** — `scope_qualifier_type` answers `PrimTy` and a clone's `spec_owner`; the steps measured 0, 34 wrong answers (`float` the MODULE as `f32`), and 27 clone segments now carried by `spec_owner` | — | `grep -rho 'lookup_type_exact(scope.scope_name)' compiler/src/compiler/sema \| wc -l` → **0** | §8.171 |
@@ -7518,6 +7519,170 @@ allocator residue; 24 artifacts gone** (+ the impl head's spelling carrier,
 the two literal rungs, the unmangled tail, and M1 - `qualifier_agrees`,
 `resolve_type_qualified_name_strict_from`, `prefix_of`, `extract_leaf` -
 with its four rows).
+
+### 8.175 Consumer 31: codegen's by-name function lane, deleted; a family is resolved by name only when it names one symbol - 2026-09-13
+
+The unmangled pin family §8.174 found: every `resolved_callee` that is a
+NAME rather than an LLVM symbol, and the codegen lane that resolved it -
+`resolve_function_by_mangled` falling into `resolve_function`, whose loop
+declared the FIRST concrete signature registered under the name, beside the
+in-module registry's name key, which was LAST-wins, and
+`resolve_function_with_arity`, first-of-arity.  Three registration-order
+rules for one question.  Shadowed over the six halves, controlled, closed at
+its causes, deleted in one commit.
+
+#### The population, and what the handoff had not scoped
+
+The handoff's probe sat in `resolve_function_by_mangled` alone and read
+25,592.  The audit named four more sites - `declaration_emitter`'s vtable
+slot fill (the mangled attempt through the NAME door, then `Type::method`),
+its body prologue (`resolve_function(qualified)` when the symbol lookup
+missed), its method prologue (the same, then the combined name), and the
+three constructor callers of `resolve_function_with_arity` (`Class::Class`
+by argument count, then by name) - none of which a probe at the pin door
+sees.  The shadow moved INTO `resolve_function` and `resolve_function_with_arity`,
+tagged by the door that asked, comparing the LLVM symbol each answer bound
+against the one symbol the family's single signature (of the arity, when
+one was given) registered, `PLURAL` where there were several.
+
+**56,486 lines over the six halves, 0 failing halves**:
+
+* **53,961 name pins** - 37,342 through the in-module name key, 16,619
+  through the extern loop - **every one a single-signature family.**
+  Module-qualified free functions (`std::fmt::format`, `libc::memmove`),
+  statics on specializations (`Box$L..$G::new`), specializations' own names
+  (`swap$L..$G`), each pinned by sema or mono before its symbol existed to
+  be pinned.  Registration order had nothing to choose from, anywhere in the
+  corpus.
+* **1,515 direct by-name calls** codegen synthesizes for itself
+  (`string::append`, `allocator::alloc`/`free`, `cryo_ast_arena_alloc`,
+  `std::env::set_args`) and **670 constructor lookups** by arity: single
+  symbol each.
+* **10 vtable slots, 5 of them PLURAL** - `BaseASTVisitor::visit`, 68
+  signatures, in every class deriving it cross-module (`SemaVisitor`,
+  `NameResolver`, `IRGeneratorVisitor`, `ASTCloner`, `ASTTypeSubstituter`).
+  The slot fill computed the slot's mangled symbol correctly and asked
+  `resolve_function` for it - the NAME door, whose index is keyed by names -
+  so for an inherited base method the module had not declared it missed,
+  fell to `BaseASTVisitor::visit`, and took the first registered signature:
+  `visit(ExpressionNode*)`.  **Right by luck:** the five slots that miss are
+  the base's own `visit(ExpressionNode*)`, which is also the first
+  registered.  Any other slot missing would have been a wrong function in a
+  vtable, silently.  The other five (`Type::is_resolved`, two `ParserBase`
+  slots) are the same miss on single-signature families.
+* **12 body-prologue fallbacks**, all closure specializations
+  (`Main::apply__cl_2985`): the prologue re-derived only the per-signature
+  symbol, which a closure has no index entry for, and found its own
+  declaration by name.  `declare_function` derives the symbol in three steps
+  (per-signature entry, the name's slot, minted and registered); the
+  prologue now derives it through the same function.
+* **308 UNBOUND** - a MANGLED pin that no lane binds:
+  `String<GlobalAlloc>::push` / `try_push` without the `$MG` spec-args
+  suffix, rescued by `call_emitter`'s reconstruction from
+  `resolved_type_args`.  A front-end writer pinning the base symbol of a
+  generic method; not this entry's, named below.
+
+Control, one build with the verdict inverted, the LSP alone: 12,423 agreeing
+pairs read `DIFF`, the 5 `PLURAL` slots read `OK`.
+
+#### The new model
+
+A function reaches codegen as a SYMBOL, or as a FAMILY name that must name
+one symbol.  `SymbolResolver` has two resolvers and no loop that picks:
+
+* `resolve_symbol(sym)`: the function this module holds under the symbol
+  (`FunctionRegistry`, keyed by symbol only now; the LLVM module), else an
+  extern declared from the index entry registered under it.
+* `resolve_family(name, arity)`: the family's concrete signatures (of the
+  arity, when given; a signature with a generic parameter is a template
+  and names nothing) must map to ONE symbol - two declarations under one
+  leaf that are the same C symbol are one function (`malloc`: the
+  intrinsic's entry and `libc::malloc`'s bare alias) - and that symbol is
+  resolved.  Several symbols is **E0900**: `` `i64::try_from` names several
+  functions and the call was not pinned to one of them ``.  The arguments
+  select among signatures, that selection is the front end's pin, and a
+  name arriving here for such a family is a front-end defect, never a
+  choice codegen makes.
+
+`resolve_function_by_mangled` is `resolve_symbol`, then `resolve_family`.
+`resolve_function` is `resolve_family(name, -1)`, for the calls codegen
+synthesizes by canonical name.  The vtable slot fill resolves its computed
+symbol as a symbol; the body and method prologues look their own symbol up
+in the registry; the constructor callers ask the family by arity.  The
+registry holds every definition under its Cryo symbol (`main`, the
+`--panic=unwind` user-main wrapper and a `![symbol]` body included, which
+is what keeps a pin to one from declaring a phantom extern) and nothing
+under a name.
+
+#### The gate, as a pair
+
+Mutation: `pin_scope_callee_combined` pins the combined NAME for a static
+family of two or more signatures (the tail §8.174 deleted), over a program
+declaring `P::make(i32)` and `P::make(string)` and calling both.
+
+* **HEAD's codegen** over the mutated front end: build exit 0, the program
+  prints `100 100` - `P::make(3)` bound to `make(string)`, the in-module
+  name key's last registration.  A wrong function, no diagnostic.  The
+  corpus shows the same lane binding `BaseASTVisitor::visit` by order five
+  times under an exit of 0.
+* **This tree's codegen** over the same mutation: refused, E0900 naming
+  `u64::try_from` and `i64::try_from` in the stdlib before the program is
+  reached.
+
+#### Objects, gates
+
+Predicted before the run: 0 movers on both populations - every binding in
+the corpus was a single symbol or the lucky slot, and the same externs are
+declared.  Measured: examples **0 of 1,126**, tests **0 of 2,182**.  Suite
+green (2,116 unit, 179 negative, 45 projects here); LSP builds directly, 0
+shadow lines under the fix; lane golden re-pinned - `LOOKUP` 49 → 48,
+`LOOKUP_OTHER` 46 → 43, all in `symbol_resolver` and `declaration_emitter`
+(the deleted name reads); b1 unmoved (B1 0 on all three arms, 56 rows -
+codegen carried no counter); roster unchanged.
+
+#### Deleted
+
+`resolve_function_with_arity`, `declare_extern_function_overload`,
+`declare_extern_function_return_only` (a no-argument extern minted from a
+return type alone - nothing reached it), the first-concrete-then-any loop
+of `resolve_function`, `owned_by_current_module`'s function use,
+`FunctionRegistry`'s `(name, arity)` registry (`register_with_arity`,
+`get_with_arity`, its arrays and index) and its name keys, the vtable
+slot's `Type::method` fallback, the body prologue's `resolve_function(qualified)`,
+the method prologue's combined-name fallback, the three constructor
+callers' by-name fallback.
+
+**Tally: 31 shadowed, 31 old paths deleted, 30 at zero and one at §8.93's
+allocator residue; 28 artifacts gone** (+ the with-arity resolver, the
+return-only declarer, the arity registry, the name-keyed registry).
+
+#### What this leaves
+
+* **The `$MG` reconstruction in `call_emitter`** (308 UNBOUND above): a
+  front-end pin for a generic method on a specialized receiver
+  (`String<GlobalAlloc>::try_push<Str>`) carries no spec args, and codegen
+  rebuilds the symbol from `resolved_type_args`.  The writer is mono's or
+  sema's; the fix is the pin carrying the symbol it names.  Next.
+* **Codegen's leaf-keyed intrinsic dispatch** (§8.173): `call_emitter`
+  inlines by `IntrinsicKind::is_name(leaf)` before reading the pin, guarded
+  by `is_intrinsic_decl_name(leaf)` - a LEAF test, so the `std::core::panic`
+  wrapper's pin, leaf `panic`, is never read.  D6 holds in sema and not in
+  codegen; §8.173's 3,318 `panic` lines were explained, not closed.  The
+  decision is the pin's symbol against the intrinsic's own, not the leaf.
+* **The impl head's HOME → BARE lookup stands three times in
+  `type_resolution.cryo`** (`lookup_type(qualify_symbol_sym_home(target))`,
+  then `lookup_type(target)`), the shape §8.174 deleted from sema, where §0's
+  row grepped.  Name resolution runs first and stamps `ImplBlockNode.res`,
+  so each can read the stamp as sema's `impl_target_type` does.  The row
+  now says so.
+* **`qualify_symbol_sym_home` - 48 sites, 24 in `type_resolution.cryo`** -
+  spelling plus the writer's module, guessing a canonical name.  Given a
+  §0 row so it is a tracked surface rather than an unenumerated one.
+* `Resolver::lookup_prelude` leaves a name two prelude modules export
+  UNANSWERED, not refused; not reached by the corpus.
+* `codegen_target_name` reads the rewritten spelling for a CLONE (a node
+  method with no arena to resolve `spec_owner`); a reader with an arena
+  could read `arena.get_qualified_name(spec_owner)`.
 
 ---
 

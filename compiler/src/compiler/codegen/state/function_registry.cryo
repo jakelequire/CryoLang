@@ -1,13 +1,8 @@
 /// Function Registry
 ///
-/// Module-local map of function declarations: `SymbolStr.id` ->
-/// `LLVMValueRef`.  Two parallel storage backends:
-///
-/// * `by_name` - single binding per name.  Last-wins; this matches what
-///    most call sites need (resolve by mangled name, which is unique).
-/// * `by_overload` - `(SymbolStr.id, arity)` parallel arrays so
-///    overloaded methods such as `Array::new()` vs `Array::new(u64)`
-///    can be disambiguated by argument count without collapsing.
+/// Module-local map of function declarations, keyed by LLVM SYMBOL:
+/// `SymbolStr.id` -> `LLVMValueRef`.  A symbol names one function, so a
+/// second registration under a key is the same value again.
 ///
 /// Leaf component: owns its arrays, holds no back-pointers.
 
@@ -27,26 +22,14 @@ import std::collections::pair::{ Pair };
 type struct FunctionRegistry {
     by_name: Pair<u32, void*>[];   // (SymbolStr.id, LLVMValueRef)
 
-    overload_keys:    u32[];
-    overload_arities: u32[];
-    overload_values:  void*[];
-
-    // O(1) indices over the flat arrays above.  `by_name_index` maps a
-    // name's SymbolStr.id to its position in `by_name`; `overload_index`
-    // maps a packed (name.id, arity) key to its position in the overload
-    // arrays.  Replace the linear scans (which walked every function in the
-    // module on every get/register) with hashed lookups.
+    // Symbol id -> position in `by_name`, so a lookup is hashed rather than
+    // a scan of every function in the module.
     by_name_index:    HashMap<u32, u32>;
-    overload_index:   HashMap<u64, u32>;
 
     static new() -> FunctionRegistry {
         return FunctionRegistry {
             by_name:          [],
-            overload_keys:    [],
-            overload_arities: [],
-            overload_values:  [],
             by_name_index:    HashMap<u32, u32>::new(),
-            overload_index:   HashMap<u64, u32>::new(),
         };
     }
 
@@ -64,33 +47,9 @@ type struct FunctionRegistry {
         this.by_name_index.insert(key, new_pos);
     }
 
-    register_with_arity(mut &this, name: SymbolStr, arity: u32, val: LValue) -> void {
-        const key: u64 = ((name.id as u64) << 32) | (arity as u64);
-        match (this.overload_index.get(&key)) {
-            Option::Some(pos) => {
-                this.overload_values[pos as i64] = val.raw;
-                return;
-            }
-            Option::None => { }
-        }
-        const new_pos: u32 = this.overload_keys.length as u32;
-        this.overload_keys.push(name.id);
-        this.overload_arities.push(arity);
-        this.overload_values.push(val.raw);
-        this.overload_index.insert(key, new_pos);
-    }
-
     get(&this, name: SymbolStr) -> LValue {
         return match (this.by_name_index.get(&name.id)) {
             Option::Some(pos) => { LValue { raw: this.by_name[pos as i64].second } }
-            Option::None      => { LValue::null() }
-        };
-    }
-
-    get_with_arity(&this, name: SymbolStr, arity: u32) -> LValue {
-        const key: u64 = ((name.id as u64) << 32) | (arity as u64);
-        return match (this.overload_index.get(&key)) {
-            Option::Some(pos) => { LValue { raw: this.overload_values[pos as i64] } }
             Option::None      => { LValue::null() }
         };
     }
