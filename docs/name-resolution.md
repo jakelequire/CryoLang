@@ -27,7 +27,7 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at the commit carrying §8.175; `git log
+Checks run from the repo root. Verified at the commit carrying §8.176; `git log
 --oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
@@ -97,6 +97,7 @@ three, and its row carries the count. Read each zero off its own row.
 | struct-literal rungs 3 and 5 (`resolve_generic_scope_name(lit.struct_type, ..)`, `lookup_type_exact(lit.struct_type)`) | **DELETED** — rung 5: 2 lines over six halves, both C-imported literals whose stamp M1 had missed (above), 0 once stamped; rung 3: 0 over six halves including the `cryo test` half its comment named, and the instrument fires on a forced case; their two rows retired | — | `grep -c 'lookup_type_exact(lit.struct_type)' compiler/src/compiler/sema/sema.cryo` → **0** | §8.174 |
 | static-call unmangled tail (`pin_scope_callee_combined` pinning the bare `Owner::method` when the family selected no signature) | **DELETED** — 2 lines over six halves, one site: `T::try_from(this)` with `this` a value and the parameter `&T`; the static matcher admits the call site's auto-ref in a second pass and pins the symbol; a family that selects nothing stays unpinned | — | `grep -c 'select_static_overload' compiler/src/compiler/sema/call_resolver.cryo` → **3** | §8.174 |
 | unmangled pin family (`pin_scope_callee_qsym`'s qualified names, mono's `combined_sym` and spec-name pins) read by codegen's by-name lane (`resolve_function_by_mangled` → `resolve_function` → `resolve_function_with_arity`, and the vtable, prologue and constructor callers asking by name) | **DELETED** — 56,486 lines over six halves, every name pin a single-symbol family; the one plural (`BaseASTVisitor::visit`, 68 signatures, 5 vtable slots) bound its own signature by luck of registration order. `resolve_symbol` and `resolve_family` replace it: a name resolves only when its family names ONE symbol, several is E0900. The name pins themselves stay (written before their symbol exists); codegen no longer chooses among signatures for them | — | `grep -c 'resolve_function_with_arity' compiler/src/compiler/codegen/ops/symbol_resolver.cryo` → **0**; `grep -rho 'register_with_arity' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'resolve_family(' compiler/src --include=*.cryo \| wc -l` → **6** | §8.174, §8.175 |
+| codegen `$MG` reconstruction (`call_emitter` rebuilding a generic method spec's symbol from `resolved_type_args` when the pin missed) | **DELETED** — the pin missed because sema's `pin_method_callee_from_qname` mangled a specialization without its own type arguments; the writer folds them in now, 7 → 0 on the LSP, 308 → 0 over six halves | — | `grep -c 'with_method_spec_args' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0**; `grep -c 'with_method_spec_args' compiler/src/compiler/sema/call_resolver.cryo` → **1** | §8.176 |
 | import tie refusal (`visit(IdentifierNode)`: a bare name whose bound symbol is an `Import` and whose leaf two imports bind from different modules) | LIVE - E0154 at the USE, stamp `Res::Err`; the tie is recorded by `Scope::insert_import` (which kept the first import and was read only for type names before) and cleared by a same-module declaration; the prelude is a separate rib and never ties | — | `grep -c 'is_ambiguous(node.name)' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.173 |
 | match-guard resolution (`NameResolution::visit(MatchArmNode)` visits `node.guard`) | LIVE - a guard is resolved in the arm's scope between the patterns and the body; unvisited, a module constant in a guard was E0201 and a callee in one bound by spelling | — | `grep -c 'node.guard.accept' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.172 |
 | scope-qualifier spelling ladder (`lookup_type_exact(scope.scope_name)` beneath `scope_qualifier_type`: `u8::MAX`, the variant payload, the static visibility gate, the static argument check's rung 3) | **DELETED** — `scope_qualifier_type` answers `PrimTy` and a clone's `spec_owner`; the steps measured 0, 34 wrong answers (`float` the MODULE as `f32`), and 27 clone segments now carried by `spec_owner` | — | `grep -rho 'lookup_type_exact(scope.scope_name)' compiler/src/compiler/sema \| wc -l` → **0** | §8.171 |
@@ -7554,6 +7555,18 @@ one was given) registered, `PLURAL` where there were several.
   (`swap$L..$G`), each pinned by sema or mono before its symbol existed to
   be pinned.  Registration order had nothing to choose from, anywhere in the
   corpus.
+
+  **That zero is the finding, and it is not "the lane was correct".**  A
+  lane that picks by registration order is right exactly when there is one
+  thing to pick; 53,961 of 53,961 having one is a fact about what the
+  corpus writes (sema pins the symbol wherever the arguments are in hand,
+  and the names that reach codegen are families singular by construction),
+  not about the lane.  The lane was UNEXERCISED, and the one time the
+  corpus exercised it - the five `visit` slots below - it answered by luck.
+  The distinction matters because this document has conflated the two
+  before: a lane deleted because it is dead needs its zero to hold; a lane
+  deleted because it is WRONG needs the mutation pair below, and only the
+  second kind of deletion can be trusted when the corpus changes.
 * **1,515 direct by-name calls** codegen synthesizes for itself
   (`string::append`, `allocator::alloc`/`free`, `cryo_ast_arena_alloc`,
   `std::env::set_args`) and **670 constructor lookups** by arity: single
@@ -7683,6 +7696,56 @@ return-only declarer, the arity registry, the name-keyed registry).
 * `codegen_target_name` reads the rewritten spelling for a CLONE (a node
   method with no arena to resolve `spec_owner`); a reader with an arena
   could read `arena.get_qualified_name(spec_owner)`.
+
+### 8.176 Consumer 32: sema's method pin carries a specialization's own type arguments; codegen's `$MG` reconstruction deleted - 2026-09-13
+
+The 308 UNBOUND lines §8.175 set aside.  A MANGLED pin no lane bound -
+`String<GlobalAlloc>::push` / `try_push` without the `$MG..` spec-args
+suffix - rescued by `call_emitter`'s MemberAccess branch, which rebuilt the
+symbol from `resolved_type_args` and asked again.  A codegen re-derivation
+of what the front end should have written, so the same shape as every
+entry since §8.158, one level up.
+
+#### The writer
+
+Two writers pin a method call's symbol.  Mono's `mangled_symbol_for_spec_method`
+mangles the method and folds `func.spec_type_args` in, as the definition
+site does (`declare_method`) and as the index does (`register_methods_for_type`).
+Sema's `pin_method_callee_from_qname` mangled the same method and stopped
+at the base: for a generic method's SPECIALIZATION - a `MethodNode` clone
+whose `generic_params` are empty and whose `spec_type_args` are `<Str>` -
+that is the symbol two specs share when their signature does not depend on
+the method parameter, and the symbol nothing is defined under.  Sema
+reaches such a clone when it re-resolves a specialized body after mono
+(`String<GlobalAlloc>`'s `write_str` calling `this.try_push<Str>`).  The
+pin now applies `with_method_spec_args(fn_node.spec_type_args)`, a no-op
+for every non-spec method.
+
+#### Measured
+
+A probe at the retry, one line per firing with the pin and the call's span,
+the LSP alone: **7** before the writer fix - `stdlib/collections/string.cryo`
+92, 118, 155 (twice), `stdlib/fmt/write.cryo` 93, `stdlib/fs/path.cryo` 322
+and 332 - **0** after it, and the probe over the unfixed writer is the
+control.  The retry is deleted.
+
+#### The gate, as a pair
+
+* **HEAD** over the unfixed writer: the LSP builds, exit 0 - seven pins
+  rescued by the reconstruction, silently.
+* **This tree's codegen** (no reconstruction) over the same writer: exit 1,
+  `E0636: no method 'push' found on type String<GlobalAlloc>` (4) and the
+  same for `try_push` (2).
+
+#### Objects
+
+Predicted 0: the reconstruction produced the symbol the writer now pins.
+Measured: examples **0 of 1,126**, tests **0 of 2,182**; suite green
+(2,116 unit, 179 negative, 45 projects).  The corpus half that reaches the
+shape is the stdlib itself, which every half compiles.
+
+**Tally: 32 shadowed, 32 old paths deleted, 31 at zero and one at §8.93's
+allocator residue; 29 artifacts gone** (+ the `$MG` reconstruction).
 
 ---
 
