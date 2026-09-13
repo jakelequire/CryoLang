@@ -904,6 +904,43 @@ type struct TypeResolutionRunner {
     /// Resolves all method signatures (MethodNode*[]) on a struct/class/impl.
     /// `owner_type` lets the resolver back-fill `this`/`&this` resolved_type
     /// (the parser leaves the receiver param's type unset).
+    /// The type an impl head is for, read off the stamp as sema's
+    /// `impl_target_type` reads it: a `Def` is canonical and the index holds
+    /// it or the declaration never registered; a written primitive is
+    /// `PrimTy` and its spelling is its registration key; an unanswered slot
+    /// is a monomorphized clone, whose head the cloner withholds a stamp
+    /// from because a specialization is not a definition, and whose owner
+    /// the monomorphizer records by arena id in `spec_owner`.
+    impl_owner(&this, node: ImplBlockNode*) -> TypeRef {
+        return match (node.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(q)    => { this.ctx.decl_index.lookup_type(q.qualified_name()) }
+                    Res::PrimTy(n) => { this.ctx.decl_index.lookup_type(n) }
+                    _              => { TypeRef::invalid() }
+                }
+            }
+            _ => { node.spec_owner }
+        };
+    }
+
+    /// The canonical name of the type an impl head is for, by the same
+    /// three answers: the `Def`'s name, the primitive's spelling, the
+    /// specialization's registered name.
+    impl_owner_qname(&this, node: ImplBlockNode*) -> SymbolStr {
+        const spec_q: SymbolStr = if (node.spec_owner.is_valid()) { this.arena.get_qualified_name(node.spec_owner) } else { SymbolStr::empty() };
+        return match (node.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(q)    => { q.qualified_name() }
+                    Res::PrimTy(n) => { n }
+                    _              => { SymbolStr::empty() }
+                }
+            }
+            _ => { spec_q }
+        };
+    }
+
     resolve_method_signatures(&this, methods: &MethodNode*[],
                               res_ctx: ResolutionContext*,
                               owner_type: TypeRef,
@@ -3062,21 +3099,16 @@ type struct TypeResolutionPasses {
                     // also has generic params (E0310).  Runs once per
                     // source-level impl here in the FuncSig phase.
                     runner.validate_impl_assoc_bindings(node);
-                    // The owner type, by the two forms an impl target can take.
-                    // A declared target is registered under its qualified name;
-                    // a primitive one is declared nowhere, so the index holds it
-                    // under its spelling and no qualified key can reach it -
-                    // `implement string` has no module to qualify into.  The
-                    // second lookup is that primitive arm, not a widening
-                    // fallback, and a declared target reaching it is a
-                    // registration defect rather than a name needing more tries.
-                    mut impl_owner: TypeRef = ctx.decl_index.lookup_type(
-                        ctx.qualify_symbol_sym_home(node.target_type, node.span.file));
-                    if (impl_owner.is_invalid()) {
-                        impl_owner = ctx.decl_index.lookup_type(node.target_type);
-                    }
-                    runner.resolve_method_signatures(node.methods, &impl_ctx, impl_owner,
-                        ctx.qualify_symbol_sym_home(node.target_type, node.span.file));
+                    // The owner type and its canonical name, off the head's
+                    // stamp.  A spelling qualified by the WRITER's module
+                    // names the type only when the writer declared it: a
+                    // trait implemented for another module's type
+                    // (`implement trait Display for Str` in `fmt::display`)
+                    // has no owner under that key, and its methods then
+                    // resolve with no receiver type to back-fill and no
+                    // `This` to bind.
+                    runner.resolve_method_signatures(node.methods, &impl_ctx,
+                        runner.impl_owner(node), runner.impl_owner_qname(node));
                     sig_count += node.methods.length;
                 }
                 NodeKind::ExternBlock => {
@@ -3492,21 +3524,10 @@ type struct TypeResolutionPasses {
                                 node.span, "");
                         }
                     }
-                    // The owner type, by the two forms an impl target can take.
-                    // A declared target is registered under its qualified name;
-                    // a primitive one is declared nowhere, so the index holds it
-                    // under its spelling and no qualified key can reach it -
-                    // `implement string` has no module to qualify into.  The
-                    // second lookup is that primitive arm, not a widening
-                    // fallback, and a declared target reaching it is a
-                    // registration defect rather than a name needing more tries.
-                    mut impl_owner2: TypeRef = ctx.decl_index.lookup_type(
-                        ctx.qualify_symbol_sym_home(node.target_type, node.span.file));
-                    if (impl_owner2.is_invalid()) {
-                        impl_owner2 = ctx.decl_index.lookup_type(node.target_type);
-                    }
-                    runner.resolve_method_signatures(node.methods, &impl_ctx, impl_owner2,
-                        ctx.qualify_symbol_sym_home(node.target_type, node.span.file));
+                    // The owner and its name off the stamp, as in the FuncSig
+                    // phase above.
+                    runner.resolve_method_signatures(node.methods, &impl_ctx,
+                        runner.impl_owner(node), runner.impl_owner_qname(node));
                     runner.emit_method_signature_diagnostics(node.methods);
                 }
                 _ => {
@@ -4319,15 +4340,15 @@ type struct TypeResolutionPasses {
                     // `NonNull::new(...)` as an argument to `deallocate`)
                     // had no concrete instantiation to point at.
                     //
-                    // Two forms, as in the FuncSig phase above: a declared
-                    // target answers under its qualified name, a primitive one
-                    // only under its spelling.  The second lookup is that
-                    // primitive arm, not a widening fallback.
-                    mut tgt: TypeRef = ctx.decl_index.lookup_type(
-                        ctx.qualify_symbol_sym_home(node.target_type, node.span.file));
-                    if (!tgt.is_valid()) {
-                        tgt = ctx.decl_index.lookup_type(node.target_type);
-                    }
+                    // The owner is read off the head's stamp.  A spelling
+                    // qualified by the writer's module misses every trait
+                    // implemented for another module's type, and those
+                    // methods were then invisible here - absent from the
+                    // type's method list, so a call's argument types could
+                    // not be propagated from them and `Type::member` could
+                    // not tell the type from a module.
+                    const sync_runner: TypeResolutionRunner = TypeResolutionRunner::new(ctx);
+                    const tgt: TypeRef = sync_runner.impl_owner(node);
                     if (!tgt.is_valid()) { continue; }
                     const tgt_t: Type* = arena.lookup(tgt.id);
                     if (tgt_t == null) { continue; }

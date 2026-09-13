@@ -27,7 +27,7 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at the commit carrying §8.178; `git log
+Checks run from the repo root. Verified at the commit carrying §8.179; `git log
 --oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
@@ -92,8 +92,8 @@ three, and its row carries the count. Read each zero off its own row.
 | callee door ladder (`lookup_callee_function_type`'s identifier branch: a `lookup_local` by spelling ahead of the stamp, then STAMP → HOME → BARE) | **DELETED** - the identifier branch is the stamp: `Local` → the local's type when callable, `Def` → `func_type_of_res`, else no hint; shadow 5,327 → 16, every line a `Pending` stamp (intrinsics through BARE, unresolved match guards and `main$async` through HOME, an unimported `swap`); the 12 left are §8.93's allocator leaf and `visibility_gate`'s refused privates; the `CALLEE-DOOR` audit stream went with it | — | `grep -c 'CALLEE-DOOR' compiler/src/compiler/resolve_counter.cryo` → **0**; `grep -c 'lookup_func_type_exact(ident.name)' compiler/src/compiler/sema/call_resolver.cryo` → **0** | §8.172 |
 | free-call template search by leaf and arity (`find_fn_template_for_call`'s registry scan, its cursor-module tie-break, `Resolver::resolve_function_source_module`) | **DELETED** - `lookup_scope_template(ident.res)` plus the arity gate; a local is never a template, which is what fixes a local fn-pointer bound to a same-leaf generic global (returned 5 for 10); shadow 12 → 0 | — | `grep -rho 'resolve_function_source_module' compiler/src \| wc -l` → **0** | §8.172 |
 | bare-callee family (`check_call_arity`, `try_pin_overload_mangled_callee`'s HOME → BARE key with its import-scoped candidate tiers and E0154, `resolve_direct_call`'s leaf-keyed `check_fnbind_candidate`, the two spelling-keyed local checks) | **DELETED** - one key, `callee_family`: the stamp's canonical name (`Def`), the local's own type (`Local`), or `intrinsic_owner_of` for a `Pending` leaf an intrinsic owns (§8.93's hold, the ONE bare path left); shadow 3,343 → 0 over six halves once `panic` (3,318, D6 landing) and the two refused privates (E0202 now, the §8.167 shape) are named; `FNVIS` 0: no `Def`-stamped bare callee is another module's private; E0353 doors 2-4 and the `FNBIND-VIOLATION` stream went with it | — | `grep -c 'bare_candidate_scope' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -c 'callee_family(&this' compiler/src/compiler/sema/call_resolver.cryo` → **1** | §8.173 |
-| impl head's spelling carrier (`impl_target_type`'s unanswered arm: `lookup_type_exact(node.target_type)`, the monomorphizer's rewritten spelling) | **DELETED in sema**; the same HOME → BARE shape (`lookup_type(qualify_symbol_sym_home(target))`, then `lookup_type(target)`) stands **3 times in `type_resolution.cryo`**, where `ImplBlockNode.res` is already stamped and unread — the arm in sema reads `ImplBlockNode.spec_owner`, the instantiation's arena id, written where the clone's methods are placed; shadow 1,466 → 0, every line an async-lowered `Future` impl head no resolver walked, stamped by its synthesizer now; `codegen_target_name` reads that stamp too, and the `!!` row that flagged an unread `Def` there is retired | — | `grep -c 'node.spec_owner' compiler/src/compiler/sema/sema.cryo` → **1**; `grep -c 'lookup_type_exact(node.target_type)' compiler/src/compiler/sema/sema.cryo` → **0**; `grep -c 'lookup_type(node.target_type)' compiler/src/compiler/passes/type_resolution.cryo` → **3** (0 when done) | §8.174, §8.175 |
-| `qualify_symbol_sym_home` (the writer's module prefixed to a spelling, guessing a canonical name) | LIVE — 48 sites, 24 of them in `type_resolution.cryo`, 6 in `sema.cryo`; a surface, not a lane: each site is a stamp the name layer already carries or should, and goes as its consumer does | — | `grep -rho 'qualify_symbol_sym_home' compiler/src --include=*.cryo \| wc -l` → **48** | §8.175 |
+| impl head's spelling carrier (`impl_target_type`'s unanswered arm: `lookup_type_exact(node.target_type)`, the monomorphizer's rewritten spelling; and the HOME → BARE pair `lookup_type(qualify_symbol_sym_home(target))`, then `lookup_type(target)`, at three sites in `type_resolution.cryo`) | **DELETED** in sema (§8.174) and in type resolution (§8.179): every site reads `ImplBlockNode.res` — `Def` → the index under the canonical name, `PrimTy` → under the spelling, unanswered → `spec_owner`; sema's shadow 1,466 → 0 (async-lowered `Future` heads, stamped by their synthesizer now); type resolution's 91,910 lines all a superset (16,930 cross-module heads the pair left INVALID, 74,977 primitives agreeing on type), 0 objects moved, no clone reaches those sites | — | `grep -c 'node.spec_owner' compiler/src/compiler/sema/sema.cryo` → **1**; `grep -c 'lookup_type_exact(node.target_type)' compiler/src/compiler/sema/sema.cryo` → **0**; `grep -c 'lookup_type(node.target_type)' compiler/src/compiler/passes/type_resolution.cryo` → **0**; `grep -c 'runner.impl_owner(node)' compiler/src/compiler/passes/type_resolution.cryo` → **3** (the two FuncSig sites and `run_struct_field_sync`) | §8.174, §8.175, §8.179 |
+| `qualify_symbol_sym_home` (the writer's module prefixed to a spelling, guessing a canonical name) | LIVE — 43 sites, 19 of them in `type_resolution.cryo`, 6 in `sema.cryo`, 4 each in `async_lower`, `specialization`, `pass_registry`, 3 in `declaration_emitter`; a surface, not a lane: each site is a stamp the name layer already carries or should, and goes as its consumer does (5 went with the impl head's pair in §8.179) | — | `grep -rho 'qualify_symbol_sym_home' compiler/src --include=*.cryo \| wc -l` → **43** | §8.175, §8.179 |
 | struct-literal rungs 3 and 5 (`resolve_generic_scope_name(lit.struct_type, ..)`, `lookup_type_exact(lit.struct_type)`) | **DELETED** — rung 5: 2 lines over six halves, both C-imported literals whose stamp M1 had missed (above), 0 once stamped; rung 3: 0 over six halves including the `cryo test` half its comment named, and the instrument fires on a forced case; their two rows retired | — | `grep -c 'lookup_type_exact(lit.struct_type)' compiler/src/compiler/sema/sema.cryo` → **0** | §8.174 |
 | static-call unmangled tail (`pin_scope_callee_combined` pinning the bare `Owner::method` when the family selected no signature) | **DELETED** — 2 lines over six halves, one site: `T::try_from(this)` with `this` a value and the parameter `&T`; the static matcher admits the call site's auto-ref in a second pass and pins the symbol; a family that selects nothing stays unpinned | — | `grep -c 'select_static_overload' compiler/src/compiler/sema/call_resolver.cryo` → **3** | §8.174 |
 | unmangled pin family (`pin_scope_callee_qsym`'s qualified names, mono's `combined_sym` and spec-name pins) read by codegen's by-name lane (`resolve_function_by_mangled` → `resolve_function` → `resolve_function_with_arity`, and the vtable, prologue and constructor callers asking by name) | **DELETED** — 56,486 lines over six halves, every name pin a single-symbol family; the one plural (`BaseASTVisitor::visit`, 68 signatures, 5 vtable slots) bound its own signature by luck of registration order. `resolve_symbol` and `resolve_family` replace it: a name resolves only when its family names ONE symbol, several is E0900. The name pins themselves stay (written before their symbol exists); codegen no longer chooses among signatures for them | — | `grep -c 'resolve_function_with_arity' compiler/src/compiler/codegen/ops/symbol_resolver.cryo` → **0**; `grep -rho 'register_with_arity' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'resolve_family(' compiler/src --include=*.cryo \| wc -l` → **6** | §8.174, §8.175 |
@@ -8052,6 +8052,120 @@ HOME → BARE lookup in `type_resolution.cryo` (3 sites, §0.2's row), then
 two-export tie, `codegen_target_name`'s rewritten spelling.  Parked for
 Jake, unchanged: D5, the keyword ruling (§8.165), the extern-visibility
 default (§8.167, normative in `docs/cryo.md` §18.1 and never confirmed).
+
+### 8.179 Consumer 34: the impl head's HOME → BARE lookup in `type_resolution.cryo`, deleted; three sites read the stamp - 2026-09-13
+
+§8.174 deleted the impl head's spelling carrier from sema and left the
+same shape standing three times in `type_resolution.cryo`:
+`lookup_type(qualify_symbol_sym_home(node.target_type, file))`, then
+`lookup_type(node.target_type)` - the writer's module prefixed to the
+spelling, then the bare spelling - at the two FuncSig-phase sites that
+resolve an impl block's method signatures and at `run_struct_field_sync`'s
+site that places the block's methods on the owner type.  Name resolution
+runs first and stamps `ImplBlockNode.res`; each site now reads it as
+sema's `impl_target_type` does: `Def(q)` → the index under `q`,
+`PrimTy(n)` → the index under `n`, an unanswered slot → the
+monomorphizer's `spec_owner`.  The owner's canonical name, which the
+FuncSig sites hand `resolve_method_signatures` for the self-growing
+check, comes off the same stamp (`impl_owner_qname`) instead of a second
+`qualify_symbol_sym_home`.
+
+#### Measured
+
+Shadow at the three sites, the old pair kept, the stamp's answer computed
+beside it, one line per disagreement in type OR name.  **91,910 over the
+six halves, 0 failing halves**:
+
+* **74,977 primitive heads** (`implement i32`, `implement trait Clone for
+  u8`, ...): the TYPE agrees; only the name differs, because
+  `qualify_symbol_sym_home` prefixes the writer's module to a primitive
+  too (`std::core::clone::i8`), a key nothing is registered under - so
+  the self-growing check has been comparing every primitive impl against
+  a name no instantiation carries.  Harmless (a primitive has no
+  instantiations to grow) and now `i8`.
+* **16,930 `Def` heads where the old pair answered INVALID and the stamp
+  answers the type** - every one a trait implemented for ANOTHER module's
+  type: `fmt/display.cryo` 13,841 (`Display`/`Debug` for `Str`, `String`,
+  `Option`, `Result`, `Array`, `HashMap`, `HashSet`, `Pair`, the error
+  types), `fmt/write.cryo` 1,749 (`FmtWrite` for `Stdout`, `Stderr`,
+  `String`), `alloc/arena_alloc.cryo` 1,166, `json/value.cryo`,
+  `net/http/conn.cryo`, `net/tls/future.cryo`, `net/ws/frame.cryo`, and
+  the LSP's `semantic_tokens.cryo`.  The HOME key names the writer's
+  module, the BARE key is a leaf no declared type registers under, so
+  those heads resolved their methods with no receiver to back-fill, no
+  `This` to bind, no self-growing check, and their methods never reached
+  the owner's method list in `run_struct_field_sync`.
+* **3 lines for one head**, `implement trait Show for int` in
+  `E0308_primitive_alias_duplicate.cryo`: the alias keyword stamps
+  `Pending` (§8.165's population, the `new int[100]` shape) and the old
+  BARE step answered it from the alias registration.  Sema's reader
+  already answers INVALID for that head, so the two stages now agree;
+  the test still pins E0308, whose coherence check resolves the head's
+  annotation itself.  Goes with the keyword ruling.
+* **0 lines carry a `spec_owner`.**  §8.177's handoff said the two
+  FuncSig sites "see mono-injected clones with rewritten spellings"; over
+  91,910 lines not one head at any of the three sites was a clone.  The
+  `spec_owner` arm of the new readers is the same arm sema's reader
+  carries and is unexercised here - written down so its zero is not read
+  as coverage.
+
+Control: one build with the verdict inverted, the LSP alone - 681
+agreeing lines printed (182 + 182 + 317), none of that build's 480
+disagreements.
+
+#### Why the objects did not move, and that it was predicted wrong
+
+Predicted before the run: a small nonzero mover set, in objects whose
+bodies call a cross-module-implemented method with a literal argument -
+the newly listed methods feed `lookup_method_param_types`'s
+expected-type propagation.  Measured: examples **0 of 1,126**, tests **0
+of 2,182**, suite green (2,116 unit, 179 negative, 45 projects).  The
+zero is explained by the consumers, not banked: `lookup_method_param_types`
+is reached only when `lookup_callee_function_type` has not already bound
+the method, and a trait-implemented method binds through the trait
+registry first; the receiver back-fill the FuncSig sites now perform was
+already performed by sema's `impl_target_type` for the same heads; the
+self-growing check gains no candidate (a `fmt(&this, &Formatter)` grows
+nothing); `scope_member_binds_type` is asked only after the static-call
+pin has had its turn.  Two probe programs confirm it: a trait implemented
+in one module for another module's struct, called as `p.weigh(2)` and
+`Parcel::weigh(&p, 0)`, and a namespace-less single file with an
+inherent impl, a trait impl and a primitive impl - each builds and runs to
+the same exit under HEAD's compiler and this tree's, with byte-identical
+objects.  The old pair was a hole another stage was filling, which is
+why it could stand for so long with sema's twin already deleted.
+
+The BARE step could never have bound WRONG here: the index keys declared
+types by canonical name, so a bare leaf reaches only the spelling-keyed
+entries - primitives and the alias keywords - and a declared target
+missing under HOME fell to INVALID, never to another module's type.  The
+deletion therefore rests on the stamp being a superset (16,930 heads
+answered that were not) with nothing observable moved, not on a wrong
+bind the corpus produced; there is none to produce.
+
+#### Gates
+
+`lane-check` re-pinned: `LOOKUP` 48 → 44 (six spelling lookups out, two
+stamp lookups in, all in `type_resolution.cryo`); `DEFID_UNWRAP` 32 → 34,
+the two `q.qualified_name()` in `impl_owner` / `impl_owner_qname` - the
+same unwrap sema's `def_type` performs, and there is no DefId-keyed index
+lookup to route it through (D12).  `qualify_symbol_sym_home` 48 → 43
+sites (24 → 19 in `type_resolution.cryo`).  `lsp-check`, `b1-check` (B1
+0, 56 rows), `cross-check` green.
+
+**Tally: 34 shadowed, 34 old paths deleted, 33 at zero and one at §8.93's
+allocator residue; 31 artifacts gone** (+ the impl head's HOME → BARE
+pair in type resolution).
+
+#### What this leaves
+
+`qualify_symbol_sym_home`, 43 sites: 19 in `type_resolution.cryo`, 6 in
+`sema.cryo`, 4 each in `async_lower`, `specialization`, `pass_registry`,
+3 in `declaration_emitter`.  Then, as §8.177 listed them:
+`Resolver::lookup_prelude`'s two-export tie, `codegen_target_name`'s
+rewritten spelling.  Parked for Jake, unchanged: D5, the keyword ruling
+(§8.165) - which now also holds `implement int` -, the extern-visibility
+default (§8.167).
 
 ---
 
