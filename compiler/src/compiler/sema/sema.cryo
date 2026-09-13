@@ -683,7 +683,10 @@ public:
     /// being declared anywhere; its spelling IS its registration key.  An
     /// unanswered slot belongs to the cloner, which leaves a specialization
     /// alone because a `Res` names a definition and a specialization is not
-    /// one - there the monomorphizer's rewritten `target_type` is the carrier.
+    /// one - there the monomorphizer's `spec_owner`, the instantiation's own
+    /// arena id, is the carrier, and a clone is the only head it is invalid
+    /// on none of.  Every head a synthesizer builds is stamped by that
+    /// synthesizer.
     ///
     /// Nothing else can name a type here: a type parameter, a local and an
     /// already-failed resolution each name something that is not a
@@ -706,7 +709,7 @@ public:
                 }
             }
             _ => {
-                this.types.lookup_type_exact(node.target_type)
+                node.spec_owner
             }
         };
     }
@@ -2975,44 +2978,18 @@ public:
         if (!struct_ref.is_valid() && lit.generic_args.length > 0) {
             struct_ref = this.resolve_struct_literal_type(lit);
         }
-        // Only where the pair could not answer.  That is not a rare case and
-        // not a fallback for a question already answered: a literal naming a
-        // type the writing module CANNOT SEE is deliberately left unstamped, so
-        // there is no definition to pair the arguments with, and the mangled
-        // spec name is the only remaining way to reach the instantiation.
-        //
-        // Deleting this on a measured zero is a mistake already made once.  The
-        // zero was taken with `cryo build`, and module discovery is
-        // import-driven, so the file that exercises it - an orphan module in
-        // `tests/projects/resolution_leaf_index`, reached only by `cryo test` -
-        // was never compiled.  Without this the literal resolves to the bare
-        // base and `Widget<T> { }` fails its own `-> Widget<T>` with E0200.
-        if (!struct_ref.is_valid() && lit.generic_args.length > 0 && this.ctx.type_resolver != null) {
-            const spec_sym: SymbolStr = this.calls.resolve_generic_scope_name(
-                lit.struct_type, lit.generic_args, lit.span,
-                this.calls.spelling_template(lit.res));
-            if (spec_sym.is_valid()) { struct_ref = this.types.lookup_type_exact(spec_sym); }
-        }
         // A literal with no arguments has no pair to resolve, so neither branch
         // above applies and the stamp is the whole answer: it names one
         // definition, canonically, accounting for the writing module's imports.
+        // A C-imported aggregate is stamped like any other: its alias-qualified
+        // spelling is the name it was declared under, whole, and the name layer
+        // reads it from the writing module's scope.  There is deliberately no
+        // spelling lookup beneath the stamp - a literal the stamp makes no claim
+        // for names nothing, and a lookup by its spelling would answer from
+        // whichever module owns the leaf.
         if (!struct_ref.is_valid()) {
             resolve_counter::Site::SpellTyLitCalls.bump();
             struct_ref = this.types.spelling_type(lit.res, resolve_counter::Site::SpellTyLitNoDef);
-        }
-        // Last, for a literal the stamp makes no claim for - a type the writing
-        // module cannot see is deliberately left unstamped - where the spelling
-        // is the only remaining way to reach the type.  A C-imported aggregate
-        // reaches ONLY here: its declaration is minted by the importer rather
-        // than written, so no stamp names it, and without this the literal
-        // takes a wrong layout and its fields read as garbage.
-        if (!struct_ref.is_valid()) {
-            struct_ref = this.types.lookup_type_exact(lit.struct_type);
-            if (struct_ref.is_valid()) {
-                resolve_counter::Site::SpellTyLitFbHit.bump();
-            } else {
-                resolve_counter::Site::SpellTyLitFbMiss.bump();
-            }
         }
         mut struct_t: Type* = if (struct_ref.is_valid()) { this.arena.lookup(struct_ref.id) } else { null };
         if (struct_t != null && struct_t.kind == TypeKind::InstantiatedType) {

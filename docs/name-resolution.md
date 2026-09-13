@@ -50,7 +50,7 @@ current-state description is the defect it exists to remove.
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
 | D10 | A plural leaf is E0155, not a directory-order bind — and a leaf two children of one FACADE declare is the same defect reached by a qualified path, in a call as in an annotation | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **5** | §8.121, §8.144, §8.151 |
-| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 40 of the 97 unasserted rows retired, 57 left (33 context, 10 B2, 14 B3); of the asserted rows, eight whose only sites were deleted went with them (one in §8.170, five in §8.171, two in §8.173; `b1-baseline.txt` re-pinned on both hosts each time, 64 → 62 rows per arm at §8.173) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1446** | §8.66, §8.80, §8.139, §8.173 |
+| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 41 of the 97 unasserted rows retired, 56 left (32 context, 10 B2, 14 B3); of the asserted rows, fourteen whose only sites were deleted went with them (one in §8.170, five in §8.171, two in §8.173, six in §8.174; `b1-baseline.txt` re-pinned on both hosts each time, 62 → 56 rows per arm at §8.174) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1404** | §8.66, §8.80, §8.139, §8.174 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
 | D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **577** | §8.145, §8.146, §8.147, §8.148, §8.150 |
@@ -81,7 +81,7 @@ three, and its row carries the count. Read each zero off its own row.
 |---|---|---|---|---|
 | type cascade (`lookup_type_by_sym`, 4 steps) | **DELETED** — `lookup_type_exact`, one step; the audit stream and its four counter rows went with it | — | `grep -rho 'lookup_type_by_sym' compiler/src --include=*.cryo \| wc -l` → **0** | §8.154 |
 | 2c home-module (ambient cursor) | STARVED | 0 | `grep -m1 '2c  home-module' tests/b1-baseline.txt` | §8.63, §8.87 |
-| M1 `qualifier_agrees` | **GUARD — NOT ENTERED on every b1 arm** since §8.156; its one caller left is the C-import alias branch of the annotation stamp | 0 calls / 0 agree / **0 reject** | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **5** | §8.120, §8.132 |
+| M1 `qualifier_agrees` (`resolve_type_qualified_name_strict_from`: resolve the LEAF in scope, then check the written qualifier against it) | **DELETED** — its last caller was the C-import alias branch of the annotation stamp, where it MISSED on every `cit::X` by construction (the alias-qualified spelling is declared whole, its leaf deliberately not); the branch looks the whole spelling up now. NOT ENTERED on the b1 arms, entered and missing under `cryo test` | — | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **0** | §8.120, §8.132, §8.174 |
 | M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane**; +246 in §8.172 when the atomics went behind `intrinsics::` | 4,006 | `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M2 resolve_module_qualified_sym calls/{print;exit}' tests/b1-baseline.txt` → **4006** | §8.120, §8.172 |
 | M4 mono bare-name scan | **DELETED** — with the current-module key before it; a callee with no usable stamp names no template | — | `grep -c 'M4Calls' compiler/src/compiler/resolve_counter.cryo` → **0** | §8.33, §8.120, §8.157 |
 | M5 import suffix fallback | **DELETED** — an import path names a module by its registered name or binds nothing | — | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **0** | §8.120, §8.157 |
@@ -92,6 +92,10 @@ three, and its row carries the count. Read each zero off its own row.
 | callee door ladder (`lookup_callee_function_type`'s identifier branch: a `lookup_local` by spelling ahead of the stamp, then STAMP → HOME → BARE) | **DELETED** - the identifier branch is the stamp: `Local` → the local's type when callable, `Def` → `func_type_of_res`, else no hint; shadow 5,327 → 16, every line a `Pending` stamp (intrinsics through BARE, unresolved match guards and `main$async` through HOME, an unimported `swap`); the 12 left are §8.93's allocator leaf and `visibility_gate`'s refused privates; the `CALLEE-DOOR` audit stream went with it | — | `grep -c 'CALLEE-DOOR' compiler/src/compiler/resolve_counter.cryo` → **0**; `grep -c 'lookup_func_type_exact(ident.name)' compiler/src/compiler/sema/call_resolver.cryo` → **0** | §8.172 |
 | free-call template search by leaf and arity (`find_fn_template_for_call`'s registry scan, its cursor-module tie-break, `Resolver::resolve_function_source_module`) | **DELETED** - `lookup_scope_template(ident.res)` plus the arity gate; a local is never a template, which is what fixes a local fn-pointer bound to a same-leaf generic global (returned 5 for 10); shadow 12 → 0 | — | `grep -rho 'resolve_function_source_module' compiler/src \| wc -l` → **0** | §8.172 |
 | bare-callee family (`check_call_arity`, `try_pin_overload_mangled_callee`'s HOME → BARE key with its import-scoped candidate tiers and E0154, `resolve_direct_call`'s leaf-keyed `check_fnbind_candidate`, the two spelling-keyed local checks) | **DELETED** - one key, `callee_family`: the stamp's canonical name (`Def`), the local's own type (`Local`), or `intrinsic_owner_of` for a `Pending` leaf an intrinsic owns (§8.93's hold, the ONE bare path left); shadow 3,343 → 0 over six halves once `panic` (3,318, D6 landing) and the two refused privates (E0202 now, the §8.167 shape) are named; `FNVIS` 0: no `Def`-stamped bare callee is another module's private; E0353 doors 2-4 and the `FNBIND-VIOLATION` stream went with it | — | `grep -c 'bare_candidate_scope' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -c 'callee_family(&this' compiler/src/compiler/sema/call_resolver.cryo` → **1** | §8.173 |
+| impl head's spelling carrier (`impl_target_type`'s unanswered arm: `lookup_type_exact(node.target_type)`, the monomorphizer's rewritten spelling) | **DELETED** — the arm reads `ImplBlockNode.spec_owner`, the instantiation's arena id, written where the clone's methods are placed; shadow 1,466 → 0, every line an async-lowered `Future` impl head no resolver walked, stamped by its synthesizer now; `codegen_target_name` reads that stamp too, and the `!!` row that flagged an unread `Def` there is retired | — | `grep -c 'node.spec_owner' compiler/src/compiler/sema/sema.cryo` → **1**; `grep -c 'lookup_type_exact(node.target_type)' compiler/src/compiler/sema/sema.cryo` → **0** | §8.174 |
+| struct-literal rungs 3 and 5 (`resolve_generic_scope_name(lit.struct_type, ..)`, `lookup_type_exact(lit.struct_type)`) | **DELETED** — rung 5: 2 lines over six halves, both C-imported literals whose stamp M1 had missed (above), 0 once stamped; rung 3: 0 over six halves including the `cryo test` half its comment named, and the instrument fires on a forced case; their two rows retired | — | `grep -c 'lookup_type_exact(lit.struct_type)' compiler/src/compiler/sema/sema.cryo` → **0** | §8.174 |
+| static-call unmangled tail (`pin_scope_callee_combined` pinning the bare `Owner::method` when the family selected no signature) | **DELETED** — 2 lines over six halves, one site: `T::try_from(this)` with `this` a value and the parameter `&T`; the static matcher admits the call site's auto-ref in a second pass and pins the symbol; a family that selects nothing stays unpinned | — | `grep -c 'select_static_overload' compiler/src/compiler/sema/call_resolver.cryo` → **3** | §8.174 |
+| unmangled pin family (`pin_scope_callee_qsym`'s qualified names, mono's `combined_sym` pins) read by codegen's by-name lane (`resolve_function_by_mangled` → `resolve_function` → `resolve_function_with_arity`, same-arity overloads by REGISTRATION ORDER) | LIVE — **measured 25,592 pins over six halves, 1,424 distinct names** (LSP alone 4,518 / 892: 518 module functions, 374 statics on specializations). Canonical keys, not spellings, but the overload choice is codegen's. Next | — | `grep -c 'resolve_function_with_arity' compiler/src/compiler/codegen/ops/symbol_resolver.cryo` → **2** | §8.174 |
 | import tie refusal (`visit(IdentifierNode)`: a bare name whose bound symbol is an `Import` and whose leaf two imports bind from different modules) | LIVE - E0154 at the USE, stamp `Res::Err`; the tie is recorded by `Scope::insert_import` (which kept the first import and was read only for type names before) and cleared by a same-module declaration; the prelude is a separate rib and never ties | — | `grep -c 'is_ambiguous(node.name)' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.173 |
 | match-guard resolution (`NameResolution::visit(MatchArmNode)` visits `node.guard`) | LIVE - a guard is resolved in the arm's scope between the patterns and the body; unvisited, a module constant in a guard was E0201 and a callee in one bound by spelling | — | `grep -c 'node.guard.accept' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.172 |
 | scope-qualifier spelling ladder (`lookup_type_exact(scope.scope_name)` beneath `scope_qualifier_type`: `u8::MAX`, the variant payload, the static visibility gate, the static argument check's rung 3) | **DELETED** — `scope_qualifier_type` answers `PrimTy` and a clone's `spec_owner`; the steps measured 0, 34 wrong answers (`float` the MODULE as `f32`), and 27 clone segments now carried by `spec_owner` | — | `grep -rho 'lookup_type_exact(scope.scope_name)' compiler/src/compiler/sema \| wc -l` → **0** | §8.171 |
@@ -99,7 +103,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `lookup_scope_template_derived` | **DELETED** | — | `grep -rho 'lookup_scope_template_derived' compiler/src \| wc -l` → **0** | §8.36 |
 | `set_module_with_scope` | **DELETED** | — | `grep -rho 'set_module_with_scope' compiler/src \| wc -l` → **0** | §8.70, §8.78 |
 | B4 bucket (instantiation keying) | **DELETED** | — | `grep -c 'B4' compiler/src/compiler/resolve_counter.cryo` → **0** | §8.121 |
-| arena `leaf_index` map | **LIVE, and NOT a lane** | — | `grep -rho 'leaf_index' compiler/src \| wc -l` → **8** | §8.121 |
+| arena `leaf_index` map | **LIVE, and NOT a lane** | — | `grep -rho 'leaf_index' compiler/src \| wc -l` → **7** (was 8 while a deleted comment named the project `resolution_leaf_index`; the map's own mentions are 7) | §8.121 |
 | `resolve_path` (§5.2's one entry point) | **LIVE, but not the entry point** — 2 call sites, both single-segment, both `Namespace::Type` | — | `grep -rho '\.resolve_path(' compiler/src --include=*.cryo \| wc -l` → **2** | §5.2, §8.5, §8.7 |
 | `canonical_type_ref` and its arena bare step | **DELETED** — a declaration's key comes from the declaration (`source_module`, else the writer's module) | — | `grep -c 'lookup_by_name' compiler/src/compiler/compilation_context.cryo` → **0** | §8.103, §8.112, §8.156 |
 | `resolve_cross_module_name` (sema's resolver re-entry by spelling) | **DELETED** — its four readers went under shadow mode | — | `grep -rho 'resolve_cross_module_name' compiler/src \| wc -l` → **0** | §8.155 |
@@ -7391,6 +7395,129 @@ bare binder with its E0154, its three doors and its audit stream).
 * `Resolver::lookup_prelude` leaves a name two prelude modules export
   UNANSWERED (Pending) rather than refused; no consumer reports it.  Not
   reached by the corpus; noted, not measured.
+
+### 8.174 Consumers 28-30: the impl head's spelling carrier, the struct literal's two spelling rungs, and the static call's unmangled tail; M1 deleted with its last caller - 2026-09-13
+
+§8.170's three leftover items, each shadowed over the six halves and closed
+at its source.  Every population the three shadows printed was a hole one
+stage up, not a case the spelling was needed for.
+
+#### Consumer 28: `impl_target_type`'s unanswered arm
+
+The arm for a `Pending` head read `lookup_type_exact(node.target_type)` -
+the spelling the monomorphizer rewrites a clone's head to, "the carrier by
+construction".  The carrier is now a slot: `ImplBlockNode.spec_owner`, the
+specialization's arena id, written where the monomorphizer places the
+clone's methods under the instantiation (`specialization.cryo`, beside the
+rewritten spelling) and read by the arm.  Shadow, by-name against the slot:
+**1,466 lines, and not one of them a clone.**  Every line was an
+async-lowered `Future` impl - `Child$join$Future_0`,
+`HttpServer$run$Future_0`, one per compilation unit that pulls the module in
+- with `spec_owner` 0: a head `async_lower` synthesizes and no resolver
+walks, so its slot stayed `Pending` and the spelling answered.  The
+synthesizer holds the definition it minted and records it now
+(`impl_node.res.answer(Res::Def(q_name))`), the way it already stamps the
+constructor literal and `main$async`.  Re-measured: **0**.  A `Pending` head
+is a clone and nothing else, and the arm reads the clone's slot.
+`codegen_target_name` still reads the rewritten spelling for a clone; it is
+a node method with no arena to hand, and it is noted, not changed.
+
+#### Consumer 29: struct-literal rungs 3 and 5
+
+Rung 5 - `lookup_type_exact(lit.struct_type)` for a literal the stamp makes
+no claim for, "a C-imported aggregate reaches ONLY here" - printed **2 lines
+over six halves**, both in `ffi_c_import`'s own `tests/` (the sixth half):
+`cit::Vec2 { .. }` and `cit::Value { .. }`, stamp `Pending`.  Every `cit::`
+ANNOTATION in that file was `Pending` too (`ANN-QUALIFIED`, ten of them),
+answered downstream by the annotation lane's own spelling step.  The cause
+is one branch of `type_spelling_res`: for a qualified spelling no module
+carries the prefix of - the C-import alias - it asked
+`resolve_type_qualified_name_strict_from`, which resolves the LEAF in the
+writer's scope and then checks the qualifier (M1).  `declare_c_imported_type`
+binds the alias-qualified spelling WHOLE and deliberately not its leaf, so
+the leaf lookup missed by construction (`M1LeafMiss`), on every C-imported
+name, in the one corpus half no b1 arm reads.  The branch now looks the
+whole spelling up in the writer's module scope, which is the name it was
+declared under and its canonical name.  Re-measured: **0** through rung 5;
+the ten annotations stamp `Def`.
+
+Rung 3 - `resolve_generic_scope_name(lit.struct_type, args, ...)`, minting
+a spec name from the spelling for a literal with arguments the pair could
+not answer - carried a comment that its zero had been measured over the
+wrong population once (an orphan module reached only by `cryo test`).  The
+six halves include that half now, and the project it names
+(`resolution_leaf_index`) runs its tests through it: **0 lines**, on every
+run this session.  Its literal `Omega::Widget<T> { v: v }` is stamped `Def`
+by the module-rooted walk and rung 2 answers it.  Both rungs deleted; the
+`SpellTyLitFbHit` / `SpellTyLitFbMiss` rows with them.
+
+#### Consumer 30: `pin_scope_callee_combined`'s unmangled tail
+
+When `try_pin_static_method_overload` declined, the tail pinned the bare
+combined `Owner::method` - not an LLVM symbol - for codegen to resolve by
+name.  **2 lines over six halves, one site**: `T::try_from(this)` in
+`JsonExtract::as<T>`'s default body, specialized `as<i64>`, where
+`i64::try_from` has three overloads (`Str`, `u64`, `&JsonValue`) and the
+argument is `this` typed `JsonValue` - a value where the parameter is
+`&JsonValue`.  The matcher admitted an exact id or a pointer/reference
+swap, never the auto-ref the call site performs, so it matched nothing and
+the tail pinned `i64::try_from`.  Codegen bound the right overload anyway,
+by luck of placement: the specialization is emitted in `std::json::value`,
+whose in-module registry holds exactly one `i64::try_from`.  The matcher now
+runs two passes - exact, then a value argument for a `&T` parameter - so a
+family carrying both `f(T)` and `f(&T)` selects the exact one whatever order
+they registered in.  Re-measured: **0**; the pin is the mangled symbol, and
+`select_family_overload` for bare callees is left as measured in §8.173.
+The tail is deleted: a static call the family cannot select stays unpinned,
+where codegen reports it, rather than bound by spelling.
+
+#### Found under it: the unmangled pin family, and codegen's by-name lane
+
+A probe in `resolve_function_by_mangled` printing every pin that is a NAME
+rather than a symbol: **4,518 on the LSP alone, 892 distinct** - 518
+module-qualified free functions (`std::fmt::format`, `std::ffi::libc::memmove`,
+`compiler::ast::node_locator::annotation_span`) and 374 static methods on
+specializations (`Box$L..$G::new`).  These are `pin_scope_callee_qsym`'s
+pins and the monomorphizer's `combined_sym` pins: canonical family keys, not
+spellings, but codegen resolves each through `functions.get(name)` →
+`get_named_function` → `resolve_function(name)` → `resolve_function_with_arity`,
+which selects among a family's same-arity overloads by REGISTRATION ORDER.
+That is the shape consumer 30 was one instance of, at the scale of every
+qualified call in the program.  Next consumer; not this entry's.
+
+#### M1
+
+`resolve_type_qualified_name_strict_from` and `qualifier_agrees` had one
+caller, the C-import branch above, and it is gone: deleted with `prefix_of`,
+`extract_leaf` and the four `M1*` counter rows (`resolve_counter.cryo` 1446
+→ 1404, with `SpellTyLitFbHit` / `SpellTyLitFbMiss` and `CgImplTargetUnResDef` below).  §0's M1 row said NOT ENTERED on every b1 arm; it was entered on
+every C-imported annotation and literal under `cryo test`, and missed.
+
+#### Objects, gates
+
+Objects, HEAD vs the tree, run twice - once with the three closures and
+once more after `codegen_target_name` learned to read the stamp: examples
+**0 of 1,126**, tests **0 of 2,182** both times.  Suite green (2,116 unit, 179
+negative, 45 projects here); LSP builds directly; lane golden re-pinned -
+`DEFID_MINT` 17 → 18 (the `Future` head's synthesizer stamp, the same
+shape as `main$async`'s in §8.172), `DEFID_UNWRAP` 31 → 32
+(`codegen_target_name` reading that stamp); b1 re-pinned on both hosts - B1
+0 → 0 on all six arms, **six rows gone from every arm and nothing else
+moved on either host**: the four `M1` rows, the two literal fallback rows,
+and `re-derived, yet res: Def` - which had moved 0 → 10 on the first
+Windows run, the one number this entry did not predict.  That row counted
+an impl head with no `qualified_target_name` whose `res` was `Def`, "a
+node the stamp could have answered for": the ten are `09-json-config`'s
+async `Future` heads, stamped now.  `codegen_target_name` reads the `Def`
+(the same name the rewritten spelling carried, hence 0 objects), and the
+row that existed to flag an unread stamp there is retired.  62 → 56 rows
+per arm.
+
+**Tally: 30 shadowed, 30 old paths deleted, 29 at zero and one at §8.93's
+allocator residue; 24 artifacts gone** (+ the impl head's spelling carrier,
+the two literal rungs, the unmangled tail, and M1 - `qualifier_agrees`,
+`resolve_type_qualified_name_strict_from`, `prefix_of`, `extract_leaf` -
+with its four rows).
 
 ---
 

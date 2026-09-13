@@ -557,97 +557,6 @@ type struct Resolver {
 
     // Type name resolution (used by TypeResolver)
 
-    /// What a QUALIFIED type path names, or empty when nothing answers it.
-    ///
-    /// The same walk `resolve_type_qualified_name_from` performs, differing
-    /// only in how it reports a refusal.  That one hands the written name back,
-    /// because its callers pass the result straight into an arena lookup that
-    /// may already hold the canonical form; a caller that must record the
-    /// answer on a node cannot tell that convention's refusal from its success.
-    /// Both go through this one walk so the two views cannot come to disagree
-    /// about what a path names.
-    ///
-    /// The scope chain is keyed by leaf alone, so resolving the leaf can land
-    /// on a same-named type from an entirely different module -
-    /// `executor::JoinHandle` reaching `thread::JoinHandle` in a program that
-    /// imports both.  The result is accepted only when its declaring module
-    /// agrees with the qualifier the source wrote; binding a contradicted
-    /// answer would make the winner whichever module registered the leaf last,
-    /// which is not a property the source mentions.
-    resolve_type_qualified_name_strict_from(&this, start: ScopeID,
-                                            name_str: string) -> SymbolStr {
-        const leaf_sym: SymbolStr = this.extract_leaf(name_str);
-        if (!leaf_sym.is_valid()) {
-            resolve_counter::Site::M1LeafMiss.bump();
-            return SymbolStr::empty();
-        }
-        const resolved: SymbolStr =
-            this.resolve_type_qualified_name_bare_from(start, leaf_sym);
-        // Separates the two ways this produces no answer: the qualifier check
-        // said no, or it was never asked because nothing resolved.  Those call
-        // for opposite fixes and the agreement counter alone cannot tell them
-        // apart.
-        if (!resolved.is_valid()) {
-            resolve_counter::Site::M1LeafMiss.bump();
-            return SymbolStr::empty();
-        }
-        if (!this.qualifier_agrees(resolved, name_str)) {
-            return SymbolStr::empty();
-        }
-        resolve_counter::path_hit(
-            "M1-AGREE", this.intern_table.resolve(this.current_module),
-            name_str, this.intern_table.resolve(resolved));
-        return resolved;
-    }
-
-    /// True when the module `resolved` was declared in is consistent with the
-    /// qualifier written in `written_str`. `resolved` is a canonical
-    /// `Module::Leaf`; `written_str` is the `Prefix::Leaf` the source spelled.
-    ///
-    /// An unqualified `written_str` agrees with anything — there is no qualifier
-    /// to contradict. A `resolved` with no module of its own agrees with nothing
-    /// qualified, since a written prefix cannot name the global namespace.
-    qualifier_agrees(&this, resolved: SymbolStr, written_str: string) -> boolean {
-        const written_prefix: string = this.prefix_of(written_str);
-        if ((written_prefix.length() as i64) == 0) { return true; }
-        const resolved_mod: string = this.prefix_of(this.intern_table.resolve(resolved));
-        // Emitted at the refusal, not tallied: the end-of-run report prints
-        // only after a successful link, and the corpus that spells a qualifier
-        // the declaring module contradicts is the compile_fail corpus, which
-        // never gets there. `M1-AGREE` is the control for this line's zero.
-        if ((resolved_mod.length() as i64) == 0) {
-            resolve_counter::Site::M1QualReject.bump();
-            resolve_counter::path_hit(
-                "M1-REJECT", this.intern_table.resolve(this.current_module),
-                written_str, "<no module>");
-            return false;
-        }
-        resolve_counter::Site::M1AgreeCalls.bump();
-        if (!Resolver::ns_written_as(resolved_mod, written_prefix)) {
-            resolve_counter::Site::M1QualReject.bump();
-            resolve_counter::path_hit(
-                "M1-REJECT", this.intern_table.resolve(this.current_module),
-                written_str, resolved_mod);
-            return false;
-        }
-        resolve_counter::Site::M1AgreeHits.bump();
-        return true;
-    }
-
-    /// Everything before the final "::" in `s`, or empty when there is none.
-    /// E.g. "std::future::executor::JoinHandle" -> "std::future::executor".
-    prefix_of(&this, s: string) -> string {
-        const len: i64 = s.length() as i64;
-        mut last_sep: i64 = -1;
-        for (mut i: i64 = 0; i + 1 < len; i++) {
-            if (s[i] == ':' && s[i + 1] == ':') {
-                last_sep = i;
-            }
-        }
-        if (last_sep <= 0) { return ""; }
-        return s.substring(0, last_sep as u32);
-    }
-
     /// Whether `written` is how a source file may spell the module whose
     /// namespace is `mod_str`: the same namespace with zero or more of its
     /// LEADING segments omitted.
@@ -860,27 +769,6 @@ type struct Resolver {
         }
         return false;
     }
-
-    /// Extract the last segment after the final "::" in a string.
-    /// E.g., "Math::Vec2::Vec2" -> intern("Vec2")
-    extract_leaf(&this, s: string) -> SymbolStr {
-        const len: i64 = s.length() as i64;
-        mut last_sep: i64 = -1;
-        for (mut i: i64 = 0; i + 1 < len; i++) {
-            if (s[i] == ':' && s[i + 1] == ':') {
-                last_sep = i;
-            }
-        }
-        if (last_sep < 0) {
-            return this.intern_table.intern(s);
-        }
-        const start: i64 = last_sep + 2;
-        if (start >= len) {
-            return SymbolStr::empty();
-        }
-        return this.intern_table.intern(s.substring(start as u32, (len - start) as u32));
-    }
-
 
     // Module-level reset (batch mode)
 

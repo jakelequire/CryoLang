@@ -1167,6 +1167,13 @@ public:
     /// anywhere - so a consumer gets an answer it must match rather than a
     /// name it can look up, and the spelling is the registration key.
     res:            ResSlot;
+    /// The SPECIALIZATION a cloned head is for, by arena id, recorded by the
+    /// monomorphizer when it places the clone's methods under the
+    /// instantiation.  The stamp beside it is withheld on a clone (above),
+    /// so this is the carrier of which instantiation the head means - the
+    /// same fact `target_type` is rewritten to spell, without the round trip
+    /// through a name.  Invalid on every head no monomorphizer placed.
+    spec_owner:     TypeRef;
     /// The canonical qualified name of the trait this block implements, as
     /// resolved from `trait_annotation` when the methods' `origin_trait` is
     /// stamped.  Empty on an inherent impl, and until stamped.
@@ -1232,6 +1239,7 @@ public:
         this.target_type           = target_type;
         this.qualified_target_name = SymbolStr::empty();
         this.res                   = ResSlot::Pending;
+        this.spec_owner            = TypeRef::invalid();
         this.qualified_trait_name  = SymbolStr::empty();
         this.generic_params        = [];
         this.target_args           = [];
@@ -1265,15 +1273,14 @@ public:
     /// no call site mangles and `declare_method` cannot look up, so the bodies
     /// are dropped silently and the linker reports them undefined.
     ///
-    /// An unstamped block is a monomorphized clone.  The cloner withholds
-    /// `qualified_target_name` and `res` together, because a specialization
-    /// rebinds WHICH type the head is for and neither stamp can name an
-    /// instantiation; the monomorphizer's rewritten spelling is the carrier by
-    /// construction, and it is already qualified.
-    ///
-    /// The slot is recorded, not consulted - it is `Pending` for the whole
-    /// unstamped population by construction.  A nonzero `Def` would mean a
-    /// stamp had become available here, and that this could read one.
+    /// A block TypeResolution never registered - one a synthesizer built -
+    /// carries its stamp, and the stamp's name is the key the type was
+    /// registered under.  An unstamped block is a monomorphized clone: the
+    /// cloner withholds `qualified_target_name` and `res` together, because a
+    /// specialization rebinds WHICH type the head is for and neither stamp
+    /// can name an instantiation; the monomorphizer's rewritten spelling is
+    /// the carrier here, already qualified (`spec_owner` carries the same
+    /// fact as an arena id, for a reader with an arena to resolve it).
     codegen_target_name(&this) -> SymbolStr {
         if (this.qualified_target_name.is_valid()) {
             return this.qualified_target_name;
@@ -1282,7 +1289,7 @@ public:
         match (this.res) {
             ResSlot::Answered(r) => {
                 match (r) {
-                    Res::Def(_)    => { resolve_counter::Site::CgImplTargetUnResDef.bump(); }
+                    Res::Def(d)    => { return d.qualified_name(); }
                     Res::PrimTy(_) => { resolve_counter::Site::CgImplTargetUnResPrim.bump(); }
                     _              => { resolve_counter::Site::CgImplTargetUnResOther.bump(); }
                 }

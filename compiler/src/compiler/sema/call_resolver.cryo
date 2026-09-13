@@ -3669,25 +3669,19 @@ type struct CallResolver {
         // Single-overload static method: pin the MANGLED symbol, consistent with
         // instance methods (`bind_method_on_receiver`) and the multi-overload
         // static path above.  The bare combined name is neither a codegen
-        // function-registry key nor an LLVM symbol, so codegen's
-        // `resolve_function_by_mangled` would synthesize a phantom extern named
-        // with the Cryo mangled symbol - which links fine for an ordinary method
-        // (its definition shares that name) but NOT for a `![symbol("...")]`-bound
-        // method (the C++ binding generator), whose definition carries the
-        // foreign mangled symbol instead.  Pinning the mangled name routes the
-        // call through the registry to the real definition.  Falls back to the
-        // bare combined when the overload isn't registered/mangled yet.
+        // function-registry key nor an LLVM symbol; a `![symbol("...")]`-bound
+        // method (the C++ binding generator) is defined under the foreign
+        // symbol, and only the mangled pin routes the call through the
+        // registry to it.  A family the arguments cannot select one signature
+        // of, or one with no symbol registered yet, is left unpinned: a name
+        // codegen would have to resolve by spelling is not a pin.
         if (this.ctx.decl_index != null) {
             const ovs: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(sym);
             if (ovs.length == 1) {
                 const mg: SymbolStr = this.ctx.decl_index.lookup_overload_mangled(sym, ovs[0]);
-                if (mg.is_valid()) {
-                    call.set_resolved_callee(mg);
-                    return;
-                }
+                if (mg.is_valid()) { call.set_resolved_callee(mg); }
             }
         }
-        call.set_resolved_callee(sym);
     }
 
     /// Pin the static method a `Type::method` VALUE names, by the symbol
@@ -3714,6 +3708,14 @@ type struct CallResolver {
         scope.set_resolved_callee(if (mg.is_valid()) { mg } else { sym });
     }
 
+    /// Pin a static call to the one signature of `combined_sym`'s family its
+    /// arguments select, or decline.  Exact matches first; only when no
+    /// signature matches exactly, the auto-ref the call site performs is
+    /// admitted - a value argument for a `&T` parameter, which is how a
+    /// trait default's `&this` receiver reaches `T::try_from(this)`.  Two
+    /// passes rather than one predicate so a family carrying both `f(T)` and
+    /// `f(&T)` selects the exact one whatever order they registered in.
+    /// Several matches in one pass is a genuine tie and pins nothing.
     try_pin_static_method_overload(mut &this, call: CallExprNode*, combined_sym: SymbolStr) -> boolean {
         const di: DeclarationIndex* = this.ctx.decl_index;
         const overloads: TypeRef[] = di.lookup_func_type_overloads(combined_sym);
@@ -3724,6 +3726,20 @@ type struct CallResolver {
             if (arg == null || !arg.resolved_type.is_valid()) { return false; }
             arg_types.push(arg.resolved_type);
         }
+        mut matched: i64 = this.select_static_overload(&overloads, &arg_types, false);
+        if (matched < 0) { matched = this.select_static_overload(&overloads, &arg_types, true); }
+        if (matched < 0) { return false; }
+        const mangled: SymbolStr = di.lookup_overload_mangled(combined_sym, overloads[matched]);
+        if (!mangled.is_valid()) { return false; }
+        call.set_resolved_callee(mangled);
+        return true;
+    }
+
+    /// The index of the one signature in `overloads` every argument fits, or
+    /// -1 for none or for several.  `autoref` admits a value argument for a
+    /// reference parameter to its type.
+    select_static_overload(&this, overloads: &TypeRef[], arg_types: &TypeRef[],
+                           autoref: boolean) -> i64 {
         mut matched: i64 = -1;
         for (mut oi: i64 = 0; oi < overloads.length; oi++) {
             const ot: Type* = this.arena.lookup(overloads[oi].id);
@@ -3732,17 +3748,19 @@ type struct CallResolver {
             if (fn_ty.param_types.length != arg_types.length) { continue; }
             mut all_match: boolean = true;
             for (mut pi: i64 = 0; pi < fn_ty.param_types.length; pi++) {
-                if (!this.overload_param_matches_arg(fn_ty.param_types[pi], arg_types[pi])) { all_match = false; break; }
+                mut ok: boolean = this.overload_param_matches_arg(fn_ty.param_types[pi], arg_types[pi]);
+                if (!ok && autoref) {
+                    const pt: Type* = this.arena.lookup(fn_ty.param_types[pi].id);
+                    ok = pt != null && pt.kind == TypeKind::Reference
+                        && (pt as ReferenceType*).referent.id == arg_types[pi].id;
+                }
+                if (!ok) { all_match = false; break; }
             }
             if (!all_match) { continue; }
-            if (matched != -1) { return false; }
+            if (matched != -1) { return -1; }
             matched = oi;
         }
-        if (matched < 0) { return false; }
-        const mangled: SymbolStr = di.lookup_overload_mangled(combined_sym, overloads[matched]);
-        if (!mangled.is_valid()) { return false; }
-        call.set_resolved_callee(mangled);
-        return true;
+        return matched;
     }
 
     pin_scope_callee_qsym(mut &this, call: CallExprNode*, q_sym: SymbolStr) -> void {
