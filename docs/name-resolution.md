@@ -45,12 +45,12 @@ current-state description is the defect it exists to remove.
 | D3 | Modules bind in the TYPE namespace | TAKEN, then SUPERSEDED by D5 | `grep -c 'SymbolKind::Namespace' compiler/src/compiler/resolver/namespace_kind.cryo` → **1** | §8.39, §8.68 |
 | D4 | The qualifier shorthand `A::B` prefers the type | SUPERSEDED by D5 — ruled dropped, never built, then overtaken | `no check` — the thing ruled on was never in the tree | §8.66 → §8.130 |
 | D5 | **Namespaces and types share ONE namespace**; a module and a type can never carry the same name, and the collision is an ordinary redeclaration error at its declaration | **RULED, NOT STARTED** — and now the one thing holding `scope_owner_key`'s cursor lane (§8.170): `module_type_name_collision` pins the pre-D5 shape | `grep -rho 'check_module_type_collision' compiler/src \| wc -l` → **2** (0 when done) | §8.130, §8.134 |
-| D6 | Intrinsics get namespaced; a bare name always means the user's function | RULED; `format`/`printf` done, the rest not started | `grep -c '^intrinsic function ' stdlib/core/intrinsics.cryo` → **58** | §8.124, §8.126, §8.129 |
+| D6 | Intrinsics get namespaced; a bare name always means the user's function | RULED; `format`/`printf` done; every other intrinsic the tree calls is behind `intrinsics::` since §8.172 - the bare surface left is the allocator leaf `malloc`/`free`/`realloc`, held by §8.93, and with it the index's bare-slot ownership for intrinsics | `grep -c '^intrinsic function ' stdlib/core/intrinsics.cryo` → **58**; `python scripts/qualify-intrinsic-calls.py stdlib/sync/atomic.cryo --names @stdlib/core/intrinsics.cryo` → `0 rewritten` | §8.124, §8.126, §8.129, §8.172 |
 | D7 | Imports stop globbing | **TAKEN** — a plain `import M;` is `ImportStyle::Module` and binds no names. Three globs remain BY DESIGN and the old row's expected `0` was unreachable: the explicit `M::*`, and the two the compiler injects (the prelude, the f-string runtime) | `grep -rho 'ImportStyle::Wildcard,' compiler/src --include=*.cryo \| wc -l` → **3** | §8.131, §8.135, §8.138 |
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
 | D10 | A plural leaf is E0155, not a directory-order bind — and a leaf two children of one FACADE declare is the same defect reached by a qualified path, in a call as in an annotation | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **5** | §8.121, §8.144, §8.151 |
-| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); of the asserted rows, six whose only sites were deleted went with them (one in §8.170, five in §8.171; `b1-baseline.txt` re-pinned on both hosts each time, 70 → 65 rows per arm) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1505** | §8.66, §8.80, §8.139 |
+| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); of the asserted rows, six whose only sites were deleted went with them (one in §8.170, five in §8.171; `b1-baseline.txt` re-pinned on both hosts each time, 70 → 65 rows per arm) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1484** | §8.66, §8.80, §8.139 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
 | D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **577** | §8.145, §8.146, §8.147, §8.148, §8.150 |
@@ -82,13 +82,16 @@ three, and its row carries the count. Read each zero off its own row.
 | type cascade (`lookup_type_by_sym`, 4 steps) | **DELETED** — `lookup_type_exact`, one step; the audit stream and its four counter rows went with it | — | `grep -rho 'lookup_type_by_sym' compiler/src --include=*.cryo \| wc -l` → **0** | §8.154 |
 | 2c home-module (ambient cursor) | STARVED | 0 | `grep -m1 '2c  home-module' tests/b1-baseline.txt` | §8.63, §8.87 |
 | M1 `qualifier_agrees` | **GUARD — NOT ENTERED on every b1 arm** since §8.156; its one caller left is the C-import alias branch of the annotation stamp | 0 calls / 0 agree / **0 reject** | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **5** | §8.120, §8.132 |
-| M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane** | 3,760 | `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M2 resolve_module_qualified_sym calls/{print;exit}' tests/b1-baseline.txt` → **3760** | §8.120 |
+| M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane**; +246 in §8.172 when the atomics went behind `intrinsics::` | 4,006 | `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M2 resolve_module_qualified_sym calls/{print;exit}' tests/b1-baseline.txt` → **4006** | §8.120, §8.172 |
 | M4 mono bare-name scan | **DELETED** — with the current-module key before it; a callee with no usable stamp names no template | — | `grep -c 'M4Calls' compiler/src/compiler/resolve_counter.cryo` → **0** | §8.33, §8.120, §8.157 |
 | M5 import suffix fallback | **DELETED** — an import path names a module by its registered name or binds nothing | — | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **0** | §8.120, §8.157 |
 | const-table bare leaf (`by_bare`, `bare_index_of`, the same-leaf chain folder) | **DELETED** — a bare constant is read off `IdentifierNode.res`; shadow 0 over six halves, the lane reached 4/4 in `const_cross_module` under the same build, and a same-leaf constant in an unimported module - which the chain folder REFUSED - now folds to the imported one | — | `grep -c 'by_bare' compiler/src/compiler/const_table.cryo` → **0** | §8.9, §8.111, §8.171 |
 | `spelling_type` call-ident fallback (E0202 tail) and `new`'s `resolve_primitive` step | **DELETED** — shadow 0 over six halves; their three rows retired | — | `grep -c 'SpellTyIdFb' compiler/src/compiler/resolve_counter.cryo` → **0** | §8.25, §8.98, §8.171 |
 | `new`'s spelling step (`lookup_type_exact(new_expr.type_name)`) | LIVE — for an ALIAS KEYWORD only (`new int[100]`): `int`/`uint`/`float`/`double` are not primitive spellings because a module may carry the name, so the stamp is Pending and the alias registration is the only key. **The pinned `spelling_type new expr: calls` row is 0 because no pinned b1 corpus contains a `new` expression** — a corpus fact, not a lane fact; `tests/lang/new_array.cryo` reaches it twice. Goes with the keyword ruling (§8.165) | 0 calls on every pinned arm | same file, `spelling_type new expr: calls` | §8.25, §8.98, §8.171 |
 | bound-directed trait filter by LEAF (`select_method`, `find_spec_impl_method`) | **DELETED** — `MemberAccessNode.resolved_trait` is the trait's identity and every reader compares it to `origin_trait` / `qualified_trait_name`; shadow 440 → 0 (the async-lowered `Future` impl was the one unstamped head); `trait_leaf_dispatch` exits 12 where a leaf comparison exits 11 | — | `grep -rho 'leaf_segment' compiler/src/compiler/sema/call_resolver.cryo \| wc -l` → **0** | §8.171 |
+| callee door ladder (`lookup_callee_function_type`'s identifier branch: a `lookup_local` by spelling ahead of the stamp, then STAMP → HOME → BARE) | **DELETED** - the identifier branch is the stamp: `Local` → the local's type when callable, `Def` → `func_type_of_res`, else no hint; shadow 5,327 → 16, every line a `Pending` stamp (intrinsics through BARE, unresolved match guards and `main$async` through HOME, an unimported `swap`); the 12 left are §8.93's allocator leaf and `visibility_gate`'s refused privates; the `CALLEE-DOOR` audit stream went with it | — | `grep -c 'CALLEE-DOOR' compiler/src/compiler/resolve_counter.cryo` → **0**; `grep -c 'lookup_func_type_exact(ident.name)' compiler/src/compiler/sema/call_resolver.cryo` → **0** | §8.172 |
+| free-call template search by leaf and arity (`find_fn_template_for_call`'s registry scan, its cursor-module tie-break, `Resolver::resolve_function_source_module`) | **DELETED** - `lookup_scope_template(ident.res)` plus the arity gate; a local is never a template, which is what fixes a local fn-pointer bound to a same-leaf generic global (returned 5 for 10); shadow 12 → 0 | — | `grep -rho 'resolve_function_source_module' compiler/src \| wc -l` → **0** | §8.172 |
+| match-guard resolution (`NameResolution::visit(MatchArmNode)` visits `node.guard`) | LIVE - a guard is resolved in the arm's scope between the patterns and the body; unvisited, a module constant in a guard was E0201 and a callee in one bound by spelling | — | `grep -c 'node.guard.accept' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.172 |
 | scope-qualifier spelling ladder (`lookup_type_exact(scope.scope_name)` beneath `scope_qualifier_type`: `u8::MAX`, the variant payload, the static visibility gate, the static argument check's rung 3) | **DELETED** — `scope_qualifier_type` answers `PrimTy` and a clone's `spec_owner`; the steps measured 0, 34 wrong answers (`float` the MODULE as `f32`), and 27 clone segments now carried by `spec_owner` | — | `grep -rho 'lookup_type_exact(scope.scope_name)' compiler/src/compiler/sema \| wc -l` → **0** | §8.171 |
 | `lookup_by_leaf` | **DELETED** | — | `grep -rho 'lookup_by_leaf(' compiler/src \| wc -l` → **0** | §8.121 |
 | `lookup_scope_template_derived` | **DELETED** | — | `grep -rho 'lookup_scope_template_derived' compiler/src \| wc -l` → **0** | §8.36 |
@@ -110,7 +113,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `CompilationContext::resolve_scoped` family (the cursor's leaf-keyed scope map, asked from sema) | `_or`, `_or_at`, `scope_is_ambiguous`, `_at` **DELETED** (7 readers at §8.161); `resolve_scoped` / `resolve_scoped_at` **HELD** with ONE reader, the D5 residue below | — | `grep -c 'resolve_scoped' compiler/src/compiler/compilation_context.cryo` → **4** | §8.161, §8.166-§8.170 |
 | `scope_owner_key` | LIVE - the static-call owner key: the substituter's `spec_owner` (a clone's specialization, by arena id), then the cursor lane, then the stamp. The cursor lane is measured at 1,974,585 answers and serves ONE shape, D5's module/type collision (`module_type_name_collision`'s `Buffer::make`); it goes with D5 | — | `grep -c '\.resolve_scoped_at(' compiler/src/compiler/sema/call_resolver.cryo` → **1** | §8.134, §8.151, §8.170 |
 | type-resolution bound stamping (`stamp_trait_ref` and its three walkers, the cursor fallback for a bound the resolver did not stamp) | **DELETED** - the name layer stamps every owner, associated-type bounds included | — | `grep -c 'stamp_trait' compiler/src/compiler/passes/type_resolution.cryo` → **0** | §8.169 |
-| callee visibility gate (E0353) | LIVE, reached; **starved of violations** | 1,812 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **21** (the name layer's two: the import gate, the rooted walk) | §8.1f, §8.2ag |
+| callee visibility gate (E0353) | LIVE, reached; **starved of violations** (+57 in §8.172: the qualified door now sees the atomics) | 1,869 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **21** (the name layer's two: the import gate, the rooted walk) | §8.1f, §8.2ag |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
 
@@ -126,7 +129,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,113 unit + 48 project + 179 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
+| `make test` | 2,116 unit + 48 project + 179 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make b1-check` | B1 total + every per-row bound, 3 corpora × 2 hosts | **2 of the 3 corpora are `examples/`**; the third is `tests/tests/projects/ffi_c_import`. The compiler's own source is NOT a corpus, and `tests/` at large is swept by none of them. |
 | `make lane-check` | 7 buckets of call sites in `compiler/src`, as a golden | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
@@ -22778,3 +22781,174 @@ held).
   Not reached by any corpus; recorded, not fixed.
 * Items 6 and 7 of §8.170's list are untouched: the callee door ladder
   (`call_resolver:342-352`) and the three further shadow candidates.
+
+### 8.172 Consumers 25-26: the callee door ladder and the free-call template search, deleted; a match guard was never name-resolved; the atomics go behind `intrinsics::` - 2026-09-12
+
+Two consumers shadowed over the six halves, controlled, and deleted in one
+commit, with the three name-layer holes the shadow exposed closed beside
+them.  `HANDOFF.md`'s ordered list is folded into this entry and the file
+deleted.
+
+#### The reproducer first, and it was not the shape the handoff named
+
+§8.170 item 6 said a local function-pointer variable shadowing a same-leaf
+global binds the global.  A local `const g: () -> i32 = seven; g()` against
+a global `g` binds the LOCAL at `57806af1` - every one of the three
+`scopes.lookup_local` checks in `resolve_call` runs ahead of the free-function
+index, and `fn_pointer_shadowing.cryo` already pinned the parameter case.  The
+live shape is one step earlier: `check_generic_free_call` runs BEFORE the
+local check, and its `find_fn_template_for_call(ident.name, argc)` scans the
+whole registry by leaf and arity.  A local `const gen: (i32) -> i32 = twice;
+gen(5)` beside a global `gen<T>(x: T) -> T` therefore binds the template and
+returns **5** where the local returns 10.  Reproduced in a scratch project
+before touching anything; `fn_pointer_shadowing.cryo` now carries both the
+local-variable case and this one.
+
+#### Consumer 25: the callee door ladder
+
+`lookup_callee_function_type`'s identifier branch - a `scopes.lookup_local`
+by spelling ahead of the stamp, then STAMP (`func_type_of_res`), then HOME
+(`qualify_symbol_sym_home` + `lookup_func_type_exact`), then BARE
+(`lookup_func_type_exact(ident.name)`, the single-slot last-write-wins map
+its own comment warned about).  The stamp alone was computed beside it:
+`Res::Local` → the local's type when callable, `Res::Def` → the signature
+under the canonical name, anything else → no hint.  One line per
+disagreement, with the stamp's kind, the door that answered, the leaf and
+the span.
+
+**5,327 lines over the six halves, and not one of them a `Local` or a `Def`.**
+Every disagreement was a `Pending` stamp - the name layer had no answer and
+the ladder found one by spelling:
+
+* **5,272 - intrinsics through BARE.**  `atomic_*` and `ptr_diff`, called
+  bare in `stdlib/sync/atomic.cryo`, `once.cryo` and `core/primitives.cryo`,
+  once per compilation unit that pulls those modules in.  An intrinsic is
+  `declare`d in the name layer and never exported, so no importer can bind
+  one by name; the only key that reaches it is the declaration index's bare
+  slot, which `register_intrinsic_function_type` gives the intrinsic durable
+  ownership of.  This is D6's remainder (§8.124, §8.129).
+* **31 - HOME, all async.**  `mg_big`, `mg_marked_guard`, `ready_true`
+  (`n if await mg_big(n)`) and `main$async`.  Two holes, below.
+* **12 - `swap` through BARE**, `compiler/mono/specializer.cryo` and
+  `trait_specializer.cryo`, neither of which imports `std::core::mem`.
+  Compiled because the template search's `count == 1` exit answers from the
+  whole program.  Both files now import it.
+* **10 - the allocator leaf**, `bare_intrinsic_priority.cryo`'s bare
+  `malloc` / `free` / `realloc`, which is §8.93's held decision.
+* **2 - `visibility_gate`'s `secret` and `stash`**, private candidates the
+  name layer refused; the project exists to produce that E0353, and still does.
+
+The instrument's control: both comparisons inverted for one build print
+**24,815 agreeing pairs on the LSP alone** (10,922 door, 13,893 template).
+
+#### Consumer 26: the free-call template search
+
+`find_fn_template_for_call(name, argc)` scanned every registered template
+for a matching leaf and arity, then broke a tie by the ambient cursor's
+module (`current_module_name`), then by `Resolver::resolve_function_source_module`
+- a scope-chain walk by leaf, asked of the cursor.  Shadowed against
+`lookup_scope_template(ident.res)` filtered to a function declaration: the
+12 `swap` lines above and nothing else.  Deleted, with
+`resolve_function_source_module` (one caller).  The arity gate stays on the
+stamp's answer, because a template whose parameter count differs is not this
+call's template: inference would otherwise return a type for `gen(1, 2)` and
+the arity diagnostic on the non-generic path would never run.  Checked:
+`gen(1, 2)` reports the same E0215 under HEAD and under the tree.
+
+#### Found under it: a match guard was never name-resolved
+
+`NameResolution::visit(MatchArmNode)` entered the arm's scope, visited the
+patterns and the body, and never visited `node.guard`.  Nothing in a guard
+was ever stamped.  Two consequences, both reproduced before the fix:
+
+* a module constant read in a guard - `n if n > LIMIT` - is refused with
+  **E0201 "cannot find value `LIMIT` in this scope"**, because the const
+  table reads the stamp (§8.171) and a Pending slot names no constant;
+* a free function called in a guard bound through the HOME door, which is
+  the 30 async lines above (the sync case reaches the same door; no corpus
+  file calls a free function in a sync guard, which is why only the async
+  ones printed).
+
+The guard is now visited between the patterns and the body, in the arm's
+scope.  `pattern_guards.cryo` gains a guard that reads a module constant and
+calls a free function.
+
+`main$async` is the other HOME line: `desugar_async_main` mints
+`main$async(<forwarded>)` and nothing name-resolves a synthesized identifier,
+so the synthesizer now stamps it - the renamed function is declared in the
+writer's own module, and its canonical name is that module and the new leaf,
+the same way `named_ann_def` records a minted annotation's referent.
+
+#### D6: the atomics and `ptr_diff` go behind the path
+
+The 5,272 intrinsic lines are one mechanism and one ruling: intrinsics move
+behind `intrinsics::` (§8.124).  `scripts/qualify-intrinsic-calls.py`
+rewrites a bare call to its qualified form in the files given, refusing a
+file that does not import the module; run over `atomic.cryo` (56),
+`once.cryo` (2), `primitives.cryo` (1) and `CLI/commands.cryo` (4,
+`dirent_name`, which had no import and reached the intrinsic by the bare slot
+alone).  The qualified form is the module lane and stamps the qualifier
+`Def`, checked with `CRYO_PATH_AUDIT` on a scratch call.  The `panic`
+sites §8.129 counted are calls to `std::core::panic`, a declared wrapper,
+and were `Def` all along; `trap` and `frame_address` are declarations that
+share a leaf.  What is left bare is the allocator leaf, held by §8.93.
+
+The export route (§8.124's alternative) is closed by the tree as it stands:
+`stdlib/prelude.cryo` re-exports `core::intrinsics`, so exporting the
+intrinsic symbols would glob all 58 names into every file - §8.65's
+experiment, which ambiguated 87 leaves.
+
+#### Re-measured, deleted, objects
+
+Second corpus run with the three holes closed and the atomics qualified:
+**5,339 → 16** - `once.cryo`'s two atomics (missed from the generator's
+first file list; qualified since), the allocator leaf's 10, and
+`visibility_gate`'s 2.  The door's identifier branch is the stamp and
+nothing else; `callee_door_probe`, the `CALLEE-DOOR` audit stream and
+`resolve_counter::callee_door` go with it (`resolve_counter.cryo` 1505 →
+1484).  The template search is `lookup_scope_template` plus the arity
+gate.
+
+Objects, HEAD vs the tree (compiler, stdlib and tests all switched, so the
+stdlib rewrite is inside the comparison): examples **0 of 1,126**.  Tests, separated by axis because two objects moved without a source change of their own: the tree's compiler over HEAD's `tests/` is **0 of 2,182** against HEAD's compiler over the same files, so the compiler and stdlib change moves nothing; over the tree's `tests/` **5** move - `FnPointerShadowing` and `PatternGuards` (edited), `__cryo_test_main` (three more tests enumerated), and `Lambdas` / `MoveLambda`, which differ ONLY in a mangled suffix: a closure specialization carries a program-wide counter in its symbol (`apply__cl_7096` → `_7097`), so one function added earlier in the suite's order renames every later closure by one.  Same-compiler-twice control: 0 of 2,182, so none of it is build nondeterminism.
+
+Gates: suite green, 45 projects, 179 negative; roster merged (2,116 unit, +3); LSP builds directly; lane golden re-pinned - `LOOKUP_OTHER` 60 → 59 and `REENTRY` 5 → 4 are the two deletions, `DEFID_MINT` 16 → 17 is the `main$async` stamp, a synthesizer minting the id of the declaration it just renamed, beside the two that file already carried; b1 re-pinned on both hosts - B1 0 → 0 on all six arms, two volume rows moved on every arm because the atomics now take the module lane: `M2 resolve_module_qualified_sym calls` and `callee visibility checks reached` (the qualified door, `FnBindVisQualified`), Windows +246 / +57, Linux the same +246 / +57 (3,722 → 3,968; 1,797 → 1,854), every other row reproduced on both.
+
+#### `corpus2.sh` now reports a half that stops compiling
+
+Handoff item 5.  The project, project-test and example halves piped the
+compiler through `grep`, so a half that FAILED to compile read as a half
+with no disagreements.  Each now runs through `run_half`, which keeps the
+exit code, compares it to what the project's `test.json` says it should be
+(`compile_fail` → non-zero; a `collect` project's `"fails": true` → its
+TEST half non-zero, its build zero), echoes a mismatch and keeps the output
+in `<tag>-fail.log`.  Controlled in isolation with a passing and a failing
+command; the first real run flagged `known_fail_canary`'s build under the
+one-expectation-per-project version, which is what split it.
+
+**Tally: 26 shadowed, 26 old paths deleted, 25 at zero and one at a residue
+of 12 that is §8.93's held leaf and a compile-fail project's refused
+privates; 19 artifacts gone** (+ the callee door ladder with its audit
+stream; the free-call template search with `resolve_function_source_module`).
+
+#### What this leaves
+
+* The rest of the bare-callee family in `call_resolver` asks the same
+  HOME → BARE question of the overload arrays: `check_call_arity`,
+  `try_pin_overload_mangled_callee` (with its import-scoped bare filter and
+  E0154), `resolve_direct_call`'s spelling-keyed local check and its
+  `lookup_qualified_alternatives(ident.name)`, and `resolve_call`'s
+  `fp_shadows_global`.  The population is the one measured here - the stamp
+  answers `Local` or `Def` everywhere but the allocator leaf - so each is a
+  shadow of the same shape.  Next.
+* §8.170's items 2-4 (`impl_target_type`'s `_ =>` arm, struct-literal rung
+  5, `pin_scope_callee_combined`'s unmangled tail) are untouched.
+* The allocator leaf (§8.93) is the only bare intrinsic surface left, and
+  the only `Pending` callee the corpus reaches through a door; every other
+  intrinsic is behind `intrinsics::`.  D6's remaining step - the index's
+  bare-slot ownership for intrinsics, and the three declarations - waits on
+  that ruling.
+* `tests/tests/projects/const_cross_module` as a b1 corpus (handoff item 7):
+  with the const table's bare lane gone it enters no lane and turns no gate
+  red; it earns a corpus slot only as a REACHED corpus for the stamped fold,
+  which is a different claim from the one it was proposed for.  Not adopted.

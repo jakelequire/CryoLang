@@ -3,9 +3,11 @@
 ///! A guard is checked after the pattern matches; a false guard falls
 ///! through to the next arm. Covers: top-level binding guards with
 ///! fall-through, expression-match guards, enum-payload guards,
-///! OR-pattern guards, guards calling a method on the binding, and a
+///! OR-pattern guards, guards calling a method on the binding, a
 ///! plain top-level identifier binding (which also exercises the
-///! identifier-binding codegen path the guard work fixed).
+///! identifier-binding codegen path the guard work fixed), and a guard that
+///! reads a module constant and calls a free function - a guard is resolved
+///! in the arm's scope like the body, so both are in scope there.
 
 ![config(testing)]
 namespace CryoTests::Tests::Lang::PatternGuards;
@@ -18,6 +20,22 @@ import std::test::assert;
 import std::test::assert::{ expect_eq };
 
 type enum Opt : i32 { None; Some(i32); }
+
+const LIMIT: i32 = 5;
+
+function above_limit(n: i32) -> boolean { return n > LIMIT; }
+
+// A guard reads a module-level constant and calls a free function.  Neither
+// is a pattern binding, so they reach the guard only through the module's
+// own scope - the same scope the arm body sees.
+function module_names_in_guard(n: i32) -> i32 {
+    match (n) {
+        x if (x > LIMIT * 2)   => { return 2; }
+        x if (above_limit(x))  => { return 1; }
+        _                      => { return 0; }
+    }
+    return -1;
+}
 
 type struct Cell { v: i32; }
 implement Cell {
@@ -128,5 +146,13 @@ function guard_calls_method() -> Result<(), TestError> {
 function top_level_identifier_binding() -> Result<(), TestError> {
     match (expect_eq(bind_only(5), 50))   { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
     match (expect_eq(bind_only(7), 1007)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}
+
+![test]
+function guard_reads_module_constant_and_calls_function() -> Result<(), TestError> {
+    match (expect_eq(module_names_in_guard(11), 2)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(module_names_in_guard(7), 1))  { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(module_names_in_guard(3), 0))  { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
     return Result::Ok(());
 }

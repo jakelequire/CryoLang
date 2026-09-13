@@ -241,47 +241,6 @@ type struct CallResolver {
     }
 
 
-    /// Record which door supplied an unqualified callee's signature, and how
-    /// many distinct modules declare the leaf that door answered from.
-    ///
-    /// Read at every exit, not only the bare one: the bare slot's exposure is
-    /// the share of callees that reach it AND land on a leaf more than one
-    /// module claims, and neither half of that is legible without the other.
-    ///
-    /// Owner 0 is a global claim that names no module - extern "C" twins and
-    /// combined-name registrations - so it is skipped rather than counted as a
-    /// distinct declarer, which would report a collision for a leaf only one
-    /// module declares.
-    callee_door_probe(&this, door: string, leaf: SymbolStr,
-                      answered: boolean) -> void {
-        if (!resolve_counter::Audit::Path.enabled()) { return; }
-        if (this.ctx == null || this.ctx.decl_index == null) { return; }
-
-        mut ans: string = "miss";
-        if (answered) { ans = "hit"; }
-
-        mut names:    string = "";
-        mut distinct: i32    = 0;
-        const owners: u32[] =
-            this.ctx.decl_index.lookup_func_overload_owners(leaf);
-        for (mut i: i64 = 0; i < owners.length; i++) {
-            const o: u32 = owners[i];
-            if (o == 0) { continue; }
-            mut seen: boolean = false;
-            for (mut j: i64 = 0; j < i; j++) {
-                if (owners[j] == o) { seen = true; break; }
-            }
-            if (seen) { continue; }
-            distinct = distinct + 1;
-            if (names.length() > 0) { names = names + ","; }
-            names = names + this.intern.resolve(SymbolStr::from_id(o));
-        }
-        if (names.length() == 0) { names = "<none>"; }
-
-        resolve_counter::callee_door(door, this.intern.resolve(leaf), ans,
-                                    distinct, names);
-    }
-
     // -- Callee / payload-type lookups (for expected-type propagation) --
 
     lookup_callee_function_type(&this, callee: ExpressionNode*) -> TypeRef {
@@ -289,67 +248,34 @@ type struct CallResolver {
         const n: ASTNode* = callee as ASTNode*;
         if (n.kind == NodeKind::Identifier) {
             const ident: IdentifierNode* = callee as IdentifierNode*;
-            // A local binding (closure, fn-pointer, plain value) shadows any
-            // free function sharing its leaf name: hint from the local's own
-            // type when it is callable, never from the free-function index.
-            const local: TypeRef = this.scopes.lookup_local(ident.name);
-            if (local.is_valid()) {
-                const local_t: Type* = this.arena.lookup(local.id);
-                if (local_t != null && local_t.kind == TypeKind::Function) { return local; }
-                return TypeRef::invalid();
-            }
-            // Current module's own signature FIRST: the bare `func_type_refs`
-            // slot is single-slot last-write-wins across EVERY module that
-            // defines this leaf, and module registration order is not
-            // meaningful (it varies with host path/enumeration order).  An
-            // unqualified call in a defining module must take the module-local
-            // signature; a wrong same-leaf signature here poisons
-            // expected-type propagation into the arguments - a generic-enum
-            // literal arg (`classify(Option::Some(-3))`) then never
-            // instantiates and codegen drops its payload store entirely.
-            // Qualified with the module that WROTE the call, not the one the
-            // compiler is standing in.  A trait default's body and a
-            // specialized clone are both re-typed with the cursor parked on
-            // another module, so the cursor's qualifier names a function that
-            // module does not declare; the lookup then misses and drops
-            // through to the bare map this comment warns about.  The span's
-            // module is where an unqualified call's leaf is actually written,
-            // which is the only module whose local signature it can mean.
-            //
-            // The bare fallback below stays load-bearing: a call to an
-            // IMPORTED free function is qualified by neither module - its
-            // qualified name is the DECLARING one - and only the bare lookup
-            // can reach it.
             // The stamp is the writing scope's own answer for this callee and
-            // names ONE declaration, so it settles the question whenever it
-            // makes a claim.  The spelling-keyed lookups below cannot: the
-            // bare slot is last-write-wins across every module declaring the
-            // leaf, and an imported `sleep` reached that way takes whichever
-            // `sleep` registered last - a different signature entirely, which
-            // is then what expected-type propagation hands the arguments.
+            // names ONE binding.  A local (closure, fn-pointer, plain value)
+            // hints from its own type when that is callable; a definition
+            // hints from the signature registered under its canonical name.
+            // Anything else - a type, a type parameter, an unanswered slot -
+            // is no callee the index holds a signature for, and there is
+            // deliberately no spelling lookup beneath: the bare slot is
+            // last-write-wins across every module declaring the leaf, so an
+            // imported `sleep` reached by leaf took whichever `sleep`
+            // registered last - a different signature entirely, which was
+            // then what expected-type propagation handed the arguments.
             match (ident.res) {
                 ResSlot::Answered(r) => {
-                    const via_res: TypeRef = this.ctx.decl_index.func_type_of_res(r);
-                    if (via_res.is_valid()) {
-                        this.callee_door_probe("STAMP", ident.name, true);
-                        return via_res;
+                    match (r) {
+                        Res::Local(_) => {
+                            const local: TypeRef = this.scopes.lookup_local(ident.name);
+                            if (local.is_valid()) {
+                                const local_t: Type* = this.arena.lookup(local.id);
+                                if (local_t != null && local_t.kind == TypeKind::Function) { return local; }
+                            }
+                            return TypeRef::invalid();
+                        }
+                        Res::Def(_) => { return this.ctx.decl_index.func_type_of_res(r); }
+                        _           => { return TypeRef::invalid(); }
                     }
                 }
-                _ => { }
+                _ => { return TypeRef::invalid(); }
             }
-            // The stamp claimed nothing, so the written spelling is all there
-            // is: an imported free function is qualified by neither the calling
-            // module nor the compiler's own, and only the bare slot reaches it.
-            const q_sym: SymbolStr =
-                this.ctx.qualify_symbol_sym_home(ident.name, ident.span.file);
-            const qual: TypeRef = this.types.lookup_func_type_exact(q_sym);
-            if (qual.is_valid()) {
-                this.callee_door_probe("HOME", ident.name, true);
-                return qual;
-            }
-            const bare: TypeRef = this.types.lookup_func_type_exact(ident.name);
-            this.callee_door_probe("BARE", ident.name, bare.is_valid());
-            return bare;
         }
         if (n.kind == NodeKind::ScopeResolution) {
             const sr: ScopeResolutionNode* = callee as ScopeResolutionNode*;
@@ -1342,66 +1268,30 @@ type struct CallResolver {
 
     // -- Generic free-call inference (the keystone) --
 
-    /// The generic function template a bare call names, or null when that can't
-    /// be decided.
+    /// The generic function template a bare call names, or null.
     ///
-    /// Candidates are every registered template with a matching leaf name and
-    /// arity, which spans the WHOLE program - templates are registered
-    /// globally, not per importer. So two unrelated modules each defining a
-    /// generic `min` both land here for either one's callers, and preferring a
-    /// module-local definition only settles the case where the caller defines
-    /// one itself. The deciding question for everyone else is which definition
-    /// the caller's imports actually bring into scope; the name resolver's
-    /// scope chain already answers it. Without that tier a same-named generic
-    /// anywhere in the program makes every call to either one return null here,
-    /// which skips generic inference entirely and leaves the call typed at its
-    /// abstract return type (reported far away as `expected i32, found T`).
-    find_fn_template_for_call(&this, name: SymbolStr, argc: i64) -> TemplateEntry* {
-        const reg: GenericRegistry* = this.ctx.generic_registry;
-        if (reg == null) { return null; }
-        mut found: TemplateEntry* = null;
-        mut count: i64 = 0;
-        mut module_match: TemplateEntry* = null;
-        mut module_match_count: i64 = 0;
-        mut import_match: TemplateEntry* = null;
-        mut import_match_count: i64 = 0;
-        const cur_mod: string = this.current_module_name();
-        // Empty when the name isn't a function visible from this scope, in
-        // which case no candidate can claim an import match and the ladder
-        // falls through to its previous behaviour.
-        mut vis_mod: string = "";
-        const resolver: Resolver* = this.ctx.get_resolver();
-        if (resolver != null) {
-            const vis_sym: SymbolStr = resolver.resolve_function_source_module(name);
-            if (vis_sym.is_valid()) { vis_mod = this.intern.resolve(vis_sym); }
-        }
-        const total: i64 = reg.template_count();
-        for (mut i: i64 = 0; i < total; i++) {
-            const cand: TemplateEntry* = &reg.entries[i];
-            if (cand == null) { continue; }
-            if (cand.node_kind != NodeKind::FunctionDeclaration) { continue; }
-            if (!cand.name.equals(name)) { continue; }
-            const f: FunctionDeclNode* = cand.ast_node as FunctionDeclNode*;
-            if (f == null) { continue; }
-            if (f.parameters.length != argc) { continue; }
-            found = cand;
-            count = count + 1;
-            const cand_mod: string = this.intern.resolve(cand.module_name);
-            if (cand_mod.eq(cur_mod)) {
-                module_match = cand;
-                module_match_count = module_match_count + 1;
-            }
-            if (vis_mod != "" && cand_mod.eq(vis_mod)) {
-                import_match = cand;
-                import_match_count = import_match_count + 1;
-            }
-        }
-        if (count == 1) { return found; }
-        // A definition in the caller's own module wins over an imported one:
-        // that is ordinary shadowing, and it is what the previous ladder did.
-        if (module_match_count == 1) { return module_match; }
-        if (import_match_count == 1) { return import_match; }
-        return null;
+    /// ONE question, asked of the stamp: a `Def` names one declaration and the
+    /// registry is keyed by that canonical name (`lookup_scope_template`).  A
+    /// local is never a template, so a fn-pointer variable shadowing a
+    /// same-leaf generic global names none here - which is what lets the
+    /// local win the call.  There is no search by leaf beneath this: the
+    /// registry spans the whole program, and a leaf-and-arity scan picked
+    /// between same-named generics by the ambient cursor's module and then by
+    /// import visibility, both of which the stamp already accounts for.
+    ///
+    /// The arity still gates the answer.  A template whose parameter count
+    /// differs from the call's is not this call's template: generic inference
+    /// would otherwise proceed on a mismatched count and return a type, and
+    /// the arity diagnostic that the non-generic path reports would never run.
+    find_fn_template_for_call(&this, ident: IdentifierNode*, argc: i64) -> TemplateEntry* {
+        const t: TemplateEntry* = match (ident.res) {
+            ResSlot::Answered(r) => { this.lookup_scope_template(r) }
+            _                    => { null }
+        };
+        if (t == null || t.node_kind != NodeKind::FunctionDeclaration) { return null; }
+        const f: FunctionDeclNode* = t.ast_node as FunctionDeclNode*;
+        if (f == null || f.parameters.length != argc) { return null; }
+        return t;
     }
 
     /// A bare / negated / arithmetic-constant numeric literal is polymorphic for
@@ -1516,7 +1406,7 @@ type struct CallResolver {
     /// diagnostic fired.  `resolved_callee` is left unpinned (mono specializes).
     check_generic_free_call(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> TypeRef {
         if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return TypeRef::invalid(); }
-        const entry: TemplateEntry* = this.find_fn_template_for_call(ident.name, call.arguments.length);
+        const entry: TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length);
         if (entry == null) { return TypeRef::invalid(); }
         const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
         if (tmpl == null) { return TypeRef::invalid(); }
@@ -1657,7 +1547,7 @@ type struct CallResolver {
         if (callee_node.kind != NodeKind::Identifier) { return out; }
         const ident: IdentifierNode* = call.callee as IdentifierNode*;
         const entry: TemplateEntry* = this.find_fn_template_for_call(
-            ident.name, call.arguments.length);
+            ident, call.arguments.length);
         if (entry == null || entry.param_type_ids.length == 0) { return out; }
 
         mut bindings: TypeRef[] = [];
@@ -2551,7 +2441,7 @@ type struct CallResolver {
         if (call.resolved_callee.is_valid()) { return TypeRef::invalid(); }
         // GATED: a generic function template has no concrete spec pre-mono; leave
         // unpinned so mono specializes.
-        const gen_tmpl: TemplateEntry* = this.find_fn_template_for_call(ident.name, call.arguments.length);
+        const gen_tmpl: TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length);
         if (gen_tmpl != null && gen_tmpl.param_type_ids.length > 0) { return TypeRef::invalid(); }
 
         mut arg_types: TypeRef[] = [];
