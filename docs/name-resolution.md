@@ -50,7 +50,7 @@ current-state description is the defect it exists to remove.
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
 | D10 | A plural leaf is E0155, not a directory-order bind — and a leaf two children of one FACADE declare is the same defect reached by a qualified path, in a call as in an annotation | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **5** | §8.121, §8.144, §8.151 |
-| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); of the asserted rows, one whose only site was deleted went with it in §8.170 (`b1-baseline.txt` re-pinned on both hosts, 70 → 69 rows per arm) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1539** | §8.66, §8.80, §8.139 |
+| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); of the asserted rows, six whose only sites were deleted went with them (one in §8.170, five in §8.171; `b1-baseline.txt` re-pinned on both hosts each time, 70 → 65 rows per arm) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1505** | §8.66, §8.80, §8.139 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
 | D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **577** | §8.145, §8.146, §8.147, §8.148, §8.150 |
@@ -85,8 +85,11 @@ three, and its row carries the count. Read each zero off its own row.
 | M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane** | 3,760 | `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M2 resolve_module_qualified_sym calls/{print;exit}' tests/b1-baseline.txt` → **3760** | §8.120 |
 | M4 mono bare-name scan | **DELETED** — with the current-module key before it; a callee with no usable stamp names no template | — | `grep -c 'M4Calls' compiler/src/compiler/resolve_counter.cryo` → **0** | §8.33, §8.120, §8.157 |
 | M5 import suffix fallback | **DELETED** — an import path names a module by its registered name or binds nothing | — | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **0** | §8.120, §8.157 |
-| const-table bare leaf | STARVED | 0 calls / 0 hits | same file, `const-table bare leaf` | §8.9, §8.111 |
-| `spelling_type` new-expr / call-ident | NOT ENTERED | 0 calls | same file, `spelling_type new expr: calls` | §8.25, §8.98 |
+| const-table bare leaf (`by_bare`, `bare_index_of`, the same-leaf chain folder) | **DELETED** — a bare constant is read off `IdentifierNode.res`; shadow 0 over six halves, the lane reached 4/4 in `const_cross_module` under the same build, and a same-leaf constant in an unimported module - which the chain folder REFUSED - now folds to the imported one | — | `grep -c 'by_bare' compiler/src/compiler/const_table.cryo` → **0** | §8.9, §8.111, §8.171 |
+| `spelling_type` call-ident fallback (E0202 tail) and `new`'s `resolve_primitive` step | **DELETED** — shadow 0 over six halves; their three rows retired | — | `grep -c 'SpellTyIdFb' compiler/src/compiler/resolve_counter.cryo` → **0** | §8.25, §8.98, §8.171 |
+| `new`'s spelling step (`lookup_type_exact(new_expr.type_name)`) | LIVE — for an ALIAS KEYWORD only (`new int[100]`): `int`/`uint`/`float`/`double` are not primitive spellings because a module may carry the name, so the stamp is Pending and the alias registration is the only key. **The pinned `spelling_type new expr: calls` row is 0 because no pinned b1 corpus contains a `new` expression** — a corpus fact, not a lane fact; `tests/lang/new_array.cryo` reaches it twice. Goes with the keyword ruling (§8.165) | 0 calls on every pinned arm | same file, `spelling_type new expr: calls` | §8.25, §8.98, §8.171 |
+| bound-directed trait filter by LEAF (`select_method`, `find_spec_impl_method`) | **DELETED** — `MemberAccessNode.resolved_trait` is the trait's identity and every reader compares it to `origin_trait` / `qualified_trait_name`; shadow 440 → 0 (the async-lowered `Future` impl was the one unstamped head); `trait_leaf_dispatch` exits 12 where a leaf comparison exits 11 | — | `grep -rho 'leaf_segment' compiler/src/compiler/sema/call_resolver.cryo \| wc -l` → **0** | §8.171 |
+| scope-qualifier spelling ladder (`lookup_type_exact(scope.scope_name)` beneath `scope_qualifier_type`: `u8::MAX`, the variant payload, the static visibility gate, the static argument check's rung 3) | **DELETED** — `scope_qualifier_type` answers `PrimTy` and a clone's `spec_owner`; the steps measured 0, 34 wrong answers (`float` the MODULE as `f32`), and 27 clone segments now carried by `spec_owner` | — | `grep -rho 'lookup_type_exact(scope.scope_name)' compiler/src/compiler/sema \| wc -l` → **0** | §8.171 |
 | `lookup_by_leaf` | **DELETED** | — | `grep -rho 'lookup_by_leaf(' compiler/src \| wc -l` → **0** | §8.121 |
 | `lookup_scope_template_derived` | **DELETED** | — | `grep -rho 'lookup_scope_template_derived' compiler/src \| wc -l` → **0** | §8.36 |
 | `set_module_with_scope` | **DELETED** | — | `grep -rho 'set_module_with_scope' compiler/src \| wc -l` → **0** | §8.70, §8.78 |
@@ -123,7 +126,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,113 unit + 47 project + 179 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
+| `make test` | 2,113 unit + 48 project + 179 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make b1-check` | B1 total + every per-row bound, 3 corpora × 2 hosts | **2 of the 3 corpora are `examples/`**; the third is `tests/tests/projects/ffi_c_import`. The compiler's own source is NOT a corpus, and `tests/` at large is swept by none of them. |
 | `make lane-check` | 7 buckets of call sites in `compiler/src`, as a golden | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
@@ -148,7 +151,7 @@ Checks for this section, one per line so each can be copied whole:
 
 * `grep -c '^\[' tests/lane-baseline.txt` → **7**
 * `grep -c '^\[host:' tests/b1-baseline.txt` → **6**
-* `grep -c '^project ' tests/test-roster.txt` → **47**
+* `grep -c '^project ' tests/test-roster.txt` → **48**
 * `grep -c '^negative ' tests/test-roster.txt` → **179**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -n 'branches:' .github/workflows/ci.yml` → `main` only, both hooks
@@ -22593,3 +22596,185 @@ Traps this session, beyond the addendum's: the Bash tool's heredoc collapses
 an escape; `--reuse-message=HEAD` after a refused commit reuses the
 PREVIOUS commit's message; a `sed` with `\n` in the pattern silently matches
 nothing; the corpus has SIX halves, not four.
+
+
+### 8.171 Consumers 22-24: the trait filter keyed on identity, the scope qualifier's spelling ladder, and the const table's bare leaf - 2026-09-12
+
+Three consumers, each shadowed over the six halves, controlled, and deleted
+in one commit. `selfhost-check` ran first, both arms, at `c328250f`: `FIXED
+POINT OK` twice, after several sessions without it.
+
+#### Consumer 22: `select_method`'s bound-directed trait filter
+
+Three `leaf_segment` comparisons in `call_resolver` (all added in `fd10049d`,
+none at the switch) decided which trait's method a bound-directed call
+(`x.render()` under `where T: Omega::Render`) prefers: the stamp on the
+`MemberAccessNode` was the trait's LEAF as written, compared against a
+method's `origin_trait` by leaf and against the impl table's leaf key.  Two
+traits sharing a leaf, both implemented for one receiver, are then one
+trait: whichever registered first answers for both bounds.  Reproduced
+before touching anything - `tests/tests/projects/trait_leaf_dispatch`,
+`Alpha::Render` renders 1, `Omega::Render` renders 2, `main` returns
+`alpha * 10 + omega`: **11** at `c328250f`, 12 expected.
+
+`resolved_trait` now carries the trait's IDENTITY - the canonical name
+`origin_trait` and an impl head's `qualified_trait_name` already carry - and
+every writer and reader is keyed on it:
+
+* the operator desugar stamps the identity of what the leaf FOUND: the
+  bound's `TraitType.qualified_name` (`trait_ref_matching`, replacing the
+  boolean `trait_ref_matches`) or the impl block's stamped head.  The
+  operator table still names its trait by leaf - that is the key the
+  trait-impl tables are indexed under, a ruling recorded in §8.2an - but
+  what the desugared call is stamped with is no longer the table's key;
+* the mono annotator's rule 1 reads `TraitRef::identity()` instead of
+  `path[last]`, rule 2 reads `ib.qualified_trait_name` instead of the head
+  annotation's leaf; its `trait_leaf_of_ann` was never reading a trait at
+  its one remaining site (a parameter's generic-param head) and is renamed
+  `param_head_of_ann`;
+* `select_method` compares `origin_trait` exactly, and the impl scan asks
+  the block it found which trait it provides (`qualified_trait_name`)
+  rather than re-deriving that from the table's leaf key;
+* `call_specializer`'s three `find_spec_impl_method` sites compare the
+  head's identity (`impl_provides_trait`); its `trait_leaf_of_ann` is
+  deleted.
+
+Shadowed - leaf-equality against identity-equality at every reader, one
+line per disagreement with both traits and the span: **440 lines, ONE
+shape**.  The async lowering synthesizes the `Future` impl for every
+`async fn` with `origin_trait = "Future"` - the bare leaf - and never sets
+the block's `qualified_trait_name`, so a call stamped with the bound's
+identity (`std::future::traits::Future`, every `poll` inside a combinator)
+matched by leaf and not by identity.  The synthesizer had the identity in
+hand (`wellknown("Future")`) and its own comment claimed the head "refers
+to the same declaration a written one would"; it now stamps both.  That
+broke the build of every generic `async` method's `?`: `async_poll_output_of`
+in sema identified a lowered `poll` by `origin_trait.equals("Future")` - a
+by-leaf check that only ever matched because the synthesizer wrote the
+leaf - and `stdlib/io/traits.cryo`'s `async send<T>` was refused with
+E0235.  Keyed on the same identity.  Re-shadowed: **0 over six halves**,
+and the reproducer exits 12.  The instrument's positive control is the
+reproducer itself: the line it printed under the shadow build is exactly
+the conflated call (`want=Omega::Render origin=Alpha::Render`).
+
+The consequence in the objects: the synthesized `poll`'s mangled symbol
+was `C$tr$6Future$...` and is now `C$tr$3std.6future.6traits.6Future$...`,
+which is what a WRITTEN `implement trait Future` already mangled to.  The
+object comparison against `c328250f` moved **30 of 1,126** objects in
+`examples/` and **77 of 2,182** in `tests/`.  Checked, not counted: the
+unit suite's IR under both compilers differs in **53 modules, and all 53
+are byte-identical after that one substring rename** - including
+`std/collections/str.ll` and `std/alloc/allocator.ll`, which hold no async
+code of their own and moved because a generic future
+(`MockSink$send$Future_8<Str>`) is emitted into the module of its type
+argument.  The same over `examples/11-http-server`, which holds all 30
+example objects: 4 modules, 4 renames.  The project objects are the same
+two stdlib modules (`std/process/command`, `child`) compiled once per
+project, the three `async_main*` mains, and `trait_leaf_dispatch`'s own
+main, which binds differently by construction.
+
+#### Consumer 23: the scope qualifier's spelling ladder, and the `PrimTy` arm
+
+`scope_qualifier_type` declined for `ResBase::PrimTy`, so every caller kept
+a spelling lookup beneath it (`u8::MAX`, `new int[100]`, a written
+`Type::static()`'s visibility gate, a variant's payload types, the static
+argument check's third rung, the E0202 tail).  The arm is added - a
+primitive's spelling IS its registration key, as `impl_target_type`
+already read it - and `spelling_type_answered` reads `Res::PrimTy` the
+same way for the `new` / struct-literal / call-identifier slots.  Every
+spelling step beneath was shadowed: a line whenever it answered, with the
+stamp's answer beside it.
+
+* `resolve_scope_resolution` (`u8::MAX`), the static argument check's
+  rung 3, the E0202 tail's `lookup_type_exact(ident.name)`, and `new`'s
+  `resolve_primitive` step: **0 over six halves** - deleted, with the
+  three counter rows that had only those sites (`new expr: answered by
+  resolve_primitive`, `spelling_type call ident: fallback found / empty`).
+* the variant-payload step: **34 lines, all `float` stamped `Def`** - the
+  MODULE `std::fmt::float`, which owns no variant, answered as the
+  primitive `f32` through the alias-keyword registration.  A wrong answer
+  that was harmless only because `f32` has no variants.  Deleted.
+* the written-qualifier path of `enforce_static_method_visibility` and
+  the variant-payload step: **27 lines stamped `TypeRelative(GenericParam)`**
+  with a written qualifier of `i64`, `boolean`, `Str`, `Probe` - a
+  monomorphized CLONE.  The substituter rewrites `T::default()` to
+  `i32::default()` by spelling and the stamp beside it is the template's,
+  exactly §8.170's `spec_owner` shape over again.  The substituter now
+  records the substituted type's arena id in `spec_owner` for the
+  parameter case as it did for the self-reference collapse, and
+  `scope_qualifier_type` reads it for a `GenericParam` base through the
+  registered name.  Re-measured: **0**.  Both spelling steps deleted; the
+  three callers that pass an already-resolved owner keep their exact
+  lookup, which is keyed by identity.
+* `new`'s step 2 (`lookup_type_exact(new_expr.type_name)`): **2 lines,
+  `int` stamped Pending** - `tests/lang/new_array.cryo:22`.  `int` is an
+  alias keyword, not a primitive spelling: `is_primitive_spelling`
+  excludes `int`/`uint`/`float`/`double` because a module may carry the
+  name, so `type_spelling_res` leaves the slot unanswered and the index's
+  forward-only alias registration is the only key that reaches it.  KEPT,
+  and its comment now says so; it goes with the queued keyword ruling
+  (§8.165), under which the aliases stop being a lexer case.  The handoff's
+  "the stamp answers `PrimTy` for `new int[100]`" was a hypothesis; the
+  measurement says Pending.
+
+`SCOPE-QUAL-NOTDEF` now fires for a `GenericParam` base only when no
+`spec_owner` is beside it - a template body walked symbolically.
+
+#### Consumer 24: the const table's bare leaf
+
+`const_table.cryo`'s own header named its retirement condition - a stamped
+bare identifier - and `IdentifierNode.res` has been written by
+NameResolution since §8.167.  `fold_named` / `fold_named_real` now take
+the node and read the stamp: a `Def` is the constant's canonical name, the
+key the table is built under; a local, a type parameter, a type or an
+unanswered slot names no module-level constant.  Shadowed against
+`bare_index_of` (the use site's qualified probe, then the program-wide
+leaf map): **0 disagreements over six halves**.  Two controls on that
+zero, because a zero over an unreached lane is nothing: the lane's own
+counter reached **4 calls / 4 hits** in `const_cross_module` under the
+same build with no line printed, and a scratch program with `const N` in
+an imported module and a same-leaf `const N` in an unimported one printed
+`stamped=0 bare=1` at once - and exits with the imported value, where the
+old `fold_chain` would have folded both, found 3 and 7 disagreeing, and
+refused a legal program.
+
+Deleted: `by_bare`, `next_same_bare`, `bare_index_of`, `fold_chain` /
+`fold_chain_real`, `ConstEval.module_ns` and `in_module` (a bare name no
+longer means anything relative to a module), `ConstEntry.module_ns`,
+`register`'s leaf and module parameters, codegen's `const_eval_at(file)`
+(now `const_eval()`), and the two B1 rows `const-table bare leaf calls /
+hits` with their `CONST-BARE-LEAF` line.  `resolve_counter.cryo` 1539 →
+1505 (D11); three string literals in it that an earlier session's heredoc
+had collapsed into real newlines (byte-identical output, which is why
+nobody saw) are restored, and two section headers whose rows were already
+gone go with them.
+
+#### Objects, gates
+
+`c328250f` vs this tree: 30 of 1,126 in `examples/`, 77 of 2,182 in
+`tests/` - all the `Future` rename above and nothing else (53 + 4 modules
+of IR checked byte-for-byte).  Suite green, **45 projects** (44 + the new
+one; the roster golden merged).  LSP builds directly.  Lane golden
+re-pinned: `LOOKUP_OTHER` +1 in `type_utils` is `lookup_type_name(spec_owner)`,
+a TypeRef-keyed identity read, the one `scope_owner_key` already makes;
+`DEFID_UNWRAP` +1 in `const_table` is the key extraction for a table keyed
+by the canonical name's interned id, beside the three that already were.
+`b1-baseline` re-pinned on both hosts: the five retired rows `GONE`, every
+other row reproduced, B1 0 → 0 on all six arms.
+
+**Tally: 25 shadowed, 25 at zero, 25 old paths deleted, 17 artifacts gone**
+(+ the const table's bare-leaf lane with its chain folder; the scope
+qualifier's spelling ladder - five steps, the alias-keyword `new` step
+held).
+
+#### What this leaves
+
+* `new`'s alias-keyword step and the keyword ruling (§8.165) - Jake's.
+* The trait-impl tables stay keyed `(leaf, target)` by the §8.2an ruling;
+  two same-leaf traits on one receiver register into ONE slot there
+  (latest wins).  The identity filter above reaches the right method for
+  a declared type because its blocks are folded into its method set; a
+  PRIMITIVE receiver with two same-leaf traits would still see one block.
+  Not reached by any corpus; recorded, not fixed.
+* Items 6 and 7 of §8.170's list are untouched: the callee door ladder
+  (`call_resolver:342-352`) and the three further shadow candidates.

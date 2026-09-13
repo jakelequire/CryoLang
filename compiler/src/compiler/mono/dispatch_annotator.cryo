@@ -94,11 +94,13 @@ type struct MonoDispatchAnnotator {
                 }
                 NodeKind::ImplementationBlock => {
                     const ib: ImplBlockNode* = stmt as ImplBlockNode*;
-                    mut trait_leaf: SymbolStr = SymbolStr::empty();
-                    if (ib.is_trait_impl()) {
-                        trait_leaf = this.trait_leaf_of_ann(ib.trait_annotation);
-                    }
-                    this.annotate_dispatch_in_methods(ib.methods, ib.where_bounds, trait_leaf);
+                    // The trait's identity as the head was stamped, not the
+                    // annotation's leaf: the stamp on the call is compared
+                    // against a method's `origin_trait`, which is this same
+                    // canonical name.
+                    mut trait_id: SymbolStr = SymbolStr::empty();
+                    if (ib.is_trait_impl()) { trait_id = ib.qualified_trait_name; }
+                    this.annotate_dispatch_in_methods(ib.methods, ib.where_bounds, trait_id);
                 }
                 _ => {}
             }
@@ -107,7 +109,7 @@ type struct MonoDispatchAnnotator {
 
     annotate_dispatch_in_methods(mut &this, methods: &MethodNode*[],
                                  impl_bounds: &TraitBound[],
-                                 trait_leaf: SymbolStr) -> void {
+                                 trait_id: SymbolStr) -> void {
         for (mut k: i64 = 0; k < methods.length; k++) {
             const m: MethodNode* = methods[k];
             if (m == null || m.func == null) { continue; }
@@ -120,7 +122,7 @@ type struct MonoDispatchAnnotator {
             for (mut b: i64 = 0; b < m.func.trait_bounds.length; b++) {
                 bounds.push(m.func.trait_bounds[b].clone());
             }
-            this.annotate_dispatch_in_func(m.func, bounds, trait_leaf);
+            this.annotate_dispatch_in_func(m.func, bounds, trait_id);
         }
     }
 
@@ -146,7 +148,7 @@ type struct MonoDispatchAnnotator {
                 const param: VarDeclNode* = func.parameters[p];
                 if (param == null) { continue; }
                 if (!param.name.equals(id.name)) { continue; }
-                const head: SymbolStr = this.trait_leaf_of_ann(param.type_annotation);
+                const head: SymbolStr = this.param_head_of_ann(param.type_annotation);
                 if (head.is_valid()) {
                     const tr: SymbolStr = this.single_bound_trait_for(head, bounds);
                     if (tr.is_valid()) {
@@ -163,9 +165,11 @@ type struct MonoDispatchAnnotator {
         }
     }
 
-    /// Return the single trait bounding `param_name`, or empty when the param
-    /// has zero or more-than-one bound trait (ambiguous - leave the dispatch to
-    /// its default).
+    /// Return the identity of the single trait bounding `param_name`, or
+    /// empty when the param has zero or more-than-one bound trait (ambiguous -
+    /// leave the dispatch to its default).  The bound's stamped identity, not
+    /// its written leaf: two traits may share a leaf, and the stamp on the
+    /// call is compared against a method's `origin_trait`.
     single_bound_trait_for(&this, param_name: SymbolStr,
                            bounds: &TraitBound[]) -> SymbolStr {
         mut found: SymbolStr = SymbolStr::empty();
@@ -176,7 +180,7 @@ type struct MonoDispatchAnnotator {
             for (mut j: i64 = 0; j < b.trait_refs.length; j++) {
                 const tr: TraitRef* = &b.trait_refs[j];
                 if (tr.path.length == 0) { continue; }
-                found = tr.path[tr.path.length - 1];
+                found = tr.identity();
                 count += 1;
             }
         }
@@ -347,16 +351,16 @@ type struct MonoDispatchAnnotator {
         }
     }
 
-    /// Recursively unwrap an annotation to its leaf `Named` symbol (the head
-    /// type-name).  Used both for the trait of a trait-impl annotation and for a
-    /// parameter's generic-param head.
-    trait_leaf_of_ann(&this, ann: TypeAnnotation*) -> SymbolStr {
+    /// Recursively unwrap a parameter's annotation to its `Named` head - the
+    /// generic parameter a `&T` / `T*` / `Box<T>` is written over - which is
+    /// the name a `where` bound is keyed by.
+    param_head_of_ann(&this, ann: TypeAnnotation*) -> SymbolStr {
         if (ann == null) { return SymbolStr::empty(); }
         return match (*ann) {
             TypeAnnotation::Named(na)     => { na.name }
-            TypeAnnotation::Generic(ga)   => { this.trait_leaf_of_ann(ga.base) }
-            TypeAnnotation::Reference(ra) => { this.trait_leaf_of_ann(ra.inner) }
-            TypeAnnotation::Pointer(pa)   => { this.trait_leaf_of_ann(pa.inner) }
+            TypeAnnotation::Generic(ga)   => { this.param_head_of_ann(ga.base) }
+            TypeAnnotation::Reference(ra) => { this.param_head_of_ann(ra.inner) }
+            TypeAnnotation::Pointer(pa)   => { this.param_head_of_ann(pa.inner) }
             _                             => { SymbolStr::empty() }
         };
     }

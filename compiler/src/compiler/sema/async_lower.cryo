@@ -6707,10 +6707,18 @@ type struct AsyncLower {
             poll_fn: null, poll_method: null,
         };
 
+        // The declaration the language means by `Future`.  The impl's dispatch
+        // key is the LEAF (the trait-impl tables are `(leaf, target)` indices),
+        // but which trait the impl provides - what a bound-directed call's
+        // stamp and the mangler read - is the IDENTITY, the same canonical
+        // name a written `implement trait Future` is stamped with.
+        const future_leaf: SymbolStr = this.intern.intern("Future");
+        const future_id: SymbolStr = this.ctx.generic_registry.wellknown(future_leaf);
+
         // `poll`'s signature, whose body `lower` supplies.
         mut poll_fn: FunctionDeclNode* = new FunctionDeclNode(this.intern.intern("poll"), span);
         poll_fn.set_resolved_return_type(poll_out);
-        poll_fn.set_origin_trait(this.intern.intern("Future"));
+        poll_fn.set_origin_trait(future_id);
         // The body is built in `lower`, long after name resolution: its shadow
         // bindings are absent from the resolution map, so the unused-local lint
         // would report every one of them against the async function's own span.
@@ -6755,22 +6763,16 @@ type struct AsyncLower {
             st.add_method(minfo);
         }
 
-        // The declaration the language means by `Future`, so the synthesized
-        // impl lands under the same key a written `implement trait Future` does,
-        // and its head refers to the same declaration a written one would.
-        const future_leaf: SymbolStr = this.intern.intern("Future");
-
-        // `implement trait Future<Output> for struct <Q>`
+        // `implement trait Future<Output> for struct <Q>`, its head stamped
+        // with the declaration a written one's would resolve to.
         mut impl_node: ImplBlockNode* = new ImplBlockNode(q_name, span);
         mut gen: GenericAnnotation* = new GenericAnnotation {
-            base: this.named_ann_def(
-                future_leaf,
-                DefId::of_definition(
-                    this.ctx.generic_registry.wellknown(future_leaf)), span),
+            base: this.named_ann_def(future_leaf, DefId::of_definition(future_id), span),
             args: [this.output_type_ann(&d, span)],
             span: span,
         };
         impl_node.set_trait_annotation(new TypeAnnotation::Generic(gen));
+        impl_node.qualified_trait_name = future_id;
         impl_node.add_assoc_binding(this.intern.intern("Output"), this.output_type_ann(&d, span));
         impl_node.add_method(poll_method);
         if (generic) {

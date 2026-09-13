@@ -112,6 +112,12 @@ type struct TypeUtils {
     /// a registration defect a spelling lookup would paper over.  The returned
     /// value is unchanged; only the counters are new.
     spelling_type_answered(&this, r: Res, nodef_site: resolve_counter::Site) -> TypeRef {
+        // A written primitive names no declaration; its spelling is its
+        // registration key, read the way an impl head's `PrimTy` is.
+        match (r) {
+            Res::PrimTy(n) => { return this.lookup_type_exact(n); }
+            _              => { }
+        }
         const q: DefId = r.def_id();
         if (!q.is_valid()) {
             resolve_counter::Site::SpellTyNoDef.bump();
@@ -240,10 +246,15 @@ type struct TypeUtils {
     /// type still resolved, and it would answer just as readily with a
     /// same-leaf type from a module the writer cannot see.
     ///
+    /// A written primitive (`u8::MAX`) is answered as `PrimTy`: it names no
+    /// declaration, because a primitive owns members without being declared
+    /// anywhere, and its spelling is the key the index registers it under -
+    /// so the answer is read the way an impl head's is.
+    ///
     /// Invalid for every other answer.  A qualifier naming a MODULE is not a
-    /// type claim, and a base that is a primitive or a type parameter names no
-    /// declaration to look up; manufacturing a type for any of them here would
-    /// assert an ownership the stamp does not make.
+    /// type claim, and a type parameter names no declaration to look up;
+    /// manufacturing a type for either here would assert an ownership the
+    /// stamp does not make.
     scope_qualifier_type(&this, scope: ScopeResolutionNode*, site: string) -> TypeRef {
         // Named at the event: the delayed tally says HOW MANY nodes arrived
         // unclaimed, only a per-node line says WHICH.
@@ -265,8 +276,27 @@ type struct TypeUtils {
         }
         mut q: SymbolStr = SymbolStr::empty();
         match (base) {
-            ResBase::Def(d) => { q = d.qualified_name(); }
-            _               => {
+            ResBase::Def(d)    => { q = d.qualified_name(); }
+            ResBase::PrimTy(n) => { q = n; }
+            ResBase::GenericParam(_) => {
+                // A clone's segment: the substituter rewrote `T::default()`
+                // to `i32::default()` and recorded the type it rewrote it
+                // to, while the stamp still describes the template.  Read
+                // through the registered name, so the answer is what the
+                // index holds under it.  A template body walked before any
+                // substitution carries no id, and a parameter names no
+                // declaration to look up.
+                if (scope.spec_owner.is_valid()) {
+                    q = this.ctx.decl_index.lookup_type_name(scope.spec_owner);
+                }
+                if (!q.is_valid()) {
+                    resolve_counter::path_hit(
+                        "SCOPE-QUAL-NOTDEF", site + " " + base.to_string(),
+                        this.intern.resolve(scope.scope_name), scope.span.to_string());
+                    return TypeRef::invalid();
+                }
+            }
+            _                  => {
                 resolve_counter::path_hit(
                     "SCOPE-QUAL-NOTDEF", site + " " + base.to_string(),
                     this.intern.resolve(scope.scope_name), scope.span.to_string());

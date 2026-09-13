@@ -571,14 +571,11 @@ type struct CallResolver {
     /// template's variants are empty.
     lookup_scope_variant_payload_types(&this, scope: ScopeResolutionNode*) -> TypeRef[] {
         // The enum this variant belongs to is what the qualifier names, and the
-        // node already carries the name layer's answer for that segment.  The
-        // spelling lookup below still serves every stamp that makes no type
-        // claim, so it answers a different question rather than retrying this
-        // one.
+        // node already carries the name layer's answer for that segment.  A
+        // stamp that makes no type claim names a module, which owns no
+        // variant; matching its spelling against the index answered the
+        // primitive `f32` for the module `float`.
         mut type_ref: TypeRef = this.types.scope_qualifier_type(scope, "call_resolver/lookup_scope_variant_payload_types");
-        if (!type_ref.is_valid()) {
-            type_ref = this.types.lookup_type_exact(scope.scope_name);
-        }
         // The variant's owner is the instantiation the node's own pair names.
         // Invalid where the qualifier's stamp makes no type claim, which leaves
         // whatever the lookups above found rather than retrying them.
@@ -2909,18 +2906,18 @@ type struct CallResolver {
     enforce_static_method_visibility(mut &this, scope: ScopeResolutionNode*, scope_sym: SymbolStr,
                                      member_sym: SymbolStr, span: SourceSpan) -> void {
         if (this.state.in_symbolic_check) { return; }
-        // The qualifier's stamp answers for the path as WRITTEN.  Three of this
-        // function's callers pass a name they have already resolved - a
-        // canonical owner, a specialization, a DI key - and for those the stamp
-        // names the generic template rather than the type that call is about,
-        // so it is consulted only where the symbol IS the written qualifier.
-        // The lookup below then serves every other caller, and every stamp that
-        // makes no type claim, rather than retrying a question already answered.
+        // The qualifier's stamp answers for the path as WRITTEN, a clone's
+        // substituted segment through the id the substituter left beside it.
+        // Three of this function's callers pass a name they have already
+        // resolved - a canonical owner, a specialization, a DI key - and for
+        // those the stamp names the generic template rather than the type that
+        // call is about, so the name is what the index is asked for.  A
+        // written qualifier the stamp makes no type claim for names a module,
+        // which owns no method to gate.
         mut owner: TypeRef = TypeRef::invalid();
         if (scope != null && scope_sym.id == scope.scope_name.id) {
             owner = this.types.scope_qualifier_type(scope, "call_resolver/enforce_static_method_visibility");
-        }
-        if (!owner.is_valid()) {
+        } else {
             owner = this.types.lookup_type_exact(scope_sym);
         }
         if (!owner.is_valid()) { return; }
@@ -3040,22 +3037,11 @@ type struct CallResolver {
             return func_ret;
         }
         // The name layer's own answer for this identifier, which is a canonical
-        // name and so names one declaration.
-        //
-        // The lookup below is reached only by an identifier whose slot no
-        // resolver answered, and across every corpus this tree compiles it has
-        // answered exactly nothing: one call reached it, and it found no type.
-        // Kept because the site is too rarely reached to certify either way,
-        // NOT because a population for it has been shown.
+        // name and so names one declaration; a slot it did not answer names
+        // nothing the index holds a type for.
         resolve_counter::Site::SpellTyIdCalls.bump();
         const stamped_ty: TypeRef = this.types.spelling_type(ident.res, resolve_counter::Site::SpellTyIdNoDef);
         if (stamped_ty.is_valid()) { return stamped_ty; }
-        const type_ref: TypeRef = this.types.lookup_type_exact(ident.name);
-        if (type_ref.is_valid()) {
-            resolve_counter::Site::SpellTyIdFbHit.bump();
-            return type_ref;
-        }
-        resolve_counter::Site::SpellTyIdFbMiss.bump();
 
         const name: string = this.intern.resolve(ident.name);
         mut diag: Diagnostic = Diagnostic::error(
@@ -3203,9 +3189,11 @@ type struct CallResolver {
         // and a receiver, so nothing but the stamp can tell them apart.  It
         // is a ranking, not a restriction - `x.drop()` inside `Drop::drop`
         // is stamped `Drop` and binds an inherent `drop` when that is what
-        // the receiver has.  Compared by leaf: the stamp is the trait as
-        // written, a method's `origin_trait` its qualified name.
-        const want_trait: SymbolStr = OwnershipQuery::leaf_segment(this.intern, member.resolved_trait);
+        // the receiver has.  Compared by identity: the stamp is the trait's
+        // canonical name, and so is a method's `origin_trait` and an impl
+        // head's `qualified_trait_name`.  Two traits can share a leaf, and
+        // a leaf comparison binds whichever of them registered first.
+        const want_trait: SymbolStr = member.resolved_trait;
         if (want_trait.is_valid()) {
             if (this.select_method(visitor, call, member, base_t, start_cls, methods_ref,
                     owner_str, &arg_types, want_trait)) { return; }
@@ -3272,20 +3260,22 @@ type struct CallResolver {
         // Trait impls on the receiver, in registration order.
         const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(owner_sym);
         for (mut ti: i64 = 0; ti < traits.length; ti++) {
-            if (only_trait.is_valid()
-                    && !OwnershipQuery::leaf_segment(this.intern, traits[ti]).equals(only_trait)) { continue; }
             const block: ImplBlockNode* = this.ctx.generic_registry.lookup_trait_impl(traits[ti], owner_sym);
             if (block == null) { continue; }
+            // The table is keyed by the trait's leaf; WHICH trait the block
+            // provides is the head's stamped identity.
+            if (only_trait.is_valid() && !block.qualified_trait_name.equals(only_trait)) { continue; }
             if (this.bind_on_impl_block(visitor, call, member, block, owner_str, arg_types)) { return true; }
         }
         return false;
     }
 
-    /// Whether `mn` is the named trait's method (by leaf), i.e. sits in an
-    /// `implement trait T for ..` block for `T`.
-    method_provided_by(&this, mn: MethodNode*, trait_leaf: SymbolStr) -> boolean {
+    /// Whether `mn` is the named trait's method, i.e. sits in an
+    /// `implement trait T for ..` block for `T` - by identity: `trait_id` and
+    /// `origin_trait` are both the trait's canonical name.
+    method_provided_by(&this, mn: MethodNode*, trait_id: SymbolStr) -> boolean {
         if (mn == null || mn.func == null || !mn.func.origin_trait.is_valid()) { return false; }
-        return OwnershipQuery::leaf_segment(this.intern, mn.func.origin_trait).equals(trait_leaf);
+        return mn.func.origin_trait.equals(trait_id);
     }
 
     /// Select among one impl block's methods, every tier in turn.  Returns
@@ -5672,18 +5662,14 @@ type struct CallResolver {
     /// single static signature of the call's arity is found.
     check_static_scope_method_args(mut &this, visitor: ASTVisitor*, lookup_sym: SymbolStr,
                                    scope: ScopeResolutionNode*, call: CallExprNode*) -> void {
-        // The pair first, for the same reason as the sibling site above.  The
-        // spelling lookups below still serve every stamp that makes no type
-        // claim, so they answer a different question rather than retrying this
-        // one.
+        // The pair first, for the same reason as the sibling site above; then
+        // the owner key the caller resolved, which names the type by identity
+        // (a specialization, a DI key) where the written qualifier does not.
         mut type_ref: TypeRef = this.resolve_generic_scope_type(
             this.types.scope_qualifier_type(scope, "call_resolver/resolve_generic_scope_name_pair"), scope.scope_generic_args,
             scope.span);
         if (!type_ref.is_valid()) {
             type_ref = this.types.lookup_type_exact(lookup_sym);
-        }
-        if (!type_ref.is_valid() && !lookup_sym.equals(scope.scope_name)) {
-            type_ref = this.types.lookup_type_exact(scope.scope_name);
         }
         if (!type_ref.is_valid()) { return; }
         mut t: Type* = this.arena.lookup(type_ref.id);
