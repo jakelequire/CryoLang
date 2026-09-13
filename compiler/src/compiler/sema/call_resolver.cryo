@@ -123,18 +123,6 @@ const PF_STRING:  i64 = 3;   // %s  (a C `string`)
 const PF_POINTER: i64 = 4;   // %p
 const PF_STRUCT:  i64 = 5;   // an aggregate argument - never valid for C printf
 
-/// Scope class of a bare-call overload candidate relative to the use site,
-/// nearest first: `Imported` (the current module or an explicit import),
-/// `Prelude` (auto-in-scope via std::prelude, incl. declared intrinsics),
-/// `Global` (un-namespaced legacy claims), `Hidden` (a module the use site
-/// never imported - must not capture a bare call).
-type enum BareCandidateScope {
-    Imported;
-    Prelude;
-    Global;
-    Hidden;
-}
-
 type struct CallResolver {
     arena:    TypeArena*;
     intern:   InternTable*;
@@ -238,6 +226,65 @@ type struct CallResolver {
         resolve_counter::Site::FnBindUseSyntax.bump();
         if (syn.id != cursor.id) { resolve_counter::Site::FnBindUseDiff.bump(); }
         return syn;
+    }
+
+    /// The overload FAMILY a bare callee names: the canonical name under which
+    /// every signature of that declaration is registered, or empty when the
+    /// callee names no family.
+    ///
+    /// A `Def` stamp IS the family - the name layer answered from the scope
+    /// the call was written in, and the declaration index keys its overload
+    /// entries by that same canonical name.  A `Local` is a value with a
+    /// type, not a set of signatures, and is read where the value is bound.
+    /// A stamp the name layer did not answer names a family only when an
+    /// intrinsic owns the leaf: an intrinsic is declared and never exported,
+    /// so nothing an importer writes can bind it, and the bare allocator
+    /// calls that still reach one bind through the index's record of which
+    /// intrinsic that is.  That is the one bare path left in this family and
+    /// it stays only until the allocator leaf is ruled on.
+    callee_family(&this, ident: IdentifierNode*) -> SymbolStr {
+        return match (ident.res) {
+            ResSlot::Answered(r) => { r.def_id().qualified_name() }
+            _                    => { this.ctx.decl_index.intrinsic_owner_of(ident.name) }
+        };
+    }
+
+    /// The index into `overloads` of the signature a call with `arg_types`
+    /// selects from one family, or -1 when none does.  A family with a single
+    /// signature is selected outright - argument conversion is checked
+    /// downstream, and a literal narrower than the parameter must not unpin
+    /// the only candidate.  Among several, the first whose parameters match
+    /// the arguments exactly (variadic: on the fixed prefix).
+    select_family_overload(&this, overloads: &TypeRef[], arg_types: &TypeRef[]) -> i64 {
+        if (overloads.length == 1) { return 0; }
+        for (mut oi: i64 = 0; oi < overloads.length; oi++) {
+            const ot: Type* = this.arena.lookup(overloads[oi].id);
+            if (ot == null || ot.kind != TypeKind::Function) { continue; }
+            const fn_ty: FunctionType* = ot as FunctionType*;
+            if (fn_ty.is_variadic) {
+                if (arg_types.length < fn_ty.param_types.length) { continue; }
+            } else if (fn_ty.param_types.length != arg_types.length) {
+                continue;
+            }
+            mut all_match: boolean = true;
+            for (mut pi: i64 = 0; pi < fn_ty.param_types.length; pi++) {
+                if (!this.overload_param_matches_arg(fn_ty.param_types[pi], arg_types[pi])) {
+                    all_match = false; break;
+                }
+            }
+            if (all_match) { return oi; }
+        }
+        return -1;
+    }
+
+    /// The LLVM symbol of overload `oi` of `family`: the entry's own mangled
+    /// name, else the family's single mangled slot (an `extern "C"` family
+    /// registers no per-overload symbol; its slot is the C name).
+    family_overload_symbol(&this, family: SymbolStr, ft: TypeRef) -> SymbolStr {
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        const own: SymbolStr = di.lookup_overload_mangled(family, ft);
+        if (own.is_valid()) { return own; }
+        return di.lookup_mangled_name(family);
     }
 
 
@@ -965,16 +1012,19 @@ type struct CallResolver {
                     if (spec_ret.is_valid()) { return spec_ret; }
                 }
             }
-            // A local function-pointer binding shadows any global function.
-            mut fp_shadows_global: boolean = false;
-            const fp_shadow: TypeRef = this.scopes.lookup_local(ident.name);
-            if (fp_shadow.is_valid()) {
-                const fp_shadow_t: Type* = this.arena.lookup(fp_shadow.id);
-                if (fp_shadow_t != null && fp_shadow_t.kind == TypeKind::Function) {
-                    fp_shadows_global = true;
+            // A callee the name layer bound to a local is a value, not a
+            // declaration: no overload family to check arity against or to
+            // pin, whatever global shares its leaf.
+            const callee_is_local: boolean = match (ident.res) {
+                ResSlot::Answered(r) => {
+                    match (r) {
+                        Res::Local(_) => { true }
+                        _             => { false }
+                    }
                 }
-            }
-            if (!fp_shadows_global) {
+                _ => { false }
+            };
+            if (!callee_is_local) {
                 this.check_call_arity(visitor, call, ident);
                 const ovl_ret: TypeRef = this.try_pin_overload_mangled_callee(call, ident);
                 if (ovl_ret.is_valid() && !this.types.contains_generic_param(ovl_ret)) {
@@ -1845,17 +1895,13 @@ type struct CallResolver {
 
     check_call_arity(mut &this, visitor: ASTVisitor*, call: CallExprNode*, ident: IdentifierNode*) -> void {
         if (call.generic_args.length > 0) { return; }
-        // The writing module, not the ambient cursor: an arity check must see
-        // the overload set of the module that wrote the call.  The cursor's
-        // qualifier names nothing whenever the body is being re-typed from
-        // another module, and the bare fallback below then reports arity
-        // against a same-leaf function from a different unit.
-        const qualified: SymbolStr =
-            this.ctx.qualify_symbol_sym_home(ident.name, ident.span.file);
-        mut overloads: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(qualified);
-        if (overloads.length == 0) {
-            overloads = this.ctx.decl_index.lookup_func_type_overloads(ident.name);
-        }
+        // Arity is checked against the family the callee names and nothing
+        // else: a leaf-keyed list holds every module's `write`, and an arity
+        // reported against one of those is a diagnostic about a function the
+        // call never named.
+        const family: SymbolStr = this.callee_family(ident);
+        if (!family.is_valid()) { return; }
+        const overloads: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(family);
         if (overloads.length == 0) { return; }
         if (overloads.length > 1) {
             this.check_overloaded_free_call_arity(call, ident, overloads);
@@ -2437,6 +2483,17 @@ type struct CallResolver {
 
     // -- Direct (free-function) call resolution --
 
+    /// Pin a bare call to one signature of the family its callee names.
+    ///
+    /// The family is the stamp's canonical name (`callee_family`), and the
+    /// only key asked: every signature of a declaration is registered under
+    /// it, and nothing outside it is a candidate.  What used to stand here
+    /// asked the writing module's qualifier and then the bare leaf, and the
+    /// leaf's list holds every module's declaration of that name - so the
+    /// selection then had to classify each candidate by the use site's
+    /// imports, and refuse a tie, and it still bound an intrinsic's C symbol
+    /// where the stamp named the exported wrapper.  A `Def` is already the
+    /// answer to which declaration; only which SIGNATURE is decided here.
     try_pin_overload_mangled_callee(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> TypeRef {
         if (call.resolved_callee.is_valid()) { return TypeRef::invalid(); }
         // GATED: a generic function template has no concrete spec pre-mono; leave
@@ -2450,240 +2507,15 @@ type struct CallResolver {
             if (arg == null || !arg.resolved_type.is_valid()) { return TypeRef::invalid(); }
             arg_types.push(arg.resolved_type);
         }
-        const di: DeclarationIndex* = this.ctx.decl_index;
-        // The writing module, not the ambient cursor.  This name also becomes
-        // `lookup_key` below, so answering from the cursor does not merely
-        // miss - it drops the call onto the import-scoped bare path
-        // (`scoped_bare`) for a leaf whose own module declares it.
-        const qualified: SymbolStr =
-            this.ctx.qualify_symbol_sym_home(ident.name, ident.span.file);
-        mut overloads: TypeRef[] = di.lookup_func_type_overloads(qualified);
-        mut lookup_key: SymbolStr = qualified;
-        // Bare fallback: candidates may span modules (per-owner entries), so
-        // binding becomes import-scoped - see the candidate selection below.
-        mut scoped_bare: boolean = false;
-        mut owners:   u32[] = [];
-        mut mangleds: u32[] = [];
-        if (overloads.length == 0) {
-            overloads = di.lookup_func_type_overloads(ident.name);
-            owners    = di.lookup_func_overload_owners(ident.name);
-            mangleds  = di.lookup_func_overload_mangleds(ident.name);
-            lookup_key = ident.name;
-            scoped_bare = true;
-        }
+        const family: SymbolStr = this.callee_family(ident);
+        if (!family.is_valid()) { return TypeRef::invalid(); }
+        const overloads: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(family);
         if (overloads.length == 0) { return TypeRef::invalid(); }
-        // The use site every scope decision below is relative to.  Computed once
-        // (it costs a module-graph path lookup) and only on the bare path - a
-        // qualified key names one declaration family and is never scope-checked.
-        const use_ns: SymbolStr = if (scoped_bare) { this.call_use_site_ns(call.span) }
-                                  else { SymbolStr::empty() };
-        if (overloads.length == 1) {
-            // AUDIT ONLY - behavior deliberately unchanged.
-            // This is the free-function twin of decl_index's single-candidate
-            // fast path (spec §8.1): the sole overload is pinned without
-            // consulting `bare_candidate_scope` at all, so a function the use
-            // site never imported binds anyway.  Measure before gating.
-            resolve_counter::Site::FnBindSingle.bump();
-            if (scoped_bare && owners.length > 0 && owners[0] != 0) {
-                this.check_fnbind_candidate(owners[0], use_ns, call.span,
-                    resolve_counter::Site::FnBindVisSingle);
-            }
-            mut unique_mangled: SymbolStr = di.lookup_overload_mangled(lookup_key, overloads[0]);
-            if (!unique_mangled.is_valid()) { unique_mangled = di.lookup_mangled_name(lookup_key); }
-            if (unique_mangled.is_valid()) { call.set_resolved_callee(unique_mangled); }
-            return this.overload_return_type(overloads[0]);
-        }
-        // Signature-matching candidates (indices into the parallel arrays).
-        mut matches: i64[] = [];
-        for (mut oi: i64 = 0; oi < overloads.length; oi++) {
-            const ot: Type* = this.arena.lookup(overloads[oi].id);
-            if (ot == null || ot.kind != TypeKind::Function) { continue; }
-            const fn_ty: FunctionType* = ot as FunctionType*;
-            if (fn_ty.is_variadic) {
-                if (arg_types.length < fn_ty.param_types.length) { continue; }
-            } else if (fn_ty.param_types.length != arg_types.length) {
-                continue;
-            }
-            mut all_match: boolean = true;
-            for (mut pi: i64 = 0; pi < fn_ty.param_types.length; pi++) {
-                if (!this.overload_param_matches_arg(fn_ty.param_types[pi], arg_types[pi])) {
-                    all_match = false; break;
-                }
-            }
-            if (!all_match) { continue; }
-            matches.push(oi);
-        }
-        if (matches.length == 0) {
-            if (!scoped_bare) { return TypeRef::invalid(); }
-            // No exact signature match - commonly an integer literal narrower
-            // than the parameter (`realloc(p, 4096)`: i32 literal vs u64).
-            // The pre-scoping behavior pinned a globally-UNIQUE candidate
-            // blind (argument conversion is checked/handled downstream); with
-            // per-owner entries a leaf can be globally plural yet still
-            // unique in the nearest visible scope tier - preserve the blind
-            // pin at that granularity.  Hidden (unimported) candidates never
-            // bind.
-            mut t_imported: i64[] = [];
-            mut t_prelude:  i64[] = [];
-            mut t_legacy:   i64[] = [];
-            for (mut oi: i64 = 0; oi < overloads.length; oi++) {
-                const owner: u32 = if (owners.length > oi) { owners[oi] } else { 0 };
-                if (owner == 0) { t_legacy.push(oi); continue; }
-                match (this.bare_candidate_scope(owner, use_ns)) {
-                    BareCandidateScope::Imported => { t_imported.push(oi); }
-                    BareCandidateScope::Prelude  => { t_prelude.push(oi); }
-                    BareCandidateScope::Global   => { t_legacy.push(oi); }
-                    BareCandidateScope::Hidden   => { }
-                }
-            }
-            mut tier_len: i64 = t_legacy.length;
-            mut tier_first: i64 = if (t_legacy.length > 0) { t_legacy[0] } else { 0 };
-            if (t_prelude.length > 0) {
-                tier_len = t_prelude.length;
-                tier_first = t_prelude[0];
-            }
-            if (t_imported.length > 0) {
-                tier_len = t_imported.length;
-                tier_first = t_imported[0];
-            }
-            if (tier_len != 1) { return TypeRef::invalid(); }
-            const oi: i64 = tier_first;
-            const owner: u32 = if (owners.length > oi) { owners[oi] } else { 0 };
-            if (owner != 0) {
-                this.check_fnbind_candidate(owner, use_ns, call.span,
-                    resolve_counter::Site::FnBindVisPlural);
-            }
-            mut mangled: SymbolStr = SymbolStr::empty();
-            if (owner != 0) {
-                mangled = di.lookup_overload_mangled_owned(lookup_key, overloads[oi], owner);
-            }
-            if (!mangled.is_valid()) {
-                mangled = di.lookup_overload_mangled(lookup_key, overloads[oi]);
-            }
-            if (!mangled.is_valid()) { mangled = di.lookup_mangled_name(lookup_key); }
-            if (mangled.is_valid()) { call.set_resolved_callee(mangled); }
-            return this.overload_return_type(overloads[oi]);
-        }
-
-        if (!scoped_bare || matches.length == 1) {
-            // Qualified key, or a unique signature match: pin it directly
-            // (the qualified path's entries all belong to one declaration
-            // family; no cross-module scoping applies).
-            const oi: i64 = matches[0];
-            mut mangled: SymbolStr = SymbolStr::empty();
-            if (scoped_bare && owners.length > oi && owners[oi] != 0) {
-                this.check_fnbind_candidate(owners[oi], use_ns, call.span,
-                    resolve_counter::Site::FnBindVisPlural);
-                mangled = di.lookup_overload_mangled_owned(
-                    lookup_key, overloads[oi], owners[oi]);
-            }
-            if (!mangled.is_valid()) {
-                mangled = di.lookup_overload_mangled(lookup_key, overloads[oi]);
-            }
-            if (mangled.is_valid()) { call.set_resolved_callee(mangled); }
-            return this.overload_return_type(overloads[oi]);
-        }
-
-        // Bare leaf with SEVERAL signature-matching candidates: import-scoped
-        // selection, nearest scope wins.
-        //   1. a candidate from the CURRENT module or an EXPLICIT import -
-        //      two of those with the same signature are a genuine ambiguity
-        //      (E0154: qualify);
-        //   2. else the prelude/intrinsic candidate - an explicit import
-        //      shadows the implicit prelude silently (standard nearer-scope
-        //      shadowing: `import std::fmt` makes bare `printf` fmt's even
-        //      though the `printf` intrinsic is prelude-visible);
-        //   3. else owner-0 entries (extern "C" twins and other global
-        //      claims), which keep their legacy first-match behavior;
-        //   4. a candidate in a module the use site never imported must NOT
-        //      capture the call.
-        mut imported_owned: i64[] = [];
-        mut prelude_owned:  i64[] = [];
-        mut legacy: i64[] = [];
-        for (mut mi: i64 = 0; mi < matches.length; mi++) {
-            const oi: i64 = matches[mi];
-            const owner: u32 = if (owners.length > oi) { owners[oi] } else { 0 };
-            if (owner == 0) { legacy.push(oi); continue; }
-            match (this.bare_candidate_scope(owner, use_ns)) {
-                BareCandidateScope::Imported => { imported_owned.push(oi); }
-                BareCandidateScope::Prelude  => { prelude_owned.push(oi); }
-                BareCandidateScope::Global   => { legacy.push(oi); }
-                BareCandidateScope::Hidden   => { }
-            }
-        }
-        if (imported_owned.length >= 2) {
-            // Two or more same-signature functions equally in scope: the
-            // author must qualify.  (Each owner is a distinct declaration -
-            // one function has one signature entry per owner.)
-            this.emit_ambiguous_bare_call(call, ident,
-                owners[imported_owned[0]], owners[imported_owned[1]]);
-            return TypeRef::invalid();
-        }
-        if (imported_owned.length == 1 || prelude_owned.length >= 1) {
-            // A unique import-scoped candidate, else the prelude one.  Two
-            // same-signature PRELUDE candidates cannot arise: prelude
-            // modules' leaves are curated (and an intrinsic leaf claims sole
-            // bare ownership), so taking the first is exact.
-            const oi: i64 = if (imported_owned.length == 1) { imported_owned[0] }
-                            else { prelude_owned[0] };
-            this.check_fnbind_candidate(owners[oi], use_ns, call.span,
-                    resolve_counter::Site::FnBindVisPlural);
-            mut mangled: SymbolStr = di.lookup_overload_mangled_owned(
-                lookup_key, overloads[oi], owners[oi]);
-            if (!mangled.is_valid()) {
-                mangled = di.lookup_overload_mangled(lookup_key, overloads[oi]);
-            }
-            if (mangled.is_valid()) { call.set_resolved_callee(mangled); }
-            return this.overload_return_type(overloads[oi]);
-        }
-        if (legacy.length > 0) {
-            const oi: i64 = legacy[0];
-            const mangled: SymbolStr = di.lookup_overload_mangled(lookup_key, overloads[oi]);
-            if (mangled.is_valid()) { call.set_resolved_callee(mangled); }
-            return this.overload_return_type(overloads[oi]);
-        }
-        // Only candidates from unimported modules remain: never bind them.
-        return TypeRef::invalid();
-    }
-
-    /// Judge a candidate the bare-call binder is about to pin, against the two
-    /// rules of §3.3/§4: its owning module must be in scope, and it must be
-    /// public.  The two halves are NOT treated alike, and the asymmetry is the
-    /// point:
-    ///
-    ///   - **in scope (D-A) is AUDIT ONLY.**  It counts and does not reject.
-    ///     The f-string lowering synthesizes `fmt_new` / `fmt_append_lit` calls
-    ///     into stdlib modules that cannot import `std::fmt::interp` -- the
-    ///     skip that prevents a prelude import cycle is load-bearing (§8.1d) --
-    ///     so enforcing scope here would reject the stdlib.  It is retired by
-    ///     §7.2 mechanism 4, not by a gate.
-    ///   - **public (D-B) is ENFORCED**, via `enforce_callee_visibility`.
-    ///
-    /// Every caller is a point where the binder is about to pin, which is why
-    /// the gate lives here rather than at each of them: doors 2, 3 and 4 all
-    /// funnel through this one function.  `door` records which.
-    check_fnbind_candidate(mut &this, owner: u32, use_ns: SymbolStr,
-                           span: SourceSpan, door: resolve_counter::Site) -> void {
-        const owner_sym: SymbolStr = SymbolStr::from_id(owner);
-        const di: DeclarationIndex* = this.ctx.decl_index;
-        const c_ns: SymbolStr = di.namespace_of(owner_sym, this.intern);
-        if (!c_ns.is_valid()) { return; }
-        // A module always sees its own items, public or not (spec §4).
-        if (c_ns.id == use_ns.id) { return; }
-        mut kind: string = "";
-        if (!di.ns_imports(use_ns, c_ns) && !di.is_prelude_ns(c_ns)) {
-            resolve_counter::Site::FnBindSingleHidden.bump();
-            kind = "HIDDEN";
-        } else if (!di.is_candidate_public(owner_sym)) {
-            resolve_counter::Site::FnBindPrivateBound.bump();
-            kind = "PRIVATE";
-        }
-        // Resolve the names only when someone is reading them.
-        if (kind != "" && resolve_counter::Audit::Visibility.enabled()) {
-            resolve_counter::fnbind_violation(kind,
-                this.intern.resolve(use_ns), this.intern.resolve(owner_sym));
-        }
-        this.enforce_callee_visibility(owner_sym, use_ns, span, door);
+        const oi: i64 = this.select_family_overload(&overloads, &arg_types);
+        if (oi < 0) { return TypeRef::invalid(); }
+        const mangled: SymbolStr = this.family_overload_symbol(family, overloads[oi]);
+        if (mangled.is_valid()) { call.set_resolved_callee(mangled); }
+        return this.overload_return_type(overloads[oi]);
     }
 
     /// Spec §3.3 - visibility is a GATE, not a tie-breaker.  Emits E0353 when
@@ -2815,46 +2647,6 @@ type struct CallResolver {
             resolve_counter::Site::MethodVisStatic);
     }
 
-    /// Scope class of a bare-call overload candidate owned by `owner` (a
-    /// qualified function-name id) relative to the module being checked.
-    /// Mirrors the type-side `resolve_qualified_scoped` visibility rules,
-    /// with explicit imports ranked NEARER than the implicit prelude.
-    ///
-    /// NOTE: no visibility dimension - an imported module's `private` function
-    /// classifies as `Imported` and binds (defect D-B, spec §8.1c).
-    ///
-    /// `use_ns` comes from `bare_use_site_ns` (the syntax's own module), NOT
-    /// from the ambient cursor: this classifier decides which candidates may
-    /// capture a bare name, so a wrong use site silently rebinds the call.
-    bare_candidate_scope(&this, owner: u32, use_ns: SymbolStr) -> BareCandidateScope {
-        const di: DeclarationIndex* = this.ctx.decl_index;
-        const owner_sym: SymbolStr = SymbolStr::from_id(owner);
-        const c_ns: SymbolStr = di.namespace_of(owner_sym, this.intern);
-        if (!c_ns.is_valid()) { return BareCandidateScope::Global; }
-        if (c_ns.id == use_ns.id) { return BareCandidateScope::Imported; }
-        if (di.ns_imports(use_ns, c_ns)) { return BareCandidateScope::Imported; }
-        if (di.is_prelude_ns(c_ns)) { return BareCandidateScope::Prelude; }
-        return BareCandidateScope::Hidden;
-    }
-
-    /// E0154 for a bare call that matches two or more same-signature
-    /// functions visible from the use site: demand qualification.
-    emit_ambiguous_bare_call(mut &this, call: CallExprNode*, ident: IdentifierNode*,
-                             owner_a: u32, owner_b: u32) -> void {
-        if (this.state.in_symbolic_check) { return; }
-        const name_str: string = this.intern.resolve(ident.name);
-        const a_str: string = this.intern.resolve(SymbolStr::from_id(owner_a));
-        const b_str: string = this.intern.resolve(SymbolStr::from_id(owner_b));
-        mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0154_AMBIGUOUS_CALL,
-            fmt::format("call to `%s` is ambiguous: multiple same-signature functions named `%s` are in scope",
-                name_str, name_str));
-        diag = diag.at_with_label(call.span,
-            fmt::format("`%s` could be `%s` or `%s`", name_str, a_str, b_str));
-        diag = diag.with_note("qualify the callee with its module path, e.g. `module::function(...)`");
-        this.ctx.emit_diagnostic(diag);
-    }
-
     overload_return_type(&this, fn_ref: TypeRef) -> TypeRef {
         const ft: Type* = this.arena.lookup(fn_ref.id);
         if (ft == null || ft.kind != TypeKind::Function) { return TypeRef::invalid(); }
@@ -2876,40 +2668,40 @@ type struct CallResolver {
     }
 
     resolve_direct_call(mut &this, ident: IdentifierNode*) -> TypeRef {
-        // A local function-pointer binding shadows any global function.
-        const fp_local: TypeRef = this.scopes.lookup_local(ident.name);
-        if (fp_local.is_valid()) {
-            const fp_t: Type* = this.arena.lookup(fp_local.id);
-            if (fp_t != null && fp_t.kind == TypeKind::Function) {
-                ident.set_resolved_type(fp_local);
-                return (fp_t as FunctionType*).return_type;
-            }
-        }
         // The name layer's own answer for this callee, and the only one asked.
-        // It is a canonical name, so it names ONE declaration.  Qualifying the
-        // leaf with the writing module answered the same declaration wherever
-        // it answered at all, and asking the bare leaf answers from whichever
-        // module registered it last - which is a different function.
-        mut func_ret: TypeRef = TypeRef::invalid();
-        {
-            mut stamped_q: SymbolStr = SymbolStr::empty();
-            match (ident.res) {
-                ResSlot::Answered(r) => { stamped_q = r.def_id().qualified_name(); }
-                _                    => {}
-            }
-            if (stamped_q.is_valid()) {
-                func_ret = this.types.lookup_func_return(stamped_q);
-            }
-            if (func_ret.is_valid()) {
-                resolve_counter::Site::FnBindStampedRet.bump();
-                const alts: SymbolStr[] =
-                    this.ctx.decl_index.lookup_qualified_alternatives(ident.name);
-                if (alts.length == 1) {
-                    this.check_fnbind_candidate(alts[0].id, this.call_use_site_ns(ident.span),
-                                                ident.span,
-                                                resolve_counter::Site::FnBindVisRetLane);
+        // A local is a value: when its type is callable, the call's type is
+        // that signature's return, whatever global shares the leaf.  A
+        // definition is a canonical name and names ONE declaration; asking
+        // the bare leaf instead answers from whichever module registered it
+        // last, which is a different function.  A refused name has already
+        // been reported by the resolver that refused it, and is not reported
+        // again as a name that does not exist.
+        mut stamped_q: SymbolStr = SymbolStr::empty();
+        match (ident.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Local(_) => {
+                        const fp_local: TypeRef = this.scopes.lookup_local(ident.name);
+                        if (fp_local.is_valid()) {
+                            const fp_t: Type* = this.arena.lookup(fp_local.id);
+                            if (fp_t != null && fp_t.kind == TypeKind::Function) {
+                                ident.set_resolved_type(fp_local);
+                                return (fp_t as FunctionType*).return_type;
+                            }
+                        }
+                    }
+                    Res::Err => { return TypeRef::invalid(); }
+                    _        => { stamped_q = r.def_id().qualified_name(); }
                 }
             }
+            _ => {}
+        }
+        mut func_ret: TypeRef = TypeRef::invalid();
+        if (stamped_q.is_valid()) {
+            func_ret = this.types.lookup_func_return(stamped_q);
+        }
+        if (func_ret.is_valid()) {
+            resolve_counter::Site::FnBindStampedRet.bump();
         }
         if (func_ret.is_valid()) {
             if (this.state.expected_type.is_valid()) {

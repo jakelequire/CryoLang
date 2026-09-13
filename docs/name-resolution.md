@@ -27,8 +27,8 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at `03d64a56`; `git log --oneline
-03d64a56..HEAD` says how far this has drifted since.
+Checks run from the repo root. Verified at the commit carrying §8.173; `git log
+--oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
 current-state description is the defect it exists to remove.
@@ -45,12 +45,12 @@ current-state description is the defect it exists to remove.
 | D3 | Modules bind in the TYPE namespace | TAKEN, then SUPERSEDED by D5 | `grep -c 'SymbolKind::Namespace' compiler/src/compiler/resolver/namespace_kind.cryo` → **1** | §8.39, §8.68 |
 | D4 | The qualifier shorthand `A::B` prefers the type | SUPERSEDED by D5 — ruled dropped, never built, then overtaken | `no check` — the thing ruled on was never in the tree | §8.66 → §8.130 |
 | D5 | **Namespaces and types share ONE namespace**; a module and a type can never carry the same name, and the collision is an ordinary redeclaration error at its declaration | **RULED, NOT STARTED** — and now the one thing holding `scope_owner_key`'s cursor lane (§8.170): `module_type_name_collision` pins the pre-D5 shape | `grep -rho 'check_module_type_collision' compiler/src \| wc -l` → **2** (0 when done) | §8.130, §8.134 |
-| D6 | Intrinsics get namespaced; a bare name always means the user's function | RULED; `format`/`printf` done; every other intrinsic the tree calls is behind `intrinsics::` since §8.172 - the bare surface left is the allocator leaf `malloc`/`free`/`realloc`, held by §8.93, and with it the index's bare-slot ownership for intrinsics | `grep -c '^intrinsic function ' stdlib/core/intrinsics.cryo` → **58**; `python scripts/qualify-intrinsic-calls.py stdlib/sync/atomic.cryo --names @stdlib/core/intrinsics.cryo` → `0 rewritten` | §8.124, §8.126, §8.129, §8.172 |
+| D6 | Intrinsics get namespaced; a bare name always means the user's function | RULED; `format`/`printf` done; every other intrinsic the tree calls is behind `intrinsics::` since §8.172 - the bare surface left is the allocator leaf `malloc`/`free`/`realloc`, held by §8.93, reached since §8.173 by ONE path (`intrinsic_owner_of`, a `Pending` callee's family) and by nothing else. **Codegen's inline dispatch is keyed by the callee's LEAF and runs before the pin is read**, so a bare `panic` pinned to the `std::core::panic` wrapper still lowers to the intrinsic (§8.173) - D6's remainder is in codegen | `grep -c '^intrinsic function ' stdlib/core/intrinsics.cryo` → **58**; `grep -c 'intrinsic_owner_of' compiler/src/compiler/sema/call_resolver.cryo` → **1**; `python scripts/qualify-intrinsic-calls.py stdlib/sync/atomic.cryo --names @stdlib/core/intrinsics.cryo` → `0 rewritten` | §8.124, §8.126, §8.129, §8.172, §8.173 |
 | D7 | Imports stop globbing | **TAKEN** — a plain `import M;` is `ImportStyle::Module` and binds no names. Three globs remain BY DESIGN and the old row's expected `0` was unreachable: the explicit `M::*`, and the two the compiler injects (the prelude, the f-string runtime) | `grep -rho 'ImportStyle::Wildcard,' compiler/src --include=*.cryo \| wc -l` → **3** | §8.131, §8.135, §8.138 |
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
 | D10 | A plural leaf is E0155, not a directory-order bind — and a leaf two children of one FACADE declare is the same defect reached by a qualified path, in a call as in an annotation | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **5** | §8.121, §8.144, §8.151 |
-| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 36 of the 97 unasserted rows retired, 61 left (37 context, 10 B2, 14 B3); of the asserted rows, six whose only sites were deleted went with them (one in §8.170, five in §8.171; `b1-baseline.txt` re-pinned on both hosts each time, 70 → 65 rows per arm) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1484** | §8.66, §8.80, §8.139 |
+| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 40 of the 97 unasserted rows retired, 57 left (33 context, 10 B2, 14 B3); of the asserted rows, eight whose only sites were deleted went with them (one in §8.170, five in §8.171, two in §8.173; `b1-baseline.txt` re-pinned on both hosts each time, 64 → 62 rows per arm at §8.173) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1446** | §8.66, §8.80, §8.139, §8.173 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
 | D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **577** | §8.145, §8.146, §8.147, §8.148, §8.150 |
@@ -91,6 +91,8 @@ three, and its row carries the count. Read each zero off its own row.
 | bound-directed trait filter by LEAF (`select_method`, `find_spec_impl_method`) | **DELETED** — `MemberAccessNode.resolved_trait` is the trait's identity and every reader compares it to `origin_trait` / `qualified_trait_name`; shadow 440 → 0 (the async-lowered `Future` impl was the one unstamped head); `trait_leaf_dispatch` exits 12 where a leaf comparison exits 11 | — | `grep -rho 'leaf_segment' compiler/src/compiler/sema/call_resolver.cryo \| wc -l` → **0** | §8.171 |
 | callee door ladder (`lookup_callee_function_type`'s identifier branch: a `lookup_local` by spelling ahead of the stamp, then STAMP → HOME → BARE) | **DELETED** - the identifier branch is the stamp: `Local` → the local's type when callable, `Def` → `func_type_of_res`, else no hint; shadow 5,327 → 16, every line a `Pending` stamp (intrinsics through BARE, unresolved match guards and `main$async` through HOME, an unimported `swap`); the 12 left are §8.93's allocator leaf and `visibility_gate`'s refused privates; the `CALLEE-DOOR` audit stream went with it | — | `grep -c 'CALLEE-DOOR' compiler/src/compiler/resolve_counter.cryo` → **0**; `grep -c 'lookup_func_type_exact(ident.name)' compiler/src/compiler/sema/call_resolver.cryo` → **0** | §8.172 |
 | free-call template search by leaf and arity (`find_fn_template_for_call`'s registry scan, its cursor-module tie-break, `Resolver::resolve_function_source_module`) | **DELETED** - `lookup_scope_template(ident.res)` plus the arity gate; a local is never a template, which is what fixes a local fn-pointer bound to a same-leaf generic global (returned 5 for 10); shadow 12 → 0 | — | `grep -rho 'resolve_function_source_module' compiler/src \| wc -l` → **0** | §8.172 |
+| bare-callee family (`check_call_arity`, `try_pin_overload_mangled_callee`'s HOME → BARE key with its import-scoped candidate tiers and E0154, `resolve_direct_call`'s leaf-keyed `check_fnbind_candidate`, the two spelling-keyed local checks) | **DELETED** - one key, `callee_family`: the stamp's canonical name (`Def`), the local's own type (`Local`), or `intrinsic_owner_of` for a `Pending` leaf an intrinsic owns (§8.93's hold, the ONE bare path left); shadow 3,343 → 0 over six halves once `panic` (3,318, D6 landing) and the two refused privates (E0202 now, the §8.167 shape) are named; `FNVIS` 0: no `Def`-stamped bare callee is another module's private; E0353 doors 2-4 and the `FNBIND-VIOLATION` stream went with it | — | `grep -c 'bare_candidate_scope' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -c 'callee_family(&this' compiler/src/compiler/sema/call_resolver.cryo` → **1** | §8.173 |
+| import tie refusal (`visit(IdentifierNode)`: a bare name whose bound symbol is an `Import` and whose leaf two imports bind from different modules) | LIVE - E0154 at the USE, stamp `Res::Err`; the tie is recorded by `Scope::insert_import` (which kept the first import and was read only for type names before) and cleared by a same-module declaration; the prelude is a separate rib and never ties | — | `grep -c 'is_ambiguous(node.name)' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.173 |
 | match-guard resolution (`NameResolution::visit(MatchArmNode)` visits `node.guard`) | LIVE - a guard is resolved in the arm's scope between the patterns and the body; unvisited, a module constant in a guard was E0201 and a callee in one bound by spelling | — | `grep -c 'node.guard.accept' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.172 |
 | scope-qualifier spelling ladder (`lookup_type_exact(scope.scope_name)` beneath `scope_qualifier_type`: `u8::MAX`, the variant payload, the static visibility gate, the static argument check's rung 3) | **DELETED** — `scope_qualifier_type` answers `PrimTy` and a clone's `spec_owner`; the steps measured 0, 34 wrong answers (`float` the MODULE as `f32`), and 27 clone segments now carried by `spec_owner` | — | `grep -rho 'lookup_type_exact(scope.scope_name)' compiler/src/compiler/sema \| wc -l` → **0** | §8.171 |
 | `lookup_by_leaf` | **DELETED** | — | `grep -rho 'lookup_by_leaf(' compiler/src \| wc -l` → **0** | §8.121 |
@@ -113,7 +115,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `CompilationContext::resolve_scoped` family (the cursor's leaf-keyed scope map, asked from sema) | `_or`, `_or_at`, `scope_is_ambiguous`, `_at` **DELETED** (7 readers at §8.161); `resolve_scoped` / `resolve_scoped_at` **HELD** with ONE reader, the D5 residue below | — | `grep -c 'resolve_scoped' compiler/src/compiler/compilation_context.cryo` → **4** | §8.161, §8.166-§8.170 |
 | `scope_owner_key` | LIVE - the static-call owner key: the substituter's `spec_owner` (a clone's specialization, by arena id), then the cursor lane, then the stamp. The cursor lane is measured at 1,974,585 answers and serves ONE shape, D5's module/type collision (`module_type_name_collision`'s `Buffer::make`); it goes with D5 | — | `grep -c '\.resolve_scoped_at(' compiler/src/compiler/sema/call_resolver.cryo` → **1** | §8.134, §8.151, §8.170 |
 | type-resolution bound stamping (`stamp_trait_ref` and its three walkers, the cursor fallback for a bound the resolver did not stamp) | **DELETED** - the name layer stamps every owner, associated-type bounds included | — | `grep -c 'stamp_trait' compiler/src/compiler/passes/type_resolution.cryo` → **0** | §8.169 |
-| callee visibility gate (E0353) | LIVE, reached; **starved of violations** (+57 in §8.172: the qualified door now sees the atomics) | 1,869 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **21** (the name layer's two: the import gate, the rooted walk) | §8.1f, §8.2ag |
+| callee visibility gate (E0353) | LIVE, reached; **starved of violations**; since §8.173 its call door is the QUALIFIED path only (-52 on the pinned arm: the bare doors 2-4 are deleted, a bare callee is vetted by the name layer before it is stamped) plus the two value doors | 1,817 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **21** (the name layer's two: the import gate, the rooted walk) | §8.1f, §8.2ag, §8.173 |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
 
@@ -7199,6 +7201,198 @@ so no registration defect is being routed around. `answer names no def` is also
 **0** -- the case all six paragraphs cite as the reason for the fallback does not
 occur. Every invalid return is a slot that was never answered. The six fallbacks
 serve UNSTAMPED nodes, which is a different defect from the one they describe.
+
+### 8.173 Consumer 27: the rest of the bare-callee family, deleted; a name two imports bind is refused where it is used; codegen answers an intrinsic's leaf before it reads the pin - 2026-09-13
+
+The four sites §8.172 left in `call_resolver` - `check_call_arity`,
+`try_pin_overload_mangled_callee` with its import-scoped bare filter and
+E0154, `resolve_direct_call`'s spelling-keyed local check and its
+`lookup_qualified_alternatives(ident.name)`, and `resolve_call`'s
+`fp_shadows_global` - shadowed over the six halves, controlled, and deleted
+in one commit.  `HANDOFF.md`'s measurement is folded in below and the file
+deleted.
+
+#### The shape of the old binder, and of the new one
+
+Each site asked HOME then BARE: `qualify_symbol_sym_home(leaf, file)` against
+the overload index, and when that missed, the bare leaf - whose list holds
+every module's declaration of that name, so the binder then classified each
+candidate by the use site's imports (`bare_candidate_scope`: imported,
+prelude, global, hidden), pinned a unique tier, refused a tie with E0154, and
+judged the one it picked for visibility (`check_fnbind_candidate`, doors 2, 3
+and 4 of the E0353 gate).  Two of the four also asked
+`scopes.lookup_local(ident.name)` by spelling ahead of everything, to let a
+local function pointer shadow a same-leaf global.
+
+The new model is one function, `callee_family`: the overload FAMILY a bare
+callee names is its stamp's canonical name, and that is the only key the
+index is asked.  `Def` → `lookup_func_type_overloads(q)`; signature selection
+within the family (`select_family_overload`) is the old selection unchanged
+- one signature is taken outright, several are matched exactly on the
+arguments; `Local` names no family, and the call's type is the local's own
+signature.  A `Pending` stamp names a family only when an intrinsic owns the
+leaf (`intrinsic_owner_of`), which is §8.93's hold made explicit and narrow:
+the map that recorded an intrinsic's leaf now records which intrinsic, and
+that record is the whole of the bare path left in this family.  It serves
+`bare_intrinsic_priority.cryo`'s five bare `malloc` / `free` / `realloc` and
+nothing else in the corpus, and it goes with the allocator ruling.
+
+#### Measured
+
+One instrumented build: the old binder answers, the new family pin is
+computed beside it, one line per disagreement with the stamp's kind, the
+leaf, both answers and the span.  Four comparisons: `FNBIND` (the pinned
+symbol), `ARITY` (the overload list the arity check reads), `FNVIS` (a
+`Def`-stamped bare callee that is private to ANOTHER module - the population
+doors 2-4 existed to catch), and the name layer's two new events below.
+
+**3,343 lines over the six halves, 0 failing halves**, every one explained:
+
+* **3,318 - `panic`, one mechanism** (1,659 FNBIND + 1,659 ARITY).  Every
+  bare `panic(msg, FILE, LINE)` in `stdlib/future/*` is stamped
+  `Def(std::core::panic)` - the exported wrapper, reached through the prelude
+  tier - while the old binder's BARE step pinned the intrinsic's C symbol
+  through the index's bare-slot ownership.  Same signature
+  `(string, string, u32) -> never`; the wrapper forwards to
+  `intrinsics::panic`.  D6's ruling, "a bare name always means the user's
+  function", landing literally.  What codegen does with it is the finding
+  below.
+* **14 - ARITY only**: `write` 6, `tint` 3, `sleep` 3, `copy` 2.  The pin
+  agreed; the old arity check read the BARE list (every module's `write`,
+  3 entries; 6 `tint`s) because HOME missed for an imported callee.  The
+  family has one entry each, so the arity check is now exact where it used
+  to be the plural-list "any arity matches" check.
+* **3 - ARITY only, the allocator leaf**: `free` (3 → 1), `realloc` (2 → 1).
+  The symbol pinned agrees under `intrinsic_owner_of`; the arity list shrinks
+  from every same-leaf declaration to the intrinsic's own.
+* **4 - `visibility_gate`'s `secret` and `stash`** (2 FNBIND + 2 ARITY),
+  `Pending`: the name layer offers a private declaration to no importer, the
+  old binder found both by searching every module's declarations of the leaf
+  and refused them at door 2 / door 3.  Resolved below.
+* **4 - the name layer's own events**: 3 `AMBIG-MARK` (a leaf two imports
+  bind from different modules: `alloc` in the E0154 negative, and `MAX_DEPTH`
+  twice under `import std::json::{ parser, serializer }`, which globs each
+  sub-module and both declare one), 1 `AMBIG-USE` (the negative's call).
+  `MAX_DEPTH` is never used bare in either file, so it is refused nowhere,
+  which is the rule: a tie is recorded at the import and reported at the use.
+* **0 - `FNLOCAL`**: both spelling-keyed local checks agree with `Res::Local`
+  everywhere (§8.172's measurement, unchanged; the sites read the stamp
+  now).  `fn_pointer_shadowing.cryo` stays green through the deletion.
+* **0 - `FNVIS`**: no `Def`-stamped bare callee anywhere in the corpus is a
+  private declaration of another module.  The name layer binds a bare name
+  only to the writer's own module's declarations, a specific import it vetted
+  (E0353 at the import, §8.167), or an export set - which a private is never
+  in - so the population doors 2-4 judged does not reach sema's pin.
+* **0 - E0154 through the binder**: the negative that pinned it is refused
+  one pass earlier, by the name layer (below), and the pipeline stops there.
+
+Control, one build with the three comparisons inverted, the LSP alone:
+**1,696 ARITY + 1,692 FNBIND agreeing pairs** - §8.172's handoff numbers to
+the unit - and 3,432 FNVIS lines naming a public or same-module callee.
+
+#### A leaf two imports bind is refused where it is used
+
+`declare_import` already recorded the tie: `Scope::insert_import` keeps the
+first import so a lookup lands somewhere and appends the pair of modules to
+an ambiguity list, and `Resolver::is_ambiguous` reads it.  The list had ONE
+reader, `types/resolver.cryo`'s type-name lookup, so a VALUE bound by two
+specific imports of one leaf was stamped `Def` of whichever import came
+first, and the E0154 the negative pinned was the sema binder's - keyed on a
+bare-leaf search that found both candidates on its own.  `visit(IdentifierNode)`
+now refuses a name whose bound symbol is an `Import` and whose leaf is
+recorded ambiguous, with E0154 "`alloc` is ambiguous: it is imported from
+both `std::alloc::heap` and `std::alloc::allocator`", and stamps `Res::Err`.
+E0154 kept over E0155: the code's own comment defines E0155 as two claimants
+with NEITHER bound in the writing scope, and E0154 as two candidates that ARE
+in scope; both imports are.  Refused at the use rather than at the second
+import because §4 rule 2 is a rule about names, not about import lines: a
+tie the file never names is not an error, and `MAX_DEPTH` above is exactly
+that.  The tier is confined by the scope itself - a declaration of the leaf
+in the module takes the slot and clears the record (`Scope::insert`), and
+the prelude is not in this scope at all (`lookup_prelude`, the outermost
+rib), so an explicit import shadowing a prelude name never records a tie.
+The negative's annotation moves with the diagnostic; the wording is no
+longer "call to", because the refusal is not about a call.
+
+The binder's E0154, `emit_ambiguous_bare_call`, is unreachable once the
+family is the stamp's name - a family has one declaration - and goes with
+the binder.  `resolve_direct_call` treats an `Err` stamp as already
+reported and reports no E0202 for it; no identifier was stamped `Err` before
+this, so the rule had no reader until now.
+
+#### `visibility_gate` doors 2 and 3
+
+The project asserted E0353 naming `Vault::secret` and `Vault::stash` for a
+bare call in a module that imports `Vault` as a plain module import.  Under
+D7 that import binds no names, the private declarations are offered to no
+importer, and the stamp is `Pending`; the old binder answered by searching
+the program for the leaf and then refusing what it found.  With the search
+gone the honest diagnostic is E0202 "cannot find function `secret` in this
+scope" - the name does not exist there, because nothing the writer wrote
+could bring it in - which is what §8.167 already settled for the value form
+(door 5b, `visibility_value_gate`'s `latched`).  Doors 2 and 3 now assert
+that line each; door 1 (the written path, sema's qualified gate) and both
+controls are unchanged, and `test.json` still requires all three names.
+The import form of the bare doors is `visibility_import_gate`, unchanged.
+
+#### Found under it: codegen answers an intrinsic's leaf before it reads the pin
+
+The prediction for the object comparison was that every `stdlib/future/*`
+object carrying a bare `panic` moves by call target.  It was wrong, and the
+reason is a lane: `call_emitter`'s identifier branch runs the inline
+intrinsic dispatcher on the callee's LEAF (`IntrinsicKind::is_name`) before
+it reads `resolved_callee`, guarded only by "the leaf is not a declared
+intrinsic" (`intr_user_shadow`).  A pin naming a real function whose leaf
+an intrinsic also owns - `std::core::panic`, the wrapper - is therefore
+never read: the intrinsic is lowered inline, under HEAD and under the tree
+alike, which is why the objects are identical and why `std::core::assert`'s
+own `panic(...)`, HOME-qualified to the wrapper all along, has never called
+it either.  The same guard sits on the `Scope::member` branch.  This is D6's
+remainder in codegen: the sema pin is the answer, and a dispatcher keyed by
+spelling in front of it is the shape every entry since §8.158 has been
+deleting.  It is recorded here and NOT changed, because switching `panic`
+from the inline lowering to a real call through the wrapper changes what an
+existing program compiles to (one more frame, and `emit_panic_unwind`'s
+drop-completeness route is gated on that same leaf), and that is the
+allocator ruling's neighbour, not this consumer's.
+
+#### Deleted, and what is left
+
+`try_pin_overload_mangled_callee` is `callee_family` → `select_family_overload`
+→ `family_overload_symbol`; `check_call_arity` reads the family; the two
+local checks read `Res::Local`; `resolve_direct_call`'s leaf-keyed
+`check_fnbind_candidate` is gone.  With them: `BareCandidateScope`,
+`bare_candidate_scope`, `emit_ambiguous_bare_call`, `check_fnbind_candidate`,
+`DeclarationIndex::lookup_func_overload_owners` / `lookup_func_overload_mangleds`
+/ `lookup_overload_mangled_owned` (readers: the binder only; the owner column
+stays because it is what keeps two same-signature declarations from
+different modules in separate mangled slots), the `FNBIND-VIOLATION` audit
+stream, and six counter rows - `FnBindSingle`, `FnBindSingleHidden`,
+`FnBindPrivateBound`, `FnBindVisSingle`, `FnBindVisPlural`, `FnBindVisRetLane`
+(`resolve_counter.cryo` 1484 → 1446).  `enforce_callee_visibility` stays with
+one call door, the qualified path, and the two value doors.
+
+Objects, HEAD vs the tree: examples **0 of 1,126**, tests **0 of 2,182** (the tree's compiler over the tree's `tests/`, whose only edits are a compile-fail project and a negative file, neither an object) (see the
+finding above for why `panic` moved nothing).  Gates: suite green (2,116 unit,
+179 negative, 45 projects on this host); LSP builds directly; lane golden
+re-pinned - `LOOKUP_OTHER` 59 → 46, all thirteen in `call_resolver` (the bare-leaf overload, owner and mangled reads); `DEFID_UNWRAP` 30 → 31, `callee_family`'s one unwrap, which is the text three index maps are keyed by; b1 re-pinned on both hosts - B1 0 → 0 on all six arms, two rows gone from every arm (`of those, owner NOT in scope (D-A)`, `bound to a PRIVATE candidate (D-B)`, the deleted binder's own), and `callee visibility checks reached` down by the bare doors' share on every arm, the same on both hosts: -52 (1,869 → 1,817 Windows, 1,854 → 1,802 Linux), -9 on the ffi arm, -53 on the gen arm.
+
+**Tally: 27 shadowed, 27 old paths deleted, 26 at zero and one at a residue
+of 5 that is §8.93's held leaf; 20 artifacts gone** (+ the import-scoped
+bare binder with its E0154, its three doors and its audit stream).
+
+#### What this leaves
+
+* §8.170's items 2-4: `impl_target_type`'s `_ =>` arm (sema ~715),
+  struct-literal rung 5 (sema ~2977, shadow over `cryo test`),
+  `pin_scope_callee_combined`'s unmangled tail.
+* Codegen's leaf-keyed intrinsic dispatch ahead of the pin (above), with the
+  allocator leaf: both are D6's remainder and one ruling.
+* `Resolver::lookup_prelude` leaves a name two prelude modules export
+  UNANSWERED (Pending) rather than refused; no consumer reports it.  Not
+  reached by the corpus; noted, not measured.
+
+---
 
 ## 9. Open questions
 

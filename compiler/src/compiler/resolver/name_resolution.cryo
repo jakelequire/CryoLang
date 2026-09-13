@@ -991,6 +991,34 @@ public:
         }
         if (sym_id.is_valid()) {
             this.resolver.record_resolution(node.span, sym_id);
+            // Two imports of one leaf from different modules bind the name to
+            // neither: the scope keeps the first so a lookup lands somewhere,
+            // and the record of the second is what says the first was never
+            // the answer.  Refused here, where the name is used, because an
+            // import brings a name into scope and it is naming the item that
+            // needs it to name one.  A declaration of the leaf in this module
+            // shadows every import of it and clears the record, so this is
+            // reached only for the import-vs-import tie.
+            const bound: Symbol = this.resolver.get_symbol(sym_id);
+            if (bound.kind == SymbolKind::Import
+                    && this.resolver.is_ambiguous(node.name)) {
+                const mods: SymbolStr[] = this.resolver.get_ambiguous_modules(node.name);
+                const leaf: string = this.resolver.intern_table.resolve(node.name);
+                const a: string = if (mods.length > 0) { this.resolver.intern_table.resolve(mods[0]) } else { "" };
+                const b: string = if (mods.length > 1) { this.resolver.intern_table.resolve(mods[1]) } else { "" };
+                mut d: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0154_AMBIGUOUS_CALL,
+                    fmt::format("`%s` is ambiguous: it is imported from both `%s` and `%s`",
+                        leaf, a, b));
+                d = d.at_with_label(node.span, "ambiguous name");
+                d = d.with_note(fmt::format(
+                    "write the path out to say which one is meant, `%s::%s` or `%s::%s`",
+                    a, leaf, b, leaf));
+                this.ctx.emit_diagnostic(d);
+                node.set_res(Res::Err);
+                this.stamp_annotation_list(&node.generic_args);
+                return;
+            }
         }
         // Stamped from the lookup already performed, never a second one: the
         // scope this walk stands in is the scope the name was written in, and

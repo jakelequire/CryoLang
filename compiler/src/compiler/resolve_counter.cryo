@@ -201,17 +201,9 @@ type enum Site {
     InstMintAgg;
     InstMintAggSymbolic;
 
-    // Free-function bare-call binder.  Counted apart because they need
-    // different fixes: D-A is a missing check, D-B is a missing input.
-    // SingleHidden is the D-A blast radius; PrivateBound is D-B's (it counts
-    // binds in ANY branch, so it is not a subset of Single).  UnscopedRet is
-    // a SECOND door - `resolve_direct_call`'s fallback to the program-wide
-    // bare `func_returns` map, which has no owner column and therefore no
-    // scope input whatsoever.  One pins the SYMBOL, the other supplies the
-    // TYPE, and a call can be answered by either alone.
-    FnBindSingle;
-    FnBindSingleHidden;
-    FnBindPrivateBound;
+    // Free-function call whose return type came from the stamp's canonical
+    // name because the family pin declined (a template, an unresolved
+    // argument).  The pin and this lane read the same key.
     FnBindStampedRet;
 
     // Where the bare-call binder's USE SITE came from.  Every scope and
@@ -235,14 +227,11 @@ type enum Site {
     // firing.  A NON-zero value is only correct if every event is a real
     // violation; read it with the corpus, never on its own.
     FnBindVisReject;
-    // ...broken down by WHICH of the doors in §8.1e caught it.  Qualified is
-    // the written path, Single the bare binder's one-candidate fast path,
-    // Plural its multi-candidate selection, RetLane the separate door that
-    // supplies a return TYPE from the owner-less bare map.
+    // ...broken down by WHICH door caught it.  Qualified is the written path;
+    // a BARE call has no door here, because the name layer binds a bare name
+    // only to a declaration the writer may see (its own module's, an import
+    // it vetted, an export set) and a private one never reaches sema's pin.
     FnBindVisQualified;
-    FnBindVisSingle;
-    FnBindVisPlural;
-    FnBindVisRetLane;
     // ...and the two VALUE doors.  A function named without being called is
     // not offered to the gate by any call path, so these two lanes ask for
     // themselves: Bare is `f = leaf`, Qual is `f = Ns::Mod::leaf`.
@@ -598,9 +587,6 @@ implement enum Site {
             Site::InstMintNew           => { "   " }
             Site::InstMintAgg           => { "   " }
             Site::InstMintAggSymbolic   => { "   " }
-            Site::FnBindSingle          => { "   " }
-            Site::FnBindSingleHidden    => { "!! " }
-            Site::FnBindPrivateBound    => { "!! " }
             Site::FnBindStampedRet      => { "B3 " }
             Site::FnBindUseSyntax       => { "B1>" }
             Site::FnBindUseCursor       => { "B1 " }
@@ -608,9 +594,6 @@ implement enum Site {
             Site::FnBindVisCalls        => { "B1 " }
             Site::FnBindVisReject       => { "!! " }
             Site::FnBindVisQualified    => { "   " }
-            Site::FnBindVisSingle       => { "   " }
-            Site::FnBindVisPlural       => { "   " }
-            Site::FnBindVisRetLane      => { "   " }
             Site::FnBindVisValueBare    => { "   " }
             Site::FnBindVisValueQual    => { "   " }
             Site::MethodVisCalls        => { "B1 " }
@@ -730,9 +713,6 @@ implement enum Site {
             Site::InstMintNew           => { "instantiations newly minted" }
             Site::InstMintAgg           => { "  of those, an aggregate base" }
             Site::InstMintAggSymbolic   => { "    of those, symbolic (never mono'd)" }
-            Site::FnBindSingle          => { "single-overload pins (no scope check)" }
-            Site::FnBindSingleHidden    => { "  of those, owner NOT in scope (D-A)" }
-            Site::FnBindPrivateBound    => { "bound to a PRIVATE candidate  (D-B)" }
             Site::FnBindStampedRet      => { "return type from the stamp (home missed)" }
             Site::FnBindUseSyntax       => { "use site from the SYNTAX's own module" }
             Site::FnBindUseCursor       => { "  fn-bind: fell back to the cursor" }
@@ -740,9 +720,6 @@ implement enum Site {
             Site::FnBindVisCalls        => { "callee visibility checks reached" }
             Site::FnBindVisReject       => { "REJECTED: private, cross-module (E0353)" }
             Site::FnBindVisQualified    => { "  door 1: written qualified path" }
-            Site::FnBindVisSingle       => { "  door 2: single-overload fast path" }
-            Site::FnBindVisPlural       => { "  door 3: multi-candidate selection" }
-            Site::FnBindVisRetLane      => { "  door 4: bare return-type lane" }
             Site::FnBindVisValueBare    => { "  door 5b: bare name in value position" }
             Site::FnBindVisValueQual    => { "  door 5a: qualified path, value position" }
             Site::MethodVisCalls        => { "method visibility checks reached" }
@@ -909,15 +886,6 @@ public function vis_record(qualified: string, is_public: boolean) -> void {
 public function vis_private(kind: string, use_site: string, cand: string) -> void {
     if (!Audit::Visibility.enabled()) { return; }
     fmt::eprintf("VIS-PRIVATE\t%s\t%s\t%s\n", kind, use_site, cand);
-}
-
-/// Print one bare free-function call that bound to a candidate the use site
-/// should not be able to name.  `kind` is `HIDDEN` (D-A: not imported) or
-/// `PRIVATE` (D-B: imported but not public).
-public function fnbind_violation(kind: string, use_site: string,
-                                 cand: string) -> void {
-    if (!Audit::Visibility.enabled()) { return; }
-    fmt::eprintf("FNBIND-VIOLATION\t%s\t%s\t%s\n", kind, use_site, cand);
 }
 
 /// Log one call REJECTED by the visibility gate, naming the door it was
@@ -1322,9 +1290,6 @@ public function report() -> void {
     Site::VisRejectNotPublic.print_row();
 
     fmt::eprintf("\n-- free-fn bare-call binder (spec §3.3, §4) ----------\n");
-    Site::FnBindSingle.print_row();
-    Site::FnBindSingleHidden.print_row();
-    Site::FnBindPrivateBound.print_row();
     Site::FnBindStampedRet.print_row();
     Site::FnBindUseSyntax.print_row();
     Site::FnBindUseCursor.print_row();
@@ -1332,9 +1297,6 @@ public function report() -> void {
     Site::FnBindVisCalls.print_row();
     Site::FnBindVisReject.print_row();
     Site::FnBindVisQualified.print_row();
-    Site::FnBindVisSingle.print_row();
-    Site::FnBindVisPlural.print_row();
-    Site::FnBindVisRetLane.print_row();
     Site::FnBindVisValueBare.print_row();
     Site::FnBindVisValueQual.print_row();
     Site::MethodVisCalls.print_row();

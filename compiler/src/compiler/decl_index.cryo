@@ -208,9 +208,7 @@ type struct DeclarationIndex {
                                       // modules coexist under one bare leaf
                                       // (`intrinsics::free` vs `alloc::heap::free`)
                                       // instead of being merged into a single
-                                      // last-writer-owned entry, and lets the
-                                      // bare-call binder filter candidates by the
-                                      // use site's imports.
+                                      // last-writer-owned entry.
 
     // Bare-name -> all qualified names ever registered for it.
     // Populated by `register_name_mapping`.
@@ -250,8 +248,11 @@ type struct DeclarationIndex {
     // from a user/stdlib function that merely shares an intrinsic's leaf name:
     // a pinned `resolved_callee` whose leaf is NOT in here is a real function
     // and must NOT be silently replaced by inline IR.  See
-    // `is_intrinsic_decl_name`.
-    intrinsic_names:     HashMap<u32, boolean>;
+    // `is_intrinsic_decl_name`.  The value is the intrinsic's qualified
+    // name: an intrinsic is declared and never exported, so no import binds
+    // its leaf and this record is the only thing that names the declaration
+    // a bare allocator call reaches (`intrinsic_owner_of`).
+    intrinsic_names:     HashMap<u32, u32>;
 
     // Bare C symbol -> owning module/file (intern id) for symbols claimed by an
     // `extern "C"` block specifically. Lets the resolver warn (W0011) when a
@@ -308,12 +309,10 @@ type struct DeclarationIndex {
     // resolve_qualified_scoped directly, and it makes `is_candidate_public`
     // honest rather than a permanently-empty stub.
     //
-    // AND IT DOES NOT GATE FUNCTION CALLS.  A bare `foo()` never reaches
-    // `resolve_qualified_scoped` at all - it is bound by sema's
-    // `try_pin_overload_mangled_callee` / `resolve_direct_call`, which have
-    // their own scope model and do not consult this map.  Recording function
-    // visibility here is what makes that measurable, not what enforces it;
-    // see docs/name-resolution.md §8.1c.
+    // AND IT DOES NOT GATE BARE FUNCTION CALLS.  A bare `foo()` binds from
+    // its stamp, and the name layer refuses a private declaration at the
+    // import that would have bound it; this map is read for a QUALIFIED
+    // call's callee (`enforce_callee_visibility`).
     decl_visibility:     HashMap<u32, boolean>;
 
 
@@ -348,7 +347,7 @@ type struct DeclarationIndex {
             module_func_first:  HashMap<u32, u32>::new(),
             module_func_pairs:  HashMap<u64, boolean>::new(),
             mangled_to_overload_pos: HashMap<u32, u32[]>::new(),
-            intrinsic_names:    HashMap<u32, boolean>::new(),
+            intrinsic_names:    HashMap<u32, u32>::new(),
             extern_bare_owner:  HashMap<u32, u32>::new(),
             module_imports:     HashMap<u32, u32[]>::new(),
             prelude_ns:         [],
@@ -423,9 +422,8 @@ type struct DeclarationIndex {
 
     /// Owner-aware variant: `owner` is the declaring function's QUALIFIED
     /// name, stamped on the overload entry so two same-signature declarations
-    /// from different modules keep separate entries (separate mangled slots),
-    /// and so the bare-call binder can filter candidates by the use site's
-    /// imports.  De-dup is by (name, TypeRef, owner): re-registering the same
+    /// from different modules keep separate entries (separate mangled slots).
+    /// De-dup is by (name, TypeRef, owner): re-registering the same
     /// declaration is a no-op; a same-signature declaration from a DIFFERENT
     /// owner appends its own entry instead of silently adopting (and later
     /// re-mangling) the first claimant's.
@@ -486,9 +484,9 @@ type struct DeclarationIndex {
         // non-intrinsic overwrites, so a later same-leaf regular function
         // (e.g. `alloc::heap::free`) can no longer silently rebind bare
         // calls program-wide.  `owner` is the intrinsic's qualified name
-        // (`std::core::intrinsics::free`), stamped on the overload entry for
-        // import-scoped candidate reporting.
-        this.intrinsic_names.insert(name.id, true);
+        // (`std::core::intrinsics::free`), and the value recorded under the
+        // leaf, which is how a bare allocator call names the declaration.
+        this.intrinsic_names.insert(name.id, owner.id);
         this.func_type_refs.insert(name.id, func_type_ref);
         const new_pos: u32 = this.overload_func_keys.length as u32;
         this.overload_func_keys.push(name.id);
@@ -499,9 +497,9 @@ type struct DeclarationIndex {
         // twins (owner 0), whose divergent Cryo signature would otherwise
         // shadow the intrinsic (see method doc).  OWNED same-leaf regular
         // functions (`fs::write` vs intrinsic `write`) keep their entries -
-        // they coexist by owner identity and the bare-call binder picks by
-        // signature + use-site imports - which also makes this registration
-        // order-robust when a regular fn's module registered first.
+        // they coexist by owner identity - which also makes this
+        // registration order-robust when a regular fn's module registered
+        // first.
         mut positions: u32[] = [];
         match (this.overload_index.get_ref(&name.id)) {
             Option::Some(prev) => {
@@ -528,6 +526,23 @@ type struct DeclarationIndex {
     /// is a real function and must be emitted as a normal call.
     is_intrinsic_decl_name(&this, name: SymbolStr) -> boolean {
         return this.intrinsic_names.contains_key(&name.id);
+    }
+
+    /// The qualified name of the `intrinsic function` declared under the leaf
+    /// `name`, or empty when no intrinsic owns that leaf.
+    ///
+    /// This is the one key a BARE intrinsic call binds through.  An intrinsic
+    /// is declared and never exported, so no import can bind its leaf and the
+    /// name layer leaves such a callee unanswered; every intrinsic the tree
+    /// calls is reached through `intrinsics::` instead, except the allocator
+    /// leaf (`malloc` / `free` / `realloc`), whose bare form is held open
+    /// until it is ruled on.  A leaf's single-slot maps cannot serve this:
+    /// they are last-write-wins across every module declaring the leaf.
+    intrinsic_owner_of(&this, name: SymbolStr) -> SymbolStr {
+        return match (this.intrinsic_names.get(&name.id)) {
+            Option::Some(owner) => { SymbolStr::from_id(owner) }
+            Option::None        => { SymbolStr::empty() }
+        };
     }
 
     /// Record that an `extern "C"` block claimed the bare C symbol `name`,
@@ -660,50 +675,6 @@ type struct DeclarationIndex {
         return SymbolStr::empty();
     }
 
-    /// Owner-aware mangled lookup: the entry matching (name, signature,
-    /// owner) exactly, or empty.
-    lookup_overload_mangled_owned(&this, name: SymbolStr, func_type_ref: TypeRef,
-                                  owner: u32) -> SymbolStr {
-        match (this.overload_index.get_ref(&name.id)) {
-            Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    const pos: u32 = (*positions)[k];
-                    if (this.overload_func_types[pos as i64].id == func_type_ref.id
-                        && this.overload_func_owner[pos as i64] == owner) {
-                        const mid: u32 = this.overload_func_mangled[pos as i64];
-                        if (mid != 0) { return SymbolStr::from_id(mid); }
-                        return SymbolStr::empty();
-                    }
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
-        }
-        return SymbolStr::empty();
-    }
-
-    /// Every overload entry registered under `name`, with its owning
-    /// declaration's qualified-name id (0 = legacy/global claim) and its
-    /// mangled-symbol id (0 = unset), as three parallel arrays the caller
-    /// indexes together.  The bare-call binder uses the owners to filter
-    /// candidates by the use site's imports and to name candidates in the
-    /// E0154 ambiguity diagnostic.
-    lookup_func_overload_owners(&this, name: SymbolStr) -> u32[] {
-        mut result: u32[] = [];
-        match (this.overload_index.get_ref(&name.id)) {
-            Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    result.push(this.overload_func_owner[(*positions)[k] as i64]);
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
-        }
-        return result;
-    }
-
     /// The FunctionType of the overload entry that carries this mangled LLVM
     /// symbol, or invalid.  The pinned `resolved_callee` is ground truth for
     /// a call's signature: name-based return lookups (`func_returns` bare
@@ -721,23 +692,6 @@ type struct DeclarationIndex {
             Option::None => { }
         }
         return TypeRef::invalid();
-    }
-
-    /// Parallel to `lookup_func_type_overloads` / `lookup_func_overload_owners`:
-    /// each entry's mangled-symbol id (0 = unset).
-    lookup_func_overload_mangleds(&this, name: SymbolStr) -> u32[] {
-        mut result: u32[] = [];
-        match (this.overload_index.get_ref(&name.id)) {
-            Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    result.push(this.overload_func_mangled[(*positions)[k] as i64]);
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
-        }
-        return result;
     }
 
     /// Register a method's return type on a specific type.
