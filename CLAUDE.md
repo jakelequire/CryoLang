@@ -155,6 +155,33 @@ Never edit sources while `make test` or `selfhost-check` is running; both
 rebuild from `$(CRYO_SOURCES)`, and a mid-run edit reads as a broken fixed
 point. Docs and `scripts/` are safe.
 
+### Long jobs: background them, then poll INSIDE the same tool call
+
+An agent does not wake when a backgrounded job finishes. A job launched
+with the turn ended is a job whose result nobody reads; this has cost
+seven sessions. The shape that works:
+
+```bash
+(bash scripts/objcmp/objcmp.sh > .objcmp/run.out 2>&1 &)
+for i in $(seq 1 19); do
+  grep -q OBJCMP_DONE .objcmp/run.out && break
+  pgrep -f objcmp.sh > /dev/null || { echo "DIED"; break; }
+  sleep 30
+done; tail -5 .objcmp/run.out
+```
+
+- Launch detached, then **poll in a bounded loop in the same call** (under
+  the tool's ten-minute limit); chain another bounded loop if it is not
+  done. Never end the turn waiting.
+- The poll checks **process liveness as well as the done marker**: a job
+  that dies in its first ten seconds should fail the loop in thirty, not
+  after ten minutes of waiting on a corpse. `pgrep -f <script>` from Git
+  Bash sees the `bash` running it; a Windows-native child needs
+  `tasklist`/`Get-CimInstance` instead.
+- Read the job's OWN summary line at the end, not the loop's exit code.
+- A bare `python -` (or `python - <<EOF`) with nothing on stdin hangs the
+  call until the timeout backgrounds it. Every script goes in a file.
+
 ## Specs — normative, and they win
 
 | document | governs |

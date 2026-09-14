@@ -8302,6 +8302,29 @@ default (§8.167); **and now the bare impl head on a template whose
 parameters all default** - concrete default instantiation or generic
 over the template - which decides `visit(ImplBlockNode)`'s lookup.
 
+#### Started, reverted, not landed: `register_generic_fn_call`'s callee key
+
+`type_resolution.cryo`'s `register_generic_fn_call` (the explicit-generic
+free call, `f<T>(...)`) finds the callee's template by a two-step ladder:
+`qualify_symbol_sym_home(fn_name, call.span.file)`, then a resolver
+re-entry `name_resolver.lookup(fn_name, current_scope)` building
+`sym.source_module::leaf`.  The stamp answers both: an `Identifier`
+callee's `res` is `Def(q)` and `q` is the template's key; a
+`ScopeResolution` callee's `scope_res` is `Def(ns)` for a module and the
+key is `ns::member`.  Shadowed (old `entry` against `get_template` of
+that key, printed on disagreement): the LSP half has only **3** such
+calls - 2 answered by the HOME step, 1 by the re-entry - and all 3 agree
+with the stamp; the inverted build printed exactly those 3.  The six-half
+run was killed by a machine restart before it reported, and the probe was
+reverted rather than left half-measured.  Next agent: rerun the six
+halves with the same shadow (`tests/` is where the explicit-generic calls
+live), then replace the ladder with the stamp read and delete the
+re-entry; `lane-check`'s `REENTRY` bucket (4) should fall by one.
+
+State at the restart: `naming-impl` at the commit carrying this section,
+pushed, tree clean but for that probe; no `objcmp` stash outstanding;
+`compiler/build` rebuilt clean from HEAD afterwards.
+
 ---
 
 ## 9. Open questions
