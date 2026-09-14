@@ -27,7 +27,7 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at the commit carrying §8.183; `git log
+Checks run from the repo root. Verified at the commit carrying §8.184; `git log
 --oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
@@ -81,6 +81,7 @@ three, and its row carries the count. Read each zero off its own row.
 | artifact | status | pinned | check → expected | § |
 |---|---|---|---|---|
 | type cascade (`lookup_type_by_sym`, 4 steps) | **DELETED** — `lookup_type_exact`, one step; the audit stream and its four counter rows went with it | — | `grep -rho 'lookup_type_by_sym' compiler/src --include=*.cryo \| wc -l` → **0** | §8.154 |
+| closure-arg specializer's callee by leaf (`lambda_synth`: the root scanned by the written name then the cursor-qualified spelling, the bare `lookup_func_type` slot, a cache keyed by the leaf) | **DELETED** — the identifier's stamp: `func_type_of_res`, the root scanned by registration key, the cache keyed by the definition; shadow 2,615 index-slot disagreements (2,301 a local fn-pointer handed a same-leaf global's signature, 307 another module's same-leaf function), 0 outcome moves in the corpus; built outside it, a local `f` called with a capturing closure ran global `f`'s clone (exit 41) and segfaulted without one - E0458 now, pinned by `E0458_closure_into_fn_pointer_local.cryo` | — | `grep -c 'lookup_func_type(ident.name)' compiler/src/compiler/sema/lambda_synth.cryo` → **0**; `grep -c 'qualify_symbol_sym(' compiler/src/compiler/sema/lambda_synth.cryo` → **0**; `grep -c 'find_top_level_function_by_key' compiler/src/compiler/sema/lambda_synth.cryo` → **2** | §8.184 |
 | annotation cascade step 3a (`resolve_named`: the written spelling, when qualified, looked up in the index) | **DELETED** — 1,561 answers over six halves, every one a synthesized annotation nobody stamped (1,559 the async lowering's canonical mints, 2 the bindgen's alias-qualified references with no span); each synthesizer stamps now, 2c reads a stamp without needing a home module, 1,561 → 0, 0 objects moved; a scratch generic async project builds under HEAD, refuses (E0200) with the `Poll` stamp reverted on this tree, builds with it. The cascade is steps 1, 1b, 2, 2c and the refusal | — | `grep -c 'lookup_type(name)' compiler/src/compiler/types/resolver.cryo` → **0**; `grep -c 'named_ann_def(' compiler/src/compiler/sema/async_lower.cryo` → **5**; `grep -c 'Res::Def(DefId::of_definition(qualified))' compiler/src/compiler/bindgen/type_map.cryo` → **1** | §8.64, §8.183 |
 | 2c home-module (ambient cursor) | STARVED | 0 | `grep -m1 '2c  home-module' tests/b1-baseline.txt` | §8.63, §8.87 |
 | M1 `qualifier_agrees` (`resolve_type_qualified_name_strict_from`: resolve the LEAF in scope, then check the written qualifier against it) | **DELETED** — its last caller was the C-import alias branch of the annotation stamp, where it MISSED on every `cit::X` by construction (the alias-qualified spelling is declared whole, its leaf deliberately not); the branch looks the whole spelling up now. NOT ENTERED on the b1 arms, entered and missing under `cryo test` | — | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **0** | §8.120, §8.132, §8.174 |
@@ -95,7 +96,7 @@ three, and its row carries the count. Read each zero off its own row.
 | free-call template search by leaf and arity (`find_fn_template_for_call`'s registry scan, its cursor-module tie-break, `Resolver::resolve_function_source_module`) | **DELETED** - `lookup_scope_template(ident.res)` plus the arity gate; a local is never a template, which is what fixes a local fn-pointer bound to a same-leaf generic global (returned 5 for 10); shadow 12 → 0 | — | `grep -rho 'resolve_function_source_module' compiler/src \| wc -l` → **0** | §8.172 |
 | bare-callee family (`check_call_arity`, `try_pin_overload_mangled_callee`'s HOME → BARE key with its import-scoped candidate tiers and E0154, `resolve_direct_call`'s leaf-keyed `check_fnbind_candidate`, the two spelling-keyed local checks) | **DELETED** - one key, `callee_family`: the stamp's canonical name (`Def`), the local's own type (`Local`), or `intrinsic_owner_of` for a `Pending` leaf an intrinsic owns (§8.93's hold, the ONE bare path left); shadow 3,343 → 0 over six halves once `panic` (3,318, D6 landing) and the two refused privates (E0202 now, the §8.167 shape) are named; `FNVIS` 0: no `Def`-stamped bare callee is another module's private; E0353 doors 2-4 and the `FNBIND-VIOLATION` stream went with it | — | `grep -c 'bare_candidate_scope' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -c 'callee_family(&this' compiler/src/compiler/sema/call_resolver.cryo` → **1** | §8.173 |
 | impl head's spelling carrier (`impl_target_type`'s unanswered arm: `lookup_type_exact(node.target_type)`, the monomorphizer's rewritten spelling; and the HOME → BARE pair `lookup_type(qualify_symbol_sym_home(target))`, then `lookup_type(target)`, at three sites in `type_resolution.cryo`) | **DELETED** in sema (§8.174) and in type resolution (§8.179): every site reads `ImplBlockNode.res` — `Def` → the index under the canonical name, `PrimTy` → under the spelling, unanswered → `spec_owner`; sema's shadow 1,466 → 0 (async-lowered `Future` heads, stamped by their synthesizer now); type resolution's 91,910 lines all a superset (16,930 cross-module heads the pair left INVALID, 74,977 primitives agreeing on type), 0 objects moved, no clone reaches those sites | — | `grep -c 'node.spec_owner' compiler/src/compiler/sema/sema.cryo` → **1**; `grep -c 'lookup_type_exact(node.target_type)' compiler/src/compiler/sema/sema.cryo` → **0**; `grep -c 'lookup_type(node.target_type)' compiler/src/compiler/passes/type_resolution.cryo` → **0**; `grep -c 'runner.impl_owner(node)' compiler/src/compiler/passes/type_resolution.cryo` → **3** (the two FuncSig sites and `run_struct_field_sync`) | §8.174, §8.175, §8.179 |
-| `qualify_symbol_sym_home` (the writer's module prefixed to a spelling, guessing a canonical name) | LIVE — 38 sites (the definition counted), 16 of them in `type_resolution.cryo`, 5 in `sema.cryo`, 4 each in `async_lower`, `pass_registry`, 3 each in `specialization`, `declaration_emitter`, 1 each in `directive_processing`, `lambda_synth`; a surface, not a lane: each site is a stamp the name layer already carries or should, and goes as its consumer does (5 went with the impl head's pair in §8.179, 4 with its registration key in §8.180, 1 with the explicit-generic callee's ladder in §8.182; the one in sema's `visit(ImplBlockNode)` waits on D16 being built) | — | `grep -rho 'qualify_symbol_sym_home' compiler/src --include=*.cryo \| wc -l` → **38** | §8.175, §8.179, §8.180, §8.182 |
+| `qualify_symbol_sym_home` (the writer's module prefixed to a spelling, guessing a canonical name) | LIVE — 39 sites (the definition counted), 16 of them in `type_resolution.cryo`, 5 in `sema.cryo`, 4 each in `async_lower`, `pass_registry`, 3 each in `specialization`, `declaration_emitter`, 2 in `lambda_synth`, 1 in `directive_processing`; a surface, not a lane: each site is a stamp the name layer already carries or should, and goes as its consumer does (5 went with the impl head's pair in §8.179, 4 with its registration key in §8.180, 1 with the explicit-generic callee's ladder in §8.182; +1 in §8.184, `find_top_level_function_by_key` deriving each root function's REGISTRATION key - the declaration-key rule, not a lookup by a written name; the one in sema's `visit(ImplBlockNode)` waits on D16 being built) | — | `grep -rho 'qualify_symbol_sym_home' compiler/src --include=*.cryo \| wc -l` → **39** | §8.175, §8.179, §8.180, §8.182, §8.184 |
 | impl head's registration key by writer module (stage-3 template attach keyed `qualify_symbol_sym_home(target)`, type resolution's re-attach guarded by "canonical ≠ that key", the legacy method alias registering every impl method under `<writer module>::<target>::<method>` as a family, sema's `impl_generic_params` fallback) | **DELETED** — `ImplBlockNode::target_key` (the stamp's name, a primitive's spelling, the clone's recorded name) keys stage 3 and sema; type resolution attaches unconditionally and `register_impl_block` refuses a block it holds (stage 3 runs before a later module's template exists: `Display for String` found no `String` template there in 621 of 624 heads); the alias's one reader, codegen's string `+` lowering, asks for `string::append`. 132,699 shadow lines, all cross-module heads; the alias's probe read a FALSE zero (it watched `method_returns`, the reader asked the function family) and the corpus has no `string + string` — `tests/lang/string_concat.cryo` pins it now | — | `grep -c 'target_key()' compiler/src/compiler/passes/specialization.cryo` → **1**; `grep -c 'register_methods_with_module_aliased' compiler/src/compiler/passes/type_resolution.cryo` → **1**; `grep -c '"string::append"' compiler/src/compiler/codegen/ops/expr_ops.cryo` → **1**; `grep -c 'impl_blocks\[i\] == block' compiler/src/compiler/types/generic_registry.cryo` → **1** | §8.180 |
 | explicit-generic callee's template by ladder (`register_generic_fn_call`: `qualify_symbol_sym_home(leaf)`, then a resolver re-entry building `source_module::leaf`; and a `ScopeResolution` arm the parser never fed, a path callee's turbofish living on the path node) | **DELETED** — the identifier callee's stamp is the registry key (`template_of(res.def_id())`); shadow 0 over six halves, control 189 agreeing (116 stdlib templates the re-entry answered, 73 same-module ones HOME answered), 0 objects moved; the file's one `get_resolver()` went with it | — | `grep -c 'name_resolver' compiler/src/compiler/passes/type_resolution.cryo` → **0**; `grep -c 'template_of(r.def_id())' compiler/src/compiler/passes/type_resolution.cryo` → **1** | §8.180, §8.182 |
 | struct-literal rungs 3 and 5 (`resolve_generic_scope_name(lit.struct_type, ..)`, `lookup_type_exact(lit.struct_type)`) | **DELETED** — rung 5: 2 lines over six halves, both C-imported literals whose stamp M1 had missed (above), 0 once stamped; rung 3: 0 over six halves including the `cryo test` half its comment named, and the instrument fires on a forced case; their two rows retired | — | `grep -c 'lookup_type_exact(lit.struct_type)' compiler/src/compiler/sema/sema.cryo` → **0** | §8.174 |
@@ -142,7 +143,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,119 unit + 48 project + 179 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
+| `make test` | 2,119 unit + 48 project + 180 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make b1-check` | B1 total + every per-row bound, 3 corpora × 2 hosts | **2 of the 3 corpora are `examples/`**; the third is `tests/tests/projects/ffi_c_import`. The compiler's own source is NOT a corpus, and `tests/` at large is swept by none of them. |
 | `make lane-check` | 7 buckets of call sites in `compiler/src`, as a golden | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
@@ -169,7 +170,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^\[' tests/lane-baseline.txt` → **7**
 * `grep -c '^\[host:' tests/b1-baseline.txt` → **6**
 * `grep -c '^project ' tests/test-roster.txt` → **48**
-* `grep -c '^negative ' tests/test-roster.txt` → **179**
+* `grep -c '^negative ' tests/test-roster.txt` → **180**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
 * `grep -n 'branches:' .github/workflows/ci.yml` → `main` only, both hooks
@@ -8576,6 +8577,98 @@ spelling lookup).
 
 `qualify_symbol_sym_home` 38, unchanged.  The list §8.182 wrote, less
 this.  The cascade is steps 1, 1b, 2 and 2c, then the refusal.
+
+### 8.184 Consumer 38: the closure-arg specializer's callee by leaf, deleted - a local `f` was bound to global `f`'s clone, exit 0 - 2026-09-14
+
+`lambda_synth.cryo`'s `try_specialize_for_closure_args` - the pass that
+clones a non-generic free function whose fn-typed parameter receives a
+capturing closure, types the clone's parameter as the closure struct, and
+pins the call - found its callee three times by spelling: the guard's
+`find_top_level_function(ident.name)` (the module's root scanned by the
+WRITTEN leaf, then by the cursor-qualified spelling), the bare index slot
+`lookup_func_type(ident.name)` for the callee's signature (its comment:
+"the bare index is the only one that can answer here"), and the same root
+scan again for the AST to clone.  Its specialization cache was keyed by
+the leaf's intern id.  Each is the identifier's stamp now: `Def(q)` gives
+the signature under `q` (`func_type_of_res`) and the root scanned by each
+function's own registration key (`find_top_level_function_by_key`); the
+cache keys by `q`.
+
+#### Measured
+
+Shadow at all three, six halves, 0 failing halves: **the two root scans
+disagreed nowhere; the index slot disagreed 2,615 times.**
+
+* **2,301 `stamp=Local`** - the callee is a fn-pointer PARAMETER or local
+  named `f` (2,276), `g`, `classify`, `dbl`, `gen`.  The bare slot handed
+  back whichever global in the program shared the spelling; the stamp says
+  a local names no declaration.  The corpus never carries a closure struct
+  to one of these, so the old path stopped at `sub_indices.length == 0` or
+  at a root scan that found no `f` - the same outcome by luck.
+* **307 `stamp=Def`, both answers valid and different** - `malloc` and
+  `free` (`std::ffi::libc`'s vs the slot's last writer), `byte_at`,
+  `apply`, `check`: the bare slot is single-slot last-write-wins across
+  every module declaring the leaf, so the arity gate and the
+  closure-struct scan ran against another function's signature.  No
+  outcome moved in the corpus; the signature was wrong.
+* **7 unstamped** - the allocator leaf (§8.93's hold) and two refused
+  privates; the stamp answers nothing and the pass does nothing, which is
+  what the old path also did after its slot lookup missed.
+
+The empty-by-luck shape, built: a global `f(cb: (i32) -> i32)` beside a
+function `g(f: ((i32) -> i32) -> i32)` whose body calls its PARAMETER `f`
+with a capturing closure `add_k`, and `main` calling `g(h)` with `h(cb) =
+cb(2)`.  Correct answer 42.
+
+* **HEAD's compiler**: builds, exit 0, the binary exits **41** - the call on
+  the parameter `f` was bound to global `f`'s closure specialization
+  (`cb(1)`), and the parameter never called.  The shadow printed all three
+  lookups disagreeing at that call (`old=f new=null stamp=Local`).
+* **HEAD's compiler, the global renamed `f2`**: builds, exit 0, the binary
+  **segfaults** - a closure struct handed to a fn-pointer parameter is
+  called as a function pointer.  Pre-existing; the wrong bind above was
+  this miscompile wearing a same-leaf global's clone.
+* **This tree**, either spelling: `error[E0458]: passing a capturing
+  closure to a fn-pointer local's parameter is not yet supported`, exit 1
+  - the refusal the generic-callee guard already gave, extended to a
+  `Local` callee.  `tests/tests/negative/E0458_closure_into_fn_pointer_local.cryo`
+  pins it (roster merged, 179 → 180 negatives).
+
+A callee declared in another module still gets no closure-arg
+specialization: its AST is not in this root, and it was not in the old
+scan's either (the root scans disagreed nowhere).  Unchanged, and now
+stated at the site rather than found by a miss.
+
+#### Objects, gates
+
+Predicted 0 movers: the specialization's mangled symbol derives from the
+same declaration, and only the cache key changed.  Measured examples **0 of
+1,126**, tests **0 of 2,183**, suite green (2,119 unit, 180 negative, 45
+projects); `lsp-check`, `cross-check` green before the object run;
+`b1-check` unmoved (B1 0, 56 rows).  `lane-check` re-pinned: **LOOKUP 43
+→ 42** (the bare `lookup_func_type`); **DEFID_UNWRAP 34 → 35** - the
+stamp's name, compared against each root function's registration key and
+used as the cache key; there is no DefId-keyed AST index to route it
+through (D12, the same case as §8.179's `impl_owner`).
+
+**Tally: 38 shadowed, 38 old paths deleted, 37 at zero and one at §8.93's
+allocator residue; 36 artifacts gone** (+ the closure-arg specializer's
+leaf lookups and the cursor-qualified rescan behind them).
+
+#### What this leaves
+
+`qualify_symbol_sym` (the cursor, no home): 12 sites, of which the ledger
+classed three as LOOKUPS - `lambda_synth` (gone here), `specialization.cryo:103`
+(a spec registered under a second, cursor-local key beside its arena name),
+`directive_processing.cryo:1166` and `:1745` (a global's `![symbol]`
+override re-recorded under the cursor key; a class's repr flags found by
+looking its own declaration up under the cursor key).  The rest mint a
+written declaration's key at registration.  `qualify_symbol_sym_home` 38
+→ 39: `find_top_level_function_by_key` derives each root function's
+registration key (`source_module::name`, else the writing file's module) to
+compare against the stamp - the declaration-key rule `fn_qualified_name`
+and `register_decl_in_index` state, added as a site of it rather than a
+lookup by a written name; it goes when a declaration carries its own key.
 
 ---
 

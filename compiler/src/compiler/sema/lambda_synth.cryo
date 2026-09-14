@@ -52,6 +52,7 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::res::{ Res, ResSlot };
 import compiler::sema::dispatch::{ SemaDispatch };
 import compiler::sema::scope_manager::{ ScopeManager };
 import compiler::sema::state::{ SemaState };
@@ -506,8 +507,43 @@ type struct LambdaSynth {
     /// When a call passes capturing closures to fn-typed params of a
     /// non-generic free function, synthesise a spec'd clone whose params are typed
     /// as the concrete closure-struct, inject it, and pin `call.resolved_callee`.
+    ///
+    /// The callee is what the identifier's stamp names, and nothing else: the
+    /// declaration's type comes off the index under that name, and its AST
+    /// is the top-level function registered under it.  A local (a fn-pointer
+    /// parameter or binding) names no declaration and is not specialized -
+    /// asking the bare index for the leaf instead handed back whichever
+    /// global shared the local's spelling, and a capturing closure passed to
+    /// a parameter `f` was then bound to global `f`'s clone, exit 0.
+    ///
+    /// A callee declared in another module has no AST in this root and is
+    /// not specialized here; that is the reach of the pass, not a lookup
+    /// that failed.
     try_specialize_for_closure_args(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> void {
         if (call == null || ident == null) { return; }
+
+        mut callee_res: Res = Res::Err;
+        match (ident.res) {
+            ResSlot::Answered(r) => { callee_res = r; }
+            _ => {}
+        }
+        const callee_q: SymbolStr = callee_res.def_id().qualified_name();
+        if (!callee_q.is_valid()) {
+            // A local fn-pointer cannot receive a closure struct: there is no
+            // declaration to specialize, and the indirect call would treat
+            // the struct as a function pointer.  Refused, as a generic or
+            // method callee is below.
+            match (callee_res) {
+                Res::Local(_) => {
+                    if (this.call_has_closure_struct_arg(call)) {
+                        this.reject_closure_struct_args_in_non_free_call(
+                            call, "passing a capturing closure to a fn-pointer local's parameter");
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
 
         // Guard: a capturing closure (closure-struct value) passed to a
         // *generic* free function's fn-typed parameter is not yet supported.
@@ -518,13 +554,9 @@ type struct LambdaSynth {
         // which segfaults at the indirect call.  Reject cleanly here, BEFORE
         // the `generic_args`/`resolved_callee` early returns below, so an
         // explicit `f<T>(closure)` call is caught as well as an inferred one.
+        const callee_fn: FunctionDeclNode* = this.find_top_level_function_by_key(callee_q);
         if (this.call_has_closure_struct_arg(call)) {
-            mut gen_fn: FunctionDeclNode* = this.find_top_level_function(ident.name);
-            if (gen_fn == null) {
-                const q: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
-                if (!q.equals(ident.name)) { gen_fn = this.find_top_level_function(q); }
-            }
-            if (gen_fn != null && gen_fn.is_generic()) {
+            if (callee_fn != null && callee_fn.is_generic()) {
                 this.reject_closure_struct_args_in_non_free_call(
                     call, "passing a capturing closure to a generic free function's parameter");
                 return;
@@ -534,11 +566,7 @@ type struct LambdaSynth {
         if (call.resolved_callee.is_valid()) { return; }
         if (call.generic_args.length > 0) { return; }
 
-        // The bare index is the only one that can answer here: a closure-arg
-        // specialization names a free function, and a free function's entry is
-        // reached by leaf.  A namespace-qualified retry behind this miss has no
-        // key to find.
-        mut callee_fn_ref: TypeRef = this.ctx.decl_index.lookup_func_type(ident.name);
+        const callee_fn_ref: TypeRef = this.ctx.decl_index.func_type_of_res(callee_res);
         if (!callee_fn_ref.is_valid()) { return; }
 
         const ft_raw: Type* = this.arena.lookup(callee_fn_ref.id);
@@ -560,7 +588,9 @@ type struct LambdaSynth {
         }
         if (sub_indices.length == 0) { return; }
 
-        mut key: string = fmt::format("%u", ident.name.id);
+        // Keyed by the DEFINITION: two callees sharing a leaf must not share
+        // a specialization.
+        mut key: string = fmt::format("%u", callee_q.id);
         for (mut ki: i64 = 0; ki < sub_indices.length; ki++) {
             key = fmt::format("%s|%lld:%llu", key, sub_indices[ki], sub_types[ki].id);
         }
@@ -572,13 +602,7 @@ type struct LambdaSynth {
             Option::None => { /* fall through */ }
         }
 
-        mut orig_func: FunctionDeclNode* = this.find_top_level_function(ident.name);
-        if (orig_func == null) {
-            const qual: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
-            if (!qual.equals(ident.name)) {
-                orig_func = this.find_top_level_function(qual);
-            }
-        }
+        const orig_func: FunctionDeclNode* = callee_fn;
         if (orig_func == null) { return; }
         // Generic receivers are handled by the capturing-closure guard at the
         // top of this function (they are rejected before reaching here).
@@ -628,8 +652,12 @@ type struct LambdaSynth {
         this.state.closure_spec_map.insert(key, mangled.value.id);
     }
 
-    /// Linear scan for a top-level FunctionDeclNode named `name`.
-    find_top_level_function(&this, name: SymbolStr) -> FunctionDeclNode* {
+    /// The top-level function registered under canonical key `q`, or null.
+    ///
+    /// A declaration's key is the rule its registration uses: the template
+    /// module stamped on a specialization's clone (`source_module`), else
+    /// the module of the file that wrote it, prefixed to its name.
+    find_top_level_function_by_key(&this, q: SymbolStr) -> FunctionDeclNode* {
         if (this.ctx.artifacts.ast.root == null) { return null; }
         const stmts: &ASTNode*[] = &this.ctx.artifacts.ast.root.statements;
         for (mut i: i64 = 0; i < stmts.length; i++) {
@@ -637,7 +665,12 @@ type struct LambdaSynth {
             if (s == null) { continue; }
             if (s.kind != NodeKind::FunctionDeclaration) { continue; }
             const fn: FunctionDeclNode* = s as FunctionDeclNode*;
-            if (fn.name.id == name.id) { return fn; }
+            const key: SymbolStr = if (fn.source_module != "") {
+                this.intern.intern(fn.source_module + "::" + this.intern.resolve(fn.name))
+            } else {
+                this.ctx.qualify_symbol_sym_home(fn.name, fn.span.file)
+            };
+            if (key.id == q.id) { return fn; }
         }
         return null;
     }
