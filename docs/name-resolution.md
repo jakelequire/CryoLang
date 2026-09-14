@@ -27,7 +27,7 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at the commit carrying §8.185; `git log
+Checks run from the repo root. Verified at the commit carrying §8.186; `git log
 --oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
@@ -81,6 +81,7 @@ three, and its row carries the count. Read each zero off its own row.
 | artifact | status | pinned | check → expected | § |
 |---|---|---|---|---|
 | type cascade (`lookup_type_by_sym`, 4 steps) | **DELETED** — `lookup_type_exact`, one step; the audit stream and its four counter rows went with it | — | `grep -rho 'lookup_type_by_sym' compiler/src --include=*.cryo \| wc -l` → **0** | §8.154 |
+| pattern constant by leaf (`codegen_pattern_value`: the local slot by name, then `resolve_global(pat.value)` through the first-registration-wins global slot) | **DELETED** — `PatternNode.const_res`, stamped by the name layer with the identifier's own answer; codegen reads `Local` → the slot, `Def` → the namespace and leaf; shadow 0 over six halves, control 16 agreeing on the LSP; 0 objects moved | — | `grep -c 'pat.const_res' compiler/src/compiler/codegen/visit/pattern_emitter.cryo` → **1**; `grep -c 'resolve_global(' compiler/src/compiler/codegen/visit/pattern_emitter.cryo` → **0**; `grep -c 'set_const_res' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.186 |
 | specialization's second index key (`register_spec`: the spec registered under `qualify_symbol_sym(spec_name)`, the CURSOR's module, beside its arena name) and `ModuleTypeRegistry` (`types/registry.cryo`, Phase 4 registering every type and alias into it by bare name) | **DELETED** — 13,667 second keys over six halves, 127 reads, all sema's async declare pass deriving a placed clone's key by the cursor; on `decl_type_key` (C-import alias, else registered name, else the writing file's module) it reads the arena key and the reads are 0; the registry's `lookup_type(module, name)` had no caller in the compiler or the LSP; 0 objects moved | — | `grep -c 'qualify_symbol_sym(' compiler/src/compiler/passes/specialization.cryo` → **0**; `ls compiler/src/compiler/types \| grep -c '^registry.cryo$'` → **0**; `grep -rho 'ModuleTypeRegistry' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'decl_type_key' compiler/src/compiler/sema/sema.cryo` → **6** | §8.185 |
 | closure-arg specializer's callee by leaf (`lambda_synth`: the root scanned by the written name then the cursor-qualified spelling, the bare `lookup_func_type` slot, a cache keyed by the leaf) | **DELETED** — the identifier's stamp: `func_type_of_res`, the root scanned by registration key, the cache keyed by the definition; shadow 2,615 index-slot disagreements (2,301 a local fn-pointer handed a same-leaf global's signature, 307 another module's same-leaf function), 0 outcome moves in the corpus; built outside it, a local `f` called with a capturing closure ran global `f`'s clone (exit 41) and segfaulted without one - E0458 now, pinned by `E0458_closure_into_fn_pointer_local.cryo` | — | `grep -c 'lookup_func_type(ident.name)' compiler/src/compiler/sema/lambda_synth.cryo` → **0**; `grep -c 'qualify_symbol_sym(' compiler/src/compiler/sema/lambda_synth.cryo` → **0**; `grep -c 'find_top_level_function_by_key' compiler/src/compiler/sema/lambda_synth.cryo` → **2** | §8.184 |
 | annotation cascade step 3a (`resolve_named`: the written spelling, when qualified, looked up in the index) | **DELETED** — 1,561 answers over six halves, every one a synthesized annotation nobody stamped (1,559 the async lowering's canonical mints, 2 the bindgen's alias-qualified references with no span); each synthesizer stamps now, 2c reads a stamp without needing a home module, 1,561 → 0, 0 objects moved; a scratch generic async project builds under HEAD, refuses (E0200) with the `Poll` stamp reverted on this tree, builds with it. The cascade is steps 1, 1b, 2, 2c and the refusal | — | `grep -c 'lookup_type(name)' compiler/src/compiler/types/resolver.cryo` → **0**; `grep -c 'named_ann_def(' compiler/src/compiler/sema/async_lower.cryo` → **5**; `grep -c 'Res::Def(DefId::of_definition(qualified))' compiler/src/compiler/bindgen/type_map.cryo` → **1** | §8.64, §8.183 |
@@ -8750,6 +8751,83 @@ declaration's key at registration - `register_decl_in_index`'s
 `qualify_binding_sym` for a struct, union or enum is the same cursor
 derivation this entry moved sema off, and holds only because Phase 4 walks
 each module's own root; `decl_type_key` is the destination for it too.
+
+### 8.186 Consumer 40: a constant in pattern position binds from its stamp; codegen's leaf-keyed `resolve_global` for it deleted - 2026-09-14
+
+The identifier-value lane's twin (§8.167), one node kind over.  An
+`Identifier` pattern that names a `const` (`match (code) { ENOENT => … }`)
+is recognised by the name layer, which records the resolution in its own
+table, moves the name into `value` and stamps NOTHING on the node - the
+base `PatternNode` carried no slot (only `EnumPatternNode` did).  Codegen's
+`codegen_pattern_value` then re-found the constant by leaf: the local slot
+map, then `resolve_global(pat.value)` - the bare global slot,
+`get_global_module` and `lookup_global` by leaf, first registration wins -
+so two modules declaring one leaf (`libc::FIONBIO` and `syscall::FIONBIO`
+are the §8.166 example) compare the subject against whichever registered
+first.
+
+`PatternNode.const_res` now carries what the constant is, stamped by the
+name layer with `bare_name_res` - the same answer an identifier naming the
+constant gets: a module-level constant by its canonical name, a local one
+as `Local`.  Codegen reads it: `Local` → the local slot, `Def(q)` →
+`resolve_global_in_namespace(leaf, namespace of q)`, the same split
+`codegen_identifier` performs; the cloner copies the slot.
+
+#### Measured
+
+Shadow (old slot against the stamp's, compared by LLVM value identity):
+**0 disagreements over the six halves, 0 failing halves.**  Control, the
+comparison inverted: 16 agreeing on the LSP alone and 16 on
+`generic_name_collision`'s test half, every one a stdlib errno constant
+(`ENOENT`, `EPIPE`, `ETIMEDOUT`, …) matched in `std::io`'s error mapping,
+all `Def`, both slots valid - the instrument reports.  The corpus has no
+two same-leaf constants matched in patterns, so the old lane's wrong bind
+is not reproduced here; the deletion stands on the stamp answering
+identically wherever the corpus reaches, with the shape the leaf cannot
+answer stated.
+
+Objects: predicted 0 - measured examples **0 of 1,126**, tests **0 of
+2,183**, suite green (2,119 unit, 180 negative, 45 projects); `lsp-check`
+and `cross-check` green before the object run; `b1-check` unmoved.
+`lane-check`: `resolve_global(pat.value)` was not a counted lookup name;
+DEFID_UNWRAP +1 for the stamp's name split into namespace and leaf, the
+key the per-module global list is keyed by (as §8.167's).
+`SymbolResolver::resolve_global` keeps its one caller, the C-import alias
+branch of the scope-value visit (`cit::FLAG`, a key space no stamp names).
+
+**Tally: 40 shadowed, 40 old paths deleted, 39 at zero and one at §8.93's
+allocator residue; 39 artifacts gone** (+ the pattern constant's leaf
+lookup).
+
+#### Handoff
+
+State: `naming-impl` at the commit carrying this section, pushed; tree
+clean; `compiler/build` is this tree's.  Landed this session, in order:
+§8.182 (the explicit-generic callee's ladder), §8.183 (`resolve_named` 3a
+and the synthesizers' stamps), §8.184 (the closure-arg specializer's
+callee; a live miscompile, E0458 now), §8.185 (the specialization's
+second key and `ModuleTypeRegistry`), this.  Every landing: 0/0 objects,
+`lsp-check` and `cross-check` before the object run, b1 unmoved.
+
+Next, in the brief's order: `directive_processing.cryo:1166` and `:1745`
+(the two `qualify_symbol_sym` sites left of §8.184's list - a global's
+`![symbol]` override re-recorded under the cursor key; a class's repr
+flags found by its own declaration under the cursor key; `decl_type_key`
+is the destination for the second, and for `register_decl_in_index`'s
+`qualify_binding_sym` derivations, which hold only because Phase 4 walks
+each module's own root); `target_key`'s last two arms; `global_extern_symbol`
+/ `is_global_thread_local` by leaf (§8.166 - both readers now hold the
+namespace, so the DI can be asked by `(leaf, ns)` the way
+`find_global_in_namespace` already is); `ir_generator`'s sizeof/alignof by
+spelling; then D16 (§8.181, ruled, not built).  Parked for Jake, unchanged:
+D5, the keyword ruling (§8.165), the extern-visibility default (§8.167),
+and D16's partial heads (7, not ruled).
+
+Traps this session: the bare `python -` reflex hung a tool call THREE
+times, twice inside a command that had nothing to do with Python; a
+`test -e …; echo $?` row check reads 0 for a missing file because the
+checker's `bash` is reached through a wrapper that expands `$?` first -
+write existence checks as `ls … | grep -c`.
 
 ---
 

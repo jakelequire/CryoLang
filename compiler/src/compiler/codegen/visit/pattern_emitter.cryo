@@ -35,6 +35,9 @@ import compiler::codegen::llvm_types::{
 };
 import compiler::codegen::util::{ CodegenUtil };
 import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::qualified_name::{ QualifiedName };
+import compiler::resolver::res::{ Res, ResSlot };
+import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ PointerType, ReferenceType };
 import compiler::types::generic::{ InstantiatedType };
@@ -657,13 +660,28 @@ type struct PatternEmitter {
                                              pat.literal_kind, subj_ty);
         } else if (pat.pattern_kind == PatternKind::Identifier) {
             // Constant-value pattern: `pat.value` holds the const's name (the
-            // resolver set it after recognising the identifier as a `const`).
-            // Load its value - from a local/parameter slot if present, else the
-            // module global - for the icmp. Loaded at the subject's width so the
-            // comparison operands agree.
-            mut slot: LValue = this.cg.values.get(pat.value);
-            if (!slot.is_valid()) {
-                slot = this.cg.resolver.resolve_global(pat.value);
+            // resolver set it after recognising the identifier as a `const`)
+            // and `const_res` what that name refers to.  A local constant is
+            // its slot; a module-level one is that module's global under the
+            // leaf - two modules may each declare the leaf, so the leaf alone
+            // names nothing.  Loaded at the subject's width so the comparison
+            // operands agree.  An unanswered slot yields no value; the
+            // resolver has already reported the name.
+            mut slot: LValue = LValue::null();
+            match (pat.const_res) {
+                ResSlot::Answered(r) => {
+                    match (r) {
+                        Res::Local(_) => { slot = this.cg.values.get(pat.value); }
+                        Res::Def(d)   => {
+                            const q_str: string = this.cg.resolve(d.qualified_name());
+                            const ns_str: string = QualifiedName::parent_of(q_str);
+                            const ns_sym: SymbolStr = if (ns_str.length() > 0) { this.cg.intern_str(ns_str) } else { SymbolStr::empty() };
+                            slot = this.cg.resolver.resolve_global_in_namespace(pat.value, ns_sym);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
             if (slot.is_valid()) {
                 mut ty: LType = this.cg.type_mapper.map_type(subj_ty);
