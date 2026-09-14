@@ -1139,12 +1139,14 @@ type struct DirectiveProcessingPasses {
         // emission (read by codegen_global_var and cross-module extern refs).
         if (decl.kind == NodeKind::VariableDeclaration) {
             const vd: VarDeclNode* = decl as VarDeclNode*;
+            // TypeResolution registered this global before directives ran, on
+            // the slot its declaration keys; a directive corrects that slot.
+            mut g_ns: SymbolStr = SymbolStr::empty();
+            const g_key: SymbolStr = ctx.decl_global_key(
+                vd.name, vd.binding_namespace, vd.span.file, &g_ns);
             if (name.eq("thread_local")) {
                 vd.is_thread_local = true;
-                // TypeResolution already registered this global (before
-                // directives run) with the flag false; update the DI record so
-                // cross-module extern refs are marked thread-local too.
-                ctx.decl_index.mark_global_thread_local(vd.name);
+                ctx.decl_index.mark_global_thread_local(g_key, g_ns);
             }
             // `![symbol("sym")]` on an IMPORTED global pins the linker symbol,
             // the way it does on an extern function.  It is what lets a C global
@@ -1156,18 +1158,10 @@ type struct DirectiveProcessingPasses {
                     && dir.args[0].kind == DirectiveArgKind::StringLit) {
                 if (vd.is_extern_import) {
                     vd.link_name = dir.args[0].str_value;
-                    // TypeResolution registered this global before directives
-                    // ran, recording its DECLARED name as the symbol; correct
-                    // every key it recorded so cross-module readers - which
-                    // arrive under the qualified spelling - bind the override.
+                    // The registration recorded the DECLARED name as the
+                    // symbol; the override replaces it on the same slot.
                     const ovr: SymbolStr = ctx.intern(vd.link_name);
-                    ctx.decl_index.record_global_extern_symbol(vd.name, ovr);
-                    ctx.decl_index.record_global_extern_symbol(
-                        ctx.qualify_symbol_sym(vd.name), ovr);
-                    if (!vd.binding_namespace.is_empty()) {
-                        ctx.decl_index.record_global_extern_symbol(
-                            ctx.qualify_binding_sym(vd.name, vd.binding_namespace), ovr);
-                    }
+                    ctx.decl_index.record_global_extern_symbol(g_key, g_ns, ovr);
                 } else {
                     mut sdiag: Diagnostic = Diagnostic::error(
                         ErrorCode::E0151_DIRECTIVE_MISPLACED,
@@ -1678,10 +1672,9 @@ type struct DirectiveProcessingPasses {
     /// flags onto the corresponding `{Struct,Class,Enum}Type*` in the arena
     /// so TypeLowering and codegen see the chosen layout.
     ///
-    /// Lookup path: qualify the decl's bare name with the current module's
-    /// namespace via `ctx.qualify_symbol_sym`, then ask the decl index for
-    /// the type's TypeRef.  This matches what StructFieldTypeSync does to
-    /// find the same Type, so a name that resolves there resolves here.
+    /// Each declaration is found in the index under its own key
+    /// (`decl_type_key`: a C import's alias-qualified name, else the module
+    /// of the file that wrote it), the key its registration used.
     static propagate_layout_attrs_to_types(ctx: CompilationContext*) -> void {
         const root: ProgramNode* = ctx.artifacts.ast.root;
         if (root == null) { return; }
@@ -1708,7 +1701,7 @@ type struct DirectiveProcessingPasses {
                             && !node.repr_transparent && node.min_alignment == 0) {
                         continue;
                     }
-                    const qsym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
+                    const qsym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
                     const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
                     if (!tref.is_valid()) { continue; }
                     const ty: Type* = arena.lookup(tref.id);
@@ -1726,7 +1719,7 @@ type struct DirectiveProcessingPasses {
                             && !node.repr_transparent && node.min_alignment == 0) {
                         continue;
                     }
-                    const qsym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
+                    const qsym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
                     const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
                     if (!tref.is_valid()) { continue; }
                     const ty: Type* = arena.lookup(tref.id);
@@ -1742,7 +1735,7 @@ type struct DirectiveProcessingPasses {
                             && !node.repr_transparent && node.min_alignment == 0) {
                         continue;
                     }
-                    const qsym: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                    const qsym: SymbolStr = ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
                     const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
                     if (!tref.is_valid()) { continue; }
                     const ty: Type* = arena.lookup(tref.id);
@@ -1755,7 +1748,7 @@ type struct DirectiveProcessingPasses {
                     const node: EnumDeclNode* = stmt as EnumDeclNode*;
                     if (node.is_generic()) { continue; }
                     if (!node.repr_c && node.min_alignment == 0) { continue; }
-                    const qsym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
+                    const qsym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
                     const tref: TypeRef = ctx.decl_index.lookup_type(qsym);
                     if (!tref.is_valid()) { continue; }
                     const ty: Type* = arena.lookup(tref.id);

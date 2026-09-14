@@ -17,7 +17,7 @@ import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ ProvisionSet };
 import compiler::resolve_counter;
 import compiler::types;
-import compiler::types::{ type_ref, arena, registry, resolver, generic_registry };
+import compiler::types::{ type_ref, arena, resolver, generic_registry };
 import compiler::mono::monomorphizer;
 import compiler::mono::monomorphizer::{ Monomorphizer };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, resolver };
@@ -655,6 +655,31 @@ public:
             return this.qualify_binding_sym(name, binding_namespace);
         }
         return this.qualify_symbol_sym_home(name, span_file);
+    }
+
+    /// The `(key, namespace)` a GLOBAL is registered under in the declaration
+    /// index, from what the node carries.  A C-imported one is reachable only
+    /// through its extern block's alias: key `cit::NAME` under namespace
+    /// `cit`, a key space no module's stamp names.  Any other is its bare leaf
+    /// under the namespace of the module that WROTE it.  Every attribute the
+    /// index records per registration - the type, the thread-local flag, the
+    /// linker symbol - is asked by this pair, so a directive applied after
+    /// registration and a reader standing in another module reach the slot
+    /// the registration wrote, and a same-leaf global of some other module
+    /// cannot answer for it.
+    ///
+    /// Falls back to the cursor when the file names no module in the graph
+    /// (single-file mode), as the type declaration key does and for the same
+    /// reason: an invalid namespace compares unequal to every real one.
+    decl_global_key(mut &this, name: SymbolStr, binding_namespace: SymbolStr,
+                    span_file: string, out_ns: SymbolStr*) -> SymbolStr {
+        if (!binding_namespace.is_empty()) {
+            *out_ns = binding_namespace;
+            return this.qualify_binding_sym(name, binding_namespace);
+        }
+        const home: SymbolStr = this.module_ns_sym_of_file(span_file);
+        *out_ns = if (home.is_valid()) { home } else { this.namespace_str };
+        return name;
     }
 
     /// Qualify `sym` under an extern-module binding namespace when
