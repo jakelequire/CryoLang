@@ -21,10 +21,13 @@ import compiler::ast::{
 };
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
+import compiler::types::arena;
+import compiler::types::arena::{ TypeArena };
+import std::fmt;
 import compiler::resolver::symbol_str;
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res;
-import compiler::resolver::res::{ Res, ResSlot };
+import compiler::resolver::res::{ Res, ResBase, ResSlot };
 import compiler::resolve_counter;
 import compiler::ast::visitor;
 import compiler::ast::visitor::{ ASTVisitor };
@@ -1139,28 +1142,18 @@ public:
     }
 }
 
-
 type class ImplBlockNode : DeclarationNode {
 public:
     target_type:    SymbolStr;
-    /// The qualified target name as DI/sema registered it (a primitive stays
-    /// its own spelling, `i32`; a declared type is its canonical name; a
-    /// specialization is its registered name).  Set
-    /// by the TypeResolution pass when registering the impl in the DI.
-    /// Used by the monomorphizer when registering newly-created spec
-    /// methods, so the spec's DI keys line up with the keys sema-time
-    /// registration used for the template.  Empty until stamped.
-    qualified_target_name: SymbolStr;
     /// What `target_type` names, stamped by NameResolution from the scope the
     /// impl head was written in.  An impl head names one type outright, so
     /// there is no trailing segment and `TypeRelative` never appears here.
     ///
-    /// A clone does NOT inherit it, for the same reason
-    /// `qualified_target_name` is not inherited: specialization rebinds WHICH
-    /// type the head is for, so a stamp naming the template, beside a
-    /// `target_type` the monomorphizer rewrote to the instantiation, would bind
-    /// the head back to the template.  On a clone the rewritten spelling is the
-    /// only carrier of which specialization the head is for.
+    /// A clone does NOT inherit it: specialization rebinds WHICH type the
+    /// head is for, so a stamp naming the template, beside a `target_type`
+    /// the monomorphizer rewrote to the instantiation, would bind the head
+    /// back to the template.  On a clone `spec_owner` carries which
+    /// specialization the head is for.
     ///
     /// A written primitive target IS answered, as `PrimTy`.  It names no
     /// declaration - a primitive owns members without being declared
@@ -1237,7 +1230,6 @@ public:
     ImplBlockNode(target_type: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::ImplementationBlock, span) {
         this.target_type           = target_type;
-        this.qualified_target_name = SymbolStr::empty();
         this.res                   = ResSlot::Pending;
         this.spec_owner            = TypeRef::invalid();
         this.qualified_trait_name  = SymbolStr::empty();
@@ -1261,58 +1253,49 @@ public:
     is_trait_impl(&this) -> boolean { return this.trait_annotation != null; }
     set_target_type(n: SymbolStr) -> void { this.target_type = n; }
 
-    /// The name codegen registers this block's methods under, and the name it
-    /// emits their bodies against.  Both must be the same name, or the methods
-    /// are declared under one key and defined under another.
-    ///
-    /// The stamp is the canonical qualified target the TypeResolution pass
-    /// recorded, and it is what puts a cross-module impl under the DEFINING
-    /// module's key: `implement trait FmtWrite for struct Stdout` written in
-    /// `fmt::write` belongs to `io::stdio::Stdout`.  Qualifying with the
-    /// emitting module instead yields `fmt::write::Stdout::write_str`, which
-    /// no call site mangles and `declare_method` cannot look up, so the bodies
-    /// are dropped silently and the linker reports them undefined.
-    ///
     /// The name the target is registered under, and so the key every
-    /// registry keyed by a type's name answers to: the stamp's canonical name
-    /// for a declared type, a primitive's own spelling (a primitive is
-    /// declared nowhere, so its spelling is its key).  A head the name layer
-    /// did not stamp is a monomorphized clone or a synthesized block: the
+    /// registry keyed by a type's name answers to - what codegen declares
+    /// this block's methods under and what it emits their bodies against,
+    /// which must be one name or the methods are declared under one key and
+    /// defined under another.
+    ///
+    /// Three answers and no fourth: the stamp's canonical name for a declared
+    /// type (which puts a cross-module impl under the DEFINING module's key:
+    /// `implement trait FmtWrite for struct Stdout` written in `fmt::write`
+    /// belongs to `io::stdio::Stdout`); a primitive's own spelling (a
+    /// primitive is declared nowhere, so its spelling is its key); and, for a
+    /// head the name layer did not stamp - a monomorphized clone, whose
     /// cloner withholds `res` because a specialization is not a definition
-    /// and no `Res` can name one, and the monomorphizer's rewritten spelling
-    /// - already qualified, and recorded in `qualified_target_name` where the
-    /// clone is registered - is the carrier (`spec_owner` carries the same
-    /// fact as an arena id, for a reader with an arena to resolve it).
-    target_key(&this) -> SymbolStr {
+    /// and no `Res` can name one - the specialization the monomorphizer
+    /// placed it under, by arena id (`spec_owner`), resolved to its
+    /// registered name.  A head with none of the three names nothing; there
+    /// is no spelling to fall back to, because a spelling looked up by the
+    /// module the compiler is standing in is the ambient-cursor defect.
+    target_key(&this, arena: TypeArena*) -> SymbolStr {
+        mut answer: SymbolStr = SymbolStr::empty();
+        mut stamped: boolean = false;
         match (this.res) {
             ResSlot::Answered(r) => {
                 match (r) {
-                    Res::Def(d)    => { return d.qualified_name(); }
-                    Res::PrimTy(n) => { return n; }
+                    Res::Def(d)    => { answer = d.qualified_name(); stamped = true; }
+                    Res::PrimTy(n) => { answer = n; stamped = true; }
                     _              => { }
                 }
             }
             _ => { }
         }
-        if (this.qualified_target_name.is_valid()) { return this.qualified_target_name; }
-        return this.target_type;
-    }
-
-    codegen_target_name(&this) -> SymbolStr {
-        if (!this.qualified_target_name.is_valid()) {
-            resolve_counter::Site::CgImplTargetUnstamped.bump();
-            match (this.res) {
-                ResSlot::Answered(r) => {
-                    match (r) {
-                        Res::Def(_)    => { }
-                        Res::PrimTy(_) => { resolve_counter::Site::CgImplTargetUnResPrim.bump(); }
-                        _              => { resolve_counter::Site::CgImplTargetUnResOther.bump(); }
-                    }
-                }
-                _ => { }
-            }
+        if (!stamped && this.spec_owner.is_valid() && arena != null) {
+            answer = arena.get_qualified_name(this.spec_owner);
         }
-        return this.target_key();
+        // A head on an alias keyword (`implement trait Show for int`) is
+        // stamped by nothing - a module may own the spelling, so the name
+        // layer answers `Pending` - and its spelling is its only carrier
+        // until the keyword ruling.  Held for exactly that population.
+        if (!stamped && !answer.is_valid() && arena != null
+                && ResBase::is_alias_keyword(arena.intern_table.resolve(this.target_type))) {
+            answer = this.target_type;
+        }
+        return answer;
     }
 
 

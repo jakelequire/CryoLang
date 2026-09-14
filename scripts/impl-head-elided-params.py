@@ -45,8 +45,18 @@ HEAD = re.compile(
 
 
 def files():
-    out = subprocess.run(["git", "ls-files", "*.cryo"], cwd=ROOT,
-                         stdout=subprocess.PIPE).stdout.decode().split()
+    # A listing that FAILED is not an empty tree: read as one, every count
+    # below is 0 and `bare=0,partial=0` is the value that means "done".
+    r = subprocess.run(["git", "ls-files", "*.cryo"], cwd=ROOT,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        sys.stderr.write("impl-head-elided-params: git ls-files failed (exit %d): %s\n"
+                         % (r.returncode, r.stderr.decode(errors="replace").strip()))
+        sys.exit(2)
+    out = r.stdout.decode().split()
+    if not out:
+        sys.stderr.write("impl-head-elided-params: git ls-files listed no .cryo file\n")
+        sys.exit(2)
     return [f for f in out if not f.startswith("legacy/")]
 
 

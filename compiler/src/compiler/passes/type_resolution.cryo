@@ -913,23 +913,6 @@ type struct TypeResolutionRunner {
         };
     }
 
-    /// The canonical name of the type an impl head is for, by the same
-    /// three answers: the `Def`'s name, the primitive's spelling, the
-    /// specialization's registered name.
-    impl_owner_qname(&this, node: ImplBlockNode*) -> SymbolStr {
-        const spec_q: SymbolStr = if (node.spec_owner.is_valid()) { this.arena.get_qualified_name(node.spec_owner) } else { SymbolStr::empty() };
-        return match (node.res) {
-            ResSlot::Answered(r) => {
-                match (r) {
-                    Res::Def(q)    => { q.qualified_name() }
-                    Res::PrimTy(n) => { n }
-                    _              => { SymbolStr::empty() }
-                }
-            }
-            _ => { spec_q }
-        };
-    }
-
     resolve_method_signatures(&this, methods: &MethodNode*[],
                               res_ctx: ResolutionContext*,
                               owner_type: TypeRef,
@@ -1732,26 +1715,9 @@ type struct TypeResolutionPasses {
                     }
                 }
                 // The impl's target under the name it is registered by, off
-                // the head's stamp: a declaration's canonical name; a
-                // primitive's own spelling; and a monomorphized clone, which
-                // carries no stamp, spells the qualified name already.  The
-                // spelling cascade that stood here - as-is, bare index slot,
-                // cursor scope map, current module - agreed with the stamp on
-                // every impl in the corpus and was deleted.
-                const target_str_full: string = ctx.intern_table.resolve(node.target_type);
-                mut canonical_target: SymbolStr = node.target_type;
-                match (node.res) {
-                    ResSlot::Answered(tres) => {
-                        match (tres) {
-                            Res::Def(tq) => { canonical_target = tq.qualified_name(); }
-                            _            => { }
-                        }
-                    }
-                    _ => { }
-                }
-                if (!node.qualified_target_name.is_valid()) {
-                    node.qualified_target_name = canonical_target;
-                }
+                // the head: a declaration's canonical name, a primitive's own
+                // spelling, a clone's specialization.
+                const canonical_target: SymbolStr = node.target_key(arena);
                 // Re-register the trait-impl entry under the canonical
                 // qualified target.  `register_impl_block` (Stage 3,
                 // DeclarationCollection) keys it under the parser-captured
@@ -3038,7 +3004,7 @@ type struct TypeResolutionPasses {
                     // resolve with no receiver type to back-fill and no
                     // `This` to bind.
                     runner.resolve_method_signatures(node.methods, &impl_ctx,
-                        runner.impl_owner(node), runner.impl_owner_qname(node));
+                        runner.impl_owner(node), node.target_key(runner.arena));
                     sig_count += node.methods.length;
                 }
                 NodeKind::ExternBlock => {
@@ -3448,7 +3414,7 @@ type struct TypeResolutionPasses {
                     // The owner and its name off the stamp, as in the FuncSig
                     // phase above.
                     runner.resolve_method_signatures(node.methods, &impl_ctx,
-                        runner.impl_owner(node), runner.impl_owner_qname(node));
+                        runner.impl_owner(node), node.target_key(runner.arena));
                     runner.emit_method_signature_diagnostics(node.methods);
                 }
                 _ => {

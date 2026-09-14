@@ -1186,20 +1186,20 @@ type struct MonoCallSpecializer {
         // under, or `resolve_function_by_mangled` misses it and codegen falls
         // back to the unmangled `Type::method` lookup (collapsing every spec
         // onto the first).  For an inherent (non-trait) impl the registration
-        // target is `impl_node.qualified_target_name` (e.g. bare `string`),
-        // which can differ from `recv_qname` for a primitive receiver; use it.
-        mut pin_target: SymbolStr = recv_qname;
-        if (impl_node != null && !impl_node.is_trait_impl()
-                && impl_node.qualified_target_name.is_valid()) {
-            pin_target = impl_node.qualified_target_name;
-        }
-        // A primitive receiver has no qualified name at all; its impl blocks
+        // target is the block's own key (e.g. bare `string`), which can
+        // differ from `recv_qname` for a primitive receiver; use it.  A
+        // primitive receiver has no qualified name at all; its impl blocks
         // are declared under the target the block itself carries (`i32`), so
         // that is the symbol's owner.  Left empty, no symbol is pinned and
         // codegen binds `i32::fmt` by name - to whichever of `Display::fmt` /
         // `Debug::fmt` the index registered first.
-        if (!pin_target.is_valid() && is_primitive_kind && impl_node != null) {
-            pin_target = impl_node.codegen_target_name();
+        mut pin_target: SymbolStr = recv_qname;
+        if (impl_node != null) {
+            const own: SymbolStr = impl_node.target_key(this.arena);
+            if (own.is_valid()
+                    && (!impl_node.is_trait_impl() || (!pin_target.is_valid() && is_primitive_kind))) {
+                pin_target = own;
+            }
         }
         const spec_sym: SymbolStr = this.mangled_symbol_for_spec_method(
             spec_method, pin_target);
@@ -1373,15 +1373,14 @@ type struct MonoCallSpecializer {
         // qualified name, except for an inherent block, which registers under
         // its own stamped target (a primitive's bare spelling).
         mut pin_target: SymbolStr = this.arena.get_qualified_name(recv_type);
-        if (!impl_node.is_trait_impl() && impl_node.qualified_target_name.is_valid()) {
-            pin_target = impl_node.qualified_target_name;
-        }
         const lazy_recv: Type* = this.arena.lookup(recv_type.id);
-        if (!pin_target.is_valid() && lazy_recv != null
+        const lazy_prim: boolean = lazy_recv != null
                 && (lazy_recv.kind == TypeKind::Int || lazy_recv.kind == TypeKind::Float
                     || lazy_recv.kind == TypeKind::Bool || lazy_recv.kind == TypeKind::Char
-                    || lazy_recv.kind == TypeKind::String)) {
-            pin_target = impl_node.codegen_target_name();
+                    || lazy_recv.kind == TypeKind::String);
+        const own: SymbolStr = impl_node.target_key(this.arena);
+        if (own.is_valid() && (!impl_node.is_trait_impl() || (!pin_target.is_valid() && lazy_prim))) {
+            pin_target = own;
         }
         for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
             const m: MethodNode* = impl_node.methods[k];
@@ -2039,8 +2038,7 @@ type struct MonoCallSpecializer {
             for (mut i: i64 = 0; i < registry.trait_impls.length; i++) {
                 const impl_node: ImplBlockNode* = registry.trait_impls[i].second;
                 if (impl_node == null) { continue; }
-                if (!impl_node.qualified_target_name.equals(qualified_target)
-                        && !impl_node.target_type.equals(qualified_target)) { continue; }
+                if (!this.impl_targets(impl_node, qualified_target)) { continue; }
                 for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
                     const m: MethodNode* = impl_node.methods[k];
                     if (m == null || m.func == null) { continue; }
@@ -2116,8 +2114,7 @@ type struct MonoCallSpecializer {
             for (mut i: i64 = 0; i < this.generic_registry.trait_impls.length; i++) {
                 const impl_node: ImplBlockNode* = this.generic_registry.trait_impls[i].second;
                 if (impl_node == null) { continue; }
-                if (!impl_node.qualified_target_name.equals(recv_qname)
-                        && !impl_node.target_type.equals(recv_qname)) { continue; }
+                if (!this.impl_targets(impl_node, recv_qname)) { continue; }
                 const m: MethodNode* = this.find_self_ret_method_in_impl(impl_node, method_name);
                 if (m != null) { *out_impl = impl_node; return m; }
             }
@@ -2448,6 +2445,13 @@ type struct MonoCallSpecializer {
 
 
     // -- DI registration + symbol pinning (re-homed; Phase-0 keystone) --
+    /// Whether `impl_node` is a block FOR the type registered as `qname` -
+    /// its key, as the block itself carries it.
+    impl_targets(&this, impl_node: ImplBlockNode*, qname: SymbolStr) -> boolean {
+        const own: SymbolStr = impl_node.target_key(this.arena);
+        return own.is_valid() && own.equals(qname);
+    }
+
 
     /// Register an impl-block-owned spec method in the DeclarationIndex under the
     /// receiver's canonical name so codegen/linker find the right func_type/mangle.
@@ -2455,8 +2459,7 @@ type struct MonoCallSpecializer {
                                recv_type: TypeRef, impl_node: ImplBlockNode*) -> void {
         if (this.decl_index == null) { return; }
         if (spec_method == null || impl_node == null) { return; }
-        mut qualified_target: SymbolStr = impl_node.qualified_target_name;
-        if (!qualified_target.is_valid()) { qualified_target = impl_node.target_type; }
+        const qualified_target: SymbolStr = impl_node.target_key(this.arena);
         mut bare_alias: SymbolStr = SymbolStr::empty();
         if (!qualified_target.equals(impl_node.target_type)) {
             bare_alias = impl_node.target_type;
