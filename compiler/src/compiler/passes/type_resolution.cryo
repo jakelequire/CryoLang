@@ -37,7 +37,7 @@ import compiler::types::{
     arena, compound, generic, generic_registry, ownership, registry, resolver, type_base,
     type_ref, TypeKind, user_defined
 };
-import compiler::resolver::{ intern_table, symbol_id, symbol_str, symbol, resolver };
+import compiler::resolver::{ intern_table, symbol_str, resolver };
 import compiler::resolver::res;
 import compiler::resolver::res::{ Res, ResSlot };
 import std::core::mem;
@@ -75,8 +75,6 @@ import compiler::diag::suggestion::{ Suggestion };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::qualified_name::{ QualifiedName };
-import compiler::resolver::symbol::{ Symbol, SymbolKind };
-import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
@@ -99,7 +97,6 @@ import compiler::types::user_defined::{
 type struct TypeResolutionRunner {
     arena:           TypeArena*;
     resolver:        TypeResolver*;
-    name_resolver:   Resolver*;
     ctx:             CompilationContext*;
     module_registry: ModuleTypeRegistry*;
     res_ctx:         ResolutionContext;
@@ -112,7 +109,6 @@ type struct TypeResolutionRunner {
         mut runner: TypeResolutionRunner;
         runner.arena           = ctx.type_arena;
         runner.resolver        = ctx.type_resolver;
-        runner.name_resolver   = ctx.get_resolver();
         runner.ctx             = ctx;
         runner.module_registry = ctx.module_type_registry;
         runner.res_ctx         = ResolutionContext::new(FILE, LINE as i32, module_name, ctx.source_file, SymbolStr::empty(), HomeOrigin::Unset);
@@ -1388,55 +1384,34 @@ type struct TypeResolutionRunner {
         }
     }
 
-    /// Register a generic function call instantiation.
-    /// Looks up the callee's template in GenericRegistry, resolves the
-    /// generic args to TypeRefs, and creates an InstantiatedType via
-    /// the registry's instantiate() method.
+    /// Register a generic function call instantiation (`f<T>(...)`): the
+    /// callee's template, the written arguments resolved, an instantiation
+    /// demanded from the registry.
+    ///
+    /// The callee is an identifier.  A path callee keeps its turbofish on the
+    /// path node (`Mod::f<T>` parses to a `ScopeResolutionNode` carrying the
+    /// arguments; the CALL node's `generic_args` are written for an identifier
+    /// callee and for a member callee's promoted `obj.m<T>`), so no other
+    /// callee kind arrives here with arguments to register.
+    ///
+    /// The template is the callee's stamp: `Def(q)` names the declaration
+    /// under the key the registry is keyed by.  A local, a type parameter or
+    /// an unanswered slot names no template, and there is no spelling to
+    /// search for one under - a bare leaf prefixed with the writer's module
+    /// misses every imported template, and a resolver re-entered from here
+    /// answers for whatever module the cursor is on.
     register_generic_fn_call(&this, call: CallExprNode*,
                              res_ctx: ResolutionContext*) -> void {
-        // Get the function name from the callee
         const callee_node: ASTNode* = call.callee as ASTNode*;
-        mut fn_name: SymbolStr = SymbolStr::empty();
-
-        if (callee_node.kind == NodeKind::Identifier) {
-            const ident: IdentifierNode* = call.callee as IdentifierNode*;
-            fn_name = ident.name;
-        } else if (callee_node.kind == NodeKind::ScopeResolution) {
-            // e.g., Module::identity<int>(...)
-            const scope: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
-            fn_name = scope.member_name;
-        } else {
-            return; // Can't determine function name
-        }
-
-        if (!fn_name.is_valid()) { return; }
-
-        // Look up the template by qualified name.
-        // First try the current module's namespace (e.g., "main::make_pair"),
-        // then fall back to the Resolver's scope chain which knows about
-        // cross-module imports (e.g., "Collections::Pair::make_pair").
+        if (callee_node.kind != NodeKind::Identifier) { return; }
         const registry: GenericRegistry* = this.ctx.generic_registry;
         if (registry == null) { return; }
 
-        const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym_home(fn_name, call.span.file);
-        mut entry: TemplateEntry* = registry.get_template(qualified_sym);
-        if (entry == null) {
-            // Cross-module fallback: resolve_type_qualified_name handles
-            // Type/TypeAlias/Import symbols but not Function symbols.
-            // In multi-module mode the global scope already has the Function
-            // symbol from the declaring module, so look it up directly and
-            // build the qualified name from its source_module.
-            const sym_id: SymbolID = this.name_resolver.lookup(fn_name, this.name_resolver.current_scope);
-            if (sym_id.is_valid()) {
-                const sym: Symbol = this.name_resolver.get_symbol(sym_id);
-                if ((sym.kind == SymbolKind::Function || sym.kind == SymbolKind::Import)
-                    && sym.source_module != "") {
-                    const bare: string = this.ctx.resolve_str(fn_name);
-                    const cross_sym: SymbolStr = this.ctx.intern(sym.source_module + "::" + bare);
-                    entry = registry.get_template(cross_sym);
-                }
-            }
-        }
+        const ident: IdentifierNode* = call.callee as IdentifierNode*;
+        const entry: TemplateEntry* = match (ident.res) {
+            ResSlot::Answered(r) => { registry.template_of(r.def_id()) }
+            _                    => { null }
+        };
         if (entry == null) { return; }
         if (entry.node_kind != NodeKind::FunctionDeclaration) { return; }
         if (!entry.base_type.is_valid()) { return; }
@@ -1457,7 +1432,7 @@ type struct TypeResolutionRunner {
         registry.instantiate_for_module(entry.base_type, args, mod_sym);
 
         LOG_DEBUG(LogComponent::General, "[TypeResolution] Registered generic function call '%s' with %lld args",
-            this.ctx.resolve_str(fn_name), args.length);
+            this.ctx.resolve_str(ident.name), args.length);
     }
 }
 
