@@ -42,11 +42,15 @@ them, because the five names are not the index's alone:
     scope stack.  Not a lane site, and no migration can remove one, so it is a
     FLOOR: driving LOOKUP to zero is reachable, driving the total to zero never
     was.
-  * REENTRY -- calls to `get_resolver()` outside the driver.  §7.2's corollary:
-    name resolution is a pass, not a service, and a stage that can call back
-    into the resolver will.  A resolver called from `sema` no longer has the
-    writer's imports in hand, so it answers from a string -- which is the
-    mechanical origin of B1.
+  * REENTRY -- calls to `get_resolver()` outside the driver, and a cursor move
+    on a resolver reached through a FIELD (`.name_resolver.set_module(...)`,
+    `find_module_scope`, `restore_scope`), which is the same re-entry with no
+    `get_resolver()` to count: the monomorphizer swaps the resolver's module
+    that way, and a gate reading `get_resolver()` alone reported 3 over a tree
+    holding 6.  §7.2's corollary: name resolution is a pass, not a service,
+    and a stage that can call back into the resolver will.  A resolver called
+    from `sema` no longer has the writer's imports in hand, so it answers from
+    a string -- which is the mechanical origin of B1.
 
 Every row is asserted exactly, in both directions.  For LOOKUP and REENTRY an
 increase is the regrowth this exists to catch, and a decrease is progress that
@@ -146,7 +150,9 @@ def lookup_bucket(receiver):
     if receiver == "this":
         return "LOOKUP_LOCAL"
     return None
-REENTRY_RE = re.compile(r"\bget_resolver\s*\(\s*\)")
+REENTRY_RE = re.compile(
+    r"\bget_resolver\s*\(\s*\)"
+    r"|\.name_resolver\.(?:set_module|find_module_scope|restore_scope)\s*\(")
 # The one door that turns a name into a resolution answer, and the one that
 # turns an answer back into a name.  `DefId`'s field is private, so the literal
 # cannot be written outside the type and every crossing goes through these two.
@@ -261,9 +267,12 @@ HEADER = [
     "#                scope stack. Not a lane site; no migration removes one. A",
     "#                FLOOR, so driving LOOKUP to zero is reachable and driving",
     "#                the total to zero never was.",
-    "# REENTRY  get_resolver() outside the driver. Name resolution is a PASS, not a",
-    "#          service: a resolver called from sema no longer holds the writer's",
-    "#          imports, so it answers from a string. That is where B1 comes from.",
+    "# REENTRY  get_resolver() outside the driver, and a cursor move on a resolver",
+    "#          reached through a field (.name_resolver.set_module / find_module_scope",
+    "#          / restore_scope), the same re-entry with nothing else to count. Name",
+    "#          resolution is a PASS, not a service: a resolver called from sema no",
+    "#          longer holds the writer's imports, so it answers from a string. That",
+    "#          is where B1 comes from.",
     "# DEFID_MINT    DefId::of_definition() -- where a name BECOMES a resolution",
     "#               answer. Legitimate only where the referent is known for a",
     "#               reason other than the spelling in front of it: a resolver",

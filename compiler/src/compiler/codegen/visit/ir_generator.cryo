@@ -212,33 +212,6 @@ public:
         return bb.get_parent();
     }
 
-    /// Look up a type in the declaration index.
-    lookup_type(mut &this, name: SymbolStr) -> TypeRef {
-        const ctx_ptr: CompilationContext* = this.cg.ctx;
-        return ctx_ptr.decl_index.lookup_type(name);
-    }
-
-
-    /// Resolve a sizeof/alignof operand TypeAnnotation to a concrete TypeRef
-    /// at codegen time.  Drives the operand through the type_resolver so that
-    /// generic args (e.g., `HashMapEntry<K, V>` after substitution by the
-    /// monomorphizer) are honoured.  Returns invalid if the resolver is
-    /// unavailable or the annotation can't be resolved; callers fall back
-    /// to a name-based lookup.
-    /// `use_span` is the `sizeof`/`alignof` expression's own span: the operand
-    /// annotation is written inside a body, so it means what that body's module
-    /// says (spec §8.2l).
-    resolve_sizeof_operand_type(mut &this, ann: TypeAnnotation*,
-                                use_span: SourceSpan) -> TypeRef {
-        if (ann == null) { return TypeRef::invalid(); }
-        const ctx_ptr: CompilationContext* = this.cg.ctx;
-        if (ctx_ptr.type_resolver == null) { return TypeRef::invalid(); }
-        mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE as i32, ctx_ptr.source_file, "", SymbolStr::empty(), HomeOrigin::Unset);
-        res_ctx.set_home_module(ctx_ptr.module_ns_sym_of_file(use_span.file),
-                                HomeOrigin::Syntax);
-        return ctx_ptr.type_resolver.resolve(ann, &res_ctx);
-    }
-
     // Top-level program generation
 
     /// Generate IR for an entire module's program.
@@ -1502,21 +1475,29 @@ public:
         }
     }
 
-    override visit(mut &this, node: SizeofExprNode*) -> void {
-        mut sz_type_ref: TypeRef = this.resolve_sizeof_operand_type(node.type_ann, node.span);
-        if (!sz_type_ref.is_valid()) {
-            sz_type_ref = this.lookup_type(node.type_name);
+    /// The operand of a `sizeof`/`alignof` is decided by sema (a body's) or
+    /// type resolution (a constant's, a `static_assert`'s), and read here.  An
+    /// operand nothing decided is a compiler defect, not a size of 0: an
+    /// annotation naming no type is not refused in expression position, and
+    /// this is where that silence would otherwise become a value.
+    layout_operand(mut &this, what: string, operand: TypeRef, span: SourceSpan) -> TypeRef {
+        if (!operand.is_valid()) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                fmt::format("codegen: the operand of `%s` reached codegen with no type decided", what),
+                span);
         }
-        this.state.last_value = this.cg.expr_ops.codegen_sizeof(sz_type_ref);
+        return operand;
+    }
+
+    override visit(mut &this, node: SizeofExprNode*) -> void {
+        this.state.last_value = this.cg.expr_ops.codegen_sizeof(
+            this.layout_operand("sizeof", node.operand_type, node.span));
         this.state.last_is_lvalue = false;
     }
 
     override visit(mut &this, node: AlignofExprNode*) -> void {
-        mut al_type_ref: TypeRef = this.resolve_sizeof_operand_type(node.type_ann, node.span);
-        if (!al_type_ref.is_valid()) {
-            al_type_ref = this.lookup_type(node.type_name);
-        }
-        this.state.last_value = this.cg.expr_ops.codegen_alignof(al_type_ref);
+        this.state.last_value = this.cg.expr_ops.codegen_alignof(
+            this.layout_operand("alignof", node.operand_type, node.span));
         this.state.last_is_lvalue = false;
     }
 

@@ -1659,8 +1659,20 @@ public:
             NodeKind::NewExpression     => { this.resolve_new_expr(expr as NewExprNode*) }
             NodeKind::ArrayLiteral      => { this.resolve_array_literal(expr as ArrayLiteralNode*) }
             NodeKind::TupleLiteral      => { this.resolve_tuple_literal(expr as TupleLiteralNode*) }
-            NodeKind::SizeofExpression  => { this.arena.get_u64() }
-            NodeKind::AlignofExpression => { this.arena.get_u64() }
+            NodeKind::SizeofExpression  => {
+                const s: SizeofExprNode* = expr as SizeofExprNode*;
+                if (!s.operand_type.is_valid()) {
+                    s.set_operand_type(this.resolve_layout_operand(s.type_ann, s.span));
+                }
+                this.arena.get_u64()
+            }
+            NodeKind::AlignofExpression => {
+                const a: AlignofExprNode* = expr as AlignofExprNode*;
+                if (!a.operand_type.is_valid()) {
+                    a.set_operand_type(this.resolve_layout_operand(a.type_ann, a.span));
+                }
+                this.arena.get_u64()
+            }
             NodeKind::TypeofExpression  => {
                 const te: TypeofExprNode* = expr as TypeofExprNode*;
                 this.resolve_expr(te.operand);
@@ -2406,6 +2418,20 @@ public:
             }
         }
         return result.result_type;
+    }
+
+    /// The type a `sizeof`/`alignof` measures, resolved from its annotation
+    /// in the body's own context - the same question a cast target asks, and
+    /// answered once: the node carries the answer for the const folder and
+    /// codegen, neither of which re-derives it.  A clone arrives with the slot
+    /// cleared by the substituter and is answered here again over the
+    /// substituted annotation.
+    resolve_layout_operand(mut &this, ann: TypeAnnotation*, span: SourceSpan) -> TypeRef {
+        if (ann == null || this.ctx.type_resolver == null) { return TypeRef::invalid(); }
+        this.prime_typeof_annotation(ann);
+        mut res_ctx: ResolutionContext = this.body_res_ctx(span);
+        this.symbolic.symbolic_bind_params(&res_ctx);
+        return this.ctx.type_resolver.resolve(ann, &res_ctx);
     }
 
     resolve_cast(mut &this, cast: CastExprNode*) -> TypeRef {
