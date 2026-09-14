@@ -27,7 +27,7 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at the commit carrying §8.182; `git log
+Checks run from the repo root. Verified at the commit carrying §8.183; `git log
 --oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
@@ -50,7 +50,7 @@ current-state description is the defect it exists to remove.
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
 | D10 | A plural leaf is E0155, not a directory-order bind — and a leaf two children of one FACADE declare is the same defect reached by a qualified path, in a call as in an annotation | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **5** | §8.121, §8.144, §8.151 |
-| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 41 of the 97 unasserted rows retired, 56 left (32 context, 10 B2, 14 B3); of the asserted rows, fourteen whose only sites were deleted went with them (one in §8.170, five in §8.171, two in §8.173, six in §8.174; `b1-baseline.txt` re-pinned on both hosts each time, 62 → 56 rows per arm at §8.174) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1404** | §8.66, §8.80, §8.139, §8.174 |
+| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 46 of the 97 unasserted rows retired, 51 left (31 context, 9 B2, 11 B3); of the asserted rows, fourteen whose only sites were deleted went with them (one in §8.170, five in §8.171, two in §8.173, six in §8.174; `b1-baseline.txt` re-pinned on both hosts each time, 62 → 56 rows per arm at §8.174) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1380** | §8.66, §8.80, §8.139, §8.174, §8.183 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
 | D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' | wc -l` → **578**\| wc -l` → **577** | §8.145, §8.146, §8.147, §8.148, §8.150 |
@@ -81,6 +81,7 @@ three, and its row carries the count. Read each zero off its own row.
 | artifact | status | pinned | check → expected | § |
 |---|---|---|---|---|
 | type cascade (`lookup_type_by_sym`, 4 steps) | **DELETED** — `lookup_type_exact`, one step; the audit stream and its four counter rows went with it | — | `grep -rho 'lookup_type_by_sym' compiler/src --include=*.cryo \| wc -l` → **0** | §8.154 |
+| annotation cascade step 3a (`resolve_named`: the written spelling, when qualified, looked up in the index) | **DELETED** — 1,561 answers over six halves, every one a synthesized annotation nobody stamped (1,559 the async lowering's canonical mints, 2 the bindgen's alias-qualified references with no span); each synthesizer stamps now, 2c reads a stamp without needing a home module, 1,561 → 0, 0 objects moved; a scratch generic async project builds under HEAD, refuses (E0200) with the `Poll` stamp reverted on this tree, builds with it. The cascade is steps 1, 1b, 2, 2c and the refusal | — | `grep -c 'lookup_type(name)' compiler/src/compiler/types/resolver.cryo` → **0**; `grep -c 'named_ann_def(' compiler/src/compiler/sema/async_lower.cryo` → **5**; `grep -c 'Res::Def(DefId::of_definition(qualified))' compiler/src/compiler/bindgen/type_map.cryo` → **1** | §8.64, §8.183 |
 | 2c home-module (ambient cursor) | STARVED | 0 | `grep -m1 '2c  home-module' tests/b1-baseline.txt` | §8.63, §8.87 |
 | M1 `qualifier_agrees` (`resolve_type_qualified_name_strict_from`: resolve the LEAF in scope, then check the written qualifier against it) | **DELETED** — its last caller was the C-import alias branch of the annotation stamp, where it MISSED on every `cit::X` by construction (the alias-qualified spelling is declared whole, its leaf deliberately not); the branch looks the whole spelling up now. NOT ENTERED on the b1 arms, entered and missing under `cryo test` | — | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **0** | §8.120, §8.132, §8.174 |
 | M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane**; +246 in §8.172 when the atomics went behind `intrinsics::` | 4,006 | `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M2 resolve_module_qualified_sym calls/{print;exit}' tests/b1-baseline.txt` → **4006** | §8.120, §8.172 |
@@ -8474,6 +8475,107 @@ then the spelling); `global_extern_symbol` / `is_global_thread_local` by
 leaf (§8.166); `ir_generator`'s sizeof/alignof by spelling; and D16, ruled
 in §8.181 and not built.  Parked for Jake, unchanged: D5, the keyword
 ruling (§8.165), the extern-visibility default (§8.167).
+
+### 8.183 Consumer 37: `resolve_named`'s step 3a deleted - a synthesized annotation carries its stamp; 2c reads the stamp without a home module - 2026-09-13
+
+Step 3a of the annotation cascade (`types/resolver.cryo`) looked the WRITTEN
+spelling up in the declaration index when it contained `::` - the comment
+said "a specialization's identifier, a synthesized declaration's key".  It
+answered 63 times in 439,175 resolutions when §8.64 measured it, and the
+question was what those were.  Measured now, with a line per answer naming
+the spelling, the slot's state, the context's origin and the span, over the
+six halves: **1,561 lines, every one `slot=Pending`**, and every one a
+synthesized annotation:
+
+* **1,559 from the async lowering**, resolved by mono's `ast_resolver`
+  (1,546), sema's `method_binding` (8), `call_specializer` (4) and the
+  trait-impl binding walk (1) as it re-resolves a generic future's clone.
+  Three mints in `async_lower.cryo` spelled a declaration canonically and
+  stamped nothing: `future_type_ann`'s base (`…$read_line$Future_5`, the
+  struct the lowering itself created), `type_ann_for`'s instantiation base
+  (`std::core::option::Option` 406, `std::io::buf::BufStream` 200, the
+  owner types), and `poll_type_ann`'s `std::future::poll::Poll` (278).
+  `named_ann_def` already existed beside them - the impl head and the
+  `Future` trait annotation of the same lowering use it - and its own
+  comment says why: the stamping walk visits what the parser produced, so
+  a minted node carries its referent or nothing resolves it.  The three
+  sites use it now; `named_ann` is documented as the generic-parameter
+  spelling it still serves.
+* **2 from the bindgen**, `cit::_NeverU` and `cit::_NeverS` in
+  `ffi_c_import`: the typedef-to-incomplete-tag shape (`typedef union
+  _NeverU NeverU;`).  `CTypeMapper::named` built the alias-qualified
+  reference with `SourceSpan::none()`, so the name layer's qualified branch
+  - which finds the writing module from the span's file - had no module to
+  ask and refused it (`ANN-QUALIFIED` with an empty module column, the only
+  two such rows in the project), and the only thing resolving the typedef's
+  target was 3a.  The bindgen declares these records itself under that
+  spelling whole, with no source module (`declare_c_imported_type`), so the
+  spelling is the canonical name and `named` stamps `Def` of it.
+
+The second needed one more change.  2c was guarded on the context carrying
+a home module, and a synthesized annotation is resolved from the type
+resolution runner's own context (`type_resolution.cryo:114`), which
+establishes none - so a stamped bindgen annotation would still have skipped
+2c and fallen through.  The home is an input to the REFUSAL only (the
+unstamped bare leaf the writing module cannot reach needs the writing
+module); the stamp is the node's answer whatever the context knows.  2c now
+reads the stamp unconditionally and the gate keeps the home guard.  The
+provenance rows are unchanged in meaning: a `Cursor`-origin context still
+counts on the B1 row, everything else on the syntax row, since an answer
+read off the stamp is the writing module's by construction.
+
+#### Measured, after the stamps
+
+Same probe, same six halves: **1,561 → 0**, 0 failing halves.  Predicted
+2 after the async stamps alone (the bindgen pair), measured 2; predicted 0
+after the bindgen stamp and the 2c change, measured 0 on `ffi_c_import`
+(19 tests pass, `3a` row 0, `2c*` 7,232).  Then 3a deleted.
+
+Control on the deletion, a mutation pair over a scratch project (a generic
+`async function ident<T>` awaited from `async function main`):
+
+* **HEAD's compiler** (3a present, `Poll` mint unstamped): builds, exit 0,
+  the binary exits 7.
+* **This tree with the `Poll` stamp reverted** (3a deleted, mint
+  unstamped): `error[E0200]: mismatched types … expected
+  Poll<i64>, found Poll<This::Output>`, exit 1 - the clone's `poll`
+  signature could not resolve its return annotation and the template
+  spelling leaked through.
+* **This tree** (3a deleted, mint stamped): builds, exit 0, exits 7.
+
+So the lookup by spelling was carrying every unstamped synthesized name,
+and each synthesizer now says what it meant.  Objects: predicted 0 - a
+stamp naming `q` reaches the index entry the spelling `q` reached -
+measured examples **0 of 1,126**, tests **0 of 2,183**, suite green
+(2,119 unit, 179 negative, 45 projects); `lsp-check`, `cross-check` green
+before the object run; `b1-check` unmoved (B1 0, 56 rows, three arms).
+
+#### Retired with it
+
+The five unasserted `resolve_named` rows: `RnCalls` (context), the
+pre-stamp steps `RnGenericBinding` (B3), `RnAssocProjection` (B2),
+`RnPrimitive` (B3), and 3a's own `RnDiLiteral` (B3).  None is pinned; the
+`rn_trace` audit lines for steps 1, 1b and 2 stay (per-event, env-gated).
+D11: 46 of 97 retired, 51 left (31 context, 9 B2, 11 B3);
+`resolve_counter.cryo` 1,404 → 1,380 lines.
+
+`lane-check` re-pinned: **LOOKUP 44 → 43** (3a's `lookup_type` in
+`types/resolver.cryo`); **DEFID_MINT 18 → 22** - the four stamps, each at a
+synthesizer holding the definition it names, which is the gate's stated
+legitimate case: `async_lower` mints the struct it created (`d.q_name`),
+the base of an arena type it holds (`base_q` off `inst.generic_base`) and
+`Poll`, whose presence it checked in the index before lowering
+(`lookup_future_type`); `type_map` mints the record the bindgen declares.
+Named here so the increase is a count of stamps and not a lane regrown.
+
+**Tally: 37 shadowed, 37 old paths deleted, 36 at zero and one at §8.93's
+allocator residue; 35 artifacts gone** (+ the annotation cascade's
+spelling lookup).
+
+#### What this leaves
+
+`qualify_symbol_sym_home` 38, unchanged.  The list §8.182 wrote, less
+this.  The cascade is steps 1, 1b, 2 and 2c, then the refusal.
 
 ---
 

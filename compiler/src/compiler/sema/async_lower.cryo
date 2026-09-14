@@ -600,14 +600,18 @@ type struct AsyncLower {
         return new TypeAnnotation::Named(n);
     }
 
-    /// A `Named` annotation resolved by NAME LOOKUP rather than short-circuited.
+    /// A `Named` annotation spelling a GENERIC PARAMETER by name, resolved by
+    /// lookup rather than short-circuited.
     ///
     /// The counterpart to `make_type_ann`, and mandatory for anything a generic
     /// future mentions: monomorphization specializes a template by rewriting the
     /// generic parameters that appear in its ANNOTATIONS, and `pre_resolved`
     /// bypasses annotation resolution entirely — a pre-resolved `T` would reach
-    /// codegen still being `T`. `name` must therefore be resolvable where the
-    /// annotation lands, which for a synthesized one means fully qualified.
+    /// codegen still being `T`.  A parameter names no declaration, so the slot
+    /// stays unanswered and the binding in the resolution context answers it.
+    /// A DECLARATION spelled by the lowering goes through `named_ann_def`: the
+    /// stamping walk visits what the parser produced, so a synthesized name
+    /// carries its referent or nothing resolves it.
     named_ann(&this, name: SymbolStr, span: SourceSpan) -> TypeAnnotation* {
         mut n: NamedAnnotation* = new NamedAnnotation {
             name: name, span: span, pre_resolved: TypeRef::invalid(),
@@ -652,7 +656,7 @@ type struct AsyncLower {
     future_type_ann(mut &this, d: AsyncDecl*, span: SourceSpan) -> TypeAnnotation* {
         if (!d.generic) { return this.make_type_ann(d.struct_ref, span); }
         mut gen: GenericAnnotation* = new GenericAnnotation {
-            base: this.named_ann(d.q_name, span),
+            base: this.named_ann_def(d.q_name, DefId::of_definition(d.q_name), span),
             args: this.generic_param_anns(d.fut_params, span),
             span: span,
         };
@@ -770,7 +774,8 @@ type struct AsyncLower {
                 args.push(arg);
             }
             return new TypeAnnotation::Generic(new GenericAnnotation {
-                base: this.named_ann(base_q, span), args: args, span: span,
+                base: this.named_ann_def(base_q, DefId::of_definition(base_q), span),
+                args: args, span: span,
             });
         }
         return null;
@@ -782,8 +787,9 @@ type struct AsyncLower {
     /// gives: this annotation is emitted by the lowering, so the module being
     /// lowered does not get to say what `Poll` means in it.
     poll_type_ann(mut &this, arg: TypeAnnotation*, span: SourceSpan) -> TypeAnnotation* {
+        const poll_q: SymbolStr = this.intern.intern(POLL_TYPE);
         mut gen: GenericAnnotation* = new GenericAnnotation {
-            base: this.named_ann(this.intern.intern(POLL_TYPE), span),
+            base: this.named_ann_def(poll_q, DefId::of_definition(poll_q), span),
             args: [arg],
             span: span,
         };

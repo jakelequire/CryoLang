@@ -1543,22 +1543,22 @@ private:
     ///      position carrying no TypeRef of its own)
     ///   2c. The name layer's stamp on the node - what the written spelling
     ///      names, decided where its imports were in hand
-    ///   3. A qualified spelling registered under exactly that name
     ///
-    /// There is no step past 3.  A leaf the stamp does not answer is
-    /// unresolved, and the caller diagnoses it; resolving it from the index's
-    /// bare slot or from the scope chain at the cursor would answer from what
-    /// other modules happen to exist rather than from what this one wrote.
+    /// There is no step past 2c.  A spelling the stamp does not answer is
+    /// unresolved, and the caller diagnoses it: looking the written spelling
+    /// up in the index answers only for a spelling that IS a canonical name,
+    /// which is a synthesized node whose synthesizer holds the definition and
+    /// owes the stamp; resolving a leaf from the index's bare slot or from
+    /// the scope chain at the cursor would answer from what other modules
+    /// happen to exist rather than from what this one wrote.
     resolve_named(&this, name: SymbolStr, ctx: ResolutionContext*,
                   slot: ResSlot, span: SourceSpan) -> TypeRef {
         const name_str: string = this.intern_table.resolve(name);
         const name_len: i64 = name_str.length() as i64;
         LOG_DEBUG(LogComponent::TypeChecker, "resolve_named() name='%s'", name_str);
-        resolve_counter::Site::RnCalls.bump();
         // 1. Check generic bindings first (O(1) SymbolStr comparison)
         mut binding: TypeRef = ctx.lookup_binding(name);
         if (binding.is_valid()) {
-            resolve_counter::Site::RnGenericBinding.bump();
             this.rn_trace("1-generic", name_str, ctx, binding);
             return binding;
         }
@@ -1587,7 +1587,6 @@ private:
                     const member_sym: SymbolStr = this.intern_table.intern(member_str);
                     const proj: TypeRef = this.project_member(prefix_ty, member_sym, ctx);
                     if (proj.is_valid()) {
-                        resolve_counter::Site::RnAssocProjection.bump();
                         this.rn_trace("1b-assoc", name_str, ctx, proj);
                         return proj;
                     }
@@ -1609,7 +1608,6 @@ private:
         //    supplying it declines.  It answers zero while no unwrap declines.
         const prim: TypeRef = this.resolve_primitive(name);
         if (prim.is_valid()) {
-            resolve_counter::Site::RnPrimitive.bump();
             this.rn_trace("2-primitive", name_str, ctx, prim);
             return prim;
         }
@@ -1640,8 +1638,14 @@ private:
         //
         //     Only on an exact hit, so a home module that does not declare the
         //     leaf falls through unchanged.
-        if (this.home_module_sym(ctx).is_valid()
-                && this.name_resolver != null) {
+        //
+        //     The stamp is read whether or not the context carries a home
+        //     module: the answer is the node's, and the home is an input only
+        //     to the refusal below, which has a spelling and nothing else to
+        //     judge.  A synthesized annotation (a bindgen's, a lowering's) is
+        //     resolved from a context that never established a home, and its
+        //     stamp is the only thing that names what it refers to.
+        if (this.name_resolver != null) {
             mut home_hit: TypeRef = TypeRef::invalid();
             // WHICH qualified name this leaf denotes, taken from the node.
             //
@@ -1687,10 +1691,13 @@ private:
                         span.to_string());
                 }
             } else if (this.decl_index != null
+                       && this.home_module_sym(ctx).is_valid()
                        && !this.name_resolver.contains_separator(name_str)) {
                 // No answer on the node.  The gate still owes a refusal for a
                 // leaf the writing module cannot reach: refusing is not a
                 // second way to ANSWER, it is the reason there is no answer.
+                // It needs the writing module, so a context with no home
+                // established has nothing to refuse against.
                 //
                 // Bare leaves only, which is the population it was measured
                 // over.  A qualified spelling names its own module, so "can the
@@ -1721,13 +1728,15 @@ private:
                 // and counts as authoritative.  When it came from the ambient
                 // cursor it is still the pre-keystone tie-breaker and stays in
                 // B1, so migrating a site to real provenance shows up as B1
-                // going DOWN rather than up.  See `HomeOrigin`.
-                if (ctx.home_origin == HomeOrigin::Syntax) {
-                    resolve_counter::Site::RnHomeModuleSyntax.bump();
-                    this.rn_trace("2c-home-syntax", name_str, ctx, home_answer);
-                } else {
+                // going DOWN rather than up.  See `HomeOrigin`.  A context
+                // that established no home answered from the stamp alone,
+                // which is the writing module's answer by construction.
+                if (ctx.home_origin == HomeOrigin::Cursor) {
                     resolve_counter::Site::RnHomeModule.bump();
                     this.rn_trace("2c-home-cursor", name_str, ctx, home_answer);
+                } else {
+                    resolve_counter::Site::RnHomeModuleSyntax.bump();
+                    this.rn_trace("2c-home-syntax", name_str, ctx, home_answer);
                 }
                 return home_answer;
             }
@@ -1759,26 +1768,6 @@ private:
             resolve_counter::Site::RnAmbiguous.bump();
             this.rn_trace("2b-ambiguous", name_str, ctx, TypeRef::invalid());
             return TypeRef::invalid();
-        }
-
-        // 3. A QUALIFIED spelling registered under exactly that name - a
-        //    specialization's identifier, a synthesized declaration's key.
-        //    A bare leaf has no step here: it is answered by the stamp above
-        //    or not at all, because the index's bare slot is single-slot
-        //    last-write-wins across every module declaring that leaf, and
-        //    canonicalizing a leaf through the scope chain from wherever the
-        //    compiler is standing answers from the walk rather than from the
-        //    source.  Both read zero over the corpus once the stamp reached
-        //    every written annotation, and were deleted.
-        if (this.decl_index != null && this.name_resolver != null
-                && this.name_resolver.contains_separator(name_str)) {
-            const di_literal: TypeRef = this.decl_index.lookup_type(name);
-            if (di_literal.is_valid()) {
-                resolve_counter::Site::RnDiLiteral.bump();
-                const a_lit: TypeRef = this.follow_alias(di_literal);
-                this.rn_trace("3a-di-literal", name_str, ctx, a_lit);
-                return a_lit;
-            }
         }
 
         // Not found; return invalid (caller should create error)
