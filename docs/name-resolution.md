@@ -27,7 +27,7 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at the commit carrying §8.180; `git log
+Checks run from the repo root. Verified at the commit carrying §8.181; `git log
 --oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
@@ -55,6 +55,7 @@ current-state description is the defect it exists to remove.
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
 | D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **IN PROGRESS** — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` now resolves (§8.150); `stdlib` and the rest of `compiler` wait on a RE-PIN (§8.147) | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' | wc -l` → **578**\| wc -l` → **577** | §8.145, §8.146, §8.147, §8.148, §8.150 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
+| D16 | **An impl head names a generic template WITH its parameters, or a concrete instantiation; the bare form is an error.** `implement trait Display for String` with `String<A = GlobalAlloc>` is refused - write `implement<A> trait Display for String<A>` or `implement trait Display for String<GlobalAlloc>`. Rust's model: `impl Display for Vec` is missing its parameters and is not given a default meaning | **RULED, NOT BUILT** (Jake, 2026-09-13, source-breaking, taken knowingly) — 4 heads in the tree, all `String`; reuse E0302 (declared, no emitter); the diagnostic names both spellings to write; sema's `visit(ImplBlockNode)` keeps its writer-module lookup until the bare form is refused, then drops it | `python3 scripts/impl-head-elided-params.py --count` → **bare=4,partial=7,unmatched=0** (`bare=0` when built) | §8.180, §8.181 |
 
 **D2 is the one to look at.** Decided in §8.39, then neither taken nor
 withdrawn across ninety-five entries: every mention of `Namespace::Function` in
@@ -8324,6 +8325,72 @@ re-entry; `lane-check`'s `REENTRY` bucket (4) should fall by one.
 State at the restart: `naming-impl` at the commit carrying this section,
 pushed, tree clean but for that probe; no `objcmp` stash outstanding;
 `compiler/build` rebuilt clean from HEAD afterwards.
+
+### 8.181 D16, RULED: an impl head writes its target's parameters, or names an instantiation; the bare form is refused - 2026-09-13
+
+§8.180 found a bare impl head on a template whose parameters all default
+carrying two meanings in the tree - the default instantiation
+`String<GlobalAlloc>` when written in another module, the template when
+written in its own - and asked which.  **Jake's ruling: neither.  The
+spelling is refused.**  The writer says which is meant, as in Rust:
+`implement<A> trait Display for String<A>` for the template, or
+`implement trait Display for String<GlobalAlloc>` for the instantiation;
+`implement trait Display for String` is a compile error because the
+parameters are missing, and no default meaning is assigned.  Source-
+breaking for every head that elides them; taken knowingly.
+
+**Decided, not built.**  What building it needs, so the next agent starts
+from a decision:
+
+* **The population** - `scripts/impl-head-elided-params.py`, committed
+  with this entry.  BARE heads (no arguments on a generic template):
+  **4**, all `String` - `stdlib/collections/string.cryo:456` and `:464`
+  (same-module, the symbolic walk today), `stdlib/fmt/display.cryo:502`
+  and `stdlib/fmt/write.cryo:91` (cross-module, the concrete path today).
+  Every other defaulted template (`PathBuf<A>`, `Mutex<T, A>`,
+  `Rc`/`Arc`/`Weak`, `Box`, `RawBuffer`, `RwLock`, `HashMap`, `HashSet`,
+  `Array`) already writes its parameters on every head.  PARTIAL heads
+  (some arguments written, the trailing defaulted ones elided -
+  `implement<T> trait Display for Array<T>` with `Array<T, A =
+  GlobalAlloc>`): **7**, in `box`, `array`, `hashmap`, `hashset`.  Rust
+  fills the default there (`impl<T> Trait for Vec<T>` is `Vec<T,
+  Global>`); the ruling names the BARE form and does not decide the
+  partial one - ask before touching it.  The script matches by leaf with
+  locality (own file, then own directory, then own tree) and lists
+  cross-tree collisions as UNMATCHED (0), so `tests/`' many independent
+  `Counter`s do not count.
+* **The code**: `E0302_GENERIC_PARAM_MISMATCH` is declared in
+  `diag/_module.cryo` with no emitter (as are E0300 and E0301); the shape
+  - 0 of N parameters written where N are declared - is a parameter-count
+  mismatch, so reuse it rather than mint.  If a reviewer reads the name
+  as something else, mint; survey first either way.
+* **The diagnostic says what to write**, not only what is wrong: for
+  `implement trait Display for String` it names both accepted spellings,
+  the template form with the head's own `<A>` and the instantiation with
+  the default filled in, since the writer of the bare form may not know
+  the parameter exists.  A `suggest` with two alternatives, or a note
+  carrying both, as `E0154`'s "write the path out" does.
+* **Where**: after name resolution stamps the head (`Def` of a template
+  entry with parameters) and before TemplateRegistration attaches it -
+  the stamp says the target is a template, the head says it wrote no
+  arguments.  `ast_validation`'s `validate_impl_block` (E0062, the
+  target-less head) is the same kind of check one pass too early to know
+  the target is generic.
+* **Then** `visit(ImplBlockNode)` in `sema.cryo` reads `target_key()`
+  like every other site (§8.180 left it on `qualify_symbol_sym_home`
+  because the two meanings disagreed there): once the bare form is
+  refused there is nothing ambiguous left to resolve, the symbolic
+  branch is for a head that wrote the template's parameters and the
+  concrete path for one that wrote an instantiation, and the last
+  impl-head `qualify_symbol_sym_home` goes.
+* **Interacts with the keyword ruling** (§8.165): `implement int` stamps
+  `Pending` because `int` is an alias keyword, not a template, so it is
+  not this ruling's population - but the same site sees both, and the
+  keyword ruling is what makes `int` resolve as `i32` for a head.  Build
+  D16 without depending on it; expect the two checks to sit side by side.
+
+**Tally unchanged: 35 shadowed, 35 old paths deleted, 34 at zero and one
+at §8.93's allocator residue; 33 artifacts gone.**
 
 ---
 
