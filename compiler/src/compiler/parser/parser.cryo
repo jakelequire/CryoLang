@@ -2231,25 +2231,36 @@ public:
             node.add_generic_param(leading_gen_params[lgi]);
         }
 
-        // Optional generic params/args after target name.
-        // For inherent impls (no leading trait annotation), `Name<T>` is the
-        // existing generic-params form; keep populating generic_params.
-        // For trait impls, `Bar<T>` are the target's type args; the binding
-        // already lives in the leading generic_params, so we consume the
-        // tokens but discard the structured args. Sema (Phase B) re-derives
-        // them from the impl's generic_params and the target's declaration.
+        // The `<...>` after the target name is what the head writes for the
+        // target's parameters, and `target_args` carries it for EVERY head.
+        // On a trait impl it is an argument list, each name bound by the
+        // leading `implement<...>`.  On an inherent impl the same list also
+        // DECLARES its names (`implement enum Option<T>` has no leading list
+        // and `T` is in scope in the body), so each name not declared by a
+        // leading list becomes a parameter, and the list is recorded as the
+        // arguments it also is: `implement<T> struct MyVec<T>` declares `T`
+        // once, not twice.
         if (this.check(TokenType::LAngle)) {
             if (trait_ann == null) {
                 const gen_params: GenericParamNode*[] = this.parse_generic_params(true);
+                mut inherent_args: TypeAnnotation*[] = [];
                 for (mut gi: int = 0; gi < gen_params.length; gi++) {
-                    node.add_generic_param(gen_params[gi]);
+                    const gp: GenericParamNode* = gen_params[gi];
+                    mut declared: boolean = false;
+                    for (mut li: int = 0; li < leading_gen_params.length; li++) {
+                        if (leading_gen_params[li].name.equals(gp.name)) { declared = true; }
+                    }
+                    if (!declared) { node.add_generic_param(gp); }
+                    const arg: NamedAnnotation* = new NamedAnnotation {
+                        name: gp.name,
+                        span: gp.span,
+                        pre_resolved: TypeRef::invalid(),
+                        res: ResSlot::Pending,
+                    };
+                    inherent_args.push(new TypeAnnotation::Named(arg));
                 }
+                node.set_target_args(inherent_args);
             } else {
-                // The target's type args (e.g. `<T>` in `for Range<T>`).
-                // The binding lives in the leading generic_params; sema
-                // re-derives the structured form, but we keep the args so
-                // `This` in a synthesized default method can be rewritten to
-                // the full Self type `Range<T>` instead of the bare `Range`.
                 node.set_target_args(this.parse_generic_args());
             }
         }

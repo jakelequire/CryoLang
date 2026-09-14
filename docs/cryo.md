@@ -2001,6 +2001,16 @@ type struct HashMap<K, V, A = GlobalAlloc> { /* ... */ }
 
 Calling `Array<int>::new()` uses `GlobalAlloc`; calling `Array<int, Arena>::new_in(my_arena)` parameterises the container over a custom allocator.
 
+A default fills a parameter that a *use* leaves out. An **`implement` head is not a use**: it names every parameter of the template it is written for, either as parameters of its own or as a concrete instantiation, and a head that leaves one out is an error (E0302), whether every parameter has a default or only the trailing ones do. `implement trait Display for String` would read as an impl for every `String<A>` while binding only `String<GlobalAlloc>`, so the writer says which is meant:
+
+```cryo
+implement<A> trait Display for String<A> { /* ... */ }        // every String<A>
+implement trait Display for String<GlobalAlloc> { /* ... */ }  // this instantiation
+implement<T, A> trait Clone for Array<T, A> { /* ... */ }      // not `Array<T>`
+```
+
+An inherent block declares its parameters in the same list that names them, so `implement enum Option<T> { /* ... */ }` is the one spelling for `Option<T>`.
+
 ### 12.3 Generic Enums
 
 ```cryo
@@ -2113,7 +2123,7 @@ type struct Atomic<T> {
     load(&this) -> T { return static match (T) { /* ... */ }; }
 }
 
-implement struct String {
+implement struct String<A> {
     // `T` here is introduced by the method.
     push<T>(mut &this, item: T) -> void { /* static match (T) ... */ }
 }

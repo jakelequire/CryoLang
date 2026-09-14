@@ -38,6 +38,7 @@ NONGEN = re.compile(
 DECL = re.compile(
     r"^\s*(?:public\s+|private\s+)?type\s+(?:struct|class|enum|union)\s+([A-Za-z_]\w*)\s*<([^>]*)>",
     re.M)
+NEGATIVE = re.compile(r"^\s*!\[config\(negative\b", re.M)
 HEAD = re.compile(
     r"^\s*implement\s*(?:<[^>]*>)?\s*(?:trait\s+[A-Za-z_][\w:]*(?:<[^>]*>)?\s+for\s+)?"
     r"(?:struct\s+|class\s+|enum\s+|union\s+)?([A-Za-z_][\w:]*)(<[^>{]*>)?\s*(?:where\b|\{)",
@@ -66,6 +67,12 @@ def main():
     heads = []
     for f in files():
         src = open(os.path.join(ROOT, f), encoding="utf-8", errors="replace").read()
+        # A compile-fail file is written to be REFUSED, and the ones pinning
+        # E0302 carry an elided head on purpose; they are the rule's tests, not
+        # its population.  Recognised by the config the runner reads, not by
+        # where the file lives.
+        if NEGATIVE.search(src):
+            continue
         for m in NONGEN.finditer(src):
             nongen.add((m.group(1), f))
         for m in DECL.finditer(src):

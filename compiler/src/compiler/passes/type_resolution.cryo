@@ -1731,6 +1731,14 @@ type struct TypeResolutionPasses {
                 // entirely; the bare-name key never lines up with the
                 // canonical receiver.
                 if (ctx.generic_registry != null && canonical_target.is_valid()) {
+                    // A written head on a template names EVERY parameter of
+                    // that template, as parameters of its own or as a concrete
+                    // instantiation; an elided one is refused here, where every
+                    // template is registered and the head is about to be
+                    // attached to it.  A clone carries no stamp and is not a
+                    // head anyone wrote.
+                    TypeResolutionPasses::refuse_elided_template_params(
+                        node, canonical_target, ctx);
                     // Attach the block to its target's template under the
                     // same key TemplateRegistration used.  That pass runs
                     // before the template exists whenever the target's
@@ -2152,6 +2160,134 @@ type struct TypeResolutionPasses {
     /// to keep type_resolution.cryo self-contained.
     /// The stamp on the head's Named annotation, walking the same wrappers
     /// `extract_trait_leaf` walks; `Pending` when there is none.
+    /// The source spelling of an annotation, for a diagnostic that proposes a
+    /// rewrite.  Enough for the shapes an impl head or a parameter default is
+    /// written in; a shape this does not spell reads as `..`.
+    static spell_annotation(ann: TypeAnnotation*, intern: InternTable*) -> string {
+        if (ann == null) { return ".."; }
+        return match (*ann) {
+            TypeAnnotation::Named(n)     => { intern.resolve(n.name) }
+            TypeAnnotation::Primitive(pr) => { intern.resolve(pr.name) }
+            TypeAnnotation::Pointer(pt)  => {
+                fmt::format("%s*", TypeResolutionPasses::spell_annotation(pt.inner, intern))
+            }
+            TypeAnnotation::Reference(rf) => {
+                fmt::format("&%s", TypeResolutionPasses::spell_annotation(rf.inner, intern))
+            }
+            TypeAnnotation::Generic(g)   => {
+                mut out: string = TypeResolutionPasses::spell_annotation(g.base, intern);
+                out = out + "<";
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    if (i > 0) { out = out + ", "; }
+                    out = out + TypeResolutionPasses::spell_annotation(g.args[i], intern);
+                }
+                out + ">"
+            }
+            _ => { ".." }
+        };
+    }
+
+    /// An impl head on a template writes every parameter of the template it
+    /// names - as parameters of its own (`implement<A> trait Display for
+    /// String<A>`) or as a concrete instantiation (`implement trait Display
+    /// for String<GlobalAlloc>`) - whether every parameter defaults or only the
+    /// trailing ones do.  A head that writes fewer is not given the default
+    /// meaning: `implement trait Display for String` would be an impl for
+    /// `String<GlobalAlloc>` alone while reading as one for every `String`,
+    /// and `implement<T> trait Foo for Array<T>` the same for `Array<T,
+    /// GlobalAlloc>`.  Refused on the WRITTEN head only: the stamp is what a
+    /// written head carries and a clone does not.
+    static refuse_elided_template_params(node: ImplBlockNode*, canonical_target: SymbolStr,
+                                         ctx: CompilationContext*) -> void {
+        mut written: boolean = false;
+        match (node.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(_) => { written = true; }
+                    _           => { }
+                }
+            }
+            _ => { }
+        }
+        if (!written) { return; }
+        const tmpl: TemplateEntry* = ctx.generic_registry.get_template(canonical_target);
+        if (tmpl == null || tmpl.param_count == 0) { return; }
+        // What the head writes after the target.  An inherent impl's list
+        // also declares its names, so its one spelling is the parameter form.
+        const inherent: boolean = !node.is_trait_impl();
+        const written_count: i64 = node.target_args.length;
+        if (written_count == tmpl.param_count) { return; }
+
+        const intern: InternTable* = ctx.intern_table;
+        const target: string = intern.resolve(node.target_type);
+        const tmpl_params: GenericParamNode*[] = tmpl.get_generic_params();
+
+        // The head as the writer would spell it with every parameter named:
+        // its own parameters first, then the template's missing ones under the
+        // template's own names.
+        mut own_params: string = "";
+        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+            if (i > 0) { own_params = own_params + ", "; }
+            own_params = own_params + intern.resolve(node.generic_params[i].name);
+        }
+        mut head_params: string = own_params;
+        mut target_args: string = "";
+        for (mut i: i64 = 0; i < written_count; i++) {
+            if (i > 0) { target_args = target_args + ", "; }
+            target_args = target_args + TypeResolutionPasses::spell_annotation(node.target_args[i], intern);
+        }
+        mut concrete_args: string = target_args;
+        mut all_defaulted: boolean = true;
+        for (mut i: i64 = written_count; i < tmpl_params.length; i++) {
+            const pname: string = intern.resolve(tmpl_params[i].name);
+            if (head_params.length() > 0) { head_params = head_params + ", "; }
+            head_params = head_params + pname;
+            if (target_args.length() > 0) { target_args = target_args + ", "; }
+            target_args = target_args + pname;
+            if (concrete_args.length() > 0) { concrete_args = concrete_args + ", "; }
+            if (tmpl_params[i].has_default_annotation()) {
+                concrete_args = concrete_args + TypeResolutionPasses::spell_annotation(
+                    tmpl_params[i].default_annotation, intern);
+            } else {
+                concrete_args = concrete_args + "..";
+                all_defaulted = false;
+            }
+        }
+        mut trait_part: string = "";
+        if (node.is_trait_impl()) {
+            trait_part = fmt::format("trait %s ", TypeResolutionPasses::spell_annotation(node.trait_annotation, intern));
+        }
+        // An inherent impl's parameters ARE the template's, so it has one
+        // spelling; a trait impl has the parameter form and the concrete one.
+        const param_form: string = if (inherent) {
+            fmt::format("implement %s<%s>", target, target_args)
+        } else {
+            fmt::format("implement<%s> %sfor %s<%s>", head_params, trait_part, target, target_args)
+        };
+        const concrete_form: string = if (node.generic_params.length > 0) {
+            fmt::format("implement<%s> %sfor %s<%s>", own_params, trait_part, target, concrete_args)
+        } else {
+            fmt::format("implement %sfor %s<%s>", trait_part, target, concrete_args)
+        };
+
+        const span: SourceSpan = if (node.target_type_span.has_location()) { node.target_type_span } else { node.span };
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0302_GENERIC_PARAM_MISMATCH,
+            fmt::format("`%s` is a template with %lld parameter%s, and this impl head names %lld of them",
+                   target, tmpl.param_count, if (tmpl.param_count == 1) { "" } else { "s" }, written_count));
+        diag = diag.at_with_label(span, "every parameter is written in an impl head");
+        diag = diag.with_note(fmt::format("write the parameters: `%s`", param_form));
+        // An inherent block is written over the template and has nothing
+        // else to offer.
+        if (!inherent && all_defaulted) {
+            diag = diag.with_note(fmt::format("or a concrete instantiation: `%s`", concrete_form));
+        }
+        if (!inherent && !all_defaulted) {
+            diag = diag.with_note(fmt::format("or a concrete instantiation, one type per parameter: `%s`", concrete_form));
+        }
+        ctx.emit_diagnostic(diag);
+    }
+
     static head_named_slot(ann: TypeAnnotation*) -> ResSlot {
         if (ann == null) { return ResSlot::Pending; }
         return match (*ann) {
