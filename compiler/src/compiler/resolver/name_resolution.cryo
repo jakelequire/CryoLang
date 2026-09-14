@@ -19,12 +19,13 @@ import compiler::resolver::namespace_kind::{ Namespace };
 import compiler::const_table;
 import compiler::const_table::{ ConstantTable };
 import compiler::diag;
-import compiler::diag::{ ErrorCode, snapshot, source_span };
+import compiler::diag::{ ErrorCode, snapshot, source_span, edit_distance };
+import compiler::diag::edit_distance::{ find_best_candidate };
 import compiler::diag::diagnostic;
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::ast;
 import compiler::ast::{
-    BaseASTVisitor, ImportStyle, NamedAnnotation, NodeKind, PatternBinding, PatternKind,
+    ImportStyle, NamedAnnotation, NodeKind, PatternBinding, PatternKind,
     TraitBound, TraitRef, TypeAnnotation, Visibility, declaration, expression, node,
     pattern, statement, visitor
 };
@@ -33,7 +34,7 @@ import compiler::passes::pass_id::{ PassResult };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext, ModuleSpellingMatch };
 import compiler::module_graph;
-import compiler::module_graph::{ ModuleInfo };
+import compiler::module_graph::{ ModuleGraph, ModuleInfo };
 import compiler::resolve_counter;
 import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
@@ -61,7 +62,7 @@ import compiler::ast::statement::{
     ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode, MatchStmtNode, ReturnStmtNode,
     StaticMatchStmtNode, UnsafeBlockStmtNode, WhileStmtNode
 };
-import compiler::ast::visitor::{ ASTVisitor };
+import compiler::ast::visitor::{ ASTVisitor, BaseASTVisitor };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
@@ -2353,6 +2354,75 @@ public:
     /// in topological order and re-exports create no ordering edge to sort by.
     /// `instance.cryo` closes over `ModuleInfo.reexports` once discovery has
     /// the full graph, and `DeclarationIndex` answers from that.
+    /// Everything `module_sym` offers to a braced import, by leaf: its own
+    /// public exports, the public exports of its re-export closure, and its
+    /// sub-modules.  The set an `import M::{ name }` entry is answered from,
+    /// in the order the three rungs ask.
+    offered_leaves(&this, module_sym: SymbolStr, resolved_module: string) -> string[] {
+        mut out: string[] = [];
+        const own: SymbolID[] = this.resolver.get_exports(module_sym);
+        for (mut i: i64 = 0; i < own.length; i++) {
+            const sym: Symbol = this.resolver.get_symbol(own[i]);
+            if (sym.visibility.is_public()) {
+                out.push(this.resolver.intern_table.resolve(sym.name));
+            }
+        }
+        const rx_all: SymbolStr[] = this.ctx.module_graph.reexport_closure(module_sym);
+        for (mut rx: i64 = 0; rx < rx_all.length; rx++) {
+            const rx_exports: SymbolID[] = this.resolver.get_exports(rx_all[rx]);
+            for (mut re: i64 = 0; re < rx_exports.length; re++) {
+                const sym: Symbol = this.resolver.get_symbol(rx_exports[re]);
+                if (sym.visibility.is_public()) {
+                    out.push(this.resolver.intern_table.resolve(sym.name));
+                }
+            }
+        }
+        const prefix: string = resolved_module + "::";
+        const graph: ModuleGraph* = this.ctx.module_graph;
+        for (mut mi: u32 = 0; mi < graph.modules.length; mi++) {
+            const cand: string = this.resolver.intern_table.resolve(graph.modules[mi].name);
+            if (!cand.starts_with(prefix)) { continue; }
+            const rest: string = cand.substring(prefix.length() as u32, (cand.length() - prefix.length()) as u32);
+            if (rest.contains("::")) { continue; }
+            out.push(rest);
+        }
+        return out;
+    }
+
+    /// E0502: a braced import entry that names nothing the module offers -
+    /// not a declaration, not a re-export, not a sub-module.  The module's
+    /// offering is named so the writer can see what to write instead; a
+    /// close spelling is offered as the fix.
+    refuse_unoffered_import(&this, node: ImportDeclNode*, module_sym: SymbolStr,
+                            resolved_module: string, name_str: string) -> void {
+        const offered: string[] = this.offered_leaves(module_sym, resolved_module);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0502_INVALID_IMPORT,
+            fmt::format("`%s` does not offer `%s`", resolved_module, name_str));
+        d = d.at_with_label(node.span, "no declaration, re-export or sub-module of that name");
+        mut listed: string = "";
+        const count: i64 = offered.length;
+        const cap: i64 = if (count < 12) { count } else { 12 };
+        for (mut i: i64 = 0; i < cap; i++) {
+            if (i > 0) { listed = listed + ", "; }
+            listed = listed + "`" + offered[i] + "`";
+        }
+        if (count > cap) {
+            listed = listed + fmt::format(" and %lld more", count - cap);
+        }
+        // Last: the candidate search consumes the list.
+        const best: string = find_best_candidate(name_str, offered);
+        if (best != "") {
+            d = d.help(fmt::format("a name with a similar spelling is offered: `%s`", best));
+        }
+        if (count == 0) {
+            d = d.with_note(fmt::format("`%s` offers no public name", resolved_module));
+        } else {
+            d = d.with_note(fmt::format("`%s` offers %s", resolved_module, listed));
+        }
+        this.ctx.emit_diagnostic(d);
+    }
+
     process_import(node: ImportDeclNode*) -> void {
         const module_path: string = node.module_path;
         LOG_DEBUG(LogComponent::General, "[NameResolver] process_import() module='%s'", module_path);
@@ -2503,11 +2573,25 @@ public:
                             this.resolver.intern_table.resolve(this.ctx.current_module_ns())));
                     d = d.at_with_label(node.span, "private declaration named by this import");
                     this.ctx.emit_diagnostic(d);
+                } else if (node.is_export
+                           && this.resolver.private_declaration(module_sym, name).is_valid()) {
+                    // An `export` naming a private declaration is E0241,
+                    // reported by the export check once the graph is whole;
+                    // it is not a name the module fails to offer.
                 } else {
                     // (b) sub-module: "<resolved_module>::<name>"
                     const name_str: string = this.resolver.intern_table.resolve(name);
                     const sub_path: string = fmt::format("%s::%s", resolved_module, name_str);
                     const sub_sym: SymbolStr = this.resolver.intern_table.intern(sub_path);
+                    if (this.ctx.module_graph.find_module_index(sub_sym) < 0) {
+                        // Neither offered nor a sub-module: the entry names
+                        // nothing, and binding nothing in silence leaves a
+                        // use site - which may never exist - to say so.  The
+                        // import is where the name is written, and what the
+                        // module DOES offer is what a writer needs to fix it.
+                        this.refuse_unoffered_import(node, module_sym, resolved_module, name_str);
+                        continue;
+                    }
                     // Import all public exports from the resolved sub-module.
                     const sub_exports: SymbolID[] = this.resolver.get_exports(sub_sym);
                     const sub_resolved: string = this.resolver.intern_table.resolve(sub_sym);
