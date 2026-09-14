@@ -79,7 +79,6 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::types::ownership::{ OwnershipQuery };
-import compiler::types::registry::{ ModuleTypeRegistry, TypeVisibility };
 import compiler::types::resolver::{ HomeOrigin, ResolutionContext, TypeResolver };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
@@ -98,7 +97,6 @@ type struct TypeResolutionRunner {
     arena:           TypeArena*;
     resolver:        TypeResolver*;
     ctx:             CompilationContext*;
-    module_registry: ModuleTypeRegistry*;
     res_ctx:         ResolutionContext;
 
     static new(ctx: CompilationContext*) -> TypeResolutionRunner {
@@ -110,7 +108,6 @@ type struct TypeResolutionRunner {
         runner.arena           = ctx.type_arena;
         runner.resolver        = ctx.type_resolver;
         runner.ctx             = ctx;
-        runner.module_registry = ctx.module_type_registry;
         runner.res_ctx         = ResolutionContext::new(FILE, LINE as i32, module_name, ctx.source_file, SymbolStr::empty(), HomeOrigin::Unset);
         return runner;
     }
@@ -1572,7 +1569,7 @@ type struct TypeResolutionPasses {
                 }
                 if (!qualified_sym.equals(node.name)) {
                     ctx.decl_index.register_name_mapping(node.name, qualified_sym);
-                    // Traits are always public (mirrors ModuleTypeRegistry).
+                    // Traits are always public.
                     ctx.decl_index.set_decl_visibility(qualified_sym, true);
                 }
                 // Register each trait method's return type on both the
@@ -3302,7 +3299,7 @@ type struct TypeResolutionPasses {
     /// Phase 1: Type aliases
     /// Phase 2: Struct/class field types
     /// Phase 3: Variable and expression types in function bodies
-    /// Phase 4: Register types in ModuleTypeRegistry
+    /// Phase 4: Register declarations in the DeclarationIndex
     static run_type_resolution(ctx: CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
@@ -3324,10 +3321,6 @@ type struct TypeResolutionPasses {
         }
 
         mut runner: TypeResolutionRunner = TypeResolutionRunner::new(ctx);
-        const module_registry: ModuleTypeRegistry* = runner.module_registry;
-        const module_name: string = ctx.has_namespace()
-            ? ctx.namespace_display()
-            : ctx.source_file;
 
         // -- Phase 1: Type alias resolution ----------------------------------
         mut alias_count: i64 = 0;
@@ -3354,11 +3347,6 @@ type struct TypeResolutionPasses {
                                 const alias_obj: TypeAliasType* = alias_ty as TypeAliasType*;
                                 alias_obj.set_target(target);
                             }
-                        }
-                        // Register in module type registry (file-namespaced
-                        // aliases only; C-imported typedefs stay qualified-only).
-                        if (module_registry != null && node.binding_namespace.is_empty()) {
-                            module_registry.register_type_alias(node.alias_name, target);
                         }
                         alias_count++;
                     } else {
@@ -3661,8 +3649,8 @@ type struct TypeResolutionPasses {
             }
         }
 
-        // -- Phase 4: Register types in ModuleTypeRegistry + DeclarationIndex
-        mut reg_count: i64 = 0;
+        // -- Phase 4: Register declarations in the DeclarationIndex, and
+        //    resolve and register top-level global variables
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
@@ -3672,66 +3660,7 @@ type struct TypeResolutionPasses {
             // Source decls are owned by the current module (empty owner_mod).
             TypeResolutionPasses::register_decl_in_index(stmt, ctx, true, SymbolStr::empty());
 
-            // Phase 4-specific: also register types in ModuleTypeRegistry
-            // for cross-module visibility, and handle global variables.
-            // Uses DeclarationIndex (just populated above by register_decl_in_index)
-            // instead of arena.lookup_by_name for consistency.
             match (stmt.kind) {
-                NodeKind::StructDeclaration => {
-                    const node: StructDeclNode* = stmt as StructDeclNode*;
-                    const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
-                    const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
-                    // C-imported types stay out of the bare-keyed ModuleTypeRegistry
-                    // (they're qualified-only, `cit::Vec2`).
-                    if (ty.is_valid() && module_registry != null && node.binding_namespace.is_empty()) {
-                        const vis: TypeVisibility = node.is_public ?
-                            TypeVisibility::Public : TypeVisibility::Private;
-                        module_registry.register_type(module_name, node.name, ty, vis);
-                    }
-                    if (ty.is_valid()) { reg_count++; }
-                }
-                NodeKind::UnionDeclaration => {
-                    const node: UnionDeclNode* = stmt as UnionDeclNode*;
-                    const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
-                    const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
-                    if (ty.is_valid() && module_registry != null && node.binding_namespace.is_empty()) {
-                        const vis: TypeVisibility = node.is_public ?
-                            TypeVisibility::Public : TypeVisibility::Private;
-                        module_registry.register_type(module_name, node.name, ty, vis);
-                    }
-                    if (ty.is_valid()) { reg_count++; }
-                }
-                NodeKind::ClassDeclaration => {
-                    const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym_home(node.name, node.span.file);
-                    const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
-                    if (ty.is_valid() && module_registry != null) {
-                        const vis: TypeVisibility = node.is_public ?
-                            TypeVisibility::Public : TypeVisibility::Private;
-                        module_registry.register_type(module_name, node.name, ty, vis);
-                    }
-                    if (ty.is_valid()) { reg_count++; }
-                }
-                NodeKind::EnumDeclaration => {
-                    const node: EnumDeclNode* = stmt as EnumDeclNode*;
-                    const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
-                    const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
-                    if (ty.is_valid() && module_registry != null && node.binding_namespace.is_empty()) {
-                        const vis: TypeVisibility = node.is_public ?
-                            TypeVisibility::Public : TypeVisibility::Private;
-                        module_registry.register_type(module_name, node.name, ty, vis);
-                    }
-                    if (ty.is_valid()) { reg_count++; }
-                }
-                NodeKind::TraitDeclaration => {
-                    const node: TraitDeclNode* = stmt as TraitDeclNode*;
-                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym_home(node.name, node.span.file);
-                    const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
-                    if (ty.is_valid() && module_registry != null) {
-                        module_registry.register_type(module_name, node.name, ty, TypeVisibility::Public);
-                    }
-                    if (ty.is_valid()) { reg_count++; }
-                }
                 NodeKind::VariableDeclaration => {
                     // Phase 4-specific: resolve and register top-level global variables
                     const var_node: VarDeclNode* = stmt as VarDeclNode*;
@@ -3786,10 +3715,6 @@ type struct TypeResolutionPasses {
                 }
                 _ => {}
             }
-        }
-
-        if (ctx.debug_mode) {
-            cdebug("[TypeResolution] Phase 4: Registered %lld types in ModuleTypeRegistry + DeclarationIndex\n", reg_count);
         }
 
         // Resolve the `sizeof`/`alignof` operand types inside module-scope

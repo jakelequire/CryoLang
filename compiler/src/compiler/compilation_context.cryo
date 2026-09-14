@@ -48,7 +48,6 @@ import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::generic_registry::{ GenericRegistry };
-import compiler::types::registry::{ ModuleTypeRegistry };
 import compiler::types::resolver::{ TypeResolver };
 import compiler::types::type_ref::{ TypeRef };
 
@@ -240,7 +239,6 @@ public:
     type_resolver:        TypeResolver*;
     generic_registry:     GenericRegistry*;
     monomorphizer:        Monomorphizer*;
-    module_type_registry: ModuleTypeRegistry*;
     directive_registry:   void*;           // DirectiveRegistry*; typed-erased to break import cycle.
 
 private:
@@ -315,7 +313,6 @@ public:
             type_checker:         null,
             generic_registry:     null,
             monomorphizer:        null,
-            module_type_registry: null,
             module_loader:        null,
             codegen:              null,
             linker:               null,
@@ -630,11 +627,34 @@ public:
     /// this was written" as "this was written somewhere else".
     qualify_symbol_sym_home(mut &this, sym: SymbolStr,
                             span_file: string) -> SymbolStr {
+        // An ALREADY-QUALIFIED name is returned unchanged, as `qualify_symbol_sym`
+        // returns it: a synthesized declaration (a closure struct, a
+        // specialization placed by name) carries the key it was registered
+        // with, and prefixing a module to it mints a doubled key nothing holds.
+        if (QualifiedName::segment_count(this.intern_table.resolve(sym)) > 1) {
+            return sym;
+        }
         const home: SymbolStr = this.module_ns_sym_of_file(span_file);
         if (!home.is_valid()) { return this.qualify_symbol_sym(sym); }
         const ns: string   = this.intern_table.resolve(home);
         const bare: string = this.intern_table.resolve(sym);
         return this.intern_table.intern(ns + "::" + bare);
+    }
+
+    /// The key a TYPE DECLARATION is registered under, from what the node
+    /// carries: a C-imported one lives under its extern block's alias
+    /// (`cit::Vec2`, the whole canonical name); any other is its registered
+    /// name when it was minted qualified (a closure struct, a placed
+    /// specialization), else the module of the file that WROTE it prefixed
+    /// to its leaf.  A reader standing in some other module - a pass
+    /// walking a root that holds injected clones - gets the same key the
+    /// registration used, which the ambient cursor cannot give it.
+    decl_type_key(mut &this, name: SymbolStr, binding_namespace: SymbolStr,
+                  span_file: string) -> SymbolStr {
+        if (!binding_namespace.is_empty()) {
+            return this.qualify_binding_sym(name, binding_namespace);
+        }
+        return this.qualify_symbol_sym_home(name, span_file);
     }
 
     /// Qualify `sym` under an extern-module binding namespace when
@@ -711,12 +731,6 @@ public:
             this.generic_registry = _box_greg.leak();
         }
 
-        // Create the ModuleTypeRegistry if it doesn't exist yet
-        if (this.module_type_registry == null) {
-            const _box_mtr: Box<ModuleTypeRegistry> = Box<ModuleTypeRegistry>::new(ModuleTypeRegistry::new());
-            this.module_type_registry = _box_mtr.leak();
-        }
-
         // Create the TypeResolver with all required dependencies.
         // The Resolver (name_resolver) is initialized by the NameResolution pass
         // which runs before TypeDeclaration, so it should be available here.
@@ -725,7 +739,6 @@ public:
                 this.type_arena,
                 this.intern_table,
                 this.generic_registry,
-                this.module_type_registry,
                 this.resolver,
                 this.decl_index,
                 this.const_table,
