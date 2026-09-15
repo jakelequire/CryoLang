@@ -341,9 +341,6 @@ public:
     /// Bounded to the statement list: the count of async fns per module is small,
     /// and `declare` is idempotent per node.
     declare_async_futures(mut &this, node: ProgramNode*) -> void {
-        // Only an impl block registers its methods under more than one owner
-        // name; every other owner shares this empty list.
-        const no_aliases: SymbolStr[] = [];
         for (mut i: i64 = 0; i < node.statements.length; i++) {
             const stmt: ASTNode* = node.statements[i];
             if (stmt == null) { continue; }
@@ -368,17 +365,17 @@ public:
                 NodeKind::StructDeclaration => {
                     const s: StructDeclNode* = stmt as StructDeclNode*;
                     this.declare_async_methods(s.methods, s.generic_params,
-                        this.ctx.decl_type_key(s.name, s.binding_namespace, s.span.file), no_aliases, null);
+                        this.ctx.decl_type_key(s.name, s.binding_namespace, s.span.file), null);
                 }
                 NodeKind::UnionDeclaration => {
                     const u: UnionDeclNode* = stmt as UnionDeclNode*;
                     this.declare_async_methods(u.methods, u.generic_params,
-                        this.ctx.decl_type_key(u.name, u.binding_namespace, u.span.file), no_aliases, null);
+                        this.ctx.decl_type_key(u.name, u.binding_namespace, u.span.file), null);
                 }
                 NodeKind::ClassDeclaration => {
                     const c: ClassDeclNode* = stmt as ClassDeclNode*;
                     this.declare_async_methods(c.methods, c.generic_params,
-                        this.ctx.decl_type_key(c.name, SymbolStr::empty(), c.span.file), no_aliases, null);
+                        this.ctx.decl_type_key(c.name, SymbolStr::empty(), c.span.file), null);
                 }
                 NodeKind::ImplementationBlock => {
                     const ib: ImplBlockNode* = stmt as ImplBlockNode*;
@@ -399,16 +396,11 @@ public:
                         resolve_counter::Site::ImplHeadAsync.bump();
                         if (!ih_stamped) { resolve_counter::Site::ImplHeadAsyncUnstamped.bump(); }
                     }
-                    // The head's key is the owner the methods were registered
-                    // under; the two other spellings the bare-alias
-                    // registration also holds them under have to be repointed
-                    // alongside it, or a call that resolved through one of
-                    // them keeps the old signature.
-                    mut aliases: SymbolStr[] = [ib.target_type,
-                                                this.ctx.qualify_symbol_sym(ib.target_type)];
+                    // The head's key is the one owner the methods were
+                    // registered under.
                     mut owner_params: GenericParamNode*[] = this.impl_owner_params(ib);
                     this.declare_async_methods(ib.methods, owner_params,
-                                               canonical, aliases, ib);
+                                               canonical, ib);
                 }
                 _ => { }
             }
@@ -418,15 +410,14 @@ public:
     /// Declare the future of every `async` method in one owner's method list.
     ///
     /// `owner_params` are the OWNER's generic parameters, which the future must
-    /// carry as well as the method's own; `qname` / `aliases` are the keys the
-    /// declaration index registered the methods' signatures under.
+    /// carry as well as the method's own; `qname` is the key the declaration
+    /// index registered the methods' signatures under.
     /// `impl_node` is the enclosing impl block when the owner is one (null
     /// otherwise); a trait impl uses it to bind the trait's implicit
     /// `<Method>Fut` associated type to the future each method lowers to.
     declare_async_methods(mut &this, methods: &MethodNode*[],
                           owner_params: &GenericParamNode*[],
-                          qname: SymbolStr, aliases: &SymbolStr[],
-                          impl_node: ImplBlockNode*) -> void {
+                          qname: SymbolStr, impl_node: ImplBlockNode*) -> void {
         if (!qname.is_valid()) { this.reject_undeclarable_async(methods, qname); return; }
         const owner_ty: TypeRef = this.types.lookup_type_exact(qname);
         if (!owner_ty.is_valid()) { this.reject_undeclarable_async(methods, qname); return; }
@@ -449,7 +440,6 @@ public:
                 method: m,
                 ty: this.async_owner_instance(owner_ty, owner_params),
                 qname: qname,
-                alias_qnames: this.clone_symbols(aliases),
                 params: this.clone_generic_params(owner_params),
                 impl_node: impl_node,
             };
@@ -475,12 +465,6 @@ public:
                 m.func.span);
             m.func.set_async(false);
         }
-    }
-
-    clone_symbols(&this, syms: &SymbolStr[]) -> SymbolStr[] {
-        mut out: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < syms.length; i++) { out.push(syms[i]); }
-        return out;
     }
 
     /// The owner type as a method body sees `this`: the type itself, or the
