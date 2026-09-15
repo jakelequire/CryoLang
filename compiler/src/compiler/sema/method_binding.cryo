@@ -631,28 +631,30 @@ type struct MethodBinding {
         }
     }
 
-    /// The head leaf name of a type annotation (`Pair<u64,X>` -> `Pair`,
-    /// `A` -> `A`), peeling references/pointers; empty for a projection or
-    /// other non-nameable shape.
-    ann_head_leaf(&this, ann: TypeAnnotation*) -> SymbolStr {
+    /// The registration key the head of a written annotation names, off its
+    /// stamp, peeling references/pointers: a declared type's canonical name,
+    /// a primitive's spelling; empty for a type parameter, a projection or
+    /// an unstamped head - shapes that name no registered type.
+    ann_head_key(&this, ann: TypeAnnotation*) -> SymbolStr {
         if (ann == null) { return SymbolStr::empty(); }
         return match (*ann) {
-            TypeAnnotation::Named(n)     => { n.name }
-            TypeAnnotation::Generic(g)   => { this.ann_head_leaf(g.base) }
-            TypeAnnotation::Reference(r) => { this.ann_head_leaf(r.inner) }
-            TypeAnnotation::Pointer(p)   => { this.ann_head_leaf(p.inner) }
+            TypeAnnotation::Named(n)     => {
+                match (n.res) {
+                    ResSlot::Answered(r) => {
+                        match (r) {
+                            Res::Def(d)    => { d.qualified_name() }
+                            Res::PrimTy(p) => { p }
+                            _              => { SymbolStr::empty() }
+                        }
+                    }
+                    _ => { SymbolStr::empty() }
+                }
+            }
+            TypeAnnotation::Generic(g)   => { this.ann_head_key(g.base) }
+            TypeAnnotation::Reference(r) => { this.ann_head_key(r.inner) }
+            TypeAnnotation::Pointer(p)   => { this.ann_head_key(p.inner) }
             _ => { SymbolStr::empty() }
         };
-    }
-
-    /// Whether `name` matches one of `impl_node`'s own head generic params.
-    impl_declares_param(&this, impl_node: ImplBlockNode*, name: SymbolStr) -> boolean {
-        if (impl_node == null || !name.is_valid()) { return false; }
-        for (mut i: i64 = 0; i < impl_node.generic_params.length; i++) {
-            const gp: GenericParamNode* = impl_node.generic_params[i];
-            if (gp != null && gp.name.equals(name)) { return true; }
-        }
-        return false;
     }
 
     /// Whether the concrete type named `type_name` is registered as implementing
@@ -743,10 +745,14 @@ type struct MethodBinding {
                 TypeAnnotation::Projection(_) => { continue; }
                 _ => { }
             }
-            const head: SymbolStr = this.ann_head_leaf(item_ann);
+            // A symbolic Item - an impl-declared parameter, an unstamped head -
+            // names no registered type and is undecidable here: keep.
+            const head: SymbolStr = this.ann_head_key(item_ann);
             if (!head.is_valid()) { continue; }
-            if (this.impl_declares_param(impl_node, head)) { continue; }
-            // Concrete Item: it must implement every bound trait.
+            // Concrete Item: it must implement every bound trait, asked under
+            // its own name - a leaf would answer for every module's type of
+            // that leaf, and `.min()` on an iterator of one module's `Rank`
+            // was admitted because another module's `Rank` is `Ord`.
             for (mut ri: i64 = 0; ri < b.trait_refs.length; ri++) {
                 const tr: TraitRef* = &b.trait_refs[ri];
                 if (tr.path.length == 0) { continue; }

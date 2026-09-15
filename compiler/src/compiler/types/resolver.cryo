@@ -529,46 +529,26 @@ type struct TypeResolver {
         return this.arena.create_assoc_projection(base_ty, member, TypeRef::invalid());
     }
 
-    /// Bare (unqualified) leaf name of a type, compared against the leaf of a
-    /// WRITTEN bound base (`bind_where_arg_params_from`).  Generic
-    /// instantiations answer with the TEMPLATE's leaf.  A leaf beside a leaf,
-    /// never a registry key: the trait-impl table is asked by
-    /// `TraitChecker::template_key_of`.
-    proj_bare_name(&this, ty: TypeRef) -> SymbolStr {
-        const t: Type* = this.arena.lookup(ty.id);
-        if (t == null) { return SymbolStr::empty(); }
-        const k: TypeKind = t.kind;
-        if (k == TypeKind::Int || k == TypeKind::Float || k == TypeKind::Bool ||
-            k == TypeKind::Char || k == TypeKind::String) {
-            return this.intern_table.intern(t.display_name());
-        }
-        // Instantiations key on the TEMPLATE's bare name.  Via `inst_generic_base`
-        // so this holds for a post-mono concrete too - it carries its own base,
-        // and without this a spec would key on its MANGLED name, which no
-        // trait-impl registry holds.
-        const inst_base: TypeRef = this.arena.inst_generic_base(ty);
-        if (inst_base.is_valid()) {
-            return this.proj_bare_name(inst_base);
-        }
-        const qname: SymbolStr = this.arena.get_qualified_name(ty);
-        if (!qname.is_valid()) { return SymbolStr::empty(); }
-        return this.symbol_bare_leaf(qname);
-    }
-
-    /// Trailing `::`-separated segment of an interned name (`core::result::Result`
-    /// -> `Result`), or the name itself when unqualified. Shared by the type-side
-    /// key (`proj_bare_name`) and the annotation-side one so a bound written with
-    /// a qualified base compares equal to the type it projects to.
-    symbol_bare_leaf(&this, qname: SymbolStr) -> SymbolStr {
-        if (!qname.is_valid()) { return SymbolStr::empty(); }
-        const qstr: string = this.intern_table.resolve(qname);
-        const qlen: i64 = qstr.length() as i64;
-        mut last_sep: i64 = -1;
-        for (mut i: i64 = 0; i + 1 < qlen; i++) {
-            if (qstr[i] == ':' && qstr[i + 1] == ':') { last_sep = i + 2; }
-        }
-        if (last_sep < 0) { return qname; }
-        return this.intern_table.intern(qstr.substring(last_sep as u32, (qlen - last_sep) as u32));
+    /// The identity a written annotation's head names, off its stamp: a
+    /// declared type's canonical name, a primitive's spelling; empty for a
+    /// type parameter or an unstamped head, which name no registered type.
+    ann_head_key(&this, ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        return match (*ann) {
+            TypeAnnotation::Named(n) => {
+                match (n.res) {
+                    ResSlot::Answered(r) => {
+                        match (r) {
+                            Res::Def(d)    => { d.qualified_name() }
+                            Res::PrimTy(p) => { p }
+                            _              => { SymbolStr::empty() }
+                        }
+                    }
+                    _ => { SymbolStr::empty() }
+                }
+            }
+            _ => { SymbolStr::empty() }
+        };
     }
 
     /// Resolve a concrete `Base::Member` projection to the member's actual type
@@ -580,16 +560,13 @@ type struct TypeResolver {
                             ctx: ResolutionContext*) -> TypeRef {
         if (this.generic_registry == null) { return TypeRef::invalid(); }
         // The base is used directly whether it is a pre-mono InstantiatedType
-        // wrapper or a post-mono concrete spec: `proj_bare_name` resolves either to
-        // the TEMPLATE's bare name, and the args below come from the same
-        // representation-neutral views.  (This used to recover the origin carrier
-        // first, because a concrete spec answered with its mangled name and no
-        // type_args.)
+        // wrapper or a post-mono concrete spec: `template_key_of` names the
+        // TEMPLATE for either, and the args below come from the same
+        // representation-neutral views.
         const base_ty: TypeRef = base_ty_in;
         const bt: Type* = this.arena.lookup(base_ty.id);
         if (bt == null) { return TypeRef::invalid(); }
-        const bare: SymbolStr = this.proj_bare_name(base_ty);
-        if (!bare.is_valid()) { return TypeRef::invalid(); }
+        if (!this.arena.template_key_of(base_ty, this.intern_table).is_valid()) { return TypeRef::invalid(); }
 
         // Element-wise copy, NOT a by-value array assignment: that would alias the
         // type's owning `type_args` buffer, and dropping the local at function exit
@@ -927,12 +904,14 @@ type struct TypeResolver {
             }
             TypeAnnotation::Generic(g) => {
                 if (g.base == null) { return; }
-                const want: SymbolStr = match (*g.base) {
-                    TypeAnnotation::Named(bn) => { this.symbol_bare_leaf(bn.name) }
-                    _                         => { SymbolStr::empty() }
-                };
+                // The written base and the projected type destructure against
+                // each other only when they are ONE template: the base's stamp
+                // beside the type's template key, never a leaf beside a leaf,
+                // which would pair a bound written against one module's
+                // `Result<T, E>` with another module's.
+                const want: SymbolStr = this.ann_head_key(g.base);
                 if (!want.is_valid()) { return; }
-                const got: SymbolStr = this.proj_bare_name(actual);
+                const got: SymbolStr = this.arena.template_key_of(actual, this.intern_table);
                 if (!got.is_valid() || !got.equals(want)) { return; }
                 if (this.arena.inst_type_arg_count(actual) != g.args.length) { return; }
                 for (mut i: i64 = 0; i < g.args.length; i++) {

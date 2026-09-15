@@ -2264,6 +2264,22 @@ type struct TypeResolutionPasses {
         ctx.emit_diagnostic(diag);
     }
 
+    /// The registration key a written annotation's head names, off its
+    /// stamp: a declared type's canonical name, a primitive's spelling;
+    /// empty for a type parameter or an unstamped head.
+    static head_type_key(ann: TypeAnnotation*) -> SymbolStr {
+        return match (TypeResolutionPasses::head_named_slot(ann)) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(d)    => { d.qualified_name() }
+                    Res::PrimTy(p) => { p }
+                    _              => { SymbolStr::empty() }
+                }
+            }
+            _ => { SymbolStr::empty() }
+        };
+    }
+
     static head_named_slot(ann: TypeAnnotation*) -> ResSlot {
         if (ann == null) { return ResSlot::Pending; }
         return match (*ann) {
@@ -2409,16 +2425,6 @@ type struct TypeResolutionPasses {
         };
     }
 
-    /// Whether `name` is one of `impl_node`'s own head generic parameters.
-    static impl_declares_generic_param(impl_node: ImplBlockNode*, name: SymbolStr) -> boolean {
-        if (impl_node == null || !name.is_valid()) { return false; }
-        for (mut i: i64 = 0; i < impl_node.generic_params.length; i++) {
-            const gp: GenericParamNode* = impl_node.generic_params[i];
-            if (gp != null && gp.name.equals(name)) { return true; }
-        }
-        return false;
-    }
-
     /// Whether the type named `type_name` is registered as implementing the
     /// trait named `trait_name`. Conservative: true (assume satisfiable) when the
     /// registry is unavailable, so a default method is only DROPPED on positive
@@ -2468,13 +2474,14 @@ type struct TypeResolutionPasses {
             if (arg_idx < 0 || arg_idx >= args_ref.length) { continue; }
             const item_ann: TypeAnnotation* = args_ref[arg_idx];
             if (item_ann == null) { continue; }
-            // Symbolic Item (projection or impl-declared generic param) -> keep.
+            // A symbolic Item - a projection, an impl-declared parameter, an
+            // unstamped head - names no registered type: keep.
             if (TypeResolutionPasses::is_projection_annotation(item_ann)) { continue; }
-            const head: SymbolStr = TypeResolutionPasses::extract_trait_leaf(item_ann);
+            const head: SymbolStr = TypeResolutionPasses::head_type_key(item_ann);
             if (!head.is_valid()) { continue; }
-            if (TypeResolutionPasses::impl_declares_generic_param(impl_node, head)) { continue; }
             // Concrete Item type: it must implement every bound trait, else the
-            // default cannot apply here.
+            // default cannot apply here - asked under its own name, since a
+            // leaf answers for every module's type of that leaf.
             for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
                 const tr: TraitRef* = &b.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
