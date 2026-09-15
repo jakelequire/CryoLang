@@ -161,29 +161,6 @@ type struct DeclarationEmitter {
         return c.decl_index;
     }
 
-    /// Qualified name for a function declaration, honoring a canonical
-    /// (template-derived) namespace stamped on injected generic specs.
-    ///
-    /// Free-function / static-method-generic specializations have no arena
-    /// type to carry a location-independent name (unlike type specs, whose
-    /// methods key off the type's arena qualified name).  Phase 6a stamps the
-    /// spec's TEMPLATE namespace onto the cloned FunctionDeclNode's
-    /// `source_module` field; reading it back here makes the emitted definition
-    /// symbol a function of the template module rather than of whichever module
-    /// emits the body, so callers (who derive the same canonical name via the
-    /// DeclarationIndex) link to it regardless of placement.  Non-spec
-    /// functions have an empty `source_module` and fall back to the ambient
-    /// module namespace.  Must stay in lockstep with the DI registration in
-    /// `TypeResolutionPasses::register_decl_in_index` (FunctionDeclaration).
-    fn_qualified_name(&this, node: FunctionDeclNode*) -> SymbolStr {
-        if (node.source_module != "") {
-            const i: InternTable* = this.get_intern();
-            return i.intern(node.source_module + "::" + i.resolve(node.name));
-        }
-        const c: CompilationContext* = this.ctx;
-        return c.qualify_symbol_sym_home(node.name, node.span.file);
-    }
-
     resolve(&this, sym: SymbolStr) -> string {
         const i: InternTable* = this.get_intern();
         return i.resolve(sym);
@@ -443,7 +420,7 @@ type struct DeclarationEmitter {
     /// made and never to a same-name neighbour.
     free_function_symbol(mut &this, node: FunctionDeclNode*, func_type_ref: TypeRef) -> SymbolStr {
         const di: DeclarationIndex* = this.ctx.decl_index;
-        const qualified: SymbolStr = this.fn_qualified_name(node);
+        const qualified: SymbolStr = this.ctx.decl_fn_key(node.name, node.span.file);
         mut mangled_sym: SymbolStr = di.lookup_overload_mangled(qualified, func_type_ref);
         if (!mangled_sym.is_valid()) {
             mangled_sym = di.lookup_mangled_name(qualified);
@@ -684,26 +661,6 @@ type struct DeclarationEmitter {
         }
     }
 
-    /// The name a TYPE declaration's methods register under, from the
-    /// declaration itself: a specialization's clone carries the template's
-    /// namespace in `source_module` and is registered as
-    /// `<that>::<identifier>`; a written declaration is registered under the
-    /// module that wrote it.  The same rule `fn_qualified_name` states for a
-    /// function, and the one `register_decl_in_index` registers by.
-    type_decl_qualified_name(&this, source_module: string, span_file: string,
-                             name: SymbolStr) -> SymbolStr {
-        const i: InternTable* = this.get_intern();
-        // A SYNTHESIZED declaration - a closure struct - carries the qualified
-        // name it was registered with; prefixing it again would mint a key
-        // nothing holds.
-        if (QualifiedName::segment_count(i.resolve(name)) > 1) { return name; }
-        if (source_module != "") {
-            return i.intern(source_module + "::" + i.resolve(name));
-        }
-        const c: CompilationContext* = this.ctx;
-        return c.qualify_symbol_sym_home(name, span_file);
-    }
-
     /// Declare methods defined inline within a struct declaration.
     declare_struct_methods(mut &this, node: StructDeclNode*) -> void {
         if (node.generic_params.length > 0) {
@@ -712,7 +669,8 @@ type struct DeclarationEmitter {
         if (node.methods.length == 0) {
             return;
         }
-        const qualified: SymbolStr = this.type_decl_qualified_name(node.source_module, node.span.file, node.name);
+        const c: CompilationContext* = this.ctx;
+        const qualified: SymbolStr = c.decl_type_key(node.name, node.binding_namespace, node.span.file);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.declare_method(node.methods[i], qualified);
         }
@@ -727,7 +685,8 @@ type struct DeclarationEmitter {
         if (node.methods.length == 0) {
             return;
         }
-        const qualified: SymbolStr = this.type_decl_qualified_name(node.source_module, node.span.file, node.name);
+        const c: CompilationContext* = this.ctx;
+        const qualified: SymbolStr = c.decl_type_key(node.name, node.binding_namespace, node.span.file);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.declare_method(node.methods[i], qualified);
         }
@@ -738,7 +697,8 @@ type struct DeclarationEmitter {
         if (node.generic_params.length > 0) {
             return;
         }
-        const qualified: SymbolStr = this.type_decl_qualified_name(node.source_module, node.span.file, node.name);
+        const c: CompilationContext* = this.ctx;
+        const qualified: SymbolStr = c.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
         const di: DeclarationIndex* = this.get_decl_index();
         const di_ref: TypeRef = di.lookup_type(qualified);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
@@ -1385,7 +1345,7 @@ type struct DeclarationEmitter {
 
         // Also register under qualified name (for cross-module resolution).
         const ctx_ptr: CompilationContext* = this.ctx;
-        const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym_home(node.name, node.span.file);
+        const qualified: SymbolStr = ctx_ptr.decl_fn_key(node.name, node.span.file);
         if (!qualified.equals(node.name)) {
             this.functions.register(qualified, fn_val);
         }

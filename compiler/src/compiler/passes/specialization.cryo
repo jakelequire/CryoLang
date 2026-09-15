@@ -637,14 +637,11 @@ type struct SpecializationPasses {
         // safe at all:
         //   * TYPE specs (struct/enum/class) are named by the type's arena
         //     qualified name, which is LOCATION-INDEPENDENT.
-        //   * FUNCTION / static-method-generic specs have no arena type, so the
-        //     template namespace is stamped onto the spec's FunctionDeclNode
-        //     (`source_module`, below) and read back at DI registration
-        //     (register_decl_in_index) and at codegen (declare_function /
-        //     codegen_function_prologue).  That makes their definition symbol
-        //     and every caller's cross-module reference both qualify by the
-        //     TEMPLATE module, so relocating the definition never diverges the
-        //     names.
+        //   * FUNCTION / static-method-generic specs have no arena type; their
+        //     key is the spec identifier under the module of the file that
+        //     wrote the template (`decl_fn_key` over the clone's span), which
+        //     the DI registration and codegen's definition both derive, so
+        //     relocating the definition never diverges the names.
         //
         // Fallback, when no type argument names an in-build module (a purely
         // primitive `Option<i64>`, or a FUNCTION spec, which carries no
@@ -663,33 +660,15 @@ type struct SpecializationPasses {
         }
         entry.owner_source = owner_module_sym;
 
-        // Stamp the canonical (template-derived) namespace onto FUNCTION specs
-        // so their definition symbol and every caller reference qualify by the
-        // template module rather than by whichever module emits/demands them.
-        // Type specs get this for free via their arena qualified name; free
-        // functions and static-method generics have no arena type, so the
-        // namespace must ride on the node.  Read back by
-        // `register_decl_in_index` (q_name) and `DeclarationEmitter`
-        // (fn_qualified_name).  Must run BEFORE `SpecInjector::register` below.
-        // `entry.template_module` is the template's namespace (or its source
-        // path for root-namespace templates); either way the stamp is the single
-        // source of truth for the spec's qualifier, so def and callers agree.
-        if (entry.ast_node != null
-                && entry.ast_node.kind == NodeKind::FunctionDeclaration
-                && entry.template_module.is_valid()) {
-            const tmpl_ns: string = ctx.intern_table.resolve(entry.template_module);
-            SpecializationPasses::tag_decl_source_module(entry.ast_node, tmpl_ns);
-        }
-
         // Scope-tag the main AST with its template module origin in the
-        // CompilationContext's node-identity side table. This is kept separate
-        // from the node's `source_module` field on purpose: that field is also
-        // used to stamp ordinary (non-injected) decls with their defining module
-        // (see type_resolution's ImplementationBlock handler), so it can't mark
-        // "this exact node is an injected spec" without conflation. The side
-        // table only ever holds injected specs, which is what `dispatch_top_level`
-        // needs. Physical placement into the owner module's root happens later
-        // in Phase 6a-iii.
+        // CompilationContext's node-identity side table.  A FUNCTION spec's
+        // key needs no stamp on the node: the clone carries the template's
+        // span, and a declaration's key is its name under the module of the
+        // file that wrote it (`decl_fn_key`), so the definition and every
+        // caller's reference qualify by the template module wherever the
+        // clone is placed.  The side table only ever holds injected specs,
+        // which is what `dispatch_top_level` needs.  Physical placement into
+        // the owner module's root happens later in Phase 6a-iii.
         if (entry.ast_node != null) {
             if (entry.template_module.is_valid()) {
                 ctx.register_injected_origin(
@@ -894,7 +873,11 @@ type struct SpecializationPasses {
                                        ctx: CompilationContext*) -> void {
         if (generic_params.length == 0) { return; }
 
-        const qualified_sym: SymbolStr = ctx.qualify_symbol_sym_home(name, ast_node.span.file);
+        const qualified_sym: SymbolStr = if (lookup_base) {
+            ctx.decl_type_key(name, SymbolStr::empty(), ast_node.span.file)
+        } else {
+            ctx.decl_fn_key(name, ast_node.span.file)
+        };
         // Use the namespace (not file path) as the module name so that
         // the monomorphizer's ResolutionContext can qualify type lookups
         // correctly (e.g., "std::core::option" not "./core/option.cryo").
@@ -958,7 +941,7 @@ type struct SpecializationPasses {
                                               ctx: CompilationContext*) -> void {
         if (methods.length == 0) { return; }
 
-        const owner_qsym: SymbolStr = ctx.qualify_symbol_sym_home(owner_name, methods[0].span.file);
+        const owner_qsym: SymbolStr = ctx.decl_type_key(owner_name, SymbolStr::empty(), methods[0].span.file);
         const owner_qstr: string = ctx.intern_table.resolve(owner_qsym);
         const module_sym: SymbolStr = if (ctx.has_namespace()) {
             ctx.namespace_str
@@ -1025,28 +1008,8 @@ type struct SpecializationPasses {
         // second key is last-writer-wins across every module declaring the
         // leaf, and a reader that reached it by a receiver's leaf was handed
         // some other module's declaration.
-        const owner_qsym: SymbolStr = ctx.qualify_symbol_sym_home(owner_name, owner_ast.span.file);
+        const owner_qsym: SymbolStr = ctx.decl_type_key(owner_name, SymbolStr::empty(), owner_ast.span.file);
         registry.register_inherent_owner(owner_qsym, owner_ast);
-    }
-
-    /// Tag an AST node's source_module field with the template's module name.
-    /// struct/class/enum/function/impl decls are all DeclarationNode subclasses and
-    /// `source_module` lives on that shared base, so a single base-pointer write
-    /// covers every kind. (The kind check keeps the cast sound - only declaration
-    /// nodes are written.) Per-leaf concrete casts are not needed here:
-    /// base-pointer field writes on the vtable'd AST hierarchy are correct at both
-    /// O0 and O2.
-    static tag_decl_source_module(node: ASTNode*, module: string) -> void {
-        if (node == null) { return; }
-        const k: NodeKind = node.kind;
-        const is_decl: boolean =
-            k == NodeKind::StructDeclaration || k == NodeKind::UnionDeclaration
-            || k == NodeKind::ClassDeclaration
-            || k == NodeKind::EnumDeclaration || k == NodeKind::FunctionDeclaration
-            || k == NodeKind::ImplementationBlock;
-        if (!is_decl) { return; }
-        const decl: DeclarationNode* = node as DeclarationNode*;
-        decl.source_module = module;
     }
 
     static register_impl_block(node: ImplBlockNode*, registry: GenericRegistry*,

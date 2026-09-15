@@ -1586,25 +1586,9 @@ type struct TypeResolutionPasses {
                     const func_type_ref: TypeRef = arena.get_function(
                         func.resolved_return_type, param_types, func.is_variadic);
 
-                    // Register under qualified name in the per-module list so
-                    // cross-module descriptors carry fully qualified names.
-                    //
-                    // Injected free-fn / static-method-generic specs carry a
-                    // canonical (template-derived) namespace stamped on
-                    // `source_module` by Phase 6a (register_spec).  Qualifying
-                    // by it - rather than by the demanding module's namespace - 
-                    // makes the spec's mangled symbol a function of its template
-                    // module, so the definition (relocated to the template's
-                    // owner module) and every caller's cross-module extern agree
-                    // regardless of placement.  Must stay in lockstep with
-                    // `DeclarationEmitter::fn_qualified_name`.  Source decls have
-                    // an empty `source_module` and keep the ambient qualifier.
-                    const q_name: SymbolStr = if (func.source_module != "") {
-                        ctx.intern_table.intern(
-                            func.source_module + "::" + ctx.intern_table.resolve(func.name))
-                    } else {
-                        ctx.qualify_symbol_sym_home(func.name, func.span.file)
-                    };
+                    // Under the declaration's own key, in the per-module list
+                    // so cross-module descriptors carry it whole.
+                    const q_name: SymbolStr = ctx.decl_fn_key(func.name, func.span.file);
                     ctx.decl_index.register_function_type_with_module(
                         q_name, func.resolved_return_type, func_type_ref, module_sym, ctx.intern_table, arena);
 
@@ -2960,9 +2944,9 @@ type struct TypeResolutionPasses {
                     mut struct_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
                     const struct_owner: TypeRef = ctx.decl_index.lookup_type(
-                        ctx.qualify_symbol_sym_home(node.name, node.span.file));
+                        ctx.decl_type_key(node.name, node.binding_namespace, node.span.file));
                     runner.resolve_method_signatures(node.methods, &struct_ctx, struct_owner,
-                        ctx.qualify_symbol_sym_home(node.name, node.span.file));
+                        ctx.decl_type_key(node.name, node.binding_namespace, node.span.file));
                     sig_count += node.methods.length;
                 }
                 NodeKind::UnionDeclaration => {
@@ -2970,9 +2954,9 @@ type struct TypeResolutionPasses {
                     mut union_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
                     const union_owner: TypeRef = ctx.decl_index.lookup_type(
-                        ctx.qualify_symbol_sym_home(node.name, node.span.file));
+                        ctx.decl_type_key(node.name, node.binding_namespace, node.span.file));
                     runner.resolve_method_signatures(node.methods, &union_ctx, union_owner,
-                        ctx.qualify_symbol_sym_home(node.name, node.span.file));
+                        ctx.decl_type_key(node.name, node.binding_namespace, node.span.file));
                     sig_count += node.methods.length;
                 }
                 NodeKind::ClassDeclaration => {
@@ -2980,9 +2964,9 @@ type struct TypeResolutionPasses {
                     mut class_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
                     const class_owner: TypeRef = ctx.decl_index.lookup_type(
-                        ctx.qualify_symbol_sym_home(node.name, node.span.file));
+                        ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file));
                     runner.resolve_method_signatures(node.methods, &class_ctx, class_owner,
-                        ctx.qualify_symbol_sym_home(node.name, node.span.file));
+                        ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file));
                     sig_count += node.methods.length;
                 }
                 NodeKind::TraitDeclaration => {
@@ -3020,7 +3004,7 @@ type struct TypeResolutionPasses {
                         // identity, and also what decides whether this IS the
                         // language's `Copy`/`Drop`/... - the leaf cannot say
                         // either, since a user trait may share it.
-                        const trait_id: SymbolStr = ctx.qualify_symbol_sym_home(node.name, node.span.file);
+                        const trait_id: SymbolStr = ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
                         ctx.generic_registry.register_trait_decl(trait_id, node);
                         ctx.generic_registry.claim_wellknown_trait(
                             trait_id, ctx.intern_table);
@@ -3327,7 +3311,7 @@ type struct TypeResolutionPasses {
                         // Register under qualified name with module
                         // so cross-module externs pick up intrinsics.
                         const i_mod_sym: SymbolStr = ctx.intern(ctx.source_file);
-                        const q_name: SymbolStr = ctx.qualify_symbol_sym_home(node.name, node.span.file);
+                        const q_name: SymbolStr = ctx.decl_fn_key(node.name, node.span.file);
                         ctx.decl_index.register_function_type_with_module(
                             q_name, node.resolved_return_type, i_func_type_ref, i_mod_sym, ctx.intern_table, arena);
 
@@ -3805,16 +3789,6 @@ type struct TypeResolutionPasses {
                             g_key, var_node.resolved_type, gmod_sym, g_ns,
                             var_node.is_thread_local);
                         TypeResolutionRunner::record_extern_symbol(ctx, var_node, g_key, g_ns);
-                        if (var_node.binding_namespace.is_empty()) {
-                            // Also register under the module-qualified name so a
-                            // same-bare-name global in another module can't shadow
-                            // this one in the (bare-keyed, last-write-wins) type
-                            // registry. See sema::TypeUtils::lookup_global_var.
-                            const gq_sym: SymbolStr = ctx.qualify_symbol_sym_home(var_node.name, var_node.span.file);
-                            if (!gq_sym.equals(var_node.name)) {
-                                ctx.decl_index.register_global(gq_sym, var_node.resolved_type);
-                            }
-                        }
                     }
                 }
                 _ => {}
@@ -4064,7 +4038,7 @@ type struct TypeResolutionPasses {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     if (node.is_generic()) { continue; }
 
-                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym_home(node.name, node.span.file);
+                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
                     const type_ref: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                     if (!type_ref.is_valid()) { continue; }
 

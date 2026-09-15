@@ -46,7 +46,6 @@ import compiler::codegen::state::global_registry::{ GlobalRegistry };
 import compiler::codegen::type_map::{ TypeMapper };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
-import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{
@@ -115,21 +114,13 @@ type struct SymbolResolver {
     // Cross-module extern declaration
 
     /// The LLVM symbol of signature `ft` of family `name`: the entry's own
-    /// registered symbol, else the family's single slot (an `extern "C"`
-    /// family registers no per-signature symbol; its slot is the C name),
-    /// else the mangling of the pair itself.
+    /// registered symbol.  Every registration writes one - a Cryo function's
+    /// mangling, an `extern "C"` function's C name, a `![symbol]` link name -
+    /// so an entry without one is unregistered, and a mangling minted here
+    /// would name a free function's symbol for a method's signature.
     family_symbol(&this, name: SymbolStr, ft: TypeRef) -> SymbolStr {
         const di: DeclarationIndex* = this.ctx.decl_index;
-        mut sym: SymbolStr = di.lookup_overload_mangled(name, ft);
-        if (!sym.is_valid()) { sym = di.lookup_mangled_name(name); }
-        if (sym.is_valid()) { return sym; }
-        const arena: TypeArena* = this.ctx.type_arena;
-        const ft_ptr: Type* = arena.lookup(ft.id);
-        if (ft_ptr == null || ft_ptr.kind != TypeKind::Function) { return SymbolStr::empty(); }
-        const f: FunctionType* = ft_ptr as FunctionType*;
-        return MangledName::for_free_function(
-            this.ctx.intern_table, arena, QualifiedName::from_symbol(name),
-            f.param_types, f.return_type, f.is_variadic).value;
+        return di.lookup_overload_mangled(name, ft);
     }
 
     /// Declare the cross-module extern `symbol` at `func_type_ref`'s
@@ -381,6 +372,15 @@ type struct SymbolResolver {
         }
         this.globals.register(cache_key, g_val);
         return g_val;
+    }
+
+    /// The global a stamp's canonical name `q` names - the slot the index
+    /// splits it to.
+    resolve_global_by_qualified(mut &this, q: SymbolStr) -> LValue {
+        mut leaf: SymbolStr = SymbolStr::empty();
+        mut ns: SymbolStr = SymbolStr::empty();
+        DeclarationIndex::split_global_key(q, this.ctx.intern_table, &leaf, &ns);
+        return this.resolve_global_in_namespace(leaf, ns);
     }
 
 
