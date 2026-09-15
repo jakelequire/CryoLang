@@ -1391,23 +1391,18 @@ type struct CallEmitter {
     va_forward_fn_type(mut &this, node: CallExprNode*) -> FunctionType* {
         if (!this.cg.abi.is_win64()) { return null; }
         if (node.callee == null) { return null; }
-        // The callee's bare name keys its `FunctionType` in the DeclarationIndex.
         // Only free / extern-"C" callees (bare identifier or `Scope::member`)
         // carry a `va_list` parameter; methods (`MemberAccess`) never do, so we
         // skip them - which also keeps `node.arguments[i]` aligned with
         // `param_types[i]` (no receiver in the parameter list).
-        mut name: SymbolStr = SymbolStr::empty();
-        if (node.callee.kind == NodeKind::Identifier) {
-            name = (node.callee as IdentifierNode*).name;
-        } else if (node.callee.kind == NodeKind::ScopeResolution) {
-            name = (node.callee as ScopeResolutionNode*).member_name;
-        } else {
+        if (node.callee.kind != NodeKind::Identifier
+                && node.callee.kind != NodeKind::ScopeResolution) {
             return null;
         }
-        if (!name.is_valid()) { return null; }
-        const di: DeclarationIndex* = this.cg.get_decl_index();
-        if (di == null) { return null; }
-        const ft_ref: TypeRef = di.lookup_func_type(name);
+        // The signature is the PINNED callee's: the bare slot under the
+        // written leaf is last-writer-wins across every module declaring it,
+        // and would hand another module's `write` its parameter list.
+        const ft_ref: TypeRef = this.cg.resolver.pinned_signature(node.resolved_callee);
         if (!ft_ref.is_valid()) { return null; }
         const ct: Type* = this.cg.lookup_type_by_id(ft_ref.id);
         if (ct == null || ct.kind != TypeKind::Function) { return null; }

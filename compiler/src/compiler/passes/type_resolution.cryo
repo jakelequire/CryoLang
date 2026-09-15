@@ -1592,45 +1592,27 @@ type struct TypeResolutionPasses {
                     ctx.decl_index.register_function_type_with_module(
                         q_name, func.resolved_return_type, func_type_ref, module_sym, ctx.intern_table, arena);
 
-                    // Also register under bare name for backward-compatible lookups.
-                    // Use the same mangled name as the qualified version.
-                    // A leaf owned by a declared `intrinsic function` keeps
-                    // its single-slot bindings: the DeclarationIndex refuses
-                    // non-intrinsic overwrites of intrinsic-owned slots (see
-                    // the intrinsic-durability guards in decl_index), while
-                    // this function's own per-signature overload entry still
-                    // registers so arity/signature dispatch can pick it.
-                    if (!q_name.equals(func.name)) {
+                    ctx.decl_index.set_decl_visibility(q_name, func.is_public);
+                    if (resolve_counter::Audit::Visibility.enabled()) {
+                        resolve_counter::vis_record(
+                            ctx.intern_table.resolve(q_name), func.is_public);
+                    }
+                    // A monomorphized clone's identifier is program-unique -
+                    // the mangling of its template and arguments - and is the
+                    // FAMILY every caller pins it by, so the clone registers
+                    // under it as well.  A written declaration's leaf is not
+                    // a key any store holds: a caller names it by its stamp,
+                    // and a leaf slot is last-writer-wins across every module
+                    // declaring the leaf.  A leaf an `intrinsic function`
+                    // owns keeps its single-slot bindings either way; the
+                    // index refuses non-intrinsic overwrites of them.
+                    if (!is_source_decl && !q_name.equals(func.name)) {
                         ctx.decl_index.register_function(func.name, func.resolved_return_type);
-                        // Owner-stamped (by q_name): a same-signature bare
-                        // leaf from another module keeps its own entry +
-                        // mangled slot instead of adopting/restamping the
-                        // first claimant's (`heap::free` vs the `free`
-                        // intrinsic).
                         ctx.decl_index.register_function_type_owned(
                             func.name, func_type_ref, q_name);
-                        ctx.decl_index.register_name_mapping(func.name, q_name);
-                        // Same-leaf resolution needs a visibility verdict for
-                        // every candidate it can be handed, and until now only
-                        // TYPES recorded one - so `is_candidate_public` fell to
-                        // its permissive default for every function and could
-                        // never reject one (measured: 0 rejections for
-                        // non-public, docs/name-resolution.md §8.1 caveat).
-                        // A module still sees its own private functions; the
-                        // namespace comparison in resolve_qualified_scoped runs
-                        // before this verdict is consulted.
-                        ctx.decl_index.set_decl_visibility(q_name, func.is_public);
-                        if (resolve_counter::Audit::Visibility.enabled()) {
-                            resolve_counter::vis_record(
-                                ctx.intern_table.resolve(q_name), func.is_public);
-                        }
                         const q_mangled: SymbolStr = ctx.decl_index.lookup_mangled_name(q_name);
                         if (q_mangled.is_valid()) {
                             ctx.decl_index.register_mangled_name(func.name, q_mangled);
-                            // Pin per-overload too; bare-name's single
-                            // mangled-name slot is overwritten across modules
-                            // (last-wins) and would otherwise hand out the
-                            // wrong symbol when this overload gets picked.
                             ctx.decl_index.register_overload_mangled_owned(
                                 func.name, func_type_ref, q_name, q_mangled);
                         }
