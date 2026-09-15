@@ -10,9 +10,11 @@
 ///   2. else an `external` declaration emitted from the `DeclarationIndex`
 ///      entry registered under that symbol, then held.
 ///
-/// A callee reaches here as the symbol the front end pinned, or - for the
-/// pins written before the symbol existed - as a FAMILY name that must name
-/// one symbol.  Nothing here chooses among a family's signatures.
+/// A callee reaches here as the front end pinned it (`CalleePin`): the
+/// symbol itself, or - for the pins written before the symbol existed - a
+/// FAMILY name that must name one symbol.  The pin says which; nothing here
+/// tries one and then the other, and nothing here chooses among a family's
+/// signatures.
 ///
 /// This mirrors what LLVM itself does via `Module::getOrInsertFunction`.
 ///
@@ -29,6 +31,8 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::codegen::state::{ function_registry, global_registry };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
+import compiler::ast::expression;
+import compiler::ast::expression::{ CalleePin };
 import compiler::decl_index;
 import compiler::decl_index::{ DeclarationIndex };
 import compiler::types;
@@ -228,11 +232,31 @@ type struct SymbolResolver {
     /// end's pin, and a name reaching here for such a family is an internal
     /// error, never a choice made here.
     resolve_family(mut &this, name: SymbolStr, arity: i64) -> LValue {
+        mut ft: TypeRef = TypeRef::invalid();
+        mut plural: boolean = false;
+        const sym: SymbolStr = this.family_answer(name, arity, &ft, &plural);
+        if (plural) {
+            this.ctx.emit_error_at(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                fmt::format("codegen: `%s` names several functions and the call was not pinned to one of them",
+                            this.ctx.intern_table.resolve(name)),
+                SourceSpan::none());
+            return LValue::null();
+        }
+        if (!sym.is_valid()) { return LValue::null(); }
+        const held: LValue = this.held_symbol(sym);
+        if (held.is_valid()) { return held; }
+        return this.declare_extern_function_as(ft, sym);
+    }
+
+    /// The one symbol the family `name` names among its signatures of
+    /// `arity` (any arity when negative), with that signature in `*out_ft`;
+    /// empty when it names none, and `*out_plural` set when it names several.
+    /// A query: declares nothing, reports nothing.
+    family_answer(&this, name: SymbolStr, arity: i64, out_ft: TypeRef*, out_plural: boolean*) -> SymbolStr {
         const di: DeclarationIndex* = this.ctx.decl_index;
         const arena: TypeArena* = this.ctx.type_arena;
         const overloads: TypeRef[] = di.lookup_func_type_overloads(name);
         mut sym: SymbolStr = SymbolStr::empty();
-        mut ft: TypeRef = TypeRef::invalid();
         for (mut i: i64 = 0; i < overloads.length; i++) {
             const t: Type* = arena.lookup(overloads[i].id);
             if (t == null || t.kind != TypeKind::Function) { continue; }
@@ -242,19 +266,13 @@ type struct SymbolResolver {
             const s: SymbolStr = this.family_symbol(name, overloads[i]);
             if (!s.is_valid()) { continue; }
             if (sym.is_valid() && !s.equals(sym)) {
-                this.ctx.emit_error_at(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    fmt::format("codegen: `%s` names several functions and the call was not pinned to one of them",
-                                this.ctx.intern_table.resolve(name)),
-                    SourceSpan::none());
-                return LValue::null();
+                *out_plural = true;
+                return SymbolStr::empty();
             }
             sym = s;
-            ft = overloads[i];
+            *out_ft = overloads[i];
         }
-        if (!sym.is_valid()) { return LValue::null(); }
-        const held: LValue = this.held_symbol(sym);
-        if (held.is_valid()) { return held; }
-        return this.declare_extern_function_as(ft, sym);
+        return sym;
     }
 
     /// A function by canonical name, for the calls codegen synthesizes
@@ -263,16 +281,16 @@ type struct SymbolResolver {
         return this.resolve_family(name, -1);
     }
 
-    /// A pinned callee.  A pin is a symbol and resolves as one; a pin that is
-    /// a family name instead - a module-qualified call, a static on a
-    /// specialization, a specialization's own name, each written before its
-    /// symbol exists to be pinned - resolves through the family, which must
-    /// name one symbol.
-    resolve_function_by_mangled(mut &this, pinned: SymbolStr) -> LValue {
-        if (!pinned.is_valid()) { return LValue::null(); }
-        const v: LValue = this.resolve_symbol(pinned);
-        if (v.is_valid()) { return v; }
-        return this.resolve_family(pinned, -1);
+    /// A pinned callee, by the kind of name the pin says it is: a symbol
+    /// resolves as a symbol, a family name through the family, which must
+    /// name one symbol.  One question each; a pin of the one kind is never
+    /// asked as the other.
+    resolve_pinned(mut &this, pin: CalleePin) -> LValue {
+        return match (pin) {
+            CalleePin::Symbol(s) => { this.resolve_symbol(s) }
+            CalleePin::Family(f) => { this.resolve_family(f, -1) }
+            _                    => { LValue::null() }
+        };
     }
 
     /// Look up a global by name, declaring a cross-module extern on demand.

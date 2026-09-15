@@ -29,6 +29,44 @@ import compiler::ast::statement::{ StatementNode };
 import compiler::ast::visitor;
 import compiler::ast::visitor::{ ASTVisitor };
 
+/// What a call's callee is pinned to once sema or the monomorphizer has
+/// decided it, and by WHICH name - the two are different keys into
+/// different tables, and a pin that did not say which left codegen to try
+/// one and then the other.
+///
+/// `Symbol` is the linker symbol itself: a mangled method or function
+/// symbol, a `![symbol]` link name, a C function's name.  It resolves as a
+/// symbol and nothing else.  `Family` is a canonical name the declaration
+/// index registers signatures under - a module-qualified free function, a
+/// specialization's registered identifier, `Owner::method` on a
+/// specialization - written by a stage that has the name before the symbol
+/// exists; it resolves through the family, which must name ONE symbol.
+type enum CalleePin {
+    None;
+    Symbol(SymbolStr);
+    Family(SymbolStr);
+}
+
+implement enum CalleePin {
+    /// Whether anything is pinned.
+    is_some(&this) -> boolean {
+        return match (&this) {
+            CalleePin::None => { false }
+            _               => { true }
+        };
+    }
+
+    /// The pinned name, whichever kind it is - for a reader that compares a
+    /// pin to a name it holds, or reports it.  Empty for `None`.
+    name(&this) -> SymbolStr {
+        return match (&this) {
+            CalleePin::Symbol(s) => { s }
+            CalleePin::Family(f) => { f }
+            _                    => { SymbolStr::empty() }
+        };
+    }
+}
+
 type class ExpressionNode : ASTNode {
 public:
     resolved_type: TypeRef;
@@ -104,10 +142,11 @@ public:
     /// template (which is skipped at codegen).
     generic_args:        TypeAnnotation*[];
 
-    /// Specialized callee symbol for a generic function-reference value,
-    /// pinned by the monomorphizer (mirrors `CallExprNode.resolved_callee`).
-    /// Empty for non-generic identifiers.
-    resolved_callee:     SymbolStr;
+    /// The function this identifier names when it is used as a VALUE,
+    /// pinned by sema (a declared function, by its canonical name) or the
+    /// monomorphizer (a generic template's specialization); `None` for an
+    /// identifier that names no function.
+    resolved_callee:     CalleePin;
 
     /// True when a following `<` was read as opening type arguments on a
     /// GUESS - the name is not a known local, global, or generic declared in
@@ -133,7 +172,7 @@ public:
         this.name                = name;
         this.is_global_reference = false;
         this.generic_args        = [];
-        this.resolved_callee     = SymbolStr::empty();
+        this.resolved_callee     = CalleePin::None;
         this.generic_angle_guessed = false;
         this.res                 = ResSlot::Pending;
     }
@@ -157,8 +196,8 @@ public:
         this.generic_args = args;
     }
 
-    set_resolved_callee(name: SymbolStr) -> void {
-        this.resolved_callee = name;
+    set_resolved_callee(pin: CalleePin) -> void {
+        this.resolved_callee = pin;
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -357,15 +396,13 @@ public:
     /// identity.
     resolved_method: ASTNode*;
 
-    /// Sema-resolved specialized callee symbol for generic free-function
-    /// calls.  When `identity<i32>(42)` or `alloc_entry(map, h, k, v)`
-    /// (with K/V/A inferred from arg types) reaches sema, the bare-name
-    /// `identity` template is renamed to its specialization
-    /// (e.g. `identity$Li32$G`) by the AST specializer.  Sema computes
-    /// that spec symbol here so codegen can look up the concrete
-    /// LLVM function instead of the bare template (which is skipped
-    /// at codegen).  Empty for non-generic free-function calls.
-    resolved_callee: SymbolStr;
+    /// The callee, once sema or the monomorphizer has decided it and by
+    /// which name (see `CalleePin`): a method's or static's mangled symbol,
+    /// a module-qualified free function's canonical name, a generic
+    /// template's specialization (`identity$Li32$G`).  `None` until then,
+    /// and for a call codegen binds from its own structure (a local function
+    /// pointer, a closure).
+    resolved_callee: CalleePin;
 
     /// Sema-resolved concrete type-arg bindings for a generic free-function
     /// call, parallel to the template's generic-parameter declaration order.
@@ -405,7 +442,7 @@ public:
         this.arguments          = [];
         this.generic_args       = [];
         this.resolved_method    = null;
-        this.resolved_callee    = SymbolStr::empty();
+        this.resolved_callee    = CalleePin::None;
         this.resolved_type_args = [];
         this.resolved_template  = SymbolStr::empty();
         this.unwind_cleanup     = [];
@@ -430,8 +467,8 @@ public:
         this.resolved_method = m;
     }
 
-    set_resolved_callee(name: SymbolStr) -> void {
-        this.resolved_callee = name;
+    set_resolved_callee(pin: CalleePin) -> void {
+        this.resolved_callee = pin;
     }
 
     set_resolved_type_args(args: TypeRef[]) -> void {
@@ -893,13 +930,12 @@ public:
     scope_res:          ResSlot;
 
     /// The function this path names when it is used as a VALUE (`Type::static`
-    /// or `Module::fn` as a function pointer), pinned by sema as the symbol
-    /// codegen's registry is keyed by - the mangled name of a static method,
-    /// the qualified name of a free function - exactly as a `CallExprNode`'s
-    /// pin is.  Empty when the path names no function: an enum variant answers
-    /// through `resolved_type`, a global through `scope_res` and the member
-    /// leaf.
-    resolved_callee:    SymbolStr;
+    /// or `Module::fn` as a function pointer), pinned by sema - the mangled
+    /// symbol of a static method, the canonical name of a free function -
+    /// exactly as a `CallExprNode`'s pin is.  `None` when the path names no
+    /// function: an enum variant answers through `resolved_type`, a global
+    /// through `scope_res` and the member leaf.
+    resolved_callee:    CalleePin;
 
     /// The SPECIALIZATION the scope segment denotes, recorded by the
     /// substituter when it collapses a template's self-reference
@@ -920,12 +956,12 @@ public:
         this.scope_span         = span;
         this.member_span        = span;
         this.scope_res          = ResSlot::Pending;
-        this.resolved_callee    = SymbolStr::empty();
+        this.resolved_callee    = CalleePin::None;
         this.spec_owner         = TypeRef::invalid();
     }
 
-    set_resolved_callee(name: SymbolStr) -> void {
-        this.resolved_callee = name;
+    set_resolved_callee(pin: CalleePin) -> void {
+        this.resolved_callee = pin;
     }
 
     set_segment_spans(scope_span: SourceSpan, member_span: SourceSpan) -> void {

@@ -45,6 +45,7 @@ import compiler::ast::declaration::{
     MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
+    CalleePin,
     ArrayAccessNode, ArrayLiteralNode, BinaryExprNode, CallExprNode, CastExprNode,
     ExpressionNode, IdentifierNode, IfExprNode, MatchExprNode, MemberAccessNode,
     ScopeResolutionNode, StaticMatchExprNode, StructLiteralNode, TryExprNode,
@@ -569,7 +570,7 @@ type struct MonoCallSpecializer {
     specialize_free_call(mut &this, call: CallExprNode*, res_ctx: ResolutionContext*,
                          subst: TypeSubstitution*) -> void {
         if (call == null) { return; }
-        if (call.resolved_callee.is_valid()) { return; }
+        if (call.resolved_callee.is_some()) { return; }
         if (call.callee == null) { return; }
         const callee_node: ASTNode* = call.callee as ASTNode*;
 
@@ -676,7 +677,7 @@ type struct MonoCallSpecializer {
         const spec_sym: SymbolStr = MangledName::specialized_identifier(
             this.intern_table, this.arena, base_qname, bindings);
         if (!spec_sym.is_valid()) { return; }
-        call.set_resolved_callee(spec_sym);
+        call.set_resolved_callee(CalleePin::Family(spec_sym));
         const new_inst: TypeRef = this.generic_registry.instantiate_for_module(
             entry.base_type, bindings, this.current_module);
         // Seed mono's pending worklist directly: the registry only tracks
@@ -694,7 +695,7 @@ type struct MonoCallSpecializer {
                             subst: TypeSubstitution*) -> void {
         if (ident == null) { return; }
         if (ident.generic_args.length == 0) { return; }
-        if (ident.resolved_callee.is_valid()) { return; }
+        if (ident.resolved_callee.is_some()) { return; }
         if (this.type_resolver == null || res_ctx == null) { return; }
         if (this.generic_registry == null) { return; }
         // Scope the turbofish by the module that WROTE it (spec §8.2m).  The
@@ -730,7 +731,7 @@ type struct MonoCallSpecializer {
         const spec_sym: SymbolStr = MangledName::specialized_identifier(
             this.intern_table, this.arena, base_qname, seeded);
         if (!spec_sym.is_valid()) { return; }
-        ident.set_resolved_callee(spec_sym);
+        ident.set_resolved_callee(CalleePin::Family(spec_sym));
         const new_inst: TypeRef = this.generic_registry.instantiate_for_module(
             entry.base_type, seeded, this.current_module);
         this.state.enqueue_from_type_ref(new_inst);
@@ -1096,9 +1097,8 @@ type struct MonoCallSpecializer {
         // exact spec was already emitted, reuse it: pin the call the same way the
         // first materialization did and stop.
         // The pin symbol must match the symbol the spec is REGISTERED + EMITTED
-        // under, or `resolve_function_by_mangled` misses it and codegen falls
-        // back to the unmangled `Type::method` lookup (collapsing every spec
-        // onto the first).  For an inherent (non-trait) impl the registration
+        // under, or codegen's `resolve_symbol` misses it and the call binds
+        // nothing.  For an inherent (non-trait) impl the registration
         // target is the block's own key (e.g. bare `string`), which can
         // differ from `recv_qname` for a primitive receiver; use it.  A
         // primitive receiver has no qualified name at all; its impl blocks
@@ -1124,7 +1124,7 @@ type struct MonoCallSpecializer {
             // method on one owner, so any unpinned call resolves to whichever spec
             // happened to be emitted first.
             if (spec_sym.is_valid()) {
-                call.set_resolved_callee(spec_sym);
+                call.set_resolved_callee(CalleePin::Symbol(spec_sym));
             }
             return;
         }
@@ -1176,7 +1176,7 @@ type struct MonoCallSpecializer {
         if (inherent_owner_ast != null) {
             this.register_spec_method_in_di_inherent(spec_method, recv_type, inherent_owner_ast);
             if (spec_sym.is_valid()) {
-                call.set_resolved_callee(spec_sym);
+                call.set_resolved_callee(CalleePin::Symbol(spec_sym));
             }
         } else {
             this.register_spec_method_in_di(spec_method, recv_type, impl_node);
@@ -1191,7 +1191,7 @@ type struct MonoCallSpecializer {
             // is the very key this pass records in `mark_method_spec`.  Pinning
             // adds no symbol: it only names the one already being emitted.
             if (spec_sym.is_valid()) {
-                call.set_resolved_callee(spec_sym);
+                call.set_resolved_callee(CalleePin::Symbol(spec_sym));
             }
         }
 
@@ -1304,7 +1304,7 @@ type struct MonoCallSpecializer {
                     && !m.func.is_lazy_self_growing
                     && m.func.generic_params.length == 0) {
                 call.set_resolved_method(m as ASTNode*);
-                call.set_resolved_callee(this.mangled_symbol_for_spec_method(m, pin_target));
+                call.set_resolved_callee(CalleePin::Symbol(this.mangled_symbol_for_spec_method(m, pin_target)));
                 return true;
             }
         }
@@ -1315,7 +1315,7 @@ type struct MonoCallSpecializer {
         if (spec_method == null || spec_method.func == null) { return false; }
         impl_node.methods.push(spec_method);
         call.set_resolved_method(spec_method as ASTNode*);
-        call.set_resolved_callee(this.mangled_symbol_for_spec_method(spec_method, pin_target));
+        call.set_resolved_callee(CalleePin::Symbol(this.mangled_symbol_for_spec_method(spec_method, pin_target)));
         this.register_spec_method_in_di(spec_method, recv_type, impl_node);
         if (spec_method.func.body != null) {
             const _empty: string = "";
@@ -1341,7 +1341,7 @@ type struct MonoCallSpecializer {
                                               scope: ScopeResolutionNode*,
                                               subst: TypeSubstitution*) -> boolean {
         if (call == null || scope == null) { return false; }
-        if (call.resolved_callee.is_valid()) { return false; }
+        if (call.resolved_callee.is_some()) { return false; }
         const registry: GenericRegistry* = this.generic_registry;
         if (registry == null) { return false; }
         // The owner is the declaration the scope segment's stamp names, under
@@ -1410,7 +1410,7 @@ type struct MonoCallSpecializer {
                 entry.base_type, binds, this.current_module);
             if (!inst_ref.is_valid()) { return false; }
             this.state.enqueue_from_type_ref(inst_ref);
-            call.set_resolved_callee(combined_sym);
+            call.set_resolved_callee(CalleePin::Family(combined_sym));
             return true;
         }
 
@@ -1632,7 +1632,7 @@ type struct MonoCallSpecializer {
         const spec_sym: SymbolStr = this.mangled_symbol_for_spec_method(spec_method, pin_target);
         if (this.state.method_spec_seen(spec_sym)) {
             call.set_resolved_method(spec_method as ASTNode*);
-            if (spec_sym.is_valid()) { call.set_resolved_callee(spec_sym); }
+            if (spec_sym.is_valid()) { call.set_resolved_callee(CalleePin::Symbol(spec_sym)); }
             return true;
         }
         this.state.mark_method_spec(spec_sym);
@@ -1650,7 +1650,7 @@ type struct MonoCallSpecializer {
         }
         call.set_resolved_method(spec_method as ASTNode*);
         this.register_spec_method_in_di_inherent(spec_method, recv_type, owner_ast);
-        if (spec_sym.is_valid()) { call.set_resolved_callee(spec_sym); }
+        if (spec_sym.is_valid()) { call.set_resolved_callee(CalleePin::Symbol(spec_sym)); }
 
         // Re-walk the body for its own generic calls with the owner param bound
         // (`A` -> concrete) so nested owner-typed calls (`Wrap::base(item)`)

@@ -48,6 +48,7 @@ import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{ FunctionDeclNode, MethodNode, VarDeclNode };
 import compiler::ast::expression::{
+    CalleePin,
     ArrayAccessNode, CallExprNode, ExpressionNode, IdentifierNode, LiteralNode,
     MemberAccessNode, ScopeResolutionNode
 };
@@ -241,12 +242,12 @@ type struct CallEmitter {
             // `try_pin_overload_mangled_callee` on every Identifier
             // call, so any function known to the DeclarationIndex
             // (qualified, bare-aliased, overloaded, or unique) gets
-            // pinned to its registered mangled symbol.  Codegen calls
-            // `resolve_function_by_mangled` once on that symbol; a
+            // pinned - by its symbol, or by a family name that names one.
+            // Codegen resolves the pin once, by the kind it says it is; a
             // qualified/bare/DI-mapping cascade here would only re-resolve
             // names sema has already resolved.
-            if (node.resolved_callee.is_valid()) {
-                callee_val = this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
+            if (node.resolved_callee.is_some()) {
+                callee_val = this.cg.resolver.resolve_pinned(node.resolved_callee);
             }
 
             // 3b. Class / struct constructor call: `ClassName(args)` resolves
@@ -474,13 +475,13 @@ type struct CallEmitter {
             // Sema's pin is the whole answer for a static call: written by
             // sema's static-method / module-function / C-import paths, or by
             // the specialization walk for a generic callee or a generic
-            // owner.  It routes through `resolve_function_by_mangled`,
-            // exactly as the Identifier branch does.  A call with no pin that
+            // owner.  It routes through `resolve_pinned`, exactly as the
+            // Identifier branch does.  A call with no pin that
             // names no enum variant below is a call the front end never
             // bound, and it is reported as one rather than bound here by a
             // name derived from the spelling or the return type.
-            if (node.resolved_callee.is_valid()) {
-                callee_val = this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
+            if (node.resolved_callee.is_some()) {
+                callee_val = this.cg.resolver.resolve_pinned(node.resolved_callee);
             }
 
             // No pin: an enum variant constructor (`Option::Some`,
@@ -524,8 +525,7 @@ type struct CallEmitter {
             // specialization) pins the mangled LLVM callee on
             // `resolved_callee`.  Codegen detects the function-pointer-field
             // shortcut, picks up virtual-dispatch state for class receivers,
-            // then routes the pinned symbol through
-            // `resolve_function_by_mangled`.
+            // then routes the pin through `resolve_pinned`.
             const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
             const di: DeclarationIndex* = this.cg.get_decl_index();
             const method_str: string = intern.resolve(ma.member);
@@ -672,10 +672,10 @@ type struct CallEmitter {
             }
 
             // `resolved_callee` is the mangled LLVM symbol selection chose;
-            // routed through `resolve_function_by_mangled`, identical to the
-            // Identifier branch.
-            if (node.resolved_callee.is_valid()) {
-                callee_val = this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
+            // routed through `resolve_pinned`, identical to the Identifier
+            // branch.
+            if (node.resolved_callee.is_some()) {
+                callee_val = this.cg.resolver.resolve_pinned(node.resolved_callee);
             }
 
             // Sema's pin is the whole answer for a method call.  A call
@@ -1210,10 +1210,11 @@ type struct CallEmitter {
     /// A leaf test in front of the pin inlined every `core::panic(...)` in
     /// the stdlib against a spelling that named the wrapper.
     callee_is_intrinsic(&this, node: CallExprNode*, leaf: SymbolStr) -> boolean {
-        if (!node.resolved_callee.is_valid()) { return true; }
-        if (node.resolved_callee.equals(leaf)) { return true; }
+        if (!node.resolved_callee.is_some()) { return true; }
+        const pinned: SymbolStr = node.resolved_callee.name();
+        if (pinned.equals(leaf)) { return true; }
         const owner: SymbolStr = this.cg.get_decl_index().intrinsic_owner_of(leaf);
-        return owner.is_valid() && node.resolved_callee.equals(owner);
+        return owner.is_valid() && pinned.equals(owner);
     }
 
     emit_panic_unwind(mut &this, visitor: ASTVisitor*, node: CallExprNode*,

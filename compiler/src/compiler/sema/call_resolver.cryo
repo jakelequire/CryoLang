@@ -64,6 +64,7 @@ import compiler::ast::declaration::{
     StructDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
+    CalleePin,
     BinaryExprNode, CallExprNode, ExpressionNode, IdentifierNode, LiteralNode,
     MemberAccessNode, ScopeResolutionNode, UnaryExprNode
 };
@@ -971,9 +972,7 @@ type struct CallResolver {
 
             const inferred_generic_ret: TypeRef = this.check_generic_free_call(call, ident);
 
-            if (call.resolved_callee.is_valid()) {
-                const spec_ret: TypeRef = this.types.lookup_func_return(call.resolved_callee);
-                if (spec_ret.is_valid()) { return spec_ret; }
+            if (call.resolved_callee.is_some()) {
                 // The pin is ground truth: on a re-resolution of an
                 // already-pinned call (a match subject is resolved once
                 // standalone and once for arm binding), the name-based
@@ -981,9 +980,19 @@ type struct CallResolver {
                 // single-slot maps, which can belong to a different
                 // same-leaf declaration (an intrinsic-owned leaf keeps the
                 // intrinsic's i64, not the pinned `fs::write`'s Result).
-                // Read the pinned overload entry's own signature instead.
-                const pinned_ft: TypeRef =
-                    this.ctx.decl_index.lookup_func_type_by_mangled(call.resolved_callee);
+                // A family pin answers through its registered return; a
+                // symbol pin through the overload entry's own signature.
+                mut pinned_ft: TypeRef = TypeRef::invalid();
+                match (&call.resolved_callee) {
+                    CalleePin::Family(fam) => {
+                        const spec_ret: TypeRef = this.types.lookup_func_return(fam);
+                        if (spec_ret.is_valid()) { return spec_ret; }
+                    }
+                    CalleePin::Symbol(sym) => {
+                        pinned_ft = this.ctx.decl_index.lookup_func_type_by_mangled(sym);
+                    }
+                    _ => { }
+                }
                 if (pinned_ft.is_valid()) {
                     const pinned_ret: TypeRef = this.overload_return_type(pinned_ft);
                     if (pinned_ret.is_valid()) {
@@ -1007,7 +1016,7 @@ type struct CallResolver {
                     ident.name, call.generic_args, call.span,
                     this.spelling_template(ident.res));
                 if (spec_sym.is_valid()) {
-                    call.set_resolved_callee(spec_sym);
+                    call.set_resolved_callee(CalleePin::Family(spec_sym));
                     const spec_ret: TypeRef = this.types.lookup_func_return(spec_sym);
                     if (spec_ret.is_valid()) { return spec_ret; }
                 }
@@ -2495,7 +2504,7 @@ type struct CallResolver {
     /// where the stamp named the exported wrapper.  A `Def` is already the
     /// answer to which declaration; only which SIGNATURE is decided here.
     try_pin_overload_mangled_callee(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> TypeRef {
-        if (call.resolved_callee.is_valid()) { return TypeRef::invalid(); }
+        if (call.resolved_callee.is_some()) { return TypeRef::invalid(); }
         // GATED: a generic function template has no concrete spec pre-mono; leave
         // unpinned so mono specializes.
         const gen_tmpl: TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length);
@@ -2514,7 +2523,7 @@ type struct CallResolver {
         const oi: i64 = this.select_family_overload(&overloads, &arg_types);
         if (oi < 0) { return TypeRef::invalid(); }
         const mangled: SymbolStr = this.family_overload_symbol(family, overloads[oi]);
-        if (mangled.is_valid()) { call.set_resolved_callee(mangled); }
+        if (mangled.is_valid()) { call.set_resolved_callee(CalleePin::Symbol(mangled)); }
         return this.overload_return_type(overloads[oi]);
     }
 
@@ -2613,7 +2622,7 @@ type struct CallResolver {
             const tmpl: TemplateEntry* = this.ctx.generic_registry.get_template(q_sym);
             if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) { is_fn_template = true; }
         }
-        if (!is_fn_template && !scope.resolved_callee.is_valid()) { scope.set_resolved_callee(q_sym); }
+        if (!is_fn_template && !scope.resolved_callee.is_some()) { scope.set_resolved_callee(CalleePin::Family(q_sym)); }
         return ft;
     }
 
@@ -2755,14 +2764,14 @@ type struct CallResolver {
         const fn_node: FunctionDeclNode* = mn.func;
         if (!fn_node.resolved_return_type.is_valid()) { return; }
         // GATED (R2): never stomp mono's exact-spec pin with a generic template mangle.
-        if (fn_node.generic_params.length > 0 && call.resolved_callee.is_valid()) { return; }
+        if (fn_node.generic_params.length > 0 && call.resolved_callee.is_some()) { return; }
         // A method bound with `![symbol("sym")]` (C++ binding generator) resolves to
         // the foreign mangled symbol; pin THAT so the call - in any module - targets
         // it, matching the DI registration (decl_index `eff_mangled`).  Read from
         // the parsed directive on the MethodNode (set before this pass runs).
         const link_str: string = mn.link_directive_symbol();
         if (link_str.length() > 0) {
-            call.set_resolved_callee(this.intern.intern(link_str));
+            call.set_resolved_callee(CalleePin::Symbol(this.intern.intern(link_str)));
             return;
         }
         const type_qn: QualifiedName = QualifiedName::single(this.intern, owner_qname_str);
@@ -2775,8 +2784,8 @@ type struct CallResolver {
         // plus its own type arguments (`$MG..`): two specs whose signature does
         // not depend on the method parameter share the base.  The pin is the
         // symbol the definition carries; a no-op for every other method.
-        call.set_resolved_callee(mangled.with_method_spec_args(
-            this.intern, this.arena, fn_node.spec_type_args).value);
+        call.set_resolved_callee(CalleePin::Symbol(mangled.with_method_spec_args(
+            this.intern, this.arena, fn_node.spec_type_args).value));
     }
 
     /// Tag `call.resolved_method` + pin `resolved_callee` for an instance method
@@ -2806,7 +2815,7 @@ type struct CallResolver {
         // specialization as `resolved_method` while the pin stays, and the
         // call's return type would fall to the name-keyed lookup, which
         // answers with whichever sibling specialization registered last.
-        if (call.resolved_callee.is_valid() && call.resolved_method != null) { return; }
+        if (call.resolved_callee.is_some() && call.resolved_method != null) { return; }
         mut base_t: Type* = this.arena.lookup(obj_type.id);
         mut unwrap_depth: i32 = 0;
         while (base_t != null && unwrap_depth < 5) {
@@ -3663,7 +3672,7 @@ type struct CallResolver {
         if (member_sym.is_valid() && scope_sym.is_valid()) {
             this.enforce_static_method_visibility(scope, scope_sym, member_sym, call.span);
         }
-        if (call.resolved_callee.is_valid()) { return; }
+        if (call.resolved_callee.is_some()) { return; }
         if (!scope_sym.is_valid() || !member_sym.is_valid()) { return; }
         if (this.scope_is_generic_template(scope_sym, member_sym)) { return; }
         const scope_str: string = this.intern.resolve(scope_sym);
@@ -3684,7 +3693,7 @@ type struct CallResolver {
             const ovs: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(sym);
             if (ovs.length == 1) {
                 const mg: SymbolStr = this.ctx.decl_index.lookup_overload_mangled(sym, ovs[0]);
-                if (mg.is_valid()) { call.set_resolved_callee(mg); }
+                if (mg.is_valid()) { call.set_resolved_callee(CalleePin::Symbol(mg)); }
             }
         }
     }
@@ -3703,14 +3712,14 @@ type struct CallResolver {
     /// combined name, as the call form does.
     pin_scope_value_static_method(mut &this, scope: ScopeResolutionNode*, owner: TypeRef,
                                   method_ft: TypeRef) -> void {
-        if (scope.resolved_callee.is_valid()) { return; }
+        if (scope.resolved_callee.is_some()) { return; }
         if (this.ctx.decl_index == null) { return; }
         const owner_sym: SymbolStr = this.ctx.decl_index.lookup_type_name(owner);
         if (!owner_sym.is_valid()) { return; }
         const sym: SymbolStr = this.intern.intern(fmt::format("%s::%s",
             this.intern.resolve(owner_sym), this.intern.resolve(scope.member_name)));
         const mg: SymbolStr = this.ctx.decl_index.lookup_overload_mangled(sym, method_ft);
-        scope.set_resolved_callee(if (mg.is_valid()) { mg } else { sym });
+        scope.set_resolved_callee(if (mg.is_valid()) { CalleePin::Symbol(mg) } else { CalleePin::Family(sym) });
     }
 
     /// Pin a static call to the one signature of `combined_sym`'s family its
@@ -3736,7 +3745,7 @@ type struct CallResolver {
         if (matched < 0) { return false; }
         const mangled: SymbolStr = di.lookup_overload_mangled(combined_sym, overloads[matched]);
         if (!mangled.is_valid()) { return false; }
-        call.set_resolved_callee(mangled);
+        call.set_resolved_callee(CalleePin::Symbol(mangled));
         return true;
     }
 
@@ -3770,9 +3779,9 @@ type struct CallResolver {
 
     pin_scope_callee_qsym(mut &this, call: CallExprNode*, q_sym: SymbolStr) -> void {
         if (call == null) { return; }
-        if (call.resolved_callee.is_valid()) { return; }
+        if (call.resolved_callee.is_some()) { return; }
         if (!q_sym.is_valid()) { return; }
-        call.set_resolved_callee(q_sym);
+        call.set_resolved_callee(CalleePin::Family(q_sym));
     }
 
     /// GATED (R1): try Scope::Member as a static method (specialized -> base -> DI
@@ -4903,7 +4912,7 @@ type struct CallResolver {
         }
         if (is_fn_template && call != null) {
             // GATED (R1): prefer mono's pin; recompute the spec return as fallback.
-            mut spec_sym: SymbolStr = call.resolved_callee;
+            mut spec_sym: SymbolStr = call.resolved_callee.name();
             if (!spec_sym.is_valid()) {
                 const base: SymbolStr = tmpl.spec_base_name(this.intern);
                 // The template is already in hand - finding it is what selected
@@ -4916,7 +4925,7 @@ type struct CallResolver {
             }
             if (spec_sym.is_valid()) {
                 const spec_ret: TypeRef = this.types.lookup_func_return(spec_sym);
-                if (spec_ret.is_valid()) { call.set_resolved_callee(spec_sym); return spec_ret; }
+                if (spec_ret.is_valid()) { call.set_resolved_callee(CalleePin::Family(spec_sym)); return spec_ret; }
             }
             const no_turbofish: boolean =
                 (scope == null || scope.generic_args.length == 0) && call.generic_args.length == 0;

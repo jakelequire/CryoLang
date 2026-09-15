@@ -27,7 +27,7 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at the commit carrying §8.194; `git log
+Checks run from the repo root. Verified at the commit carrying §8.195; `git log
 --oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
@@ -53,7 +53,7 @@ current-state description is the defect it exists to remove.
 | D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 46 of the 97 unasserted rows retired, 51 left (31 context, 9 B2, 11 B3); of the asserted rows, seventeen whose only sites were deleted went with them (one in §8.170, five in §8.171, two in §8.173, six in §8.174, three in §8.188, four in §8.193; `b1-baseline.txt` re-pinned on both hosts each time, 62 → 53 rows per arm at §8.188, 49 at §8.193) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1302** | §8.66, §8.80, §8.139, §8.174, §8.183, §8.188, §8.193 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
-| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **581** (+1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 in §8.194, a project) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **582** (+1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194 and §8.195, projects) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
 | D16 | **An impl head writes EVERY parameter of the template it names, or names a concrete instantiation; an elided parameter is an error** - whether all of them default (`implement trait Display for String` with `String<A = GlobalAlloc>`) or only the trailing ones (`implement<T> trait Display for Array<T>` with `Array<T, A = GlobalAlloc>`). Write `implement<A> trait Display for String<A>` or `implement trait Display for String<GlobalAlloc>`. Rust's model: `impl Display for Vec` is missing its parameters and is not given a default meaning, and `impl<T> Trait for Vec<T>` is not written either | **TAKEN** (ruled by Jake 2026-09-13 for the bare form, 2026-09-14 for every elided parameter; built in §8.190) — E0302 from `refuse_elided_template_params` where type resolution attaches a WRITTEN head to its template, naming the template, both counts and both spellings, the parameter form first; the 11 heads rewritten as the instantiation each meant; a head's `target_args` is what it writes after the target on EVERY kind of head (an inherent head's list also declares its names); sema's writer-module lookup deleted. The concrete spelling is accepted but not yet HONOURED by impl selection (a `Named` target argument is bound as a parameter name) - parked | `python3 scripts/impl-head-elided-params.py --count` → **bare=0,partial=0,unmatched=0**; `grep -c 'refuse_elided_template_params' compiler/src/compiler/passes/type_resolution.cryo` → **2**; `grep -c '^negative E0302' tests/test-roster.txt` → **2** | §8.180, §8.181, §8.187, §8.190 |
 | D17 | **An `extern "C"` function is public unless marked `private`** — the extern-visibility default `docs/cryo.md` §18.1 states | **RULED** (Jake, 2026-09-14) — built in §8.167 by a worker and carried as unconfirmed until ratified; the spec text is normative, not provisional | `grep -c 'mut ext_public: boolean = true;' compiler/src/compiler/parser/parser.cryo` → **1**; `grep -c 'unless written .private function' docs/cryo.md` → **1** | §8.167, §8.187 |
@@ -93,7 +93,8 @@ three, and its row carries the count. Read each zero off its own row.
 | trait-impl registry's TRAIT half under two spellings (the bare table keyed by the trait annotation's WRITTEN name via `extract_trait_leaf`, the precise index `trait_impls_typed` by its LEAF; `resolve_trait_impl_for_type` and `type_has_drop_impl` reading the precise index behind `precise_trait_leaf` with a leaf fallback; stage 3's registration under the target's written spelling) | **LIVE** — measured in §8.194's ownership shadow: 193,199 answers, **9** where the precise index and a single-table lookup disagree - a head written `implement trait LeafDispatchA::Pulse` (3) and `Alpha::Render` / `Omega::Render` for one `Shape` collapsing to one precise entry (6). The key is the head's `qualified_trait_name`; the readers pass leaves | — | `grep -c 'register_trait_impl_typed' compiler/src/compiler/types/generic_registry.cryo` → **1**; `grep -rho 'registry_name_of' compiler/src --include=*.cryo \| wc -l` → **8**; `grep -c 'register_trait_impl(' compiler/src/compiler/passes/specialization.cryo` → **2** | §8.194 |
 | annotation-leaf trait checks (`name_implements` / `name_implements_trait` asking `traits_implemented_by` by an impl's WRITTEN trait-argument head; `TypeResolver::proj_bare_name` compared to a written bound base's leaf) | LIVE — a leaf beside a leaf; the annotation is what must resolve | — | `grep -c 'ann_head_leaf' compiler/src/compiler/sema/method_binding.cryo` → **5**; `grep -c 'proj_bare_name' compiler/src/compiler/types/resolver.cryo` → **6** | §8.194 |
 | codegen synthesizing the allocator by bare leaf (`expr_ops.cryo`: `resolve_function("malloc")` at three sites, `"free"` behind a rung the `std::alloc::allocator::free` shim answers first) | **LIVE, and the leaf rungs STARVED** — measured at `f120271b` and under the pin: both shim rungs answer (`…allocator::alloc` 1, `…allocator::free` 1), a scratch `new Owned{..}`/`delete o` references `C$3std.5alloc.9allocator.5alloc$Fm_m$RPv` and `…4free$FPv_m$Rv`, so `new`/`delete` are PAIRED through `GlobalAlloc`, not split, and the `malloc`/`free` leaves answer only with the allocator module out of the DI (`no_std`). §8.93's "the first branch never answers" was measured on the array-literal RELEASE path and does not describe `delete`. D6's "one path" is sema's; the calls codegen synthesizes should name the canonical symbol or the intrinsic, never a leaf | — | `grep -c 'intern_str("malloc")' compiler/src/compiler/codegen/ops/expr_ops.cryo` → **3** (0 when done); `grep -c 'intern_str("free")' compiler/src/compiler/codegen/ops/expr_ops.cryo` → **1** (0 when done) | §8.93, §8.177, §8.187, §8.189 |
-| `resolve_scope_call`'s four-rung try-ladder (static method → variant → module function → C import) and `resolve_function_by_mangled`'s symbol-then-family | **LIVE** — the path's stamp says which kind the segment names; a try-ladder asks all four | — | `grep -rho 'resolve_scope_call' compiler/src --include=*.cryo \| wc -l` → **3**; `grep -c 'resolve_family(pinned, -1)' compiler/src/compiler/codegen/ops/symbol_resolver.cryo` → **1** | §8.175, §8.187 |
+| codegen's callee pin as ONE string, the kind decided by trying (`resolve_function_by_mangled`: `resolve_symbol(pinned)` then `resolve_family(pinned, -1)`; sema's reader of the same slot: return by family, then type by symbol) | **DELETED** — `CalleePin` is the slot: `Symbol(s)` / `Family(f)` / `None`, every writer saying which it writes, `resolve_pinned` and sema's reader asking one table by the kind. Shadow 588,298 pins over six halves: 507,301 symbol-only, 80,016 family-only, 981 both (913 an extern called in its own module, 60 §8.93's plural leaf, 8 a different function of the same leaf); tagged: Symbol 508,285 / own rung 508,285, Family 80,023 / 80,023, the cross rung needed by none. The deletion was RED on the Linux target (`getrandom`, a cross-module `extern "C"` call pinned by symbol): an extern's overload entry carried no symbol, so only the family rung reached it - registered on the entry now, as every function's is; pinned by `extern_symbol_cross_module`. 0 objects moved | — | `grep -rho 'resolve_function_by_mangled' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'type enum CalleePin' compiler/src/compiler/AST/expression.cryo` → **1**; `grep -rho 'CalleePin::Symbol(' compiler/src --include=*.cryo \| wc -l` → **19**; `grep -rho 'CalleePin::Family(' compiler/src --include=*.cryo \| wc -l` → **12**; `grep -c 'register_overload_mangled(' compiler/src/compiler/passes/type_resolution.cryo` → **4** (3 the extern's entries); `grep -c '^project extern_symbol_cross_module' tests/test-roster.txt` → **1** | §8.175, §8.195 |
+| `resolve_scope_call`'s four-rung try-ladder (static method → variant → module function → C import) | **LIVE, and the stamp decides** — measured in §8.195: 581,378 calls; a `TypeRelative` segment is answered by rungs 1-2 (454,057) and a `Def` segment by rung 3 (126,096), except 2 `Def` calls rung 1 answers (`Buffer::make`, D5's module/type collision through the cursor lane) and 968 `TypeRelative` calls rung 4 answers - every call through a C-import alias, which the name layer stamps type-relative because the alias is a namespace SYMBOL, not a graph module (§9's Q2) | — | `grep -rho 'resolve_scope_call' compiler/src --include=*.cryo \| wc -l` → **3**; `grep -c 'try_resolve_cimport_function' compiler/src/compiler/sema/call_resolver.cryo` → **2** | §8.175, §8.187, §8.195 |
 | type cascade (`lookup_type_by_sym`, 4 steps) | **DELETED** — `lookup_type_exact`, one step; the audit stream and its four counter rows went with it | — | `grep -rho 'lookup_type_by_sym' compiler/src --include=*.cryo \| wc -l` → **0** | §8.154 |
 | pattern constant by leaf (`codegen_pattern_value`: the local slot by name, then `resolve_global(pat.value)` through the first-registration-wins global slot) | **DELETED** — `PatternNode.const_res`, stamped by the name layer with the identifier's own answer; codegen reads `Local` → the slot, `Def` → the namespace and leaf; shadow 0 over six halves, control 16 agreeing on the LSP; 0 objects moved | — | `grep -c 'pat.const_res' compiler/src/compiler/codegen/visit/pattern_emitter.cryo` → **1**; `grep -c 'resolve_global(' compiler/src/compiler/codegen/visit/pattern_emitter.cryo` → **0**; `grep -c 'set_const_res' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.186 |
 | specialization's second index key (`register_spec`: the spec registered under `qualify_symbol_sym(spec_name)`, the CURSOR's module, beside its arena name) and `ModuleTypeRegistry` (`types/registry.cryo`, Phase 4 registering every type and alias into it by bare name) | **DELETED** — 13,667 second keys over six halves, 127 reads, all sema's async declare pass deriving a placed clone's key by the cursor; on `decl_type_key` (C-import alias, else registered name, else the writing file's module) it reads the arena key and the reads are 0; the registry's `lookup_type(module, name)` had no caller in the compiler or the LSP; 0 objects moved | — | `grep -c 'qualify_symbol_sym(' compiler/src/compiler/passes/specialization.cryo` → **0**; `ls compiler/src/compiler/types \| grep -c '^registry.cryo$'` → **0**; `grep -rho 'ModuleTypeRegistry' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'decl_type_key' compiler/src/compiler/sema/sema.cryo` → **8** (6 at §8.185; +2 in §8.187, the class arms) | §8.185 |
@@ -121,7 +122,7 @@ three, and its row carries the count. Read each zero off its own row.
 | explicit-generic callee's template by ladder (`register_generic_fn_call`: `qualify_symbol_sym_home(leaf)`, then a resolver re-entry building `source_module::leaf`; and a `ScopeResolution` arm the parser never fed, a path callee's turbofish living on the path node) | **DELETED** — the identifier callee's stamp is the registry key (`template_of(res.def_id())`); shadow 0 over six halves, control 189 agreeing (116 stdlib templates the re-entry answered, 73 same-module ones HOME answered), 0 objects moved; the file's one `get_resolver()` went with it | — | `grep -c 'name_resolver' compiler/src/compiler/passes/type_resolution.cryo` → **0**; `grep -c 'template_of(r.def_id())' compiler/src/compiler/passes/type_resolution.cryo` → **1** | §8.180, §8.182 |
 | struct-literal rungs 3 and 5 (`resolve_generic_scope_name(lit.struct_type, ..)`, `lookup_type_exact(lit.struct_type)`) | **DELETED** — rung 5: 2 lines over six halves, both C-imported literals whose stamp M1 had missed (above), 0 once stamped; rung 3: 0 over six halves including the `cryo test` half its comment named, and the instrument fires on a forced case; their two rows retired | — | `grep -c 'lookup_type_exact(lit.struct_type)' compiler/src/compiler/sema/sema.cryo` → **0** | §8.174 |
 | static-call unmangled tail (`pin_scope_callee_combined` pinning the bare `Owner::method` when the family selected no signature) | **DELETED** — 2 lines over six halves, one site: `T::try_from(this)` with `this` a value and the parameter `&T`; the static matcher admits the call site's auto-ref in a second pass and pins the symbol; a family that selects nothing stays unpinned | — | `grep -c 'select_static_overload' compiler/src/compiler/sema/call_resolver.cryo` → **3** | §8.174 |
-| unmangled pin family (`pin_scope_callee_qsym`'s qualified names, mono's `combined_sym` and spec-name pins) read by codegen's by-name lane (`resolve_function_by_mangled` → `resolve_function` → `resolve_function_with_arity`, and the vtable, prologue and constructor callers asking by name) | **DELETED** — 56,486 lines over six halves, every name pin a single-symbol family; the one plural (`BaseASTVisitor::visit`, 68 signatures, 5 vtable slots) bound its own signature by luck of registration order. `resolve_symbol` and `resolve_family` replace it: a name resolves only when its family names ONE symbol, several is E0900. The name pins themselves stay (written before their symbol exists); codegen no longer chooses among signatures for them. What survives is `resolve_function_by_mangled`'s OWN two rungs, `resolve_symbol(pinned)` then `resolve_family(pinned, -1)` - the `resolve_scope_call` row above | — | `grep -c 'resolve_function_with_arity' compiler/src/compiler/codegen/ops/symbol_resolver.cryo` → **0**; `grep -rho 'register_with_arity' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'resolve_family(' compiler/src --include=*.cryo \| wc -l` → **6** | §8.174, §8.175 |
+| unmangled pin family (`pin_scope_callee_qsym`'s qualified names, mono's `combined_sym` and spec-name pins) read by codegen's by-name lane (`resolve_function_by_mangled` → `resolve_function` → `resolve_function_with_arity`, and the vtable, prologue and constructor callers asking by name) | **DELETED** — 56,486 lines over six halves, every name pin a single-symbol family; the one plural (`BaseASTVisitor::visit`, 68 signatures, 5 vtable slots) bound its own signature by luck of registration order. `resolve_symbol` and `resolve_family` replace it: a name resolves only when its family names ONE symbol, several is E0900. The name pins themselves stay (written before their symbol exists), as `CalleePin::Family` since §8.195; codegen no longer chooses among signatures for them | — | `grep -c 'resolve_function_with_arity' compiler/src/compiler/codegen/ops/symbol_resolver.cryo` → **0**; `grep -rho 'register_with_arity' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'resolve_family(' compiler/src --include=*.cryo \| wc -l` → **6** | §8.174, §8.175 |
 | codegen `$MG` reconstruction (`call_emitter` rebuilding a generic method spec's symbol from `resolved_type_args` when the pin missed) | **DELETED** — the pin missed because sema's `pin_method_callee_from_qname` mangled a specialization without its own type arguments; the writer folds them in now, 7 → 0 on the LSP, 308 → 0 over six halves | — | `grep -c 'with_method_spec_args' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0**; `grep -c 'with_method_spec_args' compiler/src/compiler/sema/call_resolver.cryo` → **1** | §8.176 |
 | import tie refusal (`visit(IdentifierNode)`: a bare name whose bound symbol is an `Import` and whose leaf two imports bind from different modules) | LIVE - E0154 at the USE, stamp `Res::Err`; the tie is recorded by `Scope::insert_import` (which kept the first import and was read only for type names before) and cleared by a same-module declaration; the prelude is a separate rib and never ties | — | `grep -c 'is_ambiguous(node.name)' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.173 |
 | match-guard resolution (`NameResolution::visit(MatchArmNode)` visits `node.guard`) | LIVE - a guard is resolved in the arm's scope between the patterns and the body; unvisited, a module constant in a guard was E0201 and a callee in one bound by spelling | — | `grep -c 'node.guard.accept' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.172 |
@@ -164,7 +165,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,122 unit + 52 project + 183 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
+| `make test` | 2,122 unit + 53 project + 183 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make b1-check` | B1 total + every per-row bound, 3 corpora × 2 hosts | **2 of the 3 corpora are `examples/`**; the third is `tests/tests/projects/ffi_c_import`. The compiler's own source is NOT a corpus, and `tests/` at large is swept by none of them. |
 | `make lane-check` | 8 buckets of call sites in `compiler/src`, as a golden; REENTRY counts `get_resolver()` AND a cursor move through the `name_resolver` field since §8.189 (it read 3 over a tree holding 6: the monomorphizer's `find_module_scope`/`set_module`/`restore_scope`); `LOOKUP_ARENA` counts the arena's `lookup_by_name` since §8.192 (it read OK over a tree holding 17 in `type_resolution.cryo`) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
@@ -190,7 +191,7 @@ Checks for this section, one per line so each can be copied whole:
 
 * `grep -c '^\[' tests/lane-baseline.txt` → **8**
 * `grep -c '^\[host:' tests/b1-baseline.txt` → **6**
-* `grep -c '^project ' tests/test-roster.txt` → **52**
+* `grep -c '^project ' tests/test-roster.txt` → **53**
 * `grep -c '^negative ' tests/test-roster.txt` → **183**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
@@ -9813,6 +9814,116 @@ Parked for Jake: D5, the keyword ruling, §8.93, the plain-form import, the
 expression-position refusal (§8.189, also a head's argument position),
 concrete-argument impl selection (§8.190), the no-leading-list trait heads
 (§8.193), the LSP.
+
+### 8.195 Consumer 49: a callee pin says which name it is (`CalleePin`); codegen's symbol-then-family try deleted; an extern's symbol registered on its entry; `resolve_scope_call`'s four rungs measured against the stamp - 2026-09-15
+
+A pinned callee reached codegen as one `SymbolStr` that was either the
+linker symbol (a mangled method or function, a `![symbol]` link name, a C
+name) or a FAMILY name the declaration index registers signatures under (a
+module-qualified free function, a specialization's identifier,
+`Owner::method` on a specialization - each written by a stage that has the
+name before the symbol exists), and `resolve_function_by_mangled` tried the
+symbol first and the family second.  Sema's reader of the same slot tried
+the same two (`lookup_func_return`, then `lookup_func_type_by_mangled`).
+Twenty-five writers, forty readers, one string, and the kind decided by
+which table answered.
+
+`CalleePin` is the slot now: `Symbol(s)`, `Family(f)`, `None`.  Every
+writer says which it writes (nine mono sites: the spec identifier is a
+family, `mangled_symbol_for_spec_method` a symbol; ten sema sites; the
+static-value pin, which wrote the mangled symbol when the index held one
+and the combined name otherwise, writes `Symbol` or `Family` by the same
+test); `resolve_pinned` asks one table by the kind; sema's reader matches
+the same way; `callee_is_intrinsic` compares the pin's name.
+`resolve_function_by_mangled` is deleted.
+
+#### Measured
+
+Every pin resolved over the six halves, the answering rung beside a
+query of the other (`family_answer`, the family's one-symbol rule as a
+query that declares and reports nothing): **588,298**.  507,301 answered
+by the symbol alone and 80,016 by the family alone; 981 by the symbol with
+the family also answering - 913 the SAME symbol (an `extern "C"` called in
+the module that declares it: `_errno` 114, `malloc` 59, `_write` / `_read`
+/ `_popen` / `_pclose` / `_lseeki64` / `_isatty` 57 each - a C function's
+family is its own name), 60 with the family PLURAL (`free` 59, `realloc`
+1: §8.93's allocator leaf, the symbol pinned and the leaf-keyed family
+naming the C function and the intrinsic both), 8 with a DIFFERENT symbol
+(`abs` 2, the C function pinned where the leaf also names `std::math::abs`;
+6 `probe::bindgen_probe_*`, a C-import alias spelling the module holds
+under that key and whose family is the C name).  With the tag in place,
+one more pass: Symbol pins **508,285**, own rung 508,285; Family pins
+**80,023**, own rung 80,023; the cross rung answered 975 symbol pins and 6
+family pins, none of them needed.  Family pins by shape: 42,590
+module-qualified names (`std::core::panic` 25,436, `libc::memcpy`,
+`libc::strlen`, `fmt::format`, …), 37,426 specialization identifiers
+(`6offset$Lh$G`, `9expect_eq$Li$G`) and statics on specializations
+(`std::core::ptr::7NonNull$Lh$G::new`).
+
+**The deletion was red where the corpus was not.**  `cross-check` on the
+deletion alone: `std::random::secure`'s `getrandom(buf, len, 0)` - a bare
+call to a `![target(linux)]` `extern "C"` declared in `std::ffi::libc` -
+E0636 "cannot resolve function", and every module after it "codegen
+failed" (an error recorded once skips IR generation for the rest of the
+build).  The pin was `Symbol("getrandom")`; `resolve_symbol` declares a
+symbol the module does not hold from the index entry registered under it,
+and an extern's entry carried NO symbol: type resolution wrote the C name
+on the name's single slot (`register_mangled_name`) and never on the
+overload entry, so the family rung - which reads the slot - was the only
+way to a cross-module extern.  On the Windows target every Symbol-pinned
+C name in the corpus is called inside the module that declares it (the
+`_write` shim in `libc`, `_errno`), where the declaration pass already
+holds it: own rung 100% by corpus luck, and the Linux target is the
+population.  Fixed at the root: the extern's symbol is registered on each
+of its entries (bare when it claims the bare slot, module-qualified,
+C-import alias-qualified) as every other function's is.  `cross-check`
+OK; `tests/tests/projects/extern_symbol_cross_module` pins the shape on
+both hosts (`atoi` declared in one module, called bare from another, exit
+42; E0636 under the deletion without the registration).
+
+Predicted 0 objects; measured **examples 0 of 1,126, tests 0 of 2,297**;
+suite green (2,122 unit, 183 negative, 49 projects on this host);
+`lsp-check`, `cross-check` green; `lane-check`, `b1-check` unmoved;
+roster merged (53 projects); `selfhost-check` both arms OK.
+
+#### `resolve_scope_call`'s four rungs, against the stamp
+
+Every call printed with the rung that answered and the scope segment's
+`scope_res`: **581,378**.
+
+| stamp | static method (1) | type / variant (2) | module function (3) | C import (4) | none |
+|---|---|---|---|---|---|
+| `TypeRelative` | 233,695 | 220,362 | 0 | **968** | 255 |
+| `Def` (a module) | **2** | 0 | 126,096 | 0 | 0 |
+
+The stamp partitions the ladder: a type-owned segment is answered by the
+type's members, a module by its function.  The two exceptions are held:
+the 2 `Def`-stamped calls the static-method rung answers are
+`Buffer::make` in `module_type_name_collision` - a module and a type of
+one name, D5's shape, `scope_owner_key`'s cursor lane answering; the 968
+the C-import rung answers are every call through a C-import alias
+(`llvm::LLVMTypeOf` ×80 …, 956 in the LSP, `probe::…` 12), whose scope
+segment the name layer stamps `TypeRelative` because the alias is a
+NAMESPACE SYMBOL declared inside a module, not a graph module
+(`modules_written_as` finds none, the segment binds, the rooted walk gives
+a base), so the module rung's `stamped_ns::member` is never asked and the
+written spelling `alias::member` is - the whole spelling under which
+§8.174 declares a C import.  What a C-import alias IS - a module, or a
+scope of its own kind - is §9's Q2.  Rowed LIVE; the ladder's order
+decides nothing the stamp does not already decide.
+
+**Tally: 49 shadowed, 49 old paths deleted, 48 at zero and one at §8.93's
+allocator residue; 59 artifacts gone** (+ `resolve_function_by_mangled`).
+
+#### What this leaves
+
+`resolve_scope_call` with D5 and Q2.  `family_symbol`'s own three rungs
+(the overload entry's symbol, the name's slot, a fresh mangling) are the
+next question in the same file.  The trait-impl registry's trait half
+(§8.194); `qualify_symbol_sym_home`; the annotation-leaf comparisons.
+Parked for Jake: D5, Q2, the keyword ruling, §8.93, the plain-form import,
+the expression-position refusal, concrete-argument impl selection, the
+no-leading-list trait heads, the LSP.
 
 ---
 
