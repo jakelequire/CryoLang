@@ -27,7 +27,7 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at the commit carrying §8.191; `git log
+Checks run from the repo root. Verified at the commit carrying §8.192; `git log
 --oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
@@ -87,7 +87,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `bare_alts` (`decl_index`: every declaration under its bare leaf → its qualified names; `resolve_qualified_scoped`'s single-candidate fast path "answers WITHOUT consulting visibility or imports") | **LIVE, un-rowed until §8.189** — 14 writers (`register_name_mapping`: 8 in `type_resolution.cryo`, 5 in `pass_registry.cryo`, 1 in `specialization.cryo`); read through `resolve_qualified_scoped` (6 callers: the E0240 gate's two in type resolution, the resolver's 2c refusal, `decl_index`'s `_or` wrapper, and D5's two cursor wrappers in `compilation_context.cryo`), `canonical_qualified` (1, `type_name_key`) and the export check in `instance.cryo` | — | `grep -rho 'register_name_mapping(' compiler/src --include=*.cryo \| wc -l` → **15** (14 + the definition); `grep -rho 'resolve_qualified_scoped(' compiler/src --include=*.cryo \| wc -l` → **7** (6 + the definition) | §1, §8.1, §8.189 |
 | bare function-return registration (`type_resolution.cryo`: `register_function(func.name, …)` for a free function and for an intrinsic, `func_returns` keyed by the LEAF, last writer wins) | **STARVED for free functions, LIVE for `extern "C"`** — measured over six halves in §8.190: every bare hit is an extern asked by its C symbol (`_errno`, `malloc`, `_write`, `clang_*`, …), which is its mangled name and the key the pin carries; 0 misses, 0 non-extern hits. The last-writer-wins hazard is two extern blocks declaring one C name, which W0011 reports | — | `grep -c 'register_function(func.name' compiler/src/compiler/passes/type_resolution.cryo` → **1**; `grep -c 'register_function(node.name' compiler/src/compiler/passes/type_resolution.cryo` → **1**; `grep -rho 'lookup_func_return(' compiler/src --include=*.cryo \| wc -l` → **10** (7 + `type_utils`' wrapper, its call, and the definition) | §8.189, §8.190 |
 | a global's thread-local flag and linker symbol by LEAF (`is_global_thread_local` / `global_extern_symbol`: the first registration carrying the leaf; `mark_global_thread_local` writing every slot carrying it; `extern_global_keys`, a map fed under three spellings per imported global) and the directive pass's two cursor keys (`![symbol]` re-recorded under `qualify_symbol_sym`, the layout walk finding a declaration under `qualify_binding_sym` / `qualify_symbol_sym`) | **DELETED** — the four accessors ask `global_slot(leaf, ns)`, the symbol is a column of the registration, `decl_global_key` derives a global's `(key, ns)` once for Phase 4 and the directive pass, the layout walk and sema's class arms read `decl_type_key`; shadow 2 over six halves, both the mutation project's (`global_leaf_collision`: HEAD's compiler links `Plain::probe` to an imported twin's symbol and reads `Plain::counter` through TLS, exit 0 where 14 is right); control 181,619 agreeing; 1 object moved, the project's | — | `grep -c 'extern_global_keys' compiler/src/compiler/decl_index.cryo` → **0**; `grep -c 'global_slot(' compiler/src/compiler/decl_index.cryo` → **6**; `grep -c 'qualify_symbol_sym(' compiler/src/compiler/passes/directive_processing.cryo` → **0**; `grep -rho 'decl_global_key' compiler/src --include=*.cryo \| wc -l` → **3**; `grep -c '^project global_leaf_collision' tests/test-roster.txt` → **1** | §8.166, §8.187 |
-| arena qualified→bare family in TYPE RESOLUTION (`arena.lookup_by_name(` in `type_resolution.cryo`: six miss-fallback pairs after a qualified lookup, and a three-rung ladder in the enum-variant populate) | **LIVE, un-rowed until the audit at `16c3c470`** — the §8.156 row below checks `compilation_context.cryo` alone and is blind to this file; destination is `decl_type_key`, the declaration's own key | — | `grep -c 'arena.lookup_by_name(' compiler/src/compiler/passes/type_resolution.cryo` → **17** (0 when done) | §8.156, §8.187 |
+| arena qualified→bare family in TYPE RESOLUTION (`arena.lookup_by_name(` in `type_resolution.cryo`: six miss-fallback pairs after a cursor-keyed qualified lookup, and a three-rung ladder in the enum-variant populate) | **DELETED** — a written type declaration is found under its own key (`decl_type_key`), the key Phase 4 mints it under since the same entry, in the DeclarationIndex, once; the arena's name index is asked by nothing in type resolution. Shadow 100,893 lines over six halves, all `agree`, bare rung 0, index = arena at every one of 71,769 lookups; control 2,247 `new-only` with the qualified rung disabled, bare rung rescuing 0 - the arena holds no bare key for a declared type and a specialization never reaches these arms; 0 objects moved. The two arena name lookups left in the compiler are the resolver's second store behind the index in 2c and TemplateRegistration's base type, both by a canonical key, now pinned by `lane-check`'s `LOOKUP_ARENA` row | — | `grep -c 'arena.lookup_by_name(' compiler/src/compiler/passes/type_resolution.cryo` → **0**; `grep -rho 'arena.lookup_by_name(' compiler/src --include=*.cryo \| wc -l` → **2**; `grep -c 'decl_type_key' compiler/src/compiler/passes/type_resolution.cryo` → **16**; `grep -c 'decl_type_key' compiler/src/compiler/passes/pass_registry.cryo` → **12** | §8.156, §8.187, §8.192 |
 | `GenericRegistry` probed under two spellings of the receiver (`bare_name_of` then `get_qualified_name`, `call_specializer.cryo` and `method_binding.cryo`) | **LIVE, unmeasured** — whether one probe is starved since §8.180 keyed the registry by `target_key` needs a build; a shadow, not a grep | — | `grep -c 'bare_name_of' compiler/src/compiler/mono/call_specializer.cryo` → **5**; `grep -c 'bare_name_of' compiler/src/compiler/sema/method_binding.cryo` → **5** | §8.180, §8.187 |
 | codegen synthesizing the allocator by bare leaf (`expr_ops.cryo`: `resolve_function("malloc")` at three sites, `"free"` behind a rung the `std::alloc::allocator::free` shim answers first) | **LIVE, and the leaf rungs STARVED** — measured at `f120271b` and under the pin: both shim rungs answer (`…allocator::alloc` 1, `…allocator::free` 1), a scratch `new Owned{..}`/`delete o` references `C$3std.5alloc.9allocator.5alloc$Fm_m$RPv` and `…4free$FPv_m$Rv`, so `new`/`delete` are PAIRED through `GlobalAlloc`, not split, and the `malloc`/`free` leaves answer only with the allocator module out of the DI (`no_std`). §8.93's "the first branch never answers" was measured on the array-literal RELEASE path and does not describe `delete`. D6's "one path" is sema's; the calls codegen synthesizes should name the canonical symbol or the intrinsic, never a leaf | — | `grep -c 'intern_str("malloc")' compiler/src/compiler/codegen/ops/expr_ops.cryo` → **3** (0 when done); `grep -c 'intern_str("free")' compiler/src/compiler/codegen/ops/expr_ops.cryo` → **1** (0 when done) | §8.93, §8.177, §8.187, §8.189 |
 | `resolve_scope_call`'s four-rung try-ladder (static method → variant → module function → C import) and `resolve_function_by_mangled`'s symbol-then-family | **LIVE** — the path's stamp says which kind the segment names; a try-ladder asks all four | — | `grep -rho 'resolve_scope_call' compiler/src --include=*.cryo \| wc -l` → **3**; `grep -c 'resolve_family(pinned, -1)' compiler/src/compiler/codegen/ops/symbol_resolver.cryo` → **1** | §8.175, §8.187 |
@@ -110,7 +110,7 @@ three, and its row carries the count. Read each zero off its own row.
 | bare-callee family (`check_call_arity`, `try_pin_overload_mangled_callee`'s HOME → BARE key with its import-scoped candidate tiers and E0154, `resolve_direct_call`'s leaf-keyed `check_fnbind_candidate`, the two spelling-keyed local checks) | **DELETED** - one key, `callee_family`: the stamp's canonical name (`Def`), the local's own type (`Local`), or `intrinsic_owner_of` for a `Pending` leaf an intrinsic owns (§8.93's hold, the ONE bare path left); shadow 3,343 → 0 over six halves once `panic` (3,318, D6 landing) and the two refused privates (E0202 now, the §8.167 shape) are named; `FNVIS` 0: no `Def`-stamped bare callee is another module's private; E0353 doors 2-4 and the `FNBIND-VIOLATION` stream went with it | — | `grep -c 'bare_candidate_scope' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -c 'callee_family(&this' compiler/src/compiler/sema/call_resolver.cryo` → **1** | §8.173 |
 | impl head's spelling carrier (`impl_target_type`'s unanswered arm: `lookup_type_exact(node.target_type)`, the monomorphizer's rewritten spelling; and the HOME → BARE pair `lookup_type(qualify_symbol_sym_home(target))`, then `lookup_type(target)`, at three sites in `type_resolution.cryo`) | **DELETED** in sema (§8.174) and in type resolution (§8.179): every site reads `ImplBlockNode.res` — `Def` → the index under the canonical name, `PrimTy` → under the spelling, unanswered → `spec_owner`; sema's shadow 1,466 → 0 (async-lowered `Future` heads, stamped by their synthesizer now); type resolution's 91,910 lines all a superset (16,930 cross-module heads the pair left INVALID, 74,977 primitives agreeing on type), 0 objects moved, no clone reaches those sites | — | `grep -c 'node.spec_owner' compiler/src/compiler/sema/sema.cryo` → **1**; `grep -c 'lookup_type_exact(node.target_type)' compiler/src/compiler/sema/sema.cryo` → **0**; `grep -c 'lookup_type(node.target_type)' compiler/src/compiler/passes/type_resolution.cryo` → **0**; `grep -c 'runner.impl_owner(node)' compiler/src/compiler/passes/type_resolution.cryo` → **3** (the two FuncSig sites and `run_struct_field_sync`) | §8.174, §8.175, §8.179 |
 | impl head's second key carrier and its spelling arm (`ImplBlockNode.qualified_target_name`, written by type resolution from the stamp or the spelling and read by mono's pin targets, three identity comparisons, the spec-method DI registration, `impl_target_rank` and sema's async declare pass, whose `else` was a `qualify_symbol_sym` cursor site; `target_key`'s arms 3 and 4; `codegen_target_name` with three counters; `impl_owner_qname`) | **DELETED** — `target_key(arena)` is the stamp, else `spec_owner`'s arena name (recorded by the monomorphizer when the concrete type is decided, so a clone walked BEFORE placement no longer carries only the bare spec identifier), else the spelling for an ALIAS KEYWORD head only (`implement trait Show for int`, stamped by nothing until the keyword ruling); shadow 51 over six halves, all the pre-placement clone shape, control tens of millions agreeing; 0 objects moved; b1 re-pinned both hosts (56 → 53 rows per arm), DEFID_UNWRAP 36 → 34 | — | `grep -rho 'qualified_target_name' compiler/src --include=*.cryo | wc -l` → **0**; `grep -rho 'codegen_target_name' compiler/src --include=*.cryo | wc -l` → **0**; `grep -c 'spec_owner = concrete_type' compiler/src/compiler/mono/monomorphizer.cryo` → **1**; `grep -c 'CgImplTarget' compiler/src/compiler/resolve_counter.cryo` → **0** | §8.180, §8.188 |
-| `qualify_symbol_sym_home` (the writer's module prefixed to a spelling, guessing a canonical name) | LIVE — 33 sites (the definition and `decl_type_key` counted), 14 of them in `type_resolution.cryo`, 0 in `sema.cryo`, 4 each in `async_lower`, `pass_registry`, 3 each in `specialization`, `declaration_emitter`, 2 each in `lambda_synth`, `compilation_context`, 1 in `directive_processing`; a surface, not a lane: each site is a stamp the name layer already carries or should, and goes as its consumer does (5 went with the impl head's pair in §8.179, 4 with its registration key in §8.180, 1 with the explicit-generic callee's ladder in §8.182, 2 with Phase 4's registry in §8.185; +1 in §8.184, `find_top_level_function_by_key` deriving each root function's REGISTRATION key - the declaration-key rule, not a lookup by a written name; 2 more with the class arms in §8.187; the one in sema's `visit(ImplBlockNode)` with D16 in §8.190 - `sema.cryo` holds none) | — | `grep -rho 'qualify_symbol_sym_home' compiler/src --include=*.cryo \| wc -l` → **33**; `grep -c 'qualify_symbol_sym_home' compiler/src/compiler/sema/sema.cryo` → **0** | §8.175, §8.179, §8.180, §8.182, §8.184, §8.185, §8.187, §8.190 |
+| `qualify_symbol_sym_home` (the writer's module prefixed to a spelling, guessing a canonical name) | LIVE — 26 sites (the definition and `decl_type_key` counted), 11 of them in `type_resolution.cryo`, 0 in `sema.cryo` and `pass_registry.cryo`, 4 in `async_lower`, 3 each in `specialization`, `declaration_emitter`, 2 each in `lambda_synth`, `compilation_context`, 1 in `directive_processing`; a surface, not a lane: each site is a stamp the name layer already carries or should, and goes as its consumer does (5 went with the impl head's pair in §8.179, 4 with its registration key in §8.180, 1 with the explicit-generic callee's ladder in §8.182, 2 with Phase 4's registry in §8.185; +1 in §8.184, `find_top_level_function_by_key` deriving each root function's REGISTRATION key - the declaration-key rule, not a lookup by a written name; 2 more with the class arms in §8.187; the one in sema's `visit(ImplBlockNode)` with D16 in §8.190 - `sema.cryo` holds none; 7 type-declaration keys became `decl_type_key` in §8.192, class and trait in Phase 4 minting, the duplicate check and registration, and the trait populate - `pass_registry.cryo` holds none) | — | `grep -rho 'qualify_symbol_sym_home' compiler/src --include=*.cryo \| wc -l` → **26**; `grep -c 'qualify_symbol_sym_home' compiler/src/compiler/sema/sema.cryo` → **0** | §8.175, §8.179, §8.180, §8.182, §8.184, §8.185, §8.187, §8.190, §8.192 |
 | impl head's registration key by writer module (stage-3 template attach keyed `qualify_symbol_sym_home(target)`, type resolution's re-attach guarded by "canonical ≠ that key", the legacy method alias registering every impl method under `<writer module>::<target>::<method>` as a family, sema's `impl_generic_params` fallback) | **DELETED** — `ImplBlockNode::target_key` (the stamp's name, a primitive's spelling, the clone's recorded name) keys stage 3 and sema; type resolution attaches unconditionally and `register_impl_block` refuses a block it holds (stage 3 runs before a later module's template exists: `Display for String` found no `String` template there in 621 of 624 heads); the alias's one reader, codegen's string `+` lowering, asks for `string::append`. 132,699 shadow lines, all cross-module heads; the alias's probe read a FALSE zero (it watched `method_returns`, the reader asked the function family) and the corpus has no `string + string` — `tests/lang/string_concat.cryo` pins it now | — | `grep -c 'target_key(ctx.type_arena)' compiler/src/compiler/passes/specialization.cryo` → **1**; `grep -c 'register_methods_with_module_aliased' compiler/src/compiler/passes/type_resolution.cryo` → **1**; `grep -c '"string::append"' compiler/src/compiler/codegen/ops/expr_ops.cryo` → **1**; `grep -c 'impl_blocks\[i\] == block' compiler/src/compiler/types/generic_registry.cryo` → **1** | §8.180 |
 | explicit-generic callee's template by ladder (`register_generic_fn_call`: `qualify_symbol_sym_home(leaf)`, then a resolver re-entry building `source_module::leaf`; and a `ScopeResolution` arm the parser never fed, a path callee's turbofish living on the path node) | **DELETED** — the identifier callee's stamp is the registry key (`template_of(res.def_id())`); shadow 0 over six halves, control 189 agreeing (116 stdlib templates the re-entry answered, 73 same-module ones HOME answered), 0 objects moved; the file's one `get_resolver()` went with it | — | `grep -c 'name_resolver' compiler/src/compiler/passes/type_resolution.cryo` → **0**; `grep -c 'template_of(r.def_id())' compiler/src/compiler/passes/type_resolution.cryo` → **1** | §8.180, §8.182 |
 | struct-literal rungs 3 and 5 (`resolve_generic_scope_name(lit.struct_type, ..)`, `lookup_type_exact(lit.struct_type)`) | **DELETED** — rung 5: 2 lines over six halves, both C-imported literals whose stamp M1 had missed (above), 0 once stamped; rung 3: 0 over six halves including the `cryo test` half its comment named, and the instrument fires on a forced case; their two rows retired | — | `grep -c 'lookup_type_exact(lit.struct_type)' compiler/src/compiler/sema/sema.cryo` → **0** | §8.174 |
@@ -126,7 +126,7 @@ three, and its row carries the count. Read each zero off its own row.
 | B4 bucket (instantiation keying) | **DELETED** | — | `grep -c 'B4' compiler/src/compiler/resolve_counter.cryo` → **0** | §8.121 |
 | arena `leaf_index` map | **LIVE, and NOT a lane** | — | `grep -rho 'leaf_index' compiler/src \| wc -l` → **7** (was 8 while a deleted comment named the project `resolution_leaf_index`; the map's own mentions are 7) | §8.121 |
 | `resolve_path` (§5.2's one entry point) | **LIVE, but not the entry point** — 2 call sites, both single-segment, both `Namespace::Type` | — | `grep -rho '\.resolve_path(' compiler/src --include=*.cryo \| wc -l` → **2** | §5.2, §8.5, §8.7 |
-| `canonical_type_ref` and its arena bare step | **DELETED in `compilation_context.cryo`, which is all this check sees** — a declaration's key comes from the declaration (`source_module`, else the writer's module); the MECHANISM (a qualified miss retried under the bare leaf) lives on at 17 sites in `type_resolution.cryo`, the row above, including the enum-variant three-rung ladder (`decl_index.lookup_type` → `arena.lookup_by_name(qualified)` → `arena.lookup_by_name(bare)`) | — | `grep -c 'lookup_by_name' compiler/src/compiler/compilation_context.cryo` → **0**; `grep -c 'arena.lookup_by_name(node.name)' compiler/src/compiler/passes/type_resolution.cryo` → **5** (0 when done) | §8.103, §8.112, §8.156, §8.189 |
+| `canonical_type_ref` and its arena bare step | **DELETED** — a declaration's key comes from the declaration (`decl_type_key`: the alias namespace, else the registered name, else the writing file's module); the MECHANISM (a qualified miss retried under the bare leaf) went from `type_resolution.cryo` with the row above in §8.192 | — | `grep -c 'lookup_by_name' compiler/src/compiler/compilation_context.cryo` → **0**; `grep -c 'arena.lookup_by_name(node.name)' compiler/src/compiler/passes/type_resolution.cryo` → **0** | §8.103, §8.112, §8.156, §8.189, §8.192 |
 | `resolve_cross_module_name` (sema's resolver re-entry by spelling) | **DELETED** — its four readers went under shadow mode | — | `grep -rho 'resolve_cross_module_name' compiler/src \| wc -l` → **0** | §8.155 |
 | intrinsic symbol's placeholder module (`Symbol::intrinsic` writing `source_module: "<intrinsic>"`, so a same-module bare intrinsic call stamped a `Def` no index key matched) | **DELETED** — the symbol carries its declaring module like every other declaration; the one such call in the tree (`runtime/backtrace`'s `frame_address`, Linux-gated) compiles, `verify-freestanding` green | — | `grep -c '"<intrinsic>"' compiler/src/compiler/resolver/symbol.cryo` → **0**; `grep -c 'intr_mod' compiler/src/compiler/resolver/name_resolution.cryo` → **2** | §8.178 |
 | `check_module_type_collision` | LIVE — D5 deletes it | — | see D5 | §8.130, §8.131 |
@@ -160,7 +160,7 @@ evidence for what it covers.
 | `make test` | 2,122 unit + 50 project + 183 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make b1-check` | B1 total + every per-row bound, 3 corpora × 2 hosts | **2 of the 3 corpora are `examples/`**; the third is `tests/tests/projects/ffi_c_import`. The compiler's own source is NOT a corpus, and `tests/` at large is swept by none of them. |
-| `make lane-check` | 7 buckets of call sites in `compiler/src`, as a golden; REENTRY counts `get_resolver()` AND a cursor move through the `name_resolver` field since §8.189 (it read 3 over a tree holding 6: the monomorphizer's `find_module_scope`/`set_module`/`restore_scope`) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
+| `make lane-check` | 8 buckets of call sites in `compiler/src`, as a golden; REENTRY counts `get_resolver()` AND a cursor move through the `name_resolver` field since §8.189 (it read 3 over a tree holding 6: the monomorphizer's `find_module_scope`/`set_module`/`restore_scope`); `LOOKUP_ARENA` counts the arena's `lookup_by_name` since §8.192 (it read OK over a tree holding 17 in `type_resolution.cryo`) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
 | `make selfhost-check` | stage-3 == stage-4 byte identity, both arms | **Stability, not correctness.** It proves the compiler still emits the same bytes for code that already compiles; it says nothing about code that now STOPS compiling. |
 | `make lsp-check` | `tools/CryoLSP` compiles against **the compiler under test** | Compilation only — no language-server behaviour is exercised. |
 | `make cross-check` | `runtime/`, `stdlib/`, `compiler/`, `tools/CryoLSP` compile to OBJECTS for the other OS's triple with the compiler under test — the config-gated half every host-native gate prunes before name resolution (326 attributes in the stdlib, 23 in the runtime, 11 in the compiler, 6 in the LSP) | Objects only: nothing links, nothing runs. `tests/` and `examples/` are not built. |
@@ -181,7 +181,7 @@ is a different question and does not converge on B3. §7.3 is normative for this
 
 Checks for this section, one per line so each can be copied whole:
 
-* `grep -c '^\[' tests/lane-baseline.txt` → **7**
+* `grep -c '^\[' tests/lane-baseline.txt` → **8**
 * `grep -c '^\[host:' tests/b1-baseline.txt` → **6**
 * `grep -c '^project ' tests/test-roster.txt` → **50**
 * `grep -c '^negative ' tests/test-roster.txt` → **183**
@@ -454,9 +454,9 @@ an error with a suggestion, not an invitation to search.
 >   segment in `Namespace::Type` — a projection helper in `resolver.cryo` and
 >   the base-class name in `name_resolution.cryo`. No multi-segment path goes
 >   through it. The per-kind lookups it was to replace are still pinned by
->   `lane-check` in seven buckets. Checks:
+>   `lane-check` in eight buckets. Checks:
 >   `grep -rho '\.resolve_path(' compiler/src --include=*.cryo \| wc -l` → **2**;
->   `grep -c '^\[' tests/lane-baseline.txt` → **7**.
+>   `grep -c '^\[' tests/lane-baseline.txt` → **8**.
 > * **"There is no ambient cursor" — ASPIRATIONAL.** The machinery is present
 >   (`HomeOrigin`, `current_module`) and answers **0** on the pinned corpora, so
 >   it is starved rather than absent (§0, §8.19, §8.105, §8.109). Check:
@@ -820,12 +820,14 @@ implementing, so the mechanisms below are what carry the remaining work.
 >   wearing a wrapper. The ruling keeps the lookups PUBLIC and makes the third
 >   lock, the surface ratchet, the whole enforcement. Do not implement the
 >   second lock; §0 D12 carries the ruling.
-> * **Mechanism 5's third lock pins seven numbers, not two.** `lane-check`'s
+> * **Mechanism 5's third lock pins eight numbers, not two.** `lane-check`'s
 >   buckets are `LOOKUP`, `LOOKUP_OTHER`, `LOOKUP_ROUTED`, `LOOKUP_LOCAL`,
->   `REENTRY`, `DEFID_MINT` and `DEFID_UNWRAP` — split by RECEIVER since §8.107,
->   because a count matched on the NAME cannot separate the index's surface from
->   things that merely resemble it. Check:
->   `grep -c '^\[' tests/lane-baseline.txt` → **7**.
+>   `LOOKUP_ARENA`, `REENTRY`, `DEFID_MINT` and `DEFID_UNWRAP` — split by
+>   RECEIVER since §8.107, because a count matched on the NAME cannot separate
+>   the index's surface from things that merely resemble it; `LOOKUP_ARENA`
+>   since §8.192, because the arena's `lookup_by_name` is the same lane on a
+>   second store and the gate read OK over 17 of them. Check:
+>   `grep -c '^\[' tests/lane-baseline.txt` → **8**.
 
 1. **`Res` is an enum, and `match` is exhaustive.** Adding or changing a
    variant forces every consumer to handle it (E0405). This is the primary
@@ -9431,6 +9433,103 @@ The `lookup_by_name` family in `type_resolution.cryo` and
 `register_decl_in_index`'s cursor derivations.  Parked for Jake: D5, the
 keyword ruling, §8.93, the plain-form import, the expression-position
 refusal (§8.189), concrete-argument impl selection (§8.190), the LSP.
+
+### 8.192 Consumer 44: a written type declaration is found under its own key; type resolution's qualified-miss→bare retry, the enum-variant three-rung ladder and its second name store deleted - 2026-09-14
+
+`type_resolution.cryo` asked the arena's name index at 17 sites, and at
+seven of them asked twice: a key derived from the ambient cursor
+(`qualify_binding_sym`, which is `qualify_symbol_sym` for a file-namespaced
+declaration), then on a miss the bare leaf - the four type arms of
+`register_decl_in_index` (struct, union, class, enum), the inline-method
+signature repair, and the enum-variant populate as the tail of a three-rung
+ladder (`decl_index.lookup_type` → arena qualified → arena bare).  The bare
+retry's comment said it served "monomorphized types (e.g. `Pair_i32`)"; the
+Phase 4 minting in `pass_registry.cryo` derived the same key from the same
+cursor, so registration and lookup agreed by walking in the same order
+rather than by asking the declaration.
+
+The declaration's own key (`decl_type_key`: a C import's alias-qualified
+name, else the registered name when minted qualified, else the WRITING
+file's module prefixed to the leaf - §8.185's rule) is now what Phase 4
+mints under and what every reader in this file asks by: the E0207
+duplicate check, Phase 4 registration, Phase 2's inline-method repair
+(handed the key by its caller, not a name to re-derive), Phase 3's trait
+populate, Phase 1's alias target, Phase 5's struct/union/enum arms.  Each
+asks the DeclarationIndex once - the store `impl_owner`, the resolver's
+2c step and the Phase 5 class arm already ask - and the arena's name index
+is asked by nothing in type resolution: `arena.lookup_by_name(` 17 → 0 in
+the file, 2 in the compiler (the resolver's second store behind the index
+in 2c, TemplateRegistration's base type).  The bare retry is deleted at
+every site; the class base is read from the stamp in the index.
+
+#### Measured
+
+One shadow over the six halves, every outcome printed, at every site: the
+old answer (its rung named), the arena under `decl_type_key`, and the index
+under the same key.  **100,893 lines, all `agree`**: 19,278 struct + 6
+union + 132 class + 7,493 enum + 8,640 trait + 3 alias registrations, 19,416
+inline-method repairs, 9,194 trait populates, 3 alias targets, 111 class
+bases, 7,493 enum populates, and 29,124 Phase 4 mints (struct 20,935, enum
+8,180, union 6, alias 3) whose cursor key equalled `decl_type_key`.  The
+bare rung answered **0**; the enum ladder's index rung answered all 7,493
+and its two arena rungs 0; the index and the arena held the same id at
+every one of the 71,769 lookups.  Mint counts exceed registration counts
+only in halves where `cryo check` stops before Phase 4 (the negatives,
+`compile_fail` projects); the LSP and the examples, which build to
+completion, match exactly.
+
+**Control** (the LSP built directly and the 14 examples, one build): the
+struct arm's qualified rung looked up under a key nothing holds - 2,247
+lines read `none` / `new-only`, and the bare rung rescued **0 of 2,247**.
+The arena holds no bare key for a declared type: its only bare keys are a
+specialization's reserved names (`reserve_spec_names`, `add_name_alias`),
+and a specialization never reaches these arms - `SpecInjector::register`
+takes every type clone with a valid concrete (`create_concrete_type` never
+returns invalid for a type node; `get_qualified_name` of a valid aggregate
+is valid), and the injector's two fallbacks into `register_decl_in_index`,
+probed in the same build, printed 0.  So the retry's population is empty
+by construction, not by corpus luck; there is no front-end mutation that
+produces it short of registering a written type under its leaf, which is
+§1's defect and not a shape the model admits.
+
+Predicted 0 objects.  Measured examples **0 of 1,126**, tests **0 of
+2,241**; suite green (2,122 unit, 183 negative, 47 projects on this host).
+`lsp-check`, `cross-check` green before the object run.  `b1-check`
+unmoved.
+
+`lane-check` refused the change - LOOKUP 35 → 45, `type_resolution.cryo`
+13 → 23 - and the refusal was right about the count and wrong about the
+direction: the ten are index lookups that were ARENA lookups, on a
+receiver the gate had no row for.  `lookup_by_name` on the arena is the
+same name-keyed lane on a second store of the same declared types, and
+the gate printed OK over seventeen of them.  It counts them now
+(`LOOKUP_ARENA`, receiver `arena` / `*.arena` / `*_arena` outside
+`arena.cryo`; any other receiver of that name is refused as unplaced
+rather than dropped): the OLD gate over HEAD's tree printed `OK -- LOOKUP
+= 35`; the NEW gate over the same tree, against the re-pinned golden,
+prints `LOOKUP_ARENA TOTAL 2 -> 19 (INCREASE)`, `type_resolution.cryo 0 ->
+17`.  Golden re-pinned: LOOKUP 45 (the ten now visible; seven of the
+seventeen were second rungs and are gone outright), LOOKUP_ARENA 2.  `qualify_symbol_sym_home` 33 → 26: the three
+type-declaration keys in `type_resolution.cryo` (class and trait
+registration, trait populate) and all four in `pass_registry.cryo` (class
+and trait minting, the duplicate check's two) are `decl_type_key` now,
+which is the same function under the declaration-key name.
+
+The shadow's own instrument tripped `namespace_gate_methods`
+(`output_excludes "Carrier"`: the line named the declaration), the shape
+§8.166 recorded; the de-shadowed build passes it.
+
+**Tally: 44 shadowed, 44 old paths deleted, 43 at zero and one at §8.93's
+allocator residue; 49 artifacts gone** (+ the qualified-miss→bare retry,
++ type resolution's second name store).
+
+#### What this leaves
+
+`bare_alts` (rowed in §0; 2 of its 6 readers are D5's), then
+`GenericRegistry`'s two-spelling receiver probe and the `resolve_scope_call`
+/ `specialize_free_call` ladders.  Parked for Jake: D5, the keyword ruling,
+§8.93, the plain-form import, the expression-position refusal (§8.189),
+concrete-argument impl selection (§8.190), the LSP.
 
 ---
 

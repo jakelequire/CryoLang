@@ -42,6 +42,13 @@ them, because the five names are not the index's alone:
     scope stack.  Not a lane site, and no migration can remove one, so it is a
     FLOOR: driving LOOKUP to zero is reachable, driving the total to zero never
     was.
+  * LOOKUP_ARENA -- `lookup_by_name` on the TypeArena outside the file that
+    defines it.  The arena's name caches are a second name-keyed store of the
+    same declared types the index holds, and a lookup there is the same lane
+    under a receiver none of the rows above can see: type resolution asked it
+    at 17 sites, seven of them a qualified-miss→bare retry, and the gate read
+    OK over every one.  Pinned so a name lookup cannot leave the index for
+    the arena and read as progress.
   * REENTRY -- calls to `get_resolver()` outside the driver, and a cursor move
     on a resolver reached through a FIELD (`.name_resolver.set_module(...)`,
     `find_module_scope`, `restore_scope`), which is the same re-entry with no
@@ -164,10 +171,13 @@ DEFID_UNWRAP_RE = re.compile(r"\.qualified_name\s*\(")
 
 # ANY lookup on the index, so the five cannot be routed around by a sixth.
 ANY_LOOKUP_RE = re.compile(r"([A-Za-z_][A-Za-z_0-9.]*)\.(lookup_[A-Za-z_0-9]*)\s*\(")
+# The arena's name-keyed lookup, with its receiver.  `lookup(id)` is not a
+# name lookup and is not matched.
+ARENA_LOOKUP_RE = re.compile(r"([A-Za-z_][A-Za-z_0-9.]*)\.lookup_by_name\s*\(")
 
 # Every counted population, in the order they are rendered and compared.
 KINDS = ("LOOKUP", "LOOKUP_OTHER", "LOOKUP_ROUTED", "LOOKUP_LOCAL",
-         "REENTRY", "DEFID_MINT", "DEFID_UNWRAP")
+         "LOOKUP_ARENA", "REENTRY", "DEFID_MINT", "DEFID_UNWRAP")
 
 # The file that DEFINES the five lookups.  Its own calls are not the surface.
 #
@@ -178,6 +188,8 @@ KINDS = ("LOOKUP", "LOOKUP_OTHER", "LOOKUP_ROUTED", "LOOKUP_LOCAL",
 # count.  The exclusion is meant to be about one specific definition site, so
 # it names one.
 LOOKUP_OWNERS = {"compiler/decl_index.cryo"}
+# The file that DEFINES the arena's name lookup; its own calls are its caches.
+ARENA_OWNERS = {"compiler/types/arena.cryo"}
 # The driver legitimately owns the resolver and may ask for it.
 REENTRY_OWNERS = {"compiler/instance.cryo"}
 
@@ -234,6 +246,17 @@ def scan():
                             continue
                         if lookup_bucket(m.group(1)) == "LOOKUP":
                             tally["LOOKUP_OTHER"] += 1
+                if rel not in ARENA_OWNERS:
+                    # A name lookup on the arena is counted by its receiver
+                    # too: one that is not an arena is a lookup this gate
+                    # has no row for, and is refused rather than dropped.
+                    for m in ARENA_LOOKUP_RE.finditer(line):
+                        recv = m.group(1)
+                        if recv == "arena" or recv.endswith(".arena") \
+                                or recv.endswith("_arena"):
+                            tally["LOOKUP_ARENA"] += 1
+                        else:
+                            unplaced.append((rel, lineno, recv))
                 if rel not in REENTRY_OWNERS:
                     tally["REENTRY"] += len(REENTRY_RE.findall(line))
                 tally["DEFID_MINT"] += len(DEFID_MINT_RE.findall(line))
@@ -267,6 +290,11 @@ HEADER = [
     "#                scope stack. Not a lane site; no migration removes one. A",
     "#                FLOOR, so driving LOOKUP to zero is reachable and driving",
     "#                the total to zero never was.",
+    "# LOOKUP_ARENA   lookup_by_name on the TypeArena outside arena.cryo. A",
+    "#                second name-keyed store of the declared types the index",
+    "#                holds, so the same lane under a receiver the rows above",
+    "#                cannot see. Falls with LOOKUP; a move between the two is",
+    "#                not progress.",
     "# REENTRY  get_resolver() outside the driver, and a cursor move on a resolver",
     "#          reached through a field (.name_resolver.set_module / find_module_scope",
     "#          / restore_scope), the same re-entry with nothing else to count. Name",

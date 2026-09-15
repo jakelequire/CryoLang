@@ -921,26 +921,21 @@ type struct TypeResolutionRunner {
     }
 
     /// Repair the signatures of a struct/union/class's *inline* methods during
-    /// the TypeResolution pass, once the owner type is available in the arena.
-    /// The DeclarationCollection FunctionSignature pass resolves these methods
-    /// before the owning type is registered, so its `decl_index`-based owner
-    /// lookup returns invalid and a by-value `this` receiver (which carries no
-    /// annotation) is left without a resolved_type.  The owner is sourced from
-    /// the arena here (populated by DeclarationCollection's type creation),
-    /// mirroring `register_decl_in_index`'s qualified-then-bare lookup, so the
-    /// receiver back-fill in `Resolver::resolve_method_signatures` runs.
-    /// Idempotent for already-resolved return/param types.
-    resolve_inline_method_signatures(&this, name: SymbolStr,
-                                     binding_namespace: SymbolStr,
+    /// the TypeResolution pass, once the owner type exists.  The
+    /// DeclarationCollection FunctionSignature pass resolves these methods
+    /// before the owning type is registered, so its owner lookup returns
+    /// invalid and a by-value `this` receiver (which carries no annotation)
+    /// is left without a resolved_type.  `owner_key` is the declaration's own
+    /// key (`decl_type_key`), the one the type-declaration stage registered
+    /// it under, so the receiver back-fill in
+    /// `Resolver::resolve_method_signatures` runs.  Idempotent for
+    /// already-resolved return/param types.
+    resolve_inline_method_signatures(&this, owner_key: SymbolStr,
                                      methods: &MethodNode*[],
                                      res_ctx: ResolutionContext*) -> void {
-        const qname: SymbolStr = this.ctx.qualify_binding_sym(name, binding_namespace);
-        mut owner: TypeRef = this.arena.lookup_by_name(qname);
-        if (owner.is_invalid()) {
-            owner = this.arena.lookup_by_name(name);
-        }
+        const owner: TypeRef = this.ctx.decl_index.lookup_type(owner_key);
         if (owner.is_invalid()) { return; }
-        this.resolver.resolve_method_signatures(methods, res_ctx, owner, qname);
+        this.resolver.resolve_method_signatures(methods, res_ctx, owner, owner_key);
     }
 
     /// Resolves all function signatures (FunctionDeclNode*[]) on a trait.
@@ -1445,8 +1440,12 @@ type struct TypeResolutionPasses {
     // Shared utility: register a declaration in the DeclarationIndex
 
     /// Registers a top-level declaration (struct, class, enum, function, impl block)
-    /// in the DeclarationIndex.  Looks up the type in the arena by qualified name,
-    /// falling back to the bare name for monomorphized types (e.g. "Pair_i32").
+    /// in the DeclarationIndex.  A type declaration is found under its own key
+    /// (`decl_type_key`, the key the type-declaration stage minted it under),
+    /// and nowhere else: a monomorphized type never reaches this arm - its
+    /// registration is `SpecInjector::register`, under the arena name - so the
+    /// declarations here are the written ones, and a written type's bare leaf
+    /// is not a key any store holds.
     ///
     /// Shared by TypeResolution (Phase 4) and Specialization (injected decl
     /// registration) so that both use the same registration logic.
@@ -1475,11 +1474,8 @@ type struct TypeResolutionPasses {
         match (stmt.kind) {
             NodeKind::StructDeclaration => {
                 const node: StructDeclNode* = stmt as StructDeclNode*;
-                const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
-                mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
-                if (!ty.is_valid()) {
-                    ty = arena.lookup_by_name(node.name);
-                }
+                const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
+                const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
                 }
@@ -1494,11 +1490,8 @@ type struct TypeResolutionPasses {
             }
             NodeKind::UnionDeclaration => {
                 const node: UnionDeclNode* = stmt as UnionDeclNode*;
-                const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
-                mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
-                if (!ty.is_valid()) {
-                    ty = arena.lookup_by_name(node.name);
-                }
+                const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
+                const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
                 }
@@ -1510,11 +1503,8 @@ type struct TypeResolutionPasses {
             }
             NodeKind::ClassDeclaration => {
                 const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                const qualified_sym: SymbolStr = ctx.qualify_symbol_sym_home(node.name, node.span.file);
-                mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
-                if (!ty.is_valid()) {
-                    ty = arena.lookup_by_name(node.name);
-                }
+                const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
+                const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
                 }
@@ -1526,11 +1516,8 @@ type struct TypeResolutionPasses {
             }
             NodeKind::EnumDeclaration => {
                 const node: EnumDeclNode* = stmt as EnumDeclNode*;
-                const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
-                mut ty: TypeRef = arena.lookup_by_name(qualified_sym);
-                if (!ty.is_valid()) {
-                    ty = arena.lookup_by_name(node.name);
-                }
+                const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
+                const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
                 }
@@ -1541,8 +1528,8 @@ type struct TypeResolutionPasses {
             }
             NodeKind::TraitDeclaration => {
                 const node: TraitDeclNode* = stmt as TraitDeclNode*;
-                const qualified_sym: SymbolStr = ctx.qualify_symbol_sym_home(node.name, node.span.file);
-                const ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
+                const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
                 }
@@ -1867,8 +1854,8 @@ type struct TypeResolutionPasses {
             }
             NodeKind::TypeAliasDeclaration => {
                 const node: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
-                const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.alias_name, node.binding_namespace);
-                const ty: TypeRef = arena.lookup_by_name(qualified_sym);
+                const qualified_sym: SymbolStr = ctx.decl_type_key(node.alias_name, node.binding_namespace, node.span.file);
+                const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                 if (ty.is_valid()) {
                     ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
                 }
@@ -3049,8 +3036,8 @@ type struct TypeResolutionPasses {
                     // signatures off the arena type. Without this, every
                     // BoundedParamType receiver call has to fall back to
                     // brittle name-only lookups in the DeclarationIndex.
-                    const tr_qname: SymbolStr = ctx.qualify_symbol_sym_home(node.name, node.span.file);
-                    const tr_ref: TypeRef = arena.lookup_by_name(tr_qname);
+                    const tr_qname: SymbolStr = ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
+                    const tr_ref: TypeRef = ctx.decl_index.lookup_type(tr_qname);
                     const tr_t: Type* = if (tr_ref.is_valid()) {
                         arena.lookup(tr_ref.id)
                     } else { null };
@@ -3437,8 +3424,8 @@ type struct TypeResolutionPasses {
                     if (target.is_valid()) {
                         node.resolved_target = target;
                         // Update the TypeAliasType in the arena with the resolved target
-                        const alias_ref: TypeRef = runner.arena.lookup_by_name(
-                            ctx.qualify_binding_sym(node.alias_name, node.binding_namespace));
+                        const alias_ref: TypeRef = ctx.decl_index.lookup_type(
+                            ctx.decl_type_key(node.alias_name, node.binding_namespace, node.span.file));
                         if (alias_ref.is_valid()) {
                             const alias_ty: Type* = runner.arena.lookup(alias_ref.id);
                             if (alias_ty != null && alias_ty.kind == TypeKind::TypeAlias) {
@@ -3490,7 +3477,8 @@ type struct TypeResolutionPasses {
                     // reaches drop-insertion with an unresolved receiver and its
                     // by-value `this` is never dropped - a leak on every call.
                     runner.resolve_inline_method_signatures(
-                        node.name, node.binding_namespace, node.methods, &struct_ctx);
+                        ctx.decl_type_key(node.name, node.binding_namespace, node.span.file),
+                        node.methods, &struct_ctx);
                     runner.emit_method_signature_diagnostics(node.methods);
                 }
                 NodeKind::UnionDeclaration => {
@@ -3500,7 +3488,8 @@ type struct TypeResolutionPasses {
                     runner.resolve_fields(node.fields, &union_ctx);
                     field_count += node.fields.length;
                     runner.resolve_inline_method_signatures(
-                        node.name, node.binding_namespace, node.methods, &union_ctx);
+                        ctx.decl_type_key(node.name, node.binding_namespace, node.span.file),
+                        node.methods, &union_ctx);
                     runner.emit_method_signature_diagnostics(node.methods);
                 }
                 NodeKind::ClassDeclaration => {
@@ -3510,7 +3499,8 @@ type struct TypeResolutionPasses {
                     runner.resolve_fields(node.fields, &class_ctx);
                     field_count += node.fields.length;
                     runner.resolve_inline_method_signatures(
-                        node.name, SymbolStr::empty(), node.methods, &class_ctx);
+                        ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file),
+                        node.methods, &class_ctx);
                     runner.emit_method_signature_diagnostics(node.methods);
                 }
                 NodeKind::ImplementationBlock => {
@@ -3908,7 +3898,7 @@ type struct TypeResolutionPasses {
                     const node: StructDeclNode* = stmt as StructDeclNode*;
                     if (node.is_generic()) { continue; }
 
-                    const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
+                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
                     const type_ref: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                     if (!type_ref.is_valid()) { continue; }
 
@@ -3987,7 +3977,7 @@ type struct TypeResolutionPasses {
                     const node: UnionDeclNode* = stmt as UnionDeclNode*;
                     if (node.is_generic()) { continue; }
 
-                    const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
+                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
                     const type_ref: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                     if (!type_ref.is_valid()) { continue; }
 
@@ -4146,7 +4136,7 @@ type struct TypeResolutionPasses {
                                 .def_id().qualified_name();
                         mut base_ref: TypeRef = TypeRef::invalid();
                         if (base_q.is_valid()) {
-                            base_ref = arena.lookup_by_name(base_q);
+                            base_ref = ctx.decl_index.lookup_type(base_q);
                         }
                         if (base_ref.is_valid()) {
                             ct.set_base_class(base_ref);
@@ -4175,14 +4165,8 @@ type struct TypeResolutionPasses {
                 NodeKind::EnumDeclaration => {
                     const node: EnumDeclNode* = stmt as EnumDeclNode*;
 
-                    const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
-                    mut type_ref: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
-                    if (!type_ref.is_valid()) {
-                        type_ref = arena.lookup_by_name(qualified_sym);
-                    }
-                    if (!type_ref.is_valid()) {
-                        type_ref = arena.lookup_by_name(node.name);
-                    }
+                    const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
+                    const type_ref: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                     if (!type_ref.is_valid()) { continue; }
 
                     const base_type: Type* = arena.lookup(type_ref.id);
