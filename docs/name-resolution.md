@@ -27,7 +27,7 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at the commit carrying §8.193; `git log
+Checks run from the repo root. Verified at the commit carrying §8.194; `git log
 --oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
@@ -53,7 +53,7 @@ current-state description is the defect it exists to remove.
 | D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 46 of the 97 unasserted rows retired, 51 left (31 context, 9 B2, 11 B3); of the asserted rows, seventeen whose only sites were deleted went with them (one in §8.170, five in §8.171, two in §8.173, six in §8.174, three in §8.188, four in §8.193; `b1-baseline.txt` re-pinned on both hosts each time, 62 → 53 rows per arm at §8.188, 49 at §8.193) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1302** | §8.66, §8.80, §8.139, §8.174, §8.183, §8.188, §8.193 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
-| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **580** (+1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **581** (+1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 in §8.194, a project) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
 | D16 | **An impl head writes EVERY parameter of the template it names, or names a concrete instantiation; an elided parameter is an error** - whether all of them default (`implement trait Display for String` with `String<A = GlobalAlloc>`) or only the trailing ones (`implement<T> trait Display for Array<T>` with `Array<T, A = GlobalAlloc>`). Write `implement<A> trait Display for String<A>` or `implement trait Display for String<GlobalAlloc>`. Rust's model: `impl Display for Vec` is missing its parameters and is not given a default meaning, and `impl<T> Trait for Vec<T>` is not written either | **TAKEN** (ruled by Jake 2026-09-13 for the bare form, 2026-09-14 for every elided parameter; built in §8.190) — E0302 from `refuse_elided_template_params` where type resolution attaches a WRITTEN head to its template, naming the template, both counts and both spellings, the parameter form first; the 11 heads rewritten as the instantiation each meant; a head's `target_args` is what it writes after the target on EVERY kind of head (an inherent head's list also declares its names); sema's writer-module lookup deleted. The concrete spelling is accepted but not yet HONOURED by impl selection (a `Named` target argument is bound as a parameter name) - parked | `python3 scripts/impl-head-elided-params.py --count` → **bare=0,partial=0,unmatched=0**; `grep -c 'refuse_elided_template_params' compiler/src/compiler/passes/type_resolution.cryo` → **2**; `grep -c '^negative E0302' tests/test-roster.txt` → **2** | §8.180, §8.181, §8.187, §8.190 |
 | D17 | **An `extern "C"` function is public unless marked `private`** — the extern-visibility default `docs/cryo.md` §18.1 states | **RULED** (Jake, 2026-09-14) — built in §8.167 by a worker and carried as unconfirmed until ratified; the spec text is normative, not provisional | `grep -c 'mut ext_public: boolean = true;' compiler/src/compiler/parser/parser.cryo` → **1**; `grep -c 'unless written .private function' docs/cryo.md` → **1** | §8.167, §8.187 |
@@ -88,7 +88,10 @@ three, and its row carries the count. Read each zero off its own row.
 | bare function-return registration (`type_resolution.cryo`: `register_function(func.name, …)` for a free function and for an intrinsic, `func_returns` keyed by the LEAF, last writer wins) | **STARVED for free functions, LIVE for `extern "C"`** — measured over six halves in §8.190: every bare hit is an extern asked by its C symbol (`_errno`, `malloc`, `_write`, `clang_*`, …), which is its mangled name and the key the pin carries; 0 misses, 0 non-extern hits. The last-writer-wins hazard is two extern blocks declaring one C name, which W0011 reports | — | `grep -c 'register_function(func.name' compiler/src/compiler/passes/type_resolution.cryo` → **1**; `grep -c 'register_function(node.name' compiler/src/compiler/passes/type_resolution.cryo` → **1**; `grep -rho 'lookup_func_return(' compiler/src --include=*.cryo \| wc -l` → **10** (7 + `type_utils`' wrapper, its call, and the definition) | §8.189, §8.190 |
 | a global's thread-local flag and linker symbol by LEAF (`is_global_thread_local` / `global_extern_symbol`: the first registration carrying the leaf; `mark_global_thread_local` writing every slot carrying it; `extern_global_keys`, a map fed under three spellings per imported global) and the directive pass's two cursor keys (`![symbol]` re-recorded under `qualify_symbol_sym`, the layout walk finding a declaration under `qualify_binding_sym` / `qualify_symbol_sym`) | **DELETED** — the four accessors ask `global_slot(leaf, ns)`, the symbol is a column of the registration, `decl_global_key` derives a global's `(key, ns)` once for Phase 4 and the directive pass, the layout walk and sema's class arms read `decl_type_key`; shadow 2 over six halves, both the mutation project's (`global_leaf_collision`: HEAD's compiler links `Plain::probe` to an imported twin's symbol and reads `Plain::counter` through TLS, exit 0 where 14 is right); control 181,619 agreeing; 1 object moved, the project's | — | `grep -c 'extern_global_keys' compiler/src/compiler/decl_index.cryo` → **0**; `grep -c 'global_slot(' compiler/src/compiler/decl_index.cryo` → **6**; `grep -c 'qualify_symbol_sym(' compiler/src/compiler/passes/directive_processing.cryo` → **0**; `grep -rho 'decl_global_key' compiler/src --include=*.cryo \| wc -l` → **3**; `grep -c '^project global_leaf_collision' tests/test-roster.txt` → **1** | §8.166, §8.187 |
 | arena qualified→bare family in TYPE RESOLUTION (`arena.lookup_by_name(` in `type_resolution.cryo`: six miss-fallback pairs after a cursor-keyed qualified lookup, and a three-rung ladder in the enum-variant populate) | **DELETED** — a written type declaration is found under its own key (`decl_type_key`), the key Phase 4 mints it under since the same entry, in the DeclarationIndex, once; the arena's name index is asked by nothing in type resolution. Shadow 100,893 lines over six halves, all `agree`, bare rung 0, index = arena at every one of 71,769 lookups; control 2,247 `new-only` with the qualified rung disabled, bare rung rescuing 0 - the arena holds no bare key for a declared type and a specialization never reaches these arms; 0 objects moved. The two arena name lookups left in the compiler are the resolver's second store behind the index in 2c and TemplateRegistration's base type, both by a canonical key, now pinned by `lane-check`'s `LOOKUP_ARENA` row | — | `grep -c 'arena.lookup_by_name(' compiler/src/compiler/passes/type_resolution.cryo` → **0**; `grep -rho 'arena.lookup_by_name(' compiler/src --include=*.cryo \| wc -l` → **2**; `grep -c 'decl_type_key' compiler/src/compiler/passes/type_resolution.cryo` → **16**; `grep -c 'decl_type_key' compiler/src/compiler/passes/pass_registry.cryo` → **12** | §8.156, §8.187, §8.192 |
-| `GenericRegistry`'s inherent-owner and inherent-impl-block indexes under TWO keys (the target's canonical name and its bare leaf, the owner index last-writer-wins per leaf; readers probing `bare_name_of` then `get_qualified_name`) | **DELETED** — one key (`inherent_key_of`: a declared type's qualified name, a primitive's spelling), the bare registrations and the bare fallbacks gone; measured over six halves: 5,581,523 owner lookups, **97 bare hits, every one an unrelated non-generic type of the receiver's leaf** (`Pair<i32,i32>` → a test's `Pair`); the block index's 18,582 bare hits all primitive spellings, which survive as the primitive's only key; pinned by `inherent_owner_leaf_collision` (HEAD's compiler specializes the wrong owner's method and fails to link, exit 71 now). The trait-impl SCANS' two spellings (`bare_name_of` beside the qualified name, ranked identity-before-leaf, §8.171) are a different shape and stay | — | `grep -c 'inherent_key_of' compiler/src/compiler/mono/call_specializer.cryo` → **3**; `grep -c 'register_inherent_owner(' compiler/src/compiler/passes/specialization.cryo` → **5** (3 callers, the definition, its one registration); `grep -c 'bare_name_of' compiler/src/compiler/mono/call_specializer.cryo` → **4**; `grep -c 'bare_name_of' compiler/src/compiler/sema/method_binding.cryo` → **5**; `grep -c '^project inherent_owner_leaf_collision' tests/test-roster.txt` → **1** | §8.180, §8.187, §8.193 |
+| `GenericRegistry`'s inherent-owner and inherent-impl-block indexes under TWO keys (the target's canonical name and its bare leaf, the owner index last-writer-wins per leaf; readers probing `bare_name_of` then `get_qualified_name`) | **DELETED** — one key (`inherent_key_of`: a declared type's qualified name, a primitive's spelling), the bare registrations and the bare fallbacks gone; measured over six halves: 5,581,523 owner lookups, **97 bare hits, every one an unrelated non-generic type of the receiver's leaf** (`Pair<i32,i32>` → a test's `Pair`); the block index's 18,582 bare hits all primitive spellings, which survive as the primitive's only key; pinned by `inherent_owner_leaf_collision` (HEAD's compiler specializes the wrong owner's method and fails to link, exit 71 now) | — | `grep -c 'inherent_key_of' compiler/src/compiler/mono/call_specializer.cryo` → **3**; `grep -c 'register_inherent_owner(' compiler/src/compiler/passes/specialization.cryo` → **5** (3 callers, the definition, its one registration); `grep -c '^project inherent_owner_leaf_collision' tests/test-roster.txt` → **1** | §8.180, §8.187, §8.193 |
+| trait-impl SCANS by the receiver's LEAF (`impl_target_rank`'s rank 1 over `bare_name_of` / the qualified name's tail at three `method_binding` scans; `find_trait_impl_method_for_target`'s and `find_self_returning_default`'s bare second pass; `traits_implemented_by(bare_name_of(..))` at three readers; `lookup_method_through_trait_impls`' leaf retry) | **DELETED** — one key from a receiver, `TraitChecker::template_key_of` (a primitive's spelling, an instantiation's TEMPLATE name, a declared type's own name); `impl_target_rank(impl, qname, tkey)` is the clone placed under this specialization (2), then the template's or the primitive's (1), a leaf never; shadow 581,960 scan answers over six halves, the leaf rank's 177 all primitives, 10,704 receivers the old scan could not see (primitives in sema, unresolved wrappers); 618,587 trait-list reads, 2,306 differing (1,751 synthesized futures the leaf never found, 555 foreign same-leaf traits); leaf retry 1,093 reached, 0 answered; 0 objects moved; pinned by `trait_default_leaf_collision` (HEAD binds another module's `Cell` impl at three rungs, sema silent, E0636 at codegen; E0358 at the call now) | — | `grep -rho 'bare_name_of' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'template_key_of' compiler/src --include=*.cryo \| wc -l` → **27**; `grep -c 'bare_leaf_of_qualified' compiler/src/compiler/sema/method_binding.cryo` → **0**; `grep -c '^project trait_default_leaf_collision' tests/test-roster.txt` → **1** | §8.171, §8.194 |
+| trait-impl registry's TRAIT half under two spellings (the bare table keyed by the trait annotation's WRITTEN name via `extract_trait_leaf`, the precise index `trait_impls_typed` by its LEAF; `resolve_trait_impl_for_type` and `type_has_drop_impl` reading the precise index behind `precise_trait_leaf` with a leaf fallback; stage 3's registration under the target's written spelling) | **LIVE** — measured in §8.194's ownership shadow: 193,199 answers, **9** where the precise index and a single-table lookup disagree - a head written `implement trait LeafDispatchA::Pulse` (3) and `Alpha::Render` / `Omega::Render` for one `Shape` collapsing to one precise entry (6). The key is the head's `qualified_trait_name`; the readers pass leaves | — | `grep -c 'register_trait_impl_typed' compiler/src/compiler/types/generic_registry.cryo` → **1**; `grep -rho 'registry_name_of' compiler/src --include=*.cryo \| wc -l` → **8**; `grep -c 'register_trait_impl(' compiler/src/compiler/passes/specialization.cryo` → **2** | §8.194 |
+| annotation-leaf trait checks (`name_implements` / `name_implements_trait` asking `traits_implemented_by` by an impl's WRITTEN trait-argument head; `TypeResolver::proj_bare_name` compared to a written bound base's leaf) | LIVE — a leaf beside a leaf; the annotation is what must resolve | — | `grep -c 'ann_head_leaf' compiler/src/compiler/sema/method_binding.cryo` → **5**; `grep -c 'proj_bare_name' compiler/src/compiler/types/resolver.cryo` → **6** | §8.194 |
 | codegen synthesizing the allocator by bare leaf (`expr_ops.cryo`: `resolve_function("malloc")` at three sites, `"free"` behind a rung the `std::alloc::allocator::free` shim answers first) | **LIVE, and the leaf rungs STARVED** — measured at `f120271b` and under the pin: both shim rungs answer (`…allocator::alloc` 1, `…allocator::free` 1), a scratch `new Owned{..}`/`delete o` references `C$3std.5alloc.9allocator.5alloc$Fm_m$RPv` and `…4free$FPv_m$Rv`, so `new`/`delete` are PAIRED through `GlobalAlloc`, not split, and the `malloc`/`free` leaves answer only with the allocator module out of the DI (`no_std`). §8.93's "the first branch never answers" was measured on the array-literal RELEASE path and does not describe `delete`. D6's "one path" is sema's; the calls codegen synthesizes should name the canonical symbol or the intrinsic, never a leaf | — | `grep -c 'intern_str("malloc")' compiler/src/compiler/codegen/ops/expr_ops.cryo` → **3** (0 when done); `grep -c 'intern_str("free")' compiler/src/compiler/codegen/ops/expr_ops.cryo` → **1** (0 when done) | §8.93, §8.177, §8.187, §8.189 |
 | `resolve_scope_call`'s four-rung try-ladder (static method → variant → module function → C import) and `resolve_function_by_mangled`'s symbol-then-family | **LIVE** — the path's stamp says which kind the segment names; a try-ladder asks all four | — | `grep -rho 'resolve_scope_call' compiler/src --include=*.cryo \| wc -l` → **3**; `grep -c 'resolve_family(pinned, -1)' compiler/src/compiler/codegen/ops/symbol_resolver.cryo` → **1** | §8.175, §8.187 |
 | type cascade (`lookup_type_by_sym`, 4 steps) | **DELETED** — `lookup_type_exact`, one step; the audit stream and its four counter rows went with it | — | `grep -rho 'lookup_type_by_sym' compiler/src --include=*.cryo \| wc -l` → **0** | §8.154 |
@@ -161,7 +164,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,122 unit + 51 project + 183 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
+| `make test` | 2,122 unit + 52 project + 183 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make b1-check` | B1 total + every per-row bound, 3 corpora × 2 hosts | **2 of the 3 corpora are `examples/`**; the third is `tests/tests/projects/ffi_c_import`. The compiler's own source is NOT a corpus, and `tests/` at large is swept by none of them. |
 | `make lane-check` | 8 buckets of call sites in `compiler/src`, as a golden; REENTRY counts `get_resolver()` AND a cursor move through the `name_resolver` field since §8.189 (it read 3 over a tree holding 6: the monomorphizer's `find_module_scope`/`set_module`/`restore_scope`); `LOOKUP_ARENA` counts the arena's `lookup_by_name` since §8.192 (it read OK over a tree holding 17 in `type_resolution.cryo`) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
@@ -187,7 +190,7 @@ Checks for this section, one per line so each can be copied whole:
 
 * `grep -c '^\[' tests/lane-baseline.txt` → **8**
 * `grep -c '^\[host:' tests/b1-baseline.txt` → **6**
-* `grep -c '^project ' tests/test-roster.txt` → **51**
+* `grep -c '^project ' tests/test-roster.txt` → **52**
 * `grep -c '^negative ' tests/test-roster.txt` → **183**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
@@ -9696,6 +9699,120 @@ symbol-then-family.  Parked for Jake: D5, the keyword ruling, §8.93, the
 plain-form import, the expression-position refusal (§8.189, now also a
 head's argument position), concrete-argument impl selection (§8.190), the
 no-leading-list trait heads above, the LSP.
+
+### 8.194 Consumer 48: the trait-impl scans take one key per receiver; the leaf rank, the two bare passes and the leaf retry deleted - 2026-09-14
+
+The trait-impl registry's readers that SCAN it - three in `method_binding.cryo`
+(the turbofish method, the inferred generic method, the projection reducer) and
+two in `call_specializer.cryo` (`find_trait_impl_method_for_target`,
+`find_self_returning_default`) - asked with two spellings of the receiver: its
+qualified name, and its LEAF (`bare_name_of`, or the tail of the qualified
+name), the leaf answering wherever the identity had not (`impl_target_rank`'s
+rank 1, the two functions' "pass 2").  §8.171 ranked the leaf beneath the
+identity and named rank 1's population: a monomorphized clone with no stamp,
+and a primitive.  Since §8.188 a clone's `target_key` is its specialization's
+name and a primitive's is its spelling, so both are identities; what a leaf
+could still answer was an impl for an UNRELATED same-leaf type.  Three more
+readers asked `traits_implemented_by` by the same leaf
+(`find_generic_trait_default`, `projection_default_unavailable`,
+`diagnose_method_bounds_failure`), and `lookup_method_through_trait_impls`
+retried a qualified miss under the leaf.
+
+One key from a receiver now: `TraitChecker::template_key_of` - a primitive's
+spelling, the TEMPLATE's qualified name for an instantiation (a pre-mono
+wrapper or a post-mono concrete alike), a declared type's own qualified name.
+`impl_target_rank(impl, qname, tkey)` compares the head's `target_key` against
+the receiver's own name (2: the clone placed under this specialization) and
+then its template key (1); a leaf never enters.  The two mono functions take
+the receiver and make the same two passes under the same two keys.  The
+`traits_implemented_by` readers ask by the template key; the leaf retry is
+deleted; `bare_name_of` is deleted with its `MonoTraitSpecializer` wrapper.
+
+#### Measured
+
+Every scan answer printed over the six halves (the LSP built directly, the
+unit suite, 49 projects one by one, the `collect` projects' own tests, 14
+examples, 183 negatives), old answer beside new, **581,960 lines**:
+
+| site | none | spec identity (2) | old leaf (1) | DIFFER |
+|---|---|---|---|---|
+| `find_generic_method_in_trait_impls` | 406,138 | 7,958 | 0 | **10,692** |
+| `find_method_in_trait_impls` | 0 | 81 | 0 | **12** |
+| projection reducer | 0 | 24 | 0 | 0 |
+| `find_trait_impl_method_for_target` | 76,706 | 455 | **177** | 0 |
+| `find_self_returning_default` | 79,711 | 6 | 0 | 0 |
+
+The 177 leaf answers are all primitive receivers (`string` 94, `f64` 30,
+`i32` 17, `i64` 9, `u32` 8, `u64` 5, `u8`, `boolean`, `usize`, `char`): a
+primitive's spelling is its key, and the new pass finds the same impl by it.
+The 10,704 DIFFER are receivers the old scan could not see at all, both
+`old=0 new=1`: 10,692 primitives - the sema scans derived their leaf from the
+qualified name, which a primitive lacks, so every `u64.fmt<W>()` fell past
+them to `find_generic_trait_default` and bound the trait DECL's default where
+the impl's own method now binds - and 12 unresolved `InstantiatedType`
+wrappers (`BufStream<S>` ×11 in `io/buf.cryo`, `TdgHolder` ×1) in template
+bodies, whose qualified name is empty before resolution and whose template
+key peels to the template.  Predicted 0 objects for both (the same
+declaration once specialized; template bodies emit nothing); measured
+**examples 0 of 1,126, tests 0 of 2,297**.
+
+The `traits_implemented_by` readers, leaf list beside template-key list:
+618,587 calls, 616,281 agree, **2,306 DIFFER** in two shapes.  1,751 are the
+async lowering's synthesized future structs (`BufStream$read_line$Future_5`
+…), registered under their qualified name alone, so the leaf listed NOTHING
+and the key lists `Future` - which declares no default and no generic method,
+so neither reader's answer moves.  555 are the foreign shape: the leaf list
+carried traits of OTHER same-leaf types - `Generics::Counter` (no impls)
+listed as implementing `Iterator` because a test's `Counter` does, stdlib
+`Pair` as `Run`, a `Probe` as `Fixture`.  The leaf retry of
+`lookup_method_through_trait_impls`: 1,093 reached, **0** answered.
+
+**Control**: the identity rung disabled for one build, so the old scan is
+its leaf rung alone.  Over `trait_impl_target_leaf_collision` the instrument
+printed `mb_find_generic DIFFER old=1 new=2`, the old answer Omega's `Cell`
+impl for an Alpha `Cell` receiver, and the project failed to build - the
+§8.171 shape, reported by this instrument.
+
+**The population the corpus lacked**, built:
+`tests/tests/projects/trait_default_leaf_collision`.  `Alpha::Cell`
+implements `Feed<int>`, whose generic default `twice<B>` calls `seed`;
+`Omega::Cell` implements nothing and carries an inherent `seed`.
+`Omega::Cell.twice(0)` under HEAD: **three** leaf rungs answered Alpha's impl
+for Omega's receiver (`find_generic_method_in_trait_impls` rank 1, mono's
+pass 2, and the leaf retry - its first answer ever), sema accepted the call,
+and codegen refused it late with E0636 "no method `twice`".  Now E0358 at the
+call.  `trait_impl_target_leaf_collision` still builds and runs 0.
+
+Suite green (2,122 unit, 183 negative, 49 projects on this host, +1);
+`lsp-check`, `cross-check` green before the object run; `lane-check` and
+`b1-check` unmoved; roster merged (52 projects).
+
+**Tally: 48 shadowed, 48 old paths deleted, 47 at zero and one at §8.93's
+allocator residue; 58 artifacts gone** (+ `impl_target_rank`'s leaf rank, +
+the two mono functions' bare passes, + the leaf retry, + `bare_name_of`).
+
+#### What this leaves
+
+The trait-impl registry's TRAIT half is the same shape one key over: the bare
+table is keyed by the trait's WRITTEN spelling (`extract_trait_leaf` returns
+the `Named` annotation's name whole), the precise index by its leaf, and the
+readers of `resolve_trait_impl_for_type` pass a leaf (`dispatch_leaf`).  The
+ownership path's shadow found it: 9 of 193,199 answers DIFFER between the
+precise index and a single-table lookup - `implement trait
+LeafDispatchA::Pulse for struct Cell` written qualified (3), and
+`Alpha::Render` / `Omega::Render` for one `Shape` collapsing to one entry in
+the precise index (6), the `trait_leaf_dispatch` shape one table over.  The
+key is `ImplBlockNode.qualified_trait_name`; the readers must carry it.  With
+it go `trait_impls_typed`, `precise_trait_leaf` and their five accessors,
+`registry_name_of` / `named_qualified_id`, and stage 3's leaf registration.
+Also by leaf, a different consumer: the annotation-leaf comparisons
+(`name_implements` / `name_implements_trait` over an impl's written trait
+argument, `proj_bare_name` against a written bound base).
+`resolve_function_by_mangled`'s symbol-then-family; `qualify_symbol_sym_home`.
+Parked for Jake: D5, the keyword ruling, §8.93, the plain-form import, the
+expression-position refusal (§8.189, also a head's argument position),
+concrete-argument impl selection (§8.190), the no-leading-list trait heads
+(§8.193), the LSP.
 
 ---
 

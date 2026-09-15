@@ -935,12 +935,10 @@ type struct MonoCallSpecializer {
             }
             if (orig_method == null) {
                 // Synthesized/hand-written generic trait method on a non-generic
-                // user type (e.g. a `Display::fmt<W>` keyed by the bare target).
-                const bare: SymbolStr = this.trait_spec.bare_name_of(recv_type);
-                const recv_q: SymbolStr = this.arena.get_qualified_name(recv_type);
+                // user type (e.g. a `Display::fmt<W>`).
                 mut cand_impl: ImplBlockNode* = null;
                 const cand: MethodNode* = this.find_trait_impl_method_for_target(
-                    bare, ma.member, ma.resolved_trait, recv_q, &cand_impl);
+                    recv_type, ma.member, ma.resolved_trait, &cand_impl);
                 if (cand != null && cand.func != null
                         && (cand.func.is_synth_default || cand.func.is_generic())) {
                     orig_method = cand;
@@ -948,14 +946,12 @@ type struct MonoCallSpecializer {
                 }
             }
         } else {
-            const bare: SymbolStr = this.trait_spec.bare_name_of(recv_type);
-            const recv_q: SymbolStr = this.arena.get_qualified_name(recv_type);
             orig_method = this.find_trait_impl_method_for_target(
-                bare, ma.member, ma.resolved_trait, recv_q, &impl_node);
+                recv_type, ma.member, ma.resolved_trait, &impl_node);
             // Inherent (non-trait) generic method on a primitive receiver
             // (`"42".parse_int<u64>()` on `implement string`).  Not in the
             // trait-impl registry; consult the inherent-impl registry, keyed by
-            // the receiver's bare name, and route the spec through the impl_node
+            // the receiver's spelling, and route the spec through the impl_node
             // path below (push onto impl_node.methods + DI-register).
             if (orig_method == null && this.generic_registry != null) {
                 orig_method = this.generic_registry.find_inherent_impl_generic_method(
@@ -1934,51 +1930,49 @@ type struct MonoCallSpecializer {
         return null;
     }
 
-    /// Trait-impl-registry method lookup keyed by the bare target name (primitive
-    /// receivers + the synthesized-default fourth path).  Bound-directed dispatch.
-    find_trait_impl_method_for_target(&this, bare_target_name: SymbolStr,
+    /// A generic method (own type parameters) named `method_name` in a trait
+    /// impl for `recv_type`, from the trait-impl registry: a primitive's impl,
+    /// or a synthesized default on a non-generic user type.  Bound-directed:
+    /// among the receiver's impls, one providing `preferred_trait` wins.
+    ///
+    /// Two passes over the same key space, ranked as `impl_target_rank` ranks:
+    /// the impl FOR this specialization (a clone the monomorphizer placed
+    /// under the receiver's own qualified name) first, then the template's or
+    /// the primitive's under `template_key_of`.  Never by leaf - two modules'
+    /// same-leaf types are two keys, and the answer for one was the other's.
+    find_trait_impl_method_for_target(&this, recv_type: TypeRef,
                                       method_name: SymbolStr,
                                       preferred_trait: SymbolStr,
-                                      qualified_target: SymbolStr,
                                       out_impl: ImplBlockNode**) -> MethodNode* {
-        if (!bare_target_name.is_valid()) { return null; }
         const registry: GenericRegistry* = this.generic_registry;
         if (registry == null) { return null; }
-        // Pass 1: QUALIFIED-name match. Two modules can each define a same-leaf
-        // `struct UpTo` implementing the same trait; matching only the bare leaf
-        // returns whichever impl registered first and specializes a generic trait
-        // method (`map<B>` / `fold<Acc>`) against the WRONG type -> codegen E0636.
-        // Prefer the impl whose qualified target matches this receiver.
-        if (qualified_target.is_valid()) {
-            mut q_first_m: MethodNode* = null;
-            mut q_first_impl: ImplBlockNode* = null;
-            for (mut i: i64 = 0; i < registry.trait_impls.length; i++) {
-                const impl_node: ImplBlockNode* = registry.trait_impls[i].second;
-                if (impl_node == null) { continue; }
-                if (!this.impl_targets(impl_node, qualified_target)) { continue; }
-                for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
-                    const m: MethodNode* = impl_node.methods[k];
-                    if (m == null || m.func == null) { continue; }
-                    if (!m.func.name.equals(method_name)) { continue; }
-                    if (m.func.generic_params.length == 0) { continue; }
-                    if (preferred_trait.is_valid() && impl_node.is_trait_impl()
-                            && this.impl_provides_trait(impl_node, preferred_trait)) {
-                        *out_impl = impl_node;
-                        return m;
-                    }
-                    if (q_first_m == null) { q_first_m = m; q_first_impl = impl_node; }
-                }
-            }
-            if (q_first_m != null) { *out_impl = q_first_impl; return q_first_m; }
+        const recv_q: SymbolStr = this.arena.get_qualified_name(recv_type);
+        const tkey: SymbolStr = this.trait_spec.template_key_of(recv_type);
+        if (recv_q.is_valid()) {
+            const m: MethodNode* = this.find_generic_trait_method_under(
+                recv_q, method_name, preferred_trait, out_impl);
+            if (m != null) { return m; }
         }
-        // Pass 2: bare-name fallback (original behavior - single-impl programs,
-        // and impls whose qualified target is unavailable).
+        if (tkey.is_valid() && !tkey.equals(recv_q)) {
+            return this.find_generic_trait_method_under(
+                tkey, method_name, preferred_trait, out_impl);
+        }
+        return null;
+    }
+
+    /// One pass of `find_trait_impl_method_for_target`: the impls whose key
+    /// is `target_key`, the one providing `preferred_trait` first.
+    find_generic_trait_method_under(&this, target_key: SymbolStr,
+                                    method_name: SymbolStr,
+                                    preferred_trait: SymbolStr,
+                                    out_impl: ImplBlockNode**) -> MethodNode* {
+        const registry: GenericRegistry* = this.generic_registry;
         mut first_m: MethodNode* = null;
         mut first_impl: ImplBlockNode* = null;
         for (mut i: i64 = 0; i < registry.trait_impls.length; i++) {
             const impl_node: ImplBlockNode* = registry.trait_impls[i].second;
             if (impl_node == null) { continue; }
-            if (!impl_node.target_type.equals(bare_target_name)) { continue; }
+            if (!this.impl_targets(impl_node, target_key)) { continue; }
             for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
                 const m: MethodNode* = impl_node.methods[k];
                 if (m == null || m.func == null) { continue; }
@@ -1997,7 +1991,8 @@ type struct MonoCallSpecializer {
     }
 
     /// Find a self-returning trait default (combinator) regardless of own-generic
-    /// count: receiver's spec'd impls first, then the bare-name trait-impl registry.
+    /// count: receiver's spec'd impls first, then the trait-impl registry under
+    /// the receiver's own key, then under its template's.
     find_self_returning_default(&this, recv_type: TypeRef, method_name: SymbolStr,
                                 out_impl: ImplBlockNode**) -> MethodNode* {
         for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
@@ -2018,30 +2013,29 @@ type struct MonoCallSpecializer {
             }
         }
         if (this.generic_registry == null) { return null; }
-        const bare: SymbolStr = this.trait_spec.bare_name_of(recv_type);
-        if (!bare.is_valid()) { return null; }
-        // Pass 1: precise QUALIFIED-name match. Two modules can each define a
-        // `struct UpTo` implementing the same trait; keying only on the bare leaf
-        // would return whichever impl is registered first and specialize the
-        // adapter against the WRONG type (codegen then can't find the method on
-        // the actual receiver -> E0636). Prefer the impl whose qualified target
-        // matches this receiver's qualified name.
+        // The impl FOR this specialization first (a placed clone, under the
+        // receiver's own qualified name), then the template's or the
+        // primitive's - the same ranking as `impl_target_rank`.
         const recv_qname: SymbolStr = this.arena.get_qualified_name(recv_type);
         if (recv_qname.is_valid()) {
-            for (mut i: i64 = 0; i < this.generic_registry.trait_impls.length; i++) {
-                const impl_node: ImplBlockNode* = this.generic_registry.trait_impls[i].second;
-                if (impl_node == null) { continue; }
-                if (!this.impl_targets(impl_node, recv_qname)) { continue; }
-                const m: MethodNode* = this.find_self_ret_method_in_impl(impl_node, method_name);
-                if (m != null) { *out_impl = impl_node; return m; }
-            }
+            const m: MethodNode* = this.find_self_ret_method_under(recv_qname, method_name, out_impl);
+            if (m != null) { return m; }
         }
-        // Pass 2: bare-name fallback for impls without a qualified target (or a
-        // primitive receiver whose qualified name is unavailable).
+        const tkey: SymbolStr = this.trait_spec.template_key_of(recv_type);
+        if (tkey.is_valid() && !tkey.equals(recv_qname)) {
+            return this.find_self_ret_method_under(tkey, method_name, out_impl);
+        }
+        return null;
+    }
+
+    /// One pass of `find_self_returning_default`: the impls whose key is
+    /// `target_key`, in registration order.
+    find_self_ret_method_under(&this, target_key: SymbolStr, method_name: SymbolStr,
+                               out_impl: ImplBlockNode**) -> MethodNode* {
         for (mut i: i64 = 0; i < this.generic_registry.trait_impls.length; i++) {
             const impl_node: ImplBlockNode* = this.generic_registry.trait_impls[i].second;
             if (impl_node == null) { continue; }
-            if (!impl_node.target_type.equals(bare)) { continue; }
+            if (!this.impl_targets(impl_node, target_key)) { continue; }
             const m: MethodNode* = this.find_self_ret_method_in_impl(impl_node, method_name);
             if (m != null) { *out_impl = impl_node; return m; }
         }
@@ -2493,7 +2487,7 @@ type struct MonoCallSpecializer {
     inherent_key_of(&this, recv_type: TypeRef) -> SymbolStr {
         const qname: SymbolStr = this.arena.get_qualified_name(recv_type);
         if (qname.is_valid()) { return qname; }
-        return this.trait_spec.bare_name_of(recv_type);
+        return this.trait_spec.template_key_of(recv_type);
     }
 
     /// The template a scope-qualified call names: the one the scope segment's

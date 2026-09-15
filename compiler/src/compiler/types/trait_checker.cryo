@@ -163,18 +163,11 @@ type struct TraitChecker {
         }
 
         // The subject is used directly, whether it is a pre-mono InstantiatedType
-        // wrapper or a post-mono concrete spec: both `bare_name_of` and the
+        // wrapper or a post-mono concrete spec: both `template_key_of` and the
         // type-arg substitution below read the instantiation identity through the
         // `inst_*` views, and a concrete carries that identity itself.
-        //
-        // (This used to swap in the origin carrier first, because a concrete spec
-        // struct's bare name is its MANGLED spec name (`5Range$Li$G`) and the
-        // trait-impl registry is keyed on the template's bare name (`Range`), so
-        // the impl was wrongly dropped.  `bare_name_of` now resolves a concrete to
-        // its template, so the swap is unnecessary.)
         const subject: TypeRef = ty;
-        const target_name: SymbolStr = this.bare_name_of(subject);
-        if (!target_name.is_valid()) { return false; }
+        if (!this.template_key_of(subject).is_valid()) { return false; }
         // Collision-proof: resolve the impl by the subject's canonical
         // qualified-name identity so a same-leaf type in another module doesn't
         // inherit this trait's impl (falls back to the bare lookup when the
@@ -269,11 +262,11 @@ type struct TraitChecker {
     type_satisfies_opaque_bound(&this, ty: TypeRef, trait_name: SymbolStr) -> boolean {
         if (this.type_implements_trait(ty, trait_name, 0)) { return true; }
         if (this.generic_registry == null) { return false; }
-        // No carrier swap needed: `bare_name_of` resolves a post-mono concrete to
-        // its template, and `resolve_trait_impl_for_type` keys off the same.
+        // No carrier swap needed: `template_key_of` resolves a post-mono
+        // concrete to its template, and `resolve_trait_impl_for_type` keys off
+        // the same.
         const subject: TypeRef = ty;
-        const target_name: SymbolStr = this.bare_name_of(subject);
-        if (!target_name.is_valid()) { return false; }
+        if (!this.template_key_of(subject).is_valid()) { return false; }
         return OwnershipQuery::resolve_trait_impl_for_type(this.arena,
             this.generic_registry, this.intern_table,
             this.dispatch_leaf(trait_name), subject) != null;
@@ -293,14 +286,11 @@ type struct TraitChecker {
 
         // Sema typically passes the spec'd concrete type (e.g. the Enum for
         // `Result_int_OpaqueErr`) rather than an InstantiatedType wrapper.  Trait
-        // impls are registered against the TEMPLATE's bare name (`Result`), and
-        // `bare_name_of` resolves a concrete to its template through its intrinsic
-        // generic identity - so the receiver is probed directly.  (This used to
-        // swap in the origin carrier first; without that, the registry lookup
-        // missed every template impl and fell through to the generic
-        // "method not found" diagnostic.)
+        // impls are registered against the TEMPLATE's name (`Result`), and
+        // `template_key_of` resolves a concrete to its template through its
+        // intrinsic generic identity - so the receiver is probed directly.
         const probe_ref: TypeRef = receiver;
-        const base_name: SymbolStr = this.bare_name_of(probe_ref);
+        const base_name: SymbolStr = this.template_key_of(probe_ref);
         if (!base_name.is_valid()) { return SymbolStr::empty(); }
         const traits: SymbolStr[] = this.generic_registry.traits_implemented_by(base_name);
         for (mut i: i64 = 0; i < traits.length; i++) {
@@ -422,60 +412,30 @@ type struct TraitChecker {
         return TypeRef::invalid();
     }
 
-    /// Return the bare (unqualified) leaf name of a TypeRef, suitable for
-    /// keying into the trait-impl registry. For primitives, returns the
-    /// display name. For user-defined types, returns the last `::` segment
-    /// of the qualified name. Returns empty when no name is available.
-    bare_name_of(&this, ty: TypeRef) -> SymbolStr {
+    /// The name a trait impl for `ty` is registered under - the one key the
+    /// trait-impl table is asked by from a receiver.  A primitive's spelling
+    /// (`i32`, `string`, `()`), which is the only name a primitive has; the
+    /// TEMPLATE's qualified name for an instantiation, whether a pre-mono
+    /// `InstantiatedType` wrapper or a post-mono concrete carrying its own
+    /// base (`implement<T> trait Hash for String<T>` is keyed by `String`'s
+    /// name, whichever `String<A>` asks); a declared type's own qualified
+    /// name otherwise.  Empty for a type no trait can be implemented for by
+    /// name.  Never a leaf: two modules' same-leaf types are two keys.
+    template_key_of(&this, ty: TypeRef) -> SymbolStr {
         const t: Type* = this.arena.lookup(ty.id);
         if (t == null) { return SymbolStr::empty(); }
-        // Primitives carry their name as display_name (e.g. "i32").  Unit
-        // hashes under "()" so `implement trait Drop for ()` (and any
-        // future trait impls on the unit type) round-trip through the
-        // registry.  Void has no value-level uses outside return types,
-        // so it stays empty.
         const k: TypeKind = t.kind;
         if (k == TypeKind::Int || k == TypeKind::Float || k == TypeKind::Bool ||
             k == TypeKind::Char || k == TypeKind::String) {
             return this.intern_table.intern(t.display_name());
         }
-        if (k == TypeKind::Unit) {
-            return this.intern_table.intern("()");
-        }
-        if (k == TypeKind::Void) {
-            return SymbolStr::empty();
-        }
-        // Generic instantiations: trait impls are registered against the
-        // TEMPLATE's bare name (e.g. `implement trait Hash for String`
-        // registers `(Hash, String)` regardless of which `String<A>` spec
-        // the bound is being checked for). Recurse on `generic_base`
-        // instead of unwrapping through `resolved_type`, so a spec like
-        // `String<GlobalAlloc>` keys against `String`.
-        //
-        // `inst_generic_base` covers a pre-mono wrapper AND a post-mono concrete
-        // (which carries its own base).  Handling the concrete HERE is what lets
-        // callers pass a receiver directly: they used to have to swap in the
-        // origin carrier first, because a concrete fell through to the branch
-        // below and keyed against its SPEC name (`String_GlobalAlloc`), which no
-        // registry holds.
+        // Unit hashes under "()" so `implement trait Drop for ()` round-trips
+        // through the registry.  Void has no value-level uses outside return
+        // types, so it stays empty.
+        if (k == TypeKind::Unit) { return this.intern_table.intern("()"); }
+        if (k == TypeKind::Void) { return SymbolStr::empty(); }
         const inst_base: TypeRef = this.arena.inst_generic_base(ty);
-        if (inst_base.is_valid()) {
-            return this.bare_name_of(inst_base);
-        }
-        const qname: SymbolStr = this.arena.get_qualified_name(ty);
-        if (!qname.is_valid()) { return SymbolStr::empty(); }
-        const qstr: string = this.intern_table.resolve(qname);
-        const qlen: i64 = qstr.length() as i64;
-        mut last_sep: i64 = -1;
-        for (mut i: i64 = 0; i + 1 < qlen; i++) {
-            if (qstr[i] == ':' && qstr[i + 1] == ':') { last_sep = i + 2; }
-        }
-        if (last_sep < 0) { return qname; }
-        // The tail is the NUL-terminated suffix of `qstr` from `last_sep`;
-        // point straight at it and intern once.  (Was an O(n^2) char-by-char
-        // `format("%s%c", ...)` rebuild - a top heap consumer in a self-host
-        // build; same fix as `OwnershipQuery::leaf_segment`.)
-        const tail: string = qstr + last_sep;
-        return this.intern_table.intern(tail);
+        if (inst_base.is_valid()) { return this.template_key_of(inst_base); }
+        return this.arena.get_qualified_name(ty);
     }
 }

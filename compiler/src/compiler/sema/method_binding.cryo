@@ -676,16 +676,16 @@ type struct MethodBinding {
     /// (do not block) for symbolic receivers or symbolic Item types.
     projection_default_unavailable(&this, recv_type: TypeRef, method_name: SymbolStr) -> boolean {
         if (this.ctx.generic_registry == null || !method_name.is_valid()) { return false; }
-        const base_name: SymbolStr = this.trait_checker().bare_name_of(recv_type);
-        if (!base_name.is_valid()) { return false; }
-        const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(base_name);
+        const base_key: SymbolStr = this.trait_checker().template_key_of(recv_type);
+        if (!base_key.is_valid()) { return false; }
+        const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(base_key);
         for (mut ti: i64 = 0; ti < traits.length; ti++) {
             // `traits[ti]` is a dispatch leaf, which the decl registry does not
             // accept. The impl head carries the identity that does - read, not
             // searched for. Looked up in the SAME table `traits_implemented_by`
             // scanned, so the pair cannot disagree about what is registered.
             const dimpl: ImplBlockNode* =
-                this.ctx.generic_registry.lookup_trait_impl(traits[ti], base_name);
+                this.ctx.generic_registry.lookup_trait_impl(traits[ti], base_key);
             if (dimpl == null) { continue; }
             const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
                 TypeAnnotation::trait_identity(dimpl.trait_annotation),
@@ -757,46 +757,21 @@ type struct MethodBinding {
         return false;
     }
 
-    /// First matching trait-method return for `target_name` (qualified or bare),
-    /// for default trait methods on a concrete type that doesn't override them.
+    /// First matching trait-method return for the type registered as
+    /// `target_name`, for default trait methods on a concrete type that
+    /// doesn't override them.  Asked under that one name: a leaf would list
+    /// the traits of every same-leaf type in the build.
     lookup_method_through_trait_impls(&this, target_name: SymbolStr,
                                       method_name: SymbolStr) -> TypeRef {
         if (!target_name.is_valid() || this.ctx.generic_registry == null) {
             return TypeRef::invalid();
         }
-        const direct: TypeRef = this.try_trait_impls_for(target_name, method_name);
-        if (direct.is_valid()) { return direct; }
-        const bare: SymbolStr = this.bare_leaf_of_qualified(target_name);
-        if (bare.is_valid() && !bare.equals(target_name)) {
-            return this.try_trait_impls_for(bare, method_name);
-        }
-        return TypeRef::invalid();
-    }
-
-    try_trait_impls_for(&this, target: SymbolStr, method_name: SymbolStr) -> TypeRef {
-        const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(target);
+        const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(target_name);
         for (mut i: i64 = 0; i < traits.length; i++) {
             const ret: TypeRef = this.types.lookup_method_return(traits[i], method_name);
             if (ret.is_valid()) { return ret; }
         }
         return TypeRef::invalid();
-    }
-
-    /// Leaf segment after the final `::`, or the input unchanged when unqualified.
-    bare_leaf_of_qualified(&this, name: SymbolStr) -> SymbolStr {
-        if (!name.is_valid()) { return name; }
-        const s: string = this.intern.resolve(name);
-        const n: i64 = s.length() as i64;
-        mut last_sep: i64 = -1;
-        for (mut i: i64 = 0; i + 1 < n; i++) {
-            if (s[i] == ':' && s[i + 1] == ':') { last_sep = i + 2; }
-        }
-        if (last_sep < 0) { return name; }
-        mut tail: string = "";
-        for (mut i: i64 = last_sep; i < n; i++) {
-            tail = fmt::format("%s%c", tail, s[i] as i32);
-        }
-        return this.intern.intern(tail);
     }
 
     /// Scan registered trait decls for one that defines `method_name`; returns the
@@ -1007,19 +982,19 @@ type struct MethodBinding {
     /// whose own generic-param count matches `n_generic_args`; writes the owning
     /// impl block through `out_impl`.
     ///
-    /// An impl whose stamped identity IS the receiver wins outright; one that
-    /// matches the leaf alone answers only when no such impl exists.  See
-    /// `GenericRegistry::impl_target_rank` for why the order matters.
+    /// The impl for the receiver's own specialization wins outright; the
+    /// template's (or the primitive's) answers only when no such impl exists.
+    /// See `GenericRegistry::impl_target_rank`.
     find_method_in_trait_impls(&this, owner_ref: TypeRef, method_name: SymbolStr,
                                n_generic_args: i64, out_impl: ImplBlockNode**) -> MethodNode* {
         if (this.ctx.generic_registry == null) { return null; }
         const qname: SymbolStr = this.arena.get_qualified_name(owner_ref);
-        const bare: SymbolStr = this.bare_leaf_of_qualified(qname);
+        const tkey: SymbolStr = this.trait_checker().template_key_of(owner_ref);
         mut leaf_m: MethodNode* = null;
         mut leaf_impl: ImplBlockNode* = null;
         for (mut i: i64 = 0; i < this.ctx.generic_registry.trait_impls.length; i++) {
             const impl_node: ImplBlockNode* = this.ctx.generic_registry.trait_impls[i].second;
-            const rank: i32 = GenericRegistry::impl_target_rank(impl_node, qname, bare, this.arena);
+            const rank: i32 = GenericRegistry::impl_target_rank(impl_node, qname, tkey, this.arena);
             if (rank == 0) { continue; }
             for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
                 const m: MethodNode* = impl_node.methods[k];
@@ -1056,14 +1031,14 @@ type struct MethodBinding {
     find_generic_trait_default(mut &this, recv_type: TypeRef,
                                method_name: SymbolStr) -> FunctionDeclNode* {
         if (this.ctx.generic_registry == null) { return null; }
-        const bare: SymbolStr = this.trait_checker().bare_name_of(recv_type);
-        if (!bare.is_valid()) { return null; }
-        const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(bare);
+        const tkey: SymbolStr = this.trait_checker().template_key_of(recv_type);
+        if (!tkey.is_valid()) { return null; }
+        const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(tkey);
         for (mut i: i64 = 0; i < traits.length; i++) {
             // Same table `traits_implemented_by` scanned, so the leaf that
             // came out of it is guaranteed to key back into it.
             const gimpl: ImplBlockNode* =
-                this.ctx.generic_registry.lookup_trait_impl(traits[i], bare);
+                this.ctx.generic_registry.lookup_trait_impl(traits[i], tkey);
             if (gimpl == null) { continue; }
             const td: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
                 TypeAnnotation::trait_identity(gimpl.trait_annotation),
@@ -1082,17 +1057,17 @@ type struct MethodBinding {
 
     /// Like `find_method_in_trait_impls` but matches by name + has-own-generics
     /// (the inferred no-turbofish path solves `<U>` from arguments).  Same
-    /// identity-before-leaf ordering, for the same reason.
+    /// specialization-before-template ordering, for the same reason.
     find_generic_method_in_trait_impls(&this, owner_ref: TypeRef, method_name: SymbolStr,
                                        out_impl: ImplBlockNode**) -> MethodNode* {
         if (this.ctx.generic_registry == null) { return null; }
         const qname: SymbolStr = this.arena.get_qualified_name(owner_ref);
-        const bare: SymbolStr = this.bare_leaf_of_qualified(qname);
+        const tkey: SymbolStr = this.trait_checker().template_key_of(owner_ref);
         mut leaf_m: MethodNode* = null;
         mut leaf_impl: ImplBlockNode* = null;
         for (mut i: i64 = 0; i < this.ctx.generic_registry.trait_impls.length; i++) {
             const impl_node: ImplBlockNode* = this.ctx.generic_registry.trait_impls[i].second;
-            const rank: i32 = GenericRegistry::impl_target_rank(impl_node, qname, bare, this.arena);
+            const rank: i32 = GenericRegistry::impl_target_rank(impl_node, qname, tkey, this.arena);
             if (rank == 0) { continue; }
             const m: MethodNode* = this.find_generic_method_in(&impl_node.methods, method_name);
             if (m == null) { continue; }
@@ -1696,12 +1671,11 @@ type struct MethodBinding {
                                  trait_leaf: SymbolStr) -> TypeRef[] {
         mut out: TypeRef[] = [];
         if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return out; }
-        // No carrier normalization: `bare_name_of` and `resolve_trait_impl_for_type`
-        // both resolve a post-mono concrete to its template via its intrinsic
-        // generic identity.
+        // No carrier normalization: `template_key_of` and
+        // `resolve_trait_impl_for_type` both resolve a post-mono concrete to its
+        // template via its intrinsic generic identity.
         const subject: TypeRef = subject_in;
-        const base_name: SymbolStr = this.trait_checker().bare_name_of(subject);
-        if (!base_name.is_valid()) { return out; }
+        if (!this.trait_checker().template_key_of(subject).is_valid()) { return out; }
         const impl_node: ImplBlockNode* =
             OwnershipQuery::resolve_trait_impl_for_type(this.arena,
                 this.ctx.generic_registry, this.intern, trait_leaf, subject);
@@ -1940,48 +1914,27 @@ type struct MethodBinding {
         // carries its own base + args, so there is no carrier to normalize to.
         const subj_nargs: i64 = this.arena.inst_type_arg_count(subject_ref);
         if (subj_nargs == 0) { return TypeRef::invalid(); }
-        const base_name: SymbolStr = this.trait_checker().bare_name_of(subject_ref);
-        if (!base_name.is_valid()) { return TypeRef::invalid(); }
+        // The TEMPLATE's impl, not this specialization's: the impl supplies the
+        // type args this projection substitutes (`Named` target arguments bound
+        // to the subject's), which a placed clone has already substituted away.
+        // `template_key_of` is that key for a wrapper and a concrete alike.
+        const tkey: SymbolStr = this.trait_checker().template_key_of(subject_ref);
+        if (!tkey.is_valid()) { return TypeRef::invalid(); }
 
         mut found_impl: ImplBlockNode* = null;
         mut found_method: MethodNode* = null;
-        // Qualified name of the TEMPLATE, not of this specialization: trait impls
-        // are registered under `TakeIter`, never `TakeIter_Range_i32`.  A concrete
-        // subject would otherwise match no impl at all (previously the carrier swap
-        // supplied the wrapper here, whose qualified name IS the template's).
-        const qname_src: TypeRef = if (this.arena.inst_generic_base(subject_ref).is_valid()) {
-            this.arena.inst_generic_base(subject_ref)
-        } else {
-            subject_ref
-        };
-        const qname: SymbolStr = this.arena.get_qualified_name(qname_src);
-        // Identity before leaf, as in `find_method_in_trait_impls`: the impl
-        // supplies the type args this projection substitutes, so a same-leaf
-        // impl from another module reduces `Item` against the wrong ones.
-        mut leaf_impl: ImplBlockNode* = null;
-        mut leaf_method: MethodNode* = null;
         for (mut i: i64 = 0; i < this.ctx.generic_registry.trait_impls.length; i++) {
             const impl_node: ImplBlockNode* = this.ctx.generic_registry.trait_impls[i].second;
-            const rank: i32 = GenericRegistry::impl_target_rank(impl_node, qname, base_name, this.arena);
-            if (rank == 0) { continue; }
+            if (GenericRegistry::impl_target_rank(impl_node, tkey, tkey, this.arena) == 0) { continue; }
             for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
                 const m: MethodNode* = impl_node.methods[k];
                 if (m == null || m.func == null) { continue; }
                 if (!m.func.name.equals(method_name)) { continue; }
-                if (rank == 2) {
-                    found_impl = impl_node;
-                    found_method = m;
-                } else if (leaf_method == null) {
-                    leaf_impl = impl_node;
-                    leaf_method = m;
-                }
+                found_impl = impl_node;
+                found_method = m;
                 break;
             }
             if (found_method != null) { break; }
-        }
-        if (found_method == null && leaf_method != null) {
-            found_impl = leaf_impl;
-            found_method = leaf_method;
         }
         if (found_method == null || found_impl == null) { return TypeRef::invalid(); }
         const ret_ann: TypeAnnotation* = found_method.func.return_type_annotation;
