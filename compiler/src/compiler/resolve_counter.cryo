@@ -147,7 +147,6 @@ type enum Site {
     BareAltsHits;
     BareAltsMulti;
     BareAltsViaScoped;
-    BareAltsViaCanonical;
 
     // Visibility-gate blast radius.
     VisFastpath;
@@ -285,15 +284,6 @@ type enum Site {
     M2ViaStamp;
     M2StampMemberMiss;
 
-    /// Of `BareAltsViaCanonical`, the calls that actually FOLDED - one
-    /// candidate, and its qualified form differs from the name handed in.
-    ///
-    /// The call row cannot stand in for this one: it is bumped on entry, so it
-    /// counts attempts, while a bucket total counts answers produced.  A call
-    /// that hands its input back changed nothing and is what the caller would
-    /// have used anyway.
-    BareAltsCanonFolded;
-
     /// `ScopeResNoModule`, split by whether the segment bound to anything in
     /// the writer's scope.  The two halves are different answers, not one
     /// silence: a segment that binds names a TYPE, and the type layer owning
@@ -386,20 +376,6 @@ type enum Site {
     ///
     /// `DefMissing` is the row that decides whether those fallbacks serve a
     /// real population or only the legitimate declines.
-    /// The SCOPED sibling of the M4 leaf scan: `find_scoped_function_template`,
-    /// which matches a template whose qualified name ends with the written
-    /// `scope::name`.  It carried the same arity / longest-module-prefix /
-    /// first-match ladder as the bare scan and, unlike it, no instrumentation
-    /// at all - so nothing said whether the ladder ever decided anything.
-    ///
-    /// The stamp answers first and the scan rows are the tripwire behind it:
-    /// the stamp was measured to reach the same entry on every call the scan
-    /// could answer, so a non-zero `ScanOne` means it has stopped covering a
-    /// population it used to, and `ScanPlural` means a suffix has become
-    /// ambiguous.
-    SfCalls;
-    SfScanOne;
-    SfScanPlural;
 
     SpellTyPending;
     SpellTyNoDef;
@@ -531,7 +507,6 @@ implement enum Site {
             Site::BareAltsHits          => { "   " }
             Site::BareAltsMulti         => { "   " }
             Site::BareAltsViaScoped     => { "B3 " }
-            Site::BareAltsViaCanonical  => { "B3*" }
             Site::ScopeUseSyntax        => { "B1>" }
             Site::ScopeUseCursor        => { "B1 " }
             Site::DefaultArgExpanded    => { "B1 " }
@@ -588,13 +563,9 @@ implement enum Site {
             Site::ScopeResAmbiguous     => { "!! " }
             Site::M2ViaStamp            => { "B3 " }
             Site::M2StampMemberMiss     => { "!! " }
-            Site::BareAltsCanonFolded   => { "B3*" }
             Site::ImplHeadSeen          => { "   " }
             Site::ImplHeadAsync         => { "B1 " }
             Site::ImplHeadAsyncUnstamped => { "!! " }
-            Site::SfCalls               => { "   " }
-            Site::SfScanOne             => { "!! " }
-            Site::SfScanPlural          => { "!! " }
             Site::SpellTyPending        => { "B1 " }
             Site::SpellTyNoDef          => { "B1 " }
             Site::SpellTyHit            => { "B1>" }
@@ -641,8 +612,6 @@ implement enum Site {
             Site::BareAltsHits          => { "lookup_qualified_alternatives hits" }
             Site::BareAltsMulti         => { "  of which ambiguous (>1 candidate)" }
             Site::BareAltsViaScoped     => { "  by caller: resolve_qualified_scoped" }
-            Site::BareAltsViaCanonical  => { "  by caller: canonical_qualified" }
-            Site::BareAltsCanonFolded   => { "    of those, actually folded" }
             Site::ScopeUseSyntax        => { "scope use site from the SYNTAX's own module" }
             Site::ScopeUseCursor        => { "  scope: fell back to the cursor" }
             Site::DefaultArgExpanded    => { "default args expanded" }
@@ -702,9 +671,6 @@ implement enum Site {
             Site::ImplHeadSeen          => { "impl heads seen by the async walk" }
             Site::ImplHeadAsync         => { "  owns an `async` method (consumed)" }
             Site::ImplHeadAsyncUnstamped => { "    of those, unstamped" }
-            Site::SfCalls               => { "scoped template scan calls" }
-            Site::SfScanOne             => { "  scoped scan found: exactly one" }
-            Site::SfScanPlural          => { "  scoped scan found: PLURAL (tie-break pop)" }
             Site::SpellTyPending        => { "spelling_type: slot not answered" }
             Site::SpellTyNoDef          => { "spelling_type: answer names no def" }
             Site::SpellTyHit            => { "spelling_type: def found" }
@@ -1206,8 +1172,6 @@ public function report() -> void {
     Site::BareAltsHits.print_row();
     Site::BareAltsMulti.print_row();
     Site::BareAltsViaScoped.print_row();
-    Site::BareAltsViaCanonical.print_row();
-    Site::BareAltsCanonFolded.print_row();
 
     fmt::eprintf("\n-- visibility gate blast radius (spec §8.1) -----------\n");
     Site::ScopeUseSyntax.print_row();
@@ -1267,9 +1231,6 @@ public function report() -> void {
     Site::ImplHeadSeen.print_row();
     Site::ImplHeadAsync.print_row();
     Site::ImplHeadAsyncUnstamped.print_row();
-    Site::SfCalls.print_row();
-    Site::SfScanOne.print_row();
-    Site::SfScanPlural.print_row();
     Site::SpellTyPending.print_row();
     Site::SpellTyNoDef.print_row();
     Site::SpellTyHit.print_row();
@@ -1333,21 +1294,6 @@ public function report() -> void {
     mut b3: u64 = 0;
     b3 = b3 + Site::RnHomeModuleSyntax.count();
     b3 = b3 + Site::BareAltsViaScoped.count();
-    // `canonical_qualified` is authoritative rather than fuzzy: it never
-    // answers "which declaration does this name bind to", only "what is this
-    // type's module-independent identity", and it folds ONLY when exactly one
-    // qualified candidate is registered - a colliding leaf is handed back
-    // bare.  Its consumers are coherence keys, which must key the same type
-    // identically from every module, so a use-site-dependent answer would be
-    // the defect here and not the fix.
-    //
-    // Summed by what it FOLDED, not by how often it was called: the call row
-    // is bumped on entry, and a call that hands its input back produced
-    // nothing the caller would not have had anyway.  Both rows are pinned by
-    // the gate regardless - a caller that starts asking more often, or a new
-    // one that uses this to BIND rather than to key, is the change worth
-    // catching, and it would be invisible in an unasserted bucket.
-    b3 = b3 + Site::BareAltsCanonFolded.count();
 
     fmt::eprintf("  B1 fuzzy fallback   -> ZERO           %12llu\n", b1);
     fmt::eprintf("  B2 type-dependent   -> stays (FLOOR)  %12llu\n", b2);

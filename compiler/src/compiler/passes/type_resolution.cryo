@@ -19,7 +19,6 @@ import compiler::diag::{
     diagnostic, edit_distance, ErrorCode, snapshot, source_span, suggestion
 };
 import compiler::decl_index;
-import compiler::decl_index::{ ScopeResolution };
 import compiler::module_graph;
 import compiler::module_graph::{ ModuleGraph, ModuleInfo };
 import compiler::resolve_counter;
@@ -374,6 +373,26 @@ type struct TypeResolutionRunner {
         }
     }
 
+    /// The one type declaration carrying the leaf `name` that `site_ns` - the
+    /// module that wrote it - cannot reach, or an invalid symbol: none
+    /// declares it (E0203's case), two do (E0155's), it is the writer's own,
+    /// imported or preluded and public.  Asked of the arena's leaf index,
+    /// the pool the did-you-mean and the plurality diagnostics already read;
+    /// a name the name layer declined is not resolved here, only explained.
+    unreachable_declarer(&this, name: SymbolStr, site_ns: SymbolStr,
+                         intern: InternTable*) -> SymbolStr {
+        const cand: SymbolStr = this.arena.sole_declarer(name);
+        if (!cand.is_valid()) { return SymbolStr::empty(); }
+        const cand_ns: SymbolStr = this.ctx.decl_index.namespace_of(cand, intern);
+        if (cand_ns.id == site_ns.id) { return SymbolStr::empty(); }
+        const reach: boolean = this.ctx.decl_index.is_prelude_ns(cand_ns)
+            || this.ctx.decl_index.ns_imports(site_ns, cand_ns);
+        if (reach && this.ctx.decl_index.is_candidate_public(cand)) {
+            return SymbolStr::empty();
+        }
+        return cand;
+    }
+
     /// The name written anywhere in `ann` that the reachability gate rejects,
     /// or null when none is.  Searches the WHOLE annotation tree, generic
     /// ARGUMENTS included: `Result<(), TestError>` fails because `TestError` is
@@ -391,10 +410,9 @@ type struct TypeResolutionRunner {
                 const site_ns: SymbolStr =
                     this.ctx.module_ns_sym_of_file(n.span.file);
                 if (!site_ns.is_valid()) { return null; }
-                const res: ScopeResolution =
-                    this.ctx.decl_index.resolve_qualified_scoped(
-                        n.name, site_ns, intern, FILE, LINE as i32, "Syntax");
-                if (res.not_reachable().is_valid()) { return n; }
+                if (this.unreachable_declarer(n.name, site_ns, intern).is_valid()) {
+                    return n;
+                }
                 return null;
             }
             TypeAnnotation::Generic(g) => {
@@ -616,10 +634,8 @@ type struct TypeResolutionRunner {
             const gated_name: string = intern.resolve(gated.name);
             const gated_ns: SymbolStr =
                 this.ctx.module_ns_sym_of_file(gated.span.file);
-            const gated_res: ScopeResolution =
-                this.ctx.decl_index.resolve_qualified_scoped(
-                    gated.name, gated_ns, intern, FILE, LINE as i32, "Syntax");
-            const unreachable: SymbolStr = gated_res.not_reachable();
+            const unreachable: SymbolStr =
+                this.unreachable_declarer(gated.name, gated_ns, intern);
             if (unreachable.is_valid()) {
                 const owner_ns: SymbolStr =
                     this.ctx.decl_index.namespace_of(unreachable, intern);
@@ -2516,36 +2532,24 @@ type struct TypeResolutionPasses {
 
     /// Canonical key fragment for a type-position NAME.  Resolution order:
     ///   1. an impl-head generic param -> positional `#n` marker;
-    ///   2. a name that resolves to a concrete arena type -> that type's
-    ///      canonical id (`#T<id>`).  This folds spellings that denote the
-    ///      SAME type to one key: the primitive aliases `int`/`i32`,
-    ///      `uint`/`u32`, `float`/`double`/`f64`, and non-generic type
-    ///      aliases (the arena unwraps them).  Without this, two impls of a
-    ///      trait for `int` and for `i32` - the same dispatch type - would
-    ///      key differently and the duplicate would slip through;
-    ///   3. otherwise the import-resolved name, for things that don't
-    ///      resolve to a concrete arena type in this context (notably a
-    ///      user type referenced by bare name from a module that doesn't
-    ///      register it under that bare name - a residual false-negative,
-    ///      never a false positive).
-    static type_name_key(name: SymbolStr, node: ImplBlockNode*,
+    ///   2. a name whose stamp names a declaration -> that type's canonical
+    ///      id (`#T<id>`), which folds every spelling of one type to one key
+    ///      and keeps two same-leaf types of different modules apart - a
+    ///      leaf folded by its spelling could do neither once two modules
+    ///      declared it;
+    ///   3. otherwise the spelling itself: a primitive (whose aliases the
+    ///      arena folds through the index when it holds them), a projection
+    ///      (`I::Item`), or a name nothing stamped.
+    static type_name_key(name: SymbolStr, stamped: SymbolStr, node: ImplBlockNode*,
                          ctx: CompilationContext*) -> string {
         const pidx: i64 = TypeResolutionPasses::impl_param_index(node, name);
         if (pidx >= 0) { return fmt::format("#%lld", pidx); }
-        // Normalize to the import-resolved (qualified) form FIRST.
-        // `resolve_qualified` is a global, module-independent map, so an
-        // imported type folds to the same string from any module - whereas
-        // a raw bare name resolves only in modules that registered it bare.
-        // Resolving the qualified form first, then the raw name, means both
-        // the type-id path and the name-fallback path are module-independent,
-        // so the SAME arg/target type keys identically no matter which module
-        // wrote the impl (closes the cross-module trait-arg false negative).
-        const qual: SymbolStr = ctx.decl_index.canonical_qualified(name);
-        mut tref: TypeRef = ctx.decl_index.lookup_type(qual);
+        const key: SymbolStr = if (stamped.is_valid()) { stamped } else { name };
+        const tref: TypeRef = ctx.decl_index.lookup_type(key);
         if (tref.is_valid()) {
             return fmt::format("#T%llu", tref.id);
         }
-        return ctx.intern_table.resolve(qual);
+        return ctx.intern_table.resolve(key);
     }
 
     /// Render a type annotation to a stable, canonical string for coherence
@@ -2559,10 +2563,19 @@ type struct TypeResolutionPasses {
         if (ann == null) { return "_"; }
         return match (*ann) {
             TypeAnnotation::Primitive(p) => {
-                TypeResolutionPasses::type_name_key(p.name, node, ctx)
+                TypeResolutionPasses::type_name_key(p.name, SymbolStr::empty(), node, ctx)
             }
             TypeAnnotation::Named(n) => {
-                TypeResolutionPasses::type_name_key(n.name, node, ctx)
+                const stamped: SymbolStr = match (n.res) {
+                    ResSlot::Answered(r) => {
+                        match (r) {
+                            Res::Def(q) => { q.qualified_name() }
+                            _           => { SymbolStr::empty() }
+                        }
+                    }
+                    _ => { SymbolStr::empty() }
+                };
+                TypeResolutionPasses::type_name_key(n.name, stamped, node, ctx)
             }
             TypeAnnotation::Generic(g) => {
                 mut s: string =
@@ -2616,11 +2629,11 @@ type struct TypeResolutionPasses {
             node.trait_annotation, node, ctx);
         key = key + " for ";
         // Target base by resolved type identity (folds primitive aliases
-        // and type aliases).  `canonical_target` is already import-resolved,
-        // so it looks up to the same arena type in the type's home module
-        // (bare name) and in a foreign impl's module (qualified name).
+        // and type aliases).  `canonical_target` is the head's own key
+        // already - the stamp's name, a primitive's spelling - so it is the
+        // stamped form here.
         key = key + TypeResolutionPasses::type_name_key(
-            canonical_target, node, ctx);
+            canonical_target, canonical_target, node, ctx);
         if (node.target_args.length > 0) {
             key = key + "<";
             for (mut i: i64 = 0; i < node.target_args.length; i++) {

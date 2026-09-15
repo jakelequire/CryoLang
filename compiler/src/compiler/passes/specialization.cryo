@@ -1021,14 +1021,12 @@ type struct SpecializationPasses {
             owner_name: SymbolStr, owner_ast: ASTNode*,
             registry: GenericRegistry*, ctx: CompilationContext*) -> void {
         if (owner_ast == null) { return; }
+        // Under the declaration's own key and nothing else.  A bare leaf as a
+        // second key is last-writer-wins across every module declaring the
+        // leaf, and a reader that reached it by a receiver's leaf was handed
+        // some other module's declaration.
         const owner_qsym: SymbolStr = ctx.qualify_symbol_sym_home(owner_name, owner_ast.span.file);
         registry.register_inherent_owner(owner_qsym, owner_ast);
-        // Also register under the bare name so receiver-type lookups that
-        // miss the qualified form (e.g., when the arena returns the bare
-        // name for primitive impls) still find the owner.
-        if (!owner_qsym.equals(owner_name)) {
-            registry.register_inherent_owner(owner_name, owner_ast);
-        }
     }
 
     /// Tag an AST node's source_module field with the template's module name.
@@ -1065,13 +1063,10 @@ type struct SpecializationPasses {
         } else if (!node.is_trait_impl()) {
             // Non-generic target: there is no TemplateEntry to hang the block
             // on, so an inherent `implement T { ... }` block would otherwise be
-            // invisible to ownership classification.  Record it under both the
-            // qualified and bare names (mirroring `register_inherent_owner`) so
-            // a separately-declared `drop` makes `T` non-Copy and droppable.
+            // invisible to ownership classification.  Recorded under the
+            // target's key - a declared type's canonical name, a primitive's
+            // spelling - which is what every reader derives from a receiver.
             registry.register_inherent_impl_block(qualified_sym, node);
-            if (!qualified_sym.equals(node.target_type)) {
-                registry.register_inherent_impl_block(node.target_type, node);
-            }
             // A generic static method on a non-generic target needs its own
             // template entry, exactly as when it is written inside the type's
             // body (see the StructDeclaration arm of `run_template_registration`).

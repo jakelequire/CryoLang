@@ -27,7 +27,7 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at the commit carrying §8.192; `git log
+Checks run from the repo root. Verified at the commit carrying §8.193; `git log
 --oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
@@ -50,10 +50,10 @@ current-state description is the defect it exists to remove.
 | D8 | Inline `<T: Bound>` is deleted | TAKEN | `no check` — absence of syntax; the project holding it defends its absence | §8.116 |
 | D9 | `where` on TYPE declarations | **OWED** by D8, not started | `no check` — nothing to count until it exists | §8.116 |
 | D10 | A plural leaf is E0155, not a directory-order bind — and a leaf two children of one FACADE declare is the same defect reached by a qualified path, in a call as in an annotation | TAKEN | `grep -rho 'E0155_AMBIGUOUS_BARE_NAME' compiler/src \| wc -l` → **5** | §8.121, §8.144, §8.151 |
-| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 46 of the 97 unasserted rows retired, 51 left (31 context, 9 B2, 11 B3); of the asserted rows, seventeen whose only sites were deleted went with them (one in §8.170, five in §8.171, two in §8.173, six in §8.174, three in §8.188; `b1-baseline.txt` re-pinned on both hosts each time, 62 → 53 rows per arm at §8.188) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1356** | §8.66, §8.80, §8.139, §8.174, §8.183, §8.188 |
+| D11 | Retire `resolve_counter.cryo`. §8.80's "LAST, after the lanes it counts" is **withdrawn** — an unasserted row waits on no lane, and `bump()` is unconditional | **IN PROGRESS** — 46 of the 97 unasserted rows retired, 51 left (31 context, 9 B2, 11 B3); of the asserted rows, seventeen whose only sites were deleted went with them (one in §8.170, five in §8.171, two in §8.173, six in §8.174, three in §8.188, four in §8.193; `b1-baseline.txt` re-pinned on both hosts each time, 62 → 53 rows per arm at §8.188, 49 at §8.193) | `wc -l < compiler/src/compiler/resolve_counter.cryo` → **1302** | §8.66, §8.80, §8.139, §8.174, §8.183, §8.188, §8.193 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
-| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **579** (+1 in §8.190, a unit test; +1 in §8.191, a negative) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **580** (+1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
 | D16 | **An impl head writes EVERY parameter of the template it names, or names a concrete instantiation; an elided parameter is an error** - whether all of them default (`implement trait Display for String` with `String<A = GlobalAlloc>`) or only the trailing ones (`implement<T> trait Display for Array<T>` with `Array<T, A = GlobalAlloc>`). Write `implement<A> trait Display for String<A>` or `implement trait Display for String<GlobalAlloc>`. Rust's model: `impl Display for Vec` is missing its parameters and is not given a default meaning, and `impl<T> Trait for Vec<T>` is not written either | **TAKEN** (ruled by Jake 2026-09-13 for the bare form, 2026-09-14 for every elided parameter; built in §8.190) — E0302 from `refuse_elided_template_params` where type resolution attaches a WRITTEN head to its template, naming the template, both counts and both spellings, the parameter form first; the 11 heads rewritten as the instantiation each meant; a head's `target_args` is what it writes after the target on EVERY kind of head (an inherent head's list also declares its names); sema's writer-module lookup deleted. The concrete spelling is accepted but not yet HONOURED by impl selection (a `Named` target argument is bound as a parameter name) - parked | `python3 scripts/impl-head-elided-params.py --count` → **bare=0,partial=0,unmatched=0**; `grep -c 'refuse_elided_template_params' compiler/src/compiler/passes/type_resolution.cryo` → **2**; `grep -c '^negative E0302' tests/test-roster.txt` → **2** | §8.180, §8.181, §8.187, §8.190 |
 | D17 | **An `extern "C"` function is public unless marked `private`** — the extern-visibility default `docs/cryo.md` §18.1 states | **RULED** (Jake, 2026-09-14) — built in §8.167 by a worker and carried as unconfirmed until ratified; the spec text is normative, not provisional | `grep -c 'mut ext_public: boolean = true;' compiler/src/compiler/parser/parser.cryo` → **1**; `grep -c 'unless written .private function' docs/cryo.md` → **1** | §8.167, §8.187 |
@@ -84,11 +84,11 @@ three, and its row carries the count. Read each zero off its own row.
 | braced import entry binding nothing in silence (`process_import`'s Specific branch, rung (b): an absent sub-module has no exports, so `import M::{ nonexistent };` declared no symbol and said nothing) | **DELETED** — an entry the module neither declares, re-exports nor holds as a sub-module is E0502 at the import, naming what the module offers and the closest spelling; measured over six halves BEFORE refusing: 1,168 sub-module entries, **5** unbound - four dead imports in `compiler/src` (`registry` ×2, the module §8.185 deleted; `ResSlot` from `compiler::resolver`; `BaseASTVisitor` from `compiler::ast`) and one `export` naming a private, which stays E0241's; `cross-check` found two more on the Linux surface (`command.cryo` importing Windows-only externs ungated), qualified at their gated uses. The plain `import Unknown;` is a separate question, Jake's | — | `grep -c 'refuse_unoffered_import' compiler/src/compiler/resolver/name_resolution.cryo` → **2**; `grep -c '^negative E0502' tests/test-roster.txt` → **1** | §8.187, §8.191 |
 | impl head's `target_args` empty on an inherent head (the parser recording `implement enum Option<T>`'s list as `generic_params` alone, and `implement<T> struct MyVec<T>` declaring `T` twice) | **DELETED** — the list after the target is `target_args` on every head, and declares only the names no leading list did; the D16 check counts one thing; 0 objects moved | — | `grep -c 'inherent_args' compiler/src/compiler/parser/parser.cryo` → **3** | §8.190 |
 | `sizeof`/`alignof` operand by its first token (`ir_generator`: re-resolve the annotation at codegen with a span-derived home, then `decl_index.lookup_type(type_name)` - the operand's FIRST TOKEN, `Foo` for `sizeof(Foo::Bar)`, kept in step by two substituter rewrites) | **DELETED** — sema decides `operand_type` once in the body's context (`resolve_layout_operand`, a cast target's shape), a clone is answered again over its substituted annotation, codegen reads the slot and refuses (E0900) one nothing decided; shadow 5,488 sites over six halves, first-token rung 0 `OLD-ONLY` (1,045 `new-only`), sema's answer = codegen's re-derivation at every site; 0 objects moved. `sizeof(Nope)` with no `Nope` anywhere compiled and exited 0 under HEAD and the pin - no pass refuses an unknown type in EXPRESSION position (nor `1 as Nope`); pinned as a `compile_fail` project until that diagnostic is decided | — | `grep -c 'type_name' compiler/src/compiler/AST/expression.cryo` → **4** (all the `new` node's); `grep -c 'operand_type' compiler/src/compiler/codegen/visit/ir_generator.cryo` → **2**; `grep -c 'resolve_layout_operand' compiler/src/compiler/sema/sema.cryo` → **3**; `grep -c '^project sizeof_undeclared_type' tests/test-roster.txt` → **1** | §8.189 |
-| `bare_alts` (`decl_index`: every declaration under its bare leaf → its qualified names; `resolve_qualified_scoped`'s single-candidate fast path "answers WITHOUT consulting visibility or imports") | **LIVE, un-rowed until §8.189** — 14 writers (`register_name_mapping`: 8 in `type_resolution.cryo`, 5 in `pass_registry.cryo`, 1 in `specialization.cryo`); read through `resolve_qualified_scoped` (6 callers: the E0240 gate's two in type resolution, the resolver's 2c refusal, `decl_index`'s `_or` wrapper, and D5's two cursor wrappers in `compilation_context.cryo`), `canonical_qualified` (1, `type_name_key`) and the export check in `instance.cryo` | — | `grep -rho 'register_name_mapping(' compiler/src --include=*.cryo \| wc -l` → **15** (14 + the definition); `grep -rho 'resolve_qualified_scoped(' compiler/src --include=*.cryo \| wc -l` → **7** (6 + the definition) | §1, §8.1, §8.189 |
+| `bare_alts` (`decl_index`: every declaration under its bare leaf → its qualified names; `resolve_qualified_scoped`'s single-candidate fast path, gated since §8.1's NotReachable) | **LIVE for D5 alone** — 14 writers (`register_name_mapping`: 8 in `type_resolution.cryo`, 5 in `pass_registry.cryo`, 1 in `specialization.cryo`) and ONE reader, D5's cursor lane (`scope_owner_key` through `resolve_scoped_at`, 2,812,611 of the 2,953,192 calls measured over six halves in §8.193). Its other readers went in §8.193: mono's free-call spelling rung (2 answers, both the stamp's), the resolver's 2c refusal (a guard on a step that fails anyway), the E0240 gate (reads the arena's leaf index), `canonical_qualified` (the coherence key reads the stamp), the export check (asks `private_declaration`) | — | `grep -rho 'register_name_mapping(' compiler/src --include=*.cryo \| wc -l` → **15** (14 + the definition); `grep -rho 'resolve_qualified_scoped(' compiler/src --include=*.cryo \| wc -l` → **3** (the definition and D5's two wrappers); `grep -rho 'canonical_qualified' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'lookup_qualified_alternatives(' compiler/src --include=*.cryo \| wc -l` → **2** (the definition and `resolve_qualified_scoped`) | §1, §8.1, §8.189, §8.193 |
 | bare function-return registration (`type_resolution.cryo`: `register_function(func.name, …)` for a free function and for an intrinsic, `func_returns` keyed by the LEAF, last writer wins) | **STARVED for free functions, LIVE for `extern "C"`** — measured over six halves in §8.190: every bare hit is an extern asked by its C symbol (`_errno`, `malloc`, `_write`, `clang_*`, …), which is its mangled name and the key the pin carries; 0 misses, 0 non-extern hits. The last-writer-wins hazard is two extern blocks declaring one C name, which W0011 reports | — | `grep -c 'register_function(func.name' compiler/src/compiler/passes/type_resolution.cryo` → **1**; `grep -c 'register_function(node.name' compiler/src/compiler/passes/type_resolution.cryo` → **1**; `grep -rho 'lookup_func_return(' compiler/src --include=*.cryo \| wc -l` → **10** (7 + `type_utils`' wrapper, its call, and the definition) | §8.189, §8.190 |
 | a global's thread-local flag and linker symbol by LEAF (`is_global_thread_local` / `global_extern_symbol`: the first registration carrying the leaf; `mark_global_thread_local` writing every slot carrying it; `extern_global_keys`, a map fed under three spellings per imported global) and the directive pass's two cursor keys (`![symbol]` re-recorded under `qualify_symbol_sym`, the layout walk finding a declaration under `qualify_binding_sym` / `qualify_symbol_sym`) | **DELETED** — the four accessors ask `global_slot(leaf, ns)`, the symbol is a column of the registration, `decl_global_key` derives a global's `(key, ns)` once for Phase 4 and the directive pass, the layout walk and sema's class arms read `decl_type_key`; shadow 2 over six halves, both the mutation project's (`global_leaf_collision`: HEAD's compiler links `Plain::probe` to an imported twin's symbol and reads `Plain::counter` through TLS, exit 0 where 14 is right); control 181,619 agreeing; 1 object moved, the project's | — | `grep -c 'extern_global_keys' compiler/src/compiler/decl_index.cryo` → **0**; `grep -c 'global_slot(' compiler/src/compiler/decl_index.cryo` → **6**; `grep -c 'qualify_symbol_sym(' compiler/src/compiler/passes/directive_processing.cryo` → **0**; `grep -rho 'decl_global_key' compiler/src --include=*.cryo \| wc -l` → **3**; `grep -c '^project global_leaf_collision' tests/test-roster.txt` → **1** | §8.166, §8.187 |
 | arena qualified→bare family in TYPE RESOLUTION (`arena.lookup_by_name(` in `type_resolution.cryo`: six miss-fallback pairs after a cursor-keyed qualified lookup, and a three-rung ladder in the enum-variant populate) | **DELETED** — a written type declaration is found under its own key (`decl_type_key`), the key Phase 4 mints it under since the same entry, in the DeclarationIndex, once; the arena's name index is asked by nothing in type resolution. Shadow 100,893 lines over six halves, all `agree`, bare rung 0, index = arena at every one of 71,769 lookups; control 2,247 `new-only` with the qualified rung disabled, bare rung rescuing 0 - the arena holds no bare key for a declared type and a specialization never reaches these arms; 0 objects moved. The two arena name lookups left in the compiler are the resolver's second store behind the index in 2c and TemplateRegistration's base type, both by a canonical key, now pinned by `lane-check`'s `LOOKUP_ARENA` row | — | `grep -c 'arena.lookup_by_name(' compiler/src/compiler/passes/type_resolution.cryo` → **0**; `grep -rho 'arena.lookup_by_name(' compiler/src --include=*.cryo \| wc -l` → **2**; `grep -c 'decl_type_key' compiler/src/compiler/passes/type_resolution.cryo` → **16**; `grep -c 'decl_type_key' compiler/src/compiler/passes/pass_registry.cryo` → **12** | §8.156, §8.187, §8.192 |
-| `GenericRegistry` probed under two spellings of the receiver (`bare_name_of` then `get_qualified_name`, `call_specializer.cryo` and `method_binding.cryo`) | **LIVE, unmeasured** — whether one probe is starved since §8.180 keyed the registry by `target_key` needs a build; a shadow, not a grep | — | `grep -c 'bare_name_of' compiler/src/compiler/mono/call_specializer.cryo` → **5**; `grep -c 'bare_name_of' compiler/src/compiler/sema/method_binding.cryo` → **5** | §8.180, §8.187 |
+| `GenericRegistry`'s inherent-owner and inherent-impl-block indexes under TWO keys (the target's canonical name and its bare leaf, the owner index last-writer-wins per leaf; readers probing `bare_name_of` then `get_qualified_name`) | **DELETED** — one key (`inherent_key_of`: a declared type's qualified name, a primitive's spelling), the bare registrations and the bare fallbacks gone; measured over six halves: 5,581,523 owner lookups, **97 bare hits, every one an unrelated non-generic type of the receiver's leaf** (`Pair<i32,i32>` → a test's `Pair`); the block index's 18,582 bare hits all primitive spellings, which survive as the primitive's only key; pinned by `inherent_owner_leaf_collision` (HEAD's compiler specializes the wrong owner's method and fails to link, exit 71 now). The trait-impl SCANS' two spellings (`bare_name_of` beside the qualified name, ranked identity-before-leaf, §8.171) are a different shape and stay | — | `grep -c 'inherent_key_of' compiler/src/compiler/mono/call_specializer.cryo` → **3**; `grep -c 'register_inherent_owner(' compiler/src/compiler/passes/specialization.cryo` → **5** (3 callers, the definition, its one registration); `grep -c 'bare_name_of' compiler/src/compiler/mono/call_specializer.cryo` → **4**; `grep -c 'bare_name_of' compiler/src/compiler/sema/method_binding.cryo` → **5**; `grep -c '^project inherent_owner_leaf_collision' tests/test-roster.txt` → **1** | §8.180, §8.187, §8.193 |
 | codegen synthesizing the allocator by bare leaf (`expr_ops.cryo`: `resolve_function("malloc")` at three sites, `"free"` behind a rung the `std::alloc::allocator::free` shim answers first) | **LIVE, and the leaf rungs STARVED** — measured at `f120271b` and under the pin: both shim rungs answer (`…allocator::alloc` 1, `…allocator::free` 1), a scratch `new Owned{..}`/`delete o` references `C$3std.5alloc.9allocator.5alloc$Fm_m$RPv` and `…4free$FPv_m$Rv`, so `new`/`delete` are PAIRED through `GlobalAlloc`, not split, and the `malloc`/`free` leaves answer only with the allocator module out of the DI (`no_std`). §8.93's "the first branch never answers" was measured on the array-literal RELEASE path and does not describe `delete`. D6's "one path" is sema's; the calls codegen synthesizes should name the canonical symbol or the intrinsic, never a leaf | — | `grep -c 'intern_str("malloc")' compiler/src/compiler/codegen/ops/expr_ops.cryo` → **3** (0 when done); `grep -c 'intern_str("free")' compiler/src/compiler/codegen/ops/expr_ops.cryo` → **1** (0 when done) | §8.93, §8.177, §8.187, §8.189 |
 | `resolve_scope_call`'s four-rung try-ladder (static method → variant → module function → C import) and `resolve_function_by_mangled`'s symbol-then-family | **LIVE** — the path's stamp says which kind the segment names; a try-ladder asks all four | — | `grep -rho 'resolve_scope_call' compiler/src --include=*.cryo \| wc -l` → **3**; `grep -c 'resolve_family(pinned, -1)' compiler/src/compiler/codegen/ops/symbol_resolver.cryo` → **1** | §8.175, §8.187 |
 | type cascade (`lookup_type_by_sym`, 4 steps) | **DELETED** — `lookup_type_exact`, one step; the audit stream and its four counter rows went with it | — | `grep -rho 'lookup_type_by_sym' compiler/src --include=*.cryo \| wc -l` → **0** | §8.154 |
@@ -97,6 +97,9 @@ three, and its row carries the count. Read each zero off its own row.
 | closure-arg specializer's callee by leaf (`lambda_synth`: the root scanned by the written name then the cursor-qualified spelling, the bare `lookup_func_type` slot, a cache keyed by the leaf) | **DELETED** — the identifier's stamp: `func_type_of_res`, the root scanned by registration key, the cache keyed by the definition; shadow 2,615 index-slot disagreements (2,301 a local fn-pointer handed a same-leaf global's signature, 307 another module's same-leaf function), 0 outcome moves in the corpus; built outside it, a local `f` called with a capturing closure ran global `f`'s clone (exit 41) and segfaulted without one - E0458 now, pinned by `E0458_closure_into_fn_pointer_local.cryo` | — | `grep -c 'lookup_func_type(ident.name)' compiler/src/compiler/sema/lambda_synth.cryo` → **0**; `grep -c 'qualify_symbol_sym(' compiler/src/compiler/sema/lambda_synth.cryo` → **0**; `grep -c 'find_top_level_function_by_key' compiler/src/compiler/sema/lambda_synth.cryo` → **2** | §8.184 |
 | annotation cascade step 3a (`resolve_named`: the written spelling, when qualified, looked up in the index) | **DELETED** — 1,561 answers over six halves, every one a synthesized annotation nobody stamped (1,559 the async lowering's canonical mints, 2 the bindgen's alias-qualified references with no span); each synthesizer stamps now, 2c reads a stamp without needing a home module, 1,561 → 0, 0 objects moved; a scratch generic async project builds under HEAD, refuses (E0200) with the `Poll` stamp reverted on this tree, builds with it. The cascade is steps 1, 1b, 2, 2c and the refusal | — | `grep -c 'lookup_type(name)' compiler/src/compiler/types/resolver.cryo` → **0**; `grep -c 'named_ann_def(' compiler/src/compiler/sema/async_lower.cryo` → **5**; `grep -c 'Res::Def(DefId::of_definition(qualified))' compiler/src/compiler/bindgen/type_map.cryo` → **1** | §8.64, §8.183 |
 | 2c home-module (ambient cursor) | STARVED | 0 | `grep -m1 '2c  home-module' tests/b1-baseline.txt` | §8.63, §8.87 |
+| 2c refusal of an unstamped bare leaf (`resolve_named`: `resolve_qualified_scoped` on the writer's module, `return invalid` on NotReachable) | **DELETED** — a guard: after it the step reaches 2b (an import tie, which an unreachable leaf cannot be) and `X-failed`, so the 5 refusals over six halves changed no outcome; the diagnostic was always the type-resolution gate's | — | `grep -c 'gate-unreachable' compiler/src/compiler/types/resolver.cryo` → **0** | §8.193 |
+| free-call specialization by the scope's SPELLING (`specialize_free_call`: sema's pin, then the written scope qualified through `bare_alts`, then the bare spelling, then the segment's stamp; `find_scoped_function_template`'s suffix scan behind the stamp) | **DELETED** — pin, then the stamp; shadow 136,463 calls over six halves: spelling rungs 2 answers, both the stamp's, suffix scan 0 (its two b1 rows retired); `resolve_scope_at_span` and `fn_template_arity_compatible` went with their only callers | — | `grep -rho 'resolve_scope_at_span' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'find_scoped_function_template' compiler/src/compiler/mono/call_specializer.cryo` → **2** | §8.193 |
+| impl head's target ARGUMENTS unstamped (`visit(ImplBlockNode)` stamping the target and the trait annotation, never the list after the target) | **DELETED** — `stamp_annotation_list(&node.target_args)` after `declare_generics`; 483 of 22,978 stay unstamped over six halves, all findings: two `String<GlobalAlloc>` heads naming a `GlobalAlloc` their module could not reach (imported now), six trait heads with a trailing list and no leading `implement<...>` (Jake's) | — | `grep -c 'stamp_annotation_list(&node.target_args)' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.193 |
 | M1 `qualifier_agrees` (`resolve_type_qualified_name_strict_from`: resolve the LEAF in scope, then check the written qualifier against it) | **DELETED** — its last caller was the C-import alias branch of the annotation stamp, where it MISSED on every `cit::X` by construction (the alias-qualified spelling is declared whole, its leaf deliberately not); the branch looks the whole spelling up now. NOT ENTERED on the b1 arms, entered and missing under `cryo test` | — | `grep -rho 'qualifier_agrees' compiler/src \| wc -l` → **0** | §8.120, §8.132, §8.174 |
 | M2 `resolve_module_qualified_sym` | **LIVE — the destination, not a lane**; +246 in §8.172 when the atomics went behind `intrinsics::` | 4,006 | `awk '/^\[host:windows\]/{f=1;next} /^\[host:/{f=0} f && /^M2 resolve_module_qualified_sym calls/{print;exit}' tests/b1-baseline.txt` → **4006** | §8.120, §8.172 |
 | M4 mono bare-name scan | **DELETED** — with the current-module key before it; a callee with no usable stamp names no template | — | `grep -c 'M4Calls' compiler/src/compiler/resolve_counter.cryo` → **0** | §8.33, §8.120, §8.157 |
@@ -124,7 +127,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `lookup_scope_template_derived` | **DELETED** | — | `grep -rho 'lookup_scope_template_derived' compiler/src \| wc -l` → **0** | §8.36 |
 | `set_module_with_scope` | **DELETED** | — | `grep -rho 'set_module_with_scope' compiler/src \| wc -l` → **0** | §8.70, §8.78 |
 | B4 bucket (instantiation keying) | **DELETED** | — | `grep -c 'B4' compiler/src/compiler/resolve_counter.cryo` → **0** | §8.121 |
-| arena `leaf_index` map | **LIVE, and NOT a lane** | — | `grep -rho 'leaf_index' compiler/src \| wc -l` → **7** (was 8 while a deleted comment named the project `resolution_leaf_index`; the map's own mentions are 7) | §8.121 |
+| arena `leaf_index` map | **LIVE, and NOT a lane** — three diagnostic consumers since §8.193: the E0203 did-you-mean pool, E0155's plurality, and E0240's sole declarer (`sole_declarer`) | — | `grep -rho 'leaf_index' compiler/src \| wc -l` → **8** (the map's 7 mentions and `sole_declarer`'s read) | §8.121, §8.193 |
 | `resolve_path` (§5.2's one entry point) | **LIVE, but not the entry point** — 2 call sites, both single-segment, both `Namespace::Type` | — | `grep -rho '\.resolve_path(' compiler/src --include=*.cryo \| wc -l` → **2** | §5.2, §8.5, §8.7 |
 | `canonical_type_ref` and its arena bare step | **DELETED** — a declaration's key comes from the declaration (`decl_type_key`: the alias namespace, else the registered name, else the writing file's module); the MECHANISM (a qualified miss retried under the bare leaf) went from `type_resolution.cryo` with the row above in §8.192 | — | `grep -c 'lookup_by_name' compiler/src/compiler/compilation_context.cryo` → **0**; `grep -c 'arena.lookup_by_name(node.name)' compiler/src/compiler/passes/type_resolution.cryo` → **0** | §8.103, §8.112, §8.156, §8.189, §8.192 |
 | `resolve_cross_module_name` (sema's resolver re-entry by spelling) | **DELETED** — its four readers went under shadow mode | — | `grep -rho 'resolve_cross_module_name' compiler/src \| wc -l` → **0** | §8.155 |
@@ -143,12 +146,13 @@ three, and its row carries the count. Read each zero off its own row.
 | type-resolution bound stamping (`stamp_trait_ref` and its three walkers, the cursor fallback for a bound the resolver did not stamp) | **DELETED** - the name layer stamps every owner, associated-type bounds included | — | `grep -c 'stamp_trait' compiler/src/compiler/passes/type_resolution.cryo` → **0** | §8.169 |
 | callee visibility gate (E0353) | LIVE, reached; **starved of violations**; since §8.173 its call door is the QUALIFIED path only (-52 on the pinned arm: the bare doors 2-4 are deleted, a bare callee is vetted by the name layer before it is stamped) plus the two value doors | 1,817 reached / **0** rejected | `grep -rho 'E0353' compiler/src \| wc -l` → **21** (the name layer's two: the import gate, the rooted walk) | §8.1f, §8.2ag, §8.173 |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected | same code | §8.2af, §8.2ag |
-| E0240 reachability gate | LIVE | — | `grep -rho 'E0240' compiler/src \| wc -l` → **8** | §8.2ad, §8.2ae |
+| E0240 reachability gate | LIVE — reads the arena's leaf index since §8.193 (`sole_declarer`, the one declaration under the leaf; reachability asked of that candidate) | — | `grep -rho 'E0240' compiler/src \| wc -l` → **9**; `grep -rho 'sole_declarer' compiler/src --include=*.cryo \| wc -l` → **2** | §8.2ad, §8.2ae, §8.193 |
 
 **The arena `leaf_index` map is not the deleted leaf index.** §8.121 deleted the
-LOOKUP LANE. The map survives with two consumers, neither of them resolution:
-the E0203 did-you-mean candidate pool, and E0155 plurality detection. Deleting
-the map breaks diagnostics, not a lane.
+LOOKUP LANE. The map survives with three consumers, none of them resolution:
+the E0203 did-you-mean candidate pool, E0155 plurality detection, and E0240's
+"declared in `M`" (the sole declarer, §8.193). Deleting the map breaks
+diagnostics, not a lane.
 
 ### 0.3 Gates
 
@@ -157,7 +161,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,122 unit + 50 project + 183 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
+| `make test` | 2,122 unit + 51 project + 183 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make b1-check` | B1 total + every per-row bound, 3 corpora × 2 hosts | **2 of the 3 corpora are `examples/`**; the third is `tests/tests/projects/ffi_c_import`. The compiler's own source is NOT a corpus, and `tests/` at large is swept by none of them. |
 | `make lane-check` | 8 buckets of call sites in `compiler/src`, as a golden; REENTRY counts `get_resolver()` AND a cursor move through the `name_resolver` field since §8.189 (it read 3 over a tree holding 6: the monomorphizer's `find_module_scope`/`set_module`/`restore_scope`); `LOOKUP_ARENA` counts the arena's `lookup_by_name` since §8.192 (it read OK over a tree holding 17 in `type_resolution.cryo`) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
@@ -183,7 +187,7 @@ Checks for this section, one per line so each can be copied whole:
 
 * `grep -c '^\[' tests/lane-baseline.txt` → **8**
 * `grep -c '^\[host:' tests/b1-baseline.txt` → **6**
-* `grep -c '^project ' tests/test-roster.txt` → **50**
+* `grep -c '^project ' tests/test-roster.txt` → **51**
 * `grep -c '^negative ' tests/test-roster.txt` → **183**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
@@ -9530,6 +9534,168 @@ allocator residue; 49 artifacts gone** (+ the qualified-miss→bare retry,
 / `specialize_free_call` ladders.  Parked for Jake: D5, the keyword ruling,
 §8.93, the plain-form import, the expression-position refusal (§8.189),
 concrete-argument impl selection (§8.190), the LSP.
+
+### 8.193 Consumers 45-47: `bare_alts` down to D5's readers; the free-call spelling ladder, the inherent registries' second key and the resolver's 2c guard deleted; an impl head's target arguments stamped - 2026-09-14
+
+`bare_alts` - every declaration under its bare leaf, `decl_index`'s map of
+§1's root cause - had six readers through `resolve_qualified_scoped`, one
+through `canonical_qualified` and one through `lookup_qualified_alternatives`.
+Measured over the six halves with every call printed by its ORIGIN (the
+`FILE, LINE` each caller passes; for the resolver's 2c step, the
+`ResolutionContext`'s creation site): **2,953,192 calls**, of which
+
+* **2,812,611** are D5's cursor lane (`call_resolver.cryo:3562`,
+  `scope_owner_key` through `resolve_scoped_at`) - Unique 2,150,204,
+  NotFound 660,179, SameModule 1,718, NotReachable 465, Ambiguous 45.
+  Blocked on D5, untouched.
+* **136,463** are mono's `specialize_free_call` qualifying a written scope
+  by spelling (`resolve_scope_at_span`, rung 2 of a four-rung ladder: sema's
+  pin, the spelling qualified through `bare_alts`, the bare spelling, the
+  segment's stamp).  The ladder shadowed with the rung that answered and the
+  stamp's answer beside it: pin **0**, `alts-q` **2** (both agreeing with the
+  stamp), bare **0**, stamp alone 18,123, neither 118,338 (type scopes on
+  the static-method path, def scopes naming no free template).  The suffix
+  scan behind the stamp in `find_scoped_function_template`, whose two b1 rows
+  were pinned at 0 on three corpora, answered **0** over six halves.
+* **4,105** are the resolver's 2c refusal for an unstamped bare leaf.  It
+  fired **5** times, every one a written annotation the type-resolution gate
+  also refuses; after it the resolver reaches 2b (an import tie, which a
+  NotReachable leaf cannot be) and then `X-failed`, so the refusal changed
+  no outcome.  A guard on a step that fails anyway.
+* **13** are the E0240 gate in type resolution (`find_unreachable_named`
+  and the diagnostic's second ask): 4 NotReachable - on each the arena's
+  leaf index names the same sole declarer - 8 NotFound, 1 of them a plural
+  leaf the gate passes to E0155.
+* `canonical_qualified`, folding a spelling to its unique qualified form for
+  the impl-coherence key (`type_name_key`): **214,765** calls, 124,618
+  folded, 90,097 handed back unchanged (no candidate), 50 plural leaves
+  handed back BARE.  Against the annotation's stamp: 60,135 agree, **24
+  DIFFER** - every one a plural leaf (`V2` declared in two test modules,
+  `Pair`, `Wrap`, `Sink`, `Cell`, `Celsius`, `Allocator`) where the fold
+  gives up and keys two different types as one string while the stamp
+  names each exactly.  The stamp is the stronger key.
+* The export check in `instance.cryo`: **2** calls, both `found`.  Its
+  other branch, E0241 "is not declared in", is unreachable since §8.191:
+  `export M::{ x }` with `x` unoffered is E0502 at the name layer and the
+  compilation stops there (checked on a scratch project: one error, E0502).
+  Its private case is the name layer's own predicate,
+  `private_declaration(module, item)`.
+
+**Deleted:** `specialize_free_call`'s rungs 2 and 3 with `resolve_scope_at_span`
+and `fn_template_arity_compatible` (their only callers), the suffix scan
+(`find_scoped_function_template` is the stamp and nothing else), the 2c
+refusal, `resolve_qualified_scoped_or` and `canonical_qualified` with their
+b1 rows (`by caller: canonical_qualified`, `of those, actually folded`,
+`scoped scan found: exactly one`, `PLURAL`).  The E0240 gate reads the
+arena's leaf index (`sole_declarer`: the one declaration under the leaf,
+none when two) and asks reachability of that candidate - the pool the
+did-you-mean and E0155 already read, one map fewer; `type_name_key` takes
+the annotation's stamp; the export check asks `private_declaration`.
+`bare_alts` keeps its 14 writers and ONE reader, D5's cursor lane.
+
+#### The inherent registries had two keys, and the second bound wrong
+
+`GenericRegistry`'s inherent-owner index and inherent-impl-block index were
+each written under the target's canonical name AND its bare leaf
+("so receiver-type lookups that miss the qualified form still find the
+owner"), the owner index last-writer-wins per leaf.  Every lookup printed
+by key shape over six halves: owner 5,581,523 (qualified: 1,487,976 hit,
+4,023,100 miss; bare: 70,350 miss, **97 hit**), blocks 18,857 (bare hits
+18,582, all primitive spellings - `string`, `u64`, `u8`, … - which is a
+primitive's only name), `find_inherent_impl_generic_method` 473,093 (bare
+hit 25, `string`), `find_inherent_impl_method` 72 (bare hit 10, `string`);
+registrations 6,609 - 4,047 primitive spellings, 1,281 qualified user
+types and 1,281 bare second keys for them.
+
+The 97 bare owner hits, attributed in a second build with the receiver and
+the declaration found: **every one binds a declaration that is not the
+receiver's.**  A generic receiver's specialization is no inherent owner, so
+its qualified name misses; `bare_name_of` hands back the TEMPLATE's leaf,
+and the leaf hits an unrelated non-generic type of the same spelling in
+whichever test module registered last - `std::collections::pair::Pair<i32,
+i32>` → `tests/stdlib/clone_default.cryo`'s `Pair` (39), `Generics::Holder<T>`
+→ `match_subject_owned_place.cryo`'s `Holder` (16), `StaticMatch::Tag<T>` →
+`impl_head_full_params.cryo`'s `Tag` (14), `Wrap`, `Counter`, `Slot`, `Cell`,
+`Boxed`.  The method looked up in the wrong AST happened to miss each time;
+the shape is §8.184's closure-counter miscompile one method name away.
+Both registries take one key now (`inherent_key_of`: a declared type's
+qualified name, a primitive's spelling), the bare registrations and the
+bare fallbacks are deleted, and the two probes at each generic-method
+reader are one.
+
+#### An impl head's target arguments were never stamped
+
+`type_name_key`'s 22,978 unstamped names were the head's `target_args`:
+`visit(ImplBlockNode)` stamped the target and the trait annotation and never
+the list after the target.  Stamped now (`stamp_annotation_list`, after
+`declare_generics`); 483 stay unstamped, and every one is a finding:
+
+* `stdlib/fmt/display.cryo:503` and `fmt/write.cryo:91`, `implement trait
+  Debug / FmtWrite for struct String<GlobalAlloc>` - **`GlobalAlloc` is not
+  in scope in either module** (display imports `{ AllocError, Allocator }`,
+  write imports the module plainly).  §8.190's rewrite wrote a name the
+  module cannot reach and nothing refused it: a head's arguments never pass
+  the E0240 gate, and impl selection binds a `Named` argument as a
+  parameter NAME (§8.190's parked defect), so the head "worked".  Imported
+  in this entry.  That no pass refuses an unreachable name in a head's
+  argument position is the expression-position gap of §8.189 again, in a
+  third position; parked with it.
+* `implement trait Drop for struct Atomic<T>` (`sync/atomic.cryo:304`),
+  `AsyncRead` / `AsyncWrite` / `Drop for struct BufStream<S>` (`io/buf.cryo`
+  ×3), `Drop for struct WebSocket<S>` (`net/ws/conn.cryo:301`), and
+  `tests/lang/async_trait_method.cryo:189` - six trait heads with a trailing
+  list and NO leading `implement<...>`, so `T` / `S` is declared nowhere and
+  accepted by position.  Rust refuses this (`cannot find type T`); D16 says
+  a parameter is written "as a parameter of its own".  Whether the trailing
+  list on a TRAIT head may declare (as it does on an inherent head since
+  §8.190) is Jake's; left as written.
+
+The stamp changes one measured thing: `symbolic_owner_instance` resolves a
+head's arguments through the type resolver with a home-less context, so an
+unstamped `GlobalAlloc` failed there and the symbolic walk fell back to the
+bare owner as `this`; stamped, `String<GlobalAlloc>` resolves and `this` has
+its true type - `method visibility checks reached` 5,594 → 5,595 on the
+pinned arm, a check-only walk, 0 objects.  `UNSTAMPED bare name not in
+scope` 0 → 4 on that arm: the four no-leading-list heads the pinned corpus
+compiles, now seen by the name layer.
+
+#### Measured
+
+Predicted 0 objects for every deletion (rungs that answered nothing the stamp
+did not; a guard with no outcome; diagnostics; a stronger coherence key) and
+0 for the stamping.  Measured examples **1 of 1,126**, tests **0 of 2,241**:
+`13-closures/Main.o`, IR-diffed - 16 lines, every one the program-wide
+closure counter one higher (`apply__cl_2982` → `2983`), the rename §8.184
+and §8.190 recorded; the deletions without the stamping reproduce HEAD's
+IR byte-for-byte, so the shift is the stamping's - the symbolic walk mints
+one closure more once a `String<GlobalAlloc>` head types `this`.  Suite
+green (2,122 unit, 183 negative, 48 projects on this host, +1:
+`inherent_owner_leaf_collision`), the three E0240 projects among them; six
+halves 0 failing under the shadow build and under the deletion build;
+`lsp-check`, `cross-check` green before the object run.  `lane-check`
+re-pinned: LOOKUP_OTHER 43 → 42 (the export check's
+`lookup_qualified_alternatives`), DEFID_UNWRAP 34 → 35 (`ann_canon_key`
+turning the stamp into the coherence key's TEXT, the row's own legitimate
+case, the shape `impl_owner` already carries three of in the same file).
+`b1-check` re-pinned on both hosts, 53 → 49 rows per arm: the four rows
+above GONE, `UNSTAMPED bare name not in scope` 0 → 4 and `method
+visibility checks reached` +4 (5,594 → 5,598 windows, 5,564 → 5,568 linux)
+by the stamping as explained above, every other row unmoved on both.
+
+**Tally: 47 shadowed, 47 old paths deleted, 46 at zero and one at §8.93's
+allocator residue; 54 artifacts gone** (+ the free-call spelling rungs, +
+the suffix scan, + the 2c guard, + `canonical_qualified`, + the inherent
+registries' bare key with its fallbacks).
+
+#### What this leaves
+
+`bare_alts` with D5.  `GenericRegistry`'s remaining two-spelling shape is
+the trait-impl scans (`bare_name_of` beside the qualified name, ranked
+identity-before-leaf, §8.171); `resolve_function_by_mangled`'s
+symbol-then-family.  Parked for Jake: D5, the keyword ruling, §8.93, the
+plain-form import, the expression-position refusal (§8.189, now also a
+head's argument position), concrete-argument impl selection (§8.190), the
+no-leading-list trait heads above, the LSP.
 
 ---
 

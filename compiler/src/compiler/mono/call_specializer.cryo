@@ -170,40 +170,6 @@ type struct MonoCallSpecializer {
         return module_graph::home_ns_sym_of_file(this.module_graph, file);
     }
 
-    /// Qualify a written scope name by judging it in the module that WROTE it,
-    /// which is the module its span names - not `current_ns`, which in mono
-    /// names whoever demanded the specialization and is the writing module only
-    /// by coincidence.
-    ///
-    /// The graph failing to name a module falls back to the cursor rather than
-    /// to no scope, and says so: an unnamed module compares unequal to every
-    /// real one, so handing it over as a use site reads missing provenance as
-    /// "written somewhere else" and rejects everything.  That is the
-    /// false-positive direction that reverted the visibility gate once.
-    ///
-    /// The empty-answer policy lives here, once, for the reason
-    /// `module_graph::home_ns_of_file` is a free function: a rule spelled out at
-    /// each call site is a rule the next call site forgets.  `origin_file` and
-    /// `origin_line` still come from the CALLER - a wrapper that named itself
-    /// would collapse every call site onto one location and then read as the
-    /// whole population in an audit.
-    resolve_scope_at_span(&this, bare: SymbolStr, span_file: string,
-                          origin_file: string, origin_line: i32) -> SymbolStr {
-        const site_ns: SymbolStr = if (this.module_graph == null) {
-            SymbolStr::empty()
-        } else {
-            this.module_graph.ns_sym_of_file(span_file)
-        };
-        if (site_ns.is_valid()) {
-            return this.decl_index.resolve_qualified_scoped_or(
-                bare, site_ns, this.intern_table,
-                origin_file, origin_line, "Syntax");
-        }
-        return this.decl_index.resolve_qualified_scoped_or(
-            bare, this.current_ns, this.intern_table,
-            origin_file, origin_line, "Cursor");
-    }
-
 
     // -- Module walk (replaces discover_inferred_calls_in_module) --
 
@@ -639,43 +605,12 @@ type struct MonoCallSpecializer {
             }
         }
         if (entry == null && callee_scope.is_valid()) {
-            const member_str: string = this.intern_table.resolve(callee_name);
-            // `callee_scope` is the scope the CALL wrote, so it means what the
-            // module holding that syntax says it means.  `callee_node` IS the
-            // ScopeResolution here - the branch above is the only one that sets
-            // `callee_scope`, and an Identifier callee leaves it empty.
-            const qualified_scope: SymbolStr = if (this.decl_index != null) {
-                this.resolve_scope_at_span(callee_scope, callee_node.span.file,
-                                           FILE, LINE as i32)
-            } else {
-                callee_scope
-            };
-            const qscope_str: string = this.intern_table.resolve(qualified_scope);
-            const qualified_str: string = qscope_str + "::" + member_str;
-            const qsym: SymbolStr = this.intern_table.intern(qualified_str);
-            const call_arity_di: i64 = call.arguments.length;
-            const qe: TemplateEntry* = this.generic_registry.get_template(qsym);
-            if (qe != null && qe.node_kind == NodeKind::FunctionDeclaration
-                    && this.fn_template_arity_compatible(qe, call_arity_di)) {
-                entry = qe;
-            }
-            if (entry == null && !qualified_scope.equals(callee_scope)) {
-                const bscope_str: string = this.intern_table.resolve(callee_scope);
-                const bare_str: string = bscope_str + "::" + member_str;
-                const bsym: SymbolStr = this.intern_table.intern(bare_str);
-                const be: TemplateEntry* = this.generic_registry.get_template(bsym);
-                if (be != null && be.node_kind == NodeKind::FunctionDeclaration
-                        && this.fn_template_arity_compatible(be, call_arity_di)) {
-                    entry = be;
-                }
-            }
-            if (entry == null && this.decl_index != null) {
-                // Whether the scope names a TYPE or a MODULE is what the
-                // segment's stamp records: `TypeRelative` is the claim that a
-                // type owns the member.  An index asked by spelling cannot
-                // separate the two once a leaf names both, and a
-                // module-qualified type (`hashmap::HashMap`) is a spelling the
-                // index does not hold at all.
+            // Whether the scope names a TYPE or a MODULE is what the segment's
+            // stamp records: `TypeRelative` is the claim that a type owns the
+            // member, and a `Def` names the module by its own namespace.  The
+            // written spelling is any whole-segment suffix of the real name and
+            // several modules can share one, so it is not asked.
+            if (this.decl_index != null) {
                 const scope_names_type: boolean =
                     match (callee_scope_slot.require("specialize_free_call scope")) {
                         Res::TypeRelative(_, _) => { true }
@@ -685,8 +620,7 @@ type struct MonoCallSpecializer {
                     // Scope-qualified call to a non-type (module-alias) scope:
                     // only accept a free-function template that lives in that module.
                     entry = this.find_scoped_function_template(
-                        callee_name, callee_scope, call.arguments.length,
-                        callee_scope_slot);
+                        callee_name, callee_scope, callee_scope_slot);
                 } else {
                     // Scope resolves to a TYPE: this may be a non-generic static
                     // method on a GENERIC owner (`Slice<T>::from_raw`,
@@ -996,18 +930,8 @@ type struct MonoCallSpecializer {
             // reports E0636 "no method found". Route through the impl_node path
             // (its inherent, non-trait impl gets the `$MG` pin + DI registration).
             if (orig_method == null && this.generic_registry != null) {
-                const bare_i: SymbolStr = this.trait_spec.bare_name_of(recv_type);
-                if (bare_i.is_valid()) {
-                    orig_method = this.generic_registry.find_inherent_impl_generic_method(
-                        bare_i, ma.member, &impl_node);
-                }
-                if (orig_method == null) {
-                    const qbare_i: SymbolStr = this.arena.get_qualified_name(recv_type);
-                    if (qbare_i.is_valid() && !qbare_i.equals(bare_i)) {
-                        orig_method = this.generic_registry.find_inherent_impl_generic_method(
-                            qbare_i, ma.member, &impl_node);
-                    }
-                }
+                orig_method = this.generic_registry.find_inherent_impl_generic_method(
+                    this.inherent_key_of(recv_type), ma.member, &impl_node);
             }
             if (orig_method == null) {
                 // Synthesized/hand-written generic trait method on a non-generic
@@ -1035,14 +959,7 @@ type struct MonoCallSpecializer {
             // path below (push onto impl_node.methods + DI-register).
             if (orig_method == null && this.generic_registry != null) {
                 orig_method = this.generic_registry.find_inherent_impl_generic_method(
-                    bare, ma.member, &impl_node);
-                if (orig_method == null) {
-                    const qbare: SymbolStr = this.arena.get_qualified_name(recv_type);
-                    if (qbare.is_valid() && !qbare.equals(bare)) {
-                        orig_method = this.generic_registry.find_inherent_impl_generic_method(
-                            qbare, ma.member, &impl_node);
-                    }
-                }
+                    this.inherent_key_of(recv_type), ma.member, &impl_node);
             }
         }
         if (orig_method == null) { return; }
@@ -1988,12 +1905,12 @@ type struct MonoCallSpecializer {
         const registry: GenericRegistry* = this.generic_registry;
         if (registry == null) { return null; }
         mut owner_ast: ASTNode* = null;
+        // By the receiver's own name only.  Its LEAF is not a key: a generic
+        // receiver's specialization is no inherent owner, and its leaf can
+        // name an unrelated non-generic type of the same spelling in some
+        // other module - which is a wrong declaration, not a fallback.
         const qname: SymbolStr = this.arena.get_qualified_name(recv_type);
         if (qname.is_valid()) { owner_ast = registry.lookup_inherent_owner(qname); }
-        if (owner_ast == null) {
-            const bare: SymbolStr = this.trait_spec.bare_name_of(recv_type);
-            if (bare.is_valid()) { owner_ast = registry.lookup_inherent_owner(bare); }
-        }
         if (owner_ast == null) { return null; }
         const empty_methods: MethodNode*[] = [];
         mut owner_methods: &MethodNode*[] = &empty_methods;
@@ -2569,74 +2486,26 @@ type struct MonoCallSpecializer {
 
     // -- Template lookup helpers (LOOKUP, not inference) --
 
-    fn_template_arity_compatible(&this, entry: TemplateEntry*, call_arity: i64) -> boolean {
-        if (call_arity < 0) { return true; }
-        if (entry == null || entry.ast_node == null) { return true; }
-        if (entry.node_kind != NodeKind::FunctionDeclaration) { return true; }
-        const fd: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
-        if (fd.is_variadic) { return true; }
-        return fd.parameters.length == call_arity;
+    /// The key an inherent `implement T { ... }` block on a non-generic target
+    /// is registered under, derived from a RECEIVER: a declared type's own
+    /// qualified name, a primitive's spelling (`string`, `i64`), which is the
+    /// only name a primitive has.  One key, so a reader never asks twice.
+    inherent_key_of(&this, recv_type: TypeRef) -> SymbolStr {
+        const qname: SymbolStr = this.arena.get_qualified_name(recv_type);
+        if (qname.is_valid()) { return qname; }
+        return this.trait_spec.bare_name_of(recv_type);
     }
 
-    /// The template a scope-qualified call names.
-    ///
-    /// The scope segment's stamp answers whenever it names a module: it carries
-    /// that module's OWN namespace, which the written qualifier cannot supply,
-    /// because the source may write any whole-segment suffix of it and several
-    /// modules can share one suffix.  The suffix scan beneath serves a segment
-    /// that carries no such answer, and can establish only that exactly ONE
-    /// template bears the suffix - deciding between several is not something a
-    /// spelling can do.
+    /// The template a scope-qualified call names: the one the scope segment's
+    /// stamp names, which carries that module's OWN namespace.  The written
+    /// qualifier cannot supply it - the source may write any whole-segment
+    /// suffix of the real name and several modules can share one suffix - so
+    /// a segment whose stamp names no module names no template.
     find_scoped_function_template(mut &this, name: SymbolStr,
-                                  scope: SymbolStr, call_arity: i64,
+                                  scope: SymbolStr,
                                   scope_slot: ResSlot*) -> TemplateEntry* {
-        resolve_counter::Site::SfCalls.bump();
-        const registry: GenericRegistry* = this.generic_registry;
-        if (registry == null || !scope.is_valid()) { return null; }
-        // The scope segment already records WHICH module it names, under the
-        // canonical name this registry is keyed by.  Matching the spelling by
-        // suffix instead asks a weaker question - "whose qualified name ends
-        // this way" - which several modules can answer, and the written
-        // qualifier is any whole-segment suffix of the real one.
-        const via_res: TemplateEntry* = this.scoped_template_from_stamp(scope_slot, name);
-        if (via_res != null) { return via_res; }
-        const scope_str: string = this.intern_table.resolve(scope);
-        const name_str: string  = this.intern_table.resolve(name);
-        const tail: string      = fmt::format("%s::%s", scope_str, name_str);
-        const sep_tail: string  = fmt::format("::%s", tail);
-        const tail_len: i64     = tail.length() as i64;
-        const total: i64 = registry.template_count();
-
-        mut first: TemplateEntry* = null;
-        mut match_count: i64 = 0;
-
-        for (mut i: i64 = 0; i < total; i++) {
-            const cand: TemplateEntry* = &registry.entries[i];
-            if (cand == null) { continue; }
-            if (cand.node_kind != NodeKind::FunctionDeclaration) { continue; }
-            if (!cand.name.equals(name)) { continue; }
-            const qn: string = this.intern_table.resolve(cand.qualified_name);
-            mut is_match: boolean = qn.ends_with(sep_tail);
-            if (!is_match && qn.length() as i64 == tail_len && qn.ends_with(tail)) {
-                is_match = true;
-            }
-            if (!is_match) { continue; }
-
-            if (first == null) { first = cand; }
-            match_count = match_count + 1;
-        }
-
-        if (match_count == 1) {
-            resolve_counter::Site::SfScanOne.bump();
-        } else if (match_count > 1) {
-            resolve_counter::Site::SfScanPlural.bump();
-        }
-        // A suffix borne by more than one template is not a question the
-        // spelling can answer.  Call arity and longest shared module prefix
-        // each pick whichever candidate the registry happened to hold first,
-        // which is not a property the source states.
-        if (match_count > 1) { return null; }
-        return first;
+        if (this.generic_registry == null || !scope.is_valid()) { return null; }
+        return this.scoped_template_from_stamp(scope_slot, name);
     }
 
     /// The template the SCOPE SEGMENT's stamp names, or null when it names
