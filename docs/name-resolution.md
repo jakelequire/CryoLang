@@ -27,7 +27,7 @@ Rows that can be checked against the tree carry the command and its expected
 answer. **Run the check before trusting the row.** A row marked `no check` is
 worth less than one with a check, and is marked so you can tell.
 
-Checks run from the repo root. Verified at the commit carrying §8.200; `git log
+Checks run from the repo root. Verified at the commit carrying §8.201; `git log
 --oneline` from there says how far this has drifted since.
 
 **Maintenance rule: this section is REPLACED, never appended to.** A second
@@ -133,6 +133,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `import M as X` by a SECOND lookup (`visit(IdentifierNode)`: `lookup_import_alias(node.name)` after the scope lookup misses, an alias living in a table beside the scope rather than as a binding in it) | **DELETED** — the alias IS declared as a binding in the importing scope (`Symbol::import_sym`), so the table could answer only a name the scope did not hold, and an identifier expression never names a module; the corpus holds no aliased import at all (one, under `legacy/`). **The form itself is refused**: `docs/cryo.md` documents `import Math::Vector as V;`, and a scratch project's `U::Box` is E0203, `U::forty()` E0233, under HEAD and under this tree alike - the alias is a namespace SYMBOL no downstream lookup honours, the same species as a C-import alias (§9 Q2). Jake's | — | `grep -rho 'import_aliases\|register_import_alias\|lookup_import_alias' compiler/src --include=*.cryo \| wc -l` → **0** | §8.196, §8.197 |
 | a trait-impl method's `origin_trait` falling to the head's LEAF (`type_resolution.cryo` impl arm: `mut ot_trait = ot_trait_leaf`, overwritten by the head's stamp when it answered; a head the name layer could not place keeps its leaf, and every mangling site reads it) | LIVE - the fallback for an unstamped head; unmeasured (the trait-half row's shadow found 9 registry disagreements, none of them this slot). Goes with the trait registry's TRAIT half, Jake's | — | `grep -c 'mut ot_trait: SymbolStr = ot_trait_leaf;' compiler/src/compiler/passes/type_resolution.cryo` → **1** | §8.194, §8.196 |
 | `bare_alts`' LSP reader (`tools/CryoLSP`: one `resolve_qualified_scoped(` call, the fourth reader in the tree where the `bare_alts` row's compiler-only grep reads three) | LIVE - the LSP is Jake's, post-migration (it will read `ResolutionMap`); the row above counts the compiler and this one the LSP so the two cannot be summed into the wrong number | — | `grep -rho 'resolve_qualified_scoped(' tools/CryoLSP --include=*.cryo \| wc -l` → **1** | §8.193, §8.196 |
+| codegen's type forward-declaration by the declaration's BARE leaf (`declare_struct_type` / `_union_` / `_class_` / `_enum_type`: `lookup_type(node.name)` in a map keyed by canonical names, then `map_type`) | **DELETED** — the four ask `decl_type_key`. Measured over six halves: 18,713 declarations reach them, the bare leaf answering 541 - every one a synthesized declaration whose minted name IS its key (closure structs, placed specializations) - and missing all 18,055 written types, which reached LLVM only through the type mapper's lazy mapping on first use; the key answers 18,596 (117 async future clones registered elsewhere miss either way); 0 objects moved - a named LLVM type's declaration order is not machine code | — | `grep -c 'lookup_type(node.name)' compiler/src/compiler/codegen/ops/declaration_emitter.cryo` → **0** | §8.201 |
 | import tie refusal (`visit(IdentifierNode)`: a bare name whose bound symbol is an `Import` and whose leaf two imports bind from different modules) | LIVE - E0154 at the USE, stamp `Res::Err`; the tie is recorded by `Scope::insert_import` (which kept the first import and was read only for type names before) and cleared by a same-module declaration; the prelude is a separate rib and never ties | — | `grep -c 'is_ambiguous(node.name)' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.173 |
 | match-guard resolution (`NameResolution::visit(MatchArmNode)` visits `node.guard`) | LIVE - a guard is resolved in the arm's scope between the patterns and the body; unvisited, a module constant in a guard was E0201 and a callee in one bound by spelling | — | `grep -c 'node.guard.accept' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.172 |
 | scope-qualifier spelling ladder (`lookup_type_exact(scope.scope_name)` beneath `scope_qualifier_type`: `u8::MAX`, the variant payload, the static visibility gate, the static argument check's rung 3) | **DELETED** — `scope_qualifier_type` answers `PrimTy` and a clone's `spec_owner`; the steps measured 0, 34 wrong answers (`float` the MODULE as `f32`), and 27 clone segments now carried by `spec_owner` | — | `grep -rho 'lookup_type_exact(scope.scope_name)' compiler/src/compiler/sema \| wc -l` → **0** | §8.171 |
@@ -10380,6 +10381,38 @@ D5, Q2, the keyword ruling, §8.93, the plain-form import, the
 expression-position refusal, concrete-argument impl selection, the
 no-leading-list trait heads, the trait registry's key, `import M as X`,
 `intrinsic const`, the LSP.
+
+### 8.201 Consumer 63: codegen forward-declares a type under the declaration's key, not its bare leaf - 2026-09-15
+
+`DeclarationEmitter::declare_struct_type` and its union, class and enum
+siblings forward-declare a declaration's LLVM type by `lookup_type(node.
+name)` - the declaration's BARE leaf - in the declaration index's type
+map, which is keyed by canonical names.  Measured over the six halves,
+bare beside `decl_type_key`: **18,713** declarations reach the four.  The
+bare leaf answers **541**, every one a synthesized declaration whose
+minted name is its key - `Main::__Closure_N`, placed specializations - and
+misses every one of the **18,055** written types, which reached LLVM only
+because the type mapper maps a type lazily on first use.  The key answers
+18,596; the 117 it misses are async future clones registered under
+another name, which miss both ways.
+
+The four ask the key.  Predicted 0 objects - a named LLVM type's
+declaration order is not machine code - and measured **examples 0 of
+1,126, tests 0 of 2,352**; suite green (2,122 unit, 183 negative, 52
+projects on this host); `lsp-check`, `cross-check` green before the
+object run; `lane-check`, `b1-check` unmoved; `selfhost-check` both arms
+OK.
+
+**Tally: 63 shadowed, 63 old paths deleted, 62 at zero and one at §8.93's
+allocator residue; 84 artifacts gone.**
+
+#### What this leaves
+
+The trait-impl registry's trait half (Jake's); `resolve_scope_call` with
+D5 and Q2; the LSP's reader.  Parked for Jake: D5, Q2, the keyword ruling,
+§8.93, the plain-form import, the expression-position refusal,
+concrete-argument impl selection, the no-leading-list trait heads, the
+trait registry's key, `import M as X`, `intrinsic const`, the LSP.
 
 ---
 
