@@ -2001,6 +2001,8 @@ type struct HashMap<K, V, A = GlobalAlloc> { /* ... */ }
 
 Calling `Array<int>::new()` uses `GlobalAlloc`; calling `Array<int, Arena>::new_in(my_arena)` parameterises the container over a custom allocator.
 
+A default resolves **in the module where the type is declared**, not at the use site: writing `Array<int>` fills in `GlobalAlloc` as `collections::array`'s own scope sees it, so the user never imports `GlobalAlloc` to use the default. A user who writes `Array<int, GlobalAlloc>` names `GlobalAlloc` themselves and needs it in scope, because they wrote it. This is the general rule - a name resolves in the scope where it is written - and it is also why a function body, a type alias's right-hand side and an `implement` body resolve where they are written. A name that exists nowhere is an error in every position, expression and type-argument positions included: `sizeof(Nope)`, `1 as Nope` and `Array<Nope>` are refused, not silently accepted.
+
 A default fills a parameter that a *use* leaves out. An **`implement` head is not a use**: it names every parameter of the template it is written for, either as parameters of its own or as a concrete instantiation, and a head that leaves one out is an error (E0302), whether every parameter has a default or only the trailing ones do. `implement trait Display for String` would read as an impl for every `String<A>` while binding only `String<GlobalAlloc>`, so the writer says which is meant:
 
 ```cryo
@@ -2330,6 +2332,8 @@ const buf: u8* = malloc(1024) as u8*;
 buf[0] = 0xFF;
 free(buf);
 ```
+
+A bare `malloc`, `free` or `realloc` means a declaration in scope, as any bare name does: the module's own `intrinsic function`, an `extern "C"` it declares, or an import. With no such declaration in the writing module the bare name is an **error**, and the fix is to say which one is meant - `libc::free` for the C allocator, `heap::free` for the Cryo one. There is no freestanding exception: under `no_std` the name is declared (extern or intrinsic), so the rule holds there as everywhere.
 
 **Class instances (`new` / `delete`):**
 
