@@ -325,25 +325,6 @@ type struct TypeResolutionRunner {
         }
     }
 
-    /// Walk `ann` through wrapper layers (`*T`, `&T`, `T[]`, `T?`,
-    /// `T<...>`) until we reach a Named leaf - the identifier the user
-    /// most likely typo'd.  Pre-resolved Named leaves (those the AST
-    /// substituter already mapped to a concrete TypeRef) are ignored
-    /// because they can't be the failure point.  Walks at most a few
-    /// levels to avoid pathological annotations.
-    /// The NamedAnnotation if `ann` is DIRECTLY a named type (not a
-    /// generic/optional/tuple wrapper).  Used to flag an unknown local-var
-    /// type like `bool` without mislabeling a generic whose ARG is the
-    /// culprit (`Tagged<bool>` would otherwise blame the resolvable base
-    /// `Tagged`); those wrapped forms are left to their existing handling.
-    top_level_named(&this, ann: TypeAnnotation*) -> NamedAnnotation* {
-        if (ann == null) { return null; }
-        match (ann) {
-            TypeAnnotation::Named(n) => { return n; }
-            _ => { return null; }
-        }
-    }
-
     /// The one type declaration carrying the leaf `name` that `site_ns` - the
     /// module that wrote it - cannot reach, or an invalid symbol: none
     /// declares it (E0203's case), two do (E0155's), it is the writer's own,
@@ -405,36 +386,64 @@ type struct TypeResolutionRunner {
     }
 
     /// Whether a failed annotation is certainly a source error, so a
-    /// diagnostic is owed rather than the invalid type being dropped.
-    /// A bare `Named` is certain - the name does not exist.  So is any tree
-    /// holding a gate-rejected name, wherever it sits.  The forms this must
-    /// NOT fire on are the deferred ones - `typeof(...)`, `implement Trait`, a
-    /// generic param bound later - and none of them can be gate-rejected,
-    /// because the gate only answers about a name that already has exactly one
-    /// declaration.
+    /// diagnostic is owed rather than the invalid type being dropped: a name
+    /// in it the name layer could not place, wherever it sits, or one the
+    /// reachability gate rejected.  The forms this must NOT fire on are the
+    /// deferred ones - `typeof(...)`, `implement Trait`, a projection reduced
+    /// later - and every name in those is placed or is no name at all.
     annotation_failure_is_certain(&this, ann: TypeAnnotation*) -> boolean {
-        if (this.top_level_named(ann) != null) { return true; }
+        if (this.extract_unresolved_named(ann) != null) { return true; }
         return this.find_unreachable_named(
             ann, this.ctx.get_intern_table(), 0) != null;
     }
 
+    /// The first written name in `ann` the name layer could not place: a
+    /// `Named` leaf with no stamp and no pre-resolved type, anywhere in the
+    /// tree - pointers, references, arrays, tuples, function shapes and
+    /// generic ARGUMENTS included, since `Tagged<bool>`'s failure is
+    /// `bool`'s and a walk that stopped at the head would blame `Tagged`,
+    /// which resolves.  Null when every name is placed: the failure is
+    /// then a deferred form, not an unknown name.  A name already reported
+    /// carries `Res::Err` and is placed for this purpose, so one leaf is
+    /// reported once whichever pass asks.
     extract_unresolved_named(&this, ann: TypeAnnotation*) -> NamedAnnotation* {
-        mut cur: TypeAnnotation* = ann;
-        mut depth: i32 = 0;
-        while (cur != null && depth < 8) {
-            match (cur) {
-                TypeAnnotation::Named(n) => {
-                    if (n.pre_resolved.is_valid()) { return null; }
-                    return n;
-                }
-                _ => {}
+        if (ann == null) { return null; }
+        match (ann) {
+            TypeAnnotation::Named(n) => {
+                if (n.pre_resolved.is_valid()) { return null; }
+                return match (n.res) {
+                    ResSlot::Answered(_) => { null }
+                    _                    => { n }
+                };
             }
-            const next: TypeAnnotation* = this.peel_annotation(cur);
-            if (next == cur) { return null; }
-            cur = next;
-            depth = depth + 1;
+            TypeAnnotation::Pointer(p)   => { return this.extract_unresolved_named(p.inner); }
+            TypeAnnotation::Reference(r) => { return this.extract_unresolved_named(r.inner); }
+            TypeAnnotation::Array(a)     => { return this.extract_unresolved_named(a.element); }
+            TypeAnnotation::Tuple(t) => {
+                for (mut i: i64 = 0; i < t.elements.length; i++) {
+                    const hit: NamedAnnotation* = this.extract_unresolved_named(t.elements[i]);
+                    if (hit != null) { return hit; }
+                }
+                return null;
+            }
+            TypeAnnotation::Function(f) => {
+                for (mut i: i64 = 0; i < f.parameters.length; i++) {
+                    const hit: NamedAnnotation* = this.extract_unresolved_named(f.parameters[i]);
+                    if (hit != null) { return hit; }
+                }
+                return this.extract_unresolved_named(f.return_type);
+            }
+            TypeAnnotation::Generic(g) => {
+                const base_hit: NamedAnnotation* = this.extract_unresolved_named(g.base);
+                if (base_hit != null) { return base_hit; }
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    const hit: NamedAnnotation* = this.extract_unresolved_named(g.args[i]);
+                    if (hit != null) { return hit; }
+                }
+                return null;
+            }
+            _ => { return null; }
         }
-        return null;
     }
 
     /// Every bare type leaf name in the type arena's leaf index.  The
@@ -638,6 +647,7 @@ type struct TypeResolutionRunner {
                         gated_name));
                 }
                 this.ctx.emit_diagnostic(gdiag);
+                gated.res.answer(Res::Err);
                 return;
             }
         }
@@ -669,6 +679,7 @@ type struct TypeResolutionRunner {
             amb = amb.with_note(
                 "write the qualifier, or import the module you mean; a bare name resolves in scope and nothing here binds it");
             this.ctx.emit_diagnostic(amb);
+            named.res.answer(Res::Err);
             return;
         }
 
@@ -707,6 +718,7 @@ type struct TypeResolutionRunner {
                     hamb = hamb.with_note(
                         "write the path out in full to say which one is meant");
                     this.ctx.emit_diagnostic(hamb);
+                    named.res.answer(Res::Err);
                     return;
                 }
             }
@@ -749,6 +761,7 @@ type struct TypeResolutionRunner {
                     qamb = qamb.with_note(
                         "name the declaring module instead; a re-export offers what its children offer, and two of them offer this");
                     this.ctx.emit_diagnostic(qamb);
+                    named.res.answer(Res::Err);
                     return;
                 }
             }
@@ -778,6 +791,9 @@ type struct TypeResolutionRunner {
                 fmt::format("did you mean `%s`?", best)));
         }
         this.ctx.emit_diagnostic(diag);
+        // Reported once: a later pass asking the same annotation finds this
+        // leaf placed and reports nothing.
+        named.res.answer(Res::Err);
     }
 
 
