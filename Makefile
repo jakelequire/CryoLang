@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census roster-check lane-check ns-status-check check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census roster-check lane-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -570,6 +570,14 @@ lane-check:
 # on a migration branch the enforcement point is somebody running this.
 ns-status-check:
 	@$(PYTHON) scripts/ns-status-check.py $(ARGS)
+
+# The guards' own test: the commit-msg guard and ns-status-check driven
+# through a throwaway repository, every rule in both directions.  A guard
+# that stops guarding is silent by construction, and so is a self-test
+# nothing runs, which is why CI runs this.  About two minutes - each case
+# stands up a git repository - so it is a merge gate, not part of check-fast.
+guard-selftest:
+	@$(PYTHON) scripts/ns-guard-selftest.py
 
 # ---- everything that needs no build ------------------------------------
 # The pre-commit sweep.  Every gate here is source- or document-derived, so the

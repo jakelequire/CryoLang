@@ -2321,45 +2321,58 @@ type struct CallResolver {
             TypeKind::Enum   => { methods_ref = &(base_t as EnumType*).methods; }
             _ => { }
         }
-        mut walk: ClassType* = start_cls;
-        mut cur: &MethodInfo[] = methods_ref;
-        mut depth: i32 = 0;
-        while (depth < 16) {
-            for (mut mi: i64 = 0; mi < cur.length; mi++) {
-                const m: &MethodInfo = &cur[mi];
-                if (!m.name.equals(member.member)) { continue; }
-                if (this.method_type_is_variadic(m.function_type)) { variadic_ok = true; continue; }
-                name_seen  += 1;
-                uniq_arity  = this.diag.note_arity(uniq_arity, m.param_types.length);
-                if (m.param_types.length != argc) { continue; }
-                for (mut ci: i64 = 0; ci < m.param_types.length; ci++) {
-                    cand_params.push(m.param_types[ci]);
-                }
-                if (!found) {
-                    found = true;
-                    chosen = [];
-                    for (mut ci: i64 = 0; ci < m.param_types.length; ci++) { chosen.push(m.param_types[ci]); }
-                    found_trait = this.method_origin_trait(m);
-                } else {
+        // The receiver's inherent methods are the candidates when any of
+        // them has the call's arity; the ones its trait impls deliver are
+        // consulted only when none does.  Two traits providing the name is
+        // an ambiguity; an inherent method beside them is not, since it
+        // outranks both.
+        for (mut pass: i32 = 1; pass <= 2; pass++) {
+            if (pass == 2 && found) { break; }
+            mut walk: ClassType* = start_cls;
+            mut cur: &MethodInfo[] = methods_ref;
+            mut depth: i32 = 0;
+            while (depth < 16) {
+                for (mut mi: i64 = 0; mi < cur.length; mi++) {
+                    const m: &MethodInfo = &cur[mi];
+                    if (!m.name.equals(member.member)) { continue; }
                     const m_origin: SymbolStr = this.method_origin_trait(m);
-                    if (found_trait.is_valid() && m_origin.is_valid() && !m_origin.equals(found_trait)) {
-                        trait_ambiguous = true;
-                        other_trait = m_origin;
-                    } else if (!this.types.same_param_sig(chosen.as_slice(), m.param_types.as_slice())) {
-                        ambiguous = true;
+                    if (pass == 1 && m_origin.is_valid()) { continue; }
+                    if (pass == 2 && !m_origin.is_valid()) { continue; }
+                    if (this.method_type_is_variadic(m.function_type)) { variadic_ok = true; continue; }
+                    name_seen  += 1;
+                    uniq_arity  = this.diag.note_arity(uniq_arity, m.param_types.length);
+                    if (m.param_types.length != argc) { continue; }
+                    for (mut ci: i64 = 0; ci < m.param_types.length; ci++) {
+                        cand_params.push(m.param_types[ci]);
+                    }
+                    if (!found) {
+                        found = true;
+                        chosen = [];
+                        for (mut ci: i64 = 0; ci < m.param_types.length; ci++) { chosen.push(m.param_types[ci]); }
+                        found_trait = m_origin;
+                    } else {
+                        if (found_trait.is_valid() && m_origin.is_valid() && !m_origin.equals(found_trait)) {
+                            trait_ambiguous = true;
+                            other_trait = m_origin;
+                        } else if (!this.types.same_param_sig(chosen.as_slice(), m.param_types.as_slice())) {
+                            ambiguous = true;
+                        }
                     }
                 }
+                if (walk == null) { break; }
+                if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+                const parent_t: Type* = this.arena.lookup(walk.base_class.id);
+                if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
+                walk = parent_t as ClassType*;
+                cur = &walk.methods;
+                depth += 1;
             }
-            if (walk == null) { break; }
-            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-            const parent_t: Type* = this.arena.lookup(walk.base_class.id);
-            if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
-            walk = parent_t as ClassType*;
-            cur = &walk.methods;
-            depth += 1;
         }
 
-        if (!ambiguous && !trait_ambiguous && this.ctx.generic_registry != null) {
+        // The trait impls are candidates only when no inherent method took
+        // the call.
+        if (!ambiguous && !trait_ambiguous && !(found && !found_trait.is_valid())
+                && this.ctx.generic_registry != null) {
             mut target_name: SymbolStr = SymbolStr::empty();
             match (base_t.kind) {
                 TypeKind::Class  => { target_name = (base_t as ClassType*).qualified_name; }
@@ -2861,35 +2874,28 @@ type struct CallResolver {
     select_method(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
                   base_t: Type*, start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
                   owner_str: string, arg_types: &TypeRef[], only_trait: SymbolStr) -> boolean {
-        for (mut tier: i32 = 0; tier <= 3; tier++) {
-            if (tier == 3 && this.state.in_implicit_conversion) { break; }
-            mut walk: ClassType* = start_cls;
-            mut depth: i32 = 0;
-            mut cur_methods: Slice<MethodInfo> = methods_ref;
-            mut cur_owner: string = owner_str;
-            while (depth < 16) {
-                for (mut mi: u64 = 0; mi < cur_methods.length; mi++) {
-                    const m: MethodInfo* = cur_methods.get_ref(mi).unwrap();
-                    if (!m.name.equals(member.member)) { continue; }
-                    if (only_trait.is_valid() && !this.method_provided_by(m.ast_node as MethodNode*, only_trait)) { continue; }
-                    if (!this.args_bind_to_params(call, arg_types, m.param_types.as_slice(),
-                            this.method_type_is_variadic(m.function_type), tier)) { continue; }
-                    if (tier == 3) {
-                        this.apply_overload_converter_args(visitor, call, m.param_types.as_slice());
-                    }
-                    call.set_resolved_method(m.ast_node as ASTNode*);
-                    this.pin_method_callee_from_qname(call, cur_owner, m.ast_node as MethodNode*, m.is_static);
-                    return true;
-                }
-                if (walk == null) { break; }
-                if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-                const parent_t: Type* = this.arena.lookup(walk.base_class.id);
-                if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
-                walk = parent_t as ClassType*;
-                cur_methods = walk.methods.as_slice();
-                cur_owner = this.intern.resolve(walk.qualified_name);
-                depth += 1;
+        // The receiver's own list holds its inherent methods and the methods
+        // its trait impls deliver, in declaration order.  They are two sets,
+        // the inherent one first: the order two `implement` blocks were
+        // written in does not decide which body a call runs.
+        mut own_owner: string = "";
+        mut own_tier: i32 = 0;
+        mut own: MethodInfo* = null;
+        if (!only_trait.is_valid()) {
+            own = this.pick_own_method(call, member, start_cls, methods_ref, owner_str,
+                                       arg_types, only_trait, false, &own_owner, &own_tier);
+        }
+        if (own == null) {
+            own = this.pick_own_method(call, member, start_cls, methods_ref, owner_str,
+                                       arg_types, only_trait, true, &own_owner, &own_tier);
+        }
+        if (own != null) {
+            if (own_tier == 3) {
+                this.apply_overload_converter_args(visitor, call, own.param_types.as_slice());
             }
+            call.set_resolved_method(own.ast_node as ASTNode*);
+            this.pin_method_callee_from_qname(call, own_owner, own.ast_node as MethodNode*, own.is_static);
+            return true;
         }
 
         if (this.ctx.generic_registry == null) { return false; }
@@ -2917,6 +2923,47 @@ type struct CallResolver {
             if (this.bind_on_impl_block(visitor, call, member, block, owner_str, arg_types)) { return true; }
         }
         return false;
+    }
+
+    /// The first of the receiver's own methods (a class's base chain, leaf
+    /// to root) named as the call is whose parameters the arguments bind to,
+    /// each tier before the next.  `from_trait` selects the set: the methods
+    /// a trait impl delivers, or the inherent ones.  With `only_trait`, only
+    /// that trait's methods are candidates.  Writes the owner the method was
+    /// found on and the tier it bound at.
+    pick_own_method(mut &this, call: CallExprNode*, member: MemberAccessNode*,
+                    start_cls: ClassType*, methods_ref: Slice<MethodInfo>, owner_str: string,
+                    arg_types: &TypeRef[], only_trait: SymbolStr, from_trait: boolean,
+                    out_owner: string*, out_tier: i32*) -> MethodInfo* {
+        for (mut tier: i32 = 0; tier <= 3; tier++) {
+            if (tier == 3 && this.state.in_implicit_conversion) { break; }
+            mut walk: ClassType* = start_cls;
+            mut depth: i32 = 0;
+            mut cur_methods: Slice<MethodInfo> = methods_ref;
+            mut cur_owner: string = owner_str;
+            while (depth < 16) {
+                for (mut mi: u64 = 0; mi < cur_methods.length; mi++) {
+                    const m: MethodInfo* = cur_methods.get_ref(mi).unwrap();
+                    if (!m.name.equals(member.member)) { continue; }
+                    if (this.method_origin_trait(m).is_valid() != from_trait) { continue; }
+                    if (only_trait.is_valid() && !this.method_provided_by(m.ast_node as MethodNode*, only_trait)) { continue; }
+                    if (!this.args_bind_to_params(call, arg_types, m.param_types.as_slice(),
+                            this.method_type_is_variadic(m.function_type), tier)) { continue; }
+                    *out_owner = cur_owner;
+                    *out_tier = tier;
+                    return m;
+                }
+                if (walk == null) { break; }
+                if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+                const parent_t: Type* = this.arena.lookup(walk.base_class.id);
+                if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
+                walk = parent_t as ClassType*;
+                cur_methods = walk.methods.as_slice();
+                cur_owner = this.intern.resolve(walk.qualified_name);
+                depth += 1;
+            }
+        }
+        return null;
     }
 
     /// Whether `mn` is the named trait's method, i.e. sits in an

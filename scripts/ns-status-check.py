@@ -77,6 +77,24 @@ import ns_ledger                                              # noqa: E402
 # section of unverifiable claims should not read the same as a checked one.
 NO_CHECK = re.compile(r"`no check`")
 
+# A grep whose quoted pattern carries a pipe.  Inside a table cell every pipe
+# is written `\|`, and `rows()` turns every one back into `|` because it
+# cannot tell a column escape from a basic-regex alternation - so the
+# pattern runs with a LITERAL pipe, matches nothing, and a row expecting 0
+# holds whatever the tree grows back.  Six rows read that way for months.
+# One `-e` per alternative carries no pipe and reads the same copied whole
+# as it does here.
+PIPED_PATTERN = re.compile(r"grep(?:\s+-\S+)*\s+'[^']*\|[^']*'")
+
+
+def refused(cmd):
+    """Why `cmd` cannot be trusted as a check, or None."""
+    if PIPED_PATTERN.search(cmd):
+        return ("a `|` inside a grep pattern is a literal pipe here "
+                "(the table escape is undone before it runs); write "
+                "one -e per alternative")
+    return None
+
 
 def section(path=None):
     """§0's text and the file it came from, or None with a reason.
@@ -160,7 +178,12 @@ def main():
 
     failed = []
     loose = []
+    unusable = []
     for cmd, expected in checks:
+        why = refused(cmd)
+        if why is not None:
+            unusable.append((cmd, why))
+            continue
         r = subprocess.run(["bash", "-c", cmd], cwd=ROOT,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         out = r.stdout.decode("utf-8", "replace")
@@ -172,6 +195,16 @@ def main():
         if args.verbose:
             print("  %-5s %-64s %s" % ("ok" if got == expected else "DRIFT",
                                        cmd[:64], got))
+
+    for cmd, why in unusable:
+        print("ns-status-check: UNUSABLE CHECK")
+        print("    check    %s" % cmd)
+        print("    because  %s" % why)
+    if unusable:
+        print()
+        print("ns-status-check: %d §0 check(s) cannot report drift as written."
+              % len(unusable))
+        return 1
 
     for cmd, expected, got, out in failed:
         print("ns-status-check: DRIFT")

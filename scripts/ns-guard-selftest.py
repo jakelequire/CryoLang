@@ -30,17 +30,19 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ROWS = 26          # at or above ns-status-check's --min-rows floor
+ROWS = 28          # ns-status-check's --min-rows floor; a fixture below it is refused for that alone
 
 
-def ledger(rows, extra_entries="", archive_decl=None):
+def ledger(rows, extra_entries="", archive_decl=None, checks=None):
     """A miniature ledger: a §0 whose rows check `data.txt`, plus a §8.
 
     With `archive_decl` the §8 section is left OUT and the document declares
     where it went instead - the shape the real ledger takes once the archive is
     split off.  With `archive_decl=""` the entries are gone and nothing is
     declared, which is the state where the checks have been blinded.
+    `checks` replaces a row's command with one written another way.
     """
+    checks = checks or {}
     lines = [
         "# Name Resolution - fixture",
         "",
@@ -57,8 +59,9 @@ def ledger(rows, extra_entries="", archive_decl=None):
     ]
     for i in range(1, ROWS + 1):
         want = rows.get(i, 1)
-        lines.append("| D%d | fixture row %d | TAKEN | `grep -c 'ROW%d;' data.txt` "
-                     "→ **%d** |" % (i, i, i, want))
+        cmd = checks.get(i, "grep -c 'ROW%d;' data.txt" % i)
+        lines.append("| D%d | fixture row %d | TAKEN | `%s` → **%d** |"
+                     % (i, i, cmd, want))
     if archive_decl is None:
         lines += ["", "## 8. Archive", "", extra_entries, ""]
     return "\n".join(lines) + "\n"
@@ -135,9 +138,11 @@ def build(path, split=False):
 CASES = []
 
 
-def case(name, expect_refused, split=False):
+def case(name, expect_refused, split=False, saying=None):
+    """`saying` is text the guard's output must carry: a refusal for the
+    wrong reason is a case that passes by accident."""
     def deco(fn):
-        CASES.append((name, expect_refused, fn, split))
+        CASES.append((name, expect_refused, fn, split, saying))
         return fn
     return deco
 
@@ -209,6 +214,35 @@ def _(repo):
     return repo.guard("Grow row 7 and say so in §0\n")
 
 
+# A pipe inside a grep pattern is a literal pipe by the time the check runs
+# (the cell's `\|` is undone as a column escape), so the row can only ever
+# read 0: it holds whatever the tree grows back.  Refused as unusable - by
+# that name, since the same row also drifts, and a drift refusal would pass
+# this case for the wrong reason.
+
+@case("§0 row whose grep pattern carries a pipe", True,
+      saying="UNUSABLE CHECK")
+def _(repo):
+    repo.write("data.txt", data({7: 3}))
+    repo.write("docs/name-resolution.md",
+               ledger({7: 3}, "### 8.100 A first entry - MEASURED AND FIXED 2026-01-01\n"
+                              "\n### 8.102 Row 7 grows - MEASURED AND LANDED 2026-01-03\n",
+                      checks={7: "grep -c 'ROW7;\\|NEVER' data.txt"}))
+    repo.git("add", "-A")
+    return repo.guard("Grow row 7, checked by an alternation\n")
+
+
+@case("the same row written as one -e per alternative", False)
+def _(repo):
+    repo.write("data.txt", data({7: 3}))
+    repo.write("docs/name-resolution.md",
+               ledger({7: 3}, "### 8.100 A first entry - MEASURED AND FIXED 2026-01-01\n"
+                              "\n### 8.102 Row 7 grows - MEASURED AND LANDED 2026-01-03\n",
+                      checks={7: "grep -c -e 'ROW7;' -e 'NEVER' data.txt"}))
+    repo.git("add", "-A")
+    return repo.guard("Grow row 7, checked by two patterns\n")
+
+
 # --- the split shape: §0 in one file, the archive in another ------------
 # Written before the split lands, because the rule going inert when the file
 # moves is exactly what a hardcoded path would have caused - and it would have
@@ -273,15 +307,15 @@ def hook_case(repo):
 
 def main():
     failures = []
-    for name, expect_refused, fn, split in CASES + [
+    for name, expect_refused, fn, split, saying in CASES + [
             ("through the installed hook, on a real commit", True,
-             hook_case, False)]:
+             hook_case, False, None)]:
         tmp = tempfile.mkdtemp(prefix="ns-guard-")
         try:
             repo = build(tmp, split=split)
             code, out = fn(repo)
             refused = code != 0
-            ok = refused == expect_refused
+            ok = refused == expect_refused and (saying is None or saying in out)
             print("  %-6s %-52s %s"
                   % ("ok" if ok else "FAIL", name,
                      "refused" if refused else "allowed"))

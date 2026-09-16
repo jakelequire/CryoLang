@@ -1051,16 +1051,24 @@ type struct MethodBinding {
 
     /// Like `find_method_in_trait_impls` but matches by name + has-own-generics
     /// (the inferred no-turbofish path solves `<U>` from arguments).  Same
-    /// specialization-before-template ordering, for the same reason.
+    /// specialization-before-template ordering, for the same reason.  With
+    /// `only_trait`, only that trait's impls are candidates.  Without one,
+    /// what this answers is the method's SIGNATURE, for the call's bindings
+    /// and return type: an unstamped call several traits provide is refused
+    /// as ambiguous by the argument check once the receiver is concrete, and
+    /// until then any candidate's signature serves; which body is bound is
+    /// decided where the stamp is read.
     find_generic_method_in_trait_impls(&this, owner_ref: TypeRef, method_name: SymbolStr,
+                                       only_trait: SymbolStr,
                                        out_impl: ImplBlockNode**) -> MethodNode* {
         if (this.ctx.generic_registry == null) { return null; }
         const qname: SymbolStr = this.arena.get_qualified_name(owner_ref);
         const tkey: SymbolStr = this.trait_checker().template_key_of(owner_ref);
-        mut leaf_m: MethodNode* = null;
-        mut leaf_impl: ImplBlockNode* = null;
+        mut tmpl_m: MethodNode* = null;
+        mut tmpl_impl: ImplBlockNode* = null;
         for (mut i: i64 = 0; i < this.ctx.generic_registry.trait_impls.length; i++) {
             const impl_node: ImplBlockNode* = this.ctx.generic_registry.trait_impls[i].second;
+            if (only_trait.is_valid() && !impl_node.qualified_trait_name.equals(only_trait)) { continue; }
             const rank: i32 = GenericRegistry::impl_target_rank(impl_node, qname, tkey, this.arena);
             if (rank == 0) { continue; }
             const m: MethodNode* = this.find_generic_method_in(&impl_node.methods, method_name);
@@ -1069,10 +1077,10 @@ type struct MethodBinding {
                 *out_impl = impl_node;
                 return m;
             }
-            if (leaf_m == null) { leaf_m = m; leaf_impl = impl_node; }
+            if (tmpl_m == null) { tmpl_m = m; tmpl_impl = impl_node; }
         }
-        if (leaf_m != null) { *out_impl = leaf_impl; }
-        return leaf_m;
+        if (tmpl_m != null) { *out_impl = tmpl_impl; }
+        return tmpl_m;
     }
 
     /// Abstract-receiver method lookup (symbolic walk only): `value.fmt(f)` where
@@ -1286,6 +1294,25 @@ type struct MethodBinding {
         const empty_params: GenericParamNode*[] = [];
         mut owner_params: &GenericParamNode*[] = &empty_params;
 
+        // The precedence `select_method` binds under.  A call stamped with a
+        // trait names that trait's method, so its impls are asked first.
+        // Otherwise the INHERENT stores, then the trait ones: an inherent
+        // method of the call's name answers ahead of any trait impl's,
+        // whatever order the blocks were written in.  Inherent: the
+        // template's own methods and its inherent impl blocks, a non-generic
+        // owner's own methods, the inherent-impl registry
+        // (`"42".parse_int<u64>()` on `implement string`, or an `implement
+        // struct Driver { run<F,R> }` block, which is merged into no owner's
+        // method list).  Trait: the trait impls for the receiver, then a
+        // trait default.
+        mut trait_impl_block: ImplBlockNode* = null;
+        if (member.resolved_trait.is_valid()) {
+            found = this.find_generic_method_in_trait_impls(
+                recv_type, member.member, member.resolved_trait, &trait_impl_block);
+            if (found != null && trait_impl_block != null) {
+                owner_params = &trait_impl_block.generic_params;
+            }
+        }
         // Template key: an instantiation (`Array<i32>`) keys off its generic base; a
         // BARE template struct used directly as a receiver (`this` in `implement
         // FmtWrite for struct String`, where `this` is the un-parameterized `String`,
@@ -1295,7 +1322,7 @@ type struct MethodBinding {
         const tmpl_base_id: u64 = if (recv_base.is_valid()) { recv_base.id } else { recv_type.id };
         const tmpl: TemplateEntry* =
             this.ctx.generic_registry.get_template_by_type_id(tmpl_base_id);
-        if (tmpl != null && tmpl.ast_node != null) {
+        if (found == null && tmpl != null && tmpl.ast_node != null) {
             if (tmpl.node_kind == NodeKind::StructDeclaration) {
                 const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
                 found = this.find_generic_method_in(&sn.methods, member.member);
@@ -1312,7 +1339,7 @@ type struct MethodBinding {
             if (found == null) {
                 for (mut bi: i64 = 0; bi < tmpl.impl_blocks.length; bi++) {
                     const ib: ImplBlockNode* = tmpl.impl_blocks[bi];
-                    if (ib == null) { continue; }
+                    if (ib == null || ib.is_trait_impl()) { continue; }
                     const m: MethodNode* = this.find_generic_method_in(&ib.methods, member.member);
                     if (m != null) {
                         found = m;
@@ -1320,14 +1347,6 @@ type struct MethodBinding {
                         break;
                     }
                 }
-            }
-        }
-        mut trait_impl_block: ImplBlockNode* = null;
-        if (found == null) {
-            found = this.find_generic_method_in_trait_impls(
-                recv_type, member.member, &trait_impl_block);
-            if (found != null && trait_impl_block != null) {
-                owner_params = &trait_impl_block.generic_params;
             }
         }
         if (found == null) {
@@ -1348,11 +1367,6 @@ type struct MethodBinding {
                 }
             }
         }
-        // Generic method declared in an inherent `implement T { ... }` block on a
-        // NON-generic / primitive receiver (`"42".parse_int<u64>()` on
-        // `implement string`).  These live in the inherent-impl registry, not the
-        // inherent-owner index; without this the call's method-arg bindings are
-        // never stashed and the monomorphizer can't specialize it (codegen E0636).
         if (found == null) {
             mut impl_blk: ImplBlockNode* = null;
             mut nm: SymbolStr = this.types.lookup_type_sym(recv_type);
@@ -1368,6 +1382,13 @@ type struct MethodBinding {
                 }
             }
             if (found != null && impl_blk != null) { owner_params = &impl_blk.generic_params; }
+        }
+        if (found == null) {
+            found = this.find_generic_method_in_trait_impls(
+                recv_type, member.member, SymbolStr::empty(), &trait_impl_block);
+            if (found != null && trait_impl_block != null) {
+                owner_params = &trait_impl_block.generic_params;
+            }
         }
         mut orig_func: FunctionDeclNode* = null;
         if (found != null) {
