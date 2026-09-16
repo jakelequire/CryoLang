@@ -61,7 +61,7 @@ current-state description is the defect it exists to remove.
 | D17 | **An `extern "C"` function is public unless marked `private`** — the extern-visibility default `docs/cryo.md` §18.1 states | **RULED** (Jake, 2026-09-14) — built in §8.167 by a worker and carried as unconfirmed until ratified; the spec text is normative, not provisional | `grep -c 'mut ext_public: boolean = true;' compiler/src/compiler/parser/parser.cryo` → **1**; `grep -c 'unless written .private function' docs/cryo.md` → **1** | §8.167, §8.187 |
 | D18 | **The keyword ruling** (§8.165): the primitive type names stop being keywords; `implement … for int` and `new int[100]` are stamped like any other name | **RULED - UNBUILT** (Jake's, queued; re-affirmed 2026-09-15, §8.202) — holds `new`'s spelling step and the impl head's alias-keyword arm | `grep -rho 'is_alias_keyword' compiler/src --include=*.cryo \| wc -l` → **2** (0 when built) | §8.165, §8.188, §8.202 |
 | D19 | **A bare `malloc`/`free`/`realloc` with no declaration in the writing module is an ERROR** - D6's rule, a bare name means a declaration in scope or nothing; the diagnostic says to write `libc::free` or `heap::free`. No freestanding carve-out: in `no_std` the name IS declared (extern or intrinsic), so the rule is satisfied there as everywhere | **TAKEN** (ruled §8.202; built in §8.207) — `callee_family`'s unanswered arm names nothing, so the call is E0202 with a note naming every module declaring the leaf (`std::core::intrinsics`, `std::ffi::libc`, `std::alloc::heap` for `free`) and the spelling of each; §8.93's hold is closed: an intrinsic's leaf is a key in no function table (`note_intrinsic` records the leaf → declaration for codegen's inline decision alone), the four durability guards that kept that key are gone, and codegen's synthesized allocation names `std::core::intrinsics::malloc`/`free`. The population was ONE file, `bare_intrinsic_priority.cryo`, which asserted the bare bind and is the negative `E0202_bare_allocator_leaf` now; the two E0453 negatives the previous handoff counted declare the leaf in their own extern block and are legal | `grep -c 'intrinsic_owner_of' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -rho 'register_intrinsic_function_type' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'note_intrinsic(' compiler/src/compiler/passes/type_resolution.cryo` → **1**; `grep -c 'intrinsic_names.contains_key' compiler/src/compiler/decl_index.cryo` → **0**; `grep -c '^negative E0202_bare_allocator_leaf' tests/test-roster.txt` → **1** | §8.93, §8.173, §8.202, §8.207 |
-| D20 | **A plain `import Unknown;` naming no module is an ERROR**, as the braced form is (§8.191) | **RULED, NOT BUILT** (Jake, 2026-09-15, §8.202) — measure the population over six halves first, as §8.191 did | `no check` until built | §8.191, §8.202 |
+| D20 | **A plain `import Unknown;` naming no module is an ERROR**, as the braced form is (§8.191) | **TAKEN** (ruled §8.202; built in §8.208) — an import path the graph holds no module under is E0502 at the import for every form, with the module the path abbreviates named as the help (`core::option` → `std::core::option`); a path naming no FILE was already E0500 at discovery. Measured first with the refusal as a shadow line: **0** over the six halves and the four Linux-target builds; the instrument fires on `import core::option;` and stays silent on a module gated off this OS, which the graph still holds | `grep -c 'refuse_unknown_module_import' compiler/src/compiler/resolver/name_resolution.cryo` → **2**; `grep -c '^negative E0502' tests/test-roster.txt` → **2** | §8.191, §8.202, §8.208 |
 | D21 | **An unknown type in EXPRESSION or TYPE-ARGUMENT position is an ERROR** (`sizeof(Nope)`, `1 as Nope`, `String<Nope>`) - and **a defaulted type parameter resolves in the module where the TYPE was DECLARED**, not at the use site: `String<A = GlobalAlloc>` written as `String` fills in `GlobalAlloc` resolved in `string`'s own scope, so a user never imports it; a user who WRITES `String<GlobalAlloc>` needs it in scope, because they wrote it. Rust's rule - a name resolves in the scope where it is written | **RULED, NOT BUILT** (Jake, 2026-09-15, §8.202) — the second part is what makes the first safe; `sizeof_undeclared_type` pins the refusal shape | `grep -c '^project sizeof_undeclared_type' tests/test-roster.txt` → **1** | §8.189, §8.193, §8.202 |
 | D22 | **The six trait heads with a trailing type list and no leading `implement<...>`** (`Atomic<T>`, `BufStream<S>` ×3, `WebSocket<S>`, one test) are **covered by D16**: `implement trait Atomic<T>` with `T` declared nowhere becomes `implement<T> trait Atomic<T>`, same code and diagnostic | **RULED, NOT BUILT** (Jake, 2026-09-15, §8.202) — with any remaining D16 work | `no check` until built | §8.190, §8.193, §8.202 |
 | D23 | **The `Res` contract is AUTHORITATIVE**: an unstamped node is an error; D1 is right and the tree is wrong. Landed GRADUALLY - each silent `_ =>` arm becomes a hard door as its population is measured to zero; never all at once | **RULED, staged** (Jake, 2026-09-15, §8.202) — 10 hard doors (`require_scope_res`) against **22** silent arms at the ruling | `grep -rho 'require_scope_res(' compiler/src --include=*.cryo \| wc -l` → **14** (13 doors and the definition, the thirteenth `resolve_scope_call`'s owner-kind dispatch since §8.206; the silent-arm count is the audit's 22 and is re-measured per conversion, 22 → 0) | §8.39, §8.44, §8.202 |
@@ -89,7 +89,7 @@ three, and its row carries the count. Read each zero off its own row.
 
 | artifact | status | pinned | check → expected | § |
 |---|---|---|---|---|
-| braced import entry binding nothing in silence (`process_import`'s Specific branch, rung (b): an absent sub-module has no exports, so `import M::{ nonexistent };` declared no symbol and said nothing) | **DELETED** — an entry the module neither declares, re-exports nor holds as a sub-module is E0502 at the import, naming what the module offers and the closest spelling; measured over six halves BEFORE refusing: 1,168 sub-module entries, **5** unbound - four dead imports in `compiler/src` (`registry` ×2, the module §8.185 deleted; `ResSlot` from `compiler::resolver`; `BaseASTVisitor` from `compiler::ast`) and one `export` naming a private, which stays E0241's; `cross-check` found two more on the Linux surface (`command.cryo` importing Windows-only externs ungated), qualified at their gated uses. The plain `import Unknown;` is a separate question, Jake's | — | `grep -c 'refuse_unoffered_import' compiler/src/compiler/resolver/name_resolution.cryo` → **2**; `grep -c '^negative E0502' tests/test-roster.txt` → **1** | §8.187, §8.191 |
+| braced import entry binding nothing in silence (`process_import`'s Specific branch, rung (b): an absent sub-module has no exports, so `import M::{ nonexistent };` declared no symbol and said nothing) | **DELETED** — an entry the module neither declares, re-exports nor holds as a sub-module is E0502 at the import, naming what the module offers and the closest spelling; measured over six halves BEFORE refusing: 1,168 sub-module entries, **5** unbound - four dead imports in `compiler/src` (`registry` ×2, the module §8.185 deleted; `ResSlot` from `compiler::resolver`; `BaseASTVisitor` from `compiler::ast`) and one `export` naming a private, which stays E0241's; `cross-check` found two more on the Linux surface (`command.cryo` importing Windows-only externs ungated), qualified at their gated uses. The plain `import Unknown;` is D20's, built in §8.208 | — | `grep -c 'refuse_unoffered_import' compiler/src/compiler/resolver/name_resolution.cryo` → **2**; `grep -c '^negative E0502' tests/test-roster.txt` → **2** (the braced form's and D20's) | §8.187, §8.191 |
 | impl head's `target_args` empty on an inherent head (the parser recording `implement enum Option<T>`'s list as `generic_params` alone, and `implement<T> struct MyVec<T>` declaring `T` twice) | **DELETED** — the list after the target is `target_args` on every head, and declares only the names no leading list did; the D16 check counts one thing; 0 objects moved | — | `grep -c 'inherent_args' compiler/src/compiler/parser/parser.cryo` → **3** | §8.190 |
 | `sizeof`/`alignof` operand by its first token (`ir_generator`: re-resolve the annotation at codegen with a span-derived home, then `decl_index.lookup_type(type_name)` - the operand's FIRST TOKEN, `Foo` for `sizeof(Foo::Bar)`, kept in step by two substituter rewrites) | **DELETED** — sema decides `operand_type` once in the body's context (`resolve_layout_operand`, a cast target's shape), a clone is answered again over its substituted annotation, codegen reads the slot and refuses (E0900) one nothing decided; shadow 5,488 sites over six halves, first-token rung 0 `OLD-ONLY` (1,045 `new-only`), sema's answer = codegen's re-derivation at every site; 0 objects moved. `sizeof(Nope)` with no `Nope` anywhere compiled and exited 0 under HEAD and the pin - no pass refuses an unknown type in EXPRESSION position (nor `1 as Nope`); pinned as a `compile_fail` project until that diagnostic is decided | — | `grep -c 'type_name' compiler/src/compiler/AST/expression.cryo` → **4** (all the `new` node's); `grep -c 'operand_type' compiler/src/compiler/codegen/visit/ir_generator.cryo` → **2**; `grep -c 'resolve_layout_operand' compiler/src/compiler/sema/sema.cryo` → **3**; `grep -c '^project sizeof_undeclared_type' tests/test-roster.txt` → **1** | §8.189 |
 | `bare_alts` (`decl_index`: every declaration under its bare leaf → its qualified names; `resolve_qualified_scoped`'s single-candidate fast path, gated since §8.1's NotReachable) | **LIVE for the LSP alone** — 12 writers (`register_name_mapping`: 6 in `type_resolution.cryo`, 5 in `pass_registry.cryo`, 1 in `specialization.cryo`; the free function's went in §8.200 and the intrinsic's in §8.207, a function name never being a scope segment) and NO reader in the compiler since §8.206 deleted D5's cursor lane (`scope_owner_key` through `resolve_scoped_at`, 2,812,611 of the 2,953,192 calls measured over six halves in §8.193); the LSP's completion handler is the one reader left (the row below), and the writers stay until that handler reads `ResolutionMap`, which is Jake's. Its other readers went in §8.193: mono's free-call spelling rung (2 answers, both the stamp's), the resolver's 2c refusal (a guard on a step that fails anyway), the E0240 gate (reads the arena's leaf index), `canonical_qualified` (the coherence key reads the stamp), the export check (asks `private_declaration`) | — | `grep -rho 'register_name_mapping(' compiler/src --include=*.cryo \| wc -l` → **13** (12 + the definition; the free function's write went in §8.200, the intrinsic's in §8.207); `grep -rho 'resolve_qualified_scoped(' compiler/src --include=*.cryo \| wc -l` → **1** (the definition; D5's two wrappers went in §8.206); `grep -rho 'canonical_qualified' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'lookup_qualified_alternatives(' compiler/src --include=*.cryo \| wc -l` → **2** (the definition and `resolve_qualified_scoped`) | §1, §8.1, §8.189, §8.193 |
@@ -184,7 +184,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,120 unit + 57 project + 185 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
+| `make test` | 2,120 unit + 57 project + 186 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make lane-check` | 9 buckets of call sites in `compiler/src`, as a golden; `HOME_WRITE` pins `.set_home_module(` calls at 0 since §8.204, so the mechanism cannot come back unpinned; REENTRY counts `get_resolver()` AND a cursor move through the `name_resolver` field since §8.189 (it read 3 over a tree holding 6: the monomorphizer's `find_module_scope`/`set_module`/`restore_scope`); `LOOKUP_ARENA` counts the arena's `lookup_by_name` since §8.192 (it read OK over a tree holding 17 in `type_resolution.cryo`) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
 | `make selfhost-check` | stage-3 == stage-4 byte identity, both arms | **Stability, not correctness.** It proves the compiler still emits the same bytes for code that already compiles; it says nothing about code that now STOPS compiling. |
@@ -212,7 +212,7 @@ Checks for this section, one per line so each can be copied whole:
 
 * `grep -c '^\[' tests/lane-baseline.txt` → **9**
 * `grep -c '^project ' tests/test-roster.txt` → **57**
-* `grep -c '^negative ' tests/test-roster.txt` → **185**
+* `grep -c '^negative ' tests/test-roster.txt` → **186**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
 * `grep -n 'branches:' .github/workflows/ci.yml` → `main` only, both hooks
@@ -11113,6 +11113,56 @@ compiling `new` through the renamed rung); objects
 **Tally: 66 shadowed, 66 old paths deleted, 66 at zero - §8.93's
 allocator residue is closed; 96 artifacts gone** (+
 `register_intrinsic_function_type`, the four durability guards).
+
+---
+
+### 8.208 D20 TAKEN: an import path the graph holds no module under is E0502 at the import, measured at zero first - 2026-09-16
+
+#### What the shape is
+
+A path naming no FILE was already refused at discovery (E0500, `cannot
+find module`), plain or braced.  What survived was the path the loader
+resolves to a file whose namespace is spelled otherwise: `import
+core::option;` reaches `stdlib/core/option.cryo`, the graph registers
+`std::core::option`, and `process_import`'s `find_module_index` misses -
+so the import bound nothing, and as a plain `import M;` (D7: it binds no
+names by design) said nothing.  The braced form of the same path reached
+`refuse_unoffered_import` per entry with a message about a module that
+does not exist.  A module gated off this OS (`![config(linux)]` on
+Windows) is NOT this shape: the graph holds it, empty, and the import
+names it.
+
+#### Measured first
+
+The refusal was landed as a `SHADOW\tIMPORT-UNKNOWN` line first and
+run over the six halves (`corpus2.sh m7`: **0** lines, 0 failing halves)
+and, since `cross-check.py` keeps only error lines, over the four
+Linux-target builds by hand (`runtime`, `stdlib`, `compiler`,
+`tools/CryoLSP` with `--target=x86_64-pc-linux-gnu`: **0** lines, every
+build exit 0).  Control: a scratch project writing `import core::option;`
+printed the line and compiled; one importing a `![config(linux)]` module
+on this host printed nothing and compiled.  So the population is zero
+and the instrument can report non-zero.
+
+#### Built
+
+`refuse_unknown_module_import`, ahead of every style in `process_import`:
+E0502 `` `core::option` is not a module's name ``, labelled at the import,
+with a help naming every module the path is a whole-segment suffix of
+(`Resolver::ns_written_as` over the graph) - the mistake the shape comes
+from is writing where an import wants the whole name the abbreviation a
+qualifier is allowed.  The braced form no longer reaches its entries
+against a missing offering.  Pinned by `E0502_import_names_no_module`.
+
+#### Gates
+
+`check-fast` OK; `test-census` OK (2,120 unit, 186 compile-fail, 54 of
+57 projects on this host); `lsp-check` OK (264 modules, 0 errors);
+`cross-check` OK (243 compiler modules); objects
+(`.objcmp/m8-objcmp.out`): **examples 0 of 1,126, tests 0 of 2,333**.  `ns-status-check` every row.
+
+**Tally: 66 shadowed, 66 old paths deleted, 66 at zero; 96 artifacts
+gone** (D20 adds a refusal, not a deletion).
 
 ---
 

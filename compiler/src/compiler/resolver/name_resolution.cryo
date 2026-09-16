@@ -2256,6 +2256,32 @@ public:
         this.ctx.emit_diagnostic(d);
     }
 
+    /// E0502: an import path that is no module's registered name.  The
+    /// modules whose name the path is a whole-segment suffix of are offered
+    /// as the fix, because that is the mistake the shape comes from - the
+    /// path a QUALIFIER may abbreviate to is written where the whole name
+    /// is required.
+    refuse_unknown_module_import(&this, node: ImportDeclNode*, module_path: string) -> void {
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0502_INVALID_IMPORT,
+            fmt::format("`%s` is not a module's name", module_path));
+        d = d.at_with_label(node.span, "no module is registered under this name");
+        const graph: ModuleGraph* = this.ctx.module_graph;
+        mut named: string = "";
+        mut count: i64 = 0;
+        for (mut mi: u32 = 0; mi < graph.modules.length; mi++) {
+            const cand: string = this.resolver.intern_table.resolve(graph.modules[mi].namespace_name);
+            if (cand.length() == 0 || !Resolver::ns_written_as(cand, module_path)) { continue; }
+            if (count > 0) { named = named + ", "; }
+            named = named + "`" + cand + "`";
+            count = count + 1;
+        }
+        if (count > 0) {
+            d = d.help(fmt::format("an import names a module whole; the name this path abbreviates is %s", named));
+        }
+        this.ctx.emit_diagnostic(d);
+    }
+
     process_import(node: ImportDeclNode*) -> void {
         const module_path: string = node.module_path;
         LOG_DEBUG(LogComponent::General, "[NameResolver] process_import() module='%s'", module_path);
@@ -2277,6 +2303,20 @@ public:
         // graph does not hold binds nothing, and the use site reports it.
         // The suffix match that stood here answered zero imports over the
         // corpus and was deleted.
+
+        // An import names a module by its registered name, whole.  A path
+        // the loader resolved to a file whose namespace is spelled
+        // otherwise (`import core::option;` for `std::core::option`) names
+        // no module in the graph: nothing it could bind is registered under
+        // that spelling, and a plain `import M;` would otherwise stand in the
+        // file binding nothing and saying nothing.  Refused here for every
+        // form, before the braced form's entries are judged against an
+        // offering that does not exist.
+        if (this.ctx.module_graph != null
+                && this.ctx.module_graph.find_module_index(module_sym) < 0) {
+            this.refuse_unknown_module_import(node, module_path);
+            return;
+        }
 
         const exports: SymbolID[] = this.resolver.get_exports(module_sym);
 
