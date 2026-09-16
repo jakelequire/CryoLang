@@ -1382,10 +1382,11 @@ type struct TypeResolutionRunner {
         if (registry == null) { return; }
 
         const ident: IdentifierNode* = call.callee as IdentifierNode*;
-        const entry: TemplateEntry* = match (ident.res) {
-            ResSlot::Answered(r) => { registry.template_of(r.def_id()) }
-            _                    => { null }
-        };
+        // The callee's stamp is the registry key; a callee with no stamp is
+        // a defect the door records (an unresolved bare name is refused by
+        // sema on its own path and never reaches an explicit-generic call).
+        const entry: TemplateEntry* = registry.template_of(
+            ident.res.require("type_resolution:register_generic_fn_call").def_id());
         if (entry == null) { return; }
         if (entry.node_kind != NodeKind::FunctionDeclaration) { return; }
         if (!entry.base_type.is_valid()) { return; }
@@ -1614,7 +1615,7 @@ type struct TypeResolutionPasses {
                 if (node.source_module == "") {
                     node.set_source_module(ctx.source_file);
                 }
-                // Stamp each trait-impl method with its trait's leaf name so
+                // Stamp each trait-impl method with its trait's identity so
                 // every mangling site can disambiguate it from a same-named
                 // method of another trait implemented for the same type.
                 // Without this, `implement trait A for T { foo() }` and
@@ -1625,34 +1626,16 @@ type struct TypeResolutionPasses {
                 // stamping chokepoint: it runs for both the type-resolution
                 // path and the specialization injected-decl path (which
                 // routes spec'd impl blocks back through register_decl_in_index).
+                //
+                // The trait is the head annotation's stamp: the canonical name
+                // the trait registries key by, decided where the impl's
+                // imports were in hand.  Two traits can share a leaf, and the
+                // stamp is what tells them apart; a head with no stamp is a
+                // defect the door records, never a leaf to search for.
                 if (node.is_trait_impl()) {
-                    const ot_trait_leaf: SymbolStr =
-                        TypeResolutionPasses::extract_trait_leaf(node.trait_annotation);
-                    if (ot_trait_leaf.is_valid()) {
-                        // Prefer the canonical qualified trait name so traits
-                        // sharing a leaf in different modules (e.g. a user
-                        // `Eq` vs `std::core::cmp::Eq`) don't merge.
-                        // `resolve_qualified` returns its input unchanged when
-                        // no bare->qualified mapping exists, so this is always
-                        // valid.  Stamped once per method here; every mangling
-                        // site reads the stamped value, so definition and
-                        // call-site symbols always agree regardless of which
-                        // form resolution produced.
-                        // The trait the head names, off the head annotation's
-                        // stamp: the canonical name the trait registries key
-                        // by, decided where the impl's imports were in hand.
-                        // A head the name layer could not place keeps its leaf,
-                        // which is the search key it always was.
-                        mut ot_trait: SymbolStr = ot_trait_leaf;
-                        match (TypeResolutionPasses::head_named_slot(node.trait_annotation)) {
-                            ResSlot::Answered(tr_res) => {
-                                match (tr_res) {
-                                    Res::Def(tq) => { ot_trait = tq.qualified_name(); }
-                                    _            => { }
-                                }
-                            }
-                            _ => { }
-                        }
+                    const ot_trait: SymbolStr = TypeResolutionPasses::head_named_slot(node.trait_annotation)
+                        .require("type_resolution:trait-impl head").def_id().qualified_name();
+                    if (ot_trait.is_valid()) {
                         // Carry the same answer on the block itself: a caller
                         // asking WHICH trait this impl provides must not have to
                         // re-derive it from the registry's bare leaf key.
