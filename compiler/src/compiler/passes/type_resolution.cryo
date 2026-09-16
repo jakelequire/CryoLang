@@ -2156,9 +2156,12 @@ type struct TypeResolutionPasses {
         // also declares its names, so its one spelling is the parameter form.
         const inherent: boolean = !node.is_trait_impl();
         const written_count: i64 = node.target_args.length;
-        if (written_count == tmpl.param_count) { return; }
-
         const intern: InternTable* = ctx.intern_table;
+        if (written_count == tmpl.param_count) {
+            if (!inherent) { TypeResolutionPasses::refuse_undeclared_head_params(node, ctx); }
+            return;
+        }
+
         const target: string = intern.resolve(node.target_type);
         const tmpl_params: GenericParamNode*[] = tmpl.get_generic_params();
 
@@ -2225,6 +2228,65 @@ type struct TypeResolutionPasses {
         if (!inherent && !all_defaulted) {
             diag = diag.with_note(fmt::format("or a concrete instantiation, one type per parameter: `%s`", concrete_form));
         }
+        ctx.emit_diagnostic(diag);
+    }
+
+    /// A trait impl head's trailing list names the template's arguments; it
+    /// declares nothing.  A name in it that is declared nowhere - no leading
+    /// `implement<S>`, no type of that name in scope - is the same defect as
+    /// an elided parameter, spelled from the other side: `implement trait
+    /// AsyncRead for BufStream<S>` reads as an impl over every `S` while `S`
+    /// is a name the program does not hold.  Refused as E0302 with the head
+    /// spelled the way it must be, its undeclared names moved to the leading
+    /// list; a name the name layer could not place is what an unstamped
+    /// `Named` argument is.  Called on a written head whose count matches.
+    static refuse_undeclared_head_params(node: ImplBlockNode*, ctx: CompilationContext*) -> void {
+        const intern: InternTable* = ctx.intern_table;
+        mut undeclared: string[] = [];
+        for (mut i: i64 = 0; i < node.target_args.length; i++) {
+            const arg: TypeAnnotation* = node.target_args[i];
+            if (arg == null) { continue; }
+            match (arg) {
+                TypeAnnotation::Named(n) => {
+                    if (n.pre_resolved.is_valid()) { continue; }
+                    mut placed: boolean = false;
+                    match (n.res) {
+                        ResSlot::Answered(_) => { placed = true; }
+                        _                    => { }
+                    }
+                    if (!placed) { undeclared.push(intern.resolve(n.name)); }
+                }
+                _ => { }
+            }
+        }
+        if (undeclared.length == 0) { return; }
+        mut head_params: string = "";
+        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+            if (i > 0) { head_params = head_params + ", "; }
+            head_params = head_params + intern.resolve(node.generic_params[i].name);
+        }
+        mut listed: string = "";
+        for (mut i: i64 = 0; i < undeclared.length; i++) {
+            if (head_params.length() > 0) { head_params = head_params + ", "; }
+            head_params = head_params + undeclared[i];
+            if (i > 0) { listed = listed + ", "; }
+            listed = listed + "`" + undeclared[i] + "`";
+        }
+        mut target_args: string = "";
+        for (mut i: i64 = 0; i < node.target_args.length; i++) {
+            if (i > 0) { target_args = target_args + ", "; }
+            target_args = target_args + TypeResolutionPasses::spell_annotation(node.target_args[i], intern);
+        }
+        const target: string = intern.resolve(node.target_type);
+        const trait_part: string = TypeResolutionPasses::spell_annotation(node.trait_annotation, intern);
+        const span: SourceSpan = if (node.target_type_span.has_location()) { node.target_type_span } else { node.span };
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0302_GENERIC_PARAM_MISMATCH,
+            fmt::format("this impl head names %s, which %s declared nowhere",
+                   listed, if (undeclared.length == 1) { "is" } else { "are" }));
+        diag = diag.at_with_label(span, "a trait impl head declares its parameters in a leading list");
+        diag = diag.with_note(fmt::format("write the parameters: `implement<%s> trait %s for %s<%s>`",
+            head_params, trait_part, target, target_args));
         ctx.emit_diagnostic(diag);
     }
 
