@@ -3,8 +3,7 @@
 /// Post-clone re-resolution of a specialized AST: after `ASTSpecializer` clones a
 /// template and `ASTTypeSubstituter` rewrites its annotations to concrete names,
 /// every `resolved_type` field is invalid.  This collaborator fills them -
-/// resolving fields, method signatures, and body locals against a resolution
-/// context homed on the module that WROTE the syntax - and performs compile-time
+/// resolving fields, method signatures, and body locals - and performs compile-time
 /// `static match` arm pruning (selecting the single live arm for the concrete
 /// substitution).
 ///
@@ -28,8 +27,6 @@ import compiler::types::{
 import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
 import compiler::resolver::{ intern_table, symbol_str };
-import compiler::module_graph;
-import compiler::module_graph::{ ModuleGraph };
 import compiler::mono::{ state, trait_specializer };
 import compiler::types::generic_registry;
 import compiler::types::generic_registry::{ TemplateEntry };
@@ -72,10 +69,6 @@ type struct MonoAstResolver {
     type_resolver: TypeResolver*;
     state:         MonoState*;
     trait_spec:    MonoTraitSpecializer*;
-    // File -> namespace map, for deriving a context's HOME module from the span
-    // of the syntax being resolved rather than from the template entry.  See
-    // `MonoCallSpecializer.module_graph`.
-    module_graph:  ModuleGraph*;
 
     static null() -> MonoAstResolver {
         return MonoAstResolver {
@@ -85,7 +78,6 @@ type struct MonoAstResolver {
             type_resolver: null,
             state:         null,
             trait_spec:    null,
-            module_graph:  null,
         };
     }
 
@@ -100,52 +92,20 @@ type struct MonoAstResolver {
         this.trait_spec    = trait_spec;
     }
 
-    set_module_graph(mut &this, graph: ModuleGraph*) -> void {
-        this.module_graph = graph;
-    }
-
-    /// The module that WROTE `file`, or "" when the graph cannot say.  See
-    /// `module_graph::home_ns_of_file`.
-    home_ns_of(&this, file: string) -> SymbolStr {
-        return module_graph::home_ns_sym_of_file(this.module_graph, file);
-    }
-
 
     /// Walk the specialized AST and resolve all type annotations into concrete
-    /// TypeRefs.  The context's HOME is the module that wrote the syntax, so a
-    /// bare leaf in the clone means what it meant where it was written; its
-    /// `current_module` stays the template entry's, which is where the spec walk
-    /// registers.
+    /// TypeRefs.
     resolve_specialized_ast(mut &this, ast_node: ASTNode*, node_kind: NodeKind,
                             entry: TemplateEntry*, subst: TypeSubstitution*,
                             this_type: TypeRef) -> void {
         if (ast_node == null || this.type_resolver == null) { return; }
 
-        mut entry_ns: SymbolStr = SymbolStr::empty();
-        if (entry != null) { entry_ns = entry.module_name; }
-        const module_name: string = this.intern_table.resolve(entry_ns);
-        mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "", SymbolStr::empty());
-        // A bare leaf in this clone means what it meant in the file that WROTE
-        // it, which is not the module the template entry names: `implement
-        // Display for Option<T>` is written in `std::fmt::display`, so its
-        // `Formatter` and `FmtError` are that file's imports, while the entry
-        // names the module owning the specialized TYPE (`std::core::option`),
-        // which imports neither.
-        //
-        // The MANGLED SPEC NAMES the substituter writes into the clone
-        // (`6Result$Lm_N$L3std.2io.5error.7IoError$G$G`) are registered under
-        // the entry's module and do not need this home at all: the substituter
-        // attaches a `pre_resolved` TypeRef to each, and `TypeResolver::resolve`
-        // returns that before it consults the context.  One context therefore
-        // carries one home, and `current_module` stays the entry's because the
-        // spec walk registers into the template's module.
-        //
-        // When the graph cannot name the writing file the entry's module
-        // answers, which is not the syntax's module but the one that demanded
-        // the walk.
-        mut home: SymbolStr = this.home_ns_of(ast_node.span.file);
-        if (!home.is_valid()) { home = entry_ns; }
-        res_ctx.set_home_module(home);
+        // A bare leaf in this clone carries the stamp it was given in the file
+        // that WROTE it, and the MANGLED SPEC NAMES the substituter writes into
+        // the clone carry a `pre_resolved` TypeRef that `TypeResolver::resolve`
+        // returns before it consults the context, so the context holds only
+        // the bindings and `This`.
+        mut res_ctx: ResolutionContext = ResolutionContext::new("");
 
         match (node_kind) {
             NodeKind::StructDeclaration => {
@@ -219,7 +179,7 @@ type struct MonoAstResolver {
         if (entry != null && entry.module_name.is_valid()) {
             module_name = this.intern_table.resolve(entry.module_name);
         }
-        mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "", SymbolStr::empty());
+        mut res_ctx: ResolutionContext = ResolutionContext::new("");
         // Scoped per body below, not here.  Both kinds of name a `static match`
         // resolves - the arm patterns the author wrote and the scrutinee the
         // substituter rewrote to the concrete binding - were written wherever
@@ -248,7 +208,6 @@ type struct MonoAstResolver {
             NodeKind::FunctionDeclaration => {
                 const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
                 if (decl == null || decl.body == null) { return; }
-                res_ctx.set_home_module(this.home_ns_of((decl as ASTNode*).span.file));
                 this.prune_static_match_in_block(decl.body, &res_ctx);
             }
             NodeKind::ImplementationBlock => {
@@ -274,13 +233,6 @@ type struct MonoAstResolver {
             // would fail (E0900).  Skip them; the per-call path handles them.
             if (method.func.is_generic()) { continue; }
             if (method.func.body != null) {
-                // Re-scoped for EVERY method, never skipped: the context is
-                // shared across the walk, so leaving a previous method's home
-                // in place would bind the next body's bare names in the wrong
-                // module with no diagnostic.  An empty answer resetting it to
-                // `Unset` is the honest outcome, not a case to skip.
-                res_ctx.set_home_module(
-                    this.home_ns_of((method.func as ASTNode*).span.file));
                 this.prune_static_match_in_block(method.func.body, res_ctx);
             }
         }

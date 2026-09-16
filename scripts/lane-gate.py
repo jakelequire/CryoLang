@@ -168,6 +168,14 @@ DEFID_MINT_RE = re.compile(r"DefId::of_definition\s*\(")
 # can match, while a receiver can only be a value.
 DEFID_UNWRAP_RE = re.compile(r"\.qualified_name\s*\(")
 
+# A ResolutionContext being told which module its annotations were WRITTEN
+# in.  Every writer is a place where a stage re-resolves syntax away from the
+# pass that walked it, and the module it hands over is what decides which
+# same-leaf declaration a bare name binds to: a home taken from the ambient
+# cursor binds a name to whichever module the compiler is standing in.  The
+# definition line has no receiver, so `.set_home_module(` matches calls only.
+HOME_WRITE_RE = re.compile(r"\.set_home_module\s*\(")
+
 # ANY lookup on the index, so the five cannot be routed around by a sixth.
 ANY_LOOKUP_RE = re.compile(r"([A-Za-z_][A-Za-z_0-9.]*)\.(lookup_[A-Za-z_0-9]*)\s*\(")
 # The arena's name-keyed lookup, with its receiver.  `lookup(id)` is not a
@@ -176,7 +184,7 @@ ARENA_LOOKUP_RE = re.compile(r"([A-Za-z_][A-Za-z_0-9.]*)\.lookup_by_name\s*\(")
 
 # Every counted population, in the order they are rendered and compared.
 KINDS = ("LOOKUP", "LOOKUP_OTHER", "LOOKUP_ROUTED", "LOOKUP_LOCAL",
-         "LOOKUP_ARENA", "REENTRY", "DEFID_MINT", "DEFID_UNWRAP")
+         "LOOKUP_ARENA", "REENTRY", "HOME_WRITE", "DEFID_MINT", "DEFID_UNWRAP")
 
 # The file that DEFINES the five lookups.  Its own calls are not the surface.
 #
@@ -258,6 +266,7 @@ def scan():
                             unplaced.append((rel, lineno, recv))
                 if rel not in REENTRY_OWNERS:
                     tally["REENTRY"] += len(REENTRY_RE.findall(line))
+                tally["HOME_WRITE"] += len(HOME_WRITE_RE.findall(line))
                 tally["DEFID_MINT"] += len(DEFID_MINT_RE.findall(line))
                 tally["DEFID_UNWRAP"] += len(DEFID_UNWRAP_RE.findall(line))
             for kind in KINDS:
@@ -300,6 +309,12 @@ HEADER = [
     "#          resolution is a PASS, not a service: a resolver called from sema no",
     "#          longer holds the writer's imports, so it answers from a string. That",
     "#          is where B1 comes from.",
+    "# HOME_WRITE    ResolutionContext::set_home_module() calls -- every place a",
+    "#               stage re-resolves syntax and says which module WROTE it.",
+    "#               The module handed over decides which same-leaf declaration",
+    "#               a bare name binds to, so a writer that hands over the",
+    "#               ambient cursor binds by where the compiler stands. A new",
+    "#               writer is a new such decision and must be placed.",
     "# DEFID_MINT    DefId::of_definition() -- where a name BECOMES a resolution",
     "#               answer. Legitimate only where the referent is known for a",
     "#               reason other than the spelling in front of it: a resolver",

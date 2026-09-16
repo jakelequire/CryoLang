@@ -811,7 +811,7 @@ public:
         for (mut i: i64 = 0; i < tdecl.assoc_types.length; i++) {
             const adecl: AssocTypeDeclNode* = tdecl.assoc_types[i];
             if (adecl == null || adecl.bounds.length == 0) { continue; }
-            mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "", SymbolStr::empty());
+            mut rc: ResolutionContext = ResolutionContext::new("");
             const item_ty: TypeRef = this.ctx.type_resolver.resolve_concrete_member(impl_this, adecl.name, &rc);
             if (!item_ty.is_valid()) { continue; }
             if (this.arena.contains_generic_param(item_ty)) { continue; }
@@ -938,43 +938,11 @@ public:
 
     // -- Per-function frame setup --
 
-    /// A resolution context for annotations written in the body being checked.
-    ///
-    /// Type annotations inside a body mean what that body's OWN module says, so
-    /// `span` must be the span of the syntax being resolved - not of whatever
-    /// the walk is standing on.  Both branches now answer from where the code
-    /// was WRITTEN: inside a method, the owner
-    /// type's module, read from the arena where it was recorded at declaration;
-    /// outside one, the module claiming the span's file.  These differ from the
-    /// module being compiled whenever a body is re-checked from elsewhere - a
-    /// specialized method body is checked while the walk sits in the module
-    /// that demanded the specialization.
-    ///
-    /// Only a span that no module claims still reaches the ambient cursor.
-    body_res_ctx(&this, span: SourceSpan) -> ResolutionContext {
-        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "", SymbolStr::empty());
-        const owner_ns: SymbolStr = this.arena.module_ns_sym_of(this.state.current_owner_type);
-        if (owner_ns.is_valid()) {
-            rc.set_home_module(owner_ns);
-            return rc;
-        }
-        // Outside a method there is no owner, and this used to read the ambient
-        // cursor.  The body's own FILE answers the question directly, and does
-        // so without any state that can go stale: the previous attempt at this
-        // cached the module at `enter_function`, which has no matching exit
-        // hook, so `body_res_ctx` read whichever function was entered last and
-        // typed `mem::transmute`'s `mut result: To` as `void`.  Deriving it
-        // from the span at the point of use is the same shape as
-        // `CallResolver::call_use_site_ns`, and has no lifetime at all.
-        const cursor_ns: SymbolStr = this.ctx.namespace_str;
-        const syntax_ns: SymbolStr = this.ctx.module_ns_sym_of_file(span.file);
-        if (syntax_ns.is_valid()) {
-            rc.set_home_module(syntax_ns);
-            return rc;
-        }
-        // No module claims the file (synthesized node, single-file mode).
-        rc.set_home_module(cursor_ns);
-        return rc;
+    /// A resolution context for annotations written in the body being checked:
+    /// the annotations carry their own stamps, so it starts with no bindings
+    /// and no `This`, and the caller adds what the body is checked under.
+    body_res_ctx(&this) -> ResolutionContext {
+        return ResolutionContext::new("");
     }
 
     enter_function(mut &this, func: FunctionDeclNode*, fn_this_type: TypeRef) -> void {
@@ -1282,7 +1250,7 @@ public:
 
         if (!var_node.has_resolved_type() && var_node.type_annotation != null && this.ctx.type_resolver != null) {
             this.prime_typeof_annotation(var_node.type_annotation);
-            mut res_ctx: ResolutionContext = this.body_res_ctx(var_node.span);
+            mut res_ctx: ResolutionContext = this.body_res_ctx();
             this.symbolic.symbolic_bind_params(&res_ctx);
             const vtype: TypeRef = this.ctx.type_resolver.resolve(var_node.type_annotation, &res_ctx);
             if (vtype.is_valid()) { var_node.resolved_type = vtype; }
@@ -1436,7 +1404,7 @@ public:
 
     override visit(mut &this, node: DestructureDeclNode*) -> void {
         if (!node.has_resolved_type() && node.type_annotation != null && this.ctx.type_resolver != null) {
-            mut res_ctx: ResolutionContext = this.body_res_ctx(node.span);
+            mut res_ctx: ResolutionContext = this.body_res_ctx();
             this.symbolic.symbolic_bind_params(&res_ctx);
             const ttype: TypeRef = this.ctx.type_resolver.resolve(node.type_annotation, &res_ctx);
             if (ttype.is_valid()) { node.resolved_type = ttype; }
@@ -1605,14 +1573,14 @@ public:
             NodeKind::SizeofExpression  => {
                 const s: SizeofExprNode* = expr as SizeofExprNode*;
                 if (!s.operand_type.is_valid()) {
-                    s.set_operand_type(this.resolve_layout_operand(s.type_ann, s.span));
+                    s.set_operand_type(this.resolve_layout_operand(s.type_ann));
                 }
                 this.arena.get_u64()
             }
             NodeKind::AlignofExpression => {
                 const a: AlignofExprNode* = expr as AlignofExprNode*;
                 if (!a.operand_type.is_valid()) {
-                    a.set_operand_type(this.resolve_layout_operand(a.type_ann, a.span));
+                    a.set_operand_type(this.resolve_layout_operand(a.type_ann));
                 }
                 this.arena.get_u64()
             }
@@ -1649,7 +1617,7 @@ public:
         if (!fut_ty.is_valid()) { return TypeRef::invalid(); }
         if (this.ctx.type_resolver == null) { return TypeRef::invalid(); }
         const out_sym: SymbolStr = this.intern.intern("Output");
-        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "", SymbolStr::empty());
+        mut rc: ResolutionContext = ResolutionContext::new("");
         const out_ty: TypeRef = this.ctx.type_resolver.resolve_concrete_member(fut_ty, out_sym, &rc);
         if (out_ty.is_valid()) { return out_ty; }
         // An operand typed by an associated-type projection (`s.read(n)` typed
@@ -2369,10 +2337,10 @@ public:
     /// codegen, neither of which re-derives it.  A clone arrives with the slot
     /// cleared by the substituter and is answered here again over the
     /// substituted annotation.
-    resolve_layout_operand(mut &this, ann: TypeAnnotation*, span: SourceSpan) -> TypeRef {
+    resolve_layout_operand(mut &this, ann: TypeAnnotation*) -> TypeRef {
         if (ann == null || this.ctx.type_resolver == null) { return TypeRef::invalid(); }
         this.prime_typeof_annotation(ann);
-        mut res_ctx: ResolutionContext = this.body_res_ctx(span);
+        mut res_ctx: ResolutionContext = this.body_res_ctx();
         this.symbolic.symbolic_bind_params(&res_ctx);
         return this.ctx.type_resolver.resolve(ann, &res_ctx);
     }
@@ -2397,11 +2365,10 @@ public:
         this.state.expected_type = saved_expected;
         if (!cast.has_resolved_target() && cast.target_annotation != null && this.ctx.type_resolver != null) {
             this.prime_typeof_annotation(cast.target_annotation);
-            mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "", SymbolStr::empty());
+            mut res_ctx: ResolutionContext = ResolutionContext::new("");
             // `x as T` is written inside a body, so the target annotation means
             // what that body's module says (spec §8.2l, same shape as
             // `body_res_ctx`).
-            res_ctx.set_home_module(this.ctx.module_ns_sym_of_file(cast.span.file));
             // Bind the enclosing generic's type parameters so a cast target like
             // `x as T` resolves `T` to the abstract method/owner type parameter,
             // not a same-named global type in another module.  Without this an
@@ -2649,10 +2616,9 @@ public:
         if (arm.type_patterns.length != 1) { return save; }
         if (this.ctx.type_resolver == null || this.arena == null) { return save; }
 
-        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "", SymbolStr::empty());
+        mut rc: ResolutionContext = ResolutionContext::new("");
         // The scrutinee annotation is written at the `static match`, inside a
         // body (spec §8.2l).
-        rc.set_home_module(this.ctx.module_ns_sym_of_file(arm.span.file));
         this.symbolic.symbolic_bind_params(&rc);
         const scrut_ref: TypeRef = this.ctx.type_resolver.resolve(scrutinee, &rc);
         if (!scrut_ref.is_valid()) { return save; }
@@ -3857,14 +3823,11 @@ public:
         if (tdecl.generic_params.length != 0 || tdecl.assoc_types.length != 1) { return false; }
         const adecl: AssocTypeDeclNode* = tdecl.assoc_types[0];
         if (adecl == null) { return false; }
-        // The bound's argument is syntax written where the annotation is, so it
-        // means what that module means by it - not what the walk is standing in,
-        // and not nothing.  Scope-less, a bare same-leaf type name here reaches
-        // the module-blind chain and can bind a type this module never imported.
-        // An ABSTRACT param is a different question: it needs a binding, and no
-        // home module can supply one, so those keep failing here by construction.
-        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "", SymbolStr::empty());
-        rc.set_home_module(this.ctx.module_ns_sym_of_file(annotation_span(bound_ann).file));
+        // The bound's argument is syntax written where the annotation is, and
+        // carries that module's stamp.  An ABSTRACT param is a different
+        // question: it needs a binding, which nothing here supplies, so those
+        // keep failing here by construction.
+        mut rc: ResolutionContext = ResolutionContext::new("");
         const expected: TypeRef = this.ctx.type_resolver.resolve(gen.args[0], &rc);
         const actual:   TypeRef = this.ctx.type_resolver.resolve_concrete_member(concrete, adecl.name, &rc);
         if (!expected.is_valid() || !actual.is_valid()) { return false; }

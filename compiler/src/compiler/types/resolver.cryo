@@ -69,9 +69,9 @@ import compiler::types::type_ref::{ TypeRef };
 
 /// Ambient state needed while resolving type annotations.
 type struct ResolutionContext {
-    current_module:   string;
+    /// The module an instantiation resolved through this context is demanded
+    /// for, so per-module codegen emits it there.
     source_file:      string;
-    import_modules:   string[];     // Modules imported by this compilation unit
     generic_bindings: Pair<SymbolStr, TypeRef>[];  // generic name -> bound TypeRef
     /// What `This` resolves to in the current scope.
     /// Inside an impl block: the implementing type (same as `&this` owner).
@@ -79,25 +79,6 @@ type struct ResolutionContext {
     /// that downstream substitution rewrites to the impl target.
     /// Invalid outside trait/impl scopes; using `This` there is an error.
     this_type:        TypeRef;
-
-    /// Module namespace the annotation being resolved was WRITTEN in, or the
-    /// empty symbol when unknown.
-    ///
-    /// A type annotation is syntax, and a bare leaf in it means whatever that
-    /// leaf means in ITS module - not in whichever module the resolver's ambient
-    /// scope cursor happens to be parked on. Those coincide while a pass walks
-    /// declarations in order, and diverge whenever an annotation is re-resolved
-    /// from somewhere else: sema re-deriving a callee's return type while
-    /// checking a caller, mono re-resolving a template signature while
-    /// specializing. There the ambient cursor names the CALLER's module, and a
-    /// bare leaf both modules define binds to the wrong one - silently, since
-    /// both resolutions succeed.
-    ///
-    /// Set this to the annotation's owning module at any such re-resolution and
-    /// `resolve_named` will prefer that module's own declaration of the leaf.
-    /// Empty means "resolve as before, against the ambient scope chain", so a
-    /// site that does not know its home module keeps today's behavior.
-    home_module:      SymbolStr;
 
     /// Demand-free (symbolic) resolution mode. When set, `resolve_generic`
     /// builds an arena-only `InstantiatedType` (via `arena.create_instantiation`)
@@ -109,32 +90,16 @@ type struct ResolutionContext {
     /// the registry with type-param-bearing instantiations.
     symbolic_no_demand: boolean;
 
-    /// `home_module` is REQUIRED: a context that does not state its scope is
-    /// not a context that happens to lack one, it is a site that never asked
-    /// the question.  When the scope defaulted silently, every step below
-    /// cascade 2c was reached ONLY by such a context - the module-blind chain
-    /// served scope-less callers exclusively, so the default WAS the fallback
-    /// chain's entire supply.  A site with genuinely nothing to say writes
-    /// `SymbolStr::empty()` and is then greppable.
-    static new(current_module: string, source_file: string,
-               home_module: SymbolStr) -> ResolutionContext {
+    /// A written annotation carries its own answer (the name layer's stamp), so
+    /// a context states no module of its own: what it carries is the generic
+    /// bindings in force, `This`, and the demand mode.
+    static new(source_file: string) -> ResolutionContext {
         return ResolutionContext {
-            current_module:   current_module,
             source_file:      source_file,
-            import_modules:   [],
             generic_bindings: [],
             this_type:        TypeRef::invalid(),
-            home_module:      home_module,
             symbolic_no_demand: false,
         };
-    }
-
-    /// Declare which module the annotations resolved through this context were
-    /// written in.  See `home_module`.  An empty module means the caller looked
-    /// the module up and got nothing back, and the context then resolves
-    /// against the ambient scope chain.
-    set_home_module(mut &this, module_ns: SymbolStr) -> void {
-        this.home_module = module_ns;
     }
 
     /// Add a generic binding (e.g., T -> i32).
@@ -163,12 +128,9 @@ type struct ResolutionContext {
     /// drop-glue frees one buffer twice (double-free).  This produces an
     /// independent context with its own `generic_bindings` storage.  The
     /// element type `Pair<SymbolStr, TypeRef>` is POD (interned ids), so the
-    /// per-element copies are trivial.  `import_modules` is reconstructed as
-    /// `[]` - it is never populated anywhere, matching the prior behavior.
+    /// per-element copies are trivial.
     clone(&this) -> ResolutionContext {
-        mut out: ResolutionContext =
-            ResolutionContext::new(this.current_module, this.source_file,
-                                   this.home_module);
+        mut out: ResolutionContext = ResolutionContext::new(this.source_file);
         out.this_type = this.this_type;
         out.symbolic_no_demand = this.symbolic_no_demand;
         for (mut i: i64 = 0; i < this.generic_bindings.length; i++) {
@@ -294,7 +256,7 @@ type struct TypeResolver {
                 // resolve_generic and deliberately bypasses this, so it is NOT
                 // canonicalized here (which would nest as `String<GlobalAlloc><...>`).
                 this.canonicalize_default_generic_type(
-                    this.resolve_named_at_span(n.name, n.span, ctx, n.res))
+                    this.resolve_named(n.name, ctx, n.res, n.span))
             }
             TypeAnnotation::Pointer(p) => {
                 mut inner: TypeRef = this.resolve(p.inner, ctx);
@@ -531,9 +493,7 @@ type struct TypeResolver {
             // stand in for it: an `implement` block may live in a third module
             // again, and this context's other input is a type-param binding,
             // which carries no module at all.
-            mut bctx: ResolutionContext = ResolutionContext::new("", "",
-                module_graph::home_ns_sym_of_file(this.module_graph,
-                                                 impl_node.span.file));
+            mut bctx: ResolutionContext = ResolutionContext::new("");
             if (impl_node.target_args.length == base_args.length) {
                 for (mut ti: i64 = 0; ti < impl_node.target_args.length; ti++) {
                     const ta: TypeAnnotation* = impl_node.target_args[ti];
@@ -715,7 +675,7 @@ type struct TypeResolver {
                         // Nothing left to solve in this arg: don't pay for a lookup.
                         if (!this.where_arg_has_unbound_param(arg_ann, param_names, ictx)) { continue; }
                     }
-                    mut rc: ResolutionContext = ResolutionContext::new(source_file, "", SymbolStr::empty());
+                    mut rc: ResolutionContext = ResolutionContext::new("");
                     const member: SymbolStr = tdecl.assoc_types[assoc_idx].name;
                     if (subject_abstract) {
                         // `project_member` keeps an abstract base symbolic, giving
@@ -1141,23 +1101,11 @@ type struct TypeResolver {
             if (i >= params.length) { return filled; }
             const gp: GenericParamNode* = params[i];
             if (gp == null || !gp.has_default_annotation()) { return filled; }
-            mut def_ctx: ResolutionContext = ctx.clone();
             // A default annotation (`struct String<A = GlobalAlloc>`) is syntax
-            // written in the TEMPLATE'S module, so it resolves in that module's
-            // scope - never the caller's, and never scope-less.  Set here
-            // rather than at the nine call sites: the owning module is a
-            // property of `entry`, so this is correct by construction and
-            // cannot be forgotten by a new caller.
-            //
-            // Without it the context carries no home module and every scoped
-            // step of the cascade misses, which now leaves the name unresolved
-            // rather than answered from a program-wide index.  The re-home is
-            // what makes the scoped steps able to answer at all.  A template
-            // registered with no owning module keeps whatever home the CALLER
-            // handed in, and its default then binds per-caller.
-            if (entry.module_name.is_valid()) {
-                def_ctx.set_home_module(entry.module_name);
-            }
+            // written in the TEMPLATE'S module and carries that module's answer
+            // as its stamp; the caller's context contributes only the bindings
+            // of the arguments resolved so far.
+            mut def_ctx: ResolutionContext = ctx.clone();
             for (mut j: i64 = 0; j < filled.length; j++) {
                 def_ctx.add_binding(entry.param_names[j], filled[j]);
             }
@@ -1281,55 +1229,13 @@ type struct TypeResolver {
             const gp: GenericParamNode* = params[i];
             if (gp == null || !gp.has_default_annotation()) { return ty; }
         }
-        // The home module for the defaults is supplied by
-        // `expand_default_type_args` from `entry.module_name`, so this context
-        // deliberately stays bare.
-        mut ctx: ResolutionContext = ResolutionContext::new("", "", SymbolStr::empty());
+        // The defaults carry their own stamps; this context holds nothing but
+        // the bindings `expand_default_type_args` adds.
+        mut ctx: ResolutionContext = ResolutionContext::new("");
         mut empty: TypeRef[] = [];
         const filled: TypeRef[] = this.expand_default_type_args(entry, empty, &ctx);
         if (filled.length != entry.param_count) { return ty; }
         return this.arena.create_instantiation(ty, &filled);
-    }
-
-    /// Resolve a named annotation against the module the annotation itself was
-    /// written in, restoring the caller's home afterwards.
-    ///
-    /// An annotation TREE is not written in one place.  A default type argument
-    /// is spliced from the template's file into a use site's argument list and
-    /// keeps its own span, so `String<A = GlobalAlloc>`'s default is syntax in
-    /// `std::collections::string` however the module that named `String` spells
-    /// its imports.  `resolve` descends into children carrying ONE context, so
-    /// without a per-node home the spliced leaf is judged at the enclosing
-    /// declaration - one declaration's default then means a different thing per
-    /// caller, and it names a module those callers neither write nor import.
-    ///
-    /// The home is RESTORED rather than left in place: the context is shared
-    /// with the rest of the tree, and a home that outlives the node it came from
-    /// is the same defect one level down.
-    ///
-    /// An empty answer means the span names no module in the graph (a
-    /// synthesized node, single-file mode) and keeps the caller's home rather
-    /// than clearing it.  Reading missing provenance as a namespace would make
-    /// it compare unequal to every real module - the false-positive direction
-    /// that reverted the visibility gate once.
-    /// `slot` is the annotation node's own answer, carried alongside the
-    /// spelling rather than re-derived from it.  The span is the string-shaped
-    /// stand-in for it: it names the file, from which the home module is
-    /// recovered, which is the question the stamp already answers exactly.
-    /// Callers holding no node pass `ResSlot::Pending`.
-    resolve_named_at_span(&this, name: SymbolStr, span: SourceSpan,
-                          ctx: ResolutionContext*, slot: ResSlot) -> TypeRef {
-        if (ctx == null) { return this.resolve_named(name, ctx, slot, span); }
-        const ann_ns: SymbolStr = module_graph::home_ns_sym_of_file(
-            this.module_graph, span.file);
-        if (!ann_ns.is_valid() || ann_ns.equals(ctx.home_module)) {
-            return this.resolve_named(name, ctx, slot, span);
-        }
-        const saved_home: SymbolStr = ctx.home_module;
-        ctx.set_home_module(ann_ns);
-        const out: TypeRef = this.resolve_named(name, ctx, slot, span);
-        ctx.set_home_module(saved_home);
-        return out;
     }
 
 
@@ -1359,13 +1265,6 @@ private:
             depth += 1;
         }
         return current;
-    }
-
-    /// The module the annotation was written in, or the empty symbol when the
-    /// context is absent or names none.
-    home_module_sym(&this, ctx: ResolutionContext*) -> SymbolStr {
-        if (ctx == null) { return SymbolStr::empty(); }
-        return ctx.home_module;
     }
 
     /// Resolve a named type (user-defined or generic binding).
@@ -1442,56 +1341,29 @@ private:
             return prim;
         }
 
-        // 2c. Home-module preference.  A BARE leaf in an annotation means that
-        //     leaf as its OWN module sees it.  Every lookup below this point
-        //     goes through the ambient scope chain, which answers for whatever
-        //     module the resolver cursor is currently on -
-        //     the caller's, at any re-resolution site.  When the caller told us
-        //     where the annotation actually lives, the module's own declaration
-        //     of the leaf is authoritative and settles the tie before the
-        //     module-blind paths can pick the wrong same-leaf type.
+        // 2c. The stamp.  The annotation was answered for by NameResolution, in
+        //     the scope it was written in, and that answer is read off the
+        //     node: a BARE leaf means that leaf as its OWN module sees it, and
+        //     the module that wrote it had its imports in hand when it
+        //     answered.  Rebuilding a name the node already carries - from a
+        //     home module and the leaf, or from a second walk over the
+        //     writer's imports - would be a second way to ask one question,
+        //     free to disagree with the first.  Read, never re-derived.
         //
-        //     Runs ahead of the ambiguity check: a leaf the HOME module declares
-        //     is not ambiguous just because the module being compiled imports a
-        //     second one under the same name.
-        //
-        //     Asked for EVERY spelling, bare or qualified.  The stamp is the
-        //     name layer's answer to "what does this spelling name", and how
-        //     the source happened to abbreviate the path does not change what
-        //     it names - so a written qualifier is exactly the case where the
-        //     stamp is authoritative, not an exception to it.  The steps below
-        //     resolve a qualifier by looking the LEAF up in the ambient scope
-        //     and then vetoing the result when its module disagrees, which can
-        //     refuse a wrong answer but cannot produce the right one: with two
-        //     modules exporting one leaf, whichever registered last wins the
-        //     scope and the other spelling resolves to nothing.
-        //
-        //     Only on an exact hit, so a home module that does not declare the
-        //     leaf falls through unchanged.
-        //
-        //     The stamp is read whether or not the context carries a home
-        //     module: the answer is the node's, and the home is an input only
-        //     to the refusal below, which has a spelling and nothing else to
-        //     judge.  A synthesized annotation (a bindgen's, a lowering's) is
-        //     resolved from a context that never established a home, and its
-        //     stamp is the only thing that names what it refers to.
+        //     Asked for EVERY spelling, bare or qualified: how the source
+        //     abbreviated the path does not change what it names.  Runs ahead
+        //     of the ambiguity check, because a leaf the writer's module
+        //     declares is not ambiguous just because the module being compiled
+        //     imports a second one under the same name.  A synthesized
+        //     annotation (a bindgen's, a lowering's) is stamped by its
+        //     synthesizer, and that stamp is the only thing naming its referent.
         if (this.name_resolver != null) {
-            mut home_hit: TypeRef = TypeRef::invalid();
-            // WHICH qualified name this leaf denotes, taken from the node.
-            //
-            // The annotation was answered for by NameResolution, in the scope
-            // it was written in, and that answer is what this step used to
-            // rebuild out of `home_module + "::" + leaf` and, failing that, out
-            // of a second walk over the writing module's imports.  Rebuilding a
-            // name the node already carries is a second way to ask one
-            // question, free to disagree with the first; the string form also
-            // cannot express what an import resolves to without repeating the
-            // import walk.  Read, never re-derived.
-            mut home_key: SymbolStr = SymbolStr::empty();
+            mut stamp_hit: TypeRef = TypeRef::invalid();
+            mut stamp_key: SymbolStr = SymbolStr::empty();
             match (slot) {
                 ResSlot::Answered(r) => {
                     match (r) {
-                        Res::Def(q) => { home_key = q.qualified_name(); }
+                        Res::Def(q) => { stamp_key = q.qualified_name(); }
                         // A parameter names itself and a primitive is answered
                         // above; neither denotes a declaration to look up here.
                         _           => { }
@@ -1500,26 +1372,24 @@ private:
                 _ => { }
             }
 
-            if (home_key.is_valid()) {
+            if (stamp_key.is_valid()) {
                 // What remains is only WHERE the name's `TypeRef` is stored.
                 // The DeclarationIndex indexes the qualified NAME without
                 // necessarily holding the type, and the arena is the other
                 // place, so a miss in one is not an answer.
                 if (this.decl_index != null) {
-                    home_hit = this.decl_index.lookup_type(home_key);
+                    stamp_hit = this.decl_index.lookup_type(stamp_key);
                 }
-                if (!home_hit.is_valid()) {
-                    home_hit = this.arena.lookup_by_name(home_key);
+                if (!stamp_hit.is_valid()) {
+                    stamp_hit = this.arena.lookup_by_name(stamp_key);
                 }
                 // A name neither store serves is an ANSWER no store can serve:
                 // a declaration that never registered, not a name this step
                 // failed to derive.  It is not retried under another key.
             }
 
-            // The leaf resolved in the module that wrote it.  A context that
-            // established no home answered from the stamp alone, which is the
-            // writing module's answer by construction.
-            if (home_hit.is_valid()) { return this.follow_alias(home_hit); }
+            // The leaf resolved in the module that wrote it.
+            if (stamp_hit.is_valid()) { return this.follow_alias(stamp_hit); }
         }
 
         // 2b. Ambiguity check: if this name was imported from multiple
@@ -1593,7 +1463,7 @@ private:
         // A bare Named base goes straight through resolve_named, bypassing the
         // canonicalization the `resolve()` Named arm applies to bare uses.
         mut base: TypeRef = match (*g.base) {
-            TypeAnnotation::Named(bn) => { this.resolve_named_at_span(bn.name, bn.span, ctx, bn.res) }
+            TypeAnnotation::Named(bn) => { this.resolve_named(bn.name, ctx, bn.res, bn.span) }
             _                         => { this.resolve(g.base, ctx) }
         };
 

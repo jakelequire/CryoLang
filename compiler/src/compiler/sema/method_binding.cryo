@@ -97,12 +97,6 @@ type struct MethodBinding {
                                  this.intern, this.ctx.diagnostics);
     }
 
-    /// Module namespace that declares `ty` - the module a method's annotations
-    /// were written in, and so the `home_module` a re-resolution must supply.
-    owner_module_of(&this, ty: TypeRef) -> SymbolStr {
-        return this.arena.module_ns_sym_of(ty);
-    }
-
 
     // -- Receiver/return substitution --
 
@@ -518,7 +512,7 @@ type struct MethodBinding {
         if (this.ctx.type_resolver == null)    { return ret; }
         const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(tr.identity());
         if (tdecl == null || tdecl.assoc_types.length == 0) { return ret; }
-        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "", SymbolStr::empty());
+        mut rc: ResolutionContext = ResolutionContext::new("");
         this.symbolic.symbolic_bind_params(&rc);
         mut out: TypeRef = ret;
         for (mut a: i64 = 0; a < tdecl.assoc_types.length; a++) {
@@ -827,10 +821,9 @@ type struct MethodBinding {
         // params can't select a concrete instantiation - detect in a FRESH context
         // (no bindings) and defer the whole call.
         if (this.state.in_symbolic_check) {
-            mut sym_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "", SymbolStr::empty());
+            mut sym_ctx: ResolutionContext = ResolutionContext::new("");
             // `x.method<Widget>()` - the explicit args are the CALLER's syntax
             // (spec §8.2l), so they mean what the member access's module says.
-            sym_ctx.set_home_module(this.ctx.module_ns_sym_of_file(member.span.file));
             for (mut i: i64 = 0; i < member.generic_args.length; i++) {
                 const a: TypeRef = this.ctx.type_resolver.resolve(member.generic_args[i], &sym_ctx);
                 if (!a.is_valid()
@@ -897,7 +890,7 @@ type struct MethodBinding {
                     impl_name, member.member, member.generic_args.length);
                 if (im != null && im.func != null
                         && im.func.return_type_annotation != null) {
-                    mut imp_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "", SymbolStr::empty());
+                    mut imp_ctx: ResolutionContext = ResolutionContext::new("");
                     for (mut i: i64 = 0; i < im.func.generic_params.length; i++) {
                         const gp: GenericParamNode* = im.func.generic_params[i];
                         if (gp == null) { continue; }
@@ -954,8 +947,7 @@ type struct MethodBinding {
         const ret_ann: TypeAnnotation* = found.func.return_type_annotation;
         if (ret_ann == null) { return fallback; }
 
-        mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "", SymbolStr::empty());
-        res_ctx.set_home_module(this.owner_module_of(owner_ref));
+        mut res_ctx: ResolutionContext = ResolutionContext::new("");
         if (owner_base.is_valid()) {
             const owner_nargs: i64 = this.types.view_type_arg_count(owner_ref);
             const n: i64 = if (owner_params.length < owner_nargs) {
@@ -1092,7 +1084,7 @@ type struct MethodBinding {
                                            member: MemberAccessNode*,
                                            out_func: FunctionDeclNode**) -> ResolutionContext {
         *out_func = null;
-        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "", SymbolStr::empty());
+        mut rc: ResolutionContext = ResolutionContext::new("");
         if (!this.state.in_symbolic_check)      { return rc; }
         if (this.ctx.generic_registry == null)  { return rc; }
         if (member == null)                     { return rc; }
@@ -1168,7 +1160,6 @@ type struct MethodBinding {
             // and not in the module being checked.  The receiver is a generic param
             // and has no module of its own, so there is nothing here to key off
             // except the declaration.
-            rc.set_home_module(this.ctx.module_ns_sym_of_file(found.span.file));
             rc.set_this_type(recv_type);
             *out_func = found;
         }
@@ -1216,7 +1207,7 @@ type struct MethodBinding {
         if (orig_func == null) { return; }
         const n_method_params: i64 = orig_func.generic_params.length;
         if (n_method_params == 0) { return; }
-        mut owner_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "", SymbolStr::empty());
+        mut owner_ctx: ResolutionContext = ResolutionContext::new("");
         this.symbolic.symbolic_bind_params(&owner_ctx);
         owner_ctx.set_this_type(recv_type);
         // `orig_func` is the OWNER's method, so the annotations
@@ -1226,7 +1217,6 @@ type struct MethodBinding {
         // what it answers is the owner's module, which parts company with the
         // declaring file whenever the method is a trait default (declared in the
         // trait's file) or sits in an `implement` block outside the owner's module.
-        owner_ctx.set_home_module(this.owner_module_of(recv_type));
         mut bindings: TypeRef[] = this.solve_method_bindings(orig_func, &owner_ctx, member, call);
         if (bindings.length != n_method_params) { return; }
         call.set_resolved_type_args(bindings);
@@ -1239,7 +1229,7 @@ type struct MethodBinding {
     find_generic_method_for_call(mut &this, mut recv_type: TypeRef, member: MemberAccessNode*,
                                  out_func: FunctionDeclNode**) -> ResolutionContext {
         *out_func = null;
-        mut owner_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "", SymbolStr::empty());
+        mut owner_ctx: ResolutionContext = ResolutionContext::new("");
         if (this.ctx.generic_registry == null) { return owner_ctx; }
         if (this.ctx.type_resolver == null)    { return owner_ctx; }
         if (member == null)                    { return owner_ctx; }
@@ -1401,7 +1391,6 @@ type struct MethodBinding {
         // declaration is the thing that carries the answer; the early returns above
         // hand back an unscoped context, and every caller discards it when
         // `*out_func` is null.
-        owner_ctx.set_home_module(this.ctx.module_ns_sym_of_file(orig_func.span.file));
 
         if (recv_base.is_valid()) {
             const n_owner: i64 = if (owner_params.length < recv_nargs) {
@@ -1479,10 +1468,7 @@ type struct MethodBinding {
             // enclosing param sharing the receiver's param name).  Inside a
             // generic body, resolve in the enclosing symbolic-param context so an
             // enclosing `T` stays abstract for the substituter to concretize.
-            mut tf_ctx_buf: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "", SymbolStr::empty());
-            // The comment above already says "resolve in the CALLER's scope";
-            // this is what makes that true of the home module too (spec §8.2l).
-            tf_ctx_buf.set_home_module(this.ctx.module_ns_sym_of_file(member.span.file));
+            mut tf_ctx_buf: ResolutionContext = ResolutionContext::new("");
             mut use_symbolic: boolean = false;
             if (this.state.in_symbolic_check) {
                 this.symbolic.symbolic_bind_params(&tf_ctx_buf);
@@ -1681,7 +1667,7 @@ type struct MethodBinding {
         const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
         if (trait_ann == null) { return out; }
 
-        mut rc: ResolutionContext = ResolutionContext::new("", "", SymbolStr::empty());
+        mut rc: ResolutionContext = ResolutionContext::new("");
         // Arg count via the view: a bare `kind == InstantiatedType` test would skip
         // the impl's target-arg bindings for every post-mono concrete subject
         // (which the removed carrier swap used to paper over).
@@ -1938,7 +1924,7 @@ type struct MethodBinding {
         const ret_ann: TypeAnnotation* = found_method.func.return_type_annotation;
         if (ret_ann == null) { return TypeRef::invalid(); }
 
-        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "", SymbolStr::empty());
+        mut rc: ResolutionContext = ResolutionContext::new("");
         mut subst: TypeSubstitution = TypeSubstitution::empty();
         if (found_impl.target_args.length == subj_nargs) {
             for (mut i: i64 = 0; i < found_impl.target_args.length; i++) {

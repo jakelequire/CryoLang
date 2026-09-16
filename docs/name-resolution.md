@@ -108,7 +108,7 @@ three, and its row carries the count. Read each zero off its own row.
 | specialization's second index key (`register_spec`: the spec registered under `qualify_symbol_sym(spec_name)`, the CURSOR's module, beside its arena name) and `ModuleTypeRegistry` (`types/registry.cryo`, Phase 4 registering every type and alias into it by bare name) | **DELETED** — 13,667 second keys over six halves, 127 reads, all sema's async declare pass deriving a placed clone's key by the cursor; on `decl_type_key` (C-import alias, else registered name, else the writing file's module) it reads the arena key and the reads are 0; the registry's `lookup_type(module, name)` had no caller in the compiler or the LSP; 0 objects moved | — | `grep -c 'qualify_symbol_sym(' compiler/src/compiler/passes/specialization.cryo` → **0**; `ls compiler/src/compiler/types \| grep -c '^registry.cryo$'` → **0**; `grep -rho 'ModuleTypeRegistry' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'decl_type_key' compiler/src/compiler/sema/sema.cryo` → **8** (6 at §8.185; +2 in §8.187, the class arms) | §8.185 |
 | closure-arg specializer's callee by leaf (`lambda_synth`: the root scanned by the written name then the cursor-qualified spelling, the bare `lookup_func_type` slot, a cache keyed by the leaf) | **DELETED** — the identifier's stamp: `func_type_of_res`, the root scanned by registration key, the cache keyed by the definition; shadow 2,615 index-slot disagreements (2,301 a local fn-pointer handed a same-leaf global's signature, 307 another module's same-leaf function), 0 outcome moves in the corpus; built outside it, a local `f` called with a capturing closure ran global `f`'s clone (exit 41) and segfaulted without one - E0458 now, pinned by `E0458_closure_into_fn_pointer_local.cryo` | — | `grep -c 'lookup_func_type(ident.name)' compiler/src/compiler/sema/lambda_synth.cryo` → **0**; `grep -c 'qualify_symbol_sym(' compiler/src/compiler/sema/lambda_synth.cryo` → **0**; `grep -c 'find_top_level_function_by_key' compiler/src/compiler/sema/lambda_synth.cryo` → **2** | §8.184 |
 | annotation cascade step 3a (`resolve_named`: the written spelling, when qualified, looked up in the index) | **DELETED** — 1,561 answers over six halves, every one a synthesized annotation nobody stamped (1,559 the async lowering's canonical mints, 2 the bindgen's alias-qualified references with no span); each synthesizer stamps now, 2c reads a stamp without needing a home module, 1,561 → 0, 0 objects moved; a scratch generic async project builds under HEAD, refuses (E0200) with the `Poll` stamp reverted on this tree, builds with it. The cascade is steps 1, 1b, 2, 2c and the refusal | — | `grep -c 'lookup_type(name)' compiler/src/compiler/types/resolver.cryo` → **0**; `grep -c 'named_ann_def(' compiler/src/compiler/sema/async_lower.cryo` → **5**; `grep -c 'Res::Def(DefId::of_definition(qualified))' compiler/src/compiler/bindgen/type_map.cryo` → **1** | §8.64, §8.183 |
-| 2c home-module (ambient cursor) | STARVED - 0 on every b1 arm while the counter stood (§8.87 through §8.201); with the counter gone (§8.203) the cursor is no longer told apart from a span-derived home, and its two surviving writers are the fallbacks for a span no module claims: `body_res_ctx`'s last arm and `ast_resolver`'s entry-module arm | 0 | `grep -c 'rc.set_home_module(cursor_ns)' compiler/src/compiler/sema/sema.cryo` → **1**; `grep -c 'home = entry_ns' compiler/src/compiler/mono/ast_resolver.cryo` → **1** | §8.63, §8.87, §8.203 |
+| 2c home-module (`ResolutionContext.home_module`, the cursor lane included) | **DELETED** — the field was write-only: since §8.193 step 2c reads the node's STAMP, and no reader of `home_module` was left but a swap around a call that ignores it; its 50 writers, `set_home_module`, `resolve_named_at_span`, `home_module_sym`, the mono collaborators' `module_graph` plumbing and the five module-of-span helpers that fed them went with it. Shadowed first: 37,714 owner-module writes measured against the span's module, 9,576 differing (trait-default bodies, third-module `implement` blocks), then 0 of 3,478 objects moved on deletion, which is what a write-only field predicts. The `current_module` and `import_modules` fields on the same struct were dead too | — | `grep -rho 'set_home_module\|home_module' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -A1 '^\[HOME_WRITE\]' tests/lane-baseline.txt \| tail -1` → `TOTAL 0` | §8.63, §8.87, §8.193, §8.204 |
 | 2c refusal of an unstamped bare leaf (`resolve_named`: `resolve_qualified_scoped` on the writer's module, `return invalid` on NotReachable) | **DELETED** — a guard: after it the step reaches 2b (an import tie, which an unreachable leaf cannot be) and `X-failed`, so the 5 refusals over six halves changed no outcome; the diagnostic was always the type-resolution gate's | — | `grep -c 'gate-unreachable' compiler/src/compiler/types/resolver.cryo` → **0** | §8.193 |
 | free-call specialization by the scope's SPELLING (`specialize_free_call`: sema's pin, then the written scope qualified through `bare_alts`, then the bare spelling, then the segment's stamp; `find_scoped_function_template`'s suffix scan behind the stamp) | **DELETED** — pin, then the stamp; shadow 136,463 calls over six halves: spelling rungs 2 answers, both the stamp's, suffix scan 0 (its two b1 rows retired); `resolve_scope_at_span` and `fn_template_arity_compatible` went with their only callers | — | `grep -rho 'resolve_scope_at_span' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'find_scoped_function_template' compiler/src/compiler/mono/call_specializer.cryo` → **2** | §8.193 |
 | impl head's target ARGUMENTS unstamped (`visit(ImplBlockNode)` stamping the target and the trait annotation, never the list after the target) | **DELETED** — `stamp_annotation_list(&node.target_args)` after `declare_generics`; 483 of 22,978 stay unstamped over six halves, all findings: two `String<GlobalAlloc>` heads naming a `GlobalAlloc` their module could not reach (imported now), six trait heads with a trailing list and no leading `implement<...>` (Jake's) | — | `grep -c 'stamp_annotation_list(&node.target_args)' compiler/src/compiler/resolver/name_resolution.cryo` → **1** | §8.193 |
@@ -185,7 +185,7 @@ evidence for what it covers.
 |---|---|---|
 | `make test` | 2,122 unit + 55 project + 183 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
-| `make lane-check` | 8 buckets of call sites in `compiler/src`, as a golden; REENTRY counts `get_resolver()` AND a cursor move through the `name_resolver` field since §8.189 (it read 3 over a tree holding 6: the monomorphizer's `find_module_scope`/`set_module`/`restore_scope`); `LOOKUP_ARENA` counts the arena's `lookup_by_name` since §8.192 (it read OK over a tree holding 17 in `type_resolution.cryo`) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
+| `make lane-check` | 9 buckets of call sites in `compiler/src`, as a golden; `HOME_WRITE` pins `.set_home_module(` calls at 0 since §8.204, so the mechanism cannot come back unpinned; REENTRY counts `get_resolver()` AND a cursor move through the `name_resolver` field since §8.189 (it read 3 over a tree holding 6: the monomorphizer's `find_module_scope`/`set_module`/`restore_scope`); `LOOKUP_ARENA` counts the arena's `lookup_by_name` since §8.192 (it read OK over a tree holding 17 in `type_resolution.cryo`) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
 | `make selfhost-check` | stage-3 == stage-4 byte identity, both arms | **Stability, not correctness.** It proves the compiler still emits the same bytes for code that already compiles; it says nothing about code that now STOPS compiling. |
 | `make lsp-check` | `tools/CryoLSP` compiles against **the compiler under test** | Compilation only — no language-server behaviour is exercised. |
 | `make cross-check` | `runtime/`, `stdlib/`, `compiler/`, `tools/CryoLSP` compile to OBJECTS for the other OS's triple with the compiler under test — the config-gated half every host-native gate prunes before name resolution (326 attributes in the stdlib, 23 in the runtime, 11 in the compiler, 6 in the LSP) | Objects only: nothing links, nothing runs. `tests/` and `examples/` are not built. |
@@ -207,7 +207,7 @@ a count.
 
 Checks for this section, one per line so each can be copied whole:
 
-* `grep -c '^\[' tests/lane-baseline.txt` → **8**
+* `grep -c '^\[' tests/lane-baseline.txt` → **9**
 * `grep -c '^project ' tests/test-roster.txt` → **55**
 * `grep -c '^negative ' tests/test-roster.txt` → **183**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
@@ -10631,6 +10631,97 @@ work.  The `.todo/` plans that name `b1-check` or the counter's streams
 were not edited; `CLAUDE.md`'s example under "update that row BY HAND"
 still names the counter's line count as the event that taught the rule,
 which is history and stays.
+
+### 8.204 `ResolutionContext.home_module` was write-only; it, its 50 writers and everything that derived a module for them are deleted, and `lane-check` pins the writer surface at 0 - 2026-09-15
+
+#### The instrument first
+
+Audit 9 found the `set_home_module` writers rowed by nothing.  Landed as
+a ninth `lane-check` bucket, `HOME_WRITE`, counting `.set_home_module(`
+calls per file (the definition line has no receiver and is not matched).
+The pair that makes it evidence, over a tree with one added writer in
+`sema/lambda_synth.cryo` handing over `current_module_ns()`:
+
+* the OLD gate (`git show cc5a017c:scripts/lane-gate.py`): `lane-gate: OK
+  -- LOOKUP = 44 … DEFID_UNWRAP = 38`, exit 0;
+* the NEW gate over the same tree: exit 1, `HOME_WRITE TOTAL 50 -> 51
+  (INCREASE -- a lane regrew)`, `compiler/sema/lambda_synth.cryo 1 -> 2`.
+
+Pinned at **50** over the clean tree (audit 9's 38 were the
+`HomeOrigin::Syntax` writers on one line; the other 12 were `Cursor`, a
+variable, or a call split across two lines).
+
+#### The sites, measured
+
+The 50 writers hand over one of four things: the module claiming the
+syntax's span (`module_ns_sym_of_file(x.span.file)`, `syntax_module_of`,
+`home_ns_of`), the module that DECLARED the entity (`entry.module_name`,
+`tmpl.module_name`, `owner_entry.module_name`, `owner_module_of(ty)`,
+`body_res_ctx`'s `owner_ns`), the ambient cursor (`body_res_ctx`'s last
+arm, `ast_resolver`'s `entry_ns` arm - both for a span no module claims),
+or a saved value being restored.  The declared-entity writers are the
+suspect shape: a trait default's body and signature are written in the
+trait's file while the owner is the implementing type, and
+`method_binding.cryo`'s own comment on one of them said so.  Each of the
+five was shadowed against the span's module, with the default-annotation
+writer (`entry.module_name` vs `entry.ast_node.span.file`) as the control,
+over the six halves (`.objcmp/hw1-lines.txt`, 90,432 lines):
+
+| site | agree | differ |
+|---|---|---|
+| `resolver:default-arg-control` | 50,297 | 0 |
+| `sema:body-owner` (`body_res_ctx` inside a method) | 28,138 | **9,576** |
+| `method_binding:explicit-args` | 1,702 | **62** |
+| `method_binding:symbolic-bindings` | 648 | 0 |
+| `call_specializer:method-spec-body` (`owner_entry.module_name`) | 9 | 0 |
+| `sema:body-cursor`, `ast_resolver:entry-cursor` | — | never entered |
+
+The 9,576 are every trait-default body and third-module `implement`
+block in the corpus (`std::collections::hashmap` handed over for a body in
+`std::core::iter`, 2,280; `std::io::buf` for one in `std::net::http::conn`,
+210; …).  The two cursor fallbacks never fired: absent, not starved.
+
+#### What the differing writes changed: nothing, because nothing reads the field
+
+Before switching those writers to the span, the reader was located.
+`resolve_named`'s step 2c takes its key from the node's STAMP (§8.193)
+and never consults `ctx.home_module`; the only reads left in the tree
+were `resolve_named_at_span`'s save/swap/restore around a call that
+ignores the value, and `home_module_sym`, with no caller.  The doc on the
+field - "set this and `resolve_named` will prefer that module's own
+declaration of the leaf" - described the reader §8.193 deleted.  A
+9,576-line disagreement over a value nothing reads is not a defect to
+fix; it is a field to delete.
+
+Deleted: the field, `set_home_module` and its 50 call sites,
+`resolve_named_at_span` (its two callers call `resolve_named`),
+`home_module_sym`, `TypeResolutionRunner::scope_to_decl` (six callers,
+its body was one write), the `ModuleGraph*` field, `set_module_graph` and
+`home_ns_of` on all three mono collaborators and the monomorphizer's
+cascade of them (the graph was wired for nothing else),
+`module_graph::home_ns_sym_of_file` / `home_ns_of_file`,
+`TypeArena::module_ns_sym_of` / `module_ns_of`,
+`MethodBinding::owner_module_of`, `CallResolver::syntax_module_of`, the
+span parameter of `body_res_ctx` and `resolve_layout_operand`, and the
+dead `current_module` / `import_modules` fields on the same struct, so
+`ResolutionContext::new` takes the one thing that is read
+(`source_file`, which names the module an instantiation is demanded for)
+at all 57 constructors.  Outside this ledger: **20 files, +150 / -646**
+(`git diff --numstat`).
+
+Predicted 0 objects moved - a write-only field cannot change an answer -
+and measured **examples 0 of 1,126, tests 0 of 2,352**
+(`.objcmp/hw2-objcmp.out`), `OVERALL PASS`.  `lane-check` re-pinned with
+`HOME_WRITE 50 → 0` and the bucket kept at `TOTAL 0`, so a re-introduced
+`set_home_module` is an added row and fails; `lsp-check` OK (264 modules,
+0 errors); `cross-check` OK (243 compiler modules); `ns-status-check` 183
+rows match; `test-census` OK (2,122 unit, 183 compile-fail, 52 of 55
+projects on this host); `selfhost-check` both arms `FIXED POINT OK`, 243
+modules byte-identical.
+
+**Tally: 63 shadowed, 63 old paths deleted, 62 at zero and one at §8.93's
+allocator residue; 86 artifacts gone** (+ the home-module field and its
+plumbing).
 
 ---
 
