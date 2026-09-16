@@ -3516,9 +3516,6 @@ type struct CallResolver {
 
     // -- Scope-resolution call resolution (Type::method / Module::func / variant) --
 
-    /// Emit E0154 for a bare scope name that resolves to multiple import-visible
-    /// same-leaf types.  Lists every registered qualified candidate so the
-    /// author can pick one; the fix is always to write the fully-qualified name.
     /// The canonical name the scope segment's owner is registered under.
     ///
     /// A substituter that collapsed a template's self-reference recorded the
@@ -3532,28 +3529,14 @@ type struct CallResolver {
     /// carries the template's stamp, and the spelling is then the only thing
     /// that names the owner.  A MODULE qualifier is not a type-owner claim,
     /// and this does not manufacture one: the module lane answers from the
-    /// scope itself.
-    ///
-    /// The cursor scope map between the two serves ONE program shape, and it
-    /// is one the namespace rule forbids: a module and a type sharing a name
-    /// (`namespace Gpu::Buffer;` declaring `type struct Buffer`), where
-    /// `Buffer::make()` written against the module reaches the type only
-    /// because the map resolves the leaf to it.  Measured over every corpus
-    /// half with the stamp answering beside it: 1,974,585 answers, and the
-    /// map differed from the stamp on 885 module and C-import-alias segments -
-    /// answering a same-leaf FUNCTION in an unrelated module every time,
-    /// which nothing downstream can bind - and on that shape.  It stays until
-    /// the collision is refused at its declaration, and it is the only reader
-    /// `CompilationContext::resolve_scoped_at` has.
+    /// scope itself.  A segment spelling a module can never also bind a type
+    /// in the writer's scope - the two share one namespace and the name layer
+    /// refuses the pair - so the stamp is the whole answer.
     scope_owner_key(&this, scope: ScopeResolutionNode*) -> SymbolStr {
         if (scope.spec_owner.is_valid()) {
             const spec_q: SymbolStr = this.ctx.decl_index.lookup_type_name(scope.spec_owner);
             if (spec_q.is_valid()) { return spec_q; }
         }
-        const q: SymbolStr = this.ctx
-            .resolve_scoped_at(scope.scope_name, scope.span.file)
-            .resolved_or(SymbolStr::empty());
-        if (q.is_valid()) { return q; }
         return match (scope.require_scope_res("scope-call owner key")) {
             Res::TypeRelative(b, _) => {
                 match (b) {
@@ -3565,23 +3548,39 @@ type struct CallResolver {
         };
     }
 
+    /// A `Scope::member(...)` call.  The scope segment's stamp says which
+    /// store can own the member: a segment naming a MODULE (`Def`) owns a
+    /// module function and nothing else; any other segment names a type -
+    /// a declaration, a primitive, a type parameter, or a C-import alias,
+    /// which is a namespace SYMBOL rather than a graph module - and owns a
+    /// static method, a variant, or a C-imported function.  Modules and
+    /// types share one namespace, so a segment is never both, and the
+    /// stores of the other kind are not asked.
     resolve_scope_call(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*) -> TypeRef {
-        mut lookup_sym: SymbolStr = this.scope_owner_key(scope);
-        if (scope.scope_generic_args.length > 0) {
-            const spec_sym: SymbolStr = this.resolve_generic_scope_name(
-                scope.scope_name, scope.scope_generic_args, scope.span,
-                this.lookup_scope_template(
-                    scope.require_scope_res("scope-call spec name")));
-            if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
+        mut names_module: boolean = false;
+        match (scope.require_scope_res("scope-call owner kind")) {
+            Res::Def(_) => { names_module = true; }
+            _           => { }
         }
-        const method_ret: TypeRef = this.try_resolve_static_method(scope, lookup_sym, call);
-        if (method_ret.is_valid()) { return method_ret; }
-        const type_ret: TypeRef = this.try_resolve_type_or_variant(scope, lookup_sym, call);
-        if (type_ret.is_valid()) { return type_ret; }
-        const fn_ret: TypeRef = this.try_resolve_module_function(scope, call);
-        if (fn_ret.is_valid()) { return fn_ret; }
-        const cimport_ret: TypeRef = this.try_resolve_cimport_function(scope, call);
-        if (cimport_ret.is_valid()) { return cimport_ret; }
+        if (names_module) {
+            const fn_ret: TypeRef = this.try_resolve_module_function(scope, call);
+            if (fn_ret.is_valid()) { return fn_ret; }
+        } else {
+            mut lookup_sym: SymbolStr = this.scope_owner_key(scope);
+            if (scope.scope_generic_args.length > 0) {
+                const spec_sym: SymbolStr = this.resolve_generic_scope_name(
+                    scope.scope_name, scope.scope_generic_args, scope.span,
+                    this.lookup_scope_template(
+                        scope.require_scope_res("scope-call spec name")));
+                if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
+            }
+            const method_ret: TypeRef = this.try_resolve_static_method(scope, lookup_sym, call);
+            if (method_ret.is_valid()) { return method_ret; }
+            const type_ret: TypeRef = this.try_resolve_type_or_variant(scope, lookup_sym, call);
+            if (type_ret.is_valid()) { return type_ret; }
+            const cimport_ret: TypeRef = this.try_resolve_cimport_function(scope, call);
+            if (cimport_ret.is_valid()) { return cimport_ret; }
+        }
 
         if (this.symbolic.symbolic_name_is_generic_param(scope.scope_name)) { return TypeRef::invalid(); }
 

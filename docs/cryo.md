@@ -2309,6 +2309,21 @@ Two rules follow and are not optional:
 
 Because an `export` changes what is *reachable* and never what is *compiled first*, two modules may re-export from each other without either becoming unsatisfiable.
 
+### 14.6 Modules and Types Share One Namespace
+
+In a file's scope a name is a module or a type, never both. A module is spelled by any whole-segment suffix of its namespace — `Buffer`, `Gpu::Buffer`, `App::Gpu::Buffer` for `namespace App::Gpu::Buffer;` — once it is imported, and by that suffix inside its own file; a type is spelled by its name once it is declared or imported. A type whose name spells a module reachable from the same scope is a redeclaration, refused at the declaration or import that completed the pair (`E0205`, the same error as declaring a name twice):
+
+```cryo
+namespace App::Gpu::Buffer;
+type struct Buffer { handle: u64; }    // E0205: `Buffer` is this module
+
+namespace App::Main;
+import App::Gpu::Vertex;
+type struct Vertex { v: i32; }         // E0205: `Vertex` spells the imported module
+```
+
+A module may declare a type named like a *different* module, and a type may be reached through its module's path (`Buffer::Handle`) without being imported. The consequence is that a scope segment names exactly one owner, so `Buffer::make` is the module's function or nothing — there is no rule choosing between a module and a same-named type, because no scope holds both. This is Rust's model, where `mod x` beside `struct x` is an error.
+
 ---
 
 ## 15. Pointers and Memory

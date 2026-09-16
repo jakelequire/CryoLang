@@ -1,18 +1,13 @@
-///! A member referenced as a VALUE through a scope segment that names both a
-///! module and a type.
+///! A type's static taken as a VALUE - handed to a callback parameter from
+///! inside the type's own body (the C-callback shape, the libclang
+///! trampolines) and from outside it - beside a module-level function taken
+///! the same way through the module's own leaf.
 ///!
-///! A file that declares one main type may give it the same leaf as its own
-///! namespace, so `Leaf::member` names both owners at once. The segment alone
-///! does not say where the member lives; only the member does. The two below
-///! live on different owners, and resolving the segment to just one leaves the
-///! other's reference as an unwritten slot, with nothing diagnosed.
-///!
-///! No module in `compiler/src` or `stdlib` is spelled like a type it declares,
-///! so this file and `tests/projects/module_type_name_collision` are the whole
-///! coverage of the shape: nothing outside `tests/` carries it, and a build of
-///! the compiler cannot fail on it. A static taken as a value from INSIDE its
-///! type's body - the C-callback shape - reaches LLVM as
-///! `<null operand!>` when the segment resolves to the wrong owner.
+///! The type and the module are named differently: modules and types share
+///! one namespace, so a type spelled like the module that declares it is
+///! refused (E0205, `E0205_type_named_as_its_module`), and a scope segment
+///! names exactly one of them.  A static reaching LLVM as `<null operand!>`
+///! is what a segment resolved to the wrong owner looks like.
 
 ![config(testing)]
 namespace CryoTests::Tests::Lang::StaticMethodValue;
@@ -26,18 +21,18 @@ import std::test::assert::{ expect_eq };
 
 mut g_seen: i64 = 0;
 
-// The type's leaf is the namespace's leaf.
-type struct StaticMethodValue {
+// Its own leaf, not the namespace's.
+type struct Emitter {
     tag: i64;
 
     static record(n: i64) -> void { g_seen = g_seen + n; }
 
-    /// Its own static handed to a callback parameter, named through the
-    /// colliding segment - the shape of the libclang trampolines.
-    static fire(n: i64) -> void { apply(StaticMethodValue::record, n); }
+    /// Its own static handed to a callback parameter, named through its
+    /// type - the shape of the libclang trampolines.
+    static fire(n: i64) -> void { apply(Emitter::record, n); }
 }
 
-// A module-level free function reached through that same segment.
+// A module-level free function reached through the module's leaf.
 function tally() -> i64 { return g_seen; }
 
 // Takes the callback by parameter, so the expected type comes from the
@@ -47,15 +42,15 @@ function apply(f: (i64) -> void, n: i64) -> void { f(n); }
 ![test]
 function type_static_as_value_calls_through() -> Result<(), TestError> {
     g_seen = 0;
-    StaticMethodValue::fire(4);
-    StaticMethodValue::fire(3);
+    Emitter::fire(4);
+    Emitter::fire(3);
     return expect_eq(g_seen, 7);
 }
 
 ![test]
 function module_free_function_as_value_calls_through() -> Result<(), TestError> {
     g_seen = 0;
-    StaticMethodValue::record(5);
+    Emitter::record(5);
     const g: () -> i64 = StaticMethodValue::tally;
     return expect_eq(g(), 5);
 }
@@ -64,6 +59,6 @@ function module_free_function_as_value_calls_through() -> Result<(), TestError> 
 ![test]
 function type_static_as_argument_from_outside() -> Result<(), TestError> {
     g_seen = 0;
-    apply(StaticMethodValue::record, 6);
+    apply(Emitter::record, 6);
     return expect_eq(g_seen, 6);
 }
