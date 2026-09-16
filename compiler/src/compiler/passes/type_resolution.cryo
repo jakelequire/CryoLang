@@ -21,7 +21,6 @@ import compiler::diag::{
 import compiler::decl_index;
 import compiler::module_graph;
 import compiler::module_graph::{ ModuleGraph, ModuleInfo };
-import compiler::resolve_counter;
 import compiler::ast;
 import compiler::ast::{
     cloner, declaration, expression, GenericAnnotation, NamedAnnotation, node, NodeKind,
@@ -78,7 +77,7 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::types::ownership::{ OwnershipQuery };
-import compiler::types::resolver::{ HomeOrigin, ResolutionContext, TypeResolver };
+import compiler::types::resolver::{ ResolutionContext, TypeResolver };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
@@ -107,7 +106,7 @@ type struct TypeResolutionRunner {
         runner.arena           = ctx.type_arena;
         runner.resolver        = ctx.type_resolver;
         runner.ctx             = ctx;
-        runner.res_ctx         = ResolutionContext::new(FILE, LINE as i32, module_name, ctx.source_file, SymbolStr::empty(), HomeOrigin::Unset);
+        runner.res_ctx         = ResolutionContext::new(module_name, ctx.source_file, SymbolStr::empty());
         return runner;
     }
 
@@ -118,7 +117,7 @@ type struct TypeResolutionRunner {
     /// `module_name` above cannot stand in for it: it is `namespace_display()`,
     /// which answers "which module is the compiler standing in", and passing
     /// that here would record a cursor reading as though it came from the
-    /// syntax - the one substitution `HomeOrigin` exists to keep visible.
+    /// syntax.
     ///
     /// Called per declaration rather than once per pass because the span is the
     /// authority.  A per-pass scope is only equivalent while a compilation unit
@@ -131,8 +130,7 @@ type struct TypeResolutionRunner {
     /// from binds the next declaration's names in the wrong module with no
     /// diagnostic.  `set_home_module` normalizes the empty answer and reports it.
     scope_to_decl(mut &this, span: SourceSpan) -> void {
-        this.res_ctx.set_home_module(this.ctx.module_ns_sym_of_file(span.file),
-                                     HomeOrigin::Syntax);
+        this.res_ctx.set_home_module(this.ctx.module_ns_sym_of_file(span.file));
     }
 
 
@@ -190,8 +188,7 @@ type struct TypeResolutionRunner {
         if (gen == null || gen.args.length == 0) { return; }
         const trait_id: SymbolStr = TypeAnnotation::trait_identity(trait_ann);
         if (!trait_id.is_valid()) { return; }
-        const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
-            trait_id, "bind_trait_args_for_impl", this.ctx.get_intern_table());
+        const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_id);
         if (trait_decl == null) { return; }
 
         const ngp: i64   = trait_decl.generic_params.length;
@@ -257,9 +254,7 @@ type struct TypeResolutionRunner {
         if (trait_ann == null) { return; }
         const trait_id: SymbolStr = TypeAnnotation::trait_identity(trait_ann);
         if (!trait_id.is_valid()) { return; }
-        const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
-            trait_id, "validate_impl_assoc_bindings",
-            this.ctx.get_intern_table());
+        const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_id);
         if (trait_decl == null) { return; }
         // Only traits with associated types are subject to these checks.
         if (trait_decl.assoc_types.length == 0) { return; }
@@ -1446,7 +1441,6 @@ type struct TypeResolutionPasses {
         mut refs: TypeRef[] = [];
         for (mut i: i64 = 0; i < generic_params.length; i++) {
             const gp: GenericParamNode* = generic_params[i];
-            resolve_counter::Site::ParamRefTypeRes.bump();
             refs.push(arena.create_generic_param(gp.name, i as u64));
         }
         return refs;
@@ -1593,10 +1587,6 @@ type struct TypeResolutionPasses {
                         q_name, func.resolved_return_type, func_type_ref, module_sym, ctx.intern_table, arena);
 
                     ctx.decl_index.set_decl_visibility(q_name, func.is_public);
-                    if (resolve_counter::Audit::Visibility.enabled()) {
-                        resolve_counter::vis_record(
-                            ctx.intern_table.resolve(q_name), func.is_public);
-                    }
                     // A monomorphized clone's identifier is program-unique -
                     // the mangling of its template and arguments - and is the
                     // FAMILY every caller pins it by, so the clone registers
@@ -2703,9 +2693,7 @@ type struct TypeResolutionPasses {
             impl_node.trait_annotation);
         if (!trait_name.is_valid()) { return 0; }
 
-        const trait_decl: TraitDeclNode* = ctx.generic_registry.get_trait_decl(
-            trait_name, "synthesize_default_trait_methods",
-            ctx.get_intern_table());
+        const trait_decl: TraitDeclNode* = ctx.generic_registry.get_trait_decl(trait_name);
         if (trait_decl == null) { return 0; }
 
         // Quick scan: is there at least one default-bodied trait method
@@ -2951,33 +2939,6 @@ type struct TypeResolutionPasses {
                     const node: TraitDeclNode* = stmt as TraitDeclNode*;
 
                     if (ctx.generic_registry != null) {
-                        // The registry is keyed by bare leaf and the last write
-                        // wins, so a plural leaf silently discards the trait
-                        // registered earlier. Emitted at the registration rather
-                        // than tallied: a count says how many, only the pair of
-                        // files says which declaration was lost and which
-                        // survived. NEW/SAME are the control - a zero CLOBBER
-                        // beside a zero total means this site never ran.
-                        if (resolve_counter::Audit::Path.enabled()) {
-                            const prior: TraitDeclNode* =
-                                ctx.generic_registry.get_trait_decl(
-                                    ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file),
-                                    "path-audit-dup-probe",
-                                    ctx.get_intern_table());
-                            const leaf: string = ctx.resolve_str(node.name);
-                            if (prior == null) {
-                                resolve_counter::path_hit(
-                                    "TRAIT-REG-NEW", leaf, "", node.span.file);
-                            } else if (prior == node) {
-                                resolve_counter::path_hit(
-                                    "TRAIT-REG-SAME", leaf,
-                                    prior.span.file, node.span.file);
-                            } else {
-                                resolve_counter::path_hit(
-                                    "TRAIT-REG-CLOBBER", leaf,
-                                    prior.span.file, node.span.file);
-                            }
-                        }
                         // The import-resolved name is the declaration's
                         // identity, and also what decides whether this IS the
                         // language's `Copy`/`Drop`/... - the leaf cannot say
@@ -4158,7 +4119,7 @@ type struct TypeResolutionPasses {
                     // substitution to a known-good source.
                     const module_name: string = ctx.has_namespace()
                         ? ctx.namespace_display() : ctx.source_file;
-                    mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE as i32, module_name, ctx.source_file, SymbolStr::empty(), HomeOrigin::Unset);
+                    mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, ctx.source_file, SymbolStr::empty());
                     // The variant payload annotations mean what the module that
                     // WROTE this enum says (spec §8.2m).  That is the cursor for
                     // a declaration this module actually owns - this walk is in
@@ -4167,8 +4128,7 @@ type struct TypeResolutionPasses {
                     // span is right in both cases; `module_name` above is the
                     // cursor spelled out, and is kept only as the current-module
                     // string the resolver uses for `T[NAME]` array sizes.
-                    res_ctx.set_home_module(ctx.module_ns_sym_of_file(node.span.file),
-                                            HomeOrigin::Syntax);
+                    res_ctx.set_home_module(ctx.module_ns_sym_of_file(node.span.file));
                     // Use the canonical helper so a constrained `T: Bound`
                     // produces a BoundedParamType matching what
                     // template-registration created for the same enum.

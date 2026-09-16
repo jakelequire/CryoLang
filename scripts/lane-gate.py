@@ -10,9 +10,8 @@ their own:
   * deleting a string-keyed entity lookup stops that one, but not a helper
     being reintroduced under another name.
 
-Only a ratchet catches growth.  This is that ratchet, in the shape mechanism 3
-already proved with `b1-gate.py`: a committed golden, drift fails, and `--update`
-re-pins deliberately.
+Only a ratchet catches growth.  This is that ratchet: a committed golden, drift
+fails, and `--update` re-pins deliberately.
 
 WHAT IS PINNED
 --------------
@@ -64,13 +63,13 @@ increase is the regrowth this exists to catch, and a decrease is progress that
 still fails, because a silently-tolerated decrease leaves the old higher number
 as the bound and lets a later regression climb back to it unnoticed.  A row
 that is a destination or a floor has no preferred direction and is asserted for
-the same reason: an unexplained move is what the gate is for.  That is the same reasoning as the B1 gate, and it is the
+the same reason: an unexplained move is what the gate is for, and it is the
 reason `--update` exists rather than a tolerance.
 
 WHY THIS GATE IS SOURCE-DERIVED AND HAS NO PER-HOST SECTIONS
 ------------------------------------------------------------
-`b1-gate.py` measures a BUILD, so its numbers move with which stdlib modules
-the host compiles, and it needs a `[host:...]` section per host.  This gate
+A gate that measures a BUILD has numbers that move with which stdlib modules
+the host compiles, and needs a `[host:...]` section per host.  This gate
 counts CALL SITES IN THE SOURCE.  The same tree gives the same answer on every
 host, so a per-host split would encode a dimension that does not exist and
 would let one host's re-pin hide another's regression.  It also means this gate

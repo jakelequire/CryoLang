@@ -26,7 +26,6 @@ import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, Res, ResBase, ResSlot };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
-import compiler::resolve_counter;
 import compiler::decl_index;
 import compiler::ast;
 import compiler::ast::node;
@@ -100,24 +99,20 @@ type struct TypeUtils {
     /// same reasons: a name that answers `Local`, `PrimTy` or `GenericParam`
     /// names no declaration to look up, and that is an answer rather than a
     /// failure, so it licenses no second lookup under another key.
-    spelling_type(&this, slot: ResSlot, nodef_site: resolve_counter::Site) -> TypeRef {
+    spelling_type(&this, slot: ResSlot) -> TypeRef {
         return match (slot) {
-            ResSlot::Answered(r) => { this.spelling_type_answered(r, nodef_site) }
-            _                    => {
-                resolve_counter::Site::SpellTyPending.bump();
-                TypeRef::invalid()
-            }
+            ResSlot::Answered(r) => { this.spelling_type_answered(r) }
+            _                    => { TypeRef::invalid() }
         };
     }
 
-    /// The three outcomes `spelling_type` collapses into one invalid answer.
+    /// The answered half of `spelling_type`.
     ///
-    /// Split because a caller reading `!is_valid()` cannot tell an answer that
-    /// declines to name a type - which is complete, and licenses no second
-    /// lookup - from one naming a definition the index does not hold, which is
-    /// a registration defect a spelling lookup would paper over.  The returned
-    /// value is unchanged; only the counters are new.
-    spelling_type_answered(&this, r: Res, nodef_site: resolve_counter::Site) -> TypeRef {
+    /// An answer that declines to name a type is complete and licenses no
+    /// second lookup; an answer naming a definition the index does not hold
+    /// is a registration defect, which `def_type` records rather than papers
+    /// over with a spelling lookup.
+    spelling_type_answered(&this, r: Res) -> TypeRef {
         // A written primitive names no declaration; its spelling is its
         // registration key, read the way an impl head's `PrimTy` is.
         match (r) {
@@ -125,11 +120,7 @@ type struct TypeUtils {
             _              => { }
         }
         const q: DefId = r.def_id();
-        if (!q.is_valid()) {
-            resolve_counter::Site::SpellTyNoDef.bump();
-            nodef_site.bump();
-            return TypeRef::invalid();
-        }
+        if (!q.is_valid()) { return TypeRef::invalid(); }
         return this.def_type(q, "sema/spelling_type_answered");
     }
 
@@ -144,10 +135,8 @@ type struct TypeUtils {
     def_type(&this, q: DefId, site: string) -> TypeRef {
         const found: TypeRef = this.lookup_type_exact(q.qualified_name());
         if (found.is_valid()) {
-            resolve_counter::Site::SpellTyHit.bump();
             return found;
         }
-        resolve_counter::Site::SpellTyDefMissing.bump();
         compiler::resolver::res::record_unregistered_def(site);
         return TypeRef::invalid();
     }
@@ -260,24 +249,12 @@ type struct TypeUtils {
     /// type claim, and a type parameter names no declaration to look up;
     /// manufacturing a type for either here would assert an ownership the
     /// stamp does not make.
-    scope_qualifier_type(&this, scope: ScopeResolutionNode*, site: string) -> TypeRef {
-        // Named at the event: the delayed tally says HOW MANY nodes arrived
-        // unclaimed, only a per-node line says WHICH.
-        if (scope.scope_res.is_pending() && !scope.has_resolved_type()) {
-            resolve_counter::path_hit(
-                "RES-PENDING", this.intern.resolve(scope.scope_name),
-                this.intern.resolve(scope.member_name), scope.span.to_string());
-        }
+    scope_qualifier_type(&this, scope: ScopeResolutionNode*) -> TypeRef {
         mut base: ResBase = ResBase::PrimTy(scope.scope_name);
         const seen: Res = scope.require_scope_res("sema: scope-resolution qualifier");
         match (seen) {
             Res::TypeRelative(b, _) => { base = b; }
-            _                       => {
-                resolve_counter::path_hit(
-                    "SCOPE-QUAL-NOTREL", site + " " + seen.to_string(),
-                    this.intern.resolve(scope.scope_name), scope.span.to_string());
-                return TypeRef::invalid();
-            }
+            _                       => { return TypeRef::invalid(); }
         }
         mut q: SymbolStr = SymbolStr::empty();
         match (base) {
@@ -294,32 +271,14 @@ type struct TypeUtils {
                 if (scope.spec_owner.is_valid()) {
                     q = this.ctx.decl_index.lookup_type_name(scope.spec_owner);
                 }
-                if (!q.is_valid()) {
-                    resolve_counter::path_hit(
-                        "SCOPE-QUAL-NOTDEF", site + " " + base.to_string(),
-                        this.intern.resolve(scope.scope_name), scope.span.to_string());
-                    return TypeRef::invalid();
-                }
+                if (!q.is_valid()) { return TypeRef::invalid(); }
             }
-            _                  => {
-                resolve_counter::path_hit(
-                    "SCOPE-QUAL-NOTDEF", site + " " + base.to_string(),
-                    this.intern.resolve(scope.scope_name), scope.span.to_string());
-                return TypeRef::invalid();
-            }
+            _                  => { return TypeRef::invalid(); }
         }
-        const ty: TypeRef = this.lookup_type_exact(q);
-        if (!ty.is_valid()) {
-            // The stamp names a declaration the index does not carry under that
-            // name.  Emitted rather than searched for under another key: a
-            // second lookup for a question already answered is how this
-            // cascade grew, and the pair (stamped name, written spelling) is
-            // what says whether the defect is in the stamp or in registration.
-            resolve_counter::path_hit(
-                "SCOPE-TY-STAMP-MISS", site + " " + this.intern.resolve(scope.scope_name),
-                this.intern.resolve(q), scope.span.to_string());
-        }
-        return ty;
+        // A stamp naming a declaration the index does not carry is a
+        // registration defect; there is no second key to try, because the
+        // only other key is the spelling, which answers from any module.
+        return this.lookup_type_exact(q);
     }
 
     /// The registry name for a type: direct, else (for an InstantiatedType) its

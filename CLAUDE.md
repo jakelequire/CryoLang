@@ -25,7 +25,6 @@ make cryo                # build the self-hosted compiler (compiler/build/cryo)
 make test                # unit + compile-fail + project suites
 make test-census         # the same run, with the suite COUNTS asserted
 make roster-check        # roster golden: 2113 unit + 46 projects + 179 negative
-make b1-check            # name-resolution fallback ratchet
 make lane-check          # resolution-lane surface ratchet; needs NO build
 make ns-status-check     # run every check docs/name-resolution.md §0 carries
 make check-fast          # lane + §0 + pin, ~10s, no build. Run before committing.
@@ -129,10 +128,6 @@ not done. The remaining limits are here so nobody rediscovers them:
   A Windows PE carries a link timestamp - two clean builds of one unchanged
   source differ - so the gate refuses on this host rather than reporting a
   matrix of failures that blame incremental compilation for the linker.
-- **`b1-baseline.txt` is per host and only the host you run on is asserted.**
-  Six sections, three each. `--update` rewrites the ones it measured and
-  leaves the rest, which is what lets the other host's half go stale.
-  CI covers Linux; the Windows half is checked only by `windows-native`.
 - **Nothing runs the release ARCHIVE.** The verify job exercises a different
   binary by a different link (`make cryo` is not `--release-static`), and
   `windows-smoke` asks the artifact for `--version` - whether it starts,
@@ -418,9 +413,8 @@ separate deliverable. Write both, commit them together.
 - **Bundle to complete-work boundaries.** Prefer fewer, larger commits. A
   commit is one finished thing - the code, its tests, its goldens and its
   ledger entry - not one file's worth of edits.
-- **The same goes for goldens.** A re-pinned `b1-baseline.txt` or
-  `lane-baseline.txt` rides with the change that moved the number, and the
-  message says why it moved.
+- **The same goes for goldens.** A re-pinned `lane-baseline.txt` rides with
+  the change that moved the number, and the message says why it moved.
 
 ### No exceptions, including the handoff
 
@@ -489,7 +483,7 @@ harness-enforced, add to `.claude/settings.json`:
   `tests/`, modifies a committed golden without an explicit override in the
   environment, or weakens an assertion in a file whose header declares a flip
   protocol.
-- **`Stop`** → `make b1-check roster-check api-index-check`, so a session
+- **`Stop`** → `make lane-check roster-check api-index-check`, so a session
   cannot be declared done while a ratchet is red.
 
 `scripts/guard-edit.py` does not exist yet.

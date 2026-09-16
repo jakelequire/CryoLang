@@ -30,7 +30,6 @@ import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
 import compiler::resolver::{ intern_table, symbol_str };
 import compiler::module_graph;
 import compiler::module_graph::{ ModuleGraph };
-import compiler::resolve_counter;
 import compiler::mono::{ state, trait_specializer };
 import compiler::types::generic_registry;
 import compiler::types::generic_registry::{ TemplateEntry };
@@ -60,7 +59,7 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::generic::{ GenericParamType };
-import compiler::types::resolver::{ HomeOrigin, ResolutionContext, TypeResolver };
+import compiler::types::resolver::{ ResolutionContext, TypeResolver };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
@@ -125,7 +124,7 @@ type struct MonoAstResolver {
         mut entry_ns: SymbolStr = SymbolStr::empty();
         if (entry != null) { entry_ns = entry.module_name; }
         const module_name: string = this.intern_table.resolve(entry_ns);
-        mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE as i32, module_name, "", SymbolStr::empty(), HomeOrigin::Unset);
+        mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "", SymbolStr::empty());
         // A bare leaf in this clone means what it meant in the file that WROTE
         // it, which is not the module the template entry names: `implement
         // Display for Option<T>` is written in `std::fmt::display`, so its
@@ -142,16 +141,11 @@ type struct MonoAstResolver {
         // spec walk registers into the template's module.
         //
         // When the graph cannot name the writing file the entry's module
-        // answers, reported as `Cursor` because it is not the syntax's: a home
-        // claiming `Syntax` while holding another module's namespace makes a
-        // guess indistinguishable from provenance.
+        // answers, which is not the syntax's module but the one that demanded
+        // the walk.
         mut home: SymbolStr = this.home_ns_of(ast_node.span.file);
-        mut home_origin: HomeOrigin = HomeOrigin::Syntax;
-        if (!home.is_valid()) {
-            home = entry_ns;
-            home_origin = HomeOrigin::Cursor;
-        }
-        res_ctx.set_home_module(home, home_origin);
+        if (!home.is_valid()) { home = entry_ns; }
+        res_ctx.set_home_module(home);
 
         match (node_kind) {
             NodeKind::StructDeclaration => {
@@ -225,7 +219,7 @@ type struct MonoAstResolver {
         if (entry != null && entry.module_name.is_valid()) {
             module_name = this.intern_table.resolve(entry.module_name);
         }
-        mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE as i32, module_name, "", SymbolStr::empty(), HomeOrigin::Unset);
+        mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "", SymbolStr::empty());
         // Scoped per body below, not here.  Both kinds of name a `static match`
         // resolves - the arm patterns the author wrote and the scrutinee the
         // substituter rewrote to the concrete binding - were written wherever
@@ -254,8 +248,7 @@ type struct MonoAstResolver {
             NodeKind::FunctionDeclaration => {
                 const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
                 if (decl == null || decl.body == null) { return; }
-                res_ctx.set_home_module(this.home_ns_of((decl as ASTNode*).span.file),
-                                        HomeOrigin::Syntax);
+                res_ctx.set_home_module(this.home_ns_of((decl as ASTNode*).span.file));
                 this.prune_static_match_in_block(decl.body, &res_ctx);
             }
             NodeKind::ImplementationBlock => {
@@ -287,8 +280,7 @@ type struct MonoAstResolver {
                 // module with no diagnostic.  An empty answer resetting it to
                 // `Unset` is the honest outcome, not a case to skip.
                 res_ctx.set_home_module(
-                    this.home_ns_of((method.func as ASTNode*).span.file),
-                    HomeOrigin::Syntax);
+                    this.home_ns_of((method.func as ASTNode*).span.file));
                 this.prune_static_match_in_block(method.func.body, res_ctx);
             }
         }

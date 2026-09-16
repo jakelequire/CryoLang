@@ -15,7 +15,6 @@ import compiler::{
 import compiler::diag::{ config, diagnostic, ErrorCode, renderer, severity, sink, snapshot };
 import compiler::passes::pass_id;
 import compiler::passes::pass_id::{ ProvisionSet };
-import compiler::resolve_counter;
 import compiler::types;
 import compiler::types::{ type_ref, arena, resolver, generic_registry };
 import compiler::mono::monomorphizer;
@@ -485,17 +484,11 @@ public:
     /// processed.  Import-aware, unlike a context-free lookup;
     /// see DeclarationIndex::resolve_qualified_scoped.
     ///
-    /// The use site is `current_module_ns()` — the ambient cursor — so every
-    /// caller passes `FILE, LINE as i32` and the origin is `Cursor` by construction,
-    /// not by inspection.  The site comes from the CALLER rather than from this
-    /// wrapper, for the same reason `ResolutionContext::clone` carries the
-    /// original: one location here would collapse every caller into itself and
-    /// report the wrapper as the whole population.
-    resolve_scoped(&this, bare: SymbolStr,
-                   origin_file: string, origin_line: i32) -> ScopeResolution {
+    /// The use site is `current_module_ns()` — the ambient cursor — which is a
+    /// module that may not have written the name being judged.
+    resolve_scoped(&this, bare: SymbolStr) -> ScopeResolution {
         return this.decl_index.resolve_qualified_scoped(
-            bare, this.current_module_ns(), this.intern_table,
-            origin_file, origin_line, "Cursor");
+            bare, this.current_module_ns(), this.intern_table);
     }
 
     /// `resolve_scoped`, judged against the module that WROTE the name rather
@@ -513,19 +506,11 @@ public:
     /// scope": an invalid namespace compares unequal to every real one, so
     /// judging against it would read missing provenance as "written somewhere
     /// else" and reject everything - the false-positive direction that reverted
-    /// the visibility gate once.  The fallback is counted AND reported as the
-    /// `Cursor` origin, so a run can never confuse "provenance was available"
-    /// with "provenance agreed with the cursor".
-    resolve_scoped_at(&this, bare: SymbolStr, span_file: string,
-                      origin_file: string, origin_line: i32) -> ScopeResolution {
+    /// the visibility gate once.
+    resolve_scoped_at(&this, bare: SymbolStr, span_file: string) -> ScopeResolution {
         const syn: SymbolStr = this.module_ns_sym_of_file(span_file);
-        if (!syn.is_valid()) {
-            resolve_counter::Site::ScopeUseCursor.bump();
-            return this.resolve_scoped(bare, origin_file, origin_line);
-        }
-        resolve_counter::Site::ScopeUseSyntax.bump();
-        return this.decl_index.resolve_qualified_scoped(
-            bare, syn, this.intern_table, origin_file, origin_line, "Syntax");
+        if (!syn.is_valid()) { return this.resolve_scoped(bare); }
+        return this.decl_index.resolve_qualified_scoped(bare, syn, this.intern_table);
     }
 
     /// Which modules a spelling names, as one file can see them.

@@ -25,7 +25,6 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, source_span };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
-import compiler::resolve_counter;
 import compiler::sema::{
     state, type_utils, symbolic_checker, method_binding, diagnostics, dispatch, helpers
 };
@@ -197,8 +196,7 @@ type struct MemberResolver {
                 } else {
                     member.span
                 };
-                this.enforce_method_visibility(obj_type, member.member, acc_span,
-                    resolve_counter::Site::MethodVisMember);
+                this.enforce_method_visibility(obj_type, member.member, acc_span);
                 return method_ret;
             }
 
@@ -340,8 +338,7 @@ type struct MemberResolver {
             const method_ret: TypeRef =
                 this.binding.lookup_method_with_inheritance(walk_ty, type_sym, member.member);
             if (method_ret.is_valid()) {
-                this.enforce_method_visibility(obj_type, member.member, acc_span,
-                    resolve_counter::Site::MethodVisMember);
+                this.enforce_method_visibility(obj_type, member.member, acc_span);
                 return method_ret;
             }
         }
@@ -747,16 +744,12 @@ type struct MemberResolver {
 
     /// Method-call counterpart to `enforce_field_visibility` (E0353).
     ///
-    /// `door` records WHICH lane offered the method, because a gate that cannot
-    /// say which lane it caught cannot show that the lane a corpus entry was
-    /// written for is the lane that fired.  The static lane reached this
-    /// function through no path at all until it was given a door: every caller
-    /// was a member access, so `Type::method()` crossed module boundaries and
-    /// executed.
+    /// Reached from both lanes that offer a method: a member access and a
+    /// static `Type::method()` path.  The static lane reached no gate at all
+    /// until it was given one, so a private method crossed module boundaries
+    /// through it.
     enforce_method_visibility(mut &this, recv_type: TypeRef,
-                              method_name: SymbolStr, span: SourceSpan,
-                              door: resolve_counter::Site) -> void {
-        resolve_counter::Site::MethodVisCalls.bump();
+                              method_name: SymbolStr, span: SourceSpan) -> void {
         const base: Type* = this.types.unwrap_to_base_type(recv_type);
         if (base == null) { return; }
 
@@ -806,12 +799,8 @@ type struct MemberResolver {
             }
         }
 
-        resolve_counter::Site::MethodVisReject.bump();
-        door.bump();
         const vis_word: string = if (method.is_protected) { "protected" } else { "private" };
         const method_str: string = this.intern.resolve(method_name);
-        resolve_counter::vis_gate_reject(door.label(),
-            this.current_module_name(), fmt::format("%s::%s", declaring_name, method_str));
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
             fmt::format("method `%s` of `%s` is %s", method_str, declaring_name, vis_word));

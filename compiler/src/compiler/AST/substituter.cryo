@@ -13,7 +13,6 @@
 namespace compiler::ast::substituter;
 
 import compiler::diag;
-import compiler::resolve_counter;
 import compiler::ast;
 import compiler::ast::{
     ArrayAnnotation, declaration, expression, FunctionAnnotation, GenericAnnotation,
@@ -225,10 +224,6 @@ public:
                         const member_str: string = nm_str.substring((sep + 2) as u32, (nm_len - sep - 2) as u32);
                         const member_sym: SymbolStr = this.intern_table.intern(member_str);
                         const base_pre: TypeRef = this.resolved_arg_typeref(pi);
-                        resolve_counter::mint_pending(
-                            "substituter:projection-base",
-                            this.intern_table.resolve(this.type_arg_displays[pi]),
-                            base_pre.is_valid());
                         const base_named: NamedAnnotation* = new NamedAnnotation {
                             name:         this.type_arg_displays[pi],
                             span:         named.span,
@@ -309,10 +304,6 @@ public:
                 // a usable type immediately.
                 named.name = this.type_arg_displays[i];
                 named.pre_resolved = this.resolved_arg_typeref(i);
-                resolve_counter::mint_pending(
-                    "substituter:generic-param-named",
-                    this.intern_table.resolve(named.name),
-                    named.pre_resolved.is_valid());
                 return ann;
             }
         }
@@ -627,20 +618,10 @@ public:
         // different from the `res` beside it, which names the DEFINITION and is
         // copied verbatim by every clone.  The id is a POINTER to the spec
         // because that is what `new` evaluates to.
-        if (is_self) {
-            if (this.spec_typeref.is_valid()) {
-                node.set_resolved_type(this.arena.get_pointer_to(this.spec_typeref));
-            } else {
-                // The id is the only carrier once the spelling is stable, so a
-                // self-reference arriving without one has nothing left to
-                // denote.  Named at the event: a tally says how many, and only
-                // a line says which template was specialized with no reserved
-                // id.
-                resolve_counter::path_hit(
-                    "SELF-NEW-NO-SPECREF",
-                    this.intern_table.resolve(this.base_name),
-                    this.intern_table.resolve(this.spec_name), "");
-            }
+        // A self-reference arriving with no reserved id has nothing left to
+        // denote once the spelling is stable, and is left unresolved.
+        if (is_self && this.spec_typeref.is_valid()) {
+            node.set_resolved_type(this.arena.get_pointer_to(this.spec_typeref));
         }
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
             node.arguments[i].accept(this);
@@ -674,20 +655,10 @@ public:
         const is_self: boolean = node.struct_type.equals(this.base_name)
             && (node.generic_args.length == 0
                 || this.args_are_outer_param_refs(node.generic_args));
-        if (is_self) {
-            if (this.spec_typeref.is_valid()) {
-                node.set_resolved_type(this.spec_typeref);
-            } else {
-                // The id is the only carrier once the spelling is stable, so a
-                // self-reference arriving without one has nothing left to
-                // denote.  Named at the event: a tally says how many, and only
-                // a line says which template was specialized with no reserved
-                // id.
-                resolve_counter::path_hit(
-                    "SELF-LIT-NO-SPECREF",
-                    this.intern_table.resolve(this.base_name),
-                    this.intern_table.resolve(this.spec_name), "");
-            }
+        // A self-reference arriving with no reserved id has nothing left to
+        // denote once the spelling is stable, and is left unresolved.
+        if (is_self && this.spec_typeref.is_valid()) {
+            node.set_resolved_type(this.spec_typeref);
         }
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
@@ -1042,10 +1013,6 @@ public:
     /// resolves to nothing.
     static rewrite_to_pointer(ann: TypeAnnotation*, inner_name: SymbolStr,
                                 inner_pre_resolved: TypeRef, span: SourceSpan) -> void {
-        // No intern table on a static, so the spelling is not recoverable here;
-        // the site and the valid/invalid split are what this row is for.
-        resolve_counter::mint_pending("substituter:rewrite-to-pointer",
-                                     "<no-intern>", inner_pre_resolved.is_valid());
         const inner_named: NamedAnnotation* = new NamedAnnotation {
             name: inner_name,
             span: span,
@@ -1067,8 +1034,6 @@ public:
     /// spec site - yielding an `Array<invalid>` that later ICEs the mangler.
     static rewrite_to_array(ann: TypeAnnotation*, inner_name: SymbolStr,
                               inner_pre_resolved: TypeRef, span: SourceSpan) -> void {
-        resolve_counter::mint_pending("substituter:rewrite-to-array",
-                                     "<no-intern>", inner_pre_resolved.is_valid());
         const inner_named: NamedAnnotation* = new NamedAnnotation {
             name: inner_name,
             span: span,

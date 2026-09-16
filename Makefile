@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census roster-check b1-check lane-check ns-status-check check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census roster-check lane-check ns-status-check check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -183,7 +183,6 @@ help:
 	@echo "  make test              Run the repo-level test suite (tests/) via cryo test"
 	@echo "  make test-census       Same run, with the suite COUNTS asserted"
 	@echo "  make test-list         List the discovered test cases without running them"
-	@echo "  make b1-check          Pin the B1 fuzzy-fallback bucket against its golden"
 	@echo "  make lane-check        Pin the resolution-lane surface against its golden"
 	@echo "  make ns-status-check   Run every check docs/name-resolution.md §0 carries"
 	@echo "  make check-fast        lane-check + ns-status-check + verify-pin (~10s, no build)"
@@ -507,9 +506,6 @@ roster-check: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
 test-census: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A) runtime-tiers
 	@$(PYTHON) scripts/test-census.py --cryo "$(STAGE2_EXE)" $(ARGS)
 
-b1-check: $(STAGE2_EXE) $(LIBCRYO_A) runtime-tiers
-	@python scripts/b1-gate.py "$(STAGE2_EXE_WIN)" $(ARGS)
-
 vendor-check: $(STAGE2_EXE) $(LIBCRYO_A) runtime-tiers
 	@python scripts/vendor-consts-gate.py "$(STAGE2_EXE_WIN)" $(ARGS)
 else
@@ -534,23 +530,6 @@ roster-check: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 test-census: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
 	@python3 scripts/test-census.py --cryo "$(STAGE2)" $(ARGS)
 
-# Golden-file gate on the B1 "fuzzy fallback" bucket (docs/name-resolution.md
-# §7.2 mechanism 3).  The nine-step resolution cascade grew for years because
-# nobody could see it growing; this makes a regrown fallback a build failure
-# rather than something noticed at the next hand-taken snapshot.
-#
-# A RATCHET, not a literal `B1 == 0`: zero is the end state of Phase 2-4, so
-# asserting it today would be red on every run and get switched off.  The
-# golden pins the current value and ANY drift fails -- an increase is the
-# regression, a decrease is progress that must be re-pinned so the new lower
-# value becomes the bound.  Re-pin deliberately with ARGS=--update.
-#
-# Depends on runtime-tiers: the counter report is emitted only on the SUCCESS
-# path of a full build (after link), so a stale runtime/.bin fails this gate
-# for reasons unrelated to B1.
-b1-check: $(STAGE2) $(LIBCRYO_A) runtime-tiers
-	@python3 scripts/b1-gate.py "$(STAGE2)" $(ARGS)
-
 # End-to-end gate on the constants `cryo vendor` carries out of a C header.
 # The importer binds a constant and the serializer writes it, and when those
 # two disagree on an AST shape the constant vanishes with the generator still
@@ -572,9 +551,9 @@ endif
 # stop a NEW public wrapper and deletion cannot stop a reintroduced helper;
 # only a ratchet catches growth.
 #
-# Unlike b1-check this needs no compiler, no stdlib and no link: it counts call
-# sites in the source, so it runs on a fresh clone in under a second and has no
-# per-host golden.
+# Needs no compiler, no stdlib and no link: it counts call sites in the
+# source, so it runs on a fresh clone in under a second and has no per-host
+# golden.
 lane-check:
 	@$(PYTHON) scripts/lane-gate.py $(ARGS)
 

@@ -30,7 +30,6 @@ import compiler::const_table;
 import compiler::const_table::{ ConstantTable, ConstEval };
 import compiler::module_graph;
 import compiler::module_graph::{ ModuleGraph };
-import compiler::resolve_counter;
 import utils::logger;
 import utils::logger::{ cdebug, LOG_DEBUG, LogComponent };
 import std::collections::pair;
@@ -69,39 +68,6 @@ import compiler::types::type_ref::{ TypeRef };
 // ResolutionContext: context for type resolution
 
 /// Ambient state needed while resolving type annotations.
-/// Where a `ResolutionContext`'s `home_module` came from.
-///
-/// The distinction is load-bearing, not bookkeeping.  A home module derived
-/// from the SYNTAX's own span answers spec §5.1's question ("what does this
-/// leaf mean in the module it was written in") and is authoritative.  One
-/// derived from the ambient scope cursor answers "what does it mean in
-/// whichever module the compiler is standing in", which coincides only while a
-/// pass walks declarations in order and is wrong at every re-resolution site.
-///
-/// Both land in cascade step 2c, so without this the counter cannot tell a
-/// resolution that is right by construction from one that is right by
-/// coincidence, and migrating a site from the cursor to real provenance shows
-/// up as B1 going UP.  See `docs/name-resolution.md` §5.2.
-type enum HomeOrigin {
-    /// No home module; resolution falls through to the module-blind chain.
-    Unset;
-    /// Derived from the ambient scope cursor.  TRANSITIONAL - counts as B1.
-    Cursor;
-    /// Derived from the span of the syntax being resolved.  Counts as B3.
-    Syntax;
-}
-
-implement enum HomeOrigin {
-    /// Display name, for audit streams.
-    display_name(&this) -> string {
-        return match (this) {
-            HomeOrigin::Unset  => { "Unset" }
-            HomeOrigin::Cursor => { "Cursor" }
-            HomeOrigin::Syntax => { "Syntax" }
-        };
-    }
-}
-
 type struct ResolutionContext {
     current_module:   string;
     source_file:      string;
@@ -133,28 +99,6 @@ type struct ResolutionContext {
     /// site that does not know its home module keeps today's behavior.
     home_module:      SymbolStr;
 
-    /// Provenance of `home_module`.  See `HomeOrigin`.
-    home_origin:      HomeOrigin;
-
-    /// Which construction site built this context.  Every caller passes
-    /// `FILE, LINE as i32`, which the compiler expands at the call site.
-    ///
-    /// Required for the same reason `home_origin` is: the end-of-run tally says
-    /// how many answers a fallback step gave, and the per-answer `RN` line says
-    /// which name it answered, but neither can say which caller failed to
-    /// establish a scope.  Attribution needs the site, and a site is only
-    /// knowable where the context is built.
-    ///
-    /// A hand-written site name would be a second copy of a fact the compiler
-    /// already holds, kept in step by discipline: rename the enclosing function
-    /// or move the call and the label goes on asserting the old location.
-    ///
-    /// `clone` carries the ORIGINAL site forward rather than naming itself,
-    /// because a cloned context inherits the scope - and therefore the defect -
-    /// of the context it was copied from.
-    origin_file:      string;
-    origin_line:      i32;
-
     /// Demand-free (symbolic) resolution mode. When set, `resolve_generic`
     /// builds an arena-only `InstantiatedType` (via `arena.create_instantiation`)
     /// instead of routing through `generic_registry.instantiate_for_module`. The
@@ -165,18 +109,15 @@ type struct ResolutionContext {
     /// the registry with type-param-bearing instantiations.
     symbolic_no_demand: boolean;
 
-    /// `home_module` and `home_origin` are REQUIRED, for the same reason
-    /// `set_home_module` requires its origin: a context that does not state its
-    /// scope is not a context that happens to lack one, it is a site that never
-    /// asked the question.  When the scope defaulted silently, every step below
-    /// cascade 2c was reached ONLY by such a context — the module-blind chain
-    /// serves scope-less callers exclusively, so the default WAS the fallback
+    /// `home_module` is REQUIRED: a context that does not state its scope is
+    /// not a context that happens to lack one, it is a site that never asked
+    /// the question.  When the scope defaulted silently, every step below
+    /// cascade 2c was reached ONLY by such a context - the module-blind chain
+    /// served scope-less callers exclusively, so the default WAS the fallback
     /// chain's entire supply.  A site with genuinely nothing to say writes
-    /// `HomeOrigin::Unset` and is then greppable; a forgotten one no longer
-    /// compiles.
-    static new(origin_file: string, origin_line: i32,
-               current_module: string, source_file: string,
-               home_module: SymbolStr, home_origin: HomeOrigin) -> ResolutionContext {
+    /// `SymbolStr::empty()` and is then greppable.
+    static new(current_module: string, source_file: string,
+               home_module: SymbolStr) -> ResolutionContext {
         return ResolutionContext {
             current_module:   current_module,
             source_file:      source_file,
@@ -184,40 +125,16 @@ type struct ResolutionContext {
             generic_bindings: [],
             this_type:        TypeRef::invalid(),
             home_module:      home_module,
-            home_origin:      if (!home_module.is_valid()) { HomeOrigin::Unset }
-                              else { home_origin },
             symbolic_no_demand: false,
-            origin_file:      origin_file,
-            origin_line:      origin_line,
         };
     }
 
     /// Declare which module the annotations resolved through this context were
-    /// written in, and WHERE THAT CLAIM CAME FROM.  See `home_module` and
-    /// `HomeOrigin`.
-    ///
-    /// The origin is a required argument on purpose: it is not recoverable from
-    /// the string, and a site that cannot say which one it is has not actually
-    /// established the annotation's module.  Passing `Cursor` is honest and
-    /// costs nothing but a B1 tally; passing `Syntax` when the value came from
-    /// the ambient cursor silently launders a guess into an authoritative
-    /// answer, which is the one failure this split exists to prevent.
-    ///
-    /// A call that supplies an EMPTY module while claiming a real origin is
-    /// reported, because it is indistinguishable from a site that never asked.
-    /// The caller looked the module up, got nothing back, and the normalization
-    /// below turns that into `Unset` - so the context drops into the
-    /// module-blind chain while the source reads as though a scope was
-    /// established.  A static scan of who calls this cannot see it; only the
-    /// event can.
-    set_home_module(mut &this, module_ns: SymbolStr, origin: HomeOrigin) -> void {
-        if (!module_ns.is_valid() && origin != HomeOrigin::Unset) {
-            resolve_counter::home_empty(this.origin_file, this.origin_line,
-                                       origin.display_name());
-        }
+    /// written in.  See `home_module`.  An empty module means the caller looked
+    /// the module up and got nothing back, and the context then resolves
+    /// against the ambient scope chain.
+    set_home_module(mut &this, module_ns: SymbolStr) -> void {
         this.home_module = module_ns;
-        this.home_origin = if (!module_ns.is_valid()) { HomeOrigin::Unset }
-                           else { origin };
     }
 
     /// Add a generic binding (e.g., T -> i32).
@@ -248,16 +165,10 @@ type struct ResolutionContext {
     /// element type `Pair<SymbolStr, TypeRef>` is POD (interned ids), so the
     /// per-element copies are trivial.  `import_modules` is reconstructed as
     /// `[]` - it is never populated anywhere, matching the prior behavior.
-    ///
-    /// The scope is passed to `new` rather than assigned afterwards: a copy that
-    /// states `Unset` and then overwrites it reads as a site that never
-    /// established a scope, which is exactly the distinction the required
-    /// argument exists to make legible.
     clone(&this) -> ResolutionContext {
         mut out: ResolutionContext =
-            ResolutionContext::new(this.origin_file, this.origin_line,
-                                   this.current_module, this.source_file,
-                                   this.home_module, this.home_origin);
+            ResolutionContext::new(this.current_module, this.source_file,
+                                   this.home_module);
         out.this_type = this.this_type;
         out.symbolic_no_demand = this.symbolic_no_demand;
         for (mut i: i64 = 0; i < this.generic_bindings.length; i++) {
@@ -620,11 +531,9 @@ type struct TypeResolver {
             // stand in for it: an `implement` block may live in a third module
             // again, and this context's other input is a type-param binding,
             // which carries no module at all.
-            mut bctx: ResolutionContext = ResolutionContext::new(
-                FILE, LINE as i32, "", "",
+            mut bctx: ResolutionContext = ResolutionContext::new("", "",
                 module_graph::home_ns_sym_of_file(this.module_graph,
-                                                 impl_node.span.file),
-                HomeOrigin::Syntax);
+                                                 impl_node.span.file));
             if (impl_node.target_args.length == base_args.length) {
                 for (mut ti: i64 = 0; ti < impl_node.target_args.length; ti++) {
                     const ta: TypeAnnotation* = impl_node.target_args[ti];
@@ -676,9 +585,7 @@ type struct TypeResolver {
                 const tr: TraitRef* = &bound.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
                 const tdecl: TraitDeclNode* =
-                    this.generic_registry.get_trait_decl(
-                        tr.identity(), "derive_where_assoc_bindings",
-                        this.intern_table);
+                    this.generic_registry.get_trait_decl(tr.identity());
                 if (tdecl == null) { continue; }
                 const ngp: i64 = tdecl.generic_params.length;
                 for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
@@ -784,9 +691,7 @@ type struct TypeResolver {
             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                 const tr: TraitRef* = &bound.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
-                const tdecl: TraitDeclNode* = this.generic_registry.get_trait_decl(
-                    tr.identity(), "project_where_bound_params_into",
-                    this.intern_table);
+                const tdecl: TraitDeclNode* = this.generic_registry.get_trait_decl(tr.identity());
                 if (tdecl == null) { continue; }
                 const ngp: i64 = tdecl.generic_params.length;
                 for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
@@ -810,7 +715,7 @@ type struct TypeResolver {
                         // Nothing left to solve in this arg: don't pay for a lookup.
                         if (!this.where_arg_has_unbound_param(arg_ann, param_names, ictx)) { continue; }
                     }
-                    mut rc: ResolutionContext = ResolutionContext::new(FILE, LINE as i32, source_file, "", SymbolStr::empty(), HomeOrigin::Unset);
+                    mut rc: ResolutionContext = ResolutionContext::new(source_file, "", SymbolStr::empty());
                     const member: SymbolStr = tdecl.assoc_types[assoc_idx].name;
                     if (subject_abstract) {
                         // `project_member` keeps an abstract base symbolic, giving
@@ -1215,7 +1120,6 @@ type struct TypeResolver {
     /// `GenericParamType` and consumers needing the bound read the clause.
     create_param_type(&this, gp: GenericParamNode*, index: u64) -> TypeRef {
         if (gp == null) { return TypeRef::invalid(); }
-        resolve_counter::Site::ParamRefResolver.bump();
         return this.arena.create_generic_param(gp.name, index);
     }
 
@@ -1238,7 +1142,6 @@ type struct TypeResolver {
             const gp: GenericParamNode* = params[i];
             if (gp == null || !gp.has_default_annotation()) { return filled; }
             mut def_ctx: ResolutionContext = ctx.clone();
-            resolve_counter::Site::DefaultArgExpanded.bump();
             // A default annotation (`struct String<A = GlobalAlloc>`) is syntax
             // written in the TEMPLATE'S module, so it resolves in that module's
             // scope - never the caller's, and never scope-less.  Set here
@@ -1249,18 +1152,11 @@ type struct TypeResolver {
             // Without it the context carries no home module and every scoped
             // step of the cascade misses, which now leaves the name unresolved
             // rather than answered from a program-wide index.  The re-home is
-            // what makes the scoped steps able to answer at all.
+            // what makes the scoped steps able to answer at all.  A template
+            // registered with no owning module keeps whatever home the CALLER
+            // handed in, and its default then binds per-caller.
             if (entry.module_name.is_valid()) {
-                def_ctx.set_home_module(entry.module_name, HomeOrigin::Syntax);
-            } else {
-                // The re-home above is skipped, so the default keeps whatever
-                // home the CALLER handed in and binds per-caller.  Named, not
-                // just counted: the missing owner is a property of one template
-                // and only its name says which registration dropped it.
-                resolve_counter::Site::DefaultArgNoOwner.bump();
-                resolve_counter::default_arg_no_owner(
-                    this.intern_table.resolve(entry.name),
-                    this.intern_table.resolve(def_ctx.home_module));
+                def_ctx.set_home_module(entry.module_name);
             }
             for (mut j: i64 = 0; j < filled.length; j++) {
                 def_ctx.add_binding(entry.param_names[j], filled[j]);
@@ -1388,7 +1284,7 @@ type struct TypeResolver {
         // The home module for the defaults is supplied by
         // `expand_default_type_args` from `entry.module_name`, so this context
         // deliberately stays bare.
-        mut ctx: ResolutionContext = ResolutionContext::new(FILE, LINE as i32, "", "", SymbolStr::empty(), HomeOrigin::Unset);
+        mut ctx: ResolutionContext = ResolutionContext::new("", "", SymbolStr::empty());
         mut empty: TypeRef[] = [];
         const filled: TypeRef[] = this.expand_default_type_args(entry, empty, &ctx);
         if (filled.length != entry.param_count) { return ty; }
@@ -1429,11 +1325,10 @@ type struct TypeResolver {
         if (!ann_ns.is_valid() || ann_ns.equals(ctx.home_module)) {
             return this.resolve_named(name, ctx, slot, span);
         }
-        const saved_home:   SymbolStr  = ctx.home_module;
-        const saved_origin: HomeOrigin = ctx.home_origin;
-        ctx.set_home_module(ann_ns, HomeOrigin::Syntax);
+        const saved_home: SymbolStr = ctx.home_module;
+        ctx.set_home_module(ann_ns);
         const out: TypeRef = this.resolve_named(name, ctx, slot, span);
-        ctx.set_home_module(saved_home, saved_origin);
+        ctx.set_home_module(saved_home);
         return out;
     }
 
@@ -1464,45 +1359,6 @@ private:
             depth += 1;
         }
         return current;
-    }
-
-    /// Emit one `RN` audit line naming the cascade step that answered, the home
-    /// module the context carried, and the type it bound to.
-    ///
-    /// Off unless `CRYO_RN_AUDIT` is set.  The end-of-run tally counts answers
-    /// per step; only a per-event line can say WHICH name a step answered, and
-    /// a wrong bind is a statement about one name.
-    rn_trace(&this, step: string, name_str: string, ctx: ResolutionContext*,
-             result: TypeRef) -> void {
-        if (!resolve_counter::Audit::Named.enabled()) { return; }
-        mut answer: string = "<invalid>";
-        if (result.is_valid()) {
-            const t: Type* = this.arena.lookup(result.id);
-            if (t != null) { answer = t.display_name(); }
-        }
-        mut home: string = "<none>";
-        if (ctx != null && ctx.home_module.is_valid()) {
-            home = this.intern_table.resolve(ctx.home_module);
-        }
-        // The ambient cursor is what every step below 2c canonicalizes against,
-        // so a line that reports only the home module cannot distinguish "the
-        // scope was wrong" from "the scope was right and the LOOKUP was wrong".
-        mut cursor: string = "<none>";
-        if (this.name_resolver != null) {
-            const cur: string =
-                this.intern_table.resolve(this.name_resolver.current_module_sym());
-            if (cur.length() > 0) { cursor = cur; }
-        }
-        // Which caller built this context.  `home` says a scope is missing; only
-        // the site says whose to fix.
-        mut site_file: string = "<none>";
-        mut site_line: i32 = 0;
-        if (ctx != null && ctx.origin_file.length() > 0) {
-            site_file = ctx.origin_file;
-            site_line = ctx.origin_line;
-        }
-        resolve_counter::rn_answer(step, home, cursor, site_file, site_line,
-                                  name_str, answer);
     }
 
     /// The module the annotation was written in, or the empty symbol when the
@@ -1536,7 +1392,6 @@ private:
         // 1. Check generic bindings first (O(1) SymbolStr comparison)
         mut binding: TypeRef = ctx.lookup_binding(name);
         if (binding.is_valid()) {
-            this.rn_trace("1-generic", name_str, ctx, binding);
             return binding;
         }
 
@@ -1564,7 +1419,6 @@ private:
                     const member_sym: SymbolStr = this.intern_table.intern(member_str);
                     const proj: TypeRef = this.project_member(prefix_ty, member_sym, ctx);
                     if (proj.is_valid()) {
-                        this.rn_trace("1b-assoc", name_str, ctx, proj);
                         return proj;
                     }
                 }
@@ -1585,7 +1439,6 @@ private:
         //    supplying it declines.  It answers zero while no unwrap declines.
         const prim: TypeRef = this.resolve_primitive(name);
         if (prim.is_valid()) {
-            this.rn_trace("2-primitive", name_str, ctx, prim);
             return prim;
         }
 
@@ -1658,37 +1511,15 @@ private:
                 if (!home_hit.is_valid()) {
                     home_hit = this.arena.lookup_by_name(home_key);
                 }
-                if (!home_hit.is_valid()) {
-                    // The name is an ANSWER that no store can serve, which is a
-                    // declaration that never registered rather than a name this
-                    // step failed to derive.  Recorded rather than retried.
-                    resolve_counter::path_hit(
-                        "RN-2C-UNSERVED",
-                        this.intern_table.resolve(home_key), name_str,
-                        span.to_string());
-                }
+                // A name neither store serves is an ANSWER no store can serve:
+                // a declaration that never registered, not a name this step
+                // failed to derive.  It is not retried under another key.
             }
 
-            if (home_hit.is_valid()) {
-                const home_answer: TypeRef = this.follow_alias(home_hit);
-                // Same mechanism, two very different claims.  When the home
-                // module came from the syntax's own span this IS spec §5.1
-                // resolution - the leaf resolved in the module that wrote it -
-                // and counts as authoritative.  When it came from the ambient
-                // cursor it is still the pre-keystone tie-breaker and stays in
-                // B1, so migrating a site to real provenance shows up as B1
-                // going DOWN rather than up.  See `HomeOrigin`.  A context
-                // that established no home answered from the stamp alone,
-                // which is the writing module's answer by construction.
-                if (ctx.home_origin == HomeOrigin::Cursor) {
-                    resolve_counter::Site::RnHomeModule.bump();
-                    this.rn_trace("2c-home-cursor", name_str, ctx, home_answer);
-                } else {
-                    resolve_counter::Site::RnHomeModuleSyntax.bump();
-                    this.rn_trace("2c-home-syntax", name_str, ctx, home_answer);
-                }
-                return home_answer;
-            }
+            // The leaf resolved in the module that wrote it.  A context that
+            // established no home answered from the stamp alone, which is the
+            // writing module's answer by construction.
+            if (home_hit.is_valid()) { return this.follow_alias(home_hit); }
         }
 
         // 2b. Ambiguity check: if this name was imported from multiple
@@ -1714,13 +1545,10 @@ private:
                         Diagnostic::error(ErrorCode::E0203_UNDEFINED_TYPE, msg));
                 }
             }
-            resolve_counter::Site::RnAmbiguous.bump();
-            this.rn_trace("2b-ambiguous", name_str, ctx, TypeRef::invalid());
             return TypeRef::invalid();
         }
 
         // Not found; return invalid (caller should create error)
-        this.rn_trace("X-failed", name_str, ctx, TypeRef::invalid());
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeResolver] resolve_named() FAILED for '%s'", name_str);
         return TypeRef::invalid();
     }
