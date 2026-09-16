@@ -211,16 +211,16 @@ type struct CallResolver {
     /// the call was written in, and the declaration index keys its overload
     /// entries by that same canonical name.  A `Local` is a value with a
     /// type, not a set of signatures, and is read where the value is bound.
-    /// A stamp the name layer did not answer names a family only when an
-    /// intrinsic owns the leaf: an intrinsic is declared and never exported,
-    /// so nothing an importer writes can bind it, and the bare allocator
-    /// calls that still reach one bind through the index's record of which
-    /// intrinsic that is.  That is the one bare path left in this family and
-    /// it stays only until the allocator leaf is ruled on.
+    /// A stamp the name layer did not answer names nothing: a bare name
+    /// means a declaration in scope or it is an error, the allocator leaf
+    /// included (`malloc`/`free`/`realloc` are written `libc::free`,
+    /// `heap::free` or `intrinsics::free`, or declared in the writing
+    /// module - an extern block, or `no_std`'s own declaration - and reached
+    /// by their stamp like every other name).
     callee_family(&this, ident: IdentifierNode*) -> SymbolStr {
         return match (ident.res) {
             ResSlot::Answered(r) => { r.def_id().qualified_name() }
-            _                    => { this.ctx.decl_index.intrinsic_owner_of(ident.name) }
+            _                    => { SymbolStr::empty() }
         };
     }
 
@@ -2678,8 +2678,6 @@ type struct CallResolver {
             func_ret = this.types.lookup_func_return(stamped_q);
         }
         if (func_ret.is_valid()) {
-        }
-        if (func_ret.is_valid()) {
             if (this.state.expected_type.is_valid()) {
                 const ret_t: Type* = this.arena.lookup(func_ret.id);
                 if (ret_t != null) {
@@ -2714,8 +2712,33 @@ type struct CallResolver {
                 "`<` after `%s` was read as the start of generic type arguments; if a comparison was meant, parenthesise the operands - `(x < y)`",
                 name));
         }
-        const cands: string[] = this.diag.collect_bare_callable_names();
-        diag = this.diag.attach_did_you_mean(diag, name, cands, "function", ident.span);
+        // A leaf some other module declares - `free` in `std::ffi::libc`,
+        // `std::alloc::heap`, `std::core::intrinsics` - is not a typo of a
+        // name in scope; it is a name the writer has to say the owner of.
+        const declarers: string[] = this.diag.collect_module_declarers_of_leaf(ident.name);
+        if (declarers.length > 0) {
+            mut spellings: string = "";
+            for (mut i: i64 = 0; i < declarers.length; i++) {
+                const parent: string = QualifiedName::parent_of(declarers[i]);
+                const spelled: string = QualifiedName::leaf_of(parent) + "::" + name;
+                if (i > 0) {
+                    if (i + 1 == declarers.length) { spellings = spellings + " or "; }
+                    else                            { spellings = spellings + ", "; }
+                }
+                spellings = spellings + "`" + spelled + "`";
+            }
+            mut declared_in: string = "";
+            for (mut i: i64 = 0; i < declarers.length; i++) {
+                if (i > 0) { declared_in = declared_in + ", "; }
+                declared_in = declared_in + "`" + QualifiedName::parent_of(declarers[i]) + "`";
+            }
+            diag = diag.with_note(fmt::format(
+                "a bare name means a declaration in this module; `%s` is declared in %s - write %s, or import it",
+                name, declared_in, spellings));
+        } else {
+            const cands: string[] = this.diag.collect_bare_callable_names();
+            diag = this.diag.attach_did_you_mean(diag, name, cands, "function", ident.span);
+        }
         this.ctx.emit_diagnostic(diag);
         return TypeRef::invalid();
     }

@@ -236,13 +236,10 @@ type struct DeclarationIndex {
 
     // Leaf-name SymbolStr.id of every `intrinsic function` declaration (the
     // compiler-lowered ones in `core::intrinsics`: memcpy, ptr_diff, panic,
-    // atomic_*, ...) -> the intrinsic's qualified name.  An intrinsic is
-    // declared and never exported, so no import binds its leaf and this
-    // record is the only thing that names the declaration a bare allocator
-    // call reaches (`intrinsic_owner_of`); codegen reads the qualified name
-    // to tell a pin to the intrinsic from a pin to a function sharing its
-    // leaf (`callee_is_intrinsic`).  The leaf's single-slot bindings are
-    // durable from registration on (the `register_*` guards below).
+    // atomic_*, ...) -> the intrinsic's qualified name.  Codegen reads the
+    // qualified name to tell a pin to the intrinsic from a pin to a function
+    // sharing its leaf (`callee_is_intrinsic`); no call binds through the
+    // leaf.
     intrinsic_names:     HashMap<u32, u32>;
 
     // Bare C symbol -> owning module/file (intern id) for symbols claimed by an
@@ -349,15 +346,7 @@ type struct DeclarationIndex {
     // Registration (called by TypeResolution & Specialization passes)
 
     /// Register a function's return type.
-    ///
-    /// Intrinsic durability: once a declared `intrinsic function` owns a
-    /// leaf (see `register_intrinsic_function_type`), a later same-leaf
-    /// regular function must not overwrite the single-slot return type -
-    /// the intrinsic's own registration runs BEFORE it is marked, so this
-    /// guard never blocks the intrinsic itself, and either registration
-    /// order converges on the intrinsic's binding.
     register_function(mut &this, name: SymbolStr, return_type: TypeRef) -> void {
-        if (this.intrinsic_names.contains_key(&name.id)) { return; }
         this.func_returns.insert(name.id, return_type);
     }
 
@@ -419,12 +408,7 @@ type struct DeclarationIndex {
     /// re-mangling) the first claimant's.
     register_function_type_owned(mut &this, name: SymbolStr, func_type_ref: TypeRef,
                                  owner: SymbolStr) -> void {
-        // Intrinsic durability: the single-slot signature of an
-        // intrinsic-owned leaf is not overwritable by regular registrations
-        // (the intrinsic itself writes it in `register_intrinsic_function_type`).
-        if (!this.intrinsic_names.contains_key(&name.id)) {
-            this.func_type_refs.insert(name.id, func_type_ref);
-        }
+        this.func_type_refs.insert(name.id, func_type_ref);
         // Also append to the overload list so cross-module extern
         // declaration can enumerate every overload's signature -- scoped to
         // this name's positions via the overload_index instead of scanning
@@ -452,70 +436,20 @@ type struct DeclarationIndex {
         (*slot).push(new_pos);
     }
 
-    /// Like `register_function_type`, but claims SOLE ownership of the bare
-    /// leaf name for a compiler intrinsic: any previously-registered overload
-    /// (an `extern "C"` libc twin such as `malloc`/`strlen`/`fopen`) is
-    /// dropped from the overload index so the leaf-name dispatcher sees only
-    /// the intrinsic. An intrinsic is never overloaded, so sole ownership is
-    /// correct, and this makes bare-name resolution order-independent: an
-    /// intrinsic must win unqualified resolution even when `ffi::libc`
-    /// topo-sorts ahead of `core::intrinsics` and its extern twin registers
-    /// first (which otherwise strands `malloc`/`strlen`/... at codegen with
-    /// an ambiguous second overload, E0636). The qualified `libc::<name>`
-    /// form registered separately stays available regardless.
-    register_intrinsic_function_type(mut &this, name: SymbolStr, func_type_ref: TypeRef,
-                                     owner: SymbolStr) -> void {
-        // Record the leaf as an intrinsic declaration, with the declaration
-        // it names.  From this point on the leaf's single-slot bindings
-        // (func_type_refs / func_returns / mangled_names) are durable: the
-        // intrinsic-durability guards in the register_* methods refuse
-        // non-intrinsic overwrites, so a later same-leaf regular function
-        // (e.g. `alloc::heap::free`) can no longer silently rebind bare
-        // calls program-wide.  `owner` is the intrinsic's qualified name
-        // (`std::core::intrinsics::free`), and the value recorded under the
-        // leaf, which is how a bare allocator call names the declaration.
+    /// Record the `intrinsic function` declared under the leaf `name`, by
+    /// the declaration's qualified name.  The leaf is a key in no function
+    /// table: an intrinsic is reached through its module (`intrinsics::free`)
+    /// like every declaration, and its bare spelling is an error where it is
+    /// declared in no scope.  Codegen reads this record to tell a pin to the
+    /// intrinsic from a pin to a function sharing its leaf
+    /// (`callee_is_intrinsic`).
+    note_intrinsic(mut &this, name: SymbolStr, owner: SymbolStr) -> void {
         this.intrinsic_names.insert(name.id, owner.id);
-        this.func_type_refs.insert(name.id, func_type_ref);
-        const new_pos: u32 = this.overload_func_keys.length as u32;
-        this.overload_func_keys.push(name.id);
-        this.overload_func_types.push(func_type_ref);
-        this.overload_func_mangled.push(0);
-        this.overload_func_owner.push(owner.id);
-        // Sole bare ownership drops the UNOWNED claimants only: extern "C"
-        // twins (owner 0), whose divergent Cryo signature would otherwise
-        // shadow the intrinsic (see method doc).  OWNED same-leaf regular
-        // functions (`fs::write` vs intrinsic `write`) keep their entries -
-        // they coexist by owner identity - which also makes this
-        // registration order-robust when a regular fn's module registered
-        // first.
-        mut positions: u32[] = [];
-        match (this.overload_index.get_ref(&name.id)) {
-            Option::Some(prev) => {
-                mut k: i64 = 0;
-                while (k < (*prev).length) {
-                    const pos: u32 = (*prev)[k];
-                    if (this.overload_func_owner[pos as i64] != 0) {
-                        positions.push(pos);
-                    }
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
-        }
-        positions.push(new_pos);
-        this.overload_index.insert(name.id, positions);
     }
 
     /// The qualified name of the `intrinsic function` declared under the leaf
-    /// `name`, or empty when no intrinsic owns that leaf.
-    ///
-    /// This is the one key a BARE intrinsic call binds through.  An intrinsic
-    /// is declared and never exported, so no import can bind its leaf and the
-    /// name layer leaves such a callee unanswered; every intrinsic the tree
-    /// calls is reached through `intrinsics::` instead, except the allocator
-    /// leaf (`malloc` / `free` / `realloc`), whose bare form is held open
-    /// until it is ruled on.  A leaf's single-slot maps cannot serve this:
-    /// they are last-write-wins across every module declaring the leaf.
+    /// `name`, or empty when no intrinsic owns that leaf.  Read by codegen's
+    /// inline decision alone; no call binds through it.
     intrinsic_owner_of(&this, name: SymbolStr) -> SymbolStr {
         return match (this.intrinsic_names.get(&name.id)) {
             Option::Some(owner) => { SymbolStr::from_id(owner) }
@@ -557,15 +491,6 @@ type struct DeclarationIndex {
                     const pos: u32 = (*positions)[k];
                     if (this.overload_func_types[pos as i64].id == func_type_ref.id) {
                         const prev: u32 = this.overload_func_mangled[pos as i64];
-                        // Intrinsic durability: never restamp the intrinsic's
-                        // own entry (its mangled IS the leaf name) with a
-                        // different symbol; try the next same-signature entry
-                        // (the caller's own) instead.
-                        if (this.intrinsic_names.contains_key(&name.id)
-                            && prev == name.id && mangled.id != name.id) {
-                            k = k + 1;
-                            continue;
-                        }
                         this.overload_func_mangled[pos as i64] = mangled.id;
                         // Record the reverse mapping only when this position
                         // newly takes this mangled id, so repeated registration
@@ -1182,19 +1107,7 @@ type struct DeclarationIndex {
 
     /// Store the mangled LLVM symbol name for a function or method.
     /// Called at registration time so codegen never computes mangling.
-    ///
-    /// Intrinsic durability: a declared intrinsic's bare leaf maps to the
-    /// intrinsic's own C symbol - which IS the leaf name (`free` -> `free`) -
-    /// permanently.  A later same-leaf regular function writing its q-mangled
-    /// symbol into this single slot would silently redirect every blind
-    /// bare-name fallback (codegen `resolve_function`, extern declaration)
-    /// into a module the caller never imported.  The intrinsic's own write
-    /// (mangled == leaf) always passes, so registration order converges.
     register_mangled_name(mut &this, qualified: SymbolStr, mangled: SymbolStr) -> void {
-        if (this.intrinsic_names.contains_key(&qualified.id)
-            && mangled.id != qualified.id) {
-            return;
-        }
         this.mangled_names.insert(qualified.id, mangled.id);
     }
 
