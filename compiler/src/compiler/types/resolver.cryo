@@ -59,6 +59,10 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
+import compiler::types::substitution;
+import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::trait_checker;
+import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::types::inference::{ InferCtx };
 import compiler::types::ownership::{ OwnershipQuery };
@@ -1448,6 +1452,49 @@ private:
         }
         return this.arena.get_tuple(elements);
     }
+    /// Whether `args` satisfy every `where` bound the type declaration
+    /// `entry` names, with E0306 at the written annotation `span` and the
+    /// bound as declared for the first that does not.  A function
+    /// template's bounds are checked at its call; nothing but the four
+    /// aggregates carries a clause.
+    refuse_unsatisfied_type_bounds(&this, entry: TemplateEntry*, args: &TypeRef[],
+                                   span: SourceSpan) -> boolean {
+        if (entry == null || entry.ast_node == null || this.diagnostics == null) { return true; }
+        const none: TraitBound[] = [];
+        mut bounds: &TraitBound[] = &none;
+        match (entry.node_kind) {
+            NodeKind::StructDeclaration => { bounds = &(entry.ast_node as declaration::StructDeclNode*).where_bounds; }
+            NodeKind::UnionDeclaration  => { bounds = &(entry.ast_node as declaration::UnionDeclNode*).where_bounds; }
+            NodeKind::ClassDeclaration  => { bounds = &(entry.ast_node as declaration::ClassDeclNode*).where_bounds; }
+            NodeKind::EnumDeclaration   => { bounds = &(entry.ast_node as declaration::EnumDeclNode*).where_bounds; }
+            _ => { return true; }
+        }
+        if (bounds.length == 0) { return true; }
+        mut arg_copy: TypeRef[] = [];
+        for (mut i: i64 = 0; i < args.length; i++) { arg_copy.push(args[i]); }
+        const subst: TypeSubstitution = TypeSubstitution::from_params(&entry.param_type_ids, &arg_copy);
+        const checker: TraitChecker = TraitChecker::new(
+            this.arena, this.generic_registry, this.intern_table, this.diagnostics);
+        mut concrete: TypeRef = TypeRef::invalid();
+        const tref: TraitRef* = checker.unsatisfied_trait_ref(bounds, &subst, &concrete);
+        if (tref == null) { return true; }
+        const trait_str: string = this.intern_table.resolve(tref.path[tref.path.length - 1]);
+        const concrete_t: Type* = this.arena.lookup(concrete.id);
+        const concrete_str: string = if (concrete_t != null) { this.arena.format_display(concrete_t) } else { "?" };
+        const tmpl_str: string = this.intern_table.resolve(entry.name);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+            fmt::format("the trait bound `%s: %s` is not satisfied", concrete_str, trait_str));
+        diag = diag.at(span);
+        diag = diag.also_at(tref.span, fmt::format("required by this bound on `%s`", tmpl_str));
+        diag = diag.with_note(fmt::format("the trait `%s` is not implemented for `%s`", trait_str, concrete_str));
+        diag = diag.help(fmt::format(
+            "implement `%s` for `%s`, or instantiate `%s` with a type that does",
+            trait_str, concrete_str, tmpl_str));
+        this.diagnostics.emit(diag);
+        return false;
+    }
+
 
     /// Resolve a generic type instantiation annotation.
     /// Routes through GenericRegistry for deduplication, ensuring the
@@ -1512,6 +1559,15 @@ private:
                     "[TypeResolver] resolve_generic() arg count mismatch: "
                     "expected %d, got %d",
                     entry.param_count, args.length);
+                return TypeRef::invalid();
+            }
+
+            // The declaration's own `where` clause, at the written
+            // annotation - the one site with a span.  An abstract argument
+            // is deferred (the concrete instantiation checks it), and every
+            // instantiation demanded without an annotation is checked once
+            // more where it is specialized, the door behind this.
+            if (!this.refuse_unsatisfied_type_bounds(entry, &args, g.span)) {
                 return TypeRef::invalid();
             }
 

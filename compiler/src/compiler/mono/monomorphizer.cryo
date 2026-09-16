@@ -23,7 +23,7 @@
 namespace compiler::mono::monomorphizer;
 
 import compiler::ast;
-import compiler::ast::{ declaration, expression, node, NodeKind, pattern, statement };
+import compiler::ast::{ declaration, expression, node, NodeKind, pattern, statement, TraitBound, TraitRef };
 import compiler::types::{
     generic, user_defined, compound, type_base, arena, type_ref, substitution,
     checker, resolver, generic_registry, ownership, trait_checker, TypeKind
@@ -469,6 +469,14 @@ type struct Monomorphizer {
             entry.param_type_ids, request.type_args
         );
 
+        // The declaration's own `where` clause, checked here because every
+        // instantiation passes through this one place with the template and
+        // its arguments in hand.  An unsatisfied bound is E0306 and the
+        // build is refused on it; the specialization still proceeds, as a
+        // call whose bound fails still proceeds, so one wrong instantiation
+        // reports once rather than as every body that would have used it.
+        this.refuse_unsatisfied_type_bounds(entry, &subst, type_arg_displays);
+
         // Drop impls and methods whose where-bounds aren't satisfied for this
         // substitution.  Removing them here means resolve_specialized_ast never
         // sees an uncompilable body and DI never indexes a junk signature.
@@ -812,6 +820,54 @@ type struct Monomorphizer {
     /// Build a qualified specialized name from the template's qualified name and
     /// the bare specialized name.  E.g. "BattleTest::Pair" + "Pair_string" ->
     /// "BattleTest::Pair_string".  Bare spec name when the template has no namespace.
+    /// Whether `subst` satisfies every `where` bound the type declaration
+    /// `entry` names; E0306 at the bound as declared, naming the
+    /// instantiation, for the first that fails.  The door behind sema's
+    /// check at a written annotation (`TypeResolver::resolve_generic`):
+    /// an instantiation demanded with no span of its own - a literal, a
+    /// static call, a clone's concretized argument - is refused here, at
+    /// the one place every instantiation passes with the template and its
+    /// arguments in hand.  A bound whose argument is still abstract is
+    /// deferred to the concrete instantiation.
+    refuse_unsatisfied_type_bounds(mut &this, entry: TemplateEntry*, subst: TypeSubstitution*,
+                                   type_arg_displays: &string[]) -> boolean {
+        if (entry == null || entry.ast_node == null) { return true; }
+        // The four aggregates carry a `where` clause; a function template's
+        // bounds are checked at its call, and nothing else has one.
+        const none: TraitBound[] = [];
+        mut bounds: &TraitBound[] = &none;
+        match (entry.node_kind) {
+            NodeKind::StructDeclaration => { bounds = &(entry.ast_node as declaration::StructDeclNode*).where_bounds; }
+            NodeKind::UnionDeclaration  => { bounds = &(entry.ast_node as declaration::UnionDeclNode*).where_bounds; }
+            NodeKind::ClassDeclaration  => { bounds = &(entry.ast_node as declaration::ClassDeclNode*).where_bounds; }
+            NodeKind::EnumDeclaration   => { bounds = &(entry.ast_node as declaration::EnumDeclNode*).where_bounds; }
+            _ => { return true; }
+        }
+        mut concrete: TypeRef = TypeRef::invalid();
+        const tref: TraitRef* = this.trait_checker.unsatisfied_trait_ref(bounds, subst, &concrete);
+        if (tref == null) { return true; }
+        const trait_str: string = this.intern_table.resolve(tref.path[tref.path.length - 1]);
+        const concrete_t: Type* = this.arena.lookup(concrete.id);
+        const concrete_str: string = if (concrete_t != null) { this.arena.format_display(concrete_t) } else { "?" };
+        mut args_str: string = "";
+        for (mut ai: i64 = 0; ai < type_arg_displays.length; ai++) {
+            if (ai > 0) { args_str = args_str + ", "; }
+            args_str = args_str + type_arg_displays[ai];
+        }
+        const tmpl_str: string = this.intern_table.resolve(entry.name);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+            fmt::format("the trait bound `%s: %s` is not satisfied by `%s<%s>`",
+                concrete_str, trait_str, tmpl_str, args_str));
+        diag = diag.at_with_label(tref.span, fmt::format("required by this bound on `%s`", tmpl_str));
+        diag = diag.with_note(fmt::format("the trait `%s` is not implemented for `%s`", trait_str, concrete_str));
+        diag = diag.help(fmt::format(
+            "implement `%s` for `%s`, or instantiate `%s` with a type that does",
+            trait_str, concrete_str, tmpl_str));
+        this.diagnostics.emit(diag);
+        return false;
+    }
+
     qualify_spec_name(&this, entry: TemplateEntry*, spec_name: string) -> SymbolStr {
         const qualified_str: string = this.intern_table.resolve(entry.qualified_name);
         const bare_str: string = this.intern_table.resolve(entry.name);

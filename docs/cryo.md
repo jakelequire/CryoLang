@@ -1745,6 +1745,22 @@ Multiple bounds on the same parameter are joined with `+`. Multiple constrained 
 where T: Hash + Eq, V: Clone
 ```
 
+A `where` clause is the only way to constrain a parameter; there is no inline `<T: Bound>` form. It is written on functions and methods, on `implement` blocks, and on type declarations — a struct, class, union or enum — after the parameter list and before the body:
+
+```cryo
+type struct Holder<T> where T: Tagged {
+    inner: T;
+    label(&this) -> i32 { return this.inner.tag(); }   // reached through the bound
+}
+
+type enum Slot<T> where T: Tagged {
+    Empty;
+    Full(T);
+}
+```
+
+A type's bound is checked once per instantiation: `Holder<Plain>` with a `Plain` that does not implement `Tagged` is an error (E0306) at the annotation that wrote it, with the bound as declared beside it. An instantiation reached without an annotation — a literal, a static call — is refused the same way where it is specialised.
+
 ### 11.4 Standard Library Traits
 
 | Trait                                                                                                         | Purpose                                                                                                           |

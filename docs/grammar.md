@@ -142,6 +142,8 @@ Visibility         ::= "public" | "private" | "protected"
 
 AggregateDecl      ::= "type"? AggregateKind Ident Generics?
                        (":" Ident)?                  (* base class  *)
+                       ("where" WhereClause)?        (* bounds on the declaration's own
+                                                        parameters; checked per instantiation *)
                        "{" Member* "}"
 AggregateKind      ::= "struct" | "class"
 
@@ -171,6 +173,7 @@ Constructor        ::= Ident "(" ParamList? ")"
 Destructor         ::= "~" Ident "(" ")" Block
 
 EnumDecl           ::= "type"? "enum" Ident Generics? (":" Type)?
+                       ("where" WhereClause)?
                        "{" (EnumVariant ("," | ";"))* "}"
                        (* the optional ":" Type is the explicit discriminant
                           base type, e.g. `type enum Foo : i32 { ... }` *)
@@ -179,6 +182,7 @@ EnumVariant        ::= Ident
                      | Ident "(" Type ("," Type)* ")"
 
 UnionDecl          ::= "type" "union" Ident Generics?
+                       ("where" WhereClause)?
                        "{" Member* "}"
                        (* An untagged C-style union: every field overlaps at
                           offset 0, so the union's size is its largest member
