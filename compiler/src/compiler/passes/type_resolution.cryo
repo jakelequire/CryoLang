@@ -2273,18 +2273,28 @@ type struct TypeResolutionPasses {
         ctx.emit_diagnostic(diag);
     }
 
-    /// The registration key a written annotation's head names, off its
-    /// stamp: a declared type's canonical name, a primitive's spelling;
-    /// empty for a type parameter or an unstamped head.
+    /// The registration key a written annotation's head names, peeling
+    /// references and pointers: a declared type's canonical name, a
+    /// primitive's spelling; empty for a type parameter, a projection, an
+    /// array, a tuple or a function type - shapes that name no registered
+    /// type.  A `Named` head with no stamp is a defect the door records.
     static head_type_key(ann: TypeAnnotation*) -> SymbolStr {
-        return match (TypeResolutionPasses::head_named_slot(ann)) {
-            ResSlot::Answered(r) => {
-                match (r) {
+        if (ann == null) { return SymbolStr::empty(); }
+        return match (*ann) {
+            TypeAnnotation::Named(n) => {
+                match (n.res.require("type_resolution:annotation head")) {
                     Res::Def(d)    => { d.qualified_name() }
                     Res::PrimTy(p) => { p }
                     _              => { SymbolStr::empty() }
                 }
             }
+            // A primitive written by its keyword carries no slot to ask; its
+            // spelling is the key it is registered under, the same answer a
+            // `PrimTy` stamp gives.
+            TypeAnnotation::Primitive(p)  => { p.name }
+            TypeAnnotation::Generic(g)    => { TypeResolutionPasses::head_type_key(g.base) }
+            TypeAnnotation::Reference(r)  => { TypeResolutionPasses::head_type_key(r.inner) }
+            TypeAnnotation::Pointer(pt)   => { TypeResolutionPasses::head_type_key(pt.inner) }
             _ => { SymbolStr::empty() }
         };
     }
@@ -2483,8 +2493,8 @@ type struct TypeResolutionPasses {
             if (arg_idx < 0 || arg_idx >= args_ref.length) { continue; }
             const item_ann: TypeAnnotation* = args_ref[arg_idx];
             if (item_ann == null) { continue; }
-            // A symbolic Item - a projection, an impl-declared parameter, an
-            // unstamped head - names no registered type: keep.
+            // A symbolic Item - a projection or an impl-declared parameter -
+            // names no registered type: keep.
             if (TypeResolutionPasses::is_projection_annotation(item_ann)) { continue; }
             const head: SymbolStr = TypeResolutionPasses::head_type_key(item_ann);
             if (!head.is_valid()) { continue; }
