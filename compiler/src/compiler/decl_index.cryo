@@ -242,13 +242,10 @@ type struct DeclarationIndex {
     // leaf.
     intrinsic_names:     HashMap<u32, u32>;
 
-    // Bare C symbol -> owning module/file (intern id) for symbols claimed by an
-    // `extern "C"` block specifically. Lets the resolver warn (W0011) when a
-    // SECOND extern block tries to claim an already-extern-owned bare slot
-    // (e.g. two vendor libs both export `printf`), while staying silent on the
-    // intentional intrinsic-wins / function-wins cases (those never record an
-    // entry here). See type_resolution.cryo extern-block handling.
-    extern_bare_owner:   HashMap<u32, u32>;
+    // C symbol -> (key, function type id) of the FIRST `extern "C"` block
+    // declaration carrying it, for W0011: a later extern block declaring the
+    // same symbol with another signature is reported against this one.
+    extern_symbol_first: HashMap<u32, Pair<u32, u64>>;
 
     // --- Import-scoped name resolution (resolve_qualified_scoped) -----------
     // Everything below is keyed on the NAMESPACE identity space (e.g.
@@ -330,12 +327,12 @@ type struct DeclarationIndex {
             overload_func_owner:   [],
             bare_alts:      [],
             overload_index:     HashMap<u32, u32[]>::new(),
+            extern_symbol_first: HashMap<u32, Pair<u32, u64>>::new(),
             bare_alts_index:    HashMap<u32, u32[]>::new(),
             module_func_first:  HashMap<u32, u32>::new(),
             module_func_pairs:  HashMap<u64, boolean>::new(),
             mangled_to_overload_pos: HashMap<u32, u32[]>::new(),
             intrinsic_names:    HashMap<u32, u32>::new(),
-            extern_bare_owner:  HashMap<u32, u32>::new(),
             module_imports:     HashMap<u32, u32[]>::new(),
             prelude_ns:         [],
             decl_visibility:    HashMap<u32, boolean>::new(),
@@ -457,23 +454,6 @@ type struct DeclarationIndex {
         };
     }
 
-    /// Record that an `extern "C"` block claimed the bare C symbol `name`,
-    /// owned by `module` (an interned file/module id). Called only when the
-    /// bare slot is actually claimed by an extern block.
-    note_extern_bare_owner(mut &this, name: SymbolStr, module: SymbolStr) -> void {
-        this.extern_bare_owner.insert(name.id, module.id);
-    }
-
-    /// The module/file id that first claimed bare C symbol `name` via an
-    /// `extern "C"` block, or 0 if no extern block owns it (i.e. the bare slot
-    /// is unclaimed or owned by an intrinsic / regular function).
-    extern_bare_owner_of(&this, name: SymbolStr) -> u32 {
-        return match (this.extern_bare_owner.get(&name.id)) {
-            Option::Some(m) => { m }
-            Option::None    => { 0 }
-        };
-    }
-
     /// Associate an overload-specific mangled LLVM name with a registered
     /// (name, func_type_ref) pair.  Cross-module extern declaration uses
     /// this to emit the right LLVM symbol per overload instead of the
@@ -559,6 +539,32 @@ type struct DeclarationIndex {
     /// when the index holds no entry under it.  Several entries can share
     /// one symbol (a trait-impl method under its qualified and its combined
     /// name); they share the signature, so the first answers.
+    /// Record an `extern "C"` block's declaration `key` of the C symbol
+    /// `sym` with signature `func_type_ref`.  The first declaration of a
+    /// symbol is what a later one is compared against; a second record is
+    /// not kept, because the record exists for W0011's evidence and not for
+    /// binding - a call binds the declaration its stamp names.
+    note_extern_symbol(mut &this, sym: SymbolStr, key: SymbolStr, func_type_ref: TypeRef) -> void {
+        if (this.extern_symbol_first.contains_key(&sym.id)) { return; }
+        this.extern_symbol_first.insert(sym.id, Pair<u32, u64>::new(key.id, func_type_ref.id));
+    }
+
+    /// The key of the extern block declaration first recorded for the C
+    /// symbol `sym` when its signature is not `func_type_ref`, else empty:
+    /// two extern blocks disagreeing about one C name's Cryo signature,
+    /// which W0011 reports.  An identical redeclaration shares the interned
+    /// function type and is not a conflict; an intrinsic reaching the same
+    /// symbol is not an extern block and is not recorded here.
+    extern_symbol_conflict(&this, sym: SymbolStr, func_type_ref: TypeRef) -> SymbolStr {
+        match (this.extern_symbol_first.get_ref(&sym.id)) {
+            Option::Some(first) => {
+                if ((*first).second != func_type_ref.id) { return SymbolStr::from_id((*first).first); }
+            }
+            Option::None => { }
+        }
+        return SymbolStr::empty();
+    }
+
     symbol_signature(&this, sym: SymbolStr) -> TypeRef {
         match (this.mangled_to_overload_pos.get_ref(&sym.id)) {
             Option::Some(positions) => {

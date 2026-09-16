@@ -869,7 +869,24 @@ type struct CallEmitter {
         // origin walked while the frame was open already captured them.
         if (this.cg.ctx.project_panic_unwind) { this.cg.expr_ops.close_arg_temp_frame(); }
 
-        const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(callee_val.raw) };
+        mut fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(callee_val.raw) };
+        // A free or extern call is made at the signature the front end
+        // PINNED, not at the type the symbol happened to be declared with in
+        // this LLVM module: one C name may be declared by two extern blocks
+        // with different Cryo signatures, the symbol is declared once, and
+        // the second call would otherwise pass its arguments at the first
+        // declaration's widths.  A method's symbol is its own mangling, so a
+        // method call keeps the declared type.
+        if (node.resolved_callee.is_some()
+                && (node.callee.kind == NodeKind::Identifier
+                    || node.callee.kind == NodeKind::ScopeResolution)) {
+            const pinned_ft: TypeRef = this.cg.resolver.pinned_signature(node.resolved_callee);
+            const pinned_t: Type* = if (pinned_ft.is_valid()) { this.cg.lookup_type_by_id(pinned_ft.id) } else { null };
+            if (pinned_t != null && pinned_t.kind == TypeKind::Function) {
+                const pinned_lty: LType = this.cg.resolver.build_function_ltype(pinned_t as FunctionType*);
+                if (pinned_lty.is_valid()) { fn_ty = pinned_lty; }
+            }
+        }
         if (!fn_ty.is_valid()) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
                 "codegen: call expression: failed to retrieve function type from callee",

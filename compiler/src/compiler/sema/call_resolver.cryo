@@ -956,13 +956,20 @@ type struct CallResolver {
                 // single-slot maps, which can belong to a different
                 // same-leaf declaration (an intrinsic-owned leaf keeps the
                 // intrinsic's i64, not the pinned `fs::write`'s Result).
-                // A family pin answers through its registered return; a
-                // symbol pin through the overload entry's own signature.
+                // A family pin answers through the one signature registered
+                // under the family - a family is pinned only when it has one -
+                // so the `![implicit]` conversions below run for it as for a
+                // symbol; a family registered with a return alone answers
+                // that.  A symbol pin answers through the overload entry's
+                // own signature.
                 mut pinned_ft: TypeRef = TypeRef::invalid();
                 match (&call.resolved_callee) {
                     CalleePin::Family(fam) => {
-                        const spec_ret: TypeRef = this.types.lookup_func_return(fam);
-                        if (spec_ret.is_valid()) { return spec_ret; }
+                        pinned_ft = this.ctx.decl_index.lookup_func_type(fam);
+                        if (!pinned_ft.is_valid()) {
+                            const spec_ret: TypeRef = this.types.lookup_func_return(fam);
+                            if (spec_ret.is_valid()) { return spec_ret; }
+                        }
                     }
                     CalleePin::Symbol(sym) => {
                         pinned_ft = this.ctx.decl_index.lookup_func_type_by_mangled(sym);
@@ -2507,8 +2514,22 @@ type struct CallResolver {
         if (overloads.length == 0) { return TypeRef::invalid(); }
         const oi: i64 = this.select_family_overload(&overloads, &arg_types);
         if (oi < 0) { return TypeRef::invalid(); }
+        // A pin names a DECLARATION and one of its signatures.  A family of
+        // one signature is pinned by the family: its symbol may be shared -
+        // two extern blocks declaring one C name with different Cryo
+        // signatures both carry that name - and a symbol cannot say which
+        // declaration was meant, so codegen answered with whichever
+        // registered first.  A set is pinned by the selected signature's
+        // own symbol, which a Cryo mangling makes unique.  Either way the
+        // pin is written only for a signature that has a symbol.
         const mangled: SymbolStr = this.family_overload_symbol(family, overloads[oi]);
-        if (mangled.is_valid()) { call.set_resolved_callee(CalleePin::Symbol(mangled)); }
+        if (mangled.is_valid()) {
+            call.set_resolved_callee(if (overloads.length == 1) {
+                CalleePin::Family(family)
+            } else {
+                CalleePin::Symbol(mangled)
+            });
+        }
         return this.overload_return_type(overloads[oi]);
     }
 
