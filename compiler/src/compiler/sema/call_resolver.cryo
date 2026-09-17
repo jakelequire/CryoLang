@@ -46,7 +46,6 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::decl_index;
 import compiler::decl_index::{ DeclarationIndex, ScopeResolution };
 import compiler::module_graph;
-import compiler::module_graph::{ ModuleInfo };
 import compiler::lex;
 import compiler::sema::{
     state, type_utils, literal_resolver, diagnostics, method_binding,
@@ -5212,24 +5211,41 @@ type struct CallResolver {
     // -- Scope-call argument type checking --
 
     /// Argument type-check for a `Type::method(args)` / `Module::func(args)`
-    /// scope-resolution call: checks only when exactly ONE function-typed overload
-    /// is registered, else defers to the inherent static-method gather.
+    /// scope-resolution call: checks only when exactly ONE function-typed
+    /// overload is registered under the callee's key, else defers to the
+    /// inherent static-method gather.  A module segment owns a module
+    /// function under the module's own qualified name, which the segment's
+    /// stamp carries and the spelling does not (`fmt` for `std::fmt`, and
+    /// two modules can share a suffix), so its key comes from the one path
+    /// that resolves the call's return - the signature checked is the one
+    /// called.  A type segment's key is the owner's registered name.
     check_scope_call_arg_types(mut &this, visitor: ASTVisitor*, scope: ScopeResolutionNode*,
                                call: CallExprNode*) -> void {
         if (this.ctx.decl_index == null) { return; }
-        mut lookup_sym: SymbolStr = this.scope_owner_key(scope);
-        if (scope.scope_generic_args.length > 0) {
-            const spec_sym: SymbolStr = this.resolve_generic_scope_name(
-                scope.scope_name, scope.scope_generic_args, scope.span,
-                this.lookup_scope_template(
-                    scope.require_scope_res("scope-call spec name")));
-            if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
+        mut names_module: boolean = false;
+        match (scope.require_scope_res("scope-call arg check")) {
+            Res::Def(_) => { names_module = true; }
+            _           => { }
         }
-        if (this.scope_is_generic_template(lookup_sym, scope.member_name)) { return; }
-        const scope_str:  string = this.intern.resolve(lookup_sym);
-        const member_str: string = this.intern.resolve(scope.member_name);
-        if (scope_str.length() == 0 || member_str.length() == 0) { return; }
-        const combined: SymbolStr = this.intern.intern(fmt::format("%s::%s", scope_str, member_str));
+        mut lookup_sym: SymbolStr = this.scope_owner_key(scope);
+        mut combined: SymbolStr = SymbolStr::empty();
+        if (names_module) {
+            combined = this.resolve_module_qualified_symbol(scope.scope_name, scope.member_name, scope);
+            if (!combined.is_valid()) { return; }
+        } else {
+            if (scope.scope_generic_args.length > 0) {
+                const spec_sym: SymbolStr = this.resolve_generic_scope_name(
+                    scope.scope_name, scope.scope_generic_args, scope.span,
+                    this.lookup_scope_template(
+                        scope.require_scope_res("scope-call spec name")));
+                if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
+            }
+            if (this.scope_is_generic_template(lookup_sym, scope.member_name)) { return; }
+            const scope_str:  string = this.intern.resolve(lookup_sym);
+            const member_str: string = this.intern.resolve(scope.member_name);
+            if (scope_str.length() == 0 || member_str.length() == 0) { return; }
+            combined = this.intern.intern(fmt::format("%s::%s", scope_str, member_str));
+        }
         const overloads: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(combined);
         if (overloads.length == 1) {
             const ot: Type* = this.arena.lookup(overloads[0].id);
@@ -5246,63 +5262,9 @@ type struct CallResolver {
             }
             return;
         }
-        // The scope may be an ABBREVIATED namespace (`fmt` for `std::fmt`): the
-        // callee resolves via `resolve_module_qualified_function`'s module-suffix
-        // match, but the lookup above keyed only on the written form, so the
-        // overload (and thus its param types) was missed - which silently skipped
-        // the `![implicit]` arg conversions. `fmt::println("literal")` then passed
-        // the raw `string` where a `String` is expected (no `from_string`) and
-        // segfaulted. Recover the full `<ns>::<member>` overload by mirroring that
-        // suffix match (resolve_qualified maps only bare symbol leaves, not
-        // namespace segments), then check it exactly as the exact-key lane above
-        // does.  An abbreviated qualifier is the form `import` makes idiomatic,
-        // so leaving it unchecked exempted most calls in the tree from argument
-        // checking entirely - and an arity-wrong one did not degrade gracefully,
-        // it reached codegen and crashed it.
-        if (overloads.length == 0 && this.ctx.module_graph != null) {
-            const modules: &ModuleInfo[] = &this.ctx.module_graph.modules;
-            const scope_len: i64 = scope_str.length() as i64;
-            mut found_combined: SymbolStr = SymbolStr::empty();
-            mut match_count: i64 = 0;
-            for (mut i: i64 = 0; i < modules.length; i++) {
-                const ns_str: string = this.intern.resolve(modules[i].namespace_name);
-                const ns_len: i64 = ns_str.length() as i64;
-                mut is_match: boolean = false;
-                if (ns_len == scope_len) {
-                    is_match = ns_str.eq(scope_str);
-                } else if (ns_len > scope_len + 1) {
-                    const suffix_start: i64 = ns_len - scope_len;
-                    if (ns_str[suffix_start - 1] == ':' && ns_str[suffix_start - 2] == ':') {
-                        is_match = (ns_str + suffix_start) == scope_str;
-                    }
-                }
-                if (!is_match) { continue; }
-                const cand: SymbolStr = this.intern.intern(fmt::format("%s::%s", ns_str, member_str));
-                if (this.ctx.decl_index.lookup_func_type_overloads(cand).length == 1) {
-                    found_combined = cand;
-                    match_count = match_count + 1;
-                }
-            }
-            if (match_count == 1 && found_combined.is_valid()) {
-                const exp: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(found_combined);
-                if (exp.length == 1) {
-                    const ot: Type* = this.arena.lookup(exp[0].id);
-                    if (ot != null && ot.kind == TypeKind::Function) {
-                        const ft: FunctionType* = ot as FunctionType*;
-                        if (!ft.is_variadic) {
-                            if (ft.param_types.length == call.arguments.length) {
-                                this.check_args_against_params(
-                                    visitor, call, ft.param_types.as_slice());
-                            } else {
-                                this.diag.emit_method_arity_error(call, scope.member_name,
-                                    "function", ft.param_types.length, call.arguments.length);
-                            }
-                        }
-                    }
-                    return;
-                }
-            }
-        }
+        // A module owns no static methods; only a type segment has an
+        // inherent gather to defer to.
+        if (names_module) { return; }
         this.check_static_scope_method_args(visitor, lookup_sym, scope, call);
     }
 
