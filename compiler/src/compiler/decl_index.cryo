@@ -723,15 +723,30 @@ type struct DeclarationIndex {
 
 
 
-    /// Register each method under the combined key "QualifiedType::method",
-    /// which is what a cross-module extern declares and codegen finds.
-    /// `type_sym` is the owner's registration key - a declared type's
-    /// canonical name, a primitive's spelling - and the only key the
-    /// methods go under: a written spelling of the owner is a leaf shared
-    /// by every module's type of that name, and a reader holding one asks
-    /// the head's stamp.
-    register_methods(mut &this, type_sym: SymbolStr, methods: &MethodNode*[],
-                     intern: InternTable*, arena: TypeArena*) -> void {
+    /// Register a type's inline or impl-block methods under the key the
+    /// type itself is registered under.  The owner is the TYPE: the key is
+    /// read off this index's reverse map, so the caller derives none, and
+    /// a type this index holds no key for is a registration it never saw
+    /// - recorded, nothing registered, because a key guessed here would be
+    /// a second registration under a name no reader asks.
+    register_methods(mut &this, owner: TypeRef, methods: &MethodNode*[],
+                     intern: InternTable*, arena: TypeArena*, site: string) -> void {
+        const type_sym: SymbolStr = this.lookup_type_name(owner);
+        if (!type_sym.is_valid()) {
+            compiler::resolver::res::record_unregistered_def(site);
+            return;
+        }
+        this.register_methods_by_key(type_sym, methods, intern, arena);
+    }
+
+    /// The same registration by a KEY the caller holds, for an owner this
+    /// index cannot name from a type: an `async` owner's method repointed
+    /// under its template's key while the owner in hand is the instance;
+    /// a specialization whose methods are registered before (or without)
+    /// the specialization itself; an impl head on an alias keyword.  Each
+    /// is a name-keyed door the lane gate counts; none is a lookup.
+    register_methods_by_key(mut &this, type_sym: SymbolStr, methods: &MethodNode*[],
+                            intern: InternTable*, arena: TypeArena*) -> void {
         const type_str: string = intern.resolve(type_sym);
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
