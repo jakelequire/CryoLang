@@ -2600,6 +2600,8 @@ type struct CompilerInstance {
                     unreg, compiler::resolver::res::unregistered_def_first_site()));
         }
 
+        CompilerInstance::report_unstamped_decls(ctx);
+
         const skip_flush: boolean = match (ctx.mode) {
             CompileMode::Lsp => { true }
             _                => { false }
@@ -3208,11 +3210,31 @@ type struct CompilerInstance {
     }
 
     /// Helper: build a failure result from context diagnostics.
+    /// A type declaration reached a consumer with no registration stamped
+    /// on it.  NOT gated on the build being otherwise clean, unlike the two
+    /// tallies the success path reports: the stamping stage has no error
+    /// exit before its registration, so no user error can leave a
+    /// declaration unstamped, and the consumers of an unstamped one refuse
+    /// the program with errors that blame it (a method that cannot find
+    /// `this`, a field not on its own type) - gating this on those, or
+    /// reporting it only on the success path, would hide the defect behind
+    /// its own cascade.  The two exits are exclusive (the failure one is
+    /// reached only by a stage's early return, before the success path's
+    /// reports), so the tally is read once per build.
+    static report_unstamped_decls(ctx: CompilationContext*) -> void {
+        const unstamped: u64 = compiler::resolver::res::unstamped_decl_count();
+        if (unstamped > 0) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                fmt::format("%llu type declaration(s) reached a consumer with no registration stamped; first consumed at %s",
+                    unstamped, compiler::resolver::res::unstamped_decl_first_site()));
+        }
+    }
     project_failure(&this, ctx: CompilationContext*) -> CompilationResult {
         // Same LSP-mode skip as the success path in compile_project_with_ctx:
         // the renderer's stderr stream may be `NULL` when the compiler runs
         // as a library inside another process.  The diagnostic array stays
         // populated for the LSP to read and emit as JSON.
+        CompilerInstance::report_unstamped_decls(ctx);
         const skip_flush: boolean = match (ctx.mode) {
             CompileMode::Lsp => { true }
             _                => { false }

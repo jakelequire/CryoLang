@@ -34,6 +34,7 @@ Two kinds of script:
 | §8.225 | `stamp_tdef.py`, `readers_tdef.py`, `shadow_names.py` | the `DefId` on the six type-declaration nodes; the 21 readers moved to `type_of_def(node.def)` (`--shadow` keeps the re-derived key beside the stamp) |
 | §8.226 | `owner_tref.py` | codegen's method owner as a `TypeRef`; `DeclarationIndex::impl_owner` |
 | §8.228 | `async_owner.py` | sema's async declare pass taking the owner's type and key from the caller |
+| §8.231 | `doors_tdecl.py`, `mutate_nostamp.py`, `probes/` | the 29 readers of a type declaration's own type as `type_of_decl` doors, the third tally and its two-exit report; the no-stamp mutation and the two probes that show the old readers' silence and the door's report |
 
 Not here: the scripts that edited the ledger itself, the entry drafts, and
 the one-off controls written against a gate version that no longer exists
