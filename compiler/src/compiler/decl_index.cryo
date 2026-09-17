@@ -22,6 +22,8 @@ import compiler::types::{ arena, compound, type_base, type_ref, TypeKind };
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, OverloadId };
+import compiler::diag::source_span;
+import compiler::diag::source_span::{ SourceSpan };
 import std::core::option;
 import std::core::option::{ Option };
 import std::collections::{ hashmap, pair };
@@ -199,6 +201,7 @@ type struct DeclarationIndex {
                                       // under a key that is not its own (a
                                       // monomorphized clone under its identifier),
                                       // else 0.
+    overload_func_span:    SourceSpan[]; // where the entry's declaration is written
     overload_func_trait:   u32[];     // SymbolStr.id of the trait a trait-impl
                                       // method implements, else 0: an inherent
                                       // method beside a trait's under one key
@@ -313,6 +316,7 @@ type struct DeclarationIndex {
             overload_func_mangled: [],
             overload_func_owner:   [],
             overload_func_trait:   [],
+            overload_func_span:    [],
             bare_alts:      [],
             overload_index:     HashMap<u32, u32[]>::new(),
             extern_symbol_first: HashMap<u32, Pair<u32, u64>>::new(),
@@ -383,7 +387,8 @@ type struct DeclarationIndex {
     /// later consumer: the registrar stamps it on the node, and a call pins
     /// it.
     register_signature(mut &this, name: SymbolStr, func_type_ref: TypeRef,
-                       owner: SymbolStr, symbol: SymbolStr, trait_sym: SymbolStr) -> OverloadId {
+                       owner: SymbolStr, symbol: SymbolStr, trait_sym: SymbolStr,
+                       span: SourceSpan) -> OverloadId {
         this.func_type_refs.insert(name.id, func_type_ref);
         match (this.overload_index.get_ref(&name.id)) {
             Option::Some(positions) => {
@@ -404,6 +409,7 @@ type struct DeclarationIndex {
         this.overload_func_mangled.push(symbol.id);
         this.overload_func_owner.push(owner.id);
         this.overload_func_trait.push(trait_sym.id);
+        this.overload_func_span.push(span);
         const slot: u32[]* = this.overload_index.get_or_insert(name.id, []);
         (*slot).push(new_pos);
         return OverloadId::at_position(new_pos);
@@ -414,6 +420,12 @@ type struct DeclarationIndex {
     entry_trait(&this, id: OverloadId) -> SymbolStr {
         if (!id.is_valid()) { return SymbolStr::empty(); }
         return SymbolStr::from_id(this.overload_func_trait[id.position() as i64]);
+    }
+
+    /// Where entry `id`'s declaration is written; `none()` for an invalid id.
+    entry_span(&this, id: OverloadId) -> SourceSpan {
+        if (!id.is_valid()) { return SourceSpan::none(); }
+        return this.overload_func_span[id.position() as i64];
     }
 
     /// The linker symbol of entry `id`; empty for an invalid id.
@@ -836,7 +848,8 @@ type struct DeclarationIndex {
             // a call sema or mono binds to it, a vtable slot - reads the
             // symbol and signature registration wrote, and mangles nothing.
             func.set_overload_entry(this.register_signature(
-                combined_sym, func_type_ref, SymbolStr::empty(), eff_mangled, func.origin_trait));
+                combined_sym, func_type_ref, SymbolStr::empty(), eff_mangled, func.origin_trait,
+                if (func.has_name_span()) { func.name_span } else { func.span }));
 
             this.note_callable_name(combined_sym);
         }
@@ -961,11 +974,11 @@ type struct DeclarationIndex {
     register_function_signature(mut &this, name: SymbolStr,
                                 return_type: TypeRef, func_type_ref: TypeRef,
                                 intern: InternTable*, arena: TypeArena*,
-                                symbol: SymbolStr) -> OverloadId {
+                                symbol: SymbolStr, span: SourceSpan) -> OverloadId {
         this.register_function(name, return_type);
         this.note_callable_name(name);
         if (symbol.is_valid()) {
-            return this.register_signature(name, func_type_ref, SymbolStr::empty(), symbol, SymbolStr::empty());
+            return this.register_signature(name, func_type_ref, SymbolStr::empty(), symbol, SymbolStr::empty(), span);
         }
 
         // Compute the mangled symbol name including the full signature.
@@ -986,7 +999,7 @@ type struct DeclarationIndex {
         }
         const mangled: MangledName = MangledName::for_free_function(
             intern, arena, qname, params, return_type, is_variadic);
-        return this.register_signature(name, func_type_ref, SymbolStr::empty(), mangled.value, SymbolStr::empty());
+        return this.register_signature(name, func_type_ref, SymbolStr::empty(), mangled.value, SymbolStr::empty(), span);
     }
 
 

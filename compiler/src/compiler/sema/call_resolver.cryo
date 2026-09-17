@@ -40,7 +40,8 @@ import compiler::ast::{
 };
 import compiler::ast::node_locator;
 import compiler::diag;
-import compiler::diag::{ diagnostic, ErrorCode, source_span, suggestion };
+import compiler::diag::{ diagnostic, ErrorCode, renderer, source_span, suggestion };
+import compiler::diag::renderer::{ DiagRenderer };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::decl_index;
@@ -2295,6 +2296,10 @@ type struct CallResolver {
         mut trait_ambiguous: boolean = false;
         mut found_trait: SymbolStr = SymbolStr::empty();
         mut other_trait: SymbolStr = SymbolStr::empty();
+        // Every trait candidate at the call's arity, with where it is
+        // declared, for the tie report.
+        mut tie_traits: SymbolStr[] = [];
+        mut tie_spans: SourceSpan[] = [];
         mut variadic_ok: boolean = false;
         mut chosen:    TypeRef[] = [];
         mut name_seen:  i64 = 0;
@@ -2340,6 +2345,19 @@ type struct CallResolver {
                     if (m.param_types.length != argc) { continue; }
                     for (mut ci: i64 = 0; ci < m.param_types.length; ci++) {
                         cand_params.push(m.param_types[ci]);
+                    }
+                    if (m_origin.is_valid()) {
+                        mut seen_trait: boolean = false;
+                        for (mut ti: i64 = 0; ti < tie_traits.length; ti++) {
+                            if (tie_traits[ti].equals(m_origin)) { seen_trait = true; break; }
+                        }
+                        if (!seen_trait) {
+                            tie_traits.push(m_origin);
+                            const tmn: MethodNode* = m.ast_node as MethodNode*;
+                            tie_spans.push(if (tmn != null && tmn.func != null) {
+                                if (tmn.func.has_name_span()) { tmn.func.name_span } else { tmn.func.span }
+                            } else { SourceSpan::none() });
+                        }
                     }
                     if (!found) {
                         found = true;
@@ -2433,17 +2451,22 @@ type struct CallResolver {
         }
 
         if (trait_ambiguous && !member.resolved_trait.is_valid()) {
-            if (this.state.in_symbolic_check) { return; }
-            mut diag: Diagnostic = Diagnostic::error(
-                ErrorCode::E0154_AMBIGUOUS_CALL,
-                fmt::format("call to `%s` is ambiguous: it is provided by multiple traits implemented for this type",
-                    this.intern.resolve(member.member)));
-            diag = diag.at_with_label(member.span,
-                fmt::format("`%s` is defined by both `%s` and `%s`",
-                    this.intern.resolve(member.member),
-                    this.intern.resolve(found_trait), this.intern.resolve(other_trait)));
-            diag = diag.with_note("disambiguate by calling the trait method explicitly, e.g. `Trait::method(receiver, args)`");
-            this.ctx.emit_diagnostic(diag);
+            // The receiver is the trait-qualified call's first argument - by
+            // reference when the receiver is not one already, as the method
+            // form's auto-ref made it - and the call's own arguments follow.
+            mut args_text: string = this.source_text(member.object.span);
+            if (args_text.length() == 0) { args_text = "receiver"; }
+            const recv_t: Type* = this.arena.lookup(member.object.resolved_type.id);
+            if (recv_t == null || recv_t.kind != TypeKind::Reference) { args_text = "&" + args_text; }
+            if (call.arguments.length > 0) {
+                const first: ExpressionNode* = call.arguments[0];
+                const last: ExpressionNode* = call.arguments[call.arguments.length - 1];
+                const rest: string = this.source_text(SourceSpan::new(first.span.file,
+                    first.span.start_line, first.span.start_col, last.span.end_line, last.span.end_col));
+                args_text = args_text + ", " + (if (rest.length() == 0) { "..." } else { rest });
+            }
+            this.report_trait_method_tie(member.span, member.member,
+                this.arena.resolve_display_name_short(base_ref.id), &tie_traits, &tie_spans, true, args_text, true);
             return;
         }
         // Several arity-matching signatures is an overload SET, not a reason to
@@ -3671,6 +3694,7 @@ type struct CallResolver {
         const scope_str: string = this.intern.resolve(scope_sym);
         const member_str: string = this.intern.resolve(member_sym);
         if (scope_str.length() == 0 || member_str.length() == 0) { return; }
+        if (this.pin_trait_qualified_call(call, scope, scope_sym, member_sym)) { return; }
         const sym: SymbolStr = this.intern.intern(fmt::format("%s::%s", scope_str, member_str));
         if (this.try_pin_static_method_overload(call, scope, sym)) { return; }
         // Single-entry static method: pin the entry, consistent with
@@ -3684,6 +3708,63 @@ type struct CallResolver {
                 call.set_resolved_callee(CalleePin::Decl(entries[0]));
             }
         }
+    }
+
+    /// A call written through a TRAIT's path, `Beta::go(&p, ...)`: the
+    /// implementation is the receiver's - the first argument's type, behind
+    /// any reference or pointer - and the method is the one that trait
+    /// delivers for it, so a name two traits provide is chosen by naming
+    /// the trait, as Rust's `Trait::method(recv)` does.  Answers false when
+    /// the scope is not a trait, and true once the scope is a trait whether
+    /// or not an implementation was found: the path names a trait's method
+    /// and no other selector applies to it.  A static trait method takes no
+    /// receiver and selects nothing here.
+    pin_trait_qualified_call(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
+                             trait_sym: SymbolStr, member_sym: SymbolStr) -> boolean {
+        const qual: TypeRef = this.types.scope_qualifier_type(scope);
+        if (!qual.is_valid()) { return false; }
+        const qt: Type* = this.arena.lookup(qual.id);
+        if (qt == null || qt.kind != TypeKind::Trait) { return false; }
+        if (call.arguments.length == 0) { return true; }
+        const recv: ExpressionNode* = call.arguments[0];
+        if (recv == null || !recv.resolved_type.is_valid()) { return true; }
+        mut owner_ref: TypeRef = recv.resolved_type;
+        mut hops: i32 = 0;
+        while (hops < 4) {
+            const ot: Type* = this.arena.lookup(owner_ref.id);
+            if (ot == null) { break; }
+            if (ot.kind == TypeKind::Reference) { owner_ref = (ot as ReferenceType*).referent; }
+            else if (ot.kind == TypeKind::Pointer) { owner_ref = (ot as PointerType*).pointee; }
+            else { break; }
+            hops = hops + 1;
+        }
+        const owner_sym: SymbolStr = this.ctx.decl_index.lookup_type_name(owner_ref);
+        if (!owner_sym.is_valid()) { return true; }
+        const family: SymbolStr = this.intern.intern(fmt::format("%s::%s",
+            this.intern.resolve(owner_sym), this.intern.resolve(member_sym)));
+        const all: OverloadId[] = this.ctx.decl_index.lookup_family_entries(family);
+        mut entries: OverloadId[] = [];
+        for (mut i: i64 = 0; i < all.length; i++) {
+            if (this.ctx.decl_index.entry_trait(all[i]).equals(trait_sym)) { entries.push(all[i]); }
+        }
+        if (entries.length == 0) { return true; }
+        mut arg_types: TypeRef[] = [];
+        for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
+            const arg: ExpressionNode* = call.arguments[ai];
+            if (arg == null || !arg.resolved_type.is_valid()) { return true; }
+            arg_types.push(arg.resolved_type);
+        }
+        mut fits: OverloadId[] = this.select_static_overload(&entries, &arg_types, false);
+        if (fits.length == 0) { fits = this.select_static_overload(&entries, &arg_types, true); }
+        if (fits.length != 1) { return true; }
+        call.set_resolved_callee(CalleePin::Decl(fits[0]));
+        // The call's type is the implementation's, not the trait
+        // declaration's, which may spell it in terms the impl decides.
+        const ft: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(fits[0]).id);
+        if (ft != null && ft.kind == TypeKind::Function) {
+            scope.set_resolved_type((ft as FunctionType*).return_type);
+        }
+        return true;
     }
 
     /// Pin the static method a `Type::method` VALUE names, by the symbol
@@ -3721,7 +3802,7 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < entries.length; i++) {
             if (this.ctx.decl_index.entry_signature(entries[i]).id == ft.id) { fits.push(entries[i]); }
         }
-        return this.choose_entry(&fits, path);
+        return this.choose_entry(&fits, path, null);
     }
 
     /// The one entry of `fits` the `Type::method` path `path` names.  One
@@ -3732,7 +3813,7 @@ type struct CallResolver {
     /// one is a genuine tie: the path names nothing, and the tie is reported
     /// here, where every candidate is in hand, rather than left for codegen
     /// to refuse as a name it cannot bind.
-    choose_entry(mut &this, fits: &OverloadId[], path: ScopeResolutionNode*) -> OverloadId {
+    choose_entry(mut &this, fits: &OverloadId[], path: ScopeResolutionNode*, call: CallExprNode*) -> OverloadId {
         if (fits.length == 1) { return fits[0]; }
         mut inherent: OverloadId = OverloadId::invalid();
         mut n: i64 = 0;
@@ -3740,28 +3821,92 @@ type struct CallResolver {
             if (!this.ctx.decl_index.entry_trait(fits[i]).is_valid()) { inherent = fits[i]; n = n + 1; }
         }
         if (n == 1) { return inherent; }
-        if (n == 0 && fits.length >= 2) { this.report_static_path_tie(fits, path); }
+        if (n == 0 && fits.length >= 2) { this.report_static_path_tie(fits, path, call); }
         return OverloadId::invalid();
     }
 
     /// `path` names a method every one of `fits` provides through a
-    /// different trait, and no inherent method settles it.  Reported once per
-    /// path; a symbolic walk of a generic body defers to the concrete one.
-    report_static_path_tie(mut &this, fits: &OverloadId[], path: ScopeResolutionNode*) -> void {
-        if (this.state.in_symbolic_check) { return; }
-        const scope_str: string = this.intern.resolve(path.scope_name);
-        const member_str: string = this.intern.resolve(path.member_name);
-        mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0154_AMBIGUOUS_CALL,
-            fmt::format("`%s::%s` is ambiguous: `%s` is provided by more than one trait implemented for `%s`",
-                scope_str, member_str, member_str, scope_str));
-        diag = diag.at_with_label(path.span,
-            fmt::format("`%s` is defined by both `%s` and `%s`", member_str,
-                this.intern.resolve(this.ctx.decl_index.entry_trait(fits[0])),
-                this.intern.resolve(this.ctx.decl_index.entry_trait(fits[1]))));
+    /// different trait, and no inherent method settles it.  The candidates
+    /// are the entries, each carrying where its declaration is written; the
+    /// call form's arguments are the receiver the trait-qualified call keeps.
+    report_static_path_tie(mut &this, fits: &OverloadId[], path: ScopeResolutionNode*,
+                           call: CallExprNode*) -> void {
+        mut traits: SymbolStr[] = [];
+        mut spans: SourceSpan[] = [];
         for (mut i: i64 = 0; i < fits.length; i++) {
-            diag = diag.with_note(fmt::format("candidate #%d is defined in an impl of the trait `%s` for the type `%s`",
-                (i + 1) as i32, this.intern.resolve(this.ctx.decl_index.entry_trait(fits[i])), scope_str));
+            traits.push(this.ctx.decl_index.entry_trait(fits[i]));
+            spans.push(this.ctx.decl_index.entry_span(fits[i]));
+        }
+        mut args_text: string = "";
+        mut has_receiver: boolean = false;
+        if (call != null && call.arguments.length > 0) {
+            has_receiver = true;
+            const first: ExpressionNode* = call.arguments[0];
+            const last: ExpressionNode* = call.arguments[call.arguments.length - 1];
+            args_text = this.source_text(SourceSpan::new(first.span.file,
+                first.span.start_line, first.span.start_col, last.span.end_line, last.span.end_col));
+        }
+        this.report_trait_method_tie(path.span, path.member_name, this.intern.resolve(path.scope_name),
+            &traits, &spans, has_receiver, args_text, call != null);
+    }
+
+    /// The source text under a single-line `span`, or "" when it spans lines
+    /// or the file is not readable: a suggestion quotes the program's own
+    /// spelling of a receiver, never a rendering of it.
+    source_text(&this, span: SourceSpan) -> string {
+        if (this.ctx.diag_renderer == null || !span.has_location()) { return ""; }
+        if (span.start_line != span.end_line || span.end_col <= span.start_col) { return ""; }
+        if (!this.ctx.diag_renderer.load_source(span.file)) { return ""; }
+        const line: string = this.ctx.diag_renderer.get_line(span.file, span.start_line);
+        if (line.length() as u32 < span.end_col - 1) { return ""; }
+        return line.substring(span.start_col - 1, span.end_col - span.start_col);
+    }
+
+    /// E0156: `member` is provided for `owner` by every trait in `traits`, at
+    /// the signature the use selects, and no inherent method outranks them.
+    /// A tie is an error, never a pick by declaration or import order.  Each
+    /// candidate is named where it is declared (`decl_spans`), and the help
+    /// names the call that chooses: the trait-qualified form
+    /// `Trait::member(receiver, args)`, when there is a receiver to select
+    /// the implementation by.  Silent during a symbolic generic-body walk:
+    /// the concrete instantiation reports.
+    report_trait_method_tie(mut &this, span: SourceSpan, member: SymbolStr, owner_display: string,
+                            traits: &SymbolStr[], decl_spans: &SourceSpan[],
+                            has_receiver: boolean, args_text: string, is_call: boolean) -> void {
+        if (this.state.in_symbolic_check) { return; }
+        const member_str: string = this.intern.resolve(member);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0156_AMBIGUOUS_TRAIT_METHOD,
+            fmt::format("`%s` is provided by more than one trait implemented for `%s`",
+                member_str, owner_display));
+        diag = diag.at_with_label(span,
+            fmt::format("which `%s` is meant here is ambiguous", member_str));
+        // Two candidates of one leaf (`Alpha::Render`, `Omega::Render`) are
+        // told apart only by their full paths; otherwise the leaf reads as
+        // the program writes it.
+        mut leaf_collides: boolean = false;
+        for (mut a: i64 = 0; a < traits.length; a++) {
+            for (mut b: i64 = a + 1; b < traits.length; b++) {
+                if (QualifiedName::leaf_of(this.intern.resolve(traits[a])) == QualifiedName::leaf_of(this.intern.resolve(traits[b]))) { leaf_collides = true; }
+            }
+        }
+        mut help: string = "";
+        for (mut i: i64 = 0; i < traits.length; i++) {
+            const trait_str: string = this.intern.resolve(traits[i]);
+            const leaf: string = if (leaf_collides) { trait_str } else { QualifiedName::leaf_of(trait_str) };
+            const note: string = fmt::format("candidate #%d: `%s::%s`, from `implement trait %s for %s`",
+                (i + 1) as i32, leaf, member_str, trait_str, owner_display);
+            diag = if (decl_spans[i].has_location()) { diag.with_note_at(note, decl_spans[i]) } else { diag.with_note(note) };
+            if (has_receiver) {
+                const form: string = if (is_call) { fmt::format("`%s::%s(%s)`", leaf, member_str, args_text) }
+                                     else { fmt::format("`%s::%s`", leaf, member_str) };
+                help = if (help.length() == 0) { form } else { help + " or " + form };
+            }
+        }
+        if (has_receiver) {
+            diag = diag.help(fmt::format("name the trait the call is meant through: %s", help));
+        } else {
+            diag = diag.help("the candidates are static and take no receiver to select an implementation by; the language has no qualified form for this call yet");
         }
         this.ctx.emit_diagnostic(diag);
     }
@@ -3787,7 +3932,7 @@ type struct CallResolver {
         }
         mut fits: OverloadId[] = this.select_static_overload(&entries, &arg_types, false);
         if (fits.length == 0) { fits = this.select_static_overload(&entries, &arg_types, true); }
-        const chosen: OverloadId = this.choose_entry(&fits, scope);
+        const chosen: OverloadId = this.choose_entry(&fits, scope, call);
         if (!chosen.is_valid()) { return false; }
         call.set_resolved_callee(CalleePin::Decl(chosen));
         return true;
@@ -3878,7 +4023,7 @@ type struct CallResolver {
             }
             scope.set_resolved_type(resolved);
             this.pin_scope_callee_combined(call, scope, owner_sym, scope.member_name);
-            return resolved;
+            return scope.resolved_type;
         }
         if (scope.scope_generic_args.length > 0) {
             // `lookup_sym` stays the registries' dispatch key - they really do

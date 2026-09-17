@@ -2218,7 +2218,7 @@ After the block is loaded, `my_bool.to_i32()` resolves like any other method cal
 
 ### 13.4 Which Method a Call Names
 
-A method call `recv.m(...)` on a receiver with an **inherent** method `m` names the inherent one, whatever trait impls for the receiver also provide `m` and whatever order the `implement` blocks were written in. Only a receiver with no inherent `m` reaches its trait impls, and then exactly one of them must provide `m`: a name two traits provide is an error (E0154), resolved by calling the trait method explicitly. A call made through a bound (`x.m()` where `x: &T` and `where T: Tr`) names `Tr::m`, since `T` has no inherent methods where the call is written — the concrete type it is later instantiated with does not change that. This is Rust's rule.
+A method call `recv.m(...)` on a receiver with an **inherent** method `m` names the inherent one, whatever trait impls for the receiver also provide `m` and whatever order the `implement` blocks were written in. Only a receiver with no inherent `m` reaches its trait impls, and then exactly one of them must provide `m`: a name two traits provide is an error (E0156), whether the call is written `recv.m(...)` or `T::m(recv, ...)`, and never a pick by declaration or import order. The error names each candidate where it is declared; the call is resolved by naming the trait it is meant through - `Tr::m(&recv, ...)`, the receiver as the first argument - which runs that trait's implementation for the receiver's type. A call made through a bound (`x.m()` where `x: &T` and `where T: Tr`) names `Tr::m`, since `T` has no inherent methods where the call is written — the concrete type it is later instantiated with does not change that. This is Rust's rule.
 
 ---
 
