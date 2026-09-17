@@ -57,7 +57,7 @@ current-state description is the defect it exists to remove.
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
 | D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **588** (+1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194, §8.195 and §8.197, projects; +2 in §8.199, a project's two files; -1 in §8.203, `resolve_counter.cryo`; -1 in §8.206, a `collect` project's test file, the project being a `compile_fail` now; -1 in §8.207, `bare_intrinsic_priority.cryo`, a negative now; +1 in §8.209, a negative; +1 in §8.213, a unit test; +2 in §8.217, two projects' `beta_text.cryo`) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
-| D16 | **An impl head writes EVERY parameter of the template it names, or names a concrete instantiation; an elided parameter is an error** - whether all of them default (`implement trait Display for String` with `String<A = GlobalAlloc>`) or only the trailing ones (`implement<T> trait Display for Array<T>` with `Array<T, A = GlobalAlloc>`). Write `implement<A> trait Display for String<A>` or `implement trait Display for String<GlobalAlloc>`. Rust's model: `impl Display for Vec` is missing its parameters and is not given a default meaning, and `impl<T> Trait for Vec<T>` is not written either | **TAKEN** (ruled by Jake 2026-09-13 for the bare form, 2026-09-14 for every elided parameter; built in §8.190) — E0302 from `refuse_elided_template_params` where type resolution attaches a WRITTEN head to its template, naming the template, both counts and both spellings, the parameter form first; the 11 heads rewritten as the instantiation each meant; a head's `target_args` is what it writes after the target on EVERY kind of head (an inherent head's list also declares its names); sema's writer-module lookup deleted. The concrete spelling is accepted but not yet HONOURED by impl selection (a `Named` target argument is bound as a parameter name) - parked | `python3 scripts/impl-head-elided-params.py --count` → **bare=0,partial=0,unmatched=0**; `grep -c 'refuse_elided_template_params' compiler/src/compiler/passes/type_resolution.cryo` → **2**; `grep -c '^negative E0302' tests/test-roster.txt` → **3** (2 at §8.190; +1 in §8.210, D22's head) | §8.180, §8.181, §8.187, §8.190 |
+| D16 | **An impl head writes EVERY parameter of the template it names, or names a concrete instantiation; an elided parameter is an error** - whether all of them default (`implement trait Display for String` with `String<A = GlobalAlloc>`) or only the trailing ones (`implement<T> trait Display for Array<T>` with `Array<T, A = GlobalAlloc>`). Write `implement<A> trait Display for String<A>` or `implement trait Display for String<GlobalAlloc>`. Rust's model: `impl Display for Vec` is missing its parameters and is not given a default meaning, and `impl<T> Trait for Vec<T>` is not written either | **TAKEN** (ruled by Jake 2026-09-13 for the bare form, 2026-09-14 for every elided parameter; built in §8.190) — E0302 from `refuse_elided_template_params` where type resolution attaches a WRITTEN head to its template, naming the template, both counts and both spellings, the parameter form first; the 11 heads rewritten as the instantiation each meant; a head's `target_args` is what it writes after the target on EVERY kind of head (an inherent head's list also declares its names); sema's writer-module lookup deleted. The concrete spelling is accepted but not yet HONOURED by impl selection (a `Named` target argument is bound as a parameter name; the registry holds ONE impl per (trait, TEMPLATE), so `for Wrap<T, Alpha>` is selected for `Wrap<i32, Beta>` and two heads differing in that argument collapse - a miscompile, exit 22 where 12 is right) - **pinned RED by `impl_concrete_arg_filters_impl` and `impl_concrete_arg_selects_impl` (§8.223), scoped as D24's registry reshape, not built** | `python3 scripts/impl-head-elided-params.py --count` → **bare=0,partial=0,unmatched=0**; `grep -c 'refuse_elided_template_params' compiler/src/compiler/passes/type_resolution.cryo` → **2**; `grep -c '^negative E0302' tests/test-roster.txt` → **3** (2 at §8.190; +1 in §8.210, D22's head); `grep -c '^project impl_concrete_arg_' tests/test-roster.txt` → **2** (both RED until §8.223's reshape lands) | §8.180, §8.181, §8.187, §8.190, §8.223 |
 | D17 | **An `extern "C"` function is public unless marked `private`** — the extern-visibility default `docs/cryo.md` §18.1 states | **RULED** (Jake, 2026-09-14) — built in §8.167 by a worker and carried as unconfirmed until ratified; the spec text is normative, not provisional | `grep -c 'mut ext_public: boolean = true;' compiler/src/compiler/parser/parser.cryo` → **1**; `grep -c 'unless written .private function' docs/cryo.md` → **1** | §8.167, §8.187 |
 | D18 | **The keyword ruling** (§8.165): the primitive type names stop being keywords; `implement … for int` and `new int[100]` are stamped like any other name | **RULED - UNBUILT** (Jake's, queued; re-affirmed 2026-09-15, §8.202; the alias half ruled 2026-09-16, §8.216) — holds `new`'s spelling step and the impl head's alias-keyword arm. **The alias keywords `int`/`uint`/`float`/`double` FOLD at the name layer: `int` stamps `PrimTy("i32")`**, not `PrimTy("int")` - Jake chose the behaviour fix over deleting the arm. This is a LANGUAGE BEHAVIOUR CHANGE, not a requalification: today `implement trait Show for int` registers under the spelling "int", which no receiver key (`i32`) asks, so the impl is dead (`this` unbound, E0201; both `i32` and `int` receivers E0358); folded, it is live and reachable from an `i32` receiver, and programs that were refused compile. E0308's coherence check still collides `for int` with `for i32` (keyed by arena identity). It is the same direction as the keyword ruling - a primitive name resolves only after every scope fails to bind it, `int` being a prelude alias with no identity of its own - and it must not add a third copy of the alias table (`pass_registry.cryo` `register_type_forward_only`, `types/resolver.cryo`): measure who still reads `lookup_type_exact("int")` once every written alias is folded, and give `ResBase` the one home. `HANDOFF.md` §4.1 has the scoping | `grep -rho 'is_alias_keyword' compiler/src --include=*.cryo \| wc -l` → **2** (0 when built) | §8.165, §8.188, §8.202, §8.216 |
 | D19 | **A bare `malloc`/`free`/`realloc` with no declaration in the writing module is an ERROR** - D6's rule, a bare name means a declaration in scope or nothing; the diagnostic says to write `libc::free` or `heap::free`. No freestanding carve-out: in `no_std` the name IS declared (extern or intrinsic), so the rule is satisfied there as everywhere | **TAKEN** (ruled §8.202; built in §8.207) — `callee_family`'s unanswered arm names nothing, so the call is E0202 with a note naming every module declaring the leaf (`std::core::intrinsics`, `std::ffi::libc`, `std::alloc::heap` for `free`) and the spelling of each; §8.93's hold is closed: an intrinsic's leaf is a key in no function table (`note_intrinsic` records the leaf → declaration for codegen's inline decision alone), the four durability guards that kept that key are gone, and codegen's synthesized allocation names `std::core::intrinsics::malloc`/`free`. The population was ONE file, `bare_intrinsic_priority.cryo`, which asserted the bare bind and is the negative `E0202_bare_allocator_leaf` now; the two E0453 negatives the previous handoff counted declare the leaf in their own extern block and are legal | `grep -c 'intrinsic_owner_of' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -rho 'register_intrinsic_function_type' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'note_intrinsic(' compiler/src/compiler/passes/type_resolution.cryo` → **1**; `grep -c 'intrinsic_names.contains_key' compiler/src/compiler/decl_index.cryo` → **0**; `grep -c '^negative E0202_bare_allocator_leaf' tests/test-roster.txt` → **1** | §8.93, §8.173, §8.202, §8.207 |
@@ -220,7 +220,7 @@ a count.
 Checks for this section, one per line so each can be copied whole:
 
 * `grep -c '^\[' tests/lane-baseline.txt` → **9**
-* `grep -c '^project ' tests/test-roster.txt` → **64**
+* `grep -c '^project ' tests/test-roster.txt` → **66**
 * `grep -c '^negative ' tests/test-roster.txt` → **193**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
@@ -12551,6 +12551,114 @@ roster.
 **Tally: 72 shadowed, 72 old paths deleted, 72 at zero; 115 artifacts
 gone** (+1 lane, the permissive default, shadowed and closed; +1
 artifact, the default arm's `true`).
+
+---
+
+### 8.223 An impl head's concrete target argument is not honoured by impl selection: `implement<T> trait Show for Wrap<T, Alpha>` is selected for `Wrap<i32, Beta>`, and two heads differing only in that argument collapse to one - a miscompile with no diagnostic, pinned RED, scoped, not built - 2026-09-17
+
+#### The shape
+
+§8.190 parked this: D16's ruling offers the concrete spelling
+(`implement<T> trait Clone for Array<T, GlobalAlloc>`), type resolution
+accepts it, and the five sites that bind a head's `target_args`
+(`trait_specializer.cryo`, `method_binding.cryo` ×2,
+`call_specializer.cryo`, `types/resolver.cryo`) bind EVERY `Named`
+argument as a parameter name, so `GlobalAlloc` is bound to whatever the
+subject carries.  The binding is the smaller half.  The larger is
+SELECTION: the trait-impl registry keys an impl by `(trait, target key)`
+where the target key is the TEMPLATE's canonical name
+(`template_key_of`; `register_trait_impl_typed`, `register_trait_impl`,
+both "latest impl wins"; `impl_target_rank` compares keys and never an
+argument), so a head with a concrete argument is an impl for every
+instantiation of the template, and two heads for one template that differ
+in a concrete argument are one slot.
+
+Two probes (`.objcmp/u1-keep/concrete`, `concrete2`; a two-parameter
+`Wrap<T, A>`, two marker structs `Alpha` and `Beta`, a trait `Show`):
+
+| program | Rust | pin `bin/cryo.exe` (2026-09-11) | `1451d792` | tree `1292de9f` |
+|---|---|---|---|---|
+| one head `for Wrap<T, Alpha>`; `wb: Wrap<i32, Beta>`; `wa.show() * 10 + wb.show()` | refused: `Wrap<i32, Beta>` has no `show` | builds, **11** | 11 | 11 |
+| heads `for Wrap<T, Beta>` (2) then `for Wrap<T, Alpha>` (1); the same expression | **12** | builds, **22** | 22 | 22 |
+
+The second is the fifth miscompile of the migration's class: both
+subjects run one body, no diagnostic, every gate green.  Pre-existing -
+the pin agrees - not a regression of the migration; the migration is what
+made the head's argument a stamped `Res` the selector could read.
+
+The population where the two readings differ is EMPTY BY LUCK: 11 heads
+in the tree carry a concrete argument (`grep -rn -E 'implement.* for
+(struct )?[A-Za-z_:]+<[^>]*\bGlobalAlloc\b' stdlib ...` → 11: `Box`,
+`Array` ×2, `HashMap` ×2, `HashSet` ×2, `String` ×4, every one
+`GlobalAlloc`), and nothing instantiates a collection with a second
+allocator (`grep -rn -E '(Array|Box|HashMap|HashSet|String)<[^>]*[A-Z][a-z]+Alloc\b'
+... | grep -v GlobalAlloc` → 3, all `Box<Arena>` with the allocator
+defaulted).  The first program that does gets `GlobalAlloc`'s `clone`
+body over an arena-allocated array.
+
+#### Pinned, red
+
+Two run projects hold the shape and FAIL at this commit, honestly:
+`impl_concrete_arg_filters_impl` (compile_fail E0358 - `wb.show()` names
+no method, as a struct with no impl at all is refused today with E0358 -
+where the tree builds it and exits 11: `[FAIL] (expected build to fail)`)
+and `impl_concrete_arg_selects_impl` (run, exit 12, where the tree exits
+22: `[FAIL] (exit 22, expected 12)`).  `make test` is OVERALL FAIL with
+those two named until the change below lands; every objcmp / corpus
+half over `tests/` reads them the same way, and `corpus2.sh` reports
+`failing halves: 1` for the compile_fail one (it builds).  A red project
+over a known miscompile is the record; a green suite over it was the
+mask.
+
+#### The change this wants (scoped, not built - a registry reshape, D24's)
+
+Rust selects an impl by UNIFYING the impl's self type against the subject:
+the impl's own generic parameters are variables that bind, everything
+else must be equal, and coherence guarantees at most one impl matches.
+For Cryo:
+
+1. The registry holds a LIST of heads per `(trait identity, template
+   key)` - the key D24 rules (the trait's identity, not its leaf) with
+   the template as the second component; "latest wins" goes.
+2. One selector, `select_impl(trait, subject) -> ImplBlockNode*`: for
+   each head under the key, walk `target_args[i]` against
+   `inst_type_arg_at(subject, i)`: an argument stamped `Res::GenericParam`
+   (a parameter of the head) BINDS; one stamped as a type (`Res::Def`, a
+   primitive, a nested `Generic` whose base is a type) FILTERS - the
+   subject's argument must be that type, recursively.  No head matching
+   is no impl (E0358 at the call, as today for a type with none); two
+   heads matching one subject is an overlap, reported once at
+   registration, not at every use.  The stamps are already there
+   (§8.193 stamped every head's `target_args`).
+3. Every reader goes through the selector: `resolve_trait_impl_for_type`
+   (10 callers), `lookup_trait_impl` (6), `impl_target_rank` (3),
+   `traits_implemented_by` (9: a bound check `Wrap<i32, Beta>: Show`
+   answers yes today), and the five binding sites bind only a
+   `GenericParam`-stamped name.  `has_trait_impl_typed` and
+   `lookup_trait_impl_typed` (1 each) fold into it.
+4. Measure over the six halves before deleting the key-only readers:
+   every selection today answers with one head per key, so the selector
+   must agree at every one of them (§8.194's 193,199 answers are the
+   control population) and differ at exactly the two projects.
+
+This is the same registry D24 re-keys and the same readers; building the
+two as one reshape is one measurement instead of two over the same 28
+sites.  The sequencing is Jake's.  The interim alternative - refusing at
+registration a second head for a key already held, or a head with a
+concrete argument at all - would be a new diagnostic for a compiler
+limitation and is not taken here.
+
+#### Gates
+
+No compiler change: nothing to hash.  roster merged (+2 projects);
+`make test` over the two: `projects: 0 passed, 2 failed` (the record).
+§0: the project count 64 → 66; D16's row says the parked half is pinned
+red here.
+
+Outside the ledger: the two projects, the roster.
+
+**Tally: 72 shadowed, 72 old paths deleted, 72 at zero; 115 artifacts
+gone** (unchanged: a finding pinned, nothing deleted).
 
 ---
 
