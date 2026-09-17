@@ -122,6 +122,7 @@ three, and its row carries the count. Read each zero off its own row.
 | M5 import suffix fallback | **DELETED** — an import path names a module by its registered name or binds nothing | — | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **0** | §8.120, §8.157 |
 | scope-call argument check keyed by the segment's SPELLING (`check_scope_call_arg_types`: `<spelling>::<member>`, then a module-suffix scan over every module in the graph when that key held nothing) | **DELETED** — a `Def` segment's key is the stamp's, through `resolve_module_qualified_symbol`, the same path that resolves the call's return; shadow 162,460 over six halves: 126,642 the scan and the stamp named one function, 35,804 a type segment the scan walked the graph for and found nothing, **14 the scan checked NOTHING where the stamp answers** (12 two modules sharing the written suffix, 2 a re-export) - at those the mismatch compiled and the binary died of heap corruption | — | `grep -c 'suffix_start' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -c 'resolve_module_qualified_symbol(' compiler/src/compiler/sema/call_resolver.cryo` → **5** (the definition, the call's return, the value form, the parameter-type lookup, the argument check) | §8.217 |
 | the index's per-module ownership tables (`module_funcs.second`, `module_types`, `module_func_first`, `module_func_pairs`; `get_function_module`, `is_function_in_module`, `get_type_module`, `get_functions_in_module`; the `module` parameter of the three registrars and the `owner_mod` plumbed from spec injection to feed it) | **DELETED** — written on every registration, read by nothing: 0 callers of the four accessors in `compiler/src` and `tools` (HEAD `ccb310aa`: 29 mentions in `decl_index.cryo`, 0 outside but a comment and the arena's own `get_type_module`); the one reader of `module_funcs` wanted the function NAMES for a did-you-mean and reads `callable_names` | — | `grep -c -e 'module_func' -e 'module_types' compiler/src/compiler/decl_index.cryo` → **0**; `grep -rho -e 'register_methods_with_module' -e 'register_function_type_with_module' -e 'register_type_with_module' compiler/src --include=*.cryo \| wc -l` → **0** | §8.218 |
+| a stamped declaration's type asked by its RE-DERIVED name (`Res::Def(q)` → `q.qualified_name()` → `lookup_type` / `lookup_type_exact` / `lookup_func_type_exact`) | **CONVERTING** — the index answers a `DefId` directly (`type_of_def`, `func_type_of_def`; the `_of_res` pair rides on them), so the unwrap happens once, inside the index, and a reader hands over the id it holds. §8.219 took the six sites whose lookup was the unwrap's only consumer (`impl_owner`, the class base, the enum pattern's type, the struct literal's base, `TypeUtils::def_type`, the function value's type); the unwraps left are text (a symbol, a diagnostic) or feed a name-keyed consumer of another kind (a `Family` pin, the generic registry, a visibility gate) | — | `grep -c '_of_def(&this' compiler/src/compiler/decl_index.cryo` → **2**; `grep -A1 '^\[DEFID_UNWRAP\]' tests/lane-baseline.txt \| grep -o '[0-9]*'` → **33** (38 before §8.219); `grep -A1 '^\[LOOKUP\]' tests/lane-baseline.txt \| grep -o '[0-9]*'` → **41** (43 before) | §8.219 |
 | const-table bare leaf (`by_bare`, `bare_index_of`, the same-leaf chain folder) | **DELETED** — a bare constant is read off `IdentifierNode.res`; shadow 0 over six halves, the lane reached 4/4 in `const_cross_module` under the same build, and a same-leaf constant in an unimported module - which the chain folder REFUSED - now folds to the imported one | — | `grep -c 'by_bare' compiler/src/compiler/const_table.cryo` → **0** | §8.9, §8.111, §8.171 |
 | `spelling_type` call-ident fallback (E0202 tail) and `new`'s `resolve_primitive` step | **DELETED** — shadow 0 over six halves; their three rows retired | — | `grep -c 'resolve_primitive' compiler/src/compiler/sema/sema.cryo` → **0** | §8.25, §8.98, §8.171 |
 | `new`'s spelling step (`lookup_type_exact(new_expr.type_name)`) | LIVE — for an ALIAS KEYWORD only (`new int[100]`): `int`/`uint`/`float`/`double` are not primitive spellings because a module may carry the name, so the stamp is Pending and the alias registration is the only key. **The pinned `spelling_type new expr: calls` row is 0 because no pinned b1 corpus contains a `new` expression** — a corpus fact, not a lane fact; `tests/lang/new_array.cryo` reaches it twice. Goes with the keyword ruling (§8.165), as does the impl head's spelling arm for the same four spellings (§8.188); `ResBase::is_alias_keyword` names the population | 0 calls on every pinned arm | same file, `spelling_type new expr: calls`; `grep -rho 'is_alias_keyword' compiler/src --include=*.cryo | wc -l` → **2** (the predicate and the impl head's arm) | §8.25, §8.98, §8.171, §8.188 |
@@ -12221,6 +12222,67 @@ Outside the ledger: `decl_index.cryo`, `sema/diagnostics.cryo`,
 gone** (+ four tables, four accessors, `note_module_func`, a field, and
 the `module`/`owner_mod` parameter of six functions - counted as nine:
 the tables and accessors, and the parameter chain as one).
+
+---
+
+### 8.219 A stamped declaration answers its type through the index by its id: `type_of_def` / `func_type_of_def`, and six readers that unwrapped a `DefId` to key a lookup hand the id over instead - 2026-09-16
+
+#### The shape
+
+A `Res::Def(q)` is the name layer's answer, and `q` is a `DefId`.  Six
+readers held one and turned it back into a string to ask the index the
+type it names - `q.qualified_name()` then `lookup_type` (the index
+directly, 2) or `lookup_type_exact` / `lookup_func_type_exact` (through
+`TypeUtils`, 4).  Each is a `DEFID_UNWRAP` whose only consumer is a
+name-keyed lookup, which is the case the lane baseline's own header calls
+out: "a re-keyed lookup here has re-derived what it was handed, and
+should take the DefId instead".  The index already answered a `Res`
+without a caller-side unwrap (`type_of_res`, `func_type_of_res`, each
+unwrapping once inside the index); a `DefId` in hand had no such door.
+
+#### The change
+
+* `DeclarationIndex::type_of_def(DefId)` and `func_type_of_def(DefId)`:
+  the definition's canonical name is the map's key, so the id is
+  unwrapped there and nowhere a reader stands.  `type_of_res` and
+  `func_type_of_res` ride on them (the index's `DEFID_UNWRAP` stays 2).
+* Six sites hand the id over: `TypeResolutionPasses::impl_owner`'s `Def`
+  arm; the class base (`require_base_res` → `type_of_res`, its local
+  `base_q` gone); `pattern_resolver`'s enum pattern type; the struct
+  literal's base in `sema`; `TypeUtils::def_type`, the DefId-keyed door
+  that records an unregistered definition, which unwrapped internally;
+  and the function VALUE's type in `sema` (`func_type_of_res`).  At the
+  last, the canonical name is still derived once, for the `Family` pin
+  and the visibility gate - both keyed by name by design - so that
+  unwrap stays and the entry says why.
+* Not taken, each unwrap being for TEXT or for a name-keyed consumer of
+  another kind: the base-constructor symbol (`decl_visit_emitter`), the
+  `Family` pins, `callee_family`, `resolve_module_qualified_symbol`'s key
+  build, the const table's qualified-name reads, the generic registry's
+  `get_template(def.qualified_name())`, the annotation-head keys.  Those
+  are the next slices: each wants its consumer re-keyed, not just the
+  lookup.
+
+#### Gates
+
+lane-check `LOOKUP` 43 → 41 (`type_resolution` 21 → 19, the two
+`lookup_type` calls), `DEFID_UNWRAP` 38 → 33 (`type_resolution` 5 → 3,
+`pattern_resolver` 1 → 0, `sema` 2 → 1, `type_utils` 4 → 3), re-pinned;
+predicted −2 and −6 before the edit, the sixth unwrap kept for the pin as
+above.  lsp-check OK (490 warnings); cross-check OK (`.objcmp/u4-cross.log`);
+`make test-census` OK, 2,124 / 192 / 63; ns-status-check OK (a new row).
+**Objects: 0 of 2,557 + 1,126 moved** (`hash-tree.sh F` against `E`, HEAD
+`41208b28`'s half, `.objcmp/u4-hashF.out`; `t-F.txt.log` OVERALL PASS
+2,124 / 192 / 60, 0 allocation failures) - the same map under the same
+key, asked with the id instead of the id's name.
+
+Outside the ledger: `decl_index.cryo`, `passes/type_resolution.cryo`,
+`sema/pattern_resolver.cryo`, `sema/sema.cryo`, `sema/type_utils.cryo`,
+the lane golden.
+
+**Tally: 70 shadowed, 70 old paths deleted, 70 at zero; 114 artifacts
+gone** (unchanged: a requalification, nothing deleted; the lane rows
+carry the movement).
 
 ---
 
