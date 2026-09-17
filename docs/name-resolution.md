@@ -122,7 +122,8 @@ three, and its row carries the count. Read each zero off its own row.
 | M5 import suffix fallback | **DELETED** — an import path names a module by its registered name or binds nothing | — | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **0** | §8.120, §8.157 |
 | scope-call argument check keyed by the segment's SPELLING (`check_scope_call_arg_types`: `<spelling>::<member>`, then a module-suffix scan over every module in the graph when that key held nothing) | **DELETED** — a `Def` segment's key is the stamp's, through `resolve_module_qualified_symbol`, the same path that resolves the call's return; shadow 162,460 over six halves: 126,642 the scan and the stamp named one function, 35,804 a type segment the scan walked the graph for and found nothing, **14 the scan checked NOTHING where the stamp answers** (12 two modules sharing the written suffix, 2 a re-export) - at those the mismatch compiled and the binary died of heap corruption | — | `grep -c 'suffix_start' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -c 'resolve_module_qualified_symbol(' compiler/src/compiler/sema/call_resolver.cryo` → **5** (the definition, the call's return, the value form, the parameter-type lookup, the argument check) | §8.217 |
 | the index's per-module ownership tables (`module_funcs.second`, `module_types`, `module_func_first`, `module_func_pairs`; `get_function_module`, `is_function_in_module`, `get_type_module`, `get_functions_in_module`; the `module` parameter of the three registrars and the `owner_mod` plumbed from spec injection to feed it) | **DELETED** — written on every registration, read by nothing: 0 callers of the four accessors in `compiler/src` and `tools` (HEAD `ccb310aa`: 29 mentions in `decl_index.cryo`, 0 outside but a comment and the arena's own `get_type_module`); the one reader of `module_funcs` wanted the function NAMES for a did-you-mean and reads `callable_names` | — | `grep -c -e 'module_func' -e 'module_types' compiler/src/compiler/decl_index.cryo` → **0**; `grep -rho -e 'register_methods_with_module' -e 'register_function_type_with_module' -e 'register_type_with_module' compiler/src --include=*.cryo \| wc -l` → **0** | §8.218 |
-| a stamped declaration's type asked by its RE-DERIVED name (`Res::Def(q)` → `q.qualified_name()` → `lookup_type` / `lookup_type_exact` / `lookup_func_type_exact`) | **CONVERTING** — the index answers a `DefId` directly (`type_of_def`, `func_type_of_def`; the `_of_res` pair rides on them), so the unwrap happens once, inside the index, and a reader hands over the id it holds. §8.219 took the six sites whose lookup was the unwrap's only consumer (`impl_owner`, the class base, the enum pattern's type, the struct literal's base, `TypeUtils::def_type`, the function value's type); the unwraps left are text (a symbol, a diagnostic) or feed a name-keyed consumer of another kind (a `Family` pin, the generic registry, a visibility gate) | — | `grep -c '_of_def(&this' compiler/src/compiler/decl_index.cryo` → **2**; `grep -A1 '^\[DEFID_UNWRAP\]' tests/lane-baseline.txt \| grep -o '[0-9]*'` → **33** (38 before §8.219); `grep -A1 '^\[LOOKUP\]' tests/lane-baseline.txt \| grep -o '[0-9]*'` → **41** (43 before) | §8.219 |
+| a stamped declaration's type asked by its RE-DERIVED name (`Res::Def(q)` → `q.qualified_name()` → `lookup_type` / `lookup_type_exact` / `lookup_func_type_exact`) | **CONVERTING** — the index answers a `DefId` directly (`type_of_def`, `func_type_of_def`; the `_of_res` pair rides on them), so the unwrap happens once, inside the index, and a reader hands over the id it holds. §8.219 took the six sites whose lookup was the unwrap's only consumer (`impl_owner`, the class base, the enum pattern's type, the struct literal's base, `TypeUtils::def_type`, the function value's type); the unwraps left are text (a symbol, a diagnostic) or feed a name-keyed consumer of another kind (a `Family` pin, the generic registry, a visibility gate) | — | `grep -c '_of_def(&this' compiler/src/compiler/decl_index.cryo` → **2**; `grep -A1 '^\[DEFID_UNWRAP\]' tests/lane-baseline.txt \| grep -o '[0-9]*'` → **33** (38 before §8.219); `grep -A1 '^\[LOOKUP\]' tests/lane-baseline.txt \| grep -o '[0-9]*'` → **35** (43 before §8.219, 41 before §8.221) | §8.219 |
+| a written type declaration's type asked back from the index under its own key and re-registered under it (`register_decl_in_index`: `lookup_type(qualified_sym)` → `register_type(qualified_sym, ty)` in the struct, union, class, enum, trait and alias arms) | **DELETED** — the type-declaration stage registered the type under that key and the reverse map already names it; shadow 37,976 re-registrations over six halves, every one `agree` (map held the key, reverse map named it), 0 clones reached the arms, 0 INVALID; the arms keep what that stage does not own (bare-name mapping, visibility, methods); 0 objects moved; `lane-check` LOOKUP 41 → 35 | — | `grep -c 'lookup_type(qualified_sym)' compiler/src/compiler/passes/type_resolution.cryo` → **4** (the field-population reads, §8.221's next slice; 10 before); `grep -c 'register_type(qualified_sym' compiler/src/compiler/passes/type_resolution.cryo` → **0** | §8.221 |
 | const-table bare leaf (`by_bare`, `bare_index_of`, the same-leaf chain folder) | **DELETED** — a bare constant is read off `IdentifierNode.res`; shadow 0 over six halves, the lane reached 4/4 in `const_cross_module` under the same build, and a same-leaf constant in an unimported module - which the chain folder REFUSED - now folds to the imported one | — | `grep -c 'by_bare' compiler/src/compiler/const_table.cryo` → **0** | §8.9, §8.111, §8.171 |
 | `spelling_type` call-ident fallback (E0202 tail) and `new`'s `resolve_primitive` step | **DELETED** — shadow 0 over six halves; their three rows retired | — | `grep -c 'resolve_primitive' compiler/src/compiler/sema/sema.cryo` → **0** | §8.25, §8.98, §8.171 |
 | `new`'s spelling step (`lookup_type_exact(new_expr.type_name)`) | LIVE — for an ALIAS KEYWORD only (`new int[100]`): `int`/`uint`/`float`/`double` are not primitive spellings because a module may carry the name, so the stamp is Pending and the alias registration is the only key. **The pinned `spelling_type new expr: calls` row is 0 because no pinned b1 corpus contains a `new` expression** — a corpus fact, not a lane fact; `tests/lang/new_array.cryo` reaches it twice. Goes with the keyword ruling (§8.165), as does the impl head's spelling arm for the same four spellings (§8.188); `ResBase::is_alias_keyword` names the population | 0 calls on every pinned arm | same file, `spelling_type new expr: calls`; `grep -rho 'is_alias_keyword' compiler/src --include=*.cryo | wc -l` → **2** (the predicate and the impl head's arm) | §8.25, §8.98, §8.171, §8.188 |
@@ -12376,6 +12377,71 @@ Outside the ledger: `sema/call_resolver.cryo`, the negative, the roster.
 **Tally: 70 shadowed, 70 old paths deleted, 70 at zero; 114 artifacts
 gone** (unchanged: a diagnostic moved to the layer that knows the answer;
 nothing deleted).
+
+---
+
+### 8.221 `register_decl_in_index` asked the index for a written type under its own key and registered the answer back under the same key, six arms; deleted - 2026-09-16
+
+#### The shape
+
+Every one of the six type-declaration arms of `register_decl_in_index`
+(struct, union, class, enum, trait, alias) opened with the pair
+
+    const qualified_sym = ctx.decl_type_key(node.name, ..., node.span.file);
+    const ty = ctx.decl_index.lookup_type(qualified_sym);
+    if (ty.is_valid()) { ctx.decl_index.register_type(qualified_sym, ty); }
+
+- a name-keyed lookup whose only consumer was a registration of what it
+found under the key it was found by.  `register_type(k, ty)` writes
+`type_map[k] = ty` and `type_reverse[ty] = k`, so the pair is a no-op
+unless the reverse map named some OTHER key for that type at the time -
+a repair of `lookup_type_name`'s answer that nothing said it was, and
+that nothing would have noticed disappearing.  The six were 6 of the 19
+`LOOKUP` sites in `type_resolution.cryo`, audit 10's bucket B (a key
+derived from a declaration in hand); the type-declaration stage
+(`pass_registry.cryo`) had already registered every one of these types
+under exactly this key.
+
+#### The measurement
+
+A shadow before each re-registration (`shadow_rdi`): `agree` when the
+map held the key and `lookup_type_name(ty)` was already the key,
+`DISAGREE` with both names otherwise, and `INVALID` when the key was
+not registered at all; tagged `src`/`clone` by `is_source_decl`.  Six
+halves (`corpus2.sh u2`, `.objcmp/u2-lines.txt`): **37,976 lines, all
+`agree`** - struct 20,520, trait 9,295, enum 8,020, class 132, union 6,
+alias 3; **0 `clone`** (the spec injector registers a clone's type itself
+under the arena name, and its fallback into these arms was never taken);
+0 `DISAGREE`, 0 `INVALID`; 0 failing halves; `make test` in the run
+OVERALL PASS 193 / 60.  Control by inversion: the comparison flipped
+(`prev.id != key.id`), the same scratch project printed 166 `DISAGREE`
+and 0 `agree` where it had printed 166 `agree` - the instrument reports a
+disagreement when there is one.  ABSENT, not starved: the repair had
+nothing to repair.
+
+#### The change
+
+The six pairs are deleted; the arms keep what the type-declaration stage
+does not own - `register_name_mapping`, `set_decl_visibility`,
+`register_methods` - each still keyed by `decl_type_key`, which is the
+slice that wants the node to carry its registration's id (next).  The
+doc comment says the arm asks the index nothing about the type.
+
+#### Gates
+
+lane-check `LOOKUP` 41 → **35** (`type_resolution` 19 → 13), re-pinned;
+predicted −6.  **Objects: 0 of 2,557 + 1,126 moved** (`hash-tree.sh H`
+against `G`, HEAD `a577364f`'s half, `.objcmp/hash-H.out`; `t-H.txt.log`
+OVERALL PASS unit ok / 193 / 60); predicted 0.  lsp-check OK (490
+warnings).  §0: the `LOOKUP` cell 41 → 35 on §8.219's row; a new
+machinery row.
+
+Outside the ledger: `passes/type_resolution.cryo`, the lane golden.
+
+**Tally: 71 shadowed, 71 old paths deleted, 71 at zero; 114 artifacts
+gone** (+1 lane, the re-registration pair, shadowed and deleted here; the
+artifact count is unchanged - the pair was inline, and no named function
+or table went with it).
 
 ---
 
