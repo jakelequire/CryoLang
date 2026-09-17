@@ -110,11 +110,11 @@ type struct DeclVisitEmitter {
         const sname: string = this.cg.resolve(node.name);
         cdebug("[IRGen]   struct methods: %s (%lld methods)\n",
                sname, node.methods.length); libc::fflush(null);
-        this.state.current_impl_target = this.cg.ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
+        this.state.current_impl_target = this.cg.ctx.decl_index.type_of_def(node.def);
         for (mut j: i64 = 0; j < node.methods.length; j++) {
             this.generate_method_body(visitor, node.methods[j], null);
         }
-        this.state.current_impl_target = SymbolStr::empty();
+        this.state.current_impl_target = TypeRef::invalid();
         cdebug("[IRGen]   struct methods done\n"); libc::fflush(null);
     }
 
@@ -124,11 +124,11 @@ type struct DeclVisitEmitter {
         if (node == null) { return; }
         if (node.generic_params.length > 0) { return; }
         if (node.methods.length == 0) { return; }
-        this.state.current_impl_target = this.cg.ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
+        this.state.current_impl_target = this.cg.ctx.decl_index.type_of_def(node.def);
         for (mut j: i64 = 0; j < node.methods.length; j++) {
             this.generate_method_body(visitor, node.methods[j], null);
         }
-        this.state.current_impl_target = SymbolStr::empty();
+        this.state.current_impl_target = TypeRef::invalid();
     }
 
     emit_class_decl(mut &this, visitor: ASTVisitor*, node: ClassDeclNode*) -> void {
@@ -138,11 +138,11 @@ type struct DeclVisitEmitter {
         const cname: string = this.cg.resolve(node.name);
         cdebug("[IRGen]   class methods: %s (%lld methods)\n",
                cname, node.methods.length); libc::fflush(null);
-        this.state.current_impl_target = this.cg.ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
+        this.state.current_impl_target = this.cg.ctx.decl_index.type_of_def(node.def);
         for (mut j: i64 = 0; j < node.methods.length; j++) {
             this.generate_method_body(visitor, node.methods[j], &node.base_res);
         }
-        this.state.current_impl_target = SymbolStr::empty();
+        this.state.current_impl_target = TypeRef::invalid();
         cdebug("[IRGen]   class methods done\n"); libc::fflush(null);
     }
 
@@ -214,7 +214,7 @@ type struct DeclVisitEmitter {
                 return;
             }
         }
-        this.state.current_impl_target = qualified_impl_target;
+        this.state.current_impl_target = this.cg.ctx.decl_index.impl_owner(node, "codegen/impl bodies");
 
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             const m: MethodNode* = node.methods[i];
@@ -229,7 +229,7 @@ type struct DeclVisitEmitter {
             cdebug("[IRGen]     method[%lld] done\n", i); libc::fflush(null);
         }
 
-        this.state.current_impl_target = SymbolStr::empty();
+        this.state.current_impl_target = TypeRef::invalid();
     }
 
     /// Generate a method body: prologue, optional base-ctor call, block walk,
@@ -273,7 +273,9 @@ type struct DeclVisitEmitter {
         this.cg.decl.codegen_function_epilogue(func);
 
         if (!this.cg.diag.is_function_body_valid(fn_val)) {
-            const target_str: string = this.cg.resolve(this.state.current_impl_target);
+            const target_str: string = if (this.state.current_impl_target.is_valid()) {
+                this.cg.ctx.type_arena.resolve_display_name(this.state.current_impl_target.id)
+            } else { "" };
             const method_str: string = this.cg.resolve(func.name);
             const pretty: string = if (target_str.length() > 0) {
                 fmt::format("%s::%s", target_str, method_str)

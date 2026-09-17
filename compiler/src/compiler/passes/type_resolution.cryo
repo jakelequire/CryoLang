@@ -896,26 +896,6 @@ type struct TypeResolutionRunner {
     /// Resolves all method signatures (MethodNode*[]) on a struct/class/impl.
     /// `owner_type` lets the resolver back-fill `this`/`&this` resolved_type
     /// (the parser leaves the receiver param's type unset).
-    /// The type an impl head is for, read off the stamp as sema's
-    /// `impl_target_type` reads it: a `Def` is canonical and the index holds
-    /// it or the declaration never registered; a written primitive is
-    /// `PrimTy` and its spelling is its registration key; an unanswered slot
-    /// is a monomorphized clone, whose head the cloner withholds a stamp
-    /// from because a specialization is not a definition, and whose owner
-    /// the monomorphizer records by arena id in `spec_owner`.
-    impl_owner(&this, node: ImplBlockNode*) -> TypeRef {
-        return match (node.res) {
-            ResSlot::Answered(r) => {
-                match (r) {
-                    Res::Def(q)    => { this.ctx.decl_index.type_of_def(q) }
-                    Res::PrimTy(n) => { this.ctx.decl_index.lookup_type(n) }
-                    _              => { TypeRef::invalid() }
-                }
-            }
-            _ => { node.spec_owner }
-        };
-    }
-
     resolve_method_signatures(&this, methods: &MethodNode*[],
                               res_ctx: ResolutionContext*,
                               owner_type: TypeRef,
@@ -3064,7 +3044,7 @@ type struct TypeResolutionPasses {
                     // resolve with no receiver type to back-fill and no
                     // `This` to bind.
                     runner.resolve_method_signatures(node.methods, &impl_ctx,
-                        runner.impl_owner(node), node.target_key(runner.arena));
+                        ctx.decl_index.impl_owner(node, "type_resolution/impl methods"), node.target_key(runner.arena));
                     sig_count += node.methods.length;
                 }
                 NodeKind::ExternBlock => {
@@ -3413,7 +3393,7 @@ type struct TypeResolutionPasses {
                     // The owner and its name off the stamp, as in the FuncSig
                     // phase above.
                     runner.resolve_method_signatures(node.methods, &impl_ctx,
-                        runner.impl_owner(node), node.target_key(runner.arena));
+                        ctx.decl_index.impl_owner(node, "type_resolution/impl methods"), node.target_key(runner.arena));
                     runner.emit_method_signature_diagnostics(node.methods);
                 }
                 _ => {
@@ -4132,8 +4112,7 @@ type struct TypeResolutionPasses {
                     // type's method list, so a call's argument types could
                     // not be propagated from them and `Type::member` could
                     // not tell the type from a module.
-                    const sync_runner: TypeResolutionRunner = TypeResolutionRunner::new(ctx);
-                    const tgt: TypeRef = sync_runner.impl_owner(node);
+                    const tgt: TypeRef = ctx.decl_index.impl_owner(node, "type_resolution/struct field sync");
                     if (!tgt.is_valid()) { continue; }
                     const tgt_t: Type* = arena.lookup(tgt.id);
                     if (tgt_t == null) { continue; }

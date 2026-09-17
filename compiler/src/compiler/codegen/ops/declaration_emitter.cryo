@@ -638,8 +638,9 @@ type struct DeclarationEmitter {
             }
         }
 
+        const owner: TypeRef = this.ctx.decl_index.impl_owner(node, "codegen/declare impl");
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.declare_method(node.methods[i], qualified_target);
+            this.declare_method(node.methods[i], owner);
         }
     }
 
@@ -651,10 +652,9 @@ type struct DeclarationEmitter {
         if (node.methods.length == 0) {
             return;
         }
-        const c: CompilationContext* = this.ctx;
-        const qualified: SymbolStr = c.decl_type_key(node.name, node.binding_namespace, node.span.file);
+        const owner: TypeRef = this.ctx.decl_index.type_of_def(node.def);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.declare_method(node.methods[i], qualified);
+            this.declare_method(node.methods[i], owner);
         }
     }
 
@@ -667,10 +667,9 @@ type struct DeclarationEmitter {
         if (node.methods.length == 0) {
             return;
         }
-        const c: CompilationContext* = this.ctx;
-        const qualified: SymbolStr = c.decl_type_key(node.name, node.binding_namespace, node.span.file);
+        const owner: TypeRef = this.ctx.decl_index.type_of_def(node.def);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.declare_method(node.methods[i], qualified);
+            this.declare_method(node.methods[i], owner);
         }
     }
 
@@ -679,12 +678,9 @@ type struct DeclarationEmitter {
         if (node.generic_params.length > 0) {
             return;
         }
-        const c: CompilationContext* = this.ctx;
-        const qualified: SymbolStr = c.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
-        const di: DeclarationIndex* = this.get_decl_index();
-        const di_ref: TypeRef = di.type_of_def(node.def);
+        const di_ref: TypeRef = this.ctx.decl_index.type_of_def(node.def);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
-            this.declare_method(node.methods[i], qualified);
+            this.declare_method(node.methods[i], di_ref);
         }
 
         // Emit the vtable for classes with virtual methods.  Drive this from
@@ -908,7 +904,9 @@ type struct DeclarationEmitter {
     }
 
     /// Declare a method.  Methods get a `this` pointer as the first parameter.
-    declare_method(mut &this, node: MethodNode*, target_type: SymbolStr) -> void {
+    /// `owner` is the type the method is on: an impl head's owner or a
+    /// declaration's own type, never re-derived from a name here.
+    declare_method(mut &this, node: MethodNode*, owner: TypeRef) -> void {
         const func: FunctionDeclNode* = node.func;
         if (func == null) { return; }
 
@@ -929,9 +927,6 @@ type struct DeclarationEmitter {
 
         // The symbol is the registered entry's: registration computed it
         // once from this node, and every caller's pin names the same entry.
-        const ctx_ptr: CompilationContext* = this.ctx;
-        const di: DeclarationIndex* = ctx_ptr.decl_index;
-        const arena: TypeArena* = this.get_arena();
         const mangled_sym: SymbolStr = this.method_symbol(node);
         if (!mangled_sym.is_valid()) { return; }
         // `![symbol("sym")]` overrides the LLVM symbol name ONLY (the C++ binding
@@ -1023,23 +1018,8 @@ type struct DeclarationEmitter {
         mut target_mapped: LType = LType::null();
         mut this_ty: LType = LType::null();
         if (is_instance) {
-            mut target_ref: TypeRef = di.lookup_type(target_type);
-            if (!target_ref.is_valid()) {
-                // The unit type `()` isn't in the DeclarationIndex (it's a
-                // primitive owned by the arena, never registered through the
-                // decl-collection pass).  Fall back to the arena's canonical
-                // unit TypeRef so `implement trait Drop for ()` and similar
-                // get a real LLVM declaration.  Detected by the literal `()`
-                // suffix on the qualified target name.
-                const target_str: string = intern.resolve(target_type);
-                const tlen: u64 = target_str.length();
-                if (tlen >= 2 && target_str[tlen - 2] == 0x28 /* '(' */
-                              && target_str[tlen - 1] == 0x29 /* ')' */) {
-                    target_ref = arena.get_unit();
-                }
-            }
-            if (target_ref.is_valid()) {
-                target_mapped = this.type_mapper.map_type(target_ref);
+            if (owner.is_valid()) {
+                target_mapped = this.type_mapper.map_type(owner);
                 if (target_mapped.is_valid()) {
                     this_ty = LType::pointer_to(target_mapped);
                 }
@@ -1121,7 +1101,7 @@ type struct DeclarationEmitter {
                 // garbage.  The prologue stores the (coerced) param into the
                 // `this` alloca; opaque-pointer stores reinterpret it back to
                 // the struct, exactly as the normal value-param path does.
-                mut recv_tref_v: TypeRef = di.lookup_type(target_type);
+                mut recv_tref_v: TypeRef = owner;
                 if (!recv_tref_v.is_valid()) { recv_tref_v = param.resolved_type; }
                 const pplan_v: ParamPlan = this.abi.classify_param(recv_tref_v);
                 total_user_slots += pplan_v.llvm_slots.length as u32;
@@ -2051,12 +2031,15 @@ type struct DeclarationEmitter {
     }
 
     /// Generate function prologue for a method.  Prepends `this` parameter binding.
-    codegen_method_prologue(mut &this, node: MethodNode*, target_type: SymbolStr) -> LValue {
+    /// `owner` as in `declare_method`; its display name serves the diagnostics.
+    codegen_method_prologue(mut &this, node: MethodNode*, owner: TypeRef) -> LValue {
         const func: FunctionDeclNode* = node.func;
         if (func == null) { return LValue::null(); }
 
         const intern: InternTable* = this.get_intern();
-        const type_str: string = intern.resolve(target_type);
+        const type_str: string = if (owner.is_valid()) {
+            this.get_arena().resolve_display_name(owner.id)
+        } else { "" };
         const method_str: string = intern.resolve(func.name);
 
         // The body attaches to the function `declare_method` made, held
@@ -2127,29 +2110,11 @@ type struct DeclarationEmitter {
         // named-value that's a pointer to the struct; for by-value `this` we
         // alloca+store the struct so member-access GEPs work the same way.
         if (!node.is_static) {
-            // A method node's `target_type` is already the canonical owner
-            // name, fully qualified by the pass that stamped it.  Prepending a
-            // namespace to it can only name a type no module declares, so a
-            // qualified lane in front of this lookup cannot answer and only the
-            // name as stamped ever binds.
-            mut target_ref: TypeRef = this.ctx.decl_index.lookup_type(target_type);
+            const target_ref: TypeRef = owner;
             if (target_ref.is_invalid()) {
-                // Unit-target impls (`implement trait Drop for ()`):
-                // unit type lives in the arena, not the DeclarationIndex.
-                // Detected by the literal `()` suffix on the qualified target
-                // name; mirrors the fallback in declare_method.
-                const target_str: string = this.resolve(target_type);
-                const tlen: u64 = target_str.length();
-                if (tlen >= 2 && target_str[tlen - 2] == 0x28 /* '(' */
-                              && target_str[tlen - 1] == 0x29 /* ')' */) {
-                    target_ref = this.get_arena().get_unit();
-                }
-            }
-            if (target_ref.is_invalid()) {
-                const ts: string = this.resolve(target_type);
                 const ms: string = this.resolve(func.name);
                 this.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    fmt::format("codegen: method '%s::%s': target type '%s' not found in declaration index", ts, ms, ts),
+                    fmt::format("codegen: method '%s::%s': the owner has no type", type_str, ms),
                     func.span);
                 this.values.pop_scope();
                 return LValue::null();
