@@ -355,35 +355,31 @@ public:
                         this.async_lower.declare(f);
                     }
                 }
-                // The owner's key is the declaration's own: a C import's
-                // alias-qualified name, else its registered name when it was
-                // minted qualified, else the module of the file that WROTE
-                // it - for an injected specialization the template's file,
-                // so the key is the arena's and not the module the clone was
-                // placed in.
+                // A declaration's owner is its own registered type and the
+                // key it registered under, both off the stamp.
                 NodeKind::StructDeclaration => {
                     const s: StructDeclNode* = stmt as StructDeclNode*;
                     this.declare_async_methods(s.methods, s.generic_params,
-                        this.ctx.decl_type_key(s.name, s.binding_namespace, s.span.file), null);
+                        this.ctx.decl_index.type_of_def(s.def), s.def.qualified_name(), null);
                 }
                 NodeKind::UnionDeclaration => {
                     const u: UnionDeclNode* = stmt as UnionDeclNode*;
                     this.declare_async_methods(u.methods, u.generic_params,
-                        this.ctx.decl_type_key(u.name, u.binding_namespace, u.span.file), null);
+                        this.ctx.decl_index.type_of_def(u.def), u.def.qualified_name(), null);
                 }
                 NodeKind::ClassDeclaration => {
                     const c: ClassDeclNode* = stmt as ClassDeclNode*;
                     this.declare_async_methods(c.methods, c.generic_params,
-                        this.ctx.decl_type_key(c.name, SymbolStr::empty(), c.span.file), null);
+                        this.ctx.decl_index.type_of_def(c.def), c.def.qualified_name(), null);
                 }
                 NodeKind::ImplementationBlock => {
                     const ib: ImplBlockNode* = stmt as ImplBlockNode*;
-                    // The head's key is the one owner the methods were
-                    // registered under.
+                    // The head's owner, and its key - the one owner the
+                    // methods were registered under.
                     const canonical: SymbolStr = ib.target_key(this.arena);
                     mut owner_params: GenericParamNode*[] = this.impl_owner_params(ib);
                     this.declare_async_methods(ib.methods, owner_params,
-                                               canonical, ib);
+                        this.ctx.decl_index.impl_owner(ib, "sema/async declare"), canonical, ib);
                 }
                 _ => { }
             }
@@ -393,17 +389,18 @@ public:
     /// Declare the future of every `async` method in one owner's method list.
     ///
     /// `owner_params` are the OWNER's generic parameters, which the future must
-    /// carry as well as the method's own; `qname` is the key the declaration
-    /// index registered the methods' signatures under.
+    /// carry as well as the method's own; `owner_ty` is the owner's type and
+    /// `qname` the key the declaration index registered the methods'
+    /// signatures under - both handed over by a caller that holds them,
+    /// never re-derived here.
     /// `impl_node` is the enclosing impl block when the owner is one (null
     /// otherwise); a trait impl uses it to bind the trait's implicit
     /// `<Method>Fut` associated type to the future each method lowers to.
     declare_async_methods(mut &this, methods: &MethodNode*[],
                           owner_params: &GenericParamNode*[],
-                          qname: SymbolStr, impl_node: ImplBlockNode*) -> void {
-        if (!qname.is_valid()) { this.reject_undeclarable_async(methods, qname); return; }
-        const owner_ty: TypeRef = this.types.lookup_type_exact(qname);
-        if (!owner_ty.is_valid()) { this.reject_undeclarable_async(methods, qname); return; }
+                          owner_ty: TypeRef, qname: SymbolStr,
+                          impl_node: ImplBlockNode*) -> void {
+        if (!owner_ty.is_valid() || !qname.is_valid()) { this.reject_undeclarable_async(methods, qname); return; }
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
             if (m == null || m.func == null || m.func.body == null) { continue; }
