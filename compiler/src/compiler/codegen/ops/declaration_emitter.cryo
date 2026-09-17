@@ -33,7 +33,8 @@ import compiler::types::{
 };
 import compiler::ast;
 import compiler::ast::{ declaration, LiteralKind, node, NodeKind };
-import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
+import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name, res };
+import compiler::resolver::res::{ OverloadId };
 import std::collections::pair;
 import std::collections::pair::{ Pair };
 import std::fmt::float;
@@ -66,7 +67,7 @@ import compiler::codegen::state::value_table::{ ValueTable };
 import compiler::codegen::type_map::{ TypeMapper };
 import compiler::codegen::util::{ CodegenUtil, VTableSlot };
 import compiler::resolver::intern_table::{ InternTable };
-import compiler::resolver::mangled_name::{ MangledName, ReceiverKind };
+import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
@@ -414,32 +415,14 @@ type struct DeclarationEmitter {
             node.resolved_return_type, params, node.is_variadic);
     }
 
-    /// The LLVM symbol of a free function's declaration: the index entry for
-    /// THIS signature - the bare-keyed slot is last-write-wins, so two
-    /// `visit(A*)` / `visit(B*)` overloads under one qualified name would
-    /// share it - else the name's slot, else minted here and registered so
-    /// every later reader (the body, the callers' externs) reads the same
-    /// symbol.  The declaration and its body derive the symbol through this
+    /// The LLVM symbol of a free function's declaration: its registered
+    /// entry's.  The declaration and its body derive the symbol through this
     /// one function, so the body attaches to the function the declaration
-    /// made and never to a same-name neighbour.
-    free_function_symbol(mut &this, node: FunctionDeclNode*, func_type_ref: TypeRef) -> SymbolStr {
-        const di: DeclarationIndex* = this.ctx.decl_index;
-        const qualified: SymbolStr = this.ctx.decl_fn_key(node.name, node.span.file);
-        mut mangled_sym: SymbolStr = di.lookup_overload_mangled(qualified, func_type_ref);
-        if (!mangled_sym.is_valid()) {
-            mangled_sym = di.lookup_mangled_name(qualified);
-        }
-        if (!mangled_sym.is_valid()) {
-            const arena: TypeArena* = this.get_arena();
-            const ft: FunctionType* = arena.lookup(func_type_ref.id) as FunctionType*;
-            const computed: MangledName = MangledName::for_free_function(
-                this.get_intern(), arena, QualifiedName::from_symbol(qualified), ft.param_types,
-                node.resolved_return_type, node.is_variadic);
-            mangled_sym = computed.value;
-            di.register_mangled_name(qualified, mangled_sym);
-            di.register_overload_mangled(qualified, func_type_ref, mangled_sym);
-        }
-        return mangled_sym;
+    /// made and never to a same-name neighbour; and registration is the one
+    /// place the symbol is computed, so a declaration the index never
+    /// registered has no symbol here and is not emitted.
+    free_function_symbol(&this, node: FunctionDeclNode*) -> SymbolStr {
+        return this.ctx.decl_index.entry_symbol(node.overload_entry);
     }
 
     declare_function(mut &this, node: FunctionDeclNode*) -> void {
@@ -452,7 +435,7 @@ type struct DeclarationEmitter {
         const intern: InternTable* = ctx_ptr.intern_table;
         const arena: TypeArena* = this.get_arena();
         const func_type_ref: TypeRef = this.free_function_type(node);
-        const mangled_sym: SymbolStr = this.free_function_symbol(node, func_type_ref);
+        const mangled_sym: SymbolStr = this.free_function_symbol(node);
         // The C ABI entry point must be named `main` verbatim; the C
         // runtime's _start references the unmangled symbol.  Override the
         // mangled name for any free function whose source-level name is
@@ -793,12 +776,11 @@ type struct DeclarationEmitter {
     /// return the first matching method's LLVM function: the most-derived
     /// override, falling back to the inherited base implementation when
     /// the subclass doesn't override that specific overload.  Resolution
-    /// goes through the overload-specific mangled name so the correct LLVM
+    /// goes through the method's own registered entry so the correct LLVM
     /// function is installed in the slot, not the last-registered one
     /// under `Type::method`.
     find_vtable_slot_impl(mut &this, cls: ClassType*, slot_name: SymbolStr, slot_params: &TypeRef[]) -> LValue {
         const arena: TypeArena* = this.get_arena();
-        const intern: InternTable* = this.get_intern();
         mut walk: ClassType* = cls;
         mut depth: i32 = 0;
         while (walk != null && depth < 16) {
@@ -828,36 +810,18 @@ type struct DeclarationEmitter {
                         continue;
                     }
                 }
-                const type_qname: QualifiedName = QualifiedName::from_symbol(walk.qualified_name);
-                // Resolve method's full signature for the mangler.
-                mut method_ret: TypeRef = TypeRef::invalid();
-                mut method_variadic: boolean = false;
-                const fn_t: Type* = arena.lookup(m.function_type.id);
-                if (fn_t != null && fn_t.kind == TypeKind::Function) {
-                    const fn_ty: FunctionType* = fn_t as FunctionType*;
-                    method_ret = fn_ty.return_type;
-                    method_variadic = fn_ty.is_variadic;
-                }
-                // MethodInfo.param_types already excludes the receiver.  Default
-                // to ImmutRef receiver for virtual methods; if the method has
-                // a `mut &this` receiver we recover it from the AST node.
-                mut recv_kind: ReceiverKind = ReceiverKind::ImmutRef;
+                // The slot's function is this declaration and nothing else:
+                // an inherited base method the module has not declared yet
+                // is declared extern from its entry.  A lookup by the
+                // combined `Type::method` name would fill the slot with
+                // whichever overload registered first - right only when that
+                // is the slot's own.
+                mut slot_entry: OverloadId = OverloadId::invalid();
                 if (m.ast_node != null) {
-                    const mn: MethodNode* = m.ast_node as MethodNode*;
-                    if (mn != null && mn.func != null) {
-                        recv_kind = DeclarationIndex::method_receiver_kind(mn.func, mn.is_static, intern);
-                    }
+                    const smn: MethodNode* = m.ast_node as MethodNode*;
+                    if (smn != null && smn.func != null) { slot_entry = smn.func.overload_entry; }
                 }
-                const computed: MangledName = MangledName::for_method(
-                    intern, arena, type_qname, slot_name, recv_kind,
-                    m.param_types, method_ret, method_variadic);
-                // The slot's function is this symbol and nothing else: an
-                // inherited base method the module has not declared yet is
-                // declared extern under it.  A lookup by the combined
-                // `Type::method` name would fill the slot with whichever
-                // overload registered first - right only when that is the
-                // slot's own.
-                return this.resolver.resolve_pinned(CalleePin::Symbol(computed.value));
+                return this.resolver.resolve_pinned(CalleePin::Decl(slot_entry));
             }
             if (!walk.has_base || !walk.base_class.is_valid()) { break; }
             const base_t: Type* = arena.lookup(walk.base_class.id);
@@ -941,6 +905,13 @@ type struct DeclarationEmitter {
         global.set_linkage(LLinkage::External);
     }
 
+    /// The LLVM symbol of a method's declaration: its registered entry's.
+    /// Empty for a method the index never registered, which is then not
+    /// emitted.
+    method_symbol(&this, node: MethodNode*) -> SymbolStr {
+        return this.ctx.decl_index.entry_symbol(node.func.overload_entry);
+    }
+
     /// Declare a method.  Methods get a `this` pointer as the first parameter.
     declare_method(mut &this, node: MethodNode*, target_type: SymbolStr) -> void {
         const func: FunctionDeclNode* = node.func;
@@ -960,46 +931,21 @@ type struct DeclarationEmitter {
         }
 
         const intern: InternTable* = this.get_intern();
-        const type_str: string = intern.resolve(target_type);
-        const method_str: string = intern.resolve(func.name);
 
-        // Build the combined DI key.  Always compute the mangled name fresh
-        // from THIS overload's parameter types; the DI cache `lookup_mangled_name`
-        // only stores ONE entry per combined key, so for overloaded methods
-        // (e.g., every `visit(SomeNode*)` in BaseASTVisitor) using the cached
-        // name would map every overload to the first one's mangled name,
-        // collide at LLVM level, and leave all but the first-declared overload
-        // as unnamed declares without bodies.
-        const combined: string = fmt::format("%s::%s", type_str, method_str);
-        const combined_sym: SymbolStr = intern.intern(combined);
+        // The symbol is the registered entry's: registration computed it
+        // once from this node, and every caller's pin names the same entry.
         const ctx_ptr: CompilationContext* = this.ctx;
         const di: DeclarationIndex* = ctx_ptr.decl_index;
         const arena: TypeArena* = this.get_arena();
-        const type_qname: QualifiedName = QualifiedName::from_symbol(target_type);
-        const recv_kind: ReceiverKind = DeclarationIndex::method_receiver_kind(func, node.is_static, intern);
-        const method_param_refs: TypeRef[] = DeclarationIndex::method_non_receiver_params(func, intern);
-        const computed_base: MangledName = MangledName::for_method_or_trait_impl(
-            intern, arena, type_qname, func.origin_trait, func.name, recv_kind,
-            method_param_refs, func.resolved_return_type, func.is_variadic);
-        // Fold in the generic-method spec's type args (`$MG...`) so two specs of one
-        // method whose signature doesn't depend on the method param get distinct
-        // symbols.  Empty for every non-spec method -> byte-unchanged.  Must mirror
-        // the mono pin (call_specializer `mangled_symbol_for_spec_method`) exactly.
-        const computed: MangledName = computed_base.with_method_spec_args(
-            intern, arena, func.spec_type_args);
-        const mangled_sym: SymbolStr = computed.value;
-        // Cache into DI only if this is the first overload; preserves the
-        // existing single-slot behavior for call sites that don't disambiguate.
-        if (!di.lookup_mangled_name(combined_sym).is_valid()) {
-            di.register_mangled_name(combined_sym, mangled_sym);
-        }
+        const mangled_sym: SymbolStr = this.method_symbol(node);
+        if (!mangled_sym.is_valid()) { return; }
         // `![symbol("sym")]` overrides the LLVM symbol name ONLY (the C++ binding
         // generator uses it to pin a non-virtual C++ method to its mangled
         // Itanium symbol, e.g. `_ZNK5Point3sumEv`).  Cryo call sites resolve the
         // method through the `this.functions` registry below (keyed on
-        // `combined_sym`/`mangled_sym`, both still pointing at this fn_val), so
-        // the override is invisible to callers - it just renames the linked
-        // symbol, exactly like the extern-block path in `declare_extern_block`.
+        // `mangled_sym`, pointing at this fn_val), so the override is invisible
+        // to callers - it just renames the linked symbol, exactly like the
+        // extern-block path in `declare_extern_block`.
         mut fn_name: string = intern.resolve(mangled_sym);
         if (func.has_link_name) { fn_name = func.link_name; }
 
@@ -1731,8 +1677,7 @@ type struct DeclarationEmitter {
     /// emitting the asm (inline asm is not a terminator; the asm performs the
     /// real control transfer).
     codegen_naked_prologue(mut &this, node: FunctionDeclNode*) -> LValue {
-        const fn_val: LValue = this.functions.get(
-            this.free_function_symbol(node, this.free_function_type(node)));
+        const fn_val: LValue = this.functions.get(this.free_function_symbol(node));
         if (!fn_val.is_valid()) {
             const fname: string = this.resolve(node.name);
             this.diag.emit_warning_at_span(ErrorCode::E0606_FUNCTION_GENERATION_ERROR,
@@ -1752,7 +1697,7 @@ type struct DeclarationEmitter {
 
         // The body attaches to the function `declare_function` made for THIS
         // signature, held under the symbol both derive the same way.
-        const mangled_sym: SymbolStr = this.free_function_symbol(node, this.free_function_type(node));
+        const mangled_sym: SymbolStr = this.free_function_symbol(node);
         const fn_val: LValue = this.functions.get(mangled_sym);
         if (!fn_val.is_valid()) {
             // IRGeneration's declare-functions phase should have produced a
@@ -1897,8 +1842,8 @@ type struct DeclarationEmitter {
 
     /// Emit `std::env::set_args(argc, argv)` at the entry of the program's
     /// main function.  Looks the function up by qualified name so the
-    /// mangled symbol is whatever `MangledName::for_free_function` decides
-    /// No hardcoded mangle.  Silent no-op if the stdlib (or `set_args`
+    /// symbol is whatever its registered entry carries - no hardcoded
+    /// mangle.  Silent no-op if the stdlib (or `set_args`
     /// specifically) isn't available, which keeps `--no-std` builds and
     /// freestanding mains compiling.
     emit_set_args_call(mut &this, main_fn: LValue) -> void {
@@ -2119,25 +2064,9 @@ type struct DeclarationEmitter {
         const type_str: string = intern.resolve(target_type);
         const method_str: string = intern.resolve(func.name);
 
-        // Recompute the mangled name from THIS overload's parameter types so
-        // overloaded methods (e.g., BaseASTVisitor's 62 `visit(...)` overrides)
-        // resolve to their own LLVM function rather than all mapping to the
-        // first-declared overload via the ambiguous combined key.  Must mirror
-        // the computation in `declare_method` exactly.
-        const arena: TypeArena* = this.get_arena();
-        const type_qname: QualifiedName = QualifiedName::from_symbol(target_type);
-        const recv_kind: ReceiverKind = DeclarationIndex::method_receiver_kind(func, node.is_static, intern);
-        const method_param_refs: TypeRef[] = DeclarationIndex::method_non_receiver_params(func, intern);
-        const computed_base: MangledName = MangledName::for_method_or_trait_impl(
-            intern, arena, type_qname, func.origin_trait, func.name, recv_kind,
-            method_param_refs, func.resolved_return_type, func.is_variadic);
-        // Mirror declare_method's `$MG...` spec-args disambiguator exactly.
-        const computed: MangledName = computed_base.with_method_spec_args(
-            intern, arena, func.spec_type_args);
-        const mangled_sym: SymbolStr = computed.value;
-
-        // The body attaches to the function `declare_method` held under this
-        // symbol; the combined `Type::method` form names every overload.
+        // The body attaches to the function `declare_method` made, held
+        // under the entry's symbol - the one place both read it from.
+        const mangled_sym: SymbolStr = this.method_symbol(node);
         const fn_val: LValue = this.functions.get(mangled_sym);
         if (!fn_val.is_valid()) {
             // declare_method should have produced an LLVM declare for this

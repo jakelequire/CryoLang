@@ -37,7 +37,7 @@ import compiler::types::{
 };
 import compiler::resolver::{ intern_table, symbol_str, resolver };
 import compiler::resolver::res;
-import compiler::resolver::res::{ Res, ResSlot };
+import compiler::resolver::res::{ OverloadId, Res, ResSlot };
 import std::core::mem;
 import utils::logger;
 import utils::logger::{ cdebug, LOG_DEBUG, LogComponent };
@@ -1576,8 +1576,10 @@ type struct TypeResolutionPasses {
                     // Under the declaration's own key, in the per-module list
                     // so cross-module descriptors carry it whole.
                     const q_name: SymbolStr = ctx.decl_fn_key(func.name, func.span.file);
-                    ctx.decl_index.register_function_type_with_module(
-                        q_name, func.resolved_return_type, func_type_ref, module_sym, ctx.intern_table, arena);
+                    const entry: OverloadId = ctx.decl_index.register_function_type_with_module(
+                        q_name, func.resolved_return_type, func_type_ref, module_sym, ctx.intern_table, arena,
+                        SymbolStr::empty());
+                    func.set_overload_entry(entry);
 
                     ctx.decl_index.set_decl_visibility(q_name, func.is_public);
                     // A monomorphized clone's identifier is program-unique -
@@ -1591,14 +1593,8 @@ type struct TypeResolutionPasses {
                     // index refuses non-intrinsic overwrites of them.
                     if (!is_source_decl && !q_name.equals(func.name)) {
                         ctx.decl_index.register_function(func.name, func.resolved_return_type);
-                        ctx.decl_index.register_function_type_owned(
-                            func.name, func_type_ref, q_name);
-                        const q_mangled: SymbolStr = ctx.decl_index.lookup_mangled_name(q_name);
-                        if (q_mangled.is_valid()) {
-                            ctx.decl_index.register_mangled_name(func.name, q_mangled);
-                            ctx.decl_index.register_overload_mangled_owned(
-                                func.name, func_type_ref, q_name, q_mangled);
-                        }
+                        ctx.decl_index.register_signature(
+                            func.name, func_type_ref, q_name, ctx.decl_index.entry_symbol(entry), SymbolStr::empty());
                     }
                 }
             }
@@ -3185,12 +3181,9 @@ type struct TypeResolutionPasses {
                             // as well as the key's slot: codegen resolves a
                             // pinned declaration through the entry registered
                             // under it, an extern's as any other function's.
-                            ctx.decl_index.register_function_with_module(
-                                ext_q_name, fn_node.resolved_return_type, ext_mod_sym);
-                            ctx.decl_index.register_function_type(ext_q_name, func_type_ref);
-                            ctx.decl_index.register_mangled_name(ext_q_name, ext_link_sym);
-                            ctx.decl_index.register_overload_mangled(
-                                ext_q_name, func_type_ref, ext_link_sym);
+                            fn_node.set_overload_entry(ctx.decl_index.register_function_type_with_module(
+                                ext_q_name, fn_node.resolved_return_type, func_type_ref, ext_mod_sym,
+                                ctx.intern_table, arena, ext_link_sym));
                             ctx.decl_index.note_extern_symbol(ext_link_sym, ext_q_name, func_type_ref);
 
                             // For CImport blocks, also register under alias::name
@@ -3199,14 +3192,11 @@ type struct TypeResolutionPasses {
                                 const fn_str: string = ctx.intern_table.resolve(fn_node.name);
                                 const qualified: string = alias_str + "::" + fn_str;
                                 const q_sym: SymbolStr = ctx.intern_table.intern(qualified);
-                                ctx.decl_index.register_function_with_module(
-                                    q_sym, fn_node.resolved_return_type, ext_mod_sym);
-                                ctx.decl_index.register_function_type(q_sym, func_type_ref);
                                 // CImport qualified name maps to the bare C name (or
                                 // the `![symbol]` override).
-                                ctx.decl_index.register_mangled_name(q_sym, ext_link_sym);
-                                ctx.decl_index.register_overload_mangled(
-                                    q_sym, func_type_ref, ext_link_sym);
+                                ctx.decl_index.register_function_type_with_module(
+                                    q_sym, fn_node.resolved_return_type, func_type_ref, ext_mod_sym,
+                                    ctx.intern_table, arena, ext_link_sym);
                             }
                         }
                     }
@@ -3249,19 +3239,11 @@ type struct TypeResolutionPasses {
                         // so cross-module externs pick up intrinsics.
                         const i_mod_sym: SymbolStr = ctx.intern(ctx.source_file);
                         const q_name: SymbolStr = ctx.decl_fn_key(node.name, node.span.file);
-                        ctx.decl_index.register_function_type_with_module(
-                            q_name, node.resolved_return_type, i_func_type_ref, i_mod_sym, ctx.intern_table, arena);
-
                         // Intrinsics use C linkage; their LLVM symbol is the
                         // bare function name, not the qualified/mangled form.
-                        const bare_name_str: string = ctx.intern_table.resolve(node.name);
-                        const bare_mangled: SymbolStr = ctx.intern_table.intern(bare_name_str);
-                        ctx.decl_index.register_mangled_name(q_name, bare_mangled);
-                        // register_function_type_with_module registered the
-                        // overload-mangled to a C$ form; intrinsics use the
-                        // bare C name instead, so re-pin per overload.
-                        ctx.decl_index.register_overload_mangled(
-                            q_name, i_func_type_ref, bare_mangled);
+                        ctx.decl_index.register_function_type_with_module(
+                            q_name, node.resolved_return_type, i_func_type_ref, i_mod_sym, ctx.intern_table, arena,
+                            node.name);
 
                         // The leaf is recorded as an intrinsic's - codegen's
                         // inline decision reads it - and is a key nowhere: a

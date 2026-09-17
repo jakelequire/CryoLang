@@ -37,7 +37,8 @@ import compiler::decl_index;
 import compiler::decl_index::{ DeclarationIndex };
 import compiler::types;
 import compiler::types::{ arena, compound, generic, type_base, type_ref, TypeKind };
-import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
+import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name, res };
+import compiler::resolver::res::{ OverloadId };
 import std::fmt;
 import compiler::codegen::abi::{ AbiAttr, AbiClassifier, ArgClass, ParamPlan, SignaturePlan };
 import compiler::codegen::llvm_types::{ LModule, LType, LValue };
@@ -113,16 +114,6 @@ type struct SymbolResolver {
 
     // Cross-module extern declaration
 
-    /// The LLVM symbol of signature `ft` of family `name`: the entry's own
-    /// registered symbol.  Every registration writes one - a Cryo function's
-    /// mangling, an `extern "C"` function's C name, a `![symbol]` link name -
-    /// so an entry without one is unregistered, and a mangling minted here
-    /// would name a free function's symbol for a method's signature.
-    family_symbol(&this, name: SymbolStr, ft: TypeRef) -> SymbolStr {
-        const di: DeclarationIndex* = this.ctx.decl_index;
-        return di.lookup_overload_mangled(name, ft);
-    }
-
     /// Declare the cross-module extern `symbol` at `func_type_ref`'s
     /// signature and register it under that symbol.  An LLVM function already
     /// so named is reused.  Null when the signature cannot be lowered.
@@ -187,30 +178,17 @@ type struct SymbolResolver {
         return this.llvm_module.get_named_function(this.ctx.intern_table.resolve(sym));
     }
 
-    /// A function by SYMBOL.  Held by this module, else declared extern from
-    /// the index entry registered under that symbol: the entry gives the
-    /// signature and the symbol stays the caller's - re-deriving it from the
-    /// entry's (name, type) would hand back whichever entry of that type
-    /// registered first, and `Display::fmt<W>` and `Debug::fmt<W>` on one
-    /// receiver share a type and differ only in the symbol.  Several entries
-    /// can share one symbol (a trait-impl method under its qualified and its
-    /// bare combined name); the first whose signature lowers is declared.
-    /// Null for a symbol neither this module nor the index knows.
-    resolve_symbol(mut &this, sym: SymbolStr) -> LValue {
-        mut v: LValue = this.held_symbol(sym);
-        if (v.is_valid()) { return v; }
+    /// A function by DECLARATION.  The entry gives both the symbol and the
+    /// signature: held by this module under that symbol, else declared
+    /// extern at that signature.  Null for an invalid id or a signature
+    /// that does not lower.
+    resolve_decl(mut &this, id: OverloadId) -> LValue {
         const di: DeclarationIndex* = this.ctx.decl_index;
-        match (di.mangled_to_overload_pos.get_ref(&sym.id)) {
-            Option::Some(positions) => {
-                for (mut k: i64 = 0; k < (*positions).length; k++) {
-                    const pos: u32 = (*positions)[k];
-                    v = this.declare_extern_function_as(di.overload_func_types[pos as i64], sym);
-                    if (v.is_valid()) { return v; }
-                }
-            }
-            Option::None => { }
-        }
-        return LValue::null();
+        const sym: SymbolStr = di.entry_symbol(id);
+        if (!sym.is_valid()) { return LValue::null(); }
+        const v: LValue = this.held_symbol(sym);
+        if (v.is_valid()) { return v; }
+        return this.declare_extern_function_as(di.entry_signature(id), sym);
     }
 
     /// A function by its FAMILY name - the canonical name every signature of
@@ -246,22 +224,23 @@ type struct SymbolResolver {
     family_answer(&this, name: SymbolStr, arity: i64, out_ft: TypeRef*, out_plural: boolean*) -> SymbolStr {
         const di: DeclarationIndex* = this.ctx.decl_index;
         const arena: TypeArena* = this.ctx.type_arena;
-        const overloads: TypeRef[] = di.lookup_func_type_overloads(name);
+        const entries: OverloadId[] = di.lookup_family_entries(name);
         mut sym: SymbolStr = SymbolStr::empty();
-        for (mut i: i64 = 0; i < overloads.length; i++) {
-            const t: Type* = arena.lookup(overloads[i].id);
+        for (mut i: i64 = 0; i < entries.length; i++) {
+            const ft: TypeRef = di.entry_signature(entries[i]);
+            const t: Type* = arena.lookup(ft.id);
             if (t == null || t.kind != TypeKind::Function) { continue; }
             const f: FunctionType* = t as FunctionType*;
             if (arity >= 0 && f.param_types.length != arity) { continue; }
             if (SymbolResolver::function_type_has_generic_params(arena, f)) { continue; }
-            const s: SymbolStr = this.family_symbol(name, overloads[i]);
+            const s: SymbolStr = di.entry_symbol(entries[i]);
             if (!s.is_valid()) { continue; }
             if (sym.is_valid() && !s.equals(sym)) {
                 *out_plural = true;
                 return SymbolStr::empty();
             }
             sym = s;
-            *out_ft = overloads[i];
+            *out_ft = ft;
         }
         return sym;
     }
@@ -272,12 +251,12 @@ type struct SymbolResolver {
         return this.resolve_family(name, -1);
     }
 
-    /// The signature of a pinned callee: a symbol's registered entry, a
+    /// The signature of a pinned callee: the declaration's entry, a
     /// family's one signature; invalid for an unpinned callee or a family
     /// naming several.
     pinned_signature(&this, pin: CalleePin) -> TypeRef {
         match (pin) {
-            CalleePin::Symbol(s) => { return this.ctx.decl_index.symbol_signature(s); }
+            CalleePin::Decl(e) => { return this.ctx.decl_index.entry_signature(e); }
             CalleePin::Family(f) => {
                 mut ft: TypeRef = TypeRef::invalid();
                 mut plural: boolean = false;
@@ -290,13 +269,13 @@ type struct SymbolResolver {
         return TypeRef::invalid();
     }
 
-    /// A pinned callee, by the kind of name the pin says it is: a symbol
-    /// resolves as a symbol, a family name through the family, which must
-    /// name one symbol.  One question each; a pin of the one kind is never
-    /// asked as the other.
+    /// A pinned callee, by the kind of answer the pin says it is: a
+    /// declaration resolves through its entry, a family name through the
+    /// family, which must name one symbol.  One question each; a pin of the
+    /// one kind is never asked as the other.
     resolve_pinned(mut &this, pin: CalleePin) -> LValue {
         return match (pin) {
-            CalleePin::Symbol(s) => { this.resolve_symbol(s) }
+            CalleePin::Decl(e)   => { this.resolve_decl(e) }
             CalleePin::Family(f) => { this.resolve_family(f, -1) }
             _                    => { LValue::null() }
         };

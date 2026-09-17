@@ -63,7 +63,7 @@ import compiler::mono::trait_specializer::{ MonoTraitSpecializer };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
-import compiler::resolver::res::{ Res, ResBase, ResSlot };
+import compiler::resolver::res::{ OverloadId, Res, ResBase, ResSlot };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{
@@ -1070,14 +1070,12 @@ type struct MonoCallSpecializer {
             spec_method, pin_target);
         if (this.state.method_spec_seen(spec_sym)) {
             call.set_resolved_method(spec_method as ASTNode*);
-            // Pin the precise symbol, exactly as the first materialization does
-            // below.  This is unconditional because the unmangled `Type::method`
-            // key codegen falls back to is the SAME for every instantiation of one
-            // method on one owner, so any unpinned call resolves to whichever spec
-            // happened to be emitted first.
-            if (spec_sym.is_valid()) {
-                call.set_resolved_callee(CalleePin::Symbol(spec_sym));
-            }
+            // Pin the materialized spec's entry, exactly as the first
+            // materialization does below.  This is unconditional because the
+            // unmangled `Type::method` key codegen falls back to is the SAME for
+            // every instantiation of one method on one owner, so any unpinned
+            // call resolves to whichever spec happened to be emitted first.
+            this.pin_spec_entry(call, this.state.method_spec_entry(spec_sym), spec_sym.is_valid());
             return;
         }
         this.state.mark_method_spec(spec_sym);
@@ -1127,25 +1125,19 @@ type struct MonoCallSpecializer {
         // diverge from the emitted definition symbol).
         if (inherent_owner_ast != null) {
             this.register_spec_method_in_di_inherent(spec_method, recv_type, inherent_owner_ast);
-            if (spec_sym.is_valid()) {
-                call.set_resolved_callee(CalleePin::Symbol(spec_sym));
-            }
         } else {
             this.register_spec_method_in_di(spec_method, recv_type, impl_node);
-            // Pin the precise mangle for EVERY generic-method spec, trait-impl
-            // included.  Codegen's fallback key is the unmangled `Type::method`,
-            // which cannot tell two instantiations of one method on one owner
-            // apart, so an unpinned call silently resolves to whichever spec was
-            // emitted first - `CGen<i32>::put<u64>` running the `put<u32>` body
-            // and returning its answer.  `spec_sym` is safe to pin because it is
-            // built by the same `for_method_or_trait_impl` path the definition is
-            // emitted under (same `origin_trait`, same `spec_type_args`), and it
-            // is the very key this pass records in `mark_method_spec`.  Pinning
-            // adds no symbol: it only names the one already being emitted.
-            if (spec_sym.is_valid()) {
-                call.set_resolved_callee(CalleePin::Symbol(spec_sym));
-            }
         }
+        // Pin the registered entry for EVERY generic-method spec, trait-impl
+        // included.  Codegen's fallback key is the unmangled `Type::method`,
+        // which cannot tell two instantiations of one method on one owner
+        // apart, so an unpinned call silently resolves to whichever spec was
+        // emitted first - `CGen<i32>::put<u64>` running the `put<u32>` body
+        // and returning its answer.  The entry is the one registration just
+        // wrote for this spec (its `$MG` disambiguator included), and the
+        // definition is emitted under the same entry's symbol.
+        this.state.set_method_spec_entry(spec_sym, spec_method.func.overload_entry);
+        this.pin_spec_entry(call, spec_method.func.overload_entry, spec_sym.is_valid());
 
         // Compile-time `static match` arm pruning on the freshly-minted spec body.
         // A method-level `static match (T)` (e.g. `string::parse_int<T>`) was cloned
@@ -1236,7 +1228,7 @@ type struct MonoCallSpecializer {
                     && !m.func.is_lazy_self_growing
                     && m.func.generic_params.length == 0) {
                 call.set_resolved_method(m as ASTNode*);
-                call.set_resolved_callee(CalleePin::Symbol(this.mangled_symbol_for_spec_method(m, pin_target)));
+                this.pin_spec_entry(call, m.func.overload_entry, pin_target.is_valid());
                 return true;
             }
         }
@@ -1247,8 +1239,8 @@ type struct MonoCallSpecializer {
         if (spec_method == null || spec_method.func == null) { return false; }
         impl_node.methods.push(spec_method);
         call.set_resolved_method(spec_method as ASTNode*);
-        call.set_resolved_callee(CalleePin::Symbol(this.mangled_symbol_for_spec_method(spec_method, pin_target)));
         this.register_spec_method_in_di(spec_method, recv_type, impl_node);
+        this.pin_spec_entry(call, spec_method.func.overload_entry, pin_target.is_valid());
         if (spec_method.func.body != null) {
             mut rw_ctx: ResolutionContext = ResolutionContext::new("");
             this.walk_block(spec_method.func.body, &rw_ctx, null);
@@ -1535,7 +1527,7 @@ type struct MonoCallSpecializer {
         const spec_sym: SymbolStr = this.mangled_symbol_for_spec_method(spec_method, pin_target);
         if (this.state.method_spec_seen(spec_sym)) {
             call.set_resolved_method(spec_method as ASTNode*);
-            if (spec_sym.is_valid()) { call.set_resolved_callee(CalleePin::Symbol(spec_sym)); }
+            this.pin_spec_entry(call, this.state.method_spec_entry(spec_sym), spec_sym.is_valid());
             return true;
         }
         this.state.mark_method_spec(spec_sym);
@@ -1553,7 +1545,8 @@ type struct MonoCallSpecializer {
         }
         call.set_resolved_method(spec_method as ASTNode*);
         this.register_spec_method_in_di_inherent(spec_method, recv_type, owner_ast);
-        if (spec_sym.is_valid()) { call.set_resolved_callee(CalleePin::Symbol(spec_sym)); }
+        this.state.set_method_spec_entry(spec_sym, spec_method.func.overload_entry);
+        this.pin_spec_entry(call, spec_method.func.overload_entry, spec_sym.is_valid());
 
         // Re-walk the body for its own generic calls with the owner param bound
         // (`A` -> concrete) so nested owner-typed calls (`Wrap::base(item)`)
@@ -2315,9 +2308,20 @@ type struct MonoCallSpecializer {
             this.intern_table, this.arena);
     }
 
+    /// Pin `call` to the materialized spec's registered entry.  A spec on a
+    /// receiver with no registry key (`keyed` false: the instantiation is
+    /// not materialized when the call is specialized) is left unpinned:
+    /// its registration went under the template's own key, which names a
+    /// definition nothing emits, and the call binds through the method node
+    /// once the receiver exists.
+    pin_spec_entry(mut &this, call: CallExprNode*, entry: OverloadId, keyed: boolean) -> void {
+        if (!keyed || !entry.is_valid()) { return; }
+        call.set_resolved_callee(CalleePin::Decl(entry));
+    }
+
     /// Compute the exact LLVM-mangled symbol a spec'd method will be emitted under,
-    /// so the call can pin `resolved_callee` straight to it (disambiguates
-    /// same-receiver/different-method-generic specs that share a fallback key).
+    /// which is the key its materialization is recorded under
+    /// (`mark_method_spec`), so a second request for the same spec reuses it.
     mangled_symbol_for_spec_method(mut &this, spec_method: MethodNode*,
                                    qualified_target: SymbolStr) -> SymbolStr {
         if (spec_method == null || spec_method.func == null) { return SymbolStr::empty(); }

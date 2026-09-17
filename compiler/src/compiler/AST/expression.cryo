@@ -18,7 +18,7 @@ import compiler::types::type_ref::{ TypeRef };
 import compiler::resolver::symbol_str;
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, Res, ResBase, ResSlot };
+import compiler::resolver::res::{ DefId, OverloadId, Res, ResBase, ResSlot };
 import compiler::ast::declaration;
 import compiler::ast::declaration::{ VarDeclNode };
 import compiler::ast::pattern;
@@ -29,20 +29,24 @@ import compiler::ast::visitor;
 import compiler::ast::visitor::{ ASTVisitor };
 
 /// What a call's callee is pinned to once sema or the monomorphizer has
-/// decided it, and by WHICH name - the two are different keys into
-/// different tables, and a pin that did not say which left codegen to try
-/// one and then the other.
+/// decided it, and by WHICH kind of answer - the two are different keys
+/// into different tables, and a pin that did not say which left codegen
+/// to try one and then the other.
 ///
-/// `Symbol` is the linker symbol itself: a mangled method or function
-/// symbol, a `![symbol]` link name, a C function's name.  It resolves as a
-/// symbol and nothing else.  `Family` is a canonical name the declaration
-/// index registers signatures under - a module-qualified free function, a
-/// specialization's registered identifier, `Owner::method` on a
-/// specialization - written by a stage that has the name before the symbol
-/// exists; it resolves through the family, which must name ONE symbol.
+/// `Decl` is the declaration itself: one entry of the declaration index's
+/// function registry, which carries the linker symbol and the signature.
+/// It is what a stage that selected a signature pins - sema's overload
+/// selection, the monomorphizer's materialized specialization - and it is
+/// read through the index, never re-derived from a name: a symbol is not
+/// a declaration (two entries can share one), and a key is not one either.
+/// `Family` is a canonical name the index registers signatures under - a
+/// module-qualified free function, a specialization's registered
+/// identifier, `Owner::method` on a specialization - written by a stage
+/// that has the name before the entry exists; it resolves through the
+/// family, which must name ONE symbol.
 type enum CalleePin {
     None;
-    Symbol(SymbolStr);
+    Decl(OverloadId);
     Family(SymbolStr);
 }
 
@@ -55,11 +59,10 @@ implement enum CalleePin {
         };
     }
 
-    /// The pinned name, whichever kind it is - for a reader that compares a
-    /// pin to a name it holds, or reports it.  Empty for `None`.
-    name(&this) -> SymbolStr {
+    /// The pinned family name; empty for a `Decl` pin, whose name is the
+    /// index's to answer, and for `None`.
+    family_name(&this) -> SymbolStr {
         return match (&this) {
-            CalleePin::Symbol(s) => { s }
             CalleePin::Family(f) => { f }
             _                    => { SymbolStr::empty() }
         };

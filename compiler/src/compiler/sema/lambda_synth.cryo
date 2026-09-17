@@ -20,7 +20,7 @@ namespace compiler::sema::lambda_synth;
 import compiler::types::{
     type_ref, type_base, arena, compound, user_defined, ownership, resolver, generic_registry, TypeKind
 };
-import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name };
+import compiler::resolver::{ symbol_str, intern_table };
 import compiler::ast;
 import compiler::ast::{
     cloner, declaration, expression, node, NodeKind, statement, TypeAnnotation, Visibility,
@@ -50,10 +50,8 @@ import compiler::ast::visitor::{ ASTVisitor };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
-import compiler::resolver::mangled_name::{ MangledName };
-import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
-import compiler::resolver::res::{ Res, ResSlot };
+import compiler::resolver::res::{ OverloadId, Res, ResSlot };
 import compiler::sema::dispatch::{ SemaDispatch };
 import compiler::sema::scope_manager::{ ScopeManager };
 import compiler::sema::state::{ SemaState };
@@ -596,7 +594,7 @@ type struct LambdaSynth {
         }
         match (this.state.closure_spec_map.get(&key)) {
             Option::Some(prior) => {
-                call.set_resolved_callee(CalleePin::Symbol(SymbolStr::from_id(prior)));
+                call.set_resolved_callee(CalleePin::Decl(prior));
                 return;
             }
             Option::None => { /* fall through */ }
@@ -639,17 +637,22 @@ type struct LambdaSynth {
             this.ctx.artifacts.ast.root.add_statement(spec_func as ASTNode*);
         }
 
+        // The specialization is a declaration like any other: registered
+        // under its key, which computes its symbol and stamps the node, so
+        // the definition, this pin and any later caller read one entry.
         const qualified_spec: SymbolStr = this.ctx.decl_fn_key(spec_name, orig_func.span.file);
         mut spec_param_types: TypeRef[] = [];
         for (mut i: i64 = 0; i < spec_func.parameters.length; i++) {
             spec_param_types.push(spec_func.parameters[i].resolved_type);
         }
-        const mangled: MangledName = MangledName::for_free_function(
-            this.intern, this.arena,
-            QualifiedName::from_symbol(qualified_spec),
-            spec_param_types, spec_func.resolved_return_type, false);
-        call.set_resolved_callee(CalleePin::Symbol(mangled.value));
-        this.state.closure_spec_map.insert(key, mangled.value.id);
+        const spec_ft: TypeRef = this.arena.get_function(
+            spec_func.resolved_return_type, spec_param_types, false);
+        const entry: OverloadId = this.ctx.decl_index.register_function_type_with_module(
+            qualified_spec, spec_func.resolved_return_type, spec_ft,
+            this.intern.intern(this.ctx.source_file), this.intern, this.arena, SymbolStr::empty());
+        spec_func.set_overload_entry(entry);
+        call.set_resolved_callee(CalleePin::Decl(entry));
+        this.state.closure_spec_map.insert(key, entry);
     }
 
     /// The top-level function registered under canonical key `q`, or null.

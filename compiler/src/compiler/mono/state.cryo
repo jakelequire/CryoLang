@@ -23,7 +23,8 @@ import compiler::types::{
 };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
-import compiler::resolver::{ intern_table, symbol_str };
+import compiler::resolver::{ intern_table, symbol_str, res };
+import compiler::resolver::res::{ OverloadId };
 import std::collections::hashmap;
 import std::collections::hashmap::{ HashMap };
 import compiler::ast::node;
@@ -126,7 +127,7 @@ type struct MonoState {
     // which corrupts the owner spec's method set.  This set persists across the
     // batch (it is NOT cleared by `reset_worklist`): the spec, once emitted, is
     // shared by every module.
-    method_specs:     HashMap<string, boolean>;
+    method_specs:     HashMap<string, OverloadId>;
 
     // Arena ids of InstantiatedTypes that have a REGISTERED spec entry.
     //
@@ -169,7 +170,7 @@ type struct MonoState {
             spec_entries:     [],
             nested_visited:   [],
             error_count:      0,
-            method_specs:     HashMap<string, boolean>::new(),
+            method_specs:     HashMap<string, OverloadId>::new(),
             materialized_insts: HashMap<u64, boolean>::new(),
             spec_owner_modules: [],
         };
@@ -188,7 +189,26 @@ type struct MonoState {
     mark_method_spec(mut &this, mangled: SymbolStr) -> void {
         if (!mangled.is_valid()) { return; }
         const key: string = this.intern_table.resolve(mangled);
-        this.method_specs.insert(key, true);
+        this.method_specs.insert(key, OverloadId::invalid());
+    }
+
+    /// Record the index entry the materialized spec was registered under,
+    /// so a later call to the same spec pins the same declaration.
+    set_method_spec_entry(mut &this, mangled: SymbolStr, entry: OverloadId) -> void {
+        if (!mangled.is_valid()) { return; }
+        const key: string = this.intern_table.resolve(mangled);
+        this.method_specs.insert(key, entry);
+    }
+
+    /// The entry of the materialized spec with this mangled symbol; invalid
+    /// when none was materialized or registered.
+    method_spec_entry(&this, mangled: SymbolStr) -> OverloadId {
+        if (!mangled.is_valid()) { return OverloadId::invalid(); }
+        const key: string = this.intern_table.resolve(mangled);
+        return match (this.method_specs.get(&key)) {
+            Option::Some(e) => { e }
+            Option::None    => { OverloadId::invalid() }
+        };
     }
 
     /// True if a spec entry has been REGISTERED for this instantiation (see

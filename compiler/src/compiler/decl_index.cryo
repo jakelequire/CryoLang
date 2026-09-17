@@ -21,6 +21,7 @@ import compiler::types;
 import compiler::types::{ arena, compound, type_base, type_ref, TypeKind };
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
 import compiler::resolver::res;
+import compiler::resolver::res::{ OverloadId };
 import std::core::option;
 import std::core::option::{ Option };
 import std::collections::{ hashmap, pair };
@@ -156,10 +157,6 @@ type struct DeclarationIndex {
                                       // a Cryo definition asks the linker for a
                                       // symbol nobody emits (`errno`).
 
-    // Qualified function name -> mangled LLVM symbol name.
-    // Computed once at registration time so codegen never mangles.
-    mangled_names:       HashMap<u32, u32>;
-
     // Array element TypeRef.id -> concrete Array_<T> qualified name SymbolStr.id.
     // Populated by the specialization pass so codegen can resolve T[].method()
     // to the monomorphized Array_T struct without name reconstruction.
@@ -184,26 +181,31 @@ type struct DeclarationIndex {
     // to link against (a non-generic owner like `Str` needs no such help).
     generic_converter_methods: Pair<u32, u32>[];
 
-    // Function overload registry: parallel arrays keyed by function
-    // name (SymbolStr.id), storing every registered FunctionType TypeRef
-    // and its overload-specific mangled name.  `func_type_refs` and
-    // `mangled_names` above each keep only the last registration per
-    // name, which collapses overloads like `String::new()` and
-    // `String::new(u64)` to a single entry.  Cross-module extern
-    // declaration needs every overload's signature AND mangled name,
-    // so it walks these arrays instead.
-    overload_func_keys:    u32[];     // SymbolStr.id of function name
-    overload_func_types:   TypeRef[]; // FunctionType TypeRef for this overload
-    overload_func_mangled: u32[];     // SymbolStr.id of mangled LLVM name (0 = unset)
+    // Function registry: one entry per (key, signature, owner, symbol),
+    // in parallel arrays; an entry's position is its `OverloadId`.  The
+    // key is the family every signature of a declaration is registered
+    // under; `func_type_refs` above keeps only the last signature per key,
+    // which collapses overloads like `String::new()` and `String::new(u64)`.
+    // The symbol is part of the identity: two declarations can share a key
+    // and a signature and be two definitions (`Display::fmt` and
+    // `Debug::fmt` on one type, an inherent method beside a trait's, two
+    // specializations of a generic method whose signature does not mention
+    // its parameter), and a registration carrying a symbol the entry does
+    // not already hold appends rather than restamps.
+    overload_func_keys:    u32[];     // SymbolStr.id of the key
+    overload_func_types:   TypeRef[]; // FunctionType TypeRef of this entry
+    overload_func_mangled: u32[];     // SymbolStr.id of the linker symbol
     overload_func_owner:   u32[];     // SymbolStr.id of the owning declaration's
-                                      // QUALIFIED name (0 = legacy/global claim:
-                                      // extern "C" twins, combined-name and
-                                      // qualified-name registrations).  Lets two
-                                      // same-signature declarations from different
-                                      // modules coexist under one bare leaf
-                                      // (`intrinsics::free` vs `alloc::heap::free`)
-                                      // instead of being merged into a single
-                                      // last-writer-owned entry.
+                                      // QUALIFIED name, for an entry registered
+                                      // under a key that is not its own (a
+                                      // monomorphized clone under its identifier),
+                                      // else 0.
+    overload_func_trait:   u32[];     // SymbolStr.id of the trait a trait-impl
+                                      // method implements, else 0: an inherent
+                                      // method beside a trait's under one key
+                                      // and signature is told apart here, so a
+                                      // `Type::method` path can prefer the
+                                      // inherent one as Rust does.
 
     // Bare-name -> all qualified names ever registered for it.
     // Populated by `register_name_mapping`.
@@ -224,15 +226,6 @@ type struct DeclarationIndex {
     // is_function_in_module and the per-module registration de-dup.
     module_func_first:   HashMap<u32, u32>;
     module_func_pairs:   HashMap<u64, boolean>;
-    // Mangled LLVM name SymbolStr.id -> positions in the `overload_func_*`
-    // arrays (registration order).  Reverse of `overload_func_mangled`, so
-    // codegen's `resolve_symbol` finds an overload by its mangled symbol
-    // without scanning every registered overload in the program (~3% frontend
-    // self-time).  A multimap, not a single slot: a trait-impl method is
-    // registered under both its qualified and bare combined names, which emit
-    // the identical LLVM symbol but only one of which yields a valid extern at
-    // resolve time - the consumer must try each, like the original linear scan.
-    mangled_to_overload_pos: HashMap<u32, u32[]>;
 
     // Leaf-name SymbolStr.id of every `intrinsic function` declaration (the
     // compiler-lowered ones in `core::intrinsics`: memcpy, ptr_diff, panic,
@@ -320,18 +313,17 @@ type struct DeclarationIndex {
             module_global_modules:    [],
             module_global_namespaces: [],
             module_global_types:      [],
-            mangled_names:       HashMap<u32, u32>::new(),
             overload_func_keys:    [],
             overload_func_types:   [],
             overload_func_mangled: [],
             overload_func_owner:   [],
+            overload_func_trait:   [],
             bare_alts:      [],
             overload_index:     HashMap<u32, u32[]>::new(),
             extern_symbol_first: HashMap<u32, Pair<u32, u64>>::new(),
             bare_alts_index:    HashMap<u32, u32[]>::new(),
             module_func_first:  HashMap<u32, u32>::new(),
             module_func_pairs:  HashMap<u64, boolean>::new(),
-            mangled_to_overload_pos: HashMap<u32, u32[]>::new(),
             intrinsic_names:    HashMap<u32, u32>::new(),
             module_imports:     HashMap<u32, u32[]>::new(),
             prelude_ns:         [],
@@ -376,15 +368,6 @@ type struct DeclarationIndex {
             Pair<u32, u32>::new(type_id, method_id));
     }
 
-    /// Register a function's FunctionType TypeRef (full signature in the arena).
-    /// `func_type_refs` is a single-slot map (last wins); use the parallel
-    /// overload arrays below when every overload matters (cross-module
-    /// extern declaration).  Legacy entry point: the overload entry is owned
-    /// by nobody (owner 0 = global claim).
-    register_function_type(mut &this, name: SymbolStr, func_type_ref: TypeRef) -> void {
-        this.register_function_type_owned(name, func_type_ref, SymbolStr::empty());
-    }
-
     /// Drop every overload position previously registered for `name` so the
     /// next registration is its sole signature. Needed when a declaration's
     /// signature is rewritten mid-compile (an `async function` becomes a
@@ -396,30 +379,28 @@ type struct DeclarationIndex {
         this.overload_index.insert(name.id, empty);
     }
 
-    /// Owner-aware variant: `owner` is the declaring function's QUALIFIED
-    /// name, stamped on the overload entry so two same-signature declarations
-    /// from different modules keep separate entries (separate mangled slots).
-    /// De-dup is by (name, TypeRef, owner): re-registering the same
-    /// declaration is a no-op; a same-signature declaration from a DIFFERENT
-    /// owner appends its own entry instead of silently adopting (and later
-    /// re-mangling) the first claimant's.
-    register_function_type_owned(mut &this, name: SymbolStr, func_type_ref: TypeRef,
-                                 owner: SymbolStr) -> void {
+    /// Register one signature of a declaration: the entry under key `name`
+    /// with signature `func_type_ref`, owned by `owner` (its qualified name
+    /// when `name` is not that; else empty), emitted under the linker
+    /// `symbol`, implementing `trait_sym` (empty for anything but a
+    /// trait-impl method).  Registering the same four of key, signature,
+    /// owner and symbol again answers the existing entry; a different
+    /// symbol under the same key and signature is a different definition
+    /// and appends its own.  The id is the declaration's identity for every
+    /// later consumer: the registrar stamps it on the node, and a call pins
+    /// it.
+    register_signature(mut &this, name: SymbolStr, func_type_ref: TypeRef,
+                       owner: SymbolStr, symbol: SymbolStr, trait_sym: SymbolStr) -> OverloadId {
         this.func_type_refs.insert(name.id, func_type_ref);
-        // Also append to the overload list so cross-module extern
-        // declaration can enumerate every overload's signature -- scoped to
-        // this name's positions via the overload_index instead of scanning
-        // every overload in the program.
         match (this.overload_index.get_ref(&name.id)) {
             Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
+                for (mut k: i64 = 0; k < (*positions).length; k++) {
                     const pos: u32 = (*positions)[k];
                     if (this.overload_func_types[pos as i64].id == func_type_ref.id
-                        && this.overload_func_owner[pos as i64] == owner.id) {
-                        return;
+                            && this.overload_func_owner[pos as i64] == owner.id
+                            && this.overload_func_mangled[pos as i64] == symbol.id) {
+                        return OverloadId::at_position(pos);
                     }
-                    k = k + 1;
                 }
             }
             Option::None => { }
@@ -427,10 +408,60 @@ type struct DeclarationIndex {
         const new_pos: u32 = this.overload_func_keys.length as u32;
         this.overload_func_keys.push(name.id);
         this.overload_func_types.push(func_type_ref);
-        this.overload_func_mangled.push(0);
+        this.overload_func_mangled.push(symbol.id);
         this.overload_func_owner.push(owner.id);
+        this.overload_func_trait.push(trait_sym.id);
         const slot: u32[]* = this.overload_index.get_or_insert(name.id, []);
         (*slot).push(new_pos);
+        return OverloadId::at_position(new_pos);
+    }
+
+    /// The trait entry `id`'s declaration implements; empty for an inherent
+    /// method, a free function, or an invalid id.
+    entry_trait(&this, id: OverloadId) -> SymbolStr {
+        if (!id.is_valid()) { return SymbolStr::empty(); }
+        return SymbolStr::from_id(this.overload_func_trait[id.position() as i64]);
+    }
+
+    /// The linker symbol of entry `id`; empty for an invalid id.
+    entry_symbol(&this, id: OverloadId) -> SymbolStr {
+        if (!id.is_valid()) { return SymbolStr::empty(); }
+        return SymbolStr::from_id(this.overload_func_mangled[id.position() as i64]);
+    }
+
+    /// The signature of entry `id`; invalid for an invalid id.
+    entry_signature(&this, id: OverloadId) -> TypeRef {
+        if (!id.is_valid()) { return TypeRef::invalid(); }
+        return this.overload_func_types[id.position() as i64];
+    }
+
+    /// The key entry `id` is registered under.
+    entry_key(&this, id: OverloadId) -> SymbolStr {
+        if (!id.is_valid()) { return SymbolStr::empty(); }
+        return SymbolStr::from_id(this.overload_func_keys[id.position() as i64]);
+    }
+
+    /// Every entry registered under key `name`, in registration order.
+    lookup_family_entries(&this, name: SymbolStr) -> OverloadId[] {
+        mut result: OverloadId[] = [];
+        match (this.overload_index.get_ref(&name.id)) {
+            Option::Some(positions) => {
+                for (mut k: i64 = 0; k < (*positions).length; k++) {
+                    result.push(OverloadId::at_position((*positions)[k]));
+                }
+            }
+            Option::None => { }
+        }
+        return result;
+    }
+
+    /// The one entry under key `name`, when it has exactly one; invalid
+    /// when it has none or several.  For a synthesizer naming a declaration
+    /// it knows to carry one signature.
+    lookup_sole_entry(&this, name: SymbolStr) -> OverloadId {
+        const entries: OverloadId[] = this.lookup_family_entries(name);
+        if (entries.length != 1) { return OverloadId::invalid(); }
+        return entries[0];
     }
 
     /// Record the `intrinsic function` declared under the leaf `name`, by
@@ -454,72 +485,8 @@ type struct DeclarationIndex {
         };
     }
 
-    /// Associate an overload-specific mangled LLVM name with a registered
-    /// (name, func_type_ref) pair.  Cross-module extern declaration uses
-    /// this to emit the right LLVM symbol per overload instead of the
-    /// single mangled name stored in `mangled_names`.
-    register_overload_mangled(mut &this, name: SymbolStr, func_type_ref: TypeRef,
-                               mangled: SymbolStr) -> void {
-        // Legacy (owner-blind) entry point: matches the first entry with this
-        // signature.  Owner-aware callers use `register_overload_mangled_owned`
-        // so a same-signature entry from a different declaration is never
-        // restamped.
-        match (this.overload_index.get_ref(&name.id)) {
-            Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    const pos: u32 = (*positions)[k];
-                    if (this.overload_func_types[pos as i64].id == func_type_ref.id) {
-                        const prev: u32 = this.overload_func_mangled[pos as i64];
-                        this.overload_func_mangled[pos as i64] = mangled.id;
-                        // Record the reverse mapping only when this position
-                        // newly takes this mangled id, so repeated registration
-                        // of the same (pos, mangled) pair never duplicates the
-                        // bucket entry.
-                        if (prev != mangled.id) {
-                            const slot: u32[]* = this.mangled_to_overload_pos.get_or_insert(mangled.id, []);
-                            (*slot).push(pos);
-                        }
-                        return;
-                    }
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
-        }
-    }
-
-    /// Owner-aware variant of `register_overload_mangled`: stamps the entry
-    /// matching (name, signature, owner) exactly, so two same-signature
-    /// declarations under one bare leaf each keep their own mangled symbol.
-    register_overload_mangled_owned(mut &this, name: SymbolStr, func_type_ref: TypeRef,
-                                    owner: SymbolStr, mangled: SymbolStr) -> void {
-        match (this.overload_index.get_ref(&name.id)) {
-            Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    const pos: u32 = (*positions)[k];
-                    if (this.overload_func_types[pos as i64].id == func_type_ref.id
-                        && this.overload_func_owner[pos as i64] == owner.id) {
-                        const prev: u32 = this.overload_func_mangled[pos as i64];
-                        this.overload_func_mangled[pos as i64] = mangled.id;
-                        if (prev != mangled.id) {
-                            const slot: u32[]* = this.mangled_to_overload_pos.get_or_insert(mangled.id, []);
-                            (*slot).push(pos);
-                        }
-                        return;
-                    }
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
-        }
-    }
-
-    /// Return every (FunctionType, mangled-name) pair registered under
-    /// the given name.  Parallel arrays: `types[i]` goes with `mangled[i]`.
-    /// A mangled SymbolStr.id of 0 means no overload-specific mangled name
-    /// was registered; callers should fall back to `lookup_mangled_name`.
+    /// The signature of every entry under `name`, in registration order
+    /// (`lookup_family_entries` gives the entries themselves).
     lookup_func_type_overloads(&this, name: SymbolStr) -> TypeRef[] {
         mut result: TypeRef[] = [];
         match (this.overload_index.get_ref(&name.id)) {
@@ -535,10 +502,6 @@ type struct DeclarationIndex {
         return result;
     }
 
-    /// The signature registered under the linker symbol `sym`, or invalid
-    /// when the index holds no entry under it.  Several entries can share
-    /// one symbol (a trait-impl method under its qualified and its combined
-    /// name); they share the signature, so the first answers.
     /// Record an `extern "C"` block's declaration `key` of the C symbol
     /// `sym` with signature `func_type_ref`.  The first declaration of a
     /// symbol is what a later one is compared against; a second record is
@@ -563,60 +526,6 @@ type struct DeclarationIndex {
             Option::None => { }
         }
         return SymbolStr::empty();
-    }
-
-    symbol_signature(&this, sym: SymbolStr) -> TypeRef {
-        match (this.mangled_to_overload_pos.get_ref(&sym.id)) {
-            Option::Some(positions) => {
-                if ((*positions).length > 0) {
-                    return this.overload_func_types[(*positions)[0] as i64];
-                }
-            }
-            Option::None => { }
-        }
-        return TypeRef::invalid();
-    }
-
-    lookup_overload_mangled(&this, name: SymbolStr, func_type_ref: TypeRef) -> SymbolStr {
-        // Signature match; scans past unmangled entries so a same-signature
-        // pair (possible under a bare leaf since entries became per-owner)
-        // still yields the entry that actually carries a symbol.
-        match (this.overload_index.get_ref(&name.id)) {
-            Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    const pos: u32 = (*positions)[k];
-                    if (this.overload_func_types[pos as i64].id == func_type_ref.id) {
-                        const mid: u32 = this.overload_func_mangled[pos as i64];
-                        if (mid != 0) {
-                            return SymbolStr::from_id(mid);
-                        }
-                    }
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
-        }
-        return SymbolStr::empty();
-    }
-
-    /// The FunctionType of the overload entry that carries this mangled LLVM
-    /// symbol, or invalid.  The pinned `resolved_callee` is ground truth for
-    /// a call's signature: name-based return lookups (`func_returns` bare
-    /// slots) are single-slot and can legitimately belong to a DIFFERENT
-    /// same-leaf declaration (an intrinsic-owned leaf keeps the intrinsic's),
-    /// so a re-resolution of an already-pinned call must read the entry the
-    /// pin actually points at.
-    lookup_func_type_by_mangled(&this, mangled: SymbolStr) -> TypeRef {
-        match (this.mangled_to_overload_pos.get_ref(&mangled.id)) {
-            Option::Some(positions) => {
-                if ((*positions).length > 0) {
-                    return this.overload_func_types[(*positions)[0] as i64];
-                }
-            }
-            Option::None => { }
-        }
-        return TypeRef::invalid();
     }
 
     /// Register a method's return type on a specific type.
@@ -895,11 +804,9 @@ type struct DeclarationIndex {
             const func_type_ref: TypeRef = arena.get_function(
                 func.resolved_return_type, param_types, func.is_variadic);
 
-            // Register with full signature for cross-module externs.
             this.register_function(combined_sym, func.resolved_return_type);
-            this.register_function_type(combined_sym, func_type_ref);
 
-            // Compute and store the mangled LLVM symbol name.  The
+            // Compute the mangled LLVM symbol name.  The
             // receiver-kind / non-receiver-params split is shared with the
             // codegen vtable-resolution path (see method_receiver_kind).
             const type_qname: QualifiedName = QualifiedName::from_symbol(type_sym);
@@ -930,13 +837,12 @@ type struct DeclarationIndex {
             } else {
                 mangled.value
             };
-            this.register_mangled_name(combined_sym, eff_mangled);
-
-            // Also associate this overload's mangled name with its
-            // FunctionType in the overload registry, so cross-module
-            // extern declaration can emit the right LLVM symbol per
-            // overload (not just the last-registered one).
-            this.register_overload_mangled(combined_sym, func_type_ref, eff_mangled);
+            // The entry is the declaration's identity: stamped on the node
+            // so every consumer holding the node - the definition emitter,
+            // a call sema or mono binds to it, a vtable slot - reads the
+            // symbol and signature registration wrote, and mangles nothing.
+            func.set_overload_entry(this.register_signature(
+                combined_sym, func_type_ref, SymbolStr::empty(), eff_mangled, func.origin_trait));
 
             // Add to per-module list.  Skip if this (combined_sym, module)
             // pair was already added by a prior overload; multiple
@@ -1055,22 +961,21 @@ type struct DeclarationIndex {
         this.module_func_pairs.insert(pk, true);
     }
 
-    /// Register a function with its defining module for per-module enumeration.
-    register_function_with_module(mut &this, name: SymbolStr, return_type: TypeRef,
-                                  module: SymbolStr) -> void {
-        this.register_function(name, return_type);
-        this.module_funcs.push(Pair<u32, u32>::new(name.id, module.id));
-        this.note_module_func(name.id, module.id);
-    }
-
-    /// Register a function type with its defining module for per-module enumeration.
-    /// Also computes and stores the mangled LLVM symbol name.
+    /// Register a free function's signature under its key `name`, in
+    /// module `module`, emitted under `symbol` when one is given (an
+    /// `extern "C"` declaration's C name, a `![symbol]` link name, an
+    /// intrinsic's bare name) and under the Cryo mangling of the signature
+    /// otherwise.  Answers the entry, which the caller stamps on the node.
     register_function_type_with_module(mut &this, name: SymbolStr,
                                        return_type: TypeRef, func_type_ref: TypeRef,
                                        module: SymbolStr, intern: InternTable*,
-                                       arena: TypeArena*) -> void {
+                                       arena: TypeArena*, symbol: SymbolStr) -> OverloadId {
         this.register_function(name, return_type);
-        this.register_function_type(name, func_type_ref);
+        if (symbol.is_valid()) {
+            this.module_funcs.push(Pair<u32, u32>::new(name.id, module.id));
+            this.note_module_func(name.id, module.id);
+            return this.register_signature(name, func_type_ref, SymbolStr::empty(), symbol, SymbolStr::empty());
+        }
 
         // Compute the mangled symbol name including the full signature.
         const qname: QualifiedName = QualifiedName::from_symbol(name);
@@ -1090,17 +995,9 @@ type struct DeclarationIndex {
         }
         const mangled: MangledName = MangledName::for_free_function(
             intern, arena, qname, params, return_type, is_variadic);
-        this.register_mangled_name(name, mangled.value);
-        // Pin the mangled name to this exact overload so cross-module extern
-        // declaration can pick the right LLVM symbol when the bare-name slot
-        // has been overwritten by another module's free function (e.g.,
-        // `read` is the intrinsic in std::core::intrinsics AND a free
-        // function in std::fs::file; bare "read" -> mangled-name maps to
-        // whichever was registered last).
-        this.register_overload_mangled(name, func_type_ref, mangled.value);
-
         this.module_funcs.push(Pair<u32, u32>::new(name.id, module.id));
         this.note_module_func(name.id, module.id);
+        return this.register_signature(name, func_type_ref, SymbolStr::empty(), mangled.value, SymbolStr::empty());
     }
 
     /// Register a type with its defining module for per-module enumeration.
@@ -1110,20 +1007,6 @@ type struct DeclarationIndex {
         this.module_types.push(Pair<u32, u32>::new(qualified_name.id, module.id));
     }
 
-
-    /// Store the mangled LLVM symbol name for a function or method.
-    /// Called at registration time so codegen never computes mangling.
-    register_mangled_name(mut &this, qualified: SymbolStr, mangled: SymbolStr) -> void {
-        this.mangled_names.insert(qualified.id, mangled.id);
-    }
-
-    /// Look up the pre-computed mangled LLVM symbol name.
-    lookup_mangled_name(&this, qualified: SymbolStr) -> SymbolStr {
-        return match (this.mangled_names.get(&qualified.id)) {
-            Option::Some(val) => { SymbolStr::from_id(val) }
-            Option::None      => { SymbolStr::empty() }
-        };
-    }
 
     /// Register a bare -> qualified name mapping.
     /// Called by type_resolution when registering both forms.
