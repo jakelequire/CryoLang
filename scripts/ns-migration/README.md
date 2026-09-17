@@ -1,0 +1,41 @@
+# Generators and instruments of the name-resolution migration
+
+Each directory is one `docs/name-resolution.md` §8 entry, and holds the
+scripts that produced the edits that entry landed or the measurement it
+reports. They exist so a landing can be re-derived from outside the
+session that made it: a change produced by a script is reproducible only
+while the script exists somewhere git can see.
+
+Every script edits or reads the tree it is run against, so they run from a
+checkout at the commit BEFORE the entry they belong to (`git log --grep
+"section 8.NNN"` names the commit; check out its parent). The scripts whose
+paths were once this checkout's absolute path now derive the repository
+root from their own location (`_REPO`, three directories up); the rest
+take repo-relative paths and are run from the repository root.
+
+Two kinds of script:
+
+* **Edit scripts** rewrite compiler sources and assert every count they
+  depend on BEFORE saving, so a stale tree leaves the files untouched.
+  Those that take `--shadow` produce the instrumented tree (the old answer
+  and the new one printed side by side as `SHADOW` lines); without it they
+  produce the clean one. A re-measurement is therefore
+  `git checkout <files> && python <script> --shadow && rm -rf compiler/build
+  && make cryo`, then the corpus run the entry names.
+* **Tabulators** (`tsc_tab.py`, `tie_tab.py`, `loose.py`) read a shadow
+  corpus (`.objcmp/<tag>-lines.txt`, gitignored) and print the tables the
+  entry carries.
+
+| entry | scripts | what they produced |
+|---|---|---|
+| §8.221 | `shadow_rdi.py`, `delete_rdi.py` | the shadow at `register_decl_in_index`'s six lookup-then-re-register pairs; their deletion |
+| §8.222 | `shadow_icp.py`, `fix_icp.py` | the shadow at `is_candidate_public`'s three doors; `register_type(key, ty, is_public)` at 28 callers, the extern arm's verdicts, the `None`-arm door |
+| §8.224 | `entry_span.py`, `shadow_tsc.py`, `shadow_tie.py`, `tsc_tab.py`, `tie_tab.py`, `loose.py` | the registry entry's span; the trait-in-scope and two-trait-tie instruments and the tables built from them (277 sites, 0 of 28 ties) |
+| §8.225 | `stamp_tdef.py`, `readers_tdef.py`, `shadow_names.py` | the `DefId` on the six type-declaration nodes; the 21 readers moved to `type_of_def(node.def)` (`--shadow` keeps the re-derived key beside the stamp) |
+| §8.226 | `owner_tref.py` | codegen's method owner as a `TypeRef`; `DeclarationIndex::impl_owner` |
+| §8.228 | `async_owner.py` | sema's async declare pass taking the owner's type and key from the caller |
+
+Not here: the scripts that edited the ledger itself, the entry drafts, and
+the one-off controls written against a gate version that no longer exists
+(§8.227's `gate_diff.py` read `lane-gate.py`'s `ANY_LOOKUP_RE`, which the
+definition-derived rule removed).

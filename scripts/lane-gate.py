@@ -17,32 +17,50 @@ WHAT IS PINNED
 --------------
 Each count is broken down per file so a failure names what moved.
 
-The five per-kind lookups (`lookup_type`, `lookup_func_return`,
-`lookup_func_type`, `lookup_global`, `lookup_method_return`) are counted
-outside the file that DEFINES them, and SPLIT BY THE RECEIVER that answers
-them, because the five names are not the index's alone:
+THE RULE IS DERIVED FROM THE DEFINITION, NOT FROM A LIST OF NAMES.  A
+name-keyed reader of the `DeclarationIndex` is any method the index declares
+whose signature mentions `SymbolStr` - as a parameter (the caller hands a
+name in and gets an answer) or as the return type (the caller hands an
+answer in and gets a name back, which is the same boundary crossed the other
+way).  The set is read from `decl_index.cryo` every run, and the same rule
+read from `type_utils.cryo` gives the `TypeUtils` funnel's set.  A gate that
+pins readers by a NAME PATTERN (`lookup_*`) is blind by construction to a
+reader called anything else, and the tree held twenty-four such calls
+(`is_candidate_public`, `namespace_of`, `ns_imports`, `find_global_*`,
+`intrinsic_owner_of`, `resolve_method_owner`, ...) under a gate that read OK;
+a reader added tomorrow as `owner_of(name)` is inside this rule the moment
+it is declared.  The signature is the one thing a name-keyed reader cannot
+be written without.
 
-  * LOOKUP -- answered by the `DeclarationIndex` under one of the five.  This
-    is the lane surface,
-    and the only one of the three that should fall.
-  * LOOKUP_OTHER -- answered by the `DeclarationIndex` under any other
-    `lookup_*` name.  The index answers under sixteen of them, not five, and
-    the five carried 65 of the 122 external index lookups in this tree: over
-    half the surface the gate is named for was not on it.  A caller can leave
-    a pinned row by switching to an unpinned name, and the pinned row then
-    falls, which reads as exactly the progress this gate was built to
-    distinguish from regrowth.  The name rule is mechanical (`lookup_` prefix)
-    so that what is counted is not a matter of opinion.
-  * LOOKUP_ROUTED -- answered by a `TypeUtils` wrapper, under ANY `lookup_*`
-    name (the five and the wrappers beside them - `lookup_type_exact`,
-    `lookup_type_sym`).  Already at the destination, so it RISES as LOOKUP
-    falls and is not a target; it is pinned because a new wrapper is exactly
-    the regrowth this gate exists to catch, and a wrapper under a sixth name
-    was one the five-name rule could not see.
-  * LOOKUP_LOCAL -- a type's OWN same-named method over its own symbol map or
-    scope stack.  Not a lane site, and no migration can remove one, so it is a
-    FLOOR: driving LOOKUP to zero is reachable, driving the total to zero never
-    was.
+The calls are SPLIT BY THE RECEIVER that answers them, because the names are
+not the index's alone:
+
+  * LOOKUP -- answered by the `DeclarationIndex` under one of the five
+    per-kind names mechanism 5 gives (`lookup_type`, `lookup_func_return`,
+    `lookup_func_type`, `lookup_global`, `lookup_method_return`).  This is
+    the lane surface, and the only one of the rows that should fall.
+  * LOOKUP_OTHER -- answered by the `DeclarationIndex` under any OTHER
+    name-crossing method that READS (`&this`, or a static): the registry's
+    entry accessors, the visibility and reachability questions, the global
+    and extern tables, the intrinsic owner.  A caller can leave the pinned
+    LOOKUP row by switching to one of these, and the pinned row then falls,
+    which reads as exactly the progress this gate was built to distinguish
+    from regrowth.
+  * REGISTER -- a name-keyed WRITE to the `DeclarationIndex` (`mut &this`):
+    every registrar that is handed a key the CALLER derived from a
+    declaration it holds.  The migration's other half - the key derived at
+    registration and nowhere else - falls here, and a registrar that grows a
+    second name-keyed door is caught the same way a reader is.
+  * LOOKUP_ROUTED -- answered by a `TypeUtils` wrapper, any name-crossing
+    method that type declares.  Already at the destination, so it RISES as
+    LOOKUP falls and is not a target; it is pinned because a new wrapper is
+    exactly the regrowth this gate exists to catch, and a wrapper under a
+    sixth name was one the five-name rule could not see.
+  * LOOKUP_LOCAL -- a name from either set called on `this` OUTSIDE the file
+    that defines the set: a type's OWN same-named method over its own symbol
+    map or scope stack (`move_check`, `drop_insertion`).  Not a lane site,
+    and no migration can remove one, so it is a FLOOR: driving LOOKUP to
+    zero is reachable, driving the total to zero never was.
   * LOOKUP_ARENA -- `lookup_by_name` on the TypeArena outside the file that
     defines it.  The arena's name caches are a second name-keyed store of the
     same declared types the index holds, and a lookup there is the same lane
@@ -94,9 +112,11 @@ THREE THINGS A NAIVE GREP GETS WRONG, ALL OBSERVED HERE
     uncommenting it would read as clean.  Lines whose first non-space
     characters are `//` are skipped, and a trailing `//` comment is cut before
     matching.
-  * THE OWNER'S OWN CALLS.  `decl_index.cryo` defines the five lookups and
-    calls them internally.  Those are not the surface this gate is about -- the
-    surface is what OTHER stages reach for -- so the defining file is excluded.
+  * THE OWNER'S OWN CALLS.  `decl_index.cryo` defines the index's methods and
+    calls them internally; `type_utils.cryo` does the same for the funnel's.
+    Those are not the surface this gate is about -- the surface is what OTHER
+    stages reach for -- so each defining file is excluded from its own set
+    (and only its own: the funnel's calls INTO the index are counted).
     Excluding it by name is safe here precisely because it is the definition
     site, not a special case about some caller.
 
@@ -105,7 +125,10 @@ the golden reads as the live surface rather than a graveyard; a file reappearing
 is then an added row, which fails the same way an increase does.
 
 Usage:
-    python3 scripts/lane-gate.py [--update]
+    python3 scripts/lane-gate.py [--update] [--names]
+
+`--names` prints the two derived sets and exits, so what the rule swept up
+can be read rather than inferred.
 
 Exit codes: 0 match (or golden updated); 1 drift.
 """
@@ -118,8 +141,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "compiler", "src")
 GOLDEN = os.path.join(ROOT, "tests", "lane-baseline.txt")
 
-# The five per-kind lookups §7.2 mechanism 5 names.  Matched as `.name(` so a
-# definition (`lookup_type(&this, ...)`) is not counted as a call.
+# The five per-kind lookups §7.2 mechanism 5 names: the LOOKUP row.  They are
+# the only names this gate holds as a list, and the list decides which ROW a
+# call lands in, never whether it is counted.
 LOOKUPS = (
     "lookup_type",
     "lookup_func_return",
@@ -127,37 +151,23 @@ LOOKUPS = (
     "lookup_global",
     "lookup_method_return",
 )
-LOOKUP_RE = re.compile(r"\.(?:%s)\s*\(" % "|".join(LOOKUPS))
-# The same five names, captured WITH the receiver that answers them.
-RECEIVER_RE = re.compile(r"([A-Za-z_][A-Za-z_0-9.]*)\.(?:%s)\s*\(" % "|".join(LOOKUPS))
 
+# The two definition sites.  Each is the one file whose `type struct` carries
+# the methods, and each is excluded from counting calls to ITS OWN set.
+#
+# Matched on the path relative to compiler/src, not on the basename.  A
+# basename exclusion is a rule about a NAME: a second decl_index.cryo anywhere
+# in the tree would have its calls silently dropped, and a gate whose blind
+# spot can be created by naming a file is not one that can be trusted about a
+# count.  The exclusion is meant to be about one specific definition site, so
+# it names one.
+INDEX_FILE = "compiler/decl_index.cryo"
+INDEX_TYPE = "DeclarationIndex"
+ROUTED_FILE = "compiler/sema/type_utils.cryo"
+ROUTED_TYPE = "TypeUtils"
+# The type whose signatures make a method name-keyed.
+NAME_TYPE = "SymbolStr"
 
-def lookup_bucket(receiver):
-    """Which surface a call belongs to, decided by its RECEIVER.
-
-    The five names are not the index's alone.  `TypeUtils` carries same-named
-    wrappers, so a call already routed through the funnel matched exactly like
-    a raw index call; and `move_check`, `drop_insertion` and `ir_generator`
-    each define their own `lookup_type(&this, name)` over a local symbol map
-    or a scope stack, which has nothing to do with the `DeclarationIndex`.
-
-    A count matched on the NAME cannot separate the surface from things that
-    merely resemble it, and the consequence was not academic: one total read
-    as a migration target when a fifth of it was already at its destination
-    and a tenth of it could never move.  Splitting by receiver is what makes
-    each row mean what its heading says.
-
-    Returns None for a receiver it cannot place, which the caller treats as a
-    hard failure rather than dropping - an uncounted call is the one outcome a
-    ratchet must never produce.
-    """
-    if receiver == "di" or receiver.endswith("decl_index"):
-        return "LOOKUP"
-    if receiver == "types" or receiver.endswith(".types"):
-        return "LOOKUP_ROUTED"
-    if receiver == "this":
-        return "LOOKUP_LOCAL"
-    return None
 REENTRY_RE = re.compile(
     r"\bget_resolver\s*\(\s*\)"
     r"|\.name_resolver\.(?:set_module|find_module_scope|restore_scope)\s*\(")
@@ -178,25 +188,14 @@ DEFID_UNWRAP_RE = re.compile(r"\.qualified_name\s*\(")
 # definition line has no receiver, so `.set_home_module(` matches calls only.
 HOME_WRITE_RE = re.compile(r"\.set_home_module\s*\(")
 
-# ANY lookup on the index, so the five cannot be routed around by a sixth.
-ANY_LOOKUP_RE = re.compile(r"([A-Za-z_][A-Za-z_0-9.]*)\.(lookup_[A-Za-z_0-9]*)\s*\(")
 # The arena's name-keyed lookup, with its receiver.  `lookup(id)` is not a
 # name lookup and is not matched.
 ARENA_LOOKUP_RE = re.compile(r"([A-Za-z_][A-Za-z_0-9.]*)\.lookup_by_name\s*\(")
 
 # Every counted population, in the order they are rendered and compared.
-KINDS = ("LOOKUP", "LOOKUP_OTHER", "LOOKUP_ROUTED", "LOOKUP_LOCAL",
+KINDS = ("LOOKUP", "LOOKUP_OTHER", "REGISTER", "LOOKUP_ROUTED", "LOOKUP_LOCAL",
          "LOOKUP_ARENA", "REENTRY", "HOME_WRITE", "DEFID_MINT", "DEFID_UNWRAP")
 
-# The file that DEFINES the five lookups.  Its own calls are not the surface.
-#
-# Matched on the path relative to compiler/src, not on the basename.  A
-# basename exclusion is a rule about a NAME: a second decl_index.cryo anywhere
-# in the tree would have its calls silently dropped, and a gate whose blind
-# spot can be created by naming a file is not one that can be trusted about a
-# count.  The exclusion is meant to be about one specific definition site, so
-# it names one.
-LOOKUP_OWNERS = {"compiler/decl_index.cryo"}
 # The file that DEFINES the arena's name lookup; its own calls are its caches.
 ARENA_OWNERS = {"compiler/types/arena.cryo"}
 # The driver legitimately owns the resolver and may ask for it.
@@ -214,8 +213,107 @@ def strip_comment(line):
     return line if cut < 0 else line[:cut]
 
 
+STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
+METHOD_HEAD_RE = re.compile(r"^    (static\s+)?([a-z_][a-z_0-9]*)\s*(?:<[^>]*>)?\s*\(")
+
+
+def name_crossing_methods(rel, type_name):
+    """{name: "read" | "write" | "static"} for every method declared inline in
+    `type struct <type_name> { ... }` in `rel` whose head mentions NAME_TYPE.
+
+    The head is everything from the method's name to the `{` that opens its
+    body, joined across lines.  A method is a WRITE when its receiver is
+    `mut &this`, STATIC when it has none, and a READ otherwise.
+
+    Refuses rather than returning an empty set: a parser that finds no
+    struct, or a struct with no name-crossing method, has not measured the
+    tree, and a gate fed an empty set would report OK over every call.
+    """
+    path = os.path.join(SRC, rel.replace("/", os.sep))
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().split("\n")
+    head_re = re.compile(r"^type struct %s\b" % re.escape(type_name))
+    i = 0
+    while i < len(lines) and not head_re.match(lines[i]):
+        i += 1
+    if i == len(lines):
+        raise SystemExit("lane-gate: no `type struct %s` in %s" % (type_name, rel))
+    found = {}
+    depth = 0
+    entered = False
+    while i < len(lines):
+        code = STRING_RE.sub('""', strip_comment(lines[i]))
+        m = METHOD_HEAD_RE.match(code)
+        if m and depth == 1:
+            head = code
+            j = i
+            while "{" not in head or head.count("(") > head.count(")"):
+                j += 1
+                if j == len(lines):
+                    raise SystemExit("lane-gate: unterminated method head at %s:%d"
+                                     % (rel, i + 1))
+                head += " " + STRING_RE.sub('""', strip_comment(lines[j])).strip()
+            head = head[:head.index("{")]
+            if NAME_TYPE in head:
+                if m.group(1):
+                    found[m.group(2)] = "static"
+                elif "mut &this" in head:
+                    found[m.group(2)] = "write"
+                else:
+                    found[m.group(2)] = "read"
+        for ch in code:
+            if ch == "{":
+                depth += 1
+                entered = True
+            elif ch == "}":
+                depth -= 1
+        if entered and depth == 0:
+            break
+        i += 1
+    if not found:
+        raise SystemExit("lane-gate: `type struct %s` in %s declares no method "
+                         "whose signature mentions %s; the parser has not "
+                         "measured the tree" % (type_name, rel, NAME_TYPE))
+    return found
+
+
+def receiver_kind(receiver):
+    """Which type a dotted receiver names, decided by its spelling.
+
+    Returns "index", "routed", "this", or None for a receiver it cannot
+    place, which the caller treats as a hard failure rather than dropping -
+    an uncounted call is the one outcome a ratchet must never produce.
+    """
+    if receiver == "di" or receiver.endswith("decl_index"):
+        return "index"
+    if receiver == "types" or receiver.endswith(".types"):
+        return "routed"
+    if receiver == "this":
+        return "this"
+    return None
+
+
 def scan():
     """Return ({kind: {relpath: count}}, unplaced) over the compiler sources."""
+    index_set = name_crossing_methods(INDEX_FILE, INDEX_TYPE)
+    routed_set = name_crossing_methods(ROUTED_FILE, ROUTED_TYPE)
+    # Control on the parser: the LOOKUP row is the five names, and they are
+    # declared on the index.  A parser that cannot see them cannot see the
+    # row it is asked to pin.
+    missing = [n for n in LOOKUPS if n not in index_set]
+    if missing:
+        raise SystemExit("lane-gate: %s does not declare %s as name-crossing; "
+                         "the parser has not measured the tree"
+                         % (INDEX_FILE, ", ".join(missing)))
+    names = sorted(set(index_set) | set(routed_set), key=len, reverse=True)
+    alt = "|".join(names)
+    # Any call to a set name: a dotted receiver, a `Type::` static, or neither
+    # (which is a call this gate cannot place and refuses).  A definition line
+    # has no `.` or `::` before the name, so it is not a call.
+    seen_re = re.compile(r"(?:\.|::)\s*(?:%s)\s*\(" % alt)
+    dotted_re = re.compile(r"([A-Za-z_][A-Za-z_0-9.]*)\.(%s)\s*\(" % alt)
+    static_re = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)::(%s)\s*\(" % alt)
+
     found = {k: {} for k in KINDS}
     unplaced = []
     for dirpath, _dirs, files in os.walk(SRC):
@@ -231,38 +329,51 @@ def scan():
                 line = strip_comment(raw)
                 if not line.strip():
                     continue
-                if rel not in LOOKUP_OWNERS:
-                    seen = len(LOOKUP_RE.findall(line))
-                    accounted = 0
-                    for m in RECEIVER_RE.finditer(line):
-                        accounted += 1
-                        bucket = lookup_bucket(m.group(1))
-                        if bucket is None:
-                            unplaced.append((rel, lineno, m.group(1)))
+                seen = len(seen_re.findall(line))
+                accounted = 0
+                for m in dotted_re.finditer(line):
+                    accounted += 1
+                    recv, name = m.group(1), m.group(2)
+                    kind = receiver_kind(recv)
+                    if kind == "index" and name in index_set:
+                        if rel == INDEX_FILE:
                             continue
-                        tally[bucket] += 1
-                    # A match the receiver pattern did not reach at all - a call
-                    # on something other than a dotted name. Reported once, not
-                    # once per match, so the count is of CALLS and not of checks.
-                    for _ in range(seen - accounted):
-                        unplaced.append((rel, lineno, "<no simple receiver>"))
-                    # Every OTHER lookup_* on the index.  Mechanical rule, no
-                    # judgement about which names are "real" lookups: the index
-                    # answers under more than five names, and a migration
-                    # measured only against the five rewards moving to a sixth.
-                    for m in ANY_LOOKUP_RE.finditer(line):
-                        if m.group(2) in LOOKUPS:
-                            continue
-                        other = lookup_bucket(m.group(1))
-                        if other == "LOOKUP":
+                        if name in LOOKUPS:
+                            tally["LOOKUP"] += 1
+                        elif index_set[name] == "write":
+                            tally["REGISTER"] += 1
+                        else:
                             tally["LOOKUP_OTHER"] += 1
-                        # A `TypeUtils` wrapper under any OTHER name is the
-                        # same funnel: a wrapper named `lookup_type_exact`
-                        # beside `lookup_type` was counted by neither row,
-                        # so a call could move between the two names and
-                        # leave the surface without a row moving.
-                        elif other == "LOOKUP_ROUTED":
+                    elif kind == "routed" and name in routed_set:
+                        if rel == ROUTED_FILE:
+                            continue
+                        tally["LOOKUP_ROUTED"] += 1
+                    elif kind == "this":
+                        # The owner's own call to its own method is not the
+                        # surface; anywhere else, `this` is some other type
+                        # with a same-named method of its own.
+                        if (rel == INDEX_FILE and name in index_set) \
+                                or (rel == ROUTED_FILE and name in routed_set):
+                            continue
+                        tally["LOOKUP_LOCAL"] += 1
+                    else:
+                        unplaced.append((rel, lineno, recv))
+                for m in static_re.finditer(line):
+                    accounted += 1
+                    owner, name = m.group(1), m.group(2)
+                    if owner == INDEX_TYPE and index_set.get(name) == "static":
+                        if rel != INDEX_FILE:
+                            tally["LOOKUP_OTHER"] += 1
+                    elif owner == ROUTED_TYPE and routed_set.get(name) == "static":
+                        if rel != ROUTED_FILE:
                             tally["LOOKUP_ROUTED"] += 1
+                    else:
+                        unplaced.append((rel, lineno, owner + "::"))
+                # A match the receiver patterns did not reach at all - a call
+                # on something other than a dotted name. Reported once, not
+                # once per match, so the count is of CALLS and not of checks.
+                for _ in range(seen - accounted):
+                    unplaced.append((rel, lineno, "<no simple receiver>"))
                 if rel not in ARENA_OWNERS:
                     # A name lookup on the arena is counted by its receiver
                     # too: one that is not an arena is a lookup this gate
@@ -282,7 +393,7 @@ def scan():
             for kind in KINDS:
                 if tally[kind]:
                     found[kind][rel] = tally[kind]
-    return found, unplaced
+    return found, unplaced, index_set, routed_set
 
 
 HEADER = [
@@ -290,24 +401,31 @@ HEADER = [
     "#",
     "# ASSERTED: both totals and every per-file row.",
     "#",
-    "# The five per-kind lookups outside decl_index.cryo, which defines them,",
-    "# split by the RECEIVER that answers them - the names are not the index's",
-    "# alone, and a name-matched total cannot say what it is a total of.",
+    "# A name-keyed method is one whose signature mentions SymbolStr, read from",
+    "# the type's definition on every run - not a list of names, so a reader",
+    "# added under any spelling is inside the rule as soon as it is declared.",
+    "# Calls are split by the RECEIVER that answers them, because the names are",
+    "# not the index's alone and a name-matched total cannot say what it is a",
+    "# total of.",
     "#",
     "# LOOKUP         answered by the DeclarationIndex, under one of the five",
     "#                names mechanism 5 gives. The lane surface; falls.",
-    "# LOOKUP_OTHER   answered by the DeclarationIndex under ANY OTHER lookup_*",
-    "#                name. The index answers under sixteen, not five, and a",
-    "#                surface pinned at five is one a caller can leave by",
+    "# LOOKUP_OTHER   answered by the DeclarationIndex under ANY OTHER name-",
+    "#                crossing READ (entry accessors, visibility, reachability,",
+    "#                the global and extern tables, a static key parser). A",
+    "#                surface pinned at five names is one a caller can leave by",
     "#                switching names - which reads as progress on the row that",
-    "#                is watched. Same receiver rule, mechanical name rule.",
-    "# LOOKUP_ROUTED  answered by a TypeUtils wrapper, under ANY lookup_* name -",
-    "#                the five and the wrappers beside them (lookup_type_exact,",
-    "#                lookup_type_sym). Already at the destination, so it RISES",
-    "#                as LOOKUP falls. Pinned because a new wrapper is the",
+    "#                is watched.",
+    "# REGISTER       a name-keyed WRITE to the DeclarationIndex: a registrar",
+    "#                handed a key the CALLER derived from a declaration it",
+    "#                holds. Falls as registration takes the DefId instead.",
+    "# LOOKUP_ROUTED  answered by a TypeUtils wrapper, any name-crossing method",
+    "#                that type declares. Already at the destination, so it",
+    "#                RISES as LOOKUP falls. Pinned because a new wrapper is the",
     "#                regrowth this gate exists to catch, and one under a sixth",
     "#                name was invisible to a five-name rule.",
-    "# LOOKUP_LOCAL   a type's OWN same-named method over its own symbol map or",
+    "# LOOKUP_LOCAL   a set name called on `this` outside the defining file: a",
+    "#                type's OWN same-named method over its own symbol map or",
     "#                scope stack. Not a lane site; no migration removes one. A",
     "#                FLOOR, so driving LOOKUP to zero is reachable and driving",
     "#                the total to zero never was.",
@@ -404,20 +522,27 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--update", action="store_true",
                     help="rewrite the golden from the current measurement")
+    ap.add_argument("--names", action="store_true",
+                    help="print the two definition-derived name sets and exit")
     args = ap.parse_args()
 
-    counts, unplaced = scan()
+    counts, unplaced, index_set, routed_set = scan()
+    if args.names:
+        for label, names in ((INDEX_TYPE, index_set), (ROUTED_TYPE, routed_set)):
+            print("%s (%d):" % (label, len(names)))
+            for name in sorted(names):
+                print("  %-6s %s" % (names[name], name))
+        return 0
     if unplaced:
         sys.stderr.write(
-            "lane-gate: %d lookup call(s) could not be placed by receiver.\n"
+            "lane-gate: %d name-keyed call(s) could not be placed by receiver.\n"
             "A call this gate cannot classify is a call it cannot pin, and a\n"
-            "silently dropped one reads as progress. Extend lookup_bucket().\n"
+            "silently dropped one reads as progress. Extend receiver_kind().\n"
             % len(unplaced))
         for rel, lineno, recv in unplaced:
             sys.stderr.write("  %s:%d  receiver %s\n" % (rel, lineno, recv))
         return 1
     live_totals = {k: sum(v.values()) for k, v in counts.items()}
-
     if args.update:
         with open(GOLDEN, "w", encoding="utf-8", newline=chr(10)) as fh:
             fh.write(render(counts))

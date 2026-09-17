@@ -38,7 +38,8 @@ current-state description is the defect it exists to remove.
 ### 0.1 Decisions
 
 `TAKEN` built · `RULED` decided, not built · `OUTSTANDING` decided, then lost ·
-`SUPERSEDED` replaced by a later ruling.
+`SUPERSEDED` replaced by a later ruling · `REJECTED` ruled against, the
+measurement that decided it on the row.
 
 | # | decision | status | check → expected | § |
 |---|---|---|---|---|
@@ -67,12 +68,15 @@ current-state description is the defect it exists to remove.
 | D23 | **The `Res` contract is AUTHORITATIVE**: an unstamped node is an error; D1 is right and the tree is wrong. Landed GRADUALLY - each silent `_ =>` arm becomes a hard door as its population is measured to zero; never all at once | **RULED, staged; seven arms converted (§8.211, §8.214)** — every consumer-side `match` over a `ResSlot` with a silent outer `_ =>` arm was enumerated (14) and instrumented over the six halves: **6 entered 0 times** and are doors since §8.211 (`register_generic_fn_call`'s callee, the trait-impl head's `origin_trait` - whose LEAF fallback is deleted with it - `spelling_template`, the struct literal's base, `ann_head_key`, the constant pattern's `const_res`); **1 was entered on green programs and is a door since §8.214** (`head_type_key`: 448 entries, every one a keyword primitive's `TypeAnnotation::Primitive`, which carries no slot - not an unstamped head; the primitive's spelling is its key now, 0 `Named` heads unstamped); **4 are a clone's head answered by `spec_owner` by design** (`target_key`, `impl_owner`, `impl_target_type`, the async declare pass: entered millions of times, not a missing stamp); **3 are entered only in refused programs** (`find_fn_template_for_call` 12, `lookup_callee_function_type`'s hint 6, `ann_canon_key` 1 - the E0202/E0302/E0353 path, where the name layer leaves the slot for sema to report) | `grep -rho 'require_scope_res(' compiler/src --include=*.cryo \| wc -l` → **15** (+1 in §8.217: the scope-call argument check dispatches on the segment's kind); `grep -rho '\.require("' compiler/src --include=*.cryo \| wc -l` → **14** (7 at §8.210, +6 in §8.211, +1 in §8.214) | §8.39, §8.44, §8.202, §8.211, §8.214, §8.217 |
 | D24 | **The trait-impl registry is RE-KEYED by the trait's identity.** Measured first (§8.212), then ruled by Jake 2026-09-16: "I want to rekey" (§8.216). The previous re-key was backed out because it was decided rather than measured; that objection is discharged - the measurement below is the basis | **RULED - UNBUILT** (measured in §8.212) — over the six halves the leaf key loses an impl in ONE shape, two same-leaf traits implemented for one type: **1** registration collapse (the typed table's `(Render, Shape)` entry, `Alpha::Render`'s block overwritten by `Omega::Render`'s) and **3** bound checks answered by the wrong impl (a `T: Alpha::Render` bound satisfied by `Omega::Render`'s block), every one in `trait_leaf_dispatch`, the project written to hold the shape; 84,520 bound checks and every other identity-holding reader agree, and the readers that pass a leaf by design (the operator traits, `Index`, `Deref`) are a different question. Those 4 are the programs whose binding changes when built; `trait_leaf_dispatch` is the project that holds them | `grep -c '^project trait_leaf_dispatch' tests/test-roster.txt` → **1** (the shape's project; the re-key flips its expectation) | §8.194, §8.202, §8.212, §8.216 |
 | Q2 | **An `extern module` alias gets a REAL module-graph entry with a stamp** (§9 Q2, ruled by Jake 2026-09-16: "I don't want to have that permanent blemish" - the alias is NOT left a bare namespace symbol that resolution special-cases forever). Basis: `extern module libc as cit;` is already a declaration in source and simply is not registered, so stamping it registers what the programmer wrote rather than inventing a synthetic module; Rust binds `extern crate foo as bar` as a real nameable item. Unblocks: codegen's `resolve_global`/`resolve_global_in_namespace`/`resolve_global_by_qualified` lane and its five-step spelling ladder (`symbol_resolver.cryo`, `resolve_global`), which exists because the alias has no stamp, and `lookup_callee_function_type`'s `bare_sym` door (`call_resolver.cryo`), the C import's wholesale `alias::name` key space. SCOPING before building (not gating - `HANDOFF.md` §0): of those sites, which resolve the ALIAS itself and which resolve a MEMBER inside the `cit::X` key space; stamping the alias plausibly closes the first and leaves the second as a separate, smaller question | **RULED - UNBUILT** | `grep -rho -e '\.resolve_global(' -e '\.resolve_global_in_namespace(' -e '\.resolve_global_by_qualified(' compiler/src/compiler/codegen --include=*.cryo \| wc -l` → **5**; `grep -c 'lookup_func_type_exact(bare_sym)' compiler/src/compiler/sema/call_resolver.cryo` → **1** (both 0 when built) | §8.216, §9 Q2 |
+| D25 | **`(Beta for P)::make()` is Cryo's impl-qualified call form** (Jake, 2026-09-17). It reuses `for` exactly as `implement trait Beta for P` does - no new lexical territory, and none of the `<P as Beta>` parsing problem. It MUST cover the receiver case too, `(Beta for P)::go(&p)`, so E0156 has ONE rule to suggest rather than a short form that works sometimes; and it must compose inside a generic, `(Beta for T)::make()`. Motivation: a tie of STATIC trait methods (`P::make()` with `Beta::make` and `Gamma::make` both implemented for `P`) has no receiver to disambiguate it, so E0156 fires with no suggestable spelling today | **RULED - UNBUILT** | `no check` — syntax not in the tree; the project that lands it pins it, and E0156's help names the form then | §8.224, §8.229 |
+| D26 | **The two-trait tie is an ERROR** in both spellings (`recv.m(...)`, `T::m(recv, ...)`) - never a pick by declaration or import order; each candidate named at its declaration; the trait-qualified call `Tr::m(&recv, ...)` chooses | **TAKEN** (ruled 2026-09-17; built the same day, §8.224, as `E0156_AMBIGUOUS_TRAIT_METHOD`) | `grep -c 'E0156_AMBIGUOUS_TRAIT_METHOD' compiler/src/compiler/diag/_module.cryo` → **2**; `grep -c '^negative E0156_' tests/test-roster.txt` → **2**; `grep -c '^project trait_qualified_call_disambiguates' tests/test-roster.txt` → **1** | §8.220, §8.224, §8.229 |
+| D27 | **The Rust trait-in-scope rule is REJECTED** (Jake, 2026-09-17, on §8.224's measurement): Cryo calls a trait's methods with the trait imported nowhere in BOTH call forms today; requiring scope would break **277 call sites in 61 files** (stdlib 135, `tests/` 118, LSP 19, examples 5, `compiler/src` 0); and it would settle **0 of the 28** tie sites in the corpus - at no site is exactly one candidate in scope. D25 is what gives a tie a spelling, not scope. Not to be proposed again without new numbers | **REJECTED** | `no check` — a rule not built; `scripts/ns-migration/8.224/` re-derives the three tables from a corpus run | §8.224, §8.229 |
 
-**D18, D24 and Q2 are RULED and UNBUILT** (D5 was, until §8.206; D2 and D9 were,
+**D18, D24, D25 and Q2 are RULED and UNBUILT** (D5 was, until §8.206; D2 and D9 were,
 until §8.213). Each was decided by Jake - D18 and D2 then re-parked as open
-questions, D2 across ninety-five entries; §8.202 records the re-affirmation and
-§8.216 the three rulings of 2026-09-16. They are work, not questions - do not
-put any of them back on his desk.
+questions, D2 across ninety-five entries; §8.202 records the re-affirmation,
+§8.216 the three rulings of 2026-09-16 and §8.229 the three of 2026-09-17. They
+are work, not questions - do not put any of them back on his desk.
 
 ### 0.2 Machinery
 
@@ -195,7 +199,7 @@ evidence for what it covers.
 |---|---|---|
 | `make test` | 2,124 unit + 63 project + 192 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
-| `make lane-check` | 9 buckets of call sites in `compiler/src`, as a golden; `HOME_WRITE` pins `.set_home_module(` calls at 0 since §8.204, so the mechanism cannot come back unpinned; REENTRY counts `get_resolver()` AND a cursor move through the `name_resolver` field since §8.189 (it read 3 over a tree holding 6: the monomorphizer's `find_module_scope`/`set_module`/`restore_scope`); `LOOKUP_ARENA` counts the arena's `lookup_by_name` since §8.192 (it read OK over a tree holding 17 in `type_resolution.cryo`); `LOOKUP_ROUTED` counts every `lookup_*` on the `TypeUtils` receiver since §8.227 (it read OK over a tree with a new `types.lookup_type_sym(` call, 19 such wrappers uncounted) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
+| `make lane-check` | 10 buckets of call sites in `compiler/src`, as a golden; **a name-keyed method is any the `DeclarationIndex` or `TypeUtils` declares with `SymbolStr` in its signature, parsed from the definition file on every run** since §8.230 - not a name pattern (the `lookup_*` rule read OK over 24 readers under other names, and over a tree with a new `owner_of(name)`); reads split `LOOKUP` (the five) / `LOOKUP_OTHER` (the rest) / `LOOKUP_ROUTED` (the funnel), and `REGISTER` pins the name-keyed WRITES; `HOME_WRITE` pins `.set_home_module(` calls at 0 since §8.204, so the mechanism cannot come back unpinned; REENTRY counts `get_resolver()` AND a cursor move through the `name_resolver` field since §8.189 (it read 3 over a tree holding 6: the monomorphizer's `find_module_scope`/`set_module`/`restore_scope`); `LOOKUP_ARENA` counts the arena's `lookup_by_name` since §8.192 (it read OK over a tree holding 17 in `type_resolution.cryo`) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. A receiver it cannot place is refused, not dropped; a same-named method on a type that is NEITHER the index nor the funnel, reached through `this`, is counted as local. |
 | `make selfhost-check` | stage-3 == stage-4 byte identity, both arms | **Stability, not correctness.** It proves the compiler still emits the same bytes for code that already compiles; it says nothing about code that now STOPS compiling. |
 | `make ns-status-check` | every check this section carries, run from the repo root; a grep whose quoted pattern carries a pipe is refused unrun (a cell's `\|` is undone as a column escape, so the pipe would be a literal and the row could only read 0) | A number that moved, and nothing else - see 0.5. |
 | `make guard-selftest` | the commit-msg guard and `ns-status-check` driven through a throwaway repository, each rule refused and allowed (14 cases); CI's ubuntu job runs it | The real repository's hook installation (`make install-hooks` is per checkout). |
@@ -219,7 +223,7 @@ a count.
 
 Checks for this section, one per line so each can be copied whole:
 
-* `grep -c '^\[' tests/lane-baseline.txt` → **9**
+* `grep -c '^\[' tests/lane-baseline.txt` → **10**
 * `grep -c '^project ' tests/test-roster.txt` → **67**
 * `grep -c '^negative ' tests/test-roster.txt` → **193**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
@@ -13186,6 +13190,184 @@ Outside the ledger: `sema/sema.cryo`, the lane golden.
 
 **Tally: 75 shadowed, 75 old paths deleted, 75 at zero; 118 artifacts
 gone** (+1 lane, the async owner by re-derived key; no artifact).
+
+---
+
+### 8.229 RULED: three decisions from Jake, 2026-09-17 - `(Beta for P)::make()` is the impl-qualified call form, the two-trait tie is an error, and the Rust trait-in-scope rule is REJECTED on its measurement
+
+Three rulings that existed only in prose (§8.224's head blockquote, the
+handoff) get their §0 rows. None is reopened here; each is recorded with
+the basis Jake ruled on so it is not proposed again.
+
+#### D25 - `(Beta for P)::make()` is Cryo's impl-qualified call form (RULED - UNBUILT)
+
+The motivating case is §8.224's open item (b): a tie of STATIC trait
+methods - `P::make()` where `Beta::make` and `Gamma::make` are both
+implemented for `P` - has no receiver to disambiguate it, so E0156 fires
+with no suggestable spelling; the receiver form `Tr::m(&recv, ...)` only
+covers a method with a receiver.
+
+Jake ruled the form `(Beta for P)::make()`. It reuses `for` exactly as
+`implement trait Beta for P` does, so it adds no lexical territory and
+avoids the `<P as Beta>` parsing problem (a `<` at expression start is
+already a comparison). It MUST cover the receiver case too -
+`(Beta for P)::go(&p)` - so E0156 has ONE rule to suggest rather than a
+short form that works sometimes; and it must compose inside a generic:
+`(Beta for T)::make()` with `T` a type parameter bound by `Beta`. Not
+built: the parser, the resolution of the parenthesized head (a trait and
+a type, both stamped), the selection of THAT trait's impl for the type,
+and E0156's help naming the form.
+
+#### D26 - the two-trait tie is an ERROR (TAKEN, §8.224)
+
+Ruled 2026-09-17, built the same day as `E0156_AMBIGUOUS_TRAIT_METHOD`:
+a receiver with no inherent `m` whose trait impls provide `m` twice is
+refused in both spellings (`recv.m(...)`, `T::m(recv, ...)`), never a
+pick by declaration or import order; the error names each candidate at
+its declaration. It had no §0 row - the built diagnostic was on §8.224's
+head and nowhere in the current-state table.
+
+#### D27 - the Rust trait-in-scope rule is REJECTED (RULED)
+
+Jake leaned to Rust's rule ("a trait's methods are only callable when
+the trait is in scope"; `import` does the disambiguating) and asked for
+the blast radius first (§8.224, measurements 1-3). Ruled AGAINST on that
+measurement, 2026-09-17. The measurement is on the row so the proposal
+does not come back without new numbers:
+
+* **Cryo does not require the trait in scope today**, in either call
+  form: `p.go()` and `P::go(&p)` both compile and run with `Beta`
+  imported nowhere in the calling module and its module not transitively
+  imported (probe `scope`, §8.224 measurement 1).
+* **Requiring it breaks 277 call sites across 61 files**: stdlib 135,
+  `tests/` 118, LSP 19, examples 5, `compiler/src` 0 (measurement 2;
+  `scripts/ns-migration/8.224/shadow_tsc.py` + `tsc_tab.py` re-derive it
+  from a corpus run).
+* **It resolves 0 of the 28 tie sites** in the corpus: at no site is
+  exactly one candidate in scope - 23 `Display`/`Debug` `fmt` ties have
+  BOTH imported, 2 `Alpha::Render`/`Omega::Render` have NEITHER, 3 are the
+  negatives with both by design (measurement 3; `shadow_tie.py` +
+  `tie_tab.py`).
+
+E0156 fires just as often under either rule; D25 is what gives a tie a
+spelling, not scope.
+
+Outside the ledger: nothing - three rows and the legend's `REJECTED`
+status. Rides with §8.230's commit.
+
+**Tally: 75 shadowed, 75 old paths deleted, 75 at zero; 118 artifacts
+gone** (unchanged: rulings recorded, nothing built).
+
+---
+
+### 8.230 `lane-check` counts name-keyed calls by the receiver's TYPE, not by a name pattern: a name-crossing method is any the `DeclarationIndex` or `TypeUtils` declares with `SymbolStr` in its signature, read from the definition file on every run; 24 readers were outside the gate by construction, and the old gate printed `OK` over a tree with a new `owner_of(name)` - 2026-09-17
+
+#### The shape
+
+The gate pinned readers by a NAME PATTERN: the five names mechanism 5
+gives (`LOOKUP`), and `lookup_*` for the rest (`LOOKUP_OTHER`,
+`LOOKUP_ROUTED`). Any name-keyed reader called anything else was outside
+the gate *by construction* - which is why eleven audit rounds each found
+more. §8.227 widened the name list to cover the `TypeUtils` wrappers;
+that closed 16 sites but did not change the rule. At `d4453224` the
+tree held **24 sites blind by name**: `is_candidate_public` 3,
+`namespace_of` 3, `is_prelude_ns`/`ns_imports` 4, `find_global_*` 3,
+`get_global_*` 2, `global_extern_symbol` 2, `is_global_thread_local` 2,
+`intrinsic_owner_of` 1, `extern_symbol_conflict` 1 (the index), and
+`resolve_method_owner` 2, `alias_global` 1 (`TypeUtils`).
+
+#### The rule
+
+A name-keyed method is one whose **signature mentions `SymbolStr`** -
+as a parameter (a name in, an answer out) or as the return type (an
+answer in, a name out: the same boundary crossed the other way -
+`entry_symbol`, `lookup_type_name`, `lookup_type_sym`; without the return
+half, `lookup_type_sym`'s 7 calls would have LEFT the gate). The set is
+parsed from `type struct DeclarationIndex { … }` in `decl_index.cryo` and
+`type struct TypeUtils { … }` in `type_utils.cryo` on every run
+(`name_crossing_methods`; `--names` prints both sets). A reader added
+tomorrow as `owner_of(name)` is inside the rule the moment it is
+declared, because the signature is the one thing a name-keyed reader
+cannot be written without. The five names are the only list the gate
+still holds, and the list decides which ROW a call lands in, never
+whether it is counted.
+
+Rows, by receiver (`receiver_kind`: `di`/`*.decl_index` the index,
+`types`/`*.types` the funnel, `this` the owner's own or a same-named
+local; `DeclarationIndex::`/`TypeUtils::` a static; anything else
+refused):
+
+* `LOOKUP` - the five, on the index. Unchanged: **13**.
+* `LOOKUP_OTHER` - every other name-crossing READ (`&this`, or a
+  static) on the index. 30 → **62**: −5 type-keyed `lookup_*` that are
+  not a name crossing (`lookup_implicit_converter(u64, u64)` 4,
+  `lookup_array_type(TypeRef)` 1 - `grep -rn 'decl_index\.lookup_\(implicit_converter\|array_type\)(' compiler/src`),
+  +37 non-`lookup_` readers: the 21 index sites above, `entry_symbol` 10,
+  `entry_trait` 3, `entry_key` 1, `prelude_namespaces` 1, and the static
+  `DeclarationIndex::split_global_key` 1 (`symbol_resolver.cryo`).
+* `REGISTER` - NEW: a name-keyed WRITE (`mut &this`) on the index, a
+  registrar handed a key the CALLER derived from a declaration it holds.
+  **84** (`pass_registry` 34, `type_resolution` 27, `specialization` 7,
+  `async_lower` 7, `lambda_synth` 3, `instance` 2, `call_specializer` 2,
+  `directive_processing` 2). This is the row the registrars-take-the-`DefId`
+  slice moves; it was in no row at all.
+* `LOOKUP_ROUTED` - every name-crossing method on `TypeUtils`. 38 →
+  **41** (+`resolve_method_owner` 1, `find_template_module` 1,
+  `alias_global` 1; `sema` 4 → 6, `call_resolver` 20 → 21).
+* `LOOKUP_LOCAL` - a set name on `this` outside the defining file (a
+  same-named local method). Unchanged: **9**.
+
+The owner exclusion is per set: `decl_index.cryo`'s own calls to index
+methods and `type_utils.cryo`'s own calls to funnel methods are not the
+surface; the funnel's calls INTO the index are (`type_utils.cryo`
+`LOOKUP` 5, `LOOKUP_OTHER` 7). Two controls on the instrument: the
+parser refuses a definition file it finds no `type struct` or no
+name-crossing method in, and refuses an index set missing any of the
+five (the `LOOKUP` row would be void); every count above was predicted
+from an independent per-receiver survey before the gate ran and landed
+exactly (`LOOKUP_OTHER` 62, `REGISTER` 84, `LOOKUP_ROUTED` 41).
+
+#### The pairs
+
+Read side - `owner_of(&this, name: SymbolStr) -> TypeRef` declared on
+the index, one call `this.ctx.decl_index.owner_of(name)` in `sema.cryo`:
+
+* OLD gate (§8.227's, its golden) over the mutated tree: `lane-gate: OK
+  -- LOOKUP = 13 (6 files), LOOKUP_OTHER = 30 (6 files), LOOKUP_ROUTED =
+  38 (5 files), …`.
+* NEW gate over the same tree: `lane-gate: DRIFT … LOOKUP_OTHER TOTAL 62
+  -> 63 (INCREASE -- a lane regrew) … compiler/sema/sema.cryo 0 -> 1`.
+
+Write side - `bind_owner(mut &this, name: SymbolStr, ty: TypeRef)`
+declared on the index, one call from `pass_registry.cryo`:
+
+* OLD gate: `lane-gate: OK -- LOOKUP = 13 … LOOKUP_OTHER = 30 …`.
+* NEW gate: `lane-gate: DRIFT … REGISTER TOTAL 84 -> 85 (INCREASE -- a
+  lane regrew) … compiler/passes/pass_registry.cryo 34 -> 35`.
+
+Restored: `lane-gate: OK -- LOOKUP = 13 (6 files), LOOKUP_OTHER = 62 (9
+files), REGISTER = 84 (8 files), LOOKUP_ROUTED = 41 (5 files),
+LOOKUP_LOCAL = 9 (2 files), LOOKUP_ARENA = 2, REENTRY = 6, HOME_WRITE =
+0, DEFID_MINT = 23, DEFID_UNWRAP = 36`. Ten rows; §0's
+`grep -c '^\[' tests/lane-baseline.txt` moves 9 → 10.
+
+#### Also in this commit: the generators of §8.221-§8.228's landed edits
+
+`scripts/ns-migration/<entry>/` now holds the edit scripts and shadow
+instruments that produced §8.221, §8.222, §8.224, §8.225, §8.226 and
+§8.228 (README there), which had lived only in the gitignored
+`.objcmp/u1-keep/`. The rule is that a generator lands with what it
+generated; these did not, and the audit could not re-run §8.225's shadow
+or re-derive §8.224's 277 from outside. The one edit made in the copy:
+the `s12/` scripts' absolute checkout path is derived from the script's
+own location. §8.227's `gate_diff.py` is NOT carried: it was a control on
+the previous gate's `ANY_LOOKUP_RE`, which this entry removes.
+
+Outside the ledger: `scripts/lane-gate.py`, the lane golden,
+`scripts/ns-migration/`.
+
+**Tally: 75 shadowed, 75 old paths deleted, 75 at zero; 118 artifacts
+gone** (unchanged: a gate's rule replaced, nothing deleted).
 
 ---
 
