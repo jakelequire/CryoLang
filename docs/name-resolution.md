@@ -219,7 +219,7 @@ Checks for this section, one per line so each can be copied whole:
 
 * `grep -c '^\[' tests/lane-baseline.txt` → **9**
 * `grep -c '^project ' tests/test-roster.txt` → **63**
-* `grep -c '^negative ' tests/test-roster.txt` → **192**
+* `grep -c '^negative ' tests/test-roster.txt` → **193**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
 * `grep -n 'branches:' .github/workflows/ci.yml` → `main` only, both hooks
@@ -12283,6 +12283,99 @@ the lane golden.
 **Tally: 70 shadowed, 70 old paths deleted, 70 at zero; 114 artifacts
 gone** (unchanged: a requalification, nothing deleted; the lane rows
 carry the movement).
+
+---
+
+### 8.220 A `Type::method` path two traits provide at one signature is reported in sema as E0154, naming both traits; codegen's E0636 / E0900 refusal of the unpinned path was the wrong layer with the wrong text - 2026-09-16
+
+#### The shape
+
+§8.216's `choose_entry` selects the entry a `Type::method` path names
+from the fits its signature (value form) or its arguments (call form)
+leave: one fit is it, an inherent method beside trait methods is it, and
+several trait methods with no inherent one is a tie that pins nothing.
+Unpinned, the path reached codegen, which has no spelling fallback for a
+scope call since the `mangled_names` map went, and refused it there: the
+call form as E0636 `codegen: cannot resolve 'P::go'` / `no such
+associated function` (the method exists twice, not never), the value
+form - `pin_scope_value_static_method` falls to `CalleePin::Family` - as
+E0900 "names several functions and the call was not pinned to one of
+them" (true, and unexplained).  Rust reports both forms of this tie as
+one error, E0034 "multiple applicable items in scope", with a note per
+candidate ("candidate #1 is defined in an impl of the trait `Beta` for
+the type `P`").  Cryo's method-call form of the same tie, `p.go()`, is
+already E0154 (`sema/call_resolver.cryo`, "call to `go` is ambiguous: it
+is provided by multiple traits implemented for this type"; §13.4 of
+`docs/cryo.md` names the code).  The static-path form is the same
+ambiguity spelled as a path, so it is reported under the same code, as
+Rust does; a distinct code for the path spelling is Jake's to mint if he
+wants one, and is a one-line change.
+
+#### The change
+
+`choose_entry` takes the path node and, at a tie of two or more trait
+entries with no inherent one, reports it (`report_static_path_tie`):
+E0154 "`P::go` is ambiguous: `go` is provided by more than one trait
+implemented for `P`", the label naming both traits, a note per candidate
+in Rust's words, and nothing during a symbolic generic-body walk (the
+concrete instantiation reports, as the method form's guard does).  Both
+callers hand the node over: `try_pin_static_method_overload` (the call
+form, from `pin_scope_callee_combined`) and `entry_of_signature` (the
+value form).  No pinning decision moved: every non-tie answer is the one
+`choose_entry` gave before.
+
+Probes (scratch, each under the tree's compiler before and after):
+| probe | before | after |
+|---|---|---|
+| `tie`: `Beta::go(&this)` + `Gamma::go(&this)` for `P`, `P::go(&p)` | E0636 at codegen | E0154 at sema |
+| `stat_call`: `static make()` in both traits, `P::make()` | E0636 at codegen | E0154 at sema |
+| `stat_value`: `const f: () -> i32 = P::make;` | E0900 at codegen | E0154 at sema |
+| `disamb`: `Beta::go(&p) * 10 + Gamma::go(&p)` | E0636 at codegen | E0636 at codegen |
+
+The last row is a **finding**: the explicit trait-path call
+`Trait::method(receiver, args)`, which the method-form E0154's own note
+proposes as the disambiguation ("disambiguate by calling the trait method
+explicitly, e.g. `Trait::method(receiver, args)`") and §13.4 describes
+("resolved by calling the trait method explicitly"), compiles under no
+compiler in reach - not the tree, not HEAD `1451d792`'s
+(`.objcmp/cryo-head.exe`), not the pin (`bin/cryo.exe`, 2026-09-11):
+sema types it silently and codegen refuses `Beta::go` as unknown.  The
+corpus holds no use of the form (`grep -rn -E
+'[A-Z][A-Za-z]+::[a-z_]+\(&[a-z_]+[,)]' tests/tests examples` finds only
+`Type::method(&recv)` static calls on inherent methods).  So the
+diagnostic for the tie names no way out today: the language has no
+working trait-qualified call.  That form is a language question
+(`Trait::method(recv)` as the note promises, Rust's `<P as Beta>::go(&p)`,
+or both), Jake's, and this entry does not add a help line that promises
+either.  The method form's note that promises the broken form is left as
+written; its wording is Jake's too.
+
+Negative `E0154_static_path_two_traits` (2 annotations: the call form
+`CfP::go(&p)` and the value form `CfP::make`).  **Mutation pair**: the
+same file through `cryo check` under the pin and under `1451d792`'s
+compiler exits 0 - sema alone accepts the ambiguous program, the refusal
+lived only in codegen - and under the tree exits with the two E0154s.
+`static_path_prefers_inherent_method` (the inherent-wins rule, exit 33)
+passes unchanged.
+
+#### Gates
+
+`make test` (in `hash-tree.sh G`'s log, `.objcmp/t-G.txt.log`) OVERALL
+PASS: unit ok, compile-fail 192 → **193**, projects 60; roster merged
+(`roster-check --merge`, 1 added).  lsp-check OK (490 warnings);
+cross-check OK (`.objcmp/u1-cross.log`).  **Objects: 0 of 2,557 + 1,126
+moved** (`hash-tree.sh G` against `F`, HEAD `ed99b6a3`'s half,
+`.objcmp/hash-G.out`; predicted 0: a diagnostic on a path no green
+program reaches - §8.216 measured 0 corpus programs at the codegen
+refusal, and codegen has no fallback a sema refusal could pre-empt).
+lane-check unchanged (no lookup added; `LOOKUP` 41, `DEFID_UNWRAP` 33).
+§0: the negative count 192 → 193.
+
+Outside the ledger: `sema/call_resolver.cryo`, the negative, the roster.
+
+**Tally: 70 shadowed, 70 old paths deleted, 70 at zero; 114 artifacts
+gone** (unchanged: a diagnostic moved to the layer that knows the answer;
+nothing deleted).
 
 ---
 

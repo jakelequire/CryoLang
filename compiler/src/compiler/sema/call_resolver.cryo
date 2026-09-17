@@ -3672,7 +3672,7 @@ type struct CallResolver {
         const member_str: string = this.intern.resolve(member_sym);
         if (scope_str.length() == 0 || member_str.length() == 0) { return; }
         const sym: SymbolStr = this.intern.intern(fmt::format("%s::%s", scope_str, member_str));
-        if (this.try_pin_static_method_overload(call, sym)) { return; }
+        if (this.try_pin_static_method_overload(call, scope, sym)) { return; }
         // Single-entry static method: pin the entry, consistent with
         // instance methods (`bind_method_on_receiver`) and the multi-entry
         // static path above.  A family the arguments cannot select one entry
@@ -3696,9 +3696,10 @@ type struct CallResolver {
     /// index's entry are interned through the same `get_function`, so the id
     /// identifies it.  The owner key is the type's REGISTERED name, read off
     /// the type sema resolved rather than off the spelling, which may be any
-    /// path that reaches it.  A method with no entry yet, or several trait
-    /// methods of the selected signature under one name with no inherent one
-    /// to prefer, pins the combined name, as the call form does.
+    /// path that reaches it.  A method with no entry yet pins the combined
+    /// name, as the call form does; several trait methods of the selected
+    /// signature under one name with no inherent one to prefer is the tie
+    /// `choose_entry` reports.
     pin_scope_value_static_method(mut &this, scope: ScopeResolutionNode*, owner: TypeRef,
                                   method_ft: TypeRef) -> void {
         if (scope.resolved_callee.is_some()) { return; }
@@ -3707,36 +3708,62 @@ type struct CallResolver {
         if (!owner_sym.is_valid()) { return; }
         const sym: SymbolStr = this.intern.intern(fmt::format("%s::%s",
             this.intern.resolve(owner_sym), this.intern.resolve(scope.member_name)));
-        const entry: OverloadId = this.entry_of_signature(sym, method_ft);
+        const entry: OverloadId = this.entry_of_signature(sym, method_ft, scope);
         scope.set_resolved_callee(if (entry.is_valid()) { CalleePin::Decl(entry) } else { CalleePin::Family(sym) });
     }
 
-    /// The entry under `family` with signature `ft` a `Type::method` path
-    /// names; invalid when there is none, or several the path cannot choose
-    /// between (`choose_entry`).
-    entry_of_signature(&this, family: SymbolStr, ft: TypeRef) -> OverloadId {
+    /// The entry under `family` with signature `ft` the `Type::method` path
+    /// `path` names; invalid when there is none, or several the path cannot
+    /// choose between (`choose_entry`).
+    entry_of_signature(mut &this, family: SymbolStr, ft: TypeRef, path: ScopeResolutionNode*) -> OverloadId {
         const entries: OverloadId[] = this.ctx.decl_index.lookup_family_entries(family);
         mut fits: OverloadId[] = [];
         for (mut i: i64 = 0; i < entries.length; i++) {
             if (this.ctx.decl_index.entry_signature(entries[i]).id == ft.id) { fits.push(entries[i]); }
         }
-        return this.choose_entry(&fits);
+        return this.choose_entry(&fits, path);
     }
 
-    /// The one entry of `fits` a `Type::method` path names.  One fit is it.
-    /// Several fit when an inherent method and a trait's share the key and
-    /// the signature: the path names the inherent one, as Rust's does - a
-    /// trait's method is reached through the trait's own path.  Several
-    /// trait methods under one key and signature with no inherent one is a
-    /// genuine tie and names nothing.
-    choose_entry(&this, fits: &OverloadId[]) -> OverloadId {
+    /// The one entry of `fits` the `Type::method` path `path` names.  One
+    /// fit is it.  Several fit when an inherent method and a trait's share
+    /// the key and the signature: the path names the inherent one, as Rust's
+    /// does - a trait's method is reached through the trait's own path.
+    /// Several trait methods under one key and signature with no inherent
+    /// one is a genuine tie: the path names nothing, and the tie is reported
+    /// here, where every candidate is in hand, rather than left for codegen
+    /// to refuse as a name it cannot bind.
+    choose_entry(mut &this, fits: &OverloadId[], path: ScopeResolutionNode*) -> OverloadId {
         if (fits.length == 1) { return fits[0]; }
         mut inherent: OverloadId = OverloadId::invalid();
         mut n: i64 = 0;
         for (mut i: i64 = 0; i < fits.length; i++) {
             if (!this.ctx.decl_index.entry_trait(fits[i]).is_valid()) { inherent = fits[i]; n = n + 1; }
         }
-        return if (n == 1) { inherent } else { OverloadId::invalid() };
+        if (n == 1) { return inherent; }
+        if (n == 0 && fits.length >= 2) { this.report_static_path_tie(fits, path); }
+        return OverloadId::invalid();
+    }
+
+    /// `path` names a method every one of `fits` provides through a
+    /// different trait, and no inherent method settles it.  Reported once per
+    /// path; a symbolic walk of a generic body defers to the concrete one.
+    report_static_path_tie(mut &this, fits: &OverloadId[], path: ScopeResolutionNode*) -> void {
+        if (this.state.in_symbolic_check) { return; }
+        const scope_str: string = this.intern.resolve(path.scope_name);
+        const member_str: string = this.intern.resolve(path.member_name);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0154_AMBIGUOUS_CALL,
+            fmt::format("`%s::%s` is ambiguous: `%s` is provided by more than one trait implemented for `%s`",
+                scope_str, member_str, member_str, scope_str));
+        diag = diag.at_with_label(path.span,
+            fmt::format("`%s` is defined by both `%s` and `%s`", member_str,
+                this.intern.resolve(this.ctx.decl_index.entry_trait(fits[0])),
+                this.intern.resolve(this.ctx.decl_index.entry_trait(fits[1]))));
+        for (mut i: i64 = 0; i < fits.length; i++) {
+            diag = diag.with_note(fmt::format("candidate #%d is defined in an impl of the trait `%s` for the type `%s`",
+                (i + 1) as i32, this.intern.resolve(this.ctx.decl_index.entry_trait(fits[i])), scope_str));
+        }
+        this.ctx.emit_diagnostic(diag);
     }
 
     /// Pin a static call to the one entry of `combined_sym`'s family its
@@ -3747,7 +3774,8 @@ type struct CallResolver {
     /// passes rather than one predicate so a family carrying both `f(T)` and
     /// `f(&T)` selects the exact one whatever order they registered in.
     /// Several fits in one pass go to `choose_entry`.
-    try_pin_static_method_overload(mut &this, call: CallExprNode*, combined_sym: SymbolStr) -> boolean {
+    try_pin_static_method_overload(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
+                                   combined_sym: SymbolStr) -> boolean {
         const di: DeclarationIndex* = this.ctx.decl_index;
         const entries: OverloadId[] = di.lookup_family_entries(combined_sym);
         if (entries.length < 2) { return false; }
@@ -3759,7 +3787,7 @@ type struct CallResolver {
         }
         mut fits: OverloadId[] = this.select_static_overload(&entries, &arg_types, false);
         if (fits.length == 0) { fits = this.select_static_overload(&entries, &arg_types, true); }
-        const chosen: OverloadId = this.choose_entry(&fits);
+        const chosen: OverloadId = this.choose_entry(&fits, scope);
         if (!chosen.is_valid()) { return false; }
         call.set_resolved_callee(CalleePin::Decl(chosen));
         return true;
