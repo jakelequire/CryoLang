@@ -73,16 +73,15 @@ type struct SpecInjector {
     /// same bare name (e.g. BattleTest::Pair_i32 vs Collections::Pair::Pair_i32)
     /// from overwriting each other's methods in the DI.
     static register(node: ASTNode*, spec_name: SymbolStr,
-                    spec_type: TypeRef, owner_mod: SymbolStr,
-                    ctx: CompilationContext*) -> void {
+                    spec_type: TypeRef, ctx: CompilationContext*) -> void {
         if (node == null) { return; }
         // For function declarations, use the standard path (no naming conflict)
         if (node.kind == NodeKind::FunctionDeclaration) {
-            SpecInjector::register_injected_decl(node, owner_mod, ctx);
+            SpecInjector::register_injected_decl(node, ctx);
             return;
         }
         if (!spec_type.is_valid()) {
-            SpecInjector::register_injected_decl(node, owner_mod, ctx);
+            SpecInjector::register_injected_decl(node, ctx);
             return;
         }
 
@@ -91,20 +90,14 @@ type struct SpecInjector {
         const arena: TypeArena* = ctx.type_arena;
         const arena_qname: SymbolStr = arena.get_qualified_name(spec_type);
         if (!arena_qname.is_valid()) {
-            SpecInjector::register_injected_decl(node, owner_mod, ctx);
+            SpecInjector::register_injected_decl(node, ctx);
             return;
         }
-
-        // Owner module for DI ownership: the template's defining module for
-        // relocated type specs (so codegen's define-vs-extern decision matches
-        // where the AST is placed), else the demanding module.  Supplied by the
-        // caller; see `register_spec`.
-        const module_sym: SymbolStr = owner_mod;
 
         // Registered under its arena name and nothing else: a specialization
         // has ONE canonical identity, the template's module prefixed to the
         // spec identifier, and every reader asks under it.
-        ctx.decl_index.register_type_with_module(arena_qname, spec_type, module_sym);
+        ctx.decl_index.register_type(arena_qname, spec_type);
 
         // Register a bare->qualified name mapping for the spec.  In-body
         // calls inside a spec'd method get rewritten by ASTTypeSubstituter
@@ -126,36 +119,32 @@ type struct SpecInjector {
         // different method keys, so they can't overwrite each other.
         if (node.kind == NodeKind::StructDeclaration) {
             const sn: StructDeclNode* = node as StructDeclNode*;
-            ctx.decl_index.register_methods_with_module(
-                arena_qname, sn.methods, module_sym, ctx.intern_table, ctx.type_arena);
+            ctx.decl_index.register_methods(
+                arena_qname, sn.methods, ctx.intern_table, ctx.type_arena);
         } else if (node.kind == NodeKind::UnionDeclaration) {
             const un: UnionDeclNode* = node as UnionDeclNode*;
-            ctx.decl_index.register_methods_with_module(
-                arena_qname, un.methods, module_sym, ctx.intern_table, ctx.type_arena);
+            ctx.decl_index.register_methods(
+                arena_qname, un.methods, ctx.intern_table, ctx.type_arena);
         } else if (node.kind == NodeKind::ClassDeclaration) {
             const cn: ClassDeclNode* = node as ClassDeclNode*;
-            ctx.decl_index.register_methods_with_module(
-                arena_qname, cn.methods, module_sym, ctx.intern_table, ctx.type_arena);
+            ctx.decl_index.register_methods(
+                arena_qname, cn.methods, ctx.intern_table, ctx.type_arena);
         } else if (node.kind == NodeKind::EnumDeclaration) {
             // Enum methods come from implement blocks, not inline.
             // Type registration above already covers the enum itself.
         } else {
-            SpecInjector::register_injected_decl(node, owner_mod, ctx);
+            SpecInjector::register_injected_decl(node, ctx);
         }
     }
 
     /// Register a newly injected specialized declaration into the DeclarationIndex
     /// so that sema can look it up without rescanning the AST.
     /// Delegates to the shared TypeResolutionPasses::register_decl_in_index().
-    static register_injected_decl(stmt: ASTNode*, owner_mod: SymbolStr,
-                                    ctx: CompilationContext*) -> void {
+    static register_injected_decl(stmt: ASTNode*, ctx: CompilationContext*) -> void {
         // Injected spec clones, not source decls: pass is_source_decl=false so
         // they are skipped by the cross-module coherence check (their canonical
         // targets recur across every module that instantiates the template).
-        // `owner_mod` sets the spec's DeclarationIndex module ownership to its
-        // template's defining module (where Phase 6a-iii places its AST), so
-        // codegen's define-vs-extern decision agrees with where it is emitted.
-        TypeResolutionPasses::register_decl_in_index(stmt, ctx, false, owner_mod);
+        TypeResolutionPasses::register_decl_in_index(stmt, ctx, false);
     }
 }
 
@@ -687,7 +676,7 @@ type struct SpecializationPasses {
         // Collections::Pair::Pair_i32) from overwriting each other.
         if (entry.ast_node != null) {
             SpecInjector::register(entry.ast_node, entry.specialized_name,
-                                   entry.specialized_type, owner_module_sym, ctx);
+                                   entry.specialized_type, ctx);
         }
         // Register the InstantiatedType's TypeRef in type_reverse so
         // that codegen can look up the concrete type's qualified name
@@ -741,8 +730,8 @@ type struct SpecializationPasses {
             if (impl_qname.is_valid() && impl_node != null) {
                 impl_node.set_target_type(impl_qname);
                 impl_node.spec_owner = entry.specialized_type;
-                ctx.decl_index.register_methods_with_module(
-                    impl_qname, impl_node.methods, owner_module_sym, ctx.intern_table, ctx.type_arena);
+                ctx.decl_index.register_methods(
+                    impl_qname, impl_node.methods, ctx.intern_table, ctx.type_arena);
                 // Re-register trait-impl entries against the *specialized*
                 // target so `traits_implemented_by(spec_name)` finds them.
                 // The original impl was `implement trait Hash for struct
@@ -758,7 +747,7 @@ type struct SpecializationPasses {
                     }
                 }
             } else {
-                SpecInjector::register_injected_decl(entry.impl_nodes[j], owner_module_sym, ctx);
+                SpecInjector::register_injected_decl(entry.impl_nodes[j], ctx);
             }
         }
     }

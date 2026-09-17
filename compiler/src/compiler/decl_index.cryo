@@ -119,12 +119,11 @@ type struct DeclarationIndex {
     // Reverse: TypeRef.id -> SymbolStr.id (for looking up a type's name)
     type_reverse:   HashMap<u64, u32>;
 
-    // Per-module declaration ownership.
-    // Used by codegen to enumerate "all functions/types defined in Module X".
-    // The global maps above remain the fast-path for lookup during sema;
-    // these arrays are the slow-path for per-module enumeration.
-    module_funcs:        Pair<u32, u32>[];    // .first = SymbolStr.id of function, .second = SymbolStr.id of module
-    module_types:        Pair<u32, u32>[];    // .first = SymbolStr.id of type, .second = SymbolStr.id of module
+    // Every function key ever registered, in registration order, each
+    // once: the population a did-you-mean suggestion is drawn from.  Nothing
+    // is looked up here; a key's declarations are the registry's entries.
+    callable_names:      u32[];              // SymbolStr.id of the key
+    callable_names_seen: HashMap<u32, boolean>;
     module_global_keys:       u32[];  // SymbolStr.id of global variable
     module_global_modules:    u32[];  // SymbolStr.id of defining module (source_file)
     module_global_namespaces: u32[];  // SymbolStr.id of defining namespace (e.g.,
@@ -221,11 +220,6 @@ type struct DeclarationIndex {
     overload_index:      HashMap<u32, u32[]>;
     // Bare name SymbolStr.id -> positions in `bare_alts`.
     bare_alts_index:     HashMap<u32, u32[]>;
-    // Function SymbolStr.id -> first defining module id (get_function_module
-    // is first-wins) plus a packed (func.id, module.id) membership set used by
-    // is_function_in_module and the per-module registration de-dup.
-    module_func_first:   HashMap<u32, u32>;
-    module_func_pairs:   HashMap<u64, boolean>;
 
     // Leaf-name SymbolStr.id of every `intrinsic function` declaration (the
     // compiler-lowered ones in `core::intrinsics`: memcpy, ptr_diff, panic,
@@ -305,8 +299,8 @@ type struct DeclarationIndex {
             array_elem_to_type:  HashMap<u64, TypeRef>::new(),
             implicit_converters: HashMap<u64, u64>::new(),
             generic_converter_methods: [],
-            module_funcs:        [],
-            module_types:        [],
+            callable_names:      [],
+            callable_names_seen: HashMap<u32, boolean>::new(),
             module_global_keys:       [],
             module_global_threadlocal: [],
             module_global_extern_syms: [],
@@ -322,8 +316,6 @@ type struct DeclarationIndex {
             overload_index:     HashMap<u32, u32[]>::new(),
             extern_symbol_first: HashMap<u32, Pair<u32, u64>>::new(),
             bare_alts_index:    HashMap<u32, u32[]>::new(),
-            module_func_first:  HashMap<u32, u32>::new(),
-            module_func_pairs:  HashMap<u64, boolean>::new(),
             intrinsic_names:    HashMap<u32, u32>::new(),
             module_imports:     HashMap<u32, u32[]>::new(),
             prelude_ns:         [],
@@ -708,17 +700,15 @@ type struct DeclarationIndex {
 
 
 
-    /// Register methods with full per-module visibility.
-    /// This adds each method to the per-module function list under the
-    /// combined key "QualifiedType::method" so that cross-module externs
-    /// can declare them and codegen can find them.  `type_sym` is the
-    /// owner's registration key - a declared type's canonical name, a
-    /// primitive's spelling - and the only key the methods go under: a
-    /// written spelling of the owner is a leaf shared by every module's
-    /// type of that name, and a reader holding one asks the head's stamp.
-    register_methods_with_module(mut &this, type_sym: SymbolStr, methods: &MethodNode*[],
-                                  module: SymbolStr, intern: InternTable*,
-                                  arena: TypeArena*) -> void {
+    /// Register each method under the combined key "QualifiedType::method",
+    /// which is what a cross-module extern declares and codegen finds.
+    /// `type_sym` is the owner's registration key - a declared type's
+    /// canonical name, a primitive's spelling - and the only key the
+    /// methods go under: a written spelling of the owner is a leaf shared
+    /// by every module's type of that name, and a reader holding one asks
+    /// the head's stamp.
+    register_methods(mut &this, type_sym: SymbolStr, methods: &MethodNode*[],
+                     intern: InternTable*, arena: TypeArena*) -> void {
         const type_str: string = intern.resolve(type_sym);
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
@@ -844,15 +834,7 @@ type struct DeclarationIndex {
             func.set_overload_entry(this.register_signature(
                 combined_sym, func_type_ref, SymbolStr::empty(), eff_mangled, func.origin_trait));
 
-            // Add to per-module list.  Skip if this (combined_sym, module)
-            // pair was already added by a prior overload; multiple
-            // overloads of the same method share one per-module entry.
-            const pair_key: u64 =
-                ((combined_sym.id as u64) << 32) | (module.id as u64);
-            if (!this.module_func_pairs.contains_key(&pair_key)) {
-                this.module_funcs.push(Pair<u32, u32>::new(combined_sym.id, module.id));
-            }
-            this.note_module_func(combined_sym.id, module.id);
+            this.note_callable_name(combined_sym);
         }
     }
 
@@ -948,32 +930,25 @@ type struct DeclarationIndex {
     }
 
 
-    // Per-module registration (called alongside global registration)
-
-    /// Maintain the O(1) module-func indices alongside a `module_funcs`
-    /// push: record first-wins module ownership and (func, module)
-    /// membership.  Idempotent, so it is safe to call on every push.
-    note_module_func(mut &this, name_id: u32, module_id: u32) -> void {
-        if (!this.module_func_first.contains_key(&name_id)) {
-            this.module_func_first.insert(name_id, module_id);
-        }
-        const pk: u64 = ((name_id as u64) << 32) | (module_id as u64);
-        this.module_func_pairs.insert(pk, true);
+    /// Record `name` among the keys a did-you-mean draws from, once.
+    note_callable_name(mut &this, name: SymbolStr) -> void {
+        if (this.callable_names_seen.contains_key(&name.id)) { return; }
+        this.callable_names_seen.insert(name.id, true);
+        this.callable_names.push(name.id);
     }
 
-    /// Register a free function's signature under its key `name`, in
-    /// module `module`, emitted under `symbol` when one is given (an
-    /// `extern "C"` declaration's C name, a `![symbol]` link name, an
-    /// intrinsic's bare name) and under the Cryo mangling of the signature
-    /// otherwise.  Answers the entry, which the caller stamps on the node.
-    register_function_type_with_module(mut &this, name: SymbolStr,
-                                       return_type: TypeRef, func_type_ref: TypeRef,
-                                       module: SymbolStr, intern: InternTable*,
-                                       arena: TypeArena*, symbol: SymbolStr) -> OverloadId {
+    /// Register a free function's signature under its key `name`, emitted
+    /// under `symbol` when one is given (an `extern "C"` declaration's C
+    /// name, a `![symbol]` link name, an intrinsic's bare name) and under
+    /// the Cryo mangling of the signature otherwise.  Answers the entry,
+    /// which the caller stamps on the node.
+    register_function_signature(mut &this, name: SymbolStr,
+                                return_type: TypeRef, func_type_ref: TypeRef,
+                                intern: InternTable*, arena: TypeArena*,
+                                symbol: SymbolStr) -> OverloadId {
         this.register_function(name, return_type);
+        this.note_callable_name(name);
         if (symbol.is_valid()) {
-            this.module_funcs.push(Pair<u32, u32>::new(name.id, module.id));
-            this.note_module_func(name.id, module.id);
             return this.register_signature(name, func_type_ref, SymbolStr::empty(), symbol, SymbolStr::empty());
         }
 
@@ -995,16 +970,7 @@ type struct DeclarationIndex {
         }
         const mangled: MangledName = MangledName::for_free_function(
             intern, arena, qname, params, return_type, is_variadic);
-        this.module_funcs.push(Pair<u32, u32>::new(name.id, module.id));
-        this.note_module_func(name.id, module.id);
         return this.register_signature(name, func_type_ref, SymbolStr::empty(), mangled.value, SymbolStr::empty());
-    }
-
-    /// Register a type with its defining module for per-module enumeration.
-    register_type_with_module(mut &this, qualified_name: SymbolStr, ty: TypeRef,
-                              module: SymbolStr) -> void {
-        this.register_type(qualified_name, ty);
-        this.module_types.push(Pair<u32, u32>::new(qualified_name.id, module.id));
     }
 
 
@@ -1225,43 +1191,7 @@ type struct DeclarationIndex {
         return result;
     }
 
-    // Per-module queries (used by codegen to enumerate module exports)
-
-    /// Get all function names defined in a specific module.
-    get_functions_in_module(&this, module: SymbolStr) -> SymbolStr[] {
-        mut result: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < this.module_funcs.length; i++) {
-            if (this.module_funcs[i].second == module.id) {
-                result.push(SymbolStr::from_id(this.module_funcs[i].first));
-            }
-        }
-        return result;
-    }
-
-
-    /// Check if a function is defined in a specific module.
-    is_function_in_module(&this, name: SymbolStr, module: SymbolStr) -> boolean {
-        const pk: u64 = ((name.id as u64) << 32) | (module.id as u64);
-        return this.module_func_pairs.contains_key(&pk);
-    }
-
-    /// Get the defining module for a function. Returns empty SymbolStr if not found.
-    get_function_module(&this, name: SymbolStr) -> SymbolStr {
-        return match (this.module_func_first.get(&name.id)) {
-            Option::Some(val) => { SymbolStr::from_id(val) }
-            Option::None      => { SymbolStr::empty() }
-        };
-    }
-
-    /// Get the defining module for a type. Returns empty SymbolStr if not found.
-    get_type_module(&this, name: SymbolStr) -> SymbolStr {
-        for (mut i: i64 = 0; i < this.module_types.length; i++) {
-            if (this.module_types[i].first == name.id) {
-                return SymbolStr::from_id(this.module_types[i].second);
-            }
-        }
-        return SymbolStr::empty();
-    }
+    // Per-module queries
 
     /// Get the defining module for a global. Returns empty SymbolStr if not found.
     get_global_module(&this, name: SymbolStr) -> SymbolStr {

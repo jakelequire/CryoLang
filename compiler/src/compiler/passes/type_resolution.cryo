@@ -1460,19 +1460,9 @@ type struct TypeResolutionPasses {
     /// targets across the modules that instantiate them and would otherwise
     /// false-positive.
     static register_decl_in_index(stmt: ASTNode*, ctx: CompilationContext*,
-                                  is_source_decl: boolean,
-                                  owner_mod: SymbolStr) -> void {
+                                  is_source_decl: boolean) -> void {
         if (stmt == null) { return; }
         const arena: TypeArena* = ctx.type_arena;
-        // DeclarationIndex module ownership.  Normally the current module, but
-        // injected specializations pass their template's defining module via
-        // `owner_mod` so DI ownership matches where Phase 6a-iii places the AST
-        // (see `register_injected_decl`).  Invalid `owner_mod` => current module.
-        const module_sym: SymbolStr = if (owner_mod.is_valid()) {
-            owner_mod
-        } else {
-            ctx.intern(ctx.source_file)
-        };
 
         match (stmt.kind) {
             NodeKind::StructDeclaration => {
@@ -1480,7 +1470,7 @@ type struct TypeResolutionPasses {
                 const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
                 const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                 if (ty.is_valid()) {
-                    ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
+                    ctx.decl_index.register_type(qualified_sym, ty);
                 }
                 // Bare-name mapping only for file-namespaced types; a
                 // C-imported struct (binding_namespace set) stays
@@ -1489,40 +1479,40 @@ type struct TypeResolutionPasses {
                     ctx.decl_index.register_name_mapping(node.name, qualified_sym);
                     ctx.decl_index.set_decl_visibility(qualified_sym, node.is_public);
                 }
-                ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table, arena);
+                ctx.decl_index.register_methods(qualified_sym, node.methods, ctx.intern_table, arena);
             }
             NodeKind::UnionDeclaration => {
                 const node: UnionDeclNode* = stmt as UnionDeclNode*;
                 const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
                 const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                 if (ty.is_valid()) {
-                    ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
+                    ctx.decl_index.register_type(qualified_sym, ty);
                 }
                 if (!qualified_sym.equals(node.name) && node.binding_namespace.is_empty()) {
                     ctx.decl_index.register_name_mapping(node.name, qualified_sym);
                     ctx.decl_index.set_decl_visibility(qualified_sym, node.is_public);
                 }
-                ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table, arena);
+                ctx.decl_index.register_methods(qualified_sym, node.methods, ctx.intern_table, arena);
             }
             NodeKind::ClassDeclaration => {
                 const node: ClassDeclNode* = stmt as ClassDeclNode*;
                 const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
                 const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                 if (ty.is_valid()) {
-                    ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
+                    ctx.decl_index.register_type(qualified_sym, ty);
                 }
                 if (!qualified_sym.equals(node.name)) {
                     ctx.decl_index.register_name_mapping(node.name, qualified_sym);
                     ctx.decl_index.set_decl_visibility(qualified_sym, node.is_public);
                 }
-                ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table, arena);
+                ctx.decl_index.register_methods(qualified_sym, node.methods, ctx.intern_table, arena);
             }
             NodeKind::EnumDeclaration => {
                 const node: EnumDeclNode* = stmt as EnumDeclNode*;
                 const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
                 const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                 if (ty.is_valid()) {
-                    ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
+                    ctx.decl_index.register_type(qualified_sym, ty);
                 }
                 if (!qualified_sym.equals(node.name) && node.binding_namespace.is_empty()) {
                     ctx.decl_index.register_name_mapping(node.name, qualified_sym);
@@ -1534,7 +1524,7 @@ type struct TypeResolutionPasses {
                 const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
                 const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                 if (ty.is_valid()) {
-                    ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
+                    ctx.decl_index.register_type(qualified_sym, ty);
                 }
                 if (!qualified_sym.equals(node.name)) {
                     ctx.decl_index.register_name_mapping(node.name, qualified_sym);
@@ -1576,8 +1566,8 @@ type struct TypeResolutionPasses {
                     // Under the declaration's own key, in the per-module list
                     // so cross-module descriptors carry it whole.
                     const q_name: SymbolStr = ctx.decl_fn_key(func.name, func.span.file);
-                    const entry: OverloadId = ctx.decl_index.register_function_type_with_module(
-                        q_name, func.resolved_return_type, func_type_ref, module_sym, ctx.intern_table, arena,
+                    const entry: OverloadId = ctx.decl_index.register_function_signature(
+                        q_name, func.resolved_return_type, func_type_ref, ctx.intern_table, arena,
                         SymbolStr::empty());
                     func.set_overload_entry(entry);
 
@@ -1780,16 +1770,15 @@ type struct TypeResolutionPasses {
                             node.span);
                     }
                 }
-                ctx.decl_index.register_methods_with_module(
-                    canonical_target, node.methods, module_sym,
-                    ctx.intern_table, arena);
+                ctx.decl_index.register_methods(
+                    canonical_target, node.methods, ctx.intern_table, arena);
             }
             NodeKind::TypeAliasDeclaration => {
                 const node: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
                 const qualified_sym: SymbolStr = ctx.decl_type_key(node.alias_name, node.binding_namespace, node.span.file);
                 const ty: TypeRef = ctx.decl_index.lookup_type(qualified_sym);
                 if (ty.is_valid()) {
-                    ctx.decl_index.register_type_with_module(qualified_sym, ty, module_sym);
+                    ctx.decl_index.register_type(qualified_sym, ty);
                 }
                 if (!qualified_sym.equals(node.alias_name) && node.binding_namespace.is_empty()) {
                     ctx.decl_index.register_name_mapping(node.alias_name, qualified_sym);
@@ -3144,7 +3133,6 @@ type struct TypeResolutionPasses {
                                 fn_node.name
                             };
 
-                            const ext_mod_sym: SymbolStr = ctx.intern(ctx.source_file);
                             // The declaration is registered under its own key -
                             // its name under the module that wrote it, as any
                             // free function's - and the C name is its SYMBOL,
@@ -3181,8 +3169,8 @@ type struct TypeResolutionPasses {
                             // as well as the key's slot: codegen resolves a
                             // pinned declaration through the entry registered
                             // under it, an extern's as any other function's.
-                            fn_node.set_overload_entry(ctx.decl_index.register_function_type_with_module(
-                                ext_q_name, fn_node.resolved_return_type, func_type_ref, ext_mod_sym,
+                            fn_node.set_overload_entry(ctx.decl_index.register_function_signature(
+                                ext_q_name, fn_node.resolved_return_type, func_type_ref,
                                 ctx.intern_table, arena, ext_link_sym));
                             ctx.decl_index.note_extern_symbol(ext_link_sym, ext_q_name, func_type_ref);
 
@@ -3194,8 +3182,8 @@ type struct TypeResolutionPasses {
                                 const q_sym: SymbolStr = ctx.intern_table.intern(qualified);
                                 // CImport qualified name maps to the bare C name (or
                                 // the `![symbol]` override).
-                                ctx.decl_index.register_function_type_with_module(
-                                    q_sym, fn_node.resolved_return_type, func_type_ref, ext_mod_sym,
+                                ctx.decl_index.register_function_signature(
+                                    q_sym, fn_node.resolved_return_type, func_type_ref,
                                     ctx.intern_table, arena, ext_link_sym);
                             }
                         }
@@ -3235,14 +3223,13 @@ type struct TypeResolutionPasses {
                         const i_func_type_ref: TypeRef = arena.get_function(
                             node.resolved_return_type, i_param_types, node.is_variadic);
 
-                        // Register under qualified name with module
-                        // so cross-module externs pick up intrinsics.
-                        const i_mod_sym: SymbolStr = ctx.intern(ctx.source_file);
+                        // Register under the qualified name so cross-module
+                        // externs pick up intrinsics.
                         const q_name: SymbolStr = ctx.decl_fn_key(node.name, node.span.file);
                         // Intrinsics use C linkage; their LLVM symbol is the
                         // bare function name, not the qualified/mangled form.
-                        ctx.decl_index.register_function_type_with_module(
-                            q_name, node.resolved_return_type, i_func_type_ref, i_mod_sym, ctx.intern_table, arena,
+                        ctx.decl_index.register_function_signature(
+                            q_name, node.resolved_return_type, i_func_type_ref, ctx.intern_table, arena,
                             node.name);
 
                         // The leaf is recorded as an intrinsic's - codegen's
@@ -3651,8 +3638,7 @@ type struct TypeResolutionPasses {
             if (stmt == null) { continue; }
 
             // Register in DeclarationIndex (shared logic with Specialization).
-            // Source decls are owned by the current module (empty owner_mod).
-            TypeResolutionPasses::register_decl_in_index(stmt, ctx, true, SymbolStr::empty());
+            TypeResolutionPasses::register_decl_in_index(stmt, ctx, true);
 
             match (stmt.kind) {
                 NodeKind::VariableDeclaration => {

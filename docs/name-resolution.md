@@ -121,6 +121,7 @@ three, and its row carries the count. Read each zero off its own row.
 | M4 mono bare-name scan | **DELETED** — with the current-module key before it; a callee with no usable stamp names no template | — | `grep -rho -e 'bare_name_scan' -e 'M4Calls' compiler/src --include=*.cryo \| wc -l` → **0** | §8.33, §8.120, §8.157 |
 | M5 import suffix fallback | **DELETED** — an import path names a module by its registered name or binds nothing | — | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **0** | §8.120, §8.157 |
 | scope-call argument check keyed by the segment's SPELLING (`check_scope_call_arg_types`: `<spelling>::<member>`, then a module-suffix scan over every module in the graph when that key held nothing) | **DELETED** — a `Def` segment's key is the stamp's, through `resolve_module_qualified_symbol`, the same path that resolves the call's return; shadow 162,460 over six halves: 126,642 the scan and the stamp named one function, 35,804 a type segment the scan walked the graph for and found nothing, **14 the scan checked NOTHING where the stamp answers** (12 two modules sharing the written suffix, 2 a re-export) - at those the mismatch compiled and the binary died of heap corruption | — | `grep -c 'suffix_start' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -c 'resolve_module_qualified_symbol(' compiler/src/compiler/sema/call_resolver.cryo` → **5** (the definition, the call's return, the value form, the parameter-type lookup, the argument check) | §8.217 |
+| the index's per-module ownership tables (`module_funcs.second`, `module_types`, `module_func_first`, `module_func_pairs`; `get_function_module`, `is_function_in_module`, `get_type_module`, `get_functions_in_module`; the `module` parameter of the three registrars and the `owner_mod` plumbed from spec injection to feed it) | **DELETED** — written on every registration, read by nothing: 0 callers of the four accessors in `compiler/src` and `tools` (HEAD `ccb310aa`: 29 mentions in `decl_index.cryo`, 0 outside but a comment and the arena's own `get_type_module`); the one reader of `module_funcs` wanted the function NAMES for a did-you-mean and reads `callable_names` | — | `grep -c -e 'module_func' -e 'module_types' compiler/src/compiler/decl_index.cryo` → **0**; `grep -rho -e 'register_methods_with_module' -e 'register_function_type_with_module' -e 'register_type_with_module' compiler/src --include=*.cryo \| wc -l` → **0** | §8.218 |
 | const-table bare leaf (`by_bare`, `bare_index_of`, the same-leaf chain folder) | **DELETED** — a bare constant is read off `IdentifierNode.res`; shadow 0 over six halves, the lane reached 4/4 in `const_cross_module` under the same build, and a same-leaf constant in an unimported module - which the chain folder REFUSED - now folds to the imported one | — | `grep -c 'by_bare' compiler/src/compiler/const_table.cryo` → **0** | §8.9, §8.111, §8.171 |
 | `spelling_type` call-ident fallback (E0202 tail) and `new`'s `resolve_primitive` step | **DELETED** — shadow 0 over six halves; their three rows retired | — | `grep -c 'resolve_primitive' compiler/src/compiler/sema/sema.cryo` → **0** | §8.25, §8.98, §8.171 |
 | `new`'s spelling step (`lookup_type_exact(new_expr.type_name)`) | LIVE — for an ALIAS KEYWORD only (`new int[100]`): `int`/`uint`/`float`/`double` are not primitive spellings because a module may carry the name, so the stamp is Pending and the alias registration is the only key. **The pinned `spelling_type new expr: calls` row is 0 because no pinned b1 corpus contains a `new` expression** — a corpus fact, not a lane fact; `tests/lang/new_array.cryo` reaches it twice. Goes with the keyword ruling (§8.165), as does the impl head's spelling arm for the same four spellings (§8.188); `ResBase::is_alias_keyword` names the population | 0 calls on every pinned arm | same file, `spelling_type new expr: calls`; `grep -rho 'is_alias_keyword' compiler/src --include=*.cryo | wc -l` → **2** (the predicate and the impl head's arm) | §8.25, §8.98, §8.171, §8.188 |
@@ -12119,6 +12120,107 @@ and lane goldens.
 
 **Tally: 70 shadowed, 70 old paths deleted, 70 at zero; 105 artifacts
 gone** (+ the module-suffix scan).
+
+---
+
+### 8.218 The index's per-module ownership tables are deleted: written on every registration, read by nothing - 2026-09-16
+
+#### What they were
+
+`DeclarationIndex` kept, beside every function and type registration, the
+module that registered it: `module_funcs: Pair<name, module>[]`,
+`module_types: Pair<name, module>[]`, and two O(1) indices over the first
+- `module_func_first` (name → first module, "first-wins ownership") and
+`module_func_pairs` (a packed `(name, module)` membership set) - written
+by `note_module_func` on every push.  Four accessors read them:
+`get_functions_in_module`, `is_function_in_module`,
+`get_function_module`, `get_type_module`; the header comment said codegen
+used them to enumerate a module's exports for the define-vs-extern
+decision.  Three registrars took a `module` argument to feed them -
+`register_methods_with_module` (12 callers), `register_function_type_with_module`
+(5), `register_type_with_module` (9) - and `owner_mod` was plumbed from
+`SpecInjector::register` through `register_injected_decl` into
+`register_decl_in_index` so that an injected specialization's ownership
+would name its template's module rather than the demanding one.
+
+#### Measurement (the current tree at `ccb310aa`, `grep -rl <name> compiler/src tools --include=*.cryo`)
+
+| symbol | files outside `decl_index.cryo` |
+|---|---|
+| `module_func_first`, `module_func_pairs`, `note_module_func` | 0 |
+| `module_types` | 1 - a comment, `type_resolution.cryo:453` |
+| `get_type_module` | 1 - `arena.cryo`, the arena's own method of that name |
+| `get_function_module`, `is_function_in_module`, `get_functions_in_module` | 0 |
+| `module_funcs` | 1 - `sema/diagnostics.cryo` `collect_bare_callable_names`, reading `.first` |
+
+Inside the file the four accessors were the only readers of the four
+tables (`module_func_pairs` also gated the `module_funcs` push against a
+second overload of one method).  `module_funcs.second` was read by
+`get_functions_in_module` alone.  So every table was write-only through
+its accessors, and the one outside reader wanted the function NAMES.
+ABSENT, not starved: nothing asked; a clean deletion, no shadow to run.
+
+Control on the instrument: the grep that reports 0 for the accessors
+finds the arena's `get_type_module` and the comment mentioning
+`module_types`, so it is not a grep that finds nothing.
+
+#### The change
+
+* The four tables, `note_module_func` and the four accessors are
+  deleted.  `module_funcs` becomes `callable_names: u32[]` - every
+  function key ever registered, once, in registration order, deduplicated
+  at the push by `callable_names_seen` - and `collect_bare_callable_names`
+  reads it; its own string dedup goes, since interned symbols make id
+  identity string identity, and its order is the old first-occurrence
+  order.
+* The `module` parameter comes off the registrars, which are renamed
+  for what they now do: `register_methods` (the combined `Type::method`
+  keys), `register_function_signature` (a free function's key, symbol
+  and entry); `register_type_with_module` was `register_type` plus a
+  `module_types` push and its 9 callers call `register_type`.
+* `owner_mod` is stripped from `SpecInjector::register`,
+  `register_injected_decl` and `register_decl_in_index`, with the
+  `module_sym` locals that carried it: `type_resolution.cryo`'s
+  `register_decl_in_index` head, the extern arm's `ext_mod_sym`, the
+  intrinsic arm's `i_mod_sym`, `specialization.cryo`'s `register`, and
+  `AsyncDecl.module_sym` in `async_lower.cryo`, a field whose only reader
+  was the argument to the deleted parameter (found by the LSP gate's
+  warning count moving 490 → 491, W0001 unused variable; 490 again).
+  `owner_module_sym` in `specialization.cryo` stays: it also sets
+  `entry.owner_source`.
+
+#### Gates
+
+lsp-check OK (264 modules, 0 errors, 490 warnings); cross-check OK
+(`.objcmp/u3-cross2.log`); `make test-census` OK, 2,124 / 192 / 63;
+lane-check unchanged (`LOOKUP_OTHER` 28: none of the deleted names was a
+`lookup_*`); ns-status-check OK.  **Objects: 0 of 2,557 + 1,126 moved**
+(`hash-tree.sh E` against `D`, HEAD `ccb310aa`'s half, `.objcmp/u3-hashE.out`;
+`t-E.txt.log` OVERALL PASS 2,124 / 192 / 60, 0 allocation failures).
+
+#### Findings, not chased
+
+* `collect_bare_callable_names` keeps only keys with no `::`, and
+  `decl_fn_key` qualifies every function a namespaced file declares, so
+  the E0202 did-you-mean has an EMPTY population in practice: a probe with
+  `helper_value()` declared and `helper_valu()` called in one file gets
+  `E0202` and no suggestion, under HEAD and the tree alike
+  (`.objcmp/u1-keep/dym/`).  The list is a second copy of the registry's
+  keys (`overload_func_keys`) filtered to nothing; the suggestion wants
+  the registry's LEAVES.
+* The globals' analogue - `register_global_with_module`,
+  `module_global_modules`, `get_global_module` - has ONE outside reader;
+  not measured further here.
+
+Outside the ledger: `decl_index.cryo`, `sema/diagnostics.cryo`,
+`sema/async_lower.cryo`, `sema/lambda_synth.cryo`,
+`mono/call_specializer.cryo`, `passes/specialization.cryo`,
+`passes/type_resolution.cryo`.
+
+**Tally: 70 shadowed, 70 old paths deleted, 70 at zero; 114 artifacts
+gone** (+ four tables, four accessors, `note_module_func`, a field, and
+the `module`/`owner_mod` parameter of six functions - counted as nine:
+the tables and accessors, and the parameter chain as one).
 
 ---
 
