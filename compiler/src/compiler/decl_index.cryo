@@ -264,7 +264,8 @@ type struct DeclarationIndex {
     // (type_resolution.cryo) alongside `register_name_mapping`, so every name
     // that can appear as a same-leaf candidate carries a verdict.  A name
     // absent from this map (single-file / C-import types, which never enter the
-    // alternatives set) is treated as public (permissive).
+    // alternatives set) is a declaration that never registered, recorded as
+    // such (`is_candidate_public`).
     //
     // A same-module candidate never reaches this check: both branches of
     // `resolve_qualified_scoped` compare namespaces first, so a module always
@@ -528,13 +529,16 @@ type struct DeclarationIndex {
     }
 
     /// Register a named type (struct, class, enum, trait) under its
-    /// qualified name (e.g. "Module::Point").  Callers must qualify the
-    /// name before calling.
-    register_type(mut &this, qualified_name: SymbolStr, ty: TypeRef) -> void {
+    /// qualified name (e.g. "Module::Point"), with its visibility verdict.
+    /// Callers must qualify the name before calling.  The verdict is
+    /// recorded here, with the key, so no registered type is ever asked
+    /// about before it has one.
+    register_type(mut &this, qualified_name: SymbolStr, ty: TypeRef, is_public: boolean) -> void {
         this.type_map.insert(qualified_name.id, ty);
 
         // Reverse map: TypeRef.id -> qualified name
         this.type_reverse.insert(ty.id, qualified_name.id);
+        this.decl_visibility.insert(qualified_name.id, is_public);
     }
 
     /// Register the concrete `Array<T>` specialization a dynamic `T[]`
@@ -1102,12 +1106,20 @@ type struct DeclarationIndex {
         return false;
     }
 
-    /// Visibility verdict for a candidate; permissive default (see
-    /// `decl_visibility`).
+    /// Visibility verdict for a candidate.  Every registration records one
+    /// (a type's with `register_type`, a function's beside its signature),
+    /// so a candidate with none is a declaration that never registered -
+    /// recorded as such, which fails the build; the answer given meanwhile
+    /// is the top-level default rather than a refusal that would report a
+    /// public item as private.
     is_candidate_public(&this, qualified: SymbolStr) -> boolean {
         return match (this.decl_visibility.get(&qualified.id)) {
             Option::Some(v) => { v }
-            Option::None    => { true }
+            Option::None    => {
+                compiler::resolver::res::record_unregistered_def(
+                    "decl_index: visibility of a candidate no registration recorded a verdict for");
+                true
+            }
         };
     }
 

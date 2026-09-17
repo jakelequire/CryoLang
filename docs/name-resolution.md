@@ -124,6 +124,7 @@ three, and its row carries the count. Read each zero off its own row.
 | the index's per-module ownership tables (`module_funcs.second`, `module_types`, `module_func_first`, `module_func_pairs`; `get_function_module`, `is_function_in_module`, `get_type_module`, `get_functions_in_module`; the `module` parameter of the three registrars and the `owner_mod` plumbed from spec injection to feed it) | **DELETED** — written on every registration, read by nothing: 0 callers of the four accessors in `compiler/src` and `tools` (HEAD `ccb310aa`: 29 mentions in `decl_index.cryo`, 0 outside but a comment and the arena's own `get_type_module`); the one reader of `module_funcs` wanted the function NAMES for a did-you-mean and reads `callable_names` | — | `grep -c -e 'module_func' -e 'module_types' compiler/src/compiler/decl_index.cryo` → **0**; `grep -rho -e 'register_methods_with_module' -e 'register_function_type_with_module' -e 'register_type_with_module' compiler/src --include=*.cryo \| wc -l` → **0** | §8.218 |
 | a stamped declaration's type asked by its RE-DERIVED name (`Res::Def(q)` → `q.qualified_name()` → `lookup_type` / `lookup_type_exact` / `lookup_func_type_exact`) | **CONVERTING** — the index answers a `DefId` directly (`type_of_def`, `func_type_of_def`; the `_of_res` pair rides on them), so the unwrap happens once, inside the index, and a reader hands over the id it holds. §8.219 took the six sites whose lookup was the unwrap's only consumer (`impl_owner`, the class base, the enum pattern's type, the struct literal's base, `TypeUtils::def_type`, the function value's type); the unwraps left are text (a symbol, a diagnostic) or feed a name-keyed consumer of another kind (a `Family` pin, the generic registry, a visibility gate) | — | `grep -c '_of_def(&this' compiler/src/compiler/decl_index.cryo` → **2**; `grep -A1 '^\[DEFID_UNWRAP\]' tests/lane-baseline.txt \| grep -o '[0-9]*'` → **33** (38 before §8.219); `grep -A1 '^\[LOOKUP\]' tests/lane-baseline.txt \| grep -o '[0-9]*'` → **35** (43 before §8.219, 41 before §8.221) | §8.219 |
 | a written type declaration's type asked back from the index under its own key and re-registered under it (`register_decl_in_index`: `lookup_type(qualified_sym)` → `register_type(qualified_sym, ty)` in the struct, union, class, enum, trait and alias arms) | **DELETED** — the type-declaration stage registered the type under that key and the reverse map already names it; shadow 37,976 re-registrations over six halves, every one `agree` (map held the key, reverse map named it), 0 clones reached the arms, 0 INVALID; the arms keep what that stage does not own (bare-name mapping, visibility, methods); 0 objects moved; `lane-check` LOOKUP 41 → 35 | — | `grep -c 'lookup_type(qualified_sym)' compiler/src/compiler/passes/type_resolution.cryo` → **4** (the field-population reads, §8.221's next slice; 10 before); `grep -c 'register_type(qualified_sym' compiler/src/compiler/passes/type_resolution.cryo` → **0** | §8.221 |
+| `is_candidate_public`'s permissive default (a candidate with no recorded verdict answered PUBLIC; D12's own subject, outside `lane-check` by name) | **DELETED** — measured at its three doors over six halves (`.objcmp/u3-lines.txt`): 102,408 asks, **29,828 answered by the default** - 29,825 at the qualified-call gate `enforce_callee_visibility`, every one an extern-block function (237 keys: `std::ffi::libc`, `std::sys::syscall`, `std::ffi::openssl`, `compiler::bindgen::clang`, the `ExtDup` project), whose registration recorded no verdict, and 3 at the E0203 explainers (`unreachable_declarer` 2, `suggest_reaching_import` 1), a generic type (`NamespaceGate::Depot::Crate`) asked from a module resolved BEFORE its declaring module's Phase 4 wrote the verdict. STARVED of a writer, not absent: a `private function` in an extern block called by qualified path from another module compiled and ran under HEAD (exit 9). Every type registration now records its verdict with its key (`register_type(key, ty, is_public)`, 28 callers), the extern-block arm records each function's, `register_decl_in_index` no longer writes a type's, and the `None` arm records an unregistered definition (E0900 at the end of a build with no other error) and answers the top-level default meanwhile - a public item is never reported private. Project `extern_private_function_is_private` (compile_fail E0353; HEAD ran it). Mutation: the extern writer removed, the same probe fails E0900 `194 canonical name(s) named no registered declaration`. 0 objects moved | — | `grep -c 'Option::None    => { true }' compiler/src/compiler/decl_index.cryo` → **0**; `grep -c 'record_unregistered_def' compiler/src/compiler/decl_index.cryo` → **1**; `grep -rho 'set_decl_visibility(' compiler/src --include=*.cryo \| wc -l` → **5** (the definition, the free-function arm, the extern arm's two keys, the intrinsic arm); `grep -c '^project extern_private_function_is_private' tests/test-roster.txt` → **1** | §8.222 |
 | const-table bare leaf (`by_bare`, `bare_index_of`, the same-leaf chain folder) | **DELETED** — a bare constant is read off `IdentifierNode.res`; shadow 0 over six halves, the lane reached 4/4 in `const_cross_module` under the same build, and a same-leaf constant in an unimported module - which the chain folder REFUSED - now folds to the imported one | — | `grep -c 'by_bare' compiler/src/compiler/const_table.cryo` → **0** | §8.9, §8.111, §8.171 |
 | `spelling_type` call-ident fallback (E0202 tail) and `new`'s `resolve_primitive` step | **DELETED** — shadow 0 over six halves; their three rows retired | — | `grep -c 'resolve_primitive' compiler/src/compiler/sema/sema.cryo` → **0** | §8.25, §8.98, §8.171 |
 | `new`'s spelling step (`lookup_type_exact(new_expr.type_name)`) | LIVE — for an ALIAS KEYWORD only (`new int[100]`): `int`/`uint`/`float`/`double` are not primitive spellings because a module may carry the name, so the stamp is Pending and the alias registration is the only key. **The pinned `spelling_type new expr: calls` row is 0 because no pinned b1 corpus contains a `new` expression** — a corpus fact, not a lane fact; `tests/lang/new_array.cryo` reaches it twice. Goes with the keyword ruling (§8.165), as does the impl head's spelling arm for the same four spellings (§8.188); `ResBase::is_alias_keyword` names the population | 0 calls on every pinned arm | same file, `spelling_type new expr: calls`; `grep -rho 'is_alias_keyword' compiler/src --include=*.cryo | wc -l` → **2** (the predicate and the impl head's arm) | §8.25, §8.98, §8.171, §8.188 |
@@ -219,7 +220,7 @@ a count.
 Checks for this section, one per line so each can be copied whole:
 
 * `grep -c '^\[' tests/lane-baseline.txt` → **9**
-* `grep -c '^project ' tests/test-roster.txt` → **63**
+* `grep -c '^project ' tests/test-roster.txt` → **64**
 * `grep -c '^negative ' tests/test-roster.txt` → **193**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
@@ -12442,6 +12443,114 @@ Outside the ledger: `passes/type_resolution.cryo`, the lane golden.
 gone** (+1 lane, the re-registration pair, shadowed and deleted here; the
 artifact count is unchanged - the pair was inline, and no named function
 or table went with it).
+
+---
+
+### 8.222 `is_candidate_public`'s permissive default answered "public" for every extern-block function - a `private` extern was callable by qualified path from any module; every registration records its verdict now, and a candidate with none is a recorded defect - 2026-09-17
+
+#### The shape
+
+`DeclarationIndex::is_candidate_public(q)` read `decl_visibility` and
+answered `true` for a key with no entry.  Three doors ask it:
+`enforce_callee_visibility` (sema, the E0353 gate for a qualified call
+and for a function taken as a value), and the two E0203 explainers in
+type resolution, `unreachable_declarer` and `suggest_reaching_import`.
+The default sat outside `lane-check` by construction - no `lookup_*`
+name - while D12 names `lane-check` as the enforcement for exactly this
+class.  Audit 9 flagged it; nothing had measured whether the default was
+ever the answer.
+
+#### The measurement
+
+A shadow at the three doors (`visibility_recorded`, a temporary index
+query; door, `recorded`|`DEFAULT`, the key on `DEFAULT` only).  Six halves
+(`corpus2.sh u3`, `.objcmp/u3-lines.txt`): **102,408 asks, 29,828
+answered by the default.**
+
+| door | recorded | DEFAULT |
+|---|---|---|
+| `callee` (`enforce_callee_visibility`) | 72,573 | **29,825** |
+| `unreach` (`unreachable_declarer`) | 5 | 2 |
+| `suggest` (`suggest_reaching_import`) | 2 | 1 |
+
+The 29,825 are 237 distinct keys, every one a function declared in an
+`extern` block: `std::ffi::libc` (75 keys; `strlen` 4,511, `memcpy`
+4,320, `printf` 2,412 ...), `std::sys::syscall` (83), `std::ffi::openssl`
+(23), `compiler::bindgen::clang` (54), and the `ExtDup` project's two
+`llabs`.  The extern-block arm of type resolution registers the signature
+and the link symbol and never wrote a verdict; the free-function arm
+writes `func.is_public` beside its registration.  The 3 type asks are one
+key, `NamespaceGate::Depot::Crate`, a generic struct asked by the E0203
+explainers while resolving `Orphan` - a module that does not import
+`Depot` and so is resolved before `Depot`'s Phase 4 (where
+`register_decl_in_index` wrote a type's verdict) has run; the verdict
+existed later, not yet.
+
+STARVED of a writer, not absent - and load-bearing in the wrong
+direction.  The parser gives an extern-block function its written
+visibility (`private function llabs(v: i64) -> i64;` is `is_public =
+false`; the parser's own comment says a private one binds nothing at an
+`import ... { llabs }`), and the qualified path around that: probe
+`.objcmp/u1-keep/privext` - `PrivExt::Ffi` declares the private extern,
+`PrivExt::Main` calls `Ffi::llabs(-9)` - **compiled and ran under HEAD
+(`767e956f`), exit 9**; the shadow shows the one `DEFAULT` line for it.
+
+#### The change
+
+* **Every type registration records its verdict with its key.**
+  `register_type(key, ty)` → `register_type(key, ty, is_public)`,
+  writing `decl_visibility` in the same call, so no type is ever in the
+  map without one and no reader can be earlier than the write.  28
+  callers: the type-declaration stage's six (`node.is_public`; a trait
+  and an alias carry no modifier and are public), its 19 primitives, the
+  spec injector (`SpecInjector::node_is_public`, the template's verdict
+  the cloner copied onto the node), the async wrapper struct and the
+  closure struct (synthesized, public).  `register_decl_in_index`'s five
+  type-arm writes go: they were a second, later writer of the same
+  verdict, and the gap above was the window between the two.
+* **The extern-block arm records each imported function's verdict** under
+  its key and, for a C import, under the `alias::name` key too -
+  `fn_node.is_public`, the same rule the free-function arm applies.
+* **The `None` arm is a door**: `record_unregistered_def(...)` - the
+  build ends in E0900 "canonical name(s) named no registered declaration"
+  when nothing else failed it - and it answers `true` meanwhile, the
+  top-level default, so a public item whose registration lost its verdict
+  is reported as the registration defect it is rather than as "private".
+  The comment on `decl_visibility` no longer says "permissive".
+
+Project `extern_private_function_is_private` (compile_fail, E0353 with
+the message asserted): HEAD's compiler builds and runs it (exit 9), the
+tree refuses it at the call.  **Mutation pair for the door**: with the
+extern arm's write commented out, the same probe fails under the tree
+with `E0900: 194 canonical name(s) named no registered declaration; first
+consumed at decl_index: visibility of a candidate no registration recorded
+a verdict for` (the stdlib's own extern calls), where HEAD's compiler over
+the same program reported nothing and ran it.  Restored, the probe is
+E0353.
+
+Not taken: `register_type_forward_only` (the four alias keywords) records
+no verdict - D18's arm, and no door asked one of its keys over the
+corpus; a `Type::method` static call's visibility is
+`enforce_static_method_visibility`'s, a different map.
+
+#### Gates
+
+`make test` (in `hash-tree.sh I`'s log, `.objcmp/t-I.txt.log`) OVERALL
+PASS: unit ok, compile-fail 193, projects 60 → **61**; roster merged.
+lsp-check OK (490 warnings); cross-check OK (`.objcmp/u3-cross.log`).
+**Objects: 0 of 2,557 + 1,126 moved** (`hash-tree.sh I` against `H`,
+HEAD `767e956f`'s half, `.objcmp/hash-I.out`); predicted 0: a verdict
+map feeds diagnostics only.  lane-check unchanged (35 / 28 / 20 / 9 / 2 /
+6 / 0 / 22 / 33).  §0: the project count 63 → 64; a new machinery row.
+
+Outside the ledger: `decl_index.cryo`, `passes/pass_registry.cryo`,
+`passes/specialization.cryo`, `passes/type_resolution.cryo`,
+`sema/async_lower.cryo`, `sema/lambda_synth.cryo`, the project, the
+roster.
+
+**Tally: 72 shadowed, 72 old paths deleted, 72 at zero; 115 artifacts
+gone** (+1 lane, the permissive default, shadowed and closed; +1
+artifact, the default arm's `true`).
 
 ---
 
