@@ -2387,26 +2387,16 @@ type struct CallResolver {
         // the call.
         if (!ambiguous && !trait_ambiguous && !(found && !found_trait.is_valid())
                 && this.ctx.generic_registry != null) {
-            mut target_name: SymbolStr = SymbolStr::empty();
-            match (base_t.kind) {
-                TypeKind::Class  => { target_name = (base_t as ClassType*).qualified_name; }
-                TypeKind::Struct => { target_name = (base_t as StructType*).qualified_name; }
-                TypeKind::Enum   => { target_name = (base_t as EnumType*).qualified_name; }
-                TypeKind::Int | TypeKind::Float | TypeKind::Bool
-                | TypeKind::Char | TypeKind::String | TypeKind::Unit => {
-                    target_name = this.intern.intern(base_t.display_name());
-                }
-                _ => { }
-            }
-            if (target_name.is_valid()) {
+            // The impls selected for the receiver: a placed clone when it is
+            // a specialization, else the written heads that unify with it and
+            // whose bounds hold.
+            const blocks: ImplBlockNode*[] = this.trait_checker().impls_of(base_ref);
+            if (blocks.length > 0) {
                 const this_amp: SymbolStr = this.intern.intern("&this");
                 const this_val: SymbolStr = this.intern.intern("this");
-                const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(target_name);
-                for (mut ti: i64 = 0; ti < traits.length; ti++) {
+                for (mut ti: i64 = 0; ti < blocks.length; ti++) {
                     if (ambiguous || trait_ambiguous) { break; }
-                    const block: ImplBlockNode* =
-                        this.ctx.generic_registry.lookup_trait_impl(traits[ti], target_name);
-                    if (block == null) { continue; }
+                    const block: ImplBlockNode* = blocks[ti];
                     for (mut bmi: i64 = 0; bmi < block.methods.length; bmi++) {
                         const mn: MethodNode* = block.methods[bmi];
                         if (mn == null || mn.func == null) { continue; }
@@ -2816,17 +2806,21 @@ type struct CallResolver {
         // call's return type would fall to the name-keyed lookup, which
         // answers with whichever sibling specialization registered last.
         if (call.resolved_callee.is_some() && call.resolved_method != null) { return; }
+        mut base_ref: TypeRef = obj_type;
         mut base_t: Type* = this.arena.lookup(obj_type.id);
         mut unwrap_depth: i32 = 0;
         while (base_t != null && unwrap_depth < 5) {
             if (base_t.kind == TypeKind::Pointer) {
-                base_t = this.arena.lookup((base_t as PointerType*).pointee.id);
+                base_ref = (base_t as PointerType*).pointee;
+                base_t = this.arena.lookup(base_ref.id);
             } else if (base_t.kind == TypeKind::Reference) {
-                base_t = this.arena.lookup((base_t as ReferenceType*).referent.id);
+                base_ref = (base_t as ReferenceType*).referent;
+                base_t = this.arena.lookup(base_ref.id);
             } else if (base_t.kind == TypeKind::InstantiatedType) {
                 const inst: InstantiatedType* = base_t as InstantiatedType*;
                 if (!inst.has_resolved_type()) { break; }
-                base_t = this.arena.lookup(inst.resolved_type.id);
+                base_ref = inst.resolved_type;
+                base_t = this.arena.lookup(base_ref.id);
             } else if (base_t.kind == TypeKind::Array
                     && (base_t as ArrayType*).is_dynamic()) {
                 // A dynamic `T[]` has no method set of its own: it is laid
@@ -2836,6 +2830,7 @@ type struct CallResolver {
                 const arr_owner: TypeRef = this.ctx.decl_index.lookup_array_type(
                     (base_t as ArrayType*).element);
                 if (!arr_owner.is_valid()) { break; }
+                base_ref = arr_owner;
                 base_t = this.arena.lookup(arr_owner.id);
             } else {
                 break;
@@ -2891,10 +2886,10 @@ type struct CallResolver {
         // a leaf comparison binds whichever of them registered first.
         const want_trait: SymbolStr = member.resolved_trait;
         if (want_trait.is_valid()) {
-            if (this.select_method(visitor, call, member, base_t, start_cls, methods_ref,
+            if (this.select_method(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
                     owner_str, &arg_types, want_trait)) { return; }
         }
-        this.select_method(visitor, call, member, base_t, start_cls, methods_ref,
+        this.select_method(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
             owner_str, &arg_types, SymbolStr::empty());
     }
 
@@ -2906,7 +2901,7 @@ type struct CallResolver {
     /// `only_trait`, only that trait's methods are candidates.  Returns true
     /// when the call was bound.
     select_method(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
-                  base_t: Type*, start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
+                  base_ref: TypeRef, base_t: Type*, start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
                   owner_str: string, arg_types: &TypeRef[], only_trait: SymbolStr) -> boolean {
         // The receiver's own list holds its inherent methods and the methods
         // its trait impls deliver, in declaration order.  They are two sets,
@@ -2946,13 +2941,13 @@ type struct CallResolver {
             }
         }
 
-        // Trait impls on the receiver, in registration order.
-        const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(owner_sym);
-        for (mut ti: i64 = 0; ti < traits.length; ti++) {
-            const block: ImplBlockNode* = this.ctx.generic_registry.lookup_trait_impl(traits[ti], owner_sym);
-            if (block == null) { continue; }
-            // The table is keyed by the trait's leaf; WHICH trait the block
-            // provides is the head's stamped identity.
+        // The trait impls selected for the receiver, in registration order: a
+        // placed clone when it is a specialization, else the written heads
+        // that unify with it and whose bounds hold.
+        const blocks: ImplBlockNode*[] = this.trait_checker().impls_of(base_ref);
+        for (mut ti: i64 = 0; ti < blocks.length; ti++) {
+            const block: ImplBlockNode* = blocks[ti];
+            // WHICH trait the block provides is the head's stamped identity.
             if (only_trait.is_valid() && !block.qualified_trait_name.equals(only_trait)) { continue; }
             if (this.bind_on_impl_block(visitor, call, member, block, owner_str, arg_types)) { return true; }
         }
@@ -3295,9 +3290,16 @@ type struct CallResolver {
         // symbolic receivers / symbolic Item types (undecidable -> allow).
         const proj_blocked: boolean =
             this.binding.projection_default_unavailable(obj_type, member.member);
+        // A method only trait impls provide, none of which selects for THIS
+        // instantiation (`Wrap<i32, Beta>` against `implement<T> trait Show
+        // for Wrap<T, Alpha>`), is no method of the receiver: the index holds
+        // every head's methods under the template's key, and only the
+        // selection can tell them apart.
+        const head_blocked: boolean =
+            this.binding.trait_method_unavailable(lookup_ref, member.member);
 
         const ret: TypeRef = this.binding.lookup_method_with_inheritance(lookup_ref, type_sym, member.member);
-        if (ret.is_valid() && !proj_blocked) {
+        if (ret.is_valid() && !proj_blocked && !head_blocked) {
             const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
             this.member.enforce_method_visibility(lookup_ref, member.member, acc_span);
             const refined: TypeRef = if (member.generic_args.length > 0) {
@@ -3338,7 +3340,7 @@ type struct CallResolver {
             }
         }
 
-        const inherited: TypeRef = this.binding.lookup_method_through_trait_impls(type_sym, member.member);
+        const inherited: TypeRef = this.binding.lookup_method_through_trait_impls(lookup_ref, member.member);
         if (inherited.is_valid() && !proj_blocked) {
             const subst_inherited: TypeRef = this.binding.subst_this_in_type(inherited, obj_type);
             mut fin_inherited: TypeRef = subst_inherited;
@@ -3385,7 +3387,8 @@ type struct CallResolver {
         if (this.ctx.generic_registry != null) {
             const failed_trait: SymbolStr = this.trait_checker().diagnose_method_bounds_failure(lookup_ref, member.member);
             if (failed_trait.is_valid()) {
-                const trait_str: string = this.intern.resolve(failed_trait);
+                // The identity, rendered by its leaf as the tie report does.
+                const trait_str: string = QualifiedName::leaf_of(this.intern.resolve(failed_trait));
                 mut diag: Diagnostic = Diagnostic::error(
                     ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
                     fmt::format("the trait `%s` is not implemented for `%s`", trait_str, type_display));

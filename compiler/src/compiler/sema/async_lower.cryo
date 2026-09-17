@@ -638,7 +638,16 @@ type struct AsyncLower {
         for (mut i: i64 = 0; i < params.length; i++) {
             const gp: GenericParamNode* = params[i];
             if (gp == null) { continue; }
-            args.push(this.named_ann(gp.name, span));
+            const ann: TypeAnnotation* = this.named_ann(gp.name, span);
+            // A parameter of the declaration, as the name layer stamps a
+            // written one: a consumer matching the head against a subject
+            // reads the stamp, and a synthesized node is stamped by nothing
+            // but its synthesizer.
+            match (*ann) {
+                TypeAnnotation::Named(n) => { n.res.answer(Res::GenericParam(gp.name)); }
+                _ => { }
+            }
+            args.push(ann);
         }
         return args;
     }
@@ -6798,12 +6807,9 @@ type struct AsyncLower {
         this.ctx.decl_index.register_methods(
             struct_ref, method_arr, this.intern, this.arena, "async/future poll");
 
-        // Dispatch key: `.poll()` resolution keys on the struct's qualified name.
-        this.ctx.generic_registry.register_trait_impl(future_leaf, q_name, impl_node);
-        // Bound-check key: `F: Future<R>` resolves via qualified-name id + leaf.
-        const tgt_leaf: SymbolStr = OwnershipQuery::registry_name_of(this.arena, this.intern, struct_ref);
-        const qual_id: u64 = OwnershipQuery::named_qualified_id(this.arena, this.intern, struct_ref);
-        this.ctx.generic_registry.register_trait_impl_typed(future_leaf, tgt_leaf, qual_id, impl_node);
+        // `.poll()` dispatch and the `F: Future<R>` bound check both select
+        // the impl by the trait's identity and the struct's key.
+        this.ctx.generic_registry.register_trait_impl(future_id, q_name, impl_node);
 
         // Repoint callers at the future type.
         node.set_resolved_return_type(self_ty);

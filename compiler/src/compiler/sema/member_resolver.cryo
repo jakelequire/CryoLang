@@ -14,7 +14,7 @@
 namespace compiler::sema::member_resolver;
 
 import compiler::types::{
-    type_ref, type_base, arena, compound, user_defined, generic, checker, ownership, TypeKind
+    type_ref, type_base, arena, compound, user_defined, generic, checker, ownership, trait_checker, TypeKind
 };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::ast;
@@ -54,6 +54,7 @@ import compiler::types::checker::{ TypeChecker, TypeCheckResult };
 import compiler::types::compound::{ FunctionType, PointerType, ReferenceType, TupleType };
 import compiler::types::generic::{ BoundedParamType, InstantiatedType };
 import compiler::types::ownership::{ OwnershipQuery };
+import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
@@ -261,8 +262,8 @@ type struct MemberResolver {
             const is_user: boolean = t.kind == TypeKind::Struct || t.kind == TypeKind::Class
                                   || t.kind == TypeKind::Enum   || t.kind == TypeKind::InstantiatedType;
             if (!is_user) { return TypeRef::invalid(); }
-            const impl_block: ImplBlockNode* = OwnershipQuery::resolve_trait_impl_for_type(
-                this.arena, this.ctx.generic_registry, this.intern, deref_leaf, base_ty);
+            const impl_block: ImplBlockNode* = this.trait_checker().select_impl(
+                this.ctx.generic_registry.wellknown(deref_leaf), base_ty, 0);
             if (impl_block == null) { return TypeRef::invalid(); }
             // Build `*(cur_obj.deref())` and resolve it to the pointee `Target`.
             const member_acc: MemberAccessNode* =
@@ -287,6 +288,12 @@ type struct MemberResolver {
             cur_ty  = target_ty;
         }
         return TypeRef::invalid();
+    }
+
+    /// A fresh trait checker over the shared arena + registry (a 4-pointer view).
+    trait_checker(&this) -> TraitChecker {
+        return TraitChecker::new(this.arena, this.ctx.generic_registry,
+                                 this.intern, this.ctx.diagnostics);
     }
 
     /// Resolve `member.member` as a field (incl. generic-template field) or
@@ -551,8 +558,8 @@ type struct MemberResolver {
             overloads = this.bounded_param_has_index(t as BoundedParamType*, index_leaf);
         } else if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class
                 || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType) {
-            const impl_block: ImplBlockNode* = OwnershipQuery::resolve_trait_impl_for_type(
-                this.arena, this.ctx.generic_registry, this.intern, index_leaf, base_ty);
+            const impl_block: ImplBlockNode* = this.trait_checker().select_impl(
+                this.ctx.generic_registry.wellknown(index_leaf), base_ty, 0);
             overloads = impl_block != null;
         } else {
             return null;

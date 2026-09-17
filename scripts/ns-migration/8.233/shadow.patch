@@ -1,0 +1,1303 @@
+diff --git a/compiler/src/compiler/mono/call_specializer.cryo b/compiler/src/compiler/mono/call_specializer.cryo
+index c4530210..5b5c0291 100644
+--- a/compiler/src/compiler/mono/call_specializer.cryo
++++ b/compiler/src/compiler/mono/call_specializer.cryo
+@@ -61,6 +61,7 @@ import compiler::mono::ast_resolver::{ MonoAstResolver };
+ import compiler::mono::state::{ MonoState, SpecializationEntry };
+ import compiler::mono::trait_specializer::{ MonoTraitSpecializer };
+ import compiler::resolver::intern_table::{ InternTable };
++import compiler::types::ownership::{ OwnershipQuery };
+ import compiler::resolver::mangled_name::{ MangledName };
+ import compiler::resolver::qualified_name::{ QualifiedName };
+ import compiler::resolver::res::{ OverloadId, Res, ResBase, ResSlot };
+@@ -1860,6 +1861,31 @@ type struct MonoCallSpecializer {
+                                       method_name: SymbolStr,
+                                       only_trait: SymbolStr,
+                                       out_impl: ImplBlockNode**) -> MethodNode* {
++        mut old_impl: ImplBlockNode* = null;
++        const old_m: MethodNode* = this.find_trait_impl_method_for_target_old(recv_type, method_name, only_trait, &old_impl);
++        mut nw_m: MethodNode* = null;
++        mut nw_impl: ImplBlockNode* = null;
++        mut candidates: i64 = 0;
++        const nw_blocks: ImplBlockNode*[] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
++        for (mut i: i64 = 0; i < nw_blocks.length; i++) {
++            const impl_node: ImplBlockNode* = nw_blocks[i];
++            if (only_trait.is_valid() && !this.impl_provides_trait(impl_node, only_trait)) { continue; }
++            const m: MethodNode* = this.generic_method_in_impl(impl_node, method_name);
++            if (m == null) { continue; }
++            candidates = candidates + 1;
++            nw_m = m;
++            nw_impl = impl_node;
++        }
++        if (candidates != 1) { nw_m = null; nw_impl = null; }
++        OwnershipQuery::shadow_method("cs/find", old_m, nw_m, old_impl, nw_impl, recv_type, this.arena, this.intern_table);
++        if (old_m != null) { *out_impl = old_impl; }
++        return old_m;
++    }
++
++    find_trait_impl_method_for_target_old(&this, recv_type: TypeRef,
++                                      method_name: SymbolStr,
++                                      only_trait: SymbolStr,
++                                      out_impl: ImplBlockNode**) -> MethodNode* {
+         const registry: GenericRegistry* = this.generic_registry;
+         if (registry == null) { return null; }
+         const recv_q: SymbolStr = this.arena.get_qualified_name(recv_type);
+@@ -1911,6 +1937,35 @@ type struct MonoCallSpecializer {
+     /// the receiver's own key, then under its template's.
+     find_self_returning_default(&this, recv_type: TypeRef, method_name: SymbolStr,
+                                 out_impl: ImplBlockNode**) -> MethodNode* {
++        mut old_impl: ImplBlockNode* = null;
++        const old_m: MethodNode* = this.find_self_returning_default_old(recv_type, method_name, &old_impl);
++        mut nw_m: MethodNode* = null;
++        mut nw_impl: ImplBlockNode* = null;
++        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
++            const entry: SpecializationEntry* = &this.state.spec_entries[i];
++            if (entry.specialized_type.id != recv_type.id) { continue; }
++            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
++                const impl_node: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
++                if (impl_node == null) { continue; }
++                const m: MethodNode* = this.find_self_ret_method_in_impl(impl_node, method_name);
++                if (m != null) { nw_m = m; nw_impl = impl_node; break; }
++            }
++            if (nw_m != null) { break; }
++        }
++        if (nw_m == null && this.generic_registry != null) {
++            const nw_blocks: ImplBlockNode*[] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
++            for (mut i: i64 = 0; i < nw_blocks.length; i++) {
++                const m: MethodNode* = this.find_self_ret_method_in_impl(nw_blocks[i], method_name);
++                if (m != null) { nw_m = m; nw_impl = nw_blocks[i]; break; }
++            }
++        }
++        OwnershipQuery::shadow_method("cs/selfret", old_m, nw_m, old_impl, nw_impl, recv_type, this.arena, this.intern_table);
++        if (old_m != null) { *out_impl = old_impl; }
++        return old_m;
++    }
++
++    find_self_returning_default_old(&this, recv_type: TypeRef, method_name: SymbolStr,
++                                out_impl: ImplBlockNode**) -> MethodNode* {
+         for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
+             const entry: SpecializationEntry* = &this.state.spec_entries[i];
+             if (entry.specialized_type.id != recv_type.id) { continue; }
+diff --git a/compiler/src/compiler/mono/monomorphizer.cryo b/compiler/src/compiler/mono/monomorphizer.cryo
+index 3eddc4bb..116fd7d8 100644
+--- a/compiler/src/compiler/mono/monomorphizer.cryo
++++ b/compiler/src/compiler/mono/monomorphizer.cryo
+@@ -482,7 +482,7 @@ type struct Monomorphizer {
+         // sees an uncompilable body and DI never indexes a junk signature.
+         this.trait_spec.filter_bounds_violating_methods(result.specialized_ast, &subst);
+         const kept_impl_asts: ASTNode*[] = this.trait_spec.filter_bounds_violating_impls(
+-            result.impl_asts, &subst);
++            result.impl_asts, &subst, &request.type_args);
+ 
+         // Determine the concrete aggregate kind for this template.  Function
+         // templates (`is_named == false`) produce no arena type.
+diff --git a/compiler/src/compiler/mono/trait_specializer.cryo b/compiler/src/compiler/mono/trait_specializer.cryo
+index baf46fe9..07ec2a9e 100644
+--- a/compiler/src/compiler/mono/trait_specializer.cryo
++++ b/compiler/src/compiler/mono/trait_specializer.cryo
+@@ -127,7 +127,7 @@ type struct MonoTraitSpecializer {
+     /// name (e.g. `Iterator`), return the concrete trait args of `subject`'s impl
+     /// of that trait (e.g. `[i32]`).  Empty on any failure.
+     concrete_trait_args_for(mut &this, subject_in: TypeRef,
+-                            trait_leaf: SymbolStr) -> TypeRef[] {
++                            trait_leaf: SymbolStr, trait_id: SymbolStr) -> TypeRef[] {
+         mut out: TypeRef[] = [];
+         if (this.generic_registry == null || this.type_resolver == null) { return out; }
+         // No carrier normalization: the lookups below resolve a post-mono concrete
+@@ -136,7 +136,7 @@ type struct MonoTraitSpecializer {
+         if (!this.template_key_of(subject).is_valid()) { return out; }
+         const impl_node: ImplBlockNode* =
+             OwnershipQuery::resolve_trait_impl_for_type(this.arena,
+-                this.generic_registry, this.intern_table, trait_leaf, subject);
++                this.generic_registry, this.intern_table, trait_leaf, trait_id, "ts/args", subject);
+         if (impl_node == null) { return out; }
+         const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
+         if (trait_ann == null) { return out; }
+@@ -217,7 +217,7 @@ type struct MonoTraitSpecializer {
+             // Positional-sugar index: declared generic params come first in the
+             // trait-arg list, then the associated types.
+             const idx: i64 = tdecl.generic_params.length + assoc_pos;
+-            const args: TypeRef[] = this.concrete_trait_args_for(base_ty, tdecl.name);
++            const args: TypeRef[] = this.concrete_trait_args_for(base_ty, tdecl.name, this.generic_registry.trait_decl_keys[i]);
+             if (idx < args.length && args[idx].is_valid()) {
+                 return args[idx];
+             }
+@@ -327,7 +327,7 @@ type struct MonoTraitSpecializer {
+                 if (tr.path.length == 0) { continue; }
+                 const trait_leaf: SymbolStr = tr.path[tr.path.length - 1];
+                 const concrete_args: TypeRef[] =
+-                    this.concrete_trait_args_for(subject, trait_leaf);
++                    this.concrete_trait_args_for(subject, trait_leaf, tr.identity());
+                 if (concrete_args.length != tr.type_args.length) { continue; }
+                 for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
+                     const ta: TypeAnnotation* = tr.type_args[ai];
+@@ -497,12 +497,29 @@ type struct MonoTraitSpecializer {
+     /// Drop bounds-violating impls entirely; for surviving impls, drop any methods
+     /// whose own where-bounds don't hold.  Returns the pruned impl-AST array.
+     filter_bounds_violating_impls(mut &this, impl_asts: &ASTNode*[],
+-                                   subst: TypeSubstitution*) -> ASTNode*[] {
++                                   subst: TypeSubstitution*, type_args: &TypeRef[]) -> ASTNode*[] {
+         mut kept: ASTNode*[] = [];
+         for (mut i: i64 = 0; i < impl_asts.length; i++) {
+             const impl_ast: ASTNode* = impl_asts[i];
+             const impl_node: ImplBlockNode* = impl_ast as ImplBlockNode*;
+             if (impl_node == null) { continue; }
++            if (impl_node.is_trait_impl()) {
++                const hm: boolean = GenericRegistry::head_matches_args(impl_node, type_args, this.arena, this.intern_table);
++                mut args_s: string = "";
++                for (mut ai: i64 = 0; ai < type_args.length; ai++) {
++                    args_s = args_s + this.arena.resolve_display_name_short(type_args[ai].id) + ",";
++                }
++                mut head_s: string = "";
++                for (mut hi: i64 = 0; hi < impl_node.target_args.length; hi++) {
++                    match (*impl_node.target_args[hi]) {
++                        TypeAnnotation::Named(hn) => { head_s = head_s + this.intern_table.resolve(hn.name) + ","; }
++                        _ => { head_s = head_s + "?,"; }
++                    }
++                }
++                fmt::eprintf("SHADOW\tFILT\t%s\t%s\t%s\t%s\n", if (hm) { "KEEP" } else { "DROPHEAD" },
++                    this.intern_table.resolve(impl_node.qualified_trait_name),
++                    head_s, args_s);
++            }
+             if (!this.bounds_satisfied(impl_node.where_bounds, subst)) {
+                 continue;
+             }
+diff --git a/compiler/src/compiler/passes/specialization.cryo b/compiler/src/compiler/passes/specialization.cryo
+index 0c54bbe9..3a4715ce 100644
+--- a/compiler/src/compiler/passes/specialization.cryo
++++ b/compiler/src/compiler/passes/specialization.cryo
+@@ -770,6 +770,8 @@ type struct SpecializationPasses {
+                         ctx.generic_registry.register_trait_impl(
+                             trait_nm, impl_qname, impl_node);
+                     }
++                    ctx.generic_registry.register_trait_impl_head(
++                        impl_node.qualified_trait_name, impl_qname, impl_node);
+                 }
+             } else {
+                 SpecInjector::register_injected_decl(entry.impl_nodes[j], ctx);
+@@ -1085,6 +1087,8 @@ type struct SpecializationPasses {
+                 if (target_key.is_valid() && !target_key.equals(node.target_type)) {
+                     registry.register_trait_impl(trait_name, target_key, node);
+                 }
++                registry.register_trait_impl_head(
++                    TypeAnnotation::trait_identity(node.trait_annotation), target_key, node);
+             }
+         }
+     }
+diff --git a/compiler/src/compiler/passes/type_resolution.cryo b/compiler/src/compiler/passes/type_resolution.cryo
+index bb32afac..17d2790f 100644
+--- a/compiler/src/compiler/passes/type_resolution.cryo
++++ b/compiler/src/compiler/passes/type_resolution.cryo
+@@ -1611,6 +1611,8 @@ type struct TypeResolutionPasses {
+                             ctx.generic_registry.register_trait_impl(
+                                 trait_root, canonical_target, node);
+                         }
++                        ctx.generic_registry.register_trait_impl_head(
++                            node.qualified_trait_name, canonical_target, node);
+                         // Precise (collision-proof) registration by canonical
+                         // QUALIFIED-NAME identity.  This is the authoritative,
+                         // import-resolved site, so resolving the impl's target to
+@@ -2351,6 +2353,28 @@ type struct TypeResolutionPasses {
+         };
+     }
+ 
++    /// The registered type a written argument names, off its stamp: a
++    /// declaration's type (its template, for an instantiation), a
++    /// primitive's.  Invalid for a type parameter, a projection, or a shape
++    /// that names no registered type.
++    static item_type_of(ann: TypeAnnotation*, ctx: CompilationContext*) -> TypeRef {
++        if (ann == null) { return TypeRef::invalid(); }
++        return match (*ann) {
++            TypeAnnotation::Named(n) => {
++                match (n.res.require("type_resolution:item annotation")) {
++                    Res::Def(d)    => { ctx.decl_index.type_of_def(d) }
++                    Res::PrimTy(p) => { ctx.type_resolver.resolve_primitive(p) }
++                    _              => { TypeRef::invalid() }
++                }
++            }
++            TypeAnnotation::Primitive(p) => { ctx.type_resolver.resolve_primitive(p.name) }
++            TypeAnnotation::Generic(g)   => { TypeResolutionPasses::item_type_of(g.base, ctx) }
++            TypeAnnotation::Reference(r) => { TypeResolutionPasses::item_type_of(r.inner, ctx) }
++            TypeAnnotation::Pointer(p)   => { TypeResolutionPasses::item_type_of(p.inner, ctx) }
++            _ => { TypeRef::invalid() }
++        };
++    }
++
+     /// Whether the type named `type_name` is registered as implementing the
+     /// trait named `trait_name`. Conservative: true (assume satisfiable) when the
+     /// registry is unavailable, so a default method is only DROPPED on positive
+@@ -2412,7 +2436,11 @@ type struct TypeResolutionPasses {
+                 const tr: TraitRef* = &b.trait_refs[ti];
+                 if (tr.path.length == 0) { continue; }
+                 const need: SymbolStr = tr.path[tr.path.length - 1];
+-                if (!TypeResolutionPasses::name_implements_trait(ctx, head, need)) {
++                const old_ans: boolean = TypeResolutionPasses::name_implements_trait(ctx, head, need);
++                const item_ty: TypeRef = TypeResolutionPasses::item_type_of(item_ann, ctx);
++                const nw_ans: boolean = ctx.generic_registry.select_trait_impl(tr.identity(), item_ty, ctx.intern_table) != null;
++                OwnershipQuery::shadow_bool("tr/item", old_ans, nw_ans, tr.identity(), item_ty, ctx.type_arena, ctx.intern_table);
++                if (!old_ans) {
+                     return false;
+                 }
+             }
+diff --git a/compiler/src/compiler/sema/async_lower.cryo b/compiler/src/compiler/sema/async_lower.cryo
+index 1f68acd8..8c1defec 100644
+--- a/compiler/src/compiler/sema/async_lower.cryo
++++ b/compiler/src/compiler/sema/async_lower.cryo
+@@ -638,7 +638,16 @@ type struct AsyncLower {
+         for (mut i: i64 = 0; i < params.length; i++) {
+             const gp: GenericParamNode* = params[i];
+             if (gp == null) { continue; }
+-            args.push(this.named_ann(gp.name, span));
++            const ann: TypeAnnotation* = this.named_ann(gp.name, span);
++            // A parameter of the declaration, as the name layer stamps a
++            // written one: a consumer matching the head against a subject
++            // reads the stamp, and a synthesized node is stamped by nothing
++            // but its synthesizer.
++            match (*ann) {
++                TypeAnnotation::Named(n) => { n.res.answer(Res::GenericParam(gp.name)); }
++                _ => { }
++            }
++            args.push(ann);
+         }
+         return args;
+     }
+@@ -6800,6 +6809,7 @@ type struct AsyncLower {
+ 
+         // Dispatch key: `.poll()` resolution keys on the struct's qualified name.
+         this.ctx.generic_registry.register_trait_impl(future_leaf, q_name, impl_node);
++        this.ctx.generic_registry.register_trait_impl_head(future_id, q_name, impl_node);
+         // Bound-check key: `F: Future<R>` resolves via qualified-name id + leaf.
+         const tgt_leaf: SymbolStr = OwnershipQuery::registry_name_of(this.arena, this.intern, struct_ref);
+         const qual_id: u64 = OwnershipQuery::named_qualified_id(this.arena, this.intern, struct_ref);
+diff --git a/compiler/src/compiler/sema/call_resolver.cryo b/compiler/src/compiler/sema/call_resolver.cryo
+index 4e32ab40..8a236ec2 100644
+--- a/compiler/src/compiler/sema/call_resolver.cryo
++++ b/compiler/src/compiler/sema/call_resolver.cryo
+@@ -2402,6 +2402,13 @@ type struct CallResolver {
+                 const this_amp: SymbolStr = this.intern.intern("&this");
+                 const this_val: SymbolStr = this.intern.intern("this");
+                 const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(target_name);
++                mut old_blocks: ImplBlockNode*[] = [];
++                for (mut ti: i64 = 0; ti < traits.length; ti++) {
++                    const ob: ImplBlockNode* = this.ctx.generic_registry.lookup_trait_impl(traits[ti], target_name);
++                    if (ob != null) { old_blocks.push(ob); }
++                }
++                const nw_blocks: ImplBlockNode*[] = this.trait_checker().impls_of(base_ref);
++                OwnershipQuery::shadow_list("cr/argcheck", &old_blocks, &nw_blocks, base_ref, this.arena, this.intern);
+                 for (mut ti: i64 = 0; ti < traits.length; ti++) {
+                     if (ambiguous || trait_ambiguous) { break; }
+                     const block: ImplBlockNode* =
+@@ -2816,17 +2823,21 @@ type struct CallResolver {
+         // call's return type would fall to the name-keyed lookup, which
+         // answers with whichever sibling specialization registered last.
+         if (call.resolved_callee.is_some() && call.resolved_method != null) { return; }
++        mut base_ref: TypeRef = obj_type;
+         mut base_t: Type* = this.arena.lookup(obj_type.id);
+         mut unwrap_depth: i32 = 0;
+         while (base_t != null && unwrap_depth < 5) {
+             if (base_t.kind == TypeKind::Pointer) {
+-                base_t = this.arena.lookup((base_t as PointerType*).pointee.id);
++                base_ref = (base_t as PointerType*).pointee;
++                base_t = this.arena.lookup(base_ref.id);
+             } else if (base_t.kind == TypeKind::Reference) {
+-                base_t = this.arena.lookup((base_t as ReferenceType*).referent.id);
++                base_ref = (base_t as ReferenceType*).referent;
++                base_t = this.arena.lookup(base_ref.id);
+             } else if (base_t.kind == TypeKind::InstantiatedType) {
+                 const inst: InstantiatedType* = base_t as InstantiatedType*;
+                 if (!inst.has_resolved_type()) { break; }
+-                base_t = this.arena.lookup(inst.resolved_type.id);
++                base_ref = inst.resolved_type;
++                base_t = this.arena.lookup(base_ref.id);
+             } else if (base_t.kind == TypeKind::Array
+                     && (base_t as ArrayType*).is_dynamic()) {
+                 // A dynamic `T[]` has no method set of its own: it is laid
+@@ -2836,6 +2847,7 @@ type struct CallResolver {
+                 const arr_owner: TypeRef = this.ctx.decl_index.lookup_array_type(
+                     (base_t as ArrayType*).element);
+                 if (!arr_owner.is_valid()) { break; }
++                base_ref = arr_owner;
+                 base_t = this.arena.lookup(arr_owner.id);
+             } else {
+                 break;
+@@ -2891,10 +2903,10 @@ type struct CallResolver {
+         // a leaf comparison binds whichever of them registered first.
+         const want_trait: SymbolStr = member.resolved_trait;
+         if (want_trait.is_valid()) {
+-            if (this.select_method(visitor, call, member, base_t, start_cls, methods_ref,
++            if (this.select_method(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
+                     owner_str, &arg_types, want_trait)) { return; }
+         }
+-        this.select_method(visitor, call, member, base_t, start_cls, methods_ref,
++        this.select_method(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
+             owner_str, &arg_types, SymbolStr::empty());
+     }
+ 
+@@ -2906,7 +2918,7 @@ type struct CallResolver {
+     /// `only_trait`, only that trait's methods are candidates.  Returns true
+     /// when the call was bound.
+     select_method(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+-                  base_t: Type*, start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
++                  base_ref: TypeRef, base_t: Type*, start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
+                   owner_str: string, arg_types: &TypeRef[], only_trait: SymbolStr) -> boolean {
+         // The receiver's own list holds its inherent methods and the methods
+         // its trait impls deliver, in declaration order.  They are two sets,
+@@ -2948,6 +2960,13 @@ type struct CallResolver {
+ 
+         // Trait impls on the receiver, in registration order.
+         const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(owner_sym);
++        mut old_blocks: ImplBlockNode*[] = [];
++        for (mut ti: i64 = 0; ti < traits.length; ti++) {
++            const ob: ImplBlockNode* = this.ctx.generic_registry.lookup_trait_impl(traits[ti], owner_sym);
++            if (ob != null) { old_blocks.push(ob); }
++        }
++        const nw_blocks: ImplBlockNode*[] = this.trait_checker().impls_of(base_ref);
++        OwnershipQuery::shadow_list("cr/select", &old_blocks, &nw_blocks, base_ref, this.arena, this.intern);
+         for (mut ti: i64 = 0; ti < traits.length; ti++) {
+             const block: ImplBlockNode* = this.ctx.generic_registry.lookup_trait_impl(traits[ti], owner_sym);
+             if (block == null) { continue; }
+@@ -3338,7 +3357,7 @@ type struct CallResolver {
+             }
+         }
+ 
+-        const inherited: TypeRef = this.binding.lookup_method_through_trait_impls(type_sym, member.member);
++        const inherited: TypeRef = this.binding.lookup_method_through_trait_impls(type_sym, lookup_ref, member.member);
+         if (inherited.is_valid() && !proj_blocked) {
+             const subst_inherited: TypeRef = this.binding.subst_this_in_type(inherited, obj_type);
+             mut fin_inherited: TypeRef = subst_inherited;
+diff --git a/compiler/src/compiler/sema/member_resolver.cryo b/compiler/src/compiler/sema/member_resolver.cryo
+index 27dbbf86..8326c152 100644
+--- a/compiler/src/compiler/sema/member_resolver.cryo
++++ b/compiler/src/compiler/sema/member_resolver.cryo
+@@ -262,7 +262,8 @@ type struct MemberResolver {
+                                   || t.kind == TypeKind::Enum   || t.kind == TypeKind::InstantiatedType;
+             if (!is_user) { return TypeRef::invalid(); }
+             const impl_block: ImplBlockNode* = OwnershipQuery::resolve_trait_impl_for_type(
+-                this.arena, this.ctx.generic_registry, this.intern, deref_leaf, base_ty);
++                this.arena, this.ctx.generic_registry, this.intern, deref_leaf,
++                this.ctx.generic_registry.wellknown(deref_leaf), "mr/deref", base_ty);
+             if (impl_block == null) { return TypeRef::invalid(); }
+             // Build `*(cur_obj.deref())` and resolve it to the pointee `Target`.
+             const member_acc: MemberAccessNode* =
+@@ -552,7 +553,8 @@ type struct MemberResolver {
+         } else if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class
+                 || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType) {
+             const impl_block: ImplBlockNode* = OwnershipQuery::resolve_trait_impl_for_type(
+-                this.arena, this.ctx.generic_registry, this.intern, index_leaf, base_ty);
++                this.arena, this.ctx.generic_registry, this.intern, index_leaf,
++                this.ctx.generic_registry.wellknown(index_leaf), "mr/index", base_ty);
+             overloads = impl_block != null;
+         } else {
+             return null;
+diff --git a/compiler/src/compiler/sema/method_binding.cryo b/compiler/src/compiler/sema/method_binding.cryo
+index 41db66fe..3cab001b 100644
+--- a/compiler/src/compiler/sema/method_binding.cryo
++++ b/compiler/src/compiler/sema/method_binding.cryo
+@@ -204,7 +204,7 @@ type struct MethodBinding {
+                 }
+                 if (found_count == 0) {
+                     const tr_ret: TypeRef =
+-                        this.lookup_method_through_trait_impls(base_sym, method_name);
++                        this.lookup_method_through_trait_impls(base_sym, inst.generic_base, method_name);
+                     if (tr_ret.is_valid()) {
+                         abstract_ret = tr_ret;
+                         found_count = 1;
+@@ -652,6 +652,28 @@ type struct MethodBinding {
+         };
+     }
+ 
++    /// The registered type a written argument names, off its stamp: a
++    /// declaration's type (its template, for an instantiation), a
++    /// primitive's.  Invalid for a type parameter, a projection, or a shape
++    /// that names no registered type.
++    item_type_of(&this, ann: TypeAnnotation*) -> TypeRef {
++        if (ann == null) { return TypeRef::invalid(); }
++        return match (*ann) {
++            TypeAnnotation::Named(n) => {
++                match (n.res.require("method_binding:item annotation")) {
++                    Res::Def(d)    => { this.ctx.decl_index.type_of_def(d) }
++                    Res::PrimTy(p) => { this.ctx.type_resolver.resolve_primitive(p) }
++                    _              => { TypeRef::invalid() }
++                }
++            }
++            TypeAnnotation::Primitive(p) => { this.ctx.type_resolver.resolve_primitive(p.name) }
++            TypeAnnotation::Generic(g)   => { this.item_type_of(g.base) }
++            TypeAnnotation::Reference(r) => { this.item_type_of(r.inner) }
++            TypeAnnotation::Pointer(p)   => { this.item_type_of(p.inner) }
++            _ => { TypeRef::invalid() }
++        };
++    }
++
+     /// Whether the concrete type named `type_name` is registered as implementing
+     /// `trait_name`. Conservative: true (assume satisfiable) with no registry.
+     name_implements(&this, type_name: SymbolStr, trait_name: SymbolStr) -> boolean {
+@@ -676,6 +698,13 @@ type struct MethodBinding {
+         const base_key: SymbolStr = this.trait_checker().template_key_of(recv_type);
+         if (!base_key.is_valid()) { return false; }
+         const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(base_key);
++        mut old_blocks: ImplBlockNode*[] = [];
++        for (mut ti: i64 = 0; ti < traits.length; ti++) {
++            const ob: ImplBlockNode* = this.ctx.generic_registry.lookup_trait_impl(traits[ti], base_key);
++            if (ob != null) { old_blocks.push(ob); }
++        }
++        const nw_blocks: ImplBlockNode*[] = this.ctx.generic_registry.template_trait_impls_of(recv_type, this.intern);
++        OwnershipQuery::shadow_list("mb/projdef", &old_blocks, &nw_blocks, recv_type, this.arena, this.intern);
+         for (mut ti: i64 = 0; ti < traits.length; ti++) {
+             // `traits[ti]` is a dispatch leaf, which the decl registry does not
+             // accept. The impl head carries the identity that does - read, not
+@@ -751,7 +780,11 @@ type struct MethodBinding {
+                 const tr: TraitRef* = &b.trait_refs[ri];
+                 if (tr.path.length == 0) { continue; }
+                 const need: SymbolStr = tr.path[tr.path.length - 1];
+-                if (!this.name_implements(head, need)) { return true; }
++                const old_ans: boolean = this.name_implements(head, need);
++                const item_ty: TypeRef = this.item_type_of(item_ann);
++                const nw_ans: boolean = this.ctx.generic_registry.select_trait_impl(tr.identity(), item_ty, this.intern) != null;
++                OwnershipQuery::shadow_bool("mb/item", old_ans, nw_ans, tr.identity(), item_ty, this.arena, this.intern);
++                if (!old_ans) { return true; }
+             }
+         }
+         return false;
+@@ -761,16 +794,26 @@ type struct MethodBinding {
+     /// `target_name`, for default trait methods on a concrete type that
+     /// doesn't override them.  Asked under that one name: a leaf would list
+     /// the traits of every same-leaf type in the build.
+-    lookup_method_through_trait_impls(&this, target_name: SymbolStr,
++    lookup_method_through_trait_impls(&this, target_name: SymbolStr, subject: TypeRef,
+                                       method_name: SymbolStr) -> TypeRef {
+         if (!target_name.is_valid() || this.ctx.generic_registry == null) {
+             return TypeRef::invalid();
+         }
++        mut nw_ret: TypeRef = TypeRef::invalid();
++        const nw_blocks: ImplBlockNode*[] = this.ctx.generic_registry.trait_impls_of(subject, this.intern);
++        for (mut k: i64 = 0; k < nw_blocks.length; k++) {
++            nw_ret = this.types.lookup_method_return(nw_blocks[k].qualified_trait_name, method_name);
++            if (nw_ret.is_valid()) { break; }
++        }
+         const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(target_name);
+         for (mut i: i64 = 0; i < traits.length; i++) {
+             const ret: TypeRef = this.types.lookup_method_return(traits[i], method_name);
+-            if (ret.is_valid()) { return ret; }
++            if (ret.is_valid()) {
++                fmt::eprintf("SHADOW\tLMT\tvalid\t%s\t%s\t%s\t%s\n", this.intern.resolve(target_name), this.intern.resolve(traits[i]), this.intern.resolve(method_name), if (nw_ret.id == ret.id) { "SAME" } else { "OTHER" });
++                return ret;
++            }
+         }
++        fmt::eprintf("SHADOW\tLMT\tinvalid\t%s\t%lld\t%s\t%s\n", this.intern.resolve(target_name), traits.length, this.intern.resolve(method_name), if (nw_ret.is_valid()) { "NEWVALID" } else { "newinvalid" });
+         return TypeRef::invalid();
+     }
+ 
+@@ -1008,6 +1051,22 @@ type struct MethodBinding {
+             }
+         }
+         if (leaf_m != null) { *out_impl = leaf_impl; }
++        mut nw_m: MethodNode* = null;
++        mut nw_impl: ImplBlockNode* = null;
++        const nw_blocks: ImplBlockNode*[] = this.ctx.generic_registry.trait_impls_of(owner_ref, this.intern);
++        for (mut i: i64 = 0; i < nw_blocks.length; i++) {
++            const impl_node: ImplBlockNode* = nw_blocks[i];
++            for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
++                const m: MethodNode* = impl_node.methods[k];
++                if (m == null || m.func == null) { continue; }
++                if (!m.func.name.equals(method_name)) { continue; }
++                if (m.func.generic_params.length != n_generic_args) { continue; }
++                nw_m = m; nw_impl = impl_node;
++                break;
++            }
++            if (nw_m != null) { break; }
++        }
++        OwnershipQuery::shadow_method("mb/find", leaf_m, nw_m, leaf_impl, nw_impl, owner_ref, this.arena, this.intern);
+         return leaf_m;
+     }
+ 
+@@ -1032,6 +1091,13 @@ type struct MethodBinding {
+         const tkey: SymbolStr = this.trait_checker().template_key_of(recv_type);
+         if (!tkey.is_valid()) { return null; }
+         const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(tkey);
++        mut old_blocks: ImplBlockNode*[] = [];
++        for (mut ti: i64 = 0; ti < traits.length; ti++) {
++            const ob: ImplBlockNode* = this.ctx.generic_registry.lookup_trait_impl(traits[ti], tkey);
++            if (ob != null) { old_blocks.push(ob); }
++        }
++        const nw_blocks: ImplBlockNode*[] = this.ctx.generic_registry.template_trait_impls_of(recv_type, this.intern);
++        OwnershipQuery::shadow_list("mb/gendef", &old_blocks, &nw_blocks, recv_type, this.arena, this.intern);
+         for (mut i: i64 = 0; i < traits.length; i++) {
+             // Same table `traits_implemented_by` scanned, so the leaf that
+             // came out of it is guaranteed to key back into it.
+@@ -1083,6 +1149,18 @@ type struct MethodBinding {
+             if (tmpl_m == null) { tmpl_m = m; tmpl_impl = impl_node; }
+         }
+         if (tmpl_m != null) { *out_impl = tmpl_impl; }
++        mut nw_m: MethodNode* = null;
++        mut nw_impl: ImplBlockNode* = null;
++        const nw_blocks: ImplBlockNode*[] = this.ctx.generic_registry.trait_impls_of(owner_ref, this.intern);
++        for (mut i: i64 = 0; i < nw_blocks.length; i++) {
++            const impl_node: ImplBlockNode* = nw_blocks[i];
++            if (only_trait.is_valid() && !impl_node.qualified_trait_name.equals(only_trait)) { continue; }
++            const m: MethodNode* = this.find_generic_method_in(&impl_node.methods, method_name);
++            if (m == null) { continue; }
++            nw_m = m; nw_impl = impl_node;
++            break;
++        }
++        OwnershipQuery::shadow_method("mb/findgen", tmpl_m, nw_m, tmpl_impl, nw_impl, owner_ref, this.arena, this.intern);
+         return tmpl_m;
+     }
+ 
+@@ -1676,7 +1754,7 @@ type struct MethodBinding {
+     /// Concrete trait-arg list a base type binds for `trait_leaf`, including
+     /// associated-type bindings.  `Range<i32>` over `Iterator` yields `[i32]`.
+     proj_concrete_trait_args_for(mut &this, subject_in: TypeRef,
+-                                 trait_leaf: SymbolStr) -> TypeRef[] {
++                                 trait_leaf: SymbolStr, trait_id: SymbolStr) -> TypeRef[] {
+         mut out: TypeRef[] = [];
+         if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return out; }
+         // No carrier normalization: `template_key_of` and
+@@ -1686,7 +1764,7 @@ type struct MethodBinding {
+         if (!this.trait_checker().template_key_of(subject).is_valid()) { return out; }
+         const impl_node: ImplBlockNode* =
+             OwnershipQuery::resolve_trait_impl_for_type(this.arena,
+-                this.ctx.generic_registry, this.intern, trait_leaf, subject);
++                this.ctx.generic_registry, this.intern, trait_leaf, trait_id, "mb/proj", subject);
+         if (impl_node == null) { return out; }
+         const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
+         if (trait_ann == null) { return out; }
+@@ -1741,7 +1819,7 @@ type struct MethodBinding {
+                 const tr: TraitRef* = &bound.trait_refs[ti];
+                 if (tr.path.length == 0) { continue; }
+                 const trait_leaf: SymbolStr = tr.path[tr.path.length - 1];
+-                const concrete_args: TypeRef[] = this.proj_concrete_trait_args_for(subject, trait_leaf);
++                const concrete_args: TypeRef[] = this.proj_concrete_trait_args_for(subject, trait_leaf, tr.identity());
+                 if (concrete_args.length != tr.type_args.length) { continue; }
+                 for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
+                     const ta: TypeAnnotation* = tr.type_args[ai];
+@@ -1803,7 +1881,7 @@ type struct MethodBinding {
+             }
+             if (assoc_pos < 0) { continue; }
+             const idx: i64 = tdecl.generic_params.length + assoc_pos;
+-            const args: TypeRef[] = this.proj_concrete_trait_args_for(base_ty, tdecl.name);
++            const args: TypeRef[] = this.proj_concrete_trait_args_for(base_ty, tdecl.name, this.ctx.generic_registry.trait_decl_keys[i]);
+             if (idx < args.length && args[idx].is_valid()) { return args[idx]; }
+         }
+         return TypeRef::invalid();
+@@ -1944,6 +2022,22 @@ type struct MethodBinding {
+             }
+             if (found_method != null) { break; }
+         }
++        mut nw_m: MethodNode* = null;
++        mut nw_impl: ImplBlockNode* = null;
++        const nw_blocks: ImplBlockNode*[] = this.ctx.generic_registry.template_trait_impls_of(subject_ref, this.intern);
++        for (mut i: i64 = 0; i < nw_blocks.length; i++) {
++            const impl_node: ImplBlockNode* = nw_blocks[i];
++            for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
++                const m: MethodNode* = impl_node.methods[k];
++                if (m == null || m.func == null) { continue; }
++                if (!m.func.name.equals(method_name)) { continue; }
++                nw_impl = impl_node;
++                nw_m = m;
++                break;
++            }
++            if (nw_m != null) { break; }
++        }
++        OwnershipQuery::shadow_method("mb/projret", found_method, nw_m, found_impl, nw_impl, subject_ref, this.arena, this.intern);
+         if (found_method == null || found_impl == null) { return TypeRef::invalid(); }
+         const ret_ann: TypeAnnotation* = found_method.func.return_type_annotation;
+         if (ret_ann == null) { return TypeRef::invalid(); }
+diff --git a/compiler/src/compiler/sema/sema.cryo b/compiler/src/compiler/sema/sema.cryo
+index 88b89a18..547eb9bf 100644
+--- a/compiler/src/compiler/sema/sema.cryo
++++ b/compiler/src/compiler/sema/sema.cryo
+@@ -1780,7 +1780,8 @@ public:
+             trait_id = this.bounded_param_trait(t as BoundedParamType*, trait_leaf);
+         } else {
+             const impl_block: ImplBlockNode* = OwnershipQuery::resolve_trait_impl_for_type(
+-                this.arena, this.ctx.generic_registry, this.intern, trait_leaf, base_ty);
++                this.arena, this.ctx.generic_registry, this.intern, trait_leaf,
++                this.ctx.generic_registry.wellknown(trait_leaf), "sema/binop", base_ty);
+             if (impl_block != null) { trait_id = impl_block.qualified_trait_name; }
+         }
+         if (!trait_id.is_valid()) { return null; }
+@@ -1863,7 +1864,8 @@ public:
+         // Gate on the impl EXISTING on the primitive before building anything,
+         // so a plain `2 * 3`-shaped error never materializes a bogus call.
+         const impl_block: ImplBlockNode* = OwnershipQuery::resolve_trait_impl_for_type(
+-            this.arena, this.ctx.generic_registry, this.intern, trait_leaf, lhs);
++            this.arena, this.ctx.generic_registry, this.intern, trait_leaf,
++            this.ctx.generic_registry.wellknown(trait_leaf), "sema/primop", lhs);
+         if (impl_block == null || !impl_block.qualified_trait_name.is_valid()) { return null; }
+         const method_sym: SymbolStr = this.intern.intern(map.method);
+         mut desugared: ExpressionNode* =
+diff --git a/compiler/src/compiler/types/generic_registry.cryo b/compiler/src/compiler/types/generic_registry.cryo
+index d2ebb2c9..da8968c1 100644
+--- a/compiler/src/compiler/types/generic_registry.cryo
++++ b/compiler/src/compiler/types/generic_registry.cryo
+@@ -26,6 +26,11 @@ import compiler::resolver::symbol_str;
+ import compiler::resolver::symbol_str::{ SymbolStr };
+ import compiler::resolver::res;
+ import compiler::resolver::res::{ DefId };
++import compiler::resolver::res::{ Res };
++import compiler::ast::{ TypeAnnotation };
++import compiler::types::{ TypeKind };
++import compiler::types::compound::{ PointerType, ReferenceType };
++import compiler::types::type_base::{ Type };
+ import std::core::option;
+ import std::core::option::{ Option };
+ import std::collections::{ pair, hashmap };
+@@ -210,6 +215,14 @@ type struct TemplateEntry {
+ 
+ // GenericRegistry: Unified template + instantiation registry
+ 
++/// One `implement trait Tr for Target<...>` head, under the key it was
++/// registered by.  See `GenericRegistry::trait_heads`.
++type struct TraitImplHead {
++    trait_id:   SymbolStr;
++    target_key: SymbolStr;
++    block:      ImplBlockNode*;
++}
++
+ type struct GenericRegistry {
+     arena: TypeArena*;
+ 
+@@ -285,6 +298,20 @@ type struct GenericRegistry {
+     // negative - this is how the collision false-positive is removed); when it
+     // is absent, lookups fall back to the bare `trait_impl_index`.
+     precise_trait_leaf: HashMap<u64, i64>;
++    // -- Trait-impl heads, by (trait identity, target key) --
++
++    /// Every `implement trait Tr for Target<...>` head this program holds,
++    /// under the trait's IDENTITY and the key the target is registered by
++    /// (`ImplBlockNode::target_key`: a declared type's canonical name, a
++    /// primitive's spelling, a placed clone's specialization).  A key holds a
++    /// LIST: two heads for one template that differ in a concrete argument
++    /// (`Wrap<T, Alpha>` and `Wrap<T, Beta>`) are two heads, and which one a
++    /// subject gets is decided by `select_trait_impl`, never by which
++    /// registered last.
++    trait_heads:      TraitImplHead[];
++    /// `(trait_id, target_key)` -> indices into `trait_heads`, in
++    /// registration order.
++    trait_head_index: HashMap<u64, i64[]>;
+ 
+     // -- Trait-impl coherence index --
+     // Separate from `trait_impls` because that table is keyed on bare,
+@@ -379,6 +406,8 @@ type struct GenericRegistry {
+             trait_impl_typeid_index: HashMap<u64, i64>::new(),
+             trait_impls_typed:       [],
+             precise_trait_leaf:      HashMap<u64, i64>::new(),
++            trait_heads:       [],
++            trait_head_index:  HashMap<u64, i64[]>::new(),
+             coherence_records: [],
+             coherence_index:   HashMap<u64, i64>::new(),
+             trait_decl_index:  HashMap<u32, i64>::new(),
+@@ -775,6 +804,245 @@ type struct GenericRegistry {
+     }
+ 
+ 
++    /// Register a head under `(trait_id, target_key)`.  A block already under
++    /// that key is not pushed twice: a head is offered by TemplateRegistration
++    /// and again by TypeResolution, and once more by the specialization walk
++    /// under its clone's key, and whether an offer took is a fact of the table.
++    register_trait_impl_head(mut &this, trait_id: SymbolStr, target_key: SymbolStr,
++                             block: ImplBlockNode*) -> void {
++        if (block == null || !trait_id.is_valid() || !target_key.is_valid()) { return; }
++        const key: u64 = GenericRegistry::trait_impl_key(trait_id, target_key);
++        const slot: i64[]* = this.trait_head_index.get_or_insert(key, []);
++        for (mut i: i64 = 0; i < (*slot).length; i++) {
++            if (this.trait_heads[(*slot)[i]].block == block) { return; }
++        }
++        (*slot).push(this.trait_heads.length);
++        this.trait_heads.push(TraitImplHead { trait_id: trait_id, target_key: target_key, block: block });
++    }
++
++    /// The heads under `(trait_id, target_key)`, in registration order.
++    heads_under(&this, trait_id: SymbolStr, target_key: SymbolStr) -> ImplBlockNode*[] {
++        mut out: ImplBlockNode*[] = [];
++        if (!trait_id.is_valid() || !target_key.is_valid()) { return out; }
++        const key: u64 = GenericRegistry::trait_impl_key(trait_id, target_key);
++        match (this.trait_head_index.get_ref(&key)) {
++            Option::Some(slot) => {
++                for (mut i: i64 = 0; i < (*slot).length; i++) {
++                    out.push(this.trait_heads[(*slot)[i]].block);
++                }
++            }
++            _ => { }
++        }
++        return out;
++    }
++
++    /// The impl of `trait_id` for `subject`, or null when no head selects
++    /// for it - Rust's rule, unification of the head's self type against the
++    /// subject, with its where-clause checked by the caller that needs it
++    /// (`TraitChecker::type_implements_trait`).  A post-mono concrete - a
++    /// specialization with a name of its own beside its template's key -
++    /// selects among the clones the monomorphizer placed under it and
++    /// nothing else: those are the template's heads that unified AND whose
++    /// bounds held, so a template head absent there was refused, not missed.
++    /// Every other subject (a pre-mono instantiation, a declared type, a
++    /// primitive) selects the first head under its template key whose
++    /// written target arguments unify with its own (`head_matches`).  Two
++    /// heads unifying with one subject is an overlap; the first registered
++    /// answers here, and the overlap is a registration-time report, not one
++    /// per use.
++    select_trait_impl(&this, trait_id: SymbolStr, subject: TypeRef,
++                      intern: InternTable*) -> ImplBlockNode* {
++        const heads: ImplBlockNode*[] = this.heads_for(trait_id, subject, intern);
++        if (heads.length == 0) { return null; }
++        return heads[0];
++    }
++
++    /// Every head of `trait_id` that selects for `subject`, in registration
++    /// order: the placed clones of a post-mono concrete, else the template
++    /// heads that unify.  Several answer when the trait is generic and the
++    /// subject implements it at several arguments (`From<i8>` and `From<u8>`
++    /// for `u64`), which is one trait identity and as many impls.
++    heads_for(&this, trait_id: SymbolStr, subject: TypeRef,
++              intern: InternTable*) -> ImplBlockNode*[] {
++        mut out: ImplBlockNode*[] = [];
++        if (!trait_id.is_valid() || !subject.is_valid() || intern == null) { return out; }
++        const tkey: SymbolStr = this.arena.template_key_of(subject, intern);
++        const own: SymbolStr = this.arena.get_qualified_name(subject);
++        if (own.is_valid() && tkey.is_valid() && !own.equals(tkey)) {
++            const placed: ImplBlockNode*[] = this.heads_under(trait_id, own);
++            if (placed.length > 0) { return placed; }
++        }
++        if (!tkey.is_valid()) { return out; }
++        const heads: ImplBlockNode*[] = this.heads_under(trait_id, tkey);
++        for (mut i: i64 = 0; i < heads.length; i++) {
++            if (GenericRegistry::head_matches(heads[i], subject, this.arena, intern)) {
++                out.push(heads[i]);
++            }
++        }
++        return out;
++    }
++
++    /// Every head that selects for `subject`, of every trait, in registration
++    /// order - the candidate set a method call on `subject` binds against.
++    /// The list `traits_implemented_by` used to answer, with the selection
++    /// done rather than left to the caller.
++    trait_impls_of(&this, subject: TypeRef, intern: InternTable*) -> ImplBlockNode*[] {
++        mut out: ImplBlockNode*[] = [];
++        if (!subject.is_valid() || intern == null) { return out; }
++        const tkey: SymbolStr = this.arena.template_key_of(subject, intern);
++        const own: SymbolStr = this.arena.get_qualified_name(subject);
++        mut seen: SymbolStr[] = [];
++        for (mut i: i64 = 0; i < this.trait_heads.length; i++) {
++            const h: TraitImplHead* = &this.trait_heads[i];
++            const under_own: boolean = own.is_valid() && h.target_key.equals(own);
++            const under_tkey: boolean = tkey.is_valid() && h.target_key.equals(tkey);
++            if (!under_own && !under_tkey) { continue; }
++            mut dup: boolean = false;
++            for (mut s: i64 = 0; s < seen.length; s++) {
++                if (seen[s].equals(h.trait_id)) { dup = true; break; }
++            }
++            if (dup) { continue; }
++            seen.push(h.trait_id);
++            const heads: ImplBlockNode*[] = this.heads_for(h.trait_id, subject, intern);
++            for (mut k: i64 = 0; k < heads.length; k++) { out.push(heads[k]); }
++        }
++        return out;
++    }
++
++    /// The written head of `trait_id` for `subject` - the first under its
++    /// template key whose arguments unify - never a placed clone.  For the
++    /// readers that substitute the head's WRITTEN trait and target arguments
++    /// against the subject's own, which a clone has already substituted away.
++    template_head_for(&this, trait_id: SymbolStr, subject: TypeRef,
++                      intern: InternTable*) -> ImplBlockNode* {
++        if (!trait_id.is_valid() || !subject.is_valid() || intern == null) { return null; }
++        const tkey: SymbolStr = this.arena.template_key_of(subject, intern);
++        if (!tkey.is_valid()) { return null; }
++        const heads: ImplBlockNode*[] = this.heads_under(trait_id, tkey);
++        for (mut i: i64 = 0; i < heads.length; i++) {
++            if (GenericRegistry::head_matches(heads[i], subject, this.arena, intern)) {
++                return heads[i];
++            }
++        }
++        return null;
++    }
++
++    /// The TEMPLATE heads that select for `subject`: the written heads under
++    /// its template key whose arguments unify, never a clone the monomorphizer
++    /// placed under the specialization.  For the readers that substitute the
++    /// head's written target arguments against the subject's, which a placed
++    /// clone has already substituted away.
++    template_trait_impls_of(&this, subject: TypeRef, intern: InternTable*) -> ImplBlockNode*[] {
++        mut out: ImplBlockNode*[] = [];
++        if (!subject.is_valid() || intern == null) { return out; }
++        const tkey: SymbolStr = this.arena.template_key_of(subject, intern);
++        if (!tkey.is_valid()) { return out; }
++        for (mut i: i64 = 0; i < this.trait_heads.length; i++) {
++            const h: TraitImplHead* = &this.trait_heads[i];
++            if (!h.target_key.equals(tkey)) { continue; }
++            if (!GenericRegistry::head_matches(h.block, subject, this.arena, intern)) { continue; }
++            out.push(h.block);
++        }
++        return out;
++    }
++
++    /// Whether `block`'s head is for `subject`: its written target arguments,
++    /// position by position, unify with the subject's instantiation
++    /// arguments.  A head with no written arguments is for every subject
++    /// under its key; a subject that carries no arguments (a template asked
++    /// before any instantiation exists, a non-generic type) cannot refute
++    /// one, so every head under its key is for it.
++    static head_matches(block: ImplBlockNode*, subject: TypeRef,
++                        arena: TypeArena*, intern: InternTable*) -> boolean {
++        if (block == null) { return false; }
++        if (block.target_args.length == 0) { return true; }
++        const n: i64 = arena.inst_type_arg_count(subject);
++        if (n == 0) { return true; }
++        mut args: TypeRef[] = [];
++        for (mut i: i64 = 0; i < n; i++) { args.push(arena.inst_type_arg_at(subject, i)); }
++        return GenericRegistry::head_matches_args(block, &args, arena, intern);
++    }
++
++    /// `head_matches` over an argument list already in hand (the
++    /// monomorphizer's, before it has a subject type to ask by).  An arity
++    /// disagreement is no match: the head names a different template shape.
++    static head_matches_args(block: ImplBlockNode*, args: &TypeRef[],
++                             arena: TypeArena*, intern: InternTable*) -> boolean {
++        if (block == null) { return false; }
++        if (block.target_args.length == 0) { return true; }
++        if (block.target_args.length != args.length) { return false; }
++        for (mut i: i64 = 0; i < args.length; i++) {
++            if (!GenericRegistry::annotation_unifies(block.target_args[i], args[i], arena, intern)) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    /// One written argument of a head against one argument of the subject.
++    /// A name stamped as a parameter of the head binds to anything; one
++    /// stamped as a type (a declaration, a primitive) must BE that type - the
++    /// subject's argument is compared by the key it is registered under, and
++    /// a nested instantiation recursively.  A subject argument that is still
++    /// abstract (a type parameter of the enclosing template) cannot refute a
++    /// concrete one: the question is deferred to the concrete instantiation,
++    /// as a where-bound over an abstract argument is.  A written argument the
++    /// name layer did not stamp is recorded through `require` and refutes
++    /// nothing, so a head is never lost to a missing stamp.
++    static annotation_unifies(ann: TypeAnnotation*, arg: TypeRef,
++                              arena: TypeArena*, intern: InternTable*) -> boolean {
++        if (ann == null) { return true; }
++        const at: Type* = arena.lookup(arg.id);
++        if (at != null && (at.kind == TypeKind::GenericParam || at.kind == TypeKind::BoundedParam)) {
++            return true;
++        }
++        match (*ann) {
++            TypeAnnotation::Named(n) => {
++                match (n.res.require("generic_registry:impl head argument")) {
++                    Res::GenericParam(_) => { return true; }
++                    Res::Def(d)          => {
++                        const k: SymbolStr = arena.template_key_of(arg, intern);
++                        return k.is_valid() && k.equals(d.qualified_name());
++                    }
++                    Res::PrimTy(p)       => {
++                        const k: SymbolStr = arena.template_key_of(arg, intern);
++                        return k.is_valid() && k.equals(p);
++                    }
++                    _                    => { return true; }
++                }
++            }
++            TypeAnnotation::Primitive(p) => {
++                const k: SymbolStr = arena.template_key_of(arg, intern);
++                return k.is_valid() && k.equals(p.name);
++            }
++            TypeAnnotation::Generic(g) => {
++                if (!GenericRegistry::annotation_unifies(g.base, arg, arena, intern)) { return false; }
++                const n: i64 = arena.inst_type_arg_count(arg);
++                if (n == 0) { return true; }
++                if (g.args.length != n) { return false; }
++                for (mut j: i64 = 0; j < n; j++) {
++                    if (!GenericRegistry::annotation_unifies(
++                            g.args[j], arena.inst_type_arg_at(arg, j), arena, intern)) {
++                        return false;
++                    }
++                }
++                return true;
++            }
++            TypeAnnotation::Pointer(pa) => {
++                if (at == null || at.kind != TypeKind::Pointer) { return false; }
++                return GenericRegistry::annotation_unifies(
++                    pa.inner, (at as PointerType*).pointee, arena, intern);
++            }
++            TypeAnnotation::Reference(ra) => {
++                if (at == null || at.kind != TypeKind::Reference) { return false; }
++                return GenericRegistry::annotation_unifies(
++                    ra.inner, (at as ReferenceType*).referent, arena, intern);
++            }
++            _ => { return true; }
++        }
++    }
++
++
+     /// Return the list of trait names for which `target_name` has a
+     /// registered impl. Linear scan, acceptable while the trait-impl
+     /// table remains small. Used by sema to resolve calls to default
+@@ -861,12 +1129,11 @@ type struct GenericRegistry {
+     }
+ 
+     /// The qualified names of the declarations the language reasons about by
+-    /// identity rather than by dispatch: the structural markers and `Future`.
+-    ///
+-    /// The operator traits are deliberately ABSENT. They are looked up in the
+-    /// trait-IMPL tables, which are `(trait-leaf, target)` dispatch indices
+-    /// where the target does the disambiguating - so they ask by leaf, and
+-    /// giving them an identity would make every operator lookup miss.
++    /// identity: the structural markers, `Drop`, `Future`, and the traits an
++    /// operator desugars to.  `a + b` is `std::core::ops::Add::add`, as Rust's
++    /// `+` is `core::ops::Add` - a user trait spelled `Add` does not overload
++    /// the operator, and an operator's impl is selected by the trait's
++    /// identity like any other.
+     ///
+     /// This is the one place the compiler knows how a stdlib trait is spelled.
+     static is_wellknown_trait_path(s: string) -> boolean {
+@@ -875,6 +1142,23 @@ type struct GenericRegistry {
+         if (s == "std::core::marker::Sync")     { return true; }
+         if (s == "std::core::drop::Drop")       { return true; }
+         if (s == "std::future::traits::Future") { return true; }
++        if (s == "std::core::cmp::Eq")          { return true; }
++        if (s == "std::core::cmp::Ord")         { return true; }
++        if (s == "std::core::ops::Add")         { return true; }
++        if (s == "std::core::ops::Sub")         { return true; }
++        if (s == "std::core::ops::Mul")         { return true; }
++        if (s == "std::core::ops::Div")         { return true; }
++        if (s == "std::core::ops::Rem")         { return true; }
++        if (s == "std::core::ops::Neg")         { return true; }
++        if (s == "std::core::ops::Not")         { return true; }
++        if (s == "std::core::ops::BitNot")      { return true; }
++        if (s == "std::core::ops::BitAnd")      { return true; }
++        if (s == "std::core::ops::BitOr")       { return true; }
++        if (s == "std::core::ops::BitXor")      { return true; }
++        if (s == "std::core::ops::Shl")         { return true; }
++        if (s == "std::core::ops::Shr")         { return true; }
++        if (s == "std::core::ops::Deref")       { return true; }
++        if (s == "std::core::ops::Index")       { return true; }
+         return false;
+     }
+ 
+diff --git a/compiler/src/compiler/types/ownership.cryo b/compiler/src/compiler/types/ownership.cryo
+index 425ceeda..13ffee98 100644
+--- a/compiler/src/compiler/types/ownership.cryo
++++ b/compiler/src/compiler/types/ownership.cryo
+@@ -41,6 +41,7 @@ import compiler::types::{
+ };
+ import compiler::resolver::{ symbol_str, intern_table };
+ import compiler::ast;
++import std::fmt;
+ import compiler::ast::{ NodeKind };
+ import compiler::ast::node;
+ import compiler::ast::node::{ ASTNode };
+@@ -770,13 +771,117 @@ type struct OwnershipQuery {
+         if (!drop_name.is_valid()) { return false; }
+         const leaf: SymbolStr = OwnershipQuery::registry_name_of(arena, intern, ty);
+         const qual_id: u64 = OwnershipQuery::named_qualified_id(arena, intern, ty);
++        mut old_ans: boolean = false;
+         if (qual_id != 0 && registry.is_precise_trait_leaf(drop_name, leaf)) {
+             // Authoritative precise path: a miss here is a true negative.
+-            return registry.has_trait_impl_typed(drop_name, qual_id);
++            old_ans = registry.has_trait_impl_typed(drop_name, qual_id);
++        } else if (leaf.is_valid()) {
++            // Fallback: bare-name lookup (old behaviour, safe/conservative).
++            old_ans = OwnershipQuery::has_drop_impl(registry, intern, leaf);
++        }
++        const drop_id: SymbolStr = registry.wellknown(drop_name);
++        const nw: boolean = registry.select_trait_impl(drop_id, ty, intern) != null;
++        OwnershipQuery::shadow_bool("drop", old_ans, nw, drop_id, ty, arena, intern);
++        return old_ans;
++    }
++
++    /// SHADOW: an old selection beside the new one.  Old is returned by the
++    /// caller; this only prints.
++    static shadow_sel(site: string, old: ImplBlockNode*, nw: ImplBlockNode*,
++                      trait_id: SymbolStr, subject: TypeRef,
++                      arena: TypeArena*, intern: InternTable*) -> void {
++        mut v: string = "AGREE";
++        if (old != nw) {
++            if (old == null) { v = "NEWONLY"; }
++            else if (nw == null) { v = "OLDONLY"; }
++            else { v = "DISAGREE"; }
++        }
++        const hit: string = if (old == null && nw == null) { "null" } else { "hit" };
++        const tkey: SymbolStr = arena.template_key_of(subject, intern);
++        const ok: string = if (old != null) { intern.resolve(old.target_key(arena)) } else { "-" };
++        const nk: string = if (nw != null) { intern.resolve(nw.target_key(arena)) } else { "-" };
++        const oi: string = if (old != null) { intern.resolve(old.qualified_trait_name) } else { "-" };
++        const ni: string = if (nw != null) { intern.resolve(nw.qualified_trait_name) } else { "-" };
++        fmt::eprintf("SHADOW\tSEL\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", site, v, hit,
++            if (trait_id.is_valid()) { intern.resolve(trait_id) } else { "-" },
++            if (tkey.is_valid()) { intern.resolve(tkey) } else { "-" },
++            ok, nk, oi, ni);
++    }
++
++    /// SHADOW: an old block list beside the new one, compared as sets.
++    static shadow_list(site: string, old: &ImplBlockNode*[], nw: &ImplBlockNode*[],
++                       subject: TypeRef, arena: TypeArena*, intern: InternTable*) -> void {
++        mut only_old: string = "";
++        mut only_new: string = "";
++        for (mut i: i64 = 0; i < old.length; i++) {
++            mut found: boolean = false;
++            for (mut j: i64 = 0; j < nw.length; j++) { if (old[i] == nw[j]) { found = true; break; } }
++            if (!found && old[i] != null) {
++                only_old = only_old + intern.resolve(old[i].qualified_trait_name) + "@" + intern.resolve(old[i].target_key(arena)) + ";";
++            }
++        }
++        for (mut j: i64 = 0; j < nw.length; j++) {
++            mut found: boolean = false;
++            for (mut i: i64 = 0; i < old.length; i++) { if (old[i] == nw[j]) { found = true; break; } }
++            if (!found && nw[j] != null) {
++                only_new = only_new + intern.resolve(nw[j].qualified_trait_name) + "@" + intern.resolve(nw[j].target_key(arena)) + ";";
++            }
++        }
++        mut v: string = "AGREE";
++        if (only_old.length() != 0 || only_new.length() != 0) {
++            // The same TRAITS with different blocks (a clone for the head, or
++            // one head of several) is a weaker disagreement than a trait one
++            // side lacks.
++            mut traits_same: boolean = true;
++            for (mut i: i64 = 0; i < old.length; i++) {
++                mut f: boolean = false;
++                for (mut j: i64 = 0; j < nw.length; j++) { if (old[i] != null && nw[j] != null && old[i].qualified_trait_name.equals(nw[j].qualified_trait_name)) { f = true; break; } }
++                if (!f) { traits_same = false; }
++            }
++            for (mut j: i64 = 0; j < nw.length; j++) {
++                mut f: boolean = false;
++                for (mut i: i64 = 0; i < old.length; i++) { if (old[i] != null && nw[j] != null && old[i].qualified_trait_name.equals(nw[j].qualified_trait_name)) { f = true; break; } }
++                if (!f) { traits_same = false; }
++            }
++            v = if (traits_same) { "SAMETRAITS" } else { "DIFFER" };
+         }
+-        // Fallback: bare-name lookup (old behaviour, safe/conservative).
+-        if (!leaf.is_valid()) { return false; }
+-        return OwnershipQuery::has_drop_impl(registry, intern, leaf);
++        const tkey: SymbolStr = arena.template_key_of(subject, intern);
++        fmt::eprintf("SHADOW\tLIST\t%s\t%s\t%lld\t%lld\t%s\t%s\t%s\n", site, v, old.length, nw.length,
++            if (tkey.is_valid()) { intern.resolve(tkey) } else { "-" },
++            if (only_old.length() == 0) { "-" } else { only_old },
++            if (only_new.length() == 0) { "-" } else { only_new });
++    }
++
++    /// SHADOW: an old method answer beside the new one, by node identity.
++    static shadow_method(site: string, old: MethodNode*, nw: MethodNode*, old_impl: ImplBlockNode*,
++                         nw_impl: ImplBlockNode*, subject: TypeRef,
++                         arena: TypeArena*, intern: InternTable*) -> void {
++        mut v: string = "AGREE";
++        if (old != nw) {
++            if (old == null) { v = "NEWONLY"; }
++            else if (nw == null) { v = "OLDONLY"; }
++            else { v = "DISAGREE"; }
++        }
++        const hit: string = if (old == null && nw == null) { "null" } else { "hit" };
++        const tkey: SymbolStr = arena.template_key_of(subject, intern);
++        const own: SymbolStr = arena.get_qualified_name(subject);
++        const ok: string = if (old_impl != null) { intern.resolve(old_impl.qualified_trait_name) + "@" + intern.resolve(old_impl.target_key(arena)) } else { "-" };
++        const nk: string = if (nw_impl != null) { intern.resolve(nw_impl.qualified_trait_name) + "@" + intern.resolve(nw_impl.target_key(arena)) } else { "-" };
++        const mn: string = if (old != null && old.func != null) { intern.resolve(old.func.name) } else { if (nw != null && nw.func != null) { intern.resolve(nw.func.name) } else { "-" } };
++        fmt::eprintf("SHADOW\tMETH\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", site, v, hit, mn,
++            if (tkey.is_valid()) { intern.resolve(tkey) } else { "-" },
++            if (own.is_valid()) { intern.resolve(own) } else { "-" }, ok, nk);
++    }
++
++    /// SHADOW: an old yes/no beside the new one.
++    static shadow_bool(site: string, old: boolean, nw: boolean, trait_id: SymbolStr,
++                       subject: TypeRef, arena: TypeArena*, intern: InternTable*) -> void {
++        const v: string = if (old == nw) { "AGREE" } else { if (old) { "OLDONLY" } else { "NEWONLY" } };
++        const hit: string = if (!old && !nw) { "null" } else { "hit" };
++        const tkey: SymbolStr = arena.template_key_of(subject, intern);
++        fmt::eprintf("SHADOW\tSEL\t%s\t%s\t%s\t%s\t%s\t-\t-\t-\t-\n", site, v, hit,
++            if (trait_id.is_valid()) { intern.resolve(trait_id) } else { "-" },
++            if (tkey.is_valid()) { intern.resolve(tkey) } else { "-" });
+     }
+ 
+     /// Precise, collision-proof trait-impl lookup for ANY trait - the general
+@@ -795,6 +900,20 @@ type struct OwnershipQuery {
+     /// precise path is authoritative: a miss for a precisely-registered leaf is a
+     /// genuine negative.
+     static resolve_trait_impl_for_type(arena: TypeArena*, registry: GenericRegistry*,
++                                       intern: InternTable*, trait_name: SymbolStr,
++                                       trait_id: SymbolStr, site: string,
++                                       ty: TypeRef) -> ImplBlockNode* {
++        if (arena == null || registry == null || intern == null) { return null; }
++        const old: ImplBlockNode* = OwnershipQuery::resolve_trait_impl_for_type_old(
++            arena, registry, intern, trait_name, ty);
++        // The projection readers read the WRITTEN head; the rest select.
++        const written: boolean = site == "mb/proj" || site == "ts/args" || site == "tr/proj";
++        const nw: ImplBlockNode* = if (written) { registry.template_head_for(trait_id, ty, intern) } else { registry.select_trait_impl(trait_id, ty, intern) };
++        OwnershipQuery::shadow_sel(site, old, nw, trait_id, ty, arena, intern);
++        return old;
++    }
++
++    static resolve_trait_impl_for_type_old(arena: TypeArena*, registry: GenericRegistry*,
+                                        intern: InternTable*, trait_name: SymbolStr,
+                                        ty: TypeRef) -> ImplBlockNode* {
+         if (arena == null || registry == null || intern == null) { return null; }
+diff --git a/compiler/src/compiler/types/resolver.cryo b/compiler/src/compiler/types/resolver.cryo
+index f2c47eb3..84a921f4 100644
+--- a/compiler/src/compiler/types/resolver.cryo
++++ b/compiler/src/compiler/types/resolver.cryo
+@@ -471,7 +471,8 @@ type struct TypeResolver {
+             if (assoc_pos < 0) { continue; }
+             const impl_node: ImplBlockNode* =
+                 OwnershipQuery::resolve_trait_impl_for_type(this.arena,
+-                    this.generic_registry, this.intern_table, tdecl.name, base_ty);
++                    this.generic_registry, this.intern_table, tdecl.name,
++                    this.generic_registry.trait_decl_keys[i], "tr/proj", base_ty);
+             if (impl_node == null) { continue; }
+ 
+             // The binding annotation: positional trait arg (sugar) at
+diff --git a/compiler/src/compiler/types/trait_checker.cryo b/compiler/src/compiler/types/trait_checker.cryo
+index 1c0583f1..d531b623 100644
+--- a/compiler/src/compiler/types/trait_checker.cryo
++++ b/compiler/src/compiler/types/trait_checker.cryo
+@@ -168,14 +168,12 @@ type struct TraitChecker {
+         // `inst_*` views, and a concrete carries that identity itself.
+         const subject: TypeRef = ty;
+         if (!this.template_key_of(subject).is_valid()) { return false; }
+-        // Collision-proof: resolve the impl by the subject's canonical
+-        // qualified-name identity so a same-leaf type in another module doesn't
+-        // inherit this trait's impl (falls back to the bare lookup when the
+-        // subject isn't a precisely-registered named aggregate).
++        // OLD: the one impl under the leaf key, then its bounds.
+         const impl_block: ImplBlockNode* =
+-            OwnershipQuery::resolve_trait_impl_for_type(this.arena,
++            OwnershipQuery::resolve_trait_impl_for_type_old(this.arena,
+                 this.generic_registry, this.intern_table,
+                 this.dispatch_leaf(trait_name), subject);
++        mut old_ans: boolean = false;
+         if (impl_block == null) {
+             // No `implement trait Drop` for this type - but a non-Copy
+             // type whose destructor is written as an inherent `drop`
+@@ -190,11 +188,71 @@ type struct TraitChecker {
+             // never reach this branch and keep the `where T: Drop` check
+             // below.
+             if (drop_name.is_valid() && trait_name.equals(drop_name)) {
+-                return OwnershipQuery::has_inherent_drop(this.arena,
++                old_ans = OwnershipQuery::has_inherent_drop(this.arena,
+                     this.generic_registry, this.intern_table, ty);
+             }
+-            return false;
++        } else {
++            old_ans = this.impl_bounds_hold(impl_block, subject, depth);
++        }
++        // NEW: the candidates by identity, the first whose bounds hold.
++        const nw_block: ImplBlockNode* = this.select_impl(trait_name, subject, depth);
++        mut nw_ans: boolean = nw_block != null;
++        if (nw_block == null && drop_name.is_valid() && trait_name.equals(drop_name)
++                && this.generic_registry.heads_for(trait_name, subject, this.intern_table).length == 0) {
++            nw_ans = OwnershipQuery::has_inherent_drop(this.arena,
++                this.generic_registry, this.intern_table, ty);
++        }
++        OwnershipQuery::shadow_bool("tc/implements", old_ans, nw_ans, trait_name, subject,
++            this.arena, this.intern_table);
++        return old_ans;
++    }
++
++    /// The impl of `trait_id` for `subject` that APPLIES: the first
++    /// candidate the registry assembles by unification
++    /// (`GenericRegistry::heads_for`) whose where-clause holds for the
++    /// subject's arguments.  Null when no head unifies or every one that
++    /// does is refused by its bounds - Rust's selection, candidate assembly
++    /// then confirmation, in one place.
++    select_impl(&this, trait_id: SymbolStr, subject: TypeRef, depth: i32) -> ImplBlockNode* {
++        if (this.generic_registry == null) { return null; }
++        const heads: ImplBlockNode*[] = this.generic_registry.heads_for(trait_id, subject, this.intern_table);
++        for (mut i: i64 = 0; i < heads.length; i++) {
++            if (this.impl_applies(heads[i], subject, depth)) { return heads[i]; }
++        }
++        return null;
++    }
++
++    /// Every impl that applies to `subject`, of every trait: the registry's
++    /// candidates (`trait_impls_of`) with each one's where-clause confirmed.
++    /// The set a method call on a concrete receiver binds against.
++    impls_of(&this, subject: TypeRef) -> ImplBlockNode*[] {
++        mut out: ImplBlockNode*[] = [];
++        if (this.generic_registry == null) { return out; }
++        const heads: ImplBlockNode*[] = this.generic_registry.trait_impls_of(subject, this.intern_table);
++        for (mut i: i64 = 0; i < heads.length; i++) {
++            if (this.impl_applies(heads[i], subject, 0)) { out.push(heads[i]); }
+         }
++        return out;
++    }
++
++    /// Whether a candidate head applies to `subject`: a clone the
++    /// monomorphizer placed under a specialization was confirmed when it was
++    /// placed (its bounds held for those arguments, and are substituted away
++    /// on the clone), so it applies outright; a written head applies when
++    /// its where-clause holds for the subject.
++    impl_applies(&this, head: ImplBlockNode*, subject: TypeRef, depth: i32) -> boolean {
++        if (head == null) { return false; }
++        if (head.spec_owner.is_valid()) { return true; }
++        return this.impl_bounds_hold(head, subject, depth);
++    }
++
++    /// Whether `impl_block`'s where-clause holds for `subject`: the head's
++    /// written target parameters bound to the subject's arguments, each bound
++    /// checked recursively.  A head with no where-clause holds outright.  A
++    /// subject that carries no arguments cannot bind the head's parameters,
++    /// so a bounded head is refused for it rather than assumed.
++    impl_bounds_hold(&this, impl_block: ImplBlockNode*, subject: TypeRef, depth: i32) -> boolean {
++        if (impl_block == null) { return false; }
+         if (impl_block.where_bounds.length == 0) { return true; }
+         // Build a fresh substitution from the impl's generic params to
+         // the concrete type's args. For `implement<T> trait Eq for Option<T>`
+@@ -269,7 +327,7 @@ type struct TraitChecker {
+         if (!this.template_key_of(subject).is_valid()) { return false; }
+         return OwnershipQuery::resolve_trait_impl_for_type(this.arena,
+             this.generic_registry, this.intern_table,
+-            this.dispatch_leaf(trait_name), subject) != null;
++            this.dispatch_leaf(trait_name), trait_name, "tc/opaque", subject) != null;
+     }
+ 
+     /// When sema's call-site method lookup misses on a spec'd type, we want
+@@ -283,6 +341,34 @@ type struct TraitChecker {
+     diagnose_method_bounds_failure(&this, receiver: TypeRef,
+                                     method_name: SymbolStr) -> SymbolStr {
+         if (this.generic_registry == null) { return SymbolStr::empty(); }
++        mut old_block: ImplBlockNode* = null;
++        const old: SymbolStr = this.diagnose_method_bounds_failure_old(receiver, method_name, &old_block);
++        mut nw_block: ImplBlockNode* = null;
++        const blocks: ImplBlockNode*[] = this.generic_registry.trait_impls_of(receiver, this.intern_table);
++        for (mut i: i64 = 0; i < blocks.length; i++) {
++            const impl_block: ImplBlockNode* = blocks[i];
++            mut has_method: boolean = false;
++            for (mut mi: i64 = 0; mi < impl_block.methods.length; mi++) {
++                const m: MethodNode* = impl_block.methods[mi];
++                if (m != null && m.func != null && m.func.name.equals(method_name)) {
++                    has_method = true;
++                    break;
++                }
++            }
++            if (!has_method) { continue; }
++            if (!this.type_implements_trait(receiver, impl_block.qualified_trait_name, 0)) {
++                nw_block = impl_block;
++                break;
++            }
++        }
++        OwnershipQuery::shadow_sel("tc/diag", old_block, nw_block, SymbolStr::empty(), receiver,
++            this.arena, this.intern_table);
++        return old;
++    }
++
++    diagnose_method_bounds_failure_old(&this, receiver: TypeRef,
++                                    method_name: SymbolStr, out_block: ImplBlockNode**) -> SymbolStr {
++        if (this.generic_registry == null) { return SymbolStr::empty(); }
+ 
+         // Sema typically passes the spec'd concrete type (e.g. the Enum for
+         // `Result_int_OpaqueErr`) rather than an InstantiatedType wrapper.  Trait
+@@ -296,7 +382,7 @@ type struct TraitChecker {
+         for (mut i: i64 = 0; i < traits.length; i++) {
+             const trait_name: SymbolStr = traits[i];
+             const impl_block: ImplBlockNode* =
+-                OwnershipQuery::resolve_trait_impl_for_type(this.arena,
++                OwnershipQuery::resolve_trait_impl_for_type_old(this.arena,
+                     this.generic_registry, this.intern_table, trait_name, probe_ref);
+             if (impl_block == null) { continue; }
+             // Does this impl provide the method we're looking for?
+@@ -314,6 +400,7 @@ type struct TraitChecker {
+             const trait_id: SymbolStr =
+                 TypeAnnotation::trait_identity(impl_block.trait_annotation);
+             if (!this.type_implements_trait(probe_ref, trait_id, 0)) {
++                *out_block = impl_block;
+                 return trait_name;
+             }
+         }

@@ -1571,18 +1571,6 @@ type struct TypeResolutionPasses {
                 // the head: a declaration's canonical name, a primitive's own
                 // spelling, a clone's specialization.
                 const canonical_target: SymbolStr = node.target_key(arena);
-                // Re-register the trait-impl entry under the canonical
-                // qualified target.  `register_impl_block` (Stage 3,
-                // DeclarationCollection) keys it under the parser-captured
-                // bare `node.target_type` because cross-module name
-                // resolution isn't available that early.  Sema's
-                // `traits_implemented_by` lookup uses the canonical
-                // qualified name (via `lookup_type_name`), so without
-                // this re-registration trait method dispatch on
-                // user-defined targets (e.g. `String::write_bytes` from
-                // `implement trait FmtWrite for struct String`) misses
-                // entirely; the bare-name key never lines up with the
-                // canonical receiver.
                 if (ctx.generic_registry != null && canonical_target.is_valid()) {
                     // A written head on a template names EVERY parameter of
                     // that template, as parameters of its own or as a concrete
@@ -1603,63 +1591,12 @@ type struct TypeResolutionPasses {
                     ctx.generic_registry.register_impl_block(
                         canonical_target, node);
                     if (node.is_trait_impl()) {
-                        const trait_root: SymbolStr =
-                            TypeResolutionPasses::extract_trait_leaf(
-                                node.trait_annotation);
-                        if (trait_root.is_valid()
-                            && !canonical_target.equals(node.target_type)) {
-                            ctx.generic_registry.register_trait_impl(
-                                trait_root, canonical_target, node);
-                        }
-                        // Precise (collision-proof) registration by canonical
-                        // QUALIFIED-NAME identity.  This is the authoritative,
-                        // import-resolved site, so resolving the impl's target to
-                        // its arena type here yields the same qualified-name id
-                        // the ownership Drop/Copy queries derive from a target
-                        // TypeRef (via `named_qualified_id`) - which lets a user
-                        // type that merely SHARES a stdlib type's leaf (e.g. a
-                        // local `Pair` vs stdlib `Pair<A,B>`) avoid inheriting
-                        // its Drop impl.  A non-aggregate / unresolvable target
-                        // yields qual id 0 and is skipped (bare-name fallback
-                        // still applies).
-                        //
-                        // Resolve the target MODULE-FIRST: `qualify_symbol_sym`
-                        // qualifies the bare `node.target_type` with the impl's
-                        // OWN defining namespace, so a `Drop` impl co-located with
-                        // its type (the common shape - stdlib `Pair`'s Drop lives
-                        // in `std::collections::pair`) resolves to THAT type, not
-                        // to whichever same-leaf type `lookup_type` happens to
-                        // return first.  The `canonical_target` / bare fallbacks
-                        // below cover cross-module impls whose target is not in
-                        // the defining namespace.
-                        if (trait_root.is_valid()) {
-                            // The target is the canonical name the stamp gave
-                            // above - a declaration's qualified name, a
-                            // primitive's spelling, or a clone's already-qualified
-                            // one - and the index holds it under exactly that.
-                            const tgt_ref: TypeRef = ctx.decl_index.lookup_type(canonical_target);
-                            if (tgt_ref.is_valid()) {
-                                const qual_id: u64 =
-                                    OwnershipQuery::named_qualified_id(
-                                        ctx.type_arena, ctx.intern_table, tgt_ref);
-                                if (qual_id != 0) {
-                                    const tgt_leaf: SymbolStr =
-                                        OwnershipQuery::registry_name_of(
-                                            ctx.type_arena, ctx.intern_table, tgt_ref);
-                                    // Normalize the trait name to its LEAF so a
-                                    // qualified `implement trait Mod::Tr` and a
-                                    // bare `implement trait Tr` share one precise
-                                    // key (the lookup side uses `leaf_segment`
-                                    // too).  `Drop` is already a leaf, so the
-                                    // ownership Drop path is unaffected.
-                                    const trait_leaf_reg: SymbolStr =
-                                        OwnershipQuery::leaf_segment(
-                                            ctx.intern_table, trait_root);
-                                    ctx.generic_registry.register_trait_impl_typed(
-                                        trait_leaf_reg, tgt_leaf, qual_id, node);
-                                }
-                            }
-                        }
+                        // Under the trait's identity and the target's key.
+                        // TemplateRegistration offered the same head; the
+                        // registry keeps one, and a clone routed here after
+                        // that pass is registered here alone.
+                        ctx.generic_registry.register_trait_impl(
+                            node.qualified_trait_name, canonical_target, node);
                     }
                 }
                 // Trait-impl coherence (same file AND across modules).  A
@@ -2180,32 +2117,6 @@ type struct TypeResolutionPasses {
         ctx.emit_diagnostic(diag);
     }
 
-    /// The registration key a written annotation's head names, peeling
-    /// references and pointers: a declared type's canonical name, a
-    /// primitive's spelling; empty for a type parameter, a projection, an
-    /// array, a tuple or a function type - shapes that name no registered
-    /// type.  A `Named` head with no stamp is a defect the door records.
-    static head_type_key(ann: TypeAnnotation*) -> SymbolStr {
-        if (ann == null) { return SymbolStr::empty(); }
-        return match (*ann) {
-            TypeAnnotation::Named(n) => {
-                match (n.res.require("type_resolution:annotation head")) {
-                    Res::Def(d)    => { d.qualified_name() }
-                    Res::PrimTy(p) => { p }
-                    _              => { SymbolStr::empty() }
-                }
-            }
-            // A primitive written by its keyword carries no slot to ask; its
-            // spelling is the key it is registered under, the same answer a
-            // `PrimTy` stamp gives.
-            TypeAnnotation::Primitive(p)  => { p.name }
-            TypeAnnotation::Generic(g)    => { TypeResolutionPasses::head_type_key(g.base) }
-            TypeAnnotation::Reference(r)  => { TypeResolutionPasses::head_type_key(r.inner) }
-            TypeAnnotation::Pointer(pt)   => { TypeResolutionPasses::head_type_key(pt.inner) }
-            _ => { SymbolStr::empty() }
-        };
-    }
-
     static head_named_slot(ann: TypeAnnotation*) -> ResSlot {
         if (ann == null) { return ResSlot::Pending; }
         return match (*ann) {
@@ -2351,18 +2262,26 @@ type struct TypeResolutionPasses {
         };
     }
 
-    /// Whether the type named `type_name` is registered as implementing the
-    /// trait named `trait_name`. Conservative: true (assume satisfiable) when the
-    /// registry is unavailable, so a default method is only DROPPED on positive
-    /// evidence that a concrete Item type lacks the bound.
-    static name_implements_trait(ctx: CompilationContext*, type_name: SymbolStr,
-                                 trait_name: SymbolStr) -> boolean {
-        if (ctx == null || ctx.generic_registry == null) { return true; }
-        const traits: SymbolStr[] = ctx.generic_registry.traits_implemented_by(type_name);
-        for (mut i: i64 = 0; i < traits.length; i++) {
-            if (traits[i].equals(trait_name)) { return true; }
-        }
-        return false;
+    /// The registered type a written argument names, off its stamp: a
+    /// declaration's type (its template, for an instantiation), a
+    /// primitive's.  Invalid for a type parameter, a projection, or a shape
+    /// that names no registered type.
+    static item_type_of(ann: TypeAnnotation*, ctx: CompilationContext*) -> TypeRef {
+        if (ann == null) { return TypeRef::invalid(); }
+        return match (*ann) {
+            TypeAnnotation::Named(n) => {
+                match (n.res.require("type_resolution:item annotation")) {
+                    Res::Def(d)    => { ctx.decl_index.type_of_def(d) }
+                    Res::PrimTy(p) => { ctx.type_resolver.resolve_primitive(p) }
+                    _              => { TypeRef::invalid() }
+                }
+            }
+            TypeAnnotation::Primitive(p) => { ctx.type_resolver.resolve_primitive(p.name) }
+            TypeAnnotation::Generic(g)   => { TypeResolutionPasses::item_type_of(g.base, ctx) }
+            TypeAnnotation::Reference(r) => { TypeResolutionPasses::item_type_of(r.inner, ctx) }
+            TypeAnnotation::Pointer(p)   => { TypeResolutionPasses::item_type_of(p.inner, ctx) }
+            _ => { TypeRef::invalid() }
+        };
     }
 
     /// Whether a projection-bounded trait-default method (`min where This::Item:
@@ -2403,16 +2322,16 @@ type struct TypeResolutionPasses {
             // A symbolic Item - a projection or an impl-declared parameter -
             // names no registered type: keep.
             if (TypeResolutionPasses::is_projection_annotation(item_ann)) { continue; }
-            const head: SymbolStr = TypeResolutionPasses::head_type_key(item_ann);
-            if (!head.is_valid()) { continue; }
-            // Concrete Item type: it must implement every bound trait, else the
-            // default cannot apply here - asked under its own name, since a
-            // leaf answers for every module's type of that leaf.
+            // A concrete Item - its registered type, off the stamp - must
+            // implement every bound trait, or the default cannot apply here.
+            // Asked of the trait's IDENTITY and the type: a leaf answers for
+            // every module's trait and type of that leaf.
+            const item_ty: TypeRef = TypeResolutionPasses::item_type_of(item_ann, ctx);
+            if (!item_ty.is_valid()) { continue; }
             for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
                 const tr: TraitRef* = &b.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
-                const need: SymbolStr = tr.path[tr.path.length - 1];
-                if (!TypeResolutionPasses::name_implements_trait(ctx, head, need)) {
+                if (ctx.generic_registry.select_trait_impl(tr.identity(), item_ty, ctx.intern_table) == null) {
                     return false;
                 }
             }
@@ -2890,13 +2809,12 @@ type struct TypeResolutionPasses {
 
                     if (ctx.generic_registry != null) {
                         // The import-resolved name is the declaration's
-                        // identity, and also what decides whether this IS the
-                        // language's `Copy`/`Drop`/... - the leaf cannot say
-                        // either, since a user trait may share it.
+                        // identity - the leaf cannot say, since a user trait
+                        // may share it.  Whether it IS the language's
+                        // `Copy`/`Drop`/... was claimed when the identity was
+                        // minted (the type-declaration stage).
                         const trait_id: SymbolStr = ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
                         ctx.generic_registry.register_trait_decl(trait_id, node);
-                        ctx.generic_registry.claim_wellknown_trait(
-                            trait_id, ctx.intern_table);
                     }
 
                     mut trait_ctx: ResolutionContext = runner.make_generic_context(

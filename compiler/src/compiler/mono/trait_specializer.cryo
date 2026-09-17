@@ -42,7 +42,6 @@ import compiler::types::compound::{
 };
 import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry };
-import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::resolver::{ ResolutionContext, TypeResolver };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::type_base::{ Type };
@@ -123,20 +122,17 @@ type struct MonoTraitSpecializer {
         }
     }
 
-    /// Given a concrete type `subject` (e.g. `Range<i32>`) and a bare trait leaf
-    /// name (e.g. `Iterator`), return the concrete trait args of `subject`'s impl
-    /// of that trait (e.g. `[i32]`).  Empty on any failure.
-    concrete_trait_args_for(mut &this, subject_in: TypeRef,
-                            trait_leaf: SymbolStr) -> TypeRef[] {
+    /// Given a concrete type `subject` (e.g. `Range<i32>`) and a trait's
+    /// identity (e.g. `std::core::iter::Iterator`), return the concrete trait
+    /// args of `subject`'s impl of that trait (e.g. `[i32]`), read off the
+    /// WRITTEN head, whose trait arguments the subject's own substitute into.
+    /// Empty on any failure.
+    concrete_trait_args_for(mut &this, subject: TypeRef,
+                            trait_id: SymbolStr) -> TypeRef[] {
         mut out: TypeRef[] = [];
         if (this.generic_registry == null || this.type_resolver == null) { return out; }
-        // No carrier normalization: the lookups below resolve a post-mono concrete
-        // to its template through its intrinsic generic identity.
-        const subject: TypeRef = subject_in;
-        if (!this.template_key_of(subject).is_valid()) { return out; }
         const impl_node: ImplBlockNode* =
-            OwnershipQuery::resolve_trait_impl_for_type(this.arena,
-                this.generic_registry, this.intern_table, trait_leaf, subject);
+            this.generic_registry.template_head_for(trait_id, subject, this.intern_table);
         if (impl_node == null) { return out; }
         const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
         if (trait_ann == null) { return out; }
@@ -217,7 +213,7 @@ type struct MonoTraitSpecializer {
             // Positional-sugar index: declared generic params come first in the
             // trait-arg list, then the associated types.
             const idx: i64 = tdecl.generic_params.length + assoc_pos;
-            const args: TypeRef[] = this.concrete_trait_args_for(base_ty, tdecl.name);
+            const args: TypeRef[] = this.concrete_trait_args_for(base_ty, this.generic_registry.trait_decl_keys[i]);
             if (idx < args.length && args[idx].is_valid()) {
                 return args[idx];
             }
@@ -325,9 +321,8 @@ type struct MonoTraitSpecializer {
             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                 const tr: TraitRef* = &bound.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
-                const trait_leaf: SymbolStr = tr.path[tr.path.length - 1];
                 const concrete_args: TypeRef[] =
-                    this.concrete_trait_args_for(subject, trait_leaf);
+                    this.concrete_trait_args_for(subject, tr.identity());
                 if (concrete_args.length != tr.type_args.length) { continue; }
                 for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
                     const ta: TypeAnnotation* = tr.type_args[ai];
@@ -494,15 +489,25 @@ type struct MonoTraitSpecializer {
         }
     }
 
-    /// Drop bounds-violating impls entirely; for surviving impls, drop any methods
+    /// Drop the impls that are not for this instantiation - a head whose written
+    /// arguments do not unify with it, or whose bounds do not hold - and for
+    /// surviving impls, drop any methods
     /// whose own where-bounds don't hold.  Returns the pruned impl-AST array.
     filter_bounds_violating_impls(mut &this, impl_asts: &ASTNode*[],
-                                   subst: TypeSubstitution*) -> ASTNode*[] {
+                                   subst: TypeSubstitution*, type_args: &TypeRef[]) -> ASTNode*[] {
         mut kept: ASTNode*[] = [];
         for (mut i: i64 = 0; i < impl_asts.length; i++) {
             const impl_ast: ASTNode* = impl_asts[i];
             const impl_node: ImplBlockNode* = impl_ast as ImplBlockNode*;
             if (impl_node == null) { continue; }
+            // A head whose written target arguments do not unify with this
+            // instantiation's is not an impl for it: `implement<T> trait Show
+            // for Wrap<T, Alpha>` is dropped for `Wrap<i32, Beta>` here, where
+            // the where-clause filter below drops a head whose bounds fail.
+            if (impl_node.is_trait_impl()
+                    && !GenericRegistry::head_matches_args(impl_node, type_args, this.arena, this.intern_table)) {
+                continue;
+            }
             if (!this.bounds_satisfied(impl_node.where_bounds, subst)) {
                 continue;
             }

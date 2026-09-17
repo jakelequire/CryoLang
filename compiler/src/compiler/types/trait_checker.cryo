@@ -76,10 +76,8 @@ type struct TraitChecker {
     /// leaf: the marker comparisons below are identity comparisons, and a leaf
     /// would match a user trait that merely shares the spelling.
     ///
-    /// The trait-IMPL tables are a different key space - `(trait-leaf, target)`
-    /// dispatch indices where the target disambiguates - so this truncates to
-    /// the leaf for those, via `dispatch_leaf`. Two questions, two registries,
-    /// one answering path each.
+    /// The trait-impl registry is keyed by that identity too, so one name
+    /// asks both questions.
     type_implements_trait(&this, ty: TypeRef, trait_name: SymbolStr, depth: i32) -> boolean {
         if (depth >= 16) {
             // Depth budget exhausted on a deep or cyclic impl/where-clause
@@ -168,33 +166,73 @@ type struct TraitChecker {
         // `inst_*` views, and a concrete carries that identity itself.
         const subject: TypeRef = ty;
         if (!this.template_key_of(subject).is_valid()) { return false; }
-        // Collision-proof: resolve the impl by the subject's canonical
-        // qualified-name identity so a same-leaf type in another module doesn't
-        // inherit this trait's impl (falls back to the bare lookup when the
-        // subject isn't a precisely-registered named aggregate).
-        const impl_block: ImplBlockNode* =
-            OwnershipQuery::resolve_trait_impl_for_type(this.arena,
-                this.generic_registry, this.intern_table,
-                this.dispatch_leaf(trait_name), subject);
-        if (impl_block == null) {
-            // No `implement trait Drop` for this type - but a non-Copy
-            // type whose destructor is written as an inherent `drop`
-            // method still satisfies Drop: drop-insertion and codegen
-            // both resolve `.drop()` to the inherent method (mirroring
-            // `is_copy`, which already treats an inherent `drop` as
-            // non-Copy).  Without this, a `where T: Drop` container
-            // (`Box<T>`, `Rc<T>`, `Array<T>`, ...) rejects any T whose
-            // destructor is inline rather than a trait impl, and
-            // `Box<T>::drop` is never instantiated -> E0636 at codegen.
-            // Container types always carry a trait Drop impl, so they
-            // never reach this branch and keep the `where T: Drop` check
-            // below.
-            if (drop_name.is_valid() && trait_name.equals(drop_name)) {
-                return OwnershipQuery::has_inherent_drop(this.arena,
-                    this.generic_registry, this.intern_table, ty);
-            }
-            return false;
+        // The candidates by identity, the first whose bounds hold.
+        const impl_block: ImplBlockNode* = this.select_impl(trait_name, subject, depth);
+        if (impl_block != null) { return true; }
+        // No `implement trait Drop` for this type - but a non-Copy type whose
+        // destructor is written as an inherent `drop` method still satisfies
+        // Drop: drop-insertion and codegen both resolve `.drop()` to the
+        // inherent method (mirroring `is_copy`, which already treats an
+        // inherent `drop` as non-Copy).  Without this, a `where T: Drop`
+        // container (`Box<T>`, `Rc<T>`, `Array<T>`, ...) rejects any T whose
+        // destructor is inline rather than a trait impl, and `Box<T>::drop`
+        // is never instantiated -> E0636 at codegen.  Container types always
+        // carry a trait Drop impl, so a head that unified and was refused by
+        // its bounds keeps that answer.
+        if (drop_name.is_valid() && trait_name.equals(drop_name)
+                && this.generic_registry.heads_for(trait_name, subject, this.intern_table).length == 0) {
+            return OwnershipQuery::has_inherent_drop(this.arena,
+                this.generic_registry, this.intern_table, ty);
         }
+        return false;
+    }
+
+    /// The impl of `trait_id` for `subject` that APPLIES: the first
+    /// candidate the registry assembles by unification
+    /// (`GenericRegistry::heads_for`) whose where-clause holds for the
+    /// subject's arguments.  Null when no head unifies or every one that
+    /// does is refused by its bounds - Rust's selection, candidate assembly
+    /// then confirmation, in one place.
+    select_impl(&this, trait_id: SymbolStr, subject: TypeRef, depth: i32) -> ImplBlockNode* {
+        if (this.generic_registry == null) { return null; }
+        const heads: ImplBlockNode*[] = this.generic_registry.heads_for(trait_id, subject, this.intern_table);
+        for (mut i: i64 = 0; i < heads.length; i++) {
+            if (this.impl_applies(heads[i], subject, depth)) { return heads[i]; }
+        }
+        return null;
+    }
+
+    /// Every impl that applies to `subject`, of every trait: the registry's
+    /// candidates (`trait_impls_of`) with each one's where-clause confirmed.
+    /// The set a method call on a concrete receiver binds against.
+    impls_of(&this, subject: TypeRef) -> ImplBlockNode*[] {
+        mut out: ImplBlockNode*[] = [];
+        if (this.generic_registry == null) { return out; }
+        const heads: ImplBlockNode*[] = this.generic_registry.trait_impls_of(subject, this.intern_table);
+        for (mut i: i64 = 0; i < heads.length; i++) {
+            if (this.impl_applies(heads[i], subject, 0)) { out.push(heads[i]); }
+        }
+        return out;
+    }
+
+    /// Whether a candidate head applies to `subject`: a clone the
+    /// monomorphizer placed under a specialization was confirmed when it was
+    /// placed (its bounds held for those arguments, and are substituted away
+    /// on the clone), so it applies outright; a written head applies when
+    /// its where-clause holds for the subject.
+    impl_applies(&this, head: ImplBlockNode*, subject: TypeRef, depth: i32) -> boolean {
+        if (head == null) { return false; }
+        if (head.spec_owner.is_valid()) { return true; }
+        return this.impl_bounds_hold(head, subject, depth);
+    }
+
+    /// Whether `impl_block`'s where-clause holds for `subject`: the head's
+    /// written target parameters bound to the subject's arguments, each bound
+    /// checked recursively.  A head with no where-clause holds outright.  A
+    /// subject that carries no arguments cannot bind the head's parameters,
+    /// so a bounded head is refused for it rather than assumed.
+    impl_bounds_hold(&this, impl_block: ImplBlockNode*, subject: TypeRef, depth: i32) -> boolean {
+        if (impl_block == null) { return false; }
         if (impl_block.where_bounds.length == 0) { return true; }
         // Build a fresh substitution from the impl's generic params to
         // the concrete type's args. For `implement<T> trait Eq for Option<T>`
@@ -239,67 +277,38 @@ type struct TraitChecker {
         return this.bounds_satisfied_at_depth(impl_block.where_bounds, &nested, depth + 1);
     }
 
-    /// The leaf the trait-IMPL dispatch tables are keyed by. NOT an identity:
-    /// it answers only in combination with the target type, which is what
-    /// those tables pair it with.
-    dispatch_leaf(&this, trait_name: SymbolStr) -> SymbolStr {
-        return OwnershipQuery::leaf_segment(this.intern_table, trait_name);
-    }
-
     /// Lenient "does `ty` implement `trait_name`" check for verifying an
     /// `implement Trait` binding annotation against its initializer.
     ///
-    /// `type_implements_trait` fully verifies an impl's where-bounds, but it
-    /// can't bind where-clause-ONLY generics - e.g. the `T` in
-    /// `implement<I, T> Iterator<T> for CopiedIter<I> where I: Iterator<T*>`
-    /// is recovered by pointer-peeling at instantiation, which the bound
-    /// checker doesn't replay - so it wrongly reports `CopiedIter`/`TakeIter`/
-    /// `MapIter`/`FilterIter` as non-implementers. For an opaque-binding
-    /// sanity check the precise where-bounds don't matter: it's enough that
-    /// the trait is implemented for this type at all (a genuinely unrelated
-    /// type has no such impl). Any truly-unsatisfied where-bound still
-    /// surfaces precisely at the first trait-method call on the concrete type.
+    /// `type_implements_trait` confirms a head's where-bounds, and cannot
+    /// bind a where-clause-ONLY generic - the `T` in `implement<I, T>
+    /// Iterator<T> for CopiedIter<I> where I: Iterator<T*>` is recovered by
+    /// pointer-peeling at instantiation, which the bound checker does not
+    /// replay - so a written head with such a bound reads as unsatisfied
+    /// until its clone is placed.  For an opaque-binding sanity check the
+    /// bounds do not matter: it is enough that a head of the trait unifies
+    /// with the type at all (a genuinely unrelated type has none).  A truly
+    /// unsatisfied bound still surfaces at the first trait-method call on
+    /// the concrete type.
     type_satisfies_opaque_bound(&this, ty: TypeRef, trait_name: SymbolStr) -> boolean {
         if (this.type_implements_trait(ty, trait_name, 0)) { return true; }
         if (this.generic_registry == null) { return false; }
-        // No carrier swap needed: `template_key_of` resolves a post-mono
-        // concrete to its template, and `resolve_trait_impl_for_type` keys off
-        // the same.
-        const subject: TypeRef = ty;
-        if (!this.template_key_of(subject).is_valid()) { return false; }
-        return OwnershipQuery::resolve_trait_impl_for_type(this.arena,
-            this.generic_registry, this.intern_table,
-            this.dispatch_leaf(trait_name), subject) != null;
+        return this.generic_registry.heads_for(trait_name, ty, this.intern_table).length > 0;
     }
 
     /// When sema's call-site method lookup misses on a spec'd type, we want
     /// to distinguish "this method genuinely doesn't exist" from "the trait
     /// providing this method has a where-clause that isn't satisfied for this
-    /// specialization".  Walks the trait impls registered against `receiver`'s
-    /// base type and returns the bare name of the first trait whose impl
-    /// provides `method_name` but whose `where_bounds` aren't satisfied for the
-    /// receiver's type args.  Returns `SymbolStr::empty()` when no such
-    /// trait exists.
+    /// specialization".  Walks the heads that unify with `receiver` and
+    /// returns the IDENTITY of the first trait whose head provides
+    /// `method_name` but whose `where_bounds` do not hold for the receiver's
+    /// type args.  Returns `SymbolStr::empty()` when no such trait exists.
     diagnose_method_bounds_failure(&this, receiver: TypeRef,
                                     method_name: SymbolStr) -> SymbolStr {
         if (this.generic_registry == null) { return SymbolStr::empty(); }
-
-        // Sema typically passes the spec'd concrete type (e.g. the Enum for
-        // `Result_int_OpaqueErr`) rather than an InstantiatedType wrapper.  Trait
-        // impls are registered against the TEMPLATE's name (`Result`), and
-        // `template_key_of` resolves a concrete to its template through its
-        // intrinsic generic identity - so the receiver is probed directly.
-        const probe_ref: TypeRef = receiver;
-        const base_name: SymbolStr = this.template_key_of(probe_ref);
-        if (!base_name.is_valid()) { return SymbolStr::empty(); }
-        const traits: SymbolStr[] = this.generic_registry.traits_implemented_by(base_name);
-        for (mut i: i64 = 0; i < traits.length; i++) {
-            const trait_name: SymbolStr = traits[i];
-            const impl_block: ImplBlockNode* =
-                OwnershipQuery::resolve_trait_impl_for_type(this.arena,
-                    this.generic_registry, this.intern_table, trait_name, probe_ref);
-            if (impl_block == null) { continue; }
-            // Does this impl provide the method we're looking for?
+        const blocks: ImplBlockNode*[] = this.generic_registry.trait_impls_of(receiver, this.intern_table);
+        for (mut i: i64 = 0; i < blocks.length; i++) {
+            const impl_block: ImplBlockNode* = blocks[i];
             mut has_method: boolean = false;
             for (mut mi: i64 = 0; mi < impl_block.methods.length; mi++) {
                 const m: MethodNode* = impl_block.methods[mi];
@@ -309,12 +318,8 @@ type struct TraitChecker {
                 }
             }
             if (!has_method) { continue; }
-            // `trait_name` came from the impl-dispatch table, so it is a leaf.
-            // The impl head carries the identity the bound check needs.
-            const trait_id: SymbolStr =
-                TypeAnnotation::trait_identity(impl_block.trait_annotation);
-            if (!this.type_implements_trait(probe_ref, trait_id, 0)) {
-                return trait_name;
+            if (!this.type_implements_trait(receiver, impl_block.qualified_trait_name, 0)) {
+                return impl_block.qualified_trait_name;
             }
         }
         return SymbolStr::empty();

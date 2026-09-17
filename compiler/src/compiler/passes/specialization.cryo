@@ -757,19 +757,11 @@ type struct SpecializationPasses {
                 impl_node.spec_owner = entry.specialized_type;
                 ctx.decl_index.register_methods(
                     entry.specialized_type, impl_node.methods, ctx.intern_table, ctx.type_arena, "specialization/spec impl methods");
-                // Re-register trait-impl entries against the *specialized*
-                // target so `traits_implemented_by(spec_name)` finds them.
-                // The original impl was `implement trait Hash for struct
-                // String`, registered under bare `String` at template-
-                // registration time; without this re-register, sema's
-                // method-via-trait lookup for `String<GlobalAlloc>::hash`
-                // bottoms out and emits E0091.
+                // The clone under the SPECIALIZATION's key: a subject with a
+                // name of its own selects among the clones placed under it.
                 if (impl_node.is_trait_impl()) {
-                    const trait_nm: SymbolStr = SpecializationPasses::extract_root_name(impl_node.trait_annotation);
-                    if (trait_nm.is_valid()) {
-                        ctx.generic_registry.register_trait_impl(
-                            trait_nm, impl_qname, impl_node);
-                    }
+                    ctx.generic_registry.register_trait_impl(
+                        impl_node.qualified_trait_name, impl_qname, impl_node);
                 }
             } else {
                 SpecInjector::register_injected_decl(entry.impl_nodes[j], ctx);
@@ -1058,51 +1050,16 @@ type struct SpecializationPasses {
             }
         }
 
-        // Trait impls (`implement trait Foo for Bar`) also go into the
-        // (trait, target) registry so sema/dispatch can find them by trait
-        // name. Inherent impls (`implement Bar { ... }`) skip this branch.
+        // A trait impl goes into the trait-impl registry under the trait's
+        // identity and the target's key, both stamped by the name layer.
+        // Coherence is not checked here: the single check lives in
+        // TypeResolution, once `canonical_target` is stamped, and covers
+        // same-file and cross-module duplicates uniformly.
         if (node.is_trait_impl()) {
-            const trait_name: SymbolStr = SpecializationPasses::extract_root_name(node.trait_annotation);
-            if (trait_name.is_valid()) {
-                // NOTE: coherence (a trait may be implemented at most once per
-                // type) is NOT checked here.  At this stage (DeclarationCollection)
-                // there is no import-resolved target name, so a key would have to
-                // use bare simple names - which conflate same-named types in
-                // different modules and ignore trait/target type args.  The
-                // single coherence check lives in TypeResolution's
-                // `register_decl_in_index`, after `canonical_target` is stamped;
-                // it covers same-file and cross-module duplicates uniformly,
-                // including generic traits.  This branch only populates the
-                // dispatch registry.
-                registry.register_trait_impl(trait_name, node.target_type, node);
-                // Under the target's registration key as well, from here on:
-                // a reader that asks which traits a declared type implements
-                // asks by that key, and the trait-default synthesis in type
-                // resolution asks BEFORE that pass's own impl arm has
-                // registered it, so a key registered only there is absent
-                // for every default it filters.
-                const target_key: SymbolStr = node.target_key(ctx.type_arena);
-                if (target_key.is_valid() && !target_key.equals(node.target_type)) {
-                    registry.register_trait_impl(trait_name, target_key, node);
-                }
-            }
+            registry.register_trait_impl(
+                TypeAnnotation::trait_identity(node.trait_annotation),
+                node.target_key(ctx.type_arena), node);
         }
-    }
-
-    /// Walk a TypeAnnotation* to its underlying head identifier. Used to pull
-    /// `Foo` out of `Foo`, `Foo<T>`, or `&Foo`. Returns an invalid SymbolStr
-    /// for shapes the trait-impl registry doesn't index (Primitive, ThisType,
-    /// Tuple, Function, Optional, Array). Qualified-path traits are tracked
-    /// only by their leaf name here; full-path indexing is not yet implemented.
-    static extract_root_name(ann: TypeAnnotation*) -> SymbolStr {
-        if (ann == null) { return SymbolStr::empty(); }
-        return match (*ann) {
-            TypeAnnotation::Named(n) => { n.name }
-            TypeAnnotation::Generic(g) => { SpecializationPasses::extract_root_name(g.base) }
-            TypeAnnotation::Reference(r) => { SpecializationPasses::extract_root_name(r.inner) }
-            TypeAnnotation::Pointer(p) => { SpecializationPasses::extract_root_name(p.inner) }
-            _ => { SymbolStr::empty() }
-        };
     }
 
     static run_generic_validation_impl(ctx: CompilationContext*) -> PassResult {

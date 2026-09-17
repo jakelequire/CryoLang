@@ -1851,52 +1851,24 @@ type struct MonoCallSpecializer {
     /// sole impl providing the name, and null when several do
     /// (`find_spec_impl_trait_method`'s rule, over the registry's store).
     ///
-    /// Two passes over the same key space, ranked as `impl_target_rank` ranks:
-    /// the impl FOR this specialization (a clone the monomorphizer placed
-    /// under the receiver's own qualified name) first, then the template's or
-    /// the primitive's under `template_key_of`.  Never by leaf - two modules'
-    /// same-leaf types are two keys, and the answer for one was the other's.
+    /// The impls are those the registry selects for the receiver: a clone
+    /// the monomorphizer placed under its own specialization, else the written
+    /// heads that unify with it - never by leaf: two modules' same-leaf types
+    /// are two keys, and the answer for one was the other's.
     find_trait_impl_method_for_target(&this, recv_type: TypeRef,
                                       method_name: SymbolStr,
                                       only_trait: SymbolStr,
                                       out_impl: ImplBlockNode**) -> MethodNode* {
-        const registry: GenericRegistry* = this.generic_registry;
-        if (registry == null) { return null; }
-        const recv_q: SymbolStr = this.arena.get_qualified_name(recv_type);
-        const tkey: SymbolStr = this.trait_spec.template_key_of(recv_type);
-        if (recv_q.is_valid()) {
-            const m: MethodNode* = this.find_generic_trait_method_under(
-                recv_q, method_name, only_trait, out_impl);
-            if (m != null) { return m; }
-        }
-        if (tkey.is_valid() && !tkey.equals(recv_q)) {
-            return this.find_generic_trait_method_under(
-                tkey, method_name, only_trait, out_impl);
-        }
-        return null;
-    }
-
-    /// One pass of `find_trait_impl_method_for_target`: the impls whose key
-    /// is `target_key` - `only_trait`'s, else the sole one providing the
-    /// name, else null.
-    find_generic_trait_method_under(&this, target_key: SymbolStr,
-                                    method_name: SymbolStr,
-                                    only_trait: SymbolStr,
-                                    out_impl: ImplBlockNode**) -> MethodNode* {
-        const registry: GenericRegistry* = this.generic_registry;
+        if (this.generic_registry == null) { return null; }
         mut sole_m: MethodNode* = null;
         mut sole_impl: ImplBlockNode* = null;
         mut candidates: i64 = 0;
-        for (mut i: i64 = 0; i < registry.trait_impls.length; i++) {
-            const impl_node: ImplBlockNode* = registry.trait_impls[i].second;
-            if (impl_node == null || !impl_node.is_trait_impl()) { continue; }
-            if (!this.impl_targets(impl_node, target_key)) { continue; }
+        const blocks: ImplBlockNode*[] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
+        for (mut i: i64 = 0; i < blocks.length; i++) {
+            const impl_node: ImplBlockNode* = blocks[i];
             if (only_trait.is_valid() && !this.impl_provides_trait(impl_node, only_trait)) { continue; }
             const m: MethodNode* = this.generic_method_in_impl(impl_node, method_name);
             if (m == null) { continue; }
-            // One block is registered under both its written target and
-            // the target's key; it is one candidate.
-            if (impl_node == sole_impl) { continue; }
             candidates = candidates + 1;
             sole_m = m;
             sole_impl = impl_node;
@@ -1907,8 +1879,8 @@ type struct MonoCallSpecializer {
     }
 
     /// Find a self-returning trait default (combinator) regardless of own-generic
-    /// count: receiver's spec'd impls first, then the trait-impl registry under
-    /// the receiver's own key, then under its template's.
+    /// count: the receiver's spec'd impls first, then the impls the registry
+    /// selects for it (a placed clone, else the written heads that unify).
     find_self_returning_default(&this, recv_type: TypeRef, method_name: SymbolStr,
                                 out_impl: ImplBlockNode**) -> MethodNode* {
         for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
@@ -1917,43 +1889,15 @@ type struct MonoCallSpecializer {
             for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
                 const impl_node: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
                 if (impl_node == null) { continue; }
-                for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
-                    const m: MethodNode* = impl_node.methods[k];
-                    if (m == null || m.func == null) { continue; }
-                    if (!m.func.name.equals(method_name)) { continue; }
-                    if (!m.func.is_self_returning_default
-                            && !m.func.is_lazy_self_growing) { continue; }
-                    *out_impl = impl_node;
-                    return m;
-                }
+                const m: MethodNode* = this.find_self_ret_method_in_impl(impl_node, method_name);
+                if (m != null) { *out_impl = impl_node; return m; }
             }
         }
         if (this.generic_registry == null) { return null; }
-        // The impl FOR this specialization first (a placed clone, under the
-        // receiver's own qualified name), then the template's or the
-        // primitive's - the same ranking as `impl_target_rank`.
-        const recv_qname: SymbolStr = this.arena.get_qualified_name(recv_type);
-        if (recv_qname.is_valid()) {
-            const m: MethodNode* = this.find_self_ret_method_under(recv_qname, method_name, out_impl);
-            if (m != null) { return m; }
-        }
-        const tkey: SymbolStr = this.trait_spec.template_key_of(recv_type);
-        if (tkey.is_valid() && !tkey.equals(recv_qname)) {
-            return this.find_self_ret_method_under(tkey, method_name, out_impl);
-        }
-        return null;
-    }
-
-    /// One pass of `find_self_returning_default`: the impls whose key is
-    /// `target_key`, in registration order.
-    find_self_ret_method_under(&this, target_key: SymbolStr, method_name: SymbolStr,
-                               out_impl: ImplBlockNode**) -> MethodNode* {
-        for (mut i: i64 = 0; i < this.generic_registry.trait_impls.length; i++) {
-            const impl_node: ImplBlockNode* = this.generic_registry.trait_impls[i].second;
-            if (impl_node == null) { continue; }
-            if (!this.impl_targets(impl_node, target_key)) { continue; }
-            const m: MethodNode* = this.find_self_ret_method_in_impl(impl_node, method_name);
-            if (m != null) { *out_impl = impl_node; return m; }
+        const blocks: ImplBlockNode*[] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
+        for (mut i: i64 = 0; i < blocks.length; i++) {
+            const m: MethodNode* = this.find_self_ret_method_in_impl(blocks[i], method_name);
+            if (m != null) { *out_impl = blocks[i]; return m; }
         }
         return null;
     }
@@ -2255,12 +2199,6 @@ type struct MonoCallSpecializer {
 
 
     // -- DI registration + symbol pinning (re-homed; Phase-0 keystone) --
-    /// Whether `impl_node` is a block FOR the type registered as `qname` -
-    /// its key, as the block itself carries it.
-    impl_targets(&this, impl_node: ImplBlockNode*, qname: SymbolStr) -> boolean {
-        const own: SymbolStr = impl_node.target_key(this.arena);
-        return own.is_valid() && own.equals(qname);
-    }
 
 
     /// Register an impl-block-owned spec method in the DeclarationIndex under the
