@@ -195,7 +195,7 @@ evidence for what it covers.
 |---|---|---|
 | `make test` | 2,124 unit + 63 project + 192 negative | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
-| `make lane-check` | 9 buckets of call sites in `compiler/src`, as a golden; `HOME_WRITE` pins `.set_home_module(` calls at 0 since §8.204, so the mechanism cannot come back unpinned; REENTRY counts `get_resolver()` AND a cursor move through the `name_resolver` field since §8.189 (it read 3 over a tree holding 6: the monomorphizer's `find_module_scope`/`set_module`/`restore_scope`); `LOOKUP_ARENA` counts the arena's `lookup_by_name` since §8.192 (it read OK over a tree holding 17 in `type_resolution.cryo`) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
+| `make lane-check` | 9 buckets of call sites in `compiler/src`, as a golden; `HOME_WRITE` pins `.set_home_module(` calls at 0 since §8.204, so the mechanism cannot come back unpinned; REENTRY counts `get_resolver()` AND a cursor move through the `name_resolver` field since §8.189 (it read 3 over a tree holding 6: the monomorphizer's `find_module_scope`/`set_module`/`restore_scope`); `LOOKUP_ARENA` counts the arena's `lookup_by_name` since §8.192 (it read OK over a tree holding 17 in `type_resolution.cryo`); `LOOKUP_ROUTED` counts every `lookup_*` on the `TypeUtils` receiver since §8.227 (it read OK over a tree with a new `types.lookup_type_sym(` call, 19 such wrappers uncounted) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. |
 | `make selfhost-check` | stage-3 == stage-4 byte identity, both arms | **Stability, not correctness.** It proves the compiler still emits the same bytes for code that already compiles; it says nothing about code that now STOPS compiling. |
 | `make ns-status-check` | every check this section carries, run from the repo root; a grep whose quoted pattern carries a pipe is refused unrun (a cell's `\|` is undone as a column escape, so the pipe would be a literal and the row could only read 0) | A number that moved, and nothing else - see 0.5. |
 | `make guard-selftest` | the commit-msg guard and `ns-status-check` driven through a throwaway repository, each rule refused and allowed (14 cases); CI's ubuntu job runs it | The real repository's hook installation (`make install-hooks` is per checkout). |
@@ -13074,6 +13074,55 @@ gone** (+1 lane, the owner by name at codegen's method declare and
 prologue; +3 artifacts: `TypeResolutionRunner::impl_owner`,
 `SemanticAnalyzer::impl_target_type`, the `()`-suffix hack - counted once
 for its two copies).
+
+---
+
+### 8.227 `lane-check`'s `LOOKUP_ROUTED` counts every `lookup_*` on the `TypeUtils` receiver, not the five names: 19 wrapper calls (`lookup_type_exact` 8, `lookup_func_type_exact` 4, `lookup_type_sym` 7) were in no bucket, and the old gate printed `OK` over a tree with a new one - 2026-09-17
+
+#### The shape
+
+§8.225 predicted `LOOKUP_ROUTED` 20 → 14 for six `this.types.lookup_type_exact`
+calls it removed, and the row did not move.  The gate places a call by
+its receiver (`lookup_bucket`) but only for the five names mechanism 5
+gives; every OTHER `lookup_*` name is counted only when the receiver is
+the index (`LOOKUP_OTHER`).  A `TypeUtils` wrapper under a sixth name
+(`lookup_type_exact` beside `lookup_type`) was therefore in no row at
+all, though the row's own header reads "answered by a TypeUtils
+wrapper" - so a call could move between `types.lookup_type(` and
+`types.lookup_type_exact(` and leave the surface without a number
+moving, the hole `LOOKUP_OTHER` was built to close on the index side.
+
+#### The change
+
+`scan()`'s any-name loop places a `LOOKUP_ROUTED` receiver too; the
+row's header (golden and docstring) says "under ANY `lookup_*` name".
+Nothing else in the gate changes; `LOOKUP_LOCAL` keeps the five-name
+rule, since a `this.` receiver's other `lookup_*` methods are unrelated
+symbol-map methods and not a funnel.
+
+#### The pair
+
+Mutation: one line in `sema.cryo`, `const zz_probe: SymbolStr =
+this.types.lookup_type_sym(TypeRef::invalid());`.
+
+* OLD gate over the mutated tree: `lane-gate: OK -- LOOKUP = 13 (6
+  files), LOOKUP_OTHER = 30 (6 files), LOOKUP_ROUTED = 20 (3 files), …`.
+* NEW gate over the same tree: `lane-gate: DRIFT … LOOKUP_ROUTED TOTAL
+  39 -> 40 (INCREASE -- a lane regrew) … compiler/sema/sema.cryo 5 -> 6`.
+* Restored: `OK -- … LOOKUP_ROUTED = 39 (5 files)`.
+
+Re-pinned 20 → **39** (`call_resolver` 11 → 20, `method_binding` 7 →
+11, `sema` 2 → 5, `member_resolver` 0 → 2, `diagnostics` 0 → 1).
+Predicted 40 from a count taken before §8.226, which deleted sema's
+`impl_target_type` and its `lookup_type_exact`; recounted, the tree
+holds 19 wrapper calls, and the gate's 39 is right (`gate_diff.py` in
+`.objcmp/u1-keep/s12/`: no line where the gate's scan and a direct
+regex disagree).
+
+Outside the ledger: `scripts/lane-gate.py`, the lane golden.
+
+**Tally: 74 shadowed, 74 old paths deleted, 74 at zero; 118 artifacts
+gone** (unchanged: a gate widened, nothing deleted).
 
 ---
 

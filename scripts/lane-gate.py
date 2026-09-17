@@ -33,10 +33,12 @@ them, because the five names are not the index's alone:
     falls, which reads as exactly the progress this gate was built to
     distinguish from regrowth.  The name rule is mechanical (`lookup_` prefix)
     so that what is counted is not a matter of opinion.
-  * LOOKUP_ROUTED -- answered by a `TypeUtils` wrapper.  Already at the
-    destination, so it RISES as LOOKUP falls and is not a target; it is pinned
-    because a new same-named wrapper is exactly the regrowth this gate exists
-    to catch.
+  * LOOKUP_ROUTED -- answered by a `TypeUtils` wrapper, under ANY `lookup_*`
+    name (the five and the wrappers beside them - `lookup_type_exact`,
+    `lookup_type_sym`).  Already at the destination, so it RISES as LOOKUP
+    falls and is not a target; it is pinned because a new wrapper is exactly
+    the regrowth this gate exists to catch, and a wrapper under a sixth name
+    was one the five-name rule could not see.
   * LOOKUP_LOCAL -- a type's OWN same-named method over its own symbol map or
     scope stack.  Not a lane site, and no migration can remove one, so it is a
     FLOOR: driving LOOKUP to zero is reachable, driving the total to zero never
@@ -251,8 +253,16 @@ def scan():
                     for m in ANY_LOOKUP_RE.finditer(line):
                         if m.group(2) in LOOKUPS:
                             continue
-                        if lookup_bucket(m.group(1)) == "LOOKUP":
+                        other = lookup_bucket(m.group(1))
+                        if other == "LOOKUP":
                             tally["LOOKUP_OTHER"] += 1
+                        # A `TypeUtils` wrapper under any OTHER name is the
+                        # same funnel: a wrapper named `lookup_type_exact`
+                        # beside `lookup_type` was counted by neither row,
+                        # so a call could move between the two names and
+                        # leave the surface without a row moving.
+                        elif other == "LOOKUP_ROUTED":
+                            tally["LOOKUP_ROUTED"] += 1
                 if rel not in ARENA_OWNERS:
                     # A name lookup on the arena is counted by its receiver
                     # too: one that is not an arena is a lookup this gate
@@ -291,9 +301,12 @@ HEADER = [
     "#                surface pinned at five is one a caller can leave by",
     "#                switching names - which reads as progress on the row that",
     "#                is watched. Same receiver rule, mechanical name rule.",
-    "# LOOKUP_ROUTED  answered by a TypeUtils wrapper. Already at the destination,",
-    "#                so it RISES as LOOKUP falls. Pinned because a new same-named",
-    "#                wrapper is the regrowth this gate exists to catch.",
+    "# LOOKUP_ROUTED  answered by a TypeUtils wrapper, under ANY lookup_* name -",
+    "#                the five and the wrappers beside them (lookup_type_exact,",
+    "#                lookup_type_sym). Already at the destination, so it RISES",
+    "#                as LOOKUP falls. Pinned because a new wrapper is the",
+    "#                regrowth this gate exists to catch, and one under a sixth",
+    "#                name was invisible to a five-name rule.",
     "# LOOKUP_LOCAL   a type's OWN same-named method over its own symbol map or",
     "#                scope stack. Not a lane site; no migration removes one. A",
     "#                FLOOR, so driving LOOKUP to zero is reachable and driving",
