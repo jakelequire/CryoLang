@@ -37,6 +37,7 @@ Two kinds of script:
 | §8.231 | `doors_tdecl.py`, `mutate_nostamp.py`, `probes/` | the 29 readers of a type declaration's own type as `type_of_decl` doors, the third tally and its two-exit report; the no-stamp mutation and the two probes that show the old readers' silence and the door's report |
 | §8.232 | `rm_tref.py` | `register_methods` by the owner type at nine callers, `register_methods_by_key` at the four the index cannot name, the six duplicate name mappings deleted (`--shadow`: the `RM`/`NM` instrument behind the 130,001 / 38,974) |
 | §8.233 | `shadow.patch`, `tab.py` | the trait-impl registry shadow: the identity-keyed head table and its selector beside the old tables, every reader printing old beside new (`git apply` over `c1577f38`, then `corpus2.sh <tag>`); the tabulator behind the 8,240,226-line table |
+| §8.234 | `shadow.patch` | `scope_owner_key`'s shadow: the stamp kind, the key and the hit at each of its five readers (`git apply` over `fd3756af`, then `corpus2.sh <tag>`); the 2,509,947-line table is one `cut \| sort \| uniq -c` |
 
 Not here: the scripts that edited the ledger itself, the entry drafts, and
 the one-off controls written against a gate version that no longer exists

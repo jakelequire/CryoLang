@@ -1,0 +1,132 @@
+diff --git a/compiler/src/compiler/sema/call_resolver.cryo b/compiler/src/compiler/sema/call_resolver.cryo
+index 36058f30..089c6f5b 100644
+--- a/compiler/src/compiler/sema/call_resolver.cryo
++++ b/compiler/src/compiler/sema/call_resolver.cryo
+@@ -306,7 +306,14 @@ type struct CallResolver {
+                     this.intern.resolve(resolved_scope), this.intern.resolve(sr.member_name));
+                 const q_sym: SymbolStr = this.intern.intern(q_combined);
+                 const q_ft: TypeRef = this.types.lookup_func_type_exact(q_sym);
++                const bare_probe: TypeRef = this.types.lookup_func_type_exact(bare_sym);
++                this.shadow_sok("A:callee", sr, resolved_scope,
++                    if (q_ft.is_valid()) { "HIT" } else { if (bare_probe.is_valid()) { "miss-bareHIT" } else { "miss" } });
+                 if (q_ft.is_valid()) { return q_ft; }
++            } else {
++                const bare_probe: TypeRef = this.types.lookup_func_type_exact(bare_sym);
++                this.shadow_sok("A:callee", sr, resolved_scope,
++                    if (bare_probe.is_valid()) { "nokey-bareHIT" } else { "nokey" });
+             }
+             // A C import is declared whole under `alias::name`, the written
+             // spelling, and its alias is a namespace symbol no stamp names as
+@@ -3585,6 +3592,41 @@ type struct CallResolver {
+         };
+     }
+ 
++    /// SHADOW: which stamp reached `scope_owner_key` at `site`, the key it
++    /// answered, and whether that key hit at the caller.
++    shadow_sok(&this, site: string, scope: ScopeResolutionNode*, key: SymbolStr, hit: string) -> void {
++        mut kind: string = "Pending";
++        if (!scope.scope_res.is_pending()) {
++            const r: Res = scope.require_scope_res("shadow");
++            kind = r.to_string();
++            match (r) {
++                Res::TypeRelative(b, _) => {
++                    match (b) {
++                        ResBase::GenericParam(n) => {
++                            kind = if (n.id == scope.scope_name.id) { "TRGP-same" } else { "TRGP-subst" };
++                        }
++                        ResBase::PrimTy(_) => { kind = "TRPrim"; }
++                        ResBase::Def(d) => {
++                            kind = if (d.qualified_name().id == scope.scope_name.id) { "TRDef-canon" } else { "TRDef-other" };
++                        }
++                    }
++                }
++                Res::Def(d) => {
++                    kind = if (d.qualified_name().id == scope.scope_name.id) { "Def-canon" } else { "Def-suffix" };
++                }
++                _ => { }
++            }
++        }
++        mut spec: string = "-";
++        if (scope.spec_owner.is_valid()) {
++            const spec_q: SymbolStr = this.ctx.decl_index.lookup_type_name(scope.spec_owner);
++            spec = if (spec_q.is_valid()) { "SPEC" } else { "specnoname" };
++        }
++        fmt::eprintf("SHADOW\tSOK\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", site, kind, spec,
++            this.intern.resolve(scope.scope_name), this.intern.resolve(key),
++            this.intern.resolve(scope.member_name), hit);
++    }
++
+     /// A `Scope::member(...)` call.  The scope segment's stamp says which
+     /// store can own the member: a segment naming a MODULE (`Def`) owns a
+     /// module function and nothing else; any other segment names a type -
+@@ -3612,11 +3654,12 @@ type struct CallResolver {
+                 if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
+             }
+             const method_ret: TypeRef = this.try_resolve_static_method(scope, lookup_sym, call);
+-            if (method_ret.is_valid()) { return method_ret; }
++            if (method_ret.is_valid()) { this.shadow_sok("B:call", scope, lookup_sym, "static"); return method_ret; }
+             const type_ret: TypeRef = this.try_resolve_type_or_variant(scope, lookup_sym, call);
+-            if (type_ret.is_valid()) { return type_ret; }
++            if (type_ret.is_valid()) { this.shadow_sok("B:call", scope, lookup_sym, "variant"); return type_ret; }
+             const cimport_ret: TypeRef = this.try_resolve_cimport_function(scope, call);
+-            if (cimport_ret.is_valid()) { return cimport_ret; }
++            if (cimport_ret.is_valid()) { this.shadow_sok("B:call", scope, lookup_sym, "cimport"); return cimport_ret; }
++            this.shadow_sok("B:call", scope, lookup_sym, "none");
+         }
+ 
+         if (this.symbolic.symbolic_name_is_generic_param(scope.scope_name)) { return TypeRef::invalid(); }
+@@ -4057,6 +4100,7 @@ type struct CallResolver {
+         const owner_key: SymbolStr = this.scope_owner_key(scope);
+         if (owner_key.is_valid() && lookup_sym.id != owner_key.id) {
+             const base_ret: TypeRef = this.types.lookup_method_return(owner_key, scope.member_name);
++            this.shadow_sok("C:tmplret", scope, owner_key, if (base_ret.is_valid()) { "HIT" } else { "miss" });
+             if (base_ret.is_valid()) {
+                 const resolved: TypeRef = this.try_resolve_generic_return(base_ret, scope.scope_name, scope.member_name, scope);
+                 scope.set_resolved_type(resolved);
+@@ -4106,6 +4150,7 @@ type struct CallResolver {
+                 const qstr: string = this.intern.resolve(q) + "::" + member_str;
+                 entry = this.ctx.generic_registry.get_template(this.intern.intern(qstr));
+             }
++            this.shadow_sok("D:smt", scope, q, if (entry != null) { "HIT" } else { "miss" });
+         }
+         return entry;
+     }
+@@ -5416,13 +5461,23 @@ type struct CallResolver {
+                         scope.require_scope_res("scope-call spec name")));
+                 if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
+             }
+-            if (this.scope_is_generic_template(lookup_sym, scope.member_name)) { return; }
++            if (this.scope_is_generic_template(lookup_sym, scope.member_name)) {
++                this.shadow_sok("E:argcheck", scope, lookup_sym, "generic-template");
++                return;
++            }
+             const scope_str:  string = this.intern.resolve(lookup_sym);
+             const member_str: string = this.intern.resolve(scope.member_name);
+-            if (scope_str.length() == 0 || member_str.length() == 0) { return; }
++            if (scope_str.length() == 0 || member_str.length() == 0) {
++                this.shadow_sok("E:argcheck", scope, lookup_sym, "emptykey");
++                return;
++            }
+             combined = this.intern.intern(fmt::format("%s::%s", scope_str, member_str));
+         }
+         const overloads: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(combined);
++        if (!names_module) {
++            this.shadow_sok("E:argcheck", scope, lookup_sym,
++                if (overloads.length == 0) { "miss" } else { if (overloads.length == 1) { "HIT1" } else { "HITn" } });
++        }
+         if (overloads.length == 1) {
+             const ot: Type* = this.arena.lookup(overloads[0].id);
+             if (ot != null && ot.kind == TypeKind::Function) {
+diff --git a/docs/cryo.md b/docs/cryo.md
+index 1f4600a3..2d9463b3 100644
+--- a/docs/cryo.md
++++ b/docs/cryo.md
+@@ -1,7 +1,7 @@
+ # The Cryo Language Reference
+ 
+ > **Version:** 1.0.0 \
+-> **Last revised:** July 2026
++> **Last revised:** September 2026
+ 
+ Cryo is a statically-typed, compiled systems language. It targets native machine code through LLVM 20, has a self-hosted compiler, and ships a standard library written entirely in itself. Three principles shape the language:
+ 

@@ -294,12 +294,16 @@ type struct CallResolver {
             const bare_combined: string = fmt::format("%s::%s",
                 this.intern.resolve(sr.scope_name), this.intern.resolve(sr.member_name));
             const bare_sym: SymbolStr = this.intern.intern(bare_combined);
-            // The owner a TYPE scope names, under its registered name, whatever
-            // the source spelled.  A MODULE scope comes back as written and
-            // misses here, which is right: `mem::swap` is the module lane's
-            // to answer, and it is asked next.  A bare spelling is never
-            // asked ahead of it: `Beacon::make` written against an imported
-            // `Beacon` answered another module's same-leaf `Beacon::make`.
+            // A MODULE scope is the module lane's to answer, from the stamp,
+            // and it is asked next (`lookup_module_qualified_param_types`);
+            // no spelling is probed for it here.  The owner a TYPE scope
+            // names is asked under its registered name, whatever the source
+            // spelled: `Beacon::make` written against an imported `Beacon`
+            // once answered another module's same-leaf `Beacon::make`.
+            match (sr.require_scope_res("callee hint owner kind")) {
+                Res::Def(_) => { return TypeRef::invalid(); }
+                _           => { }
+            }
             const resolved_scope: SymbolStr = this.scope_owner_key(sr);
             if (resolved_scope.is_valid()) {
                 const q_combined: string = fmt::format("%s::%s",
@@ -3553,22 +3557,25 @@ type struct CallResolver {
 
     // -- Scope-resolution call resolution (Type::method / Module::func / variant) --
 
-    /// The canonical name the scope segment's owner is registered under.
+    /// The registered name of the TYPE the scope segment names, or empty
+    /// when the segment names no type owner.
     ///
-    /// A substituter that collapsed a template's self-reference recorded the
-    /// SPECIALIZATION on the node, and the registries hold a specialization's
-    /// methods under its registered name; that is asked first, by arena id.
-    /// Everything else is the stamp: a type's qualified name; for a primitive
-    /// the spelling it is registered under, since a primitive owns members
-    /// while declaring nothing.  A type parameter names no declaration, so it
-    /// can never be a registration key: reached when monomorphization has
-    /// substituted a concrete type into the spelling while the clone still
-    /// carries the template's stamp, and the spelling is then the only thing
-    /// that names the owner.  A MODULE qualifier is not a type-owner claim,
-    /// and this does not manufacture one: the module lane answers from the
-    /// scope itself.  A segment spelling a module can never also bind a type
-    /// in the writer's scope - the two share one namespace and the name layer
-    /// refuses the pair - so the stamp is the whole answer.
+    /// A substituter that rewrote the segment - a template's self-reference
+    /// collapsed into the clone, or a type parameter replaced by the
+    /// instantiation's argument - recorded the concrete type on the node,
+    /// and the registries hold a specialization's methods under its
+    /// registered name; that is asked first, by arena id.  Otherwise the
+    /// stamp: a declared type's qualified name, or the spelling a primitive
+    /// is registered under, since a primitive owns members while declaring
+    /// nothing.
+    ///
+    /// Nothing else is an owner, and no spelling stands in for one.  A type
+    /// parameter names no declaration, so its spelling is never a
+    /// registration key.  A MODULE qualifier is not a type-owner claim: the
+    /// module lane answers from the segment's own stamp.  A segment nothing
+    /// in the program owns has no key at all - a lookup by its spelling can
+    /// only find a registration that is itself keyed by a bare spelling,
+    /// which is a name no stamp ever named.
     scope_owner_key(&this, scope: ScopeResolutionNode*) -> SymbolStr {
         if (scope.spec_owner.is_valid()) {
             const spec_q: SymbolStr = this.ctx.decl_index.lookup_type_name(scope.spec_owner);
@@ -3577,11 +3584,11 @@ type struct CallResolver {
         return match (scope.require_scope_res("scope-call owner key")) {
             Res::TypeRelative(b, _) => {
                 match (b) {
-                    ResBase::GenericParam(_) => { scope.scope_name }
+                    ResBase::GenericParam(_) => { SymbolStr::empty() }
                     _                        => { b.name() }
                 }
             }
-            _                       => { scope.scope_name }
+            _                       => { SymbolStr::empty() }
         };
     }
 

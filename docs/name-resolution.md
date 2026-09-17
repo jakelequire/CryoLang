@@ -65,7 +65,7 @@ measurement that decided it on the row.
 | D20 | **A plain `import Unknown;` naming no module is an ERROR**, as the braced form is (§8.191) | **TAKEN** (ruled §8.202; built in §8.208) — an import path the graph holds no module under is E0502 at the import for every form, with the module the path abbreviates named as the help (`core::option` → `std::core::option`); a path naming no FILE was already E0500 at discovery. Measured first with the refusal as a shadow line: **0** over the six halves and the four Linux-target builds; the instrument fires on `import core::option;` and stays silent on a module gated off this OS, which the graph still holds | `grep -c 'refuse_unknown_module_import' compiler/src/compiler/resolver/name_resolution.cryo` → **2**; `grep -c '^negative E0502' tests/test-roster.txt` → **2** | §8.191, §8.202, §8.208 |
 | D21 | **An unknown type in EXPRESSION or TYPE-ARGUMENT position is an ERROR** (`sizeof(Nope)`, `1 as Nope`, `String<Nope>`) - and **a defaulted type parameter resolves in the module where the TYPE was DECLARED**, not at the use site: `String<A = GlobalAlloc>` written as `String` fills in `GlobalAlloc` resolved in `string`'s own scope, so a user never imports it; a user who WRITES `String<GlobalAlloc>` needs it in scope, because they wrote it. Rust's rule - a name resolves in the scope where it is written | **TAKEN** (ruled §8.202; built in §8.209) — the default half was already the name layer's (`declare_generics` stamps a parameter's default in the declaring file, §8.193); the refusal half: sema's three body-annotation sites (a local's, `sizeof`/`alignof`'s operand, a cast target) report a failed resolution through the declaration sites' reporter when the failure is a name the name layer could not place, and that reporter walks the WHOLE annotation by stamp (`extract_unresolved_named`), so a type argument is named for itself and a reported leaf is marked `Res::Err` and reported once. `docs/cryo.md` §12.2 stated both halves already; the tree was the defect. Population over six halves: the pinned `sizeof(Nope)` and nothing else; `1 as Nope` COMPILED and ran before this | `grep -c 'refuse_unresolved_body_annotation' compiler/src/compiler/sema/sema.cryo` → **4**; `grep -c 'named.res.answer(Res::Err)' compiler/src/compiler/passes/type_resolution.cryo` → **4**; `grep -c '^project sizeof_undeclared_type' tests/test-roster.txt` → **1**; `grep -c '^negative E0203_' tests/test-roster.txt` → **7** (5 declaration-position negatives, and since §8.209 the cast and the type argument) | §8.189, §8.193, §8.202, §8.209 |
 | D22 | **The six trait heads with a trailing type list and no leading `implement<...>`** (`Atomic<T>`, `BufStream<S>` ×3, `WebSocket<S>`, one test) are **covered by D16**: `implement trait Atomic<T>` with `T` declared nowhere becomes `implement<T> trait Atomic<T>`, same code and diagnostic | **TAKEN** (ruled §8.202; built in §8.210) — `refuse_undeclared_head_params`, beside D16's count check on a written trait head whose count matches: a trailing-list argument that is a `Named` leaf the name layer could not place is a name declared nowhere, E0302, the note spelling the head with it moved to the leading list. The six heads are rewritten `implement<S> trait …`; §8.193's 483 unstamped target arguments were the two `String<GlobalAlloc>` heads (imported then) and these six, so the population is 0 now | `grep -c 'refuse_undeclared_head_params' compiler/src/compiler/passes/type_resolution.cryo` → **2**; `grep -c '^negative E0302_trait_head' tests/test-roster.txt` → **1**; `grep -rhoE '^\s*implement trait [A-Za-z:_]+ for ([a-z]+ )?[A-Za-z:_]+<[A-Z][A-Za-z]*>' stdlib compiler/src tools examples tests/tests/lang tests/tests/projects runtime --include=*.cryo \| grep -vc GlobalAlloc` → **0** (the negative suite holds the one refused head) | §8.190, §8.193, §8.202, §8.210 |
-| D23 | **The `Res` contract is AUTHORITATIVE**: an unstamped node is an error; D1 is right and the tree is wrong. Landed GRADUALLY - each silent `_ =>` arm becomes a hard door as its population is measured to zero; never all at once | **RULED, staged; seven arms converted (§8.211, §8.214)** — every consumer-side `match` over a `ResSlot` with a silent outer `_ =>` arm was enumerated (14) and instrumented over the six halves: **6 entered 0 times** and are doors since §8.211 (`register_generic_fn_call`'s callee, the trait-impl head's `origin_trait` - whose LEAF fallback is deleted with it - `spelling_template`, the struct literal's base, `ann_head_key`, the constant pattern's `const_res`); **1 was entered on green programs and is a door since §8.214** (`head_type_key`: 448 entries, every one a keyword primitive's `TypeAnnotation::Primitive`, which carries no slot - not an unstamped head; the primitive's spelling is its key now, 0 `Named` heads unstamped); **4 are a clone's head answered by `spec_owner` by design** (`target_key`, `impl_owner`, `impl_target_type`, the async declare pass: entered millions of times, not a missing stamp); **3 are entered only in refused programs** (`find_fn_template_for_call` 12, `lookup_callee_function_type`'s hint 6, `ann_canon_key` 1 - the E0202/E0302/E0353 path, where the name layer leaves the slot for sema to report). **Since §8.231 the same contract covers a declaration's `DefId` stamp**: the 29 readers of a type declaration's own type go through `type_of_decl(node.def, site)`, whose unstamped arm records a third tally reported on BOTH exits of the build (an unstamped declaration is never a user error's consequence, and the old readers' silence left the program refused with errors that blamed it); 0 over examples, tests, the LSP and the cross-target build, with a no-stamp mutation as the control (138 reported) | `grep -rho 'require_scope_res(' compiler/src --include=*.cryo \| wc -l` → **15** (+1 in §8.217: the scope-call argument check dispatches on the segment's kind); `grep -rho '\.require("' compiler/src --include=*.cryo \| wc -l` → **15** (7 at §8.210, +6 in §8.211, +1 in §8.214, +1 in §8.233: an impl head's written target argument, read by the selector; the door found the async lowering's synthesized `Fut<T, …>` heads born unstamped, 71 per example, 991 over the unit suite, and `generic_param_anns` stamps them `GenericParam` now; the sema `ann_head_key` door is deleted with its function, the Item's type is read off the stamp); `grep -rho 'type_of_decl(' compiler/src --include=*.cryo \| wc -l` → **33** (29 readers, the definition, and since §8.232 the three method registrations that hand the stamped type to `register_methods`); `grep -rho 'report_unstamped_decls(' compiler/src --include=*.cryo \| wc -l` → **3** (the definition and both exits) | §8.39, §8.44, §8.202, §8.211, §8.214, §8.217, §8.231 |
+| D23 | **The `Res` contract is AUTHORITATIVE**: an unstamped node is an error; D1 is right and the tree is wrong. Landed GRADUALLY - each silent `_ =>` arm becomes a hard door as its population is measured to zero; never all at once | **RULED, staged; seven arms converted (§8.211, §8.214)** — every consumer-side `match` over a `ResSlot` with a silent outer `_ =>` arm was enumerated (14) and instrumented over the six halves: **6 entered 0 times** and are doors since §8.211 (`register_generic_fn_call`'s callee, the trait-impl head's `origin_trait` - whose LEAF fallback is deleted with it - `spelling_template`, the struct literal's base, `ann_head_key`, the constant pattern's `const_res`); **1 was entered on green programs and is a door since §8.214** (`head_type_key`: 448 entries, every one a keyword primitive's `TypeAnnotation::Primitive`, which carries no slot - not an unstamped head; the primitive's spelling is its key now, 0 `Named` heads unstamped); **4 are a clone's head answered by `spec_owner` by design** (`target_key`, `impl_owner`, `impl_target_type`, the async declare pass: entered millions of times, not a missing stamp); **3 are entered only in refused programs** (`find_fn_template_for_call` 12, `lookup_callee_function_type`'s hint 6, `ann_canon_key` 1 - the E0202/E0302/E0353 path, where the name layer leaves the slot for sema to report). **Since §8.231 the same contract covers a declaration's `DefId` stamp**: the 29 readers of a type declaration's own type go through `type_of_decl(node.def, site)`, whose unstamped arm records a third tally reported on BOTH exits of the build (an unstamped declaration is never a user error's consequence, and the old readers' silence left the program refused with errors that blamed it); 0 over examples, tests, the LSP and the cross-target build, with a no-stamp mutation as the control (138 reported) | `grep -rho 'require_scope_res(' compiler/src --include=*.cryo \| wc -l` → **16** (+1 in §8.217: the scope-call argument check dispatches on the segment's kind; +1 in §8.234: the callee hint refuses a module segment before any spelling is probed); `grep -rho '\.require("' compiler/src --include=*.cryo \| wc -l` → **15** (7 at §8.210, +6 in §8.211, +1 in §8.214, +1 in §8.233: an impl head's written target argument, read by the selector; the door found the async lowering's synthesized `Fut<T, …>` heads born unstamped, 71 per example, 991 over the unit suite, and `generic_param_anns` stamps them `GenericParam` now; the sema `ann_head_key` door is deleted with its function, the Item's type is read off the stamp); `grep -rho 'type_of_decl(' compiler/src --include=*.cryo \| wc -l` → **33** (29 readers, the definition, and since §8.232 the three method registrations that hand the stamped type to `register_methods`); `grep -rho 'report_unstamped_decls(' compiler/src --include=*.cryo \| wc -l` → **3** (the definition and both exits) | §8.39, §8.44, §8.202, §8.211, §8.214, §8.217, §8.231 |
 | D24 | **The trait-impl registry is RE-KEYED by the trait's identity.** Measured first (§8.212), then ruled by Jake 2026-09-16: "I want to rekey" (§8.216). The previous re-key was backed out because it was decided rather than measured; that objection is discharged - the measurement below is the basis | **TAKEN** (measured in §8.212, built in §8.233: `trait_heads` keyed by `(trait identity, target key)`, a LIST per key, one selector by unification - which is also §8.223's concrete-argument fix, the same table and the same readers; the operator traits are well-known identities, so the "leaf by design" readers ask by identity too; `trait_leaf_dispatch` still exits 12, its expectation unchanged) — the measurement: over the six halves the leaf key loses an impl in ONE shape, two same-leaf traits implemented for one type: **1** registration collapse (the typed table's `(Render, Shape)` entry, `Alpha::Render`'s block overwritten by `Omega::Render`'s) and **3** bound checks answered by the wrong impl (a `T: Alpha::Render` bound satisfied by `Omega::Render`'s block), every one in `trait_leaf_dispatch`, the project written to hold the shape; 84,520 bound checks and every other identity-holding reader agree, and the readers that pass a leaf by design (the operator traits, `Index`, `Deref`) are a different question. Those 4 are the programs whose binding changes when built; `trait_leaf_dispatch` is the project that holds them | `grep -c '^project trait_leaf_dispatch' tests/test-roster.txt` → **1** (the shape's project; the re-key flips its expectation) | §8.194, §8.202, §8.212, §8.216 |
 | Q2 | **An `extern module` alias gets a REAL module-graph entry with a stamp** (§9 Q2, ruled by Jake 2026-09-16: "I don't want to have that permanent blemish" - the alias is NOT left a bare namespace symbol that resolution special-cases forever). Basis: `extern module libc as cit;` is already a declaration in source and simply is not registered, so stamping it registers what the programmer wrote rather than inventing a synthetic module; Rust binds `extern crate foo as bar` as a real nameable item. Unblocks: codegen's `resolve_global`/`resolve_global_in_namespace`/`resolve_global_by_qualified` lane and its five-step spelling ladder (`symbol_resolver.cryo`, `resolve_global`), which exists because the alias has no stamp, and `lookup_callee_function_type`'s `bare_sym` door (`call_resolver.cryo`), the C import's wholesale `alias::name` key space. SCOPING before building (not gating - `HANDOFF.md` §0): of those sites, which resolve the ALIAS itself and which resolve a MEMBER inside the `cit::X` key space; stamping the alias plausibly closes the first and leaves the second as a separate, smaller question | **RULED - UNBUILT** | `grep -rho -e '\.resolve_global(' -e '\.resolve_global_in_namespace(' -e '\.resolve_global_by_qualified(' compiler/src/compiler/codegen --include=*.cryo \| wc -l` → **5**; `grep -c 'lookup_func_type_exact(bare_sym)' compiler/src/compiler/sema/call_resolver.cryo` → **1** (both 0 when built) | §8.216, §9 Q2 |
 | D25 | **`(Beta for P)::make()` is Cryo's impl-qualified call form** (Jake, 2026-09-17). It reuses `for` exactly as `implement trait Beta for P` does - no new lexical territory, and none of the `<P as Beta>` parsing problem. It MUST cover the receiver case too, `(Beta for P)::go(&p)`, so E0156 has ONE rule to suggest rather than a short form that works sometimes; and it must compose inside a generic, `(Beta for T)::make()`. Motivation: a tie of STATIC trait methods (`P::make()` with `Beta::make` and `Gamma::make` both implemented for `P`) has no receiver to disambiguate it, so E0156 fires with no suggestable spelling today | **RULED - UNBUILT** | `no check` — syntax not in the tree; the project that lands it pins it, and E0156's help names the form then | §8.224, §8.229 |
@@ -178,7 +178,7 @@ three, and its row carries the count. Read each zero off its own row.
 | name-layer visibility gates: a specific import naming a private declaration (E0353, `visibility_import_gate`), and a spelled-out path reaching one through the module-rooted walk (E0503 for a type, E0353 otherwise; `visibility_type_mask`) | LIVE, reached | — | `grep -c 'private_declaration' compiler/src/compiler/resolver/name_resolution.cryo` → **3** (the two gates, and §8.191's sub-module rung stepping over an `export` naming a private, which is E0241's) | §8.167, §8.168, §8.191 |
 | sema type-name visibility gate (`check_type_name_visibility` / `check_annotation_visibility`, keyed by `resolve_scoped_or_at` over the WRITTEN spelling, so every relative path defaulted to public) | **DELETED** - the name layer refuses a private type where the path proposes it | — | `grep -c 'check_type_name_visibility' compiler/src/compiler/sema/member_resolver.cryo` → **0** | §8.168 |
 | `CompilationContext::resolve_scoped` family (the cursor's leaf-keyed scope map, asked from sema) | **DELETED** — `_or`, `_or_at`, `scope_is_ambiguous`, `_at` went with their 7 readers at §8.161; `resolve_scoped` / `resolve_scoped_at` with their last reader, `scope_owner_key`'s cursor lane, in §8.206 | — | `grep -c 'resolve_scoped' compiler/src/compiler/compilation_context.cryo` → **0** | §8.161, §8.166-§8.170, §8.206 |
-| `scope_owner_key` | LIVE - the static-call owner key: the substituter's `spec_owner` (a clone's specialization, by arena id), then the stamp. The cursor lane between them, measured at 1,974,585 answers in §8.170 and serving the one shape D5 refuses, is deleted | — | `grep -c '\.resolve_scoped_at(' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -c 'scope_owner_key' compiler/src/compiler/sema/call_resolver.cryo` → **6** | §8.134, §8.151, §8.170, §8.206 |
+| `scope_owner_key` | LIVE - the static-call owner key: the substituter's `spec_owner` (a clone's specialization, by arena id), then the stamp's `Def` or `PrimTy` base, and EMPTY for every other stamp. The cursor lane between them, measured at 1,974,585 answers in §8.170 and serving the one shape D5 refuses, is deleted (§8.206); the spelling arms after it - `scope.scope_name` for a module's `Def`, an `Err`, a `Pending` and a `TypeRelative(GenericParam)` base - are deleted (§8.234: 229,475 answers over six halves, 0 bound anything a build keeps; a module's 236 canonical-spelling hits reach the same signature through the module lane) | — | `grep -c '\.resolve_scoped_at(' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -c 'scope_owner_key' compiler/src/compiler/sema/call_resolver.cryo` → **6**; `grep -c 'scope\.scope_name }' compiler/src/compiler/sema/call_resolver.cryo` → **0** | §8.134, §8.151, §8.170, §8.206, §8.234 |
 | type-resolution bound stamping (`stamp_trait_ref` and its three walkers, the cursor fallback for a bound the resolver did not stamp) | **DELETED** - the name layer stamps every owner, associated-type bounds included | — | `grep -c 'stamp_trait' compiler/src/compiler/passes/type_resolution.cryo` → **0** | §8.169 |
 | callee visibility gate (E0353) | LIVE, reached; **starved of violations**; since §8.173 its call door is the QUALIFIED path only (-52 on the pinned arm: the bare doors 2-4 are deleted, a bare callee is vetted by the name layer before it is stamped) plus the two value doors | 1,817 reached / **0** rejected, last counted before §8.203 | `grep -rho 'E0353' compiler/src \| wc -l` → **18** (the name layer's two: the import gate, the rooted walk; 21 until §8.203 deleted the counter's three mentions) | §8.1f, §8.2ag, §8.173, §8.203 |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected, last counted before §8.203 | same code | §8.2af, §8.2ag |
@@ -13786,6 +13786,115 @@ artifacts: `trait_impls`, `trait_impl_index`, `trait_impl_typeid_index`,
 `name_implements_trait`, `head_type_key`, sema's `ann_head_key`,
 `extract_root_name`, `impl_targets`, `find_generic_trait_method_under`,
 `find_self_ret_method_under`).
+
+---
+
+### 8.234 `scope_owner_key` answers a registered owner or nothing: the spelling arms - a module's `Def`, an `Err`, a `Pending` and a `TypeRelative(GenericParam)` base all answered `scope.scope_name` - are deleted; 229,475 answers over six halves, 0 bound anything a build keeps - 2026-09-17
+
+#### What was there
+
+The static-call owner key (`sema/call_resolver.cryo`) is asked by five
+readers - the callee hint for expected-type propagation
+(`lookup_callee_function_type`), `resolve_scope_call`'s type lane, the
+template-return fallback, `find_static_method_template` and the scope-call
+argument check.  It answered the substituter's `spec_owner` by arena id,
+then the stamp's base name for a `TypeRelative(Def | PrimTy)`, and **the
+written spelling for everything else**: `Res::Def` (a module), `Err`, a
+slot never answered, and the `GenericParam` base of a `TypeRelative`.
+§8.217 deleted the module-suffix scan that consumed a module's spelling
+and left this producer, and audit 11 named it the "drained lane,
+uncounted replacement" shape: nothing measured which stamps reached the
+arm or whether the spelling it answered ever bound anything.  The
+function's own comment said a module qualifier "is not a type-owner claim,
+and this does not manufacture one" while the code manufactured one.
+
+#### What is there now
+
+`scope_owner_key` returns `SymbolStr::empty()` for every stamp that names
+no type owner.  A type parameter's spelling is never a registration key:
+the substituter that replaces `T` with the instantiation's argument records
+that argument on `spec_owner` (`ASTTypeSubstituter::visit(ScopeResolutionNode)`,
+from `subst.replacements[i]`, one per parameter by construction) and the
+first arm answers it by arena id.  A module qualifier has no owner key;
+its member is the module lane's, from the stamp.  A segment nothing in
+the program owns has no key, because a lookup by its spelling can only
+find a registration itself keyed by a bare spelling.  The callee hint
+refuses a module segment outright (`Res::Def` → no hint; the lane that
+owns it, `lookup_module_qualified_param_types`, is asked next by
+`resolve_call` and reads the same `lookup_func_type_exact` table under the
+module's canonical name), so no spelling is probed for a module there.
+Every consumer of the key tolerates the empty symbol - `get_template`,
+`lookup_type`, `lookup_method_return`, `resolve_method_owner` are map
+misses on id 0, and `InternTable::resolve` gives `""`.
+
+#### Measured
+
+The shadow tree (`scripts/ns-migration/8.234/shadow.patch` over
+`fd3756af`: `shadow_sok` prints the stamp kind, the key and whether the
+caller's lookup under that key hit, at all five readers) over the six
+halves, `corpus2.sh x1`, **2,509,947 lines**, `failing halves: 0`
+(`cut -f4,5,6,10 .objcmp/x1-lines.txt | sort | uniq -c | sort -rn`,
+`.objcmp/x1-tab.txt`):
+
+| stamp reaching the spelling arms | answers | bound by that spelling |
+|---|---:|---|
+| `Def`, spelling a SUFFIX of the module's name | 227,941 (hint 130,115, static-method template 97,826) | **0** |
+| `Def`, spelling the module's canonical name | 466 (hint 236 + 230) | 236 `HIT` at the hint - the key IS the canonical name, and the hint's next probe (`bare_sym`, the C-import door) is the same string; the module lane gives the same signature |
+| `TypeRelative(GenericParam)`, spelling the parameter (`T::try_from`, `T::__pluck`, `T::default` in the template's own body) | 1,068 (534 + 267 + 267) | **0** - `symbolic_name_is_generic_param` stands the call down after the probes |
+| `TypeRelative(GenericParam)`, spelling substituted | **0 through the arm** - 105 substituted segments, every one answered by `spec_owner` (`SPEC`; `u64::try_from`, `std::collections::str::Str::try_from`, `i32::default`) | - |
+| `Err` / `Pending` | **0** | - |
+
+The `TypeRelative(Def)` and `PrimTy` arms, which stay, answer the rest:
+2,280,367 lines, of which the C-import alias is the `TRDef-other …
+miss-bareHIT` shape (968 - the alias is stamped `TypeRelative(Def(alias))`
+and its qualified name misses; the bare spelling hits; §9 Q2's).
+
+Controls, `.objcmp/sok-ctl/` under the shadow compiler (`cryo check
+<file> --stdlib=stdlib` from `tests/`):
+
+* `Nope::thing(1)` prints `Pending` at the hint, the call and the
+  template lookup, hits nothing, and is E0233 - the instrument reports
+  the kind the corpus never produced.
+* `implement int { static seven() }` + `int::seven()` prints `Pending …
+  HIT` at the hint, `static` at the call, `HIT1` at the argument check:
+  the ONE spelling that binds, because the D18 head registers its methods
+  under the bare key `int` and `int` is an alias keyword the name layer
+  leaves unanswered.  The build is refused by E0900 (27 unanswered slots)
+  either way, so the arm never bound a program that built.  Under the
+  clean tree the same call is still bound - by
+  `try_resolve_cimport_function`'s `lookup_func_return("int::seven")`, the
+  spelling-keyed C-import door, which is Q2's lane and not this one; E0900
+  still refuses it.
+* `make<T>() where T: Default { T::default() }` instantiated at
+  `Wrap<Wrap<i32>>` and `i32` (the case a `spec_owner` the index cannot
+  name would reach the spelling arm): every substituted segment answers
+  `SPEC` - `CryoTests::SokSpec::4Wrap$LN$L9CryoTests.7SokSpec.4Wrap$Li$G$G$G`
+  named by the index - and 0 reach the arm.
+
+#### Objects and gates
+
+`hash-tree.sh Q` against half `P` (`fd3756af`): examples **0 of 1,126**
+(`comm -3 .objcmp/ex-P.s .objcmp/ex-Q.s`), tests **0 of 2,665**
+(`comm -3 .objcmp/t-P.s .objcmp/t-Q.s`).  `make test-census`: `OVERALL
+PASS (unit: ok; compile-fail: 193 passed; projects: 64 passed)`, roster
+2,124 / 193 / 67 (`.objcmp/x2-census.log`).  `make lsp-check`: `OK --
+compiled 264 module(s) … 0 errors, 490 warning(s)` (`.objcmp/x2-lsp.log`).
+`make cross-check`: `OK -- x86_64-pc-linux-gnu … 0 errors`
+(`.objcmp/x2-cross.log`).  `lane-check` unmoved.  `ns-status-check`: the
+`require_scope_res(` row 15 → 16 (the hint's module refusal), the
+`scope_owner_key` row's text and a new check (`scope\.scope_name }` → 0,
+2 at `fd3756af`).
+
+Left for Q2: the callee hint's `bare_sym` probe and
+`try_resolve_cimport_function` are the two spelling-keyed doors still on a
+scope call, both for the C-import alias, both able to bind a `Pending`
+segment's spelling (`int::seven` above).
+
+Outside the ledger: `compiler/src/compiler/sema/call_resolver.cryo`;
+`scripts/ns-migration/8.234/` (`shadow.patch`, README row).
+
+**Tally: 78 shadowed, 78 old paths deleted, 78 at zero; 149 artifacts
+gone** (+ the owner key's spelling arms).
 
 ---
 
