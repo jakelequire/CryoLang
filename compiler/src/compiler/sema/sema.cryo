@@ -919,7 +919,10 @@ public:
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null) { continue; }
-            mut ty: TypeRef = this.arena.get_void();
+            // A parameter whose annotation failed to resolve was reported
+            // where it was written; it is bound with NO type, so a use of it
+            // is silent rather than a second report about `void`.
+            mut ty: TypeRef = TypeRef::invalid();
             if (param.resolved_type.is_valid()) {
                 ty = param.resolved_type;
             } else if (func.is_variadic && i == func.parameters.length - 1
@@ -1427,7 +1430,7 @@ public:
                 diag = diag.at_with_label(b.span, "unknown field");
                 mut cands: string[] = [];
                 for (mut k: i64 = 0; k < fields_ptr.length; k++) { cands.push(this.intern.resolve(fields_ptr[k].name)); }
-                diag = this.diag.attach_did_you_mean(diag, field_name, cands, "field", b.span);
+                diag = diag.did_you_mean(field_name, cands, "field", b.span);
                 this.ctx.emit_diagnostic(diag);
                 this.scopes.register_local_with_mut(b.local_name, this.arena.get_void(), b.is_mutable);
                 continue;
@@ -1604,6 +1607,8 @@ public:
         }
         const local: TypeRef = this.scopes.lookup_local(ident.name);
         if (local.is_valid()) { return local; }
+        // Bound, with no type: the declaration failed to type and said so.
+        if (this.scopes.is_local_or_param(ident.name)) { return TypeRef::invalid(); }
         if (this.state.in_lambda_depth > 0 && this.state.current_lambda != null) {
             match (this.state.lambda_outer_locals.get(&ident.name.id)) {
                 Option::Some(outer_ty) => { return this.lambda.record_lambda_capture(ident, outer_ty); }
@@ -1658,11 +1663,18 @@ public:
             }
             return func_ty;
         }
+        // Not a local, not a global, not a function.  A name no rib bound
+        // was refused where it was written and arrives `Err`; one that
+        // binds to something that is not a value - a type, a module - is
+        // refused here, where what the binding is has been asked.  A slot
+        // nothing answered is a bug, not a name to report.
+        match (ident.res.require("sema/resolve_identifier")) {
+            Res::Err => { return TypeRef::invalid(); }
+            _        => { }
+        }
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0201_UNDEFINED_VARIABLE,
             fmt::format("cannot find value `%s` in this scope", name_str));
         diag = diag.at_with_label(ident.span, "not found in this scope");
-        const cands: string[] = this.diag.collect_local_names();
-        diag = this.diag.attach_did_you_mean(diag, name_str, cands, "local", ident.span);
         this.ctx.emit_diagnostic(diag);
         return TypeRef::invalid();
     }

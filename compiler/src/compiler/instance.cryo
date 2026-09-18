@@ -31,6 +31,8 @@ import compiler::vendor::auto_vendor;
 import compiler::vendor::auto_vendor::{ AutoVendor };
 import compiler::diag::diagnostic;
 import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::snapshot;
+import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::lex::lexer;
 import utils;
 import utils::logger;
@@ -451,7 +453,7 @@ type struct CompilerInstance {
         LOG_DEBUG(LogComponent::General, "[Compiler] Finished: %s (%u errors, %u warnings)",
             ctx.source_file, ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
 
-        if (success) {
+        if (success && !ctx.diagnostics.has_errors()) {
             return CompilationResult::ok_with_warnings(
                 output_path, ctx.diagnostics.warning_count);
         }
@@ -2830,6 +2832,9 @@ type struct CompilerInstance {
                               ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
+        // The phase's own errors, so the walk stops after it has reported
+        // every module's rather than at the first module that had one.
+        const phase_snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         pipeline.set_passes([PassID::TypeDeclaration]);
         {
             mut initial4a: ProvisionSet = ProvisionSet::empty();
@@ -2853,7 +2858,7 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        return true;
+        return ctx.diagnostics.errors_since(phase_snap) == 0;
     }
 
     /// TemplateRegistration across ALL modules first, so every generic template
@@ -2865,6 +2870,9 @@ type struct CompilerInstance {
                        ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
+        // The phase's own errors, so the walk stops after it has reported
+        // every module's rather than at the first module that had one.
+        const phase_snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         pipeline.set_passes([PassID::TemplateRegistration]);
         {
             mut initial4b0: ProvisionSet = ProvisionSet::empty();
@@ -2890,7 +2898,7 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        return true;
+        return ctx.diagnostics.errors_since(phase_snap) == 0;
     }
 
     /// DefaultExpansion + FunctionSignature.  With templates globally
@@ -2902,6 +2910,9 @@ type struct CompilerInstance {
                                    ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
+        // The phase's own errors, so the walk stops after it has reported
+        // every module's rather than at the first module that had one.
+        const phase_snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         pipeline.set_passes([PassID::DefaultExpansion,
                              PassID::FunctionSignature]);
         {
@@ -2930,7 +2941,7 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        return true;
+        return ctx.diagnostics.errors_since(phase_snap) == 0;
     }
 
     /// TypeResolution + StructFieldTypeSync over every module.
@@ -2938,6 +2949,9 @@ type struct CompilerInstance {
                   ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
+        // The phase's own errors, so the walk stops after it has reported
+        // every module's rather than at the first module that had one.
+        const phase_snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         pipeline.set_passes([PassID::TypeResolution, PassID::StructFieldTypeSync]);
         {
             mut initial5: ProvisionSet = ProvisionSet::empty();
@@ -2964,7 +2978,8 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        return CompilerInstance::check_export_grants(ctx);
+        const grants_ok: boolean = CompilerInstance::check_export_grants(ctx);
+        return grants_ok && ctx.diagnostics.errors_since(phase_snap) == 0;
     }
 
     /// Report every `export` that names something it cannot grant (E0241).
@@ -3040,6 +3055,9 @@ type struct CompilerInstance {
                        ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
+        // The phase's own errors, so the walk stops after it has reported
+        // every module's rather than at the first module that had one.
+        const phase_snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         pipeline.set_passes([PassID::DirectiveProcessing]);
         {
             mut init6ai: ProvisionSet = ProvisionSet::empty();
@@ -3066,7 +3084,7 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        return true;
+        return ctx.diagnostics.errors_since(phase_snap) == 0;
     }
 
     /// FunctionBodyTypeCheck (semantic analysis) for ALL modules, BEFORE
@@ -3078,6 +3096,9 @@ type struct CompilerInstance {
                      ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
+        // The phase's own errors, so the walk stops after it has reported
+        // every module's rather than at the first module that had one.
+        const phase_snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         pipeline.set_passes([PassID::FunctionBodyTypeCheck]);
         {
             mut init6sema: ProvisionSet = ProvisionSet::empty();
@@ -3106,7 +3127,7 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        return true;
+        return ctx.diagnostics.errors_since(phase_snap) == 0;
     }
 
     /// Monomorphization + GenericExpressionResolution for ALL modules, now that
@@ -3116,6 +3137,9 @@ type struct CompilerInstance {
                  ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
+        // The phase's own errors, so the walk stops after it has reported
+        // every module's rather than at the first module that had one.
+        const phase_snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         pipeline.set_passes([
             PassID::Monomorphization,
             PassID::GenericExpressionResolution,
@@ -3164,7 +3188,7 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        return true;
+        return ctx.diagnostics.errors_since(phase_snap) == 0;
     }
 
     /// Spec routing: send every specialization mono created to its

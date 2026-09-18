@@ -2686,6 +2686,9 @@ type struct CallResolver {
                                 ident.set_resolved_type(fp_local);
                                 return (fp_t as FunctionType*).return_type;
                             }
+                        } else if (this.scopes.is_local_or_param(ident.name)) {
+                            // Bound, with no type: reported at the declaration.
+                            return TypeRef::invalid();
                         }
                     }
                     Res::Err => { return TypeRef::invalid(); }
@@ -2718,6 +2721,14 @@ type struct CallResolver {
         const stamped_ty: TypeRef = this.types.spelling_type(ident.res);
         if (stamped_ty.is_valid()) { return stamped_ty; }
 
+        // Bound, and to nothing callable: a callee no rib bound was refused
+        // where it was written (E0202, with the owners of the leaf and the
+        // nearest visible function) and returned `Err` above.  A slot
+        // nothing answered is a bug, not a name to report.
+        match (ident.res.require("sema/resolve_direct_call")) {
+            Res::Err => { return TypeRef::invalid(); }
+            _        => { }
+        }
         const name: string = this.intern.resolve(ident.name);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0202_UNDEFINED_FUNCTION,
@@ -2731,33 +2742,6 @@ type struct CallResolver {
             diag = diag.with_note(fmt::format(
                 "`<` after `%s` was read as the start of generic type arguments; if a comparison was meant, parenthesise the operands - `(x < y)`",
                 name));
-        }
-        // A leaf some other module declares - `free` in `std::ffi::libc`,
-        // `std::alloc::heap`, `std::core::intrinsics` - is not a typo of a
-        // name in scope; it is a name the writer has to say the owner of.
-        const declarers: string[] = this.diag.collect_module_declarers_of_leaf(ident.name);
-        if (declarers.length > 0) {
-            mut spellings: string = "";
-            for (mut i: i64 = 0; i < declarers.length; i++) {
-                const parent: string = QualifiedName::parent_of(declarers[i]);
-                const spelled: string = QualifiedName::leaf_of(parent) + "::" + name;
-                if (i > 0) {
-                    if (i + 1 == declarers.length) { spellings = spellings + " or "; }
-                    else                            { spellings = spellings + ", "; }
-                }
-                spellings = spellings + "`" + spelled + "`";
-            }
-            mut declared_in: string = "";
-            for (mut i: i64 = 0; i < declarers.length; i++) {
-                if (i > 0) { declared_in = declared_in + ", "; }
-                declared_in = declared_in + "`" + QualifiedName::parent_of(declarers[i]) + "`";
-            }
-            diag = diag.with_note(fmt::format(
-                "a bare name means a declaration in this module; `%s` is declared in %s - write %s, or import it",
-                name, declared_in, spellings));
-        } else {
-            const cands: string[] = this.diag.collect_bare_callable_names();
-            diag = this.diag.attach_did_you_mean(diag, name, cands, "function", ident.span);
         }
         this.ctx.emit_diagnostic(diag);
         return TypeRef::invalid();
@@ -3606,6 +3590,9 @@ type struct CallResolver {
         mut names_module: boolean = false;
         match (scope.require_scope_res("scope-call owner kind")) {
             Res::Def(_) => { names_module = true; }
+            // A path the name layer refused (a member two re-exports offer)
+            // was reported where it was written; no store owns it.
+            Res::Err    => { return TypeRef::invalid(); }
             _           => { }
         }
         if (names_module) {

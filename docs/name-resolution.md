@@ -65,7 +65,7 @@ measurement that decided it on the row.
 | D20 | **A plain `import Unknown;` naming no module is an ERROR**, as the braced form is (§8.191) | **TAKEN** (ruled §8.202; built in §8.208) — an import path the graph holds no module under is E0502 at the import for every form, with the module the path abbreviates named as the help (`core::option` → `std::core::option`); a path naming no FILE was already E0500 at discovery. Measured first with the refusal as a shadow line: **0** over the six halves and the four Linux-target builds; the instrument fires on `import core::option;` and stays silent on a module gated off this OS, which the graph still holds | `grep -c 'refuse_unknown_module_import' compiler/src/compiler/resolver/name_resolution.cryo` → **2**; `grep -c '^negative E0502' tests/test-roster.txt` → **2** | §8.191, §8.202, §8.208 |
 | D21 | **An unknown type in EXPRESSION or TYPE-ARGUMENT position is an ERROR** (`sizeof(Nope)`, `1 as Nope`, `String<Nope>`) - and **a defaulted type parameter resolves in the module where the TYPE was DECLARED**, not at the use site: `String<A = GlobalAlloc>` written as `String` fills in `GlobalAlloc` resolved in `string`'s own scope, so a user never imports it; a user who WRITES `String<GlobalAlloc>` needs it in scope, because they wrote it. Rust's rule - a name resolves in the scope where it is written | **TAKEN** (ruled §8.202; built in §8.209) — the default half was already the name layer's (`declare_generics` stamps a parameter's default in the declaring file, §8.193); the refusal half: sema's three body-annotation sites (a local's, `sizeof`/`alignof`'s operand, a cast target) report a failed resolution through the declaration sites' reporter when the failure is a name the name layer could not place, and that reporter walks the WHOLE annotation by stamp (`extract_unresolved_named`), so a type argument is named for itself and a reported leaf is marked `Res::Err` and reported once. `docs/cryo.md` §12.2 stated both halves already; the tree was the defect. Population over six halves: the pinned `sizeof(Nope)` and nothing else; `1 as Nope` COMPILED and ran before this | `grep -c 'refuse_unresolved_body_annotation' compiler/src/compiler/sema/sema.cryo` → **4**; `grep -c 'named.res.answer(Res::Err)' compiler/src/compiler/passes/type_resolution.cryo` → **4**; `grep -c '^project sizeof_undeclared_type' tests/test-roster.txt` → **1**; `grep -c '^negative E0203_' tests/test-roster.txt` → **7** (5 declaration-position negatives, and since §8.209 the cast and the type argument) | §8.189, §8.193, §8.202, §8.209 |
 | D22 | **The six trait heads with a trailing type list and no leading `implement<...>`** (`Atomic<T>`, `BufStream<S>` ×3, `WebSocket<S>`, one test) are **covered by D16**: `implement trait Atomic<T>` with `T` declared nowhere becomes `implement<T> trait Atomic<T>`, same code and diagnostic | **TAKEN** (ruled §8.202; built in §8.210) — `refuse_undeclared_head_params`, beside D16's count check on a written trait head whose count matches: a trailing-list argument that is a `Named` leaf the name layer could not place is a name declared nowhere, E0302, the note spelling the head with it moved to the leading list. The six heads are rewritten `implement<S> trait …`; §8.193's 483 unstamped target arguments were the two `String<GlobalAlloc>` heads (imported then) and these six, so the population is 0 now | `grep -c 'refuse_undeclared_head_params' compiler/src/compiler/passes/type_resolution.cryo` → **2**; `grep -c '^negative E0302_trait_head' tests/test-roster.txt` → **1**; `grep -rhoE '^\s*implement trait [A-Za-z:_]+ for ([a-z]+ )?[A-Za-z:_]+<[A-Z][A-Za-z]*>' stdlib compiler/src tools examples tests/tests/lang tests/tests/projects runtime --include=*.cryo \| grep -vc GlobalAlloc` → **0** (the negative suite holds the one refused head) | §8.190, §8.193, §8.202, §8.210 |
-| D23 | **The `Res` contract is AUTHORITATIVE**: an unstamped node is an error; D1 is right and the tree is wrong. Landed GRADUALLY - each silent `_ =>` arm becomes a hard door as its population is measured to zero; never all at once | **RULED, staged; seven arms converted (§8.211, §8.214)** — every consumer-side `match` over a `ResSlot` with a silent outer `_ =>` arm was enumerated (14) and instrumented over the six halves: **6 entered 0 times** and are doors since §8.211 (`register_generic_fn_call`'s callee, the trait-impl head's `origin_trait` - whose LEAF fallback is deleted with it - `spelling_template`, the struct literal's base, `ann_head_key`, the constant pattern's `const_res`); **1 was entered on green programs and is a door since §8.214** (`head_type_key`: 448 entries, every one a keyword primitive's `TypeAnnotation::Primitive`, which carries no slot - not an unstamped head; the primitive's spelling is its key now, 0 `Named` heads unstamped); **4 are a clone's head answered by `spec_owner` by design** (`target_key`, `impl_owner`, `impl_target_type`, the async declare pass: entered millions of times, not a missing stamp); **3 are entered only in refused programs** (`find_fn_template_for_call` 12, `lookup_callee_function_type`'s hint 6, `ann_canon_key` 1 - the E0202/E0302/E0353 path, where the name layer leaves the slot for sema to report; scoped in §8.248 to exactly two shapes over the negatives, a bare callee binding to nothing and an undeclared impl-head argument, and blocked on the E0202/E0201 reporting move; the `FILE`/`LINE` magic names that stood in front of it are the name layer's `Res::SourceLoc` since §8.249). **Since §8.231 the same contract covers a declaration's `DefId` stamp**: the 29 readers of a type declaration's own type go through `type_of_decl(node.def, site)`, whose unstamped arm records a third tally reported on BOTH exits of the build (an unstamped declaration is never a user error's consequence, and the old readers' silence left the program refused with errors that blamed it); 0 over examples, tests, the LSP and the cross-target build, with a no-stamp mutation as the control (138 reported) | `grep -rho 'require_scope_res(' compiler/src --include=*.cryo \| wc -l` → **16** (+1 in §8.217: the scope-call argument check dispatches on the segment's kind; +1 in §8.234: the callee hint refuses a module segment before any spelling is probed); `grep -rho '\.require("' compiler/src --include=*.cryo \| wc -l` → **15** (7 at §8.210, +6 in §8.211, +1 in §8.214, +1 in §8.233: an impl head's written target argument, read by the selector; the door found the async lowering's synthesized `Fut<T, …>` heads born unstamped, 71 per example, 991 over the unit suite, and `generic_param_anns` stamps them `GenericParam` now; the sema `ann_head_key` door is deleted with its function, the Item's type is read off the stamp); `grep -rho 'type_of_decl(' compiler/src --include=*.cryo \| wc -l` → **33** (29 readers, the definition, and since §8.232 the three method registrations that hand the stamped type to `register_methods`); `grep -rho 'report_unstamped_decls(' compiler/src --include=*.cryo \| wc -l` → **3** (the definition and both exits) | §8.39, §8.44, §8.202, §8.211, §8.214, §8.217, §8.231 |
+| D23 | **The `Res` contract is AUTHORITATIVE**: an unstamped node is an error; D1 is right and the tree is wrong. Landed GRADUALLY - each silent `_ =>` arm becomes a hard door as its population is measured to zero; never all at once | **RULED, staged; seven arms converted (§8.211, §8.214)** — every consumer-side `match` over a `ResSlot` with a silent outer `_ =>` arm was enumerated (14) and instrumented over the six halves: **6 entered 0 times** and are doors since §8.211 (`register_generic_fn_call`'s callee, the trait-impl head's `origin_trait` - whose LEAF fallback is deleted with it - `spelling_template`, the struct literal's base, `ann_head_key`, the constant pattern's `const_res`); **1 was entered on green programs and is a door since §8.214** (`head_type_key`: 448 entries, every one a keyword primitive's `TypeAnnotation::Primitive`, which carries no slot - not an unstamped head; the primitive's spelling is its key now, 0 `Named` heads unstamped); **4 are a clone's head answered by `spec_owner` by design** (`target_key`, `impl_owner`, `impl_target_type`, the async declare pass: entered millions of times, not a missing stamp); **3 are entered only in refused programs** (`find_fn_template_for_call` 12, `lookup_callee_function_type`'s hint 6, `ann_canon_key` 1 - the E0202/E0302/E0353 path, where the name layer leaves the slot for sema to report; scoped in §8.248 to exactly two shapes over the negatives, a bare callee binding to nothing and an undeclared impl-head argument, and blocked on the E0202/E0201 reporting move; the `FILE`/`LINE` magic names that stood in front of it are the name layer's `Res::SourceLoc` since §8.249, and the move itself landed in §8.250 - an unbound bare identifier is `Err` with its report made where it was written, and the driver runs sema over the refused tree - so the two call-resolver arms are reachable only by an `Err` callee now and are the next doors; the impl-head arm waits on the type lane). **Since §8.231 the same contract covers a declaration's `DefId` stamp**: the 29 readers of a type declaration's own type go through `type_of_decl(node.def, site)`, whose unstamped arm records a third tally reported on BOTH exits of the build (an unstamped declaration is never a user error's consequence, and the old readers' silence left the program refused with errors that blamed it); 0 over examples, tests, the LSP and the cross-target build, with a no-stamp mutation as the control (138 reported) | `grep -rho 'require_scope_res(' compiler/src --include=*.cryo \| wc -l` → **16** (+1 in §8.217: the scope-call argument check dispatches on the segment's kind; +1 in §8.234: the callee hint refuses a module segment before any spelling is probed); `grep -rho '\.require("' compiler/src --include=*.cryo \| wc -l` → **17** (7 at §8.210, +6 in §8.211, +1 in §8.214, +2 in §8.250: sema's identifier and direct-call tails, where an unstamped bare identifier was reported as a name that does not exist, +1 in §8.233: an impl head's written target argument, read by the selector; the door found the async lowering's synthesized `Fut<T, …>` heads born unstamped, 71 per example, 991 over the unit suite, and `generic_param_anns` stamps them `GenericParam` now; the sema `ann_head_key` door is deleted with its function, the Item's type is read off the stamp); `grep -rho 'type_of_decl(' compiler/src --include=*.cryo \| wc -l` → **33** (29 readers, the definition, and since §8.232 the three method registrations that hand the stamped type to `register_methods`); `grep -rho 'report_unstamped_decls(' compiler/src --include=*.cryo \| wc -l` → **3** (the definition and both exits) | §8.39, §8.44, §8.202, §8.211, §8.214, §8.217, §8.231 |
 | D24 | **The trait-impl registry is RE-KEYED by the trait's identity.** Measured first (§8.212), then ruled by Jake 2026-09-16: "I want to rekey" (§8.216). The previous re-key was backed out because it was decided rather than measured; that objection is discharged - the measurement below is the basis | **TAKEN** (measured in §8.212, built in §8.233: `trait_heads` keyed by `(trait identity, target key)`, a LIST per key, one selector by unification - which is also §8.223's concrete-argument fix, the same table and the same readers; the operator traits are well-known identities, so the "leaf by design" readers ask by identity too; `trait_leaf_dispatch` still exits 12, its expectation unchanged) — the measurement: over the six halves the leaf key loses an impl in ONE shape, two same-leaf traits implemented for one type: **1** registration collapse (the typed table's `(Render, Shape)` entry, `Alpha::Render`'s block overwritten by `Omega::Render`'s) and **3** bound checks answered by the wrong impl (a `T: Alpha::Render` bound satisfied by `Omega::Render`'s block), every one in `trait_leaf_dispatch`, the project written to hold the shape; 84,520 bound checks and every other identity-holding reader agree, and the readers that pass a leaf by design (the operator traits, `Index`, `Deref`) are a different question. Those 4 are the programs whose binding changes when built; `trait_leaf_dispatch` is the project that holds them | `grep -c '^project trait_leaf_dispatch' tests/test-roster.txt` → **1** (the shape's project; the re-key flips its expectation) | §8.194, §8.202, §8.212, §8.216 |
 | Q2 | **An `extern module` alias gets a REAL module-graph entry with a stamp** (§9 Q2, ruled by Jake 2026-09-16: "I don't want to have that permanent blemish" - the alias is NOT left a bare namespace symbol that resolution special-cases forever). Basis: `extern module libc as cit;` is already a declaration in source and simply is not registered, so stamping it registers what the programmer wrote rather than inventing a synthetic module; Rust binds `extern crate foo as bar` as a real nameable item. Unblocks: codegen's `resolve_global`/`resolve_global_in_namespace`/`resolve_global_by_qualified` lane and its five-step spelling ladder (`symbol_resolver.cryo`, `resolve_global`), which exists because the alias has no stamp, and `lookup_callee_function_type`'s `bare_sym` door (`call_resolver.cryo`), the C import's wholesale `alias::name` key space. SCOPING before building (not gating - `HANDOFF.md` §0): of those sites, which resolve the ALIAS itself and which resolve a MEMBER inside the `cit::X` key space; stamping the alias plausibly closes the first and leaves the second as a separate, smaller question | **RULED - UNBUILT** | `grep -rho -e '\.resolve_global(' -e '\.resolve_global_in_namespace(' -e '\.resolve_global_by_qualified(' compiler/src/compiler/codegen --include=*.cryo \| wc -l` → **5**; `grep -c 'lookup_func_type_exact(bare_sym)' compiler/src/compiler/sema/call_resolver.cryo` → **1** (both 0 when built) | §8.216, §9 Q2 |
 | D25 | **`(Beta for P)::make()` is Cryo's impl-qualified call form** (Jake, 2026-09-17). It reuses `for` exactly as `implement trait Beta for P` does - no new lexical territory, and none of the `<P as Beta>` parsing problem. It MUST cover the receiver case too, `(Beta for P)::go(&p)`, so E0156 has ONE rule to suggest rather than a short form that works sometimes; and it must compose inside a generic, `(Beta for T)::make()`. Motivation: a tie of STATIC trait methods (`P::make()` with `Beta::make` and `Gamma::make` both implemented for `P`) has no receiver to disambiguate it, so E0156 fires with no suggestable spelling today | **RULED - UNBUILT** | `no check` — syntax not in the tree; the project that lands it pins it, and E0156's help names the form then | §8.224, §8.229 |
@@ -186,7 +186,7 @@ three, and its row carries the count. Read each zero off its own row.
 | E0240 reachability gate | LIVE — reads the arena's leaf index since §8.193 (`sole_declarer`, the one declaration under the leaf; reachability asked of that candidate) | — | `grep -rho 'E0240' compiler/src \| wc -l` → **9**; `grep -rho 'sole_declarer' compiler/src --include=*.cryo \| wc -l` → **2** | §8.2ad, §8.2ae, §8.193 |
 | the `TypeArena` as a name-keyed store (29 methods under the rule: `lookup_by_name`, the reverse maps `get_qualified_name`/`template_key_of`, the leaf index `sole_declarer`/`leaf_declarers`, the display formatters returning `string`, the creators `create_struct(qualified_name, module)`… and the spec-name writers `reserve_spec_names`/`swap_wrapper_to_concrete`/`add_name_alias`) | **PINNED** (§8.241) — 76 reads / 46 writes outside `arena.cryo` (75 at §8.241; +1 in §8.242, the registry's `trait_decl_of` naming a trait type - `get_qualified_name` had no `Trait` arm before it, so a trait's name could not be asked back at all: 0 callers ever asked, measured); the written-name READ, `lookup_by_name`, is deleted since §8.247 (2 callers at §8.241, the resolver's 2c fallback and TemplateRegistration's base type, both by a canonical key the index answers); the leaf-index reads (3, `type_resolution.cryo`) explain a name the name layer already declined and resolve nothing; 32 of the reads are display text; the writes are the declaration half - a type keyed at creation by the name its declaration minted (23 of them `create_generic_param`) | — | `grep -A1 '^[[]ARENA_READ]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **76**; `grep -A1 '^[[]ARENA_WRITE]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **46** | §8.192, §8.241 |
 | the `GenericRegistry` as a name-keyed store (23 methods: templates by qualified name, inherent impl blocks and owners, trait declarations by identity, trait-impl heads by `(trait identity, target key)`, the well-known claims, `find_trait_defining_method` by bare method name) | **PINNED** (§8.241) — 67 reads / 19 writes outside `generic_registry.cryo`, the store no row enumerated before (audit 12: 22 methods, 87 sites). Keys are canonical strings derived from stamps - a registered type's qualified name, a trait's identity, a target key - so the surface is bucket B, not spelling, at every site but one: `find_trait_defining_method(method_name)` scans every trait for the first declaring a method of that BARE name, async or not, and is a HINT with one reader, sema's "defined on trait Y" note. Its second reader - the async lowering's receiver-refresh decision - reads the trait off the projection's `owning_trait` since §8.242 (`trait_decl_of(TypeRef)`, by identity): the scan answered `Read` for `AtmRead::read` and `GfTick` for `GenTick::tick` in the unit binary (4 of 11 sites; examples 28 of 28 agreed), and the refresh was dropped there - unobservably, since a carried receiver's storage never moves between polls (§8.242's mutation: every generic-receiver refresh dropped, 142 async unit tests + 17 negative + 3 projects PASS) | — | `grep -A1 '^[[]REGISTRY_READ]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **66** (67 until §8.245: sema's template question by `template_of`); `grep -A1 '^[[]REGISTRY_WRITE]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **19**; `grep -rho 'find_trait_defining_method(' compiler/src --include=*.cryo \| wc -l` → **2** (the definition, the hint); `grep -c 'trait_decl_of(' compiler/src/compiler/sema/async_lower.cryo` → **1**; `grep -c 'TypeKind::Trait => ' compiler/src/compiler/types/arena.cryo` → **1** (`get_qualified_name` names a trait) | §8.233, §8.241, §8.242 |
-| the `ModuleGraph` as a name-keyed store (6 methods: a module by namespace `find_module_index`, by path `find_module_by_path`, `reexport_closure`, `source_file_for_owner_key`, `ns_sym_of_file`, a static path comparison) | **PINNED** (§8.241) — 32 reads / 0 writes outside `module_graph.cryo`. A module IS named: an import path is a module name by the language's definition, and `find_module_index` (11) answers the loader, the resolver's import binding and two diagnostics; 12 are by filesystem path | — | `grep -A1 '^[[]GRAPH_READ]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **32**; `grep -A1 '^[[]GRAPH_WRITE]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **0** | §8.241 |
+| the `ModuleGraph` as a name-keyed store (6 methods: a module by namespace `find_module_index`, by path `find_module_by_path`, `reexport_closure`, `source_file_for_owner_key`, `ns_sym_of_file`, a static path comparison) | **PINNED** (§8.241) — 31 reads / 0 writes outside `module_graph.cryo` (32 at §8.241; -1 in §8.250, sema's E0202 declarers note, which asked the graph by name for each function key's parent, deleted with the report's move; the name layer's note walks the graph's modules by index). A module IS named: an import path is a module name by the language's definition, and `find_module_index` (10) answers the loader, the resolver's import binding and one diagnostic; 12 are by filesystem path | — | `grep -A1 '^[[]GRAPH_READ]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **31**; `grep -A1 '^[[]GRAPH_WRITE]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **0** | §8.241 |
 | the `ConstantTable` as a name-keyed store (`register`/`register_enum` under a qualified name; two static key helpers) | **PINNED** (§8.241) — 2 writes, both from `name_resolution.cryo` at the declaration (the pass that just walked to it); 3 static reads; every value read goes by stamp through `ConstEval::stamped_index_of`. Audit 12 wrote `ConstTable 0`: a zero over the wrong population - the type is `ConstantTable` | — | `grep -A1 '^[[]CONST_WRITE]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **2**; `grep -A1 '^[[]CONST_READ]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **3** | §8.241 |
 | the context's other members under the same rule (`InternTable` 4 methods, `Resolver` 33, `TypeResolver` 11, `Monomorphizer` 7, `MonoState` 5, `TypeChecker` 3, `ModuleLoader` 24, `PhaseArtifacts` 1, `DirectiveRegistry` 3) | **MEASURED, NOT STORES** (§8.241) — the intern table is the string boundary itself; the resolver's asks from outside its pass are `REENTRY` (10; 12 at §8.241, the two by-spelling asks type resolution made of the cursor's scope deleted in §8.244); the type resolver holds pointers to the stores and no table (its 18 external sites re-resolve an annotation, the `HOME_WRITE` neighbourhood); the mono pair key spec bookkeeping by mangled symbol through `this.state` only; the checker takes an operator spelling; the loader and the artifacts are keyed by path; the directive registry by directive kind | — | `grep -A1 '^[[]REENTRY]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **10** | §8.241 |
 
@@ -585,6 +585,12 @@ here; it is not a stylistic choice.
 > * **`SourceLoc(File | Line)`** is the value-lane counterpart of `PrimTy`:
 >   the answer for a bare `FILE` or `LINE` that no scope binds, a builtin
 >   the compiler expands at the reference (§8.249).
+> * **`Err` poisons downstream in fact, not only in intent, since §8.250**:
+>   the driver runs every analysis phase over a tree the name layer
+>   refused and stops before the first pass that builds from it, so an
+>   `Err` reaches type resolution and sema, which read it and report
+>   nothing further.  A bare identifier no rib binds is `Err` from the
+>   name layer with E0201/E0202 reported there.
 >
 > Check: `grep -c 'TypeRelative(ResBase, u32)' compiler/src/compiler/resolver/res.cryo`
 > → **1**; `grep -c 'SourceLoc(SourceLoc);' compiler/src/compiler/resolver/res.cryo`
@@ -15595,6 +15601,202 @@ Outside the ledger: `resolver/res.cryo`, `resolver/name_resolution.cryo`,
 
 **Tally: 89 shadowed, 89 old paths deleted, 89 at zero; 166 artifacts
 gone** (+2 artifacts: sema's and codegen's spelling tests).
+
+---
+
+### 8.250 An unbound bare identifier is refused where it is written: the name layer reports E0202 for a call's callee and E0201 for a value - with the owners of the leaf, the parse note and a did-you-mean over what the writer can see - and stamps `Err`; three bindings the name layer was missing on green programs are declared (the receiver of an instance method, 338,541 uses of `this`; a nested pattern's bindings, 5; a refused import's name, as a `Refused` symbol answered `Err`, 2); sema's two reports become `require` doors with a residual for a name bound to something that is not a value; and, ruled by Jake this session, the driver runs every analysis phase over a tree the name layer refused - stopping only after a later phase's own errors, and before the first pass that builds from the tree - so a program's name errors and its sema errors are reported together, which three `Err`-honouring fixes and one poison make cascade-free over 194 negatives and 64 projects - 2026-09-18
+
+> **Status:** LANDED.  `resolver/name_resolution.cryo` (`refuse_unbound_name`
+> and its three collectors; `receiver_of`, `callee_ident`; the nested
+> pattern descent; the two import refusals bind `Refused`),
+> `resolver/symbol.cryo` (`SymbolKind::Refused`, `Symbol::refused`),
+> `resolver/resolver.cryo` (`declare_refused`; `res_for_head` answers
+> `Err` for it), `resolver/namespace_kind.cryo` (every namespace accepts
+> it), `sema/sema.cryo` (the E0201 door and residual; a parameter whose
+> annotation failed is bound with NO type; an untyped local is silent),
+> `sema/call_resolver.cryo` (the E0202 door and residual; a refused scope
+> path is silent), `sema/diagnostics.cryo` and `decl_index.cryo` (the
+> three did-you-mean collectors and the `callable_names` population they
+> read are deleted), `diag/diagnostic.cryo` (`Diagnostic::did_you_mean`,
+> one home for three copies), `passes/type_resolution.cryo` (an
+> annotation the name layer refused is not reported again),
+> `passes/pass_registry.cryo` and `passes/pass_id.cryo` (`run_all`
+> continues past a reported failure and stops before a pass whose stage
+> `builds_from_tree`; NameResolution is not fatal), `instance.cryo` (each
+> analysis phase completes over every module and stops after if it
+> emitted).  `lane-check` `GRAPH_READ` 32 → 31 (the deleted collector's
+> `find_module_index`; the name layer asks the graph by index), re-pinned.
+
+#### The move
+
+```cryo
+cf_does_not_exist(1);        // before: Pending from the name layer, E0202 from sema
+                             // after:  E0202 from the name layer, stamped Err
+return cf_missing;           // E0201 the same way
+```
+
+`visit(IdentifierNode*)`'s unbound arm was a comment saying a later stage
+would answer; nothing could - the writing scope is the only place the
+answer is knowable - and sema reported the name after every lookup of its
+own had failed.  Now `refuse_unbound_name` reports it: E0202 when the
+enclosing call's visit marked the identifier as its callee (`callee_ident`,
+set for the callee's own visit and cleared for the arguments), E0201
+otherwise.  E0202 carries the parse note (`generic_angle_guessed`), the
+owners of the leaf (`module_declarers_of_leaf`: every module whose scope
+declares a function or intrinsic under it - byte-identical to sema's note
+on the three allocator leaves) or, failing those, a did-you-mean over the
+functions the writer can see by a bare name (`visible_function_names`,
+the rib chain's own functions and its imports followed to a function);
+E0201 a did-you-mean over the locals and parameters of the enclosing
+function (`visible_local_names`).  Sema's collectors go with the move:
+`collect_bare_callable_names` read `callable_names`, which held only
+qualified keys and was filtered to bare ones, so it was empty by
+construction - the known "E0202 did-you-mean's empty population", which
+dissolves rather than being fixed; the population is now the visible one.
+
+Sema's two reports are `require` doors: a `Pending` slot records a bug
+and returns `Err`; `Err` returns silently; anything else bound to nothing
+callable or valued is the residual E0201/E0202, without the notes that
+only an unbound name earns.
+
+#### What the probe found the name layer was not binding
+
+Probe (`scripts/ns-migration/8.249/probe_unbound.py`; every miss of the
+lookup, every found-but-Pending member, every sema report) over
+`corpus2.sh X2p` (`.objcmp/X2p-lines.txt`, 338,564 lines): `NL-MEMBER` 0,
+`SEMA-E0201` 2 and `SEMA-E0202` 6 (the 8 sites, all refused programs),
+`NL-UNBOUND` 338,556 = **`this` 338,541** + 15 others.  Seven of the 15
+were unbound on GREEN programs, the population a refusal would break:
+
+* `this`: the parser writes the receiver as a parameter spelled `&this`,
+  which no use spells, and the name layer declared nothing for it.  An
+  instance method's function now declares a parameter `this` at its own
+  rib (`receiver_of`, set by the `MethodNode` visit and by the trait's
+  method loop from the function's own `is_static`, skipped when a
+  by-value `this` parameter is written); a static method or a free
+  function binds nothing and refuses it as any name.  Control
+  (`scripts/ns-migration/8.249/shadow_u2.py --mutate`, the declaration
+  removed): a two-method scratch struct, `aborting due to 500 errors`,
+  every one `cannot find value `this``.
+* nested pattern bindings (`Some(Some(n))`: `n` at `nested_patterns.cryo`
+  30 and 49, `v` in `nested_generic_instantiation_arg`, `k` and `q` in
+  the compiler's own `ir_generator.cryo` and `async_lower.cryo`):
+  `visit(EnumPatternNode*)` declared the leaf bindings and never
+  descended into a `Sub` element.  It walks them now, so a nested
+  identifier is declared - or reclassified as a constant - by the one
+  rule.  Control (the descent removed): `E0201 cannot find value `n`` at
+  30:45 and 49:44.
+* a refused import's name (`hidden`, `llabs` in `visibility_import_gate`,
+  E0353 at the import): nothing was bound, so a use would have been a
+  second report.  Both refusals now bind `SymbolKind::Refused` (Rust's
+  dummy `Res::Err` binding): every namespace accepts it, `res_for_head`,
+  `bare_name_res`, `type_spelling_res` and the scope segment's stamp
+  answer `Err` through it, and the import's diagnostic is the report.
+  Control (the binding removed): E0353 ×2 then `E0201 cannot find value
+  `hidden`` and ``llabs``; with it, `aborting due to 2 errors`.
+
+#### The driver, and why it moved
+
+The reporting move alone broke two projects: `visibility_gate` and
+`visibility_value_gate` each put a sema-stage door (E0353 on a qualified
+call to a private function) beside bare-name doors in ONE program, and
+the driver stopped at the first PHASE with errors (`run_all` returned
+`!has_errors()`, every phase function returned false on it), so with
+E0201/E0202 the name layer's, sema never ran and E0353 never printed
+(`.objcmp/X2s-test.log`: `output missing "error[E0353]"` twice).  Making
+the pass non-fatal changed nothing (`.objcmp/x2nf-test.log`, the same
+two): every later phase read the global sink.
+
+Jake ruled for the Rust-faithful answer over splitting the projects:
+analysis continues past resolution errors, with `Err` poisoning
+downstream, which is what §6.1 has said `Err` is for and what no driver
+had exercised.  Two variants were measured:
+
+* **Full continuation** (`run_all` stops only before a `builds_from_tree`
+  stage; `.objcmp/x3-test.log`): 1 negative and 3 projects changed.
+  `E0154_ambiguous_bare_type_annotation` gained an unannotated E0203 -
+  type resolution reporting an annotation the name layer had stamped
+  `Err` - and `plural_leaf_gate`, `reexport_plural_function` and
+  `namespace_gate` gained their SECOND module's or phase's real errors,
+  which their goldens had pinned away (`aborting due to 1 error`; an
+  excluded name appearing in a neighbouring diagnostic's source context).
+* **Phase-complete continuation** (landed): the name-resolution phase's
+  errors do not stop the walk; every later analysis phase runs over every
+  module and stops AFTER it if `errors_since(phase_snap) > 0`; `run_all`
+  continues past a pass that reported and stops before Specialization,
+  CodegenPreparation, IRGeneration and Output; the single-file result is
+  `success && !has_errors()`.  `.objcmp/x3c-test.log`: 2 changed - the
+  E0154 cascade, now E0204 `no field or method `pos` on type `void``,
+  and `reexport_plural_function`'s E0233 on a scope path stamped `Err`.
+
+Three `Err`-honouring fixes and one poison take that to 0
+(`.objcmp/x3d-test.log`, then `.objcmp/x3-census2.log` on the final
+binary: `OVERALL PASS (unit: ok; compile-fail: 194 passed; projects: 64
+passed)`):
+
+1. `emit_undefined_type` returns for an annotation carrying an `Err`
+   (`annotation_refused`): reported where it was written.
+2. `resolve_scope_call` returns for a scope segment stamped `Err`.
+3. `enter_function` binds a parameter whose annotation failed to resolve
+   with NO type where it bound `void` - a valid type that every later
+   check then reported against - and `resolve_identifier` /
+   `resolve_direct_call`'s `Local` arm are silent on a bound, untyped
+   local (`is_local_or_param`): its declaration said so.
+
+The projects that pinned the phase stop are unchanged, because a
+type-resolution phase's errors still stop the walk after that phase; the
+type layer has no error answer of its own yet (`TypeRef::invalid()` is
+absence, not a `ty::Error`), which is what would let analysis continue
+past THOSE - the next boundary, and not this entry's.
+
+#### Measured
+
+Shadow (`shadow_u2.py`: a print at the name layer's refusal, at each
+sema residual, and at each door when the slot is `Pending`) over
+`corpus2.sh X3s` on the final tree (`.objcmp/X3s-lines.txt`, `lsp direct
+exit=0`, `make test exit=0`, `failing halves: 0`): **8 lines**, `NL-E0201`
+2 and `NL-E0202` 6 - the probe's 8 sema sites exactly, file:line for
+file:line - `SEMA-PENDING` **0**, `SEMA-RESIDUAL-*` **0**, with sema now
+RUNNING over every refused program in the corpus.
+
+#### Gates
+
+`make lsp-check`: `OK -- compiled 264 module(s) … 0 errors, 490
+warning(s)` (`.objcmp/x3-lsp.log`; a first build read 491, one `int`
+loop counter of this entry's, corrected); `make cross-check`: `OK … 0
+errors` (`.objcmp/x3-cross.log`); `hash-tree.sh X3` against half `X1`
+(`5e97a440`): examples **0 of 1,126**, tests **0 of 2,665** (the
+`did_you_mean` home move followed the hash and touches diagnostic
+construction alone); `make test-census`: `OK` (`.objcmp/x3-census.log`,
+`x3-census2.log`); `make lane-check` re-pinned, `lane-gate-selftest: OK
+-- baseline accepted, 17 mutations behaved`.
+
+#### Residual
+
+* D23's three refused-only arms (`find_fn_template_for_call`,
+  `lookup_callee_function_type`'s hint, `ann_canon_key`'s `Named` arm)
+  are now reachable only by an `Err`-stamped callee or an undeclared
+  impl-head argument; the first two can become doors, the third waits on
+  the type lane stamping `Err` on an undeclared type name.
+* `visible_function_names` does not walk the prelude tier; a typo of a
+  prelude function gets no suggestion.
+* The type layer's error state is absence.  Continuation past a
+  type-resolution phase's errors needs an error answer at the type layer
+  as `Err` is at the name layer; measured above as the next cascade
+  population.
+
+**New for Jake**: `SymbolKind::Refused` / `Symbol::refused` /
+`Resolver::declare_refused`; `NameResolver::refuse_unbound_name`,
+`visible_local_names`, `visible_function_names`,
+`module_declarers_of_leaf`; `Diagnostic::did_you_mean`;
+`PassStage::builds_from_tree`; `TypeResolutionPasses::annotation_refused`.
+
+Outside the ledger: the files in the status line, `tests/lane-baseline.txt`,
+`scripts/ns-migration/8.249/{probe_unbound,shadow_u2,phase_gate}.py`.
+
+**Tally: 90 shadowed, 90 old paths deleted, 90 at zero; 172 artifacts
+gone** (+6 artifacts: sema's E0201 and E0202 unbound reports, the three
+collectors, the `callable_names` population).
 
 ---
 

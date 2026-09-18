@@ -81,12 +81,24 @@ public:
     /// set while descending into its function so the list can be resolved in
     /// the parameter scope that only the function visitor opens.
     pending_base_ctor: MethodNode*;
+    /// The function whose rib binds a receiver - an instance method's, set by
+    /// the visitor that knows the method is not static - or null.
+    receiver_of: FunctionDeclNode*;
+    /// The identifier a call being visited names as its callee, while that
+    /// callee is visited: an unbound one is refused as a function that does
+    /// not exist rather than as a value.
+    callee_ident: IdentifierNode*;
+    /// The spelling of the receiver binding.
+    this_sym: SymbolStr;
 
     NameResolver(resolver: Resolver*, ctx: CompilationContext*)
         : BaseASTVisitor() {
         this.resolver = resolver;
         this.ctx      = ctx;
         this.pending_base_ctor = null;
+        this.receiver_of       = null;
+        this.callee_ident      = null;
+        this.this_sym          = resolver.intern_table.intern("this");
     }
 
     /// Extract names and spans from GenericParamNode*[] and delegate to
@@ -497,6 +509,23 @@ public:
         this.stamp_annotation(node.return_type_annotation);
         this.stamp_trait_bounds(&node.trait_bounds);
 
+        // The receiver of an instance method is a parameter of the method
+        // whether or not it was written (`&this` is written as a parameter
+        // spelled `&this`, which no use spells; a by-value `this` is a
+        // parameter spelled `this` and is already declared above).  It binds
+        // here, at the function's own rib, so `this` in the body resolves as
+        // any parameter does; in a static method or a free function it binds
+        // nowhere and is refused as any unbound name is.
+        if (this.receiver_of == node) {
+            mut written_this: boolean = false;
+            for (mut i: i64 = 0; i < node.parameters.length; i++) {
+                if (node.parameters[i].name.id == this.this_sym.id) { written_this = true; }
+            }
+            if (!written_this) {
+                this.resolver.declare_parameter(this.this_sym, node.span);
+            }
+        }
+
         // The base-constructor initializer list, if this function is the
         // constructor one was written on.  Resolved here, after the parameters
         // are declared and before the body, because that is the scope the
@@ -534,7 +563,10 @@ public:
             // because that is the one place the parameter scope is open, and
             // opening a second one would put the same names in two scopes.
             this.pending_base_ctor = node;
+            const outer_receiver: FunctionDeclNode* = this.receiver_of;
+            this.receiver_of = if (node.is_static) { null } else { node.func };
             node.func.accept(this);
+            this.receiver_of = outer_receiver;
             this.pending_base_ctor = null;
         }
     }
@@ -723,8 +755,13 @@ public:
         // it spells to be re-derived from wherever the compiler is standing at
         // instantiation time.  A method with no default has no body, and
         // `visit(FunctionDeclNode*)` already walks one only when it exists.
+        // A trait's method is its function node, so the receiver is decided
+        // here from the function's own flag.
         for (mut i: int = 0; i < node.methods.length; i++) {
+            const outer_receiver: FunctionDeclNode* = this.receiver_of;
+            this.receiver_of = if (node.methods[i].is_static) { null } else { node.methods[i] };
             node.methods[i].accept(this);
+            this.receiver_of = outer_receiver;
         }
 
         this.resolver.exit_scope();
@@ -922,6 +959,11 @@ public:
     bare_name_res(&this, sym_id: SymbolID) -> ResSlot {
         if (!sym_id.is_valid()) { return ResSlot::Pending; }
         const s: Symbol = this.resolver.get_symbol(sym_id);
+        // A refused import's binding: reported at the import, answered `Err`
+        // at every use.
+        if (s.kind == SymbolKind::Refused) {
+            return ResSlot::Answered(Res::Err);
+        }
         if (s.kind == SymbolKind::GenericParam) {
             return ResSlot::Answered(Res::GenericParam(s.name));
         }
@@ -950,6 +992,133 @@ public:
         return ResSlot::Answered(Res::Def(DefId::of_definition(this.resolver.qualified_name_of(&s))));
     }
 
+    /// The locals and parameters bound along the rib chain from the current
+    /// scope out to the enclosing function's: the candidates a did-you-mean
+    /// for a value is drawn from.  Stops at a module-level scope, which is
+    /// the function's outer edge.
+    visible_local_names(&this) -> string[] {
+        mut out: string[] = [];
+        mut scope_id: ScopeID = this.resolver.current_scope;
+        while (scope_id.is_valid()) {
+            const scope: Scope* = this.resolver.get_scope(scope_id);
+            if (scope.kind.is_module_level()) { break; }
+            for (mut i: i64 = 0; i < scope.symbols.length; i++) {
+                const s: Symbol = this.resolver.get_symbol(scope.symbols[i].sym);
+                if (s.kind == SymbolKind::Variable || s.kind == SymbolKind::Parameter) {
+                    out.push(this.resolver.intern_table.resolve(s.name));
+                }
+            }
+            scope_id = scope.parent_id;
+        }
+        return out;
+    }
+
+    /// The free functions the writer's module can see by a bare name: its
+    /// own declarations and its imports that name a function, by leaf.
+    visible_function_names(&this) -> string[] {
+        mut out: string[] = [];
+        mut scope_id: ScopeID = this.resolver.current_scope;
+        while (scope_id.is_valid()) {
+            const scope: Scope* = this.resolver.get_scope(scope_id);
+            for (mut i: i64 = 0; i < scope.symbols.length; i++) {
+                mut s: Symbol = this.resolver.get_symbol(scope.symbols[i].sym);
+                if (s.kind == SymbolKind::Import && s.source_module != "") {
+                    const decl: SymbolID = this.resolver.lookup_in_module(
+                        this.resolver.intern_table.intern(s.source_module), s.name);
+                    if (decl.is_valid()) { s = this.resolver.get_symbol(decl); }
+                }
+                if (s.kind == SymbolKind::Function || s.kind == SymbolKind::Intrinsic) {
+                    out.push(this.resolver.intern_table.resolve(s.name));
+                }
+            }
+            scope_id = scope.parent_id;
+        }
+        return out;
+    }
+
+    /// The modules that declare a free function under the leaf `name`, as
+    /// the canonical names of those declarations - public or private, since
+    /// the note names the owner the writer has to spell, and whether the
+    /// owner then admits the writer is the visibility gate's answer.
+    module_declarers_of_leaf(&this, name: SymbolStr) -> string[] {
+        mut out: string[] = [];
+        if (this.ctx.module_graph == null) { return out; }
+        const count: i64 = this.ctx.module_graph.module_count() as i64;
+        for (mut m: i64 = 0; m < count; m++) {
+            const info: ModuleInfo* = this.ctx.module_graph.get_module(m);
+            const sid: u64 = this.resolver.find_module_scope(info.name);
+            if (sid == 0) { continue; }
+            const scope: Scope* = this.resolver.get_scope(ScopeID { id: sid });
+            const found: SymbolID = scope.find(name);
+            if (!found.is_valid()) { continue; }
+            const s: Symbol = this.resolver.get_symbol(found);
+            if (s.kind != SymbolKind::Function && s.kind != SymbolKind::Intrinsic) { continue; }
+            out.push(this.resolver.intern_table.resolve(this.resolver.qualified_name_of(&s)));
+        }
+        return out;
+    }
+
+    /// Refuse a bare identifier no rib binds: E0202 when a call names it as
+    /// its callee, E0201 otherwise, with the help a writer needs - the
+    /// modules that do declare the leaf, or the nearest name in scope - and
+    /// stamp `Err`, so the report is made once, here, where the name was
+    /// written.
+    refuse_unbound_name(&this, node: IdentifierNode*) -> void {
+        const name: string = this.resolver.intern_table.resolve(node.name);
+        const as_callee: boolean = this.callee_ident == node;
+        mut d: Diagnostic = if (as_callee) {
+            Diagnostic::error(ErrorCode::E0202_UNDEFINED_FUNCTION,
+                fmt::format("cannot find function `%s` in this scope", name))
+        } else {
+            Diagnostic::error(ErrorCode::E0201_UNDEFINED_VARIABLE,
+                fmt::format("cannot find value `%s` in this scope", name))
+        };
+        d = d.at_with_label(node.span, "not found in this scope");
+        if (as_callee) {
+            // The call may not be a call at all: `f(a < b, c > (d))` reads
+            // as the generic call `a<b, c>(d)` under the same grammar, and
+            // that reading is what produced this lookup.  Say so, because the
+            // reader is otherwise sent looking for a function they never
+            // wrote.
+            if (node.generic_angle_guessed) {
+                d = d.with_note(fmt::format(
+                    "`<` after `%s` was read as the start of generic type arguments; if a comparison was meant, parenthesise the operands - `(x < y)`",
+                    name));
+            }
+            // A leaf some other module declares - `free` in `std::ffi::libc`,
+            // `std::alloc::heap`, `std::core::intrinsics` - is not a typo of
+            // a name in scope; it is a name the writer has to say the owner
+            // of.
+            const declarers: string[] = this.module_declarers_of_leaf(node.name);
+            if (declarers.length > 0) {
+                mut spellings: string = "";
+                for (mut i: i64 = 0; i < declarers.length; i++) {
+                    const parent: string = QualifiedName::parent_of(declarers[i]);
+                    const spelled: string = QualifiedName::leaf_of(parent) + "::" + name;
+                    if (i > 0) {
+                        if (i + 1 == declarers.length) { spellings = spellings + " or "; }
+                        else                            { spellings = spellings + ", "; }
+                    }
+                    spellings = spellings + "`" + spelled + "`";
+                }
+                mut declared_in: string = "";
+                for (mut i: i64 = 0; i < declarers.length; i++) {
+                    if (i > 0) { declared_in = declared_in + ", "; }
+                    declared_in = declared_in + "`" + QualifiedName::parent_of(declarers[i]) + "`";
+                }
+                d = d.with_note(fmt::format(
+                    "a bare name means a declaration in this module; `%s` is declared in %s - write %s, or import it",
+                    name, declared_in, spellings));
+            } else {
+                d = d.did_you_mean(name, this.visible_function_names(), "function", node.span);
+            }
+        } else {
+            d = d.did_you_mean(name, this.visible_local_names(), "local", node.span);
+        }
+        this.ctx.emit_diagnostic(d);
+        node.set_res(Res::Err);
+    }
+
     override visit(node: IdentifierNode*) -> void {
         mut sym_id: SymbolID = this.resolver.lookup(
             node.name, this.resolver.current_scope);
@@ -966,9 +1135,15 @@ public:
                 }
                 Option::None => { }
             }
-            LOG_DEBUG(LogComponent::General, "[NameResolver] Identifier '%s' not found in scope", this.resolver.intern_table.resolve(node.name));
-            // No error here; could be a built-in type or forward reference
-            // that will be resolved by TypeResolution
+            // No rib binds the name, the prelude included, and nothing
+            // later in the pipeline can: this scope is the one the name was
+            // written in, and it is the only place the answer is knowable.
+            // Refused here, as the name that does not exist that it is - a
+            // function when a call names it, a value otherwise - and stamped
+            // `Err` so no later stage reports it again or guesses at it.
+            this.refuse_unbound_name(node);
+            this.stamp_annotation_list(&node.generic_args);
+            return;
         }
         if (sym_id.is_valid()) {
             this.resolver.record_resolution(node.span, sym_id);
@@ -1202,6 +1377,12 @@ public:
             const bound: Symbol = this.resolver.get_symbol(scope_sym);
             if (bound.kind == SymbolKind::GenericParam || this.symbol_names_type(&bound)) {
                 node.set_scope_res(Res::TypeRelative(base, trailing));
+                return;
+            }
+            // A refused import in the scope position owns nothing; its
+            // import is the report.
+            if (bound.kind == SymbolKind::Refused) {
+                node.set_scope_res(Res::Err);
                 return;
             }
         }
@@ -1478,6 +1659,11 @@ public:
             if (sym.kind == SymbolKind::GenericParam) {
                 return ResSlot::Answered(Res::GenericParam(name));
             }
+            // A refused import bound the spelling to nothing; the import's
+            // diagnostic is the report.
+            if (sym.kind == SymbolKind::Refused) {
+                return ResSlot::Answered(Res::Err);
+            }
         }
 
         // A path's meaning turns on its first segment: that one resolves in
@@ -1652,10 +1838,17 @@ public:
     }
 
     override visit(node: CallExprNode*) -> void {
-        // Visit the callee expression (resolves the function name)
-        node.callee.accept(this);
-
         const callee_node: ASTNode* = node.callee as ASTNode*;
+        // A bare callee is visited as the callee it is, so one that binds to
+        // nothing is refused as a function rather than as a value.  Set for
+        // the callee's own visit only: an argument is not a callee.
+        const outer_callee: IdentifierNode* = this.callee_ident;
+        if (callee_node.kind == NodeKind::Identifier) {
+            this.callee_ident = node.callee as IdentifierNode*;
+        }
+        node.callee.accept(this);
+        this.callee_ident = outer_callee;
+
         // If callee is an identifier, also collect overloads
         if (callee_node.kind == NodeKind::Identifier) {
             const id_node: IdentifierNode* = node.callee as IdentifierNode*;
@@ -2067,11 +2260,18 @@ public:
             _                    => { }
         }
 
-        // Declare each binding variable
+        // Declare each binding variable.  A nested pattern (`Some(Some(n))`)
+        // binds in the same arm scope and is walked as a pattern of its own,
+        // so its identifier is declared - or reclassified as a constant - by
+        // the one rule above.
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             const pb: PatternBinding* = node.binding_at(i);
-            if (pb == null) { continue; }
-            this.resolver.declare_variable(pb.name, pb.span, false, false);
+            if (pb != null) {
+                this.resolver.declare_variable(pb.name, pb.span, false, false);
+                continue;
+            }
+            const sub: PatternNode* = node.sub_at(i);
+            if (sub != null) { sub.accept(this); }
         }
     }
 
@@ -2498,6 +2698,10 @@ public:
                             this.resolver.intern_table.resolve(this.ctx.current_module_ns())));
                     d = d.at_with_label(node.span, "private declaration named by this import");
                     this.ctx.emit_diagnostic(d);
+                    // The name is bound to nothing, HERE: a use of it is then
+                    // `Err` with this as its report, not a second diagnostic
+                    // saying the name does not exist.
+                    this.resolver.declare_refused(name, node.span);
                 } else if (node.is_export
                            && this.resolver.private_declaration(module_sym, name).is_valid()) {
                     // An `export` naming a private declaration is E0241,
@@ -2515,6 +2719,7 @@ public:
                         // import is where the name is written, and what the
                         // module DOES offer is what a writer needs to fix it.
                         this.refuse_unoffered_import(node, module_sym, resolved_module, name_str);
+                        this.resolver.declare_refused(name, node.span);
                         continue;
                     }
                     // Import all public exports from the resolved sub-module.

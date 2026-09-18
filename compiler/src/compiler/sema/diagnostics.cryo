@@ -80,63 +80,6 @@ type struct Diagnostics {
     // Each walks one symbol table and returns bare (non-`::`) names to feed
     // `find_best_candidate` from a typo diagnostic.
 
-    /// Locals in the current function's scope (E0201 did-you-mean).
-    collect_local_names(&this) -> string[] {
-        mut out: string[] = [];
-        mut it: HashMapIter<u32, TypeRef> = this.state.locals.iter();
-        loop {
-            match (it.next()) {
-                Option::Some(pair) => {
-                    const s: string = this.intern.resolve(SymbolStr::from_id(pair.first));
-                    if (s != "" && !s.contains("::")) { out.push(s); }
-                }
-                Option::None => { break; }
-            }
-        }
-        return out;
-    }
-
-    /// Every bare function name in the DeclarationIndex (E0202 did-you-mean).
-    collect_bare_callable_names(&this) -> string[] {
-        mut out: string[] = [];
-        const idx: DeclarationIndex* = this.ctx.decl_index;
-        for (mut i: i64 = 0; i < idx.callable_names.length; i++) {
-            const name: string = this.intern.resolve(SymbolStr::from_id(idx.callable_names[i]));
-            if (name == "")                 { continue; }
-            if (name.contains("::")) { continue; }
-            out.push(name);
-        }
-        return out;
-    }
-
-    /// The modules declaring a free function under the leaf `name`, as the
-    /// qualified names of those declarations (E0202's "declared elsewhere"
-    /// note).  A bare name means a declaration in the writing module, so a
-    /// leaf declared only elsewhere - `free` in `std::ffi::libc`,
-    /// `std::alloc::heap` and `std::core::intrinsics` - is named for the
-    /// writer to qualify or import.  A type's static shares the key shape
-    /// (`Owner::method`) and is not a free function: only a key whose
-    /// parent is a module in the graph is kept.
-    collect_module_declarers_of_leaf(&this, name: SymbolStr) -> string[] {
-        mut out: string[] = [];
-        const idx: DeclarationIndex* = this.ctx.decl_index;
-        if (this.ctx.module_graph == null) { return out; }
-        const leaf: string = this.intern.resolve(name);
-        for (mut i: i64 = 0; i < idx.overload_func_keys.length; i++) {
-            const key: string = this.intern.resolve(SymbolStr::from_id(idx.overload_func_keys[i]));
-            if (!key.contains("::")) { continue; }
-            if (!QualifiedName::leaf_of(key).eq(leaf)) { continue; }
-            const parent: string = QualifiedName::parent_of(key);
-            if (this.ctx.module_graph.find_module_index(this.intern.intern(parent)) < 0) { continue; }
-            mut seen: boolean = false;
-            for (mut j: i64 = 0; j < out.length; j++) {
-                if (out[j].eq(key)) { seen = true; break; }
-            }
-            if (!seen) { out.push(key); }
-        }
-        return out;
-    }
-
     /// Field + method names on a struct/class (E0204 did-you-mean).  Walks past
     /// pointer/reference/instantiation wrappers like the member-access resolver.
     collect_struct_or_class_member_names(&this, obj_type: TypeRef) -> string[] {
@@ -179,21 +122,6 @@ type struct Diagnostics {
             }
             _ => {}
         }
-        return out;
-    }
-
-    /// Build a `did you mean `<best>`?` help + machine-applicable suggestion, or
-    /// return the diagnostic unchanged when no candidate clears the threshold
-    /// (so callers can chain unconditionally).  `kind` is the help-text noun.
-    attach_did_you_mean(&this, diag: Diagnostic, name: string,
-                        candidates: string[], kind: string,
-                        span: SourceSpan) -> Diagnostic {
-        const best: string = find_best_candidate(name, candidates);
-        if (best == "") { return diag; }
-        mut out: Diagnostic = diag.help(
-            fmt::format("a %s with a similar name exists: `%s`", kind, best));
-        out = out.suggest(Suggestion::machine_applicable(span, best,
-            fmt::format("did you mean `%s`?", best)));
         return out;
     }
 

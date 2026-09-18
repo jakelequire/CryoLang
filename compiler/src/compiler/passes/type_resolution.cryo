@@ -446,6 +446,44 @@ type struct TypeResolutionRunner {
         }
     }
 
+    /// Whether a written name anywhere in `ann` was refused by the name
+    /// layer (`Err`): reported once, where it was written, so an annotation
+    /// that fails to resolve because of it is not reported again.
+    annotation_refused(&this, ann: TypeAnnotation*) -> boolean {
+        if (ann == null) { return false; }
+        match (ann) {
+            TypeAnnotation::Named(n) => {
+                return match (n.res) {
+                    ResSlot::Answered(Res::Err) => { true }
+                    _                           => { false }
+                };
+            }
+            TypeAnnotation::Pointer(p)   => { return this.annotation_refused(p.inner); }
+            TypeAnnotation::Reference(r) => { return this.annotation_refused(r.inner); }
+            TypeAnnotation::Array(a)     => { return this.annotation_refused(a.element); }
+            TypeAnnotation::Tuple(t) => {
+                for (mut i: i64 = 0; i < t.elements.length; i++) {
+                    if (this.annotation_refused(t.elements[i])) { return true; }
+                }
+                return false;
+            }
+            TypeAnnotation::Function(f) => {
+                for (mut i: i64 = 0; i < f.parameters.length; i++) {
+                    if (this.annotation_refused(f.parameters[i])) { return true; }
+                }
+                return this.annotation_refused(f.return_type);
+            }
+            TypeAnnotation::Generic(g) => {
+                if (this.annotation_refused(g.base)) { return true; }
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    if (this.annotation_refused(g.args[i])) { return true; }
+                }
+                return false;
+            }
+            _ => { return false; }
+        }
+    }
+
     /// Every bare type leaf name in the type arena's leaf index.  The
     /// candidate pool for the did-you-mean suggestion on undefined types.
     ///
@@ -588,6 +626,11 @@ type struct TypeResolutionRunner {
                         kind_label: string, noun: string, decl_name: string,
                         fallback_span: SourceSpan, defines: string) -> void {
         const intern: InternTable* = this.ctx.get_intern_table();
+
+        // A name the name layer refused is `Err`: its report was made where
+        // it was written, and the annotation failing to resolve is that
+        // refusal's consequence, not a second finding.
+        if (this.annotation_refused(ann)) { return; }
 
         // THE GATE (spec §3.3).  A name that EXISTS but that the writing module
         // cannot reach is a different condition from one that exists nowhere,
