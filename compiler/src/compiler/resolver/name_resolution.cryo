@@ -1558,7 +1558,7 @@ public:
                     // construction.
                     const q_sid: u64 = this.resolver.find_module_scope(q_ns);
                     if (q_sid != 0) {
-                        const alias_slot: ResSlot = this.leaf_in_module_scope(q_sid, name);
+                        const alias_slot: ResSlot = this.leaf_in_module_scope(q_sid, name, span);
                         if (!alias_slot.is_pending()) { return alias_slot; }
                     }
                 }
@@ -1582,7 +1582,7 @@ public:
         if (home_sid == 0) {
             return ResSlot::Pending;
         }
-        return this.leaf_in_module_scope(home_sid, name);
+        return this.leaf_in_module_scope(home_sid, name, span);
     }
 
     /// A bare leaf resolved in a MODULE's scope - that module's declarations,
@@ -1592,15 +1592,38 @@ public:
     /// definition or nothing; nothing is `Pending`, because recording an
     /// answer this pass cannot produce is how a tool limitation becomes a
     /// claim.
-    leaf_in_module_scope(&this, module_scope: u64, name: SymbolStr) -> ResSlot {
+    ///
+    /// A leaf two imports of that scope tie for is refused HERE, where the
+    /// name is written (E0154, as the identifier lane refuses it), and
+    /// stamped `Err` so the type layer stays silent about it: `resolve_path`
+    /// answered nothing for it, and the not-found the type layer would
+    /// report is false - the name is found twice.  The tie is asked of the
+    /// scope the name was written in, never of the cursor.
+    leaf_in_module_scope(&this, module_scope: u64, name: SymbolStr,
+                         span: SourceSpan) -> ResSlot {
         mut segs: SymbolStr[] = [];
         segs.push(name);
-        const r: Res = this.resolver.resolve_path(
-            &segs, Namespace::Type, ScopeID { id: module_scope });
-        return match (r) {
-            Res::Def(_) => { ResSlot::Answered(r) }
-            _           => { ResSlot::Pending }
-        };
+        const scope: ScopeID = ScopeID { id: module_scope };
+        const r: Res = this.resolver.resolve_path(&segs, Namespace::Type, scope);
+        match (r) {
+            Res::Def(_) => { return ResSlot::Answered(r); }
+            _           => { }
+        }
+        const mods: SymbolStr[] = this.resolver.ambiguous_modules_from(scope, name);
+        if (mods.length < 2) { return ResSlot::Pending; }
+        const leaf: string = this.resolver.intern_table.resolve(name);
+        const a: string = this.resolver.intern_table.resolve(mods[0]);
+        const b: string = this.resolver.intern_table.resolve(mods[1]);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0154_AMBIGUOUS_CALL,
+            fmt::format("`%s` is ambiguous: it is imported from both `%s` and `%s`",
+                leaf, a, b));
+        d = d.at_with_label(span, "ambiguous type name");
+        d = d.with_note(fmt::format(
+            "write the path out to say which one is meant, `%s::%s` or `%s::%s`",
+            a, leaf, b, leaf));
+        this.ctx.emit_diagnostic(d);
+        return ResSlot::Answered(Res::Err);
     }
 
     /// Record what one annotation's written name refers to.

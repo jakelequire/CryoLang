@@ -355,7 +355,15 @@ type struct Resolver {
     /// Get the conflicting module paths for an ambiguous name.
     /// Returns two interned SymbolStr values: [module_a, module_b].
     get_ambiguous_modules(&this, name: SymbolStr) -> SymbolStr[] {
-        mut scope_id: ScopeID = this.current_scope;
+        return this.ambiguous_modules_from(this.current_scope, name);
+    }
+
+    /// The two modules whose imports tie for `name`, walking outward from an
+    /// EXPLICIT scope - the one a name was written in - rather than from the
+    /// cursor, which a pass called from elsewhere may have left standing in
+    /// another module.  Empty when no rib on the chain records a tie.
+    ambiguous_modules_from(&this, start: ScopeID, name: SymbolStr) -> SymbolStr[] {
+        mut scope_id: ScopeID = start;
         while (scope_id.is_valid()) {
             const ids: u32[] = this.scopes[scope_id.id - 1].get_ambiguous_module_ids(name);
             if (ids.length >= 2) {
@@ -635,6 +643,16 @@ type struct Resolver {
             if (found.is_valid()) {
                 const sym: Symbol = this.get_symbol(found);
                 if (ns.accepts(sym.kind)) {
+                    // Two imports of one leaf from different modules bind
+                    // the name to neither (§4 rule 2: ambiguity within a
+                    // tier).  The rib keeps the first so a lookup lands
+                    // somewhere; the record of the second is what says the
+                    // first was never the answer.  The rib DID bind the
+                    // head - to nothing - so the walk stops here rather than
+                    // letting an outer tier answer a name this one holds.
+                    if (sym.kind == SymbolKind::Import && sc.is_ambiguous(head)) {
+                        return Res::Err;
+                    }
                     return this.res_for_head(&sym, trailing);
                 }
             }
