@@ -953,17 +953,12 @@ type struct CallResolver {
                 // A family pin answers through the one signature registered
                 // under the family - a family is pinned only when it has one -
                 // so the `![implicit]` conversions below run for it as for a
-                // declaration; a family registered with a return alone
-                // answers that.  A declaration pin answers through its
+                // declaration.  A declaration pin answers through its
                 // entry's own signature.
                 mut pinned_ft: TypeRef = TypeRef::invalid();
                 match (&call.resolved_callee) {
                     CalleePin::Family(fam) => {
                         pinned_ft = this.ctx.decl_index.lookup_func_type(fam);
-                        if (!pinned_ft.is_valid()) {
-                            const spec_ret: TypeRef = this.types.lookup_func_return(fam);
-                            if (spec_ret.is_valid()) { return spec_ret; }
-                        }
                     }
                     CalleePin::Decl(e) => {
                         pinned_ft = this.ctx.decl_index.entry_signature(e);
@@ -994,7 +989,7 @@ type struct CallResolver {
                     this.spelling_template(ident.res));
                 if (spec_sym.is_valid()) {
                     call.set_resolved_callee(CalleePin::Family(spec_sym));
-                    const spec_ret: TypeRef = this.types.lookup_func_return(spec_sym);
+                    const spec_ret: TypeRef = this.family_return_type(spec_sym);
                     if (spec_ret.is_valid()) { return spec_ret; }
                 }
             }
@@ -2646,6 +2641,14 @@ type struct CallResolver {
         const ft: Type* = this.arena.lookup(fn_ref.id);
         if (ft == null || ft.kind != TypeKind::Function) { return TypeRef::invalid(); }
         return (ft as FunctionType*).return_type;
+    }
+
+    /// The return type of the signature registered under the family key
+    /// `family`, or invalid when none is: the one map a family answers
+    /// from, so a family with a signature and no return, or a return and
+    /// no signature, cannot exist.
+    family_return_type(&this, family: SymbolStr) -> TypeRef {
+        return this.overload_return_type(this.types.lookup_func_type_exact(family));
     }
 
     overload_param_matches_arg(&this, param: TypeRef, arg: TypeRef) -> boolean {
@@ -4965,7 +4968,7 @@ type struct CallResolver {
         const scope_str: string = this.intern.resolve(scope.scope_name);
         const member_str: string = this.intern.resolve(scope.member_name);
         const q_sym: SymbolStr = this.ctx.intern(scope_str + "::" + member_str);
-        const ret: TypeRef = this.types.lookup_func_return(q_sym);
+        const ret: TypeRef = this.family_return_type(q_sym);
         if (ret.is_valid()) {
             scope.set_resolved_type(ret);
             this.pin_scope_callee_qsym(call, q_sym);
@@ -5012,7 +5015,7 @@ type struct CallResolver {
         // The module is settled but may not declare the member under its own
         // name, which a re-export would explain.  Not searched for elsewhere:
         // looking is what reopens the lane this function exists to keep closed.
-        if (!this.types.lookup_func_return(q).is_valid()) { return SymbolStr::empty(); }
+        if (!this.family_return_type(q).is_valid()) { return SymbolStr::empty(); }
         return q;
     }
 
@@ -5053,7 +5056,7 @@ type struct CallResolver {
                                       call: CallExprNode*, scope: ScopeResolutionNode*) -> TypeRef {
         const q_sym: SymbolStr = this.resolve_module_qualified_symbol(scope_name, member_name, scope);
         if (!q_sym.is_valid()) { return TypeRef::invalid(); }
-        const ret: TypeRef = this.types.lookup_func_return(q_sym);
+        const ret: TypeRef = this.family_return_type(q_sym);
         if (!ret.is_valid()) { return TypeRef::invalid(); }
         // DOOR 1 (spec §8.1e).  A WRITTEN qualified path resolves straight to a
         // symbol here and never meets the bare binder's scope classifier, so it
@@ -5087,7 +5090,7 @@ type struct CallResolver {
                 }
             }
             if (spec_sym.is_valid()) {
-                const spec_ret: TypeRef = this.types.lookup_func_return(spec_sym);
+                const spec_ret: TypeRef = this.family_return_type(spec_sym);
                 if (spec_ret.is_valid()) { call.set_resolved_callee(CalleePin::Family(spec_sym)); return spec_ret; }
             }
             const no_turbofish: boolean =

@@ -58,9 +58,10 @@ THREE RULES, EACH DERIVED FROM A DEFINITION, NONE FROM A LIST OF NAMES.
 
 The calls are SPLIT BY THE STORE that answers them and by READ vs WRITE:
 
-  * LOOKUP -- answered by the `DeclarationIndex` under one of the five
-    per-kind names mechanism 5 gives (`lookup_type`, `lookup_func_return`,
-    `lookup_func_type`, `lookup_global`, `lookup_method_return`).  This is
+  * LOOKUP -- answered by the `DeclarationIndex` under one of the four
+    per-kind names mechanism 5 gives (`lookup_type`, `lookup_func_type`,
+    `lookup_global`, `lookup_method_return`; `lookup_func_return` read a
+    second map written in lockstep with the signature's and is deleted).  This is
     the lane surface, and the only one of the rows that should fall.
   * LOOKUP_OTHER -- answered by the `DeclarationIndex` under any OTHER
     name-crossing method that READS (`&this`, or a static): the registry's
@@ -78,7 +79,7 @@ The calls are SPLIT BY THE STORE that answers them and by READ vs WRITE:
     method that type declares.  Already at the destination, so it RISES as
     LOOKUP falls and is not a target; it is pinned because a new wrapper is
     exactly the regrowth this gate exists to catch, and a wrapper under a
-    sixth name was one the five-name rule could not see.
+    fifth name was one the four-name rule could not see.
   * LOOKUP_LOCAL -- a name from any store's set called on a receiver whose
     declared type is NOT a store: a type's OWN same-named method over its
     own symbol map or scope stack (`move_check`, `drop_insertion`, sema's
@@ -186,12 +187,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_SRC = os.path.join(ROOT, "compiler", "src")
 DEFAULT_GOLDEN = os.path.join(ROOT, "tests", "lane-baseline.txt")
 
-# The five per-kind lookups §7.2 mechanism 5 names: the LOOKUP row.  They are
+# The four per-kind lookups §7.2 mechanism 5 names: the LOOKUP row.  They are
 # the only names this gate holds as a list, and the list decides which ROW a
 # call lands in, never whether it is counted.
 LOOKUPS = (
     "lookup_type",
-    "lookup_func_return",
     "lookup_func_type",
     "lookup_global",
     "lookup_method_return",
@@ -516,7 +516,7 @@ def scan(src):
     """Return ({kind: {relpath: count}}, unplaced, {store: set}) over `src`."""
     tree = Tree(src)
     sets = {name: store_methods(tree, name, st.defn) for name, st in STORES.items()}
-    # Control on the parser: the LOOKUP row is the five names, and they are
+    # Control on the parser: the LOOKUP row is the four names, and they are
     # declared on the index.  A parser that cannot see them cannot see the
     # row it is asked to pin.
     missing = [n for n in LOOKUPS if n not in sets[INDEX_TYPE]]
@@ -614,12 +614,12 @@ HEADER = [
     "# placed by its receiver's DECLARED TYPE (this, a local's annotation, a",
     "# field's declaration), never by the receiver's spelling.",
     "#",
-    "# LOOKUP         answered by the DeclarationIndex, under one of the five",
+    "# LOOKUP         answered by the DeclarationIndex, under one of the four",
     "#                names mechanism 5 gives. The lane surface; falls.",
     "# LOOKUP_OTHER   answered by the DeclarationIndex under ANY OTHER name-",
     "#                crossing READ (entry accessors, visibility, reachability,",
     "#                the global and extern tables, a static key parser). A",
-    "#                surface pinned at five names is one a caller can leave by",
+    "#                surface pinned at four names is one a caller can leave by",
     "#                switching names - which reads as progress on the row that",
     "#                is watched.",
     "# REGISTER       a name-keyed WRITE to the DeclarationIndex: a registrar",
@@ -629,7 +629,7 @@ HEADER = [
     "#                that type declares. Already at the destination, so it",
     "#                RISES as LOOKUP falls. Pinned because a new wrapper is the",
     "#                regrowth this gate exists to catch, and one under a sixth",
-    "#                name was invisible to a five-name rule.",
+    "#                name was invisible to a four-name rule.",
     "# LOOKUP_LOCAL   a set name called on a receiver whose declared type is",
     "#                not a store: a type's OWN same-named method over its own",
     "#                symbol map or scope stack. Not a lane site; no migration",

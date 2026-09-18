@@ -35,7 +35,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GATE = os.path.join(ROOT, "scripts", "lane-gate.py")
 
 # The smallest tree the gate accepts: every store present, each with one
-# name-keyed method (the index with the five LOOKUP names, the arena with
+# name-keyed method (the index with the four LOOKUP names, the arena with
 # lookup_by_name - the parser's own controls), a context carrying them, and
 # one caller exercising one call per baseline row.
 FILES = {
@@ -44,7 +44,6 @@ type struct DeclarationIndex {
     entries: TypeRef[];
 
     lookup_type(&this, name: SymbolStr) -> TypeRef { return this.entries[0]; }
-    lookup_func_return(&this, name: SymbolStr) -> TypeRef { return this.entries[0]; }
     lookup_func_type(&this, name: SymbolStr) -> TypeRef { return this.entries[0]; }
     lookup_global(&this, name: SymbolStr) -> TypeRef { return this.entries[0]; }
     lookup_method_return(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
