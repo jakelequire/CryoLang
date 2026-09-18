@@ -271,22 +271,21 @@ type struct CallResolver {
             // imported `sleep` reached by leaf took whichever `sleep`
             // registered last - a different signature entirely, which was
             // then what expected-type propagation handed the arguments.
-            match (ident.res) {
-                ResSlot::Answered(r) => {
-                    match (r) {
-                        Res::Local(_) => {
-                            const local: TypeRef = this.scopes.lookup_local(ident.name);
-                            if (local.is_valid()) {
-                                const local_t: Type* = this.arena.lookup(local.id);
-                                if (local_t != null && local_t.kind == TypeKind::Function) { return local; }
-                            }
-                            return TypeRef::invalid();
-                        }
-                        Res::Def(_) => { return this.ctx.decl_index.func_type_of_res(r); }
-                        _           => { return TypeRef::invalid(); }
+            // Every bare callee is answered - bound, or `Err` for one the
+            // name layer refused - so a slot with no answer is a defect the
+            // door records.
+            const r: Res = ident.res.require("call_resolver:callee hint");
+            match (r) {
+                Res::Local(_) => {
+                    const local: TypeRef = this.scopes.lookup_local(ident.name);
+                    if (local.is_valid()) {
+                        const local_t: Type* = this.arena.lookup(local.id);
+                        if (local_t != null && local_t.kind == TypeKind::Function) { return local; }
                     }
+                    return TypeRef::invalid();
                 }
-                _ => { return TypeRef::invalid(); }
+                Res::Def(_) => { return this.ctx.decl_index.func_type_of_res(r); }
+                _           => { return TypeRef::invalid(); }
             }
         }
         if (n.kind == NodeKind::ScopeResolution) {
@@ -1315,10 +1314,11 @@ type struct CallResolver {
     /// would otherwise proceed on a mismatched count and return a type, and
     /// the arity diagnostic that the non-generic path reports would never run.
     find_fn_template_for_call(&this, ident: IdentifierNode*, argc: i64) -> TemplateEntry* {
-        const t: TemplateEntry* = match (ident.res) {
-            ResSlot::Answered(r) => { this.lookup_scope_template(r) }
-            _                    => { null }
-        };
+        // The name layer answers every bare callee - a binding, or `Err`
+        // for one it refused - so a slot with no answer is a defect the door
+        // records; measured at 0 over the corpus before the door went in.
+        const t: TemplateEntry* = this.lookup_scope_template(
+            ident.res.require("call_resolver:free-call template"));
         if (t == null || t.node_kind != NodeKind::FunctionDeclaration) { return null; }
         const f: FunctionDeclNode* = t.ast_node as FunctionDeclNode*;
         if (f == null || f.parameters.length != argc) { return null; }
