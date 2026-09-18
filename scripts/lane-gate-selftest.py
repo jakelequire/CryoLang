@@ -36,7 +36,7 @@ GATE = os.path.join(ROOT, "scripts", "lane-gate.py")
 
 # The smallest tree the gate accepts: every store present, each with one
 # name-keyed method (the index with the four LOOKUP names, the arena with
-# lookup_by_name - the parser's own controls), a context carrying them, and
+# get_qualified_name - the parser's own controls), a context carrying them, and
 # one caller exercising one call per baseline row.
 FILES = {
     "compiler/decl_index.cryo": """\
@@ -161,7 +161,7 @@ type struct Sema {
 # from its own set.
 BASELINE = {
     "LOOKUP": 2, "LOOKUP_OTHER": 0, "REGISTER": 0, "LOOKUP_ROUTED": 1,
-    "LOOKUP_LOCAL": 1, "LOOKUP_ARENA": 1, "ARENA_READ": 1, "ARENA_WRITE": 0,
+    "LOOKUP_LOCAL": 1, "ARENA_READ": 2, "ARENA_WRITE": 0,
     "REGISTRY_READ": 0, "REGISTRY_WRITE": 0, "GRAPH_READ": 0, "GRAPH_WRITE": 0,
     "CONST_READ": 0, "CONST_WRITE": 0, "REENTRY": 0, "HOME_WRITE": 0,
     "DEFID_MINT": 0, "DEFID_UNWRAP": 0,
@@ -218,7 +218,7 @@ MUTATIONS = [
      1, "LOOKUP TOTAL 2 -> 3"),
     ("a store reached through a zero-argument accessor is placed by its return type",
      {"compiler/sema/sema.cryo": sema_with(["this.ctx.get_arena().get_qualified_name(t);"])},
-     1, "ARENA_READ TOTAL 1 -> 2"),
+     1, "ARENA_READ TOTAL 2 -> 3"),
     ("a store reached through an indexed field is placed by the element type",
      {"compiler/sema/sema.cryo": sema_with(["this.ctx.module_graph.modules[0].graph.find_module_index(name);"]),
       "compiler/module_info.cryo":

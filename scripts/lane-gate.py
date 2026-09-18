@@ -87,16 +87,15 @@ The calls are SPLIT BY THE STORE that answers them and by READ vs WRITE:
     a FLOOR: driving LOOKUP to zero is reachable, driving the total to zero
     never was.  It is also the control on rule 3: a store misplaced as a
     local moves this row.
-  * LOOKUP_ARENA -- `lookup_by_name` on the TypeArena outside the file that
-    defines it: the arena's written-name read.  Type resolution asked it at
-    17 sites, seven of them a qualified-miss→bare retry, and the gate read
-    OK over every one.  Pinned apart from the arena's other reads so a name
-    lookup cannot leave the index for the arena and read as progress.
-  * ARENA_READ / ARENA_WRITE -- the arena's other name-keyed reads (the
-    reverse maps: `get_qualified_name`, `template_key_of`, the display
-    formatters) and its creators (`create_struct(qualified_name, module)`,
+  * ARENA_READ / ARENA_WRITE -- the arena's name-keyed reads (the reverse
+    maps: `get_qualified_name`, `template_key_of`, the display formatters)
+    and its creators (`create_struct(qualified_name, module)`,
     `add_name_alias`, `reserve_spec_names`).  A creator is where a declared
-    type is keyed by the spelling the caller minted for it.
+    type is keyed by the spelling the caller minted for it.  The arena has
+    no written-name read: `lookup_by_name` was the index's lane on a second
+    store (type resolution asked it at 17 sites, seven a qualified-miss→bare
+    retry, under a gate that read OK) and is deleted; a name lookup added to
+    the arena under any spelling lands in ARENA_READ.
   * REGISTRY_READ / REGISTRY_WRITE -- the `GenericRegistry`: templates,
     inherent impl blocks, trait declarations and trait-impl heads.  Its keys
     are canonical strings derived from stamps (`trait_id`, `target_key`), so
@@ -255,7 +254,6 @@ STORES = {
 }
 INDEX_TYPE = "DeclarationIndex"
 ARENA_TYPE = "TypeArena"
-ARENA_NAME_LOOKUP = "lookup_by_name"
 
 REENTRY_RE = re.compile(r"\bget_resolver\s*\(\s*\)")
 # The driver legitimately owns the resolver and may ask for it.
@@ -280,7 +278,7 @@ HOME_WRITE_RE = re.compile(r"\.set_home_module\s*\(")
 
 # Every counted population, in the order they are rendered and compared.
 KINDS = ("LOOKUP", "LOOKUP_OTHER", "REGISTER", "LOOKUP_ROUTED", "LOOKUP_LOCAL",
-         "LOOKUP_ARENA", "ARENA_READ", "ARENA_WRITE",
+         "ARENA_READ", "ARENA_WRITE",
          "REGISTRY_READ", "REGISTRY_WRITE", "GRAPH_READ", "GRAPH_WRITE",
          "CONST_READ", "CONST_WRITE",
          "REENTRY", "HOME_WRITE", "DEFID_MINT", "DEFID_UNWRAP")
@@ -524,10 +522,6 @@ def scan(src):
         raise SystemExit("lane-gate: %s does not declare %s as name-crossing; "
                          "the parser has not measured the tree"
                          % (STORES[INDEX_TYPE].defn, ", ".join(missing)))
-    if ARENA_NAME_LOOKUP not in sets[ARENA_TYPE]:
-        raise SystemExit("lane-gate: %s does not declare %s as name-crossing; "
-                         "the parser has not measured the tree"
-                         % (STORES[ARENA_TYPE].defn, ARENA_NAME_LOOKUP))
     names = sorted(set().union(*sets.values()), key=len, reverse=True)
     alt = "|".join(names)
     # Any call to a set name: a dotted receiver, a `Type::` static, or neither
@@ -546,8 +540,6 @@ def scan(src):
             return None
         if store_name == INDEX_TYPE and name in LOOKUPS:
             return "LOOKUP"
-        if store_name == ARENA_TYPE and name == ARENA_NAME_LOOKUP:
-            return "LOOKUP_ARENA"
         return st.write if kind == "write" else st.read
 
     found = {k: {} for k in KINDS}
@@ -635,11 +627,7 @@ HEADER = [
     "#                symbol map or scope stack. Not a lane site; no migration",
     "#                removes one. A FLOOR, and the control on placement: a",
     "#                store misplaced as a local moves this row.",
-    "# LOOKUP_ARENA   lookup_by_name on the TypeArena outside arena.cryo. The",
-    "#                arena's written-name read, pinned apart from its other",
-    "#                reads so a name lookup cannot leave the index for the",
-    "#                arena and read as progress.",
-    "# ARENA_READ     the arena's other name-keyed reads: reverse maps and the",
+    "# ARENA_READ     the arena's name-keyed reads: reverse maps and the",
     "#                display formatters.",
     "# ARENA_WRITE    the arena's creators and aliases, keyed by the spelling",
     "#                the caller minted for a declared type.",
