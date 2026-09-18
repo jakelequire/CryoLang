@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census roster-check lane-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census roster-check lane-check lane-selftest ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -184,8 +184,9 @@ help:
 	@echo "  make test-census       Same run, with the suite COUNTS asserted"
 	@echo "  make test-list         List the discovered test cases without running them"
 	@echo "  make lane-check        Pin the resolution-lane surface against its golden"
+	@echo "  make lane-selftest     Drive lane-gate.py through a throwaway tree, every rule both ways"
 	@echo "  make ns-status-check   Run every check docs/name-resolution.md §0 carries"
-	@echo "  make check-fast        lane-check + ns-status-check + verify-pin (~10s, no build)"
+	@echo "  make check-fast        lane-check + lane-selftest + ns-status-check + verify-pin (~10s, no build)"
 	@echo "  make install-hooks     Point git at the tracked hooks (run once per checkout)"
 	@echo "  make lsp-check         Compile tools/CryoLSP against current source"
 	@echo "                         (installs nothing; the only gate that builds it)"
@@ -546,16 +547,24 @@ vendor-check: $(STAGE2) $(LIBCRYO_A) runtime-tiers
 endif
 
 # ---- resolution-lane surface ratchet -----------------------------------
-# Pins the count of direct per-kind lookup call sites and of get_resolver()
-# re-entries (docs/name-resolution.md §7.2 mechanism 5).  Privatization cannot
-# stop a NEW public wrapper and deletion cannot stop a reintroduced helper;
-# only a ratchet catches growth.
+# Pins the count of name-keyed call sites on every declaration-holding store
+# and of get_resolver() re-entries (docs/name-resolution.md §7.2 mechanism
+# 5).  Privatization cannot stop a NEW public wrapper and deletion cannot
+# stop a reintroduced helper; only a ratchet catches growth.
 #
 # Needs no compiler, no stdlib and no link: it counts call sites in the
 # source, so it runs on a fresh clone in under a second and has no per-host
 # golden.
 lane-check:
 	@$(PYTHON) scripts/lane-gate.py $(ARGS)
+
+# The gate's own test: every rule driven through a throwaway source tree,
+# the baseline accepted and each mutation refused by row.  A gate that has
+# never been seen to refuse anything is a decoration; three of this gate's
+# holes were found by an audit building the mutation by hand.  Two seconds,
+# no repository stood up, so it rides in check-fast.
+lane-selftest:
+	@$(PYTHON) scripts/lane-gate-selftest.py
 
 # ---- name-resolution status gate ---------------------------------------
 # Run every check §0 of docs/name-resolution.md carries and fail on drift.
@@ -585,8 +594,8 @@ guard-selftest:
 # A ten-second gate everybody runs is worth more than a twenty-minute one
 # nobody does, which is the same argument that moved lane-check ahead of
 # `make cryo` in CI.
-check-fast: lane-check ns-status-check verify-pin
-	@echo "check-fast: OK (lane surface, section 0, pin integrity)"
+check-fast: lane-check lane-selftest ns-status-check verify-pin
+	@echo "check-fast: OK (lane surface and its self-test, section 0, pin integrity)"
 
 # ---- git hooks ---------------------------------------------------------
 # Point git at the tracked hook directory.  Hooks live in scripts/git-hooks so

@@ -17,23 +17,46 @@ WHAT IS PINNED
 --------------
 Each count is broken down per file so a failure names what moved.
 
-THE RULE IS DERIVED FROM THE DEFINITION, NOT FROM A LIST OF NAMES.  A
-name-keyed reader of the `DeclarationIndex` is any method the index declares
-whose signature mentions `SymbolStr` - as a parameter (the caller hands a
-name in and gets an answer) or as the return type (the caller hands an
-answer in and gets a name back, which is the same boundary crossed the other
-way).  The set is read from `decl_index.cryo` every run, and the same rule
-read from `type_utils.cryo` gives the `TypeUtils` funnel's set.  A gate that
-pins readers by a NAME PATTERN (`lookup_*`) is blind by construction to a
-reader called anything else, and the tree held twenty-four such calls
-(`is_candidate_public`, `namespace_of`, `ns_imports`, `find_global_*`,
-`intrinsic_owner_of`, `resolve_method_owner`, ...) under a gate that read OK;
-a reader added tomorrow as `owner_of(name)` is inside this rule the moment
-it is declared.  The signature is the one thing a name-keyed reader cannot
-be written without.
+THREE RULES, EACH DERIVED FROM A DEFINITION, NONE FROM A LIST OF NAMES.
 
-The calls are SPLIT BY THE RECEIVER that answers them, because the names are
-not the index's alone:
+  1. WHICH TYPES ARE STORES.  A store is a declaration-holding type the
+     `CompilationContext` carries by pointer - the shared state every pass
+     reaches - plus `TypeUtils`, sema's funnel in front of the index.  The
+     context's other members are excluded for a stated reason each (see
+     STORES below): the intern table is the string boundary itself, the
+     module loader and the artifacts are keyed by filesystem path, the type
+     checker takes an operator spelling and holds no table.  A gate that
+     watched ONE store found new surface on every audit for eleven rounds,
+     because a reader on any other store was invisible by construction.
+
+  2. WHICH METHODS ARE NAME-KEYED.  Any method a store declares whose
+     signature mentions a KEY TYPE - `SymbolStr` or `string` - as a
+     parameter (the caller hands a name in and gets an answer) or as the
+     return type (the caller hands an answer in and gets a name back, the
+     same boundary crossed the other way).  The set is read from the tree on
+     every run: the `type struct` block's inline methods AND every
+     `implement [struct] <Store> { ... }` block in any file, because Cryo
+     lets a method be added to a type from another file and a parser that
+     read only the struct block was blind to one.  A gate that pinned
+     readers by a NAME PATTERN (`lookup_*`) was blind to a reader called
+     anything else, and the tree held twenty-four such calls under a gate
+     that read OK; a gate that matched the key type as the one token
+     `SymbolStr` was blind to a reader keyed by `string`, and the index
+     already took `string` parameters.  The signature is the one thing a
+     name-keyed reader cannot be written without.
+
+  3. WHICH STORE A CALL REACHES.  By the receiver's DECLARED TYPE, not its
+     spelling: `this` is the enclosing type, a local or parameter is what
+     its annotation says, and each `.field` is what the field's declaration
+     says, all read from the tree.  A receiver rule written as spellings
+     (`di`, `*.decl_index`) fails closed on a new spelling but has to grow a
+     new spelling for every alias, and with eight stores the same-named
+     methods on OTHER types (`this.scopes.lookup_local`, `this.functions.
+     register`) would each need one too.  A receiver whose type cannot be
+     read is a hard failure, because a call this gate cannot place is one
+     it cannot pin and a silently dropped one reads as progress.
+
+The calls are SPLIT BY THE STORE that answers them and by READ vs WRITE:
 
   * LOOKUP -- answered by the `DeclarationIndex` under one of the five
     per-kind names mechanism 5 gives (`lookup_type`, `lookup_func_return`,
@@ -56,27 +79,47 @@ not the index's alone:
     LOOKUP falls and is not a target; it is pinned because a new wrapper is
     exactly the regrowth this gate exists to catch, and a wrapper under a
     sixth name was one the five-name rule could not see.
-  * LOOKUP_LOCAL -- a name from either set called on `this` OUTSIDE the file
-    that defines the set: a type's OWN same-named method over its own symbol
-    map or scope stack (`move_check`, `drop_insertion`).  Not a lane site,
-    and no migration can remove one, so it is a FLOOR: driving LOOKUP to
-    zero is reachable, driving the total to zero never was.
+  * LOOKUP_LOCAL -- a name from any store's set called on a receiver whose
+    declared type is NOT a store: a type's OWN same-named method over its
+    own symbol map or scope stack (`move_check`, `drop_insertion`, sema's
+    `scopes`).  Not a lane site, and no migration can remove one, so it is
+    a FLOOR: driving LOOKUP to zero is reachable, driving the total to zero
+    never was.  It is also the control on rule 3: a store misplaced as a
+    local moves this row.
   * LOOKUP_ARENA -- `lookup_by_name` on the TypeArena outside the file that
-    defines it.  The arena's name caches are a second name-keyed store of the
-    same declared types the index holds, and a lookup there is the same lane
-    under a receiver none of the rows above can see: type resolution asked it
-    at 17 sites, seven of them a qualified-miss→bare retry, and the gate read
-    OK over every one.  Pinned so a name lookup cannot leave the index for
-    the arena and read as progress.
-  * REENTRY -- calls to `get_resolver()` outside the driver, and a cursor move
-    on a resolver reached through a FIELD (`.name_resolver.set_module(...)`,
-    `find_module_scope`, `restore_scope`), which is the same re-entry with no
-    `get_resolver()` to count: the monomorphizer swaps the resolver's module
-    that way, and a gate reading `get_resolver()` alone reported 3 over a tree
-    holding 6.  §7.2's corollary: name resolution is a pass, not a service,
-    and a stage that can call back into the resolver will.  A resolver called
-    from `sema` no longer has the writer's imports in hand, so it answers from
-    a string -- which is the mechanical origin of B1.
+    defines it: the arena's written-name read.  Type resolution asked it at
+    17 sites, seven of them a qualified-miss→bare retry, and the gate read
+    OK over every one.  Pinned apart from the arena's other reads so a name
+    lookup cannot leave the index for the arena and read as progress.
+  * ARENA_READ / ARENA_WRITE -- the arena's other name-keyed reads (the
+    reverse maps: `get_qualified_name`, `template_key_of`, the display
+    formatters) and its creators (`create_struct(qualified_name, module)`,
+    `add_name_alias`, `reserve_spec_names`).  A creator is where a declared
+    type is keyed by the spelling the caller minted for it.
+  * REGISTRY_READ / REGISTRY_WRITE -- the `GenericRegistry`: templates,
+    inherent impl blocks, trait declarations and trait-impl heads.  Its keys
+    are canonical strings derived from stamps (`trait_id`, `target_key`), so
+    most of this surface is bucket B rather than spelling; it is pinned
+    because it was the store no row enumerated, and a reader on it - the
+    first-match scan `find_trait_defining_method` among them - was invisible.
+  * GRAPH_READ / GRAPH_WRITE -- the `ModuleGraph`: a module asked by its
+    namespace or its path, the re-export closure, the owner-key → file map.
+  * CONST_READ / CONST_WRITE -- the `ConstantTable`: constants and enums
+    registered under their qualified name; reads go by stamp (`ConstEval`)
+    and are expected to stay at zero.
+  * REENTRY -- calls to `get_resolver()` outside the driver, and ANY
+    name-keyed `Resolver` method reached through a `Resolver`-typed
+    receiver outside the resolver's own directory and the driver
+    (`instance.cryo`, `compilation_context.cryo`, which own it and move its
+    cursor between modules).  The monomorphizer swaps the resolver's module
+    that way, and a gate reading `get_resolver()` alone reported 3 over a
+    tree holding 6; a gate reading the three cursor-move names alone read 6
+    over a tree holding 12, because type resolution asks `is_ambiguous(name)`
+    by spelling and no list named it.  §7.2's corollary: name resolution is
+    a pass, not a service, and a stage that can call back into the resolver
+    will.  A resolver called from `sema` no longer has the writer's imports
+    in hand, so it answers from a string -- which is the mechanical origin
+    of B1.
 
 Every row is asserted exactly, in both directions.  For LOOKUP and REENTRY an
 increase is the regrowth this exists to catch, and a decrease is progress that
@@ -103,9 +146,9 @@ THREE THINGS A NAIVE GREP GETS WRONG, ALL OBSERVED HERE
     and a `lookup_type(&this, name)` over a local scope stack counted as one
     too though it never touches the index.  A single total therefore could not
     say what it was a total OF, and a migration measured against it partly
-    rewarded renaming.  The split above is what fixes that; an unplaceable
-    receiver is a hard failure, because a call this gate cannot classify is one
-    it cannot pin.
+    rewarded renaming.  Placement by declared type is what fixes that; an
+    unplaceable receiver is a hard failure, because a call this gate cannot
+    classify is one it cannot pin.
   * COMMENTED-OUT CALLS.  `instance.cryo` carries a commented `//
     ctx.get_resolver();`.  Counting it pins 9 re-entries where 8 exist, so
     deleting a real call and leaving the comment would read as progress while
@@ -125,10 +168,12 @@ the golden reads as the live surface rather than a graveyard; a file reappearing
 is then an added row, which fails the same way an increase does.
 
 Usage:
-    python3 scripts/lane-gate.py [--update] [--names]
+    python3 scripts/lane-gate.py [--update] [--names] [--src DIR --golden FILE]
 
-`--names` prints the two derived sets and exits, so what the rule swept up
-can be read rather than inferred.
+`--names` prints the derived sets and exits, so what the rule swept up can be
+read rather than inferred.  `--src`/`--golden` point the gate at another tree
+and golden; `scripts/lane-gate-selftest.py` uses them to drive every rule
+through a throwaway tree in both directions.
 
 Exit codes: 0 match (or golden updated); 1 drift.
 """
@@ -138,8 +183,8 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC = os.path.join(ROOT, "compiler", "src")
-GOLDEN = os.path.join(ROOT, "tests", "lane-baseline.txt")
+DEFAULT_SRC = os.path.join(ROOT, "compiler", "src")
+DEFAULT_GOLDEN = os.path.join(ROOT, "tests", "lane-baseline.txt")
 
 # The five per-kind lookups §7.2 mechanism 5 names: the LOOKUP row.  They are
 # the only names this gate holds as a list, and the list decides which ROW a
@@ -152,25 +197,70 @@ LOOKUPS = (
     "lookup_method_return",
 )
 
-# The two definition sites.  Each is the one file whose `type struct` carries
-# the methods, and each is excluded from counting calls to ITS OWN set.
-#
-# Matched on the path relative to compiler/src, not on the basename.  A
-# basename exclusion is a rule about a NAME: a second decl_index.cryo anywhere
-# in the tree would have its calls silently dropped, and a gate whose blind
-# spot can be created by naming a file is not one that can be trusted about a
-# count.  The exclusion is meant to be about one specific definition site, so
-# it names one.
-INDEX_FILE = "compiler/decl_index.cryo"
-INDEX_TYPE = "DeclarationIndex"
-ROUTED_FILE = "compiler/sema/type_utils.cryo"
-ROUTED_TYPE = "TypeUtils"
-# The type whose signatures make a method name-keyed.
-NAME_TYPE = "SymbolStr"
+# The types whose presence in a signature makes a method name-keyed.  Matched
+# as whole tokens: `SymbolStr[]` and `string*` count, `StringBuilder` does not.
+KEY_TYPES = ("SymbolStr", "string")
+KEY_RE = re.compile(r"\b(?:%s)\b" % "|".join(KEY_TYPES))
 
-REENTRY_RE = re.compile(
-    r"\bget_resolver\s*\(\s*\)"
-    r"|\.name_resolver\.(?:set_module|find_module_scope|restore_scope)\s*\(")
+
+class Store(object):
+    """One declaration-holding type: where it is defined, which rows its
+    reads and writes land in, and which files are its own machinery.
+
+    `defn` is matched on the path relative to compiler/src, not on the
+    basename: a basename exclusion is a rule about a NAME, and a second
+    decl_index.cryo anywhere in the tree would have its calls silently
+    dropped.  `owners` are further files whose calls are the store's own
+    (the resolver's driving pass and the driver that moves its cursor); a
+    directory owner ends in `/`.
+    """
+
+    def __init__(self, defn, read, write, owners=()):
+        self.defn = defn
+        self.read = read
+        self.write = write
+        self.owners = tuple(owners)
+
+    def owns(self, rel):
+        if rel == self.defn:
+            return True
+        for o in self.owners:
+            if o.endswith("/") and rel.startswith(o):
+                return True
+            if rel == o:
+                return True
+        return False
+
+
+# Rule 1.  The context carries these by pointer and each holds declarations
+# under a name.  Not stores, with the reason: `InternTable` is the
+# string<->SymbolStr boundary (every method mentions a key type by
+# construction, and it holds strings, not declarations); `ModuleLoader` and
+# `PhaseArtifacts` are keyed by filesystem path; `TypeChecker` takes an
+# operator spelling and holds no table; `TypeResolver` holds pointers to the
+# stores below and no table of its own, so a name it answers it answers by
+# asking one of them; `Monomorphizer`/`MonoState` key their own spec
+# bookkeeping by mangled symbol, a stamp derivation reached only through
+# `this.state`; `DirectiveRegistry` is keyed by directive kind.
+STORES = {
+    "DeclarationIndex": Store("compiler/decl_index.cryo", "LOOKUP_OTHER", "REGISTER"),
+    "TypeUtils":        Store("compiler/sema/type_utils.cryo", "LOOKUP_ROUTED", "LOOKUP_ROUTED"),
+    "TypeArena":        Store("compiler/types/arena.cryo", "ARENA_READ", "ARENA_WRITE"),
+    "GenericRegistry":  Store("compiler/types/generic_registry.cryo", "REGISTRY_READ", "REGISTRY_WRITE"),
+    "ModuleGraph":      Store("compiler/module_graph.cryo", "GRAPH_READ", "GRAPH_WRITE"),
+    "ConstantTable":    Store("compiler/const_table.cryo", "CONST_READ", "CONST_WRITE"),
+    "Resolver":         Store("compiler/resolver/resolver.cryo", "REENTRY", "REENTRY",
+                              owners=("compiler/resolver/", "compiler/instance.cryo",
+                                      "compiler/compilation_context.cryo")),
+}
+INDEX_TYPE = "DeclarationIndex"
+ARENA_TYPE = "TypeArena"
+ARENA_NAME_LOOKUP = "lookup_by_name"
+
+REENTRY_RE = re.compile(r"\bget_resolver\s*\(\s*\)")
+# The driver legitimately owns the resolver and may ask for it.
+REENTRY_OWNERS = STORES["Resolver"].owners
+
 # The one door that turns a name into a resolution answer, and the one that
 # turns an answer back into a name.  `DefId`'s field is private, so the literal
 # cannot be written outside the type and every crossing goes through these two.
@@ -188,18 +278,12 @@ DEFID_UNWRAP_RE = re.compile(r"\.qualified_name\s*\(")
 # definition line has no receiver, so `.set_home_module(` matches calls only.
 HOME_WRITE_RE = re.compile(r"\.set_home_module\s*\(")
 
-# The arena's name-keyed lookup, with its receiver.  `lookup(id)` is not a
-# name lookup and is not matched.
-ARENA_LOOKUP_RE = re.compile(r"([A-Za-z_][A-Za-z_0-9.]*)\.lookup_by_name\s*\(")
-
 # Every counted population, in the order they are rendered and compared.
 KINDS = ("LOOKUP", "LOOKUP_OTHER", "REGISTER", "LOOKUP_ROUTED", "LOOKUP_LOCAL",
-         "LOOKUP_ARENA", "REENTRY", "HOME_WRITE", "DEFID_MINT", "DEFID_UNWRAP")
-
-# The file that DEFINES the arena's name lookup; its own calls are its caches.
-ARENA_OWNERS = {"compiler/types/arena.cryo"}
-# The driver legitimately owns the resolver and may ask for it.
-REENTRY_OWNERS = {"compiler/instance.cryo"}
+         "LOOKUP_ARENA", "ARENA_READ", "ARENA_WRITE",
+         "REGISTRY_READ", "REGISTRY_WRITE", "GRAPH_READ", "GRAPH_WRITE",
+         "CONST_READ", "CONST_WRITE",
+         "REENTRY", "HOME_WRITE", "DEFID_MINT", "DEFID_UNWRAP")
 
 
 def strip_comment(line):
@@ -215,32 +299,160 @@ def strip_comment(line):
 
 STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 METHOD_HEAD_RE = re.compile(r"^    (static\s+)?([a-z_][a-z_0-9]*)\s*(?:<[^>]*>)?\s*\(")
+TYPE_HEAD_RE = re.compile(r"^type\s+(?:struct|class|union|enum)\s+([A-Za-z_][A-Za-z_0-9]*)")
+# `implement<T> struct Foo<T> {` / `implement Foo {` / `implement trait Tr for Foo {`:
+# `this` inside the block is the type after `for` if there is one, else the
+# target.  A trait impl's methods belong to the target too, but a trait
+# method's signature is the trait's and is not a store's own surface, so only
+# the inherent form contributes to a set (see store_methods).
+IMPL_HEAD_RE = re.compile(
+    r"^implement(?:\s*<[^>]*>)?\s+(?:trait\s+[^\s{]+\s+for\s+)?"
+    r"(?:(?:struct|class|union|enum)\s+)?([A-Za-z_][A-Za-z_0-9]*)")
+INHERENT_IMPL_RE = re.compile(
+    r"^implement(?:\s*<[^>]*>)?\s+(?:(?:struct|class|union|enum)\s+)?"
+    r"([A-Za-z_][A-Za-z_0-9]*)(?:\s*<[^>]*>)?\s*\{")
+FIELD_RE = re.compile(r"^    ([a-z_][a-z_0-9]*)\s*:\s*&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*([A-Za-z_][A-Za-z_0-9]*)")
+RETURN_RE = re.compile(r"\)\s*->\s*&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*([A-Za-z_][A-Za-z_0-9]*)")
+# A receiver: segments joined by `.`, each an identifier optionally followed
+# by `()` (a zero-argument accessor, placed by its declared return type) or
+# `[...]` (an index, placed by the element type).  Anything else in receiver
+# position is refused.
+SEGMENT = r"[A-Za-z_][A-Za-z_0-9]*(?:\(\)|\[[^\[\]]*\])?"
+RECEIVER = r"(%s(?:\.%s)*)" % (SEGMENT, SEGMENT)
 
 
-def name_crossing_methods(rel, type_name):
-    """{name: "read" | "write" | "static"} for every method declared inline in
-    `type struct <type_name> { ... }` in `rel` whose head mentions NAME_TYPE.
+class Tree(object):
+    """Every .cryo file under `src`, read once, with the two maps rule 3
+    needs: each declared type's fields by name, and each file's top-level
+    block heads (which type `this` is on a given line)."""
+
+    def __init__(self, src):
+        self.src = src
+        self.files = {}
+        self.fields = {}
+        self.returns = {}
+        self.blocks = {}
+        for dirpath, _dirs, names in os.walk(src):
+            for fname in sorted(names):
+                if not fname.endswith(".cryo"):
+                    continue
+                full = os.path.join(dirpath, fname)
+                rel = os.path.relpath(full, src).replace(os.sep, "/")
+                with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                    lines = fh.read().split("\n")
+                self.files[rel] = lines
+                self.blocks[rel] = self.scan_blocks(lines)
+        self.rels = sorted(self.files)
+
+    def scan_blocks(self, lines):
+        """[(first_line_index, type_name)] for every top-level type or impl
+        block, in order; fills `fields` for `type` blocks and `returns` for
+        every method head at depth 1 of either."""
+        heads = []
+        current = None
+        depth = 0
+        for i, raw in enumerate(lines):
+            code = STRING_RE.sub('""', strip_comment(raw))
+            m = TYPE_HEAD_RE.match(code)
+            if m is None:
+                m = IMPL_HEAD_RE.match(code)
+            if m is not None and depth == 0:
+                current = m.group(1)
+                heads.append((i, current))
+                self.fields.setdefault(current, {})
+                self.returns.setdefault(current, {})
+                is_type = TYPE_HEAD_RE.match(code) is not None
+            elif current is not None and depth == 1:
+                mh = METHOD_HEAD_RE.match(code)
+                if mh is not None:
+                    head = code
+                    j = i
+                    while "{" not in head and j + 1 < len(lines):
+                        j += 1
+                        head += " " + STRING_RE.sub('""', strip_comment(lines[j])).strip()
+                    r = RETURN_RE.search(head[:head.index("{")] if "{" in head else head)
+                    if r is not None:
+                        self.returns[current][mh.group(2)] = r.group(1)
+                elif is_type:
+                    f = FIELD_RE.match(code)
+                    if f is not None:
+                        self.fields[current][f.group(1)] = f.group(2)
+            for ch in code:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+        return heads
+
+    def enclosing_type(self, rel, lineno):
+        """The type `this` names at 1-based `lineno` in `rel`, or None."""
+        found = None
+        for start, name in self.blocks[rel]:
+            if start < lineno:
+                found = name
+            else:
+                break
+        return found
+
+    def local_type(self, rel, lineno, name):
+        """What `name` was last declared as before `lineno`: a parameter, a
+        `const`/`mut` binding or a field of the enclosing type, whichever
+        annotation is nearest above.  A struct-literal initializer
+        (`arena: arena,`) yields a lowercase token that names no type and is
+        skipped for the next match up.  None when nothing declares it."""
+        pat = re.compile(r"\b%s\s*:\s*&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*([A-Za-z_][A-Za-z_0-9]*)"
+                         % re.escape(name))
+        lines = self.files[rel]
+        i = lineno - 1
+        while i >= 0:
+            code = STRING_RE.sub('""', strip_comment(lines[i]))
+            for m in pat.finditer(code):
+                ty = m.group(1)
+                if ty[0].isupper() or ty in self.fields:
+                    return ty
+            i -= 1
+        return None
+
+    def receiver_type(self, rel, lineno, receiver):
+        """The declared type of a dotted receiver, walked segment by
+        segment: a field by its declaration, `x()` by the method's declared
+        return type, `x[...]` by the element type (the declaration regexes
+        drop `[]`, so an array field already names its element).  None where
+        any hop is unknown."""
+        segs = re.findall(SEGMENT, receiver)
+        ty = None
+        for n, seg in enumerate(segs):
+            call = seg.endswith(")")
+            name = re.match(r"[A-Za-z_][A-Za-z_0-9]*", seg).group(0)
+            if n == 0:
+                if name == "this":
+                    ty = self.enclosing_type(rel, lineno)
+                    if call:
+                        return None
+                elif call:
+                    return None
+                else:
+                    ty = self.local_type(rel, lineno, name)
+            else:
+                if ty is None:
+                    return None
+                table = self.returns if call else self.fields
+                ty = table.get(ty, {}).get(name)
+        return ty
+
+
+def block_methods(lines, start):
+    """{name: "read" | "write" | "static"} for every method declared at depth
+    1 of the block opening at `start` whose head mentions a KEY TYPE.
 
     The head is everything from the method's name to the `{` that opens its
     body, joined across lines.  A method is a WRITE when its receiver is
     `mut &this`, STATIC when it has none, and a READ otherwise.
-
-    Refuses rather than returning an empty set: a parser that finds no
-    struct, or a struct with no name-crossing method, has not measured the
-    tree, and a gate fed an empty set would report OK over every call.
     """
-    path = os.path.join(SRC, rel.replace("/", os.sep))
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        lines = fh.read().split("\n")
-    head_re = re.compile(r"^type struct %s\b" % re.escape(type_name))
-    i = 0
-    while i < len(lines) and not head_re.match(lines[i]):
-        i += 1
-    if i == len(lines):
-        raise SystemExit("lane-gate: no `type struct %s` in %s" % (type_name, rel))
     found = {}
     depth = 0
     entered = False
+    i = start
     while i < len(lines):
         code = STRING_RE.sub('""', strip_comment(lines[i]))
         m = METHOD_HEAD_RE.match(code)
@@ -250,11 +462,10 @@ def name_crossing_methods(rel, type_name):
             while "{" not in head or head.count("(") > head.count(")"):
                 j += 1
                 if j == len(lines):
-                    raise SystemExit("lane-gate: unterminated method head at %s:%d"
-                                     % (rel, i + 1))
+                    raise SystemExit("lane-gate: unterminated method head at line %d" % (i + 1))
                 head += " " + STRING_RE.sub('""', strip_comment(lines[j])).strip()
             head = head[:head.index("{")]
-            if NAME_TYPE in head:
+            if KEY_RE.search(head):
                 if m.group(1):
                     found[m.group(2)] = "static"
                 elif "mut &this" in head:
@@ -270,130 +481,123 @@ def name_crossing_methods(rel, type_name):
         if entered and depth == 0:
             break
         i += 1
-    if not found:
-        raise SystemExit("lane-gate: `type struct %s` in %s declares no method "
-                         "whose signature mentions %s; the parser has not "
-                         "measured the tree" % (type_name, rel, NAME_TYPE))
     return found
 
 
-def receiver_kind(receiver):
-    """Which type a dotted receiver names, decided by its spelling.
+def store_methods(tree, type_name, defn):
+    """Rule 2 for one store: its `type struct` block in `defn` plus every
+    inherent `implement` block naming it in ANY file.
 
-    Returns "index", "routed", "this", or None for a receiver it cannot
-    place, which the caller treats as a hard failure rather than dropping -
-    an uncounted call is the one outcome a ratchet must never produce.
+    Refuses rather than returning an empty set: a parser that finds no
+    struct, or a struct with no name-crossing method, has not measured the
+    tree, and a gate fed an empty set would report OK over every call.
     """
-    if receiver == "di" or receiver.endswith("decl_index"):
-        return "index"
-    if receiver == "types" or receiver.endswith(".types"):
-        return "routed"
-    if receiver == "this":
-        return "this"
-    return None
+    if defn not in tree.files:
+        raise SystemExit("lane-gate: no %s under %s" % (defn, tree.src))
+    head_re = re.compile(r"^type struct %s\b" % re.escape(type_name))
+    struct_at = [i for i, l in enumerate(tree.files[defn]) if head_re.match(l)]
+    if not struct_at:
+        raise SystemExit("lane-gate: no `type struct %s` in %s" % (type_name, defn))
+    found = block_methods(tree.files[defn], struct_at[0])
+    for rel in tree.rels:
+        lines = tree.files[rel]
+        for i, line in enumerate(lines):
+            m = INHERENT_IMPL_RE.match(strip_comment(line))
+            if m is not None and m.group(1) == type_name:
+                found.update(block_methods(lines, i))
+    if not found:
+        raise SystemExit("lane-gate: `%s` declares no method whose signature "
+                         "mentions %s; the parser has not measured the tree"
+                         % (type_name, " or ".join(KEY_TYPES)))
+    return found
 
 
-def scan():
-    """Return ({kind: {relpath: count}}, unplaced) over the compiler sources."""
-    index_set = name_crossing_methods(INDEX_FILE, INDEX_TYPE)
-    routed_set = name_crossing_methods(ROUTED_FILE, ROUTED_TYPE)
+def scan(src):
+    """Return ({kind: {relpath: count}}, unplaced, {store: set}) over `src`."""
+    tree = Tree(src)
+    sets = {name: store_methods(tree, name, st.defn) for name, st in STORES.items()}
     # Control on the parser: the LOOKUP row is the five names, and they are
     # declared on the index.  A parser that cannot see them cannot see the
     # row it is asked to pin.
-    missing = [n for n in LOOKUPS if n not in index_set]
+    missing = [n for n in LOOKUPS if n not in sets[INDEX_TYPE]]
     if missing:
         raise SystemExit("lane-gate: %s does not declare %s as name-crossing; "
                          "the parser has not measured the tree"
-                         % (INDEX_FILE, ", ".join(missing)))
-    names = sorted(set(index_set) | set(routed_set), key=len, reverse=True)
+                         % (STORES[INDEX_TYPE].defn, ", ".join(missing)))
+    if ARENA_NAME_LOOKUP not in sets[ARENA_TYPE]:
+        raise SystemExit("lane-gate: %s does not declare %s as name-crossing; "
+                         "the parser has not measured the tree"
+                         % (STORES[ARENA_TYPE].defn, ARENA_NAME_LOOKUP))
+    names = sorted(set().union(*sets.values()), key=len, reverse=True)
     alt = "|".join(names)
     # Any call to a set name: a dotted receiver, a `Type::` static, or neither
     # (which is a call this gate cannot place and refuses).  A definition line
     # has no `.` or `::` before the name, so it is not a call.
     seen_re = re.compile(r"(?:\.|::)\s*(?:%s)\s*\(" % alt)
-    dotted_re = re.compile(r"([A-Za-z_][A-Za-z_0-9.]*)\.(%s)\s*\(" % alt)
+    dotted_re = re.compile(r"%s\.(%s)\s*\(" % (RECEIVER, alt))
     static_re = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)::(%s)\s*\(" % alt)
+
+    def row_for(store_name, name, rel):
+        """The row a call to `name` on `store_name` from `rel` lands in, or
+        None when it is the store's own call or not in its name-keyed set."""
+        st = STORES[store_name]
+        kind = sets[store_name].get(name)
+        if kind is None or st.owns(rel):
+            return None
+        if store_name == INDEX_TYPE and name in LOOKUPS:
+            return "LOOKUP"
+        if store_name == ARENA_TYPE and name == ARENA_NAME_LOOKUP:
+            return "LOOKUP_ARENA"
+        return st.write if kind == "write" else st.read
 
     found = {k: {} for k in KINDS}
     unplaced = []
-    for dirpath, _dirs, files in os.walk(SRC):
-        for fname in sorted(files):
-            if not fname.endswith(".cryo"):
+    for rel in tree.rels:
+        tally = {k: 0 for k in KINDS}
+        for lineno, raw in enumerate(tree.files[rel], 1):
+            line = strip_comment(raw)
+            if not line.strip():
                 continue
-            full = os.path.join(dirpath, fname)
-            rel = os.path.relpath(full, SRC).replace(os.sep, "/")
-            with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                text = fh.readlines()
-            tally = {k: 0 for k in KINDS}
-            for lineno, raw in enumerate(text, 1):
-                line = strip_comment(raw)
-                if not line.strip():
-                    continue
-                seen = len(seen_re.findall(line))
-                accounted = 0
-                for m in dotted_re.finditer(line):
-                    accounted += 1
-                    recv, name = m.group(1), m.group(2)
-                    kind = receiver_kind(recv)
-                    if kind == "index" and name in index_set:
-                        if rel == INDEX_FILE:
-                            continue
-                        if name in LOOKUPS:
-                            tally["LOOKUP"] += 1
-                        elif index_set[name] == "write":
-                            tally["REGISTER"] += 1
-                        else:
-                            tally["LOOKUP_OTHER"] += 1
-                    elif kind == "routed" and name in routed_set:
-                        if rel == ROUTED_FILE:
-                            continue
-                        tally["LOOKUP_ROUTED"] += 1
-                    elif kind == "this":
-                        # The owner's own call to its own method is not the
-                        # surface; anywhere else, `this` is some other type
-                        # with a same-named method of its own.
-                        if (rel == INDEX_FILE and name in index_set) \
-                                or (rel == ROUTED_FILE and name in routed_set):
-                            continue
-                        tally["LOOKUP_LOCAL"] += 1
-                    else:
-                        unplaced.append((rel, lineno, recv))
-                for m in static_re.finditer(line):
-                    accounted += 1
-                    owner, name = m.group(1), m.group(2)
-                    if owner == INDEX_TYPE and index_set.get(name) == "static":
-                        if rel != INDEX_FILE:
-                            tally["LOOKUP_OTHER"] += 1
-                    elif owner == ROUTED_TYPE and routed_set.get(name) == "static":
-                        if rel != ROUTED_FILE:
-                            tally["LOOKUP_ROUTED"] += 1
-                    else:
-                        unplaced.append((rel, lineno, owner + "::"))
-                # A match the receiver patterns did not reach at all - a call
-                # on something other than a dotted name. Reported once, not
-                # once per match, so the count is of CALLS and not of checks.
-                for _ in range(seen - accounted):
-                    unplaced.append((rel, lineno, "<no simple receiver>"))
-                if rel not in ARENA_OWNERS:
-                    # A name lookup on the arena is counted by its receiver
-                    # too: one that is not an arena is a lookup this gate
-                    # has no row for, and is refused rather than dropped.
-                    for m in ARENA_LOOKUP_RE.finditer(line):
-                        recv = m.group(1)
-                        if recv == "arena" or recv.endswith(".arena") \
-                                or recv.endswith("_arena"):
-                            tally["LOOKUP_ARENA"] += 1
-                        else:
-                            unplaced.append((rel, lineno, recv))
-                if rel not in REENTRY_OWNERS:
-                    tally["REENTRY"] += len(REENTRY_RE.findall(line))
-                tally["HOME_WRITE"] += len(HOME_WRITE_RE.findall(line))
-                tally["DEFID_MINT"] += len(DEFID_MINT_RE.findall(line))
-                tally["DEFID_UNWRAP"] += len(DEFID_UNWRAP_RE.findall(line))
-            for kind in KINDS:
-                if tally[kind]:
-                    found[kind][rel] = tally[kind]
-    return found, unplaced, index_set, routed_set
+            seen = len(seen_re.findall(line))
+            accounted = 0
+            for m in dotted_re.finditer(line):
+                accounted += 1
+                recv, name = m.group(1), m.group(2)
+                ty = tree.receiver_type(rel, lineno, recv)
+                if ty is None:
+                    unplaced.append((rel, lineno, recv))
+                elif ty in STORES:
+                    row = row_for(ty, name, rel)
+                    if row is not None:
+                        tally[row] += 1
+                else:
+                    # A same-named method on some other type: not the
+                    # surface, but counted so a misplaced store shows.
+                    tally["LOOKUP_LOCAL"] += 1
+            for m in static_re.finditer(line):
+                accounted += 1
+                owner, name = m.group(1), m.group(2)
+                if owner in STORES:
+                    if sets[owner].get(name) == "static":
+                        row = row_for(owner, name, rel)
+                        if row is not None:
+                            tally[row] += 1
+                else:
+                    tally["LOOKUP_LOCAL"] += 1
+            # A match the receiver patterns did not reach at all - a call
+            # on something other than a dotted name. Reported once, not
+            # once per match, so the count is of CALLS and not of checks.
+            for _ in range(seen - accounted):
+                unplaced.append((rel, lineno, "<no simple receiver>"))
+            if not STORES["Resolver"].owns(rel):
+                tally["REENTRY"] += len(REENTRY_RE.findall(line))
+            tally["HOME_WRITE"] += len(HOME_WRITE_RE.findall(line))
+            tally["DEFID_MINT"] += len(DEFID_MINT_RE.findall(line))
+            tally["DEFID_UNWRAP"] += len(DEFID_UNWRAP_RE.findall(line))
+        for kind in KINDS:
+            if tally[kind]:
+                found[kind][rel] = tally[kind]
+    return found, unplaced, sets
 
 
 HEADER = [
@@ -401,12 +605,14 @@ HEADER = [
     "#",
     "# ASSERTED: both totals and every per-file row.",
     "#",
-    "# A name-keyed method is one whose signature mentions SymbolStr, read from",
-    "# the type's definition on every run - not a list of names, so a reader",
-    "# added under any spelling is inside the rule as soon as it is declared.",
-    "# Calls are split by the RECEIVER that answers them, because the names are",
-    "# not the index's alone and a name-matched total cannot say what it is a",
-    "# total of.",
+    "# A store is a declaration-holding type the CompilationContext carries,",
+    "# plus TypeUtils (sema's funnel). A name-keyed method is one a store",
+    "# declares - inline or in an `implement` block in any file - whose",
+    "# signature mentions SymbolStr or string, read from the tree on every run:",
+    "# not a list of names, so a reader added under any spelling, in any file,",
+    "# on any store, is inside the rule as soon as it is declared. A call is",
+    "# placed by its receiver's DECLARED TYPE (this, a local's annotation, a",
+    "# field's declaration), never by the receiver's spelling.",
     "#",
     "# LOOKUP         answered by the DeclarationIndex, under one of the five",
     "#                names mechanism 5 gives. The lane surface; falls.",
@@ -424,22 +630,33 @@ HEADER = [
     "#                RISES as LOOKUP falls. Pinned because a new wrapper is the",
     "#                regrowth this gate exists to catch, and one under a sixth",
     "#                name was invisible to a five-name rule.",
-    "# LOOKUP_LOCAL   a set name called on `this` outside the defining file: a",
-    "#                type's OWN same-named method over its own symbol map or",
-    "#                scope stack. Not a lane site; no migration removes one. A",
-    "#                FLOOR, so driving LOOKUP to zero is reachable and driving",
-    "#                the total to zero never was.",
-    "# LOOKUP_ARENA   lookup_by_name on the TypeArena outside arena.cryo. A",
-    "#                second name-keyed store of the declared types the index",
-    "#                holds, so the same lane under a receiver the rows above",
-    "#                cannot see. Falls with LOOKUP; a move between the two is",
-    "#                not progress.",
-    "# REENTRY  get_resolver() outside the driver, and a cursor move on a resolver",
-    "#          reached through a field (.name_resolver.set_module / find_module_scope",
-    "#          / restore_scope), the same re-entry with nothing else to count. Name",
-    "#          resolution is a PASS, not a service: a resolver called from sema no",
-    "#          longer holds the writer's imports, so it answers from a string. That",
-    "#          is where B1 comes from.",
+    "# LOOKUP_LOCAL   a set name called on a receiver whose declared type is",
+    "#                not a store: a type's OWN same-named method over its own",
+    "#                symbol map or scope stack. Not a lane site; no migration",
+    "#                removes one. A FLOOR, and the control on placement: a",
+    "#                store misplaced as a local moves this row.",
+    "# LOOKUP_ARENA   lookup_by_name on the TypeArena outside arena.cryo. The",
+    "#                arena's written-name read, pinned apart from its other",
+    "#                reads so a name lookup cannot leave the index for the",
+    "#                arena and read as progress.",
+    "# ARENA_READ     the arena's other name-keyed reads: reverse maps and the",
+    "#                display formatters.",
+    "# ARENA_WRITE    the arena's creators and aliases, keyed by the spelling",
+    "#                the caller minted for a declared type.",
+    "# REGISTRY_READ  the GenericRegistry's name-keyed reads: templates, inherent",
+    "#                impl blocks, trait declarations, trait-impl heads. Keys are",
+    "#                canonical strings off stamps (bucket B, not spelling); pinned",
+    "#                because it was the store no row enumerated.",
+    "# REGISTRY_WRITE the GenericRegistry's registrars.",
+    "# GRAPH_READ     the ModuleGraph asked by namespace or path.",
+    "# GRAPH_WRITE    a name-keyed write to the ModuleGraph (none today).",
+    "# CONST_READ     a name-keyed read of the ConstantTable (reads go by stamp).",
+    "# CONST_WRITE    a constant or enum registered under its qualified name.",
+    "# REENTRY  get_resolver() outside the driver, and ANY name-keyed Resolver",
+    "#          method on a Resolver-typed receiver outside compiler/resolver/ and",
+    "#          the driver. Name resolution is a PASS, not a service: a resolver",
+    "#          called from sema no longer holds the writer's imports, so it",
+    "#          answers from a string. That is where B1 comes from.",
     "# HOME_WRITE    ResolutionContext::set_home_module() calls -- every place a",
     "#               stage re-resolves syntax and says which module WROTE it.",
     "#               The module handed over decides which same-leaf declaration",
@@ -514,7 +731,7 @@ def parse_golden(path):
             if name == "TOTAL":
                 totals[kind] = value
             else:
-                counts[kind][name] = value
+                counts.setdefault(kind, {})[name] = value
     return counts, totals
 
 
@@ -523,12 +740,17 @@ def main():
     ap.add_argument("--update", action="store_true",
                     help="rewrite the golden from the current measurement")
     ap.add_argument("--names", action="store_true",
-                    help="print the two definition-derived name sets and exit")
+                    help="print the definition-derived name sets and exit")
+    ap.add_argument("--src", default=DEFAULT_SRC,
+                    help="the compiler source tree to measure (default: compiler/src)")
+    ap.add_argument("--golden", default=DEFAULT_GOLDEN,
+                    help="the golden to compare against (default: tests/lane-baseline.txt)")
     args = ap.parse_args()
 
-    counts, unplaced, index_set, routed_set = scan()
+    counts, unplaced, sets = scan(args.src)
     if args.names:
-        for label, names in ((INDEX_TYPE, index_set), (ROUTED_TYPE, routed_set)):
+        for label in STORES:
+            names = sets[label]
             print("%s (%d):" % (label, len(names)))
             for name in sorted(names):
                 print("  %-6s %s" % (names[name], name))
@@ -537,20 +759,22 @@ def main():
         sys.stderr.write(
             "lane-gate: %d name-keyed call(s) could not be placed by receiver.\n"
             "A call this gate cannot classify is a call it cannot pin, and a\n"
-            "silently dropped one reads as progress. Extend receiver_kind().\n"
+            "silently dropped one reads as progress. The receiver's declared\n"
+            "type must be readable from the tree (an annotated local or\n"
+            "parameter, a declared field, or `this`).\n"
             % len(unplaced))
         for rel, lineno, recv in unplaced:
             sys.stderr.write("  %s:%d  receiver %s\n" % (rel, lineno, recv))
         return 1
     live_totals = {k: sum(v.values()) for k, v in counts.items()}
     if args.update:
-        with open(GOLDEN, "w", encoding="utf-8", newline=chr(10)) as fh:
+        with open(args.golden, "w", encoding="utf-8", newline=chr(10)) as fh:
             fh.write(render(counts))
         print("lane-gate: golden updated -- "
               + ", ".join("%s = %d" % (k, live_totals[k]) for k in KINDS))
         return 0
 
-    parsed = parse_golden(GOLDEN)
+    parsed = parse_golden(args.golden)
     if parsed is None:
         sys.stderr.write(
             "lane-gate: no golden at %s.\n"
@@ -559,7 +783,7 @@ def main():
             "    make lane-check ARGS=--update\n"
             "and commit it. NOTE: .gitignore ignores *.txt repo-wide, so the\n"
             "golden needs an explicit `!tests/lane-baseline.txt` negation or CI\n"
-            "fails on a fresh clone with exactly this message.\n" % GOLDEN)
+            "fails on a fresh clone with exactly this message.\n" % args.golden)
         return 1
     gold_counts, gold_totals = parsed
 
@@ -581,7 +805,7 @@ def main():
                 problems.append("    %-8s %-46s %d -> %d" % (kind, rel, was, now))
 
     if problems:
-        sys.stderr.write("lane-gate: DRIFT against %s\n" % os.path.relpath(GOLDEN, ROOT))
+        sys.stderr.write("lane-gate: DRIFT against %s\n" % os.path.relpath(args.golden, ROOT))
         sys.stderr.write("\n".join(problems) + "\n")
         sys.stderr.write(
             "\nAn increase means a per-kind lookup or a resolver re-entry was added:\n"
