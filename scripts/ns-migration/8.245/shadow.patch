@@ -1,0 +1,358 @@
+diff --git a/compiler/src/compiler/codegen/visit/pattern_emitter.cryo b/compiler/src/compiler/codegen/visit/pattern_emitter.cryo
+index eec50423..61787e4a 100644
+--- a/compiler/src/compiler/codegen/visit/pattern_emitter.cryo
++++ b/compiler/src/compiler/codegen/visit/pattern_emitter.cryo
+@@ -676,6 +676,10 @@ type struct PatternEmitter {
+                     const ns_str: string = QualifiedName::parent_of(q_str);
+                     const ns_sym: SymbolStr = if (ns_str.length() > 0) { this.cg.intern_str(ns_str) } else { SymbolStr::empty() };
+                     slot = this.cg.resolver.resolve_global_in_namespace(pat.value, ns_sym);
++                    const leaf_str: string = QualifiedName::leaf_of(q_str);
++                    if (leaf_str != this.cg.resolve(pat.value)) {
++                        fmt::eprintf("SHADOW\tPATLEAF-DIFF\t%s\t%s\n", q_str, this.cg.resolve(pat.value));
++                    }
+                 }
+                 _ => {}
+             }
+diff --git a/compiler/src/compiler/decl_index.cryo b/compiler/src/compiler/decl_index.cryo
+index 0a695234..d5c1e0a0 100644
+--- a/compiler/src/compiler/decl_index.cryo
++++ b/compiler/src/compiler/decl_index.cryo
+@@ -690,13 +690,19 @@ type struct DeclarationIndex {
+         *out_leaf = intern.intern(QualifiedName::leaf_of(q_str));
+     }
+ 
+-    /// The global the canonical name `q` names, from its registration slot.
+-    find_global_by_qualified(&this, q: SymbolStr, intern: InternTable*,
+-                             out_module: SymbolStr*) -> TypeRef {
++    /// The global the definition `d` is, from its registration slot, or
++    /// invalid when `d` names none or the definition is not a global.  The
++    /// slot is keyed by `(leaf, namespace)`, so the canonical name is split
++    /// HERE and nowhere a reader stands: a reader holding a `DefId` hands it
++    /// over rather than turning it back into a name to split.  Sibling of
++    /// `type_of_def`.
++    global_of_def(&this, d: DefId, intern: InternTable*) -> TypeRef {
++        if (!d.is_valid()) { return TypeRef::invalid(); }
+         mut leaf: SymbolStr = SymbolStr::empty();
+         mut ns: SymbolStr = SymbolStr::empty();
+-        DeclarationIndex::split_global_key(q, intern, &leaf, &ns);
+-        return this.find_global_in_namespace(leaf, ns, out_module);
++        DeclarationIndex::split_global_key(d.qualified_name(), intern, &leaf, &ns);
++        mut module: SymbolStr = SymbolStr::empty();
++        return this.find_global_in_namespace(leaf, ns, &module);
+     }
+ 
+     /// Whether the global `name` of namespace `ns` is `![thread_local]`, so a
+diff --git a/compiler/src/compiler/passes/type_resolution.cryo b/compiler/src/compiler/passes/type_resolution.cryo
+index 1bfde0c9..090ea58a 100644
+--- a/compiler/src/compiler/passes/type_resolution.cryo
++++ b/compiler/src/compiler/passes/type_resolution.cryo
+@@ -1617,6 +1617,14 @@ type struct TypeResolutionPasses {
+                     const coh_key: string =
+                         TypeResolutionPasses::coherence_key_for(
+                             node, canonical_target, ctx);
++                    {
++                        const coh_key2: string =
++                            TypeResolutionPasses::coherence_key_for_res(
++                                node, canonical_target, ctx);
++                        if (coh_key2 != coh_key) {
++                            fmt::eprintf("SHADOW\tCOHKEY-DIFF\t%s\t%s\n", coh_key, coh_key2);
++                        }
++                    }
+                     const coh_sym: SymbolStr =
+                         ctx.intern_table.intern(coh_key);
+                     const prior: ImplBlockNode* =
+@@ -2393,6 +2401,77 @@ type struct TypeResolutionPasses {
+         return ctx.intern_table.resolve(key);
+     }
+ 
++    /// SHADOW: the stamp-keyed form of `type_name_key`.  A definition is
++    /// asked of the index by its id, a primitive by its spelling; every other
++    /// answer names no declaration and renders as the spelling.
++    static type_name_key_res(name: SymbolStr, res: Res, node: ImplBlockNode*,
++                             ctx: CompilationContext*) -> string {
++        const pidx: i64 = TypeResolutionPasses::impl_param_index(node, name);
++        if (pidx >= 0) { return fmt::format("#%lld", pidx); }
++        const tref: TypeRef = match (res) {
++            Res::Def(q)    => { ctx.decl_index.type_of_def(q) }
++            Res::PrimTy(n) => { ctx.decl_index.lookup_type(n) }
++            _              => { TypeRef::invalid() }
++        };
++        if (tref.is_valid()) {
++            return fmt::format("#T%llu", tref.id);
++        }
++        return ctx.intern_table.resolve(name);
++    }
++
++    /// SHADOW: `ann_canon_key` over `type_name_key_res`.
++    static ann_canon_key_res(ann: TypeAnnotation*, node: ImplBlockNode*,
++                             ctx: CompilationContext*) -> string {
++        if (ann == null) { return "_"; }
++        return match (*ann) {
++            TypeAnnotation::Primitive(p) => {
++                TypeResolutionPasses::type_name_key_res(p.name, Res::PrimTy(p.name), node, ctx)
++            }
++            TypeAnnotation::Named(n) => {
++                const r: Res = match (n.res) {
++                    ResSlot::Answered(a) => { a }
++                    _                    => { Res::Err }
++                };
++                TypeResolutionPasses::type_name_key_res(n.name, r, node, ctx)
++            }
++            TypeAnnotation::Generic(g) => {
++                mut s: string =
++                    TypeResolutionPasses::ann_canon_key_res(g.base, node, ctx);
++                s = s + "<";
++                for (mut i: i64 = 0; i < g.args.length; i++) {
++                    if (i > 0) { s = s + ","; }
++                    s = s + TypeResolutionPasses::ann_canon_key_res(
++                        g.args[i], node, ctx);
++                }
++                s = s + ">";
++                s
++            }
++            TypeAnnotation::Reference(r) => {
++                const pre: string = if (r.is_mutable) { "&mut " } else { "&" };
++                pre + TypeResolutionPasses::ann_canon_key_res(r.inner, node, ctx)
++            }
++            TypeAnnotation::Pointer(p) => {
++                "*" + TypeResolutionPasses::ann_canon_key_res(p.inner, node, ctx)
++            }
++            TypeAnnotation::Array(a) => {
++                "[" + TypeResolutionPasses::ann_canon_key_res(a.element, node, ctx)
++                    + "]"
++            }
++            TypeAnnotation::Tuple(t) => {
++                mut s: string = "[";
++                for (mut i: i64 = 0; i < t.elements.length; i++) {
++                    if (i > 0) { s = s + ","; }
++                    s = s + TypeResolutionPasses::ann_canon_key_res(
++                        t.elements[i], node, ctx);
++                }
++                s = s + "]";
++                s
++            }
++            TypeAnnotation::ThisType(_) => { "This" }
++            _ => { "_" }
++        };
++    }
++
+     /// Render a type annotation to a stable, canonical string for coherence
+     /// keying.  Type-position names fold to their resolved type identity
+     /// (see `type_name_key`); the impl's own generic params normalize to
+@@ -2525,6 +2604,73 @@ type struct TypeResolutionPasses {
+         return key;
+     }
+ 
++    /// SHADOW: `coherence_key_for` over the stamp-keyed renderers.
++    static coherence_key_for_res(node: ImplBlockNode*,
++                             canonical_target: SymbolStr,
++                             ctx: CompilationContext*) -> string {
++        mut key: string = TypeResolutionPasses::ann_canon_key_res(
++            node.trait_annotation, node, ctx);
++        key = key + " for ";
++        // Target base by resolved type identity (folds primitive aliases
++        // and type aliases).  `canonical_target` is the head's own key
++        // already - the stamp's name, a primitive's spelling - so it is the
++        // stamped form here.
++        const head_res: Res = match (node.res) {
++            ResSlot::Answered(a) => { a }
++            _                    => { Res::PrimTy(canonical_target) }
++        };
++        key = key + TypeResolutionPasses::type_name_key_res(
++            canonical_target, head_res, node, ctx);
++        if (node.target_args.length > 0) {
++            key = key + "<";
++            for (mut i: i64 = 0; i < node.target_args.length; i++) {
++                if (i > 0) { key = key + ","; }
++                key = key + TypeResolutionPasses::ann_canon_key_res(
++                    node.target_args[i], node, ctx);
++            }
++            key = key + ">";
++        }
++        if (node.where_bounds.length > 0) {
++            key = key + " where ";
++            for (mut i: i64 = 0; i < node.where_bounds.length; i++) {
++                const wb: TraitBound* = &node.where_bounds[i];
++                const pidx: i64 = TypeResolutionPasses::impl_param_index(
++                    node, wb.type_parameter);
++                if (pidx >= 0) {
++                    key = key + fmt::format("#%lld:", pidx);
++                } else {
++                    key = key + ctx.intern_table.resolve(wb.type_parameter)
++                        + ":";
++                }
++                for (mut j: i64 = 0; j < wb.trait_refs.length; j++) {
++                    if (j > 0) { key = key + "+"; }
++                    const tr: TraitRef* = &wb.trait_refs[j];
++                    if (tr.path.length > 0) {
++                        // The bound's carried identity, never a search for its
++                        // leaf. Recovering the qualified name by searching the
++                        // program declines as soon as any unrelated
++                        // declaration shares the leaf, and two distinct traits
++                        // then fold to one key - so two impls differing only in
++                        // which module their bound came from rendered
++                        // identically and coherence rejected the second.
++                        key = key + ctx.intern_table.resolve(tr.identity());
++                    }
++                    if (tr.type_args.length > 0) {
++                        key = key + "<";
++                        for (mut k: i64 = 0; k < tr.type_args.length; k++) {
++                            if (k > 0) { key = key + ","; }
++                            key = key + TypeResolutionPasses::ann_canon_key_res(
++                                tr.type_args[k], node, ctx);
++                        }
++                        key = key + ">";
++                    }
++                }
++                key = key + ";";
++            }
++        }
++        return key;
++    }
++
+     /// Peel a trait annotation down to its underlying GenericAnnotation
+     /// node (through Reference/Pointer wrappers), or null when the trait is
+     /// non-generic.  Returns the NODE pointer (Copy, non-owning), NOT a copy
+diff --git a/compiler/src/compiler/sema/call_resolver.cryo b/compiler/src/compiler/sema/call_resolver.cryo
+index c4a7fc76..dfa65578 100644
+--- a/compiler/src/compiler/sema/call_resolver.cryo
++++ b/compiler/src/compiler/sema/call_resolver.cryo
+@@ -2672,6 +2672,7 @@ type struct CallResolver {
+         // been reported by the resolver that refused it, and is not reported
+         // again as a name that does not exist.
+         mut stamped_q: SymbolStr = SymbolStr::empty();
++        mut stamped_r: Res = Res::Err;
+         match (ident.res) {
+             ResSlot::Answered(r) => {
+                 match (r) {
+@@ -2686,7 +2687,7 @@ type struct CallResolver {
+                         }
+                     }
+                     Res::Err => { return TypeRef::invalid(); }
+-                    _        => { stamped_q = r.def_id().qualified_name(); }
++                    _        => { stamped_q = r.def_id().qualified_name(); stamped_r = r; }
+                 }
+             }
+             _ => {}
+@@ -2694,6 +2695,12 @@ type struct CallResolver {
+         mut func_ret: TypeRef = TypeRef::invalid();
+         if (stamped_q.is_valid()) {
+             func_ret = this.types.lookup_func_return(stamped_q);
++            const via_sig: TypeRef = this.overload_return_type(
++                this.ctx.decl_index.func_type_of_res(stamped_r));
++            if (via_sig.id != func_ret.id) {
++                fmt::eprintf("SHADOW\tFNRET-DIFF\t%s\t%llu\t%llu\n",
++                    this.intern.resolve(stamped_q), func_ret.id, via_sig.id);
++            }
+         }
+         if (func_ret.is_valid()) {
+             if (this.state.expected_type.is_valid()) {
+diff --git a/compiler/src/compiler/sema/sema.cryo b/compiler/src/compiler/sema/sema.cryo
+index 1c6a606c..4310b5a0 100644
+--- a/compiler/src/compiler/sema/sema.cryo
++++ b/compiler/src/compiler/sema/sema.cryo
+@@ -1621,13 +1621,15 @@ public:
+         // registered it last, and for a name no import offers - a private
+         // declaration elsewhere - from a module the writer cannot see.
+         mut func_ty: TypeRef = TypeRef::invalid();
++        mut def_id: DefId = DefId::invalid();
+         mut def_q: SymbolStr = SymbolStr::empty();
+         match (ident.res) {
+             ResSlot::Answered(r) => {
+                 func_ty = this.ctx.decl_index.func_type_of_res(r);
++                def_id = r.def_id();
+                 // The pin and the visibility gate below are keyed by the
+                 // canonical name; the type is not.
+-                def_q = r.def_id().qualified_name();
++                def_q = def_id.qualified_name();
+             }
+             _ => { }
+         }
+@@ -1640,7 +1642,7 @@ public:
+             if (!ident.resolved_callee.is_some() && !this.state.in_symbolic_check) {
+                 mut is_tmpl: boolean = false;
+                 if (this.ctx.generic_registry != null) {
+-                    const tm: TemplateEntry* = this.ctx.generic_registry.get_template(def_q);
++                    const tm: TemplateEntry* = this.ctx.generic_registry.template_of(def_id);
+                     if (tm != null && tm.node_kind == NodeKind::FunctionDeclaration) { is_tmpl = true; }
+                 }
+                 if (!is_tmpl) { ident.set_resolved_callee(CalleePin::Family(def_q)); }
+diff --git a/compiler/src/compiler/sema/type_utils.cryo b/compiler/src/compiler/sema/type_utils.cryo
+index 51c8d850..579f5b0f 100644
+--- a/compiler/src/compiler/sema/type_utils.cryo
++++ b/compiler/src/compiler/sema/type_utils.cryo
+@@ -88,8 +88,7 @@ type struct TypeUtils {
+ 
+     /// The global the definition `q` is, from its registration slot.
+     def_global(&this, q: DefId) -> TypeRef {
+-        mut m: SymbolStr = SymbolStr::empty();
+-        return this.ctx.decl_index.find_global_by_qualified(q.qualified_name(), this.intern, &m);
++        return this.ctx.decl_index.global_of_def(q, this.intern);
+     }
+ 
+     /// The type a WRITTEN name refers to, or invalid when it refers to
+@@ -259,7 +258,13 @@ type struct TypeUtils {
+         }
+         mut q: SymbolStr = SymbolStr::empty();
+         match (base) {
+-            ResBase::Def(d)    => { q = d.qualified_name(); }
++            ResBase::Def(d)    => {
++                const found: TypeRef = this.ctx.decl_index.type_of_def(d);
++                if (!found.is_valid()) {
++                    fmt::eprintf("SHADOW\tSCOPEQUAL-MISS\t%s\n", this.intern.resolve(d.qualified_name()));
++                }
++                return found;
++            }
+             ResBase::PrimTy(n) => { q = n; }
+             ResBase::GenericParam(_) => {
+                 // A clone's segment: the substituter rewrote `T::default()`
+diff --git a/compiler/src/compiler/types/resolver.cryo b/compiler/src/compiler/types/resolver.cryo
+index 802e9dca..de84836c 100644
+--- a/compiler/src/compiler/types/resolver.cryo
++++ b/compiler/src/compiler/types/resolver.cryo
+@@ -37,7 +37,7 @@ import std::collections::pair::{ Pair };
+ import compiler::resolver::scope;
+ import compiler::resolver::scope::{ ScopeID };
+ import compiler::resolver::res;
+-import compiler::resolver::res::{ Res, ResSlot };
++import compiler::resolver::res::{ DefId, Res, ResSlot };
+ import compiler::types::compound;
+ import compiler::types::compound::{ PointerType, ReferenceType };
+ import compiler::types::type_base;
+@@ -1364,11 +1364,11 @@ private:
+         //     synthesizer, and that stamp is the only thing naming its referent.
+         if (this.name_resolver != null) {
+             mut stamp_hit: TypeRef = TypeRef::invalid();
+-            mut stamp_key: SymbolStr = SymbolStr::empty();
++            mut stamp: DefId = DefId::invalid();
+             match (slot) {
+                 ResSlot::Answered(r) => {
+                     match (r) {
+-                        Res::Def(q) => { stamp_key = q.qualified_name(); }
++                        Res::Def(q) => { stamp = q; }
+                         // A parameter names itself and a primitive is answered
+                         // above; neither denotes a declaration to look up here.
+                         _           => { }
+@@ -1377,16 +1377,19 @@ private:
+                 _ => { }
+             }
+ 
+-            if (stamp_key.is_valid()) {
++            if (stamp.is_valid()) {
+                 // What remains is only WHERE the name's `TypeRef` is stored.
+                 // The DeclarationIndex indexes the qualified NAME without
+                 // necessarily holding the type, and the arena is the other
+                 // place, so a miss in one is not an answer.
+                 if (this.decl_index != null) {
+-                    stamp_hit = this.decl_index.lookup_type(stamp_key);
++                    stamp_hit = this.decl_index.type_of_def(stamp);
+                 }
+                 if (!stamp_hit.is_valid()) {
+-                    stamp_hit = this.arena.lookup_by_name(stamp_key);
++                    stamp_hit = this.arena.lookup_by_name(stamp.qualified_name());
++                    fmt::eprintf("SHADOW\t%s\t%s\n",
++                        if (stamp_hit.is_valid()) { "STAMP-ARENA" } else { "STAMP-MISS" },
++                        this.intern_table.resolve(stamp.qualified_name()));
+                 }
+                 // A name neither store serves is an ANSWER no store can serve:
+                 // a declaration that never registered, not a name this step

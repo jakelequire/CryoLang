@@ -2374,23 +2374,28 @@ type struct TypeResolutionPasses {
     /// Canonical key fragment for a type-position NAME.  Resolution order:
     ///   1. an impl-head generic param -> positional `#n` marker;
     ///   2. a name whose stamp names a declaration -> that type's canonical
-    ///      id (`#T<id>`), which folds every spelling of one type to one key
-    ///      and keeps two same-leaf types of different modules apart - a
-    ///      leaf folded by its spelling could do neither once two modules
-    ///      declared it;
-    ///   3. otherwise the spelling itself: a primitive (whose aliases the
-    ///      arena folds through the index when it holds them), a projection
-    ///      (`I::Item`), or a name nothing stamped.
-    static type_name_key(name: SymbolStr, stamped: SymbolStr, node: ImplBlockNode*,
+    ///      id (`#T<id>`), asked of the index by the id, which folds every
+    ///      spelling of one type to one key and keeps two same-leaf types of
+    ///      different modules apart - a leaf folded by its spelling could do
+    ///      neither once two modules declared it; a primitive by its
+    ///      spelling, which is its registration key;
+    ///   3. otherwise the spelling itself: a projection (`I::Item`), a
+    ///      parameter, or a name nothing stamped.  The spelling is never
+    ///      looked up: a name the writer's module did not resolve is not one
+    ///      the module being compiled may resolve for it.
+    static type_name_key(name: SymbolStr, res: Res, node: ImplBlockNode*,
                          ctx: CompilationContext*) -> string {
         const pidx: i64 = TypeResolutionPasses::impl_param_index(node, name);
         if (pidx >= 0) { return fmt::format("#%lld", pidx); }
-        const key: SymbolStr = if (stamped.is_valid()) { stamped } else { name };
-        const tref: TypeRef = ctx.decl_index.lookup_type(key);
+        const tref: TypeRef = match (res) {
+            Res::Def(q)    => { ctx.decl_index.type_of_def(q) }
+            Res::PrimTy(n) => { ctx.decl_index.lookup_type(n) }
+            _              => { TypeRef::invalid() }
+        };
         if (tref.is_valid()) {
             return fmt::format("#T%llu", tref.id);
         }
-        return ctx.intern_table.resolve(key);
+        return ctx.intern_table.resolve(name);
     }
 
     /// Render a type annotation to a stable, canonical string for coherence
@@ -2404,19 +2409,14 @@ type struct TypeResolutionPasses {
         if (ann == null) { return "_"; }
         return match (*ann) {
             TypeAnnotation::Primitive(p) => {
-                TypeResolutionPasses::type_name_key(p.name, SymbolStr::empty(), node, ctx)
+                TypeResolutionPasses::type_name_key(p.name, Res::PrimTy(p.name), node, ctx)
             }
             TypeAnnotation::Named(n) => {
-                const stamped: SymbolStr = match (n.res) {
-                    ResSlot::Answered(r) => {
-                        match (r) {
-                            Res::Def(q) => { q.qualified_name() }
-                            _           => { SymbolStr::empty() }
-                        }
-                    }
-                    _ => { SymbolStr::empty() }
+                const r: Res = match (n.res) {
+                    ResSlot::Answered(a) => { a }
+                    _                    => { Res::Err }
                 };
-                TypeResolutionPasses::type_name_key(n.name, stamped, node, ctx)
+                TypeResolutionPasses::type_name_key(n.name, r, node, ctx)
             }
             TypeAnnotation::Generic(g) => {
                 mut s: string =
@@ -2470,11 +2470,17 @@ type struct TypeResolutionPasses {
             node.trait_annotation, node, ctx);
         key = key + " for ";
         // Target base by resolved type identity (folds primitive aliases
-        // and type aliases).  `canonical_target` is the head's own key
-        // already - the stamp's name, a primitive's spelling - so it is the
-        // stamped form here.
+        // and type aliases), off the head's own answer.  A head the name
+        // layer left unanswered while `target_key` still gave a key is its
+        // alias-keyword door (`for int`): the spelling is the index's key
+        // for it, read as a primitive's is, so `int` and `i32` fold to one
+        // identity.  That arm retires with the keyword ruling.
+        const head_res: Res = match (node.res) {
+            ResSlot::Answered(a) => { a }
+            _                    => { Res::PrimTy(canonical_target) }
+        };
         key = key + TypeResolutionPasses::type_name_key(
-            canonical_target, canonical_target, node, ctx);
+            canonical_target, head_res, node, ctx);
         if (node.target_args.length > 0) {
             key = key + "<";
             for (mut i: i64 = 0; i < node.target_args.length; i++) {
