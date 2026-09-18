@@ -19,15 +19,27 @@ Each count is broken down per file so a failure names what moved.
 
 THREE RULES, EACH DERIVED FROM A DEFINITION, NONE FROM A LIST OF NAMES.
 
-  1. WHICH TYPES ARE STORES.  A store is a declaration-holding type the
-     `CompilationContext` carries by pointer - the shared state every pass
-     reaches - plus `TypeUtils`, sema's funnel in front of the index.  The
-     context's other members are excluded for a stated reason each (see
-     STORES below): the intern table is the string boundary itself, the
-     module loader and the artifacts are keyed by filesystem path, the type
-     checker takes an operator spelling and holds no table.  A gate that
-     watched ONE store found new surface on every audit for eleven rounds,
-     because a reader on any other store was invisible by construction.
+  1. WHICH TYPES ARE STORES.  A store is a type that OWNS A MAP: any `type`
+     block in the tree with a field of the tree's one map type, `HashMap<K,
+     V>` (or `HashSet<T>`, its set form; none today), read from the tree on
+     every run.  The key type is not consulted: no map in this tree is
+     declared `HashMap<SymbolStr, ...>` - a name keys a map by its interned
+     id, `u32`, and a `u64` is two of them packed, a type id or a source
+     position - so the key's spelling cannot tell a name-keyed table from a
+     position-keyed one, and the rule does not try.  Instead EVERY map owner
+     must be placed: as a store, with the rows its reads and writes land in
+     (STORES below), or as an exclusion with the reason it holds no
+     declaration under a name (EXCLUDED below: a table keyed by a source
+     position, a linker symbol, a file path, a directive kind; a pass's own
+     scope of the locals it just bound).  A map owner in neither is REFUSED,
+     as is a listed type that owns no map or lives in another file - a stale
+     entry is the list drifting from the tree.  `TypeUtils` is the one store
+     with no map, sema's funnel in front of the index, and is marked as such.
+     A gate that watched ONE store found new surface on every audit for
+     eleven rounds, because a reader on any other store was invisible by
+     construction; a gate whose stores were a hand-written list of seven read
+     OK over a new map-keyed store added to the context, because the list
+     never asked the tree.
 
   2. WHICH METHODS ARE NAME-KEYED.  Any method a store declares whose
      signature mentions a KEY TYPE - `SymbolStr` or `string` - as a
@@ -107,6 +119,13 @@ The calls are SPLIT BY THE STORE that answers them and by READ vs WRITE:
   * CONST_READ / CONST_WRITE -- the `ConstantTable`: constants and enums
     registered under their qualified name; reads go by stamp (`ConstEval`)
     and are expected to stay at zero.
+  * DEFAULT_READ / DEFAULT_WRITE -- the `DefaultRegistry`: the default-
+    expansion pass's table of all-default generic templates, keyed by the
+    template's BARE leaf, built on the pass's stack and threaded through it
+    as a parameter.  A store that lives in one file has its whole surface in
+    that file, and a store's own calls are not counted (see below), so both
+    rows read 0: what the gate pins is that the store EXISTS and that no
+    other stage reaches it, not how its own pass reads it.
   * REENTRY -- calls to `get_resolver()` outside the driver, and ANY
     name-keyed `Resolver` method reached through a `Resolver`-typed
     receiver outside the resolver's own directory and the driver
@@ -214,11 +233,15 @@ class Store(object):
     directory owner ends in `/`.
     """
 
-    def __init__(self, defn, read, write, owners=()):
+    def __init__(self, defn, read, write, owners=(), funnel=False):
         self.defn = defn
         self.read = read
         self.write = write
         self.owners = tuple(owners)
+        # A funnel owns no map: it is a store because every name-keyed method
+        # it declares is a wrapper over one that does.  The one exemption from
+        # rule 1's "a store owns a map", stated per store rather than inferred.
+        self.funnel = funnel
 
     def owns(self, rel):
         if rel == self.defn:
@@ -231,19 +254,19 @@ class Store(object):
         return False
 
 
-# Rule 1.  The context carries these by pointer and each holds declarations
-# under a name.  Not stores, with the reason: `InternTable` is the
-# string<->SymbolStr boundary (every method mentions a key type by
-# construction, and it holds strings, not declarations); `ModuleLoader` and
-# `PhaseArtifacts` are keyed by filesystem path; `TypeChecker` takes an
-# operator spelling and holds no table; `TypeResolver` holds pointers to the
-# stores below and no table of its own, so a name it answers it answers by
-# asking one of them; `Monomorphizer`/`MonoState` key their own spec
-# bookkeeping by mangled symbol, a stamp derivation reached only through
-# `this.state`; `DirectiveRegistry` is keyed by directive kind.
+# Rule 1's two tables.  Together they must name EVERY type in the tree that
+# owns a map, each in the file it is declared in, and nothing else; `scan`
+# refuses the tree otherwise.  The map is what makes a type a candidate; the
+# tables only say which side of the line each candidate falls on, and a
+# candidate the tables do not mention is the gate's question to whoever added
+# it, never a silent OK.
+#
+# Stores: each holds declarations under a name, and each has the rows its
+# reads and writes land in.
 STORES = {
     "DeclarationIndex": Store("compiler/decl_index.cryo", "LOOKUP_OTHER", "REGISTER"),
-    "TypeUtils":        Store("compiler/sema/type_utils.cryo", "LOOKUP_ROUTED", "LOOKUP_ROUTED"),
+    "TypeUtils":        Store("compiler/sema/type_utils.cryo", "LOOKUP_ROUTED", "LOOKUP_ROUTED",
+                              funnel=True),
     "TypeArena":        Store("compiler/types/arena.cryo", "ARENA_READ", "ARENA_WRITE"),
     "GenericRegistry":  Store("compiler/types/generic_registry.cryo", "REGISTRY_READ", "REGISTRY_WRITE"),
     "ModuleGraph":      Store("compiler/module_graph.cryo", "GRAPH_READ", "GRAPH_WRITE"),
@@ -251,9 +274,60 @@ STORES = {
     "Resolver":         Store("compiler/resolver/resolver.cryo", "REENTRY", "REENTRY",
                               owners=("compiler/resolver/", "compiler/instance.cryo",
                                       "compiler/compilation_context.cryo")),
+    "DefaultRegistry":  Store("compiler/passes/default_expansion.cryo", "DEFAULT_READ", "DEFAULT_WRITE"),
 }
 INDEX_TYPE = "DeclarationIndex"
 ARENA_TYPE = "TypeArena"
+
+
+class Excluded(object):
+    """A map owner that is not a store, with the file it is declared in and
+    the reason its map holds no declaration under a name."""
+
+    def __init__(self, defn, reason):
+        self.defn = defn
+        self.reason = reason
+
+
+# Not stores, each with the reason.  Four kinds of reason recur: the key is a
+# SOURCE POSITION (a span's file, line and column packed to a `u64`); the key
+# is an OUTPUT name - a linker symbol codegen minted, or a spec key built from
+# a stamp - reached after resolution has answered; the key is a FILE PATH or
+# a DIRECTIVE KIND, which name no declaration; or the map is a pass's OWN RIB,
+# the locals it bound while walking a body, keyed by the binding's name - the
+# population the LOOKUP_LOCAL row counts calls on, and no lane.
+EXCLUDED = {
+    "InternTable":       Excluded("compiler/resolver/intern_table.cryo",
+                                  "the string<->SymbolStr boundary itself: holds strings, not declarations"),
+    "Scope":             Excluded("compiler/resolver/scope.cryo",
+                                  "the resolver's rib; reached through Resolver, whose asks from outside its pass are REENTRY"),
+    "ResolutionMap":     Excluded("compiler/resolver/resolution_map.cryo",
+                                  "the resolver's answers keyed by SOURCE POSITION (ResolutionMap::make_key(span))"),
+    "ModuleLoader":      Excluded("compiler/module_loader.cryo",
+                                  "discovery's namespace -> file path table, read once per import before the graph exists; the graph it builds is the store"),
+    "Monomorphizer":     Excluded("compiler/mono/monomorphizer.cryo",
+                                  "spec bookkeeping keyed by a mangled symbol, a stamp derivation"),
+    "MonoState":         Excluded("compiler/mono/state.cryo",
+                                  "spec bookkeeping keyed by a mangled symbol, a stamp derivation"),
+    "SemaState":         Excluded("compiler/sema/state.cryo",
+                                  "sema's own rib of locals by binding name, and a closure-spec key built from a DefId"),
+    "MoveChecker":       Excluded("compiler/passes/move_check.cryo",
+                                  "the pass's own rib of locals by binding name"),
+    "DeadCodeChecker":   Excluded("compiler/passes/dead_code.cryo",
+                                  "use flags keyed by SOURCE POSITION (ResolutionMap::make_key(span))"),
+    "FunctionRegistry":  Excluded("compiler/codegen/state/function_registry.cryo",
+                                  "LLVM handles keyed by the LINKER SYMBOL codegen minted"),
+    "GlobalRegistry":    Excluded("compiler/codegen/state/global_registry.cryo",
+                                  "LLVM handles keyed by the LINKER SYMBOL codegen minted"),
+    "TypeMapperCache":   Excluded("compiler/codegen/type_map.cryo",
+                                  "LLVM types keyed by TypeRef id"),
+    "DiagRenderer":      Excluded("compiler/diag/renderer.cryo",
+                                  "source files keyed by FILE PATH"),
+    "DiagnosticSink":    Excluded("compiler/diag/sink.cryo",
+                                  "rendered diagnostics deduplicated by their text"),
+    "Runner":            Excluded("CLI/_module.cryo",
+                                  "the CLI's command table, keyed by the subcommand typed"),
+}
 
 REENTRY_RE = re.compile(r"\bget_resolver\s*\(\s*\)")
 # The driver legitimately owns the resolver and may ask for it.
@@ -280,7 +354,7 @@ HOME_WRITE_RE = re.compile(r"\.set_home_module\s*\(")
 KINDS = ("LOOKUP", "LOOKUP_OTHER", "REGISTER", "LOOKUP_ROUTED", "LOOKUP_LOCAL",
          "ARENA_READ", "ARENA_WRITE",
          "REGISTRY_READ", "REGISTRY_WRITE", "GRAPH_READ", "GRAPH_WRITE",
-         "CONST_READ", "CONST_WRITE",
+         "CONST_READ", "CONST_WRITE", "DEFAULT_READ", "DEFAULT_WRITE",
          "REENTRY", "HOME_WRITE", "DEFID_MINT", "DEFID_UNWRAP")
 
 
@@ -310,6 +384,13 @@ INHERENT_IMPL_RE = re.compile(
     r"^implement(?:\s*<[^>]*>)?\s+(?:(?:struct|class|union|enum)\s+)?"
     r"([A-Za-z_][A-Za-z_0-9]*)(?:\s*<[^>]*>)?\s*\{")
 FIELD_RE = re.compile(r"^    ([a-z_][a-z_0-9]*)\s*:\s*&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*([A-Za-z_][A-Za-z_0-9]*)")
+# A field whose type is the tree's map type (or its set form), qualified or
+# not: `name_index: HashMap<u32, i64>;`, `commands: hashmap::HashMap<string,
+# Command>;`.  Rule 1's candidate test.  The key is captured for `--names`
+# and for nothing else.
+MAP_FIELD_RE = re.compile(
+    r"^    (?:public\s+|private\s+)?([a-z_][a-z_0-9]*)\s*:\s*"
+    r"(?:[a-z_][a-z_0-9]*::)*(HashMap|HashSet)\s*<\s*([^,>]+)")
 RETURN_RE = re.compile(r"\)\s*->\s*&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*([A-Za-z_][A-Za-z_0-9]*)")
 # A receiver: segments joined by `.`, each an identifier optionally followed
 # by `()` (a zero-argument accessor, placed by its declared return type) or
@@ -330,6 +411,10 @@ class Tree(object):
         self.fields = {}
         self.returns = {}
         self.blocks = {}
+        # {type_name: [(relpath, field, key_type)]}: every map-owning type
+        # block, with the file it was found in.  A type declared in two files
+        # keeps both, and rule 1 refuses it.
+        self.map_owners = {}
         for dirpath, _dirs, names in os.walk(src):
             for fname in sorted(names):
                 if not fname.endswith(".cryo"):
@@ -339,13 +424,14 @@ class Tree(object):
                 with open(full, "r", encoding="utf-8", errors="replace") as fh:
                     lines = fh.read().split("\n")
                 self.files[rel] = lines
-                self.blocks[rel] = self.scan_blocks(lines)
+                self.blocks[rel] = self.scan_blocks(lines, rel)
         self.rels = sorted(self.files)
 
-    def scan_blocks(self, lines):
+    def scan_blocks(self, lines, rel):
         """[(first_line_index, type_name)] for every top-level type or impl
-        block, in order; fills `fields` for `type` blocks and `returns` for
-        every method head at depth 1 of either."""
+        block, in order; fills `fields` for `type` blocks, `map_owners` for
+        the `type` blocks with a map field, and `returns` for every method
+        head at depth 1 of either."""
         heads = []
         current = None
         depth = 0
@@ -375,6 +461,10 @@ class Tree(object):
                     f = FIELD_RE.match(code)
                     if f is not None:
                         self.fields[current][f.group(1)] = f.group(2)
+                    mf = MAP_FIELD_RE.match(code)
+                    if mf is not None:
+                        self.map_owners.setdefault(current, []).append(
+                            (rel, mf.group(1), mf.group(2), mf.group(3).strip()))
             for ch in code:
                 if ch == "{":
                     depth += 1
@@ -510,9 +600,60 @@ def store_methods(tree, type_name, defn):
     return found
 
 
+def place_map_owners(tree):
+    """Rule 1: every map owner the tree holds is a store or an exclusion, in
+    the file the table names, and every table entry owns a map.
+
+    Refuses with every problem listed rather than the first, so one run over
+    a drifted tree names everything that moved.  A map owner in neither
+    table is the gate asking whoever added it which side of the line it is
+    on; a table entry with no map behind it is the table drifting from the
+    tree, which is how a hand-written list of stores read OK over a tree
+    holding one more.
+    """
+    problems = []
+    for name in sorted(tree.map_owners):
+        rels = sorted(set(rel for rel, _f, _m, _k in tree.map_owners[name]))
+        if name in STORES:
+            want = STORES[name].defn
+            side = "STORES"
+        elif name in EXCLUDED:
+            want = EXCLUDED[name].defn
+            side = "EXCLUDED"
+        else:
+            fields = ", ".join("%s: %s<%s>" % (f, m, k) for _r, f, m, k in tree.map_owners[name])
+            problems.append(
+                "  `%s` (%s) owns a map (%s) and is in neither STORES nor EXCLUDED:\n"
+                "      a type that owns a map holds something under a key; say which -\n"
+                "      a store, with the rows its reads and writes land in, or an\n"
+                "      exclusion, with the reason its key names no declaration"
+                % (name, ", ".join(rels), fields))
+            continue
+        if rels != [want]:
+            problems.append("  `%s` is listed in %s at %s but declared with a map in %s"
+                            % (name, side, want, ", ".join(rels)))
+    for name, st in STORES.items():
+        if st.defn not in tree.files:
+            problems.append("  no %s under %s" % (st.defn, tree.src))
+        elif st.funnel:
+            if name in tree.map_owners:
+                problems.append("  `%s` is marked a funnel (no map of its own) but owns one" % name)
+        elif name not in tree.map_owners:
+            problems.append("  `%s` is listed in STORES but owns no map: a stale entry" % name)
+    for name, ex in EXCLUDED.items():
+        if ex.defn not in tree.files:
+            problems.append("  no %s under %s (`%s` is listed in EXCLUDED)" % (ex.defn, tree.src, name))
+        elif name not in tree.map_owners:
+            problems.append("  `%s` is listed in EXCLUDED but owns no map: a stale exclusion" % name)
+    if problems:
+        raise SystemExit("lane-gate: rule 1 - the map owners and the tables disagree:\n"
+                         + "\n".join(problems))
+
+
 def scan(src):
     """Return ({kind: {relpath: count}}, unplaced, {store: set}) over `src`."""
     tree = Tree(src)
+    place_map_owners(tree)
     sets = {name: store_methods(tree, name, st.defn) for name, st in STORES.items()}
     # Control on the parser: the LOOKUP row is the four names, and they are
     # declared on the index.  A parser that cannot see them cannot see the
@@ -589,7 +730,7 @@ def scan(src):
         for kind in KINDS:
             if tally[kind]:
                 found[kind][rel] = tally[kind]
-    return found, unplaced, sets
+    return found, unplaced, sets, tree.map_owners
 
 
 HEADER = [
@@ -597,8 +738,9 @@ HEADER = [
     "#",
     "# ASSERTED: both totals and every per-file row.",
     "#",
-    "# A store is a declaration-holding type the CompilationContext carries,",
-    "# plus TypeUtils (sema's funnel). A name-keyed method is one a store",
+    "# A store is a type that owns a map, read from the tree: every map owner",
+    "# is a store with rows or an exclusion with a reason, and one in neither",
+    "# refuses the run; plus TypeUtils (sema's funnel). A name-keyed method is one a store",
     "# declares - inline or in an `implement` block in any file - whose",
     "# signature mentions SymbolStr or string, read from the tree on every run:",
     "# not a list of names, so a reader added under any spelling, in any file,",
@@ -640,6 +782,11 @@ HEADER = [
     "# GRAPH_WRITE    a name-keyed write to the ModuleGraph (none today).",
     "# CONST_READ     a name-keyed read of the ConstantTable (reads go by stamp).",
     "# CONST_WRITE    a constant or enum registered under its qualified name.",
+    "# DEFAULT_READ   the DefaultRegistry (default expansion's all-default",
+    "#                templates by bare leaf, built on the pass's stack) asked",
+    "#                by name from outside its own file - 0, since the store",
+    "#                and its only reader share the file.",
+    "# DEFAULT_WRITE  the DefaultRegistry registered into from outside its file.",
     "# REENTRY  get_resolver() outside the driver, and ANY name-keyed Resolver",
     "#          method on a Resolver-typed receiver outside compiler/resolver/ and",
     "#          the driver. Name resolution is a PASS, not a service: a resolver",
@@ -735,8 +882,14 @@ def main():
                     help="the golden to compare against (default: tests/lane-baseline.txt)")
     args = ap.parse_args()
 
-    counts, unplaced, sets = scan(args.src)
+    counts, unplaced, sets, owners = scan(args.src)
     if args.names:
+        print("map owners (%d): rule 1's population, each placed" % len(owners))
+        for label in sorted(owners):
+            side = "STORE" if label in STORES else "excluded: " + EXCLUDED[label].reason
+            print("  %-20s %s" % (label, side))
+            for _rel, field, kind, key in owners[label]:
+                print("      %s: %s<%s, ...>" % (field, kind, key))
         for label in STORES:
             names = sets[label]
             print("%s (%d):" % (label, len(names)))

@@ -71,8 +71,9 @@ measurement that decided it on the row.
 | D25 | **`(Beta for P)::make()` is Cryo's impl-qualified call form** (Jake, 2026-09-17). It reuses `for` exactly as `implement trait Beta for P` does - no new lexical territory, and none of the `<P as Beta>` parsing problem. It MUST cover the receiver case too, `(Beta for P)::go(&p)`, so E0156 has ONE rule to suggest rather than a short form that works sometimes; and it must compose inside a generic, `(Beta for T)::make()`. Motivation: a tie of STATIC trait methods (`P::make()` with `Beta::make` and `Gamma::make` both implemented for `P`) has no receiver to disambiguate it, so E0156 fires with no suggestable spelling today | **RULED - UNBUILT** | `no check` — syntax not in the tree; the project that lands it pins it, and E0156's help names the form then | §8.224, §8.229 |
 | D26 | **The two-trait tie is an ERROR** in both spellings (`recv.m(...)`, `T::m(recv, ...)`) - never a pick by declaration or import order; each candidate named at its declaration; the trait-qualified call `Tr::m(&recv, ...)` chooses | **TAKEN** (ruled 2026-09-17; built the same day, §8.224, as `E0156_AMBIGUOUS_TRAIT_METHOD`) | `grep -c 'E0156_AMBIGUOUS_TRAIT_METHOD' compiler/src/compiler/diag/_module.cryo` → **2**; `grep -c '^negative E0156_' tests/test-roster.txt` → **2**; `grep -c '^project trait_qualified_call_disambiguates' tests/test-roster.txt` → **1** | §8.220, §8.224, §8.229 |
 | D27 | **The Rust trait-in-scope rule is REJECTED** (Jake, 2026-09-17, on §8.224's measurement): Cryo calls a trait's methods with the trait imported nowhere in BOTH call forms today; requiring scope would break **277 call sites in 61 files** (stdlib 135, `tests/` 118, LSP 19, examples 5, `compiler/src` 0); and it would settle **0 of the 28** tie sites in the corpus - at no site is exactly one candidate in scope. D25 is what gives a tie a spelling, not scope. Not to be proposed again without new numbers | **REJECTED** | `no check` — a rule not built; `scripts/ns-migration/8.224/` re-derives the three tables from a corpus run | §8.224, §8.229 |
+| D28 | **Overlapping impls are REFUSED OUTRIGHT, as Rust does (E0119)** - not specialisation, not declaration order (Jake, 2026-09-18: "I want to do that 'refuse overlaps outright as Rust does'") | **RULED - UNBUILT** — the shape: `implement<T> trait Show for struct Wrap<T> { show(&this) -> i32 { 1 } }` beside `implement trait Show for struct Wrap<i32> { show(&this) -> i32 { 2 } }`; `w.show()` on a `Wrap<i32>` answers 1 or 2 by which impl is WRITTEN FIRST, under the current compiler and under the pin `db5af63c` alike, so it predates the migration (audit 12's `overlap_a` / `overlap_b` projects demonstrate it). The error belongs at the OVERLAPPING DECLARATION, never at the call: the call is innocent, two impls both claiming one (trait, type) is the defect, and a use-site report blames the wrong code. `generic_registry.cryo`'s `select_trait_impl` comment - "the overlap is a registration-time report, not one per use" - is a hypothesis, not a mechanism: grep finds the comment and no report; whoever builds this makes it true, as a coherence check over `heads_under` at registration. **Measure the population first**: the registry reshape (§8.233) made overlapping heads representable in a way they were not before, so the stdlib or the projects may hold overlaps that resolve by luck today; if any do, this is a source-breaking change and Jake wants the blast radius before it lands | `grep -c 'registration-time report' compiler/src/compiler/types/generic_registry.cryo` → **1**; `grep -rho 'E0119' compiler/src --include=*.cryo \| wc -l` → **0** | — |
 
-**D18, D24, D25 and Q2 are RULED and UNBUILT** (D5 was, until §8.206; D2 and D9 were,
+**D18, D24, D25, D28 and Q2 are RULED and UNBUILT** (D5 was, until §8.206; D2 and D9 were,
 until §8.213). Each was decided by Jake - D18 and D2 then re-parked as open
 questions, D2 across ninety-five entries; §8.202 records the re-affirmation,
 §8.216 the three rulings of 2026-09-16 and §8.229 the three of 2026-09-17. They
@@ -188,7 +189,8 @@ three, and its row carries the count. Read each zero off its own row.
 | the `GenericRegistry` as a name-keyed store (23 methods: templates by qualified name, inherent impl blocks and owners, trait declarations by identity, trait-impl heads by `(trait identity, target key)`, the well-known claims, `find_trait_defining_method` by bare method name) | **PINNED** (§8.241) — 67 reads / 19 writes outside `generic_registry.cryo`, the store no row enumerated before (audit 12: 22 methods, 87 sites). Keys are canonical strings derived from stamps - a registered type's qualified name, a trait's identity, a target key - so the surface is bucket B, not spelling, at every site but one: `find_trait_defining_method(method_name)` scans every trait for the first declaring a method of that BARE name, async or not, and is a HINT with one reader, sema's "defined on trait Y" note. Its second reader - the async lowering's receiver-refresh decision - reads the trait off the projection's `owning_trait` since §8.242 (`trait_decl_of(TypeRef)`, by identity): the scan answered `Read` for `AtmRead::read` and `GfTick` for `GenTick::tick` in the unit binary (4 of 11 sites; examples 28 of 28 agreed), and the refresh was dropped there - unobservably, since a carried receiver's storage never moves between polls (§8.242's mutation: every generic-receiver refresh dropped, 142 async unit tests + 17 negative + 3 projects PASS) | — | `grep -A1 '^[[]REGISTRY_READ]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **66** (67 until §8.245: sema's template question by `template_of`); `grep -A1 '^[[]REGISTRY_WRITE]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **19**; `grep -rho 'find_trait_defining_method(' compiler/src --include=*.cryo \| wc -l` → **2** (the definition, the hint); `grep -c 'trait_decl_of(' compiler/src/compiler/sema/async_lower.cryo` → **1**; `grep -c 'TypeKind::Trait => ' compiler/src/compiler/types/arena.cryo` → **1** (`get_qualified_name` names a trait) | §8.233, §8.241, §8.242 |
 | the `ModuleGraph` as a name-keyed store (6 methods: a module by namespace `find_module_index`, by path `find_module_by_path`, `reexport_closure`, `source_file_for_owner_key`, `ns_sym_of_file`, a static path comparison) | **PINNED** (§8.241) — 31 reads / 0 writes outside `module_graph.cryo` (32 at §8.241; -1 in §8.250, sema's E0202 declarers note, which asked the graph by name for each function key's parent, deleted with the report's move; the name layer's note walks the graph's modules by index). A module IS named: an import path is a module name by the language's definition, and `find_module_index` (10) answers the loader, the resolver's import binding and one diagnostic; 12 are by filesystem path | — | `grep -A1 '^[[]GRAPH_READ]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **31**; `grep -A1 '^[[]GRAPH_WRITE]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **0** | §8.241 |
 | the `ConstantTable` as a name-keyed store (`register`/`register_enum` under a qualified name; two static key helpers) | **PINNED** (§8.241) — 2 writes, both from `name_resolution.cryo` at the declaration (the pass that just walked to it); 3 static reads; every value read goes by stamp through `ConstEval::stamped_index_of`. Audit 12 wrote `ConstTable 0`: a zero over the wrong population - the type is `ConstantTable` | — | `grep -A1 '^[[]CONST_WRITE]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **2**; `grep -A1 '^[[]CONST_READ]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **3** | §8.241 |
-| the context's other members under the same rule (`InternTable` 4 methods, `Resolver` 33, `TypeResolver` 11, `Monomorphizer` 7, `MonoState` 5, `TypeChecker` 3, `ModuleLoader` 24, `PhaseArtifacts` 1, `DirectiveRegistry` 3) | **MEASURED, NOT STORES** (§8.241) — the intern table is the string boundary itself; the resolver's asks from outside its pass are `REENTRY` (10; 12 at §8.241, the two by-spelling asks type resolution made of the cursor's scope deleted in §8.244); the type resolver holds pointers to the stores and no table (its 18 external sites re-resolve an annotation, the `HOME_WRITE` neighbourhood); the mono pair key spec bookkeeping by mangled symbol through `this.state` only; the checker takes an operator spelling; the loader and the artifacts are keyed by path; the directive registry by directive kind | — | `grep -A1 '^[[]REENTRY]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **10** | §8.241 |
+| the `DefaultRegistry` as a name-keyed store (`passes/default_expansion.cryo`: the default-expansion pass's table of all-default generic templates keyed by the template's BARE leaf, built on the pass's stack, first-registered-wins, fed from the process-global registry regardless of imports; `register(name, defaults)` / `lookup(name)`) | **PINNED** (§8.253) — the store audit 13 found outside §8.241's hand-written list: 0 reads / 0 writes outside its own file, because the store and its only reader share the file and a store's own calls are not the surface; what the row pins is that it EXISTS and that no other stage reaches it. **It carries a live bug**: the rewrite site copies the annotation's stamp across and then matches by written spelling, so `import std::fs::path;` (binding nothing, D7) beside the user's own non-generic `struct PathBuf` rewrites the user's `PathBuf` to the stdlib's defaults and `p.n` is E0204 - refused by `7239982f` and by the pin `db5af63c` alike; remove the import and it compiles. The stamp is present and ignored; the fix reads it (the next unit) | — | `grep -A1 '^[[]DEFAULT_READ]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **0**; `grep -A1 '^[[]DEFAULT_WRITE]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **0**; `grep -c 'name_index: HashMap<u32, i64>;' compiler/src/compiler/passes/default_expansion.cryo` → **1** | §8.253 |
+| the tree's other map owners, EXCLUDED under the store rule with a reason each (`InternTable`, `Scope`, `ResolutionMap`, `ModuleLoader`, `Monomorphizer`, `MonoState`, `SemaState`, `MoveChecker`, `DeadCodeChecker`, `FunctionRegistry`, `GlobalRegistry`, `TypeMapperCache`, `DiagRenderer`, `DiagnosticSink`, `Runner`) | **MEASURED, NOT STORES** (§8.241 for the context's members; §8.253 for the population as the tree gives it) — the rule is "a type that owns a map", read from the tree on every `lane-check` run: 22 owners: 7 stores and 15 exclusions (the eighth store, `TypeUtils`, is the funnel and owns no map). Each exclusion's reason is in the script's `EXCLUDED` table and falls into four kinds: keyed by SOURCE POSITION (`ResolutionMap`, `DeadCodeChecker`: `make_key(span)`), by an OUTPUT name after resolution has answered (`FunctionRegistry`/`GlobalRegistry` by the linker symbol codegen minted, `Monomorphizer`/`MonoState` by the mangled spec symbol, `SemaState.closure_spec_map` by a `DefId`), by a FILE PATH, a namespace at discovery, diagnostic text or a subcommand (`DiagRenderer`, `ModuleLoader`, `DiagnosticSink`, `Runner`), or a pass's OWN RIB of the locals it just bound (`SemaState`, `MoveChecker`, and `Scope`, the resolver's, with 0 `Scope`-typed receivers outside `compiler/resolver/`) - the population `LOOKUP_LOCAL` counts calls on. `TypeResolver`, `TypeChecker`, `PhaseArtifacts`, `DirectiveRegistry` own no map and are not candidates. The resolver's asks from outside its pass stay `REENTRY` (10; 12 at §8.241, the two by-spelling asks type resolution made of the cursor's scope deleted in §8.244) | — | `grep -A1 '^[[]REENTRY]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **10**; `python3 scripts/lane-gate.py --names \| grep -c '^  [A-Za-z]* *excluded: '` → **15**; `python3 scripts/lane-gate.py --names \| grep -c '^  [A-Za-z]* *STORE$'` → **7** | §8.241, §8.253 |
 
 **The arena `leaf_index` map is not the deleted leaf index.** §8.121 deleted the
 LOOKUP LANE. The map survives with three consumers, none of them resolution:
@@ -205,11 +207,11 @@ evidence for what it covers.
 |---|---|---|
 | `make test` | 2,124 unit + 64 project + 194 negative (67 projects on the roster, 3 gated by `requires`); `OVERALL PASS` since §8.233 - the two `impl_concrete_arg_*` projects that were RED by design from §8.223 are green | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
-| `make lane-check` | 17 buckets of call sites in `compiler/src`, as a golden, under three rules each derived from a definition and none from a list of names (§8.241): **a STORE is a declaration-holding type the `CompilationContext` carries** (`DeclarationIndex`, `TypeArena`, `GenericRegistry`, `ModuleGraph`, `ConstantTable`, `Resolver`) plus `TypeUtils`, the funnel - the context's other members are excluded for a stated reason each in the script; **a name-keyed method is any a store declares - inline or in an `implement` block in ANY file - with `SymbolStr` or `string` in its signature**, parsed from the tree on every run since §8.230 (the `lookup_*` rule read OK over 24 readers under other names; the inline-only parser read OK over a cross-file `implement struct` reader; the `SymbolStr`-token rule read OK over a `string`-keyed one); **a call is placed by its receiver's DECLARED TYPE** (`this`, a local's annotation, a field's declaration, an accessor's return type), not its spelling. Reads split `LOOKUP` (the five) / `LOOKUP_OTHER` (the rest) / `LOOKUP_ROUTED` (the funnel), `REGISTER` pins the index's name-keyed WRITES, and each other store has a `*_READ` and a `*_WRITE` row (`ARENA`, `REGISTRY`, `GRAPH`, `CONST`); `LOOKUP_ARENA` kept the arena's `lookup_by_name` apart from §8.192 (it read OK over a tree holding 17) until §8.247 deleted the method, and `ARENA_READ` is where a written-name read on the arena lands under any spelling; `HOME_WRITE` pins `.set_home_module(` at 0 since §8.204; `REENTRY` counts `get_resolver()` AND every name-keyed `Resolver` method on a `Resolver`-typed receiver outside `compiler/resolver/` and the driver (the three-name list read 6 over a tree holding 12: type resolution's `is_ambiguous`/`get_ambiguous_modules` - deleted in §8.244, 10 now - sema's three asks on its `get_resolver()` local, `Resolver::ns_written_as`); `make lane-selftest` drives every rule through a throwaway tree in both directions (17 mutations) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. A receiver whose type it cannot read is refused, not dropped; a set name on a receiver of a NON-store type is counted as local (the control on placement). A `string` parameter that is a label rather than a key (`impl_owner(node, site: string)`) is inside the rule and pinned like a key: the rule cannot tell them apart and does not try. |
+| `make lane-check` | 19 buckets of call sites in `compiler/src`, as a golden, under three rules each derived from a definition and none from a list of names (§8.241, §8.253): **a STORE is a type that OWNS A MAP** (`HashMap<K, V>` / `HashSet<T>` field, read from the tree on every run; the key type is not consulted, since a name keys a map by its `u32` id and a `u64` may be two of them packed, a type id or a source position) - every owner must be placed, as a store with its rows (`DeclarationIndex`, `TypeArena`, `GenericRegistry`, `ModuleGraph`, `ConstantTable`, `Resolver`, `DefaultRegistry`, plus `TypeUtils`, the funnel, marked as owning none) or as an exclusion with its reason (15, the script's `EXCLUDED` table), and a map owner in neither, a listed type with no map, or one declared in a file the table does not name, REFUSES the run; §8.241's version was a hand-written dict of seven the script never checked against the tree, and audit 13 added a map-keyed member to the context over which it read OK; **a name-keyed method is any a store declares - inline or in an `implement` block in ANY file - with `SymbolStr` or `string` in its signature**, parsed from the tree on every run since §8.230 (the `lookup_*` rule read OK over 24 readers under other names; the inline-only parser read OK over a cross-file `implement struct` reader; the `SymbolStr`-token rule read OK over a `string`-keyed one); **a call is placed by its receiver's DECLARED TYPE** (`this`, a local's annotation, a field's declaration, an accessor's return type), not its spelling. Reads split `LOOKUP` (the five) / `LOOKUP_OTHER` (the rest) / `LOOKUP_ROUTED` (the funnel), `REGISTER` pins the index's name-keyed WRITES, and each other store has a `*_READ` and a `*_WRITE` row (`ARENA`, `REGISTRY`, `GRAPH`, `CONST`, `DEFAULT`); `LOOKUP_ARENA` kept the arena's `lookup_by_name` apart from §8.192 (it read OK over a tree holding 17) until §8.247 deleted the method, and `ARENA_READ` is where a written-name read on the arena lands under any spelling; `HOME_WRITE` pins `.set_home_module(` at 0 since §8.204; `REENTRY` counts `get_resolver()` AND every name-keyed `Resolver` method on a `Resolver`-typed receiver outside `compiler/resolver/` and the driver (the three-name list read 6 over a tree holding 12: type resolution's `is_ambiguous`/`get_ambiguous_modules` - deleted in §8.244, 10 now - sema's three asks on its `get_resolver()` local, `Resolver::ns_written_as`); `make lane-selftest` drives every rule through a throwaway tree in both directions (23 mutations) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. A receiver whose type it cannot read is refused, not dropped; a set name on a receiver of a NON-store type is counted as local (the control on placement). A `string` parameter that is a label rather than a key (`impl_owner(node, site: string)`) is inside the rule and pinned like a key: the rule cannot tell them apart and does not try. |
 | `make selfhost-check` | stage-3 == stage-4 byte identity, both arms | **Stability, not correctness.** It proves the compiler still emits the same bytes for code that already compiles; it says nothing about code that now STOPS compiling. |
 | `make ns-status-check` | every check this section carries, run from the repo root; a grep whose quoted pattern carries a pipe is refused unrun (a cell's `\|` is undone as a column escape, so the pipe would be a literal and the row could only read 0); since §8.243 the section's SHAPE is refused before any row runs - a table row with more cells than its header, a check cell whose backticks do not pair once its well-formed checks are removed, a backticked command with no arrow-and-bold answer after it - because the extractor matches the backticked-command-arrow-bold-answer shape wherever it stands and a damaged span is skipped for the next well-formed one, not reported (two spliced cells and three checks with their answer in backticks passed here that way) | A number that moved, and nothing else - see 0.5. A check that runs and holds for the wrong reason. |
 | `make guard-selftest` | the commit-msg guard and `ns-status-check` driven through a throwaway repository, each rule refused and allowed (19 cases: 14, and since §8.243 a spliced cell, a backticked answer, an unescaped pipe, a second command with no answer, and a note's backticked names allowed); CI's ubuntu job runs it | The real repository's hook installation (`make install-hooks` is per checkout). |
-| `make lane-selftest` | `lane-gate.py` driven through a throwaway source tree: the baseline it must accept, and for each rule a mutation it must refuse by row - a cross-file `implement` reader, a `string`-keyed reader, a reader and a writer on each other store, the resolver asked by name, a store reached through a local under a new spelling / an accessor / an indexed field, an unreadable receiver, a decrease, a commented-out call, a store's own call, an unmeasured store, a missing store (17 cases); part of `check-fast` | The real tree's numbers - it proves the gate CAN refuse, and the golden proves what the tree holds. |
+| `make lane-selftest` | `lane-gate.py` driven through a throwaway source tree: the baseline it must accept, and for each rule a mutation it must refuse by row - a cross-file `implement` reader, a `string`-keyed reader, a reader and a writer on each other store, the resolver asked by name, a store reached through a local under a new spelling / an accessor / an indexed field, an unreadable receiver, a decrease, a commented-out call, a store's own call, an unmeasured store, a missing store, and for the store rule (§8.253) a new map-keyed type carried by the context with a reader and a caller (the audit's mutation), a map owner nothing carries, a store whose map is gone, an exclusion whose map is gone, a store's name declared with a map in a second file, the funnel given a map (23 cases; the fixture's exclusion stubs are generated from the gate's own `EXCLUDED` table, so an exclusion added there is exercised here without an edit); part of `check-fast` | The real tree's numbers - it proves the gate CAN refuse, and the golden proves what the tree holds. |
 | `make lsp-check` | `tools/CryoLSP` compiles against **the compiler under test** | Compilation only — no language-server behaviour is exercised. |
 | `make cross-check` | `runtime/`, `stdlib/`, `compiler/`, `tools/CryoLSP` compile to OBJECTS for the other OS's triple with the compiler under test — the config-gated half every host-native gate prunes before name resolution (326 attributes in the stdlib, 23 in the runtime, 11 in the compiler, 6 in the LSP) | Objects only: nothing links, nothing runs. `tests/` and `examples/` are not built. |
 | `make examples` | smoke-builds every `examples/` project | Build only; no program is run and no output is compared. |
@@ -230,7 +232,7 @@ a count.
 
 Checks for this section, one per line so each can be copied whole:
 
-* `grep -c '^\[' tests/lane-baseline.txt` → **17**
+* `grep -c '^\[' tests/lane-baseline.txt` → **19**
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: lane-check lane-selftest' Makefile` → **1**
 * `grep -c '^project ' tests/test-roster.txt` → **67**
@@ -513,9 +515,9 @@ an error with a suggestion, not an invitation to search.
 >   No multi-segment path goes through it. The other routes in are the nine
 >   `Resolver::lookup` sites, measured in §8.239 (§0's `resolve_path` row
 >   carries the table). The per-kind lookups it was to replace are still
->   pinned by `lane-check` in eighteen buckets (eight when this was written). Checks:
+>   pinned by `lane-check` in nineteen buckets (eight when this was written). Checks:
 >   `grep -rho '\.resolve_path(' compiler/src --include=*.cryo \| wc -l` → **2**;
->   `grep -c '^\[' tests/lane-baseline.txt` → **17** (8 when this was written; `HOME_WRITE` since §8.204, `REGISTER` since §8.230, the eight per-store rows since §8.241; `LOOKUP_ARENA` retired in §8.247 with the arena's name lookup).
+>   `grep -c '^\[' tests/lane-baseline.txt` → **19** (8 when this was written; `HOME_WRITE` since §8.204, `REGISTER` since §8.230, the eight per-store rows since §8.241; `LOOKUP_ARENA` retired in §8.247 with the arena's name lookup; `DEFAULT_READ`/`DEFAULT_WRITE` since §8.253, when the store rule read the tree and found the store the list had not).
 > * **"There is no ambient cursor" — ASPIRATIONAL.** The machinery is present
 >   (`HomeOrigin`, `current_module`) and answers **0** on the pinned corpora, so
 >   it is starved rather than absent (§0, §8.19, §8.105, §8.109). Check:
@@ -882,11 +884,12 @@ implementing, so the mechanisms below are what carry the remaining work.
 >   wearing a wrapper. The ruling keeps the lookups PUBLIC and makes the third
 >   lock, the surface ratchet, the whole enforcement. Do not implement the
 >   second lock; §0 D12 carries the ruling.
-> * **Mechanism 5's third lock pins eighteen numbers, not two.** `lane-check`'s
+> * **Mechanism 5's third lock pins nineteen numbers, not two.** `lane-check`'s
 >   buckets are `LOOKUP`, `LOOKUP_OTHER`, `LOOKUP_ROUTED`, `LOOKUP_LOCAL`,
 >   `REENTRY`, `HOME_WRITE`, `REGISTER`, `DEFID_MINT`, `DEFID_UNWRAP`,
 >   and since §8.241 a READ and a WRITE row for each of the arena, the generic
->   registry, the module graph and the constant table — split by the
+>   registry, the module graph and the constant table (and since §8.253 the
+>   default registry, the store the tree held and the list did not) — split by the
 >   RECEIVER'S DECLARED TYPE since §8.241 (by its spelling from §8.107),
 >   because a count matched on the NAME cannot separate the index's surface
 >   from things that merely resemble it; `LOOKUP_ARENA` from §8.192, because
@@ -896,7 +899,7 @@ implementing, so the mechanisms below are what carry the remaining work.
 >   context carries since
 >   §8.241, because a gate watching one store found new surface on every audit
 >   for eleven rounds. Check:
->   `grep -c '^\[' tests/lane-baseline.txt` → **17** (8 when this was written; `HOME_WRITE` since §8.204, `REGISTER` since §8.230, the eight per-store rows since §8.241; `LOOKUP_ARENA` retired in §8.247 with the arena's name lookup).
+>   `grep -c '^\[' tests/lane-baseline.txt` → **19** (8 when this was written; `HOME_WRITE` since §8.204, `REGISTER` since §8.230, the eight per-store rows since §8.241; `LOOKUP_ARENA` retired in §8.247 with the arena's name lookup; the default registry's two since §8.253).
 
 1. **`Res` is an enum, and `match` is exhaustive.** Adding or changing a
    variant forces every consumer to handle it (E0405). This is the primary
@@ -14511,9 +14514,13 @@ Now:
   | `ModuleLoader` / `PhaseArtifacts` | 24 / 1 | 9 / 3 | **no** - keyed by filesystem path |
   | `DirectiveRegistry` | 3 (`has(kind: string)`) | - | **no** - keyed by directive kind |
 
-  Each exclusion is stated in the script beside `STORES`, so the next type
-  added to the context is a question the script asks rather than one an
-  audit finds.
+  Each exclusion is stated in the script beside `STORES`.  [The sentence
+  that stood here - "so the next type added to the context is a question the
+  script asks rather than one an audit finds" - was FALSE of the script:
+  `STORES` was a hand-written dict of seven that the script never checked
+  against the tree, so a new store was exactly what an audit finds, and
+  audit 13 found one (`DefaultRegistry`) by adding a map-keyed member to the
+  context and reading OK.  §8.253 derives the store list from the tree.]
 
 * **A name-keyed method is any a store declares - in its `type struct`
   block or in an inherent `implement [<G>] [struct] Store {` block in ANY
@@ -15921,6 +15928,156 @@ sites.py` (its `LOOKUP_ARENA` arm removed with the row it named).
 **Tally: 92 shadowed, 92 old paths deleted, 92 at zero; 178 artifacts
 gone** (+4 artifacts: `resolve_global_by_qualified`, the three per-field
 accessors).
+
+### 8.253 The lane gate's store rule reads the tree: a store is a type that owns a map, every map owner is a store with rows or an exclusion with a reason, and one in neither refuses the run - §8.241's rule was a hand-written list of seven the script never checked, audit 13 added a map-keyed member to the context and it read OK, and the rule's first run over the real tree found the store the list had missed, `DefaultRegistry`, which carries a live bug; six self-test mutations, the pair re-runnable; D28 recorded - 2026-09-18
+
+> **Status:** LANDED.  `scripts/lane-gate.py` rule 1 rewritten (`STORES` +
+> `EXCLUDED`, `place_map_owners`, `--names` prints the population);
+> `tests/lane-baseline.txt` re-pinned at 19 buckets (`DEFAULT_READ` 0,
+> `DEFAULT_WRITE` 0; `LOOKUP_LOCAL` 60 → 57); `scripts/lane-gate-selftest.py`
+> 17 → 23 mutations, its fixture's exclusion stubs generated from the gate's
+> table; `scripts/ns-migration/8.253/pair.py` runs the old gate and the new
+> over the audit's mutation.  §0: D28 added (RULED - UNBUILT, Jake's ruling
+> of 2026-09-18, both checks verified at `7239982f`), the `DefaultRegistry`
+> row, the exclusions row, the `lane-check` and `lane-selftest` rows, three
+> bucket-count checks 17 → 19; §5.2 and §7 said eighteen beside checks that
+> read 17 (audit 13) and say nineteen beside checks that read 19; §8.241's
+> false sentence corrected in place with a pointer here.  No compiler
+> source changed.
+
+#### Why
+
+Audit 13's headline: §8.241's first rule - *a store is a declaration-holding
+type the `CompilationContext` carries* - was the ledger's sentence and not
+the script's.  The script held `STORES`, a dict of seven typed by hand, and
+never read the context's fields; the sentence *"the next type added to the
+context is a question the script asks"* described a check that did not
+exist.  The audit proved it the only way a gate is ever proved: a new
+pointer member on the context, its type owning a map keyed by a `SymbolStr`
+id, a reader and a caller - and `lane-gate` printed `OK`.  That is the same
+hole as the `lookup_*` name pattern §8.230 removed and the receiver
+spellings §8.241 removed, one rule further up: a list is a hole wherever it
+stands in for a definition.
+
+#### The rule
+
+**A store is a type that owns a map.**  Rule 1's candidate test is a field
+of the tree's one map type, `HashMap<K, V>` (or `HashSet<T>`, its set form;
+no field today), in any `type` block, read from the tree on every run.  The
+key type is deliberately not consulted.  No map in this tree is declared
+`HashMap<SymbolStr, …>`: a name keys a map by its interned id (`DefId`'s
+own comment: "the maps it keys are `HashMap<u32, TypeRef>` on
+`SymbolStr.id`"), and a `u64` key is two of them packed (`method_returns`),
+a type id (`type_index`) or a source position (`ResolutionMap::make_key`),
+so the key's spelling cannot separate a name-keyed table from a
+position-keyed one and a rule that pretended to would be a list of key
+spellings.  Instead every owner is PLACED: as a store, with the rows its
+reads and writes land in (`STORES`), or as an exclusion, with the reason its
+key names no declaration (`EXCLUDED`).  A map owner in neither table
+refuses the run and names itself; so does a listed type that owns no map (a
+stale entry, the table drifting from the tree the way the old list had) or
+one declared with a map in a file the table does not name (a second
+`ConstantTable` elsewhere would otherwise be placed by the first's row).
+`TypeUtils` is the one store with no map, sema's funnel in front of the
+index, marked `funnel=True`; a funnel given a map is refused too, because a
+funnel holds nothing.
+
+The population, as the tree gives it (`python scripts/lane-gate.py --names`):
+**22 map owners** - 7 stores (`DeclarationIndex` 13 maps, `GenericRegistry`
+9, `TypeArena` 11, `ConstantTable` 2, `ModuleGraph` 1, `Resolver` 1,
+`DefaultRegistry` 1) and 15 exclusions.  Audit 13's `mapowners.py` found the
+same 22 by an independent regex, the control on the parser.  The exclusions
+fall into four kinds of reason, each verified against the reader, not the
+field's name:
+
+| kind | types | what the key is |
+|---|---|---|
+| a source position | `ResolutionMap`, `DeadCodeChecker` | `ResolutionMap::make_key(span)`: file hash, line, column packed |
+| an output name, after resolution answered | `FunctionRegistry`, `GlobalRegistry` (codegen), `Monomorphizer`, `MonoState` | the linker symbol codegen minted; the mangled spec symbol; `SemaState.closure_spec_map` is a `DefId` id plus substitutions |
+| a path, a namespace at discovery, text, a subcommand | `DiagRenderer`, `ModuleLoader`, `DiagnosticSink`, `Runner` | `ModuleLoader.ns_map` IS keyed by namespace, but every external call is `discover_*` / `scan_all_project_files` / vendor / the LSP override - discovery, before the graph exists; the `ModuleGraph` it builds is the store every later ask goes to |
+| a pass's own rib | `SemaState`, `MoveChecker`, `Scope` | the locals the pass bound while walking a body, by binding name - `LOOKUP_LOCAL`'s population; `Scope` is the resolver's rib, and 0 `Scope`-typed receivers exist outside `compiler/resolver/` (`grep -rnE '\b[a-z_]+\s*:\s*&?\s*(mut\s+)?Scope\*?\b'` less `ScopeManager`/`ScopeStack`/…) |
+
+`InternTable` is the boundary itself.  `TypeResolver`, `TypeChecker`,
+`PhaseArtifacts` and `DirectiveRegistry`, which §8.241 excluded by name, own
+no map and are not candidates; the rule no longer has to say anything about
+them, which is the point.
+
+#### What the rule found
+
+The first run over the real tree refused it:
+
+```
+`DefaultRegistry` (compiler/passes/default_expansion.cryo) owns a map (name_index: HashMap<u32>) and is in neither STORES nor EXCLUDED
+```
+
+`DefaultRegistry` is a declaration store keyed by the template's BARE leaf
+(`TemplateEntry.name` - "Unqualified: `Array`"), built on the default-
+expansion pass's stack, threaded through it as a parameter,
+first-registered-wins, fed from the process-global `GenericRegistry`
+regardless of what the module imports.  It is a store by the rule and by
+what it does, so it has rows: `DEFAULT_READ` / `DEFAULT_WRITE`, both **0**,
+because the store and its only reader share one file and a store's own
+calls are not the surface.  Predicted before the run: buckets 17 → 19, both
+new rows 0, `LOOKUP_LOCAL` 60 → 57 (the three calls on a `DefaultRegistry*`
+parameter - `reg.lookup` ×2, `reg.register` ×1 - had been counted as local
+because the receiver's type was not a store; now they are the store's own),
+nothing else moving.  Measured exactly that.
+
+What the rows pin is that the store EXISTS and that no other stage reaches
+it - not how its own pass reads it.  That is a stated limit of "a store's
+own file is excluded", and it matters here because the store carries a live
+bug the gate cannot see: the rewrite site copies the annotation's stamp
+across (`old_res`) and then matches by written spelling
+(`reg.lookup(named.name)`), so an import that binds nothing poisons an
+unrelated same-leaf type:
+
+```cryo
+import std::fs::path;      // binds nothing (D7), but brings the module in
+struct PathBuf { n: i32 }  // the user's own, non-generic
+const p: PathBuf = PathBuf { n: 1 };
+p.n                        // E0204 no field or method `n` on type Main::PathBuf
+```
+
+Remove the import and it compiles.  Refused by `7239982f` and by the pin
+`db5af63c` alike.  The stamp is present and ignored; reading it is the next
+unit, and the row says so.
+
+#### The pair
+
+`scripts/ns-migration/8.253/pair.py` builds the audit's mutation from the
+self-test's fixture (a new `ImplIndex` owning `HashMap<u32, i64>`, carried
+by the context as `impl_index: ImplIndex*`, with `owner_of(&this, name:
+SymbolStr)` and a caller in sema), pins a golden with the old gate (`git
+show 7239982f:scripts/lane-gate.py`) over the fixture, and runs both gates
+over the mutated tree:
+
+* OLD: `exit 0` - `lane-gate: OK -- LOOKUP = 2 (2 files), … DEFID_UNWRAP = 0 (0 files)`
+* NEW: `exit 1` - `` lane-gate: rule 1 - the map owners and the tables disagree: `ImplIndex` (compiler/impl_index.cryo) owns a map (owners: HashMap<u32>) and is in neither STORES nor EXCLUDED ``
+
+`pair: both halves behaved`.  The self-test carries the same mutation and
+five more for the rule (a map owner nothing carries; a store whose map is
+gone; an exclusion whose map is gone; a store's name declared with a map in
+a second file; the funnel given a map): `lane-gate-selftest: OK -- baseline
+accepted, 23 mutations behaved`.  The fixture's exclusion stubs are
+generated from the gate's `EXCLUDED` table at import, so the test cannot
+accept a table it does not carry, and an exclusion added to the gate is
+exercised by the stale-exclusion case without an edit here.
+
+#### D28, recorded
+
+Jake's ruling of 2026-09-18, in his words: "I want to do that 'refuse
+overlaps outright as Rust does'."  §0's D28 row carries it - RULED,
+UNBUILT, the shape, the pre-migration evidence, the registration-time
+placement of the error, and the entry condition (measure the overlapping
+heads over the six halves first; the count is the blast radius).  Both
+checks read as stated at `7239982f` and at this commit.  It rides here
+because the ledger never commits alone.
+
+Outside the ledger: `scripts/lane-gate.py`, `scripts/lane-gate-selftest.py`,
+`scripts/ns-migration/8.253/pair.py`, `tests/lane-baseline.txt`.
+
+**Tally: 92 shadowed, 92 old paths deleted, 92 at zero; 178 artifacts
+gone** (unchanged: no compiler source in this entry).
 
 ---
 

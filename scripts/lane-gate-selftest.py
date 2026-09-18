@@ -20,6 +20,14 @@ reached through a local of a new spelling, through a zero-argument accessor,
 or through an indexed field is placed by its declared type, and a receiver
 whose type cannot be read is refused rather than dropped.
 
+And the store rule, which replaced a hand-written list of stores: a type
+that owns a map is a store or a stated exclusion, and one in neither is
+refused - the audit's mutation was a new map-keyed type carried by the
+context with a reader and a caller, over which the list read OK.  The
+fixture carries a stub for every exclusion the gate lists (generated from
+the gate's own table, so an exclusion added there is exercised here), and
+a stub that loses its map is refused as stale.
+
 Usage:
     python3 scripts/lane-gate-selftest.py
 
@@ -34,14 +42,28 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GATE = os.path.join(ROOT, "scripts", "lane-gate.py")
 
-# The smallest tree the gate accepts: every store present, each with one
-# name-keyed method (the index with the four LOOKUP names, the arena with
-# get_qualified_name - the parser's own controls), a context carrying them, and
-# one caller exercising one call per baseline row.
+
+def load_gate():
+    """The gate as a module, for its STORES and EXCLUDED tables: the fixture
+    is built from them, so a store or an exclusion added to the gate is a
+    stub added here without editing this file."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("lane_gate", GATE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# The smallest tree the gate accepts: every store present, each owning a map
+# (rule 1's candidate test) and one name-keyed method (the index with the
+# four LOOKUP names, the arena with get_qualified_name - the parser's own
+# controls), a context carrying them, a stub per exclusion, and one caller
+# exercising one call per baseline row.
 FILES = {
     "compiler/decl_index.cryo": """\
 type struct DeclarationIndex {
     entries: TypeRef[];
+    type_map: HashMap<u32, TypeRef>;
 
     lookup_type(&this, name: SymbolStr) -> TypeRef { return this.entries[0]; }
     lookup_func_type(&this, name: SymbolStr) -> TypeRef { return this.entries[0]; }
@@ -67,6 +89,7 @@ type struct TypeUtils {
     "compiler/types/arena.cryo": """\
 type struct TypeArena {
     names: SymbolStr[];
+    struct_cache: HashMap<u32, TypeRef>;
 
     lookup_by_name(&this, name: SymbolStr) -> TypeRef { return TypeRef::invalid(); }
     get_qualified_name(&this, ty: TypeRef) -> SymbolStr { return this.names[0]; }
@@ -80,6 +103,7 @@ type struct TypeArena {
     "compiler/types/generic_registry.cryo": """\
 type struct GenericRegistry {
     arena: TypeArena*;
+    name_index: HashMap<u32, i64>;
 
     get_template(&this, qualified_name: SymbolStr) -> TemplateEntry* { return null; }
     register_impl_block(mut &this, qualified_name: SymbolStr, block: ImplBlockNode*) -> void {}
@@ -88,6 +112,7 @@ type struct GenericRegistry {
     "compiler/module_graph.cryo": """\
 type struct ModuleGraph {
     modules: ModuleInfo[];
+    name_index: HashMap<u32, u32>;
 
     find_module_index(&this, name: SymbolStr) -> i64 { return -1; }
 }
@@ -95,13 +120,23 @@ type struct ModuleGraph {
     "compiler/const_table.cryo": """\
 type struct ConstantTable {
     entries: ConstEntry[];
+    by_qualified: HashMap<u32, i64>;
 
     register(mut &this, qualified: SymbolStr, init: ExpressionNode*) -> void {}
+}
+""",
+    "compiler/passes/default_expansion.cryo": """\
+type struct DefaultRegistry {
+    entries: DefaultEntry[];
+    name_index: HashMap<u32, i64>;
+
+    lookup(&this, name: SymbolStr) -> DefaultEntry* { return null; }
 }
 """,
     "compiler/resolver/resolver.cryo": """\
 type struct Resolver {
     scopes: Scope[];
+    module_scopes: HashMap<u32, u64>;
 
     lookup(&this, name: SymbolStr, start: ScopeID) -> SymbolID { return SymbolID::invalid(); }
     set_module(mut &this, name: SymbolStr) -> void {}
@@ -156,6 +191,16 @@ type struct Sema {
 """,
 }
 
+GATE_MOD = load_gate()
+
+# One stub per exclusion the gate lists, in the file the gate names, owning a
+# map: rule 1 requires every listed type to be in the tree with its map, so
+# the fixture cannot accept the gate's table without carrying it.
+EXCLUSION_STUB = "type struct %s {\n    table: HashMap<u32, i64>;\n}\n"
+for _name, _ex in GATE_MOD.EXCLUDED.items():
+    assert _ex.defn not in FILES, "an exclusion shares a file with a fixture store: %s" % _ex.defn
+    FILES[_ex.defn] = EXCLUSION_STUB % _name
+
 # LOOKUP is 2: the caller's one, and the funnel's call INTO the index in
 # type_utils.cryo, which is counted - only a store's own file is excluded
 # from its own set.
@@ -163,9 +208,12 @@ BASELINE = {
     "LOOKUP": 2, "LOOKUP_OTHER": 0, "REGISTER": 0, "LOOKUP_ROUTED": 1,
     "LOOKUP_LOCAL": 1, "ARENA_READ": 2, "ARENA_WRITE": 0,
     "REGISTRY_READ": 0, "REGISTRY_WRITE": 0, "GRAPH_READ": 0, "GRAPH_WRITE": 0,
-    "CONST_READ": 0, "CONST_WRITE": 0, "REENTRY": 0, "HOME_WRITE": 0,
+    "CONST_READ": 0, "CONST_WRITE": 0, "DEFAULT_READ": 0, "DEFAULT_WRITE": 0,
+    "REENTRY": 0, "HOME_WRITE": 0,
     "DEFID_MINT": 0, "DEFID_UNWRAP": 0,
 }
+# The first exclusion in the gate's table, for the stale-exclusion mutation.
+FIRST_EXCLUDED = sorted(GATE_MOD.EXCLUDED)[0]
 
 
 def sema_with(extra_lines):
@@ -250,12 +298,58 @@ MUTATIONS = [
      {"compiler/module_graph.cryo":
           "type struct ModuleGraph {\n"
           "    modules: ModuleInfo[];\n"
+          "    name_index: HashMap<u32, u32>;\n"
           "    count(&this) -> i64 { return 0; }\n"
           "}\n"},
      1, "declares no method whose signature mentions"),
     ("a missing store definition is refused",
      {"compiler/const_table.cryo": None},
      1, "no compiler/const_table.cryo"),
+    # Rule 1: the store list is derived from the tree's map owners.
+    ("the audit's mutation: a new map-keyed type carried by the context, with a "
+     "reader and a caller, is a map owner in neither table and is refused",
+     {"compiler/impl_index.cryo":
+          "type struct ImplIndex {\n"
+          "    owners: HashMap<u32, i64>;\n"
+          "\n"
+          "    owner_of(&this, name: SymbolStr) -> i64 { return -1; }\n"
+          "}\n",
+      "compiler/compilation_context.cryo": FILES["compiler/compilation_context.cryo"].replace(
+          "    resolver:         Resolver*;\n",
+          "    resolver:         Resolver*;\n    impl_index:       ImplIndex*;\n"),
+      "compiler/sema/sema.cryo": sema_with(["this.ctx.impl_index.owner_of(name);"])},
+     1, "`ImplIndex` (compiler/impl_index.cryo) owns a map (owners: HashMap<u32>) and is in neither STORES nor EXCLUDED"),
+    ("a map owner nothing carries is refused the same way: the map is the test, not the context",
+     {"compiler/sema/leaf_cache.cryo":
+          "type struct LeafCache {\n"
+          "    by_leaf: HashMap<u32, TypeRef>;\n"
+          "}\n"},
+     1, "`LeafCache` (compiler/sema/leaf_cache.cryo) owns a map"),
+    ("a store whose map is gone is a stale entry, refused",
+     {"compiler/module_graph.cryo":
+          "type struct ModuleGraph {\n"
+          "    modules: ModuleInfo[];\n"
+          "\n"
+          "    find_module_index(&this, name: SymbolStr) -> i64 { return -1; }\n"
+          "}\n"},
+     1, "`ModuleGraph` is listed in STORES but owns no map: a stale entry"),
+    ("an exclusion whose map is gone is a stale exclusion, refused",
+     {GATE_MOD.EXCLUDED[FIRST_EXCLUDED].defn:
+          "type struct %s {\n    items: i64[];\n}\n" % FIRST_EXCLUDED},
+     1, "`%s` is listed in EXCLUDED but owns no map: a stale exclusion" % FIRST_EXCLUDED),
+    ("a map owner named like a store but declared in another file is refused",
+     {"compiler/sema/const_table.cryo":
+          "type struct ConstantTable {\n"
+          "    by_qualified: HashMap<u32, i64>;\n"
+          "}\n"},
+     1, "`ConstantTable` is listed in STORES at compiler/const_table.cryo but declared with a map in "
+        "compiler/const_table.cryo, compiler/sema/const_table.cryo"),
+    ("the funnel given a map of its own is refused: a funnel holds nothing",
+     {"compiler/sema/type_utils.cryo":
+          FILES["compiler/sema/type_utils.cryo"].replace(
+              "    ctx: CompilationContext*;\n",
+              "    ctx: CompilationContext*;\n    memo: HashMap<u32, TypeRef>;\n")},
+     1, "`TypeUtils` is marked a funnel (no map of its own) but owns one"),
 ]
 
 
