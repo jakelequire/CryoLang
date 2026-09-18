@@ -88,6 +88,80 @@ def rows(section_text):
             for c, e in ROW_RE.findall(section_text)]
 
 
+# An unescaped pipe: a column boundary.  `\|` is a pipe inside a cell.
+CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
+# The first word of a command: what a check cell's backticked spans hold.
+# This is the grammar of §0's checks (POSIX one-liners: grep, wc, pipes), not
+# a list of names the rule depends on - a span that starts with one of these
+# and has no `→ **N**` after it is a check that lost its expected value.
+COMMAND_WORD_RE = re.compile(
+    r"^(?:grep|git|python3?|awk|sed|wc|ls|find|cat|head|tail|sort|comm|cut|"
+    r"xargs|bash|make|test|diff|nm|objdump|sha256sum)\b")
+
+
+def structural_problems(section_text):
+    """[(line_number, reason)] for every place §0's text has lost the shape
+    the row extractor relies on.
+
+    `ROW_RE` matches `` `cmd` → **N** `` wherever it stands.  A cell whose
+    first span was damaged - `` `grep -c x src \\|`grep -c y src` → **0** ``,
+    where a `sed` pattern's `\\|` alternation ate the first check's
+    `\\| wc -l` → **0** and spliced another row's check in - is then read as
+    ONE valid check: the damaged span is skipped and the next well-formed one
+    taken.  The first check stopped running and nothing said so; the section
+    carried it for a week.  Two shapes catch that:
+
+      * a table row must have as many cells as its table's header row.  The
+        splice above brought an UNESCAPED pipe with it (an extra column), and
+        a pattern fragment pasted into another row did the same;
+      * in a check cell (one holding `→ **`), the backticks left after every
+        well-formed check is removed must pair up, and no remaining span may
+        begin with a command word.  An unpaired backtick is a span that lost
+        its end; a paired span that reads `grep …` is a check that lost its
+        expected value.  A note's backticked NAMES after a value
+        (`(since \\`HOME_WRITE\\`)`) pair and are not commands, and pass.
+    """
+    problems = []
+    header_cells = None
+    for n, raw in enumerate(section_text.split("\n"), 1):
+        line = raw.rstrip()
+        is_row = line.startswith("|")
+        if not is_row:
+            header_cells = None
+        pieces = [line]
+        if is_row:
+            cells = CELL_SPLIT_RE.split(line)
+            # A row is `| a | b |`: the split yields an empty first and last.
+            count = len(cells) - 2
+            if header_cells is None:
+                header_cells = count
+            elif count != header_cells:
+                # An unescaped pipe: the cells cannot be told apart, so the
+                # span rules below would only misread them.  One report.
+                problems.append((n, "table row has %d cell(s), its header has %d"
+                                 % (count, header_cells)))
+                continue
+            pieces = cells
+        # The check cell(s) of a row, or a bullet line carrying a check: any
+        # piece with an arrow.  `→ **` alone would miss the cell whose ONLY
+        # check has its value in the wrong brackets - which is the cell
+        # that has never run.
+        for piece in pieces:
+            if "→" not in piece:
+                continue
+            rest = ROW_RE.sub("", piece)
+            if rest.count("`") % 2:
+                problems.append((n, "a check cell has an unpaired backtick after "
+                                    "its well-formed checks are removed: %s"
+                                 % rest.strip()[:80]))
+                continue
+            for span in re.findall(r"`([^`]*)`", rest):
+                if COMMAND_WORD_RE.match(span.strip()):
+                    problems.append((n, "a command with no `→ **expected**`: `%s`"
+                                     % span.strip()[:80]))
+    return problems
+
+
 def find(root):
     """(section0_path, [archive_paths], problem).
 

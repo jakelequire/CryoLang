@@ -33,16 +33,18 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROWS = 28          # ns-status-check's --min-rows floor; a fixture below it is refused for that alone
 
 
-def ledger(rows, extra_entries="", archive_decl=None, checks=None):
+def ledger(rows, extra_entries="", archive_decl=None, checks=None, cells=None):
     """A miniature ledger: a §0 whose rows check `data.txt`, plus a §8.
 
     With `archive_decl` the §8 section is left OUT and the document declares
     where it went instead - the shape the real ledger takes once the archive is
     split off.  With `archive_decl=""` the entries are gone and nothing is
     declared, which is the state where the checks have been blinded.
-    `checks` replaces a row's command with one written another way.
+    `checks` replaces a row's command with one written another way; `cells`
+    replaces a row's whole check cell, for the shapes a damaged cell takes.
     """
     checks = checks or {}
+    cells = cells or {}
     lines = [
         "# Name Resolution - fixture",
         "",
@@ -60,8 +62,8 @@ def ledger(rows, extra_entries="", archive_decl=None, checks=None):
     for i in range(1, ROWS + 1):
         want = rows.get(i, 1)
         cmd = checks.get(i, "grep -c 'ROW%d;' data.txt" % i)
-        lines.append("| D%d | fixture row %d | TAKEN | `%s` → **%d** |"
-                     % (i, i, cmd, want))
+        cell = cells.get(i, "`%s` → **%d**" % (cmd, want))
+        lines.append("| D%d | fixture row %d | TAKEN | %s |" % (i, i, cell))
     if archive_decl is None:
         lines += ["", "## 8. Archive", "", extra_entries, ""]
     return "\n".join(lines) + "\n"
@@ -87,7 +89,7 @@ class Repo(object):
     def git(self, *args, **kw):
         return subprocess.run(["git"] + list(args), cwd=self.path,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              text=True, **kw)
+                              text=True, encoding="utf-8", errors="replace", **kw)
 
     def write(self, rel, text):
         full = os.path.join(self.path, rel)
@@ -101,7 +103,7 @@ class Repo(object):
             [sys.executable, os.path.join(self.path, "scripts", "ns-commit-guard.py"),
              "--message-file", msg],
             cwd=self.path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True)
+            text=True, encoding="utf-8", errors="replace")
         return r.returncode, r.stdout
 
 
@@ -241,6 +243,62 @@ def _(repo):
                       checks={7: "grep -c -e 'ROW7;' -e 'NEVER' data.txt"}))
     repo.git("add", "-A")
     return repo.guard("Grow row 7, checked by two patterns\n")
+
+
+# --- a check cell that has lost its shape ---------------------------------
+# The extractor matches `` `cmd` → **N** `` wherever it stands, so a damaged
+# span is SKIPPED and the next well-formed one taken: the row stops checking
+# and nothing says so.  Each shape below passed the gate in the real ledger.
+
+def _damaged(repo, cell, message):
+    """§0 with row 5's check cell replaced by `cell`, staged beside a tree
+    change so no other rule is the one refusing."""
+    repo.write("src/thing.txt", "two\n")
+    repo.write("docs/name-resolution.md",
+               ledger({}, "### 8.100 A first entry - MEASURED AND FIXED 2026-01-01\n",
+                      cells={5: cell}))
+    repo.git("add", "-A")
+    return repo.guard(message)
+
+
+@case("a check cell spliced by a sed `\\|` (D5's shape at fd3756af)", True,
+      saying="MALFORMED CHECK")
+def _(repo):
+    # The first check lost its `\| wc -l` → **N**; another row's grep was
+    # pasted in behind the backtick, with an UNESCAPED pipe of its own.
+    return _damaged(repo, "`grep -c 'ROW5;' data.txt \\|`grep -c 'ROW6;' data.txt | wc -l` → **1**",
+                    "Splice two cells and notice nothing\n")
+
+
+@case("a check whose expected value is in backticks, not bold", True,
+      saying="no `→ **expected**`")
+def _(repo):
+    # `ROW_RE` needs `**N**`: this check had never run.
+    return _damaged(repo, "`grep -c 'ROW5;' data.txt` → `1`",
+                    "Write the answer in the wrong brackets\n")
+
+
+@case("a check with an unescaped pipe: one column too many", True,
+      saying="its header has")
+def _(repo):
+    # The command still runs (the backticks pair around the pipe), but the
+    # row has grown a cell and renders as something else.
+    return _damaged(repo, "`grep -c 'ROW5;' data.txt | cat` → **1**",
+                    "Forget the escape on a pipe\n")
+
+
+@case("a command in prose after the check, with no answer", True,
+      saying="no `→ **expected**`")
+def _(repo):
+    return _damaged(repo, "`grep -c 'ROW5;' data.txt` → **1** (compare `grep -c 'ROW6;' data.txt`)",
+                    "Mention a second command and never run it\n")
+
+
+@case("a check whose note carries backticked NAMES: allowed", False)
+def _(repo):
+    # Paired backticks that are not commands are a note, not a lost check.
+    return _damaged(repo, "`grep -c 'ROW5;' data.txt` → **1** (since `D3`; `ROW5` is the marker)",
+                    "Annotate a check\n")
 
 
 # --- the split shape: §0 in one file, the archive in another ------------

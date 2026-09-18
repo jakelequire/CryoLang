@@ -11,6 +11,8 @@ not a declaration, and the file imports `std::core::intrinsics`.
     python scripts/qualify-intrinsic-calls.py stdlib/sync/atomic.cryo --names @stdlib/core/intrinsics.cryo
 
 `--names @<intrinsics file>` takes every `intrinsic function` declared there.
+`--check` counts the calls a run would rewrite and writes nothing (the count
+is the line's last token, so it can stand as a §0 check).
 Prints one line per file: `<file> <n> rewritten`.  Exits 1 when a listed file
 does not import the module, since the qualified call would then not resolve.
 """
@@ -32,6 +34,10 @@ def main(argv: list[str]) -> int:
     i = argv.index("--names")
     names = names_from(argv[i + 1])
     files = argv[:i] + argv[i + 2:]
+    # `--check`: count what WOULD be rewritten and write nothing, so the
+    # count can stand as a §0 check without the check editing the tree.
+    check = "--check" in files
+    files = [f for f in files if f != "--check"]
     alt = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
     # Not preceded by `::`, `.`, an identifier character, or `function `.
     pat = re.compile(r"(?<![\w:.])(?<!function )(" + alt + r")\(")
@@ -55,6 +61,9 @@ def main(argv: list[str]) -> int:
             rest = line[len(code):]
             out.append(pat.sub(sub, code) + rest)
         new = "\n".join(out)
+        if check:
+            print(f"{f} bare intrinsic calls: {n}")
+            continue
         if new != raw:
             open(f, "w", encoding="utf-8", newline="").write(new)
         print(f"{f} {n} rewritten")

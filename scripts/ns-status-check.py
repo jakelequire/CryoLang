@@ -16,6 +16,15 @@ This extracts those rows, runs each command from the repo root, and compares.
 A drifted row is a build failure, so the section cannot quietly become a second
 archive.
 
+Before extracting, it refuses a section whose text has lost that shape: a
+table row with more cells than its header (an unescaped pipe), a check cell
+with an unpaired backtick once its well-formed checks are removed, or a
+backticked command with no `-> **expected**` after it.  The extractor matches
+the shape wherever it stands, so a damaged check is not a failing row but a
+row it never sees - which is how two spliced cells and two checks with their
+expected value in backticks passed here (scripts/ns_ledger.py
+`structural_problems`).
+
 WHAT THIS CANNOT SEE, and it is most of what goes wrong
 -------------------------------------------------------
 It catches a NUMBER THAT MOVED.  It cannot catch:
@@ -163,6 +172,23 @@ def main():
     sec, path, why = section(args.ledger)
     if sec is None:
         print("ns-status-check: FAIL -- %s" % why)
+        return 1
+
+    # The shape first.  A damaged check cell is not a drifted row - it is a
+    # row the extractor SKIPS, silently, taking the next well-formed span
+    # instead: two cells spliced by a sed pattern's `\|` alternation passed
+    # this gate for a week that way, and two checks whose expected value was
+    # written `` `0` `` rather than `**0**` had never run at all.
+    malformed = ns_ledger.structural_problems(sec)
+    if malformed:
+        for n, why in malformed:
+            print("ns-status-check: MALFORMED CHECK")
+            print("    §0 line  %d" % n)
+            print("    because  %s" % why)
+        print()
+        print("ns-status-check: %d place(s) in §0 have lost the shape a check "
+              "is read by; a damaged check is skipped, not run, so the rows "
+              "cannot be trusted until it is repaired." % len(malformed))
         return 1
 
     checks = ns_ledger.rows(sec)
