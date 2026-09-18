@@ -101,6 +101,30 @@ implement enum ScopeResolution {
 
 }
 
+/// One global's registration slot, read by value: the key the slot is
+/// under (its leaf and the namespace of the module that declared it), the
+/// global's type as that module declared it, the module, the linker symbol
+/// when another object owns the storage, and whether it is thread-local.
+/// A reader holding one asks it, and asks the index nothing further by
+/// name; `valid` is false for a slot that does not exist.
+type struct GlobalEntry {
+    valid:         boolean;
+    leaf:          SymbolStr;
+    namespace:     SymbolStr;
+    type_ref:      TypeRef;
+    module:        SymbolStr;
+    extern_symbol: SymbolStr;
+    thread_local:  boolean;
+
+    static none() -> GlobalEntry {
+        return GlobalEntry {
+            valid: false, leaf: SymbolStr::empty(), namespace: SymbolStr::empty(),
+            type_ref: TypeRef::invalid(), module: SymbolStr::empty(),
+            extern_symbol: SymbolStr::empty(), thread_local: false,
+        };
+    }
+}
+
 
 type struct DeclarationIndex {
     // Function name -> FunctionType TypeRef (full signature in the arena)
@@ -648,15 +672,25 @@ type struct DeclarationIndex {
         return -1;
     }
 
+    /// The slot at position `i`, read by value.
+    global_entry_at(&this, i: i64) -> GlobalEntry {
+        if (i < 0) { return GlobalEntry::none(); }
+        return GlobalEntry {
+            valid:         true,
+            leaf:          SymbolStr::from_id(this.module_global_keys[i]),
+            namespace:     SymbolStr::from_id(this.module_global_namespaces[i]),
+            type_ref:      this.module_global_types[i],
+            module:        SymbolStr::from_id(this.module_global_modules[i]),
+            extern_symbol: SymbolStr::from_id(this.module_global_extern_syms[i]),
+            thread_local:  this.module_global_threadlocal[i],
+        };
+    }
+
     /// The global `name` declared by the module whose namespace IS `ns` - the
-    /// module a qualified path's stamp names - with that module recorded in
-    /// `*out_module`.
-    find_global_in_namespace(&this, name: SymbolStr, ns: SymbolStr,
-                             out_module: SymbolStr*) -> TypeRef {
-        const i: i64 = this.global_slot(name, ns);
-        if (i < 0) { return TypeRef::invalid(); }
-        *out_module = SymbolStr::from_id(this.module_global_modules[i]);
-        return this.module_global_types[i];
+    /// module a qualified path's stamp names, beside the member leaf the
+    /// path wrote - or an entry that is not `valid`.
+    global_entry_in_namespace(&this, name: SymbolStr, ns: SymbolStr) -> GlobalEntry {
+        return this.global_entry_at(this.global_slot(name, ns));
     }
 
     /// The `(leaf, namespace)` pair a global's registration slot is keyed
@@ -674,36 +708,18 @@ type struct DeclarationIndex {
         *out_leaf = intern.intern(QualifiedName::leaf_of(q_str));
     }
 
-    /// The global the definition `d` is, from its registration slot, or
-    /// invalid when `d` names none or the definition is not a global.  The
-    /// slot is keyed by `(leaf, namespace)`, so the canonical name is split
-    /// HERE and nowhere a reader stands: a reader holding a `DefId` hands it
-    /// over rather than turning it back into a name to split.  Sibling of
-    /// `type_of_def`.
-    global_of_def(&this, d: DefId, intern: InternTable*) -> TypeRef {
-        if (!d.is_valid()) { return TypeRef::invalid(); }
+    /// The global the definition `d` is, from its registration slot, or an
+    /// entry that is not `valid` when `d` names none or the definition is
+    /// not a global.  The slot is keyed by `(leaf, namespace)`, so the
+    /// canonical name is split HERE and nowhere a reader stands: a reader
+    /// holding a `DefId` hands it over rather than turning it back into a
+    /// name to split.  Sibling of `type_of_def`.
+    global_entry_of_def(&this, d: DefId, intern: InternTable*) -> GlobalEntry {
+        if (!d.is_valid()) { return GlobalEntry::none(); }
         mut leaf: SymbolStr = SymbolStr::empty();
         mut ns: SymbolStr = SymbolStr::empty();
         DeclarationIndex::split_global_key(d.qualified_name(), intern, &leaf, &ns);
-        mut module: SymbolStr = SymbolStr::empty();
-        return this.find_global_in_namespace(leaf, ns, &module);
-    }
-
-    /// Whether the global `name` of namespace `ns` is `![thread_local]`, so a
-    /// cross-module reference to it is declared thread-local too (a TLS symbol
-    /// reached through a non-TLS relocation fails to link).
-    is_global_thread_local(&this, name: SymbolStr, ns: SymbolStr) -> boolean {
-        const i: i64 = this.global_slot(name, ns);
-        return i >= 0 && this.module_global_threadlocal[i];
-    }
-
-    /// The linker symbol of the global `name` of namespace `ns` when another
-    /// object owns its storage, else the empty SymbolStr: the global is Cryo's
-    /// own and is mangled under its defining namespace.
-    global_extern_symbol(&this, name: SymbolStr, ns: SymbolStr) -> SymbolStr {
-        const i: i64 = this.global_slot(name, ns);
-        if (i < 0) { return SymbolStr::empty(); }
-        return SymbolStr::from_id(this.module_global_extern_syms[i]);
+        return this.global_entry_in_namespace(leaf, ns);
     }
 
     /// Record that the global `name` of namespace `ns` binds linker symbol

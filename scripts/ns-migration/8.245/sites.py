@@ -28,8 +28,8 @@ def row_for(store_name, name, rel):
         return None
     if store_name == lg.INDEX_TYPE and name in lg.LOOKUPS:
         return "LOOKUP"
-    if store_name == lg.ARENA_TYPE and name == lg.ARENA_NAME_LOOKUP:
-        return "LOOKUP_ARENA"
+    # The arena's name lookup and its LOOKUP_ARENA row are gone (8.247); a
+    # written-name read on the arena now lands in ARENA_READ like any other.
     return st.write if kind == "write" else st.read
 
 

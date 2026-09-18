@@ -34,11 +34,11 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::ast::expression;
 import compiler::ast::expression::{ CalleePin };
 import compiler::decl_index;
-import compiler::decl_index::{ DeclarationIndex };
+import compiler::decl_index::{ DeclarationIndex, GlobalEntry };
 import compiler::types;
 import compiler::types::{ arena, compound, generic, type_base, type_ref, TypeKind };
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name, res };
-import compiler::resolver::res::{ OverloadId };
+import compiler::resolver::res::{ DefId, OverloadId };
 import std::fmt;
 import compiler::codegen::abi::{ AbiAttr, AbiClassifier, ArgClass, ParamPlan, SignaturePlan };
 import compiler::codegen::llvm_types::{ LModule, LType, LValue };
@@ -307,9 +307,9 @@ type struct SymbolResolver {
         // declaring module's namespace the way it does for a global Cryo
         // defines.  Mangling it asks the linker for a name nobody emits.
         const def_ns: SymbolStr = di.get_global_namespace(name);
-        const ext_sym: SymbolStr = di.global_extern_symbol(name, def_ns);
-        const mangled: string = if (ext_sym.is_valid()) {
-            intern.resolve(ext_sym)
+        const entry: GlobalEntry = di.global_entry_in_namespace(name, def_ns);
+        const mangled: string = if (entry.extern_symbol.is_valid()) {
+            intern.resolve(entry.extern_symbol)
         } else {
             MangledName::for_global(intern, def_ns, name).resolve(intern)
         };
@@ -323,7 +323,7 @@ type struct SymbolResolver {
             // A cross-module reference to a `![thread_local]` global must
             // itself be thread-local, or it references the TLS symbol with a
             // non-TLS relocation and fails to link.
-            if (di.is_global_thread_local(name, def_ns)) {
+            if (entry.thread_local) {
                 g_val.set_thread_local(true);
             }
         }
@@ -339,45 +339,49 @@ type struct SymbolResolver {
     /// declares no such global: the answer is then that nothing does, not a
     /// licence to ask another module.
     resolve_global_in_namespace(mut &this, name: SymbolStr, ns: SymbolStr) -> LValue {
+        return this.resolve_global_entry(this.ctx.decl_index.global_entry_in_namespace(name, ns));
+    }
+
+    /// The global the definition `d` names - a bare identifier's or a
+    /// constant pattern's stamp - from its registration slot, asked by the
+    /// id; the index splits the name to the slot's key, not this reader.
+    resolve_global_of_def(mut &this, d: DefId) -> LValue {
+        return this.resolve_global_entry(
+            this.ctx.decl_index.global_entry_of_def(d, this.ctx.intern_table));
+    }
+
+    /// The value of the global whose slot `entry` is: in-module, the value
+    /// `codegen_global_var` registered under the bare leaf; cross-module, an
+    /// extern declared under the same mangling the defining module emits,
+    /// cached under the namespace-qualified key.  Null for an entry that is
+    /// not `valid`.
+    resolve_global_entry(mut &this, entry: GlobalEntry) -> LValue {
+        if (!entry.valid) { return LValue::null(); }
         const intern: InternTable* = this.ctx.intern_table;
-        const di: DeclarationIndex* = this.ctx.decl_index;
-        mut def_module: SymbolStr = SymbolStr::empty();
-        const g_type_ref: TypeRef = di.find_global_in_namespace(name, ns, &def_module);
-        if (g_type_ref.is_invalid()) { return LValue::null(); }
-        if (this.owned_by_current_module(def_module)) { return this.globals.get(name); }
+        if (this.owned_by_current_module(entry.module)) { return this.globals.get(entry.leaf); }
 
         const cache_key: SymbolStr = intern.intern(
-            fmt::format("%s::%s", intern.resolve(ns), intern.resolve(name)));
+            fmt::format("%s::%s", intern.resolve(entry.namespace), intern.resolve(entry.leaf)));
         const cached: LValue = this.globals.get(cache_key);
         if (cached.is_valid()) { return cached; }
 
-        const g_llvm_ty: LType = this.type_mapper.map_type(g_type_ref);
+        const g_llvm_ty: LType = this.type_mapper.map_type(entry.type_ref);
         if (!g_llvm_ty.is_valid()) { return LValue::null(); }
 
-        const ext_sym: SymbolStr = di.global_extern_symbol(name, ns);
-        const mangled: string = if (ext_sym.is_valid()) {
-            intern.resolve(ext_sym)
+        const mangled: string = if (entry.extern_symbol.is_valid()) {
+            intern.resolve(entry.extern_symbol)
         } else {
-            MangledName::for_global(intern, ns, name).resolve(intern)
+            MangledName::for_global(intern, entry.namespace, entry.leaf).resolve(intern)
         };
         mut g_val: LValue = this.llvm_module.get_named_global(mangled);
         if (!g_val.is_valid()) {
             g_val = this.llvm_module.add_global(g_llvm_ty, mangled);
-            if (di.is_global_thread_local(name, ns)) {
+            if (entry.thread_local) {
                 g_val.set_thread_local(true);
             }
         }
         this.globals.register(cache_key, g_val);
         return g_val;
-    }
-
-    /// The global a stamp's canonical name `q` names - the slot the index
-    /// splits it to.
-    resolve_global_by_qualified(mut &this, q: SymbolStr) -> LValue {
-        mut leaf: SymbolStr = SymbolStr::empty();
-        mut ns: SymbolStr = SymbolStr::empty();
-        DeclarationIndex::split_global_key(q, this.ctx.intern_table, &leaf, &ns);
-        return this.resolve_global_in_namespace(leaf, ns);
     }
 
 
