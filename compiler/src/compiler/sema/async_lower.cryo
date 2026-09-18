@@ -268,11 +268,19 @@ type struct BindingCapture {
 type struct AsyncOwner {
     /// Null for a free function.
     method:       MethodNode*;
-    /// The owner type.
+    /// The owner type as the method body sees `this`: the type itself, or
+    /// the template instantiated over its own parameters for a generic
+    /// owner.
     ty:           TypeRef;
-    /// The canonical qualified owner name: the key the declaration index
-    /// registered this method's signature under.
-    qname:        SymbolStr;
+    /// The owner's REGISTERED type - the declaration the index keys this
+    /// method's signature by, so the key is the index's to name and not
+    /// carried beside it.  The same type as `ty` for a non-generic owner;
+    /// for a generic one `ty` is an instance the index never saw.
+    decl:         TypeRef;
+    /// The owner as the source spelled it - a declaration's name, an impl
+    /// head's written target.  Text for the future's minted name and
+    /// nothing else; never a key.
+    written:      SymbolStr;
     /// The owner's generic parameters. The future is generic in these as well
     /// as in the method's own, since the body may mention either.
     params:       GenericParamNode*[];
@@ -284,8 +292,8 @@ type struct AsyncOwner {
     /// The owner of a free function: no method, no receiver, no owner keys.
     static free() -> AsyncOwner {
         return AsyncOwner { method: null, ty: TypeRef::invalid(),
-                            qname: SymbolStr::empty(), params: [],
-                            impl_node: null };
+                            decl: TypeRef::invalid(), written: SymbolStr::empty(),
+                            params: [], impl_node: null };
     }
 }
 
@@ -6578,9 +6586,9 @@ type struct AsyncLower {
         // A method's future is named for the owner as well, so two types with a
         // same-named `async` method read apart in a diagnostic. (The counter in
         // `mint_bare` already makes them distinct.)
-        const base_name: string = if (owner.method != null && owner.qname.is_valid()) {
+        const base_name: string = if (owner.method != null && owner.written.is_valid()) {
             fmt::format("%s$%s", this.intern.resolve(
-                       OwnershipQuery::leaf_segment(this.intern, owner.qname)),
+                       OwnershipQuery::leaf_segment(this.intern, owner.written)),
                    this.intern.resolve(node.name))
         } else { this.intern.resolve(node.name) };
         const bare: SymbolStr = this.mint_bare(base_name);
@@ -6881,16 +6889,6 @@ type struct AsyncLower {
         }
     }
 
-    /// Drop every overload registered under the combined `<owner>::<method>`
-    /// key. The free-function counterpart resets the plain name; a method's
-    /// overload set hangs off the combined key instead, and without this the
-    /// stale Output-return signature stays resolvable next to the new one.
-    reset_method_overloads(mut &this, owner_qname: SymbolStr, method_name: SymbolStr) -> void {
-        const combined: string = fmt::format("%s::%s", this.intern.resolve(owner_qname),
-                                        this.intern.resolve(method_name));
-        this.ctx.decl_index.reset_function_overloads(this.intern.intern(combined));
-    }
-
     /// Point callers of an `async` METHOD at its future type.
     ///
     /// A free function's whole overload set is dropped and rebuilt from the
@@ -6898,15 +6896,19 @@ type struct AsyncLower {
     /// entry (what overload resolution reads) and in the declaration index under
     /// the combined `Owner::method` key (what cross-module callers and codegen
     /// read). Both derive from the node's `resolved_return_type`, which the
-    /// caller has set to the future type around this call.
+    /// caller has set to the future type around this call.  The index keys
+    /// both by the owner's registered type (`decl`): a generic owner's
+    /// instance (`ty`) is a type the index never saw.  The stale
+    /// Output-return overload is dropped first, or it stays resolvable
+    /// beside the new struct-return one.
     repoint_method(mut &this, owner: AsyncOwner*, node: FunctionDeclNode*,
                    module_sym: SymbolStr) -> void {
         this.rebuild_method_info(owner.ty, owner.method, node);
 
         mut arr: MethodNode*[] = [owner.method];
-        this.reset_method_overloads(owner.qname, node.name);
-        this.ctx.decl_index.register_methods_by_key(
-            owner.qname, arr, this.intern, this.arena);
+        this.ctx.decl_index.reset_method_overloads(owner.decl, node.name, this.intern);
+        this.ctx.decl_index.register_methods(
+            owner.decl, arr, this.intern, this.arena, "async_lower/repoint method");
     }
 
     /// Append one field to the generated future's declaration.

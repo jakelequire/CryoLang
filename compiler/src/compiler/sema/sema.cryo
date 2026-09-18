@@ -360,26 +360,25 @@ public:
                 NodeKind::StructDeclaration => {
                     const s: StructDeclNode* = stmt as StructDeclNode*;
                     this.declare_async_methods(s.methods, s.generic_params,
-                        this.ctx.decl_index.type_of_decl(s.def, "sema/async declare struct"), s.def.qualified_name(), null);
+                        this.ctx.decl_index.type_of_decl(s.def, "sema/async declare struct"), s.name, null);
                 }
                 NodeKind::UnionDeclaration => {
                     const u: UnionDeclNode* = stmt as UnionDeclNode*;
                     this.declare_async_methods(u.methods, u.generic_params,
-                        this.ctx.decl_index.type_of_decl(u.def, "sema/async declare union"), u.def.qualified_name(), null);
+                        this.ctx.decl_index.type_of_decl(u.def, "sema/async declare union"), u.name, null);
                 }
                 NodeKind::ClassDeclaration => {
                     const c: ClassDeclNode* = stmt as ClassDeclNode*;
                     this.declare_async_methods(c.methods, c.generic_params,
-                        this.ctx.decl_index.type_of_decl(c.def, "sema/async declare class"), c.def.qualified_name(), null);
+                        this.ctx.decl_index.type_of_decl(c.def, "sema/async declare class"), c.name, null);
                 }
                 NodeKind::ImplementationBlock => {
                     const ib: ImplBlockNode* = stmt as ImplBlockNode*;
-                    // The head's owner, and its key - the one owner the
-                    // methods were registered under.
-                    const canonical: SymbolStr = ib.target_key(this.arena);
+                    // The head's owner, off the stamp; the written target is
+                    // what a refusal names.
                     mut owner_params: GenericParamNode*[] = this.impl_owner_params(ib);
                     this.declare_async_methods(ib.methods, owner_params,
-                        this.ctx.decl_index.impl_owner(ib, "sema/async declare"), canonical, ib);
+                        this.ctx.decl_index.impl_owner(ib, "sema/async declare"), ib.target_type, ib);
                 }
                 _ => { }
             }
@@ -389,18 +388,19 @@ public:
     /// Declare the future of every `async` method in one owner's method list.
     ///
     /// `owner_params` are the OWNER's generic parameters, which the future must
-    /// carry as well as the method's own; `owner_ty` is the owner's type and
-    /// `qname` the key the declaration index registered the methods'
-    /// signatures under - both handed over by a caller that holds them,
-    /// never re-derived here.
+    /// carry as well as the method's own; `owner_ty` is the owner's registered
+    /// type, handed over by a caller that holds it and never re-derived here -
+    /// the key its methods are registered under is the index's to name from
+    /// it.  `written` is the owner as the source spelled it, for the refusal
+    /// of a method whose owner has no type.
     /// `impl_node` is the enclosing impl block when the owner is one (null
     /// otherwise); a trait impl uses it to bind the trait's implicit
     /// `<Method>Fut` associated type to the future each method lowers to.
     declare_async_methods(mut &this, methods: &MethodNode*[],
                           owner_params: &GenericParamNode*[],
-                          owner_ty: TypeRef, qname: SymbolStr,
+                          owner_ty: TypeRef, written: SymbolStr,
                           impl_node: ImplBlockNode*) -> void {
-        if (!owner_ty.is_valid() || !qname.is_valid()) { this.reject_undeclarable_async(methods, qname); return; }
+        if (!owner_ty.is_valid()) { this.reject_undeclarable_async(methods, written); return; }
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
             if (m == null || m.func == null || m.func.body == null) { continue; }
@@ -419,7 +419,8 @@ public:
             mut own: AsyncOwner = AsyncOwner {
                 method: m,
                 ty: this.async_owner_instance(owner_ty, owner_params),
-                qname: qname,
+                decl: owner_ty,
+                written: written,
                 params: this.clone_generic_params(owner_params),
                 impl_node: impl_node,
             };
@@ -434,8 +435,8 @@ public:
     /// undeclared reaches `lower` with no pending record, and that fallback
     /// declares it as a FREE function — where the body's `this` would silently
     /// resolve to the generated future instead of the receiver.
-    reject_undeclarable_async(mut &this, methods: &MethodNode*[], qname: SymbolStr) -> void {
-        const owner: string = if (qname.is_valid()) { this.intern.resolve(qname) } else { "?" };
+    reject_undeclarable_async(mut &this, methods: &MethodNode*[], written: SymbolStr) -> void {
+        const owner: string = if (written.is_valid()) { this.intern.resolve(written) } else { "?" };
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
             if (m == null || m.func == null || !m.func.is_async) { continue; }

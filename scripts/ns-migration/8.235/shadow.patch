@@ -1,0 +1,168 @@
+diff --git a/compiler/src/compiler/decl_index.cryo b/compiler/src/compiler/decl_index.cryo
+index 89a055b6..6e99618e 100644
+--- a/compiler/src/compiler/decl_index.cryo
++++ b/compiler/src/compiler/decl_index.cryo
+@@ -126,6 +126,7 @@ type struct DeclarationIndex {
+     // is looked up here; a key's declarations are the registry's entries.
+     callable_names:      u32[];              // SymbolStr.id of the key
+     callable_names_seen: HashMap<u32, boolean>;
++    shadow_spo_keys:     u32[];              // SHADOW: spec-method keys registered with no type
+     module_global_keys:       u32[];  // SymbolStr.id of global variable
+     module_global_modules:    u32[];  // SymbolStr.id of defining module (source_file)
+     module_global_namespaces: u32[];  // SymbolStr.id of defining namespace (e.g.,
+@@ -305,6 +306,7 @@ type struct DeclarationIndex {
+             generic_converter_methods: [],
+             callable_names:      [],
+             callable_names_seen: HashMap<u32, boolean>::new(),
++            shadow_spo_keys:     [],
+             module_global_keys:       [],
+             module_global_threadlocal: [],
+             module_global_extern_syms: [],
+diff --git a/compiler/src/compiler/instance.cryo b/compiler/src/compiler/instance.cryo
+index 0a71d787..1e6015ce 100644
+--- a/compiler/src/compiler/instance.cryo
++++ b/compiler/src/compiler/instance.cryo
+@@ -2602,6 +2602,14 @@ type struct CompilerInstance {
+ 
+         CompilerInstance::report_unstamped_decls(ctx);
+ 
++        // SHADOW: whether a spec-method key the index could not name at
++        // registration holds a type by the end of the build.
++        for (mut si: i64 = 0; si < ctx.decl_index.shadow_spo_keys.length; si++) {
++            const sk: SymbolStr = SymbolStr::from_id(ctx.decl_index.shadow_spo_keys[si]);
++            fmt::eprintf("SHADOW\tSPOEND\t%s\t%s\n", ctx.intern_table.resolve(sk),
++                if (ctx.decl_index.lookup_type(sk).is_valid()) { "registered-later" } else { "NEVER" });
++        }
++
+         const skip_flush: boolean = match (ctx.mode) {
+             CompileMode::Lsp => { true }
+             _                => { false }
+diff --git a/compiler/src/compiler/mono/call_specializer.cryo b/compiler/src/compiler/mono/call_specializer.cryo
+index d6a076d2..8bde6f9e 100644
+--- a/compiler/src/compiler/mono/call_specializer.cryo
++++ b/compiler/src/compiler/mono/call_specializer.cryo
+@@ -2201,6 +2201,38 @@ type struct MonoCallSpecializer {
+     // -- DI registration + symbol pinning (re-homed; Phase-0 keystone) --
+ 
+ 
++    /// SHADOW: why the index cannot name a spec method's receiver.
++    shadow_spec_owner(&this, site: string, recv_type: TypeRef, key: SymbolStr) -> void {
++        const named: SymbolStr = this.decl_index.lookup_type_name(recv_type);
++        mut kind: string = "null";
++        mut inst: string = "-";
++        mut resolved_named: string = "-";
++        const t: Type* = this.arena.lookup(recv_type.id);
++        if (t != null) {
++            kind = t.kind.to_string();
++            if (t.kind == TypeKind::InstantiatedType) {
++                const it: InstantiatedType* = t as InstantiatedType*;
++                inst = if (it.has_resolved_type()) { "materialized" } else { "unmaterialized" };
++                if (it.has_resolved_type()) {
++                    const rn: SymbolStr = this.decl_index.lookup_type_name(it.resolved_type);
++                    resolved_named = if (rn.is_valid()) { this.intern_table.resolve(rn) } else { "resolved-noname" };
++                }
++            }
++        }
++        const fwd: TypeRef = this.decl_index.lookup_type(key);
++        if (!named.is_valid() && key.is_valid()) { this.decl_index.shadow_spo_keys.push(key.id); }
++        mut fwd_s: string = "fwd-none";
++        if (fwd.is_valid()) {
++            const ft: Type* = this.arena.lookup(fwd.id);
++            fwd_s = fmt::format("fwd-%s-%s", if (fwd.id == recv_type.id) { "same" } else { "OTHERREF" },
++                if (ft != null) { ft.kind.to_string() } else { "null" });
++        }
++        fmt::eprintf("SHADOW\tSPO\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", site,
++            if (named.is_valid()) { if (named.id == key.id) { "AGREE" } else { "DISAGREE" } } else { "NONAME" },
++            this.intern_table.resolve(key), this.intern_table.resolve(named), kind, inst, resolved_named,
++            if (this.arena.contains_generic_param(recv_type)) { "generic" } else { "concrete" }, fwd_s);
++    }
++
+     /// Register an impl-block-owned spec method in the DeclarationIndex under the
+     /// receiver's canonical name so codegen/linker find the right func_type/mangle.
+     register_spec_method_in_di(mut &this, spec_method: MethodNode*,
+@@ -2208,6 +2240,7 @@ type struct MonoCallSpecializer {
+         if (this.decl_index == null) { return; }
+         if (spec_method == null || impl_node == null) { return; }
+         const qualified_target: SymbolStr = impl_node.target_key(this.arena);
++        this.shadow_spec_owner("impl", recv_type, qualified_target);
+         mut owning_module: SymbolStr = SymbolStr::empty();
+         if (impl_node.source_module != "") {
+             owning_module = this.intern_table.intern(impl_node.source_module);
+@@ -2233,6 +2266,7 @@ type struct MonoCallSpecializer {
+         if (this.decl_index == null) { return; }
+         if (spec_method == null || owner_ast == null) { return; }
+         mut qualified_target: SymbolStr = this.arena.get_qualified_name(recv_type);
++        this.shadow_spec_owner("inherent", recv_type, qualified_target);
+         if (!qualified_target.is_valid()) { return; }
+         const owning_module: SymbolStr = this.current_module;
+         // Flag the emitting module as a spec owner for the incremental cache (see
+diff --git a/compiler/src/compiler/sema/async_lower.cryo b/compiler/src/compiler/sema/async_lower.cryo
+index da7b8e6f..4cffaf63 100644
+--- a/compiler/src/compiler/sema/async_lower.cryo
++++ b/compiler/src/compiler/sema/async_lower.cryo
+@@ -268,8 +268,14 @@ type struct BindingCapture {
+ type struct AsyncOwner {
+     /// Null for a free function.
+     method:       MethodNode*;
+-    /// The owner type.
++    /// The owner type as the method body sees `this`: the type itself, or
++    /// the template instantiated over its own parameters for a generic
++    /// owner.
+     ty:           TypeRef;
++    /// The owner's REGISTERED type - the declaration the index keys this
++    /// method's signature by.  The same type as `ty` for a non-generic
++    /// owner; for a generic one `ty` is an instance the index never saw.
++    decl:         TypeRef;
+     /// The canonical qualified owner name: the key the declaration index
+     /// registered this method's signature under.
+     qname:        SymbolStr;
+@@ -284,6 +290,7 @@ type struct AsyncOwner {
+     /// The owner of a free function: no method, no receiver, no owner keys.
+     static free() -> AsyncOwner {
+         return AsyncOwner { method: null, ty: TypeRef::invalid(),
++                            decl: TypeRef::invalid(),
+                             qname: SymbolStr::empty(), params: [],
+                             impl_node: null };
+     }
+@@ -6904,6 +6911,16 @@ type struct AsyncLower {
+         this.rebuild_method_info(owner.ty, owner.method, node);
+ 
+         mut arr: MethodNode*[] = [owner.method];
++        // SHADOW: the key the registered type names, beside the carried key.
++        {
++            const nk: SymbolStr = this.ctx.decl_index.lookup_type_name(owner.decl);
++            const ik: SymbolStr = this.ctx.decl_index.lookup_type_name(owner.ty);
++            const v: string = if (!nk.is_valid()) { "NONAME" } else { if (nk.id == owner.qname.id) { "AGREE" } else { "DISAGREE" } };
++            fmt::eprintf("SHADOW\tRPT\t%s\t%s\t%s\t%s\t%s\n", v,
++                this.intern.resolve(owner.qname), this.intern.resolve(nk),
++                if (ik.is_valid()) { "inst-named" } else { "inst-noname" },
++                if (owner.decl.id == owner.ty.id) { "same" } else { "instance" });
++        }
+         this.reset_method_overloads(owner.qname, node.name);
+         this.ctx.decl_index.register_methods_by_key(
+             owner.qname, arr, this.intern, this.arena);
+diff --git a/compiler/src/compiler/sema/sema.cryo b/compiler/src/compiler/sema/sema.cryo
+index fa4919f4..8191d1da 100644
+--- a/compiler/src/compiler/sema/sema.cryo
++++ b/compiler/src/compiler/sema/sema.cryo
+@@ -419,6 +419,7 @@ public:
+             mut own: AsyncOwner = AsyncOwner {
+                 method: m,
+                 ty: this.async_owner_instance(owner_ty, owner_params),
++                decl: owner_ty,
+                 qname: qname,
+                 params: this.clone_generic_params(owner_params),
+                 impl_node: impl_node,
+diff --git a/docs/cryo.md b/docs/cryo.md
+index 1f4600a3..2d9463b3 100644
+--- a/docs/cryo.md
++++ b/docs/cryo.md
+@@ -1,7 +1,7 @@
+ # The Cryo Language Reference
+ 
+ > **Version:** 1.0.0 \
+-> **Last revised:** July 2026
++> **Last revised:** September 2026
+ 
+ Cryo is a statically-typed, compiled systems language. It targets native machine code through LLVM 20, has a self-hosted compiler, and ships a standard library written entirely in itself. Three principles shape the language:
+ 
