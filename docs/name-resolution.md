@@ -150,7 +150,7 @@ three, and its row carries the count. Read each zero off its own row.
 | codegen `$MG` reconstruction (`call_emitter` rebuilding a generic method spec's symbol from `resolved_type_args` when the pin missed) | **DELETED** — the pin missed because sema's `pin_method_callee_from_qname` mangled a specialization without its own type arguments; the writer folds them in now, 7 → 0 on the LSP, 308 → 0 over six halves. Since §8.216 no pin writer mangles at all - the spec's entry carries the symbol registration folded the arguments into - so `with_method_spec_args` is called by registration and by mono's dedup key alone | — | `grep -c 'with_method_spec_args' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0**; `grep -c 'with_method_spec_args' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -rho 'with_method_spec_args(' compiler/src --include=*.cryo \| wc -l` → **3** (the definition, `register_methods_with_module`, `mangled_symbol_for_spec_method`) | §8.176, §8.216 |
 | method signatures under the BARE written target (`register_methods_with_module_aliased`: every method of `implement T` registered a second time as `<T as written>::<method>` in the function tables and under the written `T` in `method_returns`, beside the canonical key; 3 writers - type resolution's impl arm, mono's spec-method registration, the async repoint) and the ONE reader that asked by it, `lookup_callee_function_type`'s scope branch asking the WRITTEN `scope::member` ahead of the head's stamp | **DELETED** — the canonical key is the only registration and the callee hint asks the stamp's owner first, then the C-import alias spelling (a C import is declared whole under `alias::name`, the door `resolve_scope_call` opens last). Measured over six halves: 79,340 bare registrations; the bare-first hint read 6,448 bare keys (6,217 static calls written `Owner::method` where the stamp answered the same signature at 6,215 and a DIFFERENT one at **2** - `Beacon::make` in `leaf_scope_use_a`, handed another module's same-leaf `Beacon::make`; 231 the async repoint's own alias reset); 968 answered by the written spelling alone, every one a C-import alias call. With the stamp first: 231 bare reads (the repoint's reset, a writer) and **0** `method_returns` reads by a bare type, control 14,053 with the canonical type in the probe's set; 0 objects moved. Pinned by `static_call_hint_leaf_collision` (HEAD types an out-of-range literal by the other module's `(i64)` and refuses the call as an `i64` narrowing to `u8`, proposing a cast that would truncate it; E0010 at the literal now) | — | `grep -rho 'register_methods_with_module_aliased' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'bare_combined_sym' compiler/src/compiler/decl_index.cryo` → **0**; `grep -c 'lookup_func_type_exact(bare_sym)' compiler/src/compiler/sema/call_resolver.cryo` → **1** (the C-import door, after the stamp); `grep -c '^project static_call_hint_leaf_collision' tests/test-roster.txt` → **1** | §8.180, §8.196, §8.197 |
 | async repoint's CURSOR-keyed alias (`sema.cryo`'s async declare pass: `aliases = [ib.target_type, qualify_symbol_sym(ib.target_type)]`, the head's spelling and the cursor's module prefixed to it, re-registered through the aliased helper by `repoint_method`) | **DELETED** with the bare key above — an owner has one registration key, the head's `target_key`; `AsyncOwner.alias_qnames` and `clone_symbols` went with it | — | `grep -c 'qualify_symbol_sym(ib.target_type)' compiler/src/compiler/sema/sema.cryo` → **0**; `grep -rho 'alias_qnames' compiler/src --include=*.cryo \| wc -l` → **0** | §8.180, §8.196, §8.197 |
-| mono's spec-method registration by KEY (`register_spec_method_in_di` under `impl_node.target_key`, `_inherent` under the arena's name - keyed because the specialized type reached the index only when the pass walked the entries, after the module's monomorphization) | **DELETED** — the monomorphizer registers the specialized type at the seam where the entry is placed (`register_type(qualified_spec_sym, …)`, the id stamped on the clone) and both sites call `register_methods(recv_type, …)`; 1,662 of 1,663 named at registration over six halves, the one unnamed an instantiation with no entry placed, deferred by kind (`receiver_unmaterialized`). `register_methods_by_key`'s one caller is D18's alias-keyword door | — | `grep -rho 'register_methods_by_key(' compiler/src --include=*.cryo \| wc -l` → **3** (the definition, `register_methods`' own call, D18's door in `type_resolution.cryo`); `grep -c 'decl_index.register_type(' compiler/src/compiler/mono/monomorphizer.cryo` → **1**; `grep -c 'register_type(' compiler/src/compiler/passes/specialization.cryo` → **0** | §8.235, §8.238 |
+| mono's spec-method registration by KEY (`register_spec_method_in_di` under `impl_node.target_key`, `_inherent` under the arena's name - keyed because the specialized type reached the index only when the pass walked the entries, after the module's monomorphization) | **DELETED** — the monomorphizer registers the specialized type at the seam where the entry is placed (`register_type(qualified_spec_sym, …)`, the id stamped on the clone) - and, since §8.240, its bare-name mapping, its inline methods and its impl blocks' methods, so the pass registers nothing for a named specialization - and both sites call `register_methods(recv_type, …)`; 1,662 of 1,663 named at registration over six halves, the one unnamed an instantiation with no entry placed, deferred by kind (`receiver_unmaterialized`). `register_methods_by_key`'s one caller is D18's alias-keyword door | — | `grep -rho 'register_methods_by_key(' compiler/src --include=*.cryo \| wc -l` → **3** (the definition, `register_methods`' own call, D18's door in `type_resolution.cryo`); `grep -c 'decl_index.register_type(' compiler/src/compiler/mono/monomorphizer.cryo` → **1**; `grep -c 'register_type(' compiler/src/compiler/passes/specialization.cryo` → **0**; `grep -c 'register_methods(' compiler/src/compiler/passes/specialization.cryo` → **0** | §8.235, §8.238, §8.240 |
 | a type alias under its BARE name (`pass_registry.cryo` Phase 4: `register_type(node.alias_name, alias_ref)` beside `decl_type_key`'s, for every alias without a binding namespace) | **DELETED** — the corpus holds NO module-level type alias (every `type X = …` in it is an associated-type binding), so the population was built: two modules each declaring `type Meters`, a consumer importing one and using it in annotation, field, parameter, return, `new`, `sizeof`, qualified and imported positions - 2 bare registrations (last writer wins), **0** bare reads, exit 43 as written; the same program under this tree | — | `grep -c 'register_type(node.alias_name, alias_ref)' compiler/src/compiler/passes/pass_registry.cryo` → **0** | §8.196, §8.197 |
 | bare-cursor `qualify_symbol_sym(` (the ambient module prefixed to a spelling: the extern block's `ext_q_name`, the intrinsic constant's second key, the async future struct's name, the debug-info display name, the trait audit probe, `qualify_binding_sym`'s empty-namespace arm through `canonical_decl_key`) | **DELETED as a surface** — the definition and `qualify_symbol_sym_home`'s fallback for a node whose file the graph does not hold are the two mentions left. Measured over six halves (§8.198): the extern block's key equals `decl_fn_key`'s at 175,728 of 175,728; the async future's name equals `decl_type_key` over the IMPL BLOCK's file (a trait default lowered in an implementing block is that block's module's, one future per implementation; the trait's own file would give all fifteen one name) at 749 of 749, where the function's own file disagreed at 112; the DWARF display name is NOT ENTERED by a release corpus - on a `--dev` build of one example 69 of 331 names differ, every one a placed clone whose `DW_AT_name` named the emitting module while its `DW_AT_linkage_name` mangles the template's; the intrinsic constant's second key is §8.196's global second key again (no `intrinsic const` exists in the tree; the construct builds and its binary fails to load, exit 127, under HEAD alike - Jake's); `canonical_decl_key`'s arm was reached by no caller (all three test the namespace first) | — | `grep -rho 'qualify_symbol_sym(' compiler/src --include=*.cryo \| wc -l` → **2**; `grep -rho 'canonical_decl_key' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'register_global(icq_sym' compiler/src/compiler/passes/type_resolution.cryo` → **0** | §8.184, §8.185, §8.187, §8.196, §8.197, §8.198 |
 | `import M as X` by a SECOND lookup (`visit(IdentifierNode)`: `lookup_import_alias(node.name)` after the scope lookup misses, an alias living in a table beside the scope rather than as a binding in it) | **DELETED** — the alias IS declared as a binding in the importing scope (`Symbol::import_sym`), so the table could answer only a name the scope did not hold, and an identifier expression never names a module; the corpus holds no aliased import at all (one, under `legacy/`). **The form itself is refused**: `docs/cryo.md` documents `import Math::Vector as V;`, and a scratch project's `U::Box` is E0203, `U::forty()` E0233, under HEAD and under this tree alike - the alias is a namespace SYMBOL no downstream lookup honours, the same species as a C-import alias (§9 Q2). Jake's | — | `grep -rho -e 'import_aliases' -e 'register_import_alias' -e 'lookup_import_alias' compiler/src --include=*.cryo \| wc -l` → **0** | §8.196, §8.197 |
@@ -14332,6 +14332,93 @@ README row).
 
 **Tally: 82 shadowed, 82 old paths deleted, 82 at zero; 152 artifacts
 gone** (+1 artifact, `resolve_type_qualified_name_bare_from`).
+
+---
+
+### 8.240 A placed specialization has ONE registrar: the monomorphizer registers the type, its bare-name mapping, the methods it carries and its impl blocks' at the seam, and the pass registers nothing for a named specialization - its four `register_methods` calls found every method already registered (190,183 of 218,521 over six halves) or skipped by the same guard at both writers (28,338: self-returning defaults, and `Result<T, E>::as_ref` whose return is unresolved at either moment) - 2026-09-17
+
+#### What was there
+
+§8.238 moved the specialized TYPE's registration to the monomorphizer's
+seam and left the methods where they were: `SpecInjector::register`'s
+struct / union / class arms registering the clone's inline methods,
+`register_spec`'s loop registering each cloned impl block's, and the
+bare-name mapping (`register_name_mapping(spec_name, arena_qname)`), all
+in the pass that walks the entries after the module's monomorphization.
+Two writers for one placed entry - and since §8.238 the pass's write of
+every generic-method spec materialized at the walk was a second
+registration of an entry already stamped.
+
+Audit 11's "dead index API" was checked on the way here and is not dead:
+`global_slot` is the private funnel of six live accessors
+(`is_global_thread_local`, `global_extern_symbol`, `find_global_in_
+namespace`, `find_global_by_qualified`, `record_global_extern_symbol`,
+`mark_global_thread_local` - 2/2/2/1/2/1 external readers); `resolved_or`
+and `lookup_qualified_alternatives` are the LSP's `bare_alts` lane, LIVE by
+the ruling on §0's two `bare_alts` rows and pinned there.  The stale
+`module_types` comment went in §8.236.  Nothing to delete; the audit's
+§7 item is retired by this paragraph.
+
+#### Measured
+
+The seam registering everything the entry carries, the pass's
+registrations kept, and a print at each of the pass's four
+(`scripts/ns-migration/8.240/shadow.patch` over `5a464de4`, `corpus2.sh
+w2`, `.objcmp/w2-lines.txt`, **218,521** `PM` lines, `failing halves: 0`,
+`OVERALL PASS … projects: 64 passed`; `awk -F'\t' '$3=="PM"' | cut -f4,5,7
+| sort | uniq -c`):
+
+| at the pass | rows | |
+|---|---:|---|
+| `ALREADY` - the method carries the entry registration stamps | **190,183** | 156,875 impl-block methods, 32,761 struct inline, 2 union inline (registered at the seam); 545 generic-method specs (registered at the walk, §8.238) |
+| `NEW`, self-returning default | 19,980 | `register_methods_by_key` skips `is_self_returning_default` at EVERY writer - a deferred template instantiated per call site - so neither the seam nor the pass registers one |
+| `NEW`, return type unresolved | 8,358 | every one `Result<T, E>::as_ref(&this) -> Result<T*, E*>` (`SEAM` rows: 8,358, all `as_ref`, trait empty): the clone's return annotation names its own template over pointer arguments and is unresolved both at the seam and when the pass walks the entry; the guard (`!resolved_return_type.is_valid()` → `continue`) skips it at both, so the pass registered nothing here either.  `Option<T>::as_ref -> Option<T*>` does not appear: the one-parameter self-instantiation resolves.  Pre-existing and outside this entry: no `Result::as_ref` call exists in the corpus, and a control that makes one (`.objcmp/asref-ctl`, `Result<i32, i32>::as_ref` then `*v + 1`) builds and exits 42 under this tree, the previous half and the pin, so the method binds by a route this entry did not measure |
+| `NEW`, anything else | **0** | |
+
+So the pass's four registrations wrote nothing the seam had not.
+
+#### What is there now
+
+* The seam (`Monomorphizer::specialize_request`, after `resolve_specialized_ast`,
+  before the entry is pushed) registers the type (§8.238), the bare-name
+  mapping, the clone's inline methods (`register_carried_methods`) and
+  each kept impl block's methods, all under the type.
+* `SpecInjector::register(node, spec_type, ctx)` registers a placed
+  specialization with NO named type - a function template's clone - as an
+  injected declaration, and nothing for a named one; the `spec_name`
+  parameter is gone with the mapping.  `register_spec` still rewrites each
+  clone's impl head to the qualified spec name, records `spec_owner`, and
+  registers the clone as a head under the specialization's key in the
+  generic registry - a registry write, not an index one, and one whose
+  timing the selector reads (a placed clone applies outright), so it is
+  deliberately NOT moved with the index writes.
+* The lane gate's `REGISTER` total is unmoved at 66: the mapping's
+  name-keyed write moved file (`specialization` 2 → 1, `monomorphizer`
+  1 → 2), re-pinned.
+
+#### Objects and gates
+
+`hash-tree.sh W` against half `Z` (`5a464de4`): tests **0 of 2,665**;
+examples **1 of 1,126**, `examples/06-word-count/…/Main.o` - whose SOURCE
+was edited on disk between the two hashes (two `.drop()` calls removed,
+an unstaged edit not this session's); the Z compiler over the edited
+source produces W's hash exactly (`d83cb8d5…`), so the compiler moved
+nothing (`comm -3 .objcmp/ex-Z.s .objcmp/ex-W.s`; `comm -3 .objcmp/t-Z.s
+.objcmp/t-W.s`).  `make test-census`: `OVERALL PASS (unit: ok;
+compile-fail: 193 passed; projects: 64 passed)`, `test-census: OK`
+(`.objcmp/w3-census.log`).  `make lsp-check`: `OK -- compiled 264
+module(s) … 0 errors, 490 warning(s)` (`.objcmp/w3-lsp.log`).  `make
+cross-check`: `OK -- x86_64-pc-linux-gnu … 0 errors` (`.objcmp/w3-cross.log`).
+`lane-check`: `REGISTER` 66 → 66 (per-file move), re-pinned.
+`ns-status-check`: unmoved.
+
+Outside the ledger: `mono/monomorphizer.cryo`, `passes/specialization.cryo`,
+`tests/lane-baseline.txt`, `scripts/ns-migration/8.240/` (`shadow.patch`,
+README row).
+
+**Tally: 82 shadowed, 82 old paths deleted, 82 at zero; 153 artifacts
+gone** (+1 artifact, the pass's second registration of a placed
+specialization's methods).
 
 ---
 

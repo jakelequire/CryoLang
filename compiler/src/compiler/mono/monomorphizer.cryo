@@ -648,13 +648,32 @@ type struct Monomorphizer {
         // declaration's.  It has to precede the nested-call walk below: that
         // walk materializes generic METHODS on this receiver and registers
         // each by the type, and a type the index cannot name yet leaves every
-        // one unregistered.  The methods the clone carries are registered
-        // when the entry is walked (`SpecInjector::register`), after the
-        // owner module is decided.  A function template has no named type.
+        // one unregistered.  What the clone CARRIES is registered here too -
+        // its own methods and its impl blocks' - since their signatures are
+        // typed by now and the type they hang off is in the index; a generic
+        // method materialized on this receiver later registers itself at
+        // the walk.  The pass that places the entry registers nothing the
+        // index keys by the type.  A function template has no named type,
+        // and its clone registers as a declaration with the module that
+        // places it.
         if (concrete_type.is_valid()) {
             Monomorphizer::stamp_def(result.specialized_ast,
                 this.decl_index.register_type(qualified_spec_sym, concrete_type,
                     Monomorphizer::node_is_public(result.specialized_ast)));
+            // The bare spec identifier maps to the canonical name: the
+            // substituter rewrites a clone body's self-references to the
+            // bare spelling, and the LSP's completion resolves it through
+            // this mapping.
+            if (!qualified_spec_sym.equals(spec_name_sym)) {
+                this.decl_index.register_name_mapping(spec_name_sym, qualified_spec_sym);
+            }
+            this.register_carried_methods(result.specialized_ast, concrete_type);
+            for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
+                if (kept_impl_asts[ri] == null) { continue; }
+                const ib: declaration::ImplBlockNode* = kept_impl_asts[ri] as declaration::ImplBlockNode*;
+                this.decl_index.register_methods(
+                    concrete_type, ib.methods, this.intern_table, this.arena, "mono/placed spec impl methods");
+            }
         }
 
         // Register the spec entry into `state.spec_entries` BEFORE specializing the
@@ -914,6 +933,23 @@ type struct Monomorphizer {
         if (node.kind == NodeKind::EnumDeclaration)   { (node as declaration::EnumDeclNode*).def = d; return; }
         if (node.kind == NodeKind::TraitDeclaration)  { (node as declaration::TraitDeclNode*).def = d; return; }
         if (node.kind == NodeKind::TypeAliasDeclaration) { (node as declaration::TypeAliasDeclNode*).def = d; return; }
+    }
+
+    /// Register the methods a specialized type declaration carries inline,
+    /// under the type.  An enum's methods live in its impl blocks; a kind
+    /// with no method list carries nothing.
+    register_carried_methods(mut &this, node: ASTNode*, spec_type: TypeRef) -> void {
+        if (node == null) { return; }
+        if (node.kind == NodeKind::StructDeclaration) {
+            this.decl_index.register_methods(spec_type, (node as declaration::StructDeclNode*).methods,
+                this.intern_table, this.arena, "mono/placed spec struct methods");
+        } else if (node.kind == NodeKind::UnionDeclaration) {
+            this.decl_index.register_methods(spec_type, (node as declaration::UnionDeclNode*).methods,
+                this.intern_table, this.arena, "mono/placed spec union methods");
+        } else if (node.kind == NodeKind::ClassDeclaration) {
+            this.decl_index.register_methods(spec_type, (node as declaration::ClassDeclNode*).methods,
+                this.intern_table, this.arena, "mono/placed spec class methods");
+        }
     }
 
     /// The visibility a specialized type declaration carries: its template's,

@@ -1,0 +1,123 @@
+diff --git a/compiler/src/compiler/mono/monomorphizer.cryo b/compiler/src/compiler/mono/monomorphizer.cryo
+index d0a2c009..5d9dcc2b 100644
+--- a/compiler/src/compiler/mono/monomorphizer.cryo
++++ b/compiler/src/compiler/mono/monomorphizer.cryo
+@@ -648,13 +648,41 @@ type struct Monomorphizer {
+         // declaration's.  It has to precede the nested-call walk below: that
+         // walk materializes generic METHODS on this receiver and registers
+         // each by the type, and a type the index cannot name yet leaves every
+-        // one unregistered.  The methods the clone carries are registered
+-        // when the entry is walked (`SpecInjector::register`), after the
+-        // owner module is decided.  A function template has no named type.
++        // one unregistered.  What the clone CARRIES is registered here too -
++        // its own methods and its impl blocks' - since their signatures are
++        // typed by now and the type they hang off is in the index; a generic
++        // method materialized on this receiver later registers itself at
++        // the walk.  The pass that places the entry registers nothing the
++        // index keys by the type.  A function template has no named type,
++        // and its clone registers as a declaration with the module that
++        // places it.
+         if (concrete_type.is_valid()) {
+             Monomorphizer::stamp_def(result.specialized_ast,
+                 this.decl_index.register_type(qualified_spec_sym, concrete_type,
+                     Monomorphizer::node_is_public(result.specialized_ast)));
++            // The bare spec identifier maps to the canonical name: the
++            // substituter rewrites a clone body's self-references to the
++            // bare spelling, and the LSP's completion resolves it through
++            // this mapping.
++            if (!qualified_spec_sym.equals(spec_name_sym)) {
++                this.decl_index.register_name_mapping(spec_name_sym, qualified_spec_sym);
++            }
++            this.register_carried_methods(result.specialized_ast, concrete_type);
++            for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
++                if (kept_impl_asts[ri] == null) { continue; }
++                const ib: declaration::ImplBlockNode* = kept_impl_asts[ri] as declaration::ImplBlockNode*;
++                // SHADOW: impl methods whose return type is not resolved at the seam.
++                for (mut si: i64 = 0; si < ib.methods.length; si++) {
++                    const sm: declaration::MethodNode* = ib.methods[si];
++                    if (sm == null || sm.func == null || sm.func.is_self_returning_default) { continue; }
++                    if (!sm.func.resolved_return_type.is_valid()) {
++                        fmt::eprintf("SHADOW\tSEAM\t%s\t%s\t%s\n", this.intern_table.resolve(sm.func.name),
++                            this.intern_table.resolve(ib.qualified_trait_name), this.intern_table.resolve(qualified_spec_sym));
++                    }
++                }
++                this.decl_index.register_methods(
++                    concrete_type, ib.methods, this.intern_table, this.arena, "mono/placed spec impl methods");
++            }
+         }
+ 
+         // Register the spec entry into `state.spec_entries` BEFORE specializing the
+@@ -916,6 +944,23 @@ type struct Monomorphizer {
+         if (node.kind == NodeKind::TypeAliasDeclaration) { (node as declaration::TypeAliasDeclNode*).def = d; return; }
+     }
+ 
++    /// Register the methods a specialized type declaration carries inline,
++    /// under the type.  An enum's methods live in its impl blocks; a kind
++    /// with no method list carries nothing.
++    register_carried_methods(mut &this, node: ASTNode*, spec_type: TypeRef) -> void {
++        if (node == null) { return; }
++        if (node.kind == NodeKind::StructDeclaration) {
++            this.decl_index.register_methods(spec_type, (node as declaration::StructDeclNode*).methods,
++                this.intern_table, this.arena, "mono/placed spec struct methods");
++        } else if (node.kind == NodeKind::UnionDeclaration) {
++            this.decl_index.register_methods(spec_type, (node as declaration::UnionDeclNode*).methods,
++                this.intern_table, this.arena, "mono/placed spec union methods");
++        } else if (node.kind == NodeKind::ClassDeclaration) {
++            this.decl_index.register_methods(spec_type, (node as declaration::ClassDeclNode*).methods,
++                this.intern_table, this.arena, "mono/placed spec class methods");
++        }
++    }
++
+     /// The visibility a specialized type declaration carries: its template's,
+     /// which the cloner copied onto the node.  A kind without a modifier is
+     /// public.
+diff --git a/compiler/src/compiler/passes/specialization.cryo b/compiler/src/compiler/passes/specialization.cryo
+index a40f005b..78a3d6eb 100644
+--- a/compiler/src/compiler/passes/specialization.cryo
++++ b/compiler/src/compiler/passes/specialization.cryo
+@@ -118,14 +118,17 @@ type struct SpecInjector {
+         // different method keys, so they can't overwrite each other.
+         if (node.kind == NodeKind::StructDeclaration) {
+             const sn: StructDeclNode* = node as StructDeclNode*;
++            SpecInjector::shadow_already("struct", sn.methods, ctx);
+             ctx.decl_index.register_methods(
+                 spec_type, sn.methods, ctx.intern_table, ctx.type_arena, "specialization/inject struct methods");
+         } else if (node.kind == NodeKind::UnionDeclaration) {
+             const un: UnionDeclNode* = node as UnionDeclNode*;
++            SpecInjector::shadow_already("union", un.methods, ctx);
+             ctx.decl_index.register_methods(
+                 spec_type, un.methods, ctx.intern_table, ctx.type_arena, "specialization/inject union methods");
+         } else if (node.kind == NodeKind::ClassDeclaration) {
+             const cn: ClassDeclNode* = node as ClassDeclNode*;
++            SpecInjector::shadow_already("class", cn.methods, ctx);
+             ctx.decl_index.register_methods(
+                 spec_type, cn.methods, ctx.intern_table, ctx.type_arena, "specialization/inject class methods");
+         } else if (node.kind == NodeKind::EnumDeclaration) {
+@@ -136,6 +139,19 @@ type struct SpecInjector {
+         }
+     }
+ 
++    /// SHADOW: whether each method the pass registers already carries the
++    /// entry a registration stamps.
++    static shadow_already(site: string, methods: &MethodNode*[], ctx: CompilationContext*) -> void {
++        for (mut i: i64 = 0; i < methods.length; i++) {
++            const m: MethodNode* = methods[i];
++            if (m == null || m.func == null) { continue; }
++            fmt::eprintf("SHADOW\tPM\t%s\t%s\t%s\t%s\n", site,
++                if (m.func.overload_entry.is_valid()) { "ALREADY" } else { "NEW" },
++                ctx.intern_table.resolve(m.func.name),
++                if (m.func.is_self_returning_default) { "self-ret-default" } else { if (m.func.spec_type_args.length > 0) { "method-spec" } else { if (m.func.resolved_return_type.is_valid()) { "plain" } else { "plain-RET-INVALID" } } });
++        }
++    }
++
+     /// Register a newly injected specialized declaration into the DeclarationIndex
+     /// so that sema can look it up without rescanning the AST.
+     /// Delegates to the shared TypeResolutionPasses::register_decl_in_index().
+@@ -729,6 +745,7 @@ type struct SpecializationPasses {
+             if (impl_qname.is_valid() && impl_node != null) {
+                 impl_node.set_target_type(impl_qname);
+                 impl_node.spec_owner = entry.specialized_type;
++                SpecInjector::shadow_already("impl", impl_node.methods, ctx);
+                 ctx.decl_index.register_methods(
+                     entry.specialized_type, impl_node.methods, ctx.intern_table, ctx.type_arena, "specialization/spec impl methods");
+                 // The clone under the SPECIALIZATION's key: a subject with a

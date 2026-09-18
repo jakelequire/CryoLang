@@ -61,77 +61,26 @@ import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 
 
-/// Register what a specialized declaration carries - its methods, its
-/// bare-name mapping - under the type the monomorphizer registered when
-/// it placed the entry.  Uses the SpecializationEntry's specialized_name
-/// as the key instead of ctx.qualify_symbol_sym to prevent cross-module
-/// specs with the same bare name from overwriting each other.  This is
-/// wrapped as a static method (not a free function) to dodge a codegen
+/// The declaration-index side of placing a specialization.  A NAMED
+/// specialization - a struct, union, class or enum clone with an arena type -
+/// was registered by the monomorphizer when its entry was placed: the type,
+/// its bare-name mapping, the methods it carries and its impl blocks', with
+/// the id stamped on the clone.  Nothing is registered for one here.  This
+/// is wrapped as a static method (not a free function) to dodge a codegen
 /// issue with parameter visibility inside free functions.
 type struct SpecInjector {
-    /// Register a specialized type's methods under the arena type's ACTUAL
-    /// qualified name.  This prevents cross-module specs with the same bare
-    /// name (e.g. BattleTest::Pair_i32 vs Collections::Pair::Pair_i32) from
-    /// overwriting each other's methods in the DI.  The TYPE itself is
-    /// registered, and the clone stamped, by the monomorphizer at the
-    /// moment the specialization is placed - before any generic method on
-    /// it is materialized - so a type is never asked for here.
-    static register(node: ASTNode*, spec_name: SymbolStr,
-                    spec_type: TypeRef, ctx: CompilationContext*) -> void {
+    /// Register a placed specialization that has NO named type - a function
+    /// template's clone - as an ordinary injected declaration.  A named one
+    /// is already in the index and is left alone: a second registration of
+    /// the same declaration is a second writer of every key it holds.
+    static register(node: ASTNode*, spec_type: TypeRef, ctx: CompilationContext*) -> void {
         if (node == null) { return; }
-        // For function declarations, use the standard path (no naming conflict)
-        if (node.kind == NodeKind::FunctionDeclaration) {
-            SpecInjector::register_injected_decl(node, ctx);
-            return;
-        }
-        if (!spec_type.is_valid()) {
-            SpecInjector::register_injected_decl(node, ctx);
-            return;
-        }
-
-        // Get the arena type's actual qualified name (e.g. "Collections::Pair::Pair_i32")
-        // via TypeArena method that safely handles the pointer cast internally.
-        const arena: TypeArena* = ctx.type_arena;
-        const arena_qname: SymbolStr = arena.get_qualified_name(spec_type);
-        if (!arena_qname.is_valid()) {
-            SpecInjector::register_injected_decl(node, ctx);
-            return;
-        }
-
-        // Register a bare->qualified name mapping for the spec.  In-body
-        // calls inside a spec'd method get rewritten by ASTTypeSubstituter
-        // to use the bare-form spec name as their scope (e.g. inside
-        // `Array<u8, GlobalAlloc>::with_capacity`'s body, the call
-        // `Array::try_with_capacity_in(...)` is substituted to
-        // `Array_<spec>::try_with_capacity_in(...)`).  Codegen's
-        // ScopeResolution lookup uses `di.resolve_qualified(scope_name)`
-        // to find the qualified form for the combined-key DI lookup,
-        // and methods are registered under the QUALIFIED arena name.
-        // Without this mapping the substituted bare scope passes through
-        // unchanged and the combined-key lookup misses.
-        if (!arena_qname.equals(spec_name)) {
-            ctx.decl_index.register_name_mapping(spec_name, arena_qname);
-        }
-
-        // Methods registered ONLY under the arena qualified name.
-        // This is the key fix: two specs with the same bare name get
-        // different method keys, so they can't overwrite each other.
-        if (node.kind == NodeKind::StructDeclaration) {
-            const sn: StructDeclNode* = node as StructDeclNode*;
-            ctx.decl_index.register_methods(
-                spec_type, sn.methods, ctx.intern_table, ctx.type_arena, "specialization/inject struct methods");
-        } else if (node.kind == NodeKind::UnionDeclaration) {
-            const un: UnionDeclNode* = node as UnionDeclNode*;
-            ctx.decl_index.register_methods(
-                spec_type, un.methods, ctx.intern_table, ctx.type_arena, "specialization/inject union methods");
-        } else if (node.kind == NodeKind::ClassDeclaration) {
-            const cn: ClassDeclNode* = node as ClassDeclNode*;
-            ctx.decl_index.register_methods(
-                spec_type, cn.methods, ctx.intern_table, ctx.type_arena, "specialization/inject class methods");
-        } else if (node.kind == NodeKind::EnumDeclaration) {
-            // Enum methods come from implement blocks, not inline.
-            // Type registration above already covers the enum itself.
-        } else {
+        const named: boolean = spec_type.is_valid()
+            && (node.kind == NodeKind::StructDeclaration
+                || node.kind == NodeKind::UnionDeclaration
+                || node.kind == NodeKind::ClassDeclaration
+                || node.kind == NodeKind::EnumDeclaration);
+        if (!named) {
             SpecInjector::register_injected_decl(node, ctx);
         }
     }
@@ -669,13 +618,10 @@ type struct SpecializationPasses {
             }
         }
 
-        // Register in DeclarationIndex using the arena type's ACTUAL
-        // qualified name for method keys.  This prevents two specs with
-        // the same bare name (e.g. BattleTest::Pair_i32 and
-        // Collections::Pair::Pair_i32) from overwriting each other.
+        // A named specialization is in the index since its placement; a
+        // function clone registers as a declaration here.
         if (entry.ast_node != null) {
-            SpecInjector::register(entry.ast_node, entry.specialized_name,
-                                   entry.specialized_type, ctx);
+            SpecInjector::register(entry.ast_node, entry.specialized_type, ctx);
         }
         // Register the InstantiatedType's TypeRef in type_reverse so
         // that codegen can look up the concrete type's qualified name
@@ -713,9 +659,10 @@ type struct SpecializationPasses {
                 }
             }
         }
-        // Register impl block methods under the SAME qualified name as
-        // the type itself (from the arena), not ctx.qualify_symbol_sym
-        // which would use the consuming module's namespace.
+        // Each cloned impl block is rewritten to target the specialization
+        // by its qualified name and recorded as a head under the
+        // specialization's key; its methods were registered under the type
+        // when the entry was placed.
         const impl_qname: SymbolStr = if (entry.specialized_type.is_valid()) {
             arena.get_qualified_name(entry.specialized_type)
         } else {
@@ -729,8 +676,6 @@ type struct SpecializationPasses {
             if (impl_qname.is_valid() && impl_node != null) {
                 impl_node.set_target_type(impl_qname);
                 impl_node.spec_owner = entry.specialized_type;
-                ctx.decl_index.register_methods(
-                    entry.specialized_type, impl_node.methods, ctx.intern_table, ctx.type_arena, "specialization/spec impl methods");
                 // The clone under the SPECIALIZATION's key: a subject with a
                 // name of its own selects among the clones placed under it.
                 if (impl_node.is_trait_impl()) {

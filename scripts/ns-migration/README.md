@@ -42,6 +42,7 @@ Two kinds of script:
 | §8.237 | `shadow.patch` | a print at `TraitRef::identity()`'s leaf fallback (`TRID`), whose corpus count is 0 and whose control is a `where T: Nope` bound (`git apply` over `b3b36ca6`, then `corpus2.sh <tag>`) |
 | §8.238 | `shadow.patch` | the spec type registered at the monomorphizer's seam and the two spec-method sites on `register_methods(recv_type, …)`, with the `SPO` print at both (the old key beside the index's name, the kind, materialized, arena-named, deferred) (`git apply` over `2e3e7f42`, then `corpus2.sh <tag>`) |
 | §8.239 | `shadow.patch` | the `RP` print at the nine `Resolver::lookup` sites: the unfiltered rib walk's binding beside the namespace-filtered walk `resolve_path` makes (`git apply` over `7d6705ac`, then `corpus2.sh <tag>`); the 3,059,355-line route table is one `cut \| sort \| uniq -c` |
+| §8.240 | `shadow.patch` | the seam registering a placed specialization's methods and mapping with the pass's registrations still in place, and the `PM` print at the pass's four `register_methods` calls (already registered, or new, and why) plus `SEAM` for an impl method unresolved at placement (`git apply` over `5a464de4`, then `corpus2.sh <tag>`) |
 
 Not here: the scripts that edited the ledger itself, the entry drafts, and
 the one-off controls written against a gate version that no longer exists
