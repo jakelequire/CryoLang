@@ -39,8 +39,7 @@ MangledName = "C$" ( TraitImpl | Tagged | Plain ) ;
 TraitImpl   = "tr$" Path "$f" Path Signature ;                 (* trait-impl method *)
 
 Tagged      = ( "ct" | "dt" | "op" ) "$" Path Signature        (* ctor / dtor / operator *)
-            | ( "vt" | "ti" | "mi" ) "$" Path                  (* vtable / type-info / module-init *)
-            | "cl" "$" Path Overload ;                         (* compiler closure *)
+            | ( "vt" | "ti" | "mi" ) "$" Path ;                (* vtable / type-info / module-init *)
 
 Plain       = Path [ Signature ] [ Overload ] ;                (* functions, methods, data symbols *)
 
@@ -121,9 +120,10 @@ a digit.
 | `vt`   | Vtable                  | `C$vt$` Path                 |
 | `ti`   | Type info / RTTI        | `C$ti$` Path                 |
 | `mi`   | Module initializer      | `C$mi$` Path                 |
-| `cl`   | Compiler-generated closure | `C$cl$` Path `$O` Index   |
 
 Plain functions, methods, global variables, and named-type symbols carry no kind tag.
+A closure carries none either: it is a synthesized type with a `__call__` method
+(§11).
 
 ---
 
@@ -153,12 +153,23 @@ Generic arguments are written `$L` Type {`_` Type} `$G` and attach to the segmen
 specialize:
 
 ```
-Pair<int>                   ->  4Pair$Li$G
-Pair<int>::new              ->  4Pair$Li$G-3new
-Math::Vec2<int>             ->  4Math.4Vec2$Li$G
+Pair<int>                   ->  4Pair$Li$G           (in a type encoding, §8)
+Pair<int>::new              ->  104Pair$Li$G-3new    (as a path segment)
+Math::Vec2<int>             ->  4Math.4Vec2$Li$G     (in a type encoding)
 ```
 
 Each distinct monomorphization therefore produces a distinct symbol.
+
+A specialization's identifier - the leaf with its argument list, `4Pair$Li$G` -
+is the name the compiler declares the monomorphized item under, and as a PATH
+SEGMENT (§5) it is length-prefixed like any other identifier: `Pair<int>::new`
+is `104Pair$Li$G-3new`, `identity<int>` is `148identity$Li$G`, and the length
+counts the whole identifier, `$L…$G` included.  Inside a type encoding (§8)
+the leaf-generics form is written directly, `N$L4Pair$Li$G$G`, because there
+the argument list belongs to the type reference rather than to a declared
+identifier.  So one specialization is spelled two ways: `137NonNull$Lh$G` as
+the owner of its own methods, `N$L3std.4core.3ptr.7NonNull$Lh$G$G` as a
+parameter or return type.
 
 ---
 
@@ -253,9 +264,9 @@ For `op` symbols the member name is replaced by a canonical code:
 ## 10. Overload Suffix
 
 `$O` followed by a decimal index disambiguates symbols that would otherwise collide.
-It is used by the closure encoding (`cl`) for the closure index, and is available to
-distinguish function overloads whose signatures alone do not (e.g. overloads differing
-only in return type).
+It is available to distinguish function overloads whose signatures alone do not (e.g.
+overloads differing only in return type); the decoder accepts it, and no encoder
+emits it today.
 
 ```
 C$3foo$Fi$Ri          first foo
@@ -273,7 +284,6 @@ Data symbols carry no signature. Their forms:
 | Vtable                     | `C$vt$` Path                      | `C$vt$6Animal`                |
 | Type info                  | `C$ti$` Path                      | `C$ti$6Animal`                |
 | Module initializer         | `C$mi$` Path                      | `C$mi$4Math.6Vector`          |
-| Closure                    | `C$cl$` Path `$O` Index           | `C$cl$8identity$O0`           |
 | Global / constant          | `C$` Path                         | `Math::PI` -> `C$4Math.2PI`    |
 | Named-type (LLVM type name)| `C$` Path                         | `Math::Vec2` -> `C$4Math.4Vec2`|
 | Generic-instance label     | `C$` Path-with-leaf-generics      | `Pair<int>` -> `C$4Pair$Li$G`  |
@@ -281,6 +291,13 @@ Data symbols carry no signature. Their forms:
 A root-namespace global with no enclosing namespace takes the bare `C$<name>` form
 (e.g. `C$3foo`). Module initializers are linked into a global init list run before
 `main`.
+
+A closure has no data symbol of its own.  It is lowered to a synthesized type
+`<namespace>::__Closure_<N>` (N counting closures in the module) whose body is
+its `__call__` method, and both mangle as any type and method do:
+`C$4Main.11__Closure_0-8__call__$F$s_i$Ri`.  A generic function called with a
+closure argument is specialized over the closure TYPE like any other argument:
+`apply<Main::__Closure_0>` is `C$4Main.345apply$LN$L4Main.11__Closure_0$G$G$F…`.
 
 ---
 
@@ -292,9 +309,11 @@ A root-namespace global with no enclosing namespace takes the bare `C$<name>` fo
 | `Util::add(a: int, b: int) -> int`                  | `C$4Util.3add$Fi_i$Ri` |
 | `Rect.area(&this) -> int`                           | `C$4Rect-4area$F$s$Ri` |
 | `Rect::new(w: int, h: int) -> Rect`                 | `C$4Rect-3new$Fi_i$RN$L4Rect$G` |
-| `Pair<int>::new(int, int) -> Pair<int>`             | `C$4Pair$Li$G-3new$Fi_i$RN$L4Pair$Li$G$G` |
+| `Pair<int>::new(int, int) -> Pair<int>`             | `C$104Pair$Li$G-3new$Fi_i$RN$L4Pair$Li$G$G` |
 | `Math::Vector::Vec2.dot(&this, Vec2) -> f64`        | `C$4Math.6Vector.4Vec2-3dot$F$s_N$L4Math.6Vector.4Vec2$G$Rd` |
-| `identity<int>(x: int) -> int`                      | `C$8identity$Li$G$Fi$Ri` |
+| `identity<int>(x: int) -> int`                      | `C$148identity$Li$G$Fi$Ri` |
+| `Main::apply<Main::__Closure_0>(f, x: int) -> int`  | `C$4Main.345apply$LN$L4Main.11__Closure_0$G$G$FN$L4Main.11__Closure_0$G_i$Ri` |
+| closure `(n: int) -> int { … }` in `Main`, its call | `C$4Main.11__Closure_0-8__call__$F$s_i$Ri` |
 | `write(buf: int*, len: int) -> int`                 | `C$5write$FPi_i$Ri` |
 | `Dog::Dog(name: string)`                            | `C$ct$3Dog-3Dog$FS$Rv` |
 | `Dog::~Dog(&this)`                                  | `C$dt$3Dog-3Dog$F$s$Rv` |
