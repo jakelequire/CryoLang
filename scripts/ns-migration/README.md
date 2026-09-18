@@ -40,6 +40,7 @@ Two kinds of script:
 | §8.234 | `shadow.patch` | `scope_owner_key`'s shadow: the stamp kind, the key and the hit at each of its five readers (`git apply` over `fd3756af`, then `corpus2.sh <tag>`); the 2,509,947-line table is one `cut \| sort \| uniq -c` |
 | §8.235 | `shadow.patch` | the async repoint's key beside the index's name for the registered owner (`RPT`), and the two mono spec-method sites' receiver beside the key with an end-of-build check of whether the key is ever registered (`SPO`, `SPOEND`) (`git apply` over `7e2541a2`, then `corpus2.sh <tag>`) |
 | §8.237 | `shadow.patch` | a print at `TraitRef::identity()`'s leaf fallback (`TRID`), whose corpus count is 0 and whose control is a `where T: Nope` bound (`git apply` over `b3b36ca6`, then `corpus2.sh <tag>`) |
+| §8.238 | `shadow.patch` | the spec type registered at the monomorphizer's seam and the two spec-method sites on `register_methods(recv_type, …)`, with the `SPO` print at both (the old key beside the index's name, the kind, materialized, arena-named, deferred) (`git apply` over `2e3e7f42`, then `corpus2.sh <tag>`) |
 
 Not here: the scripts that edited the ledger itself, the entry drafts, and
 the one-off controls written against a gate version that no longer exists

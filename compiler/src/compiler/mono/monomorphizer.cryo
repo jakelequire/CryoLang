@@ -55,6 +55,7 @@ import compiler::mono::state::{ MonomorphRequest, MonoState, SpecializationEntry
 import compiler::mono::trait_specializer::{ MonoTraitSpecializer };
 import compiler::mono::type_populator::{ MonoTypePopulator };
 import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::res::{ DefId };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ ArrayType };
@@ -638,6 +639,24 @@ type struct Monomorphizer {
             this.ast_resolver.resolve_specialized_ast(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst, this_type_for_methods);
         }
 
+        // A specialized TYPE is a declaration this pass writes, and it is
+        // registered where its identity is decided: here, under the
+        // qualified spec name this function minted (the name the arena
+        // carries once the wrapper slot is flipped below - it cannot be
+        // asked of the arena yet), with the id stamped on the clone - the
+        // clone's one writer, as the type-declaration stage is a source
+        // declaration's.  It has to precede the nested-call walk below: that
+        // walk materializes generic METHODS on this receiver and registers
+        // each by the type, and a type the index cannot name yet leaves every
+        // one unregistered.  The methods the clone carries are registered
+        // when the entry is walked (`SpecInjector::register`), after the
+        // owner module is decided.  A function template has no named type.
+        if (concrete_type.is_valid()) {
+            Monomorphizer::stamp_def(result.specialized_ast,
+                this.decl_index.register_type(qualified_spec_sym, concrete_type,
+                    Monomorphizer::node_is_public(result.specialized_ast)));
+        }
+
         // Register the spec entry into `state.spec_entries` BEFORE specializing the
         // nested calls in its own bodies.  A spec's method body can make a generic
         // call on a receiver that resolves to the SAME spec being materialized - e.g.
@@ -883,6 +902,31 @@ type struct Monomorphizer {
         return this.intern_table.intern(prefix + spec_name);
     }
 
+
+    /// Stamp the id a specialized type declaration registered under.  The
+    /// cloner leaves the field invalid (a clone has its own registration,
+    /// never its template's), so this is the clone's one writer.
+    static stamp_def(node: ASTNode*, d: DefId) -> void {
+        if (node == null) { return; }
+        if (node.kind == NodeKind::StructDeclaration) { (node as declaration::StructDeclNode*).def = d; return; }
+        if (node.kind == NodeKind::UnionDeclaration)  { (node as declaration::UnionDeclNode*).def = d; return; }
+        if (node.kind == NodeKind::ClassDeclaration)  { (node as declaration::ClassDeclNode*).def = d; return; }
+        if (node.kind == NodeKind::EnumDeclaration)   { (node as declaration::EnumDeclNode*).def = d; return; }
+        if (node.kind == NodeKind::TraitDeclaration)  { (node as declaration::TraitDeclNode*).def = d; return; }
+        if (node.kind == NodeKind::TypeAliasDeclaration) { (node as declaration::TypeAliasDeclNode*).def = d; return; }
+    }
+
+    /// The visibility a specialized type declaration carries: its template's,
+    /// which the cloner copied onto the node.  A kind without a modifier is
+    /// public.
+    static node_is_public(node: ASTNode*) -> boolean {
+        if (node == null) { return true; }
+        if (node.kind == NodeKind::StructDeclaration) { return (node as declaration::StructDeclNode*).is_public; }
+        if (node.kind == NodeKind::UnionDeclaration)  { return (node as declaration::UnionDeclNode*).is_public; }
+        if (node.kind == NodeKind::ClassDeclaration)  { return (node as declaration::ClassDeclNode*).is_public; }
+        if (node.kind == NodeKind::EnumDeclaration)   { return (node as declaration::EnumDeclNode*).is_public; }
+        return true;
+    }
 
     // Batch compilation support
 

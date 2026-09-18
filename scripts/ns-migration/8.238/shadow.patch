@@ -1,0 +1,269 @@
+diff --git a/compiler/src/compiler/decl_index.cryo b/compiler/src/compiler/decl_index.cryo
+index 61079425..0a695234 100644
+--- a/compiler/src/compiler/decl_index.cryo
++++ b/compiler/src/compiler/decl_index.cryo
+@@ -753,11 +753,9 @@ type struct DeclarationIndex {
+     }
+ 
+     /// The same registration by a KEY the caller holds, for an owner this
+-    /// index cannot name from a type: an `async` owner's method repointed
+-    /// under its template's key while the owner in hand is the instance;
+-    /// a specialization whose methods are registered before (or without)
+-    /// the specialization itself; an impl head on an alias keyword.  Each
+-    /// is a name-keyed door the lane gate counts; none is a lookup.
++    /// index cannot name from a type: an impl head on an alias keyword
++    /// (`implement trait Show for int`), stamped by nothing until the
++    /// keyword ruling.  A name-keyed door the lane gate counts; not a lookup.
+     register_methods_by_key(mut &this, type_sym: SymbolStr, methods: &MethodNode*[],
+                             intern: InternTable*, arena: TypeArena*) -> void {
+         const type_str: string = intern.resolve(type_sym);
+diff --git a/compiler/src/compiler/mono/call_specializer.cryo b/compiler/src/compiler/mono/call_specializer.cryo
+index d6a076d2..ec70bcfe 100644
+--- a/compiler/src/compiler/mono/call_specializer.cryo
++++ b/compiler/src/compiler/mono/call_specializer.cryo
+@@ -2201,13 +2201,46 @@ type struct MonoCallSpecializer {
+     // -- DI registration + symbol pinning (re-homed; Phase-0 keystone) --
+ 
+ 
++    /// Whether a receiver is an instantiation the worklist has not
++    /// materialized yet.  A generic method requested on one has nothing to
++    /// be registered under: the spec is pushed onto the TEMPLATE and is
++    /// cloned, and registered, with the owner when its entry is placed
++    /// (`pin_spec_entry`'s unkeyed shape).  Every other receiver is a type
++    /// the index holds - a declaration, a primitive, a specialization
++    /// registered at its placement - so one it cannot name is a missing
++    /// registration, recorded by `register_methods`, never keyed around.
++    receiver_unmaterialized(&this, recv_type: TypeRef) -> boolean {
++        const t: Type* = this.arena.lookup(recv_type.id);
++        if (t == null || t.kind != TypeKind::InstantiatedType) { return false; }
++        return !this.state.has_materialized_spec(recv_type);
++    }
++
++    /// SHADOW: whether the index names a spec method's receiver at registration.
++    shadow_spec_owner(&this, site: string, recv_type: TypeRef, old_key: SymbolStr) -> void {
++        const named: SymbolStr = this.decl_index.lookup_type_name(recv_type);
++        mut kind: string = "null";
++        const t: Type* = this.arena.lookup(recv_type.id);
++        if (t != null) { kind = t.kind.to_string(); }
++        const arena_name: SymbolStr = this.arena.get_qualified_name(recv_type);
++        const deferred: boolean = this.receiver_unmaterialized(recv_type);
++        mut verdict: string = "NONAME";
++        if (named.is_valid()) {
++            verdict = if (!old_key.is_valid()) { "NAMED-nokey" } else { if (named.id == old_key.id) { "AGREE" } else { "DISAGREE" } };
++        }
++        fmt::eprintf("SHADOW\tSPO\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", site, verdict,
++            this.intern_table.resolve(old_key), this.intern_table.resolve(named), kind,
++            if (this.state.has_materialized_spec(recv_type)) { "materialized" } else { "-" },
++            if (arena_name.is_valid()) { "arena-named" } else { "arena-noname" },
++            if (deferred) { "DEFERRED" } else { "registered" });
++    }
++
+     /// Register an impl-block-owned spec method in the DeclarationIndex under the
+-    /// receiver's canonical name so codegen/linker find the right func_type/mangle.
++    /// receiver's type so codegen/linker find the right func_type/mangle.
+     register_spec_method_in_di(mut &this, spec_method: MethodNode*,
+                                recv_type: TypeRef, impl_node: ImplBlockNode*) -> void {
+         if (this.decl_index == null) { return; }
+         if (spec_method == null || impl_node == null) { return; }
+-        const qualified_target: SymbolStr = impl_node.target_key(this.arena);
++        this.shadow_spec_owner("impl", recv_type, impl_node.target_key(this.arena));
+         mut owning_module: SymbolStr = SymbolStr::empty();
+         if (impl_node.source_module != "") {
+             owning_module = this.intern_table.intern(impl_node.source_module);
+@@ -2218,30 +2251,31 @@ type struct MonoCallSpecializer {
+         // owner so the per-module incremental cache does not reuse a stale object
+         // (see MonoState::record_spec_owner_module).
+         this.state.record_spec_owner_module(owning_module);
++        if (this.receiver_unmaterialized(recv_type)) { return; }
+         mut spec_methods: MethodNode*[] = [];
+         spec_methods.push(spec_method);
+-        this.decl_index.register_methods_by_key(
+-            qualified_target, spec_methods, this.intern_table, this.arena);
++        this.decl_index.register_methods(
++            recv_type, spec_methods, this.intern_table, this.arena, "mono/spec impl method");
+     }
+ 
+     /// Register a spec method whose owner is a non-generic struct/class (no impl
+-    /// block): key off the receiver's arena qualified name, owned by the
+-    /// module being walked (a written type declaration records no module of
+-    /// its own; only an impl block carries one).
++    /// block) under the receiver's type, owned by the module being walked (a
++    /// written type declaration records no module of its own; only an impl
++    /// block carries one).
+     register_spec_method_in_di_inherent(mut &this, spec_method: MethodNode*,
+                                         recv_type: TypeRef, owner_ast: ASTNode*) -> void {
+         if (this.decl_index == null) { return; }
+         if (spec_method == null || owner_ast == null) { return; }
+-        mut qualified_target: SymbolStr = this.arena.get_qualified_name(recv_type);
+-        if (!qualified_target.is_valid()) { return; }
++        this.shadow_spec_owner("inherent", recv_type, this.arena.get_qualified_name(recv_type));
++        if (this.receiver_unmaterialized(recv_type)) { return; }
+         const owning_module: SymbolStr = this.current_module;
+         // Flag the emitting module as a spec owner for the incremental cache (see
+         // MonoState::record_spec_owner_module).
+         this.state.record_spec_owner_module(owning_module);
+         mut spec_methods: MethodNode*[] = [];
+         spec_methods.push(spec_method);
+-        this.decl_index.register_methods_by_key(
+-            qualified_target, spec_methods, this.intern_table, this.arena);
++        this.decl_index.register_methods(
++            recv_type, spec_methods, this.intern_table, this.arena, "mono/spec inherent method");
+     }
+ 
+     /// Pin `call` to the materialized spec's registered entry.  A spec on a
+diff --git a/compiler/src/compiler/mono/monomorphizer.cryo b/compiler/src/compiler/mono/monomorphizer.cryo
+index 116fd7d8..d0a2c009 100644
+--- a/compiler/src/compiler/mono/monomorphizer.cryo
++++ b/compiler/src/compiler/mono/monomorphizer.cryo
+@@ -55,6 +55,7 @@ import compiler::mono::state::{ MonomorphRequest, MonoState, SpecializationEntry
+ import compiler::mono::trait_specializer::{ MonoTraitSpecializer };
+ import compiler::mono::type_populator::{ MonoTypePopulator };
+ import compiler::resolver::intern_table::{ InternTable };
++import compiler::resolver::res::{ DefId };
+ import compiler::resolver::symbol_str::{ SymbolStr };
+ import compiler::types::arena::{ TypeArena };
+ import compiler::types::compound::{ ArrayType };
+@@ -638,6 +639,24 @@ type struct Monomorphizer {
+             this.ast_resolver.resolve_specialized_ast(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst, this_type_for_methods);
+         }
+ 
++        // A specialized TYPE is a declaration this pass writes, and it is
++        // registered where its identity is decided: here, under the
++        // qualified spec name this function minted (the name the arena
++        // carries once the wrapper slot is flipped below - it cannot be
++        // asked of the arena yet), with the id stamped on the clone - the
++        // clone's one writer, as the type-declaration stage is a source
++        // declaration's.  It has to precede the nested-call walk below: that
++        // walk materializes generic METHODS on this receiver and registers
++        // each by the type, and a type the index cannot name yet leaves every
++        // one unregistered.  The methods the clone carries are registered
++        // when the entry is walked (`SpecInjector::register`), after the
++        // owner module is decided.  A function template has no named type.
++        if (concrete_type.is_valid()) {
++            Monomorphizer::stamp_def(result.specialized_ast,
++                this.decl_index.register_type(qualified_spec_sym, concrete_type,
++                    Monomorphizer::node_is_public(result.specialized_ast)));
++        }
++
+         // Register the spec entry into `state.spec_entries` BEFORE specializing the
+         // nested calls in its own bodies.  A spec's method body can make a generic
+         // call on a receiver that resolves to the SAME spec being materialized - e.g.
+@@ -884,6 +903,31 @@ type struct Monomorphizer {
+     }
+ 
+ 
++    /// Stamp the id a specialized type declaration registered under.  The
++    /// cloner leaves the field invalid (a clone has its own registration,
++    /// never its template's), so this is the clone's one writer.
++    static stamp_def(node: ASTNode*, d: DefId) -> void {
++        if (node == null) { return; }
++        if (node.kind == NodeKind::StructDeclaration) { (node as declaration::StructDeclNode*).def = d; return; }
++        if (node.kind == NodeKind::UnionDeclaration)  { (node as declaration::UnionDeclNode*).def = d; return; }
++        if (node.kind == NodeKind::ClassDeclaration)  { (node as declaration::ClassDeclNode*).def = d; return; }
++        if (node.kind == NodeKind::EnumDeclaration)   { (node as declaration::EnumDeclNode*).def = d; return; }
++        if (node.kind == NodeKind::TraitDeclaration)  { (node as declaration::TraitDeclNode*).def = d; return; }
++        if (node.kind == NodeKind::TypeAliasDeclaration) { (node as declaration::TypeAliasDeclNode*).def = d; return; }
++    }
++
++    /// The visibility a specialized type declaration carries: its template's,
++    /// which the cloner copied onto the node.  A kind without a modifier is
++    /// public.
++    static node_is_public(node: ASTNode*) -> boolean {
++        if (node == null) { return true; }
++        if (node.kind == NodeKind::StructDeclaration) { return (node as declaration::StructDeclNode*).is_public; }
++        if (node.kind == NodeKind::UnionDeclaration)  { return (node as declaration::UnionDeclNode*).is_public; }
++        if (node.kind == NodeKind::ClassDeclaration)  { return (node as declaration::ClassDeclNode*).is_public; }
++        if (node.kind == NodeKind::EnumDeclaration)   { return (node as declaration::EnumDeclNode*).is_public; }
++        return true;
++    }
++
+     // Batch compilation support
+ 
+     /// Reset transient per-module state while preserving the specialization cache
+diff --git a/compiler/src/compiler/passes/specialization.cryo b/compiler/src/compiler/passes/specialization.cryo
+index 80c3ab18..a40f005b 100644
+--- a/compiler/src/compiler/passes/specialization.cryo
++++ b/compiler/src/compiler/passes/specialization.cryo
+@@ -35,7 +35,6 @@ import compiler::types::{
+ };
+ import compiler::mono::{ monomorphizer, state };
+ import compiler::resolver::{ intern_table, res, symbol_str };
+-import compiler::resolver::res::{ DefId };
+ import utils::logger;
+ import utils::logger::{ LOG_DEBUG, LogComponent };
+ import compiler::resolver::qualified_name;
+@@ -62,17 +61,21 @@ import compiler::types::type_base::{ Type };
+ import compiler::types::type_ref::{ TypeRef };
+ 
+ 
+-/// Register a specialized type declaration using the arena type's actual
+-/// qualified name for method keys.  Uses the SpecializationEntry's
+-/// specialized_name as the key instead of ctx.qualify_symbol_sym to prevent
+-/// cross-module specs with the same bare name from overwriting each other.
+-/// This is wrapped as a static method (not a free function) to dodge a
+-/// codegen issue with parameter visibility inside free functions.
++/// Register what a specialized declaration carries - its methods, its
++/// bare-name mapping - under the type the monomorphizer registered when
++/// it placed the entry.  Uses the SpecializationEntry's specialized_name
++/// as the key instead of ctx.qualify_symbol_sym to prevent cross-module
++/// specs with the same bare name from overwriting each other.  This is
++/// wrapped as a static method (not a free function) to dodge a codegen
++/// issue with parameter visibility inside free functions.
+ type struct SpecInjector {
+-    /// Register a specialized type using the arena type's ACTUAL qualified
+-    /// name for method keys.  This prevents cross-module specs with the
+-    /// same bare name (e.g. BattleTest::Pair_i32 vs Collections::Pair::Pair_i32)
+-    /// from overwriting each other's methods in the DI.
++    /// Register a specialized type's methods under the arena type's ACTUAL
++    /// qualified name.  This prevents cross-module specs with the same bare
++    /// name (e.g. BattleTest::Pair_i32 vs Collections::Pair::Pair_i32) from
++    /// overwriting each other's methods in the DI.  The TYPE itself is
++    /// registered, and the clone stamped, by the monomorphizer at the
++    /// moment the specialization is placed - before any generic method on
++    /// it is materialized - so a type is never asked for here.
+     static register(node: ASTNode*, spec_name: SymbolStr,
+                     spec_type: TypeRef, ctx: CompilationContext*) -> void {
+         if (node == null) { return; }
+@@ -95,12 +98,6 @@ type struct SpecInjector {
+             return;
+         }
+ 
+-        // Registered under its arena name and nothing else: a specialization
+-        // has ONE canonical identity, the template's module prefixed to the
+-        // spec identifier, and every reader asks under it.
+-        SpecInjector::stamp_def(node,
+-            ctx.decl_index.register_type(arena_qname, spec_type, SpecInjector::node_is_public(node)));
+-
+         // Register a bare->qualified name mapping for the spec.  In-body
+         // calls inside a spec'd method get rewritten by ASTTypeSubstituter
+         // to use the bare-form spec name as their scope (e.g. inside
+@@ -139,29 +136,6 @@ type struct SpecInjector {
+         }
+     }
+ 
+-    /// Stamp the id a specialized type declaration registered under.  The
+-    /// cloner leaves the field invalid (a clone has its own registration,
+-    /// never its template's), so this is the clone's one writer.
+-    static stamp_def(node: ASTNode*, d: DefId) -> void {
+-        if (node.kind == NodeKind::StructDeclaration) { (node as StructDeclNode*).def = d; return; }
+-        if (node.kind == NodeKind::UnionDeclaration)  { (node as UnionDeclNode*).def = d; return; }
+-        if (node.kind == NodeKind::ClassDeclaration)  { (node as ClassDeclNode*).def = d; return; }
+-        if (node.kind == NodeKind::EnumDeclaration)   { (node as EnumDeclNode*).def = d; return; }
+-        if (node.kind == NodeKind::TraitDeclaration)  { (node as TraitDeclNode*).def = d; return; }
+-        if (node.kind == NodeKind::TypeAliasDeclaration) { (node as TypeAliasDeclNode*).def = d; return; }
+-    }
+-
+-    /// The visibility a specialized type declaration carries: its template's,
+-    /// which the cloner copied onto the node.  A kind without a modifier is
+-    /// public.
+-    static node_is_public(node: ASTNode*) -> boolean {
+-        if (node.kind == NodeKind::StructDeclaration) { return (node as StructDeclNode*).is_public; }
+-        if (node.kind == NodeKind::UnionDeclaration)  { return (node as UnionDeclNode*).is_public; }
+-        if (node.kind == NodeKind::ClassDeclaration)  { return (node as ClassDeclNode*).is_public; }
+-        if (node.kind == NodeKind::EnumDeclaration)   { return (node as EnumDeclNode*).is_public; }
+-        return true;
+-    }
+-
+     /// Register a newly injected specialized declaration into the DeclarationIndex
+     /// so that sema can look it up without rescanning the AST.
+     /// Delegates to the shared TypeResolutionPasses::register_decl_in_index().

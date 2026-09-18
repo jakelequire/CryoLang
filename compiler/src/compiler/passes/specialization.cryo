@@ -35,7 +35,6 @@ import compiler::types::{
 };
 import compiler::mono::{ monomorphizer, state };
 import compiler::resolver::{ intern_table, res, symbol_str };
-import compiler::resolver::res::{ DefId };
 import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
 import compiler::resolver::qualified_name;
@@ -62,17 +61,21 @@ import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 
 
-/// Register a specialized type declaration using the arena type's actual
-/// qualified name for method keys.  Uses the SpecializationEntry's
-/// specialized_name as the key instead of ctx.qualify_symbol_sym to prevent
-/// cross-module specs with the same bare name from overwriting each other.
-/// This is wrapped as a static method (not a free function) to dodge a
-/// codegen issue with parameter visibility inside free functions.
+/// Register what a specialized declaration carries - its methods, its
+/// bare-name mapping - under the type the monomorphizer registered when
+/// it placed the entry.  Uses the SpecializationEntry's specialized_name
+/// as the key instead of ctx.qualify_symbol_sym to prevent cross-module
+/// specs with the same bare name from overwriting each other.  This is
+/// wrapped as a static method (not a free function) to dodge a codegen
+/// issue with parameter visibility inside free functions.
 type struct SpecInjector {
-    /// Register a specialized type using the arena type's ACTUAL qualified
-    /// name for method keys.  This prevents cross-module specs with the
-    /// same bare name (e.g. BattleTest::Pair_i32 vs Collections::Pair::Pair_i32)
-    /// from overwriting each other's methods in the DI.
+    /// Register a specialized type's methods under the arena type's ACTUAL
+    /// qualified name.  This prevents cross-module specs with the same bare
+    /// name (e.g. BattleTest::Pair_i32 vs Collections::Pair::Pair_i32) from
+    /// overwriting each other's methods in the DI.  The TYPE itself is
+    /// registered, and the clone stamped, by the monomorphizer at the
+    /// moment the specialization is placed - before any generic method on
+    /// it is materialized - so a type is never asked for here.
     static register(node: ASTNode*, spec_name: SymbolStr,
                     spec_type: TypeRef, ctx: CompilationContext*) -> void {
         if (node == null) { return; }
@@ -94,12 +97,6 @@ type struct SpecInjector {
             SpecInjector::register_injected_decl(node, ctx);
             return;
         }
-
-        // Registered under its arena name and nothing else: a specialization
-        // has ONE canonical identity, the template's module prefixed to the
-        // spec identifier, and every reader asks under it.
-        SpecInjector::stamp_def(node,
-            ctx.decl_index.register_type(arena_qname, spec_type, SpecInjector::node_is_public(node)));
 
         // Register a bare->qualified name mapping for the spec.  In-body
         // calls inside a spec'd method get rewritten by ASTTypeSubstituter
@@ -137,29 +134,6 @@ type struct SpecInjector {
         } else {
             SpecInjector::register_injected_decl(node, ctx);
         }
-    }
-
-    /// Stamp the id a specialized type declaration registered under.  The
-    /// cloner leaves the field invalid (a clone has its own registration,
-    /// never its template's), so this is the clone's one writer.
-    static stamp_def(node: ASTNode*, d: DefId) -> void {
-        if (node.kind == NodeKind::StructDeclaration) { (node as StructDeclNode*).def = d; return; }
-        if (node.kind == NodeKind::UnionDeclaration)  { (node as UnionDeclNode*).def = d; return; }
-        if (node.kind == NodeKind::ClassDeclaration)  { (node as ClassDeclNode*).def = d; return; }
-        if (node.kind == NodeKind::EnumDeclaration)   { (node as EnumDeclNode*).def = d; return; }
-        if (node.kind == NodeKind::TraitDeclaration)  { (node as TraitDeclNode*).def = d; return; }
-        if (node.kind == NodeKind::TypeAliasDeclaration) { (node as TypeAliasDeclNode*).def = d; return; }
-    }
-
-    /// The visibility a specialized type declaration carries: its template's,
-    /// which the cloner copied onto the node.  A kind without a modifier is
-    /// public.
-    static node_is_public(node: ASTNode*) -> boolean {
-        if (node.kind == NodeKind::StructDeclaration) { return (node as StructDeclNode*).is_public; }
-        if (node.kind == NodeKind::UnionDeclaration)  { return (node as UnionDeclNode*).is_public; }
-        if (node.kind == NodeKind::ClassDeclaration)  { return (node as ClassDeclNode*).is_public; }
-        if (node.kind == NodeKind::EnumDeclaration)   { return (node as EnumDeclNode*).is_public; }
-        return true;
     }
 
     /// Register a newly injected specialized declaration into the DeclarationIndex
