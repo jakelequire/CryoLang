@@ -2222,8 +2222,16 @@ type struct TypeResolutionPasses {
     /// that clone must lower as an ordinary `async` method whose future's Output
     /// is `i64`. Rewriting the annotation would make the clone return its own
     /// future type, which is circular.
+    ///
+    /// The projection is born naming `trait_ref` as its owning trait: a call
+    /// on a still-generic receiver carries this type (with `This` replaced by
+    /// the receiver's parameter) and nothing else identifies the trait there -
+    /// the callee is unresolved until the owner is concrete - so a reader that
+    /// needs the declaration (the async lowering's receiver-refresh decision)
+    /// reads it off the projection rather than scanning traits by the method's
+    /// leaf, which answers the first trait declaring that leaf, async or not.
     static desugar_async_trait_methods(node: TraitDeclNode*, ctx: CompilationContext*,
-                                       arena: TypeArena*) -> void {
+                                       arena: TypeArena*, trait_ref: TypeRef) -> void {
         if (node == null || ctx == null || arena == null) { return; }
         const this_ty: TypeRef = arena.create_generic_param(
             ctx.intern("This"), 0xFFFFFFFF as u64);
@@ -2248,7 +2256,7 @@ type struct TypeResolutionPasses {
                 node.add_assoc_type(adecl);
             }
             func.set_resolved_return_type(
-                arena.create_assoc_projection(this_ty, assoc, TypeRef::invalid()));
+                arena.create_assoc_projection(this_ty, assoc, trait_ref));
         }
     }
 
@@ -2840,7 +2848,8 @@ type struct TypeResolutionPasses {
                     // annotation still spells the Output for impl-side lowering.
                     // Must precede the `required_methods` population below,
                     // which snapshots these signatures onto the TraitType.
-                    TypeResolutionPasses::desugar_async_trait_methods(node, ctx, arena);
+                    const tr_ref: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/trait populate");
+                    TypeResolutionPasses::desugar_async_trait_methods(node, ctx, arena, tr_ref);
                     sig_count += node.methods.length;
 
                     // Populate the TraitType's required_methods array so the
@@ -2848,7 +2857,6 @@ type struct TypeResolutionPasses {
                     // signatures off the arena type. Without this, every
                     // BoundedParamType receiver call has to fall back to
                     // brittle name-only lookups in the DeclarationIndex.
-                    const tr_ref: TypeRef = ctx.decl_index.type_of_decl(node.def, "type_resolution/trait populate");
                     const tr_t: Type* = if (tr_ref.is_valid()) {
                         arena.lookup(tr_ref.id)
                     } else { null };

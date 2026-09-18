@@ -2442,12 +2442,14 @@ type struct AsyncLower {
     /// dropped, even though monomorphization goes on to emit a future that does
     /// store one. The method DECLARATION settles it regardless of how abstract
     /// the owner still is: an `async` method whose receiver is spelled `&this`
-    /// or `mut &this` stores a pointer, and nothing else does.
+    /// or `mut &this` stores a pointer, and nothing else does. The declaration
+    /// is reached through the projection's OWNING TRAIT, which the desugar
+    /// stamped on it; a method's bare leaf identifies no trait (`Write::flush`
+    /// and `AsyncWrite::flush` share one).
     ///
-    /// Getting this wrong is silent. The stale pointer addresses storage the
-    /// frame has stopped using, so the callee's writes — for a transport, the
-    /// socket it swaps back after an operation — land in dead memory while the
-    /// live object keeps the placeholder the callee swapped in.
+    /// A true answer also refuses, with E0455, the two receiver shapes that
+    /// cannot be re-addressed (a temporary, a future stored first); a false
+    /// answer lets them through and drops the refresh, silently either way.
     awaited_keeps_recv_ptr(&this, e: ExpressionNode*, slot_ty: TypeRef) -> boolean {
         if (slot_ty.is_valid()) { return true; }
         if (e == null || (e as ASTNode*).kind != NodeKind::CallExpression) { return false; }
@@ -2471,12 +2473,13 @@ type struct AsyncLower {
         if (!want.is_valid() || !ap.member.equals(want)) { return false; }
 
         // The trait's declaration settles the receiver form, which the abstract
-        // future cannot.
+        // future cannot.  The projection names its trait: the desugar that
+        // minted it had the declaration in hand.  A scan for the first trait
+        // declaring a method of this LEAF answered `Write` for `AsyncWrite::
+        // flush` whenever the sync trait registered first, and its `is_async`
+        // loop then found nothing.
         if (this.ctx.generic_registry == null) { return false; }
-        const trait_leaf: SymbolStr =
-            this.ctx.generic_registry.find_trait_defining_method(mname);
-        if (!trait_leaf.is_valid()) { return false; }
-        const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
+        const tdecl: TraitDeclNode* = this.ctx.generic_registry.trait_decl_of(ap.owning_trait);
         if (tdecl == null) { return false; }
         for (mut i: i64 = 0; i < tdecl.methods.length; i++) {
             const f: FunctionDeclNode* = tdecl.methods[i];
@@ -2862,14 +2865,14 @@ type struct AsyncLower {
             "unwrap_ptr", fi_ptr, span);
         sm.blocks[resume].add_statement(this.var_decl_stmt(subp_sym, true, fi_ptr, subp_call, span));
 
-        // The sub-future recorded the ADDRESS of its receiver when it was built,
-        // and that address is only right for the state that built it. An owning
-        // receiver promoted across states still lives in a fresh block-local on
-        // every poll — taken from its frame field on entry, handed back on the
-        // way out — so re-address the receiver from this frame's own storage
-        // before every poll. Without it an `async` method with a `&this`
-        // receiver reads and writes through a stale pointer from its second poll
-        // onwards, corrupting silently instead of faulting.
+        // The sub-future recorded the ADDRESS of its receiver when it was built.
+        // No poll trusts that address: the receiver is re-addressed from this
+        // frame's own storage before every poll, so the sub-future's pointer is
+        // right whenever the storage it names is - which is the invariant a
+        // carried value's storage keeps (it is built in its field and never
+        // leaves it) and a polled future's address keeps (E0459). A receiver
+        // whose storage did move would otherwise be read and written through a
+        // stale pointer from the second poll onwards, silently.
         if (!this.emit_recv_refresh(sm, resume, aw.operand,
                                     this.ident(subp_sym, fi_ptr, span), aw.span, span)) {
             sm.ok = false; return cur;

@@ -56,7 +56,7 @@ measurement that decided it on the row.
 | D11 | **Remove `resolve_counter.cryo` completely** - the counter, its audit streams, `scripts/b1-gate.py` and `tests/b1-baseline.txt` (Jake, 2026-09-15: "I want this instrumentation to be removed completely"; §7.2 mechanism 3 amended, §8.202) | **TAKEN** (§8.203) — the module (1,302 lines), its 100 `bump()` sites and 54 audit emitters, the five audit streams and `CRYO_RESOLVE_COUNTER`, `HomeOrigin` and `ResolutionContext`'s `FILE, LINE` provenance, the `door`/`site`/`table` parameters that carried a site name to an emitter, `b1-gate.py`, `retire-counter-sites.py`, `b1-baseline.txt`, `make b1-check` and its two CI steps. 0 of 3,478 objects moved over `examples/` and `tests/`. `lane-check`, the negative tests and the mutation projects are the regrowth guard | `git ls-files \| grep -c -e 'resolve_counter' -e 'b1-gate' -e 'b1-baseline'` → **0**; `grep -rho -e 'resolve_counter' -e 'HomeOrigin' compiler/src tools --include=*.cryo \| wc -l` → **0** | §8.66, §8.80, §8.139, §8.174, §8.183, §8.188, §8.193, §8.202, §8.203 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -c 'module_offering' compiler/src/compiler/resolver/name_resolution.cryo` → **3** | §8.138, §8.144, §8.151 |
-| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **588** (+1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194, §8.195 and §8.197, projects; +2 in §8.199, a project's two files; -1 in §8.203, `resolve_counter.cryo`; -1 in §8.206, a `collect` project's test file, the project being a `compile_fail` now; -1 in §8.207, `bare_intrinsic_priority.cryo`, a negative now; +1 in §8.209, a negative; +1 in §8.213, a unit test; +2 in §8.217, two projects' `beta_text.cryo`) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **590** (+1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194, §8.195 and §8.197, projects; +2 in §8.199, a project's two files; -1 in §8.203, `resolve_counter.cryo`; -1 in §8.206, a `collect` project's test file, the project being a `compile_fail` now; -1 in §8.207, `bare_intrinsic_priority.cryo`, a negative now; +1 in §8.209, a negative; +1 in §8.213, a unit test; +2 in §8.217, two projects' `beta_text.cryo`; +2 in §8.242, the consequence repro's two sources under `scripts/ns-migration/8.242/tick-ctl/`) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `grep -c 'LOOKUP_ROUTED' tests/lane-baseline.txt` → **2** | §8.99, §8.107 |
 | D16 | **An impl head writes EVERY parameter of the template it names, or names a concrete instantiation; an elided parameter is an error** - whether all of them default (`implement trait Display for String` with `String<A = GlobalAlloc>`) or only the trailing ones (`implement<T> trait Display for Array<T>` with `Array<T, A = GlobalAlloc>`). Write `implement<A> trait Display for String<A>` or `implement trait Display for String<GlobalAlloc>`. Rust's model: `impl Display for Vec` is missing its parameters and is not given a default meaning, and `impl<T> Trait for Vec<T>` is not written either | **TAKEN** (ruled by Jake 2026-09-13 for the bare form, 2026-09-14 for every elided parameter; built in §8.190) — E0302 from `refuse_elided_template_params` where type resolution attaches a WRITTEN head to its template, naming the template, both counts and both spellings, the parameter form first; the 11 heads rewritten as the instantiation each meant; a head's `target_args` is what it writes after the target on EVERY kind of head (an inherent head's list also declares its names); sema's writer-module lookup deleted. The concrete spelling is HONOURED by impl selection since §8.233: a head's written target arguments unify with the subject's, a `Def`/`PrimTy`-stamped one filtering, so `for Wrap<T, Alpha>` is not selected for `Wrap<i32, Beta>` and two heads differing in that argument are two heads (`impl_concrete_arg_filters_impl` E0358, `impl_concrete_arg_selects_impl` 12 - both RED from §8.223 to §8.233) | `python3 scripts/impl-head-elided-params.py --count` → **bare=0,partial=0,unmatched=0**; `grep -c 'refuse_elided_template_params' compiler/src/compiler/passes/type_resolution.cryo` → **2**; `grep -c '^negative E0302' tests/test-roster.txt` → **3** (2 at §8.190; +1 in §8.210, D22's head); `grep -c '^project impl_concrete_arg_' tests/test-roster.txt` → **2** (green since §8.233) | §8.180, §8.181, §8.187, §8.190, §8.223 |
 | D17 | **An `extern "C"` function is public unless marked `private`** — the extern-visibility default `docs/cryo.md` §18.1 states | **RULED** (Jake, 2026-09-14) — built in §8.167 by a worker and carried as unconfirmed until ratified; the spec text is normative, not provisional | `grep -c 'mut ext_public: boolean = true;' compiler/src/compiler/parser/parser.cryo` → **1**; `grep -c 'unless written .private function' docs/cryo.md` → **1** | §8.167, §8.187 |
@@ -184,8 +184,8 @@ three, and its row carries the count. Read each zero off its own row.
 | callee visibility gate (E0353) | LIVE, reached; **starved of violations**; since §8.173 its call door is the QUALIFIED path only (-52 on the pinned arm: the bare doors 2-4 are deleted, a bare callee is vetted by the name layer before it is stamped) plus the two value doors | 1,817 reached / **0** rejected, last counted before §8.203 | `grep -rho 'E0353' compiler/src \| wc -l` → **18** (the name layer's two: the import gate, the rooted walk; 21 until §8.203 deleted the counter's three mentions) | §8.1f, §8.2ag, §8.173, §8.203 |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected, last counted before §8.203 | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE — reads the arena's leaf index since §8.193 (`sole_declarer`, the one declaration under the leaf; reachability asked of that candidate) | — | `grep -rho 'E0240' compiler/src \| wc -l` → **9**; `grep -rho 'sole_declarer' compiler/src --include=*.cryo \| wc -l` → **2** | §8.2ad, §8.2ae, §8.193 |
-| the `TypeArena` as a name-keyed store (29 methods under the rule: `lookup_by_name`, the reverse maps `get_qualified_name`/`template_key_of`, the leaf index `sole_declarer`/`leaf_declarers`, the display formatters returning `string`, the creators `create_struct(qualified_name, module)`… and the spec-name writers `reserve_spec_names`/`swap_wrapper_to_concrete`/`add_name_alias`) | **PINNED** (§8.241) — 75 reads / 46 writes outside `arena.cryo`; the one written-name READ is `lookup_by_name` (`LOOKUP_ARENA`, 2); the leaf-index reads (3, `type_resolution.cryo`) explain a name the name layer already declined and resolve nothing; 32 of the reads are display text; the writes are the declaration half - a type keyed at creation by the name its declaration minted (23 of them `create_generic_param`) | — | `grep -A1 '^[[]ARENA_READ]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **75**; `grep -A1 '^[[]ARENA_WRITE]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **46** | §8.192, §8.241 |
-| the `GenericRegistry` as a name-keyed store (23 methods: templates by qualified name, inherent impl blocks and owners, trait declarations by identity, trait-impl heads by `(trait identity, target key)`, the well-known claims, `find_trait_defining_method` by bare method name) | **PINNED** (§8.241) — 69 reads / 19 writes outside `generic_registry.cryo`, the store no row enumerated before (audit 12: 22 methods, 87 sites). Keys are canonical strings derived from stamps - a registered type's qualified name, a trait's identity, a target key - so the surface is bucket B, not spelling, at every site but one: `find_trait_defining_method(method_name)` (2 readers) scans every trait for the first declaring a method of that BARE name, no `is_async` filter, and `async_lower` reads it for a receiver-lifetime decision (§8.241 records it as the next unit; unbuilt) | — | `grep -A1 '^[[]REGISTRY_READ]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **69**; `grep -A1 '^[[]REGISTRY_WRITE]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **19**; `grep -c 'find_trait_defining_method(' compiler/src/compiler/sema/async_lower.cryo` → **1** | §8.233, §8.241 |
+| the `TypeArena` as a name-keyed store (29 methods under the rule: `lookup_by_name`, the reverse maps `get_qualified_name`/`template_key_of`, the leaf index `sole_declarer`/`leaf_declarers`, the display formatters returning `string`, the creators `create_struct(qualified_name, module)`… and the spec-name writers `reserve_spec_names`/`swap_wrapper_to_concrete`/`add_name_alias`) | **PINNED** (§8.241) — 76 reads / 46 writes outside `arena.cryo` (75 at §8.241; +1 in §8.242, the registry's `trait_decl_of` naming a trait type - `get_qualified_name` had no `Trait` arm before it, so a trait's name could not be asked back at all: 0 callers ever asked, measured); the one written-name READ is `lookup_by_name` (`LOOKUP_ARENA`, 2); the leaf-index reads (3, `type_resolution.cryo`) explain a name the name layer already declined and resolve nothing; 32 of the reads are display text; the writes are the declaration half - a type keyed at creation by the name its declaration minted (23 of them `create_generic_param`) | — | `grep -A1 '^[[]ARENA_READ]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **76**; `grep -A1 '^[[]ARENA_WRITE]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **46** | §8.192, §8.241 |
+| the `GenericRegistry` as a name-keyed store (23 methods: templates by qualified name, inherent impl blocks and owners, trait declarations by identity, trait-impl heads by `(trait identity, target key)`, the well-known claims, `find_trait_defining_method` by bare method name) | **PINNED** (§8.241) — 67 reads / 19 writes outside `generic_registry.cryo`, the store no row enumerated before (audit 12: 22 methods, 87 sites). Keys are canonical strings derived from stamps - a registered type's qualified name, a trait's identity, a target key - so the surface is bucket B, not spelling, at every site but one: `find_trait_defining_method(method_name)` scans every trait for the first declaring a method of that BARE name, async or not, and is a HINT with one reader, sema's "defined on trait Y" note. Its second reader - the async lowering's receiver-refresh decision - reads the trait off the projection's `owning_trait` since §8.242 (`trait_decl_of(TypeRef)`, by identity): the scan answered `Read` for `AtmRead::read` and `GfTick` for `GenTick::tick` in the unit binary (4 of 11 sites; examples 28 of 28 agreed), and the refresh was dropped there - unobservably, since a carried receiver's storage never moves between polls (§8.242's mutation: every generic-receiver refresh dropped, 142 async unit tests + 17 negative + 3 projects PASS) | — | `grep -A1 '^[[]REGISTRY_READ]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **67**; `grep -A1 '^[[]REGISTRY_WRITE]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **19**; `grep -rho 'find_trait_defining_method(' compiler/src --include=*.cryo \| wc -l` → **2** (the definition, the hint); `grep -c 'trait_decl_of(' compiler/src/compiler/sema/async_lower.cryo` → **1**; `grep -c 'TypeKind::Trait => ' compiler/src/compiler/types/arena.cryo` → **1** (`get_qualified_name` names a trait) | §8.233, §8.241, §8.242 |
 | the `ModuleGraph` as a name-keyed store (6 methods: a module by namespace `find_module_index`, by path `find_module_by_path`, `reexport_closure`, `source_file_for_owner_key`, `ns_sym_of_file`, a static path comparison) | **PINNED** (§8.241) — 32 reads / 0 writes outside `module_graph.cryo`. A module IS named: an import path is a module name by the language's definition, and `find_module_index` (11) answers the loader, the resolver's import binding and two diagnostics; 12 are by filesystem path | — | `grep -A1 '^[[]GRAPH_READ]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **32**; `grep -A1 '^[[]GRAPH_WRITE]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **0** | §8.241 |
 | the `ConstantTable` as a name-keyed store (`register`/`register_enum` under a qualified name; two static key helpers) | **PINNED** (§8.241) — 2 writes, both from `name_resolution.cryo` at the declaration (the pass that just walked to it); 3 static reads; every value read goes by stamp through `ConstEval::stamped_index_of`. Audit 12 wrote `ConstTable 0`: a zero over the wrong population - the type is `ConstantTable` | — | `grep -A1 '^[[]CONST_WRITE]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **2**; `grep -A1 '^[[]CONST_READ]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **3** | §8.241 |
 | the context's other members under the same rule (`InternTable` 4 methods, `Resolver` 33, `TypeResolver` 11, `Monomorphizer` 7, `MonoState` 5, `TypeChecker` 3, `ModuleLoader` 24, `PhaseArtifacts` 1, `DirectiveRegistry` 3) | **MEASURED, NOT STORES** (§8.241) — the intern table is the string boundary itself; the resolver's asks from outside its pass are `REENTRY` (12); the type resolver holds pointers to the stores and no table (its 18 external sites re-resolve an annotation, the `HOME_WRITE` neighbourhood); the mono pair key spec bookkeeping by mangled symbol through `this.state` only; the checker takes an operator spelling; the loader and the artifacts are keyed by path; the directive registry by directive kind | — | `grep -A1 '^[[]REENTRY]' tests/lane-baseline.txt \| grep -o '[0-9]*$'` → **12** | §8.241 |
@@ -14674,6 +14674,170 @@ Outside the ledger: `scripts/lane-gate.py`, `scripts/lane-gate-selftest.py`,
 
 **Tally: 82 shadowed, 82 old paths deleted, 82 at zero; 153 artifacts
 gone** (unchanged: a gate, not a lane).
+
+---
+
+### 8.242 The async receiver-refresh decision reads the trait off the projection's owning trait, not off a first-match scan by the method's leaf: `desugar_async_trait_methods` stamps the trait on `This::<Method>Fut` at birth, `GenericRegistry::trait_decl_of(TypeRef)` answers the declaration by identity, `TypeArena::get_qualified_name` gains the `Trait` arm it lacked; the scan disagreed at 4 of 11 unit-suite sites (`Read` for `AtmRead::read`, `GfTick` for `GenTick::tick`) and 0 of 28 example sites, and the consequence - a dropped refresh - is unobservable: every generic-receiver refresh dropped leaves 142 + 17 + 3 async tests green, because a carried receiver's storage does not move between polls - 2026-09-17
+
+> **Status:** LANDED.  Compiler: `passes/type_resolution.cryo`,
+> `sema/async_lower.cryo`, `types/generic_registry.cryo`, `types/arena.cryo`.
+> `find_trait_defining_method` keeps ONE reader, sema's "defined on trait Y"
+> hint.  `lane-check` `REGISTRY_READ` 69 → 67, `ARENA_READ` 75 → 76,
+> re-pinned.  §0.2's registry and arena rows updated.
+
+#### The shape
+
+```cryo
+type trait Write      { flush(mut &this); }            // registered first
+type trait AsyncWrite { async flush(mut &this); }      // registered later
+
+type struct BufStream<S> {
+    inner: S;
+    async flush_all(mut &this) -> void where S: AsyncWrite {
+        await this.inner.flush();      // S::FlushFut - which trait?
+    }
+}
+```
+
+At `await this.inner.flush()` the receiver's type is the bare parameter
+`S`, so the callee is unresolved (`resolved_method` needs a concrete owner)
+and the awaited type is the projection `S::FlushFut` that
+`desugar_async_trait_methods` minted for the trait method.  The lowering has
+to decide whether the sub-future stores a receiver pointer to re-address
+before each poll (`awaited_keeps_recv_ptr`), and answered it by
+`find_trait_defining_method(mname)`: the FIRST registered trait declaring
+any method of that leaf, then a loop over that trait's `is_async` methods.
+`Write` registers before `AsyncWrite` in `stdlib/io/traits.cryo`, so the
+loop found nothing and the refresh was dropped.  Audit 12's item 2.
+
+#### The root
+
+The projection carried no identity: `create_assoc_projection(this_ty,
+assoc, TypeRef::invalid())` - "invalid = infer" - although the desugar held
+the `TraitDeclNode` and the trait's type (`type_of_decl(node.def)`) was
+computed four lines later.  Now `desugar_async_trait_methods(node, ctx,
+arena, trait_ref)` mints the projection with `owning_trait = trait_ref`;
+`method_binding.cryo:549` and `substitution.cryo:262` already carry
+`owning_trait` through the `This → S` substitution, so it reaches the await
+site (shadow: `ot_valid=1` at all 39 sites).  The reader asks
+`GenericRegistry::trait_decl_of(ap.owning_trait)` - the registry holds trait
+declarations under the same identity the arena holds the trait's type
+(`decl_type_key(node.name, "", file)` at both `pass_registry.cryo:940` and
+`type_resolution.cryo:2832`), so the type answers the declaration through
+the reverse map.  No reader of `AssocProjectionType.owning_trait` exists in
+resolution or mono (`grep -rn 'owning_trait' compiler/src`: the arena's dedup
+key, two carry-throughs, and the AST's separate `SymbolStr` field), so a
+valid trait changes no resolution.
+
+**The reverse map could not name a trait.**  The first shadow answered
+`NEWNULL` at all 78 lines: `get_qualified_name` had arms for struct, class,
+enum, instantiation and alias, and `_ => {}` for a `TraitType` that carries
+`qualified_name`.  Added.  A count at the new arm over examples + the unit
+suite: 39 asks, exactly the reader's 39 - no caller had ever asked the
+arena to name a trait, so nothing that took the empty answer changes.
+
+#### The shadow (`.objcmp/s1-lines.txt`, `scripts/ns-migration/8.242/`)
+
+One line per reader call, the scan beside the identity, over the 14
+examples (built by hand; `make examples` builds nothing on this host) and
+the unit suite (`cryo test async`, which compiles the whole suite):
+
+| corpus | sites | SAME | DIFF |
+|---|---|---|---|
+| examples | 28 | 28 | 0 |
+| unit suite | 11 | 7 | 4 |
+
+The four: `async_receiver_refresh.cryo:171 tick` (scan `GfTick`, a sync
+`tick(mut &this)` in `async_generic_function.cryo`, registered first by file
+order; identity `GenTick`), `async_trait_method.cryo:94` and `:191 read`
+(scan `std::io::traits::Read`; identity `AtmRead`), `io_async_traits.cryo:173
+read_exact` (scan `Read`; identity `AsyncRead`).  Audit 12 reported 15
+entries / 8 disagreeing over the same suite: a wrong answer makes
+`emit_recv_refresh` ask a second time through `expr_has_recv_call`, so each
+DIFF printed twice - 7 + 2×4 = 15, 2×4 = 8.  Reconciled.
+
+#### The consequence, measured: unreachable
+
+The brief asked for a repro where the frame moves and something reads
+through the stale pointer.  Built (`.objcmp/tick-ctl/`, the shape above
+with `GenTick::tick(mut &this)` writing `this.hits` after a suspend and a
+sync `SyncTick` declared first):
+
+* a driver polling from a DIFFERENT stack depth on every poll: **33**, the
+  write lands.  The IR says why: the receiver `c` is not a block-local but
+  the frame's own field, reached by `unwrap_ptr` (§8's in-place carrier),
+  so `&frame.c.inner` is the same address on every poll.
+* a driver MOVING the future after every `Pending`: refused, **E0459**
+  "future 'g' is moved after it has been polled … polled here, fixing its
+  address".  The frame cannot move between polls.
+
+So the two ways a receiver's storage could move are closed by construction:
+an aggregate local is built in its carrier field and never leaves it
+(`promote_cross_state`: "the value never left"), a `mut` scalar is
+rewritten to its field in place, a parameter is carried the same way, and
+the frame itself is address-fixed once polled.  The refresh's own comment
+("an owning receiver promoted across states still lives in a fresh
+block-local on every poll") described the mechanism the in-place carrier
+replaced; corrected to the invariant.
+
+The instrument: `awaited_keeps_recv_ptr` answering `false` on the
+projection path always - every generic-receiver refresh dropped, the scan's
+worst case at every site - built and run over the async suite
+(`.objcmp/m2-test.log`): `OVERALL PASS (unit: ok; compile-fail: 17
+passed; projects: 3 passed)`, 142 unit tests passed, 0 failed.  The
+receiver-refresh test file's own generic-owner tests, whose comments say
+the write "is simply never seen again" without the refresh, pass without
+it.  A first, broader mutation (answering `false` on the concrete path too)
+failed the suite's BUILD with an E0455 at `async_pointer_across_await.cryo:
+145` - a true answer there feeds a carry decision, not only the store - so
+the concrete path is not redundant and was not the question.
+
+**What the wrong answer did change**, silently: the store itself (the
+tick-ctl IR under `1f852403`'s compiler has no `store … this$recv` before
+the resumed poll of the inner future; this tree's has one), and the two
+E0455 refusals a true answer gates (a receiver naming no storage; a stored
+method future awaited later), which no negative test exercises on a
+generic receiver.  Both now answer by identity.
+
+#### Objects and gates
+
+`make lsp-check`: `OK -- compiled 264 module(s) … 0 errors, 490
+warning(s)` (`.objcmp/u2-lsp.log`).  `make cross-check`: `OK --
+x86_64-pc-linux-gnu … 0 errors` (`.objcmp/u2-cross.log`).  `make
+test-census`: `OVERALL PASS (unit: ok; compile-fail: 193 passed; projects:
+64 passed)`, `test-census: OK` (`.objcmp/u2-census.log`).  `hash-tree.sh V`
+against half `W` (`ea31ba5a`, the previous compiler): tests **3 of 2,665**
+- `AsyncReceiverRefresh.o`, `AsyncTraitMethod.o`, `IoAsyncTraits.o`, the
+three modules holding the four DIFF sites, predicted before the run, each
+gaining the refresh store; examples **0 of 1,126 attributable** - the one
+entry that differs (`06-word-count/…/Main.o`) is W's baseline over Jake's
+edited source (§8.240 hashed it at `d83cb8d5…` before his 21:50 revert),
+and the current source hashes `1eb7da7d…` under this compiler and under
+W's alike (16 hand builds, both `CRYO_STDLIB` spellings, and the hasher run
+three times: `.objcmp/ex-V{,2,3}.s`).  `make check-fast` OK; lane golden
+re-pinned (`REGISTRY_READ` 69 → 67, `ARENA_READ` 75 → 76, both predicted).
+
+#### Residual
+
+* A user-WRITTEN `S::ReadFut` projection is still minted with an invalid
+  owning trait (`types/resolver.cryo:396/405`), so it is a different arena
+  type from the desugared one.  No source in the tree writes one
+  (`grep -rnE '::[A-Z][A-Za-z0-9]*Fut\b'` finds comments only).  Recorded.
+* Whether §3 of `docs/async-internals.md` should keep promising the per-poll
+  re-addressing now that no receiver storage moves is Jake's: the store is
+  unobservable, but its decision also drives the carry logic and two
+  refusals, so deleting the mechanism is not deleting a store.
+* The receiver-refresh test file's comments describe the block-local
+  mechanism; they are prose in a test, left for the entry that decides the
+  point above.
+
+Outside the ledger: `passes/type_resolution.cryo`, `sema/async_lower.cryo`,
+`types/generic_registry.cryo`, `types/arena.cryo`, `tests/lane-baseline.txt`,
+`scripts/ns-migration/8.242/` (`shadow.patch`, `tick-ctl/`).
+
+**Tally: 83 shadowed, 83 old paths deleted, 83 at zero; 154 artifacts
+gone** (+1 shadowed and deleted: the leaf scan at the refresh decision; +1
+artifact, the same).
 
 ---
 

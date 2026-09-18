@@ -1,0 +1,95 @@
+// The consequence of `awaited_keeps_recv_ptr` reading a first-match scan by
+// bare method name: a SYNC trait declaring `tick` registered before the async
+// one makes the scan answer it, the `is_async` loop finds nothing, and the
+// refresh of the inner future's receiver pointer is dropped.
+//
+// The stale pointer is invisible while every poll runs at one stack depth -
+// the promoted receiver's block-local lands at the same address each time, so
+// the stale pointer reads and writes the live copy.  This driver polls from a
+// DIFFERENT depth on every poll, so the block-local moves and the write made
+// through the stale pointer lands in the previous poll's dead stack.
+namespace TickCtl;
+
+import std::future;
+import std::fmt;
+import std::collections::string::{ String };
+import std::future::poll::{ Poll };
+import std::future::ready::{ PendingThenReady };
+import std::future::traits::{ Future };
+import std::future::waker::{ Context, Waker };
+
+
+// A sync trait with the same method NAME, declared first.  Delete it and the
+// scan finds `GenTick`: the control.
+type trait SyncTick {
+    tick(mut &this) -> i64;
+}
+
+type trait GenTick {
+    async tick(mut &this, n: i64) -> i64;
+}
+
+type struct GenLeaf {
+    hits: i64;
+    buf:  Array<u8>;
+}
+
+implement trait GenTick for GenLeaf {
+    async tick(mut &this, n: i64) -> i64 {
+        const a: i64 = await PendingThenReady<i64>::new(3, 10);
+        this.hits = this.hits + 1;
+        return this.hits + n + a;
+    }
+}
+
+type struct GenConn<S> {
+    inner: S;
+    seen:  i64;
+
+    async pump(mut &this, n: i64) -> i64 where S: GenTick {
+        const v: i64 = await this.inner.tick(n);
+        this.seen = this.seen + v;
+        return v;
+    }
+}
+
+async function gen_drive_mutation() -> i64 {
+    mut c: GenConn<GenLeaf> = GenConn<GenLeaf> {
+        inner: GenLeaf { hits: 0, buf: Array<u8>::new() }, seen: 0 };
+    const v: i64 = await c.pump(5);
+    return v + c.seen + c.inner.hits;
+}
+
+/// Poll `f` from `d` extra frames down, each holding a live buffer so the
+/// depth is real after optimization.
+function deep_poll<F, R>(f: F*, cx: Context*, d: i64) -> Poll<R>
+where F: Future<R> {
+    if (d > 0) {
+        const s: String = fmt::format("pad %lld", d);
+        const r: Poll<R> = deep_poll<F, R>(f, cx, d - 1);
+        if (s.length() == 0) { fmt::println("never"); }
+        return r;
+    }
+    return f.poll(cx);
+}
+
+/// `block_on` that polls from a different stack depth each time.
+function depth_block_on<F, R>(fut: F) -> R
+where F: Future<R> {
+    mut f:  F       = fut;
+    mut cx: Context = Context::new(Waker::noop());
+    mut d:  i64     = 1;
+    loop {
+        match (deep_poll<F, R>(&f, &cx, d)) {
+            Poll::Ready(v) => { return v; }
+            Poll::Pending  => { d = d + 7; }
+        }
+    }
+}
+
+function main() -> i32 {
+    // 16 (tick: 1 + 5 + 10) + 16 (seen) + 1 (hits) == 33 when the write lands.
+    const a: i64 = depth_block_on(gen_drive_mutation());
+    fmt::println(fmt::format("result %lld", a));
+    return if (a == 33) { 0 } else { 1 };
+}
