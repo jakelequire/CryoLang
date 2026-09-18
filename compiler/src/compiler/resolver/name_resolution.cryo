@@ -1558,12 +1558,8 @@ public:
                     // construction.
                     const q_sid: u64 = this.resolver.find_module_scope(q_ns);
                     if (q_sid != 0) {
-                        const mqn: SymbolStr =
-                            this.resolver.resolve_type_qualified_name_bare_from(
-                                ScopeID { id: q_sid }, name);
-                        if (mqn.is_valid()) {
-                            return ResSlot::Answered(Res::Def(DefId::of_definition(mqn)));
-                        }
+                        const alias_slot: ResSlot = this.leaf_in_module_scope(q_sid, name);
+                        if (!alias_slot.is_pending()) { return alias_slot; }
                     }
                 }
             }
@@ -1586,10 +1582,25 @@ public:
         if (home_sid == 0) {
             return ResSlot::Pending;
         }
-        const qn: SymbolStr = this.resolver.resolve_type_qualified_name_bare_from(
-            ScopeID { id: home_sid }, name);
-        if (!qn.is_valid()) { return ResSlot::Pending; }
-        return ResSlot::Answered(Res::Def(DefId::of_definition(qn)));
+        return this.leaf_in_module_scope(home_sid, name);
+    }
+
+    /// A bare leaf resolved in a MODULE's scope - that module's declarations,
+    /// its imports, then the prelude - by the one entry point, and stamped
+    /// from its answer directly.  A walk that starts at a module scope
+    /// crosses no rib that binds a generic parameter, so the answer is a
+    /// definition or nothing; nothing is `Pending`, because recording an
+    /// answer this pass cannot produce is how a tool limitation becomes a
+    /// claim.
+    leaf_in_module_scope(&this, module_scope: u64, name: SymbolStr) -> ResSlot {
+        mut segs: SymbolStr[] = [];
+        segs.push(name);
+        const r: Res = this.resolver.resolve_path(
+            &segs, Namespace::Type, ScopeID { id: module_scope });
+        return match (r) {
+            Res::Def(_) => { ResSlot::Answered(r) }
+            _           => { ResSlot::Pending }
+        };
     }
 
     /// Record what one annotation's written name refers to.
@@ -2327,8 +2338,8 @@ public:
         const exports: SymbolID[] = this.resolver.get_exports(module_sym);
 
         // Use the resolved namespace name for source_module on import symbols
-        // so that resolve_type_qualified_name_bare() constructs correct
-        // qualified names (e.g., "std::core::option::Option" not "core::option::Option").
+        // so that `qualified_name_of` builds the canonical name (e.g.
+        // "std::core::option::Option", not "core::option::Option").
         const resolved_module: string = this.resolver.intern_table.resolve(module_sym);
 
         // `ImportStyle::Module` - a plain `import M;` - binds no names at all,

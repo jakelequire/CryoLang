@@ -126,7 +126,7 @@ three, and its row carries the count. Read each zero off its own row.
 | M5 import suffix fallback | **DELETED** — an import path names a module by its registered name or binds nothing | — | `grep -rho 'module_by_path_suffix' compiler/src \| wc -l` → **0** | §8.120, §8.157 |
 | scope-call argument check keyed by the segment's SPELLING (`check_scope_call_arg_types`: `<spelling>::<member>`, then a module-suffix scan over every module in the graph when that key held nothing) | **DELETED** — a `Def` segment's key is the stamp's, through `resolve_module_qualified_symbol`, the same path that resolves the call's return; shadow 162,460 over six halves: 126,642 the scan and the stamp named one function, 35,804 a type segment the scan walked the graph for and found nothing, **14 the scan checked NOTHING where the stamp answers** (12 two modules sharing the written suffix, 2 a re-export) - at those the mismatch compiled and the binary died of heap corruption | — | `grep -c 'suffix_start' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -c 'resolve_module_qualified_symbol(' compiler/src/compiler/sema/call_resolver.cryo` → **5** (the definition, the call's return, the value form, the parameter-type lookup, the argument check) | §8.217 |
 | the index's per-module ownership tables (`module_funcs.second`, `module_types`, `module_func_first`, `module_func_pairs`; `get_function_module`, `is_function_in_module`, `get_type_module`, `get_functions_in_module`; the `module` parameter of the three registrars and the `owner_mod` plumbed from spec injection to feed it) | **DELETED** — written on every registration, read by nothing: 0 callers of the four accessors in `compiler/src` and `tools` (HEAD `ccb310aa`: 29 mentions in `decl_index.cryo`, 0 outside but a comment and the arena's own `get_type_module`); the one reader of `module_funcs` wanted the function NAMES for a did-you-mean and reads `callable_names` | — | `grep -c -e 'module_func' -e 'module_types' compiler/src/compiler/decl_index.cryo` → **0**; `grep -rho -e 'register_methods_with_module' -e 'register_function_type_with_module' -e 'register_type_with_module' compiler/src --include=*.cryo \| wc -l` → **0** | §8.218 |
-| a stamped declaration's type asked by its RE-DERIVED name (`Res::Def(q)` → `q.qualified_name()` → `lookup_type` / `lookup_type_exact` / `lookup_func_type_exact`) | **CONVERTING** — the index answers a `DefId` directly (`type_of_def`, `func_type_of_def`; the `_of_res` pair rides on them), so the unwrap happens once, inside the index, and a reader hands over the id it holds. §8.219 took the six sites whose lookup was the unwrap's only consumer (`impl_owner`, the class base, the enum pattern's type, the struct literal's base, `TypeUtils::def_type`, the function value's type); the unwraps left are text (a symbol, a diagnostic) or feed a name-keyed consumer of another kind (a `Family` pin, the generic registry, a visibility gate); §8.225 took the other direction, a declaration NODE in hand: `register_type` returns the `DefId`, the six type-declaration nodes carry it, and the 21 readers of a declaration's own type ask `type_of_def(node.def)` instead of re-deriving `decl_type_key` (which was WRONG for the future of an `async` trait default, 117 declarations per half) | — | `grep -c '_of_def(&this' compiler/src/compiler/decl_index.cryo` → **2**; `grep -A1 '^\[DEFID_UNWRAP\]' tests/lane-baseline.txt \| grep -o '[0-9]*'` → **32** (38 before §8.219; 33 before §8.228, whose three are registration keys read from a declaration's stamp in place of a re-derivation; 36 before §8.233, which deleted the two Item-head keys and added one, the selector comparing a head argument's stamped declaration to the arena's name-keyed template key; 35 before §8.235, whose three were sema's async declare pass handing an owner's key to `AsyncOwner` beside its type); `grep -A1 '^\[LOOKUP\]' tests/lane-baseline.txt \| grep -o '[0-9]*'` → **12** (43 before §8.219, 41 before §8.221, 35 before §8.225, 17 before §8.226, 13 before §8.233) | §8.219, §8.225, §8.226 |
+| a stamped declaration's type asked by its RE-DERIVED name (`Res::Def(q)` → `q.qualified_name()` → `lookup_type` / `lookup_type_exact` / `lookup_func_type_exact`) | **CONVERTING** — the index answers a `DefId` directly (`type_of_def`, `func_type_of_def`; the `_of_res` pair rides on them), so the unwrap happens once, inside the index, and a reader hands over the id it holds. §8.219 took the six sites whose lookup was the unwrap's only consumer (`impl_owner`, the class base, the enum pattern's type, the struct literal's base, `TypeUtils::def_type`, the function value's type); the unwraps left are text (a symbol, a diagnostic) or feed a name-keyed consumer of another kind (a `Family` pin, the generic registry, a visibility gate); §8.225 took the other direction, a declaration NODE in hand: `register_type` returns the `DefId`, the six type-declaration nodes carry it, and the 21 readers of a declaration's own type ask `type_of_def(node.def)` instead of re-deriving `decl_type_key` (which was WRONG for the future of an `async` trait default, 117 declarations per half) | — | `grep -c '_of_def(&this' compiler/src/compiler/decl_index.cryo` → **2**; `grep -A1 '^\[DEFID_UNWRAP\]' tests/lane-baseline.txt \| grep -o '[0-9]*'` → **31** (38 before §8.219; 33 before §8.228, whose three are registration keys read from a declaration's stamp in place of a re-derivation; 36 before §8.233, which deleted the two Item-head keys and added one, the selector comparing a head argument's stamped declaration to the arena's name-keyed template key; 35 before §8.235, whose three were sema's async declare pass handing an owner's key to `AsyncOwner` beside its type; 32 before §8.239, whose one was `resolve_type_qualified_name_bare_from` projecting `resolve_path`'s `Def` to a string its callers re-wrapped); `grep -A1 '^\[LOOKUP\]' tests/lane-baseline.txt \| grep -o '[0-9]*'` → **12** (43 before §8.219, 41 before §8.221, 35 before §8.225, 17 before §8.226, 13 before §8.233) | §8.219, §8.225, §8.226 |
 | a written type declaration's type asked back from the index under its own key and re-registered under it (`register_decl_in_index`: `lookup_type(qualified_sym)` → `register_type(qualified_sym, ty)` in the struct, union, class, enum, trait and alias arms) | **DELETED** — the type-declaration stage registered the type under that key and the reverse map already names it; shadow 37,976 re-registrations over six halves, every one `agree` (map held the key, reverse map named it), 0 clones reached the arms, 0 INVALID; the arms keep what that stage does not own (bare-name mapping, visibility, methods); 0 objects moved; `lane-check` LOOKUP 41 → 35 | — | `grep -c 'lookup_type(qualified_sym)' compiler/src/compiler/passes/type_resolution.cryo` → **0** (the four field-population reads went in §8.225; 10 before §8.221); `grep -c 'register_type(qualified_sym' compiler/src/compiler/passes/type_resolution.cryo` → **0** | §8.221 |
 | `is_candidate_public`'s permissive default (a candidate with no recorded verdict answered PUBLIC; D12's own subject, outside `lane-check` by name) | **DELETED** — measured at its three doors over six halves (`.objcmp/u3-lines.txt`): 102,408 asks, **29,828 answered by the default** - 29,825 at the qualified-call gate `enforce_callee_visibility`, every one an extern-block function (237 keys: `std::ffi::libc`, `std::sys::syscall`, `std::ffi::openssl`, `compiler::bindgen::clang`, the `ExtDup` project), whose registration recorded no verdict, and 3 at the E0203 explainers (`unreachable_declarer` 2, `suggest_reaching_import` 1), a generic type (`NamespaceGate::Depot::Crate`) asked from a module resolved BEFORE its declaring module's Phase 4 wrote the verdict. STARVED of a writer, not absent: a `private function` in an extern block called by qualified path from another module compiled and ran under HEAD (exit 9). Every type registration now records its verdict with its key (`register_type(key, ty, is_public)`, 28 callers), the extern-block arm records each function's, `register_decl_in_index` no longer writes a type's, and the `None` arm records an unregistered definition (E0900 at the end of a build with no other error) and answers the top-level default meanwhile - a public item is never reported private. Project `extern_private_function_is_private` (compile_fail E0353; HEAD ran it). Mutation: the extern writer removed, the same probe fails E0900 `194 canonical name(s) named no registered declaration`. 0 objects moved | — | `grep -c 'Option::None    => { true }' compiler/src/compiler/decl_index.cryo` → **0**; `grep -c 'record_unregistered_def' compiler/src/compiler/decl_index.cryo` → **4** (the visibility door; `impl_owner`'s `Def` door since §8.226; `type_of_decl`'s lost-registration half since §8.231; `register_methods`' unnamed-owner door since §8.232); `grep -rho 'set_decl_visibility(' compiler/src --include=*.cryo \| wc -l` → **5** (the definition, the free-function arm, the extern arm's two keys, the intrinsic arm); `grep -c '^project extern_private_function_is_private' tests/test-roster.txt` → **1** | §8.222 |
 | const-table bare leaf (`by_bare`, `bare_index_of`, the same-leaf chain folder) | **DELETED** — a bare constant is read off `IdentifierNode.res`; shadow 0 over six halves, the lane reached 4/4 in `const_cross_module` under the same build, and a same-leaf constant in an unimported module - which the chain folder REFUSED - now folds to the imported one | — | `grep -c 'by_bare' compiler/src/compiler/const_table.cryo` → **0** | §8.9, §8.111, §8.171 |
@@ -165,7 +165,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `set_module_with_scope` | **DELETED** | — | `grep -rho 'set_module_with_scope' compiler/src \| wc -l` → **0** | §8.70, §8.78 |
 | B4 bucket (instantiation keying) | **DELETED** - with the leaf index; the counter that carried the bucket is gone too (§8.203) | — | `no check` — the bucket named a counter row, and the counter is deleted | §8.121, §8.203 |
 | arena `leaf_index` map | **LIVE, and NOT a lane** — three diagnostic consumers since §8.193: the E0203 did-you-mean pool, E0155's plurality, and E0240's sole declarer (`sole_declarer`) | — | `grep -rho 'leaf_index' compiler/src \| wc -l` → **8** (the map's 7 mentions and `sole_declarer`'s read) | §8.121, §8.193 |
-| `resolve_path` (§5.2's one entry point) | **LIVE, but not the entry point** — 2 call sites, both single-segment, both `Namespace::Type` | — | `grep -rho '\.resolve_path(' compiler/src --include=*.cryo \| wc -l` → **2** | §5.2, §8.5, §8.7 |
+| `resolve_path` (§5.2's one entry point) | **LIVE, but not the entry point** — 2 call sites in `name_resolution.cryo`, both single-segment, both `Namespace::Type`: the base-class name, and `leaf_in_module_scope`, which serves the annotation lane's bare leaf and the C-import alias spelling and stamps `resolve_path`'s `Def` DIRECTLY (§8.239 deleted `resolve_type_qualified_name_bare_from`, the string projection its callers re-wrapped). **The other routes in, measured over six halves (§8.239, 3,059,355 asks):** `Resolver::lookup` - the UNFILTERED rib walk - at 9 sites (the identifier, the scope head, the annotation's generic-param probe and path head, `new`, the struct literal, the constant pattern, the enum pattern, the impl target), with `bare_name_res` as a second `Res` builder beside `res_for_head`; the namespace-filtered walk binds the SAME symbol at every site but 417: 374 where the unfiltered walk bound a field, parameter, variable or function under a TYPE question (`headers::push_all` binding `Response.headers`) and the site then ignored it, 32 where a variant shadowed an import and the site asked only "is it a generic parameter", and **11 where an identifier in CALLEE position names a CLASS** (`Node(1)`), which the value namespace refuses and `resolve_direct_call` answers today through the type stamp - a constructor lives in the value namespace in Rust; how it does here is a ruling (§9 Q13). Converting the 9 needs `resolve_path` to record the span binding the LSP reads (`record_resolution`), which is the re-plumb, not a unit | — | `grep -rho '\.resolve_path(' compiler/src --include=*.cryo \| wc -l` → **2**; `grep -rho 'resolve_type_qualified_name_bare' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'this\.resolver\.lookup(' compiler/src --include=*.cryo \| wc -l` → **9**; `grep -rho 'bare_name_res(' compiler/src --include=*.cryo \| wc -l` → **3** | §5.2, §8.5, §8.7, §8.239 |
 | `canonical_type_ref` and its arena bare step | **DELETED** — a declaration's key comes from the declaration (`decl_type_key`: the alias namespace, else the registered name, else the writing file's module); the MECHANISM (a qualified miss retried under the bare leaf) went from `type_resolution.cryo` with the row above in §8.192 | — | `grep -c 'lookup_by_name' compiler/src/compiler/compilation_context.cryo` → **0**; `grep -c 'arena.lookup_by_name(node.name)' compiler/src/compiler/passes/type_resolution.cryo` → **0** | §8.103, §8.112, §8.156, §8.189, §8.192 |
 | `resolve_cross_module_name` (sema's resolver re-entry by spelling) | **DELETED** — its four readers went under shadow mode | — | `grep -rho 'resolve_cross_module_name' compiler/src \| wc -l` → **0** | §8.155 |
 | intrinsic symbol's placeholder module (`Symbol::intrinsic` writing `source_module: "<intrinsic>"`, so a same-module bare intrinsic call stamped a `Def` no index key matched) | **DELETED** — the symbol carries its declaring module like every other declaration; the one such call in the tree (`runtime/backtrace`'s `frame_address`, Linux-gated) compiles, `verify-freestanding` green | — | `grep -c '"<intrinsic>"' compiler/src/compiler/resolver/symbol.cryo` → **0**; `grep -c 'intr_mod' compiler/src/compiler/resolver/name_resolution.cryo` → **2** | §8.178 |
@@ -500,12 +500,14 @@ an error with a suggestion, not an invitation to search.
 >   `grep -rho 'resolve_path(&this' compiler/src --include=*.cryo \| wc -l` → **1**.
 > * **"All path resolution goes through one function" — NOT TRUE.**
 >   `resolve_path` has exactly **two** call sites, and both push a SINGLE
->   segment in `Namespace::Type` — a projection helper in `resolver.cryo` and
->   the base-class name in `name_resolution.cryo`. No multi-segment path goes
->   through it. The per-kind lookups it was to replace are still pinned by
->   `lane-check` in eight buckets. Checks:
+>   segment in `Namespace::Type` — the base-class name and the annotation
+>   lane's bare leaf (`leaf_in_module_scope`), both in `name_resolution.cryo`.
+>   No multi-segment path goes through it. The other routes in are the nine
+>   `Resolver::lookup` sites, measured in §8.239 (§0's `resolve_path` row
+>   carries the table). The per-kind lookups it was to replace are still
+>   pinned by `lane-check` in ten buckets (eight when this was written). Checks:
 >   `grep -rho '\.resolve_path(' compiler/src --include=*.cryo \| wc -l` → **2**;
->   `grep -c '^\[' tests/lane-baseline.txt` → **8**.
+>   `grep -c '^\[' tests/lane-baseline.txt` → **10** (8 when this was written; `HOME_WRITE` since §8.204, `REGISTER` since §8.230).
 > * **"There is no ambient cursor" — ASPIRATIONAL.** The machinery is present
 >   (`HomeOrigin`, `current_module`) and answers **0** on the pinned corpora, so
 >   it is starved rather than absent (§0, §8.19, §8.105, §8.109). Check:
@@ -861,14 +863,14 @@ implementing, so the mechanisms below are what carry the remaining work.
 >   wearing a wrapper. The ruling keeps the lookups PUBLIC and makes the third
 >   lock, the surface ratchet, the whole enforcement. Do not implement the
 >   second lock; §0 D12 carries the ruling.
-> * **Mechanism 5's third lock pins eight numbers, not two.** `lane-check`'s
+> * **Mechanism 5's third lock pins ten numbers, not two.** `lane-check`'s
 >   buckets are `LOOKUP`, `LOOKUP_OTHER`, `LOOKUP_ROUTED`, `LOOKUP_LOCAL`,
->   `LOOKUP_ARENA`, `REENTRY`, `DEFID_MINT` and `DEFID_UNWRAP` — split by
+>   `LOOKUP_ARENA`, `REENTRY`, `HOME_WRITE`, `REGISTER`, `DEFID_MINT` and `DEFID_UNWRAP` — split by
 >   RECEIVER since §8.107, because a count matched on the NAME cannot separate
 >   the index's surface from things that merely resemble it; `LOOKUP_ARENA`
 >   since §8.192, because the arena's `lookup_by_name` is the same lane on a
 >   second store and the gate read OK over 17 of them. Check:
->   `grep -c '^\[' tests/lane-baseline.txt` → **8**.
+>   `grep -c '^\[' tests/lane-baseline.txt` → **10** (8 when this was written; `HOME_WRITE` since §8.204, `REGISTER` since §8.230).
 
 1. **`Res` is an enum, and `match` is exhaustive.** Adding or changing a
    variant forces every consumer to handle it (E0405). This is the primary
@@ -14240,6 +14242,99 @@ gone** (+2 lanes, the two spec-method registrations by key).
 
 ---
 
+### 8.239 What enters name resolution, and by which route: `resolve_path` answers 2 sites and `Resolver::lookup` - the unfiltered rib walk - answers 9, measured at 3,059,355 asks; the namespace filter binds the same symbol at every site but 417, of which 11 are a class constructor called by its name (§9 Q13); `resolve_type_qualified_name_bare_from` - `resolve_path`'s `Def` projected to a string and re-wrapped - is deleted - 2026-09-17
+
+#### What was there
+
+§5.2 names `resolve_path(segments, ns, scope) -> Res` as THE way into name
+resolution.  Audit 11 counted its callers at 2, both one-segment, both
+`Namespace::Type`, and asked what the other ways in were.  Nobody had
+measured them.
+
+The routes, enumerated (`grep -rn 'this\.resolver\.[a-z_]*(' name_resolution.cryo`;
+the `Resolver`'s reading API - `lookup`, `lookup_in_module`, `lookup_prelude`,
+`lookup_overloads`, `resolve_path` - has no caller outside that file):
+
+| route | sites | what it answers |
+|---|---:|---|
+| `resolve_path` | 2 | the base-class name (`visit(ClassDeclNode)`); `resolve_type_qualified_name_bare_from` in `resolver.cryo`, itself called twice by `type_spelling_res` - the annotation lane's bare leaf from the writer's module scope, and the C-import alias spelling - and projecting the `Res` to a qualified-name STRING its callers re-wrapped as `Res::Def` |
+| `Resolver::lookup(name, current_scope)` - the rib walk with NO namespace filter, prelude last | 9 | the identifier (`bare_name_res`, a second `Res` builder beside `res_for_head`), the scope head (`record_resolution` + `stamp_module_scope`), the annotation's generic-parameter probe and its path head (kind checks), `new`, the struct literal, the enum pattern and the impl target (`record_resolution` for the LSP; the stamp comes from `type_spelling_res`), the constant pattern (kind check) |
+| `lookup_in_module` | 7 | the rooted remainder: an import's target, a re-export's, the module lane's `walk_module_rooted_type`, an ambiguity check - the segment-after-head work §5.1 says is "resolved within what the previous segment named", which `resolve_path` hands to the type layer as `TypeRelative` and the module lane finishes here |
+| `lookup_overloads` | 1 | the overload SET at a call (`record_overloads`) - a different question |
+
+#### Measured
+
+The nine `lookup` sites with a print (`scripts/ns-migration/8.239/shadow.patch`
+over `7d6705ac`, `corpus2.sh z1`, `.objcmp/z1-lines.txt`, **3,059,355** `RP`
+lines, `failing halves: 0`; the suite's two output-exclusion projects read
+FAIL under a shadow that prints names, the known trap): the symbol the
+unfiltered walk bound beside the one the namespace-filtered walk
+`resolve_path` makes would bind (`cut -f4,5,7 | sort | uniq -c`):
+
+| verdict | rows | |
+|---|---:|---|
+| `SAME` | **2,552,752** | one symbol either way |
+| `NONE` | 506,186 | neither binds (a primitive, a builtin, a member sema resolves) |
+| `UNF-ONLY` | **385** | the unfiltered walk bound a symbol the namespace refuses and the filtered walk found nothing: 276 scope heads binding a FIELD (`headers::push_all` inside `Response`, whose field is `headers`: 240), a parameter (`fd::`), a function (`assert::`) or a variable - every one then ignored by `stamp_module_scope` (`symbol_names_type` false) and answered by the module lane, but `record_resolution` had already sent the LSP's go-to-definition to the field; 98 annotation heads (`node::…` under a parameter `node`) the site likewise ignored; **11 identifiers in CALLEE position naming a CLASS** (`Node(1)`, `Parser(…)`), stamped `Def` today and answered by `resolve_direct_call` through the type stamp (`spelling_type`) - the value namespace refuses a `Type` symbol, so under `resolve_path` these are E0202 |
+| `DIFF` | 32 | the annotation's generic-parameter probe: an enum VARIANT declared bare in the module scope (`JsonValue::String`, `::Array`) shadows the IMPORT of the same leaf; the site asked only "is it a generic parameter" and both say no, and the leaf lane then resolved the import from the module scope |
+| `FIL-ONLY` | **0** | the filter never bound past a refused nearer rib to a different declaration |
+
+So the namespace filter changes no stamp on the corpus except the 11
+constructor calls, and those are a language-model question, not a
+resolver's: Rust binds a tuple struct's constructor in the VALUE namespace
+beside the type - two bindings, one declaration - and this symbol table
+binds one `Type` symbol and cannot tell a class from a struct.  **§9 Q13.**
+
+#### What is there now
+
+* `resolve_type_qualified_name_bare_from` is deleted.  Its two callers ask
+  `leaf_in_module_scope(module_scope, name)` on the `NameResolver`, which
+  calls `resolve_path(&[name], Namespace::Type, ScopeID { id })` and stamps
+  the `Def` it answers DIRECTLY - a walk from a module scope crosses no rib
+  binding a generic parameter, so the answer is a definition or nothing,
+  and nothing is `Pending` as before.  The string projection was one
+  `DefId::of_definition(q.qualified_name())` round trip (`DEFID_UNWRAP` 32
+  → 31, `DEFID_MINT` 23 → 21).  A pure refactor by construction: the
+  function answered a string exactly when `resolve_path` answered `Def`.
+* The other seven `lookup` sites and `bare_name_res` are NOT converted.
+  The shape that makes `resolve_path` the one door is recorded here and
+  not built: (1) `resolve_path` records the span's binding for the LSP
+  (`record_resolution`), since seven of the nine sites exist to feed the
+  resolution map and a `Res` carries no `SymbolID`; (2) `res_for_head`
+  absorbs `bare_name_res`'s classification - `Local` for a parameter and
+  a function-local variable, nothing for a member kind (a method, field
+  or variant symbol is named through its owner, and `module::leaf` is a
+  name nothing is registered under); (3) Q13's ruling for the constructor
+  call; (4) the annotation lane's two scopes - the rib chain for a generic
+  parameter, the writer's MODULE scope for the leaf, because annotations
+  are re-resolved under other modules' cursors - become one explicit scope
+  when the site passes the annotation's own rib.  Each is measurable with
+  this entry's instrument; none is a unit on its own.
+
+#### Objects and gates
+
+`hash-tree.sh Z` against half `Y` (`7d6705ac`): examples **0 of 1,126**,
+tests **0 of 2,665** (`comm -3 .objcmp/ex-Y.s .objcmp/ex-Z.s`; `comm -3
+.objcmp/t-Y.s .objcmp/t-Z.s`) - predicted, the conversion being a
+refactor.  `make test` (inside `hash-tree.sh`): `OVERALL PASS (unit: ok;
+compile-fail: 193 passed; projects: 64 passed)` (`.objcmp/t-Z.txt.log`).
+`make lsp-check`: `OK -- compiled 264 module(s) … 0 errors, 490 warning(s)`
+(`.objcmp/z2-lsp.log`).  `make cross-check`: `OK -- x86_64-pc-linux-gnu …
+0 errors` (`.objcmp/z2-cross.log`).  `lane-check`: `DEFID_MINT` 23 → **21**,
+`DEFID_UNWRAP` 32 → **31**, re-pinned.  `ns-status-check`: the
+`DEFID_UNWRAP` row 32 → 31; the `resolve_path` row re-worded with the
+route table and three new checks; §5.2's and §7's status blocks corrected
+(the lane golden has had ten buckets since §8.230, both said eight).
+
+Outside the ledger: `resolver/resolver.cryo`, `resolver/name_resolution.cryo`,
+`tests/lane-baseline.txt`, `scripts/ns-migration/8.239/` (`shadow.patch`,
+README row).
+
+**Tally: 82 shadowed, 82 old paths deleted, 82 at zero; 152 artifacts
+gone** (+1 artifact, `resolve_type_qualified_name_bare_from`).
+
+---
+
 ## 9. Open questions
 
 - **Q1** — Does enforcing §3.3 require per-item `public` on declarations that
@@ -14258,6 +14353,18 @@ gone** (+2 lanes, the two spec-method registrations by key).
   §1. Either `stdlib/lib.cryo` re-exports it explicitly or it becomes an error
   with a suggestion — decided per name, deliberately. `export` now exists to
   spell the first option (§8.4).
+- **Q13** — Which namespace does a class CONSTRUCTOR live in? `Node(1)` is a
+  call whose callee identifier names the class, and the name layer binds it
+  today through the unfiltered rib walk (a `Type` symbol answered in value
+  position, stamped `Def`, read by `resolve_direct_call` through the type
+  stamp); under §5.2's namespace-filtered `resolve_path` the value namespace
+  refuses a type and the call is E0202.  Rust puts a tuple struct's
+  constructor in the VALUE namespace beside the type in the type namespace -
+  two bindings, one declaration.  Either the class declaration binds a
+  constructor symbol in the value namespace, or `Namespace::Value` accepts a
+  class (which the symbol table cannot tell from a struct today).  Measured:
+  11 sites over six halves, every one a class constructor call (§8.239).
+  Blocks converting the identifier lane to `resolve_path`.
 ### Decided 2026-08-10
 
 - **Q12 — the keystone subsumes the scope-template chain.** ANSWERED BY THE

@@ -1,0 +1,141 @@
+diff --git a/compiler/src/compiler/resolver/name_resolution.cryo b/compiler/src/compiler/resolver/name_resolution.cryo
+index d5eaf2a0..358f0291 100644
+--- a/compiler/src/compiler/resolver/name_resolution.cryo
++++ b/compiler/src/compiler/resolver/name_resolution.cryo
+@@ -740,6 +740,7 @@ public:
+         // Resolve the target type name
+         const target_id: SymbolID = this.resolver.lookup(
+             node.target_type, this.resolver.current_scope);
++        this.shadow_route("impl-target", Namespace::Type, node.target_type, target_id);
+         if (target_id.is_valid()) {
+             this.resolver.record_resolution(node.span, target_id);
+         }
+@@ -919,6 +920,33 @@ public:
+     /// Returned as a `ResSlot` because "this lookup names nothing a `Res` can
+     /// state" is exactly `Pending`, and the resolver is the one place allowed
+     /// to observe it.
++    /// SHADOW: the unfiltered scope lookup a site made beside the
++    /// namespace-filtered walk `resolve_path` would make for the same name.
++    shadow_route(&this, site: string, ns: Namespace, name: SymbolStr, unf: SymbolID) -> void {
++        const fil: SymbolID = this.resolver.shadow_lookup_ns(name, ns, this.resolver.current_scope);
++        mut uk: string = "none";
++        mut fk: string = "none";
++        mut uq: string = "-";
++        mut fq: string = "-";
++        if (unf.is_valid()) {
++            const s: Symbol = this.resolver.get_symbol(unf);
++            uk = s.kind.to_string();
++            uq = this.resolver.intern_table.resolve(this.resolver.qualified_name_of(&s));
++        }
++        if (fil.is_valid()) {
++            const s2: Symbol = this.resolver.get_symbol(fil);
++            fk = s2.kind.to_string();
++            fq = this.resolver.intern_table.resolve(this.resolver.qualified_name_of(&s2));
++        }
++        mut verdict: string = "DIFF";
++        if (!unf.is_valid() && !fil.is_valid()) { verdict = "NONE"; }
++        else if (unf.is_valid() && fil.is_valid() && unf.id == fil.id) { verdict = "SAME"; }
++        else if (unf.is_valid() && !fil.is_valid()) { verdict = "UNF-ONLY"; }
++        else if (!unf.is_valid() && fil.is_valid()) { verdict = "FIL-ONLY"; }
++        fmt::eprintf("SHADOW\tRP\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", site, ns.to_string(),
++            this.resolver.intern_table.resolve(name), verdict, uk, fk, uq, fq);
++    }
++
+     bare_name_res(&this, sym_id: SymbolID) -> ResSlot {
+         if (!sym_id.is_valid()) { return ResSlot::Pending; }
+         const s: Symbol = this.resolver.get_symbol(sym_id);
+@@ -953,6 +981,7 @@ public:
+     override visit(node: IdentifierNode*) -> void {
+         mut sym_id: SymbolID = this.resolver.lookup(
+             node.name, this.resolver.current_scope);
++        this.shadow_route("ident", Namespace::Value, node.name, sym_id);
+         if (!sym_id.is_valid()) {
+             LOG_DEBUG(LogComponent::General, "[NameResolver] Identifier '%s' not found in scope", this.resolver.intern_table.resolve(node.name));
+             // No error here; could be a built-in type or forward reference
+@@ -1003,6 +1032,7 @@ public:
+         // Look up the scope name (e.g., "Foo" in "Foo::Bar")
+         const scope_sym: SymbolID = this.resolver.lookup(
+             node.scope_name, this.resolver.current_scope);
++        this.shadow_route("scope-head", Namespace::Type, node.scope_name, scope_sym);
+         if (scope_sym.is_valid()) {
+             this.resolver.record_resolution(node.span, scope_sym);
+         }
+@@ -1461,6 +1491,7 @@ public:
+         // syntax; substitution happens strictly below this, in the type layer.
+         const in_scope: SymbolID =
+             this.resolver.lookup(name, this.resolver.current_scope);
++        this.shadow_route("tsr-gp", Namespace::Type, name, in_scope);
+         if (in_scope.is_valid()) {
+             const sym: Symbol = this.resolver.get_symbol(in_scope);
+             if (sym.kind == SymbolKind::GenericParam) {
+@@ -1482,6 +1513,7 @@ public:
+             const head_sym: SymbolID = this.resolver.lookup(
+                 this.resolver.intern_table.intern(head),
+                 this.resolver.current_scope);
++            this.shadow_route("tsr-head", Namespace::Type, this.resolver.intern_table.intern(head), head_sym);
+             if (head_sym.is_valid()) {
+                 mut hs: Symbol = this.resolver.get_symbol(head_sym);
+                 // An import binds a NAME; it does not say what kind of thing
+@@ -1741,6 +1773,7 @@ public:
+         // the ENUM rather than a leaf no scope binds.
+         const type_sym: SymbolID = this.resolver.lookup(
+             node.type_name, this.resolver.current_scope);
++        this.shadow_route("new", Namespace::Type, node.type_name, type_sym);
+         if (type_sym.is_valid()) {
+             this.resolver.record_resolution(node.span, type_sym);
+         }
+@@ -1774,6 +1807,7 @@ public:
+         // Resolve struct type name
+         const type_sym: SymbolID = this.resolver.lookup(
+             node.struct_type, this.resolver.current_scope);
++        this.shadow_route("structlit", Namespace::Type, node.struct_type, type_sym);
+         if (type_sym.is_valid()) {
+             this.resolver.record_resolution(node.span, type_sym);
+         }
+@@ -1987,6 +2021,7 @@ public:
+         if (node.pattern_kind == PatternKind::Identifier) {
+             const sym: SymbolID = this.resolver.lookup(
+                 node.binding_name, this.resolver.current_scope);
++            this.shadow_route("pattern", Namespace::Value, node.binding_name, sym);
+             if (sym.is_valid()
+                     && this.resolver.get_symbol(sym).kind == SymbolKind::Constant) {
+                 this.resolver.record_resolution(node.span, sym);
+@@ -2009,6 +2044,7 @@ public:
+         // Resolve enum name
+         const enum_sym: SymbolID = this.resolver.lookup(
+             node.enum_name, this.resolver.current_scope);
++        this.shadow_route("enumpat", Namespace::Type, node.enum_name, enum_sym);
+         if (enum_sym.is_valid()) {
+             this.resolver.record_resolution(node.span, enum_sym);
+         }
+diff --git a/compiler/src/compiler/resolver/resolver.cryo b/compiler/src/compiler/resolver/resolver.cryo
+index 27f2104b..af96a7f7 100644
+--- a/compiler/src/compiler/resolver/resolver.cryo
++++ b/compiler/src/compiler/resolver/resolver.cryo
+@@ -706,6 +706,26 @@ type struct Resolver {
+         return Res::Err;
+     }
+ 
++    /// SHADOW: the symbol `resolve_path`'s walk binds for a one-segment path.
++    shadow_lookup_ns(&this, name: SymbolStr, ns: Namespace, start: ScopeID) -> SymbolID {
++        mut scope_id: ScopeID = start;
++        while (scope_id.is_valid()) {
++            const sc: Scope* = this.get_scope(scope_id);
++            const found: SymbolID = sc.find(name);
++            if (found.is_valid()) {
++                const sym: Symbol = this.get_symbol(found);
++                if (ns.accepts(sym.kind)) { return found; }
++            }
++            scope_id = sc.parent_id;
++        }
++        const pre: SymbolID = this.lookup_prelude(name);
++        if (pre.is_valid()) {
++            const psym: Symbol = this.get_symbol(pre);
++            if (ns.accepts(psym.kind)) { return pre; }
++        }
++        return SymbolID::invalid();
++    }
++
+     /// The answer a resolved head produces, given how many segments follow it.
+     ///
+     /// Every tier of `resolve_path` builds its result here.  A tier that
