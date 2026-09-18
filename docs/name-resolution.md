@@ -14011,6 +14011,75 @@ gone** (+1 lane, the async repoint's carried key; +1 artifact,
 
 ---
 
+### 8.236 The closure-arg specialization's identifier goes through the one mangler: `mint_closure_spec_name` spelled arena ids (`apply__cl_2985`), so three objects moved on every session that created a type earlier; it is `specialized_identifier(orig, closure types)` now, and a mutation that shifts every arena id moves the old symbol and not the new - 2026-09-17
+
+#### What was there
+
+`LambdaSynth::mint_closure_spec_name` named a closure-arg specialization
+`<orig>__cl_<id>_<id>…` with the ARENA ID of each closure type - a number
+that depends on how many types the compiler created before it, so a
+change anywhere that allocates one more type renames the symbol.  That is
+why `Lambdas.o`, `MoveLambda.o` and `examples/13-closures/Main.o` moved
+in §8.216 and §8.233 ("every `__cl_NNNN` id +1") and why every object
+comparison since has had to fold the ids to read 0.  Audit 11 lists it as
+one of mono's two symbol mints outside registration.
+`MangledName::specialized_identifier` says no call site outside its module
+may invent a specialization-name format; this one had.  Nothing reads the
+`__cl` form: 0 in `compiler/src`, `tools`, `tests` (`grep -rn '__cl'`).
+
+#### What is there now
+
+The identifier is `MangledName::specialized_identifier(orig, &closure_tys)`,
+the encoding every specialization carries: `apply` over `Main::__Closure_0`
+is `5apply$LN$L4Main.11__Closure_0$G$G`, and the symbol
+`C$4Main.345apply$LN$L4Main.11__Closure_0$G$G$FN$L4Main.11__Closure_0$G_i$Ri`
+- the same shape a generic function's spec has today
+(`C$3std.11collections.5array.3513sort_range_by$LN$L4Main.4Todo$G$G$F…`).  A
+closure type's name is its module and a per-build counter
+(`mint_closure_name`), a function of the source.
+
+#### Measured
+
+The pair, on `examples/13-closures/…/Main.o` (`sha256sum`), with an arena
+mutation that allocates one unrelated extra type on every pointer-type
+miss (`get_pointer_to_q`, so every later id shifts):
+
+| mint | unshifted | shifted |
+|---|---|---|
+| OLD (`fd3756af`'s) | `1e8990c7958d7696` (half `S`) | **`a6d4a32e5508e878`** - moved; `apply__cl_3086` where `S` held another id |
+| NEW | `7aa7ddf1a4c2e049` | `7aa7ddf1a4c2e049` - unmoved |
+
+`hash-tree.sh T` against half `S` (`e326c7ed`): examples **1 of 1,126**,
+tests **2 of 2,665** - exactly `13-closures/Main.o`, `Lambdas.o`,
+`MoveLambda.o`, the three closure-spec objects, renamed once
+(`comm -3 .objcmp/ex-S.s .objcmp/ex-T.s`; `comm -3 .objcmp/t-S.s
+.objcmp/t-T.s`).  `make test-census`: `OVERALL PASS (unit: ok;
+compile-fail: 193 passed; projects: 64 passed)` (`.objcmp/x5-census.log`).
+`make lsp-check`: `OK -- compiled 264 module(s) … 0 errors, 490 warning(s)`
+(`.objcmp/x5-lsp.log`).  `make cross-check`: `OK -- x86_64-pc-linux-gnu … 0
+errors` (`.objcmp/x5-cross.log`).  `lane-check` unmoved.
+
+Also here: the stale comment on `collect_bare_type_names`
+(`type_resolution.cryo`) that named the index's `module_types` table, deleted
+in §8.218, says what the pool is and why without the table.
+
+Not this entry's: `mangled_symbol_for_spec_method` (the other mint audit 11
+names) computes the symbol a spec method WILL be emitted under as the key
+`mark_method_spec` records it by - a derivation, not an invention, but it
+is still a mangle outside registration; and the spec's `$O`-indexed
+`C$cl$` form for a closure (`cryo-mangling-spec.md` §11) is not what the
+tree emits for a closure type or its specializations, which is a spec-vs-
+code question for Jake.
+
+Outside the ledger: `sema/lambda_synth.cryo`, `passes/type_resolution.cryo`
+(a comment).
+
+**Tally: 79 shadowed, 79 old paths deleted, 79 at zero; 151 artifacts
+gone** (+1 artifact, the arena-id spec name; no lane - a mint, not a
+lookup).
+
+---
+
 ## 9. Open questions
 
 - **Q1** — Does enforcing §3.3 require per-item `public` on declarations that

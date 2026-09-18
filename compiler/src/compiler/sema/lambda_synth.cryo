@@ -20,7 +20,7 @@ namespace compiler::sema::lambda_synth;
 import compiler::types::{
     type_ref, type_base, arena, compound, user_defined, ownership, resolver, generic_registry, TypeKind
 };
-import compiler::resolver::{ symbol_str, intern_table };
+import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
 import compiler::ast;
 import compiler::ast::{
     cloner, declaration, expression, node, NodeKind, statement, TypeAnnotation, Visibility,
@@ -50,6 +50,8 @@ import compiler::ast::visitor::{ ASTVisitor };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::mangled_name::{ MangledName };
+import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res::{ OverloadId, Res, ResSlot };
 import compiler::sema::dispatch::{ SemaDispatch };
@@ -670,14 +672,16 @@ type struct LambdaSynth {
         return null;
     }
 
-    /// Mint a stable spec name `<orig>__cl_<ty1>_<ty2>_...` for a closure-arg spec.
+    /// The identifier of a closure-arg specialization of `orig`: the
+    /// specialization encoding over the closure types, through the one
+    /// mangler every specialization goes through.  A closure type's name is
+    /// its module and a per-build counter (`mint_closure_name`), so the
+    /// identifier is a function of the source; an arena id is not, and a
+    /// symbol spelling one moves whenever an unrelated type is created
+    /// earlier.
     mint_closure_spec_name(mut &this, orig: SymbolStr, closure_tys: TypeRef[]) -> SymbolStr {
-        mut s: string = this.intern.resolve(orig);
-        s = fmt::format("%s__cl", s);
-        for (mut i: i64 = 0; i < closure_tys.length; i++) {
-            s = fmt::format("%s_%llu", s, closure_tys[i].id);
-        }
-        return this.intern.intern(s);
+        return MangledName::specialized_identifier(
+            this.intern, this.arena, QualifiedName::from_symbol(orig), &closure_tys);
     }
 
     /// Emit E0458 for each closure-struct argument to a method / scope call (v1.0
