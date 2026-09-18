@@ -14080,6 +14080,73 @@ lookup).
 
 ---
 
+### 8.237 `TraitRef::identity()` is a door: the unstamped arm that answered the written leaf entered 0 times over six halves and records a missing answer now; and `BoundedParamType`'s leaf-matched operator arm is NOT a lane - the kind is uninhabited and its consumers are kept by ruling - 2026-09-17
+
+#### What was there
+
+§8.233 left two things open here.  `TraitRef::identity()` answered
+`resolved_name` when the name layer had stamped the bound and **the
+written leaf otherwise** - "a door with no tally": 22 readers, none able
+to tell a stamped identity from a spelling.  And `bounded_param_trait` /
+`trait_ref_matching` (`sema.cryo`) matched a bounded parameter's bound to
+the operator's trait by LEAF, where §8.233 had made the concrete-type arm
+ask by the claimed identity.
+
+#### Measured
+
+* **`identity()`'s fallback: 0 entries over the six halves** (a print at the
+  arm, `scripts/ns-migration/8.237/shadow.patch` over `b3b36ca6`,
+  `corpus2.sh x7`: `SHADOW lines … : 0`, `failing halves: 0`).  The
+  instrument fires: `function f<T>(a: T) -> T where T: Nope` prints 2
+  `TRID leaf` lines (`.objcmp/sok-ctl/nobound.cryo`).  Every written bound
+  is stamped by `stamp_trait_ref_identity`, every synthesized one by its
+  synthesizer (§8.233's `generic_param_anns` fix was the last hole), and
+  no negative in the suite writes a bound naming nothing.
+* **The bounded-parameter arm is dead by construction, and kept by
+  ruling.**  `TypeArena::create_bounded_param` has no caller and `new
+  BoundedParamType` no other site (`grep -rn 'create_bounded_param('
+  compiler/src` → the definition alone), since `f3082103` deleted the
+  inline `<T: Bound>` form, the kind's only producer.  A shadow at the
+  operator desugar's bounded arm printed 0 lines on hello-world before the
+  grep said why.  That commit's own entry rules the ~45 consumer sites
+  (mangling, codegen, mono, `call_resolver`, `member_resolver`,
+  `method_binding`, the LSP's hover) **kept**: "a zero needs a control
+  proving it is not starvation, and no such control can exist once the
+  only inhabiting syntax is gone", pending the ruling that extends `where`
+  to type declarations, which may feed the kind rather than retire it.
+  So the leaf match §8.233 named is a consumer of an uninhabited kind -
+  neither a lane to shadow nor a deletion for a worker.  Recorded, not
+  touched.
+
+#### What is there now
+
+`identity()` answers `resolved_name` or nothing; the unstamped arm records
+`record_pending_bug("trait bound identity")` and returns the empty symbol,
+so a consumer stops as it would for a bound nothing satisfies, and a
+build that reported nothing else is refused at its end by the existing
+E0900 flush.  The control's diagnostics are unchanged under the door
+(`E0306: the trait bound `i32: Nope` is not satisfied`, then E0200 - E0306
+renders the bound from its written path), and the E0900 stays quiet
+behind them as every pending tally does.
+
+#### Objects and gates
+
+`hash-tree.sh U` against half `T` (`b3b36ca6`): examples **0 of 1,126**,
+tests **0 of 2,665** (`comm -3 .objcmp/ex-T.s .objcmp/ex-U.s`; `comm -3
+.objcmp/t-T.s .objcmp/t-U.s`).  `make test-census`: `OVERALL PASS (unit:
+ok; compile-fail: 193 passed; projects: 64 passed)` (`.objcmp/x7-census.log`).
+`make lsp-check`: `OK -- compiled 264 module(s) … 0 errors, 490 warning(s)`
+(`.objcmp/x7-lsp.log`).  `make cross-check`: `OK -- x86_64-pc-linux-gnu …
+0 errors` (`.objcmp/x7-cross.log`).  `lane-check` unmoved.
+
+Outside the ledger: `AST/_module.cryo`; `scripts/ns-migration/8.237/`
+(`shadow.patch`, README row).
+
+**Tally: 80 shadowed, 80 old paths deleted, 80 at zero; 151 artifacts
+gone** (+1 lane, the bound identity's leaf fallback).
+
+---
+
 ## 9. Open questions
 
 - **Q1** — Does enforcing §3.3 require per-item `public` on declarations that
