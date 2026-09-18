@@ -35,6 +35,7 @@ import compiler::ast::{
 import compiler::lex;
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name };
 import compiler::resolver::res;
+import compiler::resolver::res::{ Res, ResSlot, SourceLoc };
 import utils::logger;
 import utils::logger::{ cdebug };
 import std::collections::pair;
@@ -1022,23 +1023,27 @@ public:
 
     /// Look up a named value (local, parameter, or global).
     codegen_identifier(mut &this, node: IdentifierNode*) -> void {
-        // Built-in pseudo-macros: FILE and LINE expand to the source location
-        // of the identifier reference.
-        const name_str: string = this.cg.resolve(node.name);
-        if (name_str.eq("FILE")) {
-            mut filename: string = node.span.file;
-            if (filename == null || filename.length() == 0) {
-                filename = "<unknown>";
+        // A source-location pseudo-constant expands to the location of the
+        // reference itself, which is the node's own span.
+        match (node.res) {
+            ResSlot::Answered(Res::SourceLoc(k)) => {
+                match (k) {
+                    SourceLoc::File => {
+                        mut filename: string = node.span.file;
+                        if (filename == null || filename.length() == 0) {
+                            filename = "<unknown>";
+                        }
+                        this.state.last_value = this.cg.builder.build_global_string_ptr(filename, "FILE.str");
+                    }
+                    SourceLoc::Line => {
+                        const line: u64 = node.span.start_line as u64;
+                        this.state.last_value = LType::const_int(LType::i32(), line, false);
+                    }
+                }
+                this.state.last_is_lvalue = false;
+                return;
             }
-            this.state.last_value = this.cg.builder.build_global_string_ptr(filename, "FILE.str");
-            this.state.last_is_lvalue = false;
-            return;
-        }
-        if (name_str.eq("LINE")) {
-            const line: u64 = node.span.start_line as u64;
-            this.state.last_value = LType::const_int(LType::i32(), line, false);
-            this.state.last_is_lvalue = false;
-            return;
+            _ => { }
         }
 
         // Try local/parameter first.
