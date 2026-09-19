@@ -1,0 +1,46 @@
+// E0308 for OVERLAP, not only for an identical pair: two implementations of
+// one trait whose heads unify - some type both would accept - are refused at
+// the later head, as Rust refuses them (its E0119), never picked by which was
+// written first and never told apart by a where-clause.  `Show for Wrap<T>`
+// beside `Show for Wrap<i32>` overlaps (a `Wrap<i32>` selects both); before
+// this the pair compiled and `w.show()` answered whichever impl came first.
+// The pairs that do NOT overlap are here unannotated: `Pair<T, T>` beside
+// `Pair<i32, u8>` (one `T` cannot be both), `From<i8>` beside `From<u8>` for
+// one target (the trait's arguments unify under the same substitution as the
+// target's), and the suite's exhaustiveness is the assertion that they stay
+// accepted.
+![config(testing)]
+![config(negative, E0308)]
+namespace CryoTests::Negative::OverlappingImpls;
+
+type trait CfShow { show(&this) -> i32; }
+type trait CfFrom<S> { static from(s: S) -> i32; }
+type trait CfAlpha { }
+type trait CfBeta { }
+
+type struct CfWrap<T> { v: T; }
+type struct CfPair<A, B> { a: A; b: B; }
+type struct CfHolder<T> { v: T; }
+
+implement<T> trait CfShow for struct CfWrap<T> { show(&this) -> i32 { return 1; } }
+implement trait CfShow for struct CfWrap<i32> { show(&this) -> i32 { return 2; } }   //~ ERROR[E0308] conflicting implementations of trait `CfShow`: `CfShow for CfWrap<i32>` overlaps `CfShow for CfWrap<T>`
+
+// Told apart only by their bounds: still an overlap.
+implement<T> trait CfShow for struct CfHolder<T> where T: CfAlpha { show(&this) -> i32 { return 1; } }
+implement<T> trait CfShow for struct CfHolder<T> where T: CfBeta { show(&this) -> i32 { return 2; } }   //~ ERROR[E0308] differ only in their where-clauses
+
+// A parameter written twice cannot be two types: no overlap.
+implement<T> trait CfShow for struct CfPair<T, T> { show(&this) -> i32 { return 1; } }
+implement trait CfShow for struct CfPair<i32, u8> { show(&this) -> i32 { return 2; } }
+
+// Distinct trait arguments for one target: no overlap.
+implement trait CfFrom<i8> for struct CfWrap<u64> { static from(s: i8) -> i32 { return 1; } }
+implement trait CfFrom<u8> for struct CfWrap<u64> { static from(s: u8) -> i32 { return 2; } }
+
+// The trait's argument and the target's unify under ONE substitution.
+implement<T, U> trait CfFrom<T> for struct CfPair<T, U> { static from(s: T) -> i32 { return 1; } }
+implement trait CfFrom<i32> for struct CfPair<i32, i32> { static from(s: i32) -> i32 { return 2; } }   //~ ERROR[E0308] `CfFrom<i32> for CfPair<i32, i32>` overlaps `CfFrom<T> for CfPair<T, U>`
+
+function main() -> int {
+    return 0;
+}

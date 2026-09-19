@@ -1164,6 +1164,42 @@ type struct TypeResolutionPasses {
                             fmt::format("conflicting implementations of trait `%s` for type `%s`: a trait may be implemented at most once per type, including across modules",
                                    tname, gname),
                             node.span);
+                    } else {
+                        // Not a second copy of one head, so ask whether an
+                        // earlier head under the same (trait, target) key
+                        // OVERLAPS it: some subject would select both.
+                        // Rust's rule, and refused here at the later
+                        // declaration rather than at a use - the use is
+                        // innocent, and a pick by declaration order or by
+                        // bound would make the program's meaning depend on
+                        // which impl was written first.  Where-bounds do not
+                        // separate two heads; nothing here can prove two
+                        // bounds disjoint.
+                        const over: ImplBlockNode* =
+                            ctx.generic_registry.overlapping_head(
+                                node.qualified_trait_name, canonical_target, node);
+                        if (over != null) {
+                            const this_head: string = node.spell_head(ctx.intern_table);
+                            const that_head: string = over.spell_head(ctx.intern_table);
+                            const trait_spelt: string =
+                                TypeAnnotation::spell(node.trait_annotation, ctx.intern_table);
+                            // Two heads spelled alike differ only in their
+                            // where-clauses, and that is the sentence.
+                            const msg: string = if (this_head == that_head) {
+                                fmt::format("conflicting implementations of trait `%s`: two `%s` heads differ only in their where-clauses, which do not separate them - a type satisfying both bounds would select both",
+                                    trait_spelt, this_head)
+                            } else {
+                                fmt::format("conflicting implementations of trait `%s`: `%s` overlaps `%s`, so a type both heads accept would select both",
+                                    trait_spelt, this_head, that_head)
+                            };
+                            mut od: Diagnostic = Diagnostic::error(
+                                ErrorCode::E0308_CONFLICTING_TRAIT_IMPL, msg);
+                            od = od.at_with_label(node.span, "this implementation");
+                            od = od.also_at(over.span, "overlaps this one");
+                            od = od.with_note(
+                                "two implementations of one trait must not both accept any type; a where-clause narrows which types a head is FOR but does not separate two heads, so make the targets disjoint or keep one implementation");
+                            ctx.emit_diagnostic(od);
+                        }
                     }
                 }
                 // The head's methods under the owner the index names.

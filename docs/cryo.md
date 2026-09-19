@@ -1720,6 +1720,8 @@ implement trait Ord for i32 {
 
 You may implement a trait for any type defined in the same crate, including primitive types.
 
+A trait has at most one implementation for any type, and that is decided by the heads alone. Two implementations of one trait whose heads unify - some type both would accept - are refused at the later one (`E0308`), whether the heads are identical, one generic and one concrete (`Show for Wrap<T>` beside `Show for Wrap<i32>`: a `Wrap<i32>` would select both), or told apart only by their `where` clauses (`Emit for Holder<T> where T: Alpha` beside `Emit for Holder<T> where T: Beta`: a bound narrows which types a head is for but nothing can prove two bounds disjoint). There is no specialisation and no selection by declaration order. Heads that no type satisfies together are distinct implementations: `Show for Pair<T, T>` beside `Show for Pair<i32, u8>`, or `From<i8> for u64` beside `From<u8> for u64`.
+
 ### 11.3 Trait Bounds with `where`
 
 A generic parameter is constrained to types that implement specific traits via a `where` clause:
