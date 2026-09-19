@@ -1,0 +1,317 @@
+    // -- Overlap between two written heads --
+
+    /// The head under `(trait_id, target_key)` registered before `block`
+    /// that OVERLAPS it, or null.  Only written heads are compared: a clone
+    /// the monomorphizer placed (`spec_owner` valid) is one written head's
+    /// instantiation, and two clones under one specialization are the two
+    /// template heads' overlap seen again.  The first such head is the
+    /// answer, so a third overlapping head is reported against the first
+    /// and not once per pair.
+    overlapping_head(&this, trait_id: SymbolStr, target_key: SymbolStr,
+                     block: ImplBlockNode*) -> ImplBlockNode* {
+        if (block == null || block.spec_owner.is_valid()) { return null; }
+        const heads: ImplBlockNode*[] = this.heads_under(trait_id, target_key);
+        for (mut i: i64 = 0; i < heads.length; i++) {
+            if (heads[i] == block) { return null; }
+            if (heads[i].spec_owner.is_valid()) { continue; }
+            if (GenericRegistry::heads_overlap(heads[i], block)) { return heads[i]; }
+        }
+        return null;
+    }
+
+    /// Whether two written heads under one `(trait, target)` key overlap:
+    /// some subject would select both.  Rust's rule: the heads unify, each
+    /// impl's own parameters standing as variables that may bind to any
+    /// written argument of the other head, and the where-bounds not
+    /// consulted - a bound narrows which subjects a head accepts, but nothing
+    /// here can prove two bounds disjoint, so two heads told apart only by
+    /// their bounds overlap.  The trait's written arguments and the target's
+    /// unify under ONE substitution, so `From<i8> for u64` and `From<u8> for
+    /// u64` do not overlap while `Show for Wrap<T>` and `Show for Wrap<i32>`
+    /// do, and `Show for Pair<T, T>` and `Show for Pair<i32, u8>` do not.
+    static heads_overlap(a: ImplBlockNode*, b: ImplBlockNode*) -> boolean {
+        if (a == null || b == null || a == b) { return false; }
+        mut bindings: HeadBinding[] = [];
+        const ga: GenericAnnotation* = GenericRegistry::trait_generic_of(a.trait_annotation);
+        const gb: GenericAnnotation* = GenericRegistry::trait_generic_of(b.trait_annotation);
+        const na: i64 = if (ga == null) { 0 } else { ga.args.length };
+        const nb: i64 = if (gb == null) { 0 } else { gb.args.length };
+        if (na != nb) { return false; }
+        for (mut i: i64 = 0; i < na; i++) {
+            if (!GenericRegistry::head_unify(ga.args[i], 0, gb.args[i], 1, &bindings)) { return false; }
+        }
+        if (a.target_args.length != b.target_args.length) { return false; }
+        for (mut i: i64 = 0; i < a.target_args.length; i++) {
+            if (!GenericRegistry::head_unify(a.target_args[i], 0, b.target_args[i], 1, &bindings)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// The trait annotation's generic node, through a reference or pointer
+    /// wrapper, as `TypeAnnotation::trait_identity` peels it; null for a
+    /// trait written with no arguments.  The node, never a copy of its
+    /// `args`: that array owns its elements.
+    static trait_generic_of(ann: TypeAnnotation*) -> GenericAnnotation* {
+        if (ann == null) { return null; }
+        return match (*ann) {
+            TypeAnnotation::Generic(g)   => { g }
+            TypeAnnotation::Reference(r) => { GenericRegistry::trait_generic_of(r.inner) }
+            TypeAnnotation::Pointer(p)   => { GenericRegistry::trait_generic_of(p.inner) }
+            _                            => { null }
+        };
+    }
+
+    /// The parameter a written argument names, or an empty symbol when it
+    /// names a type.
+    static head_param_of(ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        return match (*ann) {
+            TypeAnnotation::Named(n) => {
+                match (n.res.require("generic_registry:overlap head argument")) {
+                    Res::GenericParam(s) => { s }
+                    _                    => { SymbolStr::empty() }
+                }
+            }
+            _ => { SymbolStr::empty() }
+        };
+    }
+
+    /// The binding of `(side, param)`, or -1 when it is unbound.
+    static head_binding_of(side: i64, param: SymbolStr, bindings: &HeadBinding[]) -> i64 {
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            if (bindings[i].side == side && bindings[i].param.equals(param)) { return i; }
+        }
+        return -1;
+    }
+
+    /// Whether the variable `(pside, p)` occurs in the term `(t, tside)`,
+    /// through the bindings made so far.  A variable bound to a term that
+    /// contains itself would name no finite type, so the unification that
+    /// would make that binding fails instead.
+    static head_occurs(p: SymbolStr, pside: i64, t: TypeAnnotation*, tside: i64,
+                       bindings: &HeadBinding[]) -> boolean {
+        if (t == null) { return false; }
+        const q: SymbolStr = GenericRegistry::head_param_of(t);
+        if (q.is_valid()) {
+            if (q.equals(p) && tside == pside) { return true; }
+            const bi: i64 = GenericRegistry::head_binding_of(tside, q, bindings);
+            if (bi < 0) { return false; }
+            return GenericRegistry::head_occurs(p, pside, bindings[bi].term, bindings[bi].term_side, bindings);
+        }
+        return match (*t) {
+            TypeAnnotation::Generic(g) => {
+                if (GenericRegistry::head_occurs(p, pside, g.base, tside, bindings)) { return true; }
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    if (GenericRegistry::head_occurs(p, pside, g.args[i], tside, bindings)) { return true; }
+                }
+                false
+            }
+            TypeAnnotation::Pointer(pa)   => { GenericRegistry::head_occurs(p, pside, pa.inner, tside, bindings) }
+            TypeAnnotation::Reference(ra) => { GenericRegistry::head_occurs(p, pside, ra.inner, tside, bindings) }
+            TypeAnnotation::Array(aa)     => { GenericRegistry::head_occurs(p, pside, aa.element, tside, bindings) }
+            TypeAnnotation::Tuple(ta) => {
+                for (mut i: i64 = 0; i < ta.elements.length; i++) {
+                    if (GenericRegistry::head_occurs(p, pside, ta.elements[i], tside, bindings)) { return true; }
+                }
+                false
+            }
+            TypeAnnotation::Function(fa) => {
+                for (mut i: i64 = 0; i < fa.parameters.length; i++) {
+                    if (GenericRegistry::head_occurs(p, pside, fa.parameters[i], tside, bindings)) { return true; }
+                }
+                GenericRegistry::head_occurs(p, pside, fa.return_type, tside, bindings)
+            }
+            _ => { false }
+        };
+    }
+
+    /// Unify one written argument of each head, extending `bindings`.  A
+    /// parameter already bound stands for its term; an unbound one binds to
+    /// the other side's argument, if that argument does not contain it.  Two
+    /// types unify when they are the same declaration or primitive with
+    /// unifying arguments, the same pointer or reference shape over unifying
+    /// pointees, the same array, tuple or function shape element by element.
+    /// A written argument that names no type of its own - a projection, a
+    /// `This`, a `typeof`, an opaque `implement Trait` - refutes nothing.
+    static head_unify(x: TypeAnnotation*, xs: i64, y: TypeAnnotation*, ys: i64,
+                      bindings: mut &HeadBinding[]) -> boolean {
+        mut xa: TypeAnnotation* = x;
+        mut xside: i64 = xs;
+        mut ya: TypeAnnotation* = y;
+        mut yside: i64 = ys;
+        // A bound parameter stands for its term.
+        while (true) {
+            const xp: SymbolStr = GenericRegistry::head_param_of(xa);
+            if (!xp.is_valid()) { break; }
+            const bi: i64 = GenericRegistry::head_binding_of(xside, xp, bindings);
+            if (bi < 0) { break; }
+            xside = bindings[bi].term_side;
+            xa = bindings[bi].term;
+        }
+        while (true) {
+            const yp: SymbolStr = GenericRegistry::head_param_of(ya);
+            if (!yp.is_valid()) { break; }
+            const bi: i64 = GenericRegistry::head_binding_of(yside, yp, bindings);
+            if (bi < 0) { break; }
+            yside = bindings[bi].term_side;
+            ya = bindings[bi].term;
+        }
+        if (xa == null || ya == null) { return true; }
+        const xp: SymbolStr = GenericRegistry::head_param_of(xa);
+        const yp: SymbolStr = GenericRegistry::head_param_of(ya);
+        if (xp.is_valid() && yp.is_valid() && xside == yside && xp.equals(yp)) { return true; }
+        if (xp.is_valid()) {
+            if (GenericRegistry::head_occurs(xp, xside, ya, yside, bindings)) { return false; }
+            bindings.push(HeadBinding { side: xside, param: xp, term: ya, term_side: yside });
+            return true;
+        }
+        if (yp.is_valid()) {
+            if (GenericRegistry::head_occurs(yp, yside, xa, xside, bindings)) { return false; }
+            bindings.push(HeadBinding { side: yside, param: yp, term: xa, term_side: xside });
+            return true;
+        }
+        if (GenericRegistry::head_is_opaque(xa) || GenericRegistry::head_is_opaque(ya)) { return true; }
+        return match (*xa) {
+            TypeAnnotation::Named(n) => {
+                match (*ya) {
+                    TypeAnnotation::Named(m) => {
+                        GenericRegistry::head_names_agree(n.res.require("generic_registry:overlap head argument"),
+                                                          m.res.require("generic_registry:overlap head argument"))
+                    }
+                    TypeAnnotation::Primitive(q) => {
+                        match (n.res.require("generic_registry:overlap head argument")) {
+                            Res::PrimTy(p) => { p.equals(q.name) }
+                            _              => { false }
+                        }
+                    }
+                    TypeAnnotation::Generic(h) => {
+                        h.args.length == 0 && GenericRegistry::head_unify(xa, xside, h.base, yside, bindings)
+                    }
+                    _ => { false }
+                }
+            }
+            TypeAnnotation::Primitive(p) => {
+                match (*ya) {
+                    TypeAnnotation::Primitive(q) => { p.name.equals(q.name) }
+                    TypeAnnotation::Named(m) => {
+                        match (m.res.require("generic_registry:overlap head argument")) {
+                            Res::PrimTy(q) => { q.equals(p.name) }
+                            _              => { false }
+                        }
+                    }
+                    _ => { false }
+                }
+            }
+            TypeAnnotation::Generic(g) => {
+                match (*ya) {
+                    TypeAnnotation::Generic(h) => {
+                        if (g.args.length != h.args.length) { return false; }
+                        if (!GenericRegistry::head_unify(g.base, xside, h.base, yside, bindings)) { return false; }
+                        for (mut i: i64 = 0; i < g.args.length; i++) {
+                            if (!GenericRegistry::head_unify(g.args[i], xside, h.args[i], yside, bindings)) {
+                                return false;
+                            }
+                        }
+                        true
+                    }
+                    TypeAnnotation::Named(_) => {
+                        g.args.length == 0 && GenericRegistry::head_unify(g.base, xside, ya, yside, bindings)
+                    }
+                    _ => { false }
+                }
+            }
+            TypeAnnotation::Pointer(pa) => {
+                match (*ya) {
+                    TypeAnnotation::Pointer(pb) => {
+                        pa.is_const == pb.is_const
+                            && GenericRegistry::head_unify(pa.inner, xside, pb.inner, yside, bindings)
+                    }
+                    _ => { false }
+                }
+            }
+            TypeAnnotation::Reference(ra) => {
+                match (*ya) {
+                    TypeAnnotation::Reference(rb) => {
+                        ra.is_mutable == rb.is_mutable
+                            && GenericRegistry::head_unify(ra.inner, xside, rb.inner, yside, bindings)
+                    }
+                    _ => { false }
+                }
+            }
+            TypeAnnotation::Array(aa) => {
+                match (*ya) {
+                    TypeAnnotation::Array(ab) => {
+                        aa.size == ab.size
+                            && GenericRegistry::head_unify(aa.element, xside, ab.element, yside, bindings)
+                    }
+                    _ => { false }
+                }
+            }
+            TypeAnnotation::Tuple(ta) => {
+                match (*ya) {
+                    TypeAnnotation::Tuple(tb) => {
+                        if (ta.elements.length != tb.elements.length) { return false; }
+                        for (mut i: i64 = 0; i < ta.elements.length; i++) {
+                            if (!GenericRegistry::head_unify(ta.elements[i], xside, tb.elements[i], yside, bindings)) {
+                                return false;
+                            }
+                        }
+                        true
+                    }
+                    _ => { false }
+                }
+            }
+            TypeAnnotation::Function(fa) => {
+                match (*ya) {
+                    TypeAnnotation::Function(fb) => {
+                        if (fa.parameters.length != fb.parameters.length) { return false; }
+                        for (mut i: i64 = 0; i < fa.parameters.length; i++) {
+                            if (!GenericRegistry::head_unify(fa.parameters[i], xside, fb.parameters[i], yside, bindings)) {
+                                return false;
+                            }
+                        }
+                        GenericRegistry::head_unify(fa.return_type, xside, fb.return_type, yside, bindings)
+                    }
+                    _ => { false }
+                }
+            }
+            _ => { false }
+        };
+    }
+
+    /// Whether a written argument names no type of its own to refute another.
+    static head_is_opaque(ann: TypeAnnotation*) -> boolean {
+        return match (*ann) {
+            TypeAnnotation::Projection(_) => { true }
+            TypeAnnotation::ThisType(_)   => { true }
+            TypeAnnotation::Typeof(_)     => { true }
+            TypeAnnotation::ImplTrait(_)  => { true }
+            _                             => { false }
+        };
+    }
+
+    /// Two written names stand for one type: the same declaration, or the
+    /// same primitive.  An answer that is neither (an error stamp) refutes
+    /// nothing - the program is refused for the name already.
+    static head_names_agree(x: Res, y: Res) -> boolean {
+        return match (x) {
+            Res::Def(d) => {
+                match (y) {
+                    Res::Def(e) => { d.qualified_name().equals(e.qualified_name()) }
+                    Res::Err    => { true }
+                    _           => { false }
+                }
+            }
+            Res::PrimTy(p) => {
+                match (y) {
+                    Res::PrimTy(q) => { p.equals(q) }
+                    Res::Err       => { true }
+                    _              => { false }
+                }
+            }
+            _ => { true }
+        };
+    }
+

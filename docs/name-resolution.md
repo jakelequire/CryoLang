@@ -71,7 +71,7 @@ measurement that decided it on the row.
 | D25 | **`(Beta for P)::make()` is Cryo's impl-qualified call form** (Jake, 2026-09-17). It reuses `for` exactly as `implement trait Beta for P` does - no new lexical territory, and none of the `<P as Beta>` parsing problem. It MUST cover the receiver case too, `(Beta for P)::go(&p)`, so E0156 has ONE rule to suggest rather than a short form that works sometimes; and it must compose inside a generic, `(Beta for T)::make()`. Motivation: a tie of STATIC trait methods (`P::make()` with `Beta::make` and `Gamma::make` both implemented for `P`) has no receiver to disambiguate it, so E0156 fires with no suggestable spelling today | **RULED - UNBUILT** | `no check` — syntax not in the tree; the project that lands it pins it, and E0156's help names the form then | §8.224, §8.229 |
 | D26 | **The two-trait tie is an ERROR** in both spellings (`recv.m(...)`, `T::m(recv, ...)`) - never a pick by declaration or import order; each candidate named at its declaration; the trait-qualified call `Tr::m(&recv, ...)` chooses | **TAKEN** (ruled 2026-09-17; built the same day, §8.224, as `E0156_AMBIGUOUS_TRAIT_METHOD`) | `grep -c 'E0156_AMBIGUOUS_TRAIT_METHOD' compiler/src/compiler/diag/_module.cryo` → **2**; `ls tests/tests/negative/E0156_*.cryo \| wc -l` → **2**; `ls -d tests/tests/projects/trait_qualified_call_disambiguates*/test.json \| wc -l` → **1** | §8.220, §8.224, §8.229 |
 | D27 | **The Rust trait-in-scope rule is REJECTED** (Jake, 2026-09-17, on §8.224's measurement): Cryo calls a trait's methods with the trait imported nowhere in BOTH call forms today; requiring scope would break **277 call sites in 61 files** (stdlib 135, `tests/` 118, LSP 19, examples 5, `compiler/src` 0); and it would settle **0 of the 28** tie sites in the corpus - at no site is exactly one candidate in scope. D25 is what gives a tie a spelling, not scope. Not to be proposed again without new numbers | **REJECTED** | `no check` — a rule not built; `scripts/ns-migration/8.224/` re-derives the three tables from a corpus run | §8.224, §8.229 |
-| D28 | **Overlapping impls are REFUSED OUTRIGHT, as Rust does (E0119)** - not specialisation, not declaration order (Jake, 2026-09-18: "I want to do that 'refuse overlaps outright as Rust does'") | **RULED - UNBUILT** — the shape: `implement<T> trait Show for struct Wrap<T> { show(&this) -> i32 { 1 } }` beside `implement trait Show for struct Wrap<i32> { show(&this) -> i32 { 2 } }`; `w.show()` on a `Wrap<i32>` answers 1 or 2 by which impl is WRITTEN FIRST, under the current compiler and under the pin `db5af63c` alike, so it predates the migration (audit 12's `overlap_a` / `overlap_b` projects demonstrate it). The error belongs at the OVERLAPPING DECLARATION, never at the call: the call is innocent, two impls both claiming one (trait, type) is the defect, and a use-site report blames the wrong code. `generic_registry.cryo`'s `select_trait_impl` comment - "the overlap is a registration-time report, not one per use" - is a hypothesis, not a mechanism: grep finds the comment and no report; whoever builds this makes it true, as a coherence check over `heads_under` at registration. **Measure the population first**: the registry reshape (§8.233) made overlapping heads representable in a way they were not before, so the stdlib or the projects may hold overlaps that resolve by luck today; if any do, this is a source-breaking change and Jake wants the blast radius before it lands | `grep -c 'registration-time report' compiler/src/compiler/types/generic_registry.cryo` → **1**; `grep -rho 'E0119' compiler/src --include=*.cryo \| wc -l` → **0** | — |
+| D28 | **Overlapping impls are REFUSED OUTRIGHT, as Rust does (E0119)** - not specialisation, not declaration order (Jake, 2026-09-18: "I want to do that 'refuse overlaps outright as Rust does'") | **RULED - UNBUILT** — the shape: `implement<T> trait Show for struct Wrap<T> { show(&this) -> i32 { 1 } }` beside `implement trait Show for struct Wrap<i32> { show(&this) -> i32 { 2 } }`; `w.show()` on a `Wrap<i32>` answers 1 or 2 by which impl is WRITTEN FIRST, under the current compiler and under the pin `db5af63c` alike, so it predates the migration (audit 12's `overlap_a` / `overlap_b` projects demonstrate it). The error belongs at the OVERLAPPING DECLARATION, never at the call: the call is innocent, two impls both claiming one (trait, type) is the defect, and a use-site report blames the wrong code. `generic_registry.cryo`'s `select_trait_impl` comment - "the overlap is a registration-time report, not one per use" - is a hypothesis, not a mechanism: grep finds the comment and no report; whoever builds this makes it true, as a coherence check over `heads_under` at registration. **Measure the population first**: the registry reshape (§8.233) made overlapping heads representable in a way they were not before, so the stdlib or the projects may hold overlaps that resolve by luck today; if any do, this is a source-breaking change and Jake wants the blast radius before it lands. **MEASURED in §8.261 with the unifier the refusal would use** (`scripts/ns-migration/8.261/heads_overlap.cryo`, Rust's rule: trait and target arguments unify under one substitution, bounds not consulted; 6 control shapes behave): over the six halves 35 pairs of written heads share a key, **4 unify** - the three E0308 negatives and ONE green project, `where_bound_leaf_collision` (`Emit for Holder<T> where T: Alpha::Render` / `where T: Omega::Render`), whose comment asserts the pair must be accepted and which DISPATCHES by bound today (`OnlyA=1 OnlyB=2`, `Both=1` by order); stdlib, compiler, LSP, examples 0. **NOT BUILT - the bound question is Jake's**: Rust's rule refuses that project (convert it to `compile_fail` E0119, specialisation by bound gone), or keep bound-selection and refuse only the intersection at its instantiation (not Rust's rule). One line in §8.261 either way | `grep -c 'registration-time report' compiler/src/compiler/types/generic_registry.cryo` → **1**; `grep -rho 'E0119' compiler/src --include=*.cryo \| wc -l` → **0**; `ls scripts/ns-migration/8.261/*.cryo \| wc -l` → **2** | §8.261 |
 
 **D18, D24, D25, D28 and Q2 are RULED and UNBUILT** (D5 was, until §8.206; D2 and D9 were,
 until §8.213). Each was decided by Jake - D18 and D2 then re-parked as open
@@ -17046,6 +17046,146 @@ Outside the ledger: `tests/tests/negative/E0214_c_import_narrowing.cryo`,
 
 **Tally: 96 shadowed, 96 old paths deleted, 96 at zero; 214 artifacts
 gone** (unchanged; a sweep, a gate and a golden).
+
+---
+
+### 8.261 D28's population, measured with the unifier the refusal would use: over the six halves 35 distinct pairs of written heads share a `(trait, target)` key and 4 unify - 3 are the E0308 negatives (identical heads, refused today) and 1 is a GREEN project, `where_bound_leaf_collision`, two `Emit for Holder<T>` heads told apart only by their where-bounds, which Rust refuses (E0119) and the project's own comment says must be accepted; a scratch shows that pair DISPATCHING by bound today (`OnlyA=1 OnlyB=2`) and by declaration order where both bounds hold (`Both=1`); the stdlib, the compiler, the LSP and the examples hold 0; so the refusal is NOT landed - the bound question is Jake's, the unifier and the probe are committed under `scripts/ns-migration/8.261/` - 2026-09-19
+
+> **Status:** MEASURED, not built.  No compiler source changed.
+> `scripts/ns-migration/8.261/probe_d28.py` splices `head_binding.cryo` and
+> `heads_overlap.cryo` (the unifier, as it would land in
+> `types/generic_registry.cryo`) and three prints into the tree, `--revert`
+> removes them (the tree round-trips byte-identically:
+> `cmp` against the probed copies, then `git status --short compiler/src`
+> empty); `control/` is the scratch project below.
+
+#### The rule being measured
+
+Jake's ruling (D28's row): overlapping impls are refused outright, as
+Rust does - not specialisation, not declaration order.  Rust's rule is
+that two impls of one trait conflict when their heads UNIFY: the trait's
+written arguments and the target's, under one substitution, each impl's
+own parameters as variables; the where-clauses are not consulted,
+because nothing can prove two bounds disjoint.  `heads_overlap.cryo` is
+that rule over `TypeAnnotation`s: a parameter (`Res::GenericParam`)
+binds to the other head's argument unless it occurs in it; a declaration
+or primitive must be the same one (`Res::Def` by qualified name,
+`Res::PrimTy` / `Primitive` by spelling); a generic, pointer, reference,
+array, tuple or function shape unifies element by element; a projection,
+`This`, `typeof` or `implement Trait` argument refutes nothing.  Two
+heads under one `(trait, target)` key with a different trait or target
+arity do not overlap.
+
+#### Control: the unifier on six shapes (`control/shapes.cryo`, `control/bound.cryo`)
+
+```cryo
+implement<T> trait Show for struct Wrap<T>        { .. 1 }   // OVERLAP with
+implement    trait Show for struct Wrap<i32>      { .. 2 }   //   (D28's shape)
+implement<T> trait Show for struct Pair<T, T>     { .. 3 }   // no overlap:
+implement    trait Show for struct Pair<i32, u8>  { .. 4 }   //   T = i32 and T = u8
+implement<A, B> trait Show for struct Tri<A, B>   { .. 5 }   // OVERLAP at
+implement<V>    trait Show for struct Tri<i32, V> { .. 6 }   //   Tri<i32, V>
+implement trait Conv<i8> for struct Box2<i32>     { .. 7 }   // no overlap:
+implement trait Conv<u8> for struct Box2<i32>     { .. 8 }   //   the trait's argument
+implement<S> trait Conv<S>  for struct Nest<S>    { .. 9 }   // OVERLAP at
+implement<T> trait Conv<i8> for struct Nest<T>    { .. 10 }  //   S = T = i8
+implement<T> trait Emit for struct Holder<T> where T: Alpha { .. 1 }  // OVERLAP:
+implement<T> trait Emit for struct Holder<T> where T: Beta  { .. 2 }  //   bounds not consulted
+```
+
+`.objcmp/nb-control.log` (the probed compiler over the control): 6
+`D28-SIBLING` pairs, 4 `D28-OVERLAP` - 22/21, 30/29, 39/38 in
+`shapes.cryo` and 24/23 in `bound.cryo` - and nothing on 26/25 or 34/33,
+each as predicted above.  The program runs and prints what the tree does
+with an overlap today:
+
+```
+Wrap<i32>.show()=1            first-written wins (D28's symptom)
+OnlyA=1 OnlyB=2 Both=1        a bound-differentiated pair dispatches BY
+                              BOUND where one bound holds, and by
+                              declaration order where both do
+```
+
+The `D28-ARM` control: 291 written heads visited on the scratch, 0 twice;
+337 on the LSP half, 0 twice - type resolution's impl arm runs once per
+written head, so a refusal raised there reports each pair once.
+
+#### Population (`scripts/objcmp/corpus2.sh NBp`, `.objcmp/NBp-lines.txt`)
+
+lsp direct exit 0; `make test` OVERALL FAIL with 2 projects - the two
+`output_excludes` projects whose excluded word the probe's lines print
+(`namespace_gate_methods` "Carrier", `projection_bound_leaf_collision`
+"iter.cryo"), the probe's artifact and not a finding; failing halves 0.
+
+| line | count | distinct |
+|---|---|---|
+| `D28-ARM` | 72,674 | one per written head per half |
+| `D28-SIBLING` | 5,110 | **35** pairs (`.objcmp/nb-siblings.txt`): 29 in the stdlib - `core/convert.cryo`'s `From<X>` / `TryFrom<X>` families for one target (14 on the LSP half alone), `collections/str.cryo` and `json/value.cryo`'s `TryFrom<Str>` / `TryFrom<&JsonValue>` beside them, `fmt/error.cryo`'s `From<IoError>` / `From<AllocError>` for `FmtError` - and 6 outside: `impl_concrete_arg_selects_impl` (`Wrap<T, Beta>` / `Wrap<T, Alpha>`), `E0214_overload_set_no_match` (`Mul<f32, Vec3>` / `Mul<Vec3, Vec3>`), `where_bound_leaf_collision`, the three E0308 negatives |
+| `D28-OVERLAP` | 4 | **4** pairs |
+
+The four:
+
+| where | heads | bounds | today |
+|---|---|---|---|
+| `tests/negative/E0308_conflicting_trait_impl.cryo` 11/12 | identical | 0/0 | E0308 |
+| `tests/negative/E0308_generic_trait_duplicate.cryo` 14/15 | identical | 0/0 | E0308 |
+| `tests/negative/E0308_primitive_alias_duplicate.cryo` 13/14 | `for int` / `for i32`, one head since §8.256 | 0/0 | E0308 |
+| `tests/tests/projects/where_bound_leaf_collision/src/main.cryo` 14/18 | `Emit for Holder<T> where T: Alpha::Render` / `where T: Omega::Render` | 1/1 | **accepted, `outcome: run`** |
+
+So the population of overlapping heads the tree accepts today is **1**,
+and it is a test project written to assert that acceptance: "Bounds are
+folded into the coherence key precisely so bound-differentiated impls
+stay distinct, so both of these must be accepted" (its comment; the
+project, from `3720835e`, pins that two same-leaf bounds from different
+modules do not collide in the E0308 key).  The 31 sibling pairs
+that do not unify are what the unifier must keep accepting - every
+`From<X>` family in the stdlib - and it does.
+
+#### Not landed: the question for Jake
+
+The ruling's words cover the pair (`not specialisation`; Rust refuses it),
+but the tree holds a green test asserting the opposite, and the scratch
+shows the pair is not merely accepted - it WORKS as specialisation by
+bound where the bounds are disjoint (`OnlyA=1 OnlyB=2`) and fails only
+in the intersection (`Both=1`).  Deleting or converting an existing test
+is not a worker's call, and the brief said a non-zero population stops
+here.  Two options, each one landing:
+
+* **Rust's rule, as ruled.**  E0119 at the later head whenever
+  `heads_overlap`, raised in type resolution's impl arm beside E0308
+  (after it, so an identical pair stays E0308 and is not reported twice).
+  `where_bound_leaf_collision` becomes `outcome: compile_fail` asserting
+  E0119 (its property - the two bounds render as two keys - survives as
+  "E0119, not E0308").  Cost: specialisation by bound, which works today
+  for disjoint bounds, is gone; in-tree that is one project, 0 stdlib.
+* **Keep bound-selection; refuse the intersection.**  E0119 at the later
+  head only when the pair unifies AND neither head adds a bound the other
+  lacks (D28's own example, `Wrap<T>` / `Wrap<i32>`); a bound-differentiated
+  pair is refused at the INSTANTIATION whose type satisfies both
+  (`Holder<Both>`), where the monomorphizer already filters
+  bound-violating clones and would see two survive.  Cost: not Rust's
+  rule, a second report site, and the coherence key keeps carrying bounds
+  for a reason the spec does not state.
+
+Either way the unifier is the one in `heads_overlap.cryo`, the report
+site is the impl arm, and `generic_registry.cryo`'s "the overlap is a
+registration-time report" comment becomes true.
+
+#### Residual
+
+* The probe compares written heads only (`spec_owner` invalid); two
+  clones under one specialization are the template pair seen again.
+* `E0308_primitive_alias_duplicate` unifies because `for int` folds to
+  `i32` at the name layer (§8.256): its two heads are one head twice.
+
+**New for Jake**: nothing in the tree.  The names the refusal would add:
+`GenericRegistry::heads_overlap`, `overlapping_head`, `HeadBinding`.
+
+Outside the ledger: `scripts/ns-migration/8.261/{probe_d28.py,
+head_binding.cryo, heads_overlap.cryo, control/}`.
+
+**Tally: 96 shadowed, 96 old paths deleted, 96 at zero; 214 artifacts
+gone** (unchanged).
 
 ---
 
