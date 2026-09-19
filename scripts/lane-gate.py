@@ -190,8 +190,12 @@ the golden reads as the live surface rather than a graveyard; a file reappearing
 is then an added row, which fails the same way an increase does.
 
 Usage:
-    python3 scripts/lane-gate.py [--update] [--names] [--src DIR --golden FILE]
+    python3 scripts/lane-gate.py [--update] [--names] [--row KIND | --rows] [--src DIR --golden FILE]
 
+`--row KIND` prints one bucket's LIVE total and `--rows` the number of
+buckets, both read from the tree and neither from the golden: a ledger row
+that cites a bucket asks the gate, not a recorded file, so a stale golden
+cannot satisfy it.
 `--names` prints the derived sets and exits, so what the rule swept up can be
 read rather than inferred.  `--src`/`--golden` point the gate at another tree
 and golden; `scripts/lane-gate-selftest.py` uses them to drive every rule
@@ -873,13 +877,33 @@ def main():
                     help="rewrite the golden from the current measurement")
     ap.add_argument("--names", action="store_true",
                     help="print the definition-derived name sets and exit")
+    ap.add_argument("--row", metavar="KIND",
+                    help="print one bucket's live total, read from the tree, and exit")
+    ap.add_argument("--rows", action="store_true",
+                    help="print the number of buckets this gate counts and exit")
     ap.add_argument("--src", default=DEFAULT_SRC,
                     help="the compiler source tree to measure (default: compiler/src)")
     ap.add_argument("--golden", default=DEFAULT_GOLDEN,
                     help="the golden to compare against (default: tests/lane-baseline.txt)")
     args = ap.parse_args()
 
+    # The bucket count is a property of this script, not of a golden: a
+    # ledger row that asks it here asks the tree's gate, not a recorded file.
+    if args.rows:
+        print(len(KINDS))
+        return 0
+    if args.row is not None and args.row not in KINDS:
+        sys.stderr.write("lane-gate: no bucket named %s (%s)\n" % (args.row, ", ".join(KINDS)))
+        return 1
+
     counts, unplaced, sets, owners = scan(args.src)
+    if args.row is not None:
+        # A live total, read from the tree.  Refused on an unplaceable
+        # receiver below like every other read, since a count over a tree
+        # the gate could not place is not a measurement.
+        if not unplaced:
+            print(sum(counts[args.row].values()))
+            return 0
     if args.names:
         print("map owners (%d): rule 1's population, each placed" % len(owners))
         for label in sorted(owners):

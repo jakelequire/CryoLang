@@ -389,6 +389,17 @@ def main():
         code, out = run_gate(base, os.path.join(work, "absent.txt"))
         if code != 1 or "no golden" not in out:
             failures.append("a missing golden must be refused:\n%s" % out)
+        # `--row` and `--rows` read the tree, never the golden: they answer
+        # with no golden at all, and a bucket the gate does not count is refused.
+        code, out = run_gate(base, os.path.join(work, "absent.txt"), "--row", "LOOKUP")
+        if code != 0 or out.strip() != "2":
+            failures.append("--row LOOKUP must print the live total 2 with no golden:\n%s" % out)
+        code, out = run_gate(base, os.path.join(work, "absent.txt"), "--rows")
+        if code != 0 or out.strip() != str(len(BASELINE)):
+            failures.append("--rows must print %d:\n%s" % (len(BASELINE), out))
+        code, out = run_gate(base, golden, "--row", "NO_SUCH_ROW")
+        if code != 1 or "no bucket named NO_SUCH_ROW" not in out:
+            failures.append("--row of an unknown bucket must be refused:\n%s" % out)
 
         for i, (name, edits, want_code, want_text) in enumerate(MUTATIONS):
             tree = os.path.join(work, "m%d" % i)
