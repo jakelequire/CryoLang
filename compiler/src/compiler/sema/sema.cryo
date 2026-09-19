@@ -1205,10 +1205,7 @@ public:
             this.symbolic.symbolic_bind_params(&res_ctx);
             const vtype: TypeRef = this.ctx.type_resolver.resolve(var_node.type_annotation, &res_ctx);
             if (vtype.is_valid()) { var_node.resolved_type = vtype; }
-            else {
-                this.refuse_unresolved_body_annotation(var_node.type_annotation,
-                    this.intern.resolve(var_node.name), var_node.span);
-            }
+            else { this.refuse_unresolved_body_annotation(var_node.type_annotation); }
         }
 
         if (var_node.has_initializer()) {
@@ -1344,6 +1341,12 @@ public:
     register_var_decl_local(mut &this, var_node: VarDeclNode*) -> void {
         if (var_node.resolved_type.is_valid()) {
             this.scopes.register_local_with_mut(var_node.name, var_node.resolved_type, var_node.is_mutable);
+        } else if (var_node.type_annotation != null && TypeAnnotation::refused(var_node.type_annotation)) {
+            // The declaration named a type the name layer refused, reported
+            // where it was written; bound with NO type, as a parameter is,
+            // so a use of it is silent rather than a second report against
+            // the initializer's type or `void`.
+            this.scopes.register_local_with_mut(var_node.name, TypeRef::invalid(), var_node.is_mutable);
         } else if (var_node.has_initializer()) {
             const init_type: TypeRef = var_node.initializer.resolved_type;
             if (init_type.is_valid()) {
@@ -2323,21 +2326,17 @@ public:
         mut res_ctx: ResolutionContext = this.body_res_ctx();
         this.symbolic.symbolic_bind_params(&res_ctx);
         const ty: TypeRef = this.ctx.type_resolver.resolve(ann, &res_ctx);
-        if (!ty.is_valid()) { this.refuse_unresolved_body_annotation(ann, "the operand", annotation_span(ann)); }
+        if (!ty.is_valid()) { this.refuse_unresolved_body_annotation(ann); }
         return ty;
     }
 
     /// A body annotation the type layer could not resolve - a local's, a
-    /// `sizeof`/`alignof` operand's, a cast target's - is reported when the
-    /// failure is a name the program does not declare or the writer cannot
-    /// reach, through the reporter the declaration sites use, so an unknown
-    /// type is one diagnostic in every position.  A failure that is none of
-    /// those (a form resolved later in the walk) is left to that walk.
-    refuse_unresolved_body_annotation(&this, ann: TypeAnnotation*, what: string,
-                                      span: SourceSpan) -> void {
-        const runner: TypeResolutionRunner = TypeResolutionRunner::new(this.ctx);
-        if (!runner.annotation_failure_is_certain(ann)) { return; }
-        runner.emit_undefined_type(ann, "type", "type", what, span, "");
+    /// `sizeof`/`alignof` operand's, a cast target's.  A name in it the name
+    /// layer refused was reported where it was written, and a leaf left
+    /// unanswered is recorded by the door; a failure that is neither (a form
+    /// resolved later in the walk) is left to that walk.
+    refuse_unresolved_body_annotation(&this, ann: TypeAnnotation*) -> void {
+        TypeAnnotation::refused(ann);
     }
 
     resolve_cast(mut &this, cast: CastExprNode*) -> TypeRef {
@@ -2374,7 +2373,7 @@ public:
             this.symbolic.symbolic_bind_params(&res_ctx);
             const target: TypeRef = this.ctx.type_resolver.resolve(cast.target_annotation, &res_ctx);
             if (target.is_valid()) { cast.set_resolved_target(target); }
-            else { this.refuse_unresolved_body_annotation(cast.target_annotation, "the cast target", cast.span); }
+            else { this.refuse_unresolved_body_annotation(cast.target_annotation); }
         }
         const to_ty: TypeRef = cast.resolved_target;
         if (from_ty.is_valid() && to_ty.is_valid()

@@ -88,6 +88,13 @@ public:
     /// callee is visited: an unbound one is refused as a function that does
     /// not exist rather than as a value.
     callee_ident: IdentifierNode*;
+    /// The name a type alias binds, while its target annotation is stamped:
+    /// barred from the did-you-mean, since rewriting the target to it would
+    /// make the alias its own meaning.  Empty elsewhere.
+    defining_type: SymbolStr;
+    /// What a refused type spelling is called in its report: "type", or
+    /// "trait" while an impl head's trait is stamped.
+    type_noun: string;
     /// The spelling of the receiver binding.
     this_sym: SymbolStr;
 
@@ -98,6 +105,8 @@ public:
         this.pending_base_ctor = null;
         this.receiver_of       = null;
         this.callee_ident      = null;
+        this.defining_type     = SymbolStr::empty();
+        this.type_noun         = "type";
         this.this_sym          = resolver.intern_table.intern("this");
     }
 
@@ -797,12 +806,17 @@ public:
         // Without this the head's identity is only ever recoverable as the
         // leaf its spelling ends in, which is a search key - it answers only
         // while that leaf is unique program-wide.
+        // The head's own name is a trait; what it is applied to is not.
+        const trait_head: TypeAnnotation* = TypeAnnotation::head_base(node.trait_annotation);
+        this.type_noun = "trait";
+        this.stamp_annotation(trait_head);
+        this.type_noun = "type";
         this.stamp_annotation(node.trait_annotation);
         // What the head writes AFTER the target: a parameter of its own, or
         // a declaration (`Array<T, GlobalAlloc>`), and only a stamp can say
         // which.  Read after `declare_generics` for the reason the trait
         // side is.
-        this.stamp_annotation_list(&node.target_args);
+        this.stamp_impl_target_args(node);
 
         // `type Item = T;` in the body binds an associated type to written
         // syntax, and the impl's own `where` clause spells types the same way
@@ -824,6 +838,76 @@ public:
         }
 
         this.resolver.exit_scope();
+    }
+
+    /// Stamp what an impl head writes after its target.  A trait impl's list
+    /// names the template's arguments and declares nothing, so a bare name in
+    /// it that no scope binds - no leading `implement<S>`, no type `S` in
+    /// scope - reads as an impl over every `S` of a name the program does not
+    /// hold: the same defect as an elided parameter, spelled from the other
+    /// side, and refused as E0302 with the head spelled the way it must be,
+    /// its undeclared names moved to the leading list.  An inherent impl's
+    /// list declares its names (the parser makes each a parameter), so
+    /// nothing in it is unbound; anything nested, or written as more than a
+    /// name, is stamped as every annotation is.
+    stamp_impl_target_args(&this, node: ImplBlockNode*) -> void {
+        mut undeclared: string[] = [];
+        for (mut i: i64 = 0; i < node.target_args.length; i++) {
+            const arg: TypeAnnotation* = node.target_args[i];
+            if (arg == null) { continue; }
+            mut bare: NamedAnnotation* = null;
+            match (*arg) {
+                TypeAnnotation::Named(n) => { bare = n; }
+                _                        => { }
+            }
+            if (bare == null || !node.is_trait_impl()) {
+                this.stamp_annotation(arg);
+                continue;
+            }
+            match (bare.res) {
+                ResSlot::Answered(_) => { continue; }
+                _                    => { }
+            }
+            match (this.type_spelling_res(bare.name, bare.span)) {
+                ResSlot::Answered(r) => { bare.res.answer(r); }
+                _                    => {
+                    if (this.ctx.module_ns_sym_of_file(bare.span.file).is_valid()) {
+                        undeclared.push(this.resolver.intern_table.resolve(bare.name));
+                        bare.res.answer(Res::Err);
+                    }
+                }
+            }
+        }
+        if (undeclared.length == 0) { return; }
+        const intern: InternTable* = this.resolver.intern_table;
+        mut head_params: string = "";
+        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+            if (i > 0) { head_params = head_params + ", "; }
+            head_params = head_params + intern.resolve(node.generic_params[i].name);
+        }
+        mut listed: string = "";
+        for (mut i: i64 = 0; i < undeclared.length; i++) {
+            if (head_params.length() > 0) { head_params = head_params + ", "; }
+            head_params = head_params + undeclared[i];
+            if (i > 0) { listed = listed + ", "; }
+            listed = listed + "`" + undeclared[i] + "`";
+        }
+        mut target_args: string = "";
+        for (mut i: i64 = 0; i < node.target_args.length; i++) {
+            if (i > 0) { target_args = target_args + ", "; }
+            target_args = target_args + TypeAnnotation::spell(node.target_args[i], intern);
+        }
+        const target: string = intern.resolve(node.target_type);
+        const trait_part: string = TypeAnnotation::spell(node.trait_annotation, intern);
+        const span: SourceSpan = if (node.target_type_span.has_location()) { node.target_type_span } else { node.span };
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0302_GENERIC_PARAM_MISMATCH,
+            fmt::format("this impl head names %s, which %s declared nowhere",
+                   listed, if (undeclared.length == 1) { "is" } else { "are" }));
+        diag = diag.at_with_label(span, "a trait impl head declares its parameters in a leading list");
+        diag = diag.with_note(fmt::format("write the parameters: `implement<%s> trait %s for %s<%s>`",
+            head_params, trait_part, target, target_args));
+        this.ctx.emit_diagnostic(diag);
     }
 
     override visit(node: VarDeclNode*) -> void {
@@ -885,9 +969,17 @@ public:
     }
 
     override visit(node: TypeAliasDeclNode*) -> void {
-        // Already forward-declared; nothing more to resolve here.
-        // Target type resolution is deferred to the TypeResolution pass.
+        // Already forward-declared.  The alias's own parameters are in
+        // scope for its target, as a struct's are for its fields; the target
+        // is the alias's definition, so the alias's own name is no
+        // suggestion for a name inside it.
+        this.resolver.enter_scope(ScopeKind::TypeBody,
+            this.resolver.intern_table.resolve(node.alias_name), node.span);
+        this.declare_generics(node.generic_params);
+        this.defining_type = node.alias_name;
         this.stamp_annotation(node.target_annotation);
+        this.defining_type = SymbolStr::empty();
+        this.resolver.exit_scope();
     }
 
     override visit(node: ImportDeclNode*) -> void {
@@ -1119,6 +1211,242 @@ public:
         node.set_res(Res::Err);
     }
 
+    /// The type declarations under the leaf `name` across every module, as
+    /// canonical names - public or private, and never an import, since an
+    /// import binds a name a declaration elsewhere owns.  What decides
+    /// whether a bare leaf nothing binds exists nowhere (E0203), once and
+    /// out of reach (E0240), or twice (E0155), the way
+    /// `module_declarers_of_leaf` answers a function's owners.
+    type_declarers_of_leaf(&this, name: SymbolStr) -> SymbolStr[] {
+        mut out: SymbolStr[] = [];
+        if (this.ctx.module_graph == null) { return out; }
+        const count: i64 = this.ctx.module_graph.module_count() as i64;
+        for (mut m: i64 = 0; m < count; m++) {
+            const info: ModuleInfo* = this.ctx.module_graph.get_module(m);
+            const sid: u64 = this.resolver.find_module_scope(info.name);
+            if (sid == 0) { continue; }
+            const scope: Scope* = this.resolver.get_scope(ScopeID { id: sid });
+            const found: SymbolID = scope.find(name);
+            if (!found.is_valid()) { continue; }
+            const s: Symbol = this.resolver.get_symbol(found);
+            if (s.kind != SymbolKind::Type && s.kind != SymbolKind::TypeAlias) { continue; }
+            out.push(this.resolver.qualified_name_of(&s));
+        }
+        return out;
+    }
+
+    /// The type names the writer can see by a bare spelling: the primitives,
+    /// every type the rib chain binds - declared, or imported and followed
+    /// to a type - and the prelude's.  The did-you-mean pool for a type
+    /// name nothing binds; a name outside it is not a typo of anything the
+    /// writer could have written bare.
+    visible_type_names(&this) -> string[] {
+        mut out: string[] = [
+            "boolean", "char", "string", "void", "va_list",
+            "i8", "i16", "i32", "i64", "i128",
+            "u8", "u16", "u32", "u64", "u128",
+            "isize", "usize",
+            "f32", "f64",
+        ];
+        mut scope_id: ScopeID = this.resolver.current_scope;
+        while (scope_id.is_valid()) {
+            const scope: Scope* = this.resolver.get_scope(scope_id);
+            for (mut i: i64 = 0; i < scope.symbols.length; i++) {
+                const s: Symbol = this.resolver.get_symbol(scope.symbols[i].sym);
+                if (this.symbol_names_type(&s)) {
+                    out.push(this.resolver.intern_table.resolve(s.name));
+                }
+            }
+            scope_id = scope.parent_id;
+        }
+        for (mut p: i64 = 0; p < this.resolver.prelude_modules.length; p++) {
+            const ex: SymbolID[] = this.resolver.get_exports(this.resolver.prelude_modules[p]);
+            for (mut i: i64 = 0; i < ex.length; i++) {
+                const s: Symbol = this.resolver.get_symbol(ex[i]);
+                if (s.kind == SymbolKind::Type || s.kind == SymbolKind::TypeAlias) {
+                    out.push(this.resolver.intern_table.resolve(s.name));
+                }
+            }
+        }
+        return out;
+    }
+
+    /// Byte order over two equal-length paths, so the tie-break between two
+    /// modules that would both reach a declaration is a property of their
+    /// names rather than of the order the graph enumerated them.
+    static path_precedes(a: string, b: string) -> boolean {
+        const n: i64 = a.length() as i64;
+        for (mut i: i64 = 0; i < n; i++) {
+            if (a[i] != b[i]) { return a[i] < b[i]; }
+        }
+        return false;
+    }
+
+    /// The shortest `import` that makes the public declaration in `decl_ns`
+    /// reachable: the declaring module is the floor, and any module whose
+    /// re-export closure reaches it is offered instead when its path is
+    /// shorter.  Ties break on the path itself - shorter first, then byte
+    /// order - never on discovery order: a suggestion that varied with
+    /// directory enumeration would be a binding that varies with it, moved
+    /// somewhere harder to see.
+    reaching_import_for(&this, decl_ns: SymbolStr) -> string {
+        mut best: string = this.resolver.intern_table.resolve(decl_ns);
+        const graph: ModuleGraph* = this.ctx.module_graph;
+        const count: i64 = graph.module_count() as i64;
+        for (mut m: i64 = 0; m < count; m++) {
+            const cand: ModuleInfo* = graph.get_module(m);
+            if (cand.reexports.length == 0) { continue; }
+            if (cand.name.id == decl_ns.id) { continue; }
+            const via: SymbolStr[] = graph.reexport_closure(cand.name);
+            mut reaches: boolean = false;
+            for (mut i: i64 = 0; i < via.length; i++) {
+                if (via[i].id == decl_ns.id) { reaches = true; }
+            }
+            if (!reaches) { continue; }
+            const cand_str: string = this.resolver.intern_table.resolve(cand.name);
+            const cand_len: i64 = cand_str.length() as i64;
+            const best_len: i64 = best.length() as i64;
+            if (cand_len < best_len) { best = cand_str; continue; }
+            if (cand_len == best_len && NameResolver::path_precedes(cand_str, best)) {
+                best = cand_str;
+            }
+        }
+        return best;
+    }
+
+    /// Refuse a written type spelling that no scope binds and no module
+    /// owns, where it is written, with the help a writer needs; true when a
+    /// diagnostic was made, so the caller stamps `Err` and the report is
+    /// made once.  False for a spelling whose span names no file: that is a
+    /// synthesized node, its synthesizer owes the stamp, and a slot it left
+    /// unanswered is a defect for a door to record rather than a name to
+    /// report against a location that does not exist.
+    ///
+    /// A bare leaf is explained from the declarations the program holds
+    /// under it: none - E0203 with a did-you-mean over what the writer can
+    /// see; exactly one, out of the writer's reach - E0240, naming the
+    /// declarer and the import that would reach it, or that no import can;
+    /// two or more - E0155, since a leaf two modules declare identifies no
+    /// type and "cannot find" would be false.  A qualified spelling is
+    /// explained from its prefix: a module two reachable modules spell is
+    /// E0154, a module the writer cannot reach is E0240, a prefix no module
+    /// spells is E0203 by the whole spelling.  The walk that answers a
+    /// spelling reported what it could - a private declaration named by a
+    /// path, a leaf a facade offers twice - before returning here, so those
+    /// never arrive.
+    refuse_unbound_type(&this, name: SymbolStr, span: SourceSpan) -> boolean {
+        const use_ns: SymbolStr = this.ctx.module_ns_sym_of_file(span.file);
+        if (!use_ns.is_valid()) { return false; }
+        const written: string = this.resolver.intern_table.resolve(name);
+        const intern: InternTable* = this.resolver.intern_table;
+
+        if (this.resolver.contains_separator(written)) {
+            const prefix: string = QualifiedName::parent_of(written);
+            const mods: ModuleSpellingMatch = this.ctx.modules_written_as(prefix, use_ns);
+            if (mods.visible > 1) {
+                mut d: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0154_AMBIGUOUS_CALL,
+                    fmt::format("`%s` names more than one module in scope", prefix));
+                d = d.at_with_label(span, "ambiguous module path");
+                d = d.with_note(fmt::format("it could be `%s` or `%s`",
+                    intern.resolve(mods.found), intern.resolve(mods.other)));
+                d = d.with_note("write the path out in full to say which one is meant");
+                this.ctx.emit_diagnostic(d);
+                return true;
+            }
+            if (mods.matched > 0 && mods.visible == 0) {
+                // A module carries the spelling and the writer cannot reach
+                // it: the name exists, so this is E0240's story and not "no
+                // such name", as the scope lane says of the same prefix.
+                const owner: string = intern.resolve(mods.any);
+                mut d: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0240_NAMESPACE_NOT_REACHABLE,
+                    fmt::format("`%s` is not reachable from this module", prefix));
+                d = d.at_with_label(span, "not reachable in this scope");
+                d = d.with_note(fmt::format("`%s` is the module it would name", owner));
+                d = d.with_note(fmt::format("add `import %s;` to bring it into scope", owner));
+                this.ctx.emit_diagnostic(d);
+                return true;
+            }
+            mut d: Diagnostic = Diagnostic::error(
+                ErrorCode::E0203_UNDEFINED_TYPE,
+                fmt::format("cannot find %s `%s` in this scope", this.type_noun, written));
+            d = d.at_with_label(span, "not found in this scope");
+            this.ctx.emit_diagnostic(d);
+            return true;
+        }
+
+        const declarers: SymbolStr[] = this.type_declarers_of_leaf(name);
+        if (declarers.length >= 2) {
+            mut d: Diagnostic = Diagnostic::error(
+                ErrorCode::E0155_AMBIGUOUS_BARE_NAME,
+                fmt::format("`%s` is declared in more than one module, so it names no type on its own",
+                    written));
+            d = d.at_with_label(span, "ambiguous type name");
+            d = d.with_note(fmt::format("`%s` and `%s` both declare it",
+                intern.resolve(declarers[0]), intern.resolve(declarers[1])));
+            d = d.with_note(
+                "write the qualifier, or import the module you mean; a bare name resolves in scope and nothing here binds it");
+            this.ctx.emit_diagnostic(d);
+            return true;
+        }
+        if (declarers.length == 1) {
+            // THE GATE: a name that EXISTS but that the writing module cannot
+            // reach is a different condition from one that exists nowhere,
+            // and only this one has a fix to name.  Reachable and public
+            // means the module is imported but the leaf is not bound bare,
+            // which is the not-found below.
+            const decl: SymbolStr = declarers[0];
+            const decl_str: string = intern.resolve(decl);
+            const owner: string = QualifiedName::parent_of(decl_str);
+            const owner_ns: SymbolStr = intern.intern(owner);
+            const reach: boolean = owner_ns.id == use_ns.id
+                || this.ctx.decl_index.is_prelude_ns(owner_ns)
+                || this.ctx.decl_index.ns_imports(use_ns, owner_ns);
+            const is_public: boolean = this.resolver.lookup_in_module(owner_ns, name).is_valid();
+            if (!reach || !is_public) {
+                mut d: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0240_NAMESPACE_NOT_REACHABLE,
+                    fmt::format("`%s` is not reachable from this module", written));
+                d = d.at_with_label(span, "not reachable in this scope");
+                // Provenance and fix answer different questions, so both are
+                // kept: the first names who declares it, the second what to
+                // write - an aggregate that re-exports the declarer is a
+                // shorter, equally correct import.
+                d = d.with_note(fmt::format("`%s` is declared in `%s`", written, owner));
+                if (is_public) {
+                    d = d.with_note(fmt::format("add `import %s;` to bring it into scope",
+                        this.reaching_import_for(owner_ns)));
+                } else {
+                    // A private declaration is outside its module's export
+                    // set, so no import reaches it and no re-export widens it.
+                    d = d.with_note(fmt::format(
+                        "`%s` is `private`, so no import makes it reachable", written));
+                }
+                this.ctx.emit_diagnostic(d);
+                return true;
+            }
+        }
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0203_UNDEFINED_TYPE,
+            fmt::format("cannot find %s `%s` in this scope", this.type_noun, written));
+        d = d.at_with_label(span, "not found in this scope");
+        // The name a type alias is DEFINING cannot be the fix for a name
+        // inside its own definition: accepting it yields `type Foo = Foo;`,
+        // and the suggestion is machine-applicable.  Dropped from the
+        // candidates, so a genuine second-best name is still offered.
+        mut cands: string[] = [];
+        const visible: string[] = this.visible_type_names();
+        for (mut i: i64 = 0; i < visible.length; i++) {
+            if (this.defining_type.is_valid()
+                    && visible[i].eq(intern.resolve(this.defining_type))) { continue; }
+            cands.push(visible[i]);
+        }
+        d = d.did_you_mean(written, cands, this.type_noun, span);
+        this.ctx.emit_diagnostic(d);
+        return true;
+    }
+
     override visit(node: IdentifierNode*) -> void {
         mut sym_id: SymbolID = this.resolver.lookup(
             node.name, this.resolver.current_scope);
@@ -1211,30 +1539,35 @@ public:
         // TypeResolution (needs type info to find the TypeBody scope).
     }
 
-    /// The type named by a scope segment that is itself a module-rooted path,
-    /// or an invalid id when the segment is not one.
+    /// The declaration named by a module-rooted path - a scope segment
+    /// (`libc::Whence` in `libc::Whence::SEEK_END`) or a written type
+    /// spelling - as an answer: the definition it names, `Err` when the
+    /// path names something the writer may not have and the refusal was
+    /// reported here, and `Pending` when no visible module owns the prefix
+    /// or the module offers nothing under the leaf, which the caller
+    /// explains from its own position.
     ///
-    /// `libc::Whence` sits in the scope position of `libc::Whence::SEEK_END`:
-    /// its head names a module, and its last segment names a type in that
-    /// module's export set.  Resolving it in that order is the language's rule
-    /// for paths, and the result is a declaration this pass can name - so
-    /// recording the segment as type-owned WITHOUT walking it would hand the
-    /// type layer a base the name layer was supposed to supply.
+    /// Its head names a module, and its last segment names a declaration in
+    /// that module's export set.  Resolving it in that order is the
+    /// language's rule for paths, and the result is a declaration this pass
+    /// can name - so recording a segment as type-owned WITHOUT walking it
+    /// would hand the type layer a base the name layer was supposed to
+    /// supply.
     ///
     /// This is not a second attempt at the scope lookup.  A segment either
     /// binds in the writer's scope or spells a module path, never both, and
     /// which of the two it is has already been decided when this runs.
     walk_module_rooted_type(&this, written: string,
-                            use_ns: SymbolStr, span: SourceSpan) -> SymbolID {
+                            use_ns: SymbolStr, span: SourceSpan) -> ResSlot {
         const prefix: string = QualifiedName::parent_of(written);
-        if (prefix.length() == 0) { return SymbolID::invalid(); }
+        if (prefix.length() == 0) { return ResSlot::Pending; }
         const leaf: string = QualifiedName::leaf_of(written);
-        if (leaf.length() == 0) { return SymbolID::invalid(); }
+        if (leaf.length() == 0) { return ResSlot::Pending; }
 
         // A spelling two reachable modules share names neither of them, so the
         // walk stops rather than picking one.
         const head: ModuleSpellingMatch = this.ctx.modules_written_as(prefix, use_ns);
-        if (head.visible != 1) { return SymbolID::invalid(); }
+        if (head.visible != 1) { return ResSlot::Pending; }
 
         // The segment after the head resolves inside what the head named - the
         // module's OFFERED set, which is its own exports plus what its `export`
@@ -1245,11 +1578,32 @@ public:
         // has many valid spellings and `Aggregate::Widget` is one of them, even
         // though `Inner` declared it.  It is NOT a weaker alias - the same
         // refusal applies as anywhere else, so a name two of the facade's
-        // children declare is ambiguous here and resolves to neither.
-        mut offered: i64 = 0;
+        // children declare is ambiguous here and resolves to neither: saying
+        // "cannot find" of it would be false, it is found twice.
         const leaf_sym: SymbolStr = this.resolver.intern_table.intern(leaf);
-        const hit: SymbolID = this.module_offering(head.found, leaf_sym, &offered);
-        if (offered == 1) { return hit; }
+        const offered: SymbolID[] = this.module_offerings(head.found, leaf_sym);
+        if (offered.length == 1) {
+            const hs: Symbol = this.resolver.get_symbol(offered[0]);
+            return ResSlot::Answered(Res::Def(DefId::of_definition(
+                this.resolver.qualified_name_of(&hs))));
+        }
+        if (offered.length > 1) {
+            const a: Symbol = this.resolver.get_symbol(offered[0]);
+            const b: Symbol = this.resolver.get_symbol(offered[1]);
+            mut d: Diagnostic = Diagnostic::error(
+                ErrorCode::E0155_AMBIGUOUS_BARE_NAME,
+                fmt::format("`%s` is offered by `%s` from more than one module, so it names nothing",
+                    leaf, prefix));
+            d = d.at_with_label(span, "ambiguous through this path");
+            d = d.with_note(fmt::format("`%s` and `%s` both declare it, and `%s` re-exports both",
+                this.resolver.intern_table.resolve(this.resolver.qualified_name_of(&a)),
+                this.resolver.intern_table.resolve(this.resolver.qualified_name_of(&b)),
+                prefix));
+            d = d.with_note(
+                "name the declaring module instead; a re-export offers what its children offer, and two of them offer this");
+            this.ctx.emit_diagnostic(d);
+            return ResSlot::Answered(Res::Err);
+        }
         // Offered by nothing, and declared by the head as `private`: the path
         // names a declaration the writer may not see.  Visibility is checked
         // where the candidate is proposed, and this walk is where a spelled-out
@@ -1257,29 +1611,26 @@ public:
         // as a name that appears not to exist - or, worse, re-derived by a
         // later stage from the spelling, which is registered under exactly
         // this name and would answer it.
-        if (offered == 0) {
-            const hidden: SymbolID = this.resolver.private_declaration(head.found, leaf_sym);
-            if (hidden.is_valid()) {
-                const hs: Symbol = this.resolver.get_symbol(hidden);
-                const owner: string = this.resolver.intern_table.resolve(head.found);
-                if (hs.kind == SymbolKind::Type || hs.kind == SymbolKind::TypeAlias) {
-                    mut d: Diagnostic = Diagnostic::error(
-                        ErrorCode::E0503_PRIVATE_SYMBOL_ACCESS,
-                        fmt::format("type `%s` is private to module `%s`", leaf, owner));
-                    d = d.at_with_label(span,
-                        fmt::format("`%s` cannot be named outside its module `%s`", leaf, owner));
-                    this.ctx.emit_diagnostic(d);
-                } else {
-                    mut d: Diagnostic = Diagnostic::error(
-                        ErrorCode::E0353_PRIVATE_ACCESS,
-                        fmt::format("`%s::%s` is private and cannot be named from `%s`",
-                            owner, leaf, this.resolver.intern_table.resolve(use_ns)));
-                    d = d.at_with_label(span, "private declaration named by this path");
-                    this.ctx.emit_diagnostic(d);
-                }
-            }
+        const hidden: SymbolID = this.resolver.private_declaration(head.found, leaf_sym);
+        if (!hidden.is_valid()) { return ResSlot::Pending; }
+        const hs: Symbol = this.resolver.get_symbol(hidden);
+        const owner: string = this.resolver.intern_table.resolve(head.found);
+        if (hs.kind == SymbolKind::Type || hs.kind == SymbolKind::TypeAlias) {
+            mut d: Diagnostic = Diagnostic::error(
+                ErrorCode::E0503_PRIVATE_SYMBOL_ACCESS,
+                fmt::format("type `%s` is private to module `%s`", leaf, owner));
+            d = d.at_with_label(span,
+                fmt::format("`%s` cannot be named outside its module `%s`", leaf, owner));
+            this.ctx.emit_diagnostic(d);
+        } else {
+            mut d: Diagnostic = Diagnostic::error(
+                ErrorCode::E0353_PRIVATE_ACCESS,
+                fmt::format("`%s::%s` is private and cannot be named from `%s`",
+                    owner, leaf, this.resolver.intern_table.resolve(use_ns)));
+            d = d.at_with_label(span, "private declaration named by this path");
+            this.ctx.emit_diagnostic(d);
         }
-        return SymbolID::invalid();
+        return ResSlot::Answered(Res::Err);
     }
 
     /// Record which MODULE the scope segment of `Ns::member` names, as the file
@@ -1359,11 +1710,18 @@ public:
             base = ResBase::PrimTy(node.scope_name);
             have_base = true;
         } else {
-            const rooted: SymbolID = this.walk_module_rooted_type(written, use_ns, node.scope_span);
-            if (rooted.is_valid()) {
-                const rs: Symbol = this.resolver.get_symbol(rooted);
-                base = ResBase::Def(DefId::of_definition(this.resolver.qualified_name_of(&rs)));
-                have_base = true;
+            match (this.walk_module_rooted_type(written, use_ns, node.scope_span)) {
+                ResSlot::Answered(Res::Def(d)) => {
+                    base = ResBase::Def(d);
+                    have_base = true;
+                }
+                // The path names a declaration the writer may not have, and
+                // the walk reported it; nothing rooted in it is answered.
+                ResSlot::Answered(_) => {
+                    node.set_scope_res(Res::Err);
+                    return;
+                }
+                _ => { }
             }
         }
 
@@ -1743,14 +2101,9 @@ public:
                     // answer straight past a module that is ambiguous or that
                     // the writer cannot reach - recording a name the source may
                     // not legally spell as though it were fine.
-                    const q_rooted: SymbolID =
+                    const q_rooted: ResSlot =
                         this.walk_module_rooted_type(written, q_ns, span);
-                    if (q_rooted.is_valid()) {
-                        const q_sym: Symbol = this.resolver.get_symbol(q_rooted);
-                        const q_def: SymbolStr =
-                            this.resolver.qualified_name_of(&q_sym);
-                        return ResSlot::Answered(Res::Def(DefId::of_definition(q_def)));
-                    }
+                    if (!q_rooted.is_pending()) { return q_rooted; }
                 } else {
                     // No module in the program spells the prefix, so the head
                     // is not a module path at all.  A C-import namespace alias
@@ -1860,9 +2213,19 @@ public:
     /// answered by `type_spelling_res` so the two cannot come to disagree
     /// about what a spelling names.
     stamp_named_annotation(&this, n: NamedAnnotation*) -> void {
+        // A synthesizer that knows its referent answers the slot at birth
+        // (bindgen's C-import types), and its answer stands: the walk is not
+        // asked to second-guess it, and a spelling it could not place is not
+        // refused over a stamp that placed it.
+        match (n.res) {
+            ResSlot::Answered(_) => { return; }
+            _                    => { }
+        }
         match (this.type_spelling_res(n.name, n.span)) {
             ResSlot::Answered(r) => { n.res.answer(r); }
-            _                    => { }
+            _                    => {
+                if (this.refuse_unbound_type(n.name, n.span)) { n.res.answer(Res::Err); }
+            }
         }
     }
 
@@ -2053,7 +2416,11 @@ public:
         // leaf binds here, which is not the same thing.
         match (this.type_spelling_res(node.struct_type, node.span)) {
             ResSlot::Answered(r) => { node.set_res(r); }
-            _                    => { }
+            _                    => {
+                if (this.refuse_unbound_type(node.struct_type, node.span)) {
+                    node.set_res(Res::Err);
+                }
+            }
         }
         this.stamp_annotation_list(&node.generic_args);
 
@@ -2427,33 +2794,43 @@ public:
     /// because those call for different diagnostics and a bare invalid cannot
     /// tell them apart.
     module_offering(&this, m: SymbolStr, name: SymbolStr, hits: i64*) -> SymbolID {
-        *hits = 0;
+        const all: SymbolID[] = this.module_offerings(m, name);
+        *hits = all.length;
+        if (all.length == 0) { return SymbolID::invalid(); }
+        return all[0];
+    }
+
+    /// Every distinct declaration `m` offers under `name`: its own, or else
+    /// each one its re-export closure reaches, a declaration reached by two
+    /// routes counted once.  The plural form of `module_offering`, for the
+    /// refusal that names the two a facade offers.
+    module_offerings(&this, m: SymbolStr, name: SymbolStr) -> SymbolID[] {
+        mut out: SymbolID[] = [];
         // A module that DECLARES the name offers that one.  A re-export cannot
         // displace a declaration, so this is not a first-of-several choice.
         const own: SymbolID = this.resolver.lookup_in_module(m, name);
         if (own.is_valid()) {
-            *hits = 1;
-            return own;
+            out.push(own);
+            return out;
         }
         const via: SymbolStr[] = this.ctx.module_graph.reexport_closure(m);
-        mut found: SymbolID = SymbolID::invalid();
-        mut seen: SymbolStr = SymbolStr::empty();
+        mut seen: SymbolStr[] = [];
         for (mut i: i64 = 0; i < via.length; i++) {
             const cand: SymbolID = this.resolver.lookup_in_module(via[i], name);
             if (!cand.is_valid()) { continue; }
             const cs: Symbol = this.resolver.get_symbol(cand);
             const q: SymbolStr = this.resolver.qualified_name_of(&cs);
-            if (seen.is_valid()) {
-                // Same declaration reached by a second route is one item, not
-                // two candidates.
-                if (!q.equals(seen)) { *hits = *hits + 1; }
-                continue;
+            mut dup: boolean = false;
+            for (mut k: i64 = 0; k < seen.length; k++) {
+                if (seen[k].equals(q)) { dup = true; }
             }
-            seen = q;
-            found = cand;
-            *hits = 1;
+            // Same declaration reached by a second route is one item, not
+            // two candidates.
+            if (dup) { continue; }
+            seen.push(q);
+            out.push(cand);
         }
-        return found;
+        return out;
     }
 
     /// Binds what an `import` - or an `export` - names into the current scope.

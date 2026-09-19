@@ -294,293 +294,6 @@ type struct TypeResolutionRunner {
     }
 
 
-    // Did-you-mean helpers for E0203
-    //
-    // The TypeResolver returns `TypeRef::invalid()` when a Named annotation
-    // can't be resolved but doesn't itself emit the diagnostic; the caller
-    // does, with only the surrounding declaration's name in hand.  These
-    // helpers (a) extract the most-likely-typo'd Named leaf out of a
-    // possibly-wrapped TypeAnnotation tree, (b) enumerate bare type names
-    // for the candidate pool, and (c) attach a `did you mean ...?` help +
-    // suggestion to the diagnostic when a near-match exists.
-
-    /// Walk a type annotation looking for the first NamedAnnotation node
-    /// - the leaf the user most likely typo'd.  Returns null when the
-    /// annotation has no Named subtree (e.g. a pure tuple of primitives).
-    /// Pre-resolved Named leaves are skipped: the resolver already mapped
-    /// them to a concrete TypeRef during substitution, so they aren't the
-    /// failure point.
-    /// Peel through one wrapper layer to find the inner annotation a
-    /// Named name lives on.  Returns the same pointer when `ann` is
-    /// already a Named or a kind we don't peel through (Tuple,
-    /// Function, ThisType).
-    peel_annotation(&this, ann: TypeAnnotation*) -> TypeAnnotation* {
-        if (ann == null) { return null; }
-        match (ann) {
-            TypeAnnotation::Pointer(p)   => { return p.inner; }
-            TypeAnnotation::Reference(r) => { return r.inner; }
-            TypeAnnotation::Array(a)     => { return a.element; }
-            TypeAnnotation::Generic(g)   => { return g.base; }
-            _                            => { return ann; }
-        }
-    }
-
-    /// The one type declaration carrying the leaf `name` that `site_ns` - the
-    /// module that wrote it - cannot reach, or an invalid symbol: none
-    /// declares it (E0203's case), two do (E0155's), it is the writer's own,
-    /// imported or preluded and public.  Asked of the arena's leaf index,
-    /// the pool the did-you-mean and the plurality diagnostics already read;
-    /// a name the name layer declined is not resolved here, only explained.
-    unreachable_declarer(&this, name: SymbolStr, site_ns: SymbolStr,
-                         intern: InternTable*) -> SymbolStr {
-        const cand: SymbolStr = this.arena.sole_declarer(name);
-        if (!cand.is_valid()) { return SymbolStr::empty(); }
-        const cand_ns: SymbolStr = this.ctx.decl_index.namespace_of(cand, intern);
-        if (cand_ns.id == site_ns.id) { return SymbolStr::empty(); }
-        const reach: boolean = this.ctx.decl_index.is_prelude_ns(cand_ns)
-            || this.ctx.decl_index.ns_imports(site_ns, cand_ns);
-        if (reach && this.ctx.decl_index.is_candidate_public(cand)) {
-            return SymbolStr::empty();
-        }
-        return cand;
-    }
-
-    /// The name written anywhere in `ann` that the reachability gate rejects,
-    /// or null when none is.  Searches the WHOLE annotation tree, generic
-    /// ARGUMENTS included: `Result<(), TestError>` fails because `TestError` is
-    /// unreachable, and a search that stopped at the head would name `Result`,
-    /// which resolves fine - so the gate's verdict would be discarded and the
-    /// failure reported against the wrong type.  Each name is judged at the
-    /// module its OWN span names, never the ambient cursor.
-    find_unreachable_named(&this, ann: TypeAnnotation*, intern: InternTable*,
-                           depth: i32) -> NamedAnnotation* {
-        if (ann == null || depth >= 8) { return null; }
-        if (this.ctx.decl_index == null) { return null; }
-        match (ann) {
-            TypeAnnotation::Named(n) => {
-                if (n.pre_resolved.is_valid()) { return null; }
-                const site_ns: SymbolStr =
-                    this.ctx.module_ns_sym_of_file(n.span.file);
-                if (!site_ns.is_valid()) { return null; }
-                if (this.unreachable_declarer(n.name, site_ns, intern).is_valid()) {
-                    return n;
-                }
-                return null;
-            }
-            TypeAnnotation::Generic(g) => {
-                const head: NamedAnnotation* =
-                    this.find_unreachable_named(g.base, intern, depth + 1);
-                if (head != null) { return head; }
-                for (mut i: i64 = 0; i < g.args.length; i++) {
-                    const hit: NamedAnnotation* =
-                        this.find_unreachable_named(g.args[i], intern, depth + 1);
-                    if (hit != null) { return hit; }
-                }
-                return null;
-            }
-            _ => { }
-        }
-        const next: TypeAnnotation* = this.peel_annotation(ann);
-        if (next == ann) { return null; }
-        return this.find_unreachable_named(next, intern, depth + 1);
-    }
-
-    /// Whether a failed annotation is certainly a source error, so a
-    /// diagnostic is owed rather than the invalid type being dropped: a name
-    /// in it the name layer could not place, wherever it sits, or one the
-    /// reachability gate rejected.  The forms this must NOT fire on are the
-    /// deferred ones - `typeof(...)`, `implement Trait`, a projection reduced
-    /// later - and every name in those is placed or is no name at all.
-    annotation_failure_is_certain(&this, ann: TypeAnnotation*) -> boolean {
-        if (this.extract_unresolved_named(ann) != null) { return true; }
-        return this.find_unreachable_named(
-            ann, this.ctx.get_intern_table(), 0) != null;
-    }
-
-    /// The first written name in `ann` the name layer could not place: a
-    /// `Named` leaf with no stamp and no pre-resolved type, anywhere in the
-    /// tree - pointers, references, arrays, tuples, function shapes and
-    /// generic ARGUMENTS included, since `Tagged<bool>`'s failure is
-    /// `bool`'s and a walk that stopped at the head would blame `Tagged`,
-    /// which resolves.  Null when every name is placed: the failure is
-    /// then a deferred form, not an unknown name.  A name already reported
-    /// carries `Res::Err` and is placed for this purpose, so one leaf is
-    /// reported once whichever pass asks.
-    extract_unresolved_named(&this, ann: TypeAnnotation*) -> NamedAnnotation* {
-        if (ann == null) { return null; }
-        match (ann) {
-            TypeAnnotation::Named(n) => {
-                if (n.pre_resolved.is_valid()) { return null; }
-                return match (n.res) {
-                    ResSlot::Answered(_) => { null }
-                    _                    => { n }
-                };
-            }
-            TypeAnnotation::Pointer(p)   => { return this.extract_unresolved_named(p.inner); }
-            TypeAnnotation::Reference(r) => { return this.extract_unresolved_named(r.inner); }
-            TypeAnnotation::Array(a)     => { return this.extract_unresolved_named(a.element); }
-            TypeAnnotation::Tuple(t) => {
-                for (mut i: i64 = 0; i < t.elements.length; i++) {
-                    const hit: NamedAnnotation* = this.extract_unresolved_named(t.elements[i]);
-                    if (hit != null) { return hit; }
-                }
-                return null;
-            }
-            TypeAnnotation::Function(f) => {
-                for (mut i: i64 = 0; i < f.parameters.length; i++) {
-                    const hit: NamedAnnotation* = this.extract_unresolved_named(f.parameters[i]);
-                    if (hit != null) { return hit; }
-                }
-                return this.extract_unresolved_named(f.return_type);
-            }
-            TypeAnnotation::Generic(g) => {
-                const base_hit: NamedAnnotation* = this.extract_unresolved_named(g.base);
-                if (base_hit != null) { return base_hit; }
-                for (mut i: i64 = 0; i < g.args.length; i++) {
-                    const hit: NamedAnnotation* = this.extract_unresolved_named(g.args[i]);
-                    if (hit != null) { return hit; }
-                }
-                return null;
-            }
-            _ => { return null; }
-        }
-    }
-
-    /// Whether a written name anywhere in `ann` was refused by the name
-    /// layer (`Err`): reported once, where it was written, so an annotation
-    /// that fails to resolve because of it is not reported again.
-    annotation_refused(&this, ann: TypeAnnotation*) -> boolean {
-        if (ann == null) { return false; }
-        match (ann) {
-            TypeAnnotation::Named(n) => {
-                return match (n.res) {
-                    ResSlot::Answered(Res::Err) => { true }
-                    _                           => { false }
-                };
-            }
-            TypeAnnotation::Pointer(p)   => { return this.annotation_refused(p.inner); }
-            TypeAnnotation::Reference(r) => { return this.annotation_refused(r.inner); }
-            TypeAnnotation::Array(a)     => { return this.annotation_refused(a.element); }
-            TypeAnnotation::Tuple(t) => {
-                for (mut i: i64 = 0; i < t.elements.length; i++) {
-                    if (this.annotation_refused(t.elements[i])) { return true; }
-                }
-                return false;
-            }
-            TypeAnnotation::Function(f) => {
-                for (mut i: i64 = 0; i < f.parameters.length; i++) {
-                    if (this.annotation_refused(f.parameters[i])) { return true; }
-                }
-                return this.annotation_refused(f.return_type);
-            }
-            TypeAnnotation::Generic(g) => {
-                if (this.annotation_refused(g.base)) { return true; }
-                for (mut i: i64 = 0; i < g.args.length; i++) {
-                    if (this.annotation_refused(g.args[i])) { return true; }
-                }
-                return false;
-            }
-            _ => { return false; }
-        }
-    }
-
-    /// Every bare type leaf name in the type arena's leaf index.  The
-    /// candidate pool for the did-you-mean suggestion on undefined types.
-    ///
-    /// The arena's `leaf_index` is the pool, not the declaration index: an
-    /// E0203 from alias resolution or a field type fires before this pass
-    /// has registered the program's types, while the arena already holds
-    /// every user-declared type from the registration pass before it.
-    collect_bare_type_names(&this) -> string[] {
-        // Seed with the primitive type names: they aren't in the arena leaf
-        // index, so without this a typo like `bool` couldn't suggest
-        // `boolean` (the actual spelling), nor `int`->`i32` etc.
-        mut out: string[] = [
-            "boolean", "char", "string", "void", "va_list",
-            "i8", "i16", "i32", "i64", "i128",
-            "u8", "u16", "u32", "u64", "u128",
-            "isize", "usize",
-            "f32", "f64",
-        ];
-        const intern: InternTable* = this.ctx.get_intern_table();
-        mut it: implement Iterator<Pair<u32, u32>> = this.arena.leaf_index.iter();
-        loop {
-            match (it.next()) {
-                Option::Some(pair) => {
-                    const name: string = intern.resolve(SymbolStr::from_id(pair.first));
-                    if (name != "" && !name.contains("::")) {
-                        out.push(name);
-                    }
-                }
-                Option::None => { break; }
-            }
-        }
-        return out;
-    }
-
-    /// The shortest `import` that would actually make `qualified` reachable,
-    /// or `""` when none would.
-    ///
-    /// Importing the declaring module always works for a public declaration,
-    /// so that is the floor; any module whose re-export closure reaches the
-    /// declarer works too, and is worth suggesting when it is shorter to
-    /// write.  A private declaration is reachable through nothing, and the
-    /// empty string says so rather than naming an import that would not help.
-    ///
-    /// Ties break on the path itself - shorter first, then byte order - never
-    /// on the order modules were discovered.  A suggestion that varied with
-    /// directory enumeration would be the same defect as a BINDING that varies
-    /// with it, moved somewhere harder to see.
-    suggest_reaching_import(&this, qualified: SymbolStr, decl_ns: SymbolStr) -> string {
-        const intern: InternTable* = this.ctx.get_intern_table();
-        if (!this.ctx.decl_index.is_candidate_public(qualified)) { return ""; }
-
-        mut best: string = intern.resolve(decl_ns);
-        const graph: ModuleGraph* = this.ctx.module_graph;
-        for (mut mi: u32 = 0; mi < graph.modules.length; mi++) {
-            const cand: ModuleInfo* = &graph.modules[mi];
-            if (cand.reexports.length == 0) { continue; }
-            if (cand.name.id == decl_ns.id) { continue; }
-
-            // Transitive re-export closure of this candidate.  `seen` is both
-            // the worklist and the visited set, so mutual re-export terminates.
-            mut seen: SymbolStr[] = [];
-            for (mut ri: i64 = 0; ri < cand.reexports.length; ri++) {
-                seen.push(cand.reexports[ri]);
-            }
-            mut wi: i64 = 0;
-            mut reaches: boolean = false;
-            while (wi < seen.length) {
-                const via: SymbolStr = seen[wi];
-                wi = wi + 1;
-                if (via.id == decl_ns.id) { reaches = true; break; }
-                for (mut gj: u32 = 0; gj < graph.modules.length; gj++) {
-                    const src: ModuleInfo* = &graph.modules[gj];
-                    if (src.name.id != via.id) { continue; }
-                    for (mut sj: i64 = 0; sj < src.reexports.length; sj++) {
-                        const nxt: SymbolStr = src.reexports[sj];
-                        mut dup: boolean = false;
-                        for (mut qj: i64 = 0; qj < seen.length; qj++) {
-                            if (seen[qj].id == nxt.id) { dup = true; }
-                        }
-                        if (!dup) { seen.push(nxt); }
-                    }
-                }
-            }
-            if (!reaches) { continue; }
-
-            const cand_str: string = intern.resolve(cand.name);
-            const cand_len: i64 = cand_str.length() as i64;
-            const best_len: i64 = best.length() as i64;
-            if (cand_len < best_len) { best = cand_str; continue; }
-            if (cand_len == best_len
-                && TypeResolutionRunner::path_precedes(cand_str, best)) {
-                best = cand_str;
-            }
-        }
-        return best;
-    }
-
     /// Record, on the registration `(key, ns)`, the linker symbol an IMPORTED
     /// global binds - its `![symbol("...")]` override when it has one, else
     /// its declared name.  A no-op for a global Cryo defines, which is mangled
@@ -597,243 +310,20 @@ type struct TypeResolutionRunner {
         ctx.decl_index.record_global_extern_symbol(key, ns, sym);
     }
 
-    /// Byte order over two equal-length paths, so the tie-break between two
-    /// aggregates that would both work is a property of their names rather
-    /// than of the order the graph enumerated them.
-    static path_precedes(a: string, b: string) -> boolean {
-        const n: i64 = a.length() as i64;
-        for (mut i: i64 = 0; i < n; i++) {
-            if (a[i] != b[i]) { return a[i] < b[i]; }
-        }
-        return false;
-    }
-
-    /// Build the rich E0203 diagnostic for an unresolved type referenced
-    /// in `ann` from the declaration named `decl_name` (e.g. a function,
-    /// parameter, or field name used only in the headline).  If the
-    /// annotation has a Named leaf we point the caret at it and attach a
-    /// did-you-mean suggestion; otherwise fall back to the bare error
-    /// stamped at the declaration's span.
-    ///
-    /// `defines` is the name this declaration BINDS, and only when `ann` is the
-    /// definition of that name - a type alias's target.  It is barred from the
-    /// suggestions, because rewriting the annotation to it makes the declaration
-    /// its own meaning.  An annotation that merely USES a type (a parameter,
-    /// field, or variable) passes "": there the surrounding declaration's name
-    /// is an ordinary candidate, and a field named like a type is a real
-    /// coincidence rather than a self-reference.
+    /// Report an annotation the type layer could not resolve, at a
+    /// declaration site (`kind_label` and `decl_name` name it in the
+    /// headline).  A name in it the name layer refused was reported where it
+    /// was written and the annotation's failure is that refusal's
+    /// consequence, so it is not reported again; what remains is an
+    /// annotation whose every written name is placed and that still names
+    /// no type, reported at the declaration's span.
     emit_undefined_type(&this, ann: TypeAnnotation*,
-                        kind_label: string, noun: string, decl_name: string,
-                        fallback_span: SourceSpan, defines: string) -> void {
-        const intern: InternTable* = this.ctx.get_intern_table();
-
-        // A name the name layer refused is `Err`: its report was made where
-        // it was written, and the annotation failing to resolve is that
-        // refusal's consequence, not a second finding.
-        if (this.annotation_refused(ann)) { return; }
-
-        // THE GATE (spec §3.3).  A name that EXISTS but that the writing module
-        // cannot reach is a different condition from one that exists nowhere,
-        // and only this one has a fix to name.  It is judged at the module the
-        // SPAN names, never the ambient cursor, for the reason the visibility
-        // gate was reverted once: the cursor points at whatever is being
-        // processed, not at whoever wrote the annotation.
-        //
-        // It is decided here rather than where the lookup failed because a
-        // failure must produce ONE diagnostic, and this is the site holding the
-        // span.  Emitting at the lookup would report the name twice - once
-        // without a caret, then again as a spurious "did you mean".
-        //
-        // Asked over the whole annotation tree, and BEFORE the head is required
-        // to be unresolved: the rejected name can be a generic argument under a
-        // head that resolves perfectly well, and then neither the head's own
-        // lookup nor `extract_unresolved_named` can see it.
-        const gated: NamedAnnotation* =
-            this.find_unreachable_named(ann, intern, 0);
-        if (gated != null) {
-            const gated_name: string = intern.resolve(gated.name);
-            const gated_ns: SymbolStr =
-                this.ctx.module_ns_sym_of_file(gated.span.file);
-            const unreachable: SymbolStr =
-                this.unreachable_declarer(gated.name, gated_ns, intern);
-            if (unreachable.is_valid()) {
-                const owner_ns: SymbolStr =
-                    this.ctx.decl_index.namespace_of(unreachable, intern);
-                const owner: string = intern.resolve(owner_ns);
-                mut gdiag: Diagnostic = Diagnostic::error(
-                    ErrorCode::E0240_NAMESPACE_NOT_REACHABLE,
-                    fmt::format("`%s` is not reachable from this module",
-                           gated_name));
-                gdiag = gdiag.at_with_label(gated.span,
-                                            "not reachable in this scope");
-                // Provenance and fix answer different questions, so both are
-                // kept: the first names who declares it, the second what to
-                // write.  They are not always the same module - an aggregate
-                // that re-exports the declarer is a shorter, equally correct
-                // import, and naming the declarer there sends the author one
-                // level deeper than they need to go.
-                gdiag = gdiag.with_note(
-                    fmt::format("`%s` is declared in `%s`", gated_name, owner));
-                const fix: string = this.suggest_reaching_import(unreachable, owner_ns);
-                if (fix.length() > 0) {
-                    gdiag = gdiag.with_note(
-                        fmt::format("add `import %s;` to bring it into scope", fix));
-                } else {
-                    // Suggesting an import here would be false: a private
-                    // declaration is outside its module's export set, so no
-                    // import reaches it and no re-export can widen it.
-                    gdiag = gdiag.with_note(fmt::format(
-                        "`%s` is `private`, so no import makes it reachable",
-                        gated_name));
-                }
-                this.ctx.emit_diagnostic(gdiag);
-                gated.res.answer(Res::Err);
-                return;
-            }
-        }
-
-        const named: NamedAnnotation* = this.extract_unresolved_named(ann);
-        if (named == null) {
-            this.ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
-                fmt::format("cannot resolve %s for `%s`", kind_label, decl_name),
-                fallback_span);
-            return;
-        }
-        const ty_name: string = intern.resolve(named.name);
-
-        // A leaf two modules declare does not identify a type, and saying it
-        // cannot be found would be false - it is found twice.  Asked before
-        // the not-found diagnostic because the two describe different defects
-        // and only one of them is true here.
-        const declarers: SymbolStr[] = this.arena.leaf_declarers(named.name);
-        if (declarers.length == 2) {
-            const first_str: string = intern.resolve(declarers[0]);
-            const second_str: string = intern.resolve(declarers[1]);
-            mut amb: Diagnostic = Diagnostic::error(
-                ErrorCode::E0155_AMBIGUOUS_BARE_NAME,
-                fmt::format("`%s` is declared in more than one module, so it names no type on its own",
-                       ty_name));
-            amb = amb.at_with_label(named.span, "ambiguous type name");
-            amb = amb.with_note(fmt::format("`%s` and `%s` both declare it",
-                                       first_str, second_str));
-            amb = amb.with_note(
-                "write the qualifier, or import the module you mean; a bare name resolves in scope and nothing here binds it");
-            this.ctx.emit_diagnostic(amb);
-            named.res.answer(Res::Err);
-            return;
-        }
-
-        // The same defect reached by a QUALIFIED path. A facade offers what its
-        // `export` edges pass on, so two of its children declaring one leaf
-        // makes `Facade::Leaf` name neither - and `walk_module_rooted_type`
-        // refuses it for exactly that reason. Saying "cannot find" would be
-        // false in the same way the bare case above is: it is found twice.
-        //
-        // Asked from the declarers already indexed by leaf, narrowed to the
-        // ones the written prefix can reach. The closure is the graph's own, so
-        // this cannot drift from what the resolver counted when it refused.
-        if (ty_name.contains("::")) {
-            const q_leaf: string = QualifiedName::leaf_of(ty_name);
-            const q_prefix: string = QualifiedName::parent_of(ty_name);
-            const graph: ModuleGraph* = this.ctx.module_graph;
-            // A PREFIX two reachable modules spell names neither of them, so
-            // the resolver declined to root the path - the same refusal a
-            // scope segment gets, reported the same way.  `import std::future;`
-            // offers `traits` through a re-export and `import std::io::traits;`
-            // offers it directly, and `traits::Transfer` is then not "not
-            // found": it is found twice.  Asked of the module that WROTE the
-            // annotation, through the one predicate the resolver used.
-            const q_ns: SymbolStr = this.ctx.module_ns_sym_of_file(named.span.file);
-            if (q_ns.is_valid()) {
-                const heads: ModuleSpellingMatch =
-                    this.ctx.modules_written_as(q_prefix, q_ns);
-                if (heads.visible > 1) {
-                    mut hamb: Diagnostic = Diagnostic::error(
-                        ErrorCode::E0154_AMBIGUOUS_CALL,
-                        fmt::format("`%s` names more than one module in scope", q_prefix));
-                    hamb = hamb.at_with_label(named.span, "ambiguous module path");
-                    hamb = hamb.with_note(fmt::format("it could be `%s` or `%s`",
-                                                intern.resolve(heads.found),
-                                                intern.resolve(heads.other)));
-                    hamb = hamb.with_note(
-                        "write the path out in full to say which one is meant");
-                    this.ctx.emit_diagnostic(hamb);
-                    named.res.answer(Res::Err);
-                    return;
-                }
-            }
-            mut facade: SymbolStr = SymbolStr::empty();
-            mut facades: i64 = 0;
-            for (mut mi: u32 = 0; mi < graph.modules.length; mi++) {
-                const cand: ModuleInfo* = &graph.modules[mi];
-                if (Resolver::ns_written_as(intern.resolve(cand.name), q_prefix)) {
-                    facade = cand.name;
-                    facades = facades + 1;
-                }
-            }
-            if (facades == 1) {
-                const reach: SymbolStr[] = graph.reexport_closure(facade);
-                const decls: SymbolStr[] =
-                    this.arena.leaf_declarers(intern.intern(q_leaf));
-                mut via: string[] = [];
-                for (mut di: i64 = 0; di < decls.length; di++) {
-                    // `leaf_declarers` answers with fully-qualified TYPE names
-                    // (`Amb::Left::Thing`), so the module is its parent. The
-                    // closure holds module namespaces and the two never
-                    // compare equal otherwise.
-                    const decl_ns: string =
-                        QualifiedName::parent_of(intern.resolve(decls[di]));
-                    const decl_sym: SymbolStr = intern.intern(decl_ns);
-                    mut ok: boolean = decl_sym.id == facade.id;
-                    for (mut ri: i64 = 0; ri < reach.length; ri++) {
-                        if (reach[ri].id == decl_sym.id) { ok = true; }
-                    }
-                    if (ok) { via.push(intern.resolve(decls[di])); }
-                }
-                if (via.length >= 2) {
-                    mut qamb: Diagnostic = Diagnostic::error(
-                        ErrorCode::E0155_AMBIGUOUS_BARE_NAME,
-                        fmt::format("`%s` is offered by `%s` from more than one module, so it names no type",
-                               q_leaf, q_prefix));
-                    qamb = qamb.at_with_label(named.span, "ambiguous through this path");
-                    qamb = qamb.with_note(fmt::format("`%s` and `%s` both declare it, and `%s` re-exports both",
-                                               via[0], via[1], q_prefix));
-                    qamb = qamb.with_note(
-                        "name the declaring module instead; a re-export offers what its children offer, and two of them offer this");
-                    this.ctx.emit_diagnostic(qamb);
-                    named.res.answer(Res::Err);
-                    return;
-                }
-            }
-        }
-
-        mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0203_UNDEFINED_TYPE,
-            fmt::format("cannot find %s `%s` in this scope", noun, ty_name));
-        diag = diag.at_with_label(named.span, "not found in this scope");
-        // The name this declaration is DEFINING cannot be the fix for a name
-        // inside its own definition: accepting it yields `type Foo = Foo;`, a
-        // declaration whose meaning is itself.  The suggestion is
-        // machine-applicable, so a tool would make that edit unprompted.  It is
-        // dropped from the candidate set rather than from the chosen result, so
-        // a genuine second-best name is still offered when one exists.
-        mut cands: string[] = [];
-        const all_cands: string[] = this.collect_bare_type_names();
-        for (mut ci: i64 = 0; ci < all_cands.length; ci++) {
-            if (defines.length() > 0 && all_cands[ci].eq(defines)) { continue; }
-            cands.push(all_cands[ci]);
-        }
-        const best: string = find_best_candidate(ty_name, cands);
-        if (best != "") {
-            diag = diag.help(
-                fmt::format("a %s with a similar name exists: `%s`", noun, best));
-            diag = diag.suggest(Suggestion::machine_applicable(named.span, best,
-                fmt::format("did you mean `%s`?", best)));
-        }
-        this.ctx.emit_diagnostic(diag);
-        // Reported once: a later pass asking the same annotation finds this
-        // leaf placed and reports nothing.
-        named.res.answer(Res::Err);
+                        kind_label: string, decl_name: string,
+                        fallback_span: SourceSpan) -> void {
+        if (TypeAnnotation::refused(ann)) { return; }
+        this.ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
+            fmt::format("cannot resolve %s for `%s`", kind_label, decl_name),
+            fallback_span);
     }
 
 
@@ -868,9 +358,7 @@ type struct TypeResolutionRunner {
 
         if (func.return_type_annotation != null && !func.has_resolved_return_type()) {
             this.emit_undefined_type(func.return_type_annotation,
-                "return type", "type",
-                this.ctx.resolve_str(func.name),
-                func.span, "");
+                "return type", this.ctx.resolve_str(func.name), func.span);
         }
 
         // Sema reads param types directly from the AST node (param.resolved_type)
@@ -888,9 +376,7 @@ type struct TypeResolutionRunner {
                 const pname: string = this.ctx.resolve_str(param.name);
                 if (pname == "this" || pname == "&this") { continue; }
                 this.emit_undefined_type(param.type_annotation,
-                    "type", "type",
-                    this.ctx.resolve_str(param.name),
-                    param.span, "");
+                    "type", this.ctx.resolve_str(param.name), param.span);
             }
         }
     }
@@ -926,9 +412,7 @@ type struct TypeResolutionRunner {
             if (field == null) { continue; }
             if (field.type_annotation != null && !field.resolved_type.is_valid()) {
                 this.emit_undefined_type(field.type_annotation,
-                    "type", "type",
-                    this.ctx.resolve_str(field.name),
-                    field.span, "");
+                    "type", this.ctx.resolve_str(field.name), field.span);
             }
         }
     }
@@ -999,16 +483,13 @@ type struct TypeResolutionRunner {
                             const vtype: TypeRef = this.resolver.resolve(var_node.type_annotation, res_ctx);
                             if (vtype.is_valid()) {
                                 var_node.resolved_type = vtype;
-                            } else if (this.annotation_failure_is_certain(var_node.type_annotation)) {
-                                // An explicit annotation naming an UNKNOWN type (e.g. `bool`
-                                // - the boolean type is `boolean`).  Emit a clean E0203 with
-                                // a did-you-mean rather than letting the invalid type reach
-                                // codegen (an LLVM verify crash) or be silently dropped.
-                                // This body is non-generic (gated at the caller), so the name
-                                // can't be a deferred generic param; `typeof(...)` and other
-                                // non-Named forms (inferred later) fail the certainty guard.
-                                const vn: string = this.ctx.get_intern_table().resolve(var_node.name);
-                                this.emit_undefined_type(var_node.type_annotation, "type", "type", vn, var_node.span, "");
+                            } else {
+                                // A name in it the name layer refused (`bool` for
+                                // `boolean`) was reported where it was written, and
+                                // the door records one left unanswered; a form
+                                // resolved later in the walk (`typeof(...)`) is left
+                                // to that walk.
+                                TypeAnnotation::refused(var_node.type_annotation);
                             }
                         }
                         // Recurse into the initializer expression so var
@@ -1045,12 +526,10 @@ type struct TypeResolutionRunner {
                     const vtype: TypeRef = this.resolver.resolve(var_node.type_annotation, res_ctx);
                     if (vtype.is_valid()) {
                         var_node.resolved_type = vtype;
-                    } else if (this.annotation_failure_is_certain(var_node.type_annotation)) {
-                        // See the DeclStmt path above: a for-loop init like
-                        // `for (mut i: bool = ...)` naming an unknown type gets a
-                        // clean E0203 instead of a downstream codegen crash.
-                        const vn: string = this.ctx.get_intern_table().resolve(var_node.name);
-                        this.emit_undefined_type(var_node.type_annotation, "type", "type", vn, var_node.span, "");
+                    } else {
+                        // As the DeclStmt path above: reported where written,
+                        // recorded if unanswered, left to the walk otherwise.
+                        TypeAnnotation::refused(var_node.type_annotation);
                     }
                 }
             }
@@ -1968,33 +1447,6 @@ type struct TypeResolutionPasses {
     /// to keep type_resolution.cryo self-contained.
     /// The stamp on the head's Named annotation, walking the same wrappers
     /// `extract_trait_leaf` walks; `Pending` when there is none.
-    /// The source spelling of an annotation, for a diagnostic that proposes a
-    /// rewrite.  Enough for the shapes an impl head or a parameter default is
-    /// written in; a shape this does not spell reads as `..`.
-    static spell_annotation(ann: TypeAnnotation*, intern: InternTable*) -> string {
-        if (ann == null) { return ".."; }
-        return match (*ann) {
-            TypeAnnotation::Named(n)     => { intern.resolve(n.name) }
-            TypeAnnotation::Primitive(pr) => { intern.resolve(pr.name) }
-            TypeAnnotation::Pointer(pt)  => {
-                fmt::format("%s*", TypeResolutionPasses::spell_annotation(pt.inner, intern))
-            }
-            TypeAnnotation::Reference(rf) => {
-                fmt::format("&%s", TypeResolutionPasses::spell_annotation(rf.inner, intern))
-            }
-            TypeAnnotation::Generic(g)   => {
-                mut out: string = TypeResolutionPasses::spell_annotation(g.base, intern);
-                out = out + "<";
-                for (mut i: i64 = 0; i < g.args.length; i++) {
-                    if (i > 0) { out = out + ", "; }
-                    out = out + TypeResolutionPasses::spell_annotation(g.args[i], intern);
-                }
-                out + ">"
-            }
-            _ => { ".." }
-        };
-    }
-
     /// An impl head on a template writes every parameter of the template it
     /// names - as parameters of its own (`implement<A> trait Display for
     /// String<A>`) or as a concrete instantiation (`implement trait Display
@@ -2025,10 +1477,7 @@ type struct TypeResolutionPasses {
         const inherent: boolean = !node.is_trait_impl();
         const written_count: i64 = node.target_args.length;
         const intern: InternTable* = ctx.intern_table;
-        if (written_count == tmpl.param_count) {
-            if (!inherent) { TypeResolutionPasses::refuse_undeclared_head_params(node, ctx); }
-            return;
-        }
+        if (written_count == tmpl.param_count) { return; }
 
         const target: string = intern.resolve(node.target_type);
         const tmpl_params: GenericParamNode*[] = tmpl.get_generic_params();
@@ -2045,7 +1494,7 @@ type struct TypeResolutionPasses {
         mut target_args: string = "";
         for (mut i: i64 = 0; i < written_count; i++) {
             if (i > 0) { target_args = target_args + ", "; }
-            target_args = target_args + TypeResolutionPasses::spell_annotation(node.target_args[i], intern);
+            target_args = target_args + TypeAnnotation::spell(node.target_args[i], intern);
         }
         mut concrete_args: string = target_args;
         mut all_defaulted: boolean = true;
@@ -2057,7 +1506,7 @@ type struct TypeResolutionPasses {
             target_args = target_args + pname;
             if (concrete_args.length() > 0) { concrete_args = concrete_args + ", "; }
             if (tmpl_params[i].has_default_annotation()) {
-                concrete_args = concrete_args + TypeResolutionPasses::spell_annotation(
+                concrete_args = concrete_args + TypeAnnotation::spell(
                     tmpl_params[i].default_annotation, intern);
             } else {
                 concrete_args = concrete_args + "..";
@@ -2066,7 +1515,7 @@ type struct TypeResolutionPasses {
         }
         mut trait_part: string = "";
         if (node.is_trait_impl()) {
-            trait_part = fmt::format("trait %s ", TypeResolutionPasses::spell_annotation(node.trait_annotation, intern));
+            trait_part = fmt::format("trait %s ", TypeAnnotation::spell(node.trait_annotation, intern));
         }
         // An inherent impl's parameters ARE the template's, so it has one
         // spelling; a trait impl has the parameter form and the concrete one.
@@ -2096,65 +1545,6 @@ type struct TypeResolutionPasses {
         if (!inherent && !all_defaulted) {
             diag = diag.with_note(fmt::format("or a concrete instantiation, one type per parameter: `%s`", concrete_form));
         }
-        ctx.emit_diagnostic(diag);
-    }
-
-    /// A trait impl head's trailing list names the template's arguments; it
-    /// declares nothing.  A name in it that is declared nowhere - no leading
-    /// `implement<S>`, no type of that name in scope - is the same defect as
-    /// an elided parameter, spelled from the other side: `implement trait
-    /// AsyncRead for BufStream<S>` reads as an impl over every `S` while `S`
-    /// is a name the program does not hold.  Refused as E0302 with the head
-    /// spelled the way it must be, its undeclared names moved to the leading
-    /// list; a name the name layer could not place is what an unstamped
-    /// `Named` argument is.  Called on a written head whose count matches.
-    static refuse_undeclared_head_params(node: ImplBlockNode*, ctx: CompilationContext*) -> void {
-        const intern: InternTable* = ctx.intern_table;
-        mut undeclared: string[] = [];
-        for (mut i: i64 = 0; i < node.target_args.length; i++) {
-            const arg: TypeAnnotation* = node.target_args[i];
-            if (arg == null) { continue; }
-            match (arg) {
-                TypeAnnotation::Named(n) => {
-                    if (n.pre_resolved.is_valid()) { continue; }
-                    mut placed: boolean = false;
-                    match (n.res) {
-                        ResSlot::Answered(_) => { placed = true; }
-                        _                    => { }
-                    }
-                    if (!placed) { undeclared.push(intern.resolve(n.name)); }
-                }
-                _ => { }
-            }
-        }
-        if (undeclared.length == 0) { return; }
-        mut head_params: string = "";
-        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            if (i > 0) { head_params = head_params + ", "; }
-            head_params = head_params + intern.resolve(node.generic_params[i].name);
-        }
-        mut listed: string = "";
-        for (mut i: i64 = 0; i < undeclared.length; i++) {
-            if (head_params.length() > 0) { head_params = head_params + ", "; }
-            head_params = head_params + undeclared[i];
-            if (i > 0) { listed = listed + ", "; }
-            listed = listed + "`" + undeclared[i] + "`";
-        }
-        mut target_args: string = "";
-        for (mut i: i64 = 0; i < node.target_args.length; i++) {
-            if (i > 0) { target_args = target_args + ", "; }
-            target_args = target_args + TypeResolutionPasses::spell_annotation(node.target_args[i], intern);
-        }
-        const target: string = intern.resolve(node.target_type);
-        const trait_part: string = TypeResolutionPasses::spell_annotation(node.trait_annotation, intern);
-        const span: SourceSpan = if (node.target_type_span.has_location()) { node.target_type_span } else { node.span };
-        mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0302_GENERIC_PARAM_MISMATCH,
-            fmt::format("this impl head names %s, which %s declared nowhere",
-                   listed, if (undeclared.length == 1) { "is" } else { "are" }));
-        diag = diag.at_with_label(span, "a trait impl head declares its parameters in a leading list");
-        diag = diag.with_note(fmt::format("write the parameters: `implement<%s> trait %s for %s<%s>`",
-            head_params, trait_part, target, target_args));
         ctx.emit_diagnostic(diag);
     }
 
@@ -2452,11 +1842,12 @@ type struct TypeResolutionPasses {
                 TypeResolutionPasses::type_name_key(prim, Res::PrimTy(prim), node, ctx)
             }
             TypeAnnotation::Named(n) => {
-                const r: Res = match (n.res) {
-                    ResSlot::Answered(a) => { a }
-                    _                    => { Res::Err }
-                };
-                TypeResolutionPasses::type_name_key(n.name, r, node, ctx)
+                // Through the door: every written type-position name is
+                // answered - bound, or `Err` for one the name layer refused
+                // where it was written - and a slot with no answer is a
+                // defect to record, not a spelling to key by silently.
+                TypeResolutionPasses::type_name_key(n.name,
+                    n.res.require("type_resolution: coherence key name"), node, ctx)
             }
             TypeAnnotation::Generic(g) => {
                 mut s: string =
@@ -2577,28 +1968,6 @@ type struct TypeResolutionPasses {
     /// into a droppable local, and since `TypeAnnotation*[]` is deep-owning
     /// over its elements, two callers each dropping that alias double-freed
     /// the node's args buffer (and its element nodes).
-    /// The annotation node a trait head's NAME lives on, peeled through the
-    /// wrappers a written trait reference may carry.
-    ///
-    /// Mirrors `TypeAnnotation::trait_identity`'s walk, so this returns the
-    /// node whose `res` that identity reads.  Checking any other node would
-    /// be asking whether a different name resolves.
-    static trait_head_base(ann: TypeAnnotation*) -> TypeAnnotation* {
-        if (ann == null) { return null; }
-        return match (*ann) {
-            TypeAnnotation::Generic(g)   => {
-                TypeResolutionPasses::trait_head_base(g.base)
-            }
-            TypeAnnotation::Reference(r) => {
-                TypeResolutionPasses::trait_head_base(r.inner)
-            }
-            TypeAnnotation::Pointer(p)   => {
-                TypeResolutionPasses::trait_head_base(p.inner)
-            }
-            _ => { ann }
-        };
-    }
-
     static peel_to_generic(ann: TypeAnnotation*) -> GenericAnnotation* {
         if (ann == null) { return null; }
         return match (*ann) {
@@ -3234,14 +2603,8 @@ type struct TypeResolutionPasses {
                         }
                         alias_count++;
                     } else {
-                        // The alias's own name is barred from the suggestions:
-                        // this annotation IS the alias's definition, so
-                        // accepting it would write `type Foo = Foo;`.
                         runner.emit_undefined_type(node.target_annotation,
-                            "target type", "type",
-                            ctx.resolve_str(node.alias_name),
-                            node.span,
-                            ctx.resolve_str(node.alias_name));
+                            "target type", ctx.resolve_str(node.alias_name), node.span);
                     }
                 }
             }
@@ -3324,15 +2687,12 @@ type struct TypeResolutionPasses {
                     // diagnostic every other annotation gets is already built.
                     if (node.is_trait_impl()) {
                         const trait_base: TypeAnnotation* =
-                            TypeResolutionPasses::trait_head_base(
-                                node.trait_annotation);
+                            TypeAnnotation::head_base(node.trait_annotation);
                         if (trait_base != null
                                 && !resolver.resolve(trait_base,
                                                      &impl_ctx).is_valid()) {
                             runner.emit_undefined_type(trait_base,
-                                "trait", "trait",
-                                ctx.resolve_str(node.target_type),
-                                node.span, "");
+                                "trait", ctx.resolve_str(node.target_type), node.span);
                         }
                     }
                     // The owner and its name off the stamp, as in the FuncSig

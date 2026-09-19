@@ -158,25 +158,6 @@ type struct TypeArena {
     generic_param_cache:   HashMap<u64, TypeRef>;
     bounded_param_cache:   HashMap<u64, TypeRef>;
 
-    // -- Reverse index: bare leaf name -> qualified name --
-    // Populated by create_struct/class/enum/trait/alias.
-    //
-    // It does NOT answer a lookup.  Resolving a bare leaf from a
-    // program-wide index answers from what other modules happen to exist
-    // rather than from what this one wrote, which is what the spec forbids
-    // and what the deleted step 5 did.  What remains reads it: the
-    // did-you-mean candidate pool, which needs spellings rather than
-    // bindings and is filled before the DeclarationIndex is.
-    leaf_index: HashMap<u32, u32>;   // bare SymbolStr.id -> qualified SymbolStr.id
-
-    // The SECOND module to declare a leaf the first already claimed, so a
-    // diagnostic can name both.  Only DECLARATIONS register here: a
-    // specialization is cached under its bare mangled spec name, which carries
-    // no module, so two modules instantiating one generic collide on that key
-    // for a reason that is not the author's to fix.
-    leaf_second: HashMap<u32, u32>;  // bare SymbolStr.id -> second qualified id
-
-
     /// Create a new TypeArena and initialize all 20 primitive singletons.
     static new(intern_table: InternTable*) -> TypeArena {
         mut arena: TypeArena = TypeArena {
@@ -219,8 +200,6 @@ type struct TypeArena {
             func_template_cache: HashMap<u32, TypeRef>::new(),
             generic_param_cache: HashMap<u64, TypeRef>::new(),
             bounded_param_cache: HashMap<u64, TypeRef>::new(),
-            leaf_index:          HashMap<u32, u32>::new(),
-            leaf_second:         HashMap<u32, u32>::new(),
         };
 
         arena.init_primitives();
@@ -567,7 +546,6 @@ type struct TypeArena {
 
         mut ref: TypeRef = this.alloc_type(new StructType(this.next_id, qualified_name, module_name, this.intern_table));
         this.struct_cache.insert(qualified_name.id, ref);
-        this.register_leaf_name(qualified_name, true);
         return ref;
     }
 
@@ -594,7 +572,6 @@ type struct TypeArena {
 
         mut ref: TypeRef = this.alloc_type(new ClassType(this.next_id, qualified_name, module_name, this.intern_table));
         this.class_cache.insert(qualified_name.id, ref);
-        this.register_leaf_name(qualified_name, true);
         return ref;
     }
 
@@ -607,7 +584,6 @@ type struct TypeArena {
 
         mut ref: TypeRef = this.alloc_type(new EnumType(this.next_id, qualified_name, module_name, this.intern_table));
         this.enum_cache.insert(qualified_name.id, ref);
-        this.register_leaf_name(qualified_name, true);
         return ref;
     }
 
@@ -619,7 +595,6 @@ type struct TypeArena {
 
         mut ref: TypeRef = this.alloc_type(new TraitType(this.next_id, qualified_name, module_name, this.intern_table));
         this.trait_cache.insert(qualified_name.id, ref);
-        this.register_leaf_name(qualified_name, true);
         return ref;
     }
 
@@ -631,7 +606,6 @@ type struct TypeArena {
 
         mut ref: TypeRef = this.alloc_type(new TypeAliasType(this.next_id, alias_name, this.intern_table, target));
         this.alias_cache.insert(alias_name.id, ref);
-        this.register_leaf_name(alias_name, true);
         return ref;
     }
 
@@ -933,7 +907,6 @@ type struct TypeArena {
             this.struct_cache.insert(qualified_spec.id, wrapper_ref);
             if (!bare_spec.equals(qualified_spec)) { this.struct_cache.insert(bare_spec.id, wrapper_ref); }
         }
-        this.register_leaf_name(qualified_spec, false);
     }
 
     /// Flip the `InstantiatedType` slot at `wrapper_ref` into the concrete
@@ -988,59 +961,6 @@ type struct TypeArena {
         }
         this.types[index] = concrete;
         return wrapper_ref;
-    }
-
-    /// Register a bare->qualified mapping in the reverse index.
-    ///
-    /// `declared` distinguishes a written declaration from a specialization.
-    /// Only a declaration can make a leaf ambiguous to a reader: a
-    /// specialization's leaf is a mangled spec name carrying no module, so two
-    /// modules instantiating one generic meet on that key without either
-    /// source having said anything ambiguous.
-    register_leaf_name(mut &this, qualified_name: SymbolStr, declared: boolean) -> void {
-        const qname_str: string = this.intern_table.resolve(qualified_name);
-        const leaf_str: string = QualifiedName::leaf_of(qname_str);
-        if (leaf_str.length() == 0) { return; }
-
-        const leaf_sym: SymbolStr = this.intern_table.intern(leaf_str);
-        const first: Option<u32> = this.leaf_index.get(&leaf_sym.id);
-        if (first.is_none()) {
-            this.leaf_index.insert(leaf_sym.id, qualified_name.id);
-            return;
-        }
-        // The index keeps the first, because it is also the candidate pool for
-        // the did-you-mean suggestion and one entry per name is what that
-        // wants.  A second DECLARER is recorded separately, and only the first
-        // of them: naming two is enough to say the leaf does not identify a
-        // type, and a reader fixes it by qualifying either way.
-        if (!declared) { return; }
-        if (first.unwrap() == qualified_name.id) { return; }
-        if (this.leaf_second.get(&leaf_sym.id).is_none()) {
-            this.leaf_second.insert(leaf_sym.id, qualified_name.id);
-        }
-    }
-
-    /// The one declaration registered under `leaf`, or an invalid symbol when
-    /// none is or two are.  The leaf index is a diagnostic pool - the
-    /// did-you-mean candidates, E0155's plurality, and E0240's "declared in
-    /// `M`" - never a resolution: which of two declarers a bare leaf means is
-    /// exactly what a leaf cannot say.
-    sole_declarer(&this, leaf: SymbolStr) -> SymbolStr {
-        if (this.leaf_second.get(&leaf.id).is_some()) { return SymbolStr::empty(); }
-        const first: Option<u32> = this.leaf_index.get(&leaf.id);
-        if (first.is_none()) { return SymbolStr::empty(); }
-        return SymbolStr { id: first.unwrap() };
-    }
-
-    /// The two modules declaring `leaf`, or an empty array when at most one
-    /// does.  A bare leaf that two declarations claim identifies no type -
-    /// see docs/name-resolution.md §5.1 - and this is what says so.
-    leaf_declarers(&this, leaf: SymbolStr) -> SymbolStr[] {
-        const second: Option<u32> = this.leaf_second.get(&leaf.id);
-        if (second.is_none()) { return []; }
-        const first: Option<u32> = this.leaf_index.get(&leaf.id);
-        if (first.is_none()) { return []; }
-        return [SymbolStr { id: first.unwrap() }, SymbolStr { id: second.unwrap() }];
     }
 
     /// Recursively check whether a type contains any GenericParam or

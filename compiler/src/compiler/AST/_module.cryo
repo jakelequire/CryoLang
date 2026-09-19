@@ -25,9 +25,12 @@ import compiler::types::type_ref::{ TypeRef };
 import compiler::resolver::symbol_str;
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res;
-import compiler::resolver::res::{ ResSlot };
+import compiler::resolver::res::{ Res, ResSlot };
+import compiler::resolver::intern_table;
+import compiler::resolver::intern_table::{ InternTable };
 import compiler::ast::expression;
 import compiler::ast::expression::{ ExpressionNode };
+import std::fmt;
 
 /// Discriminator for all AST node types.
 type enum NodeKind {
@@ -347,6 +350,95 @@ implement enum TypeAnnotation {
             TypeAnnotation::Reference(r) => { TypeAnnotation::trait_identity(r.inner) }
             TypeAnnotation::Pointer(p)   => { TypeAnnotation::trait_identity(p.inner) }
             _ => { SymbolStr::empty() }
+        };
+    }
+
+    /// The annotation node a head's NAME lives on, peeled through the
+    /// wrappers a written reference may carry - the node whose `res`
+    /// `trait_identity` reads, so asking it is asking about that name and
+    /// no other.
+    static head_base(ann: TypeAnnotation*) -> TypeAnnotation* {
+        if (ann == null) { return null; }
+        return match (*ann) {
+            TypeAnnotation::Generic(g)   => { TypeAnnotation::head_base(g.base) }
+            TypeAnnotation::Reference(r) => { TypeAnnotation::head_base(r.inner) }
+            TypeAnnotation::Pointer(p)   => { TypeAnnotation::head_base(p.inner) }
+            _ => { ann }
+        };
+    }
+
+    /// Whether a written name anywhere in `ann` was refused by the name
+    /// layer: reported once, where it was written, so a consumer that finds
+    /// the annotation unresolved reports nothing more.  Every written leaf
+    /// is read through `require` - one the name layer never answered is a
+    /// defect, recorded there - except a leaf its synthesizer resolved
+    /// outright, which carries a type and no written name to answer for.
+    static refused(ann: TypeAnnotation*) -> boolean {
+        if (ann == null) { return false; }
+        return match (*ann) {
+            TypeAnnotation::Named(n) => {
+                mut hit: boolean = false;
+                if (!n.pre_resolved.is_valid()) {
+                    match (n.res.require("TypeAnnotation::refused")) {
+                        Res::Err => { hit = true; }
+                        _        => { }
+                    }
+                }
+                hit
+            }
+            TypeAnnotation::Pointer(p)   => { TypeAnnotation::refused(p.inner) }
+            TypeAnnotation::Reference(r) => { TypeAnnotation::refused(r.inner) }
+            TypeAnnotation::Array(a)     => { TypeAnnotation::refused(a.element) }
+            TypeAnnotation::Tuple(t) => {
+                mut hit: boolean = false;
+                for (mut i: i64 = 0; i < t.elements.length; i++) {
+                    if (TypeAnnotation::refused(t.elements[i])) { hit = true; }
+                }
+                hit
+            }
+            TypeAnnotation::Function(f) => {
+                mut hit: boolean = false;
+                for (mut i: i64 = 0; i < f.parameters.length; i++) {
+                    if (TypeAnnotation::refused(f.parameters[i])) { hit = true; }
+                }
+                if (TypeAnnotation::refused(f.return_type)) { hit = true; }
+                hit
+            }
+            TypeAnnotation::Generic(g) => {
+                mut hit: boolean = TypeAnnotation::refused(g.base);
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    if (TypeAnnotation::refused(g.args[i])) { hit = true; }
+                }
+                hit
+            }
+            _ => { false }
+        };
+    }
+
+    /// The source spelling of an annotation, for a diagnostic that proposes
+    /// a rewrite.  Enough for the shapes an impl head or a parameter default
+    /// is written in; a shape this does not spell reads as `..`.
+    static spell(ann: TypeAnnotation*, intern: InternTable*) -> string {
+        if (ann == null) { return ".."; }
+        return match (*ann) {
+            TypeAnnotation::Named(n)      => { intern.resolve(n.name) }
+            TypeAnnotation::Primitive(pr) => { intern.resolve(pr.name) }
+            TypeAnnotation::Pointer(pt)   => {
+                fmt::format("%s*", TypeAnnotation::spell(pt.inner, intern))
+            }
+            TypeAnnotation::Reference(rf) => {
+                fmt::format("&%s", TypeAnnotation::spell(rf.inner, intern))
+            }
+            TypeAnnotation::Generic(g)    => {
+                mut out: string = TypeAnnotation::spell(g.base, intern);
+                out = out + "<";
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    if (i > 0) { out = out + ", "; }
+                    out = out + TypeAnnotation::spell(g.args[i], intern);
+                }
+                out + ">"
+            }
+            _ => { ".." }
         };
     }
 
