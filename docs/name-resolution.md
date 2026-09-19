@@ -74,7 +74,7 @@ measurement that decided it on the row.
 | D28 | **Overlapping impls are REFUSED OUTRIGHT, as Rust does (E0119)** - not specialisation, not declaration order (Jake, 2026-09-18: "I want to do that 'refuse overlaps outright as Rust does'") | **RULED - UNBUILT** — the shape: `implement<T> trait Show for struct Wrap<T> { show(&this) -> i32 { 1 } }` beside `implement trait Show for struct Wrap<i32> { show(&this) -> i32 { 2 } }`; `w.show()` on a `Wrap<i32>` answers 1 or 2 by which impl is WRITTEN FIRST, under the current compiler and under the pin `db5af63c` alike, so it predates the migration (audit 12's `overlap_a` / `overlap_b` projects demonstrate it). The error belongs at the OVERLAPPING DECLARATION, never at the call: the call is innocent, two impls both claiming one (trait, type) is the defect, and a use-site report blames the wrong code. `generic_registry.cryo`'s `select_trait_impl` comment - "the overlap is a registration-time report, not one per use" - is a hypothesis, not a mechanism: grep finds the comment and no report; whoever builds this makes it true, as a coherence check over `heads_under` at registration. **Measure the population first**: the registry reshape (§8.233) made overlapping heads representable in a way they were not before, so the stdlib or the projects may hold overlaps that resolve by luck today; if any do, this is a source-breaking change and Jake wants the blast radius before it lands. **MEASURED in §8.261 with the unifier the refusal would use** (`scripts/ns-migration/8.261/heads_overlap.cryo`, Rust's rule: trait and target arguments unify under one substitution, bounds not consulted; 6 control shapes behave): over the six halves 35 pairs of written heads share a key, **4 unify** - the three E0308 negatives and ONE green project, `where_bound_leaf_collision` (`Emit for Holder<T> where T: Alpha::Render` / `where T: Omega::Render`), whose comment asserts the pair must be accepted and which DISPATCHES by bound today (`OnlyA=1 OnlyB=2`, `Both=1` by order); stdlib, compiler, LSP, examples 0. **RE-RULED on that measurement (Jake, 2026-09-19): Rust's rule, refuse anyway** - not specialisation by bound, not declaration order. He has seen the one green pair and chose E0119 over it. **Whoever builds this converts `where_bound_leaf_collision` as part of the landing** - a `compile_fail` project asserting E0119 at the later head, or two heads that no longer unify - not left red. The unifier splices in byte-identically (`python scripts/ns-migration/8.261/probe_d28.py`); delete its three prints, add the emit after type resolution's E0308 arm so an identical pair stays E0308 | `grep -c 'registration-time report' compiler/src/compiler/types/generic_registry.cryo` → **1**; `grep -rho 'E0119' compiler/src --include=*.cryo \| wc -l` → **0**; `ls scripts/ns-migration/8.261/*.cryo \| wc -l` → **2** | §8.261, §8.267 |
 | D29 | **`implement trait Tick for struct Holder<S>` with `S` undeclared KEEPS E0302** (Jake, 2026-09-19). E0203 was put to him as Rust's answer (E0412, the same code as any undeclared type name) and REJECTED: "too generic of an error for this situation". No dedicated code proposed: the message is already the situation's own ("this impl head names `S`, which is declared nowhere", with the head spelled as it must be written), and E0302's family - the head's parameter list disagreeing with its target - is where a reader looks for it; a code for one message would widen the table for no search. The nesting asymmetry stands and is recorded: `Holder<Vec<S>>` is E0203 from the general refusal, the top-level `S` is E0302 | **RULED - the question CLOSED** | `grep -c 'E0302_GENERIC_PARAM_MISMATCH' compiler/src/compiler/resolver/name_resolution.cryo` → **1**; `ls tests/tests/negative/E0302_trait_head_undeclared_param.cryo \| wc -l` → **1** | §8.258, §8.267 |
 | D30 | **A generic parameter that SHADOWS an enclosing one is REFUSED** (Jake, 2026-09-19), Cryo's E0403: `type struct Box<T> { size_of_param<T>(&this, x: T) -> u64 { sizeof(T) } }` refuses the method's `T` against the owner's; `do_something<K>` beside an owner `T` is untouched. Today the OWNER's `T` silently wins - `Box<u8>::new(1).size_of_param<i64>(5)` answers 1 - because the substitution tables are keyed by the parameter's SPELLING, so two parameters of one name are one slot. In-tree population **0** (no method redeclares its owner's parameter), so the refusal breaks nothing. **Rides with audit 14's `GenericParam` identity fix**: the resolver binds each parameter to a `SymbolID` (`name_resolution.cryo`'s `GenericParam` arm answers `Res::GenericParam(s.name)` and discards `sym_id`); stamp the id, key the substitution tables by it, and the shadowing is then a second declaration in a scope that holds the first - the refusal is the resolver's, at the declaration, as Rust's E0403 is (Cryo's E0403 is "Missing Return"; the code for this is the builder's to propose and Jake's to confirm) | **The refusal BUILT (§8.268) as `E0311_GENERIC_PARAM_SHADOWED` - a number PROPOSED, not confirmed: the generics family E03xx, the next free code after E0310** - `declare_generics` asks the scope chain before declaring each parameter and a `GenericParam` answer is the error at the parameter's span with the first declaration labelled; a method's `<T>` in `struct Box<T>`, a trait method's in `trait Conv<T>`, an impl method's in `implement<T>`, and `<T, T>` in one list are the four refused shapes (Rust's E0403 covers the same four); a parameter beside a TYPE or a value parameter of its spelling is not one. **The identity half HALF-BUILT**: `Res::GenericParam` and `ResBase::GenericParam` carry the `SymbolID` the declaration bound (`GenericParamNode.sym_id`, stamped by the resolver, copied by the cloner; every writer, the async lowering's synthesized head included), and `ResBase::name()` - the one name door off a stamp - is gone; **the substitution tables are still keyed by SPELLING**, one system fed from one end: `TemplateEntry.param_names` (15 `equals` sites across sema, type resolution and the type resolver's where-bound binder) fill `ResolutionContext.generic_bindings` (33 writers, 8 readers, `resolve_named` asking it by the written name BEFORE the stamp), whose names become `ImplBlockNode.derived_param_names` (3 writers, 2 readers), which with the entry's names feed `ASTTypeSubstituter.param_names` (6 compares over `Named.name`, a scope segment's spelling and `ArrayLiteralNode.element_type`, a string with no stamp); a `TraitBound.type_parameter` is a spelling with no stamp at all (9 compares). Re-keying is one unit over the whole chain, not a table at a time - two keys on one table is the defect. With the shadow refused, one spelling names one parameter in any scope chain the RESOLVER sees; what it does not see is a trait default's body copied under an impl whose own parameter spells the body's - the shape the id would tell apart and the spelling cannot, population unmeasured | `grep -c 'E0311_GENERIC_PARAM_SHADOWED' compiler/src/compiler/resolver/name_resolution.cryo` → **1**; `ls tests/tests/negative/E0311_*.cryo \| wc -l` → **1**; `grep -c 'Res::GenericParam(s.name)' compiler/src/compiler/resolver/name_resolution.cryo` → **0**; `grep -rhoE 'GenericParam\(SymbolID\)' compiler/src/compiler/resolver/res.cryo \| wc -l` → **2**; `grep -c 'sym_id' compiler/src/compiler/AST/declaration.cryo` → **4**; `grep -rho 'lookup_binding(' compiler/src --include=*.cryo \| wc -l` → **8** (the spelling-keyed readers, unchanged) | §8.267, §8.268 |
-| D31 | **The turbofish is REQUIRED for generic arguments in expression position** (Jake, 2026-09-19): `foo::<i32>(y)` opens type arguments; `g(LIMIT < x, MAXV > (y))` is two comparisons, always. **The rule: `<` immediately after `::` opens generic arguments; `<` anywhere else is a comparison.** The shape is `foo::<i32>(y)` - as Rust's `Vec::<i32>::new()`, where every `::` after the turbofish is an ordinary path step; there is no `::()` form. It RETIRES the parser's `ident <` lookahead tables (`parser_base.cryo` 872–912: is-a-local / is-a-global / is-declared-generic / binds-a-value, read from the module's OWN declarations; `expr_parser.cryo` ~1190, the identifier's `Name<T, U>` guess), which by their own comment cannot see an import - so one expression means two things by where its constants came from. **Source-breaking, population UNMEASURED: the first task of whoever builds it is the count of bare generic arguments in expression position over the stdlib, the projects, the examples and the compiler's own source** (`f<T>(..)`, `Type<T>::m(..)`, `Type<T> { .. }` as the parser reads them today, module by module), and Jake wants that number before it lands. Not measured this session | **RULED - UNBUILT** | `grep -c 'is_generic_call_ahead' compiler/src/compiler/parser/expr_parser.cryo` → **6** (the lookahead the rule retires; each site is a decision the `::<` form would make lexically) | §8.267 |
+| D31 | **The turbofish is REQUIRED for generic arguments in expression position** (Jake, 2026-09-19): `foo::<i32>(y)` opens type arguments; `g(LIMIT < x, MAXV > (y))` is two comparisons, always. **The rule: `<` immediately after `::` opens generic arguments; `<` anywhere else is a comparison.** The shape is `foo::<i32>(y)` - as Rust's `Vec::<i32>::new()`, where every `::` after the turbofish is an ordinary path step; there is no `::()` form. It RETIRES the parser's `ident <` lookahead tables (`parser_base.cryo` 872–912: is-a-local / is-a-global / is-declared-generic / binds-a-value, read from the module's OWN declarations; `expr_parser.cryo` ~1190, the identifier's `Name<T, U>` guess), which by their own comment cannot see an import - so one expression means two things by where its constants came from. **Source-breaking, population UNMEASURED: the first task of whoever builds it is the count of bare generic arguments in expression position over the stdlib, the projects, the examples and the compiler's own source** (`f<T>(..)`, `Type<T>::m(..)`, `Type<T> { .. }` as the parser reads them today, module by module), and Jake wants that number before it lands. **MEASURED in §8.269 (the population Jake asked for), NOT BUILT: 1,364 generic-argument lists in expression position across 272 files** - stdlib 480 (64 of 154 files), compiler/src 165, tests/unit 571, tests/projects 61, tests/negative 26, tools/CryoLSP 53, examples 8; by shape `Name<T>::m` 586, `Name<T> { .. }` 219, `f<T>(..)` 142, `f<T>` as a value 8, `obj.m<T>(..)` 172, `Scope::m<T>(..)` 237, `new Type<T>(..)` 0 (confirmed by grep); **567 of the 955 identifier-headed sites were decided by the token scan alone** - the name is declared generic in no table the writing module has (an import: `Array` 172, `PendingThenReady` 90, `HashMap` 75, `Pair` 63, `Atomic` 38, `BufStream` 36, `Box` 24). Every site is a rewrite of the same one shape, `Name<` → `Name::<`, and the probe's location list (`scripts/ns-migration/8.269/`, `probe_d31.py apply` / `tally`; `population.md` is the tally) is the migration's input; the landing is the parser change, the four sites' lexical rule, the retired tables, and that script - one unit, source-breaking by 1,364 edits | **RULED - UNBUILT** (population measured) | `grep -c 'is_generic_call_ahead' compiler/src/compiler/parser/expr_parser.cryo` → **6** (the lookahead the rule retires; each site is a decision the `::<` form would make lexically); `ls scripts/ns-migration/8.269/*.py scripts/ns-migration/8.269/*.md \| wc -l` → **2**; `grep -c '^D31 population: 1364 distinct sites' scripts/ns-migration/8.269/population.md` → **1** | §8.267, §8.269 |
 
 **D18, D24, D28 and D31 are RULED and UNBUILT, and D30's identity half is** (D5 was, until §8.206; D2 and D9 were,
 until §8.213; Q2 was, until §8.259; D25 was, until §8.263; D30's refusal was, until §8.268). Each was decided by Jake - D18 and D2 then re-parked as open
@@ -18144,6 +18144,106 @@ generic parameter `T` shadows a generic parameter of the same name" /
 
 **Tally: 96 shadowed, 96 old paths deleted, 96 at zero; 216 artifacts
 gone** (unchanged; a refusal and a stamp payload, no lane).
+
+### 8.269 D31's population, measured and NOT built: 1,364 generic-argument lists in expression position across 272 files, every one a `Name<` the turbofish rule rewrites to `Name::<` - stdlib 480, compiler 165, tests 658, LSP 53, examples 8; 567 of the 955 identifier-headed sites were decided by the token scan alone because the name is an import the parser's tables cannot see; the probe and its tally are committed and the location list is the migration's input - 2026-09-19
+
+> **Status:** MEASURED, the number Jake asked for before the rule lands.
+> Nothing in the compiler changed: the probe was applied, built, run over
+> eight halves, reverted, and the compiler rebuilt (`git diff compiler/src`
+> empty).  `scripts/ns-migration/8.269/probe_d31.py` (apply / revert /
+> tally), `scripts/ns-migration/8.269/population.md` (the tally, 851
+> lines: per population, per shape, per file, and the 567 scan-decided
+> sites by location).
+
+#### What was counted
+
+The parser opens generic arguments in expression position at four sites,
+each behind `is_generic_call_ahead()` - a 200-token scan for a balanced
+`>` followed by `(`, `{`, `::` and eleven other tokens - and at the first
+of them also behind the module's own tables (`binds_a_value`,
+`is_generic_decl_name`: names declared at depth zero in THIS file).  The
+probe prints one line per list the lookahead opened:
+
+```cryo
+Array<i32>::new()          // ident, scope step   (586)
+Pair<i32, i32> { a, b }    // ident, struct literal (219)
+free_size<i64>(5)          // ident, call          (142)
+run_catch_body<T>          // ident, a function as a value (8)
+b.size_of_param<i64>(5)    // member               (172)
+Task::new<F>(..)           // scope                (237)
+new Type<T>(..)            // new                  (0; grep agrees)
+```
+
+The fifth lookahead site, `parse_base_type`, is TYPE position - a `<`
+after a type name is never a comparison - and D31 leaves it alone; it
+was not probed.
+
+#### The eight halves
+
+`corpus2.sh qb` (the LSP built directly, the unit suite, every project,
+every `collect` project's own tests, the examples, the compile-fail
+suite) plus two the six do not reach: `cryo check` over each of the 154
+stdlib files (a project parses only the modules it imports; the stdlib
+ARCHIVE is built by the pin, which carries no probe) and the compiler
+built from `compiler/` by the probed compiler (162 local modules; the
+LSP half parses 159 of them).  46,172 + 25,833 + 410 lines, one location
+counted once whichever half parsed it (the same stdlib file arrives as an
+absolute path, `../stdlib/`, `./tests/`; the unit suite's own
+`tests/stdlib/*.cryo` is NOT the stdlib and was first miscounted as it -
+730, corrected to 480 - and a lone `\r` inside a line moved three sites by
+one line under Python's universal newlines, read raw since).  Control: the
+D30 scratch's seven known sites all reported (`.objcmp/qb-ctl.txt`); a
+second build of the same scratch printed 0 - an incremental build parses
+nothing, which is why every half clears its build directory.
+
+The probe's line names a FILE, so `projection_bound_leaf_collision`
+(`output_excludes "iter.cryo"`) failed under it - the instrument's
+artifact, as §8.261 met; `failing halves: 0` for every other half.
+
+#### The count
+
+| population | sites | files | ident | member | scope |
+|---|---|---|---|---|---|
+| stdlib | 480 | 64 of 154 | 268 | 40 | 172 |
+| compiler/src | 165 | 72 | 139 | 19 | 7 |
+| tests/unit | 571 | 143 (with the projects and negatives) | 449 | 85 | 37 |
+| tests/projects | 61 | | 37 | 8 | 16 |
+| tests/negative | 26 | | 25 | 0 | 1 |
+| tools/CryoLSP | 53 | 18 | 36 | 17 | 0 |
+| examples | 8 | 2 | 1 | 3 | 4 |
+| **total** | **1,364** | **272** | 955 | 172 | 237 |
+
+The identifier-headed 955 by what follows the list: `::` 586, `{` 219,
+`(` 142, nothing 8.  The heaviest files: `stdlib/collections/array.cryo`
+45, `stdlib/thread/_module.cryo` 32, `tests/lang/async_generic_function.cryo`
+32, `stdlib/future/executor.cryo` 30.
+
+**567 of the 955 were decided by the token scan alone** (`guess=1`: the
+name is declared generic in no table the writing module has) - `Array`
+172, `PendingThenReady` 90, `HashMap` 75, `Pair` 63, `Atomic` 38,
+`BufStream` 36, `Box` 24, `Slice` 13, `Range` 10 - every one an import.
+That is D31's defect in numbers: for 567 sites the parser's answer rests
+on a 200-token scan for a `>` followed by the right thing, and the same
+text under a local named `Array` would be two comparisons.
+
+#### What the landing costs
+
+Every one of the 1,364 is the same edit, `Name<` → `Name::<` at the
+probe's `file:line:col`, so the population is also the migration's
+input: a script over `population.md`'s locations (or a fresh `tally`
+run) rewrites the tree, and the parser change - `<` opens generic
+arguments only after `::`, the four sites read that lexically,
+`is_generic_call_ahead`, `binds_a_value`, `is_generic_decl_name`,
+`is_local_name`, `is_global_value_name`, `scan_module_names` and
+`generic_angle_guessed` retire - lands with it in one commit.  A program
+outside the tree that writes `f<T>(x)` stops compiling at that commit,
+and the diagnostic for `a < b > (c)` where `f<T>(c)` was meant should
+name the turbofish.  Not built this session: the number is what was
+asked for, and 1,364 edits across the stdlib, the compiler and the LSP
+is a unit of its own.
+
+**Tally: 96 shadowed, 96 old paths deleted, 96 at zero; 216 artifacts
+gone** (unchanged; a measurement).
 
 ---
 
