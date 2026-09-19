@@ -1499,7 +1499,17 @@ public:
         // here would assert an ownership the type layer cannot check, and an
         // unanswered slot is reported against whatever later stage actually
         // needs it - with a location - instead of being absorbed here.
-        if (!have_base) { return; }
+        //
+        // An alias keyword (`int::try_from`) is the one spelling that binds
+        // nowhere and still names a type: the primitive it spells, and only
+        // now, after every scope and every module spelling has declined it.
+        if (!have_base) {
+            const canon: SymbolStr = this.alias_keyword_primitive(written);
+            if (canon.is_valid()) {
+                node.set_scope_res(Res::TypeRelative(ResBase::PrimTy(canon), trailing));
+            }
+            return;
+        }
         node.set_scope_res(Res::TypeRelative(base, trailing));
     }
 
@@ -1780,7 +1790,26 @@ public:
         if (home_sid == 0) {
             return ResSlot::Pending;
         }
-        return this.leaf_in_module_scope(home_sid, name, span);
+        const leaf_slot: ResSlot = this.leaf_in_module_scope(home_sid, name, span);
+        if (!leaf_slot.is_pending()) { return leaf_slot; }
+        // Nothing the writer can see binds the leaf.  An alias keyword
+        // (`implement trait Show for int`, `new int[100]`) names the
+        // primitive it spells ONLY now, after every scope has declined it:
+        // a module may own the same name, and the module wins while it is in
+        // scope.  The stamp is the primitive's own spelling, never the
+        // alias - `int` and `i32` are one type and carry one key.
+        const canon: SymbolStr = this.alias_keyword_primitive(written);
+        if (!canon.is_valid()) { return ResSlot::Pending; }
+        return ResSlot::Answered(Res::PrimTy(canon));
+    }
+
+    /// The primitive's own spelling for an alias keyword, interned; empty
+    /// for any other spelling.  Asked only once every scope has declined
+    /// the name.
+    alias_keyword_primitive(&this, written: string) -> SymbolStr {
+        const canon: string = ResBase::primitive_of_alias(written);
+        if (canon.length() == 0) { return SymbolStr::empty(); }
+        return this.resolver.intern_table.intern(canon);
     }
 
     /// A bare leaf resolved in a MODULE's scope - that module's declarations,

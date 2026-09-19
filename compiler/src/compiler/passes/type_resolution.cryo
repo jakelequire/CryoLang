@@ -1679,19 +1679,10 @@ type struct TypeResolutionPasses {
                             node.span);
                     }
                 }
-                // The head's methods under the owner the index names.  A
-                // head on an alias keyword (`implement trait Show for int`)
-                // is stamped by nothing and the index holds no type under
-                // its spelling, so its key is the spelling until the keyword
-                // ruling folds it; held for exactly that population.
-                if (ResBase::is_alias_keyword(ctx.intern_table.resolve(node.target_type))) {
-                    ctx.decl_index.register_methods_by_key(
-                        canonical_target, node.methods, ctx.intern_table, arena);
-                } else {
-                    ctx.decl_index.register_methods(
-                        ctx.decl_index.impl_owner(node, "type_resolution/register impl methods"),
-                        node.methods, ctx.intern_table, arena, "type_resolution/register impl methods");
-                }
+                // The head's methods under the owner the index names.
+                ctx.decl_index.register_methods(
+                    ctx.decl_index.impl_owner(node, "type_resolution/register impl methods"),
+                    node.methods, ctx.intern_table, arena, "type_resolution/register impl methods");
             }
             _ => {}
         }
@@ -2451,7 +2442,14 @@ type struct TypeResolutionPasses {
         if (ann == null) { return "_"; }
         return match (*ann) {
             TypeAnnotation::Primitive(p) => {
-                TypeResolutionPasses::type_name_key(p.name, Res::PrimTy(p.name), node, ctx)
+                // A keyword primitive carries no slot; its lexeme is read
+                // as the name layer would stamp it, an alias keyword
+                // (`Feed<int>`) under the primitive's own spelling, so
+                // `Feed<int>` and `Feed<i32>` render to one key.
+                mut prim: SymbolStr = p.name;
+                const canon: string = ResBase::primitive_of_alias(ctx.intern_table.resolve(p.name));
+                if (canon.length() > 0) { prim = ctx.intern_table.intern(canon); }
+                TypeResolutionPasses::type_name_key(prim, Res::PrimTy(prim), node, ctx)
             }
             TypeAnnotation::Named(n) => {
                 const r: Res = match (n.res) {
@@ -2511,16 +2509,13 @@ type struct TypeResolutionPasses {
         mut key: string = TypeResolutionPasses::ann_canon_key(
             node.trait_annotation, node, ctx);
         key = key + " for ";
-        // Target base by resolved type identity (folds primitive aliases
-        // and type aliases), off the head's own answer.  A head the name
-        // layer left unanswered while `target_key` still gave a key is its
-        // alias-keyword door (`for int`): the spelling is the index's key
-        // for it, read as a primitive's is, so `int` and `i32` fold to one
-        // identity.  That arm retires with the keyword ruling.
-        const head_res: Res = match (node.res) {
-            ResSlot::Answered(a) => { a }
-            _                    => { Res::PrimTy(canonical_target) }
-        };
+        // Target base by resolved type identity, off the head's own answer.
+        // A source head with a key is a stamped head: the name layer answers
+        // every written target it can bind, a primitive by its own spelling
+        // (`for int` folds to `i32` there, so the two heads collide here),
+        // and only a clone - never a source declaration - carries a key
+        // with no stamp.
+        const head_res: Res = node.res.require("type_resolution: coherence head");
         key = key + TypeResolutionPasses::type_name_key(
             canonical_target, head_res, node, ctx);
         if (node.target_args.length > 0) {
