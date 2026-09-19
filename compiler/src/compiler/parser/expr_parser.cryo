@@ -559,6 +559,14 @@ public:
                 mut carried_gen_args: TypeAnnotation*[] = [];
                 if (expr.kind == NodeKind::ScopeResolution) {
                     const psr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+                    // An impl-qualified path names one member of one
+                    // implementation; folding it into a longer scope would
+                    // drop the trait that qualifies it.
+                    if (psr.impl_trait != null) {
+                        this.report_error(ErrorCode::E0101_UNEXPECTED_TOKEN,
+                            "`(Trait for Type)::member` names one member; it cannot be extended with `::`");
+                        break;
+                    }
                     const scope_part: string  = this.ctx.intern_table.resolve(psr.scope_name);
                     const member_part: string = this.ctx.intern_table.resolve(psr.member_name);
                     if (scope_part.length() > 0) {
@@ -1387,6 +1395,13 @@ public:
             return new LiteralNode("void", LiteralKind::Null, this.span_from(start));
         }
 
+        // Impl-qualified path: `(Trait for Type)::member`.  A `for` at the
+        // group's own depth is never an expression, so the shape is decided
+        // before the lambda and tuple readings are tried.
+        if (this.looks_like_impl_head()) {
+            return this.parse_impl_qualified_path(start);
+        }
+
         // Check for lambda: (name: Type, ...) -> body
         // Lambda pattern: identifier ':' means parameter declaration
         if (this.check(TokenType::Identifier) && this.peek_at(1).kind == TokenType::Colon) {
@@ -1457,6 +1472,105 @@ public:
             off += 1;
         }
         return false;
+    }
+
+    /// Lookahead: does the paren group just opened (the `(` consumed, `pos`
+    /// at its first token) hold a `for` at its own depth?  Nothing an
+    /// expression can be has `for` inside its parentheses - a lambda body's
+    /// `for` sits behind its `->` and braces - so the shape is an
+    /// impl-qualified head, `(Trait for Type)`.  Bracketed groups the head's
+    /// type arguments may carry (a tuple type) nest; a `for` inside one is
+    /// no expression either, and is left to the type parser to refuse.
+    looks_like_impl_head(&this) -> boolean {
+        mut depth: int = 1;
+        mut off:   int = 0;
+        while (off < 4096) {
+            const k: TokenType = this.peek_at(off).kind;
+            if (k == TokenType::EOF) { return false; }
+            if (k == TokenType::LParen || k == TokenType::LSquare || k == TokenType::LBrace) {
+                depth += 1;
+            } else if (k == TokenType::RParen || k == TokenType::RSquare || k == TokenType::RBrace) {
+                depth -= 1;
+                if (depth == 0) { return false; }
+            } else if (k == TokenType::KwFor && depth == 1) {
+                return true;
+            }
+            off += 1;
+        }
+        return false;
+    }
+
+    /// `(Trait for Type)::member`, the `(` consumed: the member THAT trait's
+    /// implementation for the type delivers, where the bare `Type::member`
+    /// would tie between two traits providing it.  The head reuses `for`
+    /// exactly as `implement trait Trait for Type` writes it.
+    ///
+    /// The path is a `Type::member` path whose scope segment is the target -
+    /// its name and generic arguments, as `Type<Args>::member` carries them -
+    /// with the trait beside it; so the target is what a scope segment can
+    /// name, a type by name with arguments or a primitive, as an impl head's
+    /// target is, and the trait is a name with arguments as an impl head's
+    /// trait is.
+    parse_impl_qualified_path(start: Token) -> ExpressionNode* {
+        const trait_ann: TypeAnnotation* = this.parse_type_annotation();
+        this.consume(TokenType::KwFor, "'for'");
+        const target_ann: TypeAnnotation* = this.parse_type_annotation();
+        this.consume(TokenType::RParen, "')'");
+        if (this.panic_mode || trait_ann == null || target_ann == null) { return null; }
+        const head_span: SourceSpan = this.span_from(start);
+
+        mut trait_ok: boolean = false;
+        match (*trait_ann) {
+            TypeAnnotation::Named(_)   => { trait_ok = true; }
+            TypeAnnotation::Generic(g) => {
+                match (*g.base) {
+                    TypeAnnotation::Named(_) => { trait_ok = true; }
+                    _                        => { }
+                }
+            }
+            _ => { }
+        }
+        if (!trait_ok) {
+            this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                "expected a trait name before `for` in `(Trait for Type)::member`");
+            return null;
+        }
+
+        mut scope_name: SymbolStr = SymbolStr::empty();
+        mut scope_args: TypeAnnotation*[] = [];
+        match (*target_ann) {
+            TypeAnnotation::Named(n)     => { scope_name = n.name; }
+            TypeAnnotation::Primitive(p) => { scope_name = p.name; }
+            TypeAnnotation::Generic(g)   => {
+                match (*g.base) {
+                    TypeAnnotation::Named(n) => {
+                        scope_name = n.name;
+                        // Deep-clone: `g` owns its pointees.
+                        for (mut gi: i64 = 0; gi < g.args.length; gi++) {
+                            scope_args.push(TypeAnnotation::clone_ptr(g.args[gi]));
+                        }
+                    }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+        if (!scope_name.is_valid()) {
+            this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                "expected a type name after `for` in `(Trait for Type)::member`, as an impl head's target is written");
+            return null;
+        }
+
+        if (!this.check(TokenType::ColonColon)) {
+            this.report_error(ErrorCode::E0101_UNEXPECTED_TOKEN,
+                fmt::format("expected `::` and a member after `(Trait for Type)`, found '%s'",
+                    this.current().lexeme));
+            return null;
+        }
+        this.advance(); // consume '::'
+        mut sr: ScopeResolutionNode* = this.parse_scope_member(scope_name, scope_args, head_span);
+        sr.set_impl_trait(trait_ann);
+        return sr;
     }
 
     /// Parse a lambda starting from the parameter list (after '(' was consumed).

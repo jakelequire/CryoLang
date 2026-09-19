@@ -294,6 +294,15 @@ Primary            ::= Literal
                      | "await"  Expr           (* parsed; no async semantics yet *)
                      | "yield"  Expr?          (* parsed; no generator semantics yet *)
                      | "(" Expr ")"
+                     | ImplQualPath
+
+ImplQualPath       ::= "(" Type "for" Type ")" "::" MemberName GenericArgs?
+                       (* the member of the first Type's (a trait's)
+                          implementation for the second: `(Beta for P)::make`.
+                          The second Type is a name with optional GenericArgs
+                          or a primitive, as an `implement trait ... for`
+                          head's target is.  Decided by the `for` at the
+                          group's own depth, which no expression carries. *)
 
 Lambda             ::= "move"? "(" (LambdaParam ("," LambdaParam)*)? ")" "->" Type
                        Block                     (* function literal; captures

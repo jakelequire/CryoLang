@@ -2452,7 +2452,7 @@ type struct CallResolver {
                 args_text = args_text + ", " + (if (rest.length() == 0) { "..." } else { rest });
             }
             this.report_trait_method_tie(member.span, member.member,
-                this.arena.resolve_display_name_short(base_ref.id), &tie_traits, &tie_spans, true, args_text, true);
+                this.arena.resolve_display_name_short(base_ref.id), &tie_traits, &tie_spans, args_text, true);
             return;
         }
         // Several arity-matching signatures is an overload SET, not a reason to
@@ -3612,6 +3612,18 @@ type struct CallResolver {
 
         if (this.symbolic.symbolic_name_is_generic_param(scope.scope_name)) { return TypeRef::invalid(); }
 
+        // An impl-qualified path that reached no method is refused in the
+        // head's terms - the trait the type does not implement, or the
+        // member its implementation lacks - not as a bare path's miss.
+        if (scope.impl_trait != null) {
+            const owner_key: SymbolStr = this.scope_owner_key(scope);
+            const trait_sym: SymbolStr = this.impl_qualified_trait(scope);
+            if (owner_key.is_valid() && trait_sym.is_valid()) {
+                this.report_impl_qualified_miss(scope, owner_key, trait_sym, scope.member_name);
+            }
+            if (owner_key.is_valid() || !trait_sym.is_valid()) { return TypeRef::invalid(); }
+        }
+
         const scope_str: string = this.intern.resolve(scope.scope_name);
         const member_str: string = this.intern.resolve(scope.member_name);
         mut diag: Diagnostic = Diagnostic::error(
@@ -3688,6 +3700,10 @@ type struct CallResolver {
         const scope_str: string = this.intern.resolve(scope_sym);
         const member_str: string = this.intern.resolve(member_sym);
         if (scope_str.length() == 0 || member_str.length() == 0) { return; }
+        if (scope.impl_trait != null) {
+            this.pin_impl_qualified_call(call, scope, scope_sym, member_sym);
+            return;
+        }
         if (this.pin_trait_qualified_call(call, scope, scope_sym, member_sym)) { return; }
         const sym: SymbolStr = this.intern.intern(fmt::format("%s::%s", scope_str, member_str));
         if (this.try_pin_static_method_overload(call, scope, sym)) { return; }
@@ -3734,6 +3750,17 @@ type struct CallResolver {
         }
         const owner_sym: SymbolStr = this.ctx.decl_index.lookup_type_name(owner_ref);
         if (!owner_sym.is_valid()) { return true; }
+        const entries: OverloadId[] = this.trait_delivered_entries(owner_sym, trait_sym, member_sym);
+        if (entries.length == 0) { return true; }
+        this.pin_trait_delivered_call(call, scope, &entries);
+        return true;
+    }
+
+    /// The entries of `owner`'s family `member` that `trait_sym`'s
+    /// implementation delivers - the candidates a call naming the trait
+    /// selects among, in registration order.
+    trait_delivered_entries(&this, owner_sym: SymbolStr, trait_sym: SymbolStr,
+                            member_sym: SymbolStr) -> OverloadId[] {
         const family: SymbolStr = this.intern.intern(fmt::format("%s::%s",
             this.intern.resolve(owner_sym), this.intern.resolve(member_sym)));
         const all: OverloadId[] = this.ctx.decl_index.lookup_family_entries(family);
@@ -3741,24 +3768,108 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < all.length; i++) {
             if (this.ctx.decl_index.entry_trait(all[i]).equals(trait_sym)) { entries.push(all[i]); }
         }
-        if (entries.length == 0) { return true; }
+        return entries;
+    }
+
+    /// Pin `call` to the one of `entries` its arguments select, with the two
+    /// passes every static pin uses, and type the path from that entry:
+    /// the implementation's signature, not the trait declaration's, which
+    /// may spell it in terms the impl decides.  Answers whether one was
+    /// pinned; an argument with no type yet, or a fit count other than one,
+    /// pins nothing and leaves the report to the caller.
+    pin_trait_delivered_call(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
+                             entries: &OverloadId[]) -> boolean {
         mut arg_types: TypeRef[] = [];
         for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
             const arg: ExpressionNode* = call.arguments[ai];
-            if (arg == null || !arg.resolved_type.is_valid()) { return true; }
+            if (arg == null || !arg.resolved_type.is_valid()) { return false; }
             arg_types.push(arg.resolved_type);
         }
-        mut fits: OverloadId[] = this.select_static_overload(&entries, &arg_types, false);
-        if (fits.length == 0) { fits = this.select_static_overload(&entries, &arg_types, true); }
-        if (fits.length != 1) { return true; }
+        mut fits: OverloadId[] = this.select_static_overload(entries, &arg_types, false);
+        if (fits.length == 0) { fits = this.select_static_overload(entries, &arg_types, true); }
+        if (fits.length != 1) { return false; }
         call.set_resolved_callee(CalleePin::Decl(fits[0]));
-        // The call's type is the implementation's, not the trait
-        // declaration's, which may spell it in terms the impl decides.
         const ft: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(fits[0]).id);
         if (ft != null && ft.kind == TypeKind::Function) {
             scope.set_resolved_type((ft as FunctionType*).return_type);
         }
         return true;
+    }
+
+    /// The trait an impl-qualified path's head names, by identity, when the
+    /// name resolves to a trait; empty otherwise, with the refusal reported
+    /// here: a head naming no trait selects no implementation, and the path
+    /// would otherwise fall to the bare `Type::member` reading and answer
+    /// for a trait the writer did not name.
+    impl_qualified_trait(mut &this, scope: ScopeResolutionNode*) -> SymbolStr {
+        if (TypeAnnotation::refused(scope.impl_trait)) { return SymbolStr::empty(); }
+        const trait_sym: SymbolStr = TypeAnnotation::trait_identity(scope.impl_trait);
+        mut is_trait: boolean = false;
+        if (trait_sym.is_valid()) {
+            const tt: Type* = this.arena.lookup(this.types.lookup_type_exact(trait_sym).id);
+            is_trait = tt != null && tt.kind == TypeKind::Trait;
+        }
+        if (is_trait) { return trait_sym; }
+        if (this.state.in_symbolic_check) { return SymbolStr::empty(); }
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0233_UNDEFINED_SYMBOL,
+            fmt::format("`%s` is not a trait", TypeAnnotation::spell(scope.impl_trait, this.intern)));
+        d = d.at_with_label(scope.scope_span,
+            "`(Trait for Type)::member` names the member of the trait's implementation for the type");
+        this.ctx.emit_diagnostic(d);
+        return SymbolStr::empty();
+    }
+
+    /// A call written through an impl-qualified path, `(Beta for P)::make()`
+    /// or `(Beta for P)::go(&p)`: the member is the one `Beta`'s
+    /// implementation for `P` delivers, whether or not other traits provide
+    /// it - the spelling a tie of static methods needs, since no receiver
+    /// selects there, and the same rule for a method with one.  `owner_sym`
+    /// is the owner that won resolution for the scope segment: the written
+    /// type, or the type a generic body's parameter was instantiated with.
+    /// A head whose trait the type does not implement, or whose
+    /// implementation has no such member, is refused here rather than left
+    /// unpinned, because an unpinned static call is bound by name and arity
+    /// later - which is the pick by registration order the head exists to
+    /// rule out.  Arguments no delivered entry accepts are reported as any
+    /// static call's are, from the pin's absence.
+    pin_impl_qualified_call(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
+                            owner_sym: SymbolStr, member_sym: SymbolStr) -> void {
+        const trait_sym: SymbolStr = this.impl_qualified_trait(scope);
+        if (!trait_sym.is_valid()) { return; }
+        const entries: OverloadId[] = this.trait_delivered_entries(owner_sym, trait_sym, member_sym);
+        if (entries.length > 0) {
+            this.pin_trait_delivered_call(call, scope, &entries);
+            return;
+        }
+        this.report_impl_qualified_miss(scope, owner_sym, trait_sym, member_sym);
+    }
+
+    /// `(Trait for Type)::member` where `Trait`'s implementation for `Type`
+    /// delivers no `member`: `Type` does not implement the trait, or the
+    /// implementation has no method of that name.  Silent during a symbolic
+    /// generic-body walk: the concrete instantiation reports.
+    report_impl_qualified_miss(mut &this, scope: ScopeResolutionNode*, owner_sym: SymbolStr,
+                               trait_sym: SymbolStr, member_sym: SymbolStr) -> void {
+        if (this.state.in_symbolic_check) { return; }
+        const owner_str: string = this.intern.resolve(owner_sym);
+        const trait_leaf: string = QualifiedName::leaf_of(this.intern.resolve(trait_sym));
+        const owner_ref: TypeRef = this.types.lookup_type_exact(owner_sym);
+        if (owner_ref.is_valid()
+                && !this.trait_checker().type_implements_trait(owner_ref, trait_sym, 0)) {
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+                fmt::format("`%s` does not implement `%s`",
+                    this.arena.resolve_display_name_short(owner_ref.id), trait_leaf));
+            d = d.at_with_label(scope.scope_span,
+                fmt::format("no `implement trait %s for %s` selects an implementation here",
+                    trait_leaf, this.arena.resolve_display_name_short(owner_ref.id)));
+            this.ctx.emit_diagnostic(d);
+            return;
+        }
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0233_UNDEFINED_SYMBOL,
+            fmt::format("`%s`'s implementation for `%s` has no method `%s`",
+                trait_leaf, QualifiedName::leaf_of(owner_str), this.intern.resolve(member_sym)));
+        d = d.at_with_label(scope.member_span, "not a method of this implementation");
+        this.ctx.emit_diagnostic(d);
     }
 
     /// Pin the static method a `Type::method` VALUE names, by the symbol
@@ -3775,16 +3886,41 @@ type struct CallResolver {
     /// name, as the call form does; several trait methods of the selected
     /// signature under one name with no inherent one to prefer is the tie
     /// `choose_entry` reports.
+    ///
+    /// Answers the value's type: `method_ft` - or, for an impl-qualified
+    /// path `(Beta for P)::make`, the signature of the entry `Beta`'s
+    /// implementation delivers, which `method_ft` (the first method of the
+    /// name the type holds) need not be.  A head that delivers nothing is
+    /// refused as the call form's is and answers no type.
     pin_scope_value_static_method(mut &this, scope: ScopeResolutionNode*, owner: TypeRef,
-                                  method_ft: TypeRef) -> void {
-        if (scope.resolved_callee.is_some()) { return; }
-        if (this.ctx.decl_index == null) { return; }
+                                  method_ft: TypeRef) -> TypeRef {
+        if (scope.resolved_callee.is_some()) { return method_ft; }
+        if (this.ctx.decl_index == null) { return method_ft; }
         const owner_sym: SymbolStr = this.ctx.decl_index.lookup_type_name(owner);
-        if (!owner_sym.is_valid()) { return; }
+        if (!owner_sym.is_valid()) { return method_ft; }
+        if (scope.impl_trait != null) {
+            const trait_sym: SymbolStr = this.impl_qualified_trait(scope);
+            if (!trait_sym.is_valid()) { return TypeRef::invalid(); }
+            const entries: OverloadId[] = this.trait_delivered_entries(owner_sym, trait_sym, scope.member_name);
+            if (entries.length == 0) {
+                this.report_impl_qualified_miss(scope, owner_sym, trait_sym, scope.member_name);
+                return TypeRef::invalid();
+            }
+            // Several delivered entries are one implementation's overloads
+            // of the name; the one of the signature sema selected, else the
+            // first, as a bare path's value takes the first of the name.
+            mut chosen: OverloadId = entries[0];
+            for (mut i: i64 = 0; i < entries.length; i++) {
+                if (this.ctx.decl_index.entry_signature(entries[i]).id == method_ft.id) { chosen = entries[i]; }
+            }
+            scope.set_resolved_callee(CalleePin::Decl(chosen));
+            return this.ctx.decl_index.entry_signature(chosen);
+        }
         const sym: SymbolStr = this.intern.intern(fmt::format("%s::%s",
             this.intern.resolve(owner_sym), this.intern.resolve(scope.member_name)));
         const entry: OverloadId = this.entry_of_signature(sym, method_ft, scope);
         scope.set_resolved_callee(if (entry.is_valid()) { CalleePin::Decl(entry) } else { CalleePin::Family(sym) });
+        return method_ft;
     }
 
     /// The entry under `family` with signature `ft` the `Type::method` path
@@ -3832,16 +3968,14 @@ type struct CallResolver {
             spans.push(this.ctx.decl_index.entry_span(fits[i]));
         }
         mut args_text: string = "";
-        mut has_receiver: boolean = false;
         if (call != null && call.arguments.length > 0) {
-            has_receiver = true;
             const first: ExpressionNode* = call.arguments[0];
             const last: ExpressionNode* = call.arguments[call.arguments.length - 1];
             args_text = this.source_text(SourceSpan::new(first.span.file,
                 first.span.start_line, first.span.start_col, last.span.end_line, last.span.end_col));
         }
         this.report_trait_method_tie(path.span, path.member_name, this.intern.resolve(path.scope_name),
-            &traits, &spans, has_receiver, args_text, call != null);
+            &traits, &spans, args_text, call != null);
     }
 
     /// The source text under a single-line `span`, or "" when it spans lines
@@ -3860,13 +3994,14 @@ type struct CallResolver {
     /// the signature the use selects, and no inherent method outranks them.
     /// A tie is an error, never a pick by declaration or import order.  Each
     /// candidate is named where it is declared (`decl_spans`), and the help
-    /// names the call that chooses: the trait-qualified form
-    /// `Trait::member(receiver, args)`, when there is a receiver to select
-    /// the implementation by.  Silent during a symbolic generic-body walk:
-    /// the concrete instantiation reports.
+    /// names the spelling that chooses: the impl-qualified path
+    /// `(Trait for Owner)::member(args)`, one rule for a method with a
+    /// receiver (the receiver its first argument, as `args_text` carries
+    /// it), a static method, and a method taken as a value.  Silent during
+    /// a symbolic generic-body walk: the concrete instantiation reports.
     report_trait_method_tie(mut &this, span: SourceSpan, member: SymbolStr, owner_display: string,
                             traits: &SymbolStr[], decl_spans: &SourceSpan[],
-                            has_receiver: boolean, args_text: string, is_call: boolean) -> void {
+                            args_text: string, is_call: boolean) -> void {
         if (this.state.in_symbolic_check) { return; }
         const member_str: string = this.intern.resolve(member);
         mut diag: Diagnostic = Diagnostic::error(
@@ -3891,17 +4026,11 @@ type struct CallResolver {
             const note: string = fmt::format("candidate #%d: `%s::%s`, from `implement trait %s for %s`",
                 (i + 1) as i32, leaf, member_str, trait_str, owner_display);
             diag = if (decl_spans[i].has_location()) { diag.with_note_at(note, decl_spans[i]) } else { diag.with_note(note) };
-            if (has_receiver) {
-                const form: string = if (is_call) { fmt::format("`%s::%s(%s)`", leaf, member_str, args_text) }
-                                     else { fmt::format("`%s::%s`", leaf, member_str) };
-                help = if (help.length() == 0) { form } else { help + " or " + form };
-            }
+            const form: string = if (is_call) { fmt::format("`(%s for %s)::%s(%s)`", leaf, owner_display, member_str, args_text) }
+                                 else { fmt::format("`(%s for %s)::%s`", leaf, owner_display, member_str) };
+            help = if (help.length() == 0) { form } else { help + " or " + form };
         }
-        if (has_receiver) {
-            diag = diag.help(fmt::format("name the trait the call is meant through: %s", help));
-        } else {
-            diag = diag.help("the candidates are static and take no receiver to select an implementation by; the language has no qualified form for this call yet");
-        }
+        diag = diag.help(fmt::format("name the implementation the call is meant through: %s", help));
         this.ctx.emit_diagnostic(diag);
     }
 
@@ -5398,6 +5527,10 @@ type struct CallResolver {
             const scope_str:  string = this.intern.resolve(lookup_sym);
             const member_str: string = this.intern.resolve(scope.member_name);
             if (scope_str.length() == 0 || member_str.length() == 0) { return; }
+            if (scope.impl_trait != null) {
+                this.check_impl_qualified_args(visitor, lookup_sym, scope, call);
+                return;
+            }
             combined = this.intern.intern(fmt::format("%s::%s", scope_str, member_str));
         }
         const overloads: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(combined);
@@ -5422,6 +5555,52 @@ type struct CallResolver {
         // inherent gather to defer to.
         if (names_module) { return; }
         this.check_static_scope_method_args(visitor, lookup_sym, scope, call);
+    }
+
+    /// Argument check for an impl-qualified call, `(Beta for P)::go(&p)`:
+    /// the candidates are the entries `Beta`'s implementation for the owner
+    /// delivers under the member's name, whether they take a receiver or
+    /// not, and the one of the call's arity is checked argument by
+    /// argument; none of its arity is the arity error, naming the arities
+    /// the implementation offers.  A head that delivers nothing was refused
+    /// where the call resolved, and a trait the head does not name was
+    /// refused there too.
+    check_impl_qualified_args(mut &this, visitor: ASTVisitor*, owner_sym: SymbolStr,
+                              scope: ScopeResolutionNode*, call: CallExprNode*) -> void {
+        if (TypeAnnotation::refused(scope.impl_trait)) { return; }
+        const trait_sym: SymbolStr = TypeAnnotation::trait_identity(scope.impl_trait);
+        if (!trait_sym.is_valid()) { return; }
+        const entries: OverloadId[] = this.trait_delivered_entries(owner_sym, trait_sym, scope.member_name);
+        if (entries.length == 0) { return; }
+        const argc: i64 = call.arguments.length;
+        mut uniq_arity: i64 = -1;
+        mut of_arity: FunctionType*[] = [];
+        for (mut i: i64 = 0; i < entries.length; i++) {
+            const et: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entries[i]).id);
+            if (et == null || et.kind != TypeKind::Function) { continue; }
+            const ft: FunctionType* = et as FunctionType*;
+            if (ft.is_variadic) { return; }
+            uniq_arity = this.diag.note_arity(uniq_arity, ft.param_types.length);
+            if (ft.param_types.length == argc) { of_arity.push(ft); }
+        }
+        if (of_arity.length == 0) {
+            this.diag.emit_method_arity_error(call, scope.member_name, "method", uniq_arity, argc, false);
+            return;
+        }
+        // Several of the arity are one implementation's overloads: the one
+        // the arguments fit is checked, as the inherent static gather does.
+        mut chosen: FunctionType* = of_arity[0];
+        if (of_arity.length > 1) {
+            mut fits: i64 = 0;
+            for (mut i: i64 = 0; i < of_arity.length; i++) {
+                if (this.args_fit_params_loosely(call, of_arity[i].param_types.as_slice())) {
+                    fits += 1;
+                    chosen = of_arity[i];
+                }
+            }
+            if (fits != 1) { return; }
+        }
+        this.check_args_against_params(visitor, call, chosen.param_types.as_slice());
     }
 
     /// Argument type-check for a `Type::method(args)` static call whose callee is
