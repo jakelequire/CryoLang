@@ -67,7 +67,7 @@ measurement that decided it on the row.
 | D22 | **The six trait heads with a trailing type list and no leading `implement<...>`** (`Atomic<T>`, `BufStream<S>` ×3, `WebSocket<S>`, one test) are **covered by D16**: `implement trait Atomic<T>` with `T` declared nowhere becomes `implement<T> trait Atomic<T>`, same code and diagnostic | **TAKEN** (ruled §8.202; built in §8.210) — `refuse_undeclared_head_params`, beside D16's count check on a written trait head whose count matches: a trailing-list argument that is a `Named` leaf the name layer could not place is a name declared nowhere, E0302, the note spelling the head with it moved to the leading list. The six heads are rewritten `implement<S> trait …`; §8.193's 483 unstamped target arguments were the two `String<GlobalAlloc>` heads (imported then) and these six, so the population is 0 now | `grep -c 'stamp_impl_target_args' compiler/src/compiler/resolver/name_resolution.cryo` → **2** (the definition and the impl-head visit; since §8.258 the refusal is the name layer's, with the same E0302 and note, and type resolution's `refuse_undeclared_head_params` is gone); `ls tests/tests/negative/E0302_trait_head*.cryo \| wc -l` → **1**; `grep -rhoE '^\s*implement trait [A-Za-z:_]+ for ([a-z]+ )?[A-Za-z:_]+<[A-Z][A-Za-z]*>' stdlib compiler/src tools examples tests/tests/lang tests/tests/projects runtime --include=*.cryo \| grep -vc GlobalAlloc` → **0** (the negative suite holds the one refused head) | §8.190, §8.193, §8.202, §8.210 |
 | D23 | **The `Res` contract is AUTHORITATIVE**: an unstamped node is an error; D1 is right and the tree is wrong. Landed GRADUALLY - each silent `_ =>` arm becomes a hard door as its population is measured to zero; never all at once | **RULED, staged; seven arms converted (§8.211, §8.214)** — every consumer-side `match` over a `ResSlot` with a silent outer `_ =>` arm was enumerated (14) and instrumented over the six halves: **6 entered 0 times** and are doors since §8.211 (`register_generic_fn_call`'s callee, the trait-impl head's `origin_trait` - whose LEAF fallback is deleted with it - `spelling_template`, the struct literal's base, `ann_head_key`, the constant pattern's `const_res`); **1 was entered on green programs and is a door since §8.214** (`head_type_key`: 448 entries, every one a keyword primitive's `TypeAnnotation::Primitive`, which carries no slot - not an unstamped head; the primitive's spelling is its key now, 0 `Named` heads unstamped); **4 are a clone's head answered by `spec_owner` by design** (`target_key`, `impl_owner`, `impl_target_type`, the async declare pass: entered millions of times, not a missing stamp); **3 are entered only in refused programs** (`find_fn_template_for_call` 12, `lookup_callee_function_type`'s hint 6, `ann_canon_key` 1 - the E0202/E0302/E0353 path, where the name layer leaves the slot for sema to report; scoped in §8.248 to exactly two shapes over the negatives, a bare callee binding to nothing and an undeclared impl-head argument, and blocked on the E0202/E0201 reporting move; the `FILE`/`LINE` magic names that stood in front of it are the name layer's `Res::SourceLoc` since §8.249, and the move itself landed in §8.250 - an unbound bare identifier is `Err` with its report made where it was written, and the driver runs sema over the refused tree - so the two call-resolver arms became doors in §8.251 - 0 entries over the six halves, the pair on a Pending callee 2 nodes at the tail door vs 8 first at the hint; the impl-head arm, `ann_canon_key`'s, waits on the type lane stamping `Err` on an undeclared written type name - measured in §8.255: the type lane leaves 38 written spellings Pending over the six halves, 34 on refused programs and 4 on green ones, every one of the 4 a ruled item - `int` ×2, D18's alias keyword, and bindgen's synthesized `cit::_NeverU` / `cit::_NeverS` at span `:0`, Q2's - so the move is blocked on D18 and Q2 (D18's alias half landed in §8.256: `int` is `PrimTy("i32")` now, and the coherence check's head arm, which substituted `PrimTy(<spelling>)` for an unstamped source head, is a `require` door; and §8.257 measured at the SLOT rather than at the walk's return - `cit::_NeverU` / `cit::_NeverS` were never unstamped: bindgen's `CTypeMapper::named` answers `Res::Def` on every annotation it builds, and the walk's Pending return was dropped by first-wins - so the green population is **0**; **the move landed in §8.258**: a written type name nothing binds is refused where it is written - E0203/E0240/E0155/E0154 from the name layer, stamped `Err` - and an impl head's undeclared argument is E0302 from the name layer with the same words, so `ann_canon_key`'s `Named` arm is a `require` door and **every one of the 14 arms is converted or a clone's by design**; the pair: a mutant leaving the argument Pending records `type_resolution: coherence key name` 1 on the E0302 negative, the tree 0 over 194 negatives and every `compile_fail` project), and carries a question for Jake that the landing kept open by keeping the code: `Holder<S>` with `S` undeclared is E0302 (the name layer's impl-head refusal, one line to change), and the general code would be E0203, Rust's E0412). **Since §8.231 the same contract covers a declaration's `DefId` stamp**: the 29 readers of a type declaration's own type go through `type_of_decl(node.def, site)`, whose unstamped arm records a third tally reported on BOTH exits of the build (an unstamped declaration is never a user error's consequence, and the old readers' silence left the program refused with errors that blamed it); 0 over examples, tests, the LSP and the cross-target build, with a no-stamp mutation as the control (138 reported) | `grep -rho 'require_scope_res(' compiler/src --include=*.cryo \| wc -l` → **17** (+1 in §8.217: the scope-call argument check dispatches on the segment's kind; +1 in §8.234: the callee hint refuses a module segment before any spelling is probed; +1 in §8.254: default expansion's scope segment); `grep -rho '\.require("' compiler/src --include=*.cryo \| wc -l` → **23** (7 at §8.210, +2 in §8.258: the coherence key's `Named` arm, D23's last, and `TypeAnnotation::refused`, the door every reporter of an unresolved annotation reads its leaves through, +1 in §8.256: the coherence check's head, once the alias keyword folds and every source head with a key is a stamped head, +6 in §8.211, +1 in §8.214, +2 in §8.250: sema's identifier and direct-call tails, where an unstamped bare identifier was reported as a name that does not exist, +2 in §8.251: the free-call template and the callee hint, +1 in §8.254: default expansion's named annotation, once the name layer stamped the `static match` scrutinee (2,517 Pending `T` over the six halves, every one that site's), +1 in §8.233: an impl head's written target argument, read by the selector; the door found the async lowering's synthesized `Fut<T, …>` heads born unstamped, 71 per example, 991 over the unit suite, and `generic_param_anns` stamps them `GenericParam` now; the sema `ann_head_key` door is deleted with its function, the Item's type is read off the stamp); `grep -rho 'type_of_decl(' compiler/src --include=*.cryo \| wc -l` → **33** (29 readers, the definition, and since §8.232 the three method registrations that hand the stamped type to `register_methods`); `grep -rho 'report_unstamped_decls(' compiler/src --include=*.cryo \| wc -l` → **3** (the definition and both exits) | §8.39, §8.44, §8.202, §8.211, §8.214, §8.217, §8.231 |
 | D24 | **The trait-impl registry is RE-KEYED by the trait's identity.** Measured first (§8.212), then ruled by Jake 2026-09-16: "I want to rekey" (§8.216). The previous re-key was backed out because it was decided rather than measured; that objection is discharged - the measurement below is the basis | **TAKEN** (measured in §8.212, built in §8.233: `trait_heads` keyed by `(trait identity, target key)`, a LIST per key, one selector by unification - which is also §8.223's concrete-argument fix, the same table and the same readers; the operator traits are well-known identities, so the "leaf by design" readers ask by identity too; `trait_leaf_dispatch` still exits 12, its expectation unchanged) — the measurement: over the six halves the leaf key loses an impl in ONE shape, two same-leaf traits implemented for one type: **1** registration collapse (the typed table's `(Render, Shape)` entry, `Alpha::Render`'s block overwritten by `Omega::Render`'s) and **3** bound checks answered by the wrong impl (a `T: Alpha::Render` bound satisfied by `Omega::Render`'s block), every one in `trait_leaf_dispatch`, the project written to hold the shape; 84,520 bound checks and every other identity-holding reader agree, and the readers that pass a leaf by design (the operator traits, `Index`, `Deref`) are a different question. Those 4 are the programs whose binding changes when built; `trait_leaf_dispatch` is the project that holds them | `ls -d tests/tests/projects/trait_leaf_dispatch*/test.json \| wc -l` → **1** (the shape's project; the re-key flips its expectation) | §8.194, §8.202, §8.212, §8.216 |
-| Q2 | **An `extern module` alias gets a REAL module-graph entry with a stamp** (§9 Q2, ruled by Jake 2026-09-16: "I don't want to have that permanent blemish" - the alias is NOT left a bare namespace symbol that resolution special-cases forever). Basis: `extern module libc as cit;` is already a declaration in source and simply is not registered, so stamping it registers what the programmer wrote rather than inventing a synthetic module; Rust binds `extern crate foo as bar` as a real nameable item. Unblocks: codegen's `resolve_global`/`resolve_global_in_namespace`/`resolve_global_by_qualified` lane and its five-step spelling ladder (`symbol_resolver.cryo`, `resolve_global`), which exists because the alias has no stamp, and `lookup_callee_function_type`'s `bare_sym` door (`call_resolver.cryo`), the C import's wholesale `alias::name` key space. SCOPED in §8.257 (`scripts/ns-migration/8.257/probe_q2.py` over the six halves, 3,047 lines): the ALIAS group is 3,036 - every call `llvm::X()` / `probe::X()` (968, each through two spelling doors) and every constant `cit::X` (22 at codegen's ladder), plus 1,078 `scope_qualifier_type` reads of the same nodes' `TypeRelative(Def(<module>::alias))` stamps, which claim a type the index holds nothing for - and the MEMBER group is 11, the C-import type annotations (`cit::Vec2`) answered by the whole-spelling declarations in the writer's scope. Stamping the alias `Def(<declaring module>::alias)` closes the alias group by construction IF the key space moves from `alias::X` to `<declaring module>::alias::X` (functions, types, globals; the C linker symbol is unaffected). **The shape is Jake's**: the ruling says "a real module-graph entry", and a file-less `ModuleInfo` row must be skipped by 55 loops over the graph (21 in the driver: build order, per-module passes, object emission, the manifest) - machinery added; the resolver already owns one scope per module keyed by namespace (`module_scope_of`), and an alias made a resolver module under `<mod>::alias` - the alias symbol binding to it, its members declared in it and keyed by that namespace - gives every consumer the same `Def` stamp through the doors a real module's members use, with no graph loop touched, and a graph row can be added on top if anything is found to need one. **BUILT as the resolver-module shape in §8.259** (the brief's author ruled it, for Jake to overrule): the alias is a module of the resolver's own under `<declaring module>::alias`, written once by the import engine on the block (`ExternBlockNode.binding_namespace`) and carried by every declaration it brings in; its functions, types and constants are declared and exported there and keyed by it; the alias symbol's qualified name is that namespace, so a scope segment or a type spelling bound to it - directly or through an import of it - answers `Def(<mod>::alias)` and its members resolve through the module lane's doors; **the namespace is PER DECLARING MODULE** (two files writing `extern module libc as cit;` get `A::cit` and `B::cit`; a global `cit` would be first-claimant-wins again - do not "fix" it into one); the C-import key space `alias::X`, codegen's global ladder, the C-import call door, the hint's spelling door, sema's `alias_global` and the index's bare-leaf global map are deleted; 518 alias answers over the six halves, 0 misses; the member group (11 type spellings) closed with the same change | **LANDED (§8.259)** | `grep -rho -e '\.resolve_global(' -e '\.resolve_global_in_namespace(' -e '\.resolve_global_by_qualified(' compiler/src/compiler/codegen --include=*.cryo \| wc -l` → **1** (the scope form's stamp reader; the alias fallback `resolve_global` is deleted); `grep -c 'lookup_func_type_exact(bare_sym)' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -rho 'alias_module_of' compiler/src --include=*.cryo \| wc -l` → **5** (the definition, its own import-following recursion, the scope segment, the walk, the type spelling's head); `grep -c 'binding_namespace' compiler/src/compiler/AST/declaration.cryo` → **18** (the four synthesized declaration kinds' fields, the block's, and their comments and initializers) | §8.216, §8.257, §8.259, §9 Q2 |
+| Q2 | **An `extern module` alias gets a REAL module-graph entry with a stamp** (§9 Q2, ruled by Jake 2026-09-16: "I don't want to have that permanent blemish" - the alias is NOT left a bare namespace symbol that resolution special-cases forever). Basis: `extern module libc as cit;` is already a declaration in source and simply is not registered, so stamping it registers what the programmer wrote rather than inventing a synthetic module; Rust binds `extern crate foo as bar` as a real nameable item. Unblocks: codegen's `resolve_global`/`resolve_global_in_namespace`/`resolve_global_by_qualified` lane and its five-step spelling ladder (`symbol_resolver.cryo`, `resolve_global`), which exists because the alias has no stamp, and `lookup_callee_function_type`'s `bare_sym` door (`call_resolver.cryo`), the C import's wholesale `alias::name` key space. SCOPED in §8.257 (`scripts/ns-migration/8.257/probe_q2.py` over the six halves, 3,047 lines): the ALIAS group is 3,036 - every call `llvm::X()` / `probe::X()` (968, each through two spelling doors) and every constant `cit::X` (22 at codegen's ladder), plus 1,078 `scope_qualifier_type` reads of the same nodes' `TypeRelative(Def(<module>::alias))` stamps, which claim a type the index holds nothing for - and the MEMBER group is 11, the C-import type annotations (`cit::Vec2`) answered by the whole-spelling declarations in the writer's scope. Stamping the alias `Def(<declaring module>::alias)` closes the alias group by construction IF the key space moves from `alias::X` to `<declaring module>::alias::X` (functions, types, globals; the C linker symbol is unaffected). **The shape is Jake's**: the ruling says "a real module-graph entry", and a file-less `ModuleInfo` row must be skipped by 55 loops over the graph (21 in the driver: build order, per-module passes, object emission, the manifest) - machinery added; the resolver already owns one scope per module keyed by namespace (`module_scope_of`), and an alias made a resolver module under `<mod>::alias` - the alias symbol binding to it, its members declared in it and keyed by that namespace - gives every consumer the same `Def` stamp through the doors a real module's members use, with no graph loop touched, and a graph row can be added on top if anything is found to need one. **BUILT as the resolver-module shape in §8.259** (the brief's author ruled it, for Jake to overrule): the alias is a module of the resolver's own under `<declaring module>::alias`, written once by the import engine on the block (`ExternBlockNode.binding_namespace`) and carried by every declaration it brings in; its functions, types and constants are declared and exported there and keyed by it; the alias symbol's qualified name is that namespace, so a scope segment or a type spelling bound to it - directly or through an import of it - answers `Def(<mod>::alias)` and its members resolve through the module lane's doors; **the namespace is PER DECLARING MODULE** (two files writing `extern module libc as cit;` get `A::cit` and `B::cit`; a global `cit` would be first-claimant-wins again - do not "fix" it into one); the C-import key space `alias::X`, codegen's global ladder, the C-import call door, the hint's spelling door, sema's `alias_global` and the index's bare-leaf global map are deleted; 518 alias answers over the six halves, 0 misses; the member group (11 type spellings) closed with the same change; the call's argument check, which the C-import door never made, is swept in §8.260 - 0 E0214 over the tree's 486 alias calls, `E0214_c_import_narrowing` pins it (the pre-§8.259 compiler compiles that file) | **LANDED (§8.259); the argument check swept and pinned (§8.260)** | `ls tests/tests/negative/E0214_c_import_narrowing.cryo \| wc -l` → **1**;  `grep -rho -e '\.resolve_global(' -e '\.resolve_global_in_namespace(' -e '\.resolve_global_by_qualified(' compiler/src/compiler/codegen --include=*.cryo \| wc -l` → **1** (the scope form's stamp reader; the alias fallback `resolve_global` is deleted); `grep -c 'lookup_func_type_exact(bare_sym)' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -rho 'alias_module_of' compiler/src --include=*.cryo \| wc -l` → **5** (the definition, its own import-following recursion, the scope segment, the walk, the type spelling's head); `grep -c 'binding_namespace' compiler/src/compiler/AST/declaration.cryo` → **18** (the four synthesized declaration kinds' fields, the block's, and their comments and initializers) | §8.216, §8.257, §8.259, §9 Q2 |
 | D25 | **`(Beta for P)::make()` is Cryo's impl-qualified call form** (Jake, 2026-09-17). It reuses `for` exactly as `implement trait Beta for P` does - no new lexical territory, and none of the `<P as Beta>` parsing problem. It MUST cover the receiver case too, `(Beta for P)::go(&p)`, so E0156 has ONE rule to suggest rather than a short form that works sometimes; and it must compose inside a generic, `(Beta for T)::make()`. Motivation: a tie of STATIC trait methods (`P::make()` with `Beta::make` and `Gamma::make` both implemented for `P`) has no receiver to disambiguate it, so E0156 fires with no suggestable spelling today | **RULED - UNBUILT** | `no check` — syntax not in the tree; the project that lands it pins it, and E0156's help names the form then | §8.224, §8.229 |
 | D26 | **The two-trait tie is an ERROR** in both spellings (`recv.m(...)`, `T::m(recv, ...)`) - never a pick by declaration or import order; each candidate named at its declaration; the trait-qualified call `Tr::m(&recv, ...)` chooses | **TAKEN** (ruled 2026-09-17; built the same day, §8.224, as `E0156_AMBIGUOUS_TRAIT_METHOD`) | `grep -c 'E0156_AMBIGUOUS_TRAIT_METHOD' compiler/src/compiler/diag/_module.cryo` → **2**; `ls tests/tests/negative/E0156_*.cryo \| wc -l` → **2**; `ls -d tests/tests/projects/trait_qualified_call_disambiguates*/test.json \| wc -l` → **1** | §8.220, §8.224, §8.229 |
 | D27 | **The Rust trait-in-scope rule is REJECTED** (Jake, 2026-09-17, on §8.224's measurement): Cryo calls a trait's methods with the trait imported nowhere in BOTH call forms today; requiring scope would break **277 call sites in 61 files** (stdlib 135, `tests/` 118, LSP 19, examples 5, `compiler/src` 0); and it would settle **0 of the 28** tie sites in the corpus - at no site is exactly one candidate in scope. D25 is what gives a tie a spelling, not scope. Not to be proposed again without new numbers | **REJECTED** | `no check` — a rule not built; `scripts/ns-migration/8.224/` re-derives the three tables from a corpus run | §8.224, §8.229 |
@@ -206,7 +206,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,127 unit + 65 project + 194 negative (68 projects on the roster, 3 gated by `requires`; `default_expansion_by_stamp` since §8.254; `lang/alias_keyword.cryo`'s three since §8.256; `plural_leaf_gate` pins four E0155 spans and `namespace_gate` both arms' E0240 spans since §8.258); `OVERALL PASS` since §8.233 - the two `impl_concrete_arg_*` projects that were RED by design from §8.223 are green | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** |
+| `make test` | 2,127 unit + 65 project + 195 negative (68 projects on the roster, 3 gated by `requires`; `default_expansion_by_stamp` since §8.254; `lang/alias_keyword.cryo`'s three since §8.256; `plural_leaf_gate` pins four E0155 spans and `namespace_gate` both arms' E0240 spans since §8.258; `E0214_c_import_narrowing` since §8.260); `OVERALL PASS` since §8.233 - the two `impl_concrete_arg_*` projects that were RED by design from §8.223 are green | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** The roster check (ubuntu CI's) compares the golden's ROWS; the census on this host reads its counts and project names - a project row whose `asserts=` moved under an unchanged count (§8.258's two, red at `4f24148d`) passes the census. Since §8.260 the roster check reads OK, 2,390 entries. |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make lane-check` | 17 buckets of call sites in `compiler/src`, as a golden, under three rules each derived from a definition and none from a list of names (§8.241, §8.253): **a STORE is a type that OWNS A MAP** (`HashMap<K, V>` / `HashSet<T>` field, read from the tree on every run; the key type is not consulted, since a name keys a map by its `u32` id and a `u64` may be two of them packed, a type id or a source position) - every owner must be placed, as a store with its rows (`DeclarationIndex`, `TypeArena`, `GenericRegistry`, `ModuleGraph`, `ConstantTable`, `Resolver`, plus `TypeUtils`, the funnel, marked as owning none) or as an exclusion with its reason (15, the script's `EXCLUDED` table), and a map owner in neither, a listed type with no map, or one declared in a file the table does not name, REFUSES the run; §8.241's version was a hand-written dict of seven the script never checked against the tree, and audit 13 added a map-keyed member to the context over which it read OK; the rule's first run found `DefaultRegistry` (two rows for one commit, §8.253) and §8.254 deleted the store, the rule refusing the stale entry until the table followed; a golden section no bucket counts is refused too (§8.254: the retired rows read OK until it was); **a name-keyed method is any a store declares - inline or in an `implement` block in ANY file - with `SymbolStr` or `string` in its signature**, parsed from the tree on every run since §8.230 (the `lookup_*` rule read OK over 24 readers under other names; the inline-only parser read OK over a cross-file `implement struct` reader; the `SymbolStr`-token rule read OK over a `string`-keyed one); **a call is placed by its receiver's DECLARED TYPE** (`this`, a local's annotation, a field's declaration, an accessor's return type), not its spelling. Reads split `LOOKUP` (the five) / `LOOKUP_OTHER` (the rest) / `LOOKUP_ROUTED` (the funnel), `REGISTER` pins the index's name-keyed WRITES, and each other store has a `*_READ` and a `*_WRITE` row (`ARENA`, `REGISTRY`, `GRAPH`, `CONST`); `LOOKUP_ARENA` kept the arena's `lookup_by_name` apart from §8.192 (it read OK over a tree holding 17) until §8.247 deleted the method, and `ARENA_READ` is where a written-name read on the arena lands under any spelling; `HOME_WRITE` pins `.set_home_module(` at 0 since §8.204; `REENTRY` counts `get_resolver()` AND every name-keyed `Resolver` method on a `Resolver`-typed receiver outside `compiler/resolver/` and the driver (the three-name list read 6 over a tree holding 12: type resolution's `is_ambiguous`/`get_ambiguous_modules` - deleted in §8.244, 10 now - sema's three asks on its `get_resolver()` local, `Resolver::ns_written_as`); `make lane-selftest` drives every rule through a throwaway tree in both directions (23 mutations) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. A receiver whose type it cannot read is refused, not dropped; a set name on a receiver of a NON-store type is counted as local (the control on placement). A `string` parameter that is a label rather than a key (`impl_owner(node, site: string)`) is inside the rule and pinned like a key: the rule cannot tell them apart and does not try. |
 | `make selfhost-check` | stage-3 == stage-4 byte identity, both arms | **Stability, not correctness.** It proves the compiler still emits the same bytes for code that already compiles; it says nothing about code that now STOPS compiling. |
@@ -237,7 +237,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: lane-check lane-selftest' Makefile` → **1**
 * `ls -d tests/tests/projects/*/test.json | wc -l` → **68**
-* `ls tests/tests/negative/*.cryo | wc -l` → **194**
+* `ls tests/tests/negative/*.cryo | wc -l` → **195**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
 * `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -256,6 +256,14 @@ Checks for this section, one per line so each can be copied whole:
 * **The other OS past the object file.** `cross-check` name-resolves and
   compiles the other OS's gated half on this host; whether it LINKS or RUNS
   there is `verify-freestanding` (WSL) and CI's, and CI fires on `main` alone.
+* **The other OS's C widths.** `bindgen` parses a C import for the HOST
+  (`importer.cryo` passes libclang no `-target`), so `cross-check` and a
+  `--target=<linux>` build both map `unsigned long` to `u32` here; the LP64
+  prototypes exist only on a Linux host.  §8.260 says why the host half is
+  the stricter one.
+* **A roster row whose count did not move.** `roster-check` is ubuntu CI's;
+  `test-census` on this host reads the golden's counts and project names,
+  not its rows (§8.260 found two project rows stale across two landings).
 
 ### 0.5 What this section is not
 
@@ -16884,6 +16892,160 @@ gone** (+11: `resolve_global`, the `alias::name` function registration,
 `alias_global`, `declare_c_imported_type`, `global_vars`, `register_global`,
 `lookup_global`, `get_global_module`, `get_global_namespace` - the
 C-import key space gone whole).
+
+---
+
+### 8.260 The C-import narrowing sweep: a call through an `extern module` alias is argument-checked since §8.259 and nothing in the tree narrows - 0 E0214 over the 486 in-tree calls (480 `llvm::`, 6 `probe::`; `cit` declares no function), with the instrument shown firing on 2 of 4 calls in a scratch the pre-§8.259 compiler accepts whole; the check is pinned by a compile-fail test whose pair is that compiler exiting 0 on it; and the roster golden is re-pinned - two project rows had been stale since §8.258 and `roster-check` was red at `4f24148d`, which no gate on this host reads - 2026-09-19
+
+> **Status:** LANDED.  `tests/tests/negative/E0214_c_import_narrowing.cryo`
+> (new), `tests/test-roster.txt` (re-pinned: the new negative; `namespace_gate`
+> asserts 5 → 7 and `plural_leaf_gate` 8 → 12, the rows §8.258's golden
+> re-pins moved).  No compiler source changed; nothing shadowed or deleted.
+
+#### The finding being swept
+
+§8.259 moved a `alias::fn(args)` call off the C-import door - which pinned
+the callee by its spelling and returned its type, asking nothing of the
+arguments - onto the module lane, where `check_scope_call_arg_types`
+(`sema/call_resolver.cryo`) compares every argument against the one
+registered prototype.  The move's own fixture was the first casualty
+(`bindgen_probe_vfmt`'s `unsigned long`, `u32` on this host, taking a
+`u64`).  The question for this entry: does anything ELSE in the tree pass a
+value through a C import that the check now refuses, and if so, is the
+caller wrong or the generated prototype?
+
+#### Population
+
+Every `extern module <alias> := "C"` block in the tree
+(`grep -rn 'extern module' --include=*.cryo .` outside `docs/` and
+`.objcmp/`): three.
+
+| alias | declared in | calls (`grep -rhoE '\b<alias>::[A-Za-z0-9_]+\(' … \| wc -l`) |
+|---|---|---|
+| `llvm` | `compiler/src/compiler/codegen/_module.cryo` | **480** (474 under `codegen/`, 6 in `instance.cryo`; 218 distinct callees) |
+| `probe` | `tests/tests/lang/c_import_libclang.cryo` | **6** (`add3`, `vsum`, `vsum_d`, `vmix`, `vstrlen`, `vfmt`) |
+| `cit` | `tests/tests/projects/ffi_c_import/tests/c_import_test.cryo` | **0** - `include/c_types.h` declares one function POINTER global (`cit_hook`) and no function |
+
+No example and nothing under `stdlib/` or `tools/` writes the form.
+`vendor_raylib` is not a member: `cryo vendor` serializes a header to
+`extern "C" { … }` prototypes under a `namespace` (`bindgen/generator.cryo`,
+the `extern "C" {` push), which are module functions reached by
+`Mod::fn()` through `check_scope_call_arg_types` and were not moved by
+§8.259.
+
+#### Measured
+
+* **`llvm`, all 480**: the LSP built directly with the compiler under test
+  (the `corpus2.sh` LSP half's command; `.objcmp/na-lsp.log`, "24 local,
+  81 std, 159 dep module(s)", `codegen/visit/ir_generator.o` and
+  `instance.o` among the 264 objects): exit 0, `grep -c '^error\['` → **0**,
+  `grep E0214` → nothing.
+* **`probe`, all 6**: `cd tests && cryo test c_import`
+  (`.objcmp/na-probe-test.log`): 12 unit tests `ok`, `ffi_c_import` PASS,
+  `OVERALL PASS`, 0 errors.
+* **Control - the instrument can fire** (`.objcmp/na-narrow/`, a scratch
+  project with `void take_ulong(unsigned long)`, `take_int(int)`,
+  `take_ull(unsigned long long)` and four calls):
+
+  ```cryo
+  const wide: u64 = 5;  const small: u32 = 5;  const big: i64 = 5;
+  probe::take_ulong(wide);   // u64 -> u32 here: E0214 at 11:23
+  probe::take_ulong(small);  // u32 -> u32: accepted
+  probe::take_int(big);      // i64 -> i32: E0214 at 13:21
+  probe::take_ull(wide);     // u64 -> u64: accepted
+  ```
+
+  `compiler/build/cryo.exe check` (HEAD's): exit 1, the two narrowings and
+  nothing else (`.objcmp/na-head.log`).  `.objcmp/cryo-U3.exe` (`02ee243e`,
+  the compiler before §8.259): exit 0, 0 errors (`.objcmp/na-u3.log`) -
+  every one of the four passed the C-import door unasked.
+
+So the blast radius of §8.259's correctness change inside the tree is the
+one fixture it already fixed.  Nothing to change; nothing to row.
+
+#### The gate
+
+The move had no test of its own: `c_import_libclang.cryo` pins that a
+64-bit parameter takes a `u64`, not that a narrower one refuses it.
+`tests/tests/negative/E0214_c_import_narrowing.cryo` passes an `i64` to
+`bindgen_probe_add3`'s `int`:
+
+```cryo
+extern module probe := "C" { #include "../../helpers/bindgen_probe.h" }
+function main() -> int {
+    const big: i64 = 5;
+    probe::bindgen_probe_add3(big, 1 as i32, 2 as i32);   //~ ERROR[E0214] mismatched types
+    return 0;
+}
+```
+
+The pair: HEAD's compiler refuses it at 17:31 with E0214 and the suite
+reports `E0214_c_import_narrowing.cryo ... [PASS]` (`cryo test
+E0214_c_import`, `.objcmp/na-neg-suite.log`); `cryo-U3.exe check` on the
+same file exits **0** (`.objcmp/na-neg.log`) - under the compiler before
+§8.259 this compile-fail test COMPILES.  The header is the one
+`c_import_libclang.cryo` already imports, so the compile-fail suite gains
+no new dependency.
+
+#### The roster golden was stale, and red, at `4f24148d`
+
+`python scripts/roster-check.py compiler/build/cryo.exe` before the new
+file was added to the golden (`.objcmp/na-roster-plain.log`):
+
+```
+MISSING  project namespace_gate:   … asserts=5 …
+MISSING  project plural_leaf_gate: … asserts=8 …
+NEW      negative E0214_c_import_narrowing.cryo: E0214 annotations=1
+NEW      project namespace_gate:   … asserts=7 …
+NEW      project plural_leaf_gate: … asserts=12 …
+roster drifted (2 missing, 3 new vs 2389 pinned)
+```
+
+The two project rows count a `test.json`'s `expect` entries; §8.258 added
+spans to both projects' goldens and re-pinned neither row.  No gate on
+this host reads the row: `roster-check` runs on ubuntu CI alone (and CI on
+`main` alone), and `test-census` reconciles the golden's COUNTS by section
+and its project NAMES (`scripts/test-census.py`, the roster read), so a
+row whose content moves under an unchanged count is invisible to it -
+§8.258's and §8.259's `test-census OK … 68 pinned` were true and did not
+cover this.  `--update` (the mode for a row that must be REPLACED; `--merge`
+keeps the stale row as "other platform") rewrote exactly the three rows
+above and nothing else (`git diff tests/test-roster.txt`: +3 −2); the plain
+check then reads `OK (2390 entries: 2127 unit, 68 project, 195 negative;
+0 gated to another platform)`.
+
+#### What the check does not see on this population, by construction
+
+* **A variadic callee is skipped whole** - `check_scope_call_arg_types`
+  and the bare call's `check_call_arity` both return on `ft.is_variadic`
+  before comparing the fixed parameters.  No C import in the tree is
+  variadic (LLVM-C has none; the `probe` functions take a `va_list`), so
+  the sweep's zero is not hiding one; a `printf`-shaped import would pass
+  its fixed arguments unasked on either path.  Pre-existing and
+  path-consistent; not this entry's.
+* **The other OS's widths.**  `bindgen/importer.cryo` hands libclang `-x c`
+  (and `-resource-dir`) and no `-target`, so the header is parsed for the
+  HOST and `--target=<linux>` on this host still maps `unsigned long` to
+  `u32` - the LP64 half of this sweep cannot be produced here.  It is also
+  the weaker half: every width libclang answers by target (`long`,
+  `unsigned long`, `wchar_t`) is at least as wide on LP64 as on this host,
+  so an argument accepted here fits there.  That bindgen ignores the
+  target is a cross-compilation defect in its own right, recorded for
+  Jake, not built.
+
+#### Residual
+
+* Nothing in-tree exercises a C import from the vendor path under this
+  host (`vendor_raylib` is `requires`-gated); its calls are module-lane
+  calls and were checked before §8.259.
+
+**New for Jake**: nothing - no API, no compiler source.
+
+Outside the ledger: `tests/tests/negative/E0214_c_import_narrowing.cryo`,
+`tests/test-roster.txt`.
+
+**Tally: 96 shadowed, 96 old paths deleted, 96 at zero; 214 artifacts
+gone** (unchanged; a sweep, a gate and a golden).
 
 ---
 
