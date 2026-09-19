@@ -73,11 +73,11 @@ measurement that decided it on the row.
 | D27 | **The Rust trait-in-scope rule is REJECTED** (Jake, 2026-09-17, on §8.224's measurement): Cryo calls a trait's methods with the trait imported nowhere in BOTH call forms today; requiring scope would break **277 call sites in 61 files** (stdlib 135, `tests/` 118, LSP 19, examples 5, `compiler/src` 0); and it would settle **0 of the 28** tie sites in the corpus - at no site is exactly one candidate in scope. D25 is what gives a tie a spelling, not scope. Not to be proposed again without new numbers | **REJECTED** | `no check` — a rule not built; `scripts/ns-migration/8.224/` re-derives the three tables from a corpus run | §8.224, §8.229 |
 | D28 | **Overlapping impls are REFUSED OUTRIGHT, as Rust does (E0119)** - not specialisation, not declaration order (Jake, 2026-09-18: "I want to do that 'refuse overlaps outright as Rust does'") | **RULED - UNBUILT** — the shape: `implement<T> trait Show for struct Wrap<T> { show(&this) -> i32 { 1 } }` beside `implement trait Show for struct Wrap<i32> { show(&this) -> i32 { 2 } }`; `w.show()` on a `Wrap<i32>` answers 1 or 2 by which impl is WRITTEN FIRST, under the current compiler and under the pin `db5af63c` alike, so it predates the migration (audit 12's `overlap_a` / `overlap_b` projects demonstrate it). The error belongs at the OVERLAPPING DECLARATION, never at the call: the call is innocent, two impls both claiming one (trait, type) is the defect, and a use-site report blames the wrong code. `generic_registry.cryo`'s `select_trait_impl` comment - "the overlap is a registration-time report, not one per use" - is a hypothesis, not a mechanism: grep finds the comment and no report; whoever builds this makes it true, as a coherence check over `heads_under` at registration. **Measure the population first**: the registry reshape (§8.233) made overlapping heads representable in a way they were not before, so the stdlib or the projects may hold overlaps that resolve by luck today; if any do, this is a source-breaking change and Jake wants the blast radius before it lands. **MEASURED in §8.261 with the unifier the refusal would use** (`scripts/ns-migration/8.261/heads_overlap.cryo`, Rust's rule: trait and target arguments unify under one substitution, bounds not consulted; 6 control shapes behave): over the six halves 35 pairs of written heads share a key, **4 unify** - the three E0308 negatives and ONE green project, `where_bound_leaf_collision` (`Emit for Holder<T> where T: Alpha::Render` / `where T: Omega::Render`), whose comment asserts the pair must be accepted and which DISPATCHES by bound today (`OnlyA=1 OnlyB=2`, `Both=1` by order); stdlib, compiler, LSP, examples 0. **RE-RULED on that measurement (Jake, 2026-09-19): Rust's rule, refuse anyway** - not specialisation by bound, not declaration order. He has seen the one green pair and chose E0119 over it. **Whoever builds this converts `where_bound_leaf_collision` as part of the landing** - a `compile_fail` project asserting E0119 at the later head, or two heads that no longer unify - not left red. The unifier splices in byte-identically (`python scripts/ns-migration/8.261/probe_d28.py`); delete its three prints, add the emit after type resolution's E0308 arm so an identical pair stays E0308 | `grep -c 'registration-time report' compiler/src/compiler/types/generic_registry.cryo` → **1**; `grep -rho 'E0119' compiler/src --include=*.cryo \| wc -l` → **0**; `ls scripts/ns-migration/8.261/*.cryo \| wc -l` → **2** | §8.261, §8.267 |
 | D29 | **`implement trait Tick for struct Holder<S>` with `S` undeclared KEEPS E0302** (Jake, 2026-09-19). E0203 was put to him as Rust's answer (E0412, the same code as any undeclared type name) and REJECTED: "too generic of an error for this situation". No dedicated code proposed: the message is already the situation's own ("this impl head names `S`, which is declared nowhere", with the head spelled as it must be written), and E0302's family - the head's parameter list disagreeing with its target - is where a reader looks for it; a code for one message would widen the table for no search. The nesting asymmetry stands and is recorded: `Holder<Vec<S>>` is E0203 from the general refusal, the top-level `S` is E0302 | **RULED - the question CLOSED** | `grep -c 'E0302_GENERIC_PARAM_MISMATCH' compiler/src/compiler/resolver/name_resolution.cryo` → **1**; `ls tests/tests/negative/E0302_trait_head_undeclared_param.cryo \| wc -l` → **1** | §8.258, §8.267 |
-| D30 | **A generic parameter that SHADOWS an enclosing one is REFUSED** (Jake, 2026-09-19), Cryo's E0403: `type struct Box<T> { size_of_param<T>(&this, x: T) -> u64 { sizeof(T) } }` refuses the method's `T` against the owner's; `do_something<K>` beside an owner `T` is untouched. Today the OWNER's `T` silently wins - `Box<u8>::new(1).size_of_param<i64>(5)` answers 1 - because the substitution tables are keyed by the parameter's SPELLING, so two parameters of one name are one slot. In-tree population **0** (no method redeclares its owner's parameter), so the refusal breaks nothing. **Rides with audit 14's `GenericParam` identity fix**: the resolver binds each parameter to a `SymbolID` (`name_resolution.cryo`'s `GenericParam` arm answers `Res::GenericParam(s.name)` and discards `sym_id`); stamp the id, key the substitution tables by it, and the shadowing is then a second declaration in a scope that holds the first - the refusal is the resolver's, at the declaration, as Rust's E0403 is (Cryo's E0403 is "Missing Return"; the code for this is the builder's to propose and Jake's to confirm) | **RULED - UNBUILT** | `grep -rhoi -e 'shadows the owner' -e 'generic parameter shadow' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'Res::GenericParam(s.name)' compiler/src/compiler/resolver/name_resolution.cryo` → **1** (the arm that discards the id) | §8.267 |
+| D30 | **A generic parameter that SHADOWS an enclosing one is REFUSED** (Jake, 2026-09-19), Cryo's E0403: `type struct Box<T> { size_of_param<T>(&this, x: T) -> u64 { sizeof(T) } }` refuses the method's `T` against the owner's; `do_something<K>` beside an owner `T` is untouched. Today the OWNER's `T` silently wins - `Box<u8>::new(1).size_of_param<i64>(5)` answers 1 - because the substitution tables are keyed by the parameter's SPELLING, so two parameters of one name are one slot. In-tree population **0** (no method redeclares its owner's parameter), so the refusal breaks nothing. **Rides with audit 14's `GenericParam` identity fix**: the resolver binds each parameter to a `SymbolID` (`name_resolution.cryo`'s `GenericParam` arm answers `Res::GenericParam(s.name)` and discards `sym_id`); stamp the id, key the substitution tables by it, and the shadowing is then a second declaration in a scope that holds the first - the refusal is the resolver's, at the declaration, as Rust's E0403 is (Cryo's E0403 is "Missing Return"; the code for this is the builder's to propose and Jake's to confirm) | **The refusal BUILT (§8.268) as `E0311_GENERIC_PARAM_SHADOWED` - a number PROPOSED, not confirmed: the generics family E03xx, the next free code after E0310** - `declare_generics` asks the scope chain before declaring each parameter and a `GenericParam` answer is the error at the parameter's span with the first declaration labelled; a method's `<T>` in `struct Box<T>`, a trait method's in `trait Conv<T>`, an impl method's in `implement<T>`, and `<T, T>` in one list are the four refused shapes (Rust's E0403 covers the same four); a parameter beside a TYPE or a value parameter of its spelling is not one. **The identity half HALF-BUILT**: `Res::GenericParam` and `ResBase::GenericParam` carry the `SymbolID` the declaration bound (`GenericParamNode.sym_id`, stamped by the resolver, copied by the cloner; every writer, the async lowering's synthesized head included), and `ResBase::name()` - the one name door off a stamp - is gone; **the substitution tables are still keyed by SPELLING**, one system fed from one end: `TemplateEntry.param_names` (15 `equals` sites across sema, type resolution and the type resolver's where-bound binder) fill `ResolutionContext.generic_bindings` (33 writers, 8 readers, `resolve_named` asking it by the written name BEFORE the stamp), whose names become `ImplBlockNode.derived_param_names` (3 writers, 2 readers), which with the entry's names feed `ASTTypeSubstituter.param_names` (6 compares over `Named.name`, a scope segment's spelling and `ArrayLiteralNode.element_type`, a string with no stamp); a `TraitBound.type_parameter` is a spelling with no stamp at all (9 compares). Re-keying is one unit over the whole chain, not a table at a time - two keys on one table is the defect. With the shadow refused, one spelling names one parameter in any scope chain the RESOLVER sees; what it does not see is a trait default's body copied under an impl whose own parameter spells the body's - the shape the id would tell apart and the spelling cannot, population unmeasured | `grep -c 'E0311_GENERIC_PARAM_SHADOWED' compiler/src/compiler/resolver/name_resolution.cryo` → **1**; `ls tests/tests/negative/E0311_*.cryo \| wc -l` → **1**; `grep -c 'Res::GenericParam(s.name)' compiler/src/compiler/resolver/name_resolution.cryo` → **0**; `grep -rhoE 'GenericParam\(SymbolID\)' compiler/src/compiler/resolver/res.cryo \| wc -l` → **2**; `grep -c 'sym_id' compiler/src/compiler/AST/declaration.cryo` → **4**; `grep -rho 'lookup_binding(' compiler/src --include=*.cryo \| wc -l` → **8** (the spelling-keyed readers, unchanged) | §8.267, §8.268 |
 | D31 | **The turbofish is REQUIRED for generic arguments in expression position** (Jake, 2026-09-19): `foo::<i32>(y)` opens type arguments; `g(LIMIT < x, MAXV > (y))` is two comparisons, always. **The rule: `<` immediately after `::` opens generic arguments; `<` anywhere else is a comparison.** The shape is `foo::<i32>(y)` - as Rust's `Vec::<i32>::new()`, where every `::` after the turbofish is an ordinary path step; there is no `::()` form. It RETIRES the parser's `ident <` lookahead tables (`parser_base.cryo` 872–912: is-a-local / is-a-global / is-declared-generic / binds-a-value, read from the module's OWN declarations; `expr_parser.cryo` ~1190, the identifier's `Name<T, U>` guess), which by their own comment cannot see an import - so one expression means two things by where its constants came from. **Source-breaking, population UNMEASURED: the first task of whoever builds it is the count of bare generic arguments in expression position over the stdlib, the projects, the examples and the compiler's own source** (`f<T>(..)`, `Type<T>::m(..)`, `Type<T> { .. }` as the parser reads them today, module by module), and Jake wants that number before it lands. Not measured this session | **RULED - UNBUILT** | `grep -c 'is_generic_call_ahead' compiler/src/compiler/parser/expr_parser.cryo` → **6** (the lookahead the rule retires; each site is a decision the `::<` form would make lexically) | §8.267 |
 
-**D18, D24, D28, D30 and D31 are RULED and UNBUILT** (D5 was, until §8.206; D2 and D9 were,
-until §8.213; Q2 was, until §8.259; D25 was, until §8.263). Each was decided by Jake - D18 and D2 then re-parked as open
+**D18, D24, D28 and D31 are RULED and UNBUILT, and D30's identity half is** (D5 was, until §8.206; D2 and D9 were,
+until §8.213; Q2 was, until §8.259; D25 was, until §8.263; D30's refusal was, until §8.268). Each was decided by Jake - D18 and D2 then re-parked as open
 questions, D2 across ninety-five entries; §8.202 records the re-affirmation,
 §8.216 the three rulings of 2026-09-16 and §8.229 the three of 2026-09-17. They
 are work, not questions - do not put any of them back on his desk.
@@ -170,7 +170,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `set_module_with_scope` | **DELETED** | — | `grep -rho 'set_module_with_scope' compiler/src \| wc -l` → **0** | §8.70, §8.78 |
 | B4 bucket (instantiation keying) | **DELETED** - with the leaf index; the counter that carried the bucket is gone too (§8.203) | — | `no check` — the bucket named a counter row, and the counter is deleted | §8.121, §8.203 |
 | arena `leaf_index` map | **DELETED** (§8.258) — its three diagnostic consumers moved to the name layer, which reads the module scopes it already holds: the E0203 did-you-mean pool is `visible_type_names` (what the writer can see, not the program), E0155's plurality and E0240's sole declarer are `type_declarers_of_leaf`; `leaf_second`, `register_leaf_name`, `sole_declarer` and `leaf_declarers` went with the map | — | `grep -rho 'leaf_index' compiler/src \| wc -l` → **0**; `grep -rho 'type_declarers_of_leaf' compiler/src --include=*.cryo \| wc -l` → **2** (the definition and the refusal) | §8.121, §8.193, §8.258 |
-| `resolve_path` (§5.2's one entry point) | **LIVE, but not the entry point** — 2 call sites in `name_resolution.cryo`, both single-segment, both `Namespace::Type`: the base-class name, and `leaf_in_module_scope`, which serves the annotation lane's bare leaf and the C-import alias spelling and stamps `resolve_path`'s `Def` DIRECTLY (§8.239 deleted `resolve_type_qualified_name_bare_from`, the string projection its callers re-wrapped). **The other routes in, measured over six halves (§8.239, 3,059,355 asks):** `Resolver::lookup` - the UNFILTERED rib walk - at 9 sites (the identifier, the scope head, the annotation's generic-param probe and path head, `new`, the struct literal, the constant pattern, the enum pattern, the impl target), with `bare_name_res` as a second `Res` builder beside `res_for_head`; the namespace-filtered walk binds the SAME symbol at every site but 417: 374 where the unfiltered walk bound a field, parameter, variable or function under a TYPE question (`headers::push_all` binding `Response.headers`) and the site then ignored it, 32 where a variant shadowed an import and the site asked only "is it a generic parameter", and **11 where an identifier in CALLEE position names a CLASS** (`Node(1)`), which the value namespace refuses and `resolve_direct_call` answers today through the type stamp - a constructor lives in the value namespace in Rust; how it does here is a ruling (§9 Q13). Converting the 9 needs `resolve_path` to record the span binding the LSP reads (`record_resolution`), which is the re-plumb, not a unit | — | `grep -rho '\.resolve_path(' compiler/src --include=*.cryo \| wc -l` → **2**; `grep -rho 'resolve_type_qualified_name_bare' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'this\.resolver\.lookup(' compiler/src --include=*.cryo \| wc -l` → **10** (+1 in §8.259: the module-rooted walk asks whether a path's head is bound to an `extern module` alias); `grep -rho 'bare_name_res(' compiler/src --include=*.cryo \| wc -l` → **3** | §5.2, §8.5, §8.7, §8.239, §8.259 |
+| `resolve_path` (§5.2's one entry point) | **LIVE, but not the entry point** — 2 call sites in `name_resolution.cryo`, both single-segment, both `Namespace::Type`: the base-class name, and `leaf_in_module_scope`, which serves the annotation lane's bare leaf and the C-import alias spelling and stamps `resolve_path`'s `Def` DIRECTLY (§8.239 deleted `resolve_type_qualified_name_bare_from`, the string projection its callers re-wrapped). **The other routes in, measured over six halves (§8.239, 3,059,355 asks):** `Resolver::lookup` - the UNFILTERED rib walk - at 9 sites (the identifier, the scope head, the annotation's generic-param probe and path head, `new`, the struct literal, the constant pattern, the enum pattern, the impl target), with `bare_name_res` as a second `Res` builder beside `res_for_head`; the namespace-filtered walk binds the SAME symbol at every site but 417: 374 where the unfiltered walk bound a field, parameter, variable or function under a TYPE question (`headers::push_all` binding `Response.headers`) and the site then ignored it, 32 where a variant shadowed an import and the site asked only "is it a generic parameter", and **11 where an identifier in CALLEE position names a CLASS** (`Node(1)`), which the value namespace refuses and `resolve_direct_call` answers today through the type stamp - a constructor lives in the value namespace in Rust; how it does here is a ruling (§9 Q13). Converting the 9 needs `resolve_path` to record the span binding the LSP reads (`record_resolution`), which is the re-plumb, not a unit | — | `grep -rho '\.resolve_path(' compiler/src --include=*.cryo \| wc -l` → **2**; `grep -rho 'resolve_type_qualified_name_bare' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'this\.resolver\.lookup(' compiler/src --include=*.cryo \| wc -l` → **11** (+1 in §8.259: the module-rooted walk asks whether a path's head is bound to an `extern module` alias; +1 in §8.268: `declare_generics` asks whether a parameter's name is an enclosing generic parameter's before declaring it - a DECLARATION-time ask, not a resolution route); `grep -rho 'bare_name_res(' compiler/src --include=*.cryo \| wc -l` → **3** | §5.2, §8.5, §8.7, §8.239, §8.259 |
 | `canonical_type_ref` and its arena bare step | **DELETED** — a declaration's key comes from the declaration (`decl_type_key`: the alias namespace, else the registered name, else the writing file's module); the MECHANISM (a qualified miss retried under the bare leaf) went from `type_resolution.cryo` with the row above in §8.192 | — | `grep -c 'lookup_by_name' compiler/src/compiler/compilation_context.cryo` → **0**; `grep -c 'arena.lookup_by_name(node.name)' compiler/src/compiler/passes/type_resolution.cryo` → **0** | §8.103, §8.112, §8.156, §8.189, §8.192 |
 | `resolve_cross_module_name` (sema's resolver re-entry by spelling) | **DELETED** — its four readers went under shadow mode | — | `grep -rho 'resolve_cross_module_name' compiler/src \| wc -l` → **0** | §8.155 |
 | intrinsic symbol's placeholder module (`Symbol::intrinsic` writing `source_module: "<intrinsic>"`, so a same-module bare intrinsic call stamped a `Def` no index key matched) | **DELETED** — the symbol carries its declaring module like every other declaration; the one such call in the tree (`runtime/backtrace`'s `frame_address`, Linux-gated) compiles, `verify-freestanding` green | — | `grep -c '"<intrinsic>"' compiler/src/compiler/resolver/symbol.cryo` → **0**; `grep -c 'intr_mod' compiler/src/compiler/resolver/name_resolution.cryo` → **2** | §8.178 |
@@ -210,7 +210,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,127 unit + 68 project + 202 negative (71 projects on the roster, 3 gated by `requires`; `default_expansion_by_stamp` since §8.254; `lang/alias_keyword.cryo`'s three since §8.256; `plural_leaf_gate` pins four E0155 spans and `namespace_gate` both arms' E0240 spans since §8.258; `E0214_c_import_narrowing` since §8.260; the two variadic negatives since §8.262; the two `impl_qualified_call*` projects and three `*_impl_qualified_*` negatives since §8.263; `E0203_refused_signature_no_cascade` since §8.265; `bound_directed_static_path` since §8.266; `E0233_trait_qualified_unselected` since §8.267); `OVERALL PASS` since §8.233 - the two `impl_concrete_arg_*` projects that were RED by design from §8.223 are green | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** The roster check (ubuntu CI's) compares the golden's ROWS; the census on this host reads its counts and project names - a project row whose `asserts=` moved under an unchanged count (§8.258's two, red at `4f24148d`) passes the census. Since §8.260 the roster check reads OK (2,400 entries at §8.267). |
+| `make test` | 2,127 unit + 68 project + 203 negative (71 projects on the roster, 3 gated by `requires`; `default_expansion_by_stamp` since §8.254; `lang/alias_keyword.cryo`'s three since §8.256; `plural_leaf_gate` pins four E0155 spans and `namespace_gate` both arms' E0240 spans since §8.258; `E0214_c_import_narrowing` since §8.260; the two variadic negatives since §8.262; the two `impl_qualified_call*` projects and three `*_impl_qualified_*` negatives since §8.263; `E0203_refused_signature_no_cascade` since §8.265; `bound_directed_static_path` since §8.266; `E0233_trait_qualified_unselected` since §8.267; `E0311_generic_param_shadowed` since §8.268); `OVERALL PASS` since §8.233 - the two `impl_concrete_arg_*` projects that were RED by design from §8.223 are green | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** The roster check (ubuntu CI's) compares the golden's ROWS; the census on this host reads its counts and project names - a project row whose `asserts=` moved under an unchanged count (§8.258's two, red at `4f24148d`) passes the census. Since §8.260 the roster check reads OK (2,401 entries at §8.268). |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make lane-check` | 17 buckets of call sites in `compiler/src`, as a golden, under three rules each derived from a definition and none from a list of names (§8.241, §8.253): **a STORE is a type that OWNS A MAP** (`HashMap<K, V>` / `HashSet<T>` field, read from the tree on every run; the key type is not consulted, since a name keys a map by its `u32` id and a `u64` may be two of them packed, a type id or a source position) - every owner must be placed, as a store with its rows (`DeclarationIndex`, `TypeArena`, `GenericRegistry`, `ModuleGraph`, `ConstantTable`, `Resolver`, plus `TypeUtils`, the funnel, marked as owning none) or as an exclusion with its reason (15, the script's `EXCLUDED` table), and a map owner in neither, a listed type with no map, or one declared in a file the table does not name, REFUSES the run; §8.241's version was a hand-written dict of seven the script never checked against the tree, and audit 13 added a map-keyed member to the context over which it read OK; the rule's first run found `DefaultRegistry` (two rows for one commit, §8.253) and §8.254 deleted the store, the rule refusing the stale entry until the table followed; a golden section no bucket counts is refused too (§8.254: the retired rows read OK until it was); **a name-keyed method is any a store declares - inline or in an `implement` block in ANY file - with `SymbolStr` or `string` in its signature**, parsed from the tree on every run since §8.230 (the `lookup_*` rule read OK over 24 readers under other names; the inline-only parser read OK over a cross-file `implement struct` reader; the `SymbolStr`-token rule read OK over a `string`-keyed one); **a call is placed by its receiver's DECLARED TYPE** (`this`, a local's annotation, a field's declaration, an accessor's return type), not its spelling. Reads split `LOOKUP` (the five) / `LOOKUP_OTHER` (the rest) / `LOOKUP_ROUTED` (the funnel), `REGISTER` pins the index's name-keyed WRITES, and each other store has a `*_READ` and a `*_WRITE` row (`ARENA`, `REGISTRY`, `GRAPH`, `CONST`); `LOOKUP_ARENA` kept the arena's `lookup_by_name` apart from §8.192 (it read OK over a tree holding 17) until §8.247 deleted the method, and `ARENA_READ` is where a written-name read on the arena lands under any spelling; `HOME_WRITE` pins `.set_home_module(` at 0 since §8.204; `REENTRY` counts `get_resolver()` AND every name-keyed `Resolver` method on a `Resolver`-typed receiver outside `compiler/resolver/` and the driver (the three-name list read 6 over a tree holding 12: type resolution's `is_ambiguous`/`get_ambiguous_modules` - deleted in §8.244, 10 now - sema's three asks on its `get_resolver()` local, `Resolver::ns_written_as`); `make lane-selftest` drives every rule through a throwaway tree in both directions (23 mutations) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. A receiver whose type it cannot read is refused, not dropped; a set name on a receiver of a NON-store type is counted as local (the control on placement). A `string` parameter that is a label rather than a key (`impl_owner(node, site: string)`) is inside the rule and pinned like a key: the rule cannot tell them apart and does not try. |
 | `make selfhost-check` | stage-3 == stage-4 byte identity, both arms | **Stability, not correctness.** It proves the compiler still emits the same bytes for code that already compiles; it says nothing about code that now STOPS compiling. |
@@ -241,7 +241,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: lane-check lane-selftest' Makefile` → **1**
 * `ls -d tests/tests/projects/*/test.json | wc -l` → **71**
-* `ls tests/tests/negative/*.cryo | wc -l` → **202**
+* `ls tests/tests/negative/*.cryo | wc -l` → **203**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
 * `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -17997,6 +17997,153 @@ Outside the ledger: the files in the status line.
 
 **Tally: 96 shadowed, 96 old paths deleted, 96 at zero; 216 artifacts
 gone** (unchanged; four rulings recorded, two silent exits made to speak).
+
+### 8.268 D30's refusal built: a generic parameter whose name an enclosing declaration's generic parameter already holds is E0311 at its declaration - a method's `<T>` in `struct Box<T>`, a trait method's in `trait Conv<T>`, an impl method's in `implement<T>`, `<T, T>` in one list - where before the OWNER's parameter silently won (`Box<u8>::new(1).size_of_param<i64>(5)` answered 1); the `Res::GenericParam` stamp carries the declaration's `SymbolID` instead of its spelling, and the one name door off it is gone; the substitution tables stay keyed by spelling, measured as one chain and left for one unit; 0 in-tree refusals, 0 objects moved - 2026-09-19
+
+> **Status:** LANDED. `resolver/name_resolution.cryo` (`declare_generics`
+> asks before declaring, records each parameter's id), `resolver/resolver.cryo`
+> (`declare_generic_param`, singular, answers the id; `res_for_head` stamps
+> it), `resolver/res.cryo` (`Res::GenericParam(SymbolID)`,
+> `ResBase::GenericParam(SymbolID)`; `ResBase::name()` deleted),
+> `AST/declaration.cryo` (`GenericParamNode.sym_id`, `set_sym_id`),
+> `AST/cloner.cryo` (copied), `sema/async_lower.cryo` (the synthesized head
+> stamps the id), `sema/call_resolver.cryo` (`scope_owner_key` reads the
+> base by kind), `diag/_module.cryo` (`E0311_GENERIC_PARAM_SHADOWED`),
+> `tests/tests/negative/E0311_generic_param_shadowed.cryo`,
+> `tests/test-roster.txt`, `tests/lane-baseline.txt`.
+
+#### The defect, as measured before the change
+
+```cryo
+type struct Box<T> {
+    v: T;
+    static new(v: T) -> Box<T> { return Box<T> { v: v }; }
+    size_of_param<T>(&this, x: T) -> u64 { return sizeof(T); }   // the method's T
+    size_of_other<K>(&this, x: K) -> u64 { return sizeof(K); }
+}
+function free_size<T>(x: T) -> u64 { return sizeof(T); }
+
+Box<u8>::new(1).size_of_param<i64>(5)   // 1: the owner's u8, not the method's i64
+Box<u8>::new(1).size_of_other<i64>(5)   // 8
+free_size<i64>(5)                       // 8
+```
+
+`.objcmp/qa-d30` under `b0327a49`'s compiler (`.objcmp/cryo-QA0.exe`):
+`shadow=1 distinct=8 free=8`.  The owner's specialization substitutes
+`T = u8` through every method body it holds, the substituter matching
+`Named("T")` by spelling (`substituter.cryo`, `named.name.equals(param_names[i])`),
+so the method's own `T` was rewritten to `u8` before the method's
+specialization ever asked for it.  Nothing reported anything.
+
+#### The refusal
+
+`declare_generics` declares one parameter at a time, and before each asks
+the scope chain from the current scope (`Resolver::lookup`); a
+`SymbolKind::GenericParam` answer is E0311 at the parameter's span, the
+first declaration labelled "first declared here", with a note.  One at a
+time is what makes `<T, T>` meet its first as an enclosing symbol.  Any
+other answer - a type of that spelling, a value parameter, nothing - is
+the ordinary nearer-rib shadowing and declares as before.  An impl's
+`<T>` beside `struct Holder<T>`'s is two scope chains (the impl's parent
+is the module) and is not asked about.
+
+Control `.objcmp/qa-d30` (`src/main.cryo` with the shadow renamed `<U>`,
+`src/edge.cryo` holding the three other shapes): predicted 3 refusals
+under the tree's compiler and 0 under `cryo-QA0.exe`; measured 3
+(`.objcmp/qa-ctl3.log`: `edge.cryo:5:19`, `:9:10`, `:17:11`) and 0
+(`.objcmp/qa-ctl3-qa0.log`, exit 0, the program printing
+`renamed=8 distinct=8 free=8 valparam=2 impl=4`).  The renamed program
+prints the same under the tree's compiler (`.objcmp/qa-ctl2.log`).
+
+The code: **E0311 is proposed, not confirmed.**  Rust's E0403 is taken in
+Cryo by "Missing Return"; E03xx is the generics family (E0302 the head's
+parameter list against its target, E0306 a bound) and E0311 is its next
+free number.  Jake to confirm or renumber.
+
+#### The stamp carries the id
+
+`Res::GenericParam(SymbolStr)` was the one `Res` variant naming a
+definition by its spelling.  The resolver had the id at every writer
+(`bare_name_res`'s `sym_id`, the scope segment's `scope_sym`, the
+qualified head's `hs.id`, `res_for_head`'s `sym.id`) and threw it away.
+Now the variant and `ResBase::GenericParam` carry the `SymbolID`, the
+node the resolver bound records it (`GenericParamNode.sym_id`), the
+cloner copies it (a `Res` names a definition, and a clone's is the
+template's), and the async lowering's synthesized trait head stamps
+`gp.sym_id`.  Readers of the payload: none in the tree took the name from
+a `GenericParam` stamp except `ResBase::name()`, whose one caller
+(`scope_owner_key`) excluded that variant first; the method is deleted and
+the caller reads `Def` and `PrimTy` by kind.  lane-check: `DEFID_UNWRAP`
+30 unchanged in total, the one unwrap moved from `res.cryo` (1 → 0) to
+`call_resolver.cryo` (2 → 3) - not predicted (the prediction was no row
+moved; the door moved from the enum's method to its caller and the gate
+counts by file), re-pinned.
+
+#### The tables stay by spelling: one chain, measured
+
+The row asked for the substitution tables keyed by the id.  They are one
+system fed from one end, and re-keying one table leaves it with two keys:
+
+* `TemplateEntry.param_names` (`generic_registry.cryo`), built from
+  `gp.name` (`specialization.cryo` ×2, `async_lower.cryo`): 15 `equals`
+  sites in `sema/call_resolver.cryo`, `passes/type_resolution.cryo` and
+  `types/resolver.cryo`'s where-bound binder (`param_name_slot`);
+* they fill `ResolutionContext.generic_bindings` (33 `add_binding`, 8
+  `lookup_binding`) which `resolve_named` asks by the WRITTEN name before
+  it reads the stamp, and whose other readers ask by `bound.type_parameter`,
+  a projection's member and the prefix of a flat `I::Item`;
+* whose names become `ImplBlockNode.derived_param_names` (3 writers, 2
+  readers, `trait_specializer.cryo` copying the bindings' names);
+* which with the entry's names feed `ASTTypeSubstituter.param_names` (6
+  compares: `Named.name`, `args_are_outer_param_refs`, a scope segment's
+  spelling, and `ArrayLiteralNode.element_type` - a plain string with no
+  stamp to read);
+* and `TraitBound.type_parameter` is a spelling with no stamp anywhere (9
+  compares).
+
+With the shadow refused, one spelling names one parameter in any scope
+chain the resolver sees, so the spelling-keyed tables are unambiguous
+over everything the resolver stamped.  What the resolver does not see is
+a trait default's body synthesized under an impl whose own parameter
+spells the body's method parameter - the body was resolved in the trait's
+file, the impl's parameter was not in its scope - and that is the shape
+the id tells apart and the spelling cannot.  Population unmeasured; the
+re-key is a unit over the whole chain with that as its control.
+
+#### Gates
+
+lsp-check 264 modules, 0 errors, 486 warnings (487 at §8.267: the deleted
+`declare_generic_params`'s `int` loop index was one W0005, confirmed by
+building the LSP over HEAD's sources with the same compiler,
+`.objcmp/qa-lspw-head.log` against `qa-lspw-new.log`); cross-check 0
+errors; objects (`hash-tree.sh QA` against `PF`, `b0327a49`'s compiler):
+examples 0 of 1,126, tests 0 of 2,829, identical path sets - a stamp's
+payload reaches no object; the suite under the hash run OVERALL PASS 68
+projects 203 negatives; the pair: the tree's compiler passes
+`E0311_generic_param_shadowed` (`.objcmp/qa-neg.log`, compile-fail 1
+passed) and `cryo-QA0.exe test generic_param_shadowed` fails it
+"(expected E0311)" (`.objcmp/qa-neg-qa0.log`); test-census OVERALL PASS 68
+projects 203 negatives 2,127 unit (roster pins 2,127 / 203 / 71,
+`.objcmp/qa-census.log`); roster-check OK 2,401 entries (`--merge`, one
+row); lane-check re-pinned as above; check-fast OK (ns-status-check 314
+rows; it refused the `resolve_path` row's `this.resolver.lookup(` count,
+10 → 11, the ask `declare_generics` makes before declaring - a
+declaration-time question, not a resolution route, noted on the row).
+
+In-tree population: 0 - no declaration in the stdlib, the compiler, the
+LSP, the tests or the examples redeclares an enclosing generic parameter
+(the hash run and the census compile all five; a refusal would have been a
+build failure in one of them).
+
+New names: `Resolver::declare_generic_param` (replaces
+`declare_generic_params`), `GenericParamNode.sym_id` / `set_sym_id`,
+`ErrorCode::E0311_GENERIC_PARAM_SHADOWED`; the diagnostic's wording "the
+generic parameter `T` shadows a generic parameter of the same name" /
+"declared again here" / "first declared here" / the note.  Deleted:
+`ResBase::name()`.
+
+**Tally: 96 shadowed, 96 old paths deleted, 96 at zero; 216 artifacts
+gone** (unchanged; a refusal and a stamp payload, no lane).
 
 ---
 

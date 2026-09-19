@@ -110,19 +110,42 @@ public:
         this.this_sym          = resolver.intern_table.intern("this");
     }
 
-    /// Extract names and spans from GenericParamNode*[] and delegate to
-    /// Resolver::declare_generic_params.  Single call site for introducing
-    /// generic type parameter symbols into the current scope.
+    /// Declare a declaration's generic parameters in the current scope, each
+    /// node recording the symbol it was bound to.  The one caller of
+    /// `Resolver::declare_generic_param`.
+    ///
+    /// A parameter whose name an enclosing declaration's parameter already
+    /// holds is refused: a method's `<T>` inside `struct Box<T>`, or a second
+    /// `T` in one list.  Two parameters of one spelling in one scope chain
+    /// would be one slot to every consumer that keys by the spelling, so the
+    /// inner one could never mean anything the outer one does not; refusing
+    /// it at the declaration is what makes the spelling unambiguous below
+    /// this layer.  A parameter shadowing a TYPE (`struct Vec<T>` beside
+    /// `type struct T`) is the ordinary case - the nearer rib wins - and is
+    /// not this.  Declared one at a time so a duplicate in one list meets
+    /// the first as an enclosing symbol.
     declare_generics(generic_params: &GenericParamNode*[]) -> void {
         if (generic_params.length == 0) { return; }
-        mut names: SymbolStr[] = [];
-        mut spans: SourceSpan[] = [];
         for (mut i: int = 0; i < generic_params.length; i++) {
             const gp: GenericParamNode* = generic_params[i];
-            names.push(gp.name);
-            spans.push(gp.span);
+            const prior_id: SymbolID = this.resolver.lookup(gp.name, this.resolver.current_scope);
+            if (prior_id.is_valid()) {
+                const prior: Symbol = this.resolver.get_symbol(prior_id);
+                if (prior.kind == SymbolKind::GenericParam) {
+                    const name_str: string = this.resolver.intern_table.resolve(gp.name);
+                    mut d: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0311_GENERIC_PARAM_SHADOWED,
+                        fmt::format("the generic parameter `%s` shadows a generic parameter of the same name",
+                            name_str));
+                    d = d.at_with_label(gp.span, "declared again here");
+                    d = d.also_at(prior.declaring_span, "first declared here");
+                    d = d.with_note(
+                        "a generic parameter is in scope for every declaration nested in its owner; give the inner one a distinct name");
+                    this.ctx.emit_diagnostic(d);
+                }
+            }
+            gp.set_sym_id(this.resolver.declare_generic_param(gp.name, gp.span));
         }
-        this.resolver.declare_generic_params(names, spans);
 
         // A parameter's default (`struct Array<T, A = GlobalAlloc>`) is written
         // type syntax with a span, in the template's own file, and it is
@@ -1106,7 +1129,7 @@ public:
             return ResSlot::Answered(Res::Err);
         }
         if (s.kind == SymbolKind::GenericParam) {
-            return ResSlot::Answered(Res::GenericParam(s.name));
+            return ResSlot::Answered(Res::GenericParam(sym_id));
         }
         if (s.kind == SymbolKind::Parameter) {
             return ResSlot::Answered(Res::Local(sym_id));
@@ -1775,7 +1798,7 @@ public:
         if (binds_in_scope) {
             const s: Symbol = this.resolver.get_symbol(scope_sym);
             if (s.kind == SymbolKind::GenericParam) {
-                base = ResBase::GenericParam(s.name);
+                base = ResBase::GenericParam(scope_sym);
             } else {
                 base = ResBase::Def(DefId::of_definition(this.resolver.qualified_name_of(&s)));
             }
@@ -2107,7 +2130,7 @@ public:
         if (in_scope.is_valid()) {
             const sym: Symbol = this.resolver.get_symbol(in_scope);
             if (sym.kind == SymbolKind::GenericParam) {
-                return ResSlot::Answered(Res::GenericParam(name));
+                return ResSlot::Answered(Res::GenericParam(in_scope));
             }
             // A refused import bound the spelling to nothing; the import's
             // diagnostic is the report.
@@ -2152,7 +2175,7 @@ public:
                     // an estimate of what remains hard.
                     const trailing: u32 =
                         QualifiedName::segment_count(written) - 1;
-                    mut hb: ResBase = ResBase::GenericParam(hs.name);
+                    mut hb: ResBase = ResBase::GenericParam(hs.id);
                     if (hs.kind == SymbolKind::Type) {
                         hb = ResBase::Def(DefId::of_definition(this.resolver.qualified_name_of(&hs)));
                     }

@@ -2074,6 +2074,8 @@ implement enum Result<T, E> {
 
 `Result`'s parameters `<T, E>` are fixed by the type; `map` introduces an additional `<U>`.
 
+A parameter a method introduces must not spell one its owner already declares: `map<T>` inside `Result<T, E>` is refused at the method's `T` (`E0311`), as is a second `T` in one list, a trait method's `<T>` inside `trait Conv<T>`, and an impl method's `<T>` inside `implement<T>`. An enclosing generic parameter is in scope for every declaration nested in its owner, so an inner one of the same name could only be that parameter again - there is nothing for the inner declaration to mean. A method's parameter that shadows a *type* of the same spelling, or a value parameter spelled like a generic one, is ordinary shadowing and is allowed.
+
 ### 12.6 Monomorphisation
 
 When the compiler sees:
