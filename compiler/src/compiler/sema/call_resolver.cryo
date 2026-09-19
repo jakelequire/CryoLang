@@ -3775,10 +3775,33 @@ type struct CallResolver {
         if (!qual.is_valid()) { return false; }
         const qt: Type* = this.arena.lookup(qual.id);
         if (qt == null || qt.kind != TypeKind::Trait) { return false; }
-        if (call.arguments.length == 0) { return true; }
+        // No argument selects an implementation: a static trait method, or
+        // a method called with nothing.  Refused here, where the path is
+        // known to be a trait's, rather than left for codegen to fail to
+        // resolve; the help names the form that does select.
+        if (call.arguments.length == 0) {
+            this.report_trait_qualified_unselected(scope, trait_sym, member_sym, call);
+            return true;
+        }
         const recv: ExpressionNode* = call.arguments[0];
         if (recv == null || !recv.resolved_type.is_valid()) { return true; }
-        mut owner_ref: TypeRef = recv.resolved_type;
+        const owner_sym: SymbolStr = this.trait_qualified_owner(recv.resolved_type);
+        if (!owner_sym.is_valid()) { return true; }
+        const entries: OverloadId[] = this.trait_delivered_entries(owner_sym, trait_sym, member_sym);
+        if (entries.length == 0) {
+            this.report_impl_qualified_miss(scope, owner_sym, trait_sym, member_sym);
+            return true;
+        }
+        this.pin_trait_delivered_call(call, scope, &entries);
+        return true;
+    }
+
+    /// The registered name of the type a trait-qualified call's first
+    /// argument selects the implementation by: the argument's type behind
+    /// any reference or pointer.  Empty for a type the index holds no name
+    /// for (a primitive's impl, left to codegen's refusal as before).
+    trait_qualified_owner(&this, recv_type: TypeRef) -> SymbolStr {
+        mut owner_ref: TypeRef = recv_type;
         mut hops: i32 = 0;
         while (hops < 4) {
             const ot: Type* = this.arena.lookup(owner_ref.id);
@@ -3788,12 +3811,24 @@ type struct CallResolver {
             else { break; }
             hops = hops + 1;
         }
-        const owner_sym: SymbolStr = this.ctx.decl_index.lookup_type_name(owner_ref);
-        if (!owner_sym.is_valid()) { return true; }
-        const entries: OverloadId[] = this.trait_delivered_entries(owner_sym, trait_sym, member_sym);
-        if (entries.length == 0) { return true; }
-        this.pin_trait_delivered_call(call, scope, &entries);
-        return true;
+        return this.ctx.decl_index.lookup_type_name(owner_ref);
+    }
+
+    /// `Trait::m()` with no argument: nothing selects an implementation.  A
+    /// static method through the trait's own path has no receiver to select
+    /// by, which is what the impl-qualified path exists for.  Silent during
+    /// a symbolic generic-body walk.
+    report_trait_qualified_unselected(mut &this, scope: ScopeResolutionNode*, trait_sym: SymbolStr,
+                                      member_sym: SymbolStr, call: CallExprNode*) -> void {
+        if (this.state.in_symbolic_check) { return; }
+        const trait_leaf: string = QualifiedName::leaf_of(this.intern.resolve(trait_sym));
+        const member_str: string = this.intern.resolve(member_sym);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0233_UNDEFINED_SYMBOL,
+            fmt::format("`%s::%s()` selects no implementation: a call through a trait's path selects by its first argument's type, and there is none",
+                trait_leaf, member_str));
+        d = d.at_with_label(call.span, "no argument to select an implementation by");
+        d = d.help(fmt::format("name the implementation: `(%s for Type)::%s()`", trait_leaf, member_str));
+        this.ctx.emit_diagnostic(d);
     }
 
     /// The entries of `owner`'s family `member` that `trait_sym`'s
@@ -5582,6 +5617,14 @@ type struct CallResolver {
                 this.check_impl_qualified_args(visitor, lookup_sym, scope, call);
                 return;
             }
+            // A scope naming a TRAIT: the call's signature is the receiver's
+            // implementation's, not the trait declaration's (which registers
+            // no signature under `Trait::m`).
+            const qt: Type* = this.arena.lookup(this.types.scope_qualifier_type(scope).id);
+            if (qt != null && qt.kind == TypeKind::Trait) {
+                this.check_trait_qualified_args(visitor, lookup_sym, scope, call);
+                return;
+            }
             combined = this.intern.intern(fmt::format("%s::%s", scope_str, member_str));
         }
         const overloads: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(combined);
@@ -5622,6 +5665,30 @@ type struct CallResolver {
         const trait_sym: SymbolStr = TypeAnnotation::trait_identity(scope.impl_trait);
         if (!trait_sym.is_valid()) { return; }
         const entries: OverloadId[] = this.trait_delivered_entries(owner_sym, trait_sym, scope.member_name);
+        this.check_delivered_args(visitor, &entries, scope, call);
+    }
+
+    /// The same check for the trait-qualified form, `Beta::go(&p, ..)`: the
+    /// owner is the first argument's type and the trait is the scope's own
+    /// stamp.  A call with no argument was refused at the pin; an owner the
+    /// index holds no name for is left to codegen, as the pin leaves it.
+    check_trait_qualified_args(mut &this, visitor: ASTVisitor*, trait_sym: SymbolStr,
+                               scope: ScopeResolutionNode*, call: CallExprNode*) -> void {
+        if (call.arguments.length == 0) { return; }
+        const recv: ExpressionNode* = call.arguments[0];
+        if (recv == null || !recv.resolved_type.is_valid()) { return; }
+        const owner_sym: SymbolStr = this.trait_qualified_owner(recv.resolved_type);
+        if (!owner_sym.is_valid()) { return; }
+        const entries: OverloadId[] = this.trait_delivered_entries(owner_sym, trait_sym, scope.member_name);
+        this.check_delivered_args(visitor, &entries, scope, call);
+    }
+
+    /// Argument check against `entries`, the candidates a trait's
+    /// implementation delivers: the one of the call's arity is checked
+    /// argument by argument, none of its arity is the arity error naming
+    /// the arities offered; no entries at all was reported at the pin.
+    check_delivered_args(mut &this, visitor: ASTVisitor*, entries: &OverloadId[],
+                         scope: ScopeResolutionNode*, call: CallExprNode*) -> void {
         if (entries.length == 0) { return; }
         const argc: i64 = call.arguments.length;
         mut uniq_arity: i64 = -1;

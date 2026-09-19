@@ -71,9 +71,12 @@ measurement that decided it on the row.
 | D25 | **`(Beta for P)::make()` is Cryo's impl-qualified call form** (Jake, 2026-09-17). It reuses `for` exactly as `implement trait Beta for P` does - no new lexical territory, and none of the `<P as Beta>` parsing problem. It MUST cover the receiver case too, `(Beta for P)::go(&p)`, so E0156 has ONE rule to suggest rather than a short form that works sometimes; and it must compose inside a generic, `(Beta for T)::make()`. Motivation: a tie of STATIC trait methods (`P::make()` with `Beta::make` and `Gamma::make` both implemented for `P`) has no receiver to disambiguate it, so E0156 fires with no suggestable spelling today | **LANDED (§8.263)** — the parser reads the head as a `Type::member` path whose scope segment is the target and whose `impl_trait` is the trait, one field; sema selects the entries THAT trait's implementation delivers for the owner (`trait_delivered_entries`, shared with the `Trait::m(recv)` form) and pins by the arguments; the receiver, static, value and generic-body shapes all resolve; E0156's help names the form in every spelling; a generic METHOD through the head (`(Display for P)::fmt(&p, &sink)` with `fmt<W>`) is E0636 at codegen exactly as the `Trait::m` form is (§8.224: D24's registry shape) | `ls -d tests/tests/projects/impl_qualified_call*/test.json \| wc -l` → **2** (the run project exits 42, the compile_fail one pins the help's three spellings); `ls tests/tests/negative/*_impl_qualified_*.cryo \| wc -l` → **3** (E0306, E0233 ×2, E0215/E0216/E0214); `grep -rho 'set_impl_trait(' compiler/src --include=*.cryo \| wc -l` → **2** (the definition, the parser's one writer); `grep -c 'no qualified form' compiler/src/compiler/sema/call_resolver.cryo` → **0** | §8.224, §8.229, §8.263 |
 | D26 | **The two-trait tie is an ERROR** in both spellings (`recv.m(...)`, `T::m(recv, ...)`) - never a pick by declaration or import order; each candidate named at its declaration; the trait-qualified call `Tr::m(&recv, ...)` chooses | **TAKEN** (ruled 2026-09-17; built the same day, §8.224, as `E0156_AMBIGUOUS_TRAIT_METHOD`) | `grep -c 'E0156_AMBIGUOUS_TRAIT_METHOD' compiler/src/compiler/diag/_module.cryo` → **2**; `ls tests/tests/negative/E0156_*.cryo \| wc -l` → **2**; `ls -d tests/tests/projects/trait_qualified_call_disambiguates*/test.json \| wc -l` → **1** | §8.220, §8.224, §8.229 |
 | D27 | **The Rust trait-in-scope rule is REJECTED** (Jake, 2026-09-17, on §8.224's measurement): Cryo calls a trait's methods with the trait imported nowhere in BOTH call forms today; requiring scope would break **277 call sites in 61 files** (stdlib 135, `tests/` 118, LSP 19, examples 5, `compiler/src` 0); and it would settle **0 of the 28** tie sites in the corpus - at no site is exactly one candidate in scope. D25 is what gives a tie a spelling, not scope. Not to be proposed again without new numbers | **REJECTED** | `no check` — a rule not built; `scripts/ns-migration/8.224/` re-derives the three tables from a corpus run | §8.224, §8.229 |
-| D28 | **Overlapping impls are REFUSED OUTRIGHT, as Rust does (E0119)** - not specialisation, not declaration order (Jake, 2026-09-18: "I want to do that 'refuse overlaps outright as Rust does'") | **RULED - UNBUILT** — the shape: `implement<T> trait Show for struct Wrap<T> { show(&this) -> i32 { 1 } }` beside `implement trait Show for struct Wrap<i32> { show(&this) -> i32 { 2 } }`; `w.show()` on a `Wrap<i32>` answers 1 or 2 by which impl is WRITTEN FIRST, under the current compiler and under the pin `db5af63c` alike, so it predates the migration (audit 12's `overlap_a` / `overlap_b` projects demonstrate it). The error belongs at the OVERLAPPING DECLARATION, never at the call: the call is innocent, two impls both claiming one (trait, type) is the defect, and a use-site report blames the wrong code. `generic_registry.cryo`'s `select_trait_impl` comment - "the overlap is a registration-time report, not one per use" - is a hypothesis, not a mechanism: grep finds the comment and no report; whoever builds this makes it true, as a coherence check over `heads_under` at registration. **Measure the population first**: the registry reshape (§8.233) made overlapping heads representable in a way they were not before, so the stdlib or the projects may hold overlaps that resolve by luck today; if any do, this is a source-breaking change and Jake wants the blast radius before it lands. **MEASURED in §8.261 with the unifier the refusal would use** (`scripts/ns-migration/8.261/heads_overlap.cryo`, Rust's rule: trait and target arguments unify under one substitution, bounds not consulted; 6 control shapes behave): over the six halves 35 pairs of written heads share a key, **4 unify** - the three E0308 negatives and ONE green project, `where_bound_leaf_collision` (`Emit for Holder<T> where T: Alpha::Render` / `where T: Omega::Render`), whose comment asserts the pair must be accepted and which DISPATCHES by bound today (`OnlyA=1 OnlyB=2`, `Both=1` by order); stdlib, compiler, LSP, examples 0. **NOT BUILT - the bound question is Jake's**: Rust's rule refuses that project (convert it to `compile_fail` E0119, specialisation by bound gone), or keep bound-selection and refuse only the intersection at its instantiation (not Rust's rule). One line in §8.261 either way | `grep -c 'registration-time report' compiler/src/compiler/types/generic_registry.cryo` → **1**; `grep -rho 'E0119' compiler/src --include=*.cryo \| wc -l` → **0**; `ls scripts/ns-migration/8.261/*.cryo \| wc -l` → **2** | §8.261 |
+| D28 | **Overlapping impls are REFUSED OUTRIGHT, as Rust does (E0119)** - not specialisation, not declaration order (Jake, 2026-09-18: "I want to do that 'refuse overlaps outright as Rust does'") | **RULED - UNBUILT** — the shape: `implement<T> trait Show for struct Wrap<T> { show(&this) -> i32 { 1 } }` beside `implement trait Show for struct Wrap<i32> { show(&this) -> i32 { 2 } }`; `w.show()` on a `Wrap<i32>` answers 1 or 2 by which impl is WRITTEN FIRST, under the current compiler and under the pin `db5af63c` alike, so it predates the migration (audit 12's `overlap_a` / `overlap_b` projects demonstrate it). The error belongs at the OVERLAPPING DECLARATION, never at the call: the call is innocent, two impls both claiming one (trait, type) is the defect, and a use-site report blames the wrong code. `generic_registry.cryo`'s `select_trait_impl` comment - "the overlap is a registration-time report, not one per use" - is a hypothesis, not a mechanism: grep finds the comment and no report; whoever builds this makes it true, as a coherence check over `heads_under` at registration. **Measure the population first**: the registry reshape (§8.233) made overlapping heads representable in a way they were not before, so the stdlib or the projects may hold overlaps that resolve by luck today; if any do, this is a source-breaking change and Jake wants the blast radius before it lands. **MEASURED in §8.261 with the unifier the refusal would use** (`scripts/ns-migration/8.261/heads_overlap.cryo`, Rust's rule: trait and target arguments unify under one substitution, bounds not consulted; 6 control shapes behave): over the six halves 35 pairs of written heads share a key, **4 unify** - the three E0308 negatives and ONE green project, `where_bound_leaf_collision` (`Emit for Holder<T> where T: Alpha::Render` / `where T: Omega::Render`), whose comment asserts the pair must be accepted and which DISPATCHES by bound today (`OnlyA=1 OnlyB=2`, `Both=1` by order); stdlib, compiler, LSP, examples 0. **RE-RULED on that measurement (Jake, 2026-09-19): Rust's rule, refuse anyway** - not specialisation by bound, not declaration order. He has seen the one green pair and chose E0119 over it. **Whoever builds this converts `where_bound_leaf_collision` as part of the landing** - a `compile_fail` project asserting E0119 at the later head, or two heads that no longer unify - not left red. The unifier splices in byte-identically (`python scripts/ns-migration/8.261/probe_d28.py`); delete its three prints, add the emit after type resolution's E0308 arm so an identical pair stays E0308 | `grep -c 'registration-time report' compiler/src/compiler/types/generic_registry.cryo` → **1**; `grep -rho 'E0119' compiler/src --include=*.cryo \| wc -l` → **0**; `ls scripts/ns-migration/8.261/*.cryo \| wc -l` → **2** | §8.261, §8.267 |
+| D29 | **`implement trait Tick for struct Holder<S>` with `S` undeclared KEEPS E0302** (Jake, 2026-09-19). E0203 was put to him as Rust's answer (E0412, the same code as any undeclared type name) and REJECTED: "too generic of an error for this situation". No dedicated code proposed: the message is already the situation's own ("this impl head names `S`, which is declared nowhere", with the head spelled as it must be written), and E0302's family - the head's parameter list disagreeing with its target - is where a reader looks for it; a code for one message would widen the table for no search. The nesting asymmetry stands and is recorded: `Holder<Vec<S>>` is E0203 from the general refusal, the top-level `S` is E0302 | **RULED - the question CLOSED** | `grep -c 'E0302_GENERIC_PARAM_MISMATCH' compiler/src/compiler/resolver/name_resolution.cryo` → **1**; `ls tests/tests/negative/E0302_trait_head_undeclared_param.cryo \| wc -l` → **1** | §8.258, §8.267 |
+| D30 | **A generic parameter that SHADOWS an enclosing one is REFUSED** (Jake, 2026-09-19), Cryo's E0403: `type struct Box<T> { size_of_param<T>(&this, x: T) -> u64 { sizeof(T) } }` refuses the method's `T` against the owner's; `do_something<K>` beside an owner `T` is untouched. Today the OWNER's `T` silently wins - `Box<u8>::new(1).size_of_param<i64>(5)` answers 1 - because the substitution tables are keyed by the parameter's SPELLING, so two parameters of one name are one slot. In-tree population **0** (no method redeclares its owner's parameter), so the refusal breaks nothing. **Rides with audit 14's `GenericParam` identity fix**: the resolver binds each parameter to a `SymbolID` (`name_resolution.cryo`'s `GenericParam` arm answers `Res::GenericParam(s.name)` and discards `sym_id`); stamp the id, key the substitution tables by it, and the shadowing is then a second declaration in a scope that holds the first - the refusal is the resolver's, at the declaration, as Rust's E0403 is (Cryo's E0403 is "Missing Return"; the code for this is the builder's to propose and Jake's to confirm) | **RULED - UNBUILT** | `grep -rhoi -e 'shadows the owner' -e 'generic parameter shadow' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'Res::GenericParam(s.name)' compiler/src/compiler/resolver/name_resolution.cryo` → **1** (the arm that discards the id) | §8.267 |
+| D31 | **The turbofish is REQUIRED for generic arguments in expression position** (Jake, 2026-09-19): `foo::<i32>(y)` opens type arguments; `g(LIMIT < x, MAXV > (y))` is two comparisons, always. **The rule: `<` immediately after `::` opens generic arguments; `<` anywhere else is a comparison.** The shape is `foo::<i32>(y)` - as Rust's `Vec::<i32>::new()`, where every `::` after the turbofish is an ordinary path step; there is no `::()` form. It RETIRES the parser's `ident <` lookahead tables (`parser_base.cryo` 872–912: is-a-local / is-a-global / is-declared-generic / binds-a-value, read from the module's OWN declarations; `expr_parser.cryo` ~1190, the identifier's `Name<T, U>` guess), which by their own comment cannot see an import - so one expression means two things by where its constants came from. **Source-breaking, population UNMEASURED: the first task of whoever builds it is the count of bare generic arguments in expression position over the stdlib, the projects, the examples and the compiler's own source** (`f<T>(..)`, `Type<T>::m(..)`, `Type<T> { .. }` as the parser reads them today, module by module), and Jake wants that number before it lands. Not measured this session | **RULED - UNBUILT** | `grep -c 'is_generic_call_ahead' compiler/src/compiler/parser/expr_parser.cryo` → **6** (the lookahead the rule retires; each site is a decision the `::<` form would make lexically) | §8.267 |
 
-**D18, D24 and D28 are RULED and UNBUILT** (D5 was, until §8.206; D2 and D9 were,
+**D18, D24, D28, D30 and D31 are RULED and UNBUILT** (D5 was, until §8.206; D2 and D9 were,
 until §8.213; Q2 was, until §8.259; D25 was, until §8.263). Each was decided by Jake - D18 and D2 then re-parked as open
 questions, D2 across ninety-five entries; §8.202 records the re-affirmation,
 §8.216 the three rulings of 2026-09-16 and §8.229 the three of 2026-09-17. They
@@ -207,7 +210,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,127 unit + 68 project + 201 negative (71 projects on the roster, 3 gated by `requires`; `default_expansion_by_stamp` since §8.254; `lang/alias_keyword.cryo`'s three since §8.256; `plural_leaf_gate` pins four E0155 spans and `namespace_gate` both arms' E0240 spans since §8.258; `E0214_c_import_narrowing` since §8.260; the two variadic negatives since §8.262; the two `impl_qualified_call*` projects and three `*_impl_qualified_*` negatives since §8.263; `E0203_refused_signature_no_cascade` since §8.265; `bound_directed_static_path` since §8.266); `OVERALL PASS` since §8.233 - the two `impl_concrete_arg_*` projects that were RED by design from §8.223 are green | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** The roster check (ubuntu CI's) compares the golden's ROWS; the census on this host reads its counts and project names - a project row whose `asserts=` moved under an unchanged count (§8.258's two, red at `4f24148d`) passes the census. Since §8.260 the roster check reads OK (2,399 entries at §8.266). |
+| `make test` | 2,127 unit + 68 project + 202 negative (71 projects on the roster, 3 gated by `requires`; `default_expansion_by_stamp` since §8.254; `lang/alias_keyword.cryo`'s three since §8.256; `plural_leaf_gate` pins four E0155 spans and `namespace_gate` both arms' E0240 spans since §8.258; `E0214_c_import_narrowing` since §8.260; the two variadic negatives since §8.262; the two `impl_qualified_call*` projects and three `*_impl_qualified_*` negatives since §8.263; `E0203_refused_signature_no_cascade` since §8.265; `bound_directed_static_path` since §8.266; `E0233_trait_qualified_unselected` since §8.267); `OVERALL PASS` since §8.233 - the two `impl_concrete_arg_*` projects that were RED by design from §8.223 are green | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** The roster check (ubuntu CI's) compares the golden's ROWS; the census on this host reads its counts and project names - a project row whose `asserts=` moved under an unchanged count (§8.258's two, red at `4f24148d`) passes the census. Since §8.260 the roster check reads OK (2,400 entries at §8.267). |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make lane-check` | 17 buckets of call sites in `compiler/src`, as a golden, under three rules each derived from a definition and none from a list of names (§8.241, §8.253): **a STORE is a type that OWNS A MAP** (`HashMap<K, V>` / `HashSet<T>` field, read from the tree on every run; the key type is not consulted, since a name keys a map by its `u32` id and a `u64` may be two of them packed, a type id or a source position) - every owner must be placed, as a store with its rows (`DeclarationIndex`, `TypeArena`, `GenericRegistry`, `ModuleGraph`, `ConstantTable`, `Resolver`, plus `TypeUtils`, the funnel, marked as owning none) or as an exclusion with its reason (15, the script's `EXCLUDED` table), and a map owner in neither, a listed type with no map, or one declared in a file the table does not name, REFUSES the run; §8.241's version was a hand-written dict of seven the script never checked against the tree, and audit 13 added a map-keyed member to the context over which it read OK; the rule's first run found `DefaultRegistry` (two rows for one commit, §8.253) and §8.254 deleted the store, the rule refusing the stale entry until the table followed; a golden section no bucket counts is refused too (§8.254: the retired rows read OK until it was); **a name-keyed method is any a store declares - inline or in an `implement` block in ANY file - with `SymbolStr` or `string` in its signature**, parsed from the tree on every run since §8.230 (the `lookup_*` rule read OK over 24 readers under other names; the inline-only parser read OK over a cross-file `implement struct` reader; the `SymbolStr`-token rule read OK over a `string`-keyed one); **a call is placed by its receiver's DECLARED TYPE** (`this`, a local's annotation, a field's declaration, an accessor's return type), not its spelling. Reads split `LOOKUP` (the five) / `LOOKUP_OTHER` (the rest) / `LOOKUP_ROUTED` (the funnel), `REGISTER` pins the index's name-keyed WRITES, and each other store has a `*_READ` and a `*_WRITE` row (`ARENA`, `REGISTRY`, `GRAPH`, `CONST`); `LOOKUP_ARENA` kept the arena's `lookup_by_name` apart from §8.192 (it read OK over a tree holding 17) until §8.247 deleted the method, and `ARENA_READ` is where a written-name read on the arena lands under any spelling; `HOME_WRITE` pins `.set_home_module(` at 0 since §8.204; `REENTRY` counts `get_resolver()` AND every name-keyed `Resolver` method on a `Resolver`-typed receiver outside `compiler/resolver/` and the driver (the three-name list read 6 over a tree holding 12: type resolution's `is_ambiguous`/`get_ambiguous_modules` - deleted in §8.244, 10 now - sema's three asks on its `get_resolver()` local, `Resolver::ns_written_as`); `make lane-selftest` drives every rule through a throwaway tree in both directions (23 mutations) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. A receiver whose type it cannot read is refused, not dropped; a set name on a receiver of a NON-store type is counted as local (the control on placement). A `string` parameter that is a label rather than a key (`impl_owner(node, site: string)`) is inside the rule and pinned like a key: the rule cannot tell them apart and does not try. |
 | `make selfhost-check` | stage-3 == stage-4 byte identity, both arms | **Stability, not correctness.** It proves the compiler still emits the same bytes for code that already compiles; it says nothing about code that now STOPS compiling. |
@@ -238,7 +241,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: lane-check lane-selftest' Makefile` → **1**
 * `ls -d tests/tests/projects/*/test.json | wc -l` → **71**
-* `ls tests/tests/negative/*.cryo | wc -l` → **201**
+* `ls tests/tests/negative/*.cryo | wc -l` → **202**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
 * `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -17858,6 +17861,142 @@ Outside the ledger: the files in the status line.
 
 **Tally: 96 shadowed, 96 old paths deleted, 96 at zero; 216 artifacts
 gone** (unchanged; a rule extended to the shape it was missing).
+
+---
+
+### 8.267 RULED: four decisions from Jake, 2026-09-19 - D28 re-ruled on its measurement (refuse overlaps, convert the one green pair), D29 keeps E0302, D30 refuses a shadowing generic parameter, D31 requires the turbofish in expression position; recorded, not built - and the carrier: `Trait::m()` with no argument, and every trait-qualified call the receiver does not select an implementation for, is refused in sema in the head's terms instead of by codegen's `E0636` - 2026-09-19
+
+> **Status:** the four rulings RECORDED in §0 (D28's row re-ruled; D29,
+> D30, D31 new); the carrier LANDED: `sema/call_resolver.cryo`
+> (`pin_trait_qualified_call` reports its two silent exits,
+> `trait_qualified_owner`, `report_trait_qualified_unselected`,
+> `check_trait_qualified_args`, `check_delivered_args` factored out of
+> `check_impl_qualified_args`, `check_scope_call_arg_types` dispatches a
+> trait scope to it), `tests/tests/negative/E0233_trait_qualified_unselected.cryo`,
+> `tests/test-roster.txt`.
+
+#### The rulings, each with what it costs whoever builds it
+
+**D28 - overlapping impls are refused outright (E0119), Rust's rule.**
+Jake saw §8.261's measurement - one green pair in the tree,
+`where_bound_leaf_collision`'s `Emit for Holder<T> where T: Alpha::Render`
+beside `where T: Omega::Render`, which dispatches by bound today and by
+declaration order when both hold - and chose to refuse anyway: not
+specialisation, not declaration order.  **The in-tree pair is converted
+as part of the landing** (a `compile_fail` project asserting E0119 at the
+later head, or heads that no longer unify), never left red.  The unifier
+is committed under `scripts/ns-migration/8.261/` and splices in
+byte-identically; the emit goes after type resolution's E0308 arm so an
+identical pair stays E0308.
+
+**D29 - `implement trait Tick for struct Holder<S>` with `S` undeclared
+keeps E0302.**  E0203 (Rust's E0412, the code for any undeclared type
+name) was put to him and rejected as "too generic of an error for this
+situation".  No dedicated code proposed: the message is already the
+situation's own, and E0302's family - a head's parameter list disagreeing
+with its target - is where a reader looks.  The nesting asymmetry
+(`Holder<Vec<S>>` is E0203) stands and is on the row.
+
+**D30 - a generic parameter that shadows an enclosing one is refused**
+(Rust's E0403; Cryo's E0403 is "Missing Return", so the code is the
+builder's to propose):
+
+```cryo
+type struct Box<T> {
+    size_of_param<T>(&this, x: T) -> u64 { sizeof(T) }   // refused: shadows the owner's T
+    do_something<K>(&this) -> int { ... }                 // fine: a distinct name
+}
+```
+
+Today the owner's `T` wins silently - `Box<u8>::new(1).size_of_param<i64>(5)`
+answers 1 - because the substitution tables are keyed by the parameter's
+SPELLING.  In-tree population 0, so nothing breaks.  It rides with audit
+14's `GenericParam` identity fix: the resolver binds each parameter to a
+`SymbolID` and the stamp arm (`name_resolution.cryo`, `Res::GenericParam(s.name)`)
+discards it; stamp the id, key the tables by it, and the shadowing is a
+second declaration in a scope that holds the first - refused at the
+declaration, by the resolver.
+
+**D31 - the turbofish is required for generic arguments in expression
+position.**  `foo::<i32>(y)` opens type arguments; `g(LIMIT < x, MAXV >
+(y))` is two comparisons, always.  **`<` immediately after `::` opens
+generic arguments; `<` anywhere else is a comparison.**  As Rust's
+`Vec::<i32>::new()`, where every `::` after the turbofish is a path step -
+there is no `::()` form; `foo::<i32>(y)` is the shape Jake confirmed.  It
+retires the parser's `ident <` lookahead tables (`parser_base.cryo`
+872–912 and `expr_parser.cryo` ~1190), which decide from the module's OWN
+locals, globals and generic declarations and by their own comment cannot
+see an import - so one expression means two things by where its
+constants came from.  **Source-breaking; the population is unmeasured.
+The first task of whoever builds it is the count of bare generic
+arguments in expression position over the stdlib, the projects, the
+examples and the compiler's own source**, module by module, and Jake
+wants that number before it lands.  Not measured here: not this
+session's work, and the budget was spent.
+
+#### The carrier (`.objcmp/pb-edge/`, `.objcmp/pf-ctl2.log`, `pf-ctl2-w6.log`)
+
+§8.263's residual: `Beta::go()` reported nothing.  Measured wider - five
+shapes of the trait-qualified call that select no implementation or the
+wrong one, under `4f24148d`'s compiler: sema silent on all five, codegen
+`E0636 cannot resolve 'Beta::go'` ×4 and `'Beta::make'` ×1 with the
+per-module cascade before them.  `pin_trait_qualified_call` had two
+silent exits - no argument (`return true`, unpinned) and no delivered
+entry (`return true`, unpinned) - and `check_scope_call_arg_types` never
+checked the form: a trait scope's `Trait::m` registers no signature
+(a trait declaration registers returns alone), so the overload lookup
+found nothing and the static gather bailed on `TypeKind::Trait`.
+
+```cryo
+Beta::go(&p)       // 2, the receiver selects - as before
+Beta::go()         // E0233 `Beta::go()` selects no implementation ... help: name the implementation: `(Beta for Type)::go()`
+Beta::make()       // E0233 the same - a static method through the trait's path has no receiver to select by
+Beta::go(&q)       // E0306 `Q` does not implement `Beta`      (report_impl_qualified_miss, §8.263's)
+Beta::go(&p, 1)    // E0215 method `go` takes 1 argument(s) but 2 were supplied
+Beta::go(1)        // E0306 `i32` does not implement `Beta`
+```
+
+Five errors, each in the head's terms; the owner derivation is
+`trait_qualified_owner` (the first argument's type behind references and
+pointers, as the pin always read it), and the argument check is
+`check_delivered_args`, the body of §8.263's `check_impl_qualified_args`
+factored out and entered from both forms.  **The pair**: the negative
+`E0233_trait_qualified_unselected` (E0233 ×2, E0306, E0215 at their lines)
+passes under the tree's compiler and `cryo-W6.exe test
+trait_qualified_unselected` fails it `(expected E0233)`
+(`.objcmp/pf-neg-suite-w6.log`).  `trait_qualified_call_disambiguates`
+(25) and every other `Trait::m(recv)` in the corpus are unchanged: 0
+objects moved.
+
+#### Gates
+
+lsp-check 264 / 0 errors / 487 warnings (`.objcmp/pf-lsp.log`);
+cross-check 0 errors (`.objcmp/pf-cross.log`); lane-check OK, no row
+moved (`.objcmp/pf-lane.log` - predicted +1 `LOOKUP_OTHER` and measured
+0: `trait_delivered_entries` is the resolver's own method, and the one
+store read, `lookup_type_name`, moved into the helper as the one site it
+was).  Objects (`hash-tree.sh PF` against `PE`, `7e39bc7c`'s compiler):
+examples **0 of 1,126**, tests **0 of 2,829**, path sets identical
+(`.objcmp/pf-hash.out`).  test-census `OVERALL PASS (unit: ok;
+compile-fail: 202 passed; projects: 68 passed)`, roster pins 2,127 / 202
+/ 71 (`.objcmp/pf-census.log`); roster-check OK 2,400
+(`.objcmp/pf-roster-ok.log`).  §0: D28 re-ruled, D29–D31 added (the
+ruled-unbuilt line names D30 and D31), the negative count 202, the make
+test row; `ns-status-check` refused D30's first check as written (a `|`
+inside a grep pattern is a literal pipe once the table escape is undone)
+- the instrument's own control, rewritten as `-e` per alternative.
+
+**New for Jake**: `CallResolver::trait_qualified_owner`,
+`report_trait_qualified_unselected`, `check_trait_qualified_args`,
+`check_delivered_args`; E0233's new wording "`Beta::go()` selects no
+implementation: a call through a trait's path selects by its first
+argument's type, and there is none" with the help "name the
+implementation: `(Beta for Type)::go()`".
+
+Outside the ledger: the files in the status line.
+
+**Tally: 96 shadowed, 96 old paths deleted, 96 at zero; 216 artifacts
+gone** (unchanged; four rulings recorded, two silent exits made to speak).
 
 ---
 
