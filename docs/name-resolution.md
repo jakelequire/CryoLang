@@ -206,7 +206,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,127 unit + 65 project + 195 negative (68 projects on the roster, 3 gated by `requires`; `default_expansion_by_stamp` since §8.254; `lang/alias_keyword.cryo`'s three since §8.256; `plural_leaf_gate` pins four E0155 spans and `namespace_gate` both arms' E0240 spans since §8.258; `E0214_c_import_narrowing` since §8.260); `OVERALL PASS` since §8.233 - the two `impl_concrete_arg_*` projects that were RED by design from §8.223 are green | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** The roster check (ubuntu CI's) compares the golden's ROWS; the census on this host reads its counts and project names - a project row whose `asserts=` moved under an unchanged count (§8.258's two, red at `4f24148d`) passes the census. Since §8.260 the roster check reads OK, 2,390 entries. |
+| `make test` | 2,127 unit + 65 project + 197 negative (68 projects on the roster, 3 gated by `requires`; `default_expansion_by_stamp` since §8.254; `lang/alias_keyword.cryo`'s three since §8.256; `plural_leaf_gate` pins four E0155 spans and `namespace_gate` both arms' E0240 spans since §8.258; `E0214_c_import_narrowing` since §8.260; the two variadic negatives since §8.262); `OVERALL PASS` since §8.233 - the two `impl_concrete_arg_*` projects that were RED by design from §8.223 are green | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** The roster check (ubuntu CI's) compares the golden's ROWS; the census on this host reads its counts and project names - a project row whose `asserts=` moved under an unchanged count (§8.258's two, red at `4f24148d`) passes the census. Since §8.260 the roster check reads OK (2,392 entries at §8.262). |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make lane-check` | 17 buckets of call sites in `compiler/src`, as a golden, under three rules each derived from a definition and none from a list of names (§8.241, §8.253): **a STORE is a type that OWNS A MAP** (`HashMap<K, V>` / `HashSet<T>` field, read from the tree on every run; the key type is not consulted, since a name keys a map by its `u32` id and a `u64` may be two of them packed, a type id or a source position) - every owner must be placed, as a store with its rows (`DeclarationIndex`, `TypeArena`, `GenericRegistry`, `ModuleGraph`, `ConstantTable`, `Resolver`, plus `TypeUtils`, the funnel, marked as owning none) or as an exclusion with its reason (15, the script's `EXCLUDED` table), and a map owner in neither, a listed type with no map, or one declared in a file the table does not name, REFUSES the run; §8.241's version was a hand-written dict of seven the script never checked against the tree, and audit 13 added a map-keyed member to the context over which it read OK; the rule's first run found `DefaultRegistry` (two rows for one commit, §8.253) and §8.254 deleted the store, the rule refusing the stale entry until the table followed; a golden section no bucket counts is refused too (§8.254: the retired rows read OK until it was); **a name-keyed method is any a store declares - inline or in an `implement` block in ANY file - with `SymbolStr` or `string` in its signature**, parsed from the tree on every run since §8.230 (the `lookup_*` rule read OK over 24 readers under other names; the inline-only parser read OK over a cross-file `implement struct` reader; the `SymbolStr`-token rule read OK over a `string`-keyed one); **a call is placed by its receiver's DECLARED TYPE** (`this`, a local's annotation, a field's declaration, an accessor's return type), not its spelling. Reads split `LOOKUP` (the five) / `LOOKUP_OTHER` (the rest) / `LOOKUP_ROUTED` (the funnel), `REGISTER` pins the index's name-keyed WRITES, and each other store has a `*_READ` and a `*_WRITE` row (`ARENA`, `REGISTRY`, `GRAPH`, `CONST`); `LOOKUP_ARENA` kept the arena's `lookup_by_name` apart from §8.192 (it read OK over a tree holding 17) until §8.247 deleted the method, and `ARENA_READ` is where a written-name read on the arena lands under any spelling; `HOME_WRITE` pins `.set_home_module(` at 0 since §8.204; `REENTRY` counts `get_resolver()` AND every name-keyed `Resolver` method on a `Resolver`-typed receiver outside `compiler/resolver/` and the driver (the three-name list read 6 over a tree holding 12: type resolution's `is_ambiguous`/`get_ambiguous_modules` - deleted in §8.244, 10 now - sema's three asks on its `get_resolver()` local, `Resolver::ns_written_as`); `make lane-selftest` drives every rule through a throwaway tree in both directions (23 mutations) | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. A receiver whose type it cannot read is refused, not dropped; a set name on a receiver of a NON-store type is counted as local (the control on placement). A `string` parameter that is a label rather than a key (`impl_owner(node, site: string)`) is inside the rule and pinned like a key: the rule cannot tell them apart and does not try. |
 | `make selfhost-check` | stage-3 == stage-4 byte identity, both arms | **Stability, not correctness.** It proves the compiler still emits the same bytes for code that already compiles; it says nothing about code that now STOPS compiling. |
@@ -237,7 +237,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: lane-check lane-selftest' Makefile` → **1**
 * `ls -d tests/tests/projects/*/test.json | wc -l` → **68**
-* `ls tests/tests/negative/*.cryo | wc -l` → **195**
+* `ls tests/tests/negative/*.cryo | wc -l` → **197**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
 * `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -17186,6 +17186,157 @@ head_binding.cryo, heads_overlap.cryo, control/}`.
 
 **Tally: 96 shadowed, 96 old paths deleted, 96 at zero; 214 artifacts
 gone** (unchanged).
+
+---
+
+### 8.262 A variadic function's declared parameters are checked: the bare call's `check_call_arity` and the module-qualified call's `check_scope_call_arg_types` returned on `is_variadic` before comparing anything, so `printf()` compiled with no arguments and `snprintf(&i8, ..)` passed an `&i8` to a `u8*` the same call refuses at every non-variadic function; now a declared parameter is required (E0216 "at least N") and checked (E0214) and only the tail is free; over the six halves the tree holds 2 such calls, both `fs_meta_dir.cryo`'s `snprintf` buffers, fixed with the cast the file writes on its next line; 0 objects moved; and bucket F's remnant confirmed as the two reads of `enforce_callee_visibility`, not convertible until the module member has a stamp - 2026-09-19
+
+> **Status:** LANDED.  `sema/call_resolver.cryo` (`check_call_arity`: the
+> variadic return deleted, E0216 says "at least", E0215 only for a
+> non-variadic callee, the fixed prefix through `check_args_against_params`;
+> `check_scope_call_arg_types`: the same), `sema/diagnostics.cryo`
+> (`emit_method_arity_error` takes `variadic`), `tests/tests/stdlib/fs_meta_dir.cryo`
+> (two casts), `tests/tests/negative/E0214_variadic_fixed_param.cryo` and
+> `E0216_variadic_missing_fixed.cryo` (new), `tests/test-roster.txt`
+> (`--merge`, two rows).
+
+#### The hole
+
+Both free-call checks treated `is_variadic` as "nothing to compare":
+
+```cryo
+// check_call_arity, before
+if (ft.is_variadic) { return; }
+// check_scope_call_arg_types, before
+if (!ft.is_variadic) { … arity, then check_args_against_params … }
+```
+
+A variadic callee's DECLARED parameters are parameters - `snprintf(buf:
+u8*, size: u64, fmt: u8*, ...)` declares three - and §8.260's sweep found
+the two paths agreeing on skipping them, path-consistently and wrong.  The
+tail past the declared parameters is what C leaves unconstrained (default
+argument promotions apply there and nothing declares a type to check
+against), and that is what stays free.
+
+#### The change
+
+`check_call_arity`: the return is gone; `got < expected` is E0216 with "at
+least" for a variadic callee; `got > expected` is E0215 only when the callee
+is not variadic; the prefix is compared by `check_args_against_params`,
+which already stops at the shorter of the two lists.
+`check_scope_call_arg_types`: `got == expected || (variadic && got >
+expected)` checks the prefix, anything else is the arity error, with the
+same "at least".  `emit_method_arity_error` gains the `variadic` flag; its
+three other callers pass `false`.
+
+#### Control (`.objcmp/nd-vararg/src/main.cryo`, `.objcmp/nd-ctl.log`)
+
+```cryo
+extern "C" { function vfix(a: i32, size: u64, ...) -> i32; }
+vfix(big, 64, 1, 2);                      // i64 -> i32: E0214 at 14:10
+vfix(1, 64);                              // fixed only: accepted
+vfix(1);                                  // E0216 "takes at least 2 argument(s) but 1"
+libc::snprintf(&buf[0], 64, "x %d", 1);   // u8[64]: accepted
+libc::snprintf(&buf[0], big, "x %d", 1);  // i64 -> u64, a non-literal word: accepted (the general rule)
+libc::printf("%d\n", 1);                  // accepted
+libc::printf();                           // E0216 "takes at least 1 argument(s) but 0"
+```
+
+The tree's compiler: exit 1, exactly the three.  `.objcmp/cryo-W6.exe`
+(`4f24148d`'s): exit 0 - `printf()` with no arguments compiled.
+
+And the rule the hole hid, `.objcmp/nd-vararg/src/ref.cryo`
+(`.objcmp/nd-ref.log`): `&i8` into a `u8*` parameter is E0214 on the bare
+non-variadic call and on `libc::strlen` under BOTH compilers, and on the
+variadic call under the tree's alone - the fixture's shape was accepted
+through the hole and nowhere else.
+
+#### Population (`scripts/objcmp/corpus2.sh NDp`, `.objcmp/ndp-corpus.out`)
+
+Predicted before the run: at most three refusals, in tests.  Measured: lsp
+direct exit 0 (the compiler's own variadic calls, `fmt::eprintf` and the
+`libc` family, all checked: 0 errors), projects, project tests, examples and
+negatives all as before (failing halves 0), and the unit half refused
+**2** calls, both in `tests/tests/stdlib/fs_meta_dir.cryo`:
+
+```cryo
+mut dirbuf: i8[256];
+const dn: i32 = libc::snprintf(&dirbuf[0], 256, "%s/cryo_md_dir_%d", ..);   // E0214: expected `u8*`, found `&i8`
+const dpath: Path = Path::from(Str::from_raw((&dirbuf[0]) as u8*, dn as u64)); // the same buffer, cast, one line down
+```
+
+Fixed by writing the cast the next line already writes (`(&dirbuf[0]) as
+u8*`, twice).  `make test-census` after the fix: `OVERALL PASS (unit: ok;
+compile-fail: 195 passed; projects: 65 passed)`, `test-census: OK`
+(`.objcmp/nd-census.log`) - the rest of the unit half holds none.
+
+#### Objects (`scripts/objcmp/hash-tree.sh ND` against `W6`, `4f24148d`'s compiler)
+
+examples **0 of 1,126**, tests **0 of 2,721** (`LC_ALL=C comm -3` over
+`ex-W6.s`/`ex-ND.s` and `t-W6.txt`/`t-ND.txt`: 0 lines).  The fixture's
+cast is a no-op in IR (a pointer cast under opaque pointers), so
+`FsMetaDir.o` is byte-identical: the change is a refusal and nothing
+else.
+
+#### The gates
+
+`tests/tests/negative/E0214_variadic_fixed_param.cryo` (an `i64` into a
+variadic extern's `i32` on the bare call, `&i8` into `snprintf`'s `u8*` on
+the qualified one; the same `i64` in the tail and the cast buffer beside
+them, accepted) and `E0216_variadic_missing_fixed.cryo` (`cf_vfix(1)` of
+two declared, `libc::printf()` of one).  The pair: the tree's compiler
+refuses each at its `//~` line and nothing else, the suite reports both
+`[PASS]` (`.objcmp/nd-neg-suite.log`); `cryo-W6.exe check` exits **0** on
+each file (`.objcmp/nd-neg.log`).  Roster merged (+2, 197 negatives).
+
+lsp-check 264 modules 0 errors 487 warnings; cross-check 0 errors
+(`.objcmp/nd-lsp.log`, `nd-cross.log`).
+
+#### Residual
+
+* **Variadic METHODS** are still skipped whole by the instance and static
+  method checks (`variadic_ok = true; continue` in the receiver gather,
+  the static-scope gather and the static arity check): their candidate
+  lists are packed `argc` parameters per candidate, which a variadic
+  candidate's shorter declared list would break.  The tree declares two
+  such methods, both in `tests/tests/lang/variadic_methods.cryo`; the
+  binding path (`args_bind_to_params`) does consider their declared
+  parameters for selection.  Not this entry's.
+* An overloaded free-function family with a variadic member is still not
+  arity-checked (`check_overloaded_free_call_arity`'s `any_variadic`).
+  No such family in the tree.
+
+#### Bucket F's remnant, confirmed against the tree
+
+`grep -rn '\.ns_imports(\|\.is_prelude_ns(\|\.namespace_of(\|\.is_candidate_public('
+compiler/src tools --include=*.cryo` at `c13ddb9c`: outside the index's
+own `resolve_qualified_scoped` (the LSP completion path) and the two
+namespace-keyed reachability reads (`compilation_context.cryo`'s
+`modules_written_as`, `name_resolution.cryo`'s E0240 gate - keyed by module
+identities, not leaves), exactly two remain: `enforce_callee_visibility`'s
+`di.namespace_of(callee)` and `di.is_candidate_public(callee)`
+(`call_resolver.cryo`).  They are not converted here, and the reason is the
+callers, not the gate: of its three callers, ONE holds a `DefId` and
+unwraps it (`sema.cryo`'s function-as-value, `def_q =
+def_id.qualified_name()`), and TWO hold a name `resolve_module_qualified_symbol`
+composed from the module stamp and the member's spelling - bucket C's
+shape, behind pin-as-declaration.  An id-form of the gate would make those
+two mint a `DefId` from a composed name in sema (two `DEFID_MINT`s at a
+consumer, the thing the lane gate counts), or keep a second name-keyed
+gate beside the id one.  The index records no declaring module for a
+function apart from its canonical name (`register_function_signature`
+keys by `decl_fn_key`), so `namespace_of` parsing the name is the one
+source either way.  When a module member carries a stamp, all three
+callers hold a `DefId` and the gate takes one: one signature change,
+then.
+
+**New for Jake**: `emit_method_arity_error`'s `variadic` parameter.  No
+new name.
+
+Outside the ledger: the files in the status line.
+
+**Tally: 96 shadowed, 96 old paths deleted, 96 at zero; 214 artifacts
+gone** (unchanged; a hole closed, not a lane).
 
 ---
 

@@ -1881,14 +1881,17 @@ type struct CallResolver {
         const ft_raw: Type* = this.arena.lookup(overloads[0].id);
         if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return; }
         const ft: FunctionType* = ft_raw as FunctionType*;
-        if (ft.is_variadic) { return; }
+        // A variadic callee's declared parameters are parameters: each must
+        // be supplied and each is checked against its declared type.  Only
+        // the tail past them is unconstrained.
         const expected: i64 = ft.param_types.length;
         const got: i64 = call.arguments.length;
         if (got < expected) {
             const name: string = this.intern.resolve(ident.name);
             mut diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0216_TOO_FEW_ARGS,
-                fmt::format("function `%s` takes %lld argument(s) but %lld were supplied", name, expected, got));
+                fmt::format("function `%s` takes %s%lld argument(s) but %lld were supplied", name,
+                    if (ft.is_variadic) { "at least " } else { "" }, expected, got));
             diag = diag.at_with_label(call.span,
                 fmt::format("missing %lld argument%s", expected - got, if (expected - got == 1) { "" } else { "s" }));
             if (call.span.has_location() && call.span.end_col > 0) {
@@ -1908,7 +1911,7 @@ type struct CallResolver {
             this.ctx.diagnostics.emit(diag);
             return;
         }
-        if (got > expected) {
+        if (got > expected && !ft.is_variadic) {
             const name: string = this.intern.resolve(ident.name);
             mut diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0215_TOO_MANY_ARGS,
@@ -1964,7 +1967,7 @@ type struct CallResolver {
         }
         if (any_variadic || matches) { return; }
         const expected_for_msg: i64 = if (uniq_arity >= 0) { uniq_arity } else { -1 };
-        this.diag.emit_method_arity_error(call, ident.name, "function", expected_for_msg, got);
+        this.diag.emit_method_arity_error(call, ident.name, "function", expected_for_msg, got, false);
     }
 
     /// Non-emitting category check: do the call's args fit `params`?  Non-concrete
@@ -2472,7 +2475,7 @@ type struct CallResolver {
         }
         if (variadic_ok) { return; }
         if (name_seen > 0) {
-            this.diag.emit_method_arity_error(call, member.member, "method", uniq_arity, argc);
+            this.diag.emit_method_arity_error(call, member.member, "method", uniq_arity, argc, false);
         }
     }
 
@@ -5402,13 +5405,15 @@ type struct CallResolver {
             const ot: Type* = this.arena.lookup(overloads[0].id);
             if (ot != null && ot.kind == TypeKind::Function) {
                 const ft: FunctionType* = ot as FunctionType*;
-                if (!ft.is_variadic) {
-                    if (ft.param_types.length == call.arguments.length) {
-                        this.check_args_against_params(visitor, call, ft.param_types.as_slice());
-                    } else {
-                        this.diag.emit_method_arity_error(call, scope.member_name, "function",
-                            ft.param_types.length, call.arguments.length);
-                    }
+                // A variadic callee's declared parameters are checked like any
+                // other's; only the tail past them is unconstrained.
+                const expected: i64 = ft.param_types.length;
+                const got: i64 = call.arguments.length;
+                if (got == expected || (ft.is_variadic && got > expected)) {
+                    this.check_args_against_params(visitor, call, ft.param_types.as_slice());
+                } else {
+                    this.diag.emit_method_arity_error(call, scope.member_name, "function",
+                        expected, got, ft.is_variadic);
                 }
             }
             return;
@@ -5492,7 +5497,7 @@ type struct CallResolver {
         if (found) { this.check_args_against_params(visitor, call, chosen.as_slice()); return; }
         if (variadic_ok) { return; }
         if (name_seen > 0) {
-            this.diag.emit_method_arity_error(call, scope.member_name, "static method", uniq_arity, argc);
+            this.diag.emit_method_arity_error(call, scope.member_name, "static method", uniq_arity, argc, false);
         }
     }
 }
