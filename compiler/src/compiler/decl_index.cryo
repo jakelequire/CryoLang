@@ -15,6 +15,7 @@
 
 namespace compiler::decl_index;
 
+import compiler::ast::{ TypeAnnotation };
 import compiler::ast::declaration;
 import compiler::ast::declaration::{ FunctionDeclNode, ImplBlockNode, MethodNode, VarDeclNode };
 import compiler::types;
@@ -304,6 +305,18 @@ type struct DeclarationIndex {
     // call's callee (`enforce_callee_visibility`).
     decl_visibility:     HashMap<u32, boolean>;
 
+    /// The declarations whose SIGNATURE the name layer refused - a parameter
+    /// or return type naming nothing the writer can see - keyed as the
+    /// function would have registered (its canonical name, or
+    /// `Type::method`).  Such a declaration registers no signature: one with
+    /// the refused parameter dropped is a different function's, and one
+    /// with no return type cannot be mangled.  What the set carries is that
+    /// the name IS declared, so a call to it reports nothing: the defect was
+    /// reported where the type was written, and "cannot find function" or
+    /// "takes 0 arguments" against a declaration that exists is a second
+    /// report of the first, stated as something false.
+    refused_signatures:  HashMap<u32, boolean>;
+
 
     static new() -> DeclarationIndex {
         return DeclarationIndex {
@@ -334,6 +347,7 @@ type struct DeclarationIndex {
             module_imports:     HashMap<u32, u32[]>::new(),
             prelude_ns:         [],
             decl_visibility:    HashMap<u32, boolean>::new(),
+            refused_signatures: HashMap<u32, boolean>::new(),
         };
     }
 
@@ -751,12 +765,19 @@ type struct DeclarationIndex {
             if (method.func.is_self_returning_default) { continue; }
             const func: FunctionDeclNode* = method.func;
 
-            this.register_method(type_sym, func.name, func.resolved_return_type);
-
             // Build combined key "QualifiedType::method".
             const method_str: string = intern.resolve(func.name);
             const combined: string = fmt::format("%s::%s", type_str, method_str);
             const combined_sym: SymbolStr = intern.intern(combined);
+
+            // A signature the name layer refused registers nothing under
+            // the key - a call finds the refusal there and stays silent.
+            if (DeclarationIndex::signature_is_refused(func)) {
+                this.mark_signature_refused(combined_sym);
+                continue;
+            }
+
+            this.register_method(type_sym, func.name, func.resolved_return_type);
 
             // Build full FunctionType.  Cryo allows three self forms on
             // non-static methods:
@@ -1109,6 +1130,55 @@ type struct DeclarationIndex {
     /// Covers types AND free functions; both share one identity space here.
     set_decl_visibility(mut &this, qualified: SymbolStr, is_public: boolean) -> void {
         this.decl_visibility.insert(qualified.id, is_public);
+    }
+
+    /// Record that the declaration `key` would register under has a
+    /// signature the name layer refused, and so registers none.
+    mark_signature_refused(mut &this, key: SymbolStr) -> void {
+        this.refused_signatures.insert(key.id, true);
+    }
+
+    /// Whether `key` names a declaration whose signature was refused where
+    /// it was written - the reason a call to it finds no signature, and the
+    /// reason that call reports nothing.
+    signature_refused(&this, key: SymbolStr) -> boolean {
+        return this.refused_signatures.contains_key(&key.id);
+    }
+
+    /// `signature_refused` for a stamp: the definition's canonical name is
+    /// the key its registration would have used.
+    signature_refused_of_def(&this, d: DefId) -> boolean {
+        if (!d.is_valid()) { return false; }
+        return this.signature_refused(d.qualified_name());
+    }
+
+    /// `signature_refused` for a module's function named through the
+    /// module, `Mod::f(..)`: the module is the stamp the qualifier carries
+    /// and the member is written, and the function's key is the two joined
+    /// - composed here, as `global_entry_in_module` composes a global's.
+    signature_refused_in_module(&this, member: SymbolStr, module: DefId,
+                                intern: InternTable*) -> boolean {
+        if (!module.is_valid()) { return false; }
+        return this.signature_refused(intern.intern(fmt::format("%s::%s",
+            intern.resolve(module.qualified_name()), intern.resolve(member))));
+    }
+
+    /// Whether `func`'s written signature carries a name the name layer
+    /// refused: its return type, or any parameter's.  Asked only of a slot
+    /// that resolved to no type - a resolved slot was not refused, and
+    /// `refused` reads the annotation's stamp through `require`, which a
+    /// synthesized declaration's annotation may not carry.  A `this`
+    /// receiver has no annotation and is never refused.
+    static signature_is_refused(func: FunctionDeclNode*) -> boolean {
+        if (func == null) { return false; }
+        if (!func.resolved_return_type.is_valid()
+                && TypeAnnotation::refused(func.return_type_annotation)) { return true; }
+        for (mut p: i64 = 0; p < func.parameters.length; p++) {
+            const param: VarDeclNode* = func.parameters[p];
+            if (param == null || param.resolved_type.is_valid()) { continue; }
+            if (TypeAnnotation::refused(param.type_annotation)) { return true; }
+        }
+        return false;
     }
 
     /// The defining namespace of a qualified name (everything before the leaf),

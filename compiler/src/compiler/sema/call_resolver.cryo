@@ -2726,6 +2726,9 @@ type struct CallResolver {
             Res::Err => { return TypeRef::invalid(); }
             _        => { }
         }
+        // Bound to a declaration whose signature was refused where it was
+        // written: it has no signature to type the call by, and it exists.
+        if (this.ctx.decl_index.signature_refused_of_def(stamped_r.def_id())) { return TypeRef::invalid(); }
         const name: string = this.intern.resolve(ident.name);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0202_UNDEFINED_FUNCTION,
@@ -3391,6 +3394,13 @@ type struct CallResolver {
         if (this.try_diagnose_method_bound_failure(obj_type, member)) { return TypeRef::invalid(); }
         if (this.try_diagnose_forin_noncopy(obj_type, member, primary_span)) { return TypeRef::invalid(); }
 
+        // The method is declared and its signature was refused where it was
+        // written; it registered none, and the call reports nothing more.
+        if (type_sym.is_valid() && this.ctx.decl_index.signature_refused(this.intern.intern(
+                fmt::format("%s::%s", this.intern.resolve(type_sym), method_name)))) {
+            return TypeRef::invalid();
+        }
+
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
             fmt::format("no method named `%s` found on type `%s`", method_name, type_display));
@@ -3612,6 +3622,12 @@ type struct CallResolver {
 
         if (this.symbolic.symbolic_name_is_generic_param(scope.scope_name)) { return TypeRef::invalid(); }
 
+        // A declaration whose signature was refused where it was written
+        // registered none, and a call to it reports nothing more: the
+        // module's function under its canonical name, or the type's method
+        // under `Owner::member`.
+        if (this.scope_callee_signature_refused(scope, names_module)) { return TypeRef::invalid(); }
+
         // An impl-qualified path that reached no method is refused in the
         // head's terms - the trait the type does not implement, or the
         // member its implementation lacks - not as a bare path's miss.
@@ -3638,6 +3654,22 @@ type struct CallResolver {
         }
         this.ctx.emit_diagnostic(diag);
         return TypeRef::invalid();
+    }
+
+    /// Whether the declaration a `Scope::member` call names has a signature
+    /// the name layer refused: a module's function under its canonical name
+    /// (`names_module`), else the owner's method under `Owner::member`, the
+    /// owner by the key its methods registered under.
+    scope_callee_signature_refused(mut &this, scope: ScopeResolutionNode*, names_module: boolean) -> boolean {
+        if (names_module) {
+            return this.ctx.decl_index.signature_refused_in_module(scope.member_name,
+                scope.require_scope_res("scope-call refused signature").def_id(), this.intern);
+        }
+        const owner_key: SymbolStr = this.scope_owner_key(scope);
+        if (!owner_key.is_valid()) { return false; }
+        const combined: SymbolStr = this.intern.intern(fmt::format("%s::%s",
+            this.intern.resolve(owner_key), this.intern.resolve(scope.member_name)));
+        return this.ctx.decl_index.signature_refused(combined);
     }
 
     /// True when `scope_sym` - a registered name: the owner that won
