@@ -125,14 +125,6 @@ type struct ConstantTable {
     register(mut &this, qualified: SymbolStr, init: ExpressionNode*) -> void {}
 }
 """,
-    "compiler/passes/default_expansion.cryo": """\
-type struct DefaultRegistry {
-    entries: DefaultEntry[];
-    name_index: HashMap<u32, i64>;
-
-    lookup(&this, name: SymbolStr) -> DefaultEntry* { return null; }
-}
-""",
     "compiler/resolver/resolver.cryo": """\
 type struct Resolver {
     scopes: Scope[];
@@ -208,7 +200,7 @@ BASELINE = {
     "LOOKUP": 2, "LOOKUP_OTHER": 0, "REGISTER": 0, "LOOKUP_ROUTED": 1,
     "LOOKUP_LOCAL": 1, "ARENA_READ": 2, "ARENA_WRITE": 0,
     "REGISTRY_READ": 0, "REGISTRY_WRITE": 0, "GRAPH_READ": 0, "GRAPH_WRITE": 0,
-    "CONST_READ": 0, "CONST_WRITE": 0, "DEFAULT_READ": 0, "DEFAULT_WRITE": 0,
+    "CONST_READ": 0, "CONST_WRITE": 0,
     "REENTRY": 0, "HOME_WRITE": 0,
     "DEFID_MINT": 0, "DEFID_UNWRAP": 0,
 }
@@ -412,6 +404,18 @@ def main():
                 _c, names = run_gate(tree, golden, "--names")
                 if "read   probe" not in names:
                     failures.append("mutation 0: --names does not list the implement-block reader:\n%s" % names)
+
+        # The golden's side: a section the gate does not count (a retired
+        # bucket left behind) is refused, not read past.  The tree is the
+        # unmutated base, so the only thing wrong is the golden.
+        stale = os.path.join(work, "stale-golden.txt")
+        with open(golden, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        with open(stale, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text + "\n[RETIRED_ROW]\nTOTAL 0\n\n")
+        code, out = run_gate(base, stale)
+        if code != 1 or "RETIRED_ROW: golden carries a section this gate does not count" not in out:
+            failures.append("a golden section the gate does not count must be refused:\n%s" % out)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -420,7 +424,7 @@ def main():
         for f in failures:
             sys.stderr.write(f + "\n\n")
         return 1
-    print("lane-gate-selftest: OK -- baseline accepted, %d mutations behaved" % len(MUTATIONS))
+    print("lane-gate-selftest: OK -- baseline accepted, %d mutations behaved, a stale golden section refused" % len(MUTATIONS))
     return 0
 
 

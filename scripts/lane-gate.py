@@ -119,13 +119,16 @@ The calls are SPLIT BY THE STORE that answers them and by READ vs WRITE:
   * CONST_READ / CONST_WRITE -- the `ConstantTable`: constants and enums
     registered under their qualified name; reads go by stamp (`ConstEval`)
     and are expected to stay at zero.
-  * DEFAULT_READ / DEFAULT_WRITE -- the `DefaultRegistry`: the default-
-    expansion pass's table of all-default generic templates, keyed by the
-    template's BARE leaf, built on the pass's stack and threaded through it
-    as a parameter.  A store that lives in one file has its whole surface in
-    that file, and a store's own calls are not counted (see below), so both
-    rows read 0: what the gate pins is that the store EXISTS and that no
-    other stage reaches it, not how its own pass reads it.
+  * (The default-expansion pass kept a table of all-default templates keyed
+    by the template's BARE leaf on its own stack, threaded through it as a
+    parameter.  Rule 1's first run over the tree found it - the store the
+    hand-written list had missed - and it had two rows here for one commit.
+    It is deleted: the pass asks the generic registry by the annotation's
+    stamp, `template_of(def)`, which mentions no key type and is no surface.
+    A store whose only reader shares its file has both rows at 0 by
+    construction, since a store's own calls are not counted; what such rows
+    pin is that the store EXISTS, and that it is the tree's question to
+    answer, not the list's.)
   * REENTRY -- calls to `get_resolver()` outside the driver, and ANY
     name-keyed `Resolver` method reached through a `Resolver`-typed
     receiver outside the resolver's own directory and the driver
@@ -274,7 +277,6 @@ STORES = {
     "Resolver":         Store("compiler/resolver/resolver.cryo", "REENTRY", "REENTRY",
                               owners=("compiler/resolver/", "compiler/instance.cryo",
                                       "compiler/compilation_context.cryo")),
-    "DefaultRegistry":  Store("compiler/passes/default_expansion.cryo", "DEFAULT_READ", "DEFAULT_WRITE"),
 }
 INDEX_TYPE = "DeclarationIndex"
 ARENA_TYPE = "TypeArena"
@@ -354,7 +356,7 @@ HOME_WRITE_RE = re.compile(r"\.set_home_module\s*\(")
 KINDS = ("LOOKUP", "LOOKUP_OTHER", "REGISTER", "LOOKUP_ROUTED", "LOOKUP_LOCAL",
          "ARENA_READ", "ARENA_WRITE",
          "REGISTRY_READ", "REGISTRY_WRITE", "GRAPH_READ", "GRAPH_WRITE",
-         "CONST_READ", "CONST_WRITE", "DEFAULT_READ", "DEFAULT_WRITE",
+         "CONST_READ", "CONST_WRITE",
          "REENTRY", "HOME_WRITE", "DEFID_MINT", "DEFID_UNWRAP")
 
 
@@ -782,11 +784,6 @@ HEADER = [
     "# GRAPH_WRITE    a name-keyed write to the ModuleGraph (none today).",
     "# CONST_READ     a name-keyed read of the ConstantTable (reads go by stamp).",
     "# CONST_WRITE    a constant or enum registered under its qualified name.",
-    "# DEFAULT_READ   the DefaultRegistry (default expansion's all-default",
-    "#                templates by bare leaf, built on the pass's stack) asked",
-    "#                by name from outside its own file - 0, since the store",
-    "#                and its only reader share the file.",
-    "# DEFAULT_WRITE  the DefaultRegistry registered into from outside its file.",
     "# REENTRY  get_resolver() outside the driver, and ANY name-keyed Resolver",
     "#          method on a Resolver-typed receiver outside compiler/resolver/ and",
     "#          the driver. Name resolution is a PASS, not a service: a resolver",
@@ -929,6 +926,10 @@ def main():
     gold_counts, gold_totals = parsed
 
     problems = []
+    # A golden section the gate does not count is a row nobody measures: a
+    # retired bucket left in the file would read OK forever.
+    for kind in sorted(set(gold_totals) - set(KINDS)):
+        problems.append("  %s: golden carries a section this gate does not count; re-pin" % kind)
     for kind in KINDS:
         if kind not in gold_totals:
             problems.append("  %s: golden has no TOTAL line" % kind)
