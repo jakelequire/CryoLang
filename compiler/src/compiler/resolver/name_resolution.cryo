@@ -163,10 +163,31 @@ public:
     declare_c_imported(&this, alias: SymbolStr, name: SymbolStr,
                        span: SourceSpan) -> void {
         if (alias.is_empty() || !name.is_valid()) { return; }
-        const q: string = this.resolver.intern_table.resolve(alias) + "::"
-                        + this.resolver.intern_table.resolve(name);
-        this.resolver.declare_c_imported_type(
-            this.resolver.intern_table.intern(q), span);
+        const saved_module: SymbolStr = this.resolver.current_module_sym();
+        const saved_scope: u64 = this.resolver.get_current_scope_id();
+        this.resolver.set_module(alias);
+        const sym_id: SymbolID = this.resolver.declare_type(name, span, true);
+        this.resolver.export_symbol(sym_id);
+        this.resolver.restore_scope(saved_module, saved_scope);
+    }
+
+    /// Declare a C-imported global in its alias's module, as the module's
+    /// own constant or variable, exported: `cit::FLAG_A` is then the
+    /// module lane's answer, as `cit::add3` and `cit::Vec2` are.
+    declare_c_imported_global(&this, alias: SymbolStr, node: VarDeclNode*) -> void {
+        if (alias.is_empty() || !node.name.is_valid()) { return; }
+        const saved_module: SymbolStr = this.resolver.current_module_sym();
+        const saved_scope: u64 = this.resolver.get_current_scope_id();
+        this.resolver.set_module(alias);
+        const sym_id: SymbolID = if (node.is_mutable) {
+            this.resolver.declare_variable(node.name, node.span, true, true)
+        } else {
+            this.resolver.declare_constant(node.name, node.span)
+        };
+        this.resolver.record_resolution(node.span, sym_id);
+        this.resolver.export_symbol(sym_id);
+        if (!node.is_mutable) { this.record_const_value_in(alias, node); }
+        this.resolver.restore_scope(saved_module, saved_scope);
     }
 
     forward_declare_node(node: ASTNode*) -> void {
@@ -258,10 +279,10 @@ public:
             }
             NodeKind::VariableDeclaration => {
                 const var_node: VarDeclNode* = node as VarDeclNode*;
-                // A C-imported global const (binding_namespace set) is reachable
-                // only through its alias namespace (`cit::NAME`, via the
-                // decl_index qualified key); declaring it bare here would pollute
-                // the file scope and shadow same-leaf globals in other modules.
+                // A C-imported global (binding_namespace set) is a
+                // declaration of its alias's module, reachable as
+                // `cit::NAME`; declared bare here it would shadow same-leaf
+                // globals in other modules.
                 if (var_node.is_global && var_node.binding_namespace.is_empty()) {
                     // An immutable global is a named constant
                     // (`SymbolKind::Constant`); a mutable global is a variable.
@@ -284,6 +305,8 @@ public:
                     if (!var_node.is_mutable) {
                         this.record_const_value(var_node);
                     }
+                } else if (var_node.is_global) {
+                    this.declare_c_imported_global(var_node.binding_namespace, var_node);
                 }
             }
             NodeKind::ImportDeclaration => {
@@ -324,31 +347,34 @@ public:
             NodeKind::ExternBlock => {
                 const extern_node: ExternBlockNode* = node as ExternBlockNode*;
                 if (extern_node.is_c_import()) {
-                    // CImport: declare the namespace alias as a symbol, create
-                    // a child scope, and declare all imported functions in it.
+                    // A C import: the alias is a binding of this module to a
+                    // module of its own - the resolver's, under the canonical
+                    // namespace the import engine wrote on the block
+                    // (`<mod>::cit`) - and the block's functions are that
+                    // module's declarations.  The alias symbol's qualified
+                    // name IS that namespace, so a scope segment or a type
+                    // spelling bound to it answers `Def(<mod>::cit)` and its
+                    // members resolve through the doors a module's do.
                     const alias: SymbolStr = extern_node.namespace_alias;
+                    const canon: SymbolStr = extern_node.binding_namespace;
                     const ns_id: SymbolID = this.resolver.alloc_symbol_id();
-                    const mod_str: string = this.resolver.intern_table.resolve(
-                        this.resolver.current_module);
                     const ns_sym: Symbol = Symbol::namespace_sym(
                         ns_id, alias, this.resolver.current_scope,
-                        extern_node.span, mod_str);
+                        extern_node.span,
+                        QualifiedName::parent_of(this.resolver.intern_table.resolve(canon)));
                     this.resolver.declare(ns_sym);
                     this.resolver.export_symbol(ns_id);
 
-                    // Enter a child scope for the namespace alias
-                    const alias_str: string = this.resolver.intern_table.resolve(alias);
-                    const _scope_id: ScopeID = this.resolver.enter_scope(
-                        ScopeKind::Module, alias_str, extern_node.span);
-
+                    const saved_module: SymbolStr = this.resolver.current_module_sym();
+                    const saved_scope: u64 = this.resolver.get_current_scope_id();
+                    this.resolver.set_module(canon);
                     for (mut j: int = 0; j < extern_node.functions.length; j++) {
                         const fn_node: FunctionDeclNode* = extern_node.functions[j];
                         const fn_sym: SymbolID = this.resolver.declare_function(
                             fn_node.name, fn_node.span, true);
                         this.resolver.export_symbol(fn_sym);
                     }
-
-                    this.resolver.exit_scope();
+                    this.resolver.restore_scope(saved_module, saved_scope);
                 } else {
                     // Regular extern block: declare functions in current scope
                     for (mut j: int = 0; j < extern_node.functions.length; j++) {
@@ -411,6 +437,29 @@ public:
     /// set - the way every qualified path is - and ITS kind is the answer.
     /// The type index cannot serve this: it is not populated until a later
     /// pass.
+    /// The module an `extern module` alias binds - its canonical namespace,
+    /// `<mod>::alias`, which is the alias symbol's own qualified name - or
+    /// an empty symbol for any other binding.  An alias is the one
+    /// `Namespace` symbol a module's scope declares; the global scope's
+    /// `Namespace` symbols are module IDENTITIES, declared under their full
+    /// names, and a path spelling one of those is the module lane's
+    /// (`modules_written_as`), not this one's.
+    alias_module_of(&this, s: &Symbol) -> SymbolStr {
+        // An import binds a NAME; what it names is the declaration it points
+        // at, reached through the owning module's export set - the alias is
+        // exported, so `import compiler::codegen::{ llvm }` binds it here.
+        if (s.kind == SymbolKind::Import && s.source_module != "") {
+            const decl: SymbolID = this.resolver.lookup_in_module(
+                this.resolver.intern_table.intern(s.source_module), s.name);
+            if (!decl.is_valid()) { return SymbolStr::empty(); }
+            const target: Symbol = this.resolver.get_symbol(decl);
+            return this.alias_module_of(&target);
+        }
+        if (s.kind != SymbolKind::Namespace) { return SymbolStr::empty(); }
+        if (s.scope_id.id == this.resolver.global_scope.id) { return SymbolStr::empty(); }
+        return this.resolver.qualified_name_of(s);
+    }
+
     symbol_names_type(&this, s: &Symbol) -> boolean {
         if (s.kind == SymbolKind::Type || s.kind == SymbolKind::TypeAlias) { return true; }
         if (s.kind != SymbolKind::Import) { return false; }
@@ -1564,6 +1613,28 @@ public:
         const leaf: string = QualifiedName::leaf_of(written);
         if (leaf.length() == 0) { return ResSlot::Pending; }
 
+        // A path rooted in an `extern module` alias: the alias is a module of
+        // the resolver's own, not the graph's, bound in the writer's scope,
+        // and its declarations are one segment deep - so the leaf is asked of
+        // its export set and nothing else.  Asked of the current scope, which
+        // is the writing scope for every caller.
+        if (!this.resolver.contains_separator(prefix)) {
+            const head_bound: SymbolID = this.resolver.lookup(
+                this.resolver.intern_table.intern(prefix), this.resolver.current_scope);
+            if (head_bound.is_valid()) {
+                const hb: Symbol = this.resolver.get_symbol(head_bound);
+                const alias_ns: SymbolStr = this.alias_module_of(&hb);
+                if (alias_ns.is_valid()) {
+                    const decl: SymbolID = this.resolver.lookup_in_module(
+                        alias_ns, this.resolver.intern_table.intern(leaf));
+                    if (!decl.is_valid()) { return ResSlot::Pending; }
+                    const ds: Symbol = this.resolver.get_symbol(decl);
+                    return ResSlot::Answered(Res::Def(DefId::of_definition(
+                        this.resolver.qualified_name_of(&ds))));
+                }
+            }
+        }
+
         // A spelling two reachable modules share names neither of them, so the
         // walk stops rather than picking one.
         const head: ModuleSpellingMatch = this.ctx.modules_written_as(prefix, use_ns);
@@ -1741,6 +1812,14 @@ public:
             // import is the report.
             if (bound.kind == SymbolKind::Refused) {
                 node.set_scope_res(Res::Err);
+                return;
+            }
+            // An `extern module` alias names a module - the resolver's own,
+            // not the graph's - and the member is that module's declaration:
+            // the module lane's answer, read through the module lane's doors.
+            const alias_ns: SymbolStr = this.alias_module_of(&bound);
+            if (alias_ns.is_valid()) {
+                node.set_scope_res(Res::Def(DefId::of_definition(alias_ns)));
                 return;
             }
         }
@@ -2075,6 +2154,13 @@ public:
                         hb = ResBase::Def(DefId::of_definition(this.resolver.qualified_name_of(&hs)));
                     }
                     return ResSlot::Answered(Res::TypeRelative(hb, trailing));
+                }
+                // The head names an `extern module` alias - a module of the
+                // resolver's own, bound in the writer's scope, which the
+                // graph does not hold and the module lane below cannot see -
+                // so the path is module-rooted and the walk answers it.
+                if (this.alias_module_of(&hs).is_valid()) {
+                    return this.walk_module_rooted_type(written, SymbolStr::empty(), span);
                 }
             }
             // The head names neither a type nor a generic parameter, so the
@@ -2722,13 +2808,21 @@ public:
     /// too and simply never folds - only a use that needs the value reports
     /// anything.
     record_const_value(&this, node: VarDeclNode*) -> void {
+        this.record_const_value_in(
+            if (this.ctx != null && this.ctx.has_namespace()) { this.ctx.namespace_str } else { SymbolStr::empty() },
+            node);
+    }
+
+    /// `record_const_value` under an explicit namespace: a C-imported
+    /// constant is its alias module's, keyed there.
+    record_const_value_in(&this, ns: SymbolStr, node: VarDeclNode*) -> void {
         if (this.ctx == null || this.ctx.const_table == null) { return; }
         const intern: InternTable* = this.ctx.intern_table;
         if (intern == null) { return; }
         if (node.initializer == null) { return; }
 
-        const qualified: SymbolStr = if (this.ctx.has_namespace()) {
-            ConstantTable::intern_qualified(intern, this.ctx.namespace_str, node.name)
+        const qualified: SymbolStr = if (ns.is_valid()) {
+            ConstantTable::intern_qualified(intern, ns, node.name)
         } else {
             node.name
         };
@@ -2748,8 +2842,17 @@ public:
         const intern: InternTable* = this.ctx.intern_table;
         if (intern == null) { return; }
 
-        const qualified: SymbolStr = if (this.ctx.has_namespace()) {
-            ConstantTable::intern_qualified(intern, this.ctx.namespace_str, node.name)
+        // Keyed by its declaring module's namespace: the alias module's for
+        // a C-imported enum, this module's for any other, as the enum's
+        // stamp names it.
+        mut ns: SymbolStr = SymbolStr::empty();
+        if (!node.binding_namespace.is_empty()) {
+            ns = node.binding_namespace;
+        } else if (this.ctx.has_namespace()) {
+            ns = this.ctx.namespace_str;
+        }
+        const qualified: SymbolStr = if (ns.is_valid()) {
+            ConstantTable::intern_qualified(intern, ns, node.name)
         } else {
             node.name
         };

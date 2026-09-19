@@ -136,9 +136,6 @@ type struct DeclarationIndex {
     // Type name -> TypeRef (for struct, class, enum, trait lookups)
     type_map:       HashMap<u32, TypeRef>;
 
-    // Global variable name -> TypeRef
-    global_vars:    HashMap<u32, TypeRef>;
-
     // Reverse: TypeRef.id -> SymbolStr.id (for looking up a type's name)
     type_reverse:   HashMap<u64, u32>;
 
@@ -152,11 +149,11 @@ type struct DeclarationIndex {
                                       // same private `const NAME = ...` without
                                       // colliding at link time.
     module_global_types:      TypeRef[];  // parallel to module_global_keys: the
-                                      // global's type AS DECLARED IN THAT module.
-                                      // `global_vars` is keyed by bare name and is
-                                      // last-write-wins, so it cannot answer "the
-                                      // `FIONBIO` declared in `sys::syscall`" when
-                                      // another module declares that leaf too.
+                                      // global's type AS DECLARED IN THAT module -
+                                      // a slot is `(leaf, namespace)`, so "the
+                                      // `FIONBIO` declared in `sys::syscall`" is
+                                      // answerable when another module declares
+                                      // that leaf too.
     module_global_threadlocal: boolean[];  // parallel to module_global_keys:
                                       // whether the global is `![thread_local]`,
                                       // so a cross-module extern reference is
@@ -313,7 +310,6 @@ type struct DeclarationIndex {
             func_type_refs:      HashMap<u32, TypeRef>::new(),
             method_returns:      HashMap<u64, TypeRef>::new(),
             type_map:            HashMap<u32, TypeRef>::new(),
-            global_vars:         HashMap<u32, TypeRef>::new(),
             type_reverse:        HashMap<u64, u32>::new(),
             array_elem_to_type:  HashMap<u64, TypeRef>::new(),
             implicit_converters: HashMap<u64, u64>::new(),
@@ -611,15 +607,9 @@ type struct DeclarationIndex {
         this.type_reverse.insert(ty.id, qualified_name.id);
     }
 
-    /// Register a global variable's type.
-    register_global(mut &this, name: SymbolStr, ty: TypeRef) -> void {
-        this.global_vars.insert(name.id, ty);
-    }
-
     /// Register a global with its defining module so codegen can walk the
-    /// per-module list to emit cross-module externs.  Callers already set
-    /// the shared type map via register_global; this method is additive.
-    /// `namespace` is the namespace this module declares (e.g.
+    /// per-module list to emit cross-module externs.  The slot is
+    /// `(name, namespace)`: `namespace` is the namespace this module declares (e.g.
     /// `std::collections::hashmap`); codegen mangles the global as
     /// `C$<namespace>.<name>` so two modules with the same private
     /// `const NAME = ...` don't collide.  Pass an empty SymbolStr when no
@@ -627,7 +617,6 @@ type struct DeclarationIndex {
     register_global_with_module(mut &this, name: SymbolStr, ty: TypeRef,
                                  module: SymbolStr, namespace: SymbolStr,
                                  thread_local: boolean) -> void {
-        this.register_global(name, ty);
         // Dedup so re-processing doesn't grow the list unboundedly.
         for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
             if (this.module_global_keys[i] == name.id &&
@@ -689,9 +678,8 @@ type struct DeclarationIndex {
     /// by, from the canonical name a stamp carries: its last segment under
     /// the rest (the root namespace when there is no rest).  The one place a
     /// canonical name is split back into the slot's key, so sema and codegen
-    /// cannot split it differently.  A C-import alias's global is registered
-    /// under the whole `alias::NAME` as its leaf and is not addressed this
-    /// way - no stamp names that key space.
+    /// cannot split it differently.  A C-import alias's global is the alias
+    /// module's (`<mod>::cit::NAME`) and splits like any other.
     static split_global_key(q: SymbolStr, intern: InternTable*,
                             out_leaf: SymbolStr*, out_ns: SymbolStr*) -> void {
         const q_str: string = intern.resolve(q);
@@ -1007,14 +995,6 @@ type struct DeclarationIndex {
         };
     }
 
-    /// Look up a global variable's type by name.
-    lookup_global(&this, name: SymbolStr) -> TypeRef {
-        return match (this.global_vars.get(&name.id)) {
-            Option::Some(val) => { val }
-            Option::None      => { TypeRef::invalid() }
-        };
-    }
-
     /// Reverse-lookup: get the SymbolStr for a TypeRef.
     lookup_type_name(&this, ty: TypeRef) -> SymbolStr {
         return match (this.type_reverse.get(&ty.id)) {
@@ -1281,31 +1261,6 @@ type struct DeclarationIndex {
             Option::None => { }
         }
         return result;
-    }
-
-    // Per-module queries
-
-    /// Get the defining module for a global. Returns empty SymbolStr if not found.
-    get_global_module(&this, name: SymbolStr) -> SymbolStr {
-        for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
-            if (this.module_global_keys[i] == name.id) {
-                return SymbolStr::from_id(this.module_global_modules[i]);
-            }
-        }
-        return SymbolStr::empty();
-    }
-
-    /// Get the defining namespace for a global. Returns empty SymbolStr if
-    /// not found or if the global was registered without a namespace.
-    /// `resolve_global` uses this to mangle a cross-module extern with the
-    /// same module-qualified name the defining module emits.
-    get_global_namespace(&this, name: SymbolStr) -> SymbolStr {
-        for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
-            if (this.module_global_keys[i] == name.id) {
-                return SymbolStr::from_id(this.module_global_namespaces[i]);
-            }
-        }
-        return SymbolStr::empty();
     }
 
     /// Combines a type's SymbolStr.id and a method's SymbolStr.id into a single

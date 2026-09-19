@@ -290,12 +290,10 @@ type struct CallResolver {
         }
         if (n.kind == NodeKind::ScopeResolution) {
             const sr: ScopeResolutionNode* = callee as ScopeResolutionNode*;
-            const bare_combined: string = fmt::format("%s::%s",
-                this.intern.resolve(sr.scope_name), this.intern.resolve(sr.member_name));
-            const bare_sym: SymbolStr = this.intern.intern(bare_combined);
-            // A MODULE scope is the module lane's to answer, from the stamp,
-            // and it is asked next (`lookup_module_qualified_param_types`);
-            // no spelling is probed for it here.  The owner a TYPE scope
+            // A MODULE scope - a graph module's or an `extern module`
+            // alias's - is the module lane's to answer, from the stamp, and
+            // it is asked next (`lookup_module_qualified_param_types`); no
+            // spelling is probed for it here.  The owner a TYPE scope
             // names is asked under its registered name, whatever the source
             // spelled: `Beacon::make` written against an imported `Beacon`
             // once answered another module's same-leaf `Beacon::make`.
@@ -308,13 +306,9 @@ type struct CallResolver {
                 const q_combined: string = fmt::format("%s::%s",
                     this.intern.resolve(resolved_scope), this.intern.resolve(sr.member_name));
                 const q_sym: SymbolStr = this.intern.intern(q_combined);
-                const q_ft: TypeRef = this.types.lookup_func_type_exact(q_sym);
-                if (q_ft.is_valid()) { return q_ft; }
+                return this.types.lookup_func_type_exact(q_sym);
             }
-            // A C import is declared whole under `alias::name`, the written
-            // spelling, and its alias is a namespace symbol no stamp names as
-            // an owner; the same door the call resolution opens last.
-            return this.types.lookup_func_type_exact(bare_sym);
+            return TypeRef::invalid();
         }
         return TypeRef::invalid();
     }
@@ -3579,12 +3573,12 @@ type struct CallResolver {
     }
 
     /// A `Scope::member(...)` call.  The scope segment's stamp says which
-    /// store can own the member: a segment naming a MODULE (`Def`) owns a
-    /// module function and nothing else; any other segment names a type -
-    /// a declaration, a primitive, a type parameter, or a C-import alias,
-    /// which is a namespace SYMBOL rather than a graph module - and owns a
-    /// static method, a variant, or a C-imported function.  Modules and
-    /// types share one namespace, so a segment is never both, and the
+    /// store can own the member: a segment naming a MODULE (`Def` - a graph
+    /// module's, or an `extern module` alias's, whose functions are
+    /// declared in the alias's module) owns a module function and nothing
+    /// else; any other segment names a type - a declaration, a primitive,
+    /// a type parameter - and owns a static method or a variant.  Modules
+    /// and types share one namespace, so a segment is never both, and the
     /// stores of the other kind are not asked.
     resolve_scope_call(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*) -> TypeRef {
         mut names_module: boolean = false;
@@ -3611,8 +3605,6 @@ type struct CallResolver {
             if (method_ret.is_valid()) { return method_ret; }
             const type_ret: TypeRef = this.try_resolve_type_or_variant(scope, lookup_sym, call);
             if (type_ret.is_valid()) { return type_ret; }
-            const cimport_ret: TypeRef = this.try_resolve_cimport_function(scope, call);
-            if (cimport_ret.is_valid()) { return cimport_ret; }
         }
 
         if (this.symbolic.symbolic_name_is_generic_param(scope.scope_name)) { return TypeRef::invalid(); }
@@ -4948,19 +4940,6 @@ type struct CallResolver {
     try_resolve_module_function(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*) -> TypeRef {
         const q_ret: TypeRef = this.resolve_module_qualified_function(scope.scope_name, scope.member_name, call, scope);
         if (q_ret.is_valid()) { scope.set_resolved_type(q_ret); return q_ret; }
-        return TypeRef::invalid();
-    }
-
-    try_resolve_cimport_function(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*) -> TypeRef {
-        const scope_str: string = this.intern.resolve(scope.scope_name);
-        const member_str: string = this.intern.resolve(scope.member_name);
-        const q_sym: SymbolStr = this.ctx.intern(scope_str + "::" + member_str);
-        const ret: TypeRef = this.family_return_type(q_sym);
-        if (ret.is_valid()) {
-            scope.set_resolved_type(ret);
-            this.pin_scope_callee_qsym(call, q_sym);
-            return ret;
-        }
         return TypeRef::invalid();
     }
 

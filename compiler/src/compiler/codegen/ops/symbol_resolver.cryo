@@ -281,63 +281,20 @@ type struct SymbolResolver {
         };
     }
 
-    /// Look up a global by name, declaring a cross-module extern on demand.
-    resolve_global(mut &this, name: SymbolStr) -> LValue {
-        const cached: LValue = this.globals.get(name);
-        if (cached.is_valid()) { return cached; }
-
-        const intern: InternTable* = this.ctx.intern_table;
-        const di: DeclarationIndex* = this.ctx.decl_index;
-        if (this.owned_by_current_module(di.get_global_module(name))) {
-            return LValue::null();
-        }
-
-        const g_type_ref: TypeRef = di.lookup_global(name);
-        if (g_type_ref.is_invalid()) { return LValue::null(); }
-
-        const g_llvm_ty: LType = this.type_mapper.map_type(g_type_ref);
-        if (!g_llvm_ty.is_valid()) { return LValue::null(); }
-
-        // Mirror codegen_global_var's mangle: pull the defining namespace
-        // out of DI so the extern decl in this module refers to the same
-        // LLVM symbol the defining module emits.  Empty namespace -> bare
-        // `C$<name>` (root-namespace globals).
-        // An IMPORTED global has exactly one symbol in the whole program - the
-        // one the C library exports - so a reader must not mangle it under the
-        // declaring module's namespace the way it does for a global Cryo
-        // defines.  Mangling it asks the linker for a name nobody emits.
-        const def_ns: SymbolStr = di.get_global_namespace(name);
-        const entry: GlobalEntry = di.global_entry_in_namespace(name, def_ns);
-        const mangled: string = if (entry.extern_symbol.is_valid()) {
-            intern.resolve(entry.extern_symbol)
-        } else {
-            MangledName::for_global(intern, def_ns, name).resolve(intern)
-        };
-
-        // Reuse an existing LLVM global if something (e.g. a prior pass)
-        // already created one with the same mangled name; identical-name
-        // externs share the same symbol at link time.
-        mut g_val: LValue = this.llvm_module.get_named_global(mangled);
-        if (!g_val.is_valid()) {
-            g_val = this.llvm_module.add_global(g_llvm_ty, mangled);
-            // A cross-module reference to a `![thread_local]` global must
-            // itself be thread-local, or it references the TLS symbol with a
-            // non-TLS relocation and fails to link.
-            if (entry.thread_local) {
-                g_val.set_thread_local(true);
-            }
-        }
-        this.globals.register(name, g_val);
-        return g_val;
+    /// The key a global's value is cached under: its leaf under its
+    /// declaring namespace, the one form `codegen_global_var` registers a
+    /// definition by and `resolve_global_entry` a cross-module extern by.
+    static global_cache_key_of(intern: InternTable*, ns: SymbolStr, leaf: SymbolStr) -> SymbolStr {
+        return intern.intern(fmt::format("%s::%s", intern.resolve(ns), intern.resolve(leaf)));
     }
 
     /// The global `name` as declared by the module whose namespace is `ns` -
     /// the module a qualified reference's stamp names.  In-module, it is the
-    /// value `codegen_global_var` registered under the bare leaf; cross-module,
-    /// an extern declared under the same mangling the defining module emits,
-    /// cached under the namespace-qualified key.  Null when that module
-    /// declares no such global: the answer is then that nothing does, not a
-    /// licence to ask another module.
+    /// value `codegen_global_var` registered; cross-module, an extern
+    /// declared under the same mangling the defining module emits, cached
+    /// under the same key.  Null when that module declares no such global:
+    /// the answer is then that nothing does, not a licence to ask another
+    /// module.
     resolve_global_in_namespace(mut &this, name: SymbolStr, ns: SymbolStr) -> LValue {
         return this.resolve_global_entry(this.ctx.decl_index.global_entry_in_namespace(name, ns));
     }
@@ -351,19 +308,19 @@ type struct SymbolResolver {
     }
 
     /// The value of the global whose slot `entry` is: in-module, the value
-    /// `codegen_global_var` registered under the bare leaf; cross-module, an
-    /// extern declared under the same mangling the defining module emits,
-    /// cached under the namespace-qualified key.  Null for an entry that is
-    /// not `valid`.
+    /// `codegen_global_var` registered; cross-module, an extern declared
+    /// under the same mangling the defining module emits, cached under the
+    /// same key.  Null for an entry that is not `valid`, and for one this
+    /// module defines but has not emitted yet - never an extern for a
+    /// module's own global.
     resolve_global_entry(mut &this, entry: GlobalEntry) -> LValue {
         if (!entry.valid) { return LValue::null(); }
         const intern: InternTable* = this.ctx.intern_table;
-        if (this.owned_by_current_module(entry.module)) { return this.globals.get(entry.leaf); }
-
-        const cache_key: SymbolStr = intern.intern(
-            fmt::format("%s::%s", intern.resolve(entry.namespace), intern.resolve(entry.leaf)));
+        const cache_key: SymbolStr = SymbolResolver::global_cache_key_of(
+            intern, entry.namespace, entry.leaf);
         const cached: LValue = this.globals.get(cache_key);
         if (cached.is_valid()) { return cached; }
+        if (this.owned_by_current_module(entry.module)) { return LValue::null(); }
 
         const g_llvm_ty: LType = this.type_mapper.map_type(entry.type_ref);
         if (!g_llvm_ty.is_valid()) { return LValue::null(); }

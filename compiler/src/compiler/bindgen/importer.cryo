@@ -183,8 +183,9 @@ type struct Importer {
     /// macro definition's extent (`clang_tokenize`).
     tu:             void*;
     count:          i32;
-    /// The extern module's alias namespace (e.g. `probe`/`llvm`); emitted
-    /// types are qualified under it via StructDeclNode.binding_namespace.
+    /// The extern module alias's canonical namespace (`<mod>::probe`,
+    /// `<mod>::llvm`); emitted types are qualified under it via
+    /// StructDeclNode.binding_namespace.
     alias:          SymbolStr;
     /// `![functions_only]`: emit prototypes only, no struct/enum/typedef.
     functions_only: boolean;
@@ -289,10 +290,12 @@ type struct Importer {
     probe_reasons:  string[];
     probe_lost:     boolean[];
 
-    /// Build a per-TU importer.  Alias and `functions_only` are derived from the
-    /// extern block; the type mapper is wired with the same (ctx, alias).
+    /// Build a per-TU importer.  The alias's canonical namespace and
+    /// `functions_only` are derived from the extern block; the type mapper is
+    /// wired with the same (ctx, namespace), so every declaration and every
+    /// reference the engine synthesizes is keyed under `<mod>::alias`.
     static new(extern_node: ExternBlockNode*, ctx: CompilationContext*, tu: void*) -> Importer {
-        const alias: SymbolStr = extern_node.namespace_alias;
+        const alias: SymbolStr = extern_node.binding_namespace;
         return Importer {
             extern_node:    extern_node,
             ctx:            ctx,
@@ -2167,6 +2170,16 @@ type struct Importer {
 
             const extern_node: ExternBlockNode* = node as ExternBlockNode*;
             if (!extern_node.is_c_import()) { continue; }
+
+            // The alias's canonical namespace, decided once and here: the
+            // declaring module's (its declared namespace, else the file, the
+            // identity every other declaration of the module is keyed by)
+            // with the alias under it.  Every declaration this block brings
+            // in carries it, and the name layer declares the alias's module
+            // from it.
+            const mod_name: string = if (root.namespace_name != "") { root.namespace_name } else { ctx.source_file };
+            extern_node.binding_namespace = ctx.intern_table.intern(
+                mod_name + "::" + ctx.intern_table.resolve(extern_node.namespace_alias));
 
             const source_dir: string = Importer::get_directory(ctx.source_file);
 

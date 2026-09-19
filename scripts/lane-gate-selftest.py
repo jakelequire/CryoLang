@@ -67,7 +67,6 @@ type struct DeclarationIndex {
 
     lookup_type(&this, name: SymbolStr) -> TypeRef { return this.entries[0]; }
     lookup_func_type(&this, name: SymbolStr) -> TypeRef { return this.entries[0]; }
-    lookup_global(&this, name: SymbolStr) -> TypeRef { return this.entries[0]; }
     lookup_method_return(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
         return this.entries[0];
     }
@@ -177,7 +176,7 @@ type struct Sema {
         this.ctx.type_arena.lookup_by_name(name);
         const arena: TypeArena* = this.ctx.type_arena;
         arena.get_qualified_name(t);
-        // this.ctx.decl_index.lookup_global(name);
+        // this.ctx.decl_index.lookup_func_type(name);
     }
 }
 """,
@@ -254,7 +253,7 @@ MUTATIONS = [
      1, "REENTRY TOTAL 0 -> 2"),
     ("a store reached through a local under a new spelling is placed by its annotation",
      {"compiler/sema/sema.cryo": sema_with(["const idx: DeclarationIndex* = this.ctx.decl_index;",
-                                            "idx.lookup_global(name);"])},
+                                            "idx.lookup_func_type(name);"])},
      1, "LOOKUP TOTAL 2 -> 3"),
     ("a store reached through a zero-argument accessor is placed by its return type",
      {"compiler/sema/sema.cryo": sema_with(["this.ctx.get_arena().get_qualified_name(t);"])},
@@ -270,7 +269,7 @@ MUTATIONS = [
      {"compiler/sema/sema.cryo": sema_with(["const g = mystery();", "g.get_template(name);"])},
      1, "could not be placed by receiver"),
     ("a call on something other than a dotted receiver is refused",
-     {"compiler/sema/sema.cryo": sema_with(["(this.ctx.decl_index).lookup_global(name);"])},
+     {"compiler/sema/sema.cryo": sema_with(["(this.ctx.decl_index).lookup_func_type(name);"])},
      1, "could not be placed by receiver"),
     ("a decrease is refused too (the ceiling must be re-pinned deliberately)",
      {"compiler/sema/sema.cryo": FILES["compiler/sema/sema.cryo"].replace(
@@ -278,8 +277,8 @@ MUTATIONS = [
      1, "LOOKUP TOTAL 2 -> 1"),
     ("a commented-out call is not counted (uncommenting it is)",
      {"compiler/sema/sema.cryo": FILES["compiler/sema/sema.cryo"].replace(
-          "        // this.ctx.decl_index.lookup_global(name);\n",
-          "        this.ctx.decl_index.lookup_global(name);\n")},
+          "        // this.ctx.decl_index.lookup_func_type(name);\n",
+          "        this.ctx.decl_index.lookup_func_type(name);\n")},
      1, "LOOKUP TOTAL 2 -> 3"),
     ("a store's own calls are not the surface",
      {"compiler/decl_index.cryo": FILES["compiler/decl_index.cryo"].replace(

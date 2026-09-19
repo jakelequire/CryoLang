@@ -70,10 +70,12 @@ THREE RULES, EACH DERIVED FROM A DEFINITION, NONE FROM A LIST OF NAMES.
 
 The calls are SPLIT BY THE STORE that answers them and by READ vs WRITE:
 
-  * LOOKUP -- answered by the `DeclarationIndex` under one of the four
-    per-kind names mechanism 5 gives (`lookup_type`, `lookup_func_type`,
-    `lookup_global`, `lookup_method_return`; `lookup_func_return` read a
-    second map written in lockstep with the signature's and is deleted).  This is
+  * LOOKUP -- answered by the `DeclarationIndex` under one of the per-kind
+    names mechanism 5 gives (`lookup_type`, `lookup_func_type`,
+    `lookup_method_return`; `lookup_func_return` read a second map written
+    in lockstep with the signature's and is deleted, and `lookup_global`
+    read a bare-leaf map that was last-write-wins across modules and is
+    deleted: a global is read from its `(leaf, namespace)` slot).  This is
     the lane surface, and the only one of the rows that should fall.
   * LOOKUP_OTHER -- answered by the `DeclarationIndex` under any OTHER
     name-crossing method that READS (`&this`, or a static): the registry's
@@ -212,13 +214,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_SRC = os.path.join(ROOT, "compiler", "src")
 DEFAULT_GOLDEN = os.path.join(ROOT, "tests", "lane-baseline.txt")
 
-# The four per-kind lookups §7.2 mechanism 5 names: the LOOKUP row.  They are
+# The per-kind lookups §7.2 mechanism 5 names: the LOOKUP row.  They are
 # the only names this gate holds as a list, and the list decides which ROW a
-# call lands in, never whether it is counted.
+# call lands in, never whether it is counted.  `lookup_global` was the
+# fourth: the bare-leaf global map it read (last-write-wins across every
+# module declaring a leaf) is deleted, and a global is read from its
+# `(leaf, namespace)` slot by a stamp.
 LOOKUPS = (
     "lookup_type",
     "lookup_func_type",
-    "lookup_global",
     "lookup_method_return",
 )
 
@@ -661,9 +665,9 @@ def scan(src):
     tree = Tree(src)
     place_map_owners(tree)
     sets = {name: store_methods(tree, name, st.defn) for name, st in STORES.items()}
-    # Control on the parser: the LOOKUP row is the four names, and they are
-    # declared on the index.  A parser that cannot see them cannot see the
-    # row it is asked to pin.
+    # Control on the parser: the LOOKUP row is the per-kind names, and they
+    # are declared on the index.  A parser that cannot see them cannot see
+    # the row it is asked to pin.
     missing = [n for n in LOOKUPS if n not in sets[INDEX_TYPE]]
     if missing:
         raise SystemExit("lane-gate: %s does not declare %s as name-crossing; "
@@ -754,12 +758,12 @@ HEADER = [
     "# placed by its receiver's DECLARED TYPE (this, a local's annotation, a",
     "# field's declaration), never by the receiver's spelling.",
     "#",
-    "# LOOKUP         answered by the DeclarationIndex, under one of the four",
-    "#                names mechanism 5 gives. The lane surface; falls.",
+    "# LOOKUP         answered by the DeclarationIndex, under one of the",
+    "#                per-kind names mechanism 5 gives. The lane surface; falls.",
     "# LOOKUP_OTHER   answered by the DeclarationIndex under ANY OTHER name-",
     "#                crossing READ (entry accessors, visibility, reachability,",
     "#                the global and extern tables, a static key parser). A",
-    "#                surface pinned at four names is one a caller can leave by",
+    "#                surface pinned at a few names is one a caller can leave by",
     "#                switching names - which reads as progress on the row that",
     "#                is watched.",
     "# REGISTER       a name-keyed WRITE to the DeclarationIndex: a registrar",

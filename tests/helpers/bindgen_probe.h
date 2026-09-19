@@ -41,4 +41,7 @@ int    bindgen_probe_vsum(int n, va_list ap);
 double bindgen_probe_vsum_d(int n, va_list ap);
 double bindgen_probe_vmix(int ni, int nd, va_list ap);
 int    bindgen_probe_vstrlen(int n, va_list ap);
-int    bindgen_probe_vfmt(char *buf, unsigned long size, const char *fmt, va_list ap);
+/* `size` is `unsigned long long`, 64 bits on every host: a C-import call is
+ * argument-checked against the imported signature, and the Cryo caller
+ * passes a `u64` - an `unsigned long` would be `u32` on Windows. */
+int    bindgen_probe_vfmt(char *buf, unsigned long long size, const char *fmt, va_list ap);

@@ -178,6 +178,6 @@ int bindgen_probe_vstrlen(int n, va_list ap) {
 // Forward the SAME va_list a second time, into real libc `vsnprintf` - proves a
 // va_list survives a double hand-off (Cryo args -> this C fn -> libc) and that
 // format-string processing reads the forwarded list correctly.
-int bindgen_probe_vfmt(char *buf, unsigned long size, const char *fmt, va_list ap) {
-    return vsnprintf(buf, size, fmt, ap);
+int bindgen_probe_vfmt(char *buf, unsigned long long size, const char *fmt, va_list ap) {
+    return vsnprintf(buf, (size_t)size, fmt, ap);
 }

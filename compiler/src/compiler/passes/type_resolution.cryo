@@ -2398,15 +2398,23 @@ type struct TypeResolutionPasses {
                             };
 
                             // The declaration is registered under its own key -
-                            // its name under the module that wrote it, as any
-                            // free function's - and the C name is its SYMBOL,
-                            // never a key: a bare leaf shared by every extern
-                            // block declaring that C name could only hold one
-                            // of them, and a call pinned by the symbol alone
-                            // could not say which declaration it meant.  A
-                            // call binds the declaration its stamp names and is
-                            // emitted at that declaration's signature.
-                            const ext_q_name: SymbolStr = ctx.decl_fn_key(fn_node.name, fn_node.span.file);
+                            // its name under the module that declares it, as
+                            // any free function's: the alias's module for a C
+                            // import (`<mod>::cit::add3`, the namespace the
+                            // alias's stamp names), the writing module for a
+                            // plain extern block - and the C name is its
+                            // SYMBOL, never a key: a bare leaf shared by every
+                            // extern block declaring that C name could only
+                            // hold one of them, and a call pinned by the
+                            // symbol alone could not say which declaration it
+                            // meant.  A call binds the declaration its stamp
+                            // names and is emitted at that declaration's
+                            // signature.
+                            const ext_q_name: SymbolStr = if (node.is_c_import()) {
+                                ctx.qualify_binding_sym(fn_node.name, node.binding_namespace)
+                            } else {
+                                ctx.decl_fn_key(fn_node.name, fn_node.span.file)
+                            };
                             // Two extern blocks declaring one C name with
                             // DIFFERENT Cryo signatures is an ABI hazard the
                             // program carries whichever one a call names - at
@@ -2442,22 +2450,12 @@ type struct TypeResolutionPasses {
                             // module and takes its written visibility, as a
                             // free function does: a `private` one is not
                             // callable by qualified path from another module.
-                            ctx.decl_index.set_decl_visibility(ext_q_name, fn_node.is_public);
-
-                            // For CImport blocks, also register under alias::name
-                            if (node.is_c_import()) {
-                                const alias_str: string = ctx.intern_table.resolve(node.namespace_alias);
-                                const fn_str: string = ctx.intern_table.resolve(fn_node.name);
-                                const qualified: string = alias_str + "::" + fn_str;
-                                const q_sym: SymbolStr = ctx.intern_table.intern(qualified);
-                                // CImport qualified name maps to the bare C name (or
-                                // the `![symbol]` override).
-                                ctx.decl_index.register_function_signature(
-                                    q_sym, fn_node.resolved_return_type, func_type_ref,
-                                    ctx.intern_table, arena, ext_link_sym,
-                                    if (fn_node.has_name_span()) { fn_node.name_span } else { fn_node.span });
-                                ctx.decl_index.set_decl_visibility(q_sym, fn_node.is_public);
-                            }
+                            // A C import's prototypes are its alias module's
+                            // public declarations - the alias exists to be
+                            // reached through, and the name layer declares
+                            // them so - whatever the block's text wrote.
+                            ctx.decl_index.set_decl_visibility(ext_q_name,
+                                node.is_c_import() || fn_node.is_public);
                         }
                     }
                     sig_count += node.functions.length;

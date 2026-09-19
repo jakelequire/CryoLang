@@ -1338,16 +1338,6 @@ type struct DeclarationEmitter {
             }
 
             this.functions.register(func.name, fn_val);
-            // A C-imported function is declared under `alias::name` as well,
-            // and a call written that way pins that key.  The registry is
-            // what answers a pin for a function this module owns - the
-            // by-name lookup refuses to declare an extern for one - so the
-            // key must be here, not only in the declaration index.
-            if (node.is_c_import()) {
-                const alias_key: SymbolStr = intern.intern(fmt::format("%s::%s",
-                    intern.resolve(node.namespace_alias), name_str));
-                this.functions.register(alias_key, fn_val);
-            }
         }
     }
 
@@ -1535,25 +1525,22 @@ type struct DeclarationEmitter {
             global.set_thread_local(true);
         }
 
-        // A C-imported const is referenced only as `cit::NAME` (a
-        // ScopeResolution), which `resolve_global` probes under the qualified
-        // key.  `resolve_global` checks this cache before its cross-module
-        // (owned-by-current-module) short-circuit, so register under the
-        // qualified key - the bare key would never be hit and would risk a
-        // last-write-wins collision between two imports' same-named consts.
         this.globals.register(this.global_cache_key(node), global);
     }
 
-    /// The key a global is cached under for later reference resolution.  A
-    /// C-imported global is reachable only as `alias::NAME` (a ScopeResolution),
-    /// which `resolve_global` probes under the qualified key; the bare key would
-    /// never be hit, and two imports declaring the same name would race to
-    /// last-write-wins under it.
+    /// The key a global is cached under for later reference resolution: its
+    /// leaf under its declaring namespace - the alias module's for a
+    /// C-imported one, this module's for any other - the one key
+    /// `SymbolResolver::resolve_global_entry` reads and writes too, so a
+    /// reader in this module and one in another reach the same value, and
+    /// two imports declaring one leaf (`a::FOO`, `b::FOO`) hold two.
     global_cache_key(&this, node: VarDeclNode*) -> SymbolStr {
-        if (!node.binding_namespace.is_empty()) {
-            return this.ctx.qualify_binding_sym(node.name, node.binding_namespace);
-        }
-        return node.name;
+        const ns: SymbolStr = if (!node.binding_namespace.is_empty()) {
+            node.binding_namespace
+        } else {
+            this.ctx.namespace_str
+        };
+        return SymbolResolver::global_cache_key_of(this.ctx.intern_table, ns, node.name);
     }
 
     /// Generate the body of a function.  Called from the IRGeneratorVisitor.
