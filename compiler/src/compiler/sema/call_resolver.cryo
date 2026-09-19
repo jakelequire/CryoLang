@@ -3736,6 +3736,14 @@ type struct CallResolver {
             this.pin_impl_qualified_call(call, scope, scope_sym, member_sym);
             return;
         }
+        // A path a bound directs (`T::make()` under `where T: Beta`, the
+        // parameter since substituted): the member is THAT trait's when its
+        // implementation for the owner delivers one - a direction, so a
+        // trait that delivers nothing leaves the path to the bare reading.
+        if (scope.resolved_trait.is_valid()) {
+            const directed: OverloadId[] = this.trait_delivered_entries(scope_sym, scope.resolved_trait, member_sym);
+            if (directed.length > 0 && this.pin_trait_delivered_call(call, scope, &directed)) { return; }
+        }
         if (this.pin_trait_qualified_call(call, scope, scope_sym, member_sym)) { return; }
         const sym: SymbolStr = this.intern.intern(fmt::format("%s::%s", scope_str, member_str));
         if (this.try_pin_static_method_overload(call, scope, sym)) { return; }
@@ -3947,6 +3955,17 @@ type struct CallResolver {
             }
             scope.set_resolved_callee(CalleePin::Decl(chosen));
             return this.ctx.decl_index.entry_signature(chosen);
+        }
+        // A bound-directed value, `T::make` under `where T: Beta`: that
+        // trait's entry of the selected signature, when it delivers one.
+        if (scope.resolved_trait.is_valid()) {
+            const directed: OverloadId[] = this.trait_delivered_entries(owner_sym, scope.resolved_trait, scope.member_name);
+            for (mut i: i64 = 0; i < directed.length; i++) {
+                if (this.ctx.decl_index.entry_signature(directed[i]).id == method_ft.id) {
+                    scope.set_resolved_callee(CalleePin::Decl(directed[i]));
+                    return method_ft;
+                }
+            }
         }
         const sym: SymbolStr = this.intern.intern(fmt::format("%s::%s",
             this.intern.resolve(owner_sym), this.intern.resolve(scope.member_name)));

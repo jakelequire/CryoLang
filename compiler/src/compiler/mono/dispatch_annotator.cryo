@@ -12,11 +12,13 @@
 /// before mono clones anything; the cloner copies `resolved_trait` onto every
 /// spec.
 ///
-/// Two rules:
+/// Three rules:
 ///   1. Param receiver: `recv.m()` where `recv` is a parameter whose annotation
 ///      head is a generic param bounded by exactly ONE trait -> that trait.
 ///   2. Trait-impl recursion: a call to the enclosing method's own name inside a
 ///      trait-impl method -> the impl's trait.
+///   3. Static path: `T::m(..)` where `T` is a generic param bounded by exactly
+///      ONE trait -> that trait (the same bound, read at the scope segment).
 ///
 /// Plain `type struct` collaborator: back-pointers set by `wire()`, no recursion
 /// seam (it walks the AST directly).
@@ -36,7 +38,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayLiteralNode, BinaryExprNode, CallExprNode, CastExprNode,
-    ExpressionNode, IdentifierNode, MemberAccessNode, StructLiteralNode, TryExprNode,
+    ExpressionNode, IdentifierNode, MemberAccessNode, ScopeResolutionNode, StructLiteralNode, TryExprNode,
     UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -163,6 +165,25 @@ type struct MonoDispatchAnnotator {
         if (enclosing_trait.is_valid() && ma.member.equals(func.name)) {
             ma.set_resolved_trait(enclosing_trait);
         }
+    }
+
+    /// Rule 3, the static path: `T::m(..)` where `T` is a generic parameter
+    /// of the enclosing function bounded by exactly ONE trait names that
+    /// trait's `m` - `T` has no inherent methods where the call is written,
+    /// and the bound is the only thing that says what `m` is, exactly as a
+    /// parameter receiver's bound does in rule 1.  Once `T` is substituted
+    /// the bound is gone and the concrete type may implement two traits
+    /// providing `m`; the stamp is what keeps the written meaning.  A path
+    /// the writer qualified with a head (`(Beta for T)::m`) is already
+    /// directed and is left alone; a parameter with two bounds is left to
+    /// the tie the concrete instantiation reports.  The scope segment is a
+    /// parameter exactly when a bound names it - a where-clause bounds the
+    /// function's or the impl's parameters and nothing else - so the bound
+    /// list is the one question, as it is for rule 1's receiver.
+    annotate_dispatch_path(mut &this, sr: ScopeResolutionNode*, bounds: &TraitBound[]) -> void {
+        if (sr == null || sr.impl_trait != null || sr.resolved_trait.is_valid()) { return; }
+        const tr: SymbolStr = this.single_bound_trait_for(sr.scope_name, bounds);
+        if (tr.is_valid()) { sr.set_resolved_trait(tr); }
     }
 
     /// Return the identity of the single trait bounding `param_name`, or
@@ -312,6 +333,11 @@ type struct MonoDispatchAnnotator {
             NodeKind::MemberAccess => {
                 const ma: MemberAccessNode* = expr as MemberAccessNode*;
                 this.annotate_dispatch_expr(ma.object, func, bounds, enclosing_trait);
+            }
+            // Rule 3, wherever the path stands: a call's callee, or the
+            // method taken as a value.
+            NodeKind::ScopeResolution => {
+                this.annotate_dispatch_path(expr as ScopeResolutionNode*, bounds);
             }
             NodeKind::BinaryExpression => {
                 const be: BinaryExprNode* = expr as BinaryExprNode*;
