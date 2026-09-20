@@ -1180,13 +1180,30 @@ public:
         return k;
     }
 
+    /// True at `::<`: the turbofish, the one place `<` opens generic
+    /// arguments in expression position.  `<` anywhere else is a comparison,
+    /// so `g(LIMIT < x, MAXV > (y))` is two comparisons whatever `LIMIT` and
+    /// `MAXV` name, and `Vec::<i32>::new()` is a path whose every `::` after
+    /// the arguments is an ordinary step.
+    at_turbofish() -> boolean {
+        return this.check(TokenType::ColonColon) && this.peek_at(1).kind == TokenType::LAngle;
+    }
+
     /// Parse an identifier, handling scope resolution, generic calls, and struct literals.
     parse_identifier_or_call() -> ExpressionNode* {
         const tok: Token = this.advance();
         const name: SymbolStr = this.intern_lexeme(tok);
         mut expr: ExpressionNode* = new IdentifierNode(name, this.span_from_token(tok));
 
-        // Check for generic args: Name<T, U>.
+        // Generic arguments on the name: `Name::<T, U>`.
+        mut turbofish: boolean = false;
+        if (this.at_turbofish()) {
+            this.advance(); // consume '::'
+            turbofish = true;
+        }
+        // The lookahead spelling `Name<T, U>` is still read while the pin
+        // predates the turbofish; the tree is rewritten and this arm retired
+        // once the pin reads `::<`.
         //
         // A name bound to a value - a parameter, a local, or a module-level
         // global - is not a generic function or type, so its `<` is a
@@ -1195,60 +1212,64 @@ public:
         // scan alone reads as the generic call `a<b, c>(d)`. Names that bind
         // no known value - including everything imported - still go to the
         // scan.
-        if (this.check(TokenType::LAngle) && !this.binds_a_value(name) &&
-            this.is_generic_call_ahead()) {
+        if (turbofish || (this.check(TokenType::LAngle) && !this.binds_a_value(name) &&
+                          this.is_generic_call_ahead())) {
             // Record whether this was knowledge or a guess. Knowing the name is
             // declared generic in this module settles it; otherwise only the
             // token scan spoke, and the same text may have been comparisons.
-            if (!this.is_generic_decl_name(name)) {
+            if (!turbofish && !this.is_generic_decl_name(name)) {
                 (expr as IdentifierNode*).set_generic_angle_guessed(true);
             }
-            const gen_args: TypeAnnotation*[] = this.parse_generic_args();
+            return this.parse_generic_head(expr, name, tok);
+        }
+        return this.parse_identifier_tail(expr, name, tok);
+    }
 
-            // After generic args, check what follows
-            if (this.check(TokenType::LParen)) {
-                // Generic function call: func<T>(args)
-                // Check if uppercase first char -> struct constructor
-                if (tok.lexeme.length() > 0 && tok.lexeme[0] >= 'A' && tok.lexeme[0] <= 'Z') {
-                    // Could be struct constructor or function call; check for '{'
-                    // For now treat all Name<T>(...) as call
-                }
-                mut call: CallExprNode* = new CallExprNode(expr, expr.span);
-                call.set_generic_args(gen_args);
-                this.advance(); // consume '('
-                if (!this.check(TokenType::RParen)) {
-                    while (true) {
-                        const arg: ExpressionNode* = this.parse_expression();
-                        if (arg != null) {
-                            call.add_argument(arg);
-                        }
-                        if (!this.match_tok(TokenType::Comma)) {
-                            break;
-                        }
+    /// The generic-argument list on a name and what follows it: a call
+    /// `f::<T>(..)`, a struct literal `Name::<T> { .. }`, a scope step
+    /// `Name::<T>::member`, or the generic function itself as a value
+    /// (`tramp::<i32>` passed, cast or assigned).  The cursor is on the `<`.
+    parse_generic_head(expr: ExpressionNode*, name: SymbolStr, tok: Token) -> ExpressionNode* {
+        mut head: ExpressionNode* = expr;
+        const gen_args: TypeAnnotation*[] = this.parse_generic_args();
+
+        if (this.check(TokenType::LParen)) {
+            mut call: CallExprNode* = new CallExprNode(head, head.span);
+            call.set_generic_args(gen_args);
+            this.advance(); // consume '('
+            if (!this.check(TokenType::RParen)) {
+                while (true) {
+                    const arg: ExpressionNode* = this.parse_expression();
+                    if (arg != null) {
+                        call.add_argument(arg);
+                    }
+                    if (!this.match_tok(TokenType::Comma)) {
+                        break;
                     }
                 }
-                this.consume(TokenType::RParen, "')'");
-                call.span = this.span_from(tok);
-                return call;
-            } else if (this.check(TokenType::LBrace) && !this.struct_lit_suppressed()) {
-                // Generic struct literal: Name<T> { field: value }
-                return this.parse_struct_literal_body(name, gen_args, tok);
-            } else if (this.check(TokenType::ColonColon)) {
-                // Generic scope resolution: Name<T>::member
-                this.advance(); // consume '::'
-                expr = this.parse_scope_member(name, gen_args, this.span_from_token(tok));
-            } else {
-                // Generic args parsed but no `(`, `{`, or `::` follows: this is
-                // a generic function-reference VALUE, e.g. `tramp<i32>` used as
-                // a value (passed/cast/assigned, not called). Attach the args to
-                // the identifier so the monomorphizer can instantiate the named
-                // template for them and codegen can reference the specialized
-                // symbol. `expr` is the IdentifierNode built at the top of this
-                // routine; nothing else has consumed it yet.
-                (expr as IdentifierNode*).set_generic_args(gen_args);
             }
-            // Generic args parsed but nothing useful follows; just continue with postfix
+            this.consume(TokenType::RParen, "')'");
+            call.span = this.span_from(tok);
+            return call;
+        } else if (this.check(TokenType::LBrace) && !this.struct_lit_suppressed()) {
+            return this.parse_struct_literal_body(name, gen_args, tok);
+        } else if (this.check(TokenType::ColonColon)) {
+            this.advance(); // consume '::'
+            head = this.parse_scope_member(name, gen_args, this.span_from_token(tok));
+        } else {
+            // The args are attached to the identifier so the monomorphizer can
+            // instantiate the named template for them and codegen can
+            // reference the specialized symbol.  `head` is the IdentifierNode
+            // built by the caller; nothing else has consumed it yet.
+            (head as IdentifierNode*).set_generic_args(gen_args);
         }
+        return this.parse_identifier_tail(head, name, tok);
+    }
+
+    /// What may follow a name, with or without generic arguments: a scope
+    /// step `Name::member` and a struct literal `Name { field: value }`.
+    parse_identifier_tail(expr_in: ExpressionNode*, name: SymbolStr, tok: Token) -> ExpressionNode* {
+        mut expr: ExpressionNode* = expr_in;
 
         // Check for scope resolution without generic args: Name::member
         if (this.check(TokenType::ColonColon)) {
@@ -2498,12 +2519,15 @@ public:
         const span: SourceSpan = ParserBase::merge_spans(object.span, member_span);
         mut node: MemberAccessNode* = new MemberAccessNode(object, member, member_span, span);
 
-        // Pick up explicit type arguments on the member: `obj.method<T, U>(...)`.
-        // Mirrors the same lookahead that scope-resolution and primary
-        // identifiers already do; without it `obj.cast<T>()` parses as
-        // `(obj.cast) < T > ()` (comparison + shift) and the call
-        // disappears.
-        if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+        // Explicit type arguments on the member: `obj.method::<T, U>(...)`.
+        // The lookahead spelling `obj.method<T>(..)` is read until the pin
+        // reads the turbofish.
+        mut turbofish: boolean = false;
+        if (this.at_turbofish()) {
+            this.advance(); // consume '::'
+            turbofish = true;
+        }
+        if (turbofish || (this.check(TokenType::LAngle) && this.is_generic_call_ahead())) {
             const member_gen_args: TypeAnnotation*[] = this.parse_generic_args();
             node.set_generic_args(member_gen_args);
         }
@@ -2542,8 +2566,14 @@ public:
             sr.set_scope_generic_args(scope_gen_args);
         }
 
-        // Check for generic args on the member itself: Foo::bar<U>
-        if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+        // Generic args on the member itself: `Foo::bar::<U>`.  The lookahead
+        // spelling `Foo::bar<U>` is read until the pin reads the turbofish.
+        mut turbofish: boolean = false;
+        if (this.at_turbofish()) {
+            this.advance(); // consume '::'
+            turbofish = true;
+        }
+        if (turbofish || (this.check(TokenType::LAngle) && this.is_generic_call_ahead())) {
             const member_gen_args: TypeAnnotation*[] = this.parse_generic_args();
             sr.set_generic_args(member_gen_args);
         }

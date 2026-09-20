@@ -7,6 +7,7 @@ the six halves.
     python scripts/ns-migration/8.269/probe_d31.py apply    # splice the probe in
     python scripts/ns-migration/8.269/probe_d31.py revert   # take it out again
     python scripts/ns-migration/8.269/probe_d31.py tally .objcmp/<tag>-lines.txt [more lines files]
+    python scripts/ns-migration/8.269/probe_d31.py sites .objcmp/<tag>-lines.txt [more]   # the location list
 
 Four sites, one per expression shape the lookahead decides:
 
@@ -172,7 +173,24 @@ def follower(loc):
     return "?"
 
 
-def tally(paths):
+_TRACKED = None
+
+
+def tracked_spelling(file):
+    """The file's path as git tracks it.  The LSP half reaches two compiler
+    modules by a capitalised spelling (`types/Resolver.cryo`) that only a
+    case-insensitive filesystem opens, so the same site arrived twice and was
+    counted twice; one spelling per file, the tree's."""
+    global _TRACKED
+    if _TRACKED is None:
+        import subprocess
+        out = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True).stdout
+        _TRACKED = {p.lower(): p for p in out.split("\n") if p}
+    return _TRACKED.get(os.path.normpath(file).replace("\\", "/").lower(), file)
+
+
+def collect(paths):
+    """One entry per distinct (population, location) over every lines file."""
     seen = {}
     for lines_path in paths:
         with open(lines_path, "r", encoding="utf-8", errors="replace") as f:
@@ -183,10 +201,30 @@ def tally(paths):
                 half, _, shape, loc, name = parts[0], parts[1], parts[2], parts[3], parts[4]
                 guess = parts[5] if len(parts) > 5 else ""
                 pop, loc = normalize(half, loc)
+                file, line, col = loc.rsplit(":", 2)
+                loc = "%s:%s:%s" % (tracked_spelling(file), line, col)
                 key = (pop, loc)
                 if key in seen:
                     continue
                 seen[key] = (shape, name, guess, half)
+    return seen
+
+
+def sites(paths):
+    """The location list itself, one site per line, sorted by file then
+    position: `pop\\tfile\\tline\\tcol\\tshape\\tname\\tguess`.  This is the
+    turbofish rewrite's input (`scripts/ns-migration/8.278/turbofish.py`)."""
+    rows = []
+    for (pop, loc), (shape, name, guess, half) in collect(paths).items():
+        file, line, col = loc.rsplit(":", 2)
+        rows.append((file, int(line), int(col), pop, shape, name, guess))
+    rows.sort()
+    for file, line, col, pop, shape, name, guess in rows:
+        print("%s\t%s\t%d\t%d\t%s\t%s\t%s" % (pop, file, line, col, shape, name, guess))
+
+
+def tally(paths):
+    seen = collect(paths)
     by_pop = {}
     by_shape = {}
     by_pop_shape = {}
@@ -231,6 +269,8 @@ if __name__ == "__main__":
         revert()
     elif cmd == "tally":
         tally(sys.argv[2:])
+    elif cmd == "sites":
+        sites(sys.argv[2:])
     else:
         print(__doc__)
         sys.exit(2)

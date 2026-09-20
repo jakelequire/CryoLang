@@ -1,0 +1,102 @@
+// Generic arguments in EXPRESSION position are spelled with the turbofish:
+// `<` opens type arguments only immediately after `::`, and `<` anywhere else
+// is a comparison.  So `Wrap::<i64>::new(7)` names a specialization, and
+// `g(LIMIT < x, MAXV > (y))` is two comparisons whatever `LIMIT` and `MAXV`
+// name - the same text no longer means two things by where its names were
+// declared.  Every shape the parser reads is here: a scope step after the
+// arguments, a struct literal, a generic call, a static method's own arguments,
+// a method's own arguments, and the generic function taken as a value.  Each
+// test asserts a NUMBER THAT DEPENDS ON THE ARGUMENT, so an argument list that
+// parsed but bound nothing fails rather than passes.
+![config(testing)]
+namespace CryoTests::Tests::Lang::TurbofishExpressionGenerics;
+
+import std::core::result;
+import std::core::result::{ Result };
+import std::test::error;
+import std::test::error::{ TestError };
+import std::test::assert;
+import std::test::assert::{ expect_eq };
+import std::collections::array;
+import std::collections::array::{ Array };
+import std::collections::pair;
+import std::collections::pair::{ Pair };
+
+type struct TfWrap<T> {
+    v: T;
+    static new(v: T) -> TfWrap<T> { return TfWrap::<T> { v: v }; }
+    size_of<U>(&this, x: U) -> u64 { return sizeof(U) as u64; }
+}
+
+type struct TfPlain {
+    v: i32;
+    static make<U>(u: U) -> u64 { return sizeof(U) as u64; }
+}
+
+function tf_free_size<T>(x: T) -> u64 { return sizeof(T) as u64; }
+function tf_tramp<T>(x: u8*) -> u64 { return sizeof(T) as u64; }
+
+const TF_LIMIT: i64 = 3;
+const TF_MAXV: i64 = 9;
+
+function tf_two_bools(a: boolean, b: boolean) -> i64 {
+    return (if (a) { 1 } else { 0 }) + (if (b) { 2 } else { 0 });
+}
+
+// `Name::<T>::m(..)`: the owner's argument, then an ordinary path step.
+![test]
+function turbofish_owner_then_scope_step() -> Result<(), TestError> {
+    const w: TfWrap<i64> = TfWrap::<i64>::new(7);
+    return expect_eq(w.v, 7 as i64);
+}
+
+// `Name::<T> { .. }`: the owner's argument on a struct literal.
+![test]
+function turbofish_struct_literal() -> Result<(), TestError> {
+    const p: Pair<i32, i64> = Pair::<i32, i64> { first: 1, second: 2 };
+    return expect_eq(p.second + (p.first as i64), 3);
+}
+
+// `f::<T>(..)`: a free generic function's own argument decides the answer.
+![test]
+function turbofish_free_call() -> Result<(), TestError> {
+    return expect_eq(tf_free_size::<i64>(5) as i64 + tf_free_size::<u8>(5) as i64, 9);
+}
+
+// `Scope::m::<T>(..)`: a static method's own argument.
+![test]
+function turbofish_static_method() -> Result<(), TestError> {
+    return expect_eq(TfPlain::make::<u16>(1) as i64 + TfPlain::make::<u32>(1) as i64, 6);
+}
+
+// `obj.m::<T>(..)`: a method's own argument, beside the owner's.
+![test]
+function turbofish_method_call() -> Result<(), TestError> {
+    const w: TfWrap<i64> = TfWrap::<i64>::new(1);
+    return expect_eq(w.size_of::<u32>(1) as i64 + w.size_of::<u8>(1) as i64, 5);
+}
+
+// `f::<T>` as a VALUE: the specialization is what the pointer names.
+![test]
+function turbofish_function_as_a_value() -> Result<(), TestError> {
+    const t: (u8*) -> u64 = tf_tramp::<i64>;
+    return expect_eq(t(null) as i64, 8);
+}
+
+// An import's name: `Array` is declared generic in no table of this module, and
+// the turbofish needs none.
+![test]
+function turbofish_on_an_imported_generic() -> Result<(), TestError> {
+    mut arr: Array<i32> = Array::<i32>::new();
+    arr.push(4);
+    arr.push(5);
+    return expect_eq(arr.length as i64, 2);
+}
+
+// `<` and `>` that are not after `::` are comparisons, argument by argument.
+![test]
+function angle_brackets_elsewhere_are_comparisons() -> Result<(), TestError> {
+    const x: i64 = 5;
+    const y: i64 = 6;
+    return expect_eq(tf_two_bools(TF_LIMIT < x, TF_MAXV > (y)), 3);
+}
