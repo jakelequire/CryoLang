@@ -192,6 +192,23 @@ for _name, _ex in GATE_MOD.EXCLUDED.items():
     assert _ex.defn not in FILES, "an exclusion shares a file with a fixture store: %s" % _ex.defn
     FILES[_ex.defn] = EXCLUSION_STUB % _name
 
+# One stub per ARRAY exclusion (rule 1b), each a candidate as the gate
+# defines one: no map, an array of names, a method taking a name.  Several
+# share a file with each other or with a fixture store (the context, the
+# graph, the registry), so a stub is appended rather than written.
+ARRAY_MEMBERS = ("    names: SymbolStr[];\n\n"
+                 "    index_of(&this, name: SymbolStr) -> i64 { return -1; }\n")
+ARRAY_STUB = "type struct %s {\n" + ARRAY_MEMBERS + "}\n"
+for _name, _ex in sorted(GATE_MOD.EXCLUDED_ARRAYS.items()):
+    _existing = FILES.get(_ex.defn, "")
+    _head = "type struct %s {\n" % _name
+    if _head in _existing:
+        # A fixture type of that name already lives there (the context): it
+        # becomes the candidate itself rather than gaining a twin.
+        FILES[_ex.defn] = _existing.replace(_head, _head + ARRAY_MEMBERS, 1)
+    else:
+        FILES[_ex.defn] = _existing + ARRAY_STUB % _name
+
 # LOOKUP is 2: the caller's one, and the funnel's call INTO the index in
 # type_utils.cryo, which is counted - only a store's own file is excluded
 # from its own set.
@@ -205,6 +222,11 @@ BASELINE = {
 }
 # The first exclusion in the gate's table, for the stale-exclusion mutation.
 FIRST_EXCLUDED = sorted(GATE_MOD.EXCLUDED)[0]
+# The first ARRAY exclusion declared in a file of its own (so the stub's
+# text is the whole file and the mutations below can rewrite it).
+FIRST_ARRAY_EXCLUDED = sorted(
+    n for n, ex in GATE_MOD.EXCLUDED_ARRAYS.items()
+    if FILES[ex.defn] == ARRAY_STUB % n)[0]
 
 
 def sema_with(extra_lines):
@@ -287,11 +309,9 @@ MUTATIONS = [
      0, "lane-gate: OK"),
     ("a store with no name-keyed method is an unmeasured tree, refused",
      {"compiler/module_graph.cryo":
-          "type struct ModuleGraph {\n"
-          "    modules: ModuleInfo[];\n"
-          "    name_index: HashMap<u32, u32>;\n"
-          "    count(&this) -> i64 { return 0; }\n"
-          "}\n"},
+          FILES["compiler/module_graph.cryo"].replace(
+              "    find_module_index(&this, name: SymbolStr) -> i64 { return -1; }\n",
+              "    count(&this) -> i64 { return 0; }\n", 1)},
      1, "declares no method whose signature mentions"),
     ("a missing store definition is refused",
      {"compiler/const_table.cryo": None},
@@ -341,6 +361,62 @@ MUTATIONS = [
               "    ctx: CompilationContext*;\n",
               "    ctx: CompilationContext*;\n    memo: HashMap<u32, TypeRef>;\n")},
      1, "`TypeUtils` is marked a funnel (no map of its own) but owns one"),
+    # Rule 1b: a name-keyed table that is an ARRAY, not a map.  Audit 14's
+    # m8 read OK under the map rule: an array-backed store on the context
+    # with a linear lookup and a caller.
+    ("audit 14's m8: an array-backed store (`Pair<SymbolStr, TypeRef>[]`, a linear "
+     "lookup by name) carried by the context, with a caller, is refused",
+     {"compiler/sema/leaf_table.cryo":
+          "type struct LeafTable {\n"
+          "    entries: Pair<SymbolStr, TypeRef>[];\n"
+          "\n"
+          "    lookup_leaf(&this, name: SymbolStr) -> TypeRef { return TypeRef::invalid(); }\n"
+          "}\n",
+      "compiler/compilation_context.cryo": FILES["compiler/compilation_context.cryo"].replace(
+          "    resolver:         Resolver*;\n",
+          "    resolver:         Resolver*;\n    leaf_table:       LeafTable*;\n"),
+      "compiler/sema/sema.cryo": sema_with(["this.ctx.leaf_table.lookup_leaf(name);"])},
+     1, "`LeafTable` (compiler/sema/leaf_table.cryo) owns an array of names (entries: Pair<SymbolStr,TypeRef>[]), "
+        "takes a name (lookup_leaf) and is in"),
+    ("an array of bare names with a linear search is refused the same way, carried by nothing",
+     {"compiler/parser/name_tables.cryo":
+          "type struct NameTables {\n"
+          "    generic_decl_names: SymbolStr[];\n"
+          "\n"
+          "    is_generic_decl_name(&this, name: SymbolStr) -> boolean { return false; }\n"
+          "}\n"},
+     1, "`NameTables` (compiler/parser/name_tables.cryo) owns an array of names (generic_decl_names: SymbolStr[]), "
+        "takes a name (is_generic_decl_name) and is in"),
+    ("an array of names nothing asks by name is data, not a table: accepted",
+     {"compiler/parser/name_tables.cryo":
+          "type struct NameTables {\n"
+          "    generic_decl_names: SymbolStr[];\n"
+          "\n"
+          "    count(&this) -> i64 { return this.generic_decl_names.length; }\n"
+          "}\n"},
+     0, "lane-gate: OK"),
+    ("a method taking an ARRAY of names is not a name-keyed ask: accepted",
+     {"compiler/parser/name_tables.cryo":
+          "type struct NameTables {\n"
+          "    generic_decl_names: SymbolStr[];\n"
+          "\n"
+          "    replace(mut &this, names: SymbolStr[]) -> void { this.generic_decl_names = names; }\n"
+          "}\n"},
+     0, "lane-gate: OK"),
+    ("an array exclusion whose array is gone is a stale exclusion, refused",
+     {GATE_MOD.EXCLUDED_ARRAYS[FIRST_ARRAY_EXCLUDED].defn:
+          FILES[GATE_MOD.EXCLUDED_ARRAYS[FIRST_ARRAY_EXCLUDED].defn].replace(
+              "type struct %s {\n    names: SymbolStr[];\n" % FIRST_ARRAY_EXCLUDED,
+              "type struct %s {\n    names: i64[];\n" % FIRST_ARRAY_EXCLUDED, 1)},
+     1, "`%s` is listed in EXCLUDED_ARRAYS but owns no array of names or takes no name: a stale exclusion"
+        % FIRST_ARRAY_EXCLUDED),
+    ("an array exclusion that gains a map becomes rule 1's question first: refused as an unplaced map owner",
+     {GATE_MOD.EXCLUDED_ARRAYS[FIRST_ARRAY_EXCLUDED].defn:
+          FILES[GATE_MOD.EXCLUDED_ARRAYS[FIRST_ARRAY_EXCLUDED].defn].replace(
+              "type struct %s {\n    names: SymbolStr[];\n" % FIRST_ARRAY_EXCLUDED,
+              "type struct %s {\n    names: SymbolStr[];\n    by_id: HashMap<u32, i64>;\n" % FIRST_ARRAY_EXCLUDED, 1)},
+     1, "`%s` (%s) owns a map (by_id: HashMap<u32>) and is in neither STORES nor EXCLUDED"
+        % (FIRST_ARRAY_EXCLUDED, GATE_MOD.EXCLUDED_ARRAYS[FIRST_ARRAY_EXCLUDED].defn)),
 ]
 
 
