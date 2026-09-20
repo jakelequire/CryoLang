@@ -63,14 +63,27 @@ type struct TypeSubstitution {
 
 
     /// Look up the replacement for a given param TypeID.
-    /// Returns TypeRef::invalid() if not found.
+    /// Returns TypeRef::invalid() if not found - or if found TWICE with two
+    /// different answers.
+    ///
+    /// The arena hands out one parameter type per SPELLING
+    /// (`create_generic_param` caches by the name alone), so a method's
+    /// `<J>` and the `implement<.., J, ..>` its body was copied under are
+    /// one arena type, and a specialization binding the method's `J` to one
+    /// type and the impl's to another holds two answers for one question.
+    /// Answering with whichever was added first rebuilt `This`'s own
+    /// arguments with the method's, silently; an invalid answer leaves the
+    /// type it was asked for unresolved, and the call that needed it is
+    /// reported where its specialization is missed.  A parameter bound
+    /// twice to the SAME type is one answer and is given.
     get(&this, param_id: u64) -> TypeRef {
+        mut found: TypeRef = TypeRef::invalid();
         for (mut i: i64 = 0; i < this.param_ids.length; i++) {
-            if (this.param_ids[i] == param_id) {
-                return this.replacements[i];
-            }
+            if (this.param_ids[i] != param_id) { continue; }
+            if (!found.is_valid()) { found = this.replacements[i]; continue; }
+            if (found.id != this.replacements[i].id) { return TypeRef::invalid(); }
         }
-        return TypeRef::invalid();
+        return found;
     }
 
     /// Whether this substitution has any mappings.
