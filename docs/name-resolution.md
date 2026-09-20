@@ -75,7 +75,7 @@ measurement that decided it on the row.
 | D29 | **`implement trait Tick for struct Holder<S>` with `S` undeclared KEEPS E0302** (Jake, 2026-09-19). E0203 was put to him as Rust's answer (E0412, the same code as any undeclared type name) and REJECTED: "too generic of an error for this situation". No dedicated code proposed: the message is already the situation's own ("this impl head names `S`, which is declared nowhere", with the head spelled as it must be written), and E0302's family - the head's parameter list disagreeing with its target - is where a reader looks for it; a code for one message would widen the table for no search. The nesting asymmetry stands and is recorded: `Holder<Vec<S>>` is E0203 from the general refusal, the top-level `S` is E0302 | **RULED - the question CLOSED** | `grep -c 'E0302_GENERIC_PARAM_MISMATCH' compiler/src/compiler/resolver/name_resolution.cryo` → **1**; `ls tests/tests/negative/E0302_trait_head_undeclared_param.cryo \| wc -l` → **1** | §8.258, §8.267 |
 | D30 | **A generic parameter that SHADOWS an enclosing one is REFUSED** (Jake, 2026-09-19), Cryo's E0403: `type struct Box<T> { size_of_param<T>(&this, x: T) -> u64 { sizeof(T) } }` refuses the method's `T` against the owner's; `do_something<K>` beside an owner `T` is untouched. Today the OWNER's `T` silently wins - `Box<u8>::new(1).size_of_param<i64>(5)` answers 1 - because the substitution tables are keyed by the parameter's SPELLING, so two parameters of one name are one slot. In-tree population **0** (no method redeclares its owner's parameter), so the refusal breaks nothing. **Rides with audit 14's `GenericParam` identity fix**: the resolver binds each parameter to a `SymbolID` (`name_resolution.cryo`'s `GenericParam` arm answers `Res::GenericParam(s.name)` and discards `sym_id`); stamp the id, key the substitution tables by it, and the shadowing is then a second declaration in a scope that holds the first - the refusal is the resolver's, at the declaration, as Rust's E0403 is (Cryo's E0403 is "Missing Return"; the code for this is the builder's to propose and Jake's to confirm) | **The refusal BUILT (§8.268) as `E0311_GENERIC_PARAM_SHADOWED` - a number PROPOSED, not confirmed: the generics family E03xx, the next free code after E0310** - `declare_generics` asks the scope chain before declaring each parameter and a `GenericParam` answer is the error at the parameter's span with the first declaration labelled; a method's `<T>` in `struct Box<T>`, a trait method's in `trait Conv<T>`, an impl method's in `implement<T>`, and `<T, T>` in one list are the four refused shapes (Rust's E0403 covers the same four); a parameter beside a TYPE or a value parameter of its spelling is not one. **The identity half BUILT (§8.272)**: `Res::GenericParam` and `ResBase::GenericParam` carry the `SymbolID` the declaration bound (`GenericParamNode.sym_id`, stamped by the resolver, copied by the cloner; every writer, the async lowering's synthesized head included, §8.268), and the substitution chain is keyed by it end to end: `TemplateEntry.param_syms` beside the names, `ResolutionContext.generic_bindings` a `GenericBinding { sym, name, ty }` written by `add_binding(sym, name, ty)` and read by `lookup_binding(sym)` alone (`resolve_named` asks by the stamp's `generic_param_sym`, a flat `I::Item` by its `relative_param_sym`), `This::Member` in its own `assoc_bindings` table (an associated type is no symbol), `ImplBlockNode.derived_param_syms`, `ASTTypeSubstituter.param_syms` matched against `NamedAnnotation::param_sym` / a scope segment's `relative_param_sym`, `TraitBound.subject_sym` stamped by `stamp_trait_bounds`; an impl block is specialized under ITS OWN parameters (`ASTSpecializer::impl_substituter`, each bound to the argument at the head position it is written), the async lowering stamps every parameter it spells, and the mono fallback that re-resolved a signature under name-keyed bindings is deleted (0 entries over the LSP's 264 modules, 0 resolutions over the six-half corpus). `ArrayLiteralNode.element_type` deleted (no writer but the substituter, no reader but the dumper). **Left keyed by spelling, by design**: the arena's `GenericParamType.param_name` against `TemplateEntry.param_names` (4 compares in `call_resolver.cryo`) and a bound's subject against the arena substitution (`lookup_subst_for_param`, 5 callers) - **the type layer's own identity is the SPELLING ALONE** (`TypeArena::create_generic_param` caches by the name; the index is the first creation's - §8.275 corrects §8.272's "name+index") and carries no symbol. Control: a trait default's own `<U>` copied under `implement<U> trait Conv for struct Holder<U>` - `h.conv<i64>(5)` answered sizeof(u8) = 1 and answers 8; in-tree population 2 (`Iterator`'s `chain<J>` / `zip<J>` under `ChainIter<I, J>` / `ZipIter<I, J>`), never demanded through the conflation, 0 objects moved. **The arena half (§8.275)**: with the AST tables keyed by symbol, `a.chain(b).chain(c)` on a `ChainIter` receiver - E0636 "no method 'chain'" before, and NOT a separate defect as §8.272 said - RUNS when `c`'s type is the impl's `J` (`chain_default_same_param`, exit 25) and is REFUSED when it is not (`chain_default_param_conflict`, E0636 "cannot resolve 'ChainIter::new'"): the two `J`s are one arena type with two answers, and `TypeSubstitution::get` answers nothing for a parameter bound to two different types rather than whichever was added first - which rebuilt `This` as `ChainIter<Range, TakeIter>` and iterated over garbage (`.objcmp/rd-ctl2.log`, `chained=0`, under c596a14b's compiler). **The arena keyed by symbol is Jake's design unit**; that project becomes a run project exiting 25 when it lands | `grep -c 'E0311_GENERIC_PARAM_SHADOWED' compiler/src/compiler/resolver/name_resolution.cryo` → **1**; `ls tests/tests/negative/E0311_*.cryo \| wc -l` → **1**; `grep -c 'Res::GenericParam(s.name)' compiler/src/compiler/resolver/name_resolution.cryo` → **0**; `grep -rhoE 'GenericParam\(SymbolID\)' compiler/src/compiler/resolver/res.cryo \| wc -l` → **2**; `grep -c 'sym_id' compiler/src/compiler/AST/declaration.cryo` → **4**; `grep -c 'sym: SymbolID, name: SymbolStr, bound_type: TypeRef' compiler/src/compiler/types/resolver.cryo` → **1**; `grep -rho 'lookup_binding(' compiler/src --include=*.cryo \| wc -l` → **7**; `grep -rhoE -e 'lookup_binding\([a-z_.]*name\)' -e 'lookup_binding\([a-z_.]*param\)' -e 'lookup_binding\([a-z_.]*type_parameter\)' -e 'lookup_binding\([a-z_.]*prefix_sym\)' -e 'lookup_binding\([a-z_.]*member\)' compiler/src --include=*.cryo \| wc -l` → **0** (5 at §8.271: no reader asks by a spelling); `grep -rho 'subject_sym' compiler/src --include=*.cryo \| wc -l` → **13**; `grep -rho 'param_syms' compiler/src --include=*.cryo \| wc -l` → **92** (89 at §8.272; +3 in §8.279, the three copy loops that ran over the deleted `ASTTypeSubstituter.param_names` now run over `param_syms`); `grep -rn 'param_names\[.*\]\.equals' compiler/src --include=*.cryo \| wc -l` → **4** (10 at §8.271; the arena-name residual); `grep -c 'element_type' compiler/src/compiler/AST/expression.cryo` → **0**; `grep -c 'Fallback resolution with substitution-derived bindings' compiler/src/compiler/mono/ast_resolver.cryo` → **0**; `ls -d tests/tests/projects/default_param_keyed_by_symbol \| wc -l` → **1**; `ls -d tests/tests/projects/chain_default_*/test.json \| wc -l` → **2**; `grep -c 'if (found.id != this.replacements\[i\].id) { return TypeRef::invalid(); }' compiler/src/compiler/types/substitution.cryo` → **1** | §8.267, §8.268, §8.272, §8.275 |
 | D31 | **The turbofish is REQUIRED for generic arguments in expression position** (Jake, 2026-09-19): `foo::<i32>(y)` opens type arguments; `g(LIMIT < x, MAXV > (y))` is two comparisons, always. **The rule: `<` immediately after `::` opens generic arguments; `<` anywhere else is a comparison.** The shape is `foo::<i32>(y)` - as Rust's `Vec::<i32>::new()`, where every `::` after the turbofish is an ordinary path step; there is no `::()` form. It RETIRES the parser's `ident <` lookahead tables (`parser_base.cryo` 872–912: is-a-local / is-a-global / is-declared-generic / binds-a-value, read from the module's OWN declarations; `expr_parser.cryo` ~1190, the identifier's `Name<T, U>` guess), which by their own comment cannot see an import - so one expression means two things by where its constants came from. **Source-breaking, population UNMEASURED: the first task of whoever builds it is the count of bare generic arguments in expression position over the stdlib, the projects, the examples and the compiler's own source** (`f<T>(..)`, `Type<T>::m(..)`, `Type<T> { .. }` as the parser reads them today, module by module), and Jake wants that number before it lands. **MEASURED in §8.269 (the population Jake asked for), NOT BUILT: 1,364 generic-argument lists in expression position across 272 files** - stdlib 480 (64 of 154 files), compiler/src 165, tests/unit 571, tests/projects 61, tests/negative 26, tools/CryoLSP 53, examples 8; by shape `Name<T>::m` 586, `Name<T> { .. }` 219, `f<T>(..)` 142, `f<T>` as a value 8, `obj.m<T>(..)` 172, `Scope::m<T>(..)` 237, `new Type<T>(..)` 0 (confirmed by grep); **567 of the 955 identifier-headed sites were decided by the token scan alone** - the name is declared generic in no table the writing module has (an import: `Array` 172, `PendingThenReady` 90, `HashMap` 75, `Pair` 63, `Atomic` 38, `BufStream` 36, `Box` 24). Every site is a rewrite of the same one shape, `Name<` → `Name::<`, and the probe's location list (`scripts/ns-migration/8.269/`, `probe_d31.py apply` / `tally`; `population.md` is the tally) is the migration's input; the landing is the parser change, the four sites' lexical rule, the retired tables, and that script - one unit, source-breaking by 1,364 edits. **AUTHORISED by Jake on the 1,364-site figure (2026-09-19, §8.272): the turbofish lands.** Not built here - a source-breaking change across the stdlib, the tests, the compiler and the examples plus the parser change wants a dedicated session with a full budget. The landing: the lexical rule (`<` opens generic arguments only after `::`), `is_generic_call_ahead` ×6 and the `parser_base.cryo` 872–912 tables retired, and the 1,364 rewrites produced by a COMMITTED GENERATOR run over `population.md` - never a hand edit - so the migration is reproducible and auditable; 567 of the 955 identifier-headed sites are decided by the token scan alone today, so the generator's list, not the parser's tables, is what says where they are. **BUILT in three landings: §8.277 the parser reads the turbofish beside the lookahead and the population is re-verified at 1,368 sites / 271 files (§8.269's 1,364 double-counted two sites under a capitalised path; +6 in a project added since); the pin refreshed from that compiler; §8.278 the tree rewritten by `scripts/ns-migration/8.278/turbofish.py` over `8.277/sites.tsv` + `8.278/sites-extra.tsv` (1,376 sites, 274 files, a second run edits nothing) and the lookahead retired - `is_generic_call_ahead`, the three module tables with `scan_module_names`, the `generic_angle_guessed` flag and its two notes; 0 of 154 stdlib, 0 of 2,893 test, 0 of 1,126 example objects moved.** `new Type<T>(..)` and type position open `<` outright (no comparison can stand after a type name); `a < b > c` stays the chained comparison it was; the old spelling's leading E0102 names the turbofish | **TAKEN** (§8.277, §8.278; two open shapes on §8.278's "For Jake": `new Type::<T>` and refusing chained comparisons) | `grep -c 'is_generic_call_ahead' compiler/src/compiler/parser/expr_parser.cryo` → **0**; `grep -c 'at_turbofish' compiler/src/compiler/parser/expr_parser.cryo` → **4** (the one method and its three askers - the control for the zero beside it); `grep -c -e binds_a_value -e scan_module_names -e generic_decl_names compiler/src/compiler/parser/parser_base.cryo` → **0**; `git grep -l generic_angle_guessed -- compiler/src \| wc -l` → **0**; `grep -c . scripts/ns-migration/8.277/sites.tsv` → **1368** and `grep -vc '^#' scripts/ns-migration/8.278/sites-extra.tsv` → **8** (the rewrite's input; `turbofish.py check` over both reads every site as `::<` at the parent of §8.278's commit after `apply` and before `retire_lookahead.py`, which shifts one compiler/src site's line - so the check is the recipe's audit, not a row); `grep -c '^D31 population: 1368 distinct sites' scripts/ns-migration/8.277/population.md` → **1**; `grep -c '^D31 population: 1364 distinct sites' scripts/ns-migration/8.269/population.md` → **1** (the superseded figure, kept as written) | §8.267, §8.269, §8.277, §8.278 |
-| D32 | **The migration's COMPLETION CRITERION - the gate on merging `naming-impl` to `main`** (Jake, 2026-09-19): the migration is complete when there are **ZERO name-keyed reads outside an ENUMERATED, JUSTIFIED residue** - every member of the residue named, each carrying a one-line reason it is correct where it is (member lookup inside an owner is the canonical member: a struct's field or method by its name off the owner's type, name-keyed in Rust too), and the residue **PINNED BY COUNT** so it cannot grow. "Complete" means complete - not "correct with known items rowed". The by-design sites are "the maximum allowed": a residue that lands ABOVE the by-design set either moves the ceiling with a justification per extra site or converts those sites. **The count is NOT yet fixed and is not to be pinned on any recollection**: "about sixteen" was a paraphrase of audit 12's bucket D, and audit 14 remeasured the whole population at 55 sites with the buckets redistributed, so the true justified residue may be more or fewer. It is set by ENUMERATING the residue - one list, each site with its justification - and Jake rules on the final number. The enumeration is a unit of its own, after the id-move's remaining buckets land (they are still shrinking the population); its artifact is `scripts/ns-migration/residue.md` and this row's check flips to it | **RULED - the criterion; the count TO BE SET by enumeration** | `ls scripts/ns-migration/residue.md 2>/dev/null \| wc -l` → **0** (no enumeration yet; when it lands this row carries its count and the check that counts the residue against it) | §8.276 |
+| D32 | **The migration's COMPLETION CRITERION - the gate on merging `naming-impl` to `main`** (Jake, 2026-09-19): the migration is complete when there are **ZERO name-keyed reads outside an ENUMERATED, JUSTIFIED residue** - every member of the residue named, each carrying a one-line reason it is correct where it is (member lookup inside an owner is the canonical member: a struct's field or method by its name off the owner's type, name-keyed in Rust too), and the residue **PINNED BY COUNT** so it cannot grow. "Complete" means complete - not "correct with known items rowed". The by-design sites are "the maximum allowed": a residue that lands ABOVE the by-design set either moves the ceiling with a justification per extra site or converts those sites. **The count is NOT yet fixed and is not to be pinned on any recollection**: "about sixteen" was a paraphrase of audit 12's bucket D, and audit 14 remeasured the whole population at 55 sites with the buckets redistributed, so the true justified residue may be more or fewer. It is set by ENUMERATING the residue - one list, each site with its justification - and Jake rules on the final number. **The enumeration LANDED (§8.281)**: `scripts/ns-migration/residue.md`, every site derived from the lane gate's own parser (`residue.py`: the stores and the member-table array owners, a key type in parameter position, a read, the receiver placed by declared type) and classified with its reason by `residue_classify.py` - **J** justified by design (member-in-owner 7, language-named 18, module-by-path 24, primitive 1, extern 1, hint 1), **N** not a key (a label beside a `DefId`, a path, a literal's text, a constructor's source file), and the convertible remainder **S** stamp-derived, **B** the registry's canonical keys (Jake's re-key unit), **C** composed, **F** visibility, **W** written; the list is matched to the tree by (file, method, key text) in both directions and the row pins the counts | **RULED - the criterion; the enumeration LANDED with J = 52, the count TO BE RULED by Jake** (the migration is complete when S + B + C + F + W = 0 and J is at or below the ceiling he sets; the J sub-kinds are grouped so `module` or `lang` can be ruled convertible by count) | `python3 scripts/ns-migration/residue.py --check \| grep -c '^residue: OK'` → **1** (the list and the tree agree, no row unclassified); `python3 scripts/ns-migration/residue.py --count` → **265** (the population); `python3 scripts/ns-migration/residue.py --check \| grep -o 'J [0-9]*' \| cut -d' ' -f2` → **52** (the justified residue); `python3 scripts/ns-migration/residue.py --check \| grep -o 'convertible [0-9]*' \| cut -d' ' -f2` → **96** (S + B + C + F + W, the remainder that reaches 0 when the migration is complete) | §8.276, §8.281 |
 
 **D18's keyword half is RULED and UNBUILT, and D32 is the criterion it is built toward** (D5 was, until §8.206; D2 and D9 were,
 until §8.213; D24 was, until §8.233 - this line kept naming it for forty-six entries after its row said TAKEN, §8.280; Q2 was, until §8.259; D25 was, until §8.263; D30's refusal was, until §8.268; D28 was, until §8.270; D30's identity half was, until §8.272; D31 was, until §8.278). Each was decided by Jake - D18 and D2 then re-parked as open
@@ -35314,3 +35314,160 @@ arrays, so predicted and measured: `make lane-check` OK with no row moved.
 Predicted 0 objects moved (no reader; the struct's layout changes, which
 is the compiler's own objects, not the programs'), measured **0 of 2,893**
 tests and **0 of 1,126** examples (`hash-tree.sh se` against `sd2`).
+
+### 8.281 D32's residue enumerated: every name-keyed read in `compiler/src` derived from the lane gate's own parser - 265 sites - each classified with its reason, 52 justified by design (7 member-in-owner, 18 language-named, 24 module-by-path, 1 primitive, 1 extern, 1 hint) and 96 convertible (26 stamp-derived, 49 the registry's canonical keys, 18 composed, 2 visibility, 1 written), 117 not keys; the list is checked against the tree in both directions and the count Jake rules on is set by the list, not by a recollection - 2026-09-20
+
+> **Status:** LANDED (an enumeration and its instruments; no compiler
+> change).  `scripts/ns-migration/residue.md` (the list),
+> `scripts/ns-migration/residue.py` (the population and the check),
+> `scripts/ns-migration/residue_classify.py` (the classes, held as code,
+> and the table's generator), `scripts/ns-migration/README.md`; §0's D32
+> row.
+
+#### The population is derived, not recalled
+
+D32 (§8.276) said the count would be set by an enumeration and never by a
+recollection.  The enumeration's first question is what a "name-keyed
+read" is, and the answer is taken from the instrument that already
+decides it on every commit: `residue.py` loads `scripts/lane-gate.py`
+and asks its `Tree` for the same stores rule 1 places and the same array
+owners rule 1b places, keeps the array owners whose exclusion reason is
+*a member table inside its owner* (the one kind that holds declarations -
+`ImplBlockNode`, `ResolutionContext`, `TraitType`; `DiagSink`,
+`ParsedArgs`, `ProjectConfig` and the rest hold paths, flags, texts or a
+pass's own rib and are outside), narrows rule 2's signature test to a key
+type in PARAMETER position (a name handed IN; a method that only returns a
+name is a display) on a read (`&this` or static; a `mut &this` registrar is
+the write side D32 does not count), and places every call by its
+receiver's declared type as the gate does.  A store's own file is
+excluded as its machinery.  A call it cannot place is REFUSED, not
+dropped - the first draft dropped one silently, and a planted read on a
+receiver of a misspelled type read OK through it (the control below).
+
+`python scripts/ns-migration/residue.py --count` → **265**.  The first
+draft, taking every placed array owner, read 849: `DiagSink::emit_raw`
+alone was 266 of them, which is what "holds no declaration" looks like
+when it is not applied.
+
+#### The classes, held as code
+
+`residue_classify.py` maps each read METHOD to a class with its reason
+(one table), and overrides a SITE where its key comes from somewhere the
+method's other callers' do not (a second table), then writes the site
+table into `residue.md` between two markers.  It refuses a method it
+classifies that the tree no longer declares, a read method the tree calls
+that it does not classify, and an override matching no call.  The classes:
+
+* **J - justified, name-keyed by design (52)**, in sub-kinds Jake can
+  rule on separately: `member` 7 - a leaf inside a settled owner
+  (`lookup_assoc_binding` ×4 on the impl's own `This::Member` bindings,
+  `global_entry_in_module(leaf, DefId)` ×2, `signature_refused_in_module(leaf, DefId)`),
+  Rust's shape for a field or method off its owner; `lang` 18 - a
+  declaration the language names by its own spelling and claims at
+  declaration (`wellknown` ×12: `Drop`, `Copy`, `Send`, `Sync`, `Future`,
+  `Deref`, `Index`, the operator traits; the test runner's three entry
+  points by path; `std::collections::array::Array` ×2, the type `T[]`
+  lowers to; `lookup_future_type`), Rust's lang items being keyed by the
+  attribute's string; `module` 24 - a module by its namespace path
+  (`find_module_index` ×10, `reexport_closure` ×5, `source_file_for_owner_key` ×3,
+  `is_prelude_ns` ×2, `ns_imports` ×2, `find_module_scope` ×2): the graph is
+  the declaration of modules and a namespace names exactly one (D5);
+  `prim` 1 - `Res::PrimTy(n)` carries the spelling and nothing else;
+  `extern` 1 - a C symbol by its link name; `hint` 1 - the did-you-mean
+  asking which trait spells a method leaf.
+* **N - not a key (117)**: `ResolutionContext::new(source_file)` ×53,
+  `type_of_decl(DefId, label)` ×32 and `impl_owner(node, label)` ×10 - the
+  string is the asking site's diagnostic label beside the real key -
+  `find_module_by_path` ×12, `ns_sym_of_file`, `parse_int_literal`, the
+  funnel's three forwarding bodies, two writes onto AST nodes, and
+  `intern_qualified` ×2 (a key MINTED at a constant's declaration).  In
+  the population because the gate's parameter test cannot tell a label
+  from a key; outside D32.
+* **S - stamp-derived (26)**: an index or funnel door keyed by a canonical
+  string the caller took off a stamp or a `TypeRef` (`scope_owner_key`,
+  `lookup_type_name(ref)`, `get_qualified_name(ref)`, `tr.identity()`,
+  `trait_identity(ann)`): `lookup_type_exact` ×8, `lookup_method_return`
+  ×14 (the owner half; the member is a leaf inside it), `resolve_method_owner`,
+  `lookup_type(owner_key)`, `is_self_growing_instantiation` ×2.  Convertible: the door can take the
+  stamp.
+* **B - the registry's canonical keys (49)**: `get_template` ×15 (of 20:
+  3 are composed keys under C, 2 the language's `Array` under J),
+  `get_trait_decl` ×13, `lookup_inherent_owner` ×5, `heads_for` ×4,
+  `template_head_for` ×3, `select_trait_impl` ×2, the four inherent-impl
+  readers (6 sites), `overlapping_head`.  Bucket B's reader side (§8.245: "re-keying
+  it by identity is Jake's"); not started.
+* **C - composed (18)**: `owner::member`, a family string, `ns::name` -
+  `lookup_family_entries` ×6, `lookup_func_type_exact` ×4, the two
+  overload readers, `lookup_func_type(fam)`, `signature_refused` ×2,
+  three composed `get_template` keys.  Bucket C, behind
+  pin-as-declaration (§8.279).
+* **F - visibility by name (2)**: `enforce_callee_visibility`'s
+  `namespace_of` and `is_candidate_public`.  Bucket F, the same.
+* **W - written, no stamp, no reason (1)**: `intrinsic_owner_of(leaf)` in
+  `call_emitter.cryo` - the callee's written leaf asked for the intrinsic
+  it may name and then COMPARED with the pin; the pin's entry could carry
+  the intrinsic mark and the read would go.
+
+```cryo
+// J `member`: the leaf inside a settled owner (the module is a DefId)
+di.global_entry_in_module(scope.member_name, seen.def_id())
+// S: a canonical string off a TypeRef, where the door could take the ref
+this.types.lookup_type_exact(this.ctx.decl_index.lookup_type_name(spec_ref))
+// C: a key built from parts, the family door pin-as-declaration retires
+di.lookup_family_entries(this.intern.intern(fmt::format("%s::%s", owner, member)))
+```
+
+**The migration is complete when S + B + C + F + W = 0 and J is at or
+below the ceiling Jake sets.**  Today that remainder is **96**.  The J
+count is 52 by this classification; it is not sixteen and not
+fifty-five, and neither figure was a measurement of this population -
+audit 12's "about sixteen" was its bucket D (member-in-owner: 7 here),
+audit 14's 55 was the index and funnel readers taking a name in, which
+here are the J `member` 7 + S 26 + C 18 + F 2 + W 1 + `lang` 4 + `prim` 1
+= 59 with the funnel's own bodies out.  Two of the J sub-kinds are the
+ones most open to a ruling: `module` (24 - a module addressed by its path
+rather than by an id the graph could mint) and `lang` (18 - a name the
+language itself fixes).  The rows are grouped so either can be ruled
+convertible by its count alone.
+
+#### The pair
+
+Over the real tree (`b032fe79` + §8.280):
+
+* a read planted on a placed receiver (`implement Diagnostics {
+  residue_probe(&this, name: SymbolStr) -> TypeRef { return
+  this.types.lookup_type_exact(name); } }` appended to
+  `sema/diagnostics.cryo`): `residue: compiler/sema/diagnostics.cryo
+  TypeUtils::lookup_type_exact (name): tree 1, list 0` / `residue: DRIFT -
+  tree 266, list 265`, exit 1;
+* the same read on a receiver the parser cannot place (`implement
+  SemaDiagnostics`, a type that does not exist): `residue: 1 call(s) to a
+  read method on a receiver whose type cannot be read, e.g.
+  compiler/sema/diagnostics.cryo:389 this.types.lookup_type_exact(`, exit
+  1 - the first draft printed `OK -- 265` over this tree;
+* a row deleted from the list (`is_candidate_public`): `tree 1, list 0`,
+  `DRIFT - tree 265, list 264`, exit 1;
+* a row's class blanked to `?`: `residue: 1 sites UNCLASSIFIED`, exit 1;
+* the tree restored: `residue: OK -- 265 sites, list and tree agree; B 49,
+  C 18, F 2, J 52, N 117, S 26, W 1; convertible 96`, exit 0.
+
+The row's checks are spelled `python3`, as §0's other script rows are:
+`make check-fast`'s bash resolves `python3` and not `python`, and the
+first spelling read `command not found` as four drifts.  The remainder is
+printed by `--check` itself rather than summed in the row, because a `$2`
+inside the row's awk did not survive the check's extraction.
+
+The list is matched to the tree by (file, method, key text), not by
+line, so an edit that only moves lines is not drift and a site added,
+removed or re-keyed is.
+
+#### What the row pins
+
+D32's row carries four checks: the check reads OK, the population is 265,
+J is 52, and the convertible remainder S + B + C + F + W is 96.  The row's
+status stays RULED with the count TO BE RULED: the enumeration sets the
+number Jake rules on, and this entry does not rule it.  Twelve read
+methods the classifier found declared and called from outside their file
+by nothing (`global_slot`, `pack_method_key`, `split_global_key`,
+`heads_under`, `def_type`, `lookup_method_return_raw`, …) each have
+callers inside their own file or the LSP; none is dead.
