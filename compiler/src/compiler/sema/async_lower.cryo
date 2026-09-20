@@ -29,6 +29,8 @@ import compiler::resolver::{
 };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, Res, ResBase, ResSlot };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::ast;
 import compiler::ast::{
     ArgBinding, ArrayAnnotation, cloner, declaration, expression, GenericAnnotation,
@@ -600,24 +602,42 @@ type struct AsyncLower {
         return new TypeAnnotation::Named(n);
     }
 
-    /// A `Named` annotation spelling a GENERIC PARAMETER by name, resolved by
-    /// lookup rather than short-circuited.
+    /// A `Named` annotation spelling the GENERIC PARAMETER `gp`, stamped as
+    /// the name layer stamps a written one and resolved by lookup rather than
+    /// short-circuited.
     ///
     /// The counterpart to `make_type_ann`, and mandatory for anything a generic
     /// future mentions: monomorphization specializes a template by rewriting the
     /// generic parameters that appear in its ANNOTATIONS, and `pre_resolved`
     /// bypasses annotation resolution entirely — a pre-resolved `T` would reach
-    /// codegen still being `T`.  A parameter names no declaration, so the slot
-    /// stays unanswered and the binding in the resolution context answers it.
-    /// A DECLARATION spelled by the lowering goes through `named_ann_def`: the
-    /// stamping walk visits what the parser produced, so a synthesized name
-    /// carries its referent or nothing resolves it.
-    named_ann(&this, name: SymbolStr, span: SourceSpan) -> TypeAnnotation* {
+    /// codegen still being `T`.  The stamp carries the parameter's symbol,
+    /// because every substitution table is keyed by it and a spelling matches
+    /// nothing; a synthesized node is stamped by nothing but its synthesizer.
+    /// A DECLARATION spelled by the lowering goes through `named_ann_def` for
+    /// the same reason.
+    named_ann(&this, gp: GenericParamNode*, span: SourceSpan) -> TypeAnnotation* {
         mut n: NamedAnnotation* = new NamedAnnotation {
-            name: name, span: span, pre_resolved: TypeRef::invalid(),
+            name: gp.name, span: span, pre_resolved: TypeRef::invalid(),
             res: ResSlot::Pending,
         };
+        n.res.answer(Res::GenericParam(gp.sym_id));
         return new TypeAnnotation::Named(n);
+    }
+
+    /// The parameter among `params` whose arena type spells `name`, or null.
+    ///
+    /// The lowering rebuilds a frame field's type from the ARENA, whose
+    /// parameter types carry a spelling and no symbol; the declaration
+    /// being lowered is the scope that spelling was resolved in, and its
+    /// parameters (the owner's, then the function's own) are the only ones
+    /// a type the body computed can mention.  One spelling names one of
+    /// them: a nested declaration cannot redeclare an enclosing one.
+    param_spelled(&this, params: &GenericParamNode*[], name: SymbolStr) -> GenericParamNode* {
+        for (mut i: i64 = 0; i < params.length; i++) {
+            const gp: GenericParamNode* = params[i];
+            if (gp != null && gp.name.equals(name)) { return gp; }
+        }
+        return null;
     }
 
     /// `named_ann`, carrying the definition it refers to.
@@ -646,16 +666,7 @@ type struct AsyncLower {
         for (mut i: i64 = 0; i < params.length; i++) {
             const gp: GenericParamNode* = params[i];
             if (gp == null) { continue; }
-            const ann: TypeAnnotation* = this.named_ann(gp.name, span);
-            // A parameter of the declaration, as the name layer stamps a
-            // written one: a consumer matching the head against a subject
-            // reads the stamp, and a synthesized node is stamped by nothing
-            // but its synthesizer.
-            match (*ann) {
-                TypeAnnotation::Named(n) => { n.res.answer(Res::GenericParam(gp.sym_id)); }
-                _ => { }
-            }
-            args.push(ann);
+            args.push(this.named_ann(gp, span));
         }
         return args;
     }
@@ -703,7 +714,7 @@ type struct AsyncLower {
     /// An annotation for the `Future`'s `Output` — the declared return type, or
     /// unit for `-> void`.
     output_type_ann(mut &this, d: AsyncDecl*, span: SourceSpan) -> TypeAnnotation* {
-        return this.type_ann_for(d.output_ref, span);
+        return this.type_ann_for(d.output_ref, &d.fut_params, span);
     }
 
     /// Spell `ty` as an annotation monomorphization can substitute.
@@ -715,23 +726,29 @@ type struct AsyncLower {
     /// the substituter can see and rewrite it.
     ///
     /// Null when the type mentions a parameter through a shape with no annotation
-    /// spelling; the caller reports that rather than emitting a field whose type
-    /// would silently stay generic.
-    type_ann_for(mut &this, ty: TypeRef, span: SourceSpan) -> TypeAnnotation* {
+    /// spelling, or a parameter that is none of `params` (the future's own);
+    /// the caller reports that rather than emitting a field whose type would
+    /// silently stay generic.
+    type_ann_for(mut &this, ty: TypeRef, params: &GenericParamNode*[],
+                 span: SourceSpan) -> TypeAnnotation* {
         if (!ty.is_valid()) { return null; }
         if (!this.arena.contains_generic_param(ty)) { return this.make_type_ann(ty, span); }
 
         const t: Type* = this.arena.lookup(ty.id);
         if (t == null) { return null; }
-        if (t.kind == TypeKind::GenericParam) {
-            return this.named_ann((t as GenericParamType*).param_name, span);
-        }
-        if (t.kind == TypeKind::BoundedParam) {
-            return this.named_ann((t as BoundedParamType*).param_name, span);
+        if (t.kind == TypeKind::GenericParam || t.kind == TypeKind::BoundedParam) {
+            const spelled: SymbolStr = if (t.kind == TypeKind::GenericParam) {
+                (t as GenericParamType*).param_name
+            } else {
+                (t as BoundedParamType*).param_name
+            };
+            const gp: GenericParamNode* = this.param_spelled(params, spelled);
+            if (gp == null) { return null; }
+            return this.named_ann(gp, span);
         }
         if (t.kind == TypeKind::Pointer) {
             const p: PointerType* = t as PointerType*;
-            mut inner: TypeAnnotation* = this.type_ann_for(p.pointee, span);
+            mut inner: TypeAnnotation* = this.type_ann_for(p.pointee, params, span);
             if (inner == null) { return null; }
             return new TypeAnnotation::Pointer(new PointerAnnotation {
                 inner: inner, is_const: false, span: span,
@@ -739,7 +756,7 @@ type struct AsyncLower {
         }
         if (t.kind == TypeKind::Reference) {
             const r: ReferenceType* = t as ReferenceType*;
-            mut inner: TypeAnnotation* = this.type_ann_for(r.referent, span);
+            mut inner: TypeAnnotation* = this.type_ann_for(r.referent, params, span);
             if (inner == null) { return null; }
             return new TypeAnnotation::Reference(new ReferenceAnnotation {
                 inner: inner, is_mutable: r.is_mutable(), span: span,
@@ -747,7 +764,7 @@ type struct AsyncLower {
         }
         if (t.kind == TypeKind::Array) {
             const a: ArrayType* = t as ArrayType*;
-            mut elem: TypeAnnotation* = this.type_ann_for(a.element, span);
+            mut elem: TypeAnnotation* = this.type_ann_for(a.element, params, span);
             if (elem == null) { return null; }
             return new TypeAnnotation::Array(new ArrayAnnotation {
                 element: elem, size: a.size, size_expr: null, span: span,
@@ -761,7 +778,7 @@ type struct AsyncLower {
         // all and the whole lowering is refused.
         if (t.kind == TypeKind::AssocProjection) {
             const proj: AssocProjectionType* = t as AssocProjectionType*;
-            mut base: TypeAnnotation* = this.type_ann_for(proj.base, span);
+            mut base: TypeAnnotation* = this.type_ann_for(proj.base, params, span);
             if (base == null) { return null; }
             return new TypeAnnotation::Projection(new ProjectionAnnotation {
                 base:         base,
@@ -777,7 +794,7 @@ type struct AsyncLower {
             if (!base_q.is_valid()) { return null; }
             mut args: TypeAnnotation*[] = [];
             for (mut i: i64 = 0; i < inst.type_args.length; i++) {
-                mut arg: TypeAnnotation* = this.type_ann_for(inst.type_args[i], span);
+                mut arg: TypeAnnotation* = this.type_ann_for(inst.type_args[i], params, span);
                 if (arg == null) { return null; }
                 args.push(arg);
             }
@@ -6694,9 +6711,11 @@ type struct AsyncLower {
             const param_refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
                 fut_params, this.arena);
             mut param_names: SymbolStr[] = [];
+            mut param_syms: SymbolID[] = [];
             mut param_type_ids: u64[] = [];
             for (mut gi: i64 = 0; gi < fut_params.length; gi++) {
                 param_names.push(fut_params[gi].name);
+                param_syms.push(fut_params[gi].sym_id);
                 param_type_ids.push(param_refs[gi].id);
             }
             // The NAMESPACE, not the file path: the monomorphizer's resolution
@@ -6705,7 +6724,7 @@ type struct AsyncLower {
                 this.ctx.namespace_str
             } else { module_sym };
             this.ctx.generic_registry.register_template(TemplateEntry::new(
-                bare, q_name, tmpl_module, param_names, param_type_ids,
+                bare, q_name, tmpl_module, param_names, param_syms, param_type_ids,
                 struct_decl as ASTNode*, NodeKind::StructDeclaration, struct_ref));
             self_ty = this.ctx.generic_registry.instantiate(struct_ref, &param_refs);
         }
@@ -6923,12 +6942,12 @@ type struct AsyncLower {
     /// the field anyway would leave the specialization's field still generic,
     /// which surfaces far from here as an unresolved member type.
     add_future_field(mut &this, struct_decl: StructDeclNode*, name: SymbolStr,
-                     ty: TypeRef, generic: boolean, span: SourceSpan) -> boolean {
+                     ty: TypeRef, d: AsyncDecl*, span: SourceSpan) -> boolean {
         mut f: FieldDeclNode* = new FieldDeclNode(name, span);
         f.set_visibility(Visibility::Public);
         f.set_resolved_type(ty);
-        if (generic) {
-            mut ann: TypeAnnotation* = this.type_ann_for(ty, span);
+        if (d.generic) {
+            mut ann: TypeAnnotation* = this.type_ann_for(ty, &d.fut_params, span);
             if (ann == null) {
                 this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                     fmt::format("async: a generic `async function` cannot carry a value of type `%s` across a suspend; give it a concrete type",
@@ -7058,28 +7077,28 @@ type struct AsyncLower {
         // an annotation as well as resolved; `add_future_field` reports a type
         // with no such spelling rather than emitting a field that would stay
         // generic in the specialization.
-        mut fields_ok: boolean = this.add_future_field(struct_decl, state_sym, u32_ty, generic, span);
+        mut fields_ok: boolean = this.add_future_field(struct_decl, state_sym, u32_ty, &this.pending[pi], span);
 
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const p: VarDeclNode* = node.parameters[i];
             if (!this.param_has_slot(&this.pending[pi], p)) { continue; }
             if (!this.add_future_field(struct_decl, this.param_field_name(p),
                     this.param_field_type(&sm, this.param_slot_type(&this.pending[pi], p)),
-                    generic, span)) {
+                    &this.pending[pi], span)) {
                 fields_ok = false;
             }
         }
         // One sub-future field per await (`Option::None` until built lazily on
         // first entry to its resume state) so the machine can suspend/resume.
         for (mut i: i64 = 0; i < sm.naw; i++) {
-            if (!this.add_future_field(struct_decl, sm.fut_syms[i], sm.fut_opt[i], generic, span)) {
+            if (!this.add_future_field(struct_decl, sm.fut_syms[i], sm.fut_opt[i], &this.pending[pi], span)) {
                 fields_ok = false;
             }
         }
         // One field per promoted cross-state local (a value read in a state other
         // than the one declaring it cannot live on the native stack).
         for (mut i: i64 = 0; i < sm.nprom; i++) {
-            if (!this.add_future_field(struct_decl, sm.prom_field[i], sm.prom_tys[i], generic, span)) {
+            if (!this.add_future_field(struct_decl, sm.prom_field[i], sm.prom_tys[i], &this.pending[pi], span)) {
                 fields_ok = false;
             }
         }

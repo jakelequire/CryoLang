@@ -36,6 +36,8 @@ import compiler::ast::node::{ ASTNode };
 import compiler::ast::substituter::{ ASTTypeSubstituter };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{
     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
@@ -118,7 +120,7 @@ type struct MonoTraitSpecializer {
             if (gp == null) { continue; }
             const arg_ty: TypeRef = this.type_resolver.resolve(trait_args[i], res_ctx);
             if (!arg_ty.is_valid()) { continue; }
-            res_ctx.add_binding(gp.name, arg_ty);
+            res_ctx.add_binding(gp.sym_id, gp.name, arg_ty);
         }
     }
 
@@ -158,7 +160,7 @@ type struct MonoTraitSpecializer {
                     if (ta == null) { continue; }
                     match (*ta) {
                         TypeAnnotation::Named(n) => {
-                            ctx.add_binding(n.name, this.arena.inst_type_arg_at(subject, i));
+                            ctx.add_binding(n.param_sym(), n.name, this.arena.inst_type_arg_at(subject, i));
                             const gp_ref: TypeRef =
                                 this.arena.create_generic_param(n.name, i as u64);
                             subst.add(gp_ref.id, this.arena.inst_type_arg_at(subject, i));
@@ -341,12 +343,12 @@ type struct MonoTraitSpecializer {
                                res_ctx: ResolutionContext*) -> void {
         if (impl_node == null || res_ctx == null) { return; }
         for (mut i: i64 = 0; i < res_ctx.generic_bindings.length; i++) {
-            const name: SymbolStr = res_ctx.generic_bindings[i].first;
-            const ty: TypeRef = res_ctx.generic_bindings[i].second;
+            const sym: SymbolID = res_ctx.generic_bindings[i].sym;
+            const ty: TypeRef = res_ctx.generic_bindings[i].ty;
             if (!ty.is_valid()) { continue; }
             if (this.arena.contains_generic_param(ty)) { continue; }
-            if (impl_node.lookup_derived_param(name).is_valid()) { continue; }
-            impl_node.add_derived_param(name, ty);
+            if (impl_node.lookup_derived_param(sym).is_valid()) { continue; }
+            impl_node.add_derived_param(sym, res_ctx.generic_bindings[i].name, ty);
         }
     }
 
@@ -387,18 +389,20 @@ type struct MonoTraitSpecializer {
             allocator::alloc(sizeof(TypeSubstitution), 16) as TypeSubstitution*;
         *subst_ptr = subst_val;
         const empty_sym: SymbolStr = SymbolStr::empty();
-        // Copy the node's derived names: the substituter constructor moves
-        // `param_names`, and the node keeps owning its `derived_param_names`.
+        // Copy the node's derived lists: the substituter constructor moves
+        // its parameter arrays, and the node keeps owning its own.
         mut pnames: SymbolStr[] = [];
+        mut psyms: SymbolID[] = [];
         for (mut i: i64 = 0; i < decl.derived_param_names.length; i++) {
             pnames.push(decl.derived_param_names[i]);
+            psyms.push(decl.derived_param_syms[i]);
         }
         // No spec id: the base/spec names are empty here, so the substituter's
         // base-name rewrite cannot fire and has nothing to attach.
         mut substituter: ASTTypeSubstituter* = new ASTTypeSubstituter(
             subst_ptr, this.arena, this.intern_table,
             empty_sym, empty_sym,
-            pnames, arg_displays, TypeRef::invalid());
+            pnames, psyms, arg_displays, TypeRef::invalid());
         for (mut mi: i64 = 0; mi < decl.methods.length; mi++) {
             const method: MethodNode* = decl.methods[mi];
             if (method == null || method.func == null) { continue; }
@@ -419,8 +423,8 @@ type struct MonoTraitSpecializer {
         match (*ta) {
             TypeAnnotation::Named(n) => {
                 if (this.lookup_subst_for_param(n.name, subst).is_invalid()
-                        && res_ctx.lookup_binding(n.name).is_invalid()) {
-                    res_ctx.add_binding(n.name, concrete);
+                        && res_ctx.lookup_binding(n.param_sym()).is_invalid()) {
+                    res_ctx.add_binding(n.param_sym(), n.name, concrete);
                 }
             }
             TypeAnnotation::Pointer(p) => {

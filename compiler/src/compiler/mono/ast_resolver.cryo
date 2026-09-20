@@ -55,7 +55,6 @@ import compiler::mono::trait_specializer::{ MonoTraitSpecializer };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
-import compiler::types::generic::{ GenericParamType };
 import compiler::types::resolver::{ ResolutionContext, TypeResolver };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::type_base::{ Type };
@@ -112,19 +111,19 @@ type struct MonoAstResolver {
                 const decl: StructDeclNode* = ast_node as StructDeclNode*;
                 if (decl == null) { return; }
                 this.type_resolver.resolve_fields(decl.fields, &res_ctx);
-                this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
+                this.resolve_methods(decl.methods, &res_ctx, this_type);
             }
             NodeKind::UnionDeclaration => {
                 const decl: UnionDeclNode* = ast_node as UnionDeclNode*;
                 if (decl == null) { return; }
                 this.type_resolver.resolve_fields(decl.fields, &res_ctx);
-                this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
+                this.resolve_methods(decl.methods, &res_ctx, this_type);
             }
             NodeKind::ClassDeclaration => {
                 const decl: ClassDeclNode* = ast_node as ClassDeclNode*;
                 if (decl == null) { return; }
                 this.type_resolver.resolve_fields(decl.fields, &res_ctx);
-                this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
+                this.resolve_methods(decl.methods, &res_ctx, this_type);
             }
             NodeKind::EnumDeclaration => {
                 // Enum variants use SymbolStr names; resolution handled in
@@ -134,7 +133,7 @@ type struct MonoAstResolver {
                 const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
                 if (decl == null) { return; }
                 // Free functions have no `this`.
-                this.resolve_func_and_body(decl, &res_ctx, subst, TypeRef::invalid());
+                this.resolve_func_and_body(decl, &res_ctx, TypeRef::invalid());
             }
             NodeKind::ImplementationBlock => {
                 const decl: ImplBlockNode* = ast_node as ImplBlockNode*;
@@ -162,7 +161,7 @@ type struct MonoAstResolver {
                 // BODIES so a struct literal `Pair<A, A>{..}` becomes concrete before
                 // body resolution.  Run before resolve_methods.
                 this.trait_spec.substitute_derived_params_in_method_bodies(decl);
-                this.resolve_methods(decl.methods, &res_ctx, subst, this_type);
+                this.resolve_methods(decl.methods, &res_ctx, this_type);
             }
             _ => {}
         }
@@ -506,7 +505,7 @@ type struct MonoAstResolver {
     /// Resolve signatures on an array of methods; delegates core signature
     /// resolution to TypeResolver, then resolves body locals.
     resolve_methods(mut &this, methods: &MethodNode*[], res_ctx: ResolutionContext*,
-                    subst: TypeSubstitution*, this_type: TypeRef) -> void {
+                    this_type: TypeRef) -> void {
         // Share `nested_visited` across all methods in this impl block so repeated
         // return types only produce a single monomorphization request per impl.
         this.state.nested_visited = [];
@@ -535,11 +534,11 @@ type struct MonoAstResolver {
                     if (gp == null) { continue; }
                     const gp_ref: TypeRef = this.arena.create_generic_param(
                         gp.name, j as u64);
-                    method_ctx.add_binding(gp.name, gp_ref);
+                    method_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
                 }
-                this.resolve_func_and_body(method.func, &method_ctx, subst, m_this);
+                this.resolve_func_and_body(method.func, &method_ctx, m_this);
             } else {
-                this.resolve_func_and_body(method.func, res_ctx, subst, m_this);
+                this.resolve_func_and_body(method.func, res_ctx, m_this);
             }
         }
     }
@@ -549,9 +548,12 @@ type struct MonoAstResolver {
     ///
     /// Sema typed the body and stashed every generic call; MonoCallSpecializer
     /// consumes the stash.  Only local-decl resolution + return-type nested
-    /// discovery remain here.
+    /// discovery remain here.  The signature's annotations were rewritten by
+    /// the substituter before this runs, so a parameter left in one names a
+    /// declaration the clone cannot see, and there is no second context to
+    /// try it under.
     resolve_func_and_body(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*,
-                          subst: TypeSubstitution*, this_type: TypeRef) -> void {
+                          this_type: TypeRef) -> void {
         // Spec'd method clones have their `&this` parameter annotated as
         // `Reference(ThisType)`; thread `this_type` onto a per-call copy of the
         // context so `&this` resolves to `Reference(<spec'd_owner>)`.
@@ -577,46 +579,6 @@ type struct MonoAstResolver {
                 }
             }
         }
-        // Fallback resolution with substitution-derived bindings.  The
-        // ASTTypeSubstituter doesn't always reach every spot (virtual-dispatch gaps
-        // and some annotation kinds - Function, nested Generic - aren't walked), so
-        // a post-substitution annotation can still read `T` and the empty res_ctx
-        // can't resolve it.  Build a `gen_ctx` mapping every original generic-param
-        // SymbolStr to its concrete replacement and re-resolve still-invalid slots.
-        if (subst != null) {
-            mut gen_ctx: ResolutionContext = res_ctx.clone();
-            if (this_type.is_valid()) { gen_ctx.set_this_type(this_type); }
-            for (mut si: i64 = 0; si < subst.param_ids.length; si++) {
-                const param_t: Type* = this.arena.lookup(subst.param_ids[si]);
-                if (param_t != null && param_t.kind == TypeKind::GenericParam) {
-                    const gp: GenericParamType* = param_t as GenericParamType*;
-                    gen_ctx.add_binding(gp.param_name, subst.replacements[si]);
-                }
-            }
-            // Return type fallback.
-            if (!func.has_resolved_return_type() && func.return_type_annotation != null) {
-                const resolved: TypeRef = this.type_resolver.resolve(
-                    func.return_type_annotation, &gen_ctx);
-                if (resolved.is_valid()) {
-                    func.resolved_return_type = resolved;
-                }
-            }
-            // Param fallback: every still-unresolved explicitly-annotated parameter
-            // gets one more shot via the concrete-binding context.  Skips `&this`/
-            // `this` (back-filled above from `this_type`).
-            for (mut pi: i64 = 0; pi < func.parameters.length; pi++) {
-                const param: VarDeclNode* = func.parameters[pi];
-                if (param == null) { continue; }
-                if (param.resolved_type.is_valid()) { continue; }
-                if (param.type_annotation == null) { continue; }
-                const ptype: TypeRef = this.type_resolver.resolve(
-                    param.type_annotation, &gen_ctx);
-                if (ptype.is_valid()) {
-                    param.resolved_type = ptype;
-                }
-            }
-        }
-
         // Reduce concrete-base associated-type projections in the spec signature
         // (`P::Item` under `P := IntSeq` -> `i32`) so the signature is fully
         // concrete before it is registered/mangled.

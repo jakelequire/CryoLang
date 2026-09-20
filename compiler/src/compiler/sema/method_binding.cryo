@@ -46,6 +46,8 @@ import compiler::ast::expression::{
 import compiler::ast::node::{ ASTNode };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::sema::helpers::{ sema_expr_has_numeric_suffix };
 import compiler::sema::state::{ SemaState };
 import compiler::sema::symbolic_checker::{ SymbolicChecker };
@@ -932,7 +934,7 @@ type struct MethodBinding {
                         if (gp == null) { continue; }
                         const ar: TypeRef = this.ctx.type_resolver.resolve(member.generic_args[i], &imp_ctx);
                         if (!ar.is_valid()) { return fallback; }
-                        imp_ctx.add_binding(gp.name, ar);
+                        imp_ctx.add_binding(gp.sym_id, gp.name, ar);
                     }
                     const ir: TypeRef = this.ctx.type_resolver.resolve(
                         im.func.return_type_annotation, &imp_ctx);
@@ -994,7 +996,7 @@ type struct MethodBinding {
             for (mut i: i64 = 0; i < n; i++) {
                 const gp: GenericParamNode* = owner_params[i];
                 if (gp == null) { continue; }
-                res_ctx.add_binding(gp.name, this.types.view_type_arg_at(owner_ref, i));
+                res_ctx.add_binding(gp.sym_id, gp.name, this.types.view_type_arg_at(owner_ref, i));
             }
         }
         for (mut i: i64 = 0; i < found.func.generic_params.length; i++) {
@@ -1002,7 +1004,7 @@ type struct MethodBinding {
             if (gp == null) { continue; }
             const arg_ref: TypeRef = this.ctx.type_resolver.resolve(member.generic_args[i], &res_ctx);
             if (!arg_ref.is_valid()) { return fallback; }
-            res_ctx.add_binding(gp.name, arg_ref);
+            res_ctx.add_binding(gp.sym_id, gp.name, arg_ref);
         }
         const refined: TypeRef = this.ctx.type_resolver.resolve(ret_ann, &res_ctx);
         if (!refined.is_valid()) { return fallback; }
@@ -1429,7 +1431,7 @@ type struct MethodBinding {
             for (mut i: i64 = 0; i < n_owner; i++) {
                 const gp: GenericParamNode* = owner_params[i];
                 if (gp == null) { continue; }
-                owner_ctx.add_binding(gp.name, this.types.view_type_arg_at(recv_type, i));
+                owner_ctx.add_binding(gp.sym_id, gp.name, this.types.view_type_arg_at(recv_type, i));
             }
         }
         owner_ctx.set_this_type(recv_type);
@@ -1522,7 +1524,7 @@ type struct MethodBinding {
                 const gp: GenericParamNode* = orig_func.generic_params[i];
                 if (gp == null) { return []; }
                 const gp_ref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
-                infer_ctx.add_binding(gp.name, gp_ref);
+                infer_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
                 method_param_ids.push(gp_ref.id);
             }
             const this_amp: SymbolStr = this.intern.intern("&this");
@@ -1601,14 +1603,14 @@ type struct MethodBinding {
             // turbofish or expected-type hint required. Shares the free-function
             // projection; `ictx.bindings[i]` is index-aligned with
             // `orig_func.generic_params[i]` (both built from the same order).
-            mut method_param_names_d: SymbolStr[] = [];
+            mut method_param_syms_d: SymbolID[] = [];
             for (mut i: i64 = 0; i < n_method_params; i++) {
                 const gp: GenericParamNode* = orig_func.generic_params[i];
                 if (gp == null) { return []; }
-                method_param_names_d.push(gp.name);
+                method_param_syms_d.push(gp.sym_id);
             }
             this.ctx.type_resolver.project_where_bound_params_into(
-                &orig_func.trait_bounds, &method_param_names_d, &ictx, this.ctx.source_file,
+                &orig_func.trait_bounds, &method_param_syms_d, &ictx, this.ctx.source_file,
                 this.state.in_symbolic_check);
             for (mut i: i64 = 0; i < n_method_params; i++) {
                 const b: TypeRef = ictx.bindings[i];
@@ -1662,7 +1664,7 @@ type struct MethodBinding {
         for (mut i: i64 = 0; i < n_method_params; i++) {
             const gp: GenericParamNode* = orig_func.generic_params[i];
             if (gp == null) { return fallback; }
-            ret_ctx.add_binding(gp.name, method_bindings[i]);
+            ret_ctx.add_binding(gp.sym_id, gp.name, method_bindings[i]);
         }
         ret_ctx.set_this_type(recv_type);
         mut refined: TypeRef = this.ctx.type_resolver.resolve(ret_ann, &ret_ctx);
@@ -1704,7 +1706,7 @@ type struct MethodBinding {
                     if (ta == null) { continue; }
                     match (*ta) {
                         TypeAnnotation::Named(n) => {
-                            rc.add_binding(n.name, this.arena.inst_type_arg_at(subject, i));
+                            rc.add_binding(n.param_sym(), n.name, this.arena.inst_type_arg_at(subject, i));
                             const gp_ref: TypeRef = this.arena.create_generic_param(n.name, i as u64);
                             subst.add(gp_ref.id, this.arena.inst_type_arg_at(subject, i));
                         }
@@ -1759,8 +1761,8 @@ type struct MethodBinding {
         match (*ta) {
             TypeAnnotation::Named(n) => {
                 if (this.trait_checker().lookup_subst_for_param(n.name, subst).is_invalid()
-                        && res_ctx.lookup_binding(n.name).is_invalid()) {
-                    res_ctx.add_binding(n.name, concrete);
+                        && res_ctx.lookup_binding(n.param_sym()).is_invalid()) {
+                    res_ctx.add_binding(n.param_sym(), n.name, concrete);
                 }
             }
             TypeAnnotation::Pointer(p) => {
@@ -1951,7 +1953,7 @@ type struct MethodBinding {
                 if (ta == null) { continue; }
                 match (*ta) {
                     TypeAnnotation::Named(n) => {
-                        rc.add_binding(n.name, this.arena.inst_type_arg_at(subject_ref, i));
+                        rc.add_binding(n.param_sym(), n.name, this.arena.inst_type_arg_at(subject_ref, i));
                         const gp_ref: TypeRef = this.arena.create_generic_param(n.name, i as u64);
                         subst.add(gp_ref.id, this.arena.inst_type_arg_at(subject_ref, i));
                     }

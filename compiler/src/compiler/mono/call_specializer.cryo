@@ -65,6 +65,8 @@ import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::res::{ OverloadId, Res, ResBase, ResSlot };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{
     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
@@ -981,7 +983,7 @@ type struct MonoCallSpecializer {
 
         const recv_qname: SymbolStr = this.arena.get_qualified_name(recv_type);
         const spec_method: MethodNode* = this.specialize_method(
-            orig_method, &method_param_names, &bindings, recv_type, impl_node);
+            orig_method, &orig_func.generic_params, &bindings, recv_type, impl_node);
         if (spec_method == null) { return; }
 
         // Whether this spec is resolved through a PINNED `resolved_callee` (the
@@ -1232,10 +1234,10 @@ type struct MonoCallSpecializer {
                 return true;
             }
         }
-        mut empty_names: SymbolStr[] = [];
+        mut empty_params: GenericParamNode*[] = [];
         mut empty_args: TypeRef[] = [];
         const spec_method: MethodNode* = this.specialize_method(
-            orig, &empty_names, &empty_args, recv_type, impl_node);
+            orig, &empty_params, &empty_args, recv_type, impl_node);
         if (spec_method == null || spec_method.func == null) { return false; }
         impl_node.methods.push(spec_method);
         call.set_resolved_method(spec_method as ASTNode*);
@@ -1464,16 +1466,13 @@ type struct MonoCallSpecializer {
         if (!recv_type.is_valid() || owner_ast == null) { return false; }
         if (orig_method.func == null) { return false; }
 
-        mut method_param_names: SymbolStr[] = [];
         for (mut i: i64 = 0; i < orig_method.func.generic_params.length; i++) {
-            const gp: GenericParamNode* = orig_method.func.generic_params[i];
-            if (gp == null) { return false; }
-            method_param_names.push(gp.name);
+            if (orig_method.func.generic_params[i] == null) { return false; }
         }
-        if (method_param_names.length != method_binds.length) { return false; }
+        if (orig_method.func.generic_params.length != method_binds.length) { return false; }
 
         const spec_method: MethodNode* = this.specialize_method(
-            orig_method, &method_param_names, method_binds, recv_type, null);
+            orig_method, &orig_method.func.generic_params, method_binds, recv_type, null);
         if (spec_method == null || spec_method.func == null) { return false; }
 
         // A `-> Owner` (bare-template) return substitutes to the still-bare owner
@@ -1510,16 +1509,10 @@ type struct MonoCallSpecializer {
             if (recv_type.is_valid()) { prune_ctx.set_this_type(recv_type); }
             this.ast_resolver.prune_static_match_in_block(spec_method.func.body, &prune_ctx);
 
-            mut full_subst: TypeSubstitution = TypeSubstitution::empty();
-            this.add_owner_param_bindings(&full_subst, recv_type);
-            for (mut i: i64 = 0; i < method_param_names.length; i++) {
-                const pref: TypeRef = this.arena.create_generic_param(method_param_names[i], i as u64);
-                full_subst.add(pref.id, method_binds[i]);
-            }
             mut body_ctx: ResolutionContext = ResolutionContext::new("");
             // The body's local annotations were written in the owner's module;
             // the ambient scope chain is the caller's.
-            this.ast_resolver.resolve_func_and_body(spec_method.func, &body_ctx, &full_subst, recv_type);
+            this.ast_resolver.resolve_func_and_body(spec_method.func, &body_ctx, recv_type);
         }
 
         // Dedup: materialize once per (owner spec, method, bindings).
@@ -1920,14 +1913,22 @@ type struct MonoCallSpecializer {
 
     // -- The spec CORE: clone + substitute + re-resolve --
 
-    /// Clone a generic method's func, substitute its own generic params with `args`,
-    /// clear generic_params, and re-resolve the signature against the owner type.
+    /// Clone a generic method's func, substitute its own generic params
+    /// (`params`, the method's declared parameter nodes) with `args`, clear
+    /// generic_params, and re-resolve the signature against the owner type.
     /// Returns the spec'd MethodNode, or null if the signature didn't fully resolve.
     specialize_method(mut &this, original: MethodNode*,
-                      param_names: &SymbolStr[], args: &TypeRef[],
+                      params: &GenericParamNode*[], args: &TypeRef[],
                       owner_type: TypeRef, owner_impl: ImplBlockNode*) -> MethodNode* {
         if (original == null || original.func == null) { return null; }
-        if (param_names.length != args.length) { return null; }
+        if (params.length != args.length) { return null; }
+        mut param_names: SymbolStr[] = [];
+        mut param_syms: SymbolID[] = [];
+        for (mut i: i64 = 0; i < params.length; i++) {
+            if (params[i] == null) { return null; }
+            param_names.push(params[i].name);
+            param_syms.push(params[i].sym_id);
+        }
 
         mut arg_displays: SymbolStr[] = [];
         for (mut i: i64 = 0; i < args.length; i++) {
@@ -2015,19 +2016,22 @@ type struct MonoCallSpecializer {
             if (p != null) { p.set_resolved_type(TypeRef::invalid()); }
         }
 
-        // The substituter takes ownership of its `param_names`; `param_names` is
-        // borrowed here (by ref) so the caller stays its sole owner, so hand the
-        // substituter an INDEPENDENT copy rather than aliasing the caller's buffer
-        // (a by-value pass would shallow-copy it and both would free it -> the
-        // double-free heap-corruption wall).
+        // The substituter takes ownership of its parameter lists, so it is
+        // handed INDEPENDENT copies rather than the buffers this frame still
+        // owns (a by-value pass would shallow-copy them and both would free
+        // them -> the double-free heap-corruption wall).
         mut pn_owned: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < param_names.length; i++) { pn_owned.push(param_names[i]); }
+        mut ps_owned: SymbolID[] = [];
+        for (mut i: i64 = 0; i < param_names.length; i++) {
+            pn_owned.push(param_names[i]);
+            ps_owned.push(param_syms[i]);
+        }
         const empty_sym: SymbolStr = SymbolStr::empty();
         // No spec id: the base/spec names are empty here, so the substituter's
         // base-name rewrite cannot fire and has nothing to attach.
         mut substituter: ASTTypeSubstituter* = new ASTTypeSubstituter(
             subst_ptr, this.arena, this.intern_table,
-            empty_sym, empty_sym, pn_owned, arg_displays,
+            empty_sym, empty_sym, pn_owned, ps_owned, arg_displays,
             TypeRef::invalid());
         cloned_node.accept(substituter);
 
@@ -2044,7 +2048,8 @@ type struct MonoCallSpecializer {
             if (owner_type.is_valid()) { res_ctx.set_this_type(owner_type); }
             if (owner_impl != null) {
                 for (mut di: i64 = 0; di < owner_impl.derived_param_names.length; di++) {
-                    res_ctx.add_binding(owner_impl.derived_param_names[di],
+                    res_ctx.add_binding(owner_impl.derived_param_syms[di],
+                                        owner_impl.derived_param_names[di],
                                         owner_impl.derived_param_types[di]);
                 }
             }
@@ -2446,8 +2451,8 @@ type struct MonoCallSpecializer {
             const bound: TraitBound* = &tmpl_func.trait_bounds[bi];
             // Position of this bound's type parameter = index into `bindings`.
             mut idx: i64 = -1;
-            for (mut pi: i64 = 0; pi < entry.param_names.length; pi++) {
-                if (entry.param_names[pi].equals(bound.type_parameter)) {
+            for (mut pi: i64 = 0; pi < entry.param_syms.length; pi++) {
+                if (entry.param_syms[pi].equals(bound.subject_sym)) {
                     idx = pi;
                     break;
                 }

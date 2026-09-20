@@ -74,6 +74,8 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::types::ownership::{ OwnershipQuery };
@@ -120,7 +122,7 @@ type struct TypeResolutionRunner {
             generic_params, this.arena);
         for (mut i: i64 = 0; i < generic_params.length; i++) {
             const gp: GenericParamNode* = generic_params[i];
-            res_ctx.add_binding(gp.name, refs[i]);
+            res_ctx.add_binding(gp.sym_id, gp.name, refs[i]);
         }
     }
 
@@ -181,23 +183,23 @@ type struct TypeResolutionRunner {
                 if (gp == null) { continue; }
                 const arg_ty: TypeRef = this.resolver.resolve(gen.args[i], res_ctx);
                 if (!arg_ty.is_valid()) { continue; }
-                res_ctx.add_binding(gp.name, arg_ty);
+                res_ctx.add_binding(gp.sym_id, gp.name, arg_ty);
             }
             return;
         }
 
-        // Associated-type positional sugar (plan rule #6): a trait with 0
-        // generic params and exactly 1 associated type binds that associated
-        // type from a single positional arg - `implement Iterator<T>` =>
-        // `Item -> T`. Binds `Item` in the impl context so `This::Item` (and
-        // cloned trait default methods) resolve, and records the binding on
-        // the impl node so a concrete `X::Item` projection can look it up.
+        // Associated-type positional sugar: a trait with 0 generic params and
+        // exactly 1 associated type binds that associated type from a single
+        // positional arg - `implement Iterator<T>` => `Item -> T`. Binds
+        // `This::Item` in the impl context so a cloned trait default's body
+        // resolves it, and records the binding on the impl node so a
+        // concrete `X::Item` projection can look it up.
         if (trait_decl.assoc_types.length == 1 && nargs == 1) {
             const adecl: AssocTypeDeclNode* = trait_decl.assoc_types[0];
             if (adecl != null) {
                 const arg_ty: TypeRef = this.resolver.resolve(gen.args[0], res_ctx);
                 if (arg_ty.is_valid()) {
-                    res_ctx.add_binding(adecl.name, arg_ty);
+                    res_ctx.add_assoc_binding(adecl.name, arg_ty);
                 }
                 if (impl_node.lookup_assoc_binding(adecl.name) == null) {
                     impl_node.add_assoc_binding(adecl.name, gen.args[0]);
@@ -1342,10 +1344,10 @@ type struct TypeResolutionPasses {
     /// impl-specialization substituter (keyed on the impl's own params, e.g.
     /// `T`) never touches; the leftover generic surfaces as an invalid
     /// TypeRef and crashes the mangler when the method is later specialized
-    /// for a concrete instantiation.  `param_names[i]` maps to `arg_anns[i]`;
+    /// for a concrete instantiation.  `param_syms[i]` maps to `arg_anns[i]`;
     /// complex args (e.g. `Pair<u64, A>`) are deep-cloned into the slot.
     static rewrite_trait_params_annotation(ann: TypeAnnotation*,
-                                            param_names: &SymbolStr[],
+                                            param_syms: &SymbolID[],
                                             arg_anns: &TypeAnnotation*[]) -> void {
         if (ann == null) { return; }
         match (*ann) {
@@ -1353,8 +1355,10 @@ type struct TypeResolutionPasses {
                 // Pre-resolved leaves already map to a concrete TypeRef and
                 // can't be a trait param awaiting substitution.
                 if (n.pre_resolved.is_valid()) { return; }
-                for (mut i: i64 = 0; i < param_names.length; i++) {
-                    if (n.name.equals(param_names[i])) {
+                const sym: SymbolID = n.param_sym();
+                if (!sym.is_valid()) { return; }
+                for (mut i: i64 = 0; i < param_syms.length; i++) {
+                    if (sym.equals(param_syms[i])) {
                         const cloned: TypeAnnotation* =
                             TypeAnnotation::clone_ptr(arg_anns[i]);
                         if (cloned != null) {
@@ -1366,36 +1370,36 @@ type struct TypeResolutionPasses {
             }
             TypeAnnotation::Reference(r) => {
                 TypeResolutionPasses::rewrite_trait_params_annotation(
-                    r.inner, param_names, arg_anns);
+                    r.inner, param_syms, arg_anns);
             }
             TypeAnnotation::Pointer(p) => {
                 TypeResolutionPasses::rewrite_trait_params_annotation(
-                    p.inner, param_names, arg_anns);
+                    p.inner, param_syms, arg_anns);
             }
             TypeAnnotation::Array(a) => {
                 TypeResolutionPasses::rewrite_trait_params_annotation(
-                    a.element, param_names, arg_anns);
+                    a.element, param_syms, arg_anns);
             }
             TypeAnnotation::Generic(g) => {
                 TypeResolutionPasses::rewrite_trait_params_annotation(
-                    g.base, param_names, arg_anns);
+                    g.base, param_syms, arg_anns);
                 for (mut i: i64 = 0; i < g.args.length; i++) {
                     TypeResolutionPasses::rewrite_trait_params_annotation(
-                        g.args[i], param_names, arg_anns);
+                        g.args[i], param_syms, arg_anns);
                 }
             }
             TypeAnnotation::Tuple(tu) => {
                 for (mut i: i64 = 0; i < tu.elements.length; i++) {
                     TypeResolutionPasses::rewrite_trait_params_annotation(
-                        tu.elements[i], param_names, arg_anns);
+                        tu.elements[i], param_syms, arg_anns);
                 }
             }
             TypeAnnotation::Function(f) => {
                 TypeResolutionPasses::rewrite_trait_params_annotation(
-                    f.return_type, param_names, arg_anns);
+                    f.return_type, param_syms, arg_anns);
                 for (mut i: i64 = 0; i < f.parameters.length; i++) {
                     TypeResolutionPasses::rewrite_trait_params_annotation(
-                        f.parameters[i], param_names, arg_anns);
+                        f.parameters[i], param_syms, arg_anns);
                 }
             }
             _ => { }
@@ -1410,7 +1414,7 @@ type struct TypeResolutionPasses {
     static rewrite_default_method_signature(cloned: FunctionDeclNode*,
                                             target: SymbolStr,
                                             target_args: &TypeAnnotation*[],
-                                            param_names: &SymbolStr[],
+                                            param_syms: &SymbolID[],
                                             arg_anns: &TypeAnnotation*[],
                                             home_span: SourceSpan,
                                             home_res: ResSlot) -> void {
@@ -1418,9 +1422,9 @@ type struct TypeResolutionPasses {
         const ret_ann: TypeAnnotation* = cloned.return_type_annotation;
         if (ret_ann != null) {
             TypeResolutionPasses::rewrite_this_type_annotation(ret_ann, target, target_args, home_span, home_res);
-            if (param_names.length > 0) {
+            if (param_syms.length > 0) {
                 TypeResolutionPasses::rewrite_trait_params_annotation(
-                    ret_ann, param_names, arg_anns);
+                    ret_ann, param_syms, arg_anns);
             }
         }
         for (mut p: i64 = 0; p < cloned.parameters.length; p++) {
@@ -1428,9 +1432,9 @@ type struct TypeResolutionPasses {
             if (param != null && param.type_annotation != null) {
                 TypeResolutionPasses::rewrite_this_type_annotation(
                     param.type_annotation, target, target_args, home_span, home_res);
-                if (param_names.length > 0) {
+                if (param_syms.length > 0) {
                     TypeResolutionPasses::rewrite_trait_params_annotation(
-                        param.type_annotation, param_names, arg_anns);
+                        param.type_annotation, param_syms, arg_anns);
                 }
             }
         }
@@ -2080,15 +2084,15 @@ type struct TypeResolutionPasses {
         const arg_count: i64 = if (gen != null) { gen.args.length } else { 0 };
         const args_ref: &TypeAnnotation*[] =
             if (gen != null) { &gen.args } else { &empty_args };
-        mut trait_param_names: SymbolStr[] = [];
+        mut trait_param_syms: SymbolID[] = [];
         if (arg_count == trait_decl.generic_params.length) {
             for (mut gi: i64 = 0; gi < trait_decl.generic_params.length; gi++) {
                 const gp: GenericParamNode* = trait_decl.generic_params[gi];
                 if (gp == null) {
-                    trait_param_names = [];
+                    trait_param_syms = [];
                     break;
                 }
-                trait_param_names.push(gp.name);
+                trait_param_syms.push(gp.sym_id);
             }
         }
 
@@ -2157,7 +2161,7 @@ type struct TypeResolutionPasses {
                 };
             TypeResolutionPasses::rewrite_default_method_signature(
                 cloned, impl_node.target_type, impl_node.target_args,
-                trait_param_names, args_ref, this_home_span, impl_node.res);
+                trait_param_syms, args_ref, this_home_span, impl_node.res);
             mut method: MethodNode* = new MethodNode(cloned, cloned.span);
             method.set_static(cloned.is_static);
             impl_node.add_method(method);
@@ -3382,7 +3386,7 @@ type struct TypeResolutionPasses {
                     for (mut gpi: i64 = 0; gpi < node.generic_params.length; gpi++) {
                         const gp: GenericParamNode* = node.generic_params[gpi];
                         if (gp == null) { continue; }
-                        res_ctx.add_binding(gp.name, refs[gpi]);
+                        res_ctx.add_binding(gp.sym_id, gp.name, refs[gpi]);
                     }
 
                     // Discriminants come from the declaration itself, which

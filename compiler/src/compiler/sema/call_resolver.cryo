@@ -76,6 +76,8 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::sema::diagnostics::{ Diagnostics };
 import compiler::sema::dispatch::{ SemaDispatch };
 import compiler::sema::helpers::{
@@ -1659,7 +1661,7 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < n_method_params; i++) {
             const gp: GenericParamNode* = orig_func.generic_params[i];
             if (gp == null) { return out; }
-            pctx.add_binding(gp.name, bindings[i]);
+            pctx.add_binding(gp.sym_id, gp.name, bindings[i]);
         }
         pctx.set_this_type(recv_type);
 
@@ -1718,13 +1720,13 @@ type struct CallResolver {
     /// `where F: Future<R>`) by projecting it off the now-bound subject
     /// (`R = F::Output`). Thin wrapper over the shared
     /// `TypeResolver::project_where_bound_params_into`, which the static + instance
-    /// generic-method paths share; the template's `param_names` are index-aligned
+    /// generic-method paths share; the template's `param_syms` are index-aligned
     /// with `ictx.bindings`, exactly as that helper requires.
     project_where_bound_params(mut &this, tmpl: FunctionDeclNode*, entry: TemplateEntry*,
                                ictx: InferCtx*) -> void {
         if (this.ctx.type_resolver == null) { return; }
         this.ctx.type_resolver.project_where_bound_params_into(
-            &tmpl.trait_bounds, &entry.param_names, ictx, this.ctx.source_file,
+            &tmpl.trait_bounds, &entry.param_syms, ictx, this.ctx.source_file,
             this.state.in_symbolic_check);
     }
 
@@ -3462,8 +3464,8 @@ type struct CallResolver {
         for (mut bi: i64 = 0; bi < func.trait_bounds.length; bi++) {
             const bound: &TraitBound = &func.trait_bounds[bi];
             mut concrete: TypeRef = TypeRef::invalid();
-            for (mut pi: i64 = 0; pi < tmpl.param_names.length; pi++) {
-                if (tmpl.param_names[pi].equals(bound.type_parameter)) { concrete = inst.type_args[pi]; break; }
+            for (mut pi: i64 = 0; pi < tmpl.param_syms.length; pi++) {
+                if (tmpl.param_syms[pi].equals(bound.subject_sym)) { concrete = inst.type_args[pi]; break; }
             }
             if (!concrete.is_valid()) { continue; }
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
@@ -3520,8 +3522,8 @@ type struct CallResolver {
         for (mut bi: i64 = 0; bi < iter_fn.trait_bounds.length; bi++) {
             const bound: &TraitBound = &iter_fn.trait_bounds[bi];
             mut concrete: TypeRef = TypeRef::invalid();
-            for (mut pi: i64 = 0; pi < tmpl.param_names.length; pi++) {
-                if (tmpl.param_names[pi].equals(bound.type_parameter)) { concrete = inst.type_args[pi]; break; }
+            for (mut pi: i64 = 0; pi < tmpl.param_syms.length; pi++) {
+                if (tmpl.param_syms[pi].equals(bound.subject_sym)) { concrete = inst.type_args[pi]; break; }
             }
             if (!concrete.is_valid()) { continue; }
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
@@ -4406,7 +4408,7 @@ type struct CallResolver {
     }
 
     /// E0306 where-clause bound check for a generic call whose bound args are in
-    /// `bindings` (declaration order, index-aligned with `entry.param_names`).
+    /// `bindings` (declaration order, index-aligned with `entry.param_syms`).
     /// Emits the bound failure and returns false on the first unsatisfied bound;
     /// true when every bound holds (or the arg is still abstract/skippable).
     /// Shared by the free-function and static-method-template call paths.
@@ -4415,8 +4417,8 @@ type struct CallResolver {
         for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length; bi++) {
             const bound: TraitBound* = &tmpl.trait_bounds[bi];
             mut idx: i64 = -1;
-            for (mut pi: i64 = 0; pi < entry.param_names.length; pi++) {
-                if (entry.param_names[pi].equals(bound.type_parameter)) { idx = pi; break; }
+            for (mut pi: i64 = 0; pi < entry.param_syms.length; pi++) {
+                if (entry.param_syms[pi].equals(bound.subject_sym)) { idx = pi; break; }
             }
             if (idx < 0 || idx >= bindings.length) { continue; }
             const concrete: TypeRef = bindings[idx];
@@ -4585,10 +4587,10 @@ type struct CallResolver {
         // PASS D - a method param that appears only in a where-bound (`R` in
         // `make<F, R>(fut: F) -> R where F: Future<R>`) projects off its now-bound
         // subject; `ictx.bindings[i]` is index-aligned with `func.generic_params[i]`.
-        mut method_names_d: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < n; i++) { method_names_d.push(func.generic_params[i].name); }
+        mut method_syms_d: SymbolID[] = [];
+        for (mut i: i64 = 0; i < n; i++) { method_syms_d.push(func.generic_params[i].sym_id); }
         this.ctx.type_resolver.project_where_bound_params_into(
-            &func.trait_bounds, &method_names_d, &ictx, this.ctx.source_file,
+            &func.trait_bounds, &method_syms_d, &ictx, this.ctx.source_file,
             this.state.in_symbolic_check);
         mut bindings: TypeRef[] = [];
         for (mut i: i64 = 0; i < ictx.bindings.length; i++) { bindings.push(ictx.bindings[i]); }

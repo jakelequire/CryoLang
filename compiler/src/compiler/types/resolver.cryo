@@ -58,6 +58,8 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::substitution;
 import compiler::types::substitution::{ TypeSubstitution };
@@ -70,12 +72,31 @@ import compiler::types::type_ref::{ TypeRef };
 
 // ResolutionContext: context for type resolution
 
+/// One type parameter bound to a type, keyed by the parameter's symbol.
+///
+/// The spelling rides along for the one consumer that mints an arena
+/// parameter type from a binding (`cache_derived_trait_params`); it is
+/// never what a binding is looked up by.  Two parameters may share a
+/// spelling - a trait default's own `<U>` and the `implement<U>` its body is
+/// copied under - and only the symbol says which one a written `U` names.
+type struct GenericBinding {
+    sym:  SymbolID;
+    name: SymbolStr;
+    ty:   TypeRef;
+}
+
 /// Ambient state needed while resolving type annotations.
 type struct ResolutionContext {
     /// The module an instantiation resolved through this context is demanded
     /// for, so per-module codegen emits it there.
     source_file:      string;
-    generic_bindings: Pair<SymbolStr, TypeRef>[];  // generic name -> bound TypeRef
+    generic_bindings: GenericBinding[];
+    /// An associated type of `This` bound to a type, by the member's
+    /// spelling: `This::Item` in a default's body under an impl that binds
+    /// `Item`.  A separate table because an associated type is not a symbol
+    /// the name layer declares - its identity is the trait's and the
+    /// member's name - so it cannot share the parameters' key.
+    assoc_bindings:   Pair<SymbolStr, TypeRef>[];
     /// What `This` resolves to in the current scope.
     /// Inside an impl block: the implementing type (same as `&this` owner).
     /// Inside a trait decl: a synthetic GenericParam("This") placeholder
@@ -100,21 +121,40 @@ type struct ResolutionContext {
         return ResolutionContext {
             source_file:      source_file,
             generic_bindings: [],
+            assoc_bindings:   [],
             this_type:        TypeRef::invalid(),
             symbolic_no_demand: false,
         };
     }
 
-    /// Add a generic binding (e.g., T -> i32).
-    add_binding(mut &this, name: SymbolStr, bound_type: TypeRef) -> void {
-        this.generic_bindings.push(Pair<SymbolStr, TypeRef>::new(name, bound_type));
+    /// Bind the parameter `sym` was declared as to `bound_type`.  An invalid
+    /// symbol names no parameter - a written arg that is a concrete type, a
+    /// synthesized node nothing stamped - and binds nothing.
+    add_binding(mut &this, sym: SymbolID, name: SymbolStr, bound_type: TypeRef) -> void {
+        if (!sym.is_valid()) { return; }
+        this.generic_bindings.push(GenericBinding { sym: sym, name: name, ty: bound_type });
     }
 
-    /// Look up a generic binding by name.
-    lookup_binding(&this, name: SymbolStr) -> TypeRef {
+    /// The type the parameter `sym` is bound to, or invalid.
+    lookup_binding(&this, sym: SymbolID) -> TypeRef {
         for (mut i: i64 = 0; i < this.generic_bindings.length; i++) {
-            if (this.generic_bindings[i].first.equals(name)) {
-                return this.generic_bindings[i].second;
+            if (this.generic_bindings[i].sym.equals(sym)) {
+                return this.generic_bindings[i].ty;
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Bind `This::member` to `bound_type`.
+    add_assoc_binding(mut &this, member: SymbolStr, bound_type: TypeRef) -> void {
+        this.assoc_bindings.push(Pair<SymbolStr, TypeRef>::new(member, bound_type));
+    }
+
+    /// The type `This::member` is bound to, or invalid.
+    lookup_assoc_binding(&this, member: SymbolStr) -> TypeRef {
+        for (mut i: i64 = 0; i < this.assoc_bindings.length; i++) {
+            if (this.assoc_bindings[i].first.equals(member)) {
+                return this.assoc_bindings[i].second;
             }
         }
         return TypeRef::invalid();
@@ -129,16 +169,20 @@ type struct ResolutionContext {
     /// `generic_bindings` buffer between the original and the copy, so a
     /// later `push`/realloc on either invalidates the other and end-of-scope
     /// drop-glue frees one buffer twice (double-free).  This produces an
-    /// independent context with its own `generic_bindings` storage.  The
-    /// element type `Pair<SymbolStr, TypeRef>` is POD (interned ids), so the
-    /// per-element copies are trivial.
+    /// independent context with its own binding storage.  The element types
+    /// are POD (interned ids), so the per-element copies are trivial.
     clone(&this) -> ResolutionContext {
         mut out: ResolutionContext = ResolutionContext::new(this.source_file);
         out.this_type = this.this_type;
         out.symbolic_no_demand = this.symbolic_no_demand;
         for (mut i: i64 = 0; i < this.generic_bindings.length; i++) {
-            out.add_binding(this.generic_bindings[i].first,
-                            this.generic_bindings[i].second);
+            out.add_binding(this.generic_bindings[i].sym,
+                            this.generic_bindings[i].name,
+                            this.generic_bindings[i].ty);
+        }
+        for (mut i: i64 = 0; i < this.assoc_bindings.length; i++) {
+            out.add_assoc_binding(this.assoc_bindings[i].first,
+                                  this.assoc_bindings[i].second);
         }
         return out;
     }
@@ -355,7 +399,7 @@ type struct TypeResolver {
 
         match (*proj.base) {
             TypeAnnotation::ThisType(_tt) => {
-                const b: TypeRef = ctx.lookup_binding(proj.member);
+                const b: TypeRef = ctx.lookup_assoc_binding(proj.member);
                 if (b.is_valid()) { return b; }
                 if (ctx.this_type.is_valid()) {
                     return this.project_from_base(ctx.this_type, proj, ctx);
@@ -504,7 +548,7 @@ type struct TypeResolver {
                     const ta: TypeAnnotation* = impl_node.target_args[ti];
                     if (ta == null) { continue; }
                     match (*ta) {
-                        TypeAnnotation::Named(n) => { bctx.add_binding(n.name, base_args[ti]); }
+                        TypeAnnotation::Named(n) => { bctx.add_binding(n.param_sym(), n.name, base_args[ti]); }
                         _ => {}
                     }
                 }
@@ -544,7 +588,7 @@ type struct TypeResolver {
         if (impl_node == null) { return; }
         for (mut bi: i64 = 0; bi < impl_node.where_bounds.length; bi++) {
             const bound: TraitBound* = &impl_node.where_bounds[bi];
-            const subject: TypeRef = bctx.lookup_binding(bound.type_parameter);
+            const subject: TypeRef = bctx.lookup_binding(bound.subject_sym);
             if (!subject.is_valid()) { continue; }
             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                 const tr: TraitRef* = &bound.trait_refs[ti];
@@ -584,8 +628,8 @@ type struct TypeResolver {
         if (ta == null || !concrete.is_valid()) { return; }
         match (*ta) {
             TypeAnnotation::Named(n) => {
-                if (!bctx.lookup_binding(n.name).is_valid()) {
-                    bctx.add_binding(n.name, concrete);
+                if (!bctx.lookup_binding(n.param_sym()).is_valid()) {
+                    bctx.add_binding(n.param_sym(), n.name, concrete);
                 }
             }
             TypeAnnotation::Pointer(p) => {
@@ -615,7 +659,7 @@ type struct TypeResolver {
     /// each still-unbound assoc-slot param, project the trait's assoc type off the
     /// now-bound subject and fill it, so argument inference alone settles a
     /// return-only / bound-only param without a turbofish or expected-type hint.
-    /// `param_names[i]` MUST align with `ictx.bindings[i]` (the caller builds the
+    /// `param_syms[i]` MUST align with `ictx.bindings[i]` (the caller builds the
     /// InferCtx from the same ordered param list). Index-keyed analogue of the
     /// impl-side `derive_where_assoc_bindings`; an existing binding is kept.
     ///
@@ -641,13 +685,13 @@ type struct TypeResolver {
     /// unspecialized (E0636). Outside the symbolic walk an abstract subject has no
     /// findable impl, so it still derives nothing.
     project_where_bound_params_into(&this, trait_bounds: &TraitBound[],
-                                    param_names: &SymbolStr[], ictx: InferCtx*,
+                                    param_syms: &SymbolID[], ictx: InferCtx*,
                                     source_file: string, symbolic: boolean) -> void {
         if (this.generic_registry == null) { return; }
         for (mut bi: i64 = 0; bi < trait_bounds.length; bi++) {
             const bound: TraitBound* = &trait_bounds[bi];
             if (bound.has_projection_subject()) { continue; }
-            const s: i64 = this.param_name_slot(param_names, bound.type_parameter);
+            const s: i64 = this.param_slot(param_syms, bound.subject_sym);
             if (s < 0 || s >= ictx.bindings.length) { continue; }
             const subject: TypeRef = ictx.bindings[s];
             if (!subject.is_valid()) { continue; }
@@ -673,12 +717,12 @@ type struct TypeResolver {
                     // only by destructuring what the projection yields, which
                     // `bind_where_arg_params_from` does below. Both need the same
                     // projection, so decide which case this is, then project once.
-                    const j: i64 = this.where_arg_param_slot(arg_ann, param_names);
+                    const j: i64 = this.where_arg_param_slot(arg_ann, param_syms);
                     if (j >= 0) {
                         if (j >= ictx.bindings.length || ictx.bindings[j].is_valid()) { continue; }
                     } else {
                         // Nothing left to solve in this arg: don't pay for a lookup.
-                        if (!this.where_arg_has_unbound_param(arg_ann, param_names, ictx)) { continue; }
+                        if (!this.where_arg_has_unbound_param(arg_ann, param_syms, ictx)) { continue; }
                     }
                     mut rc: ResolutionContext = ResolutionContext::new("");
                     const member: SymbolStr = tdecl.assoc_types[assoc_idx].name;
@@ -698,29 +742,32 @@ type struct TypeResolver {
                     if (j >= 0) {
                         ictx.bind_slot(j, derived);
                     } else {
-                        this.bind_where_arg_params_from(arg_ann, param_names, derived, ictx);
+                        this.bind_where_arg_params_from(arg_ann, param_syms, derived, ictx);
                     }
                 }
             }
         }
     }
 
-    /// Index of `name` in an ordered generic-param-name list, or -1. The list,
-    /// the caller's param-id list, and the InferCtx's `bindings` share one index
-    /// space (all built from the same ordered generic params).
-    param_name_slot(&this, param_names: &SymbolStr[], name: SymbolStr) -> i64 {
-        for (mut i: i64 = 0; i < param_names.length; i++) {
-            if (param_names[i].equals(name)) { return i; }
+    /// Index of the parameter `sym` in an ordered generic-param list, or -1.
+    /// The list, the caller's arena param-id list, and the InferCtx's
+    /// `bindings` share one index space (all built from the same ordered
+    /// generic params).  An invalid symbol - a spelling that is no parameter
+    /// of this list's owner - is in no slot.
+    param_slot(&this, param_syms: &SymbolID[], sym: SymbolID) -> i64 {
+        if (!sym.is_valid()) { return -1; }
+        for (mut i: i64 = 0; i < param_syms.length; i++) {
+            if (param_syms[i].equals(sym)) { return i; }
         }
         return -1;
     }
 
     /// The param-list index a where-bound trait arg names, or -1 when it is not a
     /// bare `Named` parameter reference (a wrapped/concrete arg derives nothing).
-    where_arg_param_slot(&this, ta: TypeAnnotation*, param_names: &SymbolStr[]) -> i64 {
+    where_arg_param_slot(&this, ta: TypeAnnotation*, param_syms: &SymbolID[]) -> i64 {
         if (ta == null) { return -1; }
         match (*ta) {
-            TypeAnnotation::Named(n) => { return this.param_name_slot(param_names, n.name); }
+            TypeAnnotation::Named(n) => { return this.param_slot(param_syms, n.param_sym()); }
             _                       => { return -1; }
         }
     }
@@ -730,18 +777,18 @@ type struct TypeResolver {
     /// `project_where_bound_params_into`: an arg that can bind nothing new must
     /// not pay for the lookup, which keeps the cost of the compound case on the
     /// bounds that actually need it.
-    where_arg_has_unbound_param(&this, ta: TypeAnnotation*, param_names: &SymbolStr[],
+    where_arg_has_unbound_param(&this, ta: TypeAnnotation*, param_syms: &SymbolID[],
                                 ictx: InferCtx*) -> boolean {
         if (ta == null) { return false; }
         match (*ta) {
             TypeAnnotation::Named(n) => {
-                const s: i64 = this.param_name_slot(param_names, n.name);
+                const s: i64 = this.param_slot(param_syms, n.param_sym());
                 if (s < 0 || s >= ictx.bindings.length) { return false; }
                 return !ictx.bindings[s].is_valid();
             }
             TypeAnnotation::Generic(g) => {
                 for (mut i: i64 = 0; i < g.args.length; i++) {
-                    if (this.where_arg_has_unbound_param(g.args[i], param_names, ictx)) { return true; }
+                    if (this.where_arg_has_unbound_param(g.args[i], param_syms, ictx)) { return true; }
                 }
                 return false;
             }
@@ -764,12 +811,12 @@ type struct TypeResolver {
     /// shape mismatch is a silent no-op rather than an error: this is inference,
     /// and `check_call_where_bounds` is what rejects a bound the subject really
     /// fails to satisfy.
-    bind_where_arg_params_from(&this, ta: TypeAnnotation*, param_names: &SymbolStr[],
+    bind_where_arg_params_from(&this, ta: TypeAnnotation*, param_syms: &SymbolID[],
                                actual: TypeRef, ictx: InferCtx*) -> void {
         if (ta == null || !actual.is_valid()) { return; }
         match (*ta) {
             TypeAnnotation::Named(n) => {
-                const s: i64 = this.param_name_slot(param_names, n.name);
+                const s: i64 = this.param_slot(param_syms, n.param_sym());
                 if (s >= 0) { ictx.bind_slot(s, actual); }
             }
             TypeAnnotation::Generic(g) => {
@@ -785,7 +832,7 @@ type struct TypeResolver {
                 if (!got.is_valid() || !got.equals(want)) { return; }
                 if (this.arena.inst_type_arg_count(actual) != g.args.length) { return; }
                 for (mut i: i64 = 0; i < g.args.length; i++) {
-                    this.bind_where_arg_params_from(g.args[i], param_names,
+                    this.bind_where_arg_params_from(g.args[i], param_syms,
                                                     this.arena.inst_type_arg_at(actual, i), ictx);
                 }
             }
@@ -1007,7 +1054,7 @@ type struct TypeResolver {
                 for (mut j: i64 = 0; j < method.func.generic_params.length; j++) {
                     const gp: GenericParamNode* = method.func.generic_params[j];
                     const gp_ref: TypeRef = this.create_param_type(gp, j as u64);
-                    method_ctx.add_binding(gp.name, gp_ref);
+                    method_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
                 }
                 this.resolve_func_signature(method.func, &method_ctx);
             } else {
@@ -1112,7 +1159,7 @@ type struct TypeResolver {
             // of the arguments resolved so far.
             mut def_ctx: ResolutionContext = ctx.clone();
             for (mut j: i64 = 0; j < filled.length; j++) {
-                def_ctx.add_binding(entry.param_names[j], filled[j]);
+                def_ctx.add_binding(entry.param_syms[j], entry.param_names[j], filled[j]);
             }
             const def_type: TypeRef = this.resolve(gp.default_annotation, &def_ctx);
             if (!def_type.is_valid()) { return filled; }
@@ -1149,7 +1196,7 @@ type struct TypeResolver {
                 for (mut j: i64 = 0; j < func.generic_params.length; j++) {
                     const gp: GenericParamNode* = func.generic_params[j];
                     const gp_ref: TypeRef = this.create_param_type(gp, j as u64);
-                    method_ctx.add_binding(gp.name, gp_ref);
+                    method_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
                 }
                 this.resolve_func_signature(func, &method_ctx);
             } else {
@@ -1276,7 +1323,8 @@ private:
     /// Resolve a named type (user-defined or generic binding).
     ///
     /// In order:
-    ///   1. Generic bindings (T -> i32 from enclosing generic context)
+    ///   1. Generic bindings (T -> i32 from enclosing generic context), asked
+    ///      by the parameter the stamp names, never by the spelling
     ///   2. Primitive name check (a primitive spelling that reached Named
     ///      position carrying no TypeRef of its own)
     ///   2c. The name layer's stamp on the node - what the written spelling
@@ -1294,8 +1342,12 @@ private:
         const name_str: string = this.intern_table.resolve(name);
         const name_len: i64 = name_str.length() as i64;
         LOG_DEBUG(LogComponent::TypeChecker, "resolve_named() name='%s'", name_str);
-        // 1. Check generic bindings first (O(1) SymbolStr comparison)
-        mut binding: TypeRef = ctx.lookup_binding(name);
+        // 1. A type parameter, bound in the enclosing generic context.  The
+        //    stamp says WHICH parameter the spelling names; the binding
+        //    table is keyed by that and holds nothing under a spelling, so a
+        //    trait default's own `<U>` copied under an `implement<U>` reads
+        //    its own binding and not the impl's.
+        mut binding: TypeRef = ctx.lookup_binding(slot.generic_param_sym());
         if (binding.is_valid()) {
             return binding;
         }
@@ -1303,10 +1355,11 @@ private:
         // 1b. Associated-type projection on a generic parameter: `I::Item`,
         //     where `I` is a generic parameter in scope. Such a projection is
         //     parsed as a FLAT qualified Named (only `This::Item` becomes a
-        //     Projection node), so detect it here: if the segment before the
-        //     first `::` binds to a type in scope, project the remainder off it.
-        //     A real module-qualified type (`core::iter::Foo`) has a prefix
-        //     (`core`) that is NOT a generic-param binding, so it is unaffected.
+        //     Projection node), and the stamp says the type layer owns the
+        //     rest of a path rooted at that parameter: if the parameter is
+        //     bound, project the remainder off its binding.  A real
+        //     module-qualified type (`core::iter::Foo`) is rooted at no
+        //     parameter, so it is unaffected.
         if (name_len > 2) {
             mut sep: i64 = -1;
             mut k: i64 = 0;
@@ -1315,9 +1368,7 @@ private:
                 k = k + 1;
             }
             if (sep > 0) {
-                const prefix_str: string = name_str.substring(0, sep as u32);
-                const prefix_sym: SymbolStr = this.intern_table.intern(prefix_str);
-                const prefix_ty: TypeRef = ctx.lookup_binding(prefix_sym);
+                const prefix_ty: TypeRef = ctx.lookup_binding(slot.relative_param_sym());
                 if (prefix_ty.is_valid()) {
                     const member_str: string =
                         name_str.substring((sep + 2) as u32, (name_len - sep - 2) as u32);
@@ -1558,7 +1609,7 @@ private:
                 if (alias_node != null && alias_node.target_annotation != null) {
                     mut alias_ctx: ResolutionContext = ctx.clone();
                     for (mut i: i64 = 0; i < entry.param_count; i++) {
-                        alias_ctx.add_binding(entry.param_names[i], args[i]);
+                        alias_ctx.add_binding(entry.param_syms[i], entry.param_names[i], args[i]);
                     }
                     LOG_DEBUG(LogComponent::TypeChecker,
                         "[TypeResolver] expanding generic alias '%s' with %d args",

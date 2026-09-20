@@ -52,6 +52,8 @@ import compiler::ast::statement::{
 };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::ast::visitor::{ BaseASTVisitor };
@@ -64,7 +66,15 @@ public:
     intern_table:      InternTable*;
     base_name:         SymbolStr;         // "Array"
     spec_name:         SymbolStr;         // "Array_i32"
+    /// The parameters' spellings, index-aligned with `param_syms` and the
+    /// substitution's replacements; a display, never a key.
     param_names:       SymbolStr[];       // ["T"]
+    /// The symbols the parameters were declared as.  A written `T` in the
+    /// cloned body carries its declaration's symbol in its stamp, and it is
+    /// rewritten only when that symbol is one of these: a trait default's
+    /// own `<U>` copied under an `implement<U>` keeps its `U` while the
+    /// impl's is rewritten, which no comparison of spellings can do.
+    param_syms:        SymbolID[];
     type_arg_displays: SymbolStr[];       // ["i32"]
     /// The arena id the specialization will occupy, or invalid when the caller
     /// has none.  Attached as `pre_resolved` to every annotation rewritten to
@@ -77,7 +87,8 @@ public:
     ASTTypeSubstituter(subst: TypeSubstitution*, arena: TypeArena*,
                        intern_table: InternTable*,
                        base_name: SymbolStr, spec_name: SymbolStr,
-                       param_names: SymbolStr[], type_arg_displays: SymbolStr[],
+                       param_names: SymbolStr[], param_syms: SymbolID[],
+                       type_arg_displays: SymbolStr[],
                        spec_typeref: TypeRef)
         : BaseASTVisitor() {
         this.subst             = subst;
@@ -86,8 +97,19 @@ public:
         this.base_name         = base_name;
         this.spec_name         = spec_name;
         this.param_names       = param_names;
+        this.param_syms        = param_syms;
         this.type_arg_displays = type_arg_displays;
         this.spec_typeref      = spec_typeref;
+    }
+
+    /// The slot of the parameter `sym`, or -1 when it is none of this
+    /// substitution's - including an invalid symbol, which names nothing.
+    param_slot(&this, sym: SymbolID) -> i64 {
+        if (!sym.is_valid()) { return -1; }
+        for (mut i: i64 = 0; i < this.param_syms.length; i++) {
+            if (this.param_syms[i].equals(sym)) { return i; }
+        }
+        return -1;
     }
 
 
@@ -203,13 +225,15 @@ public:
     substitute_named_annotation(ann: TypeAnnotation*, named: NamedAnnotation*) -> TypeAnnotation* {
         // Associated-type projection on a generic param written as a FLAT
         // qualified name (`I::Item` - only `This::Item` is a Projection node).
-        // If the segment before the first `::` is one of our substituted params,
-        // rewrite the whole thing to a `Projection` over the param's concrete
-        // replacement, so a field/signature type `(I::Item)->O` becomes a real
-        // projection over `IntSeq` that the resolver reduces to the member type.
-        const nm_str: string = this.intern_table.resolve(named.name);
-        const nm_len: i64 = nm_str.length() as i64;
-        if (nm_len > 2) {
+        // The stamp says which parameter the path is rooted at; when it is one
+        // of our substituted params, rewrite the whole thing to a `Projection`
+        // over the param's concrete replacement, so a field/signature type
+        // `(I::Item)->O` becomes a real projection over `IntSeq` that the
+        // resolver reduces to the member type.
+        const pi: i64 = this.param_slot(named.relative_param_sym());
+        if (pi >= 0) {
+            const nm_str: string = this.intern_table.resolve(named.name);
+            const nm_len: i64 = nm_str.length() as i64;
             mut sep: i64 = -1;
             mut k: i64 = 0;
             while (k + 1 < nm_len) {
@@ -217,95 +241,88 @@ public:
                 k = k + 1;
             }
             if (sep > 0) {
-                const pfx: string = nm_str.substring(0, sep as u32);
-                const pfx_sym: SymbolStr = this.intern_table.intern(pfx);
-                for (mut pi: i64 = 0; pi < this.param_names.length; pi++) {
-                    if (pfx_sym.equals(this.param_names[pi])) {
-                        const member_str: string = nm_str.substring((sep + 2) as u32, (nm_len - sep - 2) as u32);
-                        const member_sym: SymbolStr = this.intern_table.intern(member_str);
-                        const base_pre: TypeRef = this.resolved_arg_typeref(pi);
-                        const base_named: NamedAnnotation* = new NamedAnnotation {
-                            name:         this.type_arg_displays[pi],
-                            span:         named.span,
-                            pre_resolved: base_pre,
-                            res: ResSlot::Pending,
-                        };
-                        const base_ann: TypeAnnotation* =
-                            new TypeAnnotation::Named(base_named);
-                        const proj: ProjectionAnnotation* = new ProjectionAnnotation {
-                            base:         base_ann,
-                            member:       member_sym,
-                            owning_trait: SymbolStr::empty(),
-                            resolved:     TypeRef::invalid(),
-                            span:         named.span,
-                        };
-                        *ann = TypeAnnotation::Projection(proj);
-                        return ann;
-                    }
-                }
+                const member_str: string = nm_str.substring((sep + 2) as u32, (nm_len - sep - 2) as u32);
+                const member_sym: SymbolStr = this.intern_table.intern(member_str);
+                const base_pre: TypeRef = this.resolved_arg_typeref(pi);
+                const base_named: NamedAnnotation* = new NamedAnnotation {
+                    name:         this.type_arg_displays[pi],
+                    span:         named.span,
+                    pre_resolved: base_pre,
+                    res: ResSlot::Pending,
+                };
+                const base_ann: TypeAnnotation* =
+                    new TypeAnnotation::Named(base_named);
+                const proj: ProjectionAnnotation* = new ProjectionAnnotation {
+                    base:         base_ann,
+                    member:       member_sym,
+                    owning_trait: SymbolStr::empty(),
+                    resolved:     TypeRef::invalid(),
+                    span:         named.span,
+                };
+                *ann = TypeAnnotation::Projection(proj);
+                return ann;
             }
         }
 
-        // Check if this named annotation is one of our generic params.
-        for (mut i: i64 = 0; i < this.param_names.length; i++) {
-            if (named.name.equals(this.param_names[i])) {
-                // Instead of blindly setting named.name (which produces
-                // Named("i32"), Named("void*"), Named("Foo[]") that the
-                // resolver must parse), produce the correct annotation kind.
-                const display: string = this.intern_table.resolve(this.type_arg_displays[i]);
-                const display_len: i64 = display.length() as i64;
+        // The parameter this annotation names, when it is one of ours.
+        const i: i64 = this.param_slot(named.param_sym());
+        if (i >= 0) {
+            // Instead of blindly setting named.name (which produces
+            // Named("i32"), Named("void*"), Named("Foo[]") that the
+            // resolver must parse), produce the correct annotation kind.
+            const display: string = this.intern_table.resolve(this.type_arg_displays[i]);
+            const display_len: i64 = display.length() as i64;
 
-                // Unit type `()` has no Named form; it must become an empty Tuple
-                // annotation so resolve_tuple produces a valid unit TypeRef.
-                if (display_len == 2 && display[0] == '(' && display[1] == ')') {
-                    ASTTypeSubstituter::rewrite_to_unit(ann, named.span);
-                    return ann;
-                }
-                // Primitive type? -> Primitive annotation
-                if (ResBase::is_primitive_spelling(display)) {
-                    ASTTypeSubstituter::rewrite_to_primitive(ann, this.type_arg_displays[i], named.span);
-                    return ann;
-                }
-                // Pointer suffix? -> Pointer(Named(inner))
-                if (display_len > 1 && display[display_len - 1] == '*') {
-                    const inner_str: string = display.substr(0, display_len - 1);
-                    const inner_sym: SymbolStr = this.intern_table.intern(inner_str);
-                    // Unwrap one Pointer level off the substitution arg so
-                    // the inner Named gets a pre_resolved TypeRef. Critical
-                    // for sizeof/alignof in spec'd bodies; without it the
-                    // resolver falls back to bare-name lookup and fails for
-                    // any user-defined type not in scope at the spec site.
-                    const inner_pre: TypeRef = this.unwrap_pointer_pointee(
-                        this.resolved_arg_typeref(i));
-                    ASTTypeSubstituter::rewrite_to_pointer(ann, inner_sym, inner_pre, named.span);
-                    return ann;
-                }
-                // Array suffix? -> Array(Named(inner), -1)
-                if (display_len > 2 && display[display_len - 2] == '[' && display[display_len - 1] == ']') {
-                    const inner_str: string = display.substr(0, display_len - 2);
-                    const inner_sym: SymbolStr = this.intern_table.intern(inner_str);
-                    // Unwrap one Array level off the substitution arg so the
-                    // inner Named gets a pre_resolved TypeRef (mirrors the
-                    // Pointer branch above). Without it, a non-bare-name element
-                    // (a pointer, or an out-of-scope user type) resolves to
-                    // invalid and produces an Array<invalid> that ICEs mangling.
-                    const inner_pre: TypeRef = this.arena.array_element_of(
-                        this.resolved_arg_typeref(i).id);
-                    ASTTypeSubstituter::rewrite_to_array(ann, inner_sym, inner_pre, named.span);
-                    return ann;
-                }
-                // User-defined type: keep as Named with new name, and attach
-                // the pre-resolved TypeRef so the resolver doesn't need to
-                // re-derive it from the (potentially very long) mangled spec
-                // name. The substituter owns the answer here: subst.replacements[i]
-                // is the concrete TypeRef the user gave for this generic param.
-                // If it's still wrapped in InstantiatedType, follow through to
-                // the resolved struct/enum/class so resolve_named's caller sees
-                // a usable type immediately.
-                named.name = this.type_arg_displays[i];
-                named.pre_resolved = this.resolved_arg_typeref(i);
+            // Unit type `()` has no Named form; it must become an empty Tuple
+            // annotation so resolve_tuple produces a valid unit TypeRef.
+            if (display_len == 2 && display[0] == '(' && display[1] == ')') {
+                ASTTypeSubstituter::rewrite_to_unit(ann, named.span);
                 return ann;
             }
+            // Primitive type? -> Primitive annotation
+            if (ResBase::is_primitive_spelling(display)) {
+                ASTTypeSubstituter::rewrite_to_primitive(ann, this.type_arg_displays[i], named.span);
+                return ann;
+            }
+            // Pointer suffix? -> Pointer(Named(inner))
+            if (display_len > 1 && display[display_len - 1] == '*') {
+                const inner_str: string = display.substr(0, display_len - 1);
+                const inner_sym: SymbolStr = this.intern_table.intern(inner_str);
+                // Unwrap one Pointer level off the substitution arg so
+                // the inner Named gets a pre_resolved TypeRef. Critical
+                // for sizeof/alignof in spec'd bodies; without it the
+                // resolver falls back to bare-name lookup and fails for
+                // any user-defined type not in scope at the spec site.
+                const inner_pre: TypeRef = this.unwrap_pointer_pointee(
+                    this.resolved_arg_typeref(i));
+                ASTTypeSubstituter::rewrite_to_pointer(ann, inner_sym, inner_pre, named.span);
+                return ann;
+            }
+            // Array suffix? -> Array(Named(inner), -1)
+            if (display_len > 2 && display[display_len - 2] == '[' && display[display_len - 1] == ']') {
+                const inner_str: string = display.substr(0, display_len - 2);
+                const inner_sym: SymbolStr = this.intern_table.intern(inner_str);
+                // Unwrap one Array level off the substitution arg so the
+                // inner Named gets a pre_resolved TypeRef (mirrors the
+                // Pointer branch above). Without it, a non-bare-name element
+                // (a pointer, or an out-of-scope user type) resolves to
+                // invalid and produces an Array<invalid> that ICEs mangling.
+                const inner_pre: TypeRef = this.arena.array_element_of(
+                    this.resolved_arg_typeref(i).id);
+                ASTTypeSubstituter::rewrite_to_array(ann, inner_sym, inner_pre, named.span);
+                return ann;
+            }
+            // User-defined type: keep as Named with new name, and attach
+            // the pre-resolved TypeRef so the resolver doesn't need to
+            // re-derive it from the (potentially very long) mangled spec
+            // name. The substituter owns the answer here: subst.replacements[i]
+            // is the concrete TypeRef the user gave for this generic param.
+            // If it's still wrapped in InstantiatedType, follow through to
+            // the resolved struct/enum/class so resolve_named's caller sees
+            // a usable type immediately.
+            named.name = this.type_arg_displays[i];
+            named.pre_resolved = this.resolved_arg_typeref(i);
+            return ann;
         }
 
         // Rewrite the base type name to the specialized name.
@@ -391,14 +408,15 @@ public:
     /// to whatever the current spec used. Empty `args` is also a self-
     /// reference (a bare unparameterized name).
     args_are_outer_param_refs(&this, args: &TypeAnnotation*[]) -> boolean {
-        if (args.length > this.param_names.length) { return false; }
+        if (args.length > this.param_syms.length) { return false; }
         for (mut i: i64 = 0; i < args.length; i++) {
             const a: TypeAnnotation* = args[i];
             if (a == null) { return false; }
             mut matched: boolean = false;
             match (*a) {
                 TypeAnnotation::Named(named) => {
-                    matched = named.name.equals(this.param_names[i]);
+                    matched = named.param_sym().is_valid()
+                        && named.param_sym().equals(this.param_syms[i]);
                 }
                 _ => { matched = false; }
             }
@@ -695,13 +713,11 @@ public:
             // the clone's syntax is the template's - so the arena id is
             // recorded as well: it is the only carrier of which type the
             // segment now means that is not a spelling to be looked up.
-            for (mut i: i64 = 0; i < this.param_names.length; i++) {
-                if (node.scope_name.equals(this.param_names[i])) {
-                    node.scope_name = this.type_arg_displays[i];
-                    const arg_ref: TypeRef = this.resolved_arg_typeref(i);
-                    if (arg_ref.is_valid()) { node.spec_owner = arg_ref; }
-                    break;
-                }
+            const si: i64 = this.param_slot(node.scope_res.relative_param_sym());
+            if (si >= 0) {
+                node.scope_name = this.type_arg_displays[si];
+                const arg_ref: TypeRef = this.resolved_arg_typeref(si);
+                if (arg_ref.is_valid()) { node.spec_owner = arg_ref; }
             }
         }
         if (node.generic_args.length > 0) {
@@ -916,13 +932,6 @@ public:
     override visit(node: ArrayLiteralNode*) -> void {
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             node.elements[i].accept(this);
-        }
-        // Substitute element_type string (element_type stays string, resolve SymbolStr for comparison)
-        for (mut i: i64 = 0; i < this.param_names.length; i++) {
-            if (node.element_type == this.intern_table.resolve(this.param_names[i])) {
-                node.element_type = this.intern_table.resolve(this.type_arg_displays[i]);
-                break;
-            }
         }
         if (node.repeat_count_expr != null) {
             node.repeat_count_expr.accept(this);

@@ -50,6 +50,8 @@ import compiler::ast::statement::{
 };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
 
 
@@ -150,7 +152,7 @@ type struct MonoDispatchAnnotator {
                 const param: VarDeclNode* = func.parameters[p];
                 if (param == null) { continue; }
                 if (!param.name.equals(id.name)) { continue; }
-                const head: SymbolStr = this.param_head_of_ann(param.type_annotation);
+                const head: SymbolID = this.param_head_of_ann(param.type_annotation);
                 if (head.is_valid()) {
                     const tr: SymbolStr = this.single_bound_trait_for(head, bounds);
                     if (tr.is_valid()) {
@@ -182,22 +184,25 @@ type struct MonoDispatchAnnotator {
     /// list is the one question, as it is for rule 1's receiver.
     annotate_dispatch_path(mut &this, sr: ScopeResolutionNode*, bounds: &TraitBound[]) -> void {
         if (sr == null || sr.impl_trait != null || sr.resolved_trait.is_valid()) { return; }
-        const tr: SymbolStr = this.single_bound_trait_for(sr.scope_name, bounds);
+        const tr: SymbolStr = this.single_bound_trait_for(
+            sr.scope_res.relative_param_sym(), bounds);
         if (tr.is_valid()) { sr.set_resolved_trait(tr); }
     }
 
-    /// Return the identity of the single trait bounding `param_name`, or
-    /// empty when the param has zero or more-than-one bound trait (ambiguous -
-    /// leave the dispatch to its default).  The bound's stamped identity, not
-    /// its written leaf: two traits may share a leaf, and the stamp on the
-    /// call is compared against a method's `origin_trait`.
-    single_bound_trait_for(&this, param_name: SymbolStr,
+    /// Return the identity of the single trait bounding the parameter `param`,
+    /// or empty when the param has zero or more-than-one bound trait
+    /// (ambiguous - leave the dispatch to its default), or when `param` names
+    /// no parameter.  The bound's stamped identity, not its written leaf: two
+    /// traits may share a leaf, and the stamp on the call is compared against
+    /// a method's `origin_trait`.
+    single_bound_trait_for(&this, param: SymbolID,
                            bounds: &TraitBound[]) -> SymbolStr {
         mut found: SymbolStr = SymbolStr::empty();
         mut count: i64 = 0;
+        if (!param.is_valid()) { return found; }
         for (mut i: i64 = 0; i < bounds.length; i++) {
             const b: TraitBound* = &bounds[i];
-            if (!b.type_parameter.equals(param_name)) { continue; }
+            if (!b.subject_sym.equals(param)) { continue; }
             for (mut j: i64 = 0; j < b.trait_refs.length; j++) {
                 const tr: TraitRef* = &b.trait_refs[j];
                 if (tr.path.length == 0) { continue; }
@@ -380,14 +385,14 @@ type struct MonoDispatchAnnotator {
     /// Recursively unwrap a parameter's annotation to its `Named` head - the
     /// generic parameter a `&T` / `T*` / `Box<T>` is written over - which is
     /// the name a `where` bound is keyed by.
-    param_head_of_ann(&this, ann: TypeAnnotation*) -> SymbolStr {
-        if (ann == null) { return SymbolStr::empty(); }
+    param_head_of_ann(&this, ann: TypeAnnotation*) -> SymbolID {
+        if (ann == null) { return SymbolID::invalid(); }
         return match (*ann) {
-            TypeAnnotation::Named(na)     => { na.name }
+            TypeAnnotation::Named(na)     => { na.param_sym() }
             TypeAnnotation::Generic(ga)   => { this.param_head_of_ann(ga.base) }
             TypeAnnotation::Reference(ra) => { this.param_head_of_ann(ra.inner) }
             TypeAnnotation::Pointer(pa)   => { this.param_head_of_ann(pa.inner) }
-            _                             => { SymbolStr::empty() }
+            _                             => { SymbolID::invalid() }
         };
     }
 }
