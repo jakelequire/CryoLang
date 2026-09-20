@@ -60,7 +60,7 @@ measurement that decided it on the row.
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `python3 scripts/lane-gate.py --row LOOKUP_ROUTED` → **53** (54 before §8.256 deleted sema's `new` spelling step; 53 before §8.259 deleted the callee hint's `bare_sym` door and sema's `alias_global`; 51 before §8.263's two `lookup_type_exact` by a canonical name - the impl-qualified head's trait, asked whether it IS a trait, and its owner for the E0306 report) | §8.99, §8.107 |
 | D16 | **An impl head writes EVERY parameter of the template it names, or names a concrete instantiation; an elided parameter is an error** - whether all of them default (`implement trait Display for String` with `String<A = GlobalAlloc>`) or only the trailing ones (`implement<T> trait Display for Array<T>` with `Array<T, A = GlobalAlloc>`). Write `implement<A> trait Display for String<A>` or `implement trait Display for String<GlobalAlloc>`. Rust's model: `impl Display for Vec` is missing its parameters and is not given a default meaning, and `impl<T> Trait for Vec<T>` is not written either | **TAKEN** (ruled by Jake 2026-09-13 for the bare form, 2026-09-14 for every elided parameter; built in §8.190) — E0302 from `refuse_elided_template_params` where type resolution attaches a WRITTEN head to its template, naming the template, both counts and both spellings, the parameter form first; the 11 heads rewritten as the instantiation each meant; a head's `target_args` is what it writes after the target on EVERY kind of head (an inherent head's list also declares its names); sema's writer-module lookup deleted. The concrete spelling is HONOURED by impl selection since §8.233: a head's written target arguments unify with the subject's, a `Def`/`PrimTy`-stamped one filtering, so `for Wrap<T, Alpha>` is not selected for `Wrap<i32, Beta>` and two heads differing in that argument are two heads (`impl_concrete_arg_filters_impl` E0358, `impl_concrete_arg_selects_impl` 12 - both RED from §8.223 to §8.233) | `python3 scripts/impl-head-elided-params.py --count` → **bare=0,partial=0,unmatched=0**; `grep -c 'refuse_elided_template_params' compiler/src/compiler/passes/type_resolution.cryo` → **2**; `ls tests/tests/negative/E0302*.cryo \| wc -l` → **3** (2 at §8.190; +1 in §8.210, D22's head); `ls -d tests/tests/projects/impl_concrete_arg_*/test.json \| wc -l` → **2** (green since §8.233) | §8.180, §8.181, §8.187, §8.190, §8.223 |
 | D17 | **An `extern "C"` function is public unless marked `private`** — the extern-visibility default `docs/cryo.md` §18.1 states | **RULED** (Jake, 2026-09-14) — built in §8.167 by a worker and carried as unconfirmed until ratified; the spec text is normative, not provisional | `grep -c 'mut ext_public: boolean = true;' compiler/src/compiler/parser/parser.cryo` → **1**; `grep -c 'unless written .private function' docs/cryo.md` → **1** | §8.167, §8.187 |
-| D18 | **The keyword ruling** (§8.165): the primitive type names stop being keywords; `implement … for int` and `new int[100]` are stamped like any other name | **The alias half LANDED (§8.256); the keyword half RULED - UNBUILT** (Jake's, queued; re-affirmed 2026-09-15, §8.202; the alias half ruled 2026-09-16, §8.216). **The alias keywords `int`/`uint`/`float`/`double` FOLD at the name layer: `int` stamps `PrimTy("i32")`**, not `PrimTy("int")` - Jake chose the behaviour fix over deleting the arm, and it is a LANGUAGE BEHAVIOUR CHANGE, not a requalification: `implement trait Show for int` registered under the spelling "int", which no receiver key (`i32`) asked, so the impl was dead (`this` unbound, E0201; both `i32` and `int` receivers E0358), and `int::try_from` reached codegen unresolved (E0636); folded, the impl is live from either receiver and the scope form is `i32::try_from` - programs that were refused compile. The fold is asked ONLY after every scope has declined the name (Rust's rule: a primitive name resolves after every scope fails to bind it, `int` being a prelude alias with no identity of its own), so a module named like one (`std::fmt::float`) wins while it is in scope; the unit `AliasKeyword` pins all three, and a mutant folding first refuses its module case with E0233. E0308's coherence check still collides `for int` with `for i32`, now off the head's stamp. The alias table has ONE home, `ResBase::primitive_of_alias`: `types/resolver.cryo`'s four arms and the four forward-only index registrations (`register_type_forward_only`, deleted with them) are gone, the second on a measured 0 reads over the six halves (112 and 54 under the same probe at HEAD); the const table's two annotation-text readers fold through it. Blast radius in the tree: one impl head (the E0308 negative) and one `new int[100]`; 0 objects moved. The keyword half (primitives stop being lexer keywords, `TypeAnnotation::Primitive` goes) still wants §8.165's scoping (a)-(d) reported before building | `grep -rho 'is_alias_keyword' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rh 'primitive_of_alias' compiler/src --include=*.cryo \| grep -v '^\s*//' \| grep -o 'primitive_of_alias' \| wc -l` → **5** (the home, the name layer's fold, type resolution's keyword arm in `ann_canon_key`, the type resolver's `resolve_primitive`, the const table's `keyword_primitive`; the comment where the registrations were is excluded since §8.271); `grep -rho 'register_type_forward_only' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'TokenType::KwInt' compiler/src/compiler/lex/_module.cryo` → **7** (the keyword half's population: the lexer still reserves `int` as a token) | §8.165, §8.188, §8.202, §8.216, §8.256 |
+| D18 | **The keyword ruling** (§8.165): the primitive type names stop being keywords; `implement … for int` and `new int[100]` are stamped like any other name | **The alias half LANDED (§8.256); the keyword half RULED - UNBUILT** (Jake's, queued; re-affirmed 2026-09-15, §8.202; the alias half ruled 2026-09-16, §8.216). **The alias keywords `int`/`uint`/`float`/`double` FOLD at the name layer: `int` stamps `PrimTy("i32")`**, not `PrimTy("int")` - Jake chose the behaviour fix over deleting the arm, and it is a LANGUAGE BEHAVIOUR CHANGE, not a requalification: `implement trait Show for int` registered under the spelling "int", which no receiver key (`i32`) asked, so the impl was dead (`this` unbound, E0201; both `i32` and `int` receivers E0358), and `int::try_from` reached codegen unresolved (E0636); folded, the impl is live from either receiver and the scope form is `i32::try_from` - programs that were refused compile. The fold is asked ONLY after every scope has declined the name (Rust's rule: a primitive name resolves after every scope fails to bind it, `int` being a prelude alias with no identity of its own), so a module named like one (`std::fmt::float`) wins while it is in scope; the unit `AliasKeyword` pins all three, and a mutant folding first refuses its module case with E0233. E0308's coherence check still collides `for int` with `for i32`, now off the head's stamp. The alias table has ONE home, `ResBase::primitive_of_alias`: `types/resolver.cryo`'s four arms and the four forward-only index registrations (`register_type_forward_only`, deleted with them) are gone, the second on a measured 0 reads over the six halves (112 and 54 under the same probe at HEAD); the const table's two annotation-text readers fold through it. Blast radius in the tree: one impl head (the E0308 negative) and one `new int[100]`; 0 objects moved. The keyword half (primitives stop being lexer keywords, `TypeAnnotation::Primitive` goes) is SCOPED under §8.165's (a)-(d) in §8.280 and measured at a session's size: 23 tokens plus `void`, `TypeAnnotation::Primitive` read in 16 files (two of them the LSP's), 5 parser sites, and one ORDER change - a primitive spelling answered AFTER every scope declines it, where the alias fold already is, so `std::collections::string` and `string` the type can coexist; `tuple` and `optional` are reserved and read by nothing, and go with it | `grep -rho 'is_alias_keyword' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rh 'primitive_of_alias' compiler/src --include=*.cryo \| grep -v '^\s*//' \| grep -o 'primitive_of_alias' \| wc -l` → **5** (the home, the name layer's fold, type resolution's keyword arm in `ann_canon_key`, the type resolver's `resolve_primitive`, the const table's `keyword_primitive`; the comment where the registrations were is excluded since §8.271); `grep -rho 'register_type_forward_only' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'TokenType::KwInt' compiler/src/compiler/lex/_module.cryo` → **7** (the keyword half's population: the lexer still reserves `int` as a token); `grep -rl -e 'TypeAnnotation::Primitive\b' -e 'PrimitiveAnnotation\b' compiler/src tools --include=*.cryo \| wc -l` → **16** (the annotation variant's readers, the keyword half's other population); `grep -rn -e KwTuple -e KwOptional compiler/src tools --include=*.cryo \| grep -v lex/_module.cryo \| wc -l` → **0** (the two reserved words nothing reads) | §8.165, §8.188, §8.202, §8.216, §8.256, §8.280 |
 | D19 | **A bare `malloc`/`free`/`realloc` with no declaration in the writing module is an ERROR** - D6's rule, a bare name means a declaration in scope or nothing; the diagnostic says to write `libc::free` or `heap::free`. No freestanding carve-out: in `no_std` the name IS declared (extern or intrinsic), so the rule is satisfied there as everywhere | **TAKEN** (ruled §8.202; built in §8.207) — `callee_family`'s unanswered arm names nothing, so the call is E0202 with a note naming every module declaring the leaf (`std::core::intrinsics`, `std::ffi::libc`, `std::alloc::heap` for `free`) and the spelling of each; §8.93's hold is closed: an intrinsic's leaf is a key in no function table (`note_intrinsic` records the leaf → declaration for codegen's inline decision alone), the four durability guards that kept that key are gone, and codegen's synthesized allocation names `std::core::intrinsics::malloc`/`free`. The population was ONE file, `bare_intrinsic_priority.cryo`, which asserted the bare bind and is the negative `E0202_bare_allocator_leaf` now; the two E0453 negatives the previous handoff counted declare the leaf in their own extern block and are legal | `grep -c 'intrinsic_owner_of' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -rho 'register_intrinsic_function_type' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'note_intrinsic(' compiler/src/compiler/passes/type_resolution.cryo` → **1**; `grep -c 'intrinsic_names.contains_key' compiler/src/compiler/decl_index.cryo` → **0**; `ls tests/tests/negative/E0202_bare_allocator_leaf*.cryo \| wc -l` → **1** | §8.93, §8.173, §8.202, §8.207 |
 | D20 | **A plain `import Unknown;` naming no module is an ERROR**, as the braced form is (§8.191) | **TAKEN** (ruled §8.202; built in §8.208) — an import path the graph holds no module under is E0502 at the import for every form, with the module the path abbreviates named as the help (`core::option` → `std::core::option`); a path naming no FILE was already E0500 at discovery. Measured first with the refusal as a shadow line: **0** over the six halves and the four Linux-target builds; the instrument fires on `import core::option;` and stays silent on a module gated off this OS, which the graph still holds | `grep -c 'refuse_unknown_module_import' compiler/src/compiler/resolver/name_resolution.cryo` → **2**; `ls tests/tests/negative/E0502*.cryo \| wc -l` → **2** | §8.191, §8.202, §8.208 |
 | D21 | **An unknown type in EXPRESSION or TYPE-ARGUMENT position is an ERROR** (`sizeof(Nope)`, `1 as Nope`, `String<Nope>`) - and **a defaulted type parameter resolves in the module where the TYPE was DECLARED**, not at the use site: `String<A = GlobalAlloc>` written as `String` fills in `GlobalAlloc` resolved in `string`'s own scope, so a user never imports it; a user who WRITES `String<GlobalAlloc>` needs it in scope, because they wrote it. Rust's rule - a name resolves in the scope where it is written | **TAKEN** (ruled §8.202; built in §8.209) — the default half was already the name layer's (`declare_generics` stamps a parameter's default in the declaring file, §8.193); the refusal half: sema's three body-annotation sites (a local's, `sizeof`/`alignof`'s operand, a cast target) report a failed resolution through the declaration sites' reporter when the failure is a name the name layer could not place, and that reporter walks the WHOLE annotation by stamp (`extract_unresolved_named`), so a type argument is named for itself and a reported leaf is marked `Res::Err` and reported once. `docs/cryo.md` §12.2 stated both halves already; the tree was the defect. Population over six halves: the pinned `sizeof(Nope)` and nothing else; `1 as Nope` COMPILED and ran before this | `grep -c 'refuse_unresolved_body_annotation' compiler/src/compiler/sema/sema.cryo` → **4**; `grep -c 'refuse_unbound_type' compiler/src/compiler/resolver/name_resolution.cryo` → **3** (since §8.258 the name layer reports where the name is written and stamps `Err`; the four `named.res.answer(Res::Err)` sites of type resolution's reporter are gone with it); `ls -d tests/tests/projects/sizeof_undeclared_type*/test.json \| wc -l` → **1**; `ls tests/tests/negative/E0203_*.cryo \| wc -l` → **8** (5 declaration-position negatives, since §8.209 the cast and the type argument, and since §8.265 the refused signature whose calls report nothing) | §8.189, §8.193, §8.202, §8.209 |
@@ -77,8 +77,8 @@ measurement that decided it on the row.
 | D31 | **The turbofish is REQUIRED for generic arguments in expression position** (Jake, 2026-09-19): `foo::<i32>(y)` opens type arguments; `g(LIMIT < x, MAXV > (y))` is two comparisons, always. **The rule: `<` immediately after `::` opens generic arguments; `<` anywhere else is a comparison.** The shape is `foo::<i32>(y)` - as Rust's `Vec::<i32>::new()`, where every `::` after the turbofish is an ordinary path step; there is no `::()` form. It RETIRES the parser's `ident <` lookahead tables (`parser_base.cryo` 872–912: is-a-local / is-a-global / is-declared-generic / binds-a-value, read from the module's OWN declarations; `expr_parser.cryo` ~1190, the identifier's `Name<T, U>` guess), which by their own comment cannot see an import - so one expression means two things by where its constants came from. **Source-breaking, population UNMEASURED: the first task of whoever builds it is the count of bare generic arguments in expression position over the stdlib, the projects, the examples and the compiler's own source** (`f<T>(..)`, `Type<T>::m(..)`, `Type<T> { .. }` as the parser reads them today, module by module), and Jake wants that number before it lands. **MEASURED in §8.269 (the population Jake asked for), NOT BUILT: 1,364 generic-argument lists in expression position across 272 files** - stdlib 480 (64 of 154 files), compiler/src 165, tests/unit 571, tests/projects 61, tests/negative 26, tools/CryoLSP 53, examples 8; by shape `Name<T>::m` 586, `Name<T> { .. }` 219, `f<T>(..)` 142, `f<T>` as a value 8, `obj.m<T>(..)` 172, `Scope::m<T>(..)` 237, `new Type<T>(..)` 0 (confirmed by grep); **567 of the 955 identifier-headed sites were decided by the token scan alone** - the name is declared generic in no table the writing module has (an import: `Array` 172, `PendingThenReady` 90, `HashMap` 75, `Pair` 63, `Atomic` 38, `BufStream` 36, `Box` 24). Every site is a rewrite of the same one shape, `Name<` → `Name::<`, and the probe's location list (`scripts/ns-migration/8.269/`, `probe_d31.py apply` / `tally`; `population.md` is the tally) is the migration's input; the landing is the parser change, the four sites' lexical rule, the retired tables, and that script - one unit, source-breaking by 1,364 edits. **AUTHORISED by Jake on the 1,364-site figure (2026-09-19, §8.272): the turbofish lands.** Not built here - a source-breaking change across the stdlib, the tests, the compiler and the examples plus the parser change wants a dedicated session with a full budget. The landing: the lexical rule (`<` opens generic arguments only after `::`), `is_generic_call_ahead` ×6 and the `parser_base.cryo` 872–912 tables retired, and the 1,364 rewrites produced by a COMMITTED GENERATOR run over `population.md` - never a hand edit - so the migration is reproducible and auditable; 567 of the 955 identifier-headed sites are decided by the token scan alone today, so the generator's list, not the parser's tables, is what says where they are. **BUILT in three landings: §8.277 the parser reads the turbofish beside the lookahead and the population is re-verified at 1,368 sites / 271 files (§8.269's 1,364 double-counted two sites under a capitalised path; +6 in a project added since); the pin refreshed from that compiler; §8.278 the tree rewritten by `scripts/ns-migration/8.278/turbofish.py` over `8.277/sites.tsv` + `8.278/sites-extra.tsv` (1,376 sites, 274 files, a second run edits nothing) and the lookahead retired - `is_generic_call_ahead`, the three module tables with `scan_module_names`, the `generic_angle_guessed` flag and its two notes; 0 of 154 stdlib, 0 of 2,893 test, 0 of 1,126 example objects moved.** `new Type<T>(..)` and type position open `<` outright (no comparison can stand after a type name); `a < b > c` stays the chained comparison it was; the old spelling's leading E0102 names the turbofish | **TAKEN** (§8.277, §8.278; two open shapes on §8.278's "For Jake": `new Type::<T>` and refusing chained comparisons) | `grep -c 'is_generic_call_ahead' compiler/src/compiler/parser/expr_parser.cryo` → **0**; `grep -c 'at_turbofish' compiler/src/compiler/parser/expr_parser.cryo` → **4** (the one method and its three askers - the control for the zero beside it); `grep -c -e binds_a_value -e scan_module_names -e generic_decl_names compiler/src/compiler/parser/parser_base.cryo` → **0**; `git grep -l generic_angle_guessed -- compiler/src \| wc -l` → **0**; `grep -c . scripts/ns-migration/8.277/sites.tsv` → **1368** and `grep -vc '^#' scripts/ns-migration/8.278/sites-extra.tsv` → **8** (the rewrite's input; `turbofish.py check` over both reads every site as `::<` at the parent of §8.278's commit after `apply` and before `retire_lookahead.py`, which shifts one compiler/src site's line - so the check is the recipe's audit, not a row); `grep -c '^D31 population: 1368 distinct sites' scripts/ns-migration/8.277/population.md` → **1**; `grep -c '^D31 population: 1364 distinct sites' scripts/ns-migration/8.269/population.md` → **1** (the superseded figure, kept as written) | §8.267, §8.269, §8.277, §8.278 |
 | D32 | **The migration's COMPLETION CRITERION - the gate on merging `naming-impl` to `main`** (Jake, 2026-09-19): the migration is complete when there are **ZERO name-keyed reads outside an ENUMERATED, JUSTIFIED residue** - every member of the residue named, each carrying a one-line reason it is correct where it is (member lookup inside an owner is the canonical member: a struct's field or method by its name off the owner's type, name-keyed in Rust too), and the residue **PINNED BY COUNT** so it cannot grow. "Complete" means complete - not "correct with known items rowed". The by-design sites are "the maximum allowed": a residue that lands ABOVE the by-design set either moves the ceiling with a justification per extra site or converts those sites. **The count is NOT yet fixed and is not to be pinned on any recollection**: "about sixteen" was a paraphrase of audit 12's bucket D, and audit 14 remeasured the whole population at 55 sites with the buckets redistributed, so the true justified residue may be more or fewer. It is set by ENUMERATING the residue - one list, each site with its justification - and Jake rules on the final number. The enumeration is a unit of its own, after the id-move's remaining buckets land (they are still shrinking the population); its artifact is `scripts/ns-migration/residue.md` and this row's check flips to it | **RULED - the criterion; the count TO BE SET by enumeration** | `ls scripts/ns-migration/residue.md 2>/dev/null \| wc -l` → **0** (no enumeration yet; when it lands this row carries its count and the check that counts the residue against it) | §8.276 |
 
-**D18 and D24 are RULED and UNBUILT, and D32 is the criterion they are built toward** (D5 was, until §8.206; D2 and D9 were,
-until §8.213; Q2 was, until §8.259; D25 was, until §8.263; D30's refusal was, until §8.268; D28 was, until §8.270; D30's identity half was, until §8.272; D31 was, until §8.278). Each was decided by Jake - D18 and D2 then re-parked as open
+**D18's keyword half is RULED and UNBUILT, and D32 is the criterion it is built toward** (D5 was, until §8.206; D2 and D9 were,
+until §8.213; D24 was, until §8.233 - this line kept naming it for forty-six entries after its row said TAKEN, §8.280; Q2 was, until §8.259; D25 was, until §8.263; D30's refusal was, until §8.268; D28 was, until §8.270; D30's identity half was, until §8.272; D31 was, until §8.278). Each was decided by Jake - D18 and D2 then re-parked as open
 questions, D2 across ninety-five entries; §8.202 records the re-affirmation,
 §8.216 the three rulings of 2026-09-16 and §8.229 the three of 2026-09-17. They
 are work, not questions - do not put any of them back on his desk.
@@ -35191,3 +35191,126 @@ stream; the free-call template search with `resolve_function_source_module`).
   with the const table's bare lane gone it enters no lane and turns no gate
   red; it earns a corpus slot only as a REACHED corpus for the stamped fold,
   which is a different claim from the one it was proposed for.  Not adopted.
+
+### 8.280 The record corrected: D24 has been TAKEN since §8.233 and §0's ruled-unbuilt line kept naming it for forty-six entries; D18's keyword half scoped under §8.165's (a)-(d) and measured at a session's size, not built; `ModuleInfo.exports_functions` / `exports_types` deleted, 0 objects moved - 2026-09-20
+
+> **Status:** LANDED (a record, a scoping, one deletion).  §0.1's
+> ruled-unbuilt line and the D18 row; `compiler/module_graph.cryo`.
+
+#### The record
+
+§0's line under the decisions table read *"D18 and D24 are RULED and
+UNBUILT"*.  D24's own row has said **TAKEN** since `fd3756af` (§8.233:
+`trait_heads` keyed by `(trait identity, target key)`, one selector by
+unification), and that commit moved the row and not the line: `git show
+fd3756af~1:docs/name-resolution.md` and `git show fd3756af:docs/name-resolution.md`
+both print the line as *"D18, D24, D25 and Q2 are RULED and UNBUILT"*.
+Every later entry that trimmed a name off it (Q2 at §8.259, D25 at §8.263,
+D30 at §8.268, D28 at §8.270, D31 at §8.278) left D24 in place, and the
+line was relayed to Jake as the remaining list.  §0.4's warning is the
+mechanism: a row check catches a NUMBER that moved and nothing else, and
+this line has no check.
+
+What the later entries call "D24's shape" is a different defect from D24:
+a generic METHOD reached through a trait head or a generic owner does not
+instantiate (§8.263's residual: `(Display for P)::fmt(&p, &sink)` with
+`fmt<W>` is E0636 at codegen, as `Display::fmt(&p, &sink)` is; §8.277's
+scratch: `Wrap<i64>::make<u8>(1)`), because the static-method template
+registry holds one template per `Owner::method` key.  That is a
+name-keyed registry with one slot where a generic method needs one per
+signature - not the trait-impl registry D24 re-keyed - and it has no row.
+It is a defect of its own, not a decision awaiting a build:
+
+```cryo
+type struct Wrap<T> { v: T; }
+implement<T> Wrap<T> {
+    static make<U>(u: U) -> Wrap<T> { .. }
+}
+const w: Wrap<i64> = Wrap<i64>::make::<u8>(1);   // E0636 `codegen: cannot resolve 'Wrap::make'`
+```
+
+The line now names D18's keyword half alone, and records where D24 went.
+
+#### D18's keyword half, scoped and measured (§8.165's (a)-(d))
+
+The ruling (§8.165, re-affirmed §8.202): the primitive type names stop
+being lexer keywords; Rust's model, where `str` the type and `std::str`
+the module coexist under no special rule.  The alias half landed in
+§8.256.  The keyword half, measured at `b032fe79`:
+
+* **(a) The keywords that are primitive type names**: the 23 tokens
+  `TokenType::is_primitive_type` answers true for - `boolean`, `int`,
+  `i8`…`i128`, `uint`, `u8`…`u128`, `isize`, `usize`, `float`, `f32`,
+  `f64`, `double`, `char`, `string`, `never`, `va_list` - plus `void`,
+  return-position only, parsed ahead of the primitive test
+  (`expr_parser.cryo:2821`, `is_type_start`).  `grep -c 'TokenType::KwInt'
+  compiler/src/compiler/lex/_module.cryo` → 7 is the row's population
+  check: each token has its variant, the `is_primitive_type` arm, the
+  `is_keyword` arm, the lexeme arm and the `from_keyword` arm.  Two more
+  reserved words sit in the same block and are read by NOTHING:
+  `KwTuple` (`tuple`) and `KwOptional` (`optional`) - `grep -rn -e KwTuple
+  -e KwOptional compiler/src tools --include=*.cryo | grep -v
+  lex/_module.cryo | wc -l` → 0.  Each reserves an identifier for a
+  type-position form no parser arm reads; they go with the keyword half
+  or before it.
+* **(b) `default`** is `KwDefault`, read by `parser.cryo` alone as the
+  clause it is (the `match` arm and the trait default) - a genuine
+  keyword, not a type name, and it stays one.  Its own answer is "no
+  change".
+* **(c) Removes or adds**: it REMOVES.  Gone: the 23 variants and their
+  four arms each in `lex/_module.cryo` (the token stays an `Identifier`);
+  `TypeAnnotation::Primitive` and `PrimitiveAnnotation` - 46 mentions in
+  16 files (`grep -rho -e 'TypeAnnotation::Primitive\b' -e 'PrimitiveAnnotation\b'
+  compiler/src tools --include=*.cryo | wc -l`; two of the files are the
+  LSP's `hover.cryo` and `semantic_tokens.cryo`) - a primitive is then a
+  `Named` annotation whose stamp is `Res::PrimTy`, which the name layer
+  already answers for a named annotation (`type_spelling_res`,
+  `name_resolution.cryo:2121`; the scope form at 1796); the parser's four
+  `is_primitive_type_token` sites (`expr_parser.cryo:799` primitive as an
+  expression head, 1769 `new int[100]`, 2876 the annotation arm, 3208
+  `is_type_start`) and `parser.cryo:898`'s `from_keyword(..).is_primitive_type()`
+  on the synthesized impl receiver; `utils/syntax_highlighter.cryo`'s
+  hand mirror of the keyword table (`is_type_keyword`).  ADDED: nothing,
+  but one ORDER changes, and it is the whole point: today a primitive
+  spelling is answered FIRST at `type_spelling_res` (before any scope is
+  asked) while an alias keyword is answered LAST (after every scope has
+  declined, §8.256's rule), and the two agree only because the lexer
+  makes a primitive undeclarable.  With `string` an identifier,
+  `std::collections::string` - a module the stdlib already has - and
+  `string` the type collide on exactly the `&string::String` form
+  §8.165 names, so the primitive answer moves to where the alias answer
+  is: after every scope, one rule, `is_primitive_spelling` and
+  `primitive_of_alias` asked at the same point.  `is_primitive_spelling`
+  has three readers (`substituter.cryo:279` a display, and the two name
+  layer arms).
+* **(d) What breaks**: (i) programs that were REFUSED compile - a local
+  or field named `int`, `float`, `string`, `char` is E0100 today and legal
+  after, a language behaviour change of §8.256's kind; (ii) shadowing: a
+  user `type struct i32` or a module named `int` becomes legal and wins
+  while in scope, as Rust's `struct u8;` does; (iii) diagnostics keyed on
+  the token: 0 negatives pin a parse error AT a primitive word (the grep
+  over `//~ ERROR[E010x]` lines finds `E0100_missing_semicolon` and
+  `E0102_expected_expression`, whose error tokens are `return` and `;`);
+  (iv) the LSP's semantic tokens class a primitive as a keyword through
+  `TypeAnnotation::Primitive` - highlighting moves to the stamp; (v) no
+  repin: every source in the tree stays valid under both lexers, but
+  removing a `TypeAnnotation` variant shifts the enum, so a clean
+  rebuild; (vi) the bare `string::String` form's in-tree population is 0
+  by construction (it does not parse) - the reproducer that fails before
+  and passes after is that line.
+
+Size: the lexer (~100 lines), 16 files of `Primitive` readers, 5 parser
+sites, the name layer's order, the highlighter, the grammar and
+`docs/cryo.md`, and a negative for the collision.  A session's unit, not
+this one's; the row now carries the scoping and the two dead tokens.
+
+#### `ModuleInfo.exports_functions` / `exports_types` deleted
+
+Found by §8.279's rule 1b and left for the next session: two
+`SymbolStr[]` fields written `[]` at both constructors and pushed or read
+nowhere in `compiler/src` or `tools/` (6 mentions, all declaration and
+initialization; 0 after).  `ModuleInfo` stays placed by its other name
+arrays, so predicted and measured: `make lane-check` OK with no row moved.
+Predicted 0 objects moved (no reader; the struct's layout changes, which
+is the compiler's own objects, not the programs'), measured **0 of 2,893**
+tests and **0 of 1,126** examples (`hash-tree.sh se` against `sd2`).
