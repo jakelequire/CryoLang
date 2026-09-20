@@ -199,7 +199,7 @@ type struct CallEmitter {
             // fail with `undefined reference`.  Run the inline dispatcher
             // up front to avoid that path.
             const intr_name_str: string = intern.resolve(id.name);
-            if (IntrinsicKind::is_name(intr_name_str) && this.callee_is_intrinsic(node, id.name)) {
+            if (IntrinsicKind::is_name(intr_name_str) && this.callee_is_intrinsic(node)) {
                 // `intr_args` is scoped to this branch: it is built and moved
                 // into try_emit unconditionally here, so nothing is left
                 // conditionally moved past the if.
@@ -442,7 +442,7 @@ type struct CallEmitter {
             // causing the linker to look for a real `ptr_diff` symbol that
             // doesn't exist (intrinsics are lowered inline, never linked).
             const sr_leaf_str: string = intern.resolve(sr.member_name);
-            if (IntrinsicKind::is_name(sr_leaf_str) && this.callee_is_intrinsic(node, sr.member_name)) {
+            if (IntrinsicKind::is_name(sr_leaf_str) && this.callee_is_intrinsic(node)) {
                 mut sr_args: LValue[] = [];
                 for (mut sai: i64 = 0; sai < node.arguments.length; sai++) {
                     sr_args.push(this.dispatch.codegen_rvalue(visitor,node.arguments[sai]));
@@ -1216,24 +1216,22 @@ type struct CallEmitter {
     /// `emit_panic_call`.
     /// Whether a call whose leaf `IntrinsicKind::is_name` knows names the
     /// INTRINSIC, and so lowers inline, or a function that shares the leaf,
-    /// and so is called.  The pin decides: an intrinsic is declared under
-    /// its leaf as its own symbol and under its qualified name, so a pin
-    /// equal to either is the intrinsic and any other pin - the exported
-    /// `std::core::panic` wrapper, a user's `rotl32` - is a real function
-    /// with a body, whatever its leaf.  An unpinned callee is a pure-magic
-    /// form (`bswap32`, the casts) no declaration carries, and inlines; a
-    /// bare allocator call is an error in sema and never reaches here.
-    /// A leaf test in front of the pin inlined every `core::panic(...)` in
-    /// the stdlib against a spelling that named the wrapper.
-    callee_is_intrinsic(&this, node: CallExprNode*, leaf: SymbolStr) -> boolean {
+    /// and so is called.  The pin decides, by the mark the intrinsic's
+    /// registration put on its entry: any other pin - the exported
+    /// `std::core::panic` wrapper, a user's `rotl32`, an `extern "C"`
+    /// declaration whose C symbol IS the leaf - is a real function with a
+    /// body, whatever its leaf or its symbol.  An unpinned callee is a
+    /// pure-magic form (`bswap32`, the casts) no declaration carries, and
+    /// inlines; a bare allocator call is an error in sema and never reaches
+    /// here.  A leaf test in front of the pin inlined every `core::panic(...)`
+    /// in the stdlib against a spelling that named the wrapper, and a
+    /// symbol test after it would take `libc::malloc` for the intrinsic.
+    callee_is_intrinsic(&this, node: CallExprNode*) -> boolean {
         const di: DeclarationIndex* = this.cg.get_decl_index();
-        const owner: SymbolStr = di.intrinsic_owner_of(leaf);
         return match (&node.resolved_callee) {
             CalleePin::None      => { true }
-            CalleePin::Family(f) => { f.equals(leaf) || (owner.is_valid() && f.equals(owner)) }
-            CalleePin::Decl(e)   => {
-                di.entry_symbol(e).equals(leaf) || (owner.is_valid() && di.entry_key(e).equals(owner))
-            }
+            CalleePin::Family(f) => { di.family_is_intrinsic(f) }
+            CalleePin::Decl(e)   => { di.entry_is_intrinsic(e) }
         };
     }
 

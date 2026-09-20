@@ -65,7 +65,7 @@ in this population - they are §8.275's arena unit and retire with it.
 ## The table
 
 <!-- residue-table:begin -->
-Population **265** - J 52 · N 117 · S 26 · B 49 · C 18 · F 2 · W 1
+Population **265** - J 52 · N 117 · S 26 · B 49 · C 19 · F 2 · W 0
 
 | site | read | key as written | class | reason |
 |---|---|---|---|---|
@@ -118,6 +118,7 @@ Population **265** - J 52 · N 117 · S 26 · B 49 · C 18 · F 2 · W 1
 | `compiler/mono/trait_specializer.cryo:137` | `GenericRegistry::template_head_for` | `trait_id, subject, this.intern_table` | B | the written head of a trait identity for a subject `TypeRef` |
 | `compiler/sema/method_binding.cryo:1691` | `GenericRegistry::template_head_for` | `trait_id, subject, this.intern` | B | the written head of a trait identity for a subject `TypeRef` |
 | `compiler/types/resolver.cryo:518` | `GenericRegistry::template_head_for` | ` ...` | B | the written head of a trait identity for a subject `TypeRef` |
+| `compiler/codegen/visit/call_emitter.cryo:1233` | `DeclarationIndex::family_is_intrinsic` | `f` | C | a family by its key string, asked whether every entry is an intrinsic (the `CalleePin::Family` arm; the `Decl` arm reads the mark off the entry) |
 | `compiler/codegen/ops/symbol_resolver.cryo:227` | `DeclarationIndex::lookup_family_entries` | `name` | C | a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door |
 | `compiler/sema/call_resolver.cryo:2513` | `DeclarationIndex::lookup_family_entries` | `family` | C | a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door |
 | `compiler/sema/call_resolver.cryo:3750` | `DeclarationIndex::lookup_family_entries` | `sym` | C | a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door |
@@ -197,8 +198,8 @@ Population **265** - J 52 · N 117 · S 26 · B 49 · C 18 · F 2 · W 1
 | `compiler/codegen/visit/decl_visit_emitter.cryo:217` | `DeclarationIndex::impl_owner` | `node, "codegen/impl bodies"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
 | `compiler/passes/type_resolution.cryo:1208` | `DeclarationIndex::impl_owner` | `node, "type_resolution/register impl methods"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
 | `compiler/passes/type_resolution.cryo:2408` | `DeclarationIndex::impl_owner` | `node, "type_resolution/impl methods"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:2746` | `DeclarationIndex::impl_owner` | `node, "type_resolution/impl methods"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:3465` | `DeclarationIndex::impl_owner` | `node, "type_resolution/struct field sync"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:2747` | `DeclarationIndex::impl_owner` | `node, "type_resolution/impl methods"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:3466` | `DeclarationIndex::impl_owner` | `node, "type_resolution/struct field sync"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
 | `compiler/sema/sema.cryo:381` | `DeclarationIndex::impl_owner` | `ib, "sema/async declare"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
 | `compiler/sema/sema.cryo:631` | `DeclarationIndex::impl_owner` | `node, "sema/visit:ImplBlockNode"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
 | `compiler/sema/sema.cryo:663` | `DeclarationIndex::impl_owner` | `node, "sema/visit:ImplBlockNode"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
@@ -227,11 +228,11 @@ Population **265** - J 52 · N 117 · S 26 · B 49 · C 18 · F 2 · W 1
 | `compiler/passes/type_resolution.cryo:2268` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/union methods"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
 | `compiler/passes/type_resolution.cryo:2277` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/class methods"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
 | `compiler/passes/type_resolution.cryo:2310` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/trait populate"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:2641` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/alias target"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:3090` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/struct field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:3168` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/union field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:3231` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/class field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:3349` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/enum field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:2642` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/alias target"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:3091` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/struct field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:3169` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/union field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:3232` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/class field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:3350` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/enum field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
 | `compiler/sema/sema.cryo:363` | `DeclarationIndex::type_of_decl` | `s.def, "sema/async declare struct"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
 | `compiler/sema/sema.cryo:368` | `DeclarationIndex::type_of_decl` | `u.def, "sema/async declare union"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
 | `compiler/sema/sema.cryo:373` | `DeclarationIndex::type_of_decl` | `c.def, "sema/async declare class"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
@@ -273,7 +274,7 @@ Population **265** - J 52 · N 117 · S 26 · B 49 · C 18 · F 2 · W 1
 | `compiler/mono/state.cryo:408` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/mono/trait_specializer.cryo:147` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/passes/type_resolution.cryo:111` | `ResolutionContext::new` | `ctx.source_file` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/passes/type_resolution.cryo:3371` | `ResolutionContext::new` | `ctx.source_file` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/passes/type_resolution.cryo:3372` | `ResolutionContext::new` | `ctx.source_file` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/call_resolver.cryo:674` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/call_resolver.cryo:1449` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/call_resolver.cryo:1581` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
@@ -333,5 +334,4 @@ Population **265** - J 52 · N 117 · S 26 · B 49 · C 18 · F 2 · W 1
 | `compiler/sema/diagnostics.cryo:282` | `TypeUtils::lookup_type_exact` | `type_sym` | S | a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`) |
 | `compiler/sema/method_binding.cryo:449` | `TypeUtils::lookup_type_exact` | `tr.identity()` | S | a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`) |
 | `compiler/sema/call_resolver.cryo:4216` | `TypeUtils::resolve_method_owner` | `lookup_sym, scope.member_name, null` | S | `(owner, member)`: the owner from `scope_owner_key` (a stamp), the member a leaf inside it |
-| `compiler/codegen/visit/call_emitter.cryo:1230` | `DeclarationIndex::intrinsic_owner_of` | `leaf` | W | the callee's WRITTEN leaf asked for the intrinsic it may name, then compared with the pin; the pin's entry could carry the intrinsic mark and retire the read |
 <!-- residue-table:end -->

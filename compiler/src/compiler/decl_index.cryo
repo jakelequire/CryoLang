@@ -222,6 +222,15 @@ type struct DeclarationIndex {
                                       // and signature is told apart here, so a
                                       // `Type::method` path can prefer the
                                       // inherent one as Rust does.
+    overload_func_intrinsic: boolean[]; // the entry is an `intrinsic function`
+                                      // declaration, one codegen lowers inline
+                                      // (memcpy, ptr_diff, panic, atomic_*, ...).
+                                      // The mark is on the ENTRY, so a pin to
+                                      // a function sharing the intrinsic's
+                                      // leaf or its C symbol (`libc::malloc`
+                                      // beside `intrinsics::malloc`) is not
+                                      // mistaken for it: no spelling is
+                                      // compared to decide it.
 
     // Bare-name -> all qualified names ever registered for it.
     // Populated by `register_name_mapping`.
@@ -237,14 +246,6 @@ type struct DeclarationIndex {
     overload_index:      HashMap<u32, u32[]>;
     // Bare name SymbolStr.id -> positions in `bare_alts`.
     bare_alts_index:     HashMap<u32, u32[]>;
-
-    // Leaf-name SymbolStr.id of every `intrinsic function` declaration (the
-    // compiler-lowered ones in `core::intrinsics`: memcpy, ptr_diff, panic,
-    // atomic_*, ...) -> the intrinsic's qualified name.  Codegen reads the
-    // qualified name to tell a pin to the intrinsic from a pin to a function
-    // sharing its leaf (`callee_is_intrinsic`); no call binds through the
-    // leaf.
-    intrinsic_names:     HashMap<u32, u32>;
 
     // C symbol -> (key, function type id) of the FIRST `extern "C"` block
     // declaration carrying it, for W0011: a later extern block declaring the
@@ -339,11 +340,11 @@ type struct DeclarationIndex {
             overload_func_owner:   [],
             overload_func_trait:   [],
             overload_func_span:    [],
+            overload_func_intrinsic: [],
             bare_alts:      [],
             overload_index:     HashMap::<u32, u32[]>::new(),
             extern_symbol_first: HashMap::<u32, Pair<u32, u64>>::new(),
             bare_alts_index:    HashMap::<u32, u32[]>::new(),
-            intrinsic_names:    HashMap::<u32, u32>::new(),
             module_imports:     HashMap::<u32, u32[]>::new(),
             prelude_ns:         [],
             decl_visibility:    HashMap::<u32, boolean>::new(),
@@ -441,6 +442,7 @@ type struct DeclarationIndex {
         this.overload_func_owner.push(owner.id);
         this.overload_func_trait.push(trait_sym.id);
         this.overload_func_span.push(span);
+        this.overload_func_intrinsic.push(false);
         const slot: u32[]* = this.overload_index.get_or_insert(name.id, []);
         (*slot).push(new_pos);
         return OverloadId::at_position(new_pos);
@@ -500,25 +502,34 @@ type struct DeclarationIndex {
         return entries[0];
     }
 
-    /// Record the `intrinsic function` declared under the leaf `name`, by
-    /// the declaration's qualified name.  The leaf is a key in no function
-    /// table: an intrinsic is reached through its module (`intrinsics::free`)
-    /// like every declaration, and its bare spelling is an error where it is
-    /// declared in no scope.  Codegen reads this record to tell a pin to the
-    /// intrinsic from a pin to a function sharing its leaf
-    /// (`callee_is_intrinsic`).
-    note_intrinsic(mut &this, name: SymbolStr, owner: SymbolStr) -> void {
-        this.intrinsic_names.insert(name.id, owner.id);
+    /// Mark entry `id` as an `intrinsic function` declaration.  Its leaf is
+    /// a key in no function table: an intrinsic is reached through its
+    /// module (`intrinsics::free`) like every declaration, and its bare
+    /// spelling is an error where it is declared in no scope.  Codegen
+    /// reads the mark off the pin to tell the intrinsic from a function
+    /// sharing its leaf (`callee_is_intrinsic`).
+    mark_intrinsic(mut &this, id: OverloadId) -> void {
+        if (!id.is_valid()) { return; }
+        this.overload_func_intrinsic[id.position() as i64] = true;
     }
 
-    /// The qualified name of the `intrinsic function` declared under the leaf
-    /// `name`, or empty when no intrinsic owns that leaf.  Read by codegen's
-    /// inline decision alone; no call binds through it.
-    intrinsic_owner_of(&this, name: SymbolStr) -> SymbolStr {
-        return match (this.intrinsic_names.get(&name.id)) {
-            Option::Some(owner) => { SymbolStr::from_id(owner) }
-            Option::None        => { SymbolStr::empty() }
-        };
+    /// Whether entry `id` is an `intrinsic function` declaration; false for
+    /// an invalid id.
+    entry_is_intrinsic(&this, id: OverloadId) -> boolean {
+        if (!id.is_valid()) { return false; }
+        return this.overload_func_intrinsic[id.position() as i64];
+    }
+
+    /// Whether every entry under key `name` is an intrinsic: a call pinned
+    /// to a FAMILY rather than an entry names the intrinsic only when the
+    /// family holds nothing else.  False for a key with no entries.
+    family_is_intrinsic(&this, name: SymbolStr) -> boolean {
+        const entries: OverloadId[] = this.lookup_family_entries(name);
+        if (entries.length == 0) { return false; }
+        for (mut k: i64 = 0; k < entries.length; k++) {
+            if (!this.entry_is_intrinsic(entries[k])) { return false; }
+        }
+        return true;
     }
 
     /// The signature of every entry under `name`, in registration order
