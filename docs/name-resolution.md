@@ -154,6 +154,7 @@ three, and its row carries the count. Read each zero off its own row.
 | unmangled pin family (`pin_scope_callee_qsym`'s qualified names, mono's `combined_sym` and spec-name pins) read by codegen's by-name lane (`resolve_function_by_mangled` → `resolve_function` → `resolve_function_with_arity`, and the vtable, prologue and constructor callers asking by name) | **DELETED** — 56,486 lines over six halves, every name pin a single-symbol family; the one plural (`BaseASTVisitor::visit`, 68 signatures, 5 vtable slots) bound its own signature by luck of registration order. `resolve_symbol` and `resolve_family` replace it: a name resolves only when its family names ONE symbol, several is E0900. The name pins themselves stay (written before their symbol exists), as `CalleePin::Family` since §8.195; codegen no longer chooses among signatures for them | — | `grep -c 'resolve_function_with_arity' compiler/src/compiler/codegen/ops/symbol_resolver.cryo` → **0**; `grep -rho 'register_with_arity' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'resolve_family(' compiler/src --include=*.cryo \| wc -l` → **6** | §8.174, §8.175 |
 | codegen `$MG` reconstruction (`call_emitter` rebuilding a generic method spec's symbol from `resolved_type_args` when the pin missed) | **DELETED** — the pin missed because sema's `pin_method_callee_from_qname` mangled a specialization without its own type arguments; the writer folds them in now, 7 → 0 on the LSP, 308 → 0 over six halves. Since §8.216 no pin writer mangles at all - the spec's entry carries the symbol registration folded the arguments into - so `with_method_spec_args` is called by registration and by mono's dedup key alone | — | `grep -c 'with_method_spec_args' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0**; `grep -c 'with_method_spec_args' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -rho 'with_method_spec_args(' compiler/src --include=*.cryo \| wc -l` → **3** (the definition, `register_methods_with_module`, `mangled_symbol_for_spec_method`) | §8.176, §8.216 |
 | method signatures under the BARE written target (`register_methods_with_module_aliased`: every method of `implement T` registered a second time as `<T as written>::<method>` in the function tables and under the written `T` in `method_returns`, beside the canonical key; 3 writers - type resolution's impl arm, mono's spec-method registration, the async repoint) and the ONE reader that asked by it, `lookup_callee_function_type`'s scope branch asking the WRITTEN `scope::member` ahead of the head's stamp | **DELETED** — the canonical key is the only registration and the callee hint asks the stamp's owner first, then the C-import alias spelling (a C import is declared whole under `alias::name`, the door `resolve_scope_call` opens last). Measured over six halves: 79,340 bare registrations; the bare-first hint read 6,448 bare keys (6,217 static calls written `Owner::method` where the stamp answered the same signature at 6,215 and a DIFFERENT one at **2** - `Beacon::make` in `leaf_scope_use_a`, handed another module's same-leaf `Beacon::make`; 231 the async repoint's own alias reset); 968 answered by the written spelling alone, every one a C-import alias call. With the stamp first: 231 bare reads (the repoint's reset, a writer) and **0** `method_returns` reads by a bare type, control 14,053 with the canonical type in the probe's set; 0 objects moved. Pinned by `static_call_hint_leaf_collision` (HEAD types an out-of-range literal by the other module's `(i64)` and refuses the call as an `i64` narrowing to `u8`, proposing a cast that would truncate it; E0010 at the literal now) | — | `grep -rho 'register_methods_with_module_aliased' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'bare_combined_sym' compiler/src/compiler/decl_index.cryo` → **0**; `grep -c 'lookup_func_type_exact(bare_sym)' compiler/src/compiler/sema/call_resolver.cryo` → **0** (the C-import door that stood after the stamp is deleted in §8.259: an alias segment is the module lane's); `ls -d tests/tests/projects/static_call_hint_leaf_collision*/test.json \| wc -l` → **1** | §8.180, §8.196, §8.197, §8.259 |
+| a trait method's return under the trait's BARE LEAF (the trait arm of `register_decl_in_index` wrote `method_returns` twice per method, under the canonical name and under the written leaf, "so bound-aware dispatch can find the method by leaf name" - audit 13's finding, audit 14's "still unmeasured"; a trait registers a RETURN and no signature, its parameters being checked against the selected implementation) | **DELETED** — measured over six halves under a probe that recorded every bare-leaf key and printed each `lookup_method_return` hitting one (`.objcmp/rc-lines.txt`): **25,374 bare writes, 0 reads**; control by inversion, one read by the leaf added at the write: 96 writes, 96 hits (`.objcmp/rc-ctl1.log`). Every reader holds a registered name (`resolve_method_owner`'s contract), and a bound's trait is its stamped identity. The canonical write stays; 0 objects moved | — | `grep -c 'register_method(node.name' compiler/src/compiler/passes/type_resolution.cryo` → **0**; `grep -rho 'register_method(' compiler/src --include=*.cryo \| wc -l` → **3** (the definition, the trait arm's canonical write, the impl-method registrar) | §8.274 |
 | async repoint's CURSOR-keyed alias (`sema.cryo`'s async declare pass: `aliases = [ib.target_type, qualify_symbol_sym(ib.target_type)]`, the head's spelling and the cursor's module prefixed to it, re-registered through the aliased helper by `repoint_method`) | **DELETED** with the bare key above — an owner has one registration key, the head's `target_key`; `AsyncOwner.alias_qnames` and `clone_symbols` went with it | — | `grep -c 'qualify_symbol_sym(ib.target_type)' compiler/src/compiler/sema/sema.cryo` → **0**; `grep -rho 'alias_qnames' compiler/src --include=*.cryo \| wc -l` → **0** | §8.180, §8.196, §8.197 |
 | mono's spec-method registration by KEY (`register_spec_method_in_di` under `impl_node.target_key`, `_inherent` under the arena's name - keyed because the specialized type reached the index only when the pass walked the entries, after the module's monomorphization) | **DELETED** — the monomorphizer registers the specialized type at the seam where the entry is placed (`register_type(qualified_spec_sym, …)`, the id stamped on the clone) - and, since §8.240, its bare-name mapping, its inline methods and its impl blocks' methods, so the pass registers nothing for a named specialization - and both sites call `register_methods(recv_type, …)`; 1,662 of 1,663 named at registration over six halves, the one unnamed an instantiation with no entry placed, deferred by kind (`receiver_unmaterialized`). `register_methods_by_key`, whose one caller was D18's alias-keyword door, is folded into `register_methods` since §8.256 | — | `grep -rho 'register_methods_by_key(' compiler/src --include=*.cryo \| wc -l` → **0** (3 before §8.256: the definition, `register_methods`' own call, D18's door in `type_resolution.cryo`); `grep -c 'decl_index.register_type(' compiler/src/compiler/mono/monomorphizer.cryo` → **1**; `grep -c 'register_type(' compiler/src/compiler/passes/specialization.cryo` → **0**; `grep -c 'register_methods(' compiler/src/compiler/passes/specialization.cryo` → **0** | §8.235, §8.238, §8.240 |
 | a type alias under its BARE name (`pass_registry.cryo` Phase 4: `register_type(node.alias_name, alias_ref)` beside `decl_type_key`'s, for every alias without a binding namespace) | **DELETED** — the corpus holds NO module-level type alias (every `type X = …` in it is an associated-type binding), so the population was built: two modules each declaring `type Meters`, a consumer importing one and using it in annotation, field, parameter, return, `new`, `sizeof`, qualified and imported positions - 2 bare registrations (last writer wins), **0** bare reads, exit 43 as written; the same program under this tree | — | `grep -c 'register_type(node.alias_name, alias_ref)' compiler/src/compiler/passes/pass_registry.cryo` → **0** | §8.196, §8.197 |
@@ -18774,6 +18775,52 @@ consumer; the index's refusal record is the answer every reporter reads.
 
 **Tally: 97 shadowed, 97 old paths deleted, 97 at zero; 217 artifacts
 gone** (unchanged; three asks, no lane).
+
+### 8.274 The trait arm's bare-leaf `method_returns` write, measured and deleted: every trait method's return was registered twice, under the trait's canonical name and under its written leaf, "so bound-aware dispatch can find the method by leaf name"; over the six-half corpus 25,374 bare writes were read 0 times, the control read by the leaf hits every time, so the leaf key is gone and the canonical write stays; 0 objects moved - 2026-09-19
+
+> **Status:** LANDED.  `passes/type_resolution.cryo` (the trait arm of
+> `register_decl_in_index` writes the canonical key only),
+> `tests/lane-baseline.txt` (`REGISTER` 72 → 71).
+
+#### The finding
+
+Audit 13 named it and audit 14 recorded it as still unmeasured and not in
+the ledger: the trait arm registered `node.name::method` beside
+`<module>::Trait::method` in `method_returns`, and it registered a return
+with no signature.  The second half is by design - a trait declares what
+its methods return and nothing checks a call's arguments against a trait
+(the selected implementation is checked, §8.267) - so the question was
+the leaf key: two modules' same-leaf traits would be one key under it,
+and a reader that asked by it would take whichever registered last.
+
+#### Measured
+
+A probe compiler recorded every key the bare write produced
+(`register_method_bare_probe`, a set beside the table) and printed
+`SHADOW MR-BARE-HIT` at every `lookup_method_return` whose key was in the
+set - a hit is a read the bare write alone could have answered, because a
+trait whose canonical name IS its leaf is skipped by the write's own
+guard.  Over the six halves (`corpus2.sh rc`, `.objcmp/rc-corpus.out`:
+LSP direct exit 0, make test OVERALL PASS 204 / 69, 0 failing halves):
+**25,374 bare writes** (`SHADOW MR-BARE-WRITE`, 263 per trait method
+across the compilations), **0 hits**.  Control by inversion: one read by
+the leaf added at the write (`.objcmp/ra/probe_mr_ctl.py on`), a one-file
+program: 96 writes, **96 hits** (`.objcmp/rc-ctl1.log`); removed.  The
+readers: `resolve_method_owner`'s contract is a registered name, and a
+bound's trait is `tr.identity()`, the stamped canonical name - the leaf
+the comment said would be asked for was never asked for.  The LSP holds
+no reader of its own.
+
+#### Gates
+
+lsp-check 264 / 0 / 486; cross-check 0 errors; objects (`hash-tree.sh
+RC` against `RB`): examples 0 of 1,126, tests 0 of 2,827 moved, identical
+path sets; test-census OVERALL PASS 69 / 204 / 2,127 (roster pins 2,127 /
+204 / 72); lane-check `REGISTER type_resolution.cryo 19 → 18`, total 72 →
+71, re-pinned (a store deleted; predicted in kind); check-fast OK.
+
+**Tally: 98 shadowed, 98 old paths deleted, 98 at zero; 217 artifacts
+gone** (the bare-leaf write, measured at zero reads and deleted).
 
 ---
 
