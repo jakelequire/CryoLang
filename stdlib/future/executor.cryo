@@ -207,7 +207,7 @@ function detach_shared<O>(sh: TaskShared<O>*) -> void {
             const rp: O* = &sh.result;
             rp.drop();
         }
-        alloc.deallocate(NonNull::new(sh as u8*), Layout::of<TaskShared<O>>());
+        alloc.deallocate(NonNull::new(sh as u8*), Layout::of::<TaskShared<O>>());
     }
     // else: task still running; it frees the block when it observes GONE.
 }
@@ -248,7 +248,7 @@ type struct Task {
             shared:     shared,
             next:       null,
             exec:       exec,
-            run_state:  Atomic<u8>::new(ST_SCHEDULED),
+            run_state:  Atomic::<u8>::new(ST_SCHEDULED),
             self_arc:   null,
         };
     }
@@ -431,7 +431,7 @@ type struct ExecInner {
 /// and the wake path (handing the ready queue its own reference) call this; it
 /// pairs one-for-one with `task_decref`.
 private function task_incref(task: Task*) -> void {
-    Arc<Task, GlobalAlloc>::increment_strong_count(task.self_arc);
+    Arc::<Task, GlobalAlloc>::increment_strong_count(task.self_arc);
 }
 
 /// Release one strong reference to `task`'s box. The last release runs
@@ -439,7 +439,7 @@ private function task_incref(task: Task*) -> void {
 /// `task_incref`, the initial `Arc::new` scheduling reference, and each stored
 /// waker.
 private function task_decref(task: Task*) -> void {
-    Arc<Task, GlobalAlloc>::decrement_strong_count(task.self_arc);
+    Arc::<Task, GlobalAlloc>::decrement_strong_count(task.self_arc);
 }
 
 /// `Waker` `clone_fn` for an owning task waker: acquire a reference and return
@@ -576,7 +576,7 @@ function task_drop_thunk<F>(fut_raw: u8*) -> void {
     mut _owned: F;
     unsafe { _owned = *fut; }
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    alloc.deallocate(NonNull::new(fut_raw), Layout::of<F>());
+    alloc.deallocate(NonNull::new(fut_raw), Layout::of::<F>());
     // `_owned` drops here, after its storage has been released.
 }
 
@@ -591,7 +591,7 @@ function dispose_shared_thunk<O>(shared_raw: u8*, drop_result: u8) -> void {
         rp.drop();
     }
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    alloc.deallocate(NonNull::new(shared_raw), Layout::of<TaskShared<O>>());
+    alloc.deallocate(NonNull::new(shared_raw), Layout::of::<TaskShared<O>>());
 }
 
 
@@ -693,20 +693,20 @@ where F: Future<O> {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
 
     mut sh: TaskShared<O>* = null;
-    match (alloc.allocate(Layout::of<TaskShared<O>>())) {
-        Result::Ok(raw) => { sh = raw.cast<TaskShared<O>>().as_ptr(); }
+    match (alloc.allocate(Layout::of::<TaskShared<O>>())) {
+        Result::Ok(raw) => { sh = raw.cast::<TaskShared<O>>().as_ptr(); }
         Result::Err(_)  => { panic("Executor::spawn: shared allocation failed", FILE, LINE); }
     }
-    sh.ctl.outcome = Atomic<u8>::new(OUTCOME_PENDING);
-    sh.ctl.hs      = Atomic<u8>::new(HS_LIVE);
-    sh.ctl.cancel  = Atomic<u8>::new(0);
+    sh.ctl.outcome = Atomic::<u8>::new(OUTCOME_PENDING);
+    sh.ctl.hs      = Atomic::<u8>::new(HS_LIVE);
+    sh.ctl.cancel  = Atomic::<u8>::new(0);
     sh.ctl.panic   = PanicInfo { msg: "", file: "", line: 0 };
 
     mut fbox: F* = null;
-    match (alloc.allocate(Layout::of<F>())) {
-        Result::Ok(raw) => { fbox = raw.cast<F>().as_ptr(); }
+    match (alloc.allocate(Layout::of::<F>())) {
+        Result::Ok(raw) => { fbox = raw.cast::<F>().as_ptr(); }
         Result::Err(_)  => {
-            alloc.deallocate(NonNull::new(sh as u8*), Layout::of<TaskShared<O>>());
+            alloc.deallocate(NonNull::new(sh as u8*), Layout::of::<TaskShared<O>>());
             panic("Executor::spawn: future allocation failed", FILE, LINE);
         }
     }
@@ -723,8 +723,8 @@ where F: Future<O> {
     // drop). `self_arc` back-points at the header so `task_incref`/`task_decref`
     // reach the count from any `Task*`.
     mut arc_res: Result<Arc<Task, GlobalAlloc>, AllocError> =
-        Arc::try_new(Task::new(task_poll_thunk<F, O>, task_drop_thunk<F>,
-                               dispose_shared_thunk<O>, fbox as u8*, sh as u8*, inner));
+        Arc::try_new(Task::new(task_poll_thunk::<F, O>, task_drop_thunk::<F>,
+                               dispose_shared_thunk::<O>, fbox as u8*, sh as u8*, inner));
     match (arc_res) {
         Result::Ok(arc) => {
             const ap: ArcInner<Task, GlobalAlloc>* = arc.into_raw();
@@ -734,12 +734,12 @@ where F: Future<O> {
         Result::Err(_)  => {
             // `try_new` dropped the Task value; its `Drop` finished it CANCELLED
             // and dropped the boxed future, so only the shared block remains.
-            alloc.deallocate(NonNull::new(sh as u8*), Layout::of<TaskShared<O>>());
+            alloc.deallocate(NonNull::new(sh as u8*), Layout::of::<TaskShared<O>>());
             panic("Executor::spawn: task allocation failed", FILE, LINE);
         }
     }
 
-    return JoinHandle<O> { shared: sh, exec: inner };
+    return JoinHandle::<O> { shared: sh, exec: inner };
 }
 
 
@@ -781,15 +781,15 @@ type struct JoinHandle<O> {
         if (outcome == OUTCOME_READY) {
             const rptr: O* = &shared.result;
             const out:  O  = *rptr;
-            alloc.deallocate(NonNull::new(shared as u8*), Layout::of<TaskShared<O>>());
+            alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<TaskShared<O>>());
             return Result::Ok(out);
         }
         if (outcome == OUTCOME_PANICKED) {
             const info: PanicInfo = ctl.panic;
-            alloc.deallocate(NonNull::new(shared as u8*), Layout::of<TaskShared<O>>());
+            alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<TaskShared<O>>());
             return Result::Err(JoinError::Panicked(info));
         }
-        alloc.deallocate(NonNull::new(shared as u8*), Layout::of<TaskShared<O>>());
+        alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<TaskShared<O>>());
         return Result::Err(JoinError::Cancelled);
     }
 
@@ -798,7 +798,7 @@ type struct JoinHandle<O> {
     detach(mut this) -> void {
         const shared: TaskShared<O>* = this.shared;
         this.shared = null;   // consume: neutralize this handle's Drop
-        detach_shared<O>(shared);
+        detach_shared::<O>(shared);
     }
 
     /// Request that the task be cancelled. It is reclaimed — its `Output` never
@@ -823,7 +823,7 @@ type struct JoinHandle<O> {
 implement<O> trait Drop for struct JoinHandle<O> {
     drop(mut &this) -> void {
         if (this.shared == null) { return; }
-        detach_shared<O>(this.shared);
+        detach_shared::<O>(this.shared);
         this.shared = null;
     }
 }
@@ -863,8 +863,8 @@ type struct Executor {
         if (count == 0) { count = 1; }
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         mut inner: ExecInner* = null;
-        match (alloc.allocate(Layout::of<ExecInner>())) {
-            Result::Ok(raw) => { inner = raw.cast<ExecInner>().as_ptr(); }
+        match (alloc.allocate(Layout::of::<ExecInner>())) {
+            Result::Ok(raw) => { inner = raw.cast::<ExecInner>().as_ptr(); }
             Result::Err(_)  => { panic("Executor::new: allocation failed", FILE, LINE); }
         }
         if (exec_mtx_init(&inner.q_mutex[0]) != 0) { panic("Executor: queue mutex init failed", FILE, LINE); }
@@ -896,14 +896,14 @@ type struct Executor {
     /// immediately.
     spawn<F, O>(mut &this, fut: F) -> JoinHandle<O>
     where F: Future<O> {
-        return spawn_on<F, O>(this.inner, fut);
+        return spawn_on::<F, O>(this.inner, fut);
     }
 
     /// Spawn `fut` as fire-and-forget: it runs to completion and its result is
     /// discarded. Sugar for `spawn(fut).detach()`.
     spawn_detached<F, O>(mut &this, fut: F) -> void
     where F: Future<O> {
-        mut h: JoinHandle<O> = spawn_on<F, O>(this.inner, fut);
+        mut h: JoinHandle<O> = spawn_on::<F, O>(this.inner, fut);
         h.detach();
     }
 
@@ -912,7 +912,7 @@ type struct Executor {
     /// could not complete; use `spawn(root).join()` for the `Result`.
     block_on<F, O>(mut &this, root: F) -> O
     where F: Future<O> {
-        mut h: JoinHandle<O> = spawn_on<F, O>(this.inner, root);
+        mut h: JoinHandle<O> = spawn_on::<F, O>(this.inner, root);
         match (h.join()) {
             Result::Ok(v)  => { return v; }
             Result::Err(_) => { panic("Executor::block_on: root future did not complete", FILE, LINE); }
@@ -979,7 +979,7 @@ implement trait Drop for struct Executor {
         exec_cond_destroy(&inner.q_cond[0]);
         exec_mtx_destroy(&inner.q_mutex[0]);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(inner as u8*), Layout::of<ExecInner>());
+        alloc.deallocate(NonNull::new(inner as u8*), Layout::of::<ExecInner>());
         this.inner = null;
     }
 }

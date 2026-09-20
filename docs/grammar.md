@@ -240,6 +240,13 @@ GenericParam       ::= Ident ("=" Type)?
                           bound here: a bound is written in a WhereClause, so
                           `<T: Bound>` is a syntax error. *)
 GenericArgs        ::= "<" Type ("," Type)* ">"
+TurbofishArgs      ::= "::" GenericArgs
+                       (* generic arguments in EXPRESSION position: `<`
+                          opens them only immediately after `::`, and is
+                          the comparison operator anywhere else in an
+                          expression.  `Vec::<i32>::new()`, `f::<T>(x)`,
+                          `o.m::<T>()`, `Pair::<A, B> { .. }`, `f::<T>` as a
+                          value.  Type position uses GenericArgs directly. *)
 
 
 (*  Expressions ================================================ *)
@@ -267,8 +274,8 @@ UnaryOp            ::= "-" | "!" | "&" | "*" | "~" | "++" | "--"
 PostfixExpr        ::= Primary PostfixOp*
 PostfixOp          ::= "(" ArgList? ")"
                      | "[" Expr "]"
-                     | "." MemberName GenericArgs?    (* `.` auto-derefs pointers; there is no `->` operator *)
-                     | "::" MemberName GenericArgs?
+                     | "." MemberName TurbofishArgs?  (* `.` auto-derefs pointers; there is no `->` operator *)
+                     | "::" MemberName TurbofishArgs?
                      | "?"                              (* error propagation / try *)
                      | "++" | "--"
 
@@ -278,8 +285,8 @@ Primary            ::= Literal
                      | "null" | "this"
                      | Ident
                      | QualName
-                     | Ident GenericArgs ("(" ArgList? ")")?
-                     | QualName GenericArgs ("(" ArgList? ")")?
+                     | Ident TurbofishArgs ("(" ArgList? ")")?
+                     | QualName TurbofishArgs ("(" ArgList? ")")?
                      | StructLit
                      | ArrayLit
                      | NewExpr
@@ -296,7 +303,7 @@ Primary            ::= Literal
                      | "(" Expr ")"
                      | ImplQualPath
 
-ImplQualPath       ::= "(" Type "for" Type ")" "::" MemberName GenericArgs?
+ImplQualPath       ::= "(" Type "for" Type ")" "::" MemberName TurbofishArgs?
                        (* the member of the first Type's (a trait's)
                           implementation for the second: `(Beta for P)::make`.
                           The second Type is a name with optional GenericArgs
@@ -312,7 +319,7 @@ Lambda             ::= "move"? "(" (LambdaParam ("," LambdaParam)*)? ")" "->" Ty
                                                     move-capture explicit. *)
 LambdaParam        ::= Ident (":" Type)?
 
-StructLit          ::= Ident GenericArgs?
+StructLit          ::= Ident TurbofishArgs?
                        "{" MemberName ":" Expr ("," MemberName ":" Expr)* ","? "}"
                        (* The shorthand `{ field }` form takes an Ident only:
                           it means `{ field: field }`, and a keyword binds no

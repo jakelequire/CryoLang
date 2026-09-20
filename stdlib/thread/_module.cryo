@@ -210,7 +210,7 @@ function thread_body<C, T>(arg: u8*) -> void {
     // `ctx` now solely owns whatever heap state it carried.
     const c: C = (*p).ctx;
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    alloc.deallocate(NonNull::new(arg), Layout::of<Payload<C, T>>());
+    alloc.deallocate(NonNull::new(arg), Layout::of::<Payload<C, T>>());
 
     // Run the user body and publish the result. Writing through a raw
     // `T*` avoids drop-synthesis on the (uninitialized) destination.
@@ -222,23 +222,23 @@ function thread_body<C, T>(arg: u8*) -> void {
     const prev: u8 = (*shared).state.swap(STATE_THREAD_DONE, MemoryOrder::AcqRel);
     if (prev == STATE_DETACHED) {
         (*rptr).drop();
-        alloc.deallocate(NonNull::new(shared as u8*), Layout::of<Shared<T>>());
+        alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<Shared<T>>());
     }
 }
 
 /// The C entry point handed to the OS thread creator. One monomorphization
 /// per `(C,T)`, addressable thanks to the generic function-reference fix.
 ![target(unix)]
-function thread_trampoline<C, T>(arg: u8*) -> u8* { thread_body<C, T>(arg); return null; }
+function thread_trampoline<C, T>(arg: u8*) -> u8* { thread_body::<C, T>(arg); return null; }
 ![target(windows)]
-function thread_trampoline<C, T>(arg: u8*) -> u32 { thread_body<C, T>(arg); return 0; }
+function thread_trampoline<C, T>(arg: u8*) -> u32 { thread_body::<C, T>(arg); return 0; }
 
 /// Create an OS thread running `thread_trampoline<C,T>(arg)`, writing the
 /// joinable id/handle into `tbuf` (8 bytes).  `stack_bytes == 0` requests
 /// the OS default stack.  Returns 0 on success, non-zero on failure.
 ![target(linux)]
 private function os_create_thread<C, T>(tbuf: u8*, arg: u8*, stack_bytes: u64) -> i32 {
-    const tramp_fn: (u8*) -> u8* = thread_trampoline<C, T>;
+    const tramp_fn: (u8*) -> u8* = thread_trampoline::<C, T>;
     if (stack_bytes == 0) {
         return pthread_create(tbuf, null, tramp_fn as void*, arg);
     }
@@ -256,7 +256,7 @@ private function os_create_thread<C, T>(tbuf: u8*, arg: u8*, stack_bytes: u64) -
 }
 ![target(windows)]
 private function os_create_thread<C, T>(tbuf: u8*, arg: u8*, stack_bytes: u64) -> i32 {
-    const tramp_fn: (u8*) -> u32 = thread_trampoline<C, T>;
+    const tramp_fn: (u8*) -> u32 = thread_trampoline::<C, T>;
     // dwStackSize = 0 means "default"; CreateThread takes the size directly,
     // so no attribute object is needed.
     const h: u8* = syscall::CreateThread(null, stack_bytes, tramp_fn as void*,
@@ -279,7 +279,7 @@ function reap_detached<T>(tid: u64, shared: Shared<T>*) -> void {
         const rptr: T* = &(*shared).result;
         (*rptr).drop();
         mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(shared as u8*), Layout::of<Shared<T>>());
+        alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<Shared<T>>());
     }
     // Otherwise the thread is still running and will reclaim the block
     // when it observes STATE_DETACHED.
@@ -308,7 +308,7 @@ type struct JoinHandle<T> {
         unsafe {
             const out: T = *rptr;
             mut alloc: GlobalAlloc = GlobalAlloc::new();
-            alloc.deallocate(NonNull::new(shared as u8*), Layout::of<Shared<T>>());
+            alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<Shared<T>>());
             return out;
         }
     }
@@ -318,7 +318,7 @@ type struct JoinHandle<T> {
     /// handle.
     detach(mut this) -> void {
         const { tid, shared }: JoinHandle<T> = this;
-        reap_detached<T>(tid, shared);
+        reap_detached::<T>(tid, shared);
     }
 
     /// True once the thread has finished running its body. Does not
@@ -339,7 +339,7 @@ type struct JoinHandle<T> {
 implement<T> trait Drop for struct JoinHandle<T> {
     drop(mut &this) -> void {
         if (this.shared == null) { return; }
-        reap_detached<T>(this.tid, this.shared);
+        reap_detached::<T>(this.tid, this.shared);
         this.shared = null;
     }
 }
@@ -365,7 +365,7 @@ implement<T> trait Drop for struct JoinHandle<T> {
 /// "move a non-thread-safe value into a thread" hole.
 function spawn<C, T>(ctx: C, body: (C) -> T) -> JoinHandle<T>
 where C: Send, T: Send {
-    match (spawn_with_attr<C, T>(ctx, body, 0)) {
+    match (spawn_with_attr::<C, T>(ctx, body, 0)) {
         Result::Ok(h)  => { return h; }
         Result::Err(_) => {
             core::panic("thread::spawn: failed to create thread", FILE, LINE);
@@ -382,17 +382,17 @@ where C: Send, T: Send {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
 
     mut shared: Shared<T>* = null;
-    match (alloc.allocate(Layout::of<Shared<T>>())) {
-        Result::Ok(raw) => { shared = raw.cast<Shared<T>>().as_ptr(); }
+    match (alloc.allocate(Layout::of::<Shared<T>>())) {
+        Result::Ok(raw) => { shared = raw.cast::<Shared<T>>().as_ptr(); }
         Result::Err(_)  => { return Result::Err(SpawnError::OutOfMemory); }
     }
-    (*shared).state = Atomic<u8>::new(STATE_LIVE);
+    (*shared).state = Atomic::<u8>::new(STATE_LIVE);
 
     mut p: Payload<C, T>* = null;
-    match (alloc.allocate(Layout::of<Payload<C, T>>())) {
-        Result::Ok(raw) => { p = raw.cast<Payload<C, T>>().as_ptr(); }
+    match (alloc.allocate(Layout::of::<Payload<C, T>>())) {
+        Result::Ok(raw) => { p = raw.cast::<Payload<C, T>>().as_ptr(); }
         Result::Err(_)  => {
-            alloc.deallocate(NonNull::new(shared as u8*), Layout::of<Shared<T>>());
+            alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<Shared<T>>());
             return Result::Err(SpawnError::OutOfMemory);
         }
     }
@@ -401,18 +401,18 @@ where C: Send, T: Send {
     (*p).shared = shared;
 
     mut tbuf: u8[8] = [0; 8];
-    const rc: i32 = os_create_thread<C, T>(&tbuf[0], p as u8*, stack_bytes);
+    const rc: i32 = os_create_thread::<C, T>(&tbuf[0], p as u8*, stack_bytes);
     if (rc != 0) {
         // The thread never started, so we still own both boxes. The
         // payload's `ctx` was moved in; reclaim it so owned state inside
         // it is released rather than leaked, then free both boxes.
         const cback: C = (*p).ctx;
         cback.drop();
-        alloc.deallocate(NonNull::new(p as u8*), Layout::of<Payload<C, T>>());
-        alloc.deallocate(NonNull::new(shared as u8*), Layout::of<Shared<T>>());
+        alloc.deallocate(NonNull::new(p as u8*), Layout::of::<Payload<C, T>>());
+        alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<Shared<T>>());
         return Result::Err(SpawnError::from_errno(rc));
     }
-    return Result::Ok(JoinHandle<T> { tid: *(&tbuf[0] as u64*), shared: shared });
+    return Result::Ok(JoinHandle::<T> { tid: *(&tbuf[0] as u64*), shared: shared });
 }
 
 
@@ -450,7 +450,7 @@ implement enum SpawnError {
 ///   ```
 function try_spawn<C, T>(ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError>
 where C: Send, T: Send {
-    return spawn_with_attr<C, T>(ctx, body, 0);
+    return spawn_with_attr::<C, T>(ctx, body, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -521,7 +521,7 @@ type struct Builder {
     /// `try_spawn` for a fallible spawn.
     spawn<C, T>(this, ctx: C, body: (C) -> T) -> JoinHandle<T>
     where C: Send, T: Send {
-        match (this.try_spawn<C, T>(ctx, body)) {
+        match (this.try_spawn::<C, T>(ctx, body)) {
             Result::Ok(h)  => { return h; }
             Result::Err(_) => {
                 core::panic("thread::Builder::spawn: failed to create thread", FILE, LINE);
@@ -538,7 +538,7 @@ type struct Builder {
         // `pthread_attr_t` on POSIX, `dwStackSize` on Windows), so the
         // builder just forwards the configured size.
         mut result: Result<JoinHandle<T>, SpawnError> =
-            spawn_with_attr<C, T>(ctx, body, this.stack_bytes);
+            spawn_with_attr::<C, T>(ctx, body, this.stack_bytes);
 
         match (result) {
             Result::Ok(h) => {
@@ -620,20 +620,20 @@ function scope_body<C>(arg: u8*) -> void {
     const body: (C) -> void = (*p).body;
     const c: C = (*p).ctx;
     mut alloc: GlobalAlloc = GlobalAlloc::new();
-    alloc.deallocate(NonNull::new(arg), Layout::of<ScopePayload<C>>());
+    alloc.deallocate(NonNull::new(arg), Layout::of::<ScopePayload<C>>());
     body(c);
 }
 
 ![target(unix)]
-function scope_trampoline<C>(arg: u8*) -> u8* { scope_body<C>(arg); return null; }
+function scope_trampoline<C>(arg: u8*) -> u8* { scope_body::<C>(arg); return null; }
 ![target(windows)]
-function scope_trampoline<C>(arg: u8*) -> u32 { scope_body<C>(arg); return 0; }
+function scope_trampoline<C>(arg: u8*) -> u32 { scope_body::<C>(arg); return 0; }
 
 /// Create an OS thread running `scope_trampoline<C>(arg)`, writing the
 /// joinable id/handle into `tbuf`. Returns 0 on success.
 ![target(unix)]
 private function os_create_scope_thread<C>(tbuf: u8*, arg: u8*, stack_bytes: u64) -> i32 {
-    const t: (u8*) -> u8* = scope_trampoline<C>;
+    const t: (u8*) -> u8* = scope_trampoline::<C>;
     if (stack_bytes == 0) {
         return pthread_create(tbuf, null, t as void*, arg);
     }
@@ -651,7 +651,7 @@ private function os_create_scope_thread<C>(tbuf: u8*, arg: u8*, stack_bytes: u64
 }
 ![target(windows)]
 private function os_create_scope_thread<C>(tbuf: u8*, arg: u8*, stack_bytes: u64) -> i32 {
-    const t: (u8*) -> u32 = scope_trampoline<C>;
+    const t: (u8*) -> u32 = scope_trampoline::<C>;
     // STACK_SIZE_PARAM_IS_A_RESERVATION (0x10000): treat `stack_bytes` as the
     // reserve (committed lazily) rather than an eager commit, so a large worker
     // stack costs address space, not resident memory.
@@ -706,14 +706,14 @@ type struct Scope {
     where C: Send {
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         mut p: ScopePayload<C>* = null;
-        match (alloc.allocate(Layout::of<ScopePayload<C>>())) {
-            Result::Ok(raw) => { p = raw.cast<ScopePayload<C>>().as_ptr(); }
+        match (alloc.allocate(Layout::of::<ScopePayload<C>>())) {
+            Result::Ok(raw) => { p = raw.cast::<ScopePayload<C>>().as_ptr(); }
             Result::Err(_)  => { core::panic("Scope::spawn: alloc failed", FILE, LINE); }
         }
         (*p).body = body;
         (*p).ctx  = ctx;
         mut tbuf: u8[8] = [0; 8];
-        const rc: i32 = os_create_scope_thread<C>(&tbuf[0], p as u8*, this.stack_bytes);
+        const rc: i32 = os_create_scope_thread::<C>(&tbuf[0], p as u8*, this.stack_bytes);
         if (rc != 0) { core::panic("Scope::spawn: thread creation failed", FILE, LINE); }
         this.tids.push(*(&tbuf[0] as u64*));
     }

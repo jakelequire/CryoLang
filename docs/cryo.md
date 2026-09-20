@@ -386,7 +386,7 @@ falling back to an indirect call:
 | Callee                                    | Capturing closure           | Non-capturing lambda / named fn |
 | ----------------------------------------- | --------------------------- | ------------------------------- |
 | Non-generic free function - `apply(c, x)` | **yes**                     | yes                             |
-| Generic free function - `apply<T>(c, x)`  | E0458                       | yes                             |
+| Generic free function - `apply::<T>(c, x)`  | E0458                       | yes                             |
 | Method - `obj.run(c)`                     | E0458                       | yes                             |
 | Scope-resolution call - `Type::run(c)`    | E0458                       | yes                             |
 | `extern "C"` callback parameter           | never (no environment slot) | yes                             |
@@ -426,7 +426,7 @@ function tentimes(n: int) -> int { return n * 10; }
 const out2: Option<int> = some.map(tentimes);                            // U = int, inferred
 ```
 
-The explicit form is still accepted (`some.map<int>(...)`) and is required only
+The explicit form is still accepted (`some.map::<int>(...)`) and is required only
 when the type parameter appears *nowhere* the call can infer it from.
 
 ### 2.6 Tuple Types
@@ -529,7 +529,7 @@ to write it.
 ```cryo
 // The concrete iterator (`SliceIter<T>`) never appears in the signature.
 iter(&this) -> implement Iterator<T> where T: Copy {
-    return SliceIter<T> { ptr: this.ptr, remaining: this.length };
+    return SliceIter::<T> { ptr: this.ptr, remaining: this.length };
 }
 
 // A caller binds the result without naming the concrete type either.
@@ -550,7 +550,7 @@ declaration* it introduces an implement block - the two never overlap.)
 
 - **Return type** - the concrete type is inferred from the body's first
   `return` expression. That expression must currently be a *struct literal*
-  (e.g. `return SliceIter<T> { ... }`), which is how every standard-library
+  (e.g. `return SliceIter::<T> { ... }`), which is how every standard-library
   iterator is written.
 - **Variable binding** - `mut it: implement Iterator<i32> = expr;`. The type
   is taken from the initialiser, which is then checked to actually implement
@@ -561,7 +561,7 @@ declaration* it introduces an implement block - the two never overlap.)
   ```
 
   When the initialiser is a **concrete static constructor**
-  (`mut it: implement Iterator<i32> = Range<i32>::new(0, 10);`), you can
+  (`mut it: implement Iterator<i32> = Range::<i32>::new(0, 10);`), you can
   re-adapt the local directly - `it.take(3)` specialises the adapter against
   the recovered concrete receiver. The binding's *visible* type is still the
   opaque trait; the compiler recovers the concrete initialiser type for
@@ -673,14 +673,16 @@ function swap<T>(a: T*, b: T*) -> void {
 }
 ```
 
-At the call site, supply the concrete type:
+At the call site, supply the concrete type after `::` - the *turbofish*:
 
 ```cryo
-const n: int    = identity<int>(42);
-const s: string = identity<string>("hello");
+const n: int    = identity::<int>(42);
+const s: string = identity::<string>("hello");
 ```
 
 Each call produces a fully specialised version of the function. See [section 12.6 Monomorphisation](#126-monomorphisation).
+
+In expression position `<` opens generic arguments **only immediately after `::`**; anywhere else it is the comparison operator. So `identity::<int>(42)`, `Array::<int>::new()`, `Pair::<int, int> { first: 1, second: 2 }`, `obj.method::<T>(x)` and `Scope::method::<T>(x)` name a specialization, while `g(LIMIT < x, MAXV > (y))` is two comparisons whatever `LIMIT` and `MAXV` are - the same text never means two things by where its names were declared. Every `::` after the arguments is an ordinary path step. Type position is unaffected: `Array<int>` in an annotation, a `where` bound or a `static match` arm, and `new Array<int>(..)`, are written as before, because a `<` after a type name is never a comparison.
 
 To require capabilities of `T` (such as the ability to compare it with `<`), use a `where` clause:
 
@@ -714,12 +716,12 @@ function sum(count: i32, args...) -> i64 {
 }
 ```
 
-`va.next<T>()` is the explicit form; `va.next()` infers `T` from the expected type at the call site (see [section 17](#17-directives-and-attributes) on `![implicit]`). `va.as_ptr()` returns the raw `va_list` pointer for forwarding to a C `v*printf` callee - equivalently, pass the original `args` identifier.
+`va.next::<T>()` is the explicit form; `va.next()` infers `T` from the expected type at the call site (see [section 17](#17-directives-and-attributes) on `![implicit]`). `va.as_ptr()` returns the raw `va_list` pointer for forwarding to a C `v*printf` callee - equivalently, pass the original `args` identifier.
 
 Two limits are inherited from C varargs and no wrapper can remove them:
 
 - **Not count-safe.** Nothing records how many arguments were passed or their types; the callee must learn that out of band (a format string, a leading count, a sentinel).
-- **Default argument promotions apply.** A variadic call promotes `i8`/`i16`/`boolean` to `i32` and `f32` to `f64`. `VaArg` is therefore implemented only for the promoted scalar set (`i32`, `u32`, `i64`, `u64`, `f64`, `string`); `va.next<i8>()` is a compile error - read it as `i32` and narrow. Pass `i64`-typed values when reading with `next<i64>()`.
+- **Default argument promotions apply.** A variadic call promotes `i8`/`i16`/`boolean` to `i32` and `f32` to `f64`. `VaArg` is therefore implemented only for the promoted scalar set (`i32`, `u32`, `i64`, `u64`, `f64`, `string`); `va.next::<i8>()` is a compile error - read it as `i32` and narrow. Pass `i64`-typed values when reading with `next::<i64>()`.
 
 ### 4.4 Extern Functions
 
@@ -1357,8 +1359,8 @@ type struct Pair<T> {
     }
 }
 
-const ints: Pair<int>    = Pair<int>::new(1, 2);
-const strs: Pair<string> = Pair<string>::new("hello", "world");
+const ints: Pair<int>    = Pair::<int>::new(1, 2);
+const strs: Pair<string> = Pair::<string>::new("hello", "world");
 ```
 
 `Pair<int>` and `Pair<string>` are independent types. See [section 12.6](#126-monomorphisation).
@@ -1412,7 +1414,7 @@ type union Either<A, B> {
     b: B;
 }
 
-const e: Either<i64, f64> = Either<i64, f64> { a: 100 };
+const e: Either<i64, f64> = Either::<i64, f64> { a: 100 };
 ```
 
 **Layout control.** `![repr(c)]` and `![align(N)]` apply to unions exactly as they do to structs (see [section 17](#17-directives-and-attributes)).
@@ -1954,7 +1956,7 @@ type struct Boxed<T> { value: T; }
 implement<T> trait Deref<T> for struct Boxed<T> {
     deref(&this) -> T* { return &this.value; }
 }
-mut b: Boxed<Vec2> = Boxed<Vec2> { value: Vec2 { x: 1, y: 2 } };
+mut b: Boxed<Vec2> = Boxed::<Vec2> { value: Vec2 { x: 1, y: 2 } };
 const v: Vec2 = *b;   // *(b.deref())
 b.x = 10;             // auto-deref: (*b.deref()).x - b has no field `x`
 ```
@@ -2017,7 +2019,7 @@ type struct Array<T, A = GlobalAlloc> { /* ... */ }
 type struct HashMap<K, V, A = GlobalAlloc> { /* ... */ }
 ```
 
-Calling `Array<int>::new()` uses `GlobalAlloc`; calling `Array<int, Arena>::new_in(my_arena)` parameterises the container over a custom allocator.
+Calling `Array::<int>::new()` uses `GlobalAlloc`; calling `Array::<int, Arena>::new_in(my_arena)` parameterises the container over a custom allocator.
 
 A default resolves **in the module where the type is declared**, not at the use site: writing `Array<int>` fills in `GlobalAlloc` as `collections::array`'s own scope sees it, so the user never imports `GlobalAlloc` to use the default. A user who writes `Array<int, GlobalAlloc>` names `GlobalAlloc` themselves and needs it in scope, because they wrote it. This is the general rule - a name resolves in the scope where it is written - and it is also why a function body, a type alias's right-hand side and an `implement` body resolve where they are written. A name that exists nowhere is an error in every position, expression and type-argument positions included: `sizeof(Nope)`, `1 as Nope` and `Array<Nope>` are refused, not silently accepted.
 
@@ -2049,7 +2051,7 @@ function identity<T>(x: T) -> T {
     return x;
 }
 
-const n: int = identity<int>(42);
+const n: int = identity::<int>(42);
 ```
 
 ### 12.5 Generic Implement Blocks
@@ -2083,8 +2085,8 @@ A parameter a method introduces must not spell one its owner already declares: `
 When the compiler sees:
 
 ```cryo
-const a: Pair<int>    = Pair<int>::new(1, 2);
-const b: Pair<string> = Pair<string>::new("x", "y");
+const a: Pair<int>    = Pair::<int>::new(1, 2);
+const b: Pair<string> = Pair::<string>::new("x", "y");
 ```
 
 it generates two independent types and two specialised function bodies, one for each instantiation. There is no shared dispatch; every call is a direct call to a fully-typed function. The trade-off is binary size: each instantiation produces its own code.
@@ -2674,7 +2676,7 @@ type struct AlignedData {
 | `![allow(name)]` / `![warn(name)]` / `![deny(name)]`      | any decl                           | Intended to adjust a named lint's level. *Parsed and validated; lint-level adjustment is not yet implemented.*                                                                                                                                                                                                                                                                                                                  |
 | `![derive(Trait, ...)]`                                   | struct / class / enum              | Intended to auto-derive one or more traits. *Parsed and validated; no trait is actually synthesized.* See [section 22](#22-reserved-syntax).                                                                                                                                                                                                                                                                                    |
 | `![sink]`                                                 | method                             | Marks a method as consuming its receiver, even when the receiver is syntactically `&this` or `mut &this`. Useful for methods that semantically take ownership but want the borrow-style call ergonomics.                                                                                                                                                                                                                        |
-| `![implicit]`                                             | generic function / method          | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = ...` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f<T>(...)`) there. Used by `VaArgs::next` so `const n: i64 = va.next()` reads cleanly. |
+| `![implicit]`                                             | generic function / method          | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = ...` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f::<T>(...)`) there. Used by `VaArgs::next` so `const n: i64 = va.next()` reads cleanly. |
 | `![config(<atom>)]` / `![target(<atom>)]` / `![<atom>]`   | any decl                           | Platform / build-flavor gate. `<atom>` is `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`. The bare-atom form (`![windows]`) is sugar for `![config(windows)]`. The decl is stripped from the AST when the gate doesn't match.                                                                                                                                                                                            |
 | `![repr(C)]` / `![repr(packed)]` / `![repr(transparent)]` | struct / class / enum              | Memory layout control. See [section 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                                                  |
 | `![align(N)]`                                             | struct / class / variable          | Minimum alignment in bytes; N must be a power of two. See [section 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                   |

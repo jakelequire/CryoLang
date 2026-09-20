@@ -342,6 +342,24 @@ public:
             const op: Token = this.advance();
             const right: ExpressionNode* = this.parse_binary_expression(prec + 1);
             if (right == null) {
+                // `a < b >` with nothing an expression can start with after
+                // it is the shape a generic-argument list spelled without its
+                // `::` leaves behind - `Name<T>::m`, `Name<T> { .. }`,
+                // `f<T>` as a value - since `<` after a name is a comparison.
+                // Name the spelling; the reader is otherwise sent to fix a
+                // comparison they never wrote.
+                if (op.kind == TokenType::RAngle && left.kind == NodeKind::BinaryExpression
+                        && (left as BinaryExprNode*).op.kind == TokenType::LAngle) {
+                    this.panic_mode = true;
+                    this.error_count += 1;
+                    mut diag: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0102_EXPECTED_EXPRESSION,
+                        fmt::format("expected expression after '%s'", op.lexeme));
+                    diag = diag.at(this.current_span());
+                    diag = diag.with_note("`<` after a name is a comparison; generic arguments in expression position follow `::` - `Name::<T>::member`, `f::<T>(x)`, `Name::<T> { .. }`");
+                    this.ctx.emit_diagnostic(diag);
+                    return left;
+                }
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
                     fmt::format("expected expression after '%s'", op.lexeme));
                 return left;
@@ -1195,31 +1213,10 @@ public:
         const name: SymbolStr = this.intern_lexeme(tok);
         mut expr: ExpressionNode* = new IdentifierNode(name, this.span_from_token(tok));
 
-        // Generic arguments on the name: `Name::<T, U>`.
-        mut turbofish: boolean = false;
+        // Generic arguments on the name: `Name::<T, U>`.  A bare `<` after a
+        // name is a comparison, whatever the name binds.
         if (this.at_turbofish()) {
             this.advance(); // consume '::'
-            turbofish = true;
-        }
-        // The lookahead spelling `Name<T, U>` is still read while the pin
-        // predates the turbofish; the tree is rewritten and this arm retired
-        // once the pin reads `::<`.
-        //
-        // A name bound to a value - a parameter, a local, or a module-level
-        // global - is not a generic function or type, so its `<` is a
-        // comparison however much the following tokens resemble type
-        // arguments. This is what settles `f(a < b, c > (d))`, which the token
-        // scan alone reads as the generic call `a<b, c>(d)`. Names that bind
-        // no known value - including everything imported - still go to the
-        // scan.
-        if (turbofish || (this.check(TokenType::LAngle) && !this.binds_a_value(name) &&
-                          this.is_generic_call_ahead())) {
-            // Record whether this was knowledge or a guess. Knowing the name is
-            // declared generic in this module settles it; otherwise only the
-            // token scan spoke, and the same text may have been comparisons.
-            if (!turbofish && !this.is_generic_decl_name(name)) {
-                (expr as IdentifierNode*).set_generic_angle_guessed(true);
-            }
             return this.parse_generic_head(expr, name, tok);
         }
         return this.parse_identifier_tail(expr, name, tok);
@@ -1785,11 +1782,12 @@ public:
         mut type_name: SymbolStr = this.ctx.intern(path);
         mut node: NewExprNode* = new NewExprNode(type_name, this.span_from_token(start));
 
-        // Optional generic args on the type: new Type<T>(...)
+        // Optional generic args on the type: `new Type<T>(...)`.  The operand
+        // of `new` is a type, so a `<` here is never a comparison.
         // Scope `scope_gen_args` to this branch: it is moved into the node
         // unconditionally here and never read afterwards, so a branch-local
         // binding leaves nothing conditionally moved past the if.
-        if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+        if (this.check(TokenType::LAngle)) {
             const scope_gen_args: TypeAnnotation*[] = this.parse_generic_args();
             node.set_generic_args(scope_gen_args);
         }
@@ -2520,14 +2518,8 @@ public:
         mut node: MemberAccessNode* = new MemberAccessNode(object, member, member_span, span);
 
         // Explicit type arguments on the member: `obj.method::<T, U>(...)`.
-        // The lookahead spelling `obj.method<T>(..)` is read until the pin
-        // reads the turbofish.
-        mut turbofish: boolean = false;
         if (this.at_turbofish()) {
             this.advance(); // consume '::'
-            turbofish = true;
-        }
-        if (turbofish || (this.check(TokenType::LAngle) && this.is_generic_call_ahead())) {
             const member_gen_args: TypeAnnotation*[] = this.parse_generic_args();
             node.set_generic_args(member_gen_args);
         }
@@ -2566,14 +2558,9 @@ public:
             sr.set_scope_generic_args(scope_gen_args);
         }
 
-        // Generic args on the member itself: `Foo::bar::<U>`.  The lookahead
-        // spelling `Foo::bar<U>` is read until the pin reads the turbofish.
-        mut turbofish: boolean = false;
+        // Generic args on the member itself: `Foo::bar::<U>`.
         if (this.at_turbofish()) {
             this.advance(); // consume '::'
-            turbofish = true;
-        }
-        if (turbofish || (this.check(TokenType::LAngle) && this.is_generic_call_ahead())) {
             const member_gen_args: TypeAnnotation*[] = this.parse_generic_args();
             sr.set_generic_args(member_gen_args);
         }
@@ -2583,106 +2570,6 @@ public:
 
 
     // Generic Disambiguation
-
-    /// Scan forward to determine if `<` begins generic type arguments.
-    /// Returns true if we find a matching `>` followed by `(`, `{`, or `::`.
-    ///
-    /// The scan stays inside the grouping the `<` appeared in. A type argument
-    /// list is balanced with respect to `()` and `[]` - a tuple type `(i32,
-    /// i64)` or an array suffix `[]` nests, but nothing may close a group the
-    /// list did not open. So a closer arriving at depth zero means the `<` was
-    /// a comparison, and any `>` found beyond it belongs to something else
-    /// entirely. Without this the scan runs out of the enclosing argument list
-    /// and pairs the `<` with a `>` from a LATER argument: in
-    /// `f((a < b), (c > (d)))` it spans `a < b), (c >`, then generic-argument
-    /// parsing fails on the `)` it never expected to see.
-    is_generic_call_ahead() -> boolean {
-        mut angle_depth: int = 1;
-        mut group_depth: int = 0;
-        mut offset: int = 1;
-        const max_lookahead: int = 200;
-
-        while (offset < max_lookahead) {
-            const tok: Token = this.peek_at(offset);
-
-            // EOF: not a generic
-            if (tok.kind == TokenType::EOF) { return false; }
-
-            if (tok.kind == TokenType::LParen || tok.kind == TokenType::LSquare) {
-                group_depth += 1;
-            } else if (tok.kind == TokenType::RParen ||
-                       tok.kind == TokenType::RSquare) {
-                if (group_depth == 0) { return false; }
-                group_depth -= 1;
-            }
-
-            if (tok.kind == TokenType::LAngle) {
-                angle_depth += 1;
-            } else if (tok.kind == TokenType::RAngle) {
-                angle_depth -= 1;
-                if (angle_depth == 0) {
-                    // Check what follows the closing >
-                    const next: Token = this.peek_at(offset + 1);
-                    if (next.kind == TokenType::LParen ||
-                        next.kind == TokenType::LBrace ||
-                        next.kind == TokenType::ColonColon) {
-                        return true;
-                    }
-                    // Also allow > followed by > (nested generic closing)
-                    if (next.kind == TokenType::RAngle) {
-                        return true;
-                    }
-                    // Also allow > at end of type annotation context (e.g., in parameter lists)
-                    // or before type suffixes (*, [], ?)
-                    if (next.kind == TokenType::Comma)     { return true; }
-                    if (next.kind == TokenType::RParen)    { return true; }
-                    if (next.kind == TokenType::Semicolon) { return true; }
-                    if (next.kind == TokenType::Equal)     { return true; }
-                    if (next.kind == TokenType::Star)      { return true; }
-                    if (next.kind == TokenType::LSquare)   { return true; }
-                    if (next.kind == TokenType::Question)  { return true; }
-                    if (next.kind == TokenType::Arrow)     { return true; }
-                    // `Type<Args> =>` heads a `static match` arm whose scrutinee
-                    // type is itself generic (`Slice<u8> => { ... }`).  Without
-                    // this the `<Args>` is left unconsumed and the arm fails to
-                    // parse.  A bare `a < b => c` has no balanced `>`, so it
-                    // never reaches this follower check and stays a comparison.
-                    if (next.kind == TokenType::FatArrow)  { return true; }
-                    // Generic function-reference value cast: `tramp<i32> as void*`.
-                    // Without this, `<` is mis-parsed as less-than and the cast
-                    // fails to parse. (GAP 1a)
-                    if (next.kind == TokenType::KwAs)      { return true; }
-                    // Trait-impl follower: `Foo<T> for Bar`. Only meaningful
-                    // when parsing a trait annotation inside parse_impl block.
-                    if (next.kind == TokenType::KwFor)     { return true; }
-                    // `Bar<T> where ...` in impl blocks.
-                    if (next.kind == TokenType::KwWhere)   { return true; }
-                    return false;
-                }
-            } else if (tok.kind == TokenType::GreaterGreater) {
-                // >> could be two > tokens for nested generics
-                angle_depth -= 2;
-                if (angle_depth <= 0) {
-                    return true;
-                }
-            }
-
-            // Tokens that cannot appear in type arguments -> not generic
-            if (tok.kind == TokenType::Semicolon ||
-                tok.kind == TokenType::LBrace ||
-                tok.kind == TokenType::RBrace ||
-                tok.kind == TokenType::KwIf ||
-                tok.kind == TokenType::KwWhile ||
-                tok.kind == TokenType::KwFor ||
-                tok.kind == TokenType::KwReturn) {
-                return false;
-            }
-
-            offset += 1;
-        }
-
-        return false;
-    }
 
     /// Error recovery for a `<...>` that turned out not to hold type
     /// arguments: advance past its closing `>` so the enclosing expression can
@@ -2728,12 +2615,10 @@ public:
         while (!this.check(TokenType::RAngle) &&
                !this.check(TokenType::GreaterGreater) &&
                !this.is_at_end()) {
-            // A literal can never begin a type, so the `<` was a comparison
-            // that the lookahead misread - `f(x < 2, 3 > (4))` being the usual
-            // shape. Diagnosed here rather than in `parse_type_annotation`,
-            // which would first report a bare "expected type" from a position
-            // where the reader has no reason to expect one, leaving two errors
-            // for one mistake.
+            // A literal can never begin a type.  Diagnosed here rather than in
+            // `parse_type_annotation`, which would first report a bare
+            // "expected type" from a position where the reader has no reason
+            // to expect one, leaving two errors for one mistake.
             const lead: TokenType = this.current().kind;
             if (lead == TokenType::NumericConstant ||
                 lead == TokenType::StringLiteral ||
@@ -2742,7 +2627,7 @@ public:
                 lead == TokenType::KwTrue ||
                 lead == TokenType::KwFalse) {
                 this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                    fmt::format("expected a type in generic arguments, found the value `%s`; if `<` was meant as a comparison, parenthesise the operands - `(x < y)`",
+                    fmt::format("expected a type in generic arguments, found the value `%s`",
                            this.current().lexeme));
                 // Resync past the matching `>` and return rather than break.
                 // Leaving the cursor on the offending token makes the enclosing
@@ -3025,8 +2910,9 @@ public:
 
             const name: SymbolStr = this.ctx.intern(qn.display(this.ctx.get_intern_table()));
 
-            // Check for generic parameters: Type<A, B>
-            if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+            // Generic arguments: `Type<A, B>`.  Type position - a `<` after a
+            // type name is never a comparison.
+            if (this.check(TokenType::LAngle)) {
                 const base_ann: TypeAnnotation* = new TypeAnnotation::Named(
                     new NamedAnnotation {
                         name: name,
