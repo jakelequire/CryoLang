@@ -34,6 +34,11 @@ import compiler::types::{
 };
 import compiler::resolver::symbol_str;
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::res;
+import compiler::resolver::res::{ Res, ResBase };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::ast::expression::{ ScopeResolutionNode };
 import compiler::ast;
 import compiler::ast::{ declaration, node, NodeKind };
 import compiler::compilation_context;
@@ -72,12 +77,56 @@ type struct SymbolicChecker {
     }
 
 
-    /// True when `sym` names a generic parameter of the body currently under
-    /// symbolic check (only meaningful while `state.in_symbolic_check`).
+    /// True when `sid` is the symbol of a generic parameter in scope for the
+    /// body under symbolic check - the owner's or the method's own.  False
+    /// outside a symbolic walk.
+    symbolic_param_in_scope(&this, sid: SymbolID) -> boolean {
+        if (!this.state.in_symbolic_check) { return false; }
+        for (mut i: i64 = 0; i < this.state.symbolic_owner_param_nodes.length; i++) {
+            const p: GenericParamNode* = this.state.symbolic_owner_param_nodes[i];
+            if (p != null && p.sym_id.equals(sid)) { return true; }
+        }
+        for (mut j: i64 = 0; j < this.state.symbolic_method_param_nodes.length; j++) {
+            const p: GenericParamNode* = this.state.symbolic_method_param_nodes[j];
+            if (p != null && p.sym_id.equals(sid)) { return true; }
+        }
+        return false;
+    }
+
+    /// True when a qualified path's scope segment names a generic parameter
+    /// in scope for the body under symbolic check, by the segment's stamp.
+    /// The owner list can carry a spelling no binding in the body has: an
+    /// impl on a concrete instantiation walks its methods over the
+    /// TEMPLATE's parameters, so `A::f()` beside a `type struct A` stamps
+    /// the struct, and by spelling it would pass for the parameter.
+    symbolic_scope_is_generic_param(&this, scope: ScopeResolutionNode*) -> boolean {
+        if (!this.state.in_symbolic_check) { return false; }
+        return match (scope.require_scope_res("symbolic scope segment")) {
+            Res::TypeRelative(b, _) => {
+                match (b) {
+                    ResBase::GenericParam(s) => { this.symbolic_param_in_scope(s) }
+                    _                        => { false }
+                }
+            }
+            _ => { false }
+        };
+    }
+
+    /// True when a parameter TYPE's spelling is one of the parameters in
+    /// scope for the body under symbolic check.  By spelling because the
+    /// arena's `GenericParamType` / `BoundedParamType` carry a name and an
+    /// index and no symbol - the type layer's own identity for a parameter
+    /// is its spelling until the arena is keyed by symbol.  Only meaningful
+    /// while `state.in_symbolic_check`.
     symbolic_name_is_generic_param(&this, sym: SymbolStr) -> boolean {
         if (!this.state.in_symbolic_check) { return false; }
-        for (mut i: i64 = 0; i < this.state.symbolic_generic_param_ids.length; i++) {
-            if (this.state.symbolic_generic_param_ids[i] == sym.id) { return true; }
+        for (mut i: i64 = 0; i < this.state.symbolic_owner_param_nodes.length; i++) {
+            const p: GenericParamNode* = this.state.symbolic_owner_param_nodes[i];
+            if (p != null && p.name.equals(sym)) { return true; }
+        }
+        for (mut j: i64 = 0; j < this.state.symbolic_method_param_nodes.length; j++) {
+            const p: GenericParamNode* = this.state.symbolic_method_param_nodes[j];
+            if (p != null && p.name.equals(sym)) { return true; }
         }
         return false;
     }

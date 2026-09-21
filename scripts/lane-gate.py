@@ -119,8 +119,15 @@ The calls are SPLIT BY THE STORE that answers them and by READ vs WRITE:
   * GRAPH_READ / GRAPH_WRITE -- the `ModuleGraph`: a module asked by its
     namespace or its path, the re-export closure, the owner-key → file map.
   * CONST_READ / CONST_WRITE -- the `ConstantTable`: constants and enums
-    registered under their qualified name; reads go by stamp (`ConstEval`)
-    and are expected to stay at zero.
+    registered under their qualified name.  The reader, `ConstEval`, takes
+    the STAMP off the node and enters the table by that declaration's
+    canonical name - `by_qualified` under `DefId::qualified_name()`, a
+    module-qualified constant under the stamped module's name and the
+    written leaf, an enum's variant under the stamped enum's name - so a
+    spelling never picks the entry; it shares the store's file, so its four
+    reads are counted nowhere here.  CONST_READ counts the rest: today the
+    key MINTED at a constant's declaration for its registration (the write
+    side, in `name_resolution`) and a literal's text parsed to a value.
   * (The default-expansion pass kept a table of all-default templates keyed
     by the template's BARE leaf on its own stack, threaded through it as a
     parameter.  Rule 1's first run over the tree found it - the store the
@@ -1093,7 +1100,8 @@ HEADER = [
     "# REGISTRY_WRITE the GenericRegistry's registrars.",
     "# GRAPH_READ     the ModuleGraph asked by namespace or path.",
     "# GRAPH_WRITE    a name-keyed write to the ModuleGraph (none today).",
-    "# CONST_READ     a name-keyed read of the ConstantTable (reads go by stamp).",
+    "# CONST_READ     a name-keyed read of the ConstantTable (ConstEval enters it by",
+    "#                the stamp's canonical name, from the store's own file).",
     "# CONST_WRITE    a constant or enum registered under its qualified name.",
     "# REENTRY  get_resolver() outside the driver, and ANY name-keyed Resolver",
     "#          method on a Resolver-typed receiver outside compiler/resolver/ and",

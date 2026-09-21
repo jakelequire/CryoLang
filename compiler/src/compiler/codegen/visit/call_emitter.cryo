@@ -178,61 +178,12 @@ type struct CallEmitter {
         if (node.callee.kind == NodeKind::Identifier) {
             const id: IdentifierNode* = node.callee as IdentifierNode*;
 
-            // `try_catch(body, data)` - the catch_unwind primitive.  Needs an
-            // `invoke` + a catch-all landing pad + a phi (control flow the
-            // generic `try_emit` inline path cannot build), so it is special-
-            // lowered here rather than through `IntrinsicKind`.  Handles both
-            // the bare and `intrinsics::`-qualified call shapes (ScopeResolution
-            // branch below).
-            if (id.name.equals(intern.intern("try_catch"))) {
-                this.emit_catch_unwind(visitor, node);
-                return;
-            }
-
-            // Intrinsics first: `i32_to_i64`, `ptr_diff`, `bswap32`, etc.
-            // are emitted as inline LLVM IR, not as real function calls,
-            // so they have no LLVM definition.  If sema pinned
-            // `resolved_callee` to an intrinsic's mangled name, the
-            // module DOES contain an extern declaration (from
-            // declare_function), but no module DEFINES the function;
-            // calling it would emit a real call and the link step would
-            // fail with `undefined reference`.  Run the inline dispatcher
-            // up front to avoid that path.
-            const intr_name_str: string = intern.resolve(id.name);
-            if (IntrinsicKind::is_name(intr_name_str) && this.callee_is_intrinsic(node)) {
-                // `intr_args` is scoped to this branch: it is built and moved
-                // into try_emit unconditionally here, so nothing is left
-                // conditionally moved past the if.
-                mut intr_args: LValue[] = [];
-                for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
-                    intr_args.push(this.dispatch.codegen_rvalue(visitor,node.arguments[ai]));
-                }
-                // `--panic=unwind` direct-panic drop-completeness: route the
-                // panic funnel through an invoke + cleanup landing pad so the
-                // frame's live droppable locals drop on unwind (the plain-call
-                // `emit_panic_call` path bypasses the invoke-swap and leaks
-                // them).  Gated on a hosted unwind build WITH live locals; every
-                // other case falls through to the byte-identical `try_emit`
-                // plain-call path below.
-                if (id.name.equals(intern.intern("panic"))
-                    && this.cg.ctx.project_panic_unwind
-                    && !this.cg.intrinsics.no_runtime
-                    && (node.unwind_cleanup.length > 0
-                        || this.cg.expr_ops.has_live_arg_temps())
-                    && intr_args.length >= 3) {
-                    this.emit_panic_unwind(visitor, node,
-                        intr_args[0], intr_args[1], intr_args[2]);
-                    return;
-                }
-                match (this.cg.intrinsics.try_emit(intr_name_str, intr_args)) {
-                    Option::Some(v) => {
-                        this.state.last_value = v;
-                        this.state.last_is_lvalue = false;
-                        return;
-                    }
-                    Option::None => { }
-                }
-            }
+            // An intrinsic is lowered inline before anything reads the
+            // written name: sema pins `resolved_callee` to the intrinsic's
+            // entry, and the module carries an extern declaration for it
+            // (from declare_function) that nothing defines, so a real call
+            // would fail the link with `undefined reference`.
+            if (this.emit_pinned_intrinsic(visitor, node)) { return; }
 
             // Trust sema: `resolved_callee` is the mangled LLVM symbol
             // chosen by overload resolution (or, for unique-name
@@ -424,52 +375,11 @@ type struct CallEmitter {
             // qualified type name, then build the combined key.
             const sr: ScopeResolutionNode* = node.callee as ScopeResolutionNode*;
 
-            // `intrinsics::try_catch(body, data)` - the catch_unwind primitive.
-            // See the Identifier-branch twin for why this is special-lowered.
-            if (sr.member_name.equals(intern.intern("try_catch"))) {
-                this.emit_catch_unwind(visitor, node);
-                return;
-            }
-
-            // Inline-lower intrinsics referenced via a namespace prefix
-            // (e.g., `intrinsics::fpclass`, `intrinsics::ptr_diff`).  The
-            // leaf name uniquely identifies the intrinsic; the prefix is
-            // ignored because intrinsics live in the global LLVM namespace,
-            // not in the source-level module they were declared in.  Run
-            // BEFORE the resolved_callee lookup: sema pins
-            // `intrinsics::ptr_diff` as a qualified callee symbol, and the
-            // declaration table would happily declare it as an extern,
-            // causing the linker to look for a real `ptr_diff` symbol that
-            // doesn't exist (intrinsics are lowered inline, never linked).
-            const sr_leaf_str: string = intern.resolve(sr.member_name);
-            if (IntrinsicKind::is_name(sr_leaf_str) && this.callee_is_intrinsic(node)) {
-                mut sr_args: LValue[] = [];
-                for (mut sai: i64 = 0; sai < node.arguments.length; sai++) {
-                    sr_args.push(this.dispatch.codegen_rvalue(visitor,node.arguments[sai]));
-                }
-                // `--panic=unwind` direct-panic drop-completeness (mirrors the
-                // Identifier branch): `intrinsics::panic(...)` / `core::panic`'s
-                // inner call arrive here as a ScopeResolution intrinsic.  Route
-                // through invoke + cleanup pad when the frame has live locals.
-                if (sr.member_name.equals(intern.intern("panic"))
-                    && this.cg.ctx.project_panic_unwind
-                    && !this.cg.intrinsics.no_runtime
-                    && (node.unwind_cleanup.length > 0
-                        || this.cg.expr_ops.has_live_arg_temps())
-                    && sr_args.length >= 3) {
-                    this.emit_panic_unwind(visitor, node,
-                        sr_args[0], sr_args[1], sr_args[2]);
-                    return;
-                }
-                match (this.cg.intrinsics.try_emit(sr_leaf_str, sr_args)) {
-                    Option::Some(v) => {
-                        this.state.last_value = v;
-                        this.state.last_is_lvalue = false;
-                        return;
-                    }
-                    Option::None => { }
-                }
-            }
+            // An intrinsic reached through its module (`intrinsics::ptr_diff`)
+            // is lowered inline BEFORE the pin is resolved as a callee: the
+            // declaration table would declare the pinned symbol as an extern
+            // and the link would look for a `ptr_diff` nothing defines.
+            if (this.emit_pinned_intrinsic(visitor, node)) { return; }
 
             // Sema's pin is the whole answer for a static call: written by
             // sema's static-method / module-function / C-import paths, or by
@@ -1214,24 +1124,78 @@ type struct CallEmitter {
     /// the hosted raising funnel applies; the plain-call fast-path (empty
     /// schedule / abort mode / freestanding trap) stays byte-identical through
     /// `emit_panic_call`.
-    /// Whether a call whose leaf `IntrinsicKind::is_name` knows names the
-    /// INTRINSIC, and so lowers inline, or a function that shares the leaf,
-    /// and so is called.  The pin decides, by the mark the intrinsic's
+    /// The leaf of the INTRINSIC a call is pinned to, or "" when the call
+    /// is a function call.  The pin decides, by the mark the intrinsic's
     /// registration put on its entry: any other pin - the exported
     /// `std::core::panic` wrapper, a user's `rotl32`, an `extern "C"`
     /// declaration whose C symbol IS the leaf - is a real function with a
-    /// body, whatever its leaf or its symbol.  An unpinned callee is a
-    /// pure-magic form (`bswap32`, the casts) no declaration carries, and
-    /// inlines; a bare allocator call is an error in sema and never reaches
-    /// here.  A leaf test in front of the pin inlined every `core::panic(...)`
-    /// in the stdlib against a spelling that named the wrapper, and a
-    /// symbol test after it would take `libc::malloc` for the intrinsic.
-    callee_is_intrinsic(&this, node: CallExprNode*) -> boolean {
+    /// body, whatever its leaf or its symbol; and a call with NO pin is a
+    /// call through a VALUE - a parameter, a local or a field holding a
+    /// function pointer - which is never an intrinsic, whatever the value
+    /// is named (a parameter `bswap32: (u32) -> u32` called through the
+    /// pointer was inlined as the byte swap).  The kind is then selected by
+    /// the pinned declaration's own leaf, never by the written one.  A leaf
+    /// test in front of the pin inlined every `core::panic(...)` in the
+    /// stdlib against a spelling that named the wrapper, and a symbol test
+    /// after it would take `libc::malloc` for the intrinsic.
+    pinned_intrinsic_leaf(&this, node: CallExprNode*) -> string {
         const di: DeclarationIndex* = this.cg.get_decl_index();
-        return match (&node.resolved_callee) {
-            CalleePin::None      => { true }
-            CalleePin::Family(f) => { di.family_is_intrinsic(f) }
-            CalleePin::Decl(e)   => { di.entry_is_intrinsic(e) }
+        mut key: SymbolStr = SymbolStr::empty();
+        match (&node.resolved_callee) {
+            CalleePin::None      => { }
+            CalleePin::Family(f) => { if (di.family_is_intrinsic(f)) { key = f; } }
+            CalleePin::Decl(e)   => { if (di.entry_is_intrinsic(e)) { key = di.entry_key(e); } }
+        }
+        if (!key.is_valid()) { return ""; }
+        return QualifiedName::leaf_of(this.cg.get_intern().resolve(key));
+    }
+
+    /// Lower a call pinned to an intrinsic inline, for both callee shapes
+    /// (`ptr_diff(..)` and `intrinsics::ptr_diff(..)`).  False when the
+    /// call is a function call, or names an intrinsic the dispatcher
+    /// declines (an arity it does not take), which then goes through the
+    /// pin as a call.
+    emit_pinned_intrinsic(mut &this, visitor: ASTVisitor*, node: CallExprNode*) -> boolean {
+        const leaf: string = this.pinned_intrinsic_leaf(node);
+        if (leaf.length() == 0) { return false; }
+        // `try_catch(body, data)` - the catch_unwind primitive.  Needs an
+        // `invoke` + a catch-all landing pad + a phi (control flow the
+        // generic `try_emit` inline path cannot build), so it is special-
+        // lowered here rather than through `IntrinsicKind`.
+        if (leaf.eq("try_catch")) {
+            this.emit_catch_unwind(visitor, node);
+            return true;
+        }
+        if (!IntrinsicKind::is_name(leaf)) { return false; }
+        // `args` is scoped to this call: it is built and moved into
+        // `try_emit` unconditionally, so nothing is left conditionally
+        // moved past the if.
+        mut args: LValue[] = [];
+        for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
+            args.push(this.dispatch.codegen_rvalue(visitor, node.arguments[ai]));
+        }
+        // `--panic=unwind` direct-panic drop-completeness: route the panic
+        // funnel through an invoke + cleanup landing pad so the frame's live
+        // droppable locals drop on unwind (the plain-call `emit_panic_call`
+        // path bypasses the invoke-swap and leaks them).  Gated on a hosted
+        // unwind build WITH live locals; every other case falls through to
+        // the byte-identical `try_emit` plain-call path below.
+        if (leaf.eq("panic")
+            && this.cg.ctx.project_panic_unwind
+            && !this.cg.intrinsics.no_runtime
+            && (node.unwind_cleanup.length > 0
+                || this.cg.expr_ops.has_live_arg_temps())
+            && args.length >= 3) {
+            this.emit_panic_unwind(visitor, node, args[0], args[1], args[2]);
+            return true;
+        }
+        return match (this.cg.intrinsics.try_emit(leaf, args)) {
+            Option::Some(v) => {
+                this.state.last_value = v;
+                this.state.last_is_lvalue = false;
+                true
+            }
+            Option::None => { false }
         };
     }
 
