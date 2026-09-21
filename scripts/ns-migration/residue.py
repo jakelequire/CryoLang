@@ -30,8 +30,25 @@ Every site prints as one tab-separated row:
 site table (`residue_classify.py` writes it) and refuses when the tree's
 population and the table differ in either direction - matched by (file,
 method, key text), so a line shift is not drift and a new or re-keyed site
-is - or when a row is unclassified; on OK it prints the count per class, so
-the count pinned in §0 is checked against the tree AND against the list.
+is - when a row's class is not the one `residue_classify.py` derives for
+that site (a class is a judgement held as code; the list is its rendering,
+and a list that says otherwise is the list that is wrong), or when a class
+letter is one the classifier has no meaning for; on OK it prints the count
+per class FROM THE CLASSIFIER, so the count pinned in §0 is checked against
+the tree, against the list and against the code that decides it.  A list
+whose one J row had been flipped to N by hand read `OK ... J 51, N 118`
+through a check that summed the letters as written.
+
+Two controls the gate has and this enumerator did without, both refused
+now: a call to a population name that neither receiver pattern reaches
+(`(this.ctx.decl_index).lookup_type(`, a receiver with arguments) is
+refused as unplaceable rather than not counted; and every dotted call to a
+population name whose receiver is placed on a type that is NOT a holder
+(`DropInserter::lookup_type`, `ScopeManager::lookup_local`, ...) is
+tallied per (type, method) into the list's second table, so a holder
+misplaced as something else moves a pinned number instead of vanishing -
+the gate's LOOKUP_LOCAL row.  A static call's owner is spelled and cannot
+be misplaced, so statics on non-holders are not tallied.
 """
 import argparse
 import importlib.util
@@ -119,63 +136,169 @@ def population(gate, src):
     names = sorted(set().union(*sets.values()), key=len, reverse=True)
     if not names:
         raise SystemExit("residue: no name-taking read on any holder; the parser has not measured the tree")
-    alt = "|".join(re.escape(n) for n in names)
-    dotted_re = re.compile(r"%s\.(%s)\s*\(" % (gate.RECEIVER, alt))
-    static_re = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)::(%s)\s*\(" % alt)
+    seen_re, dotted_re, cast_re, static_re = gate.call_patterns(names)
     rows = []
     unplaced = []
+    unreached = []
+    elsewhere = {}
     for rel in tree.rels:
         for lineno, raw in enumerate(tree.files[rel], 1):
             line = gate.strip_comment(raw)
             if not line.strip():
                 continue
-            for m in dotted_re.finditer(line):
-                recv, name = m.group(1), m.group(2)
-                ty = tree.receiver_type(rel, lineno, recv)
+            seen = len(seen_re.findall(line))
+            accounted = 0
+            placed = [(m, m.group(1), m.group(2), tree.receiver_type(rel, lineno, m.group(1)))
+                      for m in dotted_re.finditer(line)]
+            placed += [(m, m.group(0), m.group(2), m.group(1)) for m in cast_re.finditer(line)]
+            for m, recv, name, ty in placed:
+                accounted += 1
                 if ty is None:
                     # A call this enumerator cannot place is one it cannot
                     # count, and a silently dropped one reads as a shorter
                     # list; lane-gate refuses the same way.
                     unplaced.append((rel, lineno, recv, name))
                     continue
-                if ty not in sets or name not in sets[ty]:
+                if ty not in sets:
+                    # A population name on a type that holds nothing: not a
+                    # site, but tallied so a holder misplaced as one shows.
+                    elsewhere[(ty, name)] = elsewhere.get((ty, name), 0) + 1
+                    continue
+                if name not in sets[ty]:
                     continue
                 if rel == holders[ty] or (ty in gate.STORES and gate.STORES[ty].owns(rel)):
                     continue
                 rows.append((rel, lineno, ty, name, argument_text(line, m.end() - 1)))
             for m in static_re.finditer(line):
+                accounted += 1
                 owner, name = m.group(1), m.group(2)
                 if owner not in sets or name not in sets[owner]:
                     continue
                 if rel == holders[owner] or (owner in gate.STORES and gate.STORES[owner].owns(rel)):
                     continue
                 rows.append((rel, lineno, owner, name, argument_text(line, m.end() - 1)))
+            # A call to a population name on something no pattern reaches: a
+            # receiver with arguments, a parenthesized expression.  Refused,
+            # as the gate refuses it - unreached is uncounted.
+            for _ in range(seen - accounted):
+                unreached.append((rel, lineno, line.strip()))
     if unplaced:
         raise SystemExit("residue: %d call(s) to a read method on a receiver whose type "
                          "cannot be read, e.g. %s:%d `%s.%s(`; place it or the count is short"
                          % (len(unplaced), unplaced[0][0], unplaced[0][1], unplaced[0][2], unplaced[0][3]))
-    return rows, sets
+    if unreached:
+        raise SystemExit("residue: %d call(s) to a read method on no simple receiver, "
+                         "e.g. %s:%d `%s`; a call no pattern reaches is a call this "
+                         "enumerator cannot count"
+                         % (len(unreached), unreached[0][0], unreached[0][1], unreached[0][2][:120]))
+    return rows, sets, elsewhere
 
 
 # A row of the residue's site table: `file:line` | `Holder::method` | `key` | class | reason.
 # The list is matched to the tree by (file, method, key text), not by line,
 # so an edit that only moves a file's lines does not read as drift; a site
-# added, removed or re-keyed does.
-SITE_RE = re.compile(r"^\|\s*`([^`]+):(\d+)`\s*\|\s*`([^`]+)`\s*\|\s*(?:`(.*?)`)?\s*\|\s*([A-Z?])\s*\|")
+# added, removed or re-keyed does.  The class letter is one character of any
+# kind, so a letter the classifier does not know is read here and refused
+# there instead of falling out of the table unseen.
+SITE_RE = re.compile(r"^\|\s*`([^`]+):(\d+)`\s*\|\s*`([^`]+)`\s*\|\s*(?:`(.*?)`)?\s*\|\s*(\S+)\s*\|")
+# A row of the list's second table: `Type::method` | calls - the dotted
+# calls to a population name whose receiver is placed on a type that holds
+# nothing (the gate's LOOKUP_LOCAL, pinned here per (type, method)).
+ELSEWHERE_RE = re.compile(r"^\|\s*`([^`]+)::([^`]+)`\s*\|\s*(\d+)\s*\|")
+ELSEWHERE_BEGIN = "<!-- residue-elsewhere:begin -->"
+ELSEWHERE_END = "<!-- residue-elsewhere:end -->"
 
 
 def residue_sites(path):
-    """{(file, method, key): count} and {class: count} from the table."""
+    """{(file, method, key): [class, ...]} from the site table and
+    {(type, method): calls} from the elsewhere table, as the list has them."""
     sites = {}
-    classes = {}
+    elsewhere = {}
     with open(path, "r", encoding="utf-8") as fh:
-        for line in fh:
-            m = SITE_RE.match(line)
-            if m:
-                key = (m.group(1), m.group(3), (m.group(4) or "").replace("\\|", "|"))
-                sites[key] = sites.get(key, 0) + 1
-                classes[m.group(5)] = classes.get(m.group(5), 0) + 1
-    return sites, classes
+        text = fh.read()
+    b, e = text.find(ELSEWHERE_BEGIN), text.find(ELSEWHERE_END)
+    other = text[b:e] if b >= 0 and e > b else ""
+    for line in text.splitlines():
+        m = SITE_RE.match(line)
+        if m:
+            key = (m.group(1), m.group(3), (m.group(4) or "").replace("\\|", "|"))
+            sites.setdefault(key, []).append(m.group(5))
+    for line in other.splitlines():
+        m = ELSEWHERE_RE.match(line)
+        if m:
+            elsewhere[(m.group(1), m.group(2))] = int(m.group(3))
+    return sites, elsewhere
+
+
+def check(rows, elsewhere, path, out=print):
+    """The list at `path` against the tree's `rows` and the classifier's
+    verdict on each: every site present in both, no more than once each
+    way; every row's class the one the classifier derives for it; every
+    class letter one the classifier defines; the elsewhere table equal to
+    the tree's tally.  Prints each disagreement and returns 0 on OK, 1 on
+    any refusal.  The counts it prints on OK are the classifier's."""
+    import residue_classify as rc
+    listed, listed_elsewhere = residue_sites(path)
+    classified, unknown = rc.classify(rows)
+    if unknown:
+        out("residue: read methods called in the tree with no class in residue_classify.py: %s"
+            % ", ".join(sorted(unknown)))
+        return 1
+    tree = {}
+    for rel, _l, key, arg, cls, _reason in classified:
+        tree.setdefault((rel, key, arg), []).append(cls)
+    drift = False
+    for k in sorted(set(tree) | set(listed)):
+        if len(tree.get(k, ())) != len(listed.get(k, ())):
+            drift = True
+            out("residue: %s %s (%s): tree %d, list %d"
+                % (k[0], k[1], k[2], len(tree.get(k, ())), len(listed.get(k, ()))))
+    if drift:
+        out("residue: DRIFT - tree %d, list %d; re-run residue_classify.py and review the rows it changes"
+            % (sum(len(v) for v in tree.values()), sum(len(v) for v in listed.values())))
+        return 1
+    # The class is the classifier's; the list only renders it.  Every letter
+    # in the list is checked against the letter the code derives for that
+    # site, so a row edited by hand - flipped, blanked, given a letter the
+    # classes do not include - is refused rather than summed.
+    mismatched = 0
+    for k in sorted(tree):
+        want = tree[k][0]
+        for got in listed[k]:
+            if got == want:
+                continue
+            mismatched += 1
+            if got not in rc.CLASSES:
+                out("residue: %s %s (%s): the list says `%s`, which is no class (%s); the classifier says %s"
+                    % (k[0], k[1], k[2], got, rc.CLASSES, want))
+            else:
+                out("residue: %s %s (%s): the list says %s, the classifier says %s"
+                    % (k[0], k[1], k[2], got, want))
+    if mismatched:
+        out("residue: %d row(s) whose class is not the classifier's; a class is a judgement held in "
+            "residue_classify.py - change it there, with its reason, and regenerate the list" % mismatched)
+        return 1
+    moved = False
+    for k in sorted(set(elsewhere) | set(listed_elsewhere)):
+        if elsewhere.get(k, 0) != listed_elsewhere.get(k, 0):
+            moved = True
+            out("residue: elsewhere %s::%s: tree %d, list %d"
+                % (k[0], k[1], elsewhere.get(k, 0), listed_elsewhere.get(k, 0)))
+    if moved:
+        out("residue: ELSEWHERE - a population name on a type that holds nothing moved (tree %d, list %d); "
+            "a holder misplaced as another type lands here - place it, or regenerate the list and say why"
+            % (sum(elsewhere.values()), sum(listed_elsewhere.values())))
+        return 1
+    counts = {}
+    for row in classified:
+        counts[row[4]] = counts.get(row[4], 0) + 1
+    # The convertible remainder is every class that is neither justified
+    # (J) nor outside D32 (N); the migration is complete at 0.
+    convertible = sum(n for c, n in counts.items() if c not in ("J", "N"))
+    out("residue: OK -- %d sites, list, tree and classifier agree; %s; convertible %d; elsewhere %d"
+        % (len(classified), ", ".join("%s %d" % (c, counts[c]) for c in sorted(counts)),
+           convertible, sum(elsewhere.values())))
+    return 0
 
 
 def main():
@@ -183,42 +306,25 @@ def main():
     ap.add_argument("--src", default=os.path.join(ROOT, "compiler", "src"))
     ap.add_argument("--count", action="store_true", help="print the population size alone")
     ap.add_argument("--methods", action="store_true", help="print the read methods per holder")
+    ap.add_argument("--elsewhere", action="store_true",
+                    help="print the population names called on types that hold nothing, per (type, method)")
     ap.add_argument("--check", nargs="?", const=DEFAULT_RESIDUE, metavar="RESIDUE_MD",
-                    help="refuse unless the tree's population equals the residue's site table")
+                    help="refuse unless the tree's population, the residue's site table and the classifier agree")
     args = ap.parse_args()
     gate = load_gate()
-    rows, sets = population(gate, args.src)
+    rows, sets, elsewhere = population(gate, args.src)
     if args.methods:
         for holder in sorted(sets):
             if sets[holder]:
                 print("%s: %s" % (holder, ", ".join(sorted(sets[holder]))))
         return 0
-    if args.check:
-        listed, classes = residue_sites(args.check)
-        tree = {}
-        for r, _l, t, n, a in rows:
-            k = (r, t + "::" + n, a)
-            tree[k] = tree.get(k, 0) + 1
-        drift = False
-        for k in sorted(set(tree) | set(listed)):
-            if tree.get(k, 0) != listed.get(k, 0):
-                drift = True
-                print("residue: %s %s (%s): tree %d, list %d"
-                      % (k[0], k[1], k[2], tree.get(k, 0), listed.get(k, 0)))
-        if drift:
-            print("residue: DRIFT - tree %d, list %d; re-run residue_classify.py and review the rows it changes"
-                  % (sum(tree.values()), sum(listed.values())))
-            return 1
-        if "?" in classes:
-            print("residue: %d sites UNCLASSIFIED" % classes["?"])
-            return 1
-        # The convertible remainder is every class that is neither justified
-        # (J) nor outside D32 (N); the migration is complete at 0.
-        convertible = sum(n for c, n in classes.items() if c not in ("J", "N"))
-        print("residue: OK -- %d sites, list and tree agree; %s; convertible %d"
-              % (sum(tree.values()),
-                 ", ".join("%s %d" % (c, classes[c]) for c in sorted(classes)), convertible))
+    if args.elsewhere:
+        for (ty, name), n in sorted(elsewhere.items()):
+            print("%s::%s\t%d" % (ty, name, n))
         return 0
+    if args.check:
+        sys.path.insert(0, HERE)
+        return check(rows, elsewhere, args.check)
     if args.count:
         print(len(rows))
         return 0

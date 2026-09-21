@@ -245,9 +245,37 @@ def render(classified):
     return "\n".join(lines) + "\n", counts
 
 
+def render_elsewhere(elsewhere):
+    """The second table: every population name called through a dotted
+    receiver placed on a type that holds nothing, per (type, method) with
+    its count.  Not sites - the type is no holder - but pinned, because a
+    holder the placement rule misreads as another type lands here and
+    nowhere else; the gate's LOOKUP_LOCAL row, by name."""
+    lines = ["Elsewhere **%d** - a population name on a type that holds nothing, per (type, method)"
+             % sum(elsewhere.values()), ""]
+    lines.append("| receiver type and read | calls |")
+    lines.append("|---|---|")
+    for (ty, name), n in sorted(elsewhere.items()):
+        lines.append("| `%s::%s` | %d |" % (ty, name, n))
+    return "\n".join(lines) + "\n"
+
+
+def write_list(path, classified, elsewhere):
+    """Rewrite the two generated tables of the list at `path`, between their
+    markers, leaving the prose around them as it is."""
+    table, counts = render(classified)
+    text = io.open(path, encoding="utf-8").read()
+    b, e = text.index(BEGIN), text.index(END)
+    text = text[:b + len(BEGIN)] + "\n" + table + text[e:]
+    b, e = text.index(residue.ELSEWHERE_BEGIN), text.index(residue.ELSEWHERE_END)
+    text = text[:b + len(residue.ELSEWHERE_BEGIN)] + "\n" + render_elsewhere(elsewhere) + text[e:]
+    io.open(path, "w", encoding="utf-8", newline="\n").write(text)
+    return counts
+
+
 def main():
     gate = residue.load_gate()
-    rows, sets = residue.population(gate, os.path.join(residue.ROOT, "compiler", "src"))
+    rows, sets, elsewhere = residue.population(gate, os.path.join(residue.ROOT, "compiler", "src"))
     declared = {h + "::" + m for h, ms in sets.items() for m in ms}
     called = {ty + "::" + name for _r, _l, ty, name, _a in rows}
     stale = sorted(k for k in CLASS_OF_METHOD if k not in declared)
@@ -263,16 +291,12 @@ def main():
     if stale_sites:
         raise SystemExit("residue_classify: site overrides that match no call in the tree: "
                          + "; ".join("%s %s (%s)" % k for k in stale_sites))
-    table, counts = render(classified)
     path = residue.DEFAULT_RESIDUE
-    text = io.open(path, encoding="utf-8").read()
-    b, e = text.index(BEGIN), text.index(END)
-    text = text[:b + len(BEGIN)] + "\n" + table + text[e:]
-    io.open(path, "w", encoding="utf-8", newline="\n").write(text)
+    counts = write_list(path, classified, elsewhere)
     unread = sorted(declared - called)
-    print("residue_classify: %d sites written to %s (J %d); %d read methods declared and called from nowhere: %s"
-          % (len(classified), os.path.relpath(path, residue.ROOT), counts["J"], len(unread),
-             ", ".join(unread) if unread else "-"))
+    print("residue_classify: %d sites written to %s (J %d; elsewhere %d); %d read methods declared and called from nowhere: %s"
+          % (len(classified), os.path.relpath(path, residue.ROOT), counts["J"], sum(elsewhere.values()),
+             len(unread), ", ".join(unread) if unread else "-"))
     return 0
 
 

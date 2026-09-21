@@ -293,6 +293,12 @@ MUTATIONS = [
     ("a call on something other than a dotted receiver is refused",
      {"compiler/sema/sema.cryo": sema_with(["(this.ctx.decl_index).lookup_func_type(name);"])},
      1, "could not be placed by receiver"),
+    ("a cast receiver is placed by the type the cast names",
+     {"compiler/sema/sema.cryo": sema_with(["(this.ctx.something as DeclarationIndex*).lookup_func_type(name);"])},
+     1, "LOOKUP TOTAL 2 -> 3"),
+    ("a cast whose operand carries parentheses is refused, not guessed",
+     {"compiler/sema/sema.cryo": sema_with(["(this.ctx.get_arena() as DeclarationIndex*).lookup_func_type(name);"])},
+     1, "could not be placed by receiver"),
     ("a decrease is refused too (the ceiling must be re-pinned deliberately)",
      {"compiler/sema/sema.cryo": FILES["compiler/sema/sema.cryo"].replace(
           "        this.ctx.decl_index.lookup_type(name);\n", "")},

@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census roster-check lane-check lane-selftest ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census roster-check lane-check lane-selftest residue-selftest ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -185,8 +185,9 @@ help:
 	@echo "  make test-list         List the discovered test cases without running them"
 	@echo "  make lane-check        Pin the resolution-lane surface against its golden"
 	@echo "  make lane-selftest     Drive lane-gate.py through a throwaway tree, every rule both ways"
+	@echo "  make residue-selftest  Drive residue.py --check through a throwaway tree and list, both ways"
 	@echo "  make ns-status-check   Run every check docs/name-resolution.md §0 carries"
-	@echo "  make check-fast        lane-check + lane-selftest + ns-status-check + verify-pin (~10s, no build)"
+	@echo "  make check-fast        lane-check + the two self-tests + ns-status-check + verify-pin (~10s, no build)"
 	@echo "  make install-hooks     Point git at the tracked hooks (run once per checkout)"
 	@echo "  make lsp-check         Compile tools/CryoLSP against current source"
 	@echo "                         (installs nothing; the only gate that builds it)"
@@ -566,6 +567,16 @@ lane-check:
 lane-selftest:
 	@$(PYTHON) scripts/lane-gate-selftest.py
 
+# The residue check's own test: residue.py --check driven through a throwaway
+# tree and a throwaway list, in both directions - the pair it must accept,
+# and for each of its three inputs (tree, list, classifier) a mutation it
+# must refuse.  The first check summed the list's class letters as written,
+# so a J row flipped to N by hand read OK with J one lower - and the J count
+# pinned in section 0 is a grep over that line.  Two seconds; rides in
+# check-fast.
+residue-selftest:
+	@$(PYTHON) scripts/ns-migration/residue_selftest.py
+
 # ---- name-resolution status gate ---------------------------------------
 # Run every check §0 of docs/name-resolution.md carries and fail on drift.
 #
@@ -594,8 +605,8 @@ guard-selftest:
 # A ten-second gate everybody runs is worth more than a twenty-minute one
 # nobody does, which is the same argument that moved lane-check ahead of
 # `make cryo` in CI.
-check-fast: lane-check lane-selftest ns-status-check verify-pin
-	@echo "check-fast: OK (lane surface and its self-test, section 0, pin integrity)"
+check-fast: lane-check lane-selftest residue-selftest ns-status-check verify-pin
+	@echo "check-fast: OK (lane surface and its self-test, the residue check's self-test, section 0, pin integrity)"
 
 # ---- git hooks ---------------------------------------------------------
 # Point git at the tracked hook directory.  Hooks live in scripts/git-hooks so

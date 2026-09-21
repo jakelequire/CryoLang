@@ -493,6 +493,31 @@ RETURN_RE = re.compile(r"\)\s*->\s*&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*([A-Za
 # position is refused.
 SEGMENT = r"[A-Za-z_][A-Za-z_0-9]*(?:\(\)|\[[^\[\]]*\])?"
 RECEIVER = r"(%s(?:\.%s)*)" % (SEGMENT, SEGMENT)
+# A CAST receiver, `(t as StructType*).get_method(`: placed by the type the
+# cast names, which is the receiver's static type whatever `t` was declared
+# as.  The cast's operand carries no parentheses of its own; one that does is
+# refused with the rest of the unplaceable forms.
+CAST_RECEIVER = r"\(\s*[^()]*?\bas\s+([A-Za-z_][A-Za-z_0-9]*)\s*\*?\s*\)"
+# A static call's owner, `Owner::name(` or the turbofish `Owner::<T, U>::name(`:
+# the owner is spelled, so it is placed by that spelling and cannot be
+# misplaced.  `Pair::<LValue, TypeRef>::new(` is the shape a constructor call
+# on a generic type takes, and a static pattern that stops at the first `::`
+# reads it as a call it cannot place.
+STATIC_OWNER = r"([A-Za-z_][A-Za-z_0-9]*)(?:::<[^;]*?>)?"
+
+
+def call_patterns(names):
+    """The four patterns every call to one of `names` is matched by, given the
+    names longest first: `seen` (any `.name(` / `::name(`, the count the other
+    three must account for), `dotted` (a placeable receiver), `cast` (a cast
+    receiver, placed by the cast's type) and `static` (an owner, plain or
+    turbofish).  One definition, so the residue enumerator that derives its
+    population from this gate places exactly what the gate places."""
+    alt = "|".join(re.escape(n) for n in names)
+    return (re.compile(r"(?:\.|::)\s*(?:%s)\s*\(" % alt),
+            re.compile(r"%s\.(%s)\s*\(" % (RECEIVER, alt)),
+            re.compile(r"%s\.(%s)\s*\(" % (CAST_RECEIVER, alt)),
+            re.compile(r"%s::(%s)\s*\(" % (STATIC_OWNER, alt)))
 
 
 class Tree(object):
@@ -871,13 +896,11 @@ def scan(src):
                          "the parser has not measured the tree"
                          % (STORES[INDEX_TYPE].defn, ", ".join(missing)))
     names = sorted(set().union(*sets.values()), key=len, reverse=True)
-    alt = "|".join(names)
-    # Any call to a set name: a dotted receiver, a `Type::` static, or neither
-    # (which is a call this gate cannot place and refuses).  A definition line
-    # has no `.` or `::` before the name, so it is not a call.
-    seen_re = re.compile(r"(?:\.|::)\s*(?:%s)\s*\(" % alt)
-    dotted_re = re.compile(r"%s\.(%s)\s*\(" % (RECEIVER, alt))
-    static_re = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)::(%s)\s*\(" % alt)
+    # Any call to a set name: a dotted or a cast receiver, a `Type::` static,
+    # or none of those (which is a call this gate cannot place and refuses).
+    # A definition line has no `.` or `::` before the name, so it is not a
+    # call.
+    seen_re, dotted_re, cast_re, static_re = call_patterns(names)
 
     def row_for(store_name, name, rel):
         """The row a call to `name` on `store_name` from `rel` lands in, or
@@ -900,10 +923,12 @@ def scan(src):
                 continue
             seen = len(seen_re.findall(line))
             accounted = 0
-            for m in dotted_re.finditer(line):
+            placed = [(m.group(1), m.group(2), tree.receiver_type(rel, lineno, m.group(1)))
+                      for m in dotted_re.finditer(line)]
+            # A cast receiver is placed by the cast's type, not by a lookup.
+            placed += [(m.group(0), m.group(2), m.group(1)) for m in cast_re.finditer(line)]
+            for recv, name, ty in placed:
                 accounted += 1
-                recv, name = m.group(1), m.group(2)
-                ty = tree.receiver_type(rel, lineno, recv)
                 if ty is None:
                     unplaced.append((rel, lineno, recv))
                 elif ty in STORES:
@@ -953,7 +978,8 @@ HEADER = [
     "# not a list of names, so a reader added under any spelling, in any file,",
     "# on any store, is inside the rule as soon as it is declared. A call is",
     "# placed by its receiver's DECLARED TYPE (this, a local's annotation, a",
-    "# field's declaration), never by the receiver's spelling.",
+    "# field's declaration, the type a cast names), never by the receiver's",
+    "# spelling; a static's owner, plain or turbofish, is that spelling.",
     "#",
     "# LOOKUP         answered by the DeclarationIndex, under one of the",
     "#                per-kind names mechanism 5 gives. The lane surface; falls.",
