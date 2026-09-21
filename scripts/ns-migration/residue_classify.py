@@ -77,6 +77,27 @@ CLASS_OF_METHOD = {
         ("J", "member: the `This::Member` binding of the impl being resolved, by leaf"),
     "ResolutionContext::new":
         ("N", "a constructor: the string is the SOURCE FILE the context resolves in"),
+    # -- the member tables of the user-defined types: an array of records
+    #    (`FieldInfo[]`, `MethodInfo[]`, `EnumVariantInfo[]`) with the name
+    #    in each, searched by leaf off the type already in hand --
+    "StructType::get_field":
+        ("J", "member: a struct's field by its leaf off the `StructType` in hand; Rust's field lookup is name-keyed off the owner too"),
+    "StructType::field_index":
+        ("J", "member: a struct's field position by its leaf off the `StructType` in hand"),
+    "StructType::get_method":
+        ("J", "member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too"),
+    "ClassType::get_field":
+        ("J", "member: a class's field by its leaf off the `ClassType` in hand"),
+    "ClassType::field_index":
+        ("J", "member: a class's field position by its leaf off the `ClassType` in hand"),
+    "ClassType::get_method":
+        ("J", "member: a class's method by its leaf off the `ClassType` in hand"),
+    "EnumType::get_variant":
+        ("J", "member: an enum's variant by its leaf off the `EnumType` in hand"),
+    "EnumType::get_method":
+        ("J", "member: an enum's method by its leaf off the `EnumType` in hand"),
+    "TraitDeclNode::lookup_assoc_type":
+        ("J", "member: the trait's own associated type by its leaf, asked from the trait node in hand"),
     # -- the declaration index --
     "DeclarationIndex::type_of_decl":
         ("N", "keyed by the `DefId`; the string is the diagnostic label of the asking site"),
@@ -205,6 +226,26 @@ SITE_OVERRIDES = {
         ("B", "the call's pinned template KEY, a registry key string sema recorded"),
     ("compiler/sema/async_lower.cryo", "GenericRegistry::get_template", "c.resolved_template"):
         ("B", "the call's pinned template KEY, a registry key string sema recorded"),
+    # The member tables asked with a leaf the LANGUAGE fixes rather than one
+    # the program wrote: the protocols' own variant and method names.
+    ("compiler/sema/sema.cryo", "EnumType::get_variant", 'this.intern.intern("Ready")'):
+        ("J", "lang: `Poll::Ready`, the variant the async protocol names, inside the enum a future's `poll` returns"),
+    ("compiler/sema/sema.cryo", "EnumType::get_variant", 'this.intern.intern("Ok")'):
+        ("J", "lang: `Result::Ok`, one of the variants `?` shapes its operand by (see `enum_try_shape`; the owner is any enum spelling them, a finding, not this read's)"),
+    ("compiler/sema/sema.cryo", "EnumType::get_variant", 'this.intern.intern("Err")'):
+        ("J", "lang: `Result::Err`, one of the variants `?` shapes its operand by"),
+    ("compiler/sema/sema.cryo", "EnumType::get_variant", 'this.intern.intern("Some")'):
+        ("J", "lang: `Option::Some`, one of the variants `?` shapes its operand by"),
+    ("compiler/sema/sema.cryo", "EnumType::get_variant", 'this.intern.intern("None")'):
+        ("J", "lang: `Option::None`, one of the variants `?` shapes its operand by"),
+    ("compiler/sema/lambda_synth.cryo", "StructType::get_method", 'this.intern.intern("__call__")'):
+        ("J", "lang: the call protocol's `__call__`, the method leaf the language fixes for a callable struct"),
+    ("compiler/types/checker.cryo", "StructType::get_method", " ..."):
+        ("J", "lang: the call protocol's `__call__` (the argument continues on the next line), asked when a struct converts to a function type"),
+    ("compiler/sema/member_resolver.cryo", "StructType::get_field", 'this.intern.intern("this$recv")'):
+        ("J", "member: the receiver field the async lowering minted on the frame struct, asked back by the spelling it minted"),
+    ("compiler/sema/async_lower.cryo", "StructType::get_field", "this.recv_sym"):
+        ("J", "member: the receiver field the lowering minted on the frame struct, asked back by the spelling it minted"),
 }
 
 CLASSES = "JNSBCFW"

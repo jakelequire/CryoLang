@@ -73,10 +73,23 @@ they landed: the member table inside its owner (`ImplBlockNode::lookup_assoc_bin
 are `equals` calls on an array, not a method of a holder, so they are not
 in this population - they are §8.275's arena unit and retire with it.
 
+A third shape the first list could not see: the member tables of the
+user-defined types themselves. `StructType.fields: FieldInfo[]`,
+`ClassType.methods: MethodInfo[]`, `EnumType.variants: EnumVariantInfo[]`
+and `TraitDeclNode.assoc_types` are arrays of RECORDS with the name in
+each, searched by `rows[i].name.equals(n)` - neither a map nor an array
+of names, so no rule reached them and their 43 callers were nobody's.
+The gate's rule 1b now takes an array of records carrying a key-typed
+field as a candidate (37 owners on this tree, 20 placed as exclusions by
+reason, four of them member tables), and those callers are J `member` -
+a struct's field or method, an enum's variant, a trait's associated type,
+each by its leaf off the type already in hand - or J `lang` where the leaf
+is one the language fixes (`__call__`, `Ready`, `Ok`/`Err`, `Some`/`None`).
+
 ## The table
 
 <!-- residue-table:begin -->
-Population **265** - J 52 · N 117 · S 26 · B 49 · C 19 · F 2 · W 0
+Population **308** - J 95 · N 117 · S 26 · B 49 · C 19 · F 2 · W 0
 
 | site | read | key as written | class | reason |
 |---|---|---|---|---|
@@ -150,6 +163,14 @@ Population **265** - J 52 · N 117 · S 26 · B 49 · C 19 · F 2 · W 0
 | `compiler/sema/call_resolver.cryo:5221` | `TypeUtils::lookup_func_type_exact` | `q_sym` | C | a family or a `module::member` composed by `resolve_module_qualified_symbol` |
 | `compiler/sema/call_resolver.cryo:2559` | `DeclarationIndex::is_candidate_public` | `callee` | F | `enforce_callee_visibility` asks the callee's visibility by the callee's name |
 | `compiler/sema/call_resolver.cryo:2556` | `DeclarationIndex::namespace_of` | `callee, this.intern` | F | `enforce_callee_visibility` asks the callee's module by the callee's name |
+| `compiler/codegen/type_map.cryo:316` | `ClassType::field_index` | `member` | J | member: a class's field position by its leaf off the `ClassType` in hand |
+| `compiler/mono/call_specializer.cryo:749` | `ClassType::get_field` | `ma.member` | J | member: a class's field by its leaf off the `ClassType` in hand |
+| `compiler/sema/member_resolver.cryo:708` | `ClassType::get_field` | `field_name` | J | member: a class's field by its leaf off the `ClassType` in hand |
+| `compiler/sema/sema.cryo:2959` | `ClassType::get_field` | `field_init.field_name` | J | member: a class's field by its leaf off the `ClassType` in hand |
+| `compiler/types/checker.cryo:1045` | `ClassType::get_field` | `field_name` | J | member: a class's field by its leaf off the `ClassType` in hand |
+| `compiler/sema/diagnostics.cryo:314` | `ClassType::get_method` | `member_name` | J | member: a class's method by its leaf off the `ClassType` in hand |
+| `compiler/sema/member_resolver.cryo:774` | `ClassType::get_method` | `method_name` | J | member: a class's method by its leaf off the `ClassType` in hand |
+| `compiler/sema/sema.cryo:3138` | `ClassType::get_method` | `scope.member_name` | J | member: a class's method by its leaf off the `ClassType` in hand |
 | `compiler/passes/type_resolution.cryo:2474` | `DeclarationIndex::extern_symbol_conflict` | `ext_link_sym, func_type_ref` | J | extern: a C symbol by its link name, the only identity a C symbol has |
 | `compiler/codegen/ops/symbol_resolver.cryo:299` | `DeclarationIndex::global_entry_in_module` | `name, module` | J | member: a global's leaf inside the module the qualifier's stamp names (a `DefId`) |
 | `compiler/sema/type_utils.cryo:149` | `DeclarationIndex::global_entry_in_module` | `scope.member_name, seen.def_id()` | J | member: a global's leaf inside the module the qualifier's stamp names (a `DefId`) |
@@ -163,6 +184,24 @@ Population **265** - J 52 · N 117 · S 26 · B 49 · C 19 · F 2 · W 0
 | `compiler/compilation_context.cryo:523` | `DeclarationIndex::ns_imports` | `use_ns, cand_ns` | J | module: two namespaces asked whether one imports the other; module identities |
 | `compiler/resolver/name_resolution.cryo:1467` | `DeclarationIndex::ns_imports` | `use_ns, owner_ns` | J | module: two namespaces asked whether one imports the other; module identities |
 | `compiler/sema/call_resolver.cryo:3659` | `DeclarationIndex::signature_refused_in_module` | `scope.member_name, ...` | J | member: a function's leaf inside the module the qualifier's stamp names (a `DefId`) |
+| `compiler/sema/diagnostics.cryo:319` | `EnumType::get_method` | `member_name` | J | member: an enum's method by its leaf off the `EnumType` in hand |
+| `compiler/codegen/ops/declaration_emitter.cryo:2371` | `EnumType::get_variant` | `sr.member_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
+| `compiler/codegen/visit/call_emitter.cryo:508` | `EnumType::get_variant` | `sr.member_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
+| `compiler/codegen/visit/ir_generator.cryo:1644` | `EnumType::get_variant` | `node.member_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
+| `compiler/codegen/visit/new_delete_emitter.cryo:160` | `EnumType::get_variant` | `node.variant_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
+| `compiler/codegen/visit/pattern_emitter.cryo:284` | `EnumType::get_variant` | `epat.variant_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
+| `compiler/codegen/visit/pattern_emitter.cryo:477` | `EnumType::get_variant` | `epat.variant_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
+| `compiler/codegen/visit/pattern_emitter.cryo:547` | `EnumType::get_variant` | `epat.variant_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
+| `compiler/sema/call_resolver.cryo:550` | `EnumType::get_variant` | `scope.member_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
+| `compiler/sema/call_resolver.cryo:5098` | `EnumType::get_variant` | `member` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
+| `compiler/sema/diagnostics.cryo:319` | `EnumType::get_variant` | `member_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
+| `compiler/sema/pattern_resolver.cryo:168` | `EnumType::get_variant` | `enum_pat.variant_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
+| `compiler/sema/sema.cryo:2694` | `EnumType::get_variant` | `this.intern.intern("Ready")` | J | lang: `Poll::Ready`, the variant the async protocol names, inside the enum a future's `poll` returns |
+| `compiler/sema/sema.cryo:2707` | `EnumType::get_variant` | `this.intern.intern("Ok")` | J | lang: `Result::Ok`, one of the variants `?` shapes its operand by (see `enum_try_shape`; the owner is any enum spelling them, a finding, not this read's) |
+| `compiler/sema/sema.cryo:2707` | `EnumType::get_variant` | `this.intern.intern("Err")` | J | lang: `Result::Err`, one of the variants `?` shapes its operand by |
+| `compiler/sema/sema.cryo:2708` | `EnumType::get_variant` | `this.intern.intern("Some")` | J | lang: `Option::Some`, one of the variants `?` shapes its operand by |
+| `compiler/sema/sema.cryo:2708` | `EnumType::get_variant` | `this.intern.intern("None")` | J | lang: `Option::None`, one of the variants `?` shapes its operand by |
+| `compiler/sema/sema.cryo:3211` | `EnumType::get_variant` | `scope.member_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
 | `compiler/sema/method_binding.cryo:816` | `GenericRegistry::find_trait_defining_method` | `method_name` | J | hint: the did-you-mean asks which trait declares a method of this leaf; the spelling is the question |
 | `compiler/mono/monomorphizer.cryo:302` | `GenericRegistry::get_template` | `array_sym` | J | lang: `std::collections::array::Array`, the type the language lowers `T[]` to, by its own path |
 | `compiler/mono/state.cryo:404` | `GenericRegistry::get_template` | `array_sym` | J | lang: `std::collections::array::Array`, the type the language lowers `T[]` to, by its own path |
@@ -202,6 +241,23 @@ Population **265** - J 52 · N 117 · S 26 · B 49 · C 19 · F 2 · W 0
 | `compiler/passes/specialization.cryo:598` | `ModuleGraph::source_file_for_owner_key` | ` ...` | J | module: a module's source file by its namespace path |
 | `compiler/mono/monomorphizer.cryo:602` | `Resolver::find_module_scope` | `entry.module_name` | J | module: a module's scope by its namespace path, to stand in it while a template is instantiated |
 | `compiler/sema/sema.cryo:520` | `Resolver::find_module_scope` | `template_mod` | J | module: a module's scope by its namespace path, to stand in it while a template is instantiated |
+| `compiler/codegen/type_map.cryo:299` | `StructType::field_index` | `member` | J | member: a struct's field position by its leaf off the `StructType` in hand |
+| `compiler/codegen/visit/ir_generator.cryo:1132` | `StructType::field_index` | `field_names[0]` | J | member: a struct's field position by its leaf off the `StructType` in hand |
+| `compiler/codegen/visit/new_delete_emitter.cryo:268` | `StructType::field_index` | `finit.field_name` | J | member: a struct's field position by its leaf off the `StructType` in hand |
+| `compiler/codegen/visit/place_emitter.cryo:163` | `StructType::field_index` | `member` | J | member: a struct's field position by its leaf off the `StructType` in hand |
+| `compiler/mono/call_specializer.cryo:746` | `StructType::get_field` | `ma.member` | J | member: a struct's field by its leaf off the `StructType` in hand; Rust's field lookup is name-keyed off the owner too |
+| `compiler/sema/async_lower.cryo:2443` | `StructType::get_field` | `this.recv_sym` | J | member: the receiver field the lowering minted on the frame struct, asked back by the spelling it minted |
+| `compiler/sema/member_resolver.cryo:683` | `StructType::get_field` | `this.intern.intern("this$recv")` | J | member: the receiver field the async lowering minted on the frame struct, asked back by the spelling it minted |
+| `compiler/sema/member_resolver.cryo:703` | `StructType::get_field` | `field_name` | J | member: a struct's field by its leaf off the `StructType` in hand; Rust's field lookup is name-keyed off the owner too |
+| `compiler/sema/sema.cryo:2958` | `StructType::get_field` | `field_init.field_name` | J | member: a struct's field by its leaf off the `StructType` in hand; Rust's field lookup is name-keyed off the owner too |
+| `compiler/types/checker.cryo:1032` | `StructType::get_field` | `field_name` | J | member: a struct's field by its leaf off the `StructType` in hand; Rust's field lookup is name-keyed off the owner too |
+| `compiler/sema/diagnostics.cryo:310` | `StructType::get_method` | `member_name` | J | member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too |
+| `compiler/sema/lambda_synth.cryo:475` | `StructType::get_method` | `this.intern.intern("__call__")` | J | lang: the call protocol's `__call__`, the method leaf the language fixes for a callable struct |
+| `compiler/sema/member_resolver.cryo:769` | `StructType::get_method` | `method_name` | J | member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too |
+| `compiler/sema/sema.cryo:3137` | `StructType::get_method` | `scope.member_name` | J | member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too |
+| `compiler/types/checker.cryo:331` | `StructType::get_method` | ` ...` | J | lang: the call protocol's `__call__` (the argument continues on the next line), asked when a struct converts to a function type |
+| `compiler/passes/type_resolution.cryo:1718` | `TraitDeclNode::lookup_assoc_type` | `assoc` | J | member: the trait's own associated type by its leaf, asked from the trait node in hand |
+| `compiler/sema/async_lower.cryo:709` | `TraitDeclNode::lookup_assoc_type` | `assoc` | J | member: the trait's own associated type by its leaf, asked from the trait node in hand |
 | `compiler/resolver/name_resolution.cryo:2851` | `ConstantTable::intern_qualified` | `intern, ns, node.name` | N | a key MINTED at the constant's declaration (`ns::name`) for its registration; the write side |
 | `compiler/resolver/name_resolution.cryo:2881` | `ConstantTable::intern_qualified` | `intern, ns, node.name` | N | a key MINTED at the constant's declaration (`ns::name`) for its registration; the write side |
 | `compiler/passes/drop_insertion.cryo:3319` | `ConstantTable::parse_int_literal` | `text, &v` | N | a literal's text parsed to a value |
@@ -360,18 +416,14 @@ method on an unrelated type gained or lost a caller (regenerate, and say
 which in the commit).
 
 <!-- residue-elsewhere:begin -->
-Elsewhere **29** - a population name on a type that holds nothing, per (type, method)
+Elsewhere **18** - a population name on a type that holds nothing, per (type, method)
 
 | receiver type and read | calls |
 |---|---|
-| `ClassType::get_method` | 3 |
 | `DropInserter::lookup_type` | 5 |
-| `EnumType::get_method` | 1 |
 | `ModuleKeyTable::lookup` | 1 |
 | `MoveChecker::lookup_type` | 4 |
 | `Scope::is_ambiguous` | 2 |
 | `ScopeManager::lookup_local` | 5 |
-| `StructType::get_method` | 5 |
-| `TraitDeclNode::add_assoc_type` | 2 |
 | `TypeMapperCache::lookup` | 1 |
 <!-- residue-elsewhere:end -->

@@ -363,14 +363,34 @@ EXCLUDED_ARRAYS = {
                                    "the lowering's OWN RIB: the captured binding names of one lambda body"),
     "BindingRename":      Excluded("compiler/sema/async_lower.cryo",
                                    "the lowering's OWN RIB: original binding names beside the fresh ones it minted"),
+    "ClassDeclNode":      Excluded("compiler/AST/declaration.cryo",
+                                   "the declaration's OWN WRITTEN members - its parameters, fields, methods, variants and `where` bounds as spelled; resolution stamps them, and the name-taking methods are writes onto the node"),
+    "ClassType":          Excluded("compiler/types/user_defined.cryo",
+                                   "the class's own fields and methods (`FieldInfo[]`, `MethodInfo[]`), asked by the member's leaf off the type in hand: a member table inside its owner"),
+    "Command":            Excluded("CLI/_module.cryo",
+                                   "one CLI command's declared arguments: FLAGS by the spelling typed"),
     "CompilationContext": Excluded("compiler/compilation_context.cryo",
                                    "include paths, FILE PATHS; the stores the context carries by pointer are placed on their own"),
+    "DeclarationNode":    Excluded("compiler/AST/declaration.cryo",
+                                   "the declaration's own attached directives, asked by the directive's kind - a spelling the language fixes (`inline`, `cfg`, `test`), TEXTS, not a declaration looked up"),
     "DiagSink":           Excluded("compiler/codegen/state/diag_sink.cryo",
                                    "codegen's record of the functions whose bodies it stripped, by the LINKER SYMBOL it minted (utils/diag_sink.cryo declares an unrelated type of the same name with no array)"),
+    "Diagnostic":         Excluded("compiler/diag/diagnostic.cryo",
+                                   "a diagnostic's labels, children and suggestions: TEXTS"),
+    "DirectiveRegistry":  Excluded("compiler/passes/directive_processing.cryo",
+                                   "the directives observed in a module, asked whether any is of a kind - a spelling the language fixes, TEXTS"),
+    "DropInserter":       Excluded("compiler/passes/drop_insertion.cryo",
+                                   "the pass's OWN RIB: the bindings it tracks and the drop flags it minted, with their spans (FILE PATHS); its `lookup_type` is over its own locals"),
+    "EnumDeclNode":       Excluded("compiler/AST/declaration.cryo",
+                                   "the declaration's OWN WRITTEN members - its parameters, fields, methods, variants and `where` bounds as spelled; resolution stamps them, and the name-taking methods are writes onto the node"),
+    "EnumType":           Excluded("compiler/types/user_defined.cryo",
+                                   "the enum's own variants and methods (`EnumVariantInfo[]`, `MethodInfo[]`), asked by the member's leaf off the type in hand: a member table inside its owner"),
     "ErrorType":          Excluded("compiler/types/generic.cryo",
                                    "a diagnostic's notes, TEXTS"),
     "ExternBlockNode":    Excluded("compiler/AST/declaration.cryo",
                                    "the extern block's own written include paths, FILE PATHS"),
+    "FunctionDeclNode":   Excluded("compiler/AST/declaration.cryo",
+                                   "the declaration's OWN WRITTEN members - its parameters, fields, methods, variants and `where` bounds as spelled; resolution stamps them, and the name-taking methods are writes onto the node"),
     "ImplBlockNode":      Excluded("compiler/AST/declaration.cryo",
                                    "the impl's own `This::Member` bindings and derived parameter DISPLAYS, asked by the member's leaf from inside the block that declared them: a member table inside its owner"),
     "ImportDeclNode":     Excluded("compiler/AST/declaration.cryo",
@@ -381,6 +401,8 @@ EXCLUDED_ARRAYS = {
                                    "the C importer's own bookkeeping of the C spellings it has emitted, before any Cryo declaration exists to look up"),
     "LambdaExprNode":     Excluded("compiler/AST/expression.cryo",
                                    "the lambda's own captured names as WRITTEN; sema binds them"),
+    "Lockfile":           Excluded("compiler/deps/lockfile.cryo",
+                                   "the dependency lockfile's packages and vendored libraries by name: FILE-level records, FILE PATHS and hashes"),
     "ModuleDeclNode":     Excluded("compiler/AST/declaration.cryo",
                                    "the module declaration's own WRITTEN SEGMENTS"),
     "ModuleInfo":         Excluded("compiler/module_graph.cryo",
@@ -389,10 +411,14 @@ EXCLUDED_ARRAYS = {
                                    "the build manifest's module keys by source FILE PATH"),
     "ParsedArgs":         Excluded("CLI/_module.cryo",
                                    "the command line's FLAGS by the spelling typed"),
+    "Parser":             Excluded("compiler/parser/parser.cryo",
+                                   "the parser's pending `static_assert` items, TEXTS, beside the doc-comment texts `ParserBase` carries"),
     "ParserBase":         Excluded("compiler/parser/parser_base.cryo",
                                    "pending doc-comment TEXTS; the parser's name tables that decided `ident <` by module-local spelling are deleted (the turbofish)"),
     "PhaseArtifacts":     Excluded("compiler/artifacts.cryo",
                                    "object and source FILE PATHS kept for the link"),
+    "ProgramNode":        Excluded("compiler/AST/node.cryo",
+                                   "the program's own written namespace name and its `static_assert` messages, TEXTS"),
     "ProjectConfig":      Excluded("compiler/project_config.cryo",
                                    "cryoconfig's link flags and source roots, FILE PATHS and FLAGS"),
     "QualifiedName":      Excluded("compiler/resolver/qualified_name.cryo",
@@ -401,12 +427,26 @@ EXCLUDED_ARRAYS = {
                                    "the `This::Member` bindings of the impl being resolved, asked by the member's leaf from inside it: a member table inside its owner; the generic bindings beside it are keyed by SymbolID"),
     "StringCache":        Excluded("compiler/codegen/state/string_cache.cryo",
                                    "LLVM string constants deduplicated by their TEXT"),
+    "StructDeclNode":     Excluded("compiler/AST/declaration.cryo",
+                                   "the declaration's OWN WRITTEN members - its parameters, fields, methods, variants and `where` bounds as spelled; resolution stamps them, and the name-taking methods are writes onto the node; the binding accessors are the C importer's, written onto the node"),
+    "StructType":         Excluded("compiler/types/user_defined.cryo",
+                                   "the struct's own fields and methods (`FieldInfo[]`, `MethodInfo[]`), asked by the member's leaf off the type in hand: a member table inside its owner"),
+    "Suggestion":         Excluded("compiler/diag/suggestion.cryo",
+                                   "a suggestion's replacement parts, TEXTS"),
     "TemplateEntry":      Excluded("compiler/types/generic_registry.cryo",
                                    "the registry's row: its parameters' DISPLAYS beside `param_syms`, the key; the spelling compares call_resolver still makes over them are the residue the arena keyed by symbol retires"),
+    "TokenStream":        Excluded("compiler/artifacts.cryo",
+                                   "a file's tokens, TEXTS handed on to the parser"),
+    "TraitDeclNode":      Excluded("compiler/AST/declaration.cryo",
+                                   "the trait's own associated-type declarations (`assoc_types`), asked by the member's leaf from the trait node: a member table inside its owner; its methods, base traits and generic parameters are WRITTEN members resolution stamps"),
     "TraitType":          Excluded("compiler/types/user_defined.cryo",
                                    "the trait's own associated-type and method names, asked by the member's leaf from the trait: a member table inside its owner"),
+    "UnionDeclNode":      Excluded("compiler/AST/declaration.cryo",
+                                   "the declaration's OWN WRITTEN members - its parameters, fields, methods, variants and `where` bounds as spelled; resolution stamps them, and the name-taking methods are writes onto the node"),
     "VendorEntry":        Excluded("compiler/vendor/registry.cryo",
                                    "a vendored library's headers, include dirs and defines: FILE PATHS and FLAGS"),
+    "VendorRegistry":     Excluded("compiler/vendor/registry.cryo",
+                                   "the vendored libraries by key and name: FILE PATHS and FLAGS, as `VendorEntry` is"),
 }
 
 REENTRY_RE = re.compile(r"\bget_resolver\s*\(\s*\)")
@@ -482,6 +522,17 @@ NAME_ARRAY_RE = re.compile(
     r"^    (?:public\s+|private\s+)?([a-z_][a-z_0-9]*)\s*:\s*"
     r"((?:[a-z_][a-z_0-9]*::)*(?:SymbolStr|string)|(?:[a-z_][a-z_0-9]*::)*Pair\s*<\s*(?:SymbolStr|string)\s*,[^;]*>)"
     r"\s*\[\]\s*;")
+# A field that is an ARRAY OF RECORDS, `fields: FieldInfo[];`, `assoc_types:
+# AssocTypeDeclNode*[];`: a candidate when the record is a type declared in
+# the tree with a key-typed field of its own, because `if (rows[i].name.equals(n))`
+# over such an array is the same table as an array of names with the answer
+# stored beside each - the shape `StructType`, `ClassType` and `EnumType`
+# keep their members in, invisible to the name-array test above.  The
+# element is resolved against the tree after every file is read, so the
+# record may be declared anywhere.
+RECORD_ARRAY_RE = re.compile(
+    r"^    (?:public\s+|private\s+)?([a-z_][a-z_0-9]*)\s*:\s*"
+    r"(?:[a-z_][a-z_0-9]*::)*([A-Z][A-Za-z_0-9]*)\s*\*?\s*\[\]\s*;")
 # A key type in PARAMETER position: `name: SymbolStr`, `s: string`, `&SymbolStr`,
 # never `SymbolStr[]` (an array handed in is a table, not a key).  Rule 1b's
 # signature test, the half of rule 2's that says "the caller hands a name in".
@@ -538,6 +589,10 @@ class Tree(object):
         # {type_name: [(relpath, field, element)]}: every type block owning
         # an array of names, rule 1b's candidates before the signature test.
         self.array_owners = {}
+        # {type_name: [(relpath, field, element)]}: every type block owning
+        # an array of some declared type; `record_owners` keeps the ones
+        # whose element carries a key-typed field, once the tree is read.
+        self.typed_arrays = {}
         for dirpath, _dirs, names in os.walk(src):
             for fname in sorted(names):
                 if not fname.endswith(".cryo"):
@@ -592,12 +647,28 @@ class Tree(object):
                     if na is not None:
                         self.array_owners.setdefault(current, []).append(
                             (rel, na.group(1), re.sub(r"\s+", "", na.group(2))))
+                    ra = RECORD_ARRAY_RE.match(code)
+                    if ra is not None:
+                        self.typed_arrays.setdefault(current, []).append(
+                            (rel, ra.group(1), ra.group(2)))
             for ch in code:
                 if ch == "{":
                     depth += 1
                 elif ch == "}":
                     depth -= 1
         return heads
+
+    def record_owners(self):
+        """{type_name: [(relpath, field, element)]}: the typed arrays whose
+        element is a type this tree declares with a field of a key type -
+        a record with a spelling in it, so an array of them is a table the
+        owner can search by that spelling."""
+        out = {}
+        for owner, arrays in self.typed_arrays.items():
+            for rel, field, elem in arrays:
+                if any(ty in KEY_TYPES for ty in self.fields.get(elem, {}).values()):
+                    out.setdefault(owner, []).append((rel, field, elem))
+        return out
 
     def enclosing_type(self, rel, lineno):
         """The type `this` names at 1-based `lineno` in `rel`, or None."""
@@ -820,32 +891,41 @@ def name_taking_methods(tree, type_name):
 
 def array_candidates(tree):
     """Rule 1b's population: {type_name: (rels, fields, methods)} for every
-    type block that owns NO map, owns an array of names, and declares a
-    method taking a name.  A map owner is rule 1's whatever else it owns; an
-    array owner with no name-taking method is never asked by name, so its
-    array is data, not a table."""
+    type block that owns NO map, owns an array of names or an array of
+    records carrying a key-typed field, and declares a method taking a name.
+    A map owner is rule 1's whatever else it owns; an array owner with no
+    name-taking method is never asked by name, so its array is data, not a
+    table."""
+    arrays = {}
+    for owners in (tree.array_owners, tree.record_owners()):
+        for name, entries in owners.items():
+            arrays.setdefault(name, []).extend(entries)
     out = {}
-    for name in sorted(tree.array_owners):
+    for name in sorted(arrays):
         if name in tree.map_owners:
             continue
         methods = name_taking_methods(tree, name)
         if not methods:
             continue
-        rels = sorted(set(rel for rel, _f, _e in tree.array_owners[name]))
-        fields = ["%s: %s[]" % (f, e) for _r, f, e in tree.array_owners[name]]
+        rels = sorted(set(rel for rel, _f, _e in arrays[name]))
+        fields = ["%s: %s[]" % (f, e) for _r, f, e in arrays[name]]
         out[name] = (rels, fields, sorted(methods))
     return out
 
 
 def place_array_owners(tree):
-    """Rule 1b: every array-of-names owner that owns no map and takes a name
-    is a store or an array exclusion, in the file the table names, and every
-    array exclusion is still such a candidate.
+    """Rule 1b: every owner of an array of names, or of an array of records
+    carrying a key-typed field, that owns no map and takes a name is a store
+    or an array exclusion, in the file the table names, and every array
+    exclusion is still such a candidate.
 
     The map rule cannot reach a table that is an array: a linear search over
     `SymbolStr[]` answers "which declaration is spelled X" as a map does, and
     the parser's `ident <` tables and the substitution chain's parameter
-    lists were both this shape.  Refuses with every problem listed.
+    lists were both this shape.  Nor can the name-array test reach a table
+    of RECORDS: `StructType.fields: FieldInfo[]` searched by
+    `fields[i].name.equals(name)` is the member table of every struct in the
+    program, and it was in neither rule.  Refuses with every problem listed.
     """
     problems = []
     candidates = array_candidates(tree)
@@ -859,7 +939,7 @@ def place_array_owners(tree):
             side = "EXCLUDED_ARRAYS"
         else:
             problems.append(
-                "  `%s` (%s) owns an array of names (%s), takes a name (%s) and is in\n"
+                "  `%s` (%s) owns an array of names or records (%s), takes a name (%s) and is in\n"
                 "      neither STORES nor EXCLUDED_ARRAYS: a linear search over an array of names\n"
                 "      is a table; say which - a store, with the rows its reads and writes land\n"
                 "      in, or an exclusion, with the reason the array holds no declaration a\n"
@@ -875,7 +955,7 @@ def place_array_owners(tree):
         elif name in tree.map_owners:
             problems.append("  `%s` is listed in EXCLUDED_ARRAYS but owns a map: rule 1's tables place it" % name)
         elif name not in candidates:
-            problems.append("  `%s` is listed in EXCLUDED_ARRAYS but owns no array of names or takes no name: a stale exclusion" % name)
+            problems.append("  `%s` is listed in EXCLUDED_ARRAYS but owns no array of names or records, or takes no name: a stale exclusion" % name)
     if problems:
         raise SystemExit("lane-gate: rule 1b - the array owners and the tables disagree:\n"
                          + "\n".join(problems))

@@ -382,7 +382,7 @@ MUTATIONS = [
           "    resolver:         Resolver*;\n",
           "    resolver:         Resolver*;\n    leaf_table:       LeafTable*;\n"),
       "compiler/sema/sema.cryo": sema_with(["this.ctx.leaf_table.lookup_leaf(name);"])},
-     1, "`LeafTable` (compiler/sema/leaf_table.cryo) owns an array of names (entries: Pair<SymbolStr,TypeRef>[]), "
+     1, "`LeafTable` (compiler/sema/leaf_table.cryo) owns an array of names or records (entries: Pair<SymbolStr,TypeRef>[]), "
         "takes a name (lookup_leaf) and is in"),
     ("an array of bare names with a linear search is refused the same way, carried by nothing",
      {"compiler/parser/name_tables.cryo":
@@ -391,7 +391,7 @@ MUTATIONS = [
           "\n"
           "    is_generic_decl_name(&this, name: SymbolStr) -> boolean { return false; }\n"
           "}\n"},
-     1, "`NameTables` (compiler/parser/name_tables.cryo) owns an array of names (generic_decl_names: SymbolStr[]), "
+     1, "`NameTables` (compiler/parser/name_tables.cryo) owns an array of names or records (generic_decl_names: SymbolStr[]), "
         "takes a name (is_generic_decl_name) and is in"),
     ("an array of names nothing asks by name is data, not a table: accepted",
      {"compiler/parser/name_tables.cryo":
@@ -409,12 +409,56 @@ MUTATIONS = [
           "    replace(mut &this, names: SymbolStr[]) -> void { this.generic_decl_names = names; }\n"
           "}\n"},
      0, "lane-gate: OK"),
+    # Rule 1b over RECORDS: the verification's m4 - a type owning an array of
+    # records that carry a name field, searched by `rows[i].name.equals(n)`,
+    # is neither a map owner nor a name-array owner and read OK.
+    ("the verification's m4: a table of records with a key-typed field (`FieldInfo[]`, a linear "
+     "search by the record's name) with a name-taking reader is refused as an unplaced candidate",
+     {"compiler/types/field_table.cryo":
+          "type struct FieldInfo {\n"
+          "    name: SymbolStr;\n"
+          "    ty:   TypeRef;\n"
+          "}\n"
+          "\n"
+          "type struct FieldTable {\n"
+          "    rows: FieldInfo[];\n"
+          "\n"
+          "    find(&this, name: SymbolStr) -> FieldInfo* { return null; }\n"
+          "}\n"},
+     1, "`FieldTable` (compiler/types/field_table.cryo) owns an array of names or records (rows: FieldInfo[]), "
+        "takes a name (find) and is in"),
+    ("an array of POINTERS to such records is the same table: refused",
+     {"compiler/types/field_table.cryo":
+          "type struct AssocTypeDeclNode {\n"
+          "    name: SymbolStr;\n"
+          "}\n"
+          "\n"
+          "type struct AssocTable {\n"
+          "    rows: AssocTypeDeclNode*[];\n"
+          "\n"
+          "    lookup(&this, name: SymbolStr) -> AssocTypeDeclNode* { return null; }\n"
+          "}\n"},
+     1, "`AssocTable` (compiler/types/field_table.cryo) owns an array of names or records (rows: AssocTypeDeclNode[]), "
+        "takes a name (lookup) and is in"),
+    ("an array of records with no key-typed field is data, whatever asks by name: accepted",
+     {"compiler/types/field_table.cryo":
+          "type struct SlotInfo {\n"
+          "    offset: i64;\n"
+          "    ty:     TypeRef;\n"
+          "}\n"
+          "\n"
+          "type struct SlotTable {\n"
+          "    rows: SlotInfo[];\n"
+          "\n"
+          "    find(&this, name: SymbolStr) -> SlotInfo* { return null; }\n"
+          "}\n"},
+     0, "lane-gate: OK"),
     ("an array exclusion whose array is gone is a stale exclusion, refused",
      {GATE_MOD.EXCLUDED_ARRAYS[FIRST_ARRAY_EXCLUDED].defn:
           FILES[GATE_MOD.EXCLUDED_ARRAYS[FIRST_ARRAY_EXCLUDED].defn].replace(
               "type struct %s {\n    names: SymbolStr[];\n" % FIRST_ARRAY_EXCLUDED,
               "type struct %s {\n    names: i64[];\n" % FIRST_ARRAY_EXCLUDED, 1)},
-     1, "`%s` is listed in EXCLUDED_ARRAYS but owns no array of names or takes no name: a stale exclusion"
+     1, "`%s` is listed in EXCLUDED_ARRAYS but owns no array of names or records, or takes no name: a stale exclusion"
         % FIRST_ARRAY_EXCLUDED),
     ("an array exclusion that gains a map becomes rule 1's question first: refused as an unplaced map owner",
      {GATE_MOD.EXCLUDED_ARRAYS[FIRST_ARRAY_EXCLUDED].defn:
