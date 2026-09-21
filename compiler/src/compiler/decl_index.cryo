@@ -575,10 +575,13 @@ type struct DeclarationIndex {
         return SymbolStr::empty();
     }
 
-    /// Register a method's return type on a specific type.
-    register_method(mut &this, type_sym: SymbolStr, method_sym: SymbolStr,
+    /// Register a method's return type on the type `owner`, by the type's
+    /// identity: two declarations of one leaf in two modules are two owners,
+    /// and an owner is never asked for by a spelling.
+    register_method(mut &this, owner: TypeRef, method_sym: SymbolStr,
                     return_type: TypeRef) -> void {
-        const key: u64 = DeclarationIndex::pack_method_key(type_sym, method_sym);
+        if (!owner.is_valid()) { return; }
+        const key: u64 = DeclarationIndex::pack_method_key(owner, method_sym);
         this.method_returns.insert(key, return_type);
     }
 
@@ -788,7 +791,7 @@ type struct DeclarationIndex {
                 continue;
             }
 
-            this.register_method(type_sym, func.name, func.resolved_return_type);
+            this.register_method(owner, func.name, func.resolved_return_type);
 
             // Build full FunctionType.  Cryo allows three self forms on
             // non-static methods:
@@ -1001,9 +1004,15 @@ type struct DeclarationIndex {
         return this.lookup_type(d.qualified_name());
     }
 
-    /// Look up a method's return type by (type, method) names.
-    lookup_method_return(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
-        const key: u64 = DeclarationIndex::pack_method_key(type_sym, method_sym);
+    /// The return type of the method `method_sym` declared on the type
+    /// `owner`, or invalid when `owner` declares none.  `owner` is the type
+    /// the methods were registered on - a declaration's own type, a
+    /// specialization's, a trait's - never an alias of it; a caller holding
+    /// a wrapper (an instantiation, a dynamic array) asks
+    /// `TypeUtils::method_owner_ref` for the registered owner first.
+    lookup_method_return(&this, owner: TypeRef, method_sym: SymbolStr) -> TypeRef {
+        if (!owner.is_valid()) { return TypeRef::invalid(); }
+        const key: u64 = DeclarationIndex::pack_method_key(owner, method_sym);
         return match (this.method_returns.get(&key)) {
             Option::Some(val) => { val }
             Option::None      => { TypeRef::invalid() }
@@ -1348,12 +1357,13 @@ type struct DeclarationIndex {
         return result;
     }
 
-    /// Combines a type's SymbolStr.id and a method's SymbolStr.id into a single
-    /// u64 key.  Uses the upper 32 bits for the type and lower 32 bits for the
-    /// method name.  Uses bit shift instead of multiply-by-2^32, since the
-    /// literal 4294967296 overflows i32 and silently becomes 0.
-    static pack_method_key(type_sym: SymbolStr, method_sym: SymbolStr) -> u64 {
-        return ((type_sym.id as u64) << 32) | (method_sym.id as u64);
+    /// Combines an owner type's arena id and a method's SymbolStr.id into a
+    /// single u64 key: the upper 32 bits the type, the lower 32 the method
+    /// leaf.  Arena ids fit in 32 bits in practice (`pack_converter_key`).
+    /// Uses bit shift instead of multiply-by-2^32, since the literal
+    /// 4294967296 overflows i32 and silently becomes 0.
+    static pack_method_key(owner: TypeRef, method_sym: SymbolStr) -> u64 {
+        return (owner.id << 32) | (method_sym.id as u64);
     }
 
     /// Pack an implicit-converter registry key from the argument and return

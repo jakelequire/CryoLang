@@ -149,9 +149,34 @@ type struct TypeUtils {
         return this.ctx.decl_index.global_entry_in_module(scope.member_name, seen.def_id()).type_ref;
     }
 
-    lookup_method_return(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
+    /// The return type of `method_sym` on the registered owner `owner`,
+    /// folded to its canonical instantiation; invalid when `owner` declares
+    /// no such method.  `owner` is a registered type - a caller holding a
+    /// wrapper asks `method_owner_ref` first.
+    lookup_method_return(&this, owner: TypeRef, method_sym: SymbolStr) -> TypeRef {
         return this.canonicalize_method_return(
-            this.lookup_method_return_raw(type_sym, method_sym));
+            this.ctx.decl_index.lookup_method_return(owner, method_sym));
+    }
+
+    /// The registered type `ty` reads its methods off, or invalid: `ty`
+    /// itself when the index registered it; an instantiation's resolved
+    /// type once it has one, else its template; a dynamic array's
+    /// registration, keyed by its element.  The ref-keyed twin of
+    /// `lookup_type_sym`, which answers the same owner's NAME for display
+    /// and for the composed keys.
+    method_owner_ref(&this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return TypeRef::invalid(); }
+        if (this.ctx.decl_index.lookup_type_name(ty).is_valid()) { return ty; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t != null && t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) { return inst.resolved_type; }
+            if (this.ctx.decl_index.lookup_type_name(inst.generic_base).is_valid()) { return inst.generic_base; }
+        }
+        if (t != null && t.kind == TypeKind::Array && (t as ArrayType*).is_dynamic()) {
+            return this.ctx.decl_index.lookup_array_type((t as ArrayType*).element);
+        }
+        return TypeRef::invalid();
     }
 
     /// Fold a method's stored return annotation to its canonical instantiation
@@ -161,37 +186,6 @@ type struct TypeUtils {
     canonicalize_method_return(&this, ty: TypeRef) -> TypeRef {
         if (this.ctx.type_resolver == null) { return ty; }
         return this.ctx.type_resolver.canonicalize_default_generic_type(ty);
-    }
-
-    lookup_method_return_raw(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
-        mut ret: TypeRef = TypeRef::invalid();
-        this.resolve_method_owner(type_sym, method_sym, &ret);
-        return ret;
-    }
-
-    /// The name `method_sym` is registered under for the owner `type_sym`, or
-    /// an invalid symbol when that owner carries no such method.
-    ///
-    /// `type_sym` is a registered name - a canonical owner from a stamp, a
-    /// specialization's registered name, a type's own qualified name - and
-    /// the registries hold one canonical name per declaration, so the lookup
-    /// is exact.  A spelling is not a key here: the callers that once passed
-    /// one now read the owner off the node, and the two widening steps that
-    /// covered for them (the ambient cursor, the resolver re-entry) answered
-    /// zero times over the corpus once the specialization identifier was
-    /// registered under one name.
-    ///
-    /// `out_ret` (when non-null) hands back the return type the lookup
-    /// fetched, so a caller does not ask the registry twice for one answer.
-    resolve_method_owner(&this, type_sym: SymbolStr, method_sym: SymbolStr,
-                         out_ret: TypeRef*) -> SymbolStr {
-        // As-is (already-qualified names from monomorphized types).
-        const as_is: TypeRef = this.ctx.decl_index.lookup_method_return(type_sym, method_sym);
-        if (as_is.is_valid()) {
-            if (out_ret != null) { *out_ret = as_is; }
-            return type_sym;
-        }
-        return SymbolStr::empty();
     }
 
     /// The type registered under EXACTLY this name, with no widening.

@@ -190,15 +190,12 @@ type struct MethodBinding {
             abstract_ret = m.func.resolved_return_type;
         }
 
-        // Impl-block / enum methods: look the return up in the DI under the
-        // generic BASE's symbol (still-abstract; substituted concrete below).
+        // Impl-block / enum methods: look the return up in the DI on the
+        // generic BASE (still-abstract; substituted concrete below).
         if (found_count == 0) {
-            mut base_sym: SymbolStr = this.types.lookup_type_sym(inst.generic_base);
-            if (!base_sym.is_valid()) {
-                base_sym = this.arena.get_qualified_name(inst.generic_base);
-            }
-            if (base_sym.is_valid()) {
-                const di_ret: TypeRef = this.types.lookup_method_return(base_sym, method_name);
+            const base_ref: TypeRef = this.types.method_owner_ref(inst.generic_base);
+            if (base_ref.is_valid()) {
+                const di_ret: TypeRef = this.types.lookup_method_return(base_ref, method_name);
                 if (di_ret.is_valid()) {
                     abstract_ret = di_ret;
                     found_count = 1;
@@ -232,8 +229,7 @@ type struct MethodBinding {
         for (mut i: i64 = 0; i < bp.bounds.length; i++) {
             const bound_t: Type* = this.arena.lookup(bp.bounds[i].id);
             if (bound_t == null || bound_t.kind != TypeKind::Trait) { continue; }
-            const ret: TypeRef = this.types.lookup_method_return(
-                (bound_t as TraitType*).qualified_name, method_name);
+            const ret: TypeRef = this.types.lookup_method_return(bp.bounds[i], method_name);
             if (ret.is_valid()) { return this.subst_this_in_trait_return(ret, recv); }
         }
         return TypeRef::invalid();
@@ -393,7 +389,7 @@ type struct MethodBinding {
                 // by bare leaf alone, and a qualified key there misses silently.
                 const leaf: SymbolStr = tr.path[tr.path.length - 1];
                 const ret: TypeRef = this.types.lookup_method_return(
-                    tr.identity(), method_name);
+                    this.types.lookup_type_exact(tr.identity()), method_name);
                 if (ret.is_valid()) {
                     const sub: TypeRef = this.subst_bound_assoc_args(ret, leaf, tr);
                     return this.subst_this_in_trait_return(sub, recv);
@@ -483,7 +479,7 @@ type struct MethodBinding {
                 // `get_trait_decl`, which is keyed by bare leaf alone.
                 const leaf: SymbolStr = tr.path[tr.path.length - 1];
                 const ret: TypeRef = this.types.lookup_method_return(
-                    tr.identity(), method_name);
+                    this.types.lookup_type_exact(tr.identity()), method_name);
                 if (ret.is_valid()) {
                     // Bound-supplied assoc args first (`Future<i64>` -> Output);
                     // any `This` the bound left unbound then rebases onto the
@@ -803,7 +799,8 @@ type struct MethodBinding {
         }
         const blocks: ImplBlockNode*[] = this.ctx.generic_registry.trait_impls_of(subject, this.intern);
         for (mut k: i64 = 0; k < blocks.length; k++) {
-            const ret: TypeRef = this.types.lookup_method_return(blocks[k].qualified_trait_name, method_name);
+            const ret: TypeRef = this.types.lookup_method_return(
+                this.types.lookup_type_exact(blocks[k].qualified_trait_name), method_name);
             if (ret.is_valid()) { return ret; }
         }
         return TypeRef::invalid();
@@ -818,9 +815,10 @@ type struct MethodBinding {
 
     /// Look up a method by walking the class inheritance chain (immediate type
     /// first, then parent classes).
-    lookup_method_with_inheritance(&this, type_ref: TypeRef, type_sym: SymbolStr,
+    lookup_method_with_inheritance(&this, type_ref: TypeRef,
                                    method_name: SymbolStr) -> TypeRef {
-        const direct: TypeRef = this.types.lookup_method_return(type_sym, method_name);
+        const direct: TypeRef = this.types.lookup_method_return(
+            this.types.method_owner_ref(type_ref), method_name);
         if (direct.is_valid()) { return direct; }
 
         mut current_t: Type* = this.arena.lookup(type_ref.id);
@@ -832,11 +830,8 @@ type struct MethodBinding {
             const parent_ref: TypeRef = current.base_class;
             const parent_t: Type* = this.arena.lookup(parent_ref.id);
             if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
-            const parent_sym: SymbolStr = this.ctx.decl_index.lookup_type_name(parent_ref);
-            if (parent_sym.is_valid()) {
-                const parent_ret: TypeRef = this.types.lookup_method_return(parent_sym, method_name);
-                if (parent_ret.is_valid()) { return parent_ret; }
-            }
+            const parent_ret: TypeRef = this.types.lookup_method_return(parent_ref, method_name);
+            if (parent_ret.is_valid()) { return parent_ret; }
             current = parent_t as ClassType*;
         }
         return TypeRef::invalid();

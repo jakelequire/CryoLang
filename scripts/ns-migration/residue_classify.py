@@ -118,7 +118,7 @@ CLASS_OF_METHOD = {
     "DeclarationIndex::lookup_type":
         ("S", "a type by a canonical name derived from a stamp"),
     "DeclarationIndex::lookup_method_return":
-        ("S", "`(owner, member)`: the owner a canonical name off a `TypeRef`, the member a leaf inside it"),
+        ("J", "member: a method's return by its leaf off the owner `TypeRef` in hand; the store is keyed by the owner's arena id"),
     "DeclarationIndex::lookup_sole_entry":
         ("J", "lang: the test runner's entry points `std::env::set_args` / `set_env` / `std::test::runner::run_all`, named by the language's own paths"),
     "DeclarationIndex::namespace_of":
@@ -139,9 +139,7 @@ CLASS_OF_METHOD = {
     "TypeUtils::lookup_func_type_exact":
         ("C", "a family or a `module::member` composed by `resolve_module_qualified_symbol`"),
     "TypeUtils::lookup_method_return":
-        ("S", "`(owner, member)`: the owner a canonical name off a `TypeRef` or stamp, the member a leaf inside it"),
-    "TypeUtils::resolve_method_owner":
-        ("S", "`(owner, member)`: the owner from `scope_owner_key` (a stamp), the member a leaf inside it"),
+        ("J", "member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name)"),
     # -- the generic registry --
     "GenericRegistry::get_template":
         ("B", "a template by the canonical name of a stamped type (`target_key`, `get_qualified_name`, a `Def` stamp, the call's pinned template key)"),
@@ -212,16 +210,14 @@ SITE_OVERRIDES = {
         ("N", "the funnel's own forwarding body (`lookup_type_exact`); its callers are the sites"),
     ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_func_type", "name"):
         ("N", "the funnel's own forwarding body (`lookup_func_type_exact`); its callers are the sites"),
-    ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_method_return", "type_sym, method_sym"):
-        ("N", "the funnel's own forwarding body (`resolve_method_owner`); its callers are the sites"),
-    ("compiler/sema/call_resolver.cryo", "DeclarationIndex::lookup_method_return", "spec_qn, scope.member_name"):
-        ("S", "the owner from `lookup_type_name(spec_ref)`, a `TypeRef`; the member a leaf inside it"),
+    ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_method_return", "owner, method_sym"):
+        ("N", "the funnel's own forwarding body (`lookup_method_return`); its callers are the sites"),
     ("compiler/sema/call_resolver.cryo", "DeclarationIndex::lookup_func_type", "fam"):
         ("C", "the `CalleePin::Family` key string"),
-    ("compiler/sema/sema.cryo", "TypeUtils::lookup_method_return", 'type_sym, this.intern.intern("next")'):
-        ("S", "the owner a canonical name off the iterated `TypeRef`; the member the for-in protocol's `next`"),
-    ("compiler/sema/sema.cryo", "TypeUtils::lookup_method_return", 'type_sym, this.intern.intern("iter")'):
-        ("S", "the owner a canonical name off the iterated `TypeRef`; the member the for-in protocol's `iter`"),
+    ("compiler/sema/sema.cryo", "TypeUtils::lookup_method_return", 'owner_ref, this.intern.intern("next")'):
+        ("J", "member: the for-in protocol's `next` off the iterated type's registered owner"),
+    ("compiler/sema/sema.cryo", "TypeUtils::lookup_method_return", 'owner_ref, this.intern.intern("iter")'):
+        ("J", "member: the for-in protocol's `iter` off the iterated type's registered owner"),
     ("compiler/mono/call_specializer.cryo", "GenericRegistry::get_template", "call.resolved_template"):
         ("B", "the call's pinned template KEY, a registry key string sema recorded"),
     ("compiler/sema/async_lower.cryo", "GenericRegistry::get_template", "c.resolved_template"):

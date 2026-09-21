@@ -3281,7 +3281,7 @@ type struct CallResolver {
         const head_blocked: boolean =
             this.binding.trait_method_unavailable(lookup_ref, member.member);
 
-        const ret: TypeRef = this.binding.lookup_method_with_inheritance(lookup_ref, type_sym, member.member);
+        const ret: TypeRef = this.binding.lookup_method_with_inheritance(lookup_ref, member.member);
         if (ret.is_valid() && !proj_blocked && !head_blocked) {
             const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
             this.member.enforce_method_visibility(lookup_ref, member.member, acc_span);
@@ -4211,16 +4211,14 @@ type struct CallResolver {
         // expected-type-unify source can recover an owner param the args don't
         // determine.  Idempotent (no-op once `resolved_type_args` is set).
         this.stash_static_owner_bindings_for(scope, call);
-        // The owner the method is REGISTERED under, which is not always the one
-        // the call site spelled: a module-relative path (`Deque::Gadget`) names a
-        // type the leaf-keyed import index above cannot fold, so `lookup_sym` is
-        // still the written text.  Pinning must use the name that answered - a
-        // symbol rebuilt from the spelling names no declaration, and codegen then
-        // binds it by bare leaf and arity or fails to bind it at all.
-        const owner_sym: SymbolStr = this.types.resolve_method_owner(lookup_sym, scope.member_name, null);
+        // `lookup_sym` is the owner's registered name (the stamp's, or the
+        // specialization's), so the type under it is the owner the method
+        // was registered on; the pin carries that same name.
+        const owner_ref: TypeRef = this.types.lookup_type_exact(lookup_sym);
+        const owner_sym: SymbolStr = lookup_sym;
         mut method_ret: TypeRef = TypeRef::invalid();
-        if (owner_sym.is_valid()) {
-            method_ret = this.types.lookup_method_return(owner_sym, scope.member_name);
+        if (owner_ref.is_valid()) {
+            method_ret = this.types.lookup_method_return(owner_ref, scope.member_name);
         }
         if (method_ret.is_valid()) {
             mut resolved: TypeRef = this.try_resolve_generic_return(method_ret, scope.scope_name, scope.member_name, scope);
@@ -4243,7 +4241,7 @@ type struct CallResolver {
             if (spec_ref.is_valid()) {
                 const spec_qn: SymbolStr = this.ctx.decl_index.lookup_type_name(spec_ref);
                 if (spec_qn.is_valid() && !spec_qn.equals(lookup_sym)) {
-                    const qn_ret: TypeRef = this.ctx.decl_index.lookup_method_return(spec_qn, scope.member_name);
+                    const qn_ret: TypeRef = this.ctx.decl_index.lookup_method_return(spec_ref, scope.member_name);
                     if (qn_ret.is_valid()) {
                         scope.set_resolved_type(qn_ret);
                         this.pin_scope_callee_combined(call, scope, spec_qn, scope.member_name);
@@ -4260,7 +4258,8 @@ type struct CallResolver {
         // module-qualified path cannot take.
         const owner_key: SymbolStr = this.scope_owner_key(scope);
         if (owner_key.is_valid() && lookup_sym.id != owner_key.id) {
-            const base_ret: TypeRef = this.types.lookup_method_return(owner_key, scope.member_name);
+            const base_ret: TypeRef = this.types.lookup_method_return(
+                this.types.lookup_type_exact(owner_key), scope.member_name);
             if (base_ret.is_valid()) {
                 const resolved: TypeRef = this.try_resolve_generic_return(base_ret, scope.scope_name, scope.member_name, scope);
                 scope.set_resolved_type(resolved);
@@ -5049,7 +5048,7 @@ type struct CallResolver {
         if (!type_ref.is_valid()) { return TypeRef::invalid(); }
         const di_name: SymbolStr = this.ctx.decl_index.lookup_type_name(type_ref);
         if (di_name.is_valid()) {
-            const di_method_ret: TypeRef = this.types.lookup_method_return(di_name, scope.member_name);
+            const di_method_ret: TypeRef = this.types.lookup_method_return(type_ref, scope.member_name);
             if (di_method_ret.is_valid()) {
                 const resolved: TypeRef = this.try_resolve_generic_return(di_method_ret, scope.scope_name, scope.member_name, scope);
                 scope.set_resolved_type(resolved);
@@ -5537,16 +5536,13 @@ type struct CallResolver {
         const exp_base: TypeRef = this.types.view_generic_base(exp_ref);
         if (!exp_base.is_valid()) { return ret; }
         if (ret_inst.generic_base.id != exp_base.id) { return ret; }
-        // The expected type IS the instantiation, so the name its methods are
-        // registered under is read off it; before it is materialized it has
-        // none, and the expected type itself is the answer.  Minting the name
-        // from the written scope reached the registration only through the
-        // ambient namespace.
-        const spec_qn: SymbolStr = this.ctx.decl_index.lookup_type_name(exp_ref);
-        if (spec_qn.is_valid()) {
-            const spec_ret: TypeRef = this.types.lookup_method_return(spec_qn, member_name);
-            if (spec_ret.is_valid()) { return spec_ret; }
-        }
+        // The expected type IS the instantiation, so its methods are asked
+        // for on it; before it is materialized it has none registered, and
+        // the expected type itself is the answer.  Minting a name from the
+        // written scope reached the registration only through the ambient
+        // namespace.
+        const spec_ret: TypeRef = this.types.lookup_method_return(exp_ref, member_name);
+        if (spec_ret.is_valid()) { return spec_ret; }
         return this.state.expected_type;
     }
 
