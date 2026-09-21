@@ -89,7 +89,7 @@ is one the language fixes (`__call__`, `Ready`, `Ok`/`Err`, `Some`/`None`).
 ## The table
 
 <!-- residue-table:begin -->
-Population **308** - J 95 · N 117 · S 26 · B 49 · C 19 · F 2 · W 0
+Population **306** - J 93 · N 117 · S 26 · B 49 · C 19 · F 2 · W 0
 
 | site | read | key as written | class | reason |
 |---|---|---|---|---|
@@ -122,7 +122,7 @@ Population **308** - J 95 · N 117 · S 26 · B 49 · C 19 · F 2 · W 0
 | `compiler/sema/method_binding.cryo:1057` | `GenericRegistry::get_trait_decl` | `blocks[i].qualified_trait_name` | B | a trait declaration by its identity string (`tr.identity()`, `trait_identity(ann)`, `qualified_trait_name`) |
 | `compiler/sema/method_binding.cryo:1162` | `GenericRegistry::get_trait_decl` | `bound_leaves[i]` | B | a trait declaration by its identity string (`tr.identity()`, `trait_identity(ann)`, `qualified_trait_name`) |
 | `compiler/sema/sema.cryo:754` | `GenericRegistry::get_trait_decl` | `trait_leaf` | B | a trait declaration by its identity string (`tr.identity()`, `trait_identity(ann)`, `qualified_trait_name`) |
-| `compiler/sema/sema.cryo:3815` | `GenericRegistry::get_trait_decl` | `trait_leaf` | B | a trait declaration by its identity string (`tr.identity()`, `trait_identity(ann)`, `qualified_trait_name`) |
+| `compiler/sema/sema.cryo:3828` | `GenericRegistry::get_trait_decl` | `trait_leaf` | B | a trait declaration by its identity string (`tr.identity()`, `trait_identity(ann)`, `qualified_trait_name`) |
 | `compiler/types/resolver.cryo:597` | `GenericRegistry::get_trait_decl` | `tr.identity()` | B | a trait declaration by its identity string (`tr.identity()`, `trait_identity(ann)`, `qualified_trait_name`) |
 | `compiler/types/resolver.cryo:703` | `GenericRegistry::get_trait_decl` | `tr.identity()` | B | a trait declaration by its identity string (`tr.identity()`, `trait_identity(ann)`, `qualified_trait_name`) |
 | `compiler/types/ownership.cryo:762` | `GenericRegistry::heads_for` | `drop_id, ty, intern` | B | the impl heads of a trait identity for a subject `TypeRef` |
@@ -166,11 +166,11 @@ Population **308** - J 95 · N 117 · S 26 · B 49 · C 19 · F 2 · W 0
 | `compiler/codegen/type_map.cryo:316` | `ClassType::field_index` | `member` | J | member: a class's field position by its leaf off the `ClassType` in hand |
 | `compiler/mono/call_specializer.cryo:749` | `ClassType::get_field` | `ma.member` | J | member: a class's field by its leaf off the `ClassType` in hand |
 | `compiler/sema/member_resolver.cryo:711` | `ClassType::get_field` | `field_name` | J | member: a class's field by its leaf off the `ClassType` in hand |
-| `compiler/sema/sema.cryo:2958` | `ClassType::get_field` | `field_init.field_name` | J | member: a class's field by its leaf off the `ClassType` in hand |
+| `compiler/sema/sema.cryo:2971` | `ClassType::get_field` | `field_init.field_name` | J | member: a class's field by its leaf off the `ClassType` in hand |
 | `compiler/types/checker.cryo:1045` | `ClassType::get_field` | `field_name` | J | member: a class's field by its leaf off the `ClassType` in hand |
 | `compiler/sema/diagnostics.cryo:314` | `ClassType::get_method` | `member_name` | J | member: a class's method by its leaf off the `ClassType` in hand |
 | `compiler/sema/member_resolver.cryo:777` | `ClassType::get_method` | `method_name` | J | member: a class's method by its leaf off the `ClassType` in hand |
-| `compiler/sema/sema.cryo:3137` | `ClassType::get_method` | `scope.member_name` | J | member: a class's method by its leaf off the `ClassType` in hand |
+| `compiler/sema/sema.cryo:3150` | `ClassType::get_method` | `scope.member_name` | J | member: a class's method by its leaf off the `ClassType` in hand |
 | `compiler/passes/type_resolution.cryo:2474` | `DeclarationIndex::extern_symbol_conflict` | `ext_link_sym, func_type_ref` | J | extern: a C symbol by its link name, the only identity a C symbol has |
 | `compiler/codegen/ops/symbol_resolver.cryo:299` | `DeclarationIndex::global_entry_in_module` | `name, module` | J | member: a global's leaf inside the module the qualifier's stamp names (a `DefId`) |
 | `compiler/sema/type_utils.cryo:149` | `DeclarationIndex::global_entry_in_module` | `scope.member_name, seen.def_id()` | J | member: a global's leaf inside the module the qualifier's stamp names (a `DefId`) |
@@ -197,26 +197,24 @@ Population **308** - J 95 · N 117 · S 26 · B 49 · C 19 · F 2 · W 0
 | `compiler/sema/diagnostics.cryo:319` | `EnumType::get_variant` | `member_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
 | `compiler/sema/pattern_resolver.cryo:168` | `EnumType::get_variant` | `enum_pat.variant_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
 | `compiler/sema/sema.cryo:2693` | `EnumType::get_variant` | `this.intern.intern("Ready")` | J | lang: `Poll::Ready`, the variant the async protocol names, inside the enum a future's `poll` returns |
-| `compiler/sema/sema.cryo:2706` | `EnumType::get_variant` | `this.intern.intern("Ok")` | J | lang: `Result::Ok`, one of the variants `?` shapes its operand by (see `enum_try_shape`; the owner is any enum spelling them, a finding, not this read's) |
-| `compiler/sema/sema.cryo:2706` | `EnumType::get_variant` | `this.intern.intern("Err")` | J | lang: `Result::Err`, one of the variants `?` shapes its operand by |
-| `compiler/sema/sema.cryo:2707` | `EnumType::get_variant` | `this.intern.intern("Some")` | J | lang: `Option::Some`, one of the variants `?` shapes its operand by |
-| `compiler/sema/sema.cryo:2707` | `EnumType::get_variant` | `this.intern.intern("None")` | J | lang: `Option::None`, one of the variants `?` shapes its operand by |
-| `compiler/sema/sema.cryo:3210` | `EnumType::get_variant` | `scope.member_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
+| `compiler/sema/sema.cryo:3223` | `EnumType::get_variant` | `scope.member_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
 | `compiler/sema/method_binding.cryo:816` | `GenericRegistry::find_trait_defining_method` | `method_name` | J | hint: the did-you-mean asks which trait declares a method of this leaf; the spelling is the question |
 | `compiler/mono/monomorphizer.cryo:302` | `GenericRegistry::get_template` | `array_sym` | J | lang: `std::collections::array::Array`, the type the language lowers `T[]` to, by its own path |
 | `compiler/mono/state.cryo:404` | `GenericRegistry::get_template` | `array_sym` | J | lang: `std::collections::array::Array`, the type the language lowers `T[]` to, by its own path |
-| `compiler/passes/move_check.cryo:433` | `GenericRegistry::wellknown` | `this.intern.intern("Future")` | J | lang: a trait the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits), claimed at its declaration |
-| `compiler/sema/async_lower.cryo:6753` | `GenericRegistry::wellknown` | `future_leaf` | J | lang: a trait the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits), claimed at its declaration |
-| `compiler/sema/member_resolver.cryo:265` | `GenericRegistry::wellknown` | `deref_leaf` | J | lang: a trait the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits), claimed at its declaration |
-| `compiler/sema/member_resolver.cryo:557` | `GenericRegistry::wellknown` | `this.intern.intern("Index")` | J | lang: a trait the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits), claimed at its declaration |
-| `compiler/sema/sema.cryo:1813` | `GenericRegistry::wellknown` | `this.intern.intern(map.trait_leaf)` | J | lang: a trait the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits), claimed at its declaration |
-| `compiler/sema/sema.cryo:1901` | `GenericRegistry::wellknown` | `trait_leaf` | J | lang: a trait the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits), claimed at its declaration |
-| `compiler/sema/sema.cryo:2684` | `GenericRegistry::wellknown` | `this.intern.intern("Future")` | J | lang: a trait the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits), claimed at its declaration |
-| `compiler/types/ownership.cryo:761` | `GenericRegistry::wellknown` | `intern.intern("Drop")` | J | lang: a trait the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits), claimed at its declaration |
-| `compiler/types/trait_checker.cryo:106` | `GenericRegistry::wellknown` | `this.intern_table.intern("Copy")` | J | lang: a trait the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits), claimed at its declaration |
-| `compiler/types/trait_checker.cryo:116` | `GenericRegistry::wellknown` | `this.intern_table.intern("Send")` | J | lang: a trait the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits), claimed at its declaration |
-| `compiler/types/trait_checker.cryo:121` | `GenericRegistry::wellknown` | `this.intern_table.intern("Sync")` | J | lang: a trait the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits), claimed at its declaration |
-| `compiler/types/trait_checker.cryo:133` | `GenericRegistry::wellknown` | `this.intern_table.intern("Drop")` | J | lang: a trait the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits), claimed at its declaration |
+| `compiler/passes/move_check.cryo:433` | `GenericRegistry::wellknown` | `this.intern.intern("Future")` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration |
+| `compiler/sema/async_lower.cryo:6753` | `GenericRegistry::wellknown` | `future_leaf` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration |
+| `compiler/sema/member_resolver.cryo:265` | `GenericRegistry::wellknown` | `deref_leaf` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration |
+| `compiler/sema/member_resolver.cryo:557` | `GenericRegistry::wellknown` | `this.intern.intern("Index")` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration |
+| `compiler/sema/sema.cryo:1813` | `GenericRegistry::wellknown` | `this.intern.intern(map.trait_leaf)` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration |
+| `compiler/sema/sema.cryo:1901` | `GenericRegistry::wellknown` | `trait_leaf` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration |
+| `compiler/sema/sema.cryo:2684` | `GenericRegistry::wellknown` | `this.intern.intern("Future")` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration |
+| `compiler/sema/sema.cryo:2717` | `GenericRegistry::wellknown` | `this.intern.intern("Result")` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration |
+| `compiler/sema/sema.cryo:2719` | `GenericRegistry::wellknown` | `this.intern.intern("Option")` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration |
+| `compiler/types/ownership.cryo:761` | `GenericRegistry::wellknown` | `intern.intern("Drop")` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration |
+| `compiler/types/trait_checker.cryo:106` | `GenericRegistry::wellknown` | `this.intern_table.intern("Copy")` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration |
+| `compiler/types/trait_checker.cryo:116` | `GenericRegistry::wellknown` | `this.intern_table.intern("Send")` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration |
+| `compiler/types/trait_checker.cryo:121` | `GenericRegistry::wellknown` | `this.intern_table.intern("Sync")` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration |
+| `compiler/types/trait_checker.cryo:133` | `GenericRegistry::wellknown` | `this.intern_table.intern("Drop")` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration |
 | `compiler/passes/type_resolution.cryo:204` | `ImplBlockNode::lookup_assoc_binding` | `adecl.name` | J | member: the impl's own `This::Member` binding by the member's leaf, asked from inside the block |
 | `compiler/passes/type_resolution.cryo:281` | `ImplBlockNode::lookup_assoc_binding` | `adecl.name` | J | member: the impl's own `This::Member` binding by the member's leaf, asked from inside the block |
 | `compiler/sema/async_lower.cryo:710` | `ImplBlockNode::lookup_assoc_binding` | `assoc` | J | member: the impl's own `This::Member` binding by the member's leaf, asked from inside the block |
@@ -227,7 +225,7 @@ Population **308** - J 95 · N 117 · S 26 · B 49 · C 19 · F 2 · W 0
 | `compiler/module_loader.cryo:775` | `ModuleGraph::find_module_index` | `item_sym` | J | module: a module by its namespace path |
 | `compiler/module_loader.cryo:834` | `ModuleGraph::find_module_index` | `exp_sym` | J | module: a module by its namespace path |
 | `compiler/module_loader.cryo:891` | `ModuleGraph::find_module_index` | `eitem_sym` | J | module: a module by its namespace path |
-| `compiler/passes/pass_registry.cryo:1210` | `ModuleGraph::find_module_index` | `mod_sym` | J | module: a module by its namespace path |
+| `compiler/passes/pass_registry.cryo:1216` | `ModuleGraph::find_module_index` | `mod_sym` | J | module: a module by its namespace path |
 | `compiler/resolver/name_resolution.cryo:536` | `ModuleGraph::find_module_index` | `canonical` | J | module: a module by its namespace path |
 | `compiler/resolver/name_resolution.cryo:3106` | `ModuleGraph::find_module_index` | `module_sym` | J | module: a module by its namespace path |
 | `compiler/resolver/name_resolution.cryo:3253` | `ModuleGraph::find_module_index` | `sub_sym` | J | module: a module by its namespace path |
@@ -249,12 +247,12 @@ Population **308** - J 95 · N 117 · S 26 · B 49 · C 19 · F 2 · W 0
 | `compiler/sema/async_lower.cryo:2443` | `StructType::get_field` | `this.recv_sym` | J | member: the receiver field the lowering minted on the frame struct, asked back by the spelling it minted |
 | `compiler/sema/member_resolver.cryo:686` | `StructType::get_field` | `this.intern.intern("this$recv")` | J | member: the receiver field the async lowering minted on the frame struct, asked back by the spelling it minted |
 | `compiler/sema/member_resolver.cryo:706` | `StructType::get_field` | `field_name` | J | member: a struct's field by its leaf off the `StructType` in hand; Rust's field lookup is name-keyed off the owner too |
-| `compiler/sema/sema.cryo:2957` | `StructType::get_field` | `field_init.field_name` | J | member: a struct's field by its leaf off the `StructType` in hand; Rust's field lookup is name-keyed off the owner too |
+| `compiler/sema/sema.cryo:2970` | `StructType::get_field` | `field_init.field_name` | J | member: a struct's field by its leaf off the `StructType` in hand; Rust's field lookup is name-keyed off the owner too |
 | `compiler/types/checker.cryo:1032` | `StructType::get_field` | `field_name` | J | member: a struct's field by its leaf off the `StructType` in hand; Rust's field lookup is name-keyed off the owner too |
 | `compiler/sema/diagnostics.cryo:310` | `StructType::get_method` | `member_name` | J | member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too |
 | `compiler/sema/lambda_synth.cryo:475` | `StructType::get_method` | `this.intern.intern("__call__")` | J | lang: the call protocol's `__call__`, the method leaf the language fixes for a callable struct |
 | `compiler/sema/member_resolver.cryo:772` | `StructType::get_method` | `method_name` | J | member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too |
-| `compiler/sema/sema.cryo:3136` | `StructType::get_method` | `scope.member_name` | J | member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too |
+| `compiler/sema/sema.cryo:3149` | `StructType::get_method` | `scope.member_name` | J | member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too |
 | `compiler/types/checker.cryo:331` | `StructType::get_method` | ` ...` | J | lang: the call protocol's `__call__` (the argument continues on the next line), asked when a struct converts to a function type |
 | `compiler/passes/type_resolution.cryo:1718` | `TraitDeclNode::lookup_assoc_type` | `assoc` | J | member: the trait's own associated type by its leaf, asked from the trait node in hand |
 | `compiler/sema/async_lower.cryo:709` | `TraitDeclNode::lookup_assoc_type` | `assoc` | J | member: the trait's own associated type by its leaf, asked from the trait node in hand |
@@ -372,7 +370,7 @@ Population **308** - J 95 · N 117 · S 26 · B 49 · C 19 · F 2 · W 0
 | `compiler/sema/sema.cryo:1582` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/sema.cryo:2369` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/sema.cryo:2621` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/sema.cryo:3824` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/sema.cryo:3837` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/symbolic_checker.cryo:130` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/passes/type_resolution.cryo:2330` | `TraitType::add_assoc_type` | `adecl.name` | N | a write: the trait's own associated-type name recorded on the trait type |
 | `compiler/sema/call_resolver.cryo:4242` | `DeclarationIndex::lookup_method_return` | `spec_qn, scope.member_name` | S | the owner from `lookup_type_name(spec_ref)`, a `TypeRef`; the member a leaf inside it |

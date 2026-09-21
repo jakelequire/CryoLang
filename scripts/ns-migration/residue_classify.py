@@ -168,7 +168,7 @@ CLASS_OF_METHOD = {
     "GenericRegistry::find_trait_defining_method":
         ("J", "hint: the did-you-mean asks which trait declares a method of this leaf; the spelling is the question"),
     "GenericRegistry::wellknown":
-        ("J", "lang: a trait the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits), claimed at its declaration"),
+        ("J", "lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration"),
     # -- the module graph and the resolver's module scopes --
     "ModuleGraph::find_module_index":
         ("J", "module: a module by its namespace path"),
@@ -230,14 +230,6 @@ SITE_OVERRIDES = {
     # the program wrote: the protocols' own variant and method names.
     ("compiler/sema/sema.cryo", "EnumType::get_variant", 'this.intern.intern("Ready")'):
         ("J", "lang: `Poll::Ready`, the variant the async protocol names, inside the enum a future's `poll` returns"),
-    ("compiler/sema/sema.cryo", "EnumType::get_variant", 'this.intern.intern("Ok")'):
-        ("J", "lang: `Result::Ok`, one of the variants `?` shapes its operand by (see `enum_try_shape`; the owner is any enum spelling them, a finding, not this read's)"),
-    ("compiler/sema/sema.cryo", "EnumType::get_variant", 'this.intern.intern("Err")'):
-        ("J", "lang: `Result::Err`, one of the variants `?` shapes its operand by"),
-    ("compiler/sema/sema.cryo", "EnumType::get_variant", 'this.intern.intern("Some")'):
-        ("J", "lang: `Option::Some`, one of the variants `?` shapes its operand by"),
-    ("compiler/sema/sema.cryo", "EnumType::get_variant", 'this.intern.intern("None")'):
-        ("J", "lang: `Option::None`, one of the variants `?` shapes its operand by"),
     ("compiler/sema/lambda_synth.cryo", "StructType::get_method", 'this.intern.intern("__call__")'):
         ("J", "lang: the call protocol's `__call__`, the method leaf the language fixes for a callable struct"),
     ("compiler/types/checker.cryo", "StructType::get_method", " ..."):
