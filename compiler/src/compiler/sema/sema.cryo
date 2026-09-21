@@ -122,7 +122,6 @@ import compiler::types::checker::{ TypeChecker, TypeCheckResult, TypeCompatibili
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType, TupleType };
 import compiler::types::generic::{ BoundedParamType, InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
-import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::resolver::{ ResolutionContext };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
@@ -1732,37 +1731,35 @@ public:
         return call as ExpressionNode*;
     }
 
-    /// The identity of the trait `bound` resolves to when its leaf is
-    /// `trait_leaf`, or (transitively, to bounded depth) of the super-trait
-    /// whose leaf is.  Covers `T: Ord` satisfying `Eq` (`Ord : Eq`).  Empty
-    /// when neither names the operator's trait.
+    /// True when `bound` resolves to the trait whose identity is `trait_id`,
+    /// or (transitively, to bounded depth) to one that has it as a
+    /// super-trait.  Covers `T: Ord` satisfying `Eq` (`Ord : Eq`).
     ///
-    /// The operator table names its trait by leaf - that is the key the
-    /// trait-impl tables are indexed under - but what the desugared call is
-    /// stamped with is the trait that was FOUND, under its canonical name.
-    trait_ref_matching(&this, bound: TypeRef, trait_leaf: SymbolStr, depth: i32) -> SymbolStr {
-        if (depth > 4) { return SymbolStr::empty(); }
+    /// The comparison is by identity, never by leaf: a user trait spelled
+    /// `Add` is a different trait, and a bound naming it does not make `+`
+    /// overload - the concrete-operand path asks `wellknown` and selects by
+    /// identity, and the two paths must agree on what a bound means.
+    trait_ref_matching(&this, bound: TypeRef, trait_id: SymbolStr, depth: i32) -> boolean {
+        if (depth > 4) { return false; }
         const bt: Type* = this.arena.lookup(bound.id);
-        if (bt == null || bt.kind != TypeKind::Trait) { return SymbolStr::empty(); }
+        if (bt == null || bt.kind != TypeKind::Trait) { return false; }
         const tt: TraitType* = bt as TraitType*;
-        const leaf: SymbolStr = OwnershipQuery::leaf_segment(this.intern, tt.qualified_name);
-        if (leaf.is_valid() && leaf.equals(trait_leaf)) { return tt.qualified_name; }
+        if (tt.qualified_name.equals(trait_id)) { return true; }
         for (mut i: i64 = 0; i < tt.super_traits.length; i++) {
-            const via_super: SymbolStr = this.trait_ref_matching(tt.super_traits[i], trait_leaf, depth + 1);
-            if (via_super.is_valid()) { return via_super; }
+            if (this.trait_ref_matching(tt.super_traits[i], trait_id, depth + 1)) { return true; }
         }
-        return SymbolStr::empty();
+        return false;
     }
 
-    /// The identity of the trait among a generic `BoundedParam`'s declared
-    /// bounds (or their super-traits) whose leaf is `trait_leaf`, so an
-    /// operator on that param overloads; empty when none is.
-    bounded_param_trait(&this, bp: BoundedParamType*, trait_leaf: SymbolStr) -> SymbolStr {
+    /// True when a generic `BoundedParam`'s declared bounds (or their
+    /// super-traits) include the trait whose identity is `trait_id`, so an
+    /// operator on that param overloads.
+    bounded_param_trait(&this, bp: BoundedParamType*, trait_id: SymbolStr) -> boolean {
+        if (!trait_id.is_valid()) { return false; }
         for (mut i: i64 = 0; i < bp.bounds.length; i++) {
-            const found: SymbolStr = this.trait_ref_matching(bp.bounds[i], trait_leaf, 0);
-            if (found.is_valid()) { return found; }
+            if (this.trait_ref_matching(bp.bounds[i], trait_id, 0)) { return true; }
         }
-        return SymbolStr::empty();
+        return false;
     }
 
     /// Decide whether operand type `ty` overloads `map`'s operator and, if so,
@@ -1807,19 +1804,21 @@ public:
         const is_user: boolean = t.kind == TypeKind::Struct || t.kind == TypeKind::Class
                               || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType;
         if (!is_bounded && !is_user) { return null; }
-        const trait_leaf: SymbolStr = this.intern.intern(map.trait_leaf);
-        // The trait's identity: the bound's trait for a parameter, or the
-        // language's operator trait (`std::core::ops::Add` for `+`, as Rust's
-        // `+` is `core::ops::Add`) when the type has an impl of it.
-        mut trait_id: SymbolStr = SymbolStr::empty();
-        if (is_bounded) {
-            trait_id = this.bounded_param_trait(t as BoundedParamType*, trait_leaf);
-        } else {
-            const impl_block: ImplBlockNode* = this.trait_checker().select_impl(
-                this.ctx.generic_registry.wellknown(trait_leaf), base_ty, 0);
-            if (impl_block != null) { trait_id = impl_block.qualified_trait_name; }
-        }
+        // The operator's trait is the language's (`std::core::ops::Add` for
+        // `+`, as Rust's `+` is `core::ops::Add`), by the identity its
+        // declaration claimed; the table spells the leaf and nothing else.
+        // A parameter overloads when a bound names that trait, a concrete
+        // type when it has an impl of it; a user trait of the same spelling
+        // is neither, on either path.
+        const trait_id: SymbolStr = this.ctx.generic_registry.wellknown(this.intern.intern(map.trait_leaf));
         if (!trait_id.is_valid()) { return null; }
+        mut overloads: boolean = false;
+        if (is_bounded) {
+            overloads = this.bounded_param_trait(t as BoundedParamType*, trait_id);
+        } else {
+            overloads = this.trait_checker().select_impl(trait_id, base_ty, 0) != null;
+        }
+        if (!overloads) { return null; }
         const method_sym: SymbolStr = this.intern.intern(map.method);
         mut desugared: ExpressionNode* =
             this.build_operator_call(receiver, method_sym, trait_id, rhs, op_tok, span);

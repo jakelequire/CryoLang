@@ -53,7 +53,6 @@ import compiler::types::arena::{ TypeArena };
 import compiler::types::checker::{ TypeChecker, TypeCheckResult };
 import compiler::types::compound::{ FunctionType, PointerType, ReferenceType, TupleType };
 import compiler::types::generic::{ BoundedParamType, InstantiatedType };
-import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
@@ -552,15 +551,17 @@ type struct MemberResolver {
             rdepth += 1;
         }
         if (t == null) { return null; }
-        const index_leaf: SymbolStr = this.intern.intern("Index");
+        // `[]` is `std::core::ops::Index`, by the identity its declaration
+        // claimed; a user trait spelled `Index` overloads nothing, whether a
+        // parameter is bounded by it or a type implements it.
+        const index_id: SymbolStr = this.ctx.generic_registry.wellknown(this.intern.intern("Index"));
+        if (!index_id.is_valid()) { return null; }
         mut overloads: boolean = false;
         if (t.kind == TypeKind::BoundedParam) {
-            overloads = this.bounded_param_has_index(t as BoundedParamType*, index_leaf);
+            overloads = this.bounded_param_has_index(t as BoundedParamType*, index_id);
         } else if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class
                 || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType) {
-            const impl_block: ImplBlockNode* = this.trait_checker().select_impl(
-                this.ctx.generic_registry.wellknown(index_leaf), base_ty, 0);
-            overloads = impl_block != null;
+            overloads = this.trait_checker().select_impl(index_id, base_ty, 0) != null;
         } else {
             return null;
         }
@@ -584,25 +585,27 @@ type struct MemberResolver {
     }
 
     /// True when a generic `BoundedParam`'s bounds (or their super-traits, to
-    /// bounded depth) name the `Index` trait, so `a[i]` on that param overloads.
-    bounded_param_has_index(&this, bp: BoundedParamType*, index_leaf: SymbolStr) -> boolean {
+    /// bounded depth) include the trait whose identity is `index_id`, so
+    /// `a[i]` on that param overloads.
+    bounded_param_has_index(&this, bp: BoundedParamType*, index_id: SymbolStr) -> boolean {
         for (mut i: i64 = 0; i < bp.bounds.length; i++) {
-            if (this.trait_bound_names(bp.bounds[i], index_leaf, 0)) { return true; }
+            if (this.trait_bound_names(bp.bounds[i], index_id, 0)) { return true; }
         }
         return false;
     }
 
-    /// True when `bound` resolves to a `TraitType` whose leaf is `leaf`, or
-    /// (transitively, to bounded depth) one of its super-traits is.
-    trait_bound_names(&this, bound: TypeRef, leaf: SymbolStr, depth: i32) -> boolean {
+    /// True when `bound` resolves to the `TraitType` whose identity is
+    /// `trait_id`, or (transitively, to bounded depth) to one that has it as
+    /// a super-trait.  By identity, never by leaf: a user trait spelled
+    /// `Index` is another trait.
+    trait_bound_names(&this, bound: TypeRef, trait_id: SymbolStr, depth: i32) -> boolean {
         if (depth > 4) { return false; }
         const bt: Type* = this.arena.lookup(bound.id);
         if (bt == null || bt.kind != TypeKind::Trait) { return false; }
         const tt: TraitType* = bt as TraitType*;
-        const bl: SymbolStr = OwnershipQuery::leaf_segment(this.intern, tt.qualified_name);
-        if (bl.is_valid() && bl.equals(leaf)) { return true; }
+        if (tt.qualified_name.equals(trait_id)) { return true; }
         for (mut i: i64 = 0; i < tt.super_traits.length; i++) {
-            if (this.trait_bound_names(tt.super_traits[i], leaf, depth + 1)) { return true; }
+            if (this.trait_bound_names(tt.super_traits[i], trait_id, depth + 1)) { return true; }
         }
         return false;
     }

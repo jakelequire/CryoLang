@@ -138,7 +138,7 @@ three, and its row carries the count. Read each zero off its own row.
 | const-table bare leaf (`by_bare`, `bare_index_of`, the same-leaf chain folder) | **DELETED** — a bare constant is read off `IdentifierNode.res`; shadow 0 over six halves, the lane reached 4/4 in `const_cross_module` under the same build, and a same-leaf constant in an unimported module - which the chain folder REFUSED - now folds to the imported one | — | `grep -c 'by_bare' compiler/src/compiler/const_table.cryo` → **0** | §8.9, §8.111, §8.171 |
 | `spelling_type` call-ident fallback (E0202 tail) and `new`'s `resolve_primitive` step | **DELETED** — shadow 0 over six halves; their three rows retired | — | `grep -c 'resolve_primitive' compiler/src/compiler/sema/sema.cryo` → **0** | §8.25, §8.98, §8.171 |
 | `new`'s spelling step (`lookup_type_exact(new_expr.type_name)`) | **DELETED** (§8.256) — its whole population was an ALIAS KEYWORD (`new int[100]`), which the name layer stamps `PrimTy("i32")` now, so `spelling_type(new_expr.res)` is the one answer; shadow over the six halves: 0 `new` expressions answered by the spelling and not the stamp (1,407 by the stamp, the control; at HEAD the same probe printed the two `new int[100]` lines). The impl head's spelling arm for the same four spellings went with it (§8.188's `target_key` arm and type resolution's `register_methods_by_key` dispatch) | — | `grep -c 'lookup_type_exact(new_expr' compiler/src/compiler/sema/sema.cryo` → **0**; `grep -rho 'is_alias_keyword' compiler/src --include=*.cryo \| wc -l` → **0** | §8.25, §8.98, §8.171, §8.188, §8.256 |
-| bound-directed trait filter by LEAF (`select_method`, mono's spec-impl and trait-registry method lookups) | **DELETED** — `MemberAccessNode.resolved_trait` is the trait's identity and every reader compares it to `origin_trait` / `qualified_trait_name`; shadow 440 → 0 (the async-lowered `Future` impl was the one unstamped head); `trait_leaf_dispatch` exits 12 where a leaf comparison exits 11. The check is paired treewide the way the leaf-scan rows are: a zero over the two files that select a method, and the treewide count naming the survivors, every non-locator one a reader of the trait registry's TRAIT half (the row below, D24's) | — | `grep -rho 'leaf_segment' compiler/src/compiler/sema/call_resolver.cryo compiler/src/compiler/mono/call_specializer.cryo \| wc -l` → **0**; `grep -rh 'leaf_segment' compiler/src --include=*.cryo \| grep -v '^\s*//' \| grep -o 'leaf_segment' \| wc -l` → **11** (`AST/node_locator.cryo` 8, the LSP locator's own `leaf_segment_str`; `types/ownership.cryo` 1, the definition; `sema/sema.cryo`, `sema/member_resolver.cryo`, `sema/async_lower.cryo` 1 each; 18 before §8.233 deleted the trait registry's leaf keys) | §8.171, §8.205 |
+| bound-directed trait filter by LEAF (`select_method`, mono's spec-impl and trait-registry method lookups) | **DELETED** — `MemberAccessNode.resolved_trait` is the trait's identity and every reader compares it to `origin_trait` / `qualified_trait_name`; shadow 440 → 0 (the async-lowered `Future` impl was the one unstamped head); `trait_leaf_dispatch` exits 12 where a leaf comparison exits 11. The check is paired treewide the way the leaf-scan rows are: a zero over the two files that select a method, and the treewide count naming the survivors, every non-locator one a reader of the trait registry's TRAIT half (the row below, D24's) | — | `grep -rho 'leaf_segment' compiler/src/compiler/sema/call_resolver.cryo compiler/src/compiler/mono/call_specializer.cryo \| wc -l` → **0**; `grep -rh 'leaf_segment' compiler/src --include=*.cryo \| grep -v '^\s*//' \| grep -o 'leaf_segment' \| wc -l` → **9** (`AST/node_locator.cryo` 7, the LSP locator's own `leaf_segment_str`; `types/ownership.cryo` 1, the definition; `sema/async_lower.cryo` 1; 18 before §8.233 deleted the trait registry's leaf keys, 11 before §8.285 replaced the operator paths' two bound-by-leaf compares in `sema/sema.cryo` and `sema/member_resolver.cryo` with the trait's identity) | §8.171, §8.205 |
 | method selection by REGISTRATION ORDER (sema's `select_method` over the type's folded method list, where an impl block's methods sit beside the inherent ones in declaration order; its generic-method finder over the template's impl blocks as one list, and the trait registry ahead of the inherent owner and the inherent-impl registry; mono's `find_spec_impl_method` and `find_generic_trait_method_under`, whose `first_m` arm bound whichever impl the walk met first) | **DELETED** — one precedence at every selector, `docs/cryo.md` §13.4: the trait the call is stamped with, else an INHERENT method from any store, else the sole trait providing the name, else nothing; two traits beside an inherent method are not an ambiguity. Sema's binder measured 518,079 selections over six halves, 0 differing; mono's ladder 80,903, 0; the ambiguity check 12,867, 0; the stash finder 35,849 with 14,478 differing - 14,242 stamped calls (10,775 `Debug` stamps the old walk answered with `Display`'s identical `fmt<W>` signature, 3,467 the placed clone's node under the same trait) and 236 unstamped, one trait, the clone's node. The corpus never held a receiver with both an inherent and a trait method of one name, so the population was built: `inherent_method_over_trait` writes the four shapes (plain or generic type, plain or generic method) in both block orders plus a bound-directed call; the pin binds the trait's body for four of the eight and refuses the ninth (an inherent `go` between two traits') as the two-trait tie (E0154 then; E0156 since §8.224) | — | `grep -rho -e 'find_spec_impl_method' -e 'first_m\b' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho -e 'find_spec_impl_inherent_method' -e 'find_spec_impl_trait_method' compiler/src --include=*.cryo \| wc -l` → **6** (two definitions, three callers, one mention in the registry finder's doc); `grep -c 'pick_own_method' compiler/src/compiler/sema/call_resolver.cryo` → **3**; `grep -c '^### 13.4' docs/cryo.md` → **1**; `ls -d tests/tests/projects/inherent_method_over_trait*/test.json \| wc -l` → **1** | §8.205 |
 | callee door ladder (`lookup_callee_function_type`'s identifier branch: a `lookup_local` by spelling ahead of the stamp, then STAMP → HOME → BARE) | **DELETED** - the identifier branch is the stamp: `Local` → the local's type when callable, `Def` → `func_type_of_res`, else no hint; shadow 5,327 → 16, every line a `Pending` stamp (intrinsics through BARE, unresolved match guards and `main$async` through HOME, an unimported `swap`); the 12 left are §8.93's allocator leaf and `visibility_gate`'s refused privates; the `CALLEE-DOOR` audit stream went with it | — | `grep -c 'lookup_func_type_exact(ident.name)' compiler/src/compiler/sema/call_resolver.cryo` → **0** | §8.172 |
 | free-call template search by leaf and arity (`find_fn_template_for_call`'s registry scan, its cursor-module tie-break, `Resolver::resolve_function_source_module`) | **DELETED** - `lookup_scope_template(ident.res)` plus the arity gate; a local is never a template, which is what fixes a local fn-pointer bound to a same-leaf generic global (returned 5 for 10); shadow 12 → 0 | — | `grep -rho 'resolve_function_source_module' compiler/src \| wc -l` → **0** | §8.172 |
@@ -212,7 +212,7 @@ evidence for what it covers.
 
 | gate | holds | structurally blind to |
 |---|---|---|
-| `make test` | 2,135 unit + 71 project + 205 negative (74 projects on the roster, 3 gated by `requires`; `default_expansion_by_stamp` since §8.254; `lang/alias_keyword.cryo`'s three since §8.256; `plural_leaf_gate` pins four E0155 spans and `namespace_gate` both arms' E0240 spans since §8.258; `E0214_c_import_narrowing` since §8.260; the two variadic negatives since §8.262; the two `impl_qualified_call*` projects and three `*_impl_qualified_*` negatives since §8.263; `E0203_refused_signature_no_cascade` since §8.265; `bound_directed_static_path` since §8.266; `E0233_trait_qualified_unselected` since §8.267; `E0311_generic_param_shadowed` since §8.268; `E0308_overlapping_impls` and `where_bound_leaf_collision` as a `compile_fail` since §8.270; `default_param_keyed_by_symbol` since §8.272; `chain_default_same_param` and `chain_default_param_conflict` since §8.275; `lang/turbofish_expression_generics.cryo`'s eight since §8.277; `E0102_generic_args_without_turbofish` since §8.278); `OVERALL PASS` since §8.233 - the two `impl_concrete_arg_*` projects that were RED by design from §8.223 are green | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** The roster check (ubuntu CI's) compares the golden's ROWS; the census on this host reads its counts and project names - a project row whose `asserts=` moved under an unchanged count (§8.258's two, red at `4f24148d`) passes the census. Since §8.260 the roster check reads OK (2,405 entries at §8.275). |
+| `make test` | 2,135 unit + 71 project + 207 negative (74 projects on the roster, 3 gated by `requires`; `default_expansion_by_stamp` since §8.254; `lang/alias_keyword.cryo`'s three since §8.256; `plural_leaf_gate` pins four E0155 spans and `namespace_gate` both arms' E0240 spans since §8.258; `E0214_c_import_narrowing` since §8.260; the two variadic negatives since §8.262; the two `impl_qualified_call*` projects and three `*_impl_qualified_*` negatives since §8.263; `E0203_refused_signature_no_cascade` since §8.265; `bound_directed_static_path` since §8.266; `E0233_trait_qualified_unselected` since §8.267; `E0311_generic_param_shadowed` since §8.268; `E0308_overlapping_impls` and `where_bound_leaf_collision` as a `compile_fail` since §8.270; `default_param_keyed_by_symbol` since §8.272; `chain_default_same_param` and `chain_default_param_conflict` since §8.275; `lang/turbofish_expression_generics.cryo`'s eight since §8.277; `E0102_generic_args_without_turbofish` since §8.278; `E0229_user_trait_spelled_add` and `E0229_user_trait_spelled_add_bound` since §8.285); `OVERALL PASS` since §8.233 - the two `impl_concrete_arg_*` projects that were RED by design from §8.223 are green | Echoes only FAILING projects — a project that never ran prints exactly what a passing one prints. **The evidence is `projects: N passed` moving, never the word PASS.** The roster check (ubuntu CI's) compares the golden's ROWS; the census on this host reads its counts and project names - a project row whose `asserts=` moved under an unchanged count (§8.258's two, red at `4f24148d`) passes the census. Since §8.260 the roster check reads OK (2,405 entries at §8.275). |
 | `make roster-check` | the discovered roster of all three suites, as a golden | Platform-gated tests: `--update` on one host silently DELETES the other host's rows, and then passes. |
 | `make lane-check` | 17 buckets of call sites in `compiler/src`, as a golden, under three rules each derived from a definition and none from a list of names (§8.241, §8.253): **a STORE is a type that OWNS A MAP** (`HashMap<K, V>` / `HashSet<T>` field, read from the tree on every run; the key type is not consulted, since a name keys a map by its `u32` id and a `u64` may be two of them packed, a type id or a source position) - every owner must be placed, as a store with its rows (`DeclarationIndex`, `TypeArena`, `GenericRegistry`, `ModuleGraph`, `ConstantTable`, `Resolver`, plus `TypeUtils`, the funnel, marked as owning none) or as an exclusion with its reason (15, the script's `EXCLUDED` table), and a map owner in neither, a listed type with no map, or one declared in a file the table does not name, REFUSES the run; §8.241's version was a hand-written dict of seven the script never checked against the tree, and audit 13 added a map-keyed member to the context over which it read OK; the rule's first run found `DefaultRegistry` (two rows for one commit, §8.253) and §8.254 deleted the store, the rule refusing the stale entry until the table followed; a golden section no bucket counts is refused too (§8.254: the retired rows read OK until it was); **a name-keyed method is any a store declares - inline or in an `implement` block in ANY file - with `SymbolStr` or `string` in its signature**, parsed from the tree on every run since §8.230 (the `lookup_*` rule read OK over 24 readers under other names; the inline-only parser read OK over a cross-file `implement struct` reader; the `SymbolStr`-token rule read OK over a `string`-keyed one); **a call is placed by its receiver's DECLARED TYPE** (`this`, a local's annotation, a field's declaration, an accessor's return type), not its spelling. Reads split `LOOKUP` (the five) / `LOOKUP_OTHER` (the rest) / `LOOKUP_ROUTED` (the funnel), `REGISTER` pins the index's name-keyed WRITES, and each other store has a `*_READ` and a `*_WRITE` row (`ARENA`, `REGISTRY`, `GRAPH`, `CONST`); `LOOKUP_ARENA` kept the arena's `lookup_by_name` apart from §8.192 (it read OK over a tree holding 17) until §8.247 deleted the method, and `ARENA_READ` is where a written-name read on the arena lands under any spelling; `HOME_WRITE` pins `.set_home_module(` at 0 since §8.204; `REENTRY` counts `get_resolver()` AND every name-keyed `Resolver` method on a `Resolver`-typed receiver outside `compiler/resolver/` and the driver (the three-name list read 6 over a tree holding 12: type resolution's `is_ambiguous`/`get_ambiguous_modules` - deleted in §8.244, 10 now - sema's three asks on its `get_resolver()` local, `Resolver::ns_written_as`); `make lane-selftest` drives every rule through a throwaway tree in both directions (29 mutations). **Rule 1b (§8.279): a name-keyed table need not be a map** - a type that owns NO map, owns an ARRAY OF NAMES (`SymbolStr[]`, `string[]`, `Pair<SymbolStr\|string, ..>[]`) and declares a method TAKING a name is a candidate too, and every one is placed, as a store or in the script's `EXCLUDED_ARRAYS` with a reason (27: AST nodes' own written segments, a pass's own rib, file paths and flags, displays beside a symbol key, a member table inside its owner); audit 14's `m8` - an array-backed store with a linear `lookup_leaf(name)` on the context and a caller - read OK under the map rule and is refused, and the two by-name lanes audit 14 found under this shape (the parser's `ident <` tables, D31; the substitution chain's parameter lists, D30) are both gone from the tree | Source text only — no compiler, no stdlib, no link, no behaviour. It sees a lane that EXISTS, never one that ANSWERS. A receiver whose type it cannot read is refused, not dropped; a set name on a receiver of a NON-store type is counted as local (the control on placement). A `string` parameter that is a label rather than a key (`impl_owner(node, site: string)`) is inside the rule and pinned like a key: the rule cannot tell them apart and does not try. |
 | `make selfhost-check` | stage-3 == stage-4 byte identity, both arms | **Stability, not correctness.** It proves the compiler still emits the same bytes for code that already compiles; it says nothing about code that now STOPS compiling. |
@@ -243,7 +243,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: lane-check lane-selftest' Makefile` → **1**
 * `ls -d tests/tests/projects/*/test.json | wc -l` → **74**
-* `ls tests/tests/negative/*.cryo | wc -l` → **205**
+* `ls tests/tests/negative/*.cryo | wc -l` → **207**
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
 * `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -35840,3 +35840,141 @@ unit.
 D32's row: population **308**, J **95**, `--check` OK, convertible **96**.
 The J that moved is 43 rows that were always in the compiler and never in
 the count; nothing was reclassified, and the ceiling is still Jake's.
+
+### 8.285 The operator's trait matched by identity on the bounded-parameter path as it already was on the concrete one - `where T: Add<T, T>` no longer selects a trait by its leaf; measured first: not a miscompile, the concrete re-walk refused every probe either way, so the two walks now agree and 0 objects moved; two negatives pin the property; the `?` operator's `Result`/`Option` shape test by variant spelling recorded as the open defect of this class; `lookup_subst_for_param` NOT converted - §8.272 left it keyed by spelling by design, pending the arena keyed by symbol, Jake's unit - 2026-09-20
+
+> **Status:** LANDED (a compiler change with no observable difference on
+> any program tried; two negative tests; a finding).  `sema/sema.cryo`
+> (`trait_ref_matching`, `bounded_param_trait`, `operator_overload_expr`),
+> `sema/member_resolver.cryo` (`bounded_param_has_index`,
+> `trait_bound_names`, the `[]` overload decision), both files' unused
+> `OwnershipQuery` import gone; `tests/tests/negative/E0229_user_trait_spelled_add.cryo`
+> and `..._bound.cryo`; `tests/test-roster.txt` (+2); the regenerated
+> `residue.md` (two `wellknown` sites re-keyed, counts unchanged); §0's
+> `make test` row (207 negatives).
+
+#### The read, and what it could reach
+
+`operator_overload_expr` decides whether `a + b` overloads.  For a
+concrete operand it asked `wellknown(leaf)` for the operator trait's
+identity and `select_impl` by that identity - a user trait spelled `Add`
+never answered.  For a `BoundedParam` operand it asked the parameter's
+bounds instead, and `trait_ref_matching` compared each bound's trait by
+**leaf**: `leaf_segment(tt.qualified_name).equals(trait_leaf)`.  A user
+trait spelled `Add` in the bound matched, and the generic body's `+` was
+desugared to THAT trait's `add`.  `member_resolver.cryo`'s `[]` decision
+had the same two paths and the same asymmetry for `Index`.
+
+```cryo
+type trait Add<Rhs, Output> { add(&this, rhs: &Rhs) -> Output; }   // a user trait
+type struct P { x: i64; }
+implement trait Add<P, P> for struct P { add(&this, rhs: &P) -> P { ... } }
+function plus<T>(a: T, b: T) -> T where T: Add<T, T> { return a + b; }
+```
+
+Measured before the fix, with the §8.282 compiler (`compiler/build/cryo.exe`
+at `04b93c2b`), each from a clean `build/` after an incremental "up to
+date" read a stale answer once:
+
+| program | verdict |
+|---|---|
+| `plus::<P>(...)` called | E0229 "`main::P` does not implement `Add`" at `a + b`, exit 1 |
+| the same shape as `implement<T> trait Add<Wrap<T>, Wrap<T>> for struct Wrap<T> where T: Add<T, T>` with `this.v + rhs.v`, called | E0229, exit 1 |
+| `plus` never instantiated | compiles, exit 0 |
+| the control: the user trait spelled `Plus`, never instantiated | compiles, exit 0 |
+| the user `Add` with NO `add` method, uninstantiated (the pin `bin/cryo.exe` and the fixed compiler) | compiles under both |
+
+So the leaf match reached nothing a program can see.  The generic walk
+desugars against the user trait, but the specialization re-walks `a + b`
+with the operand concrete (`resolve_binary`: a post-mono desugar is "a
+clone the substituter left unbound: walk it again"), takes the concrete
+path, asks `wellknown`, finds no impl of the language's `Add` on `P` and
+refuses.  An uninstantiated body is deferred whatever the bound is
+spelled (`T + T` on a symbolic operand is not judged until the type is).
+The defect was a disagreement between two walks about what a bound means,
+with the concrete walk's answer the one that reached codegen.
+
+Not fixing it would have left a name-keyed decision one line away from
+the identity it should have used, and the diagnostic it produces is the
+one thing a user does see: E0229 tells the writer of the program above
+that `P` "does not implement `Add`; add `implement trait Add ... for P`",
+which they did.  The message prints `map.trait_leaf`; naming
+`std::core::ops::Add` there would say what is meant.  **Diagnostic wording
+is Jake's**; not changed.
+
+#### The fix
+
+`trait_ref_matching` and `trait_bound_names` take the trait's IDENTITY
+(`wellknown(leaf)`, computed once at the top of each decision) and compare
+`tt.qualified_name` to it, through super-traits as before; both return
+`boolean` - the identity the caller passes in is the identity the desugar
+is stamped with, so nothing needs returning.  `bounded_param_trait` and
+`bounded_param_has_index` take the identity too.  When `wellknown`
+answers empty (the language's trait is not in this program's module
+graph) neither path overloads, which is what "no such trait" means; before,
+the bounded path could still match a user trait by leaf in that state.
+The two `OwnershipQuery` imports had no other use.
+
+Corpus: `grep -rnE "type trait (Add|Sub|...|Index|Eq|Ord|Copy|Send|Sync|Drop|Future)\b" stdlib tests examples`
+outside the declaring stdlib files → 0.  Predicted 0 objects moved;
+`hash-tree.sh sg` against `sf` (§8.282's halves, the test tree unchanged
+between): **0 of 1,126 example and 0 of 2,893 test objects** moved
+(`comm -3`, both halves).  `test-census` OK (2,135 unit, 205 compile-fail,
+74 projects pinned; 71 ran); `lsp-check` OK (264 modules); `cross-check`
+OK (0 errors).  Under the fixed compiler every probe above answers as it
+did.
+
+#### The tests
+
+Nothing pinned the property end to end.  Two negatives do now, one per
+path, because a sema error aborts before the instantiation that judges a
+bounded body and the two diagnostics cannot share a file:
+`E0229_user_trait_spelled_add.cryo` (`CfP { x: 3 } + CfP { x: 4 }` on a type
+implementing the user `Add` alone) and `E0229_user_trait_spelled_add_bound.cryo`
+(`cf_plus::<CfP>` with `where T: Add<T, T>` over the user trait).  Each
+provokes exactly one E0229 at its `//~` line.  Inversion: the same two
+files with the user trait's declaration deleted, so the impl targets the
+prelude's `std::core::ops::Add`, compile with **0 errors** - which is what
+the negative refuses, a file that compiles cleanly.  Roster `--merge` +2.
+
+#### Not built: `lookup_subst_for_param` (the brief's (b))
+
+The brief read §8.272 as having declared the collision class closed and
+`TraitChecker::lookup_subst_for_param(name, subst)` - which reads a
+substitution by `gp.param_name.equals(name)` - as a hole in that claim.
+§8.272 and §0's D30 row say the opposite, in so many words: "**Left keyed
+by spelling, by design**: ... a bound's subject against the arena
+substitution (`lookup_subst_for_param`, 5 callers) - the type layer's own
+identity is the SPELLING ALONE (`TypeArena::create_generic_param` caches by
+the name) and carries no symbol", and route it to §8.275's arena keyed by
+symbol, Jake's design unit.  A `TypeSubstitution` is `param_ids: u64[]`
+(arena type ids) beside `replacements`, and the arena's `GenericParamType`
+/ `BoundedParamType` carry `param_name` and `param_index` and no
+`SymbolID`; a sym-keyed read needs the table or the arena types to carry
+the symbol, which is that unit.  The callers are 7 today (`method_binding.cryo`
+1739 and 1763 - the second with `n.param_sym()` on the same line, the
+symbol in hand and no table to ask with it - `trait_specializer.cryo` 320,
+423, 633, `trait_checker.cryo` 342, 378, 405).  The standing record wins
+over the brief; nothing converted, nothing in §8.272 corrected, the
+conflict recorded here.
+
+#### Recorded, not fixed: `?` shapes its operand by variant spelling
+
+Found while classifying §8.284's rows.  `enum_try_shape` (`sema.cryo:2699`)
+answers "`Result`" for ANY enum with variants spelled `Ok` and `Err` and
+"`Option`" for any with `Some` and `None`; `build_try_desugar` then writes
+the arms as `Result::Ok(x)` / `Result::Err(e)` with the enclosing
+function's return type as the synthesized reference.  `docs/cryo.md` says
+`?` acts "on a `Result`/`Option`".
+
+```cryo
+type enum Outcome { Ok(i32), Err(string) }      // passes enum_try_shape as a Result
+```
+
+The same class as this entry's defect - a language-named declaration
+identified by spelling where an identity exists (`wellknown` holds
+identities for the traits; `Result` and `Option` have no lang identity
+recorded anywhere - `async_lower.cryo` spells `std::core::option::Option`
+as a string constant).  Not measured; the honest fix claims the two enums
+at declaration as `claim_wellknown_trait` claims the traits, and asks the
+identity in `enum_try_shape`.  A unit of its own.
