@@ -84,25 +84,15 @@ import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ ClassType, FieldInfo, MethodInfo, StructType };
 
-/// The canonical name of the type the lowering wraps every completion in.
-/// Synthesized `Poll::…` nodes are SPELLED with it, not just typed by it: a
-/// bare `Poll` in a node no one wrote is resolved by later stages against the
-/// module it was lowered INTO, where the spelling may name something else
-/// entirely or nothing at all.
-const POLL_TYPE: string = "std::future::poll::Poll";
-
-/// The canonical name of the type every carried value the state machine may not
-/// yet hold is wrapped in — a sub-future slot before its future is constructed,
-/// a promoted local before its state runs. Spelled for the reason `POLL_TYPE`
-/// is: the module being lowered does not get to say what `Option` means in a
-/// node it did not write.
-const OPTION_TYPE: string = "std::core::option::Option";
-
 /// The canonical name of the type that drives an `async function main`. The
-/// wrapper synthesized around it is spelled with this for the reason
-/// `POLL_TYPE` is, and the failure is louder here: the wrapper lands in the
-/// user's entry-point module, so a type of the same name declared beside
-/// `main` is precisely the one a bare spelling would find.
+/// wrapper synthesized around it is spelled with this: the wrapper lands in
+/// the user's entry-point module, so a type of the same name declared beside
+/// `main` is precisely the one a bare spelling would find.  `Poll` and
+/// `Option`, the two types the state machine is built out of, are not
+/// spelled here at all: each is the identity its declaration claimed
+/// (`poll_identity`, `option_identity`), and every synthesized `Poll::…` /
+/// `Option::…` node carries that identity as its scope, not a bare leaf a
+/// later stage would resolve against the module it was lowered INTO.
 const EXECUTOR_TYPE: string = "std::future::executor::Executor";
 
 /// The state-machine builder's accumulator for lowering one `async function`
@@ -580,8 +570,25 @@ type struct AsyncLower {
     ///
     /// Invalid when the declaration is absent from the program, which is the
     /// case the callers' "add `import std::future;`" diagnostics report.
-    lookup_future_type(&this, qualified: string) -> TypeRef {
-        return this.ctx.decl_index.lookup_type(this.intern.intern(qualified));
+    lookup_future_type(&this, qualified: SymbolStr) -> TypeRef {
+        if (!qualified.is_valid()) { return TypeRef::invalid(); }
+        return this.ctx.decl_index.lookup_type(qualified);
+    }
+
+    /// The identity of the language's `Poll` - `std::future::poll::Poll`,
+    /// claimed where it is declared - or empty when no such declaration is in
+    /// this program's module graph, which `declare` reports as the missing
+    /// `std::future` import.  Never a spelling: a user enum named `Poll`
+    /// beside an `async function` is another enum.
+    poll_identity(&this) -> SymbolStr {
+        return this.ctx.generic_registry.wellknown(this.intern.intern("Poll"));
+    }
+
+    /// The identity of the language's `Option`, the type every carried value
+    /// the state machine may not yet hold is wrapped in; empty when absent
+    /// from the program, which `lower` reports.
+    option_identity(&this) -> SymbolStr {
+        return this.ctx.generic_registry.wellknown(this.intern.intern("Option"));
     }
 
     mint_bare(mut &this, base: string) -> SymbolStr {
@@ -812,7 +819,7 @@ type struct AsyncLower {
     /// gives: this annotation is emitted by the lowering, so the module being
     /// lowered does not get to say what `Poll` means in it.
     poll_type_ann(mut &this, arg: TypeAnnotation*, span: SourceSpan) -> TypeAnnotation* {
-        const poll_q: SymbolStr = this.intern.intern(POLL_TYPE);
+        const poll_q: SymbolStr = this.poll_identity();
         mut gen: GenericAnnotation* = new GenericAnnotation {
             base: this.named_ann_def(poll_q, DefId::of_definition(poll_q), span),
             args: [arg],
@@ -853,10 +860,10 @@ type struct AsyncLower {
     /// only guessed at downstream — the move passes read it as a transfer while
     /// the carrier substitution reads it as a borrow. Saying what it actually is
     /// keeps every consumer on the same move set.
-    variant_call1(&this, scope_name: string, member_name: string, value: ExpressionNode*,
+    variant_call1(&this, scope_name: SymbolStr, member_name: string, value: ExpressionNode*,
                   ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
         mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
-            this.intern.intern(scope_name), this.intern.intern(member_name), span);
+            scope_name, this.intern.intern(member_name), span);
         scope.set_synthesized_ref(ty, this.ctx.definition_id_of(ty));
         mut call: CallExprNode* = new CallExprNode(scope as ExpressionNode*, span);
         if (value != null) { value.arg_binding = ArgBinding::ByValue; }
@@ -868,7 +875,7 @@ type struct AsyncLower {
     /// Wrap an already-typed value expression in `Poll::Ready(<expr>)` typed as
     /// `Poll<Output>`.
     make_poll_ready(&this, value: ExpressionNode*, poll_out: TypeRef, span: SourceSpan) -> ExpressionNode* {
-        return this.variant_call1(POLL_TYPE, "Ready", value, poll_out, span);
+        return this.variant_call1(this.poll_identity(), "Ready", value, poll_out, span);
     }
 
     /// Rewrite every `return E;` reachable in `stmt` to `return Poll::Ready(E);`,
@@ -1433,13 +1440,13 @@ type struct AsyncLower {
 
     /// `Option::Some(<value>)` typed `opt_ty`.
     option_some(&this, value: ExpressionNode*, opt_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
-        return this.variant_call1(OPTION_TYPE, "Some", value, opt_ty, span);
+        return this.variant_call1(this.option_identity(), "Some", value, opt_ty, span);
     }
 
     /// `Option::None` typed `opt_ty`.
     option_none(&this, opt_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
         mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
-            this.intern.intern(OPTION_TYPE), this.intern.intern("None"), span);
+            this.option_identity(), this.intern.intern("None"), span);
         scope.set_synthesized_ref(opt_ty, this.ctx.definition_id_of(opt_ty));
         return scope as ExpressionNode*;
     }
@@ -1447,7 +1454,7 @@ type struct AsyncLower {
     /// `Poll::Pending` typed `poll_ty`.
     poll_pending(&this, poll_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
         mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
-            this.intern.intern(POLL_TYPE), this.intern.intern("Pending"), span);
+            this.poll_identity(), this.intern.intern("Pending"), span);
         scope.set_synthesized_ref(poll_ty, this.ctx.definition_id_of(poll_ty));
         return scope as ExpressionNode*;
     }
@@ -6412,8 +6419,8 @@ type struct AsyncLower {
         // Without `std::future` the module has no future types at all, and
         // `declare` reports that with the message naming the missing import; bow
         // out silently rather than reporting one cause twice.
-        if (!this.lookup_future_type(POLL_TYPE).is_valid()) { return false; }
-        const exec_ty: TypeRef = this.lookup_future_type(EXECUTOR_TYPE);
+        if (!this.lookup_future_type(this.poll_identity()).is_valid()) { return false; }
+        const exec_ty: TypeRef = this.lookup_future_type(this.intern.intern(EXECUTOR_TYPE));
         if (!exec_ty.is_valid()) {
             this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
                 "`async function main` is driven by an `Executor`; add `import std::future;`",
@@ -6582,8 +6589,8 @@ type struct AsyncLower {
         // Absent from the PROGRAM, not merely from this module's imports: the
         // names below are canonical, so the only way they miss is that nothing
         // imports the module declaring them and it was never compiled.
-        const poll_base: TypeRef = this.lookup_future_type(POLL_TYPE);
-        const ctx_ref:   TypeRef = this.lookup_future_type("std::future::waker::Context");
+        const poll_base: TypeRef = this.lookup_future_type(this.poll_identity());
+        const ctx_ref:   TypeRef = this.lookup_future_type(this.intern.intern("std::future::waker::Context"));
         if (!poll_base.is_valid() || !ctx_ref.is_valid()) {
             this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
                 "an `async function` requires the future types in scope; add `import std::future;`",
@@ -7051,7 +7058,7 @@ type struct AsyncLower {
         // parameter has to move out of its field on the single poll, and only a
         // slot that can be left empty records that the future no longer owns it.
         mut body_block: BlockStmtNode* = null;
-        sm.opt_base = this.lookup_future_type(OPTION_TYPE);
+        sm.opt_base = this.lookup_future_type(this.option_identity());
         if (!sm.opt_base.is_valid()
             && (total_await > 0 || this.params_need_carrier(&this.pending[pi], node))) {
             this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,

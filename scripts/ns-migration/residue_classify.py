@@ -168,7 +168,7 @@ CLASS_OF_METHOD = {
     "GenericRegistry::find_trait_defining_method":
         ("J", "hint: the did-you-mean asks which trait declares a method of this leaf; the spelling is the question"),
     "GenericRegistry::wellknown":
-        ("J", "lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`), claimed at its declaration"),
+        ("J", "lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`, `Poll`), claimed at its declaration"),
     # -- the module graph and the resolver's module scopes --
     "ModuleGraph::find_module_index":
         ("J", "module: a module by its namespace path"),
@@ -206,8 +206,8 @@ SITE_OVERRIDES = {
         ("C", "`owner::member` composed from `scope_owner_key` and the written member"),
     ("compiler/passes/type_resolution.cryo", "DeclarationIndex::lookup_type", "n"):
         ("J", "prim: `Res::PrimTy(n)` - the primitive's identity is the spelling the stamp carries"),
-    ("compiler/sema/async_lower.cryo", "DeclarationIndex::lookup_type", "this.intern.intern(qualified)"):
-        ("J", "lang: `lookup_future_type` - the `std::future` declarations the lowering names by their own paths"),
+    ("compiler/sema/async_lower.cryo", "DeclarationIndex::lookup_type", "qualified"):
+        ("J", "lang: `lookup_future_type` - `Context` and `Executor` by their own paths; `Poll` and `Option` by the identity each declaration claimed (`wellknown`)"),
     ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_type", "name"):
         ("N", "the funnel's own forwarding body (`lookup_type_exact`); its callers are the sites"),
     ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_func_type", "name"):
@@ -229,7 +229,7 @@ SITE_OVERRIDES = {
     # The member tables asked with a leaf the LANGUAGE fixes rather than one
     # the program wrote: the protocols' own variant and method names.
     ("compiler/sema/sema.cryo", "EnumType::get_variant", 'this.intern.intern("Ready")'):
-        ("J", "lang: `Poll::Ready`, the variant the async protocol names, inside the enum a future's `poll` returns"),
+        ("J", "lang: `Poll::Ready`, the variant the async protocol names, inside the enum a synthesized `poll` returns - the enum matched to the language's `Poll` by the identity its declaration claimed before the variant is read"),
     ("compiler/sema/lambda_synth.cryo", "StructType::get_method", 'this.intern.intern("__call__")'):
         ("J", "lang: the call protocol's `__call__`, the method leaf the language fixes for a callable struct"),
     ("compiler/types/checker.cryo", "StructType::get_method", " ..."):

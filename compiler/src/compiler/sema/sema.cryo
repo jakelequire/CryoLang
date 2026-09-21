@@ -2642,7 +2642,7 @@ public:
     make_poll_ready(&this, value: ExpressionNode*, poll_out: TypeRef,
                     span: SourceSpan) -> ExpressionNode* {
         mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
-            this.intern.intern(async_lower::POLL_TYPE), this.intern.intern("Ready"), span);
+            this.async_lower.poll_identity(), this.intern.intern("Ready"), span);
         scope.set_synthesized_ref(poll_out, this.ctx.definition_id_of(poll_out));
         mut call: CallExprNode* = new CallExprNode(scope as ExpressionNode*, span);
         call.add_argument(value);
@@ -2671,9 +2671,19 @@ public:
         // Read the Output off `Poll::Ready`'s payload rather than the return
         // type's generic argument: once monomorphization has specialized it,
         // `Poll<Output>` is a plain enum with no instantiation left to peel.
+        // The enum is the language's `Poll` by its declaration's identity
+        // (a specialized enum carries its template as `generic_base`), and
+        // `Ready` is read inside a type known to declare it.
         const e: Type* = this.types.unwrap_to_enum(func.resolved_return_type);
         if (e == null || e.kind != TypeKind::Enum) { return TypeRef::invalid(); }
         const et: EnumType* = e as EnumType*;
+        mut decl: EnumType* = et;
+        if (et.generic_base.is_valid()) {
+            const base: Type* = this.arena.lookup(et.generic_base.id);
+            if (base != null && base.kind == TypeKind::Enum) { decl = base as EnumType*; }
+        }
+        const poll_id: SymbolStr = this.async_lower.poll_identity();
+        if (!poll_id.is_valid() || !decl.qualified_name.equals(poll_id)) { return TypeRef::invalid(); }
         const ready: EnumVariantInfo* = et.get_variant(this.intern.intern("Ready"));
         if (ready == null || ready.payload_types.length != 1) { return TypeRef::invalid(); }
         return ready.payload_types[0];
