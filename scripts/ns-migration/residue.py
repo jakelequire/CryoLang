@@ -24,6 +24,17 @@ A site is in the population when
   * the call is outside the declaring type's own file (a store's own calls
     are its machinery, as lane-gate has it).
 
+The same read WRITTEN INLINE is a site too (lane-gate's rule 1c): a loop
+that compares an array element's key-typed field with a spelling -
+`st.methods[i].name.equals(n)`, through a local bound to the element, by
+`.name.id ==`, over an array of bare names, over a LOCAL array of records
+- is the door's body written at the caller.  The gate places every scanned
+(owner, array) as a TABLE or as DATA and refuses one in neither; a TABLE's
+scans outside the owner's own file are rows whose read is `field[]` on the
+owner (`StructType::methods[]`; a local table `local::MethodNode[]`).  The
+population was 294 method calls while the tree held 156 such scans, and a
+count from a rule blind to a whole shape is not a count.
+
 Every site prints as one tab-separated row:
     file<TAB>line<TAB>receiver-type<TAB>method<TAB>argument text
 `--count` prints the size alone; `--check [residue.md]` reads the residue's
@@ -94,24 +105,31 @@ def read_methods(gate, tree, type_name, defn):
     return {n for n in taking if kinds.get(n) in ("read", "static")}
 
 
-def argument_text(line, start):
-    """The text between the `(` at `start` and its matching `)`, one line."""
-    depth = 0
-    for i in range(start, len(line)):
-        ch = line[i]
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                return line[start + 1:i].strip()
-    return line[start + 1:].strip() + " ..."
+def scan_rows(gate, tree, scans):
+    """The inline-scan half of the population: every rule 1c scan over an
+    array placed as a TABLE, outside the owner's own file, as a row whose
+    read is `field[]` on the owner (`StructType::methods[]`) and whose key
+    is the text the element's key field was compared with.  A scan over
+    DATA (a text, a flag, a path) is no read of a declaration and is not a
+    row; a scan in the owner's own file is the door's body, as a store's own
+    calls are its machinery."""
+    rows = []
+    for rel, lineno, owner, field, _elem, _chain, key in scans:
+        entry = gate.SCANNED_ARRAYS["%s.%s" % (owner, field)]
+        if entry.kind != gate.TABLE:
+            continue
+        if rel == entry.defn or (owner in gate.STORES and gate.STORES[owner].owns(rel)):
+            continue
+        rows.append((rel, lineno, owner, field + "[]", key))
+    return rows
 
 
 def population(gate, src):
     tree = gate.Tree(src)
     gate.place_map_owners(tree)
     gate.place_array_owners(tree)
+    scans = gate.place_inline_scans(tree)
+    argument_text = gate.argument_text
     # The types that hold something under a name: every store, and every
     # placed array owner (rule 1b's candidates, each already in
     # EXCLUDED_ARRAYS with its reason).  Their declaring files.
@@ -191,6 +209,14 @@ def population(gate, src):
                          "e.g. %s:%d `%s`; a call no pattern reaches is a call this "
                          "enumerator cannot count"
                          % (len(unreached), unreached[0][0], unreached[0][1], unreached[0][2][:120]))
+    # The inline half: the arrays the gate placed as TABLES, each a read
+    # `field[]` on its owner, so the classifier's stale check and `--methods`
+    # see a scanned table exactly as they see a door.
+    for label, entry in gate.SCANNED_ARRAYS.items():
+        if entry.kind == gate.TABLE:
+            owner, field = label.split(".", 1)
+            sets.setdefault(owner, set()).add(field + "[]")
+    rows.extend(scan_rows(gate, tree, scans))
     return rows, sets, elsewhere
 
 

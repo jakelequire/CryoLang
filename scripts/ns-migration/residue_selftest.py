@@ -96,11 +96,21 @@ FILES["compiler/types/resolver.cryo"] = FILES["compiler/types/resolver.cryo"].re
     "    index_of(&this, name: SymbolStr) -> i64 { return -1; }\n"
     "    static new(source_file: string) -> ResolutionContext { return ResolutionContext { names: [] }; }\n", 1)
 
-# What the fixture must produce: 5 sites (the funnel's own forwarding call
-# into the index is the fifth, N by override), 1 elsewhere row.
-BASE_SITES = 5
+# What the fixture must produce: 5 call sites (the funnel's own forwarding
+# call into the index is the fifth, N by override), plus one inline scan
+# per LOCAL table the gate lists (the lane fixture carries a stub scan for
+# each, and a local table has no owner file to be excluded by), each with
+# the class the real classifier gives it; 1 elsewhere row.
+GATE_MOD = residue.load_gate()
+LOCAL_TABLES = sorted(label.split(".", 1)[1] for label, sc in GATE_MOD.SCANNED_ARRAYS.items()
+                      if label.startswith(GATE_MOD.LOCAL + ".") and sc.kind == GATE_MOD.TABLE)
+BASE_SITES = 5 + len(LOCAL_TABLES)
 BASE_CLASSES = {"S": 2, "N": 1, "J": 1, "B": 1}
+for _elem in LOCAL_TABLES:
+    _cls = rc.CLASS_OF_METHOD["%s::%s[]" % (GATE_MOD.LOCAL, _elem)][0]
+    BASE_CLASSES[_cls] = BASE_CLASSES.get(_cls, 0) + 1
 BASE_ELSEWHERE = {("ScopeManager", "lookup_type"): 1}
+DRIFT_ONE = "DRIFT - tree %d, list %d" % (BASE_SITES + 1, BASE_SITES)
 
 LIST_HEAD = """\
 # fixture list
@@ -163,10 +173,10 @@ TREE_MUTATIONS = [
     ("a read planted through a local under a new spelling is placed by its annotation, and is drift",
      {"compiler/sema/sema.cryo": caller_with(["const idx: DeclarationIndex* = this.ctx.decl_index;",
                                               "idx.lookup_type(name);"])},
-     1, "DRIFT - tree 6, list 5"),
+     1, DRIFT_ONE),
     ("a cast receiver is placed by the type the cast names",
      {"compiler/sema/sema.cryo": caller_with(["(this.ctx.something as DeclarationIndex*).lookup_type(name);"])},
-     1, "DRIFT - tree 6, list 5"),
+     1, DRIFT_ONE),
     ("a receiver whose type cannot be read is refused, not dropped",
      {"compiler/sema/sema.cryo": caller_with(["const g = mystery();", "g.get_template(name);"])},
      1, "receiver whose type cannot be read"),
@@ -199,6 +209,19 @@ TREE_MUTATIONS = [
      0, "residue: OK"),
     ("a commented-out call is not counted",
      {"compiler/sema/sema.cryo": caller_with(["// this.ctx.decl_index.lookup_func_type(name);"])},
+     0, "residue: OK"),
+    # Rule 1c: a scan over a TABLE array is a site as its door would be; a
+    # scan over DATA is not.
+    ("the door's loop written at the caller over a member table is a site, and is drift",
+     {"compiler/sema/sema.cryo": caller_with(["const td: TraitDeclNode* = null;",
+                                              "for (mut i: i64 = 0; i < td.methods.length; i++) {",
+                                              "    const f: FunctionDeclNode* = td.methods[i];",
+                                              "    if (f.name.equals(name)) { return; }",
+                                              "}"])},
+     1, "TraitDeclNode::methods[] (name): tree 1, list 0"),
+    ("the same loop over an array placed as data (a diagnostic's labels) is no site",
+     {"compiler/sema/sema.cryo": caller_with(["const dg: Diagnostic* = null;",
+                                              "if (dg.labels[0].name.equals(name)) { return; }"])},
      0, "residue: OK"),
 ]
 
@@ -266,7 +289,7 @@ def main():
             failures.append("baseline: elsewhere %s, want %s" % (elsewhere, BASE_ELSEWHERE))
         rc.write_list(list_path, classified, elsewhere)
         code, out = run_check(base, list_path)
-        if code != 0 or "residue: OK -- 5 sites" not in out or "elsewhere 1" not in out:
+        if code != 0 or "residue: OK -- %d sites" % BASE_SITES not in out or "elsewhere 1" not in out:
             failures.append("baseline: the check did not read OK against the list it wrote:\n%s" % out)
         text = io.open(list_path, encoding="utf-8").read()
 

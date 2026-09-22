@@ -100,6 +100,101 @@ CLASS_OF_METHOD = {
         ("J", "member: an enum's method by its leaf off the `EnumType` in hand"),
     "TraitDeclNode::lookup_assoc_type":
         ("J", "member: the trait's own associated type by its leaf, asked from the trait node in hand"),
+    "TraitDeclNode::assoc_type_index":
+        ("J", "member: the trait's own associated type's position by its leaf, asked from the trait node in hand - the index the positional trait arguments are read by"),
+    "TraitDeclNode::lookup_method":
+        ("J", "member: the trait's own method by its leaf, asked from the trait node in hand"),
+    # -- the same tables scanned INLINE (rule 1c): the door's loop written at
+    #    the caller, `field[]` on the owner.  The class is the door's; a
+    #    scan a door cannot express (a second predicate beside the leaf)
+    #    stays a scan and stays a row --
+    "StructType::fields[]":
+        ("J", "member: a struct's field by its leaf off the `StructType` in hand, scanned inline"),
+    "StructType::methods[]":
+        ("J", "member: a struct's method by its leaf off the `StructType` in hand, scanned inline with an arity predicate"),
+    "ClassType::fields[]":
+        ("J", "member: a class's field by its leaf off the `ClassType` in hand, scanned inline"),
+    "ClassType::methods[]":
+        ("J", "member: a class's method by its leaf off the `ClassType` in hand, scanned inline (the vtable's slot walk; an arity predicate)"),
+    "EnumType::variants[]":
+        ("J", "member: an enum's variant by its leaf off the `EnumType` in hand, scanned inline"),
+    "EnumType::methods[]":
+        ("J", "member: an enum's method by its leaf off the `EnumType` in hand, scanned inline with an arity predicate"),
+    "TraitType::required_methods[]":
+        ("J", "member: a trait's required method by its leaf off the `TraitType` in hand, scanned inline"),
+    "TraitDeclNode::assoc_types[]":
+        ("J", "member: the trait's own associated type by its leaf off the trait node in hand, scanned inline"),
+    "TraitDeclNode::methods[]":
+        ("J", "member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf)"),
+    "ImplBlockNode::methods[]":
+        ("J", "member: the impl's own method by its leaf off the impl node in hand, scanned inline"),
+    "ImplBlockNode::generic_params[]":
+        ("J", "member: the impl's own generic parameter by its leaf off the impl node in hand, scanned inline"),
+    "ImplBlockNode::where_bounds[]":
+        ("S", "the impl's `where` bound by the bounded parameter's leaf, the leaf read off the arena's `GenericParamType.param_name` - the type layer's only identity for a parameter until the arena is keyed by symbol"),
+    "FunctionDeclNode::trait_bounds[]":
+        ("S", "the function's `where` bound by the bounded parameter's leaf, read off the arena's `GenericParamType.param_name` (see `ImplBlockNode::where_bounds[]`)"),
+    "FunctionDeclNode::parameters[]":
+        ("J", "lang: the receiver parameter, `this` / `&this`, by the spelling the language fixes; asked at every site that skips or finds the receiver"),
+    "StructDeclNode::fields[]":
+        ("J", "member: a struct declaration's field by its leaf off the node in hand, scanned inline"),
+    "StructDeclNode::methods[]":
+        ("J", "member: a struct declaration's method by its leaf off the node in hand, scanned inline"),
+    "UnionDeclNode::fields[]":
+        ("J", "member: a union declaration's field by its leaf off the node in hand, scanned inline"),
+    "UnionDeclNode::methods[]":
+        ("J", "member: a union declaration's method by its leaf off the node in hand, scanned inline"),
+    "ClassDeclNode::fields[]":
+        ("J", "member: a class declaration's field by its leaf off the node in hand, scanned inline"),
+    "ClassDeclNode::methods[]":
+        ("J", "member: a class declaration's method by its leaf off the node in hand, scanned inline"),
+    "ExternBlockNode::functions[]":
+        ("J", "member: an extern block's function by its leaf off the block in hand, scanned inline"),
+    "SemaState::symbolic_owner_param_nodes[]":
+        ("S", "the owner's generic parameters under symbolic check, asked whether a parameter TYPE's spelling is one of them - the arena's `GenericParamType` carries a name and no symbol"),
+    "SemaState::symbolic_method_param_nodes[]":
+        ("S", "the method's generic parameters under symbolic check, asked whether a parameter TYPE's spelling is one of them (see the owner's)"),
+    "GenericRegistry::entries[]":
+        ("B", "the registry's template rows by name and module, scanned in the registry's own file only"),
+    "GenericRegistry::trait_heads[]":
+        ("B", "the registry's trait-impl heads by target key and trait identity, scanned in the registry's own file only"),
+    "ModuleGraph::modules[]":
+        ("J", "module: the graph's modules by namespace, scanned inline"),
+    "ModuleInfo::reexports[]":
+        ("J", "module: a module's re-exported namespaces, module identities by path, scanned inline"),
+    "ModuleInfo::imported_namespaces[]":
+        ("J", "module: a module's imported namespaces, module identities by path, scanned in the graph's own file only"),
+    "ModuleInfo::submodules[]":
+        ("J", "module: a module's submodules, module identities by path, scanned in the graph's own file only"),
+    "EnumDeclNode::variants[]":
+        ("J", "member: an enum declaration's variant by its leaf off the node in hand, scanned inline"),
+    "StructLiteralNode::field_inits[]":
+        ("J", "member: a struct literal's written initializer by the field's leaf, scanned inline"),
+    "DestructureDeclNode::bindings[]":
+        ("J", "member: a destructure's written binding by the source field's leaf (which binding takes a field), scanned inline"),
+    "ImplBlockNode::assoc_binding_names[]":
+        ("J", "member: the impl's own `This::Member` binding by the member's leaf (the door's body; own file only)"),
+    "LambdaExprNode::captured_names[]":
+        ("J", "member: the lambda's captured names, asked whether one is captured (own file only)"),
+    "TemplateEntry::param_names[]":
+        ("S", "the template's parameter DISPLAYS compared by spelling with a parameter type's name - the compares the arena keyed by symbol retires"),
+    # -- local tables: the owner out of view, the element says what it is --
+    "local::MethodNode[]":
+        ("J", "member: an impl's or a declaration's methods held in a local, by leaf"),
+    "local::MethodInfo[]":
+        ("J", "member: an arena type's methods held in a local, by leaf"),
+    "local::FieldInfo[]":
+        ("J", "member: a struct's or class's fields held by reference in a local, by leaf"),
+    "local::FieldDeclNode[]":
+        ("J", "member: a declaration's written fields held in a local, by leaf (the duplicate-field check)"),
+    "local::GenericParamNode[]":
+        ("J", "member: a declaration's written generic parameters held in a local, by leaf (the parser's duplicate check)"),
+    "local::TraitBound[]":
+        ("S", "`where` bounds held in a local, by the bounded parameter's leaf read off the arena's `GenericParamType.param_name`"),
+    "local::ImplBlockNode[]":
+        ("B", "impl blocks held in a local, selected by the trait's qualified name - the registry's canonical key"),
+    "local::VTableSlot[]":
+        ("J", "member: a class's vtable slots held in a local, by the method's leaf (the override walk)"),
     # -- the declaration index --
     "DeclarationIndex::type_of_decl":
         ("N", "keyed by the `DefId`; the string is the diagnostic label of the asking site"),
@@ -232,6 +327,19 @@ SITE_OVERRIDES = {
         ("J", "lang: the call protocol's `__call__`, the method leaf the language fixes for a callable struct"),
     ("compiler/types/checker.cryo", "StructType::get_method", " ..."):
         ("J", "lang: the call protocol's `__call__` (the argument continues on the next line), asked when a struct converts to a function type"),
+    # The inline scans whose key is not the table's usual one.
+    ("compiler/bindgen/importer.cryo", "ExternBlockNode::functions[]", "sym"):
+        ("J", "extern: the C importer asks whether it already emitted a function of this C symbol, the only identity a C symbol has"),
+    ("compiler/mono/dispatch_annotator.cryo", "FunctionDeclNode::parameters[]", "id.name"):
+        ("W", "an identifier matched to the function's parameter by spelling; the identifier's own stamp is not asked"),
+    ("compiler/sema/async_lower.cryo", "FunctionDeclNode::parameters[]", "(val as IdentifierNode*).name"):
+        ("W", "a struct literal's identifier value matched to the async function's parameter by spelling; the identifier's own stamp is not asked"),
+    ("compiler/resolver/name_resolution.cryo", "FunctionDeclNode::parameters[]", "param.name.id"):
+        ("J", "member: the resolver's duplicate-parameter check, a parameter by leaf inside the function being bound"),
+    ("compiler/AST/dumper.cryo", "DestructureDeclNode::bindings[]", "b.local_name.id"):
+        ("N", "a display: the binding's own two names compared to print `x` rather than `x: x`"),
+    ("compiler/resolver/name_resolution.cryo", "DestructureDeclNode::bindings[]", "b.local_name.id"):
+        ("J", "member: the resolver's duplicate-binding check, a binding by its local's leaf inside the destructure being bound"),
 }
 
 CLASSES = "JNSBCFW"

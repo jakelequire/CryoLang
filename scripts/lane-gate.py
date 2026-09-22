@@ -57,6 +57,18 @@ THREE RULES, EACH DERIVED FROM A DEFINITION, NONE FROM A LIST OF NAMES.
      already took `string` parameters.  The signature is the one thing a
      name-keyed reader cannot be written without.
 
+     One thing a name-keyed READ can be written without is a method: the
+     door's loop, written at the caller (`for (i) if
+     (st.methods[i].name.equals(n))`), is the same read and mentions no
+     signature.  Rule 1c (SCANNED_ARRAYS, `inline_scans`) reads that shape
+     from the tree - an element of a typed array or of a local array of
+     records, directly or through a local bound to it, whose key-typed
+     field (or the element itself, for an array of names; or its `.id`) is
+     compared with `.equals(` / `.eq(` / `==` / `!=` - and places every
+     scanned (owner, array) as a TABLE or as DATA, refusing one in neither.
+     The tree held 156 such scans, 145 of them outside the owner's file,
+     under a residue of 294 method calls that read OK.
+
   3. WHICH STORE A CALL REACHES.  By the receiver's DECLARED TYPE, not its
      spelling: `this` is the enclosing type, a local or parameter is what
      its annotation says, and each `.field` is what the field's declaration
@@ -456,6 +468,207 @@ EXCLUDED_ARRAYS = {
                                    "the vendored libraries by key and name: FILE PATHS and FLAGS, as `VendorEntry` is"),
 }
 
+TABLE = "table"
+DATA = "data"
+
+
+class Scanned(object):
+    """Rule 1c's placement of one array a caller SCANS INLINE - `for (..) {
+    if (rows[i].name.equals(n)) .. }` written at the call site instead of
+    behind a door.  `defn` is the owner's declaring file, `elem` the
+    element type the scan compares a key-typed field of, `kind` TABLE when
+    the array is a member table (the declarations of an owner in hand, by
+    their leaf - D32's population, exactly as a call to the owner's door
+    would be) or DATA when what is compared is a text, a flag, a file path
+    or a triple, which names no declaration."""
+
+    def __init__(self, defn, elem, kind, reason):
+        self.defn = defn
+        self.elem = elem
+        self.kind = kind
+        self.reason = reason
+
+
+# Every array the tree scans inline, placed.  A scan is the door's body
+# written at the caller: `StructType::get_method` is `for (i) if
+# (this.methods[i].name.equals(name))`, and a caller that writes that loop
+# over `st.methods` itself has read the same table by the same key with no
+# method call for rule 2 to see.  The rule reads the tree: an element of a
+# typed array (`<recv>.<field>[i]`, the receiver placed by declared type, the
+# field one of the owner's `Elem[]` / `Elem*[]` arrays) - or a local bound
+# to one, for the block it is bound in - whose key-typed field (walked through
+# the element's declared fields, `m.func.name`) is compared with `.equals(`
+# or `==` / `!=`, in either operand position.  Every (owner, array) so
+# scanned must be here, and an entry the tree no longer scans is stale.
+# The count of such scans was 0 by construction under rules 1-1b: a grep for
+# `methods[i].name.equals(` found 11 of them in the compiler while the
+# residue read OK, and this table is what the shape reaches in full.
+SCANNED_ARRAYS = {
+    # -- the arena's member tables: the doors' own bodies, and callers that
+    #    re-wrote a door's loop with a predicate of their own --
+    "StructType.fields":       Scanned("compiler/types/user_defined.cryo", "FieldInfo", TABLE,
+                                       "a struct's fields by leaf off the `StructType` in hand"),
+    "StructType.methods":      Scanned("compiler/types/user_defined.cryo", "MethodInfo", TABLE,
+                                       "a struct's methods by leaf off the `StructType` in hand"),
+    "ClassType.fields":        Scanned("compiler/types/user_defined.cryo", "FieldInfo", TABLE,
+                                       "a class's fields by leaf off the `ClassType` in hand"),
+    "ClassType.methods":       Scanned("compiler/types/user_defined.cryo", "MethodInfo", TABLE,
+                                       "a class's methods by leaf off the `ClassType` in hand"),
+    "EnumType.variants":       Scanned("compiler/types/user_defined.cryo", "EnumVariantInfo", TABLE,
+                                       "an enum's variants by leaf off the `EnumType` in hand"),
+    "EnumType.methods":        Scanned("compiler/types/user_defined.cryo", "MethodInfo", TABLE,
+                                       "an enum's methods by leaf off the `EnumType` in hand"),
+    "TraitType.required_methods": Scanned("compiler/types/user_defined.cryo", "MethodInfo", TABLE,
+                                          "a trait's required methods by leaf off the `TraitType` in hand"),
+    # -- the declarations' own member arrays, read by leaf from other files:
+    #    the same table as the arena's, on the AST side --
+    "TraitDeclNode.assoc_types":  Scanned("compiler/AST/declaration.cryo", "AssocTypeDeclNode", TABLE,
+                                          "a trait's associated types by leaf off the trait node in hand"),
+    "TraitDeclNode.methods":      Scanned("compiler/AST/declaration.cryo", "FunctionDeclNode", TABLE,
+                                          "a trait's methods by leaf off the trait node in hand"),
+    "ImplBlockNode.methods":      Scanned("compiler/AST/declaration.cryo", "MethodNode", TABLE,
+                                          "an impl's methods by leaf off the impl node in hand"),
+    "ImplBlockNode.generic_params": Scanned("compiler/AST/declaration.cryo", "GenericParamNode", TABLE,
+                                            "an impl's generic parameters by leaf off the impl node in hand"),
+    "ImplBlockNode.where_bounds": Scanned("compiler/AST/declaration.cryo", "TraitBound", TABLE,
+                                          "an impl's `where` bounds by the bounded parameter's leaf"),
+    "StructDeclNode.fields":      Scanned("compiler/AST/declaration.cryo", "FieldDeclNode", TABLE,
+                                          "a struct declaration's fields by leaf off the node in hand"),
+    "StructDeclNode.methods":     Scanned("compiler/AST/declaration.cryo", "MethodNode", TABLE,
+                                          "a struct declaration's methods by leaf off the node in hand"),
+    "UnionDeclNode.fields":       Scanned("compiler/AST/declaration.cryo", "FieldDeclNode", TABLE,
+                                          "a union declaration's fields by leaf off the node in hand"),
+    "UnionDeclNode.methods":      Scanned("compiler/AST/declaration.cryo", "MethodNode", TABLE,
+                                          "a union declaration's methods by leaf off the node in hand"),
+    "ClassDeclNode.fields":       Scanned("compiler/AST/declaration.cryo", "FieldDeclNode", TABLE,
+                                          "a class declaration's fields by leaf off the node in hand"),
+    "ClassDeclNode.methods":      Scanned("compiler/AST/declaration.cryo", "MethodNode", TABLE,
+                                          "a class declaration's methods by leaf off the node in hand"),
+    "FunctionDeclNode.parameters": Scanned("compiler/AST/declaration.cryo", "VarDeclNode", TABLE,
+                                           "a function's parameters by leaf off the function node in hand"),
+    "FunctionDeclNode.trait_bounds": Scanned("compiler/AST/declaration.cryo", "TraitBound", TABLE,
+                                             "a function's `where` bounds by the bounded parameter's leaf"),
+    "ExternBlockNode.functions":  Scanned("compiler/AST/declaration.cryo", "FunctionDeclNode", TABLE,
+                                          "an extern block's functions by leaf off the block in hand"),
+    # -- a pass's rib of generic-parameter NODES, asked by spelling --
+    "SemaState.symbolic_owner_param_nodes": Scanned("compiler/sema/state.cryo", "GenericParamNode", TABLE,
+                                                    "the owner's generic parameters under symbolic check, asked whether a spelling is one of them"),
+    "SemaState.symbolic_method_param_nodes": Scanned("compiler/sema/state.cryo", "GenericParamNode", TABLE,
+                                                     "the method's generic parameters under symbolic check, asked whether a spelling is one of them"),
+    # -- more declaration tables on the AST side, and the written members
+    #    of a literal and a destructure --
+    "EnumDeclNode.variants":      Scanned("compiler/AST/declaration.cryo", "EnumVariantNode", TABLE,
+                                          "an enum declaration's variants by leaf off the node in hand"),
+    "ImplBlockNode.assoc_binding_names": Scanned("compiler/AST/declaration.cryo", "SymbolStr", TABLE,
+                                                 "the impl's own `This::Member` bindings by the member's leaf (the door `lookup_assoc_binding`'s body)"),
+    "LambdaExprNode.captured_names": Scanned("compiler/AST/expression.cryo", "SymbolStr", TABLE,
+                                             "the lambda's captured names, asked whether one is captured (its own accessor's body)"),
+    "StructLiteralNode.field_inits": Scanned("compiler/AST/expression.cryo", "FieldInit", TABLE,
+                                             "a struct literal's written initializers by the field's leaf"),
+    "DestructureDeclNode.bindings": Scanned("compiler/AST/declaration.cryo", "DestructureBinding", TABLE,
+                                            "a destructure's bindings by the source field's leaf (which binding takes a field) or the local's"),
+    "TemplateEntry.param_names":  Scanned("compiler/types/generic_registry.cryo", "SymbolStr", TABLE,
+                                          "the template's parameter DISPLAYS, compared by spelling - the compares the arena keyed by symbol retires"),
+    "ModuleInfo.imported_namespaces": Scanned("compiler/module_graph.cryo", "SymbolStr", TABLE,
+                                              "a module's imported namespaces: module identities by path"),
+    "ModuleInfo.reexports":       Scanned("compiler/module_graph.cryo", "SymbolStr", TABLE,
+                                          "a module's re-exported namespaces: module identities by path"),
+    "ModuleInfo.submodules":      Scanned("compiler/module_graph.cryo", "SymbolStr", TABLE,
+                                          "a module's submodules: module identities by path"),
+    # -- LOCAL tables: a local or parameter annotated as an array of records
+    #    and scanned; the owner is out of view, the element says what it is --
+    "local.MethodNode":           Scanned(None, "MethodNode", TABLE,
+                                          "an impl's or a declaration's methods, held in a local, by leaf"),
+    "local.MethodInfo":           Scanned(None, "MethodInfo", TABLE,
+                                          "an arena type's methods, held in a local, by leaf"),
+    "local.FieldInfo":            Scanned(None, "FieldInfo", TABLE,
+                                          "a struct's or class's fields, held by reference in a local, by leaf"),
+    "local.FieldDeclNode":        Scanned(None, "FieldDeclNode", TABLE,
+                                          "a declaration's written fields, held in a local, by leaf"),
+    "local.GenericParamNode":     Scanned(None, "GenericParamNode", TABLE,
+                                          "a declaration's written generic parameters, held in a local, by leaf"),
+    "local.TraitBound":           Scanned(None, "TraitBound", TABLE,
+                                          "`where` bounds, held in a local, by the bounded parameter's leaf"),
+    "local.ImplBlockNode":        Scanned(None, "ImplBlockNode", TABLE,
+                                          "impl blocks, held in a local, by the trait's qualified name"),
+    "local.VTableSlot":           Scanned(None, "VTableSlot", TABLE,
+                                          "a class's vtable slots, held in a local, by the method's leaf"),
+    "local.NegDiag":              Scanned(None, "NegDiag", DATA,
+                                          "the negative test runner's expected diagnostics matched by code and severity: TEXTS"),
+    "local.EmitJob":              Scanned(None, "EmitJob", DATA,
+                                          "an emit job's error TEXT, asked whether it is set"),
+    "local.SymbolStr":            Scanned(None, "SymbolStr", DATA,
+                                          "a function's own scratch list of names (`seen`, `results`, `tie_traits`), asked whether it already holds one: a dedupe set"),
+    "local.DirectiveNode":        Scanned(None, "DirectiveNode", DATA,
+                                          "directives held in a local, by kind: spellings the language fixes, TEXTS"),
+    # -- the ribs, texts, file paths and C spellings rule 1b already placed
+    #    on their owners, scanned inline --
+    "AsyncLower.frame_locals":    Scanned("compiler/sema/async_lower.cryo", "SymbolStr", DATA,
+                                          "the lowering's OWN RIB: the frame locals it carries across suspends"),
+    "BindingCapture.names":       Scanned("compiler/sema/async_lower.cryo", "SymbolStr", DATA,
+                                          "the lowering's OWN RIB: one lambda body's captured names"),
+    "BindingRename.orig":         Scanned("compiler/sema/async_lower.cryo", "SymbolStr", DATA,
+                                          "the lowering's OWN RIB: original binding names beside the fresh ones it minted"),
+    "PollSm.frame_names":         Scanned("compiler/sema/async_lower.cryo", "SymbolStr", DATA,
+                                          "the lowering's OWN RIB: the poll state machine's frame slots by the names it minted"),
+    "RenameCtx.orig":             Scanned("compiler/sema/async_lower.cryo", "SymbolStr", DATA,
+                                          "the lowering's OWN RIB: the names a rename pass replaces"),
+    "DeclarationNode.attached_directives": Scanned("compiler/AST/declaration.cryo", "DirectiveNode", DATA,
+                                                   "a declaration's attached directives by kind: spellings the language fixes, TEXTS"),
+    "DirectiveRegistry.records":  Scanned("compiler/passes/directive_processing.cryo", "DirectiveRecord", DATA,
+                                          "the directives observed in a module by kind: spellings the language fixes, TEXTS"),
+    "DiagSink.stripped_func_names": Scanned("compiler/codegen/state/diag_sink.cryo", "string", DATA,
+                                            "the functions whose bodies codegen stripped, by the LINKER SYMBOL it minted"),
+    "DiagnosticSink.vendor_files": Scanned("compiler/diag/sink.cryo", "string", DATA,
+                                           "the vendored files whose diagnostics are demoted: FILE PATHS"),
+    "Importer.ec_names":          Scanned("compiler/bindgen/importer.cryo", "SymbolStr", DATA,
+                                          "the C importer's bookkeeping of the enum-constant spellings it emitted"),
+    "Importer.mac_names":         Scanned("compiler/bindgen/importer.cryo", "SymbolStr", DATA,
+                                          "the C importer's bookkeeping of the macro spellings it emitted"),
+    "Importer.seen_names":        Scanned("compiler/bindgen/importer.cryo", "SymbolStr", DATA,
+                                          "the C importer's bookkeeping of the C spellings it has seen"),
+    "Importer.struct_names":      Scanned("compiler/bindgen/importer.cryo", "SymbolStr", DATA,
+                                          "the C importer's bookkeeping of the struct tags it emitted"),
+    "Importer.type_names":        Scanned("compiler/bindgen/importer.cryo", "SymbolStr", DATA,
+                                          "the C importer's bookkeeping of the typedef spellings it emitted"),
+    "Lockfile.packages":          Scanned("compiler/deps/lockfile.cryo", "LockedDep", DATA,
+                                          "the lockfile's packages by name: FILE-level records"),
+    "Lockfile.vendor":            Scanned("compiler/deps/lockfile.cryo", "LockedVendor", DATA,
+                                          "the lockfile's vendored libraries by name: FILE-level records"),
+    "ModuleKeyTable.names":       Scanned("compiler/build_manifest.cryo", "string", DATA,
+                                          "the build manifest's module keys by source FILE PATH"),
+    "ModuleLoader.loaded_paths":  Scanned("compiler/module_loader.cryo", "string", DATA,
+                                          "the files already loaded: FILE PATHS"),
+    "ModuleLoader.used_vendor_keys": Scanned("compiler/module_loader.cryo", "string", DATA,
+                                             "the vendored libraries a build used, by key: FLAGS"),
+    "ParserBase.pending_doc_comments": Scanned("compiler/parser/parser_base.cryo", "string", DATA,
+                                               "pending doc-comment TEXTS"),
+    "PhaseArtifacts.object_files": Scanned("compiler/artifacts.cryo", "string", DATA,
+                                           "object FILE PATHS kept for the link"),
+    "QualifiedName.parts":        Scanned("compiler/resolver/qualified_name.cryo", "SymbolStr", DATA,
+                                          "the segments of ONE path, the string algebra a name is spelled with"),
+    # -- the stores' own rows, scanned only in their own files --
+    "GenericRegistry.entries":    Scanned("compiler/types/generic_registry.cryo", "TemplateEntry", TABLE,
+                                          "the registry's template rows by name and module"),
+    "GenericRegistry.trait_heads": Scanned("compiler/types/generic_registry.cryo", "TraitImplHead", TABLE,
+                                           "the registry's trait-impl heads by target key and trait identity"),
+    "ModuleGraph.modules":        Scanned("compiler/module_graph.cryo", "ModuleInfo", TABLE,
+                                          "the graph's modules by namespace"),
+    # -- texts, flags, file paths and triples: no declaration --
+    "Diagnostic.labels":          Scanned("compiler/diag/diagnostic.cryo", "SpanLabel", DATA,
+                                          "a diagnostic's labels: message TEXTS and span FILE PATHS"),
+    "DirectiveNode.args":         Scanned("compiler/AST/pattern.cryo", "DirectiveArg", DATA,
+                                          "a directive's arguments: spellings the language fixes (`packed`, `intel`), TEXTS"),
+    "ModuleLoader.vendor_pins":   Scanned("compiler/module_loader.cryo", "VendorPin", DATA,
+                                          "the project's vendored-library pins by library name and target triple: FILE-level records"),
+    "ProgramNode.static_asserts": Scanned("compiler/AST/node.cryo", "StaticAssertItem", DATA,
+                                          "`static_assert` messages, TEXTS"),
+    "VendorEntry.cache":          Scanned("compiler/vendor/registry.cryo", "VendorCacheItem", DATA,
+                                          "a vendored library's built artifacts by target triple: FILE PATHS"),
+    "VendorRegistry.entries":     Scanned("compiler/vendor/registry.cryo", "VendorEntry", DATA,
+                                          "the vendored libraries by key and name: FILE PATHS and FLAGS"),
+}
+
 REENTRY_RE = re.compile(r"\bget_resolver\s*\(\s*\)")
 # The driver legitimately owns the resolver and may ask for it.
 REENTRY_OWNERS = STORES["Resolver"].owners
@@ -576,6 +789,241 @@ def call_patterns(names):
             re.compile(r"%s\.(%s)\s*\(" % (RECEIVER, alt)),
             re.compile(r"%s\.(%s)\s*\(" % (CAST_RECEIVER, alt)),
             re.compile(r"%s::(%s)\s*\(" % (STATIC_OWNER, alt)))
+
+
+# Rule 1c's element read: `<recv>.<field>[<index>]`, the receiver a placeable
+# one, not preceded by a segment of its own (so `a.b[i].c[j]` is read once at
+# `c`, with `a.b[i]` its receiver, and once at `b`).
+ELEM_RE = re.compile(r"(?<![A-Za-z_0-9.])%s\.([a-z_][a-z_0-9]*)\[([^\[\]]*)\]" % RECEIVER)
+# A local table's element read: a bare local or parameter indexed,
+# `fields[i]`, `slots[ki]` - placed by the local's annotation.
+LOCAL_ELEM_RE = re.compile(r"(?<![A-Za-z_0-9.])([a-z_][a-z_0-9]*)\[([^\[\]]*)\]")
+# The owner a local table is placed under.
+LOCAL = "local"
+# A local bound to a whole expression: `const m: MethodNode* = <expr>;`,
+# `mut f: &FieldInfo = &<expr>;`.  The alias holds for the block it is bound
+# in; a binding to a PART of an element (`.value`) is not an alias.
+BIND_RE = re.compile(r"^\s*(?:const|mut|let)\s+([a-z_][a-z_0-9]*)\s*:\s*[^=]+=\s*&?\s*(.+?)\s*;\s*$")
+IDENT = r"[a-z_][a-z_0-9]*"
+# What ends an operand of `==` / `!=` read outward from the operator.
+OPERAND_END_RE = re.compile(r"\)|&&|\|\||;|\{|\?|:")
+
+
+def argument_text(line, start):
+    """The text between the `(` at `start` and its matching `)`, one line."""
+    depth = 0
+    for i in range(start, len(line)):
+        ch = line[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return line[start + 1:i].strip()
+    return line[start + 1:].strip() + " ..."
+
+
+def operand_before(line, end):
+    """The operand ending at `end`, read backwards to the nearest `(`,
+    `&&`, `||`, `=`, `;` or `{` (one line)."""
+    i = end
+    depth = 0
+    while i > 0:
+        ch = line[i - 1]
+        two = line[i - 2:i]
+        if ch == ")":
+            depth += 1
+        elif ch == "(":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and (ch in "=;{!" or two in ("&&", "||")):
+            break
+        i -= 1
+    return line[i:end].strip()
+
+
+def operand_after(line, start):
+    """The operand starting at `start`, read forward to the nearest
+    operand end (one line)."""
+    depth = 0
+    i = start
+    while i < len(line):
+        ch = line[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and OPERAND_END_RE.match(line, i):
+            break
+        i += 1
+    return line[start:i].strip()
+
+
+def key_chain(tree, elem, chain):
+    """Whether `.a.b.c` walked from `elem` through the tree's declared fields
+    ends on a KEY-typed field.  A hop the tree does not declare (a field
+    inherited from a base class, an accessor) is unknown, and unknown is not
+    a key.  An empty chain is the element itself: an array of NAMES
+    (`captured_names[i].equals(n)`) is a table whose record is its key."""
+    ty = elem
+    segs = [s for s in chain.split(".") if s]
+    if not segs:
+        return elem in KEY_TYPES
+    for n, s in enumerate(segs):
+        # `.name.id`: the interned id IS the symbol, compared as a number.
+        if s == "id" and ty == "SymbolStr" and n == len(segs) - 1:
+            return True
+        f = tree.fields.get(ty, {}).get(s)
+        if f is None:
+            return False
+        if n == len(segs) - 1:
+            return f in KEY_TYPES
+        ty = f
+    return False
+
+
+def inline_scans(tree):
+    """Rule 1c's reads: [(rel, lineno, owner, field, elem, chain, key text)]
+    for every comparison of a typed array element's key-typed field, read
+    directly (`st.methods[i].name.equals(n)`) or through a local bound to
+    the element in the enclosing block (`const m: MethodNode* =
+    d.methods[i]; .. m.func.name.equals(n)`), against `.equals(`'s
+    argument or receiver, or the other operand of `==` / `!=`.  One row per
+    comparison: a compare with elements on both sides (`a[i].name.equals(b[j].name)`)
+    is the left element's read, keyed by the right.
+
+    A LOCAL TABLE - a local or parameter annotated as an array of records
+    (`mut fields: &FieldInfo[] = &st.fields;`, `slots: MethodInfo[]`) and
+    indexed - is the same scan with the owner out of view; it is placed
+    by its element under the owner `local` (`local.FieldInfo`)."""
+    elem_of = {}
+    for owner, arrays in tree.typed_arrays.items():
+        for _rel, field, elem in arrays:
+            elem_of[(owner, field)] = elem
+    # Rule 1b's arrays of bare names (`string[]` is lowercase and not a
+    # typed array above): the element is the key itself.
+    for owner, arrays in tree.array_owners.items():
+        for _rel, field, elem in arrays:
+            if elem in KEY_TYPES:
+                elem_of[(owner, field)] = elem
+    # A record is any declared type with a key-typed field; a key type is
+    # its own record.
+    records = {ty for ty, fs in tree.fields.items() if any(t in KEY_TYPES for t in fs.values())}
+    records |= set(KEY_TYPES)
+    rows = []
+    for rel in tree.rels:
+        depth = 0
+        aliases = {}
+        for lineno, raw in enumerate(tree.files[rel], 1):
+            code = STRING_RE.sub('""', strip_comment(raw))
+            for k in [k for k, v in aliases.items() if depth < v[3]]:
+                del aliases[k]
+            exprs = []
+            for m in ELEM_RE.finditer(code):
+                owner = tree.receiver_type(rel, lineno, m.group(1))
+                if owner is None:
+                    continue
+                elem = elem_of.get((owner, m.group(2)))
+                if elem is None:
+                    continue
+                exprs.append((m.group(0), owner, m.group(2), elem))
+            for m in LOCAL_ELEM_RE.finditer(code):
+                if m.group(1) == "this":
+                    continue
+                elem = tree.local_array_elem(rel, lineno, m.group(1))
+                if elem is None or elem not in records:
+                    continue
+                exprs.append((m.group(0), LOCAL, elem, elem))
+            b = BIND_RE.match(code)
+            if b is not None:
+                for text, owner, field, elem in exprs:
+                    if b.group(2) == text:
+                        aliases[b.group(1)] = (owner, field, elem, depth)
+            cands = [(re.escape(t), o, f, e) for t, o, f, e in exprs]
+            cands += [(r"\b" + re.escape(k), v[0], v[1], v[2]) for k, v in aliases.items()]
+            seen_at = set()
+            found = []
+            chain = r"((?:\.%s)*)" % IDENT
+            for pat, owner, field, elem in cands:
+                # `elem.key.equals(X)` / `.eq(X)`: keyed by X.
+                for cm in re.finditer(pat + chain + r"\.(?:equals|eq)\s*\(", code):
+                    if key_chain(tree, elem, cm.group(1)):
+                        found.append((cm.end() - 1, 0, owner, field, elem, cm.group(1),
+                                      argument_text(code, cm.end() - 1)))
+                # `X.equals(elem.key)`: keyed by X, the receiver.
+                for cm in re.finditer(r"\.(?:equals|eq)\s*\(\s*" + pat + chain + r"\s*\)", code):
+                    if key_chain(tree, elem, cm.group(1)):
+                        found.append((code.index("(", cm.start()), 1, owner, field, elem, cm.group(1),
+                                      operand_before(code, cm.start())))
+                # `elem.key == X` / `!= X`: keyed by X.
+                for cm in re.finditer(pat + chain + r"\s*(==|!=)\s*", code):
+                    if key_chain(tree, elem, cm.group(1)):
+                        found.append((cm.start(2), 0, owner, field, elem, cm.group(1),
+                                      operand_after(code, cm.end())))
+                # `X == elem.key`: keyed by X.
+                for cm in re.finditer(r"(?<![=!<>])(==|!=)\s*" + pat + chain, code):
+                    if key_chain(tree, elem, cm.group(2)):
+                        found.append((cm.start(1), 1, owner, field, elem, cm.group(2),
+                                      operand_before(code, cm.start(1))))
+            # One row per comparison, keyed at the operator's position: the
+            # element on the LEFT is the read where one stands on both sides.
+            for pos, _side, owner, field, elem, ch, key in sorted(found, key=lambda f: (f[0], f[1])):
+                if pos in seen_at:
+                    continue
+                seen_at.add(pos)
+                rows.append((rel, lineno, owner, field, elem, ch, key))
+            for ch in code:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+    return rows
+
+
+def place_inline_scans(tree):
+    """Rule 1c: every (owner, array) the tree scans inline is in
+    SCANNED_ARRAYS, as a TABLE or as DATA with its reason, declared in the
+    file and with the element the entry names; every entry is still scanned
+    somewhere.  Refuses with every problem listed.  Returns the scans."""
+    scans = inline_scans(tree)
+    problems = []
+    seen = {}
+    for rel, lineno, owner, field, elem, chain, key in scans:
+        seen.setdefault((owner, field), []).append((rel, lineno, elem, chain))
+    for (owner, field), sites in sorted(seen.items()):
+        label = "%s.%s" % (owner, field)
+        entry = SCANNED_ARRAYS.get(label)
+        rel, lineno, elem, chain = sites[0]
+        if entry is None:
+            problems.append(
+                "  `%s` (%s: %s[]) is scanned inline by its element's key (%s:%d `%s`, %d site%s) and is not in\n"
+                "      SCANNED_ARRAYS: a loop comparing a record's name is the same read as the owner's\n"
+                "      door; say which - a TABLE of declarations by leaf, or DATA with the reason the\n"
+                "      field compared names no declaration"
+                % (label, owner, elem, rel, lineno, chain, len(sites), "" if len(sites) == 1 else "s"))
+            continue
+        if entry.elem != elem:
+            problems.append("  `%s` is listed in SCANNED_ARRAYS with element `%s` but the tree declares `%s[]`"
+                            % (label, entry.elem, elem))
+        if owner == LOCAL:
+            continue
+        declared = sorted({r for r, f, _e in tree.typed_arrays.get(owner, []) + tree.array_owners.get(owner, [])
+                           if f == field})
+        if entry.defn not in declared:
+            problems.append("  `%s` is listed in SCANNED_ARRAYS at %s but declared in %s"
+                            % (label, entry.defn, ", ".join(declared) or "no file"))
+    for label, entry in sorted(SCANNED_ARRAYS.items()):
+        owner, field = label.split(".", 1)
+        if (owner, field) not in seen:
+            problems.append("  `%s` is listed in SCANNED_ARRAYS but nothing in the tree scans it inline: a stale entry"
+                            % label)
+    if problems:
+        raise SystemExit("lane-gate: rule 1c - the inline scans and the table disagree:\n"
+                         + "\n".join(problems))
+    return scans
 
 
 class Tree(object):
@@ -703,6 +1151,24 @@ class Tree(object):
                 ty = m.group(1)
                 if ty[0].isupper() or ty in self.fields:
                     return ty
+            i -= 1
+        return None
+
+    def local_array_elem(self, rel, lineno, name):
+        """The element type `name` was last annotated as an ARRAY of before
+        `lineno` - `slots: MethodInfo[]`, `fields: &FieldInfo[]`,
+        `params: GenericParamNode*[]` - or None when its nearest annotation
+        is not an array (`local_type` answers that one)."""
+        pat = re.compile(r"\b%s\s*:\s*(&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*([A-Za-z_][A-Za-z_0-9]*)\s*\*?\s*(\[\])?)"
+                         % re.escape(name))
+        lines = self.files[rel]
+        i = lineno - 1
+        while i >= 0:
+            code = STRING_RE.sub('""', strip_comment(lines[i]))
+            for m in pat.finditer(code):
+                ty = m.group(2)
+                if ty[0].isupper() or ty in self.fields:
+                    return ty if m.group(3) else None
             i -= 1
         return None
 
@@ -973,6 +1439,7 @@ def scan(src):
     tree = Tree(src)
     place_map_owners(tree)
     place_array_owners(tree)
+    scans = place_inline_scans(tree)
     sets = {name: store_methods(tree, name, st.defn) for name, st in STORES.items()}
     # Control on the parser: the LOOKUP row is the per-kind names, and they
     # are declared on the index.  A parser that cannot see them cannot see
@@ -1049,7 +1516,7 @@ def scan(src):
         for kind in KINDS:
             if tally[kind]:
                 found[kind][rel] = tally[kind]
-    return found, unplaced, sets, (tree.map_owners, array_candidates(tree))
+    return found, unplaced, sets, (tree.map_owners, array_candidates(tree), scans)
 
 
 HEADER = [
@@ -1211,7 +1678,7 @@ def main():
         sys.stderr.write("lane-gate: no bucket named %s (%s)\n" % (args.row, ", ".join(KINDS)))
         return 1
 
-    counts, unplaced, sets, (owners, array_owners) = scan(args.src)
+    counts, unplaced, sets, (owners, array_owners, scans) = scan(args.src)
     if args.row is not None:
         # A live total, read from the tree.  Refused on an unplaceable
         # receiver below like every other read, since a count over a tree
@@ -1233,6 +1700,15 @@ def main():
             side = "STORE" if label in STORES else "excluded (array): " + EXCLUDED_ARRAYS[label].reason
             print("  %-20s %s" % (label, side))
             print("      %s; takes a name in: %s" % (", ".join(fields), ", ".join(methods)))
+        by_array = {}
+        for rel, lineno, owner, field, _elem, _chain, _key in scans:
+            by_array.setdefault("%s.%s" % (owner, field), []).append("%s:%d" % (rel, lineno))
+        print("scanned arrays (%d): rule 1c's population - an element's key compared inline - each placed"
+              % len(by_array))
+        for label in sorted(by_array):
+            sc = SCANNED_ARRAYS[label]
+            print("  %-36s %s: %s" % (label, sc.kind.upper(), sc.reason))
+            print("      %s[] scanned at %s" % (sc.elem, ", ".join(by_array[label])))
         for label in STORES:
             names = sets[label]
             print("%s (%d):" % (label, len(names)))

@@ -209,6 +209,78 @@ for _name, _ex in sorted(GATE_MOD.EXCLUDED_ARRAYS.items()):
     else:
         FILES[_ex.defn] = _existing + ARRAY_STUB % _name
 
+# One stub per SCANNED array (rule 1c): the element type with a `name`
+# key, the owner with the array, and a scan of it in the owner's own file
+# (so the residue, which shares this fixture, sees no site).  Rule 1c
+# refuses an entry nothing scans, so the fixture cannot accept the gate's
+# table without carrying every one.
+SCAN_ELEMS_FILE = "compiler/scan_elems.cryo"
+
+
+def _insert_field(text, head, line):
+    """`line` inserted after `head` in `text` unless the block already
+    declares that field."""
+    start = text.index(head) + len(head)
+    body = text[start:start + text[start:].index("}")]
+    name = line.split(":")[0].strip()
+    for old in body.split("\n"):
+        if old.startswith("    %s:" % name):
+            if old + "\n" == line:
+                return text
+            # The same field under another type (an array stub's `names:
+            # SymbolStr[]` where the gate's entry says `string[]`): the
+            # entry's spelling wins.
+            return text.replace(old + "\n", line, 1)
+    return text.replace(head, head + line, 1)
+
+
+def _scan_block(owner, field, elem):
+    """A scan of `o.<field>` (or, for a LOCAL table, of a local `<field>[]`
+    of `elem`) by the element's key: `.name` of a record, the element
+    itself when the array is one of names."""
+    key = "" if elem in GATE_MOD.KEY_TYPES else ".name"
+    if owner == GATE_MOD.LOCAL:
+        return ("type struct Scan_local_%s {\n"
+                "    scan(&this, name: SymbolStr) -> void {\n"
+                "        mut xs: %s[] = [];\n"
+                "        for (mut i: i64 = 0; i < xs.length; i++) {\n"
+                "            if (xs[i]%s.equals(name)) { return; }\n"
+                "        }\n"
+                "    }\n"
+                "}\n" % (elem, elem, key))
+    return ("type struct Scan_%s_%s {\n"
+            "    scan(&this, name: SymbolStr, o: %s*) -> void {\n"
+            "        for (mut i: i64 = 0; i < o.%s.length; i++) {\n"
+            "            if (o.%s[i]%s.equals(name)) { return; }\n"
+            "        }\n"
+            "    }\n"
+            "}\n" % (owner, field, owner, field, field, key))
+
+
+SCAN_LOCALS_FILE = "compiler/scan_locals.cryo"
+for _label, _sc in sorted(GATE_MOD.SCANNED_ARRAYS.items()):
+    _owner, _field = _label.split(".", 1)
+    if _sc.elem not in GATE_MOD.KEY_TYPES:
+        _ehead = "type struct %s {\n" % _sc.elem
+        _where = [r for r, t in FILES.items() if _ehead in t]
+        if _where:
+            FILES[_where[0]] = _insert_field(FILES[_where[0]], _ehead, "    name: SymbolStr;\n")
+        else:
+            FILES[SCAN_ELEMS_FILE] = FILES.get(SCAN_ELEMS_FILE, "") + _ehead + "    name: SymbolStr;\n}\n"
+    if _owner == GATE_MOD.LOCAL:
+        FILES[SCAN_LOCALS_FILE] = FILES.get(SCAN_LOCALS_FILE, "") + _scan_block(_owner, _field, _sc.elem)
+        continue
+    _ohead = "type struct %s {\n" % _owner
+    _existing = FILES.get(_sc.defn, "")
+    if _ohead in _existing:
+        FILES[_sc.defn] = _insert_field(_existing, _ohead, "    %s: %s[];\n" % (_field, _sc.elem))
+    else:
+        FILES[_sc.defn] = _existing + _ohead + "    %s: %s[];\n}\n" % (_field, _sc.elem)
+    FILES[_sc.defn] += _scan_block(_owner, _field, _sc.elem)
+
+# The first scanned array in the gate's table, for the stale-entry mutation.
+FIRST_SCANNED = sorted(GATE_MOD.SCANNED_ARRAYS)[0]
+
 # LOOKUP is 2: the caller's one, and the funnel's call INTO the index in
 # type_utils.cryo, which is counted - only a store's own file is excluded
 # from its own set.
@@ -467,6 +539,65 @@ MUTATIONS = [
               "type struct %s {\n    names: SymbolStr[];\n    by_id: HashMap<u32, i64>;\n" % FIRST_ARRAY_EXCLUDED, 1)},
      1, "`%s` (%s) owns a map (by_id: HashMap<u32>) and is in neither STORES nor EXCLUDED"
         % (FIRST_ARRAY_EXCLUDED, GATE_MOD.EXCLUDED_ARRAYS[FIRST_ARRAY_EXCLUDED].defn)),
+    # Rule 1c: the door's loop written at the caller.  Eleven such loops
+    # stood in the compiler under rules 1-1b reading OK, because a scan is
+    # no method call and the array's owner had no name-taking method to
+    # make it a candidate.
+    ("the audit's grep: a caller that scans a record array by its element's name inline, "
+     "over an array in neither table, is refused",
+     {"compiler/types/field_table.cryo":
+          "type struct SlotDecl {\n"
+          "    name: SymbolStr;\n"
+          "    ty:   TypeRef;\n"
+          "}\n"
+          "\n"
+          "type struct SlotTable {\n"
+          "    rows: SlotDecl[];\n"
+          "}\n",
+      "compiler/sema/sema.cryo": sema_with(["const st: SlotTable* = null;",
+                                            "for (mut i: i64 = 0; i < st.rows.length; i++) {",
+                                            "    if (st.rows[i].name.equals(name)) { return; }",
+                                            "}"])},
+     1, "`SlotTable.rows` (SlotTable: SlotDecl[]) is scanned inline by its element's key "
+        "(compiler/sema/sema.cryo:15 `.name`, 1 site) and is not in"),
+    ("the same scan through a local bound to the element is the same read, refused",
+     {"compiler/types/field_table.cryo":
+          "type struct SlotDecl {\n"
+          "    name: SymbolStr;\n"
+          "    ty:   TypeRef;\n"
+          "}\n"
+          "\n"
+          "type struct SlotTable {\n"
+          "    rows: SlotDecl[];\n"
+          "}\n",
+      "compiler/sema/sema.cryo": sema_with(["const st: SlotTable* = null;",
+                                            "for (mut i: i64 = 0; i < st.rows.length; i++) {",
+                                            "    const row: SlotDecl* = st.rows[i];",
+                                            "    if (name.equals(row.name)) { return; }",
+                                            "}"])},
+     1, "`SlotTable.rows` (SlotTable: SlotDecl[]) is scanned inline by its element's key "
+        "(compiler/sema/sema.cryo:16 `.name`, 1 site) and is not in"),
+    ("a scan comparing a field that is no key (the element's type) is data: accepted",
+     {"compiler/types/field_table.cryo":
+          "type struct SlotDecl {\n"
+          "    name: SymbolStr;\n"
+          "    ty:   TypeRef;\n"
+          "}\n"
+          "\n"
+          "type struct SlotTable {\n"
+          "    rows: SlotDecl[];\n"
+          "}\n",
+      "compiler/sema/sema.cryo": sema_with(["const st: SlotTable* = null;",
+                                            "for (mut i: i64 = 0; i < st.rows.length; i++) {",
+                                            "    if (st.rows[i].ty == t) { return; }",
+                                            "}"])},
+     0, "lane-gate: OK"),
+    ("a scanned-array entry nothing scans any more is a stale entry, refused",
+     {GATE_MOD.SCANNED_ARRAYS[FIRST_SCANNED].defn:
+          FILES[GATE_MOD.SCANNED_ARRAYS[FIRST_SCANNED].defn].replace(
+              _scan_block(*(FIRST_SCANNED.split(".", 1) + [GATE_MOD.SCANNED_ARRAYS[FIRST_SCANNED].elem])), "", 1)},
+     1, "`%s` is listed in SCANNED_ARRAYS but nothing in the tree scans it inline: a stale entry"
+        % FIRST_SCANNED),
 ]
 
 
