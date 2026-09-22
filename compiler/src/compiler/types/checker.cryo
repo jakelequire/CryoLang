@@ -65,6 +65,26 @@ implement enum TypeCompatibility {
 
 // TypeCheckResult: Result of a type-checking operation
 
+/// A field as `check_field_access` found it: the entry, the type that
+/// DECLARES it (the struct, or the class in the base chain that carries
+/// it), and its coordinates - `index` into that type's field list, `depth`
+/// steps up the chain from the receiver's type.  Handed to the caller so
+/// the field's visibility and type are read off this one walk; nothing
+/// downstream finds the field again by its name.  `field` is null when
+/// the walk found nothing.
+type struct FieldLookup {
+    field: FieldInfo*;
+    owner: Type*;
+    depth: i64;
+    index: i64;
+
+    static none() -> FieldLookup {
+        return FieldLookup { field: null, owner: null, depth: -1, index: -1 };
+    }
+
+    found(&this) -> boolean { return this.field != null; }
+}
+
 type struct TypeCheckResult {
     result_type:   TypeRef;
     success:       boolean;
@@ -991,18 +1011,18 @@ type struct TypeChecker {
         return TypeCheckResult::ok(fn_type.return_type);
     }
 
-    /// Check field access on a type.  On success `*out_depth` / `*out_index`
-    /// are the field's coordinates in the receiver's type: `out_index` into
-    /// the field list of the class `out_depth` steps up the base chain (0
-    /// for a struct or a class's own field) - the answer this walk found,
-    /// handed to the caller so no later stage finds it again by the name.
-    /// A derived class's own field wins over a base's of the same name,
-    /// which is the order this walk searches in.
+    /// Check field access on a type.  On success `*out` is the field this
+    /// walk found - its entry, the type declaring it, and its coordinates
+    /// (`index` into the field list of the class `depth` steps up the base
+    /// chain; 0 for a struct or a class's own field) - handed to the caller
+    /// so no later stage finds it again by the name.  A derived class's own
+    /// field wins over a base's of the same name, which is the order this
+    /// walk searches in.  A tuple element and an array's `length` are
+    /// answered with a type alone.
     check_field_access(&this, base: TypeRef, field_name: SymbolStr,
-                       out_depth: i64*, out_index: i64*) -> TypeCheckResult {
+                       out: FieldLookup*) -> TypeCheckResult {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeChecker] check_field_access() base=%lu field_id=%u", base.id, field_name.id);
-        *out_depth = -1;
-        *out_index = -1;
+        *out = FieldLookup::none();
         mut base_type: Type* = this.arena.lookup(base.id);
         if (base_type == null) {
             return TypeCheckResult::fail("Type lookup failed for field access");
@@ -1040,8 +1060,7 @@ type struct TypeChecker {
             mut st: StructType* = base_type as StructType*;
             const fi: i64 = st.field_index(field_name);
             if (fi >= 0) {
-                *out_depth = 0;
-                *out_index = fi;
+                *out = FieldLookup { field: &st.fields[fi], owner: base_type, depth: 0, index: fi };
                 return TypeCheckResult::ok(st.fields[fi].field_type);
             }
             return TypeCheckResult::fail(fmt::format("Struct '%s' has no field '%s'",
@@ -1056,8 +1075,8 @@ type struct TypeChecker {
             while (current != null) {
                 const fi: i64 = current.field_index(field_name);
                 if (fi >= 0) {
-                    *out_depth = depth;
-                    *out_index = fi;
+                    *out = FieldLookup { field: &current.fields[fi], owner: current as Type*,
+                                         depth: depth, index: fi };
                     return TypeCheckResult::ok(current.fields[fi].field_type);
                 }
                 // Walk to parent class

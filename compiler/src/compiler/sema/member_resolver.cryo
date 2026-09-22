@@ -50,7 +50,7 @@ import compiler::sema::state::{ SemaState };
 import compiler::sema::symbolic_checker::{ SymbolicChecker };
 import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
-import compiler::types::checker::{ TypeChecker, TypeCheckResult };
+import compiler::types::checker::{ FieldLookup, TypeChecker, TypeCheckResult };
 import compiler::types::compound::{ FunctionType, PointerType, ReferenceType, TupleType };
 import compiler::types::generic::{ BoundedParamType, InstantiatedType };
 import compiler::types::trait_checker::{ TraitChecker };
@@ -167,18 +167,19 @@ type struct MemberResolver {
         }
 
         // Struct/class field access via TypeChecker.
-        mut f_depth: i64 = -1;
-        mut f_index: i64 = -1;
+        mut fl: FieldLookup = FieldLookup::none();
         const result: TypeCheckResult =
-            this.checker.check_field_access(obj_type, member.member, &f_depth, &f_index);
+            this.checker.check_field_access(obj_type, member.member, &fl);
         if (result.success) {
             const acc_span: SourceSpan = if (member.member_span.has_location()) {
                 member.member_span
             } else {
                 member.span
             };
-            member.set_resolved_member(MemberPin::Field(f_depth, f_index));
-            this.enforce_field_visibility(obj_type, member.member, acc_span);
+            if (fl.found()) {
+                member.set_resolved_member(MemberPin::Field(fl.depth, fl.index));
+                this.enforce_field_visibility(fl.field, fl.owner, member.member, acc_span);
+            }
             // Mono-after-sema: substitute the receiver's type_args so a template
             // field types concretely (`.second -> i64`).
             return this.binding.subst_method_return_from_receiver(obj_type, result.result_type);
@@ -318,13 +319,14 @@ type struct MemberResolver {
             member.span
         };
         // Field.
-        mut f_depth: i64 = -1;
-        mut f_index: i64 = -1;
+        mut fl: FieldLookup = FieldLookup::none();
         const result: TypeCheckResult =
-            this.checker.check_field_access(obj_type, member.member, &f_depth, &f_index);
+            this.checker.check_field_access(obj_type, member.member, &fl);
         if (result.success) {
-            member.set_resolved_member(MemberPin::Field(f_depth, f_index));
-            this.enforce_field_visibility(obj_type, member.member, acc_span);
+            if (fl.found()) {
+                member.set_resolved_member(MemberPin::Field(fl.depth, fl.index));
+                this.enforce_field_visibility(fl.field, fl.owner, member.member, acc_span);
+            }
             return this.binding.subst_method_return_from_receiver(obj_type, result.result_type);
         }
         // Generic base-template field.
@@ -710,42 +712,14 @@ type struct MemberResolver {
 
     /// Emit E0353 when a private/protected field is accessed outside its declaring
     /// type (allowing `protected` from subclasses).  No-op for public/non-aggregate.
-    enforce_field_visibility(mut &this, recv_type: TypeRef,
+    /// `field` and `declaring_t` are the entry and the declaring type the
+    /// caller's lookup found (`check_field_access`); `field_name` is the
+    /// spelling, for the diagnostic alone.  Nothing here finds the field
+    /// again.
+    enforce_field_visibility(mut &this, field: FieldInfo*, declaring_t: Type*,
                              field_name: SymbolStr, span: SourceSpan) -> void {
-        const base: Type* = this.types.unwrap_to_base_type(recv_type);
-        if (base == null) { return; }
-
-        mut field: FieldInfo* = null;
-        mut declaring_t: Type* = null;
-        mut declaring_name: string = "";
-
-        if (base.kind == TypeKind::Struct) {
-            mut st: StructType* = base as StructType*;
-            field = st.get_field(field_name);
-            if (field != null) { declaring_t = base; declaring_name = st.display_name(); }
-        } else if (base.kind == TypeKind::Class) {
-            mut current: ClassType* = base as ClassType*;
-            while (current != null) {
-                field = current.get_field(field_name);
-                if (field != null) {
-                    declaring_t = current as Type*;
-                    declaring_name = current.display_name();
-                    break;
-                }
-                if (current.has_base && current.base_class.is_valid()) {
-                    const parent_t: Type* = this.arena.lookup(current.base_class.id);
-                    if (parent_t != null && parent_t.kind == TypeKind::Class) {
-                        current = parent_t as ClassType*;
-                    } else {
-                        current = null;
-                    }
-                } else {
-                    current = null;
-                }
-            }
-        }
-
-        if (field == null) { return; }
+        if (field == null || declaring_t == null) { return; }
+        const declaring_name: string = declaring_t.display_name();
         if (field.is_public) { return; }
 
         if (this.state.current_owner_type.is_valid()) {

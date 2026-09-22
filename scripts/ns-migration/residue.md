@@ -89,7 +89,7 @@ is one the language fixes (`__call__`, `Ready`, `Ok`/`Err`, `Some`/`None`).
 ## The table
 
 <!-- residue-table:begin -->
-Population **300** - J 97 · N 117 · S 16 · B 49 · C 19 · F 2 · W 0
+Population **297** - J 94 · N 117 · S 16 · B 49 · C 19 · F 2 · W 0
 
 | site | read | key as written | class | reason |
 |---|---|---|---|---|
@@ -107,7 +107,7 @@ Population **300** - J 97 · N 117 · S 16 · B 49 · C 19 · F 2 · W 0
 | `compiler/sema/call_resolver.cryo:352` | `GenericRegistry::get_template` | `owner` | B | a template by the canonical name of a stamped type (`target_key`, `get_qualified_name`, a `Def` stamp, the call's pinned template key) |
 | `compiler/sema/call_resolver.cryo:2605` | `GenericRegistry::get_template` | `q_sym` | B | a template by the canonical name of a stamped type (`target_key`, `get_qualified_name`, a `Def` stamp, the call's pinned template key) |
 | `compiler/sema/call_resolver.cryo:3685` | `GenericRegistry::get_template` | `scope_sym` | B | a template by the canonical name of a stamped type (`target_key`, `get_qualified_name`, a `Def` stamp, the call's pinned template key) |
-| `compiler/sema/call_resolver.cryo:5259` | `GenericRegistry::get_template` | `q_sym` | B | a template by the canonical name of a stamped type (`target_key`, `get_qualified_name`, a `Def` stamp, the call's pinned template key) |
+| `compiler/sema/call_resolver.cryo:5268` | `GenericRegistry::get_template` | `q_sym` | B | a template by the canonical name of a stamped type (`target_key`, `get_qualified_name`, a `Def` stamp, the call's pinned template key) |
 | `compiler/sema/method_binding.cryo:905` | `GenericRegistry::get_template` | `recv_qname` | B | a template by the canonical name of a stamped type (`target_key`, `get_qualified_name`, a `Def` stamp, the call's pinned template key) |
 | `compiler/sema/sema.cryo:485` | `GenericRegistry::get_template` | `ib.target_key(this.arena)` | B | a template by the canonical name of a stamped type (`target_key`, `get_qualified_name`, a `Def` stamp, the call's pinned template key) |
 | `compiler/types/ownership.cryo:796` | `GenericRegistry::get_template` | `qname` | B | a template by the canonical name of a stamped type (`target_key`, `get_qualified_name`, a `Def` stamp, the call's pinned template key) |
@@ -122,7 +122,7 @@ Population **300** - J 97 · N 117 · S 16 · B 49 · C 19 · F 2 · W 0
 | `compiler/sema/method_binding.cryo:1052` | `GenericRegistry::get_trait_decl` | `blocks[i].qualified_trait_name` | B | a trait declaration by its identity string (`tr.identity()`, `trait_identity(ann)`, `qualified_trait_name`) |
 | `compiler/sema/method_binding.cryo:1157` | `GenericRegistry::get_trait_decl` | `bound_leaves[i]` | B | a trait declaration by its identity string (`tr.identity()`, `trait_identity(ann)`, `qualified_trait_name`) |
 | `compiler/sema/sema.cryo:754` | `GenericRegistry::get_trait_decl` | `trait_leaf` | B | a trait declaration by its identity string (`tr.identity()`, `trait_identity(ann)`, `qualified_trait_name`) |
-| `compiler/sema/sema.cryo:3868` | `GenericRegistry::get_trait_decl` | `trait_leaf` | B | a trait declaration by its identity string (`tr.identity()`, `trait_identity(ann)`, `qualified_trait_name`) |
+| `compiler/sema/sema.cryo:3869` | `GenericRegistry::get_trait_decl` | `trait_leaf` | B | a trait declaration by its identity string (`tr.identity()`, `trait_identity(ann)`, `qualified_trait_name`) |
 | `compiler/types/resolver.cryo:597` | `GenericRegistry::get_trait_decl` | `tr.identity()` | B | a trait declaration by its identity string (`tr.identity()`, `trait_identity(ann)`, `qualified_trait_name`) |
 | `compiler/types/resolver.cryo:703` | `GenericRegistry::get_trait_decl` | `tr.identity()` | B | a trait declaration by its identity string (`tr.identity()`, `trait_identity(ann)`, `qualified_trait_name`) |
 | `compiler/types/ownership.cryo:762` | `GenericRegistry::heads_for` | `drop_id, ty, intern` | B | the impl heads of a trait identity for a subject `TypeRef` |
@@ -151,7 +151,7 @@ Population **300** - J 97 · N 117 · S 16 · B 49 · C 19 · F 2 · W 0
 | `compiler/sema/call_resolver.cryo:4134` | `DeclarationIndex::lookup_family_entries` | `combined_sym` | C | a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door |
 | `compiler/sema/call_resolver.cryo:958` | `DeclarationIndex::lookup_func_type` | `fam` | C | the `CalleePin::Family` key string |
 | `compiler/sema/call_resolver.cryo:1879` | `DeclarationIndex::lookup_func_type_overloads` | `family` | C | a family by its key string (see `lookup_family_entries`) |
-| `compiler/sema/call_resolver.cryo:5626` | `DeclarationIndex::lookup_func_type_overloads` | `combined` | C | a family by its key string (see `lookup_family_entries`) |
+| `compiler/sema/call_resolver.cryo:5635` | `DeclarationIndex::lookup_func_type_overloads` | `combined` | C | a family by its key string (see `lookup_family_entries`) |
 | `compiler/sema/call_resolver.cryo:3394` | `DeclarationIndex::signature_refused` | `this.intern.intern( ...` | C | `Owner::member` composed from the owner key and the written member |
 | `compiler/sema/call_resolver.cryo:3672` | `DeclarationIndex::signature_refused` | `combined` | C | `Owner::member` composed from the owner key and the written member |
 | `compiler/mono/call_specializer.cryo:2370` | `GenericRegistry::get_template` | `this.intern_table.intern(q_str)` | C | `ns::name` composed from a namespace and a leaf |
@@ -160,16 +160,15 @@ Population **300** - J 97 · N 117 · S 16 · B 49 · C 19 · F 2 · W 0
 | `compiler/sema/call_resolver.cryo:311` | `TypeUtils::lookup_func_type_exact` | `q_sym` | C | a family or a `module::member` composed by `resolve_module_qualified_symbol` |
 | `compiler/sema/call_resolver.cryo:2595` | `TypeUtils::lookup_func_type_exact` | `q_sym` | C | a family or a `module::member` composed by `resolve_module_qualified_symbol` |
 | `compiler/sema/call_resolver.cryo:2652` | `TypeUtils::lookup_func_type_exact` | `family` | C | a family or a `module::member` composed by `resolve_module_qualified_symbol` |
-| `compiler/sema/call_resolver.cryo:5226` | `TypeUtils::lookup_func_type_exact` | `q_sym` | C | a family or a `module::member` composed by `resolve_module_qualified_symbol` |
+| `compiler/sema/call_resolver.cryo:5235` | `TypeUtils::lookup_func_type_exact` | `q_sym` | C | a family or a `module::member` composed by `resolve_module_qualified_symbol` |
 | `compiler/sema/call_resolver.cryo:2561` | `DeclarationIndex::is_candidate_public` | `callee` | F | `enforce_callee_visibility` asks the callee's visibility by the callee's name |
 | `compiler/sema/call_resolver.cryo:2558` | `DeclarationIndex::namespace_of` | `callee, this.intern` | F | `enforce_callee_visibility` asks the callee's module by the callee's name |
-| `compiler/sema/member_resolver.cryo:444` | `ClassType::field_index` | `field_name` | J | member: a class's field position by its leaf off the `ClassType` in hand |
-| `compiler/types/checker.cryo:1057` | `ClassType::field_index` | `field_name` | J | member: a class's field position by its leaf off the `ClassType` in hand |
+| `compiler/sema/member_resolver.cryo:446` | `ClassType::field_index` | `field_name` | J | member: a class's field position by its leaf off the `ClassType` in hand |
+| `compiler/types/checker.cryo:1076` | `ClassType::field_index` | `field_name` | J | member: a class's field position by its leaf off the `ClassType` in hand |
 | `compiler/mono/call_specializer.cryo:749` | `ClassType::get_field` | `ma.member` | J | member: a class's field by its leaf off the `ClassType` in hand |
-| `compiler/sema/member_resolver.cryo:729` | `ClassType::get_field` | `field_name` | J | member: a class's field by its leaf off the `ClassType` in hand |
 | `compiler/sema/diagnostics.cryo:314` | `ClassType::get_method` | `member_name` | J | member: a class's method by its leaf off the `ClassType` in hand |
-| `compiler/sema/member_resolver.cryo:795` | `ClassType::get_method` | `method_name` | J | member: a class's method by its leaf off the `ClassType` in hand |
-| `compiler/sema/sema.cryo:3158` | `ClassType::get_method` | `scope.member_name` | J | member: a class's method by its leaf off the `ClassType` in hand |
+| `compiler/sema/member_resolver.cryo:769` | `ClassType::get_method` | `method_name` | J | member: a class's method by its leaf off the `ClassType` in hand |
+| `compiler/sema/sema.cryo:3159` | `ClassType::get_method` | `scope.member_name` | J | member: a class's method by its leaf off the `ClassType` in hand |
 | `compiler/passes/type_resolution.cryo:2473` | `DeclarationIndex::extern_symbol_conflict` | `ext_link_sym, func_type_ref` | J | extern: a C symbol by its link name, the only identity a C symbol has |
 | `compiler/sema/type_utils.cryo:152` | `DeclarationIndex::global_entry_in_module` | `scope.member_name, seen.def_id()` | J | member: a global's leaf inside the module the qualifier's stamp names (a `DefId`) |
 | `compiler/compilation_context.cryo:522` | `DeclarationIndex::is_prelude_ns` | `cand_ns` | J | module: a namespace asked whether it is the prelude's; a module's identity is its path |
@@ -184,13 +183,12 @@ Population **300** - J 97 · N 117 · S 16 · B 49 · C 19 · F 2 · W 0
 | `compiler/resolver/name_resolution.cryo:1467` | `DeclarationIndex::ns_imports` | `use_ns, owner_ns` | J | module: two namespaces asked whether one imports the other; module identities |
 | `compiler/sema/call_resolver.cryo:3665` | `DeclarationIndex::signature_refused_in_module` | `scope.member_name, ...` | J | member: a function's leaf inside the module the qualifier's stamp names (a `DefId`) |
 | `compiler/sema/diagnostics.cryo:319` | `EnumType::get_method` | `member_name` | J | member: an enum's method by its leaf off the `EnumType` in hand |
-| `compiler/sema/call_resolver.cryo:5103` | `EnumType::get_variant` | `member` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
 | `compiler/sema/diagnostics.cryo:319` | `EnumType::get_variant` | `member_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
 | `compiler/sema/sema.cryo:2687` | `EnumType::get_variant` | `this.intern.intern("Ready")` | J | lang: `Poll::Ready`, the variant the async protocol names, inside the enum a synthesized `poll` returns - the enum matched to the language's `Poll` by the identity its declaration claimed before the variant is read |
 | `compiler/sema/call_resolver.cryo:550` | `EnumType::variant_index` | `scope.member_name` | J | member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen |
 | `compiler/sema/pattern_resolver.cryo:177` | `EnumType::variant_index` | `enum_pat.variant_name` | J | member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen |
-| `compiler/sema/sema.cryo:3230` | `EnumType::variant_index` | `scope.member_name` | J | member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen |
-| `compiler/sema/sema.cryo:3273` | `EnumType::variant_index` | `new_expr.variant_name` | J | member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen |
+| `compiler/sema/sema.cryo:3231` | `EnumType::variant_index` | `scope.member_name` | J | member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen |
+| `compiler/sema/sema.cryo:3274` | `EnumType::variant_index` | `new_expr.variant_name` | J | member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen |
 | `compiler/sema/method_binding.cryo:813` | `GenericRegistry::find_trait_defining_method` | `method_name` | J | hint: the did-you-mean asks which trait declares a method of this leaf; the spelling is the question |
 | `compiler/mono/monomorphizer.cryo:302` | `GenericRegistry::get_template` | `array_sym` | J | lang: `std::collections::array::Array`, the type the language lowers `T[]` to, by its own path |
 | `compiler/mono/state.cryo:404` | `GenericRegistry::get_template` | `array_sym` | J | lang: `std::collections::array::Array`, the type the language lowers `T[]` to, by its own path |
@@ -198,8 +196,8 @@ Population **300** - J 97 · N 117 · S 16 · B 49 · C 19 · F 2 · W 0
 | `compiler/sema/async_lower.cryo:584` | `GenericRegistry::wellknown` | `this.intern.intern("Poll")` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`, `Poll`), claimed at its declaration |
 | `compiler/sema/async_lower.cryo:591` | `GenericRegistry::wellknown` | `this.intern.intern("Option")` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`, `Poll`), claimed at its declaration |
 | `compiler/sema/async_lower.cryo:6761` | `GenericRegistry::wellknown` | `future_leaf` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`, `Poll`), claimed at its declaration |
-| `compiler/sema/member_resolver.cryo:276` | `GenericRegistry::wellknown` | `deref_leaf` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`, `Poll`), claimed at its declaration |
-| `compiler/sema/member_resolver.cryo:575` | `GenericRegistry::wellknown` | `this.intern.intern("Index")` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`, `Poll`), claimed at its declaration |
+| `compiler/sema/member_resolver.cryo:277` | `GenericRegistry::wellknown` | `deref_leaf` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`, `Poll`), claimed at its declaration |
+| `compiler/sema/member_resolver.cryo:577` | `GenericRegistry::wellknown` | `this.intern.intern("Index")` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`, `Poll`), claimed at its declaration |
 | `compiler/sema/sema.cryo:1797` | `GenericRegistry::wellknown` | `this.intern.intern(map.trait_leaf)` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`, `Poll`), claimed at its declaration |
 | `compiler/sema/sema.cryo:1885` | `GenericRegistry::wellknown` | `trait_leaf` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`, `Poll`), claimed at its declaration |
 | `compiler/sema/sema.cryo:2668` | `GenericRegistry::wellknown` | `this.intern.intern("Future")` | J | lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`, `Poll`), claimed at its declaration |
@@ -234,23 +232,22 @@ Population **300** - J 97 · N 117 · S 16 · B 49 · C 19 · F 2 · W 0
 | `compiler/passes/specialization.cryo:598` | `ModuleGraph::source_file_for_owner_key` | ` ...` | J | module: a module's source file by its namespace path |
 | `compiler/mono/monomorphizer.cryo:602` | `Resolver::find_module_scope` | `entry.module_name` | J | module: a module's scope by its namespace path, to stand in it while a template is instantiated |
 | `compiler/sema/sema.cryo:519` | `Resolver::find_module_scope` | `template_mod` | J | module: a module's scope by its namespace path, to stand in it while a template is instantiated |
-| `compiler/sema/member_resolver.cryo:440` | `StructType::field_index` | `field_name` | J | member: a struct's field position by its leaf off the `StructType` in hand |
-| `compiler/types/checker.cryo:1041` | `StructType::field_index` | `field_name` | J | member: a struct's field position by its leaf off the `StructType` in hand |
+| `compiler/sema/member_resolver.cryo:442` | `StructType::field_index` | `field_name` | J | member: a struct's field position by its leaf off the `StructType` in hand |
+| `compiler/types/checker.cryo:1061` | `StructType::field_index` | `field_name` | J | member: a struct's field position by its leaf off the `StructType` in hand |
 | `compiler/mono/call_specializer.cryo:746` | `StructType::get_field` | `ma.member` | J | member: a struct's field by its leaf off the `StructType` in hand; Rust's field lookup is name-keyed off the owner too |
 | `compiler/sema/async_lower.cryo:2451` | `StructType::get_field` | `this.recv_sym` | J | member: the receiver field the lowering minted on the frame struct, asked back by the spelling it minted |
-| `compiler/sema/member_resolver.cryo:704` | `StructType::get_field` | `this.intern.intern("this$recv")` | J | member: the receiver field the async lowering minted on the frame struct, asked back by the spelling it minted |
-| `compiler/sema/member_resolver.cryo:724` | `StructType::get_field` | `field_name` | J | member: a struct's field by its leaf off the `StructType` in hand; Rust's field lookup is name-keyed off the owner too |
+| `compiler/sema/member_resolver.cryo:706` | `StructType::get_field` | `this.intern.intern("this$recv")` | J | member: the receiver field the async lowering minted on the frame struct, asked back by the spelling it minted |
 | `compiler/sema/diagnostics.cryo:310` | `StructType::get_method` | `member_name` | J | member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too |
 | `compiler/sema/lambda_synth.cryo:475` | `StructType::get_method` | `this.intern.intern("__call__")` | J | lang: the call protocol's `__call__`, the method leaf the language fixes for a callable struct |
-| `compiler/sema/member_resolver.cryo:790` | `StructType::get_method` | `method_name` | J | member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too |
-| `compiler/sema/sema.cryo:3157` | `StructType::get_method` | `scope.member_name` | J | member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too |
-| `compiler/types/checker.cryo:331` | `StructType::get_method` | ` ...` | J | lang: the call protocol's `__call__` (the argument continues on the next line), asked when a struct converts to a function type |
+| `compiler/sema/member_resolver.cryo:764` | `StructType::get_method` | `method_name` | J | member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too |
+| `compiler/sema/sema.cryo:3158` | `StructType::get_method` | `scope.member_name` | J | member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too |
+| `compiler/types/checker.cryo:351` | `StructType::get_method` | ` ...` | J | lang: the call protocol's `__call__` (the argument continues on the next line), asked when a struct converts to a function type |
 | `compiler/passes/type_resolution.cryo:1717` | `TraitDeclNode::lookup_assoc_type` | `assoc` | J | member: the trait's own associated type by its leaf, asked from the trait node in hand |
 | `compiler/sema/async_lower.cryo:716` | `TraitDeclNode::lookup_assoc_type` | `assoc` | J | member: the trait's own associated type by its leaf, asked from the trait node in hand |
 | `compiler/sema/call_resolver.cryo:4223` | `TypeUtils::lookup_method_return` | `owner_ref, scope.member_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
 | `compiler/sema/call_resolver.cryo:4263` | `TypeUtils::lookup_method_return` | ` ...` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
 | `compiler/sema/call_resolver.cryo:5053` | `TypeUtils::lookup_method_return` | `type_ref, scope.member_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
-| `compiler/sema/call_resolver.cryo:5546` | `TypeUtils::lookup_method_return` | `exp_ref, member_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
+| `compiler/sema/call_resolver.cryo:5555` | `TypeUtils::lookup_method_return` | `exp_ref, member_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
 | `compiler/sema/method_binding.cryo:198` | `TypeUtils::lookup_method_return` | `base_ref, method_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
 | `compiler/sema/method_binding.cryo:232` | `TypeUtils::lookup_method_return` | `bp.bounds[i], method_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
 | `compiler/sema/method_binding.cryo:391` | `TypeUtils::lookup_method_return` | ` ...` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
@@ -354,10 +351,10 @@ Population **300** - J 97 · N 117 · S 16 · B 49 · C 19 · F 2 · W 0
 | `compiler/sema/call_resolver.cryo:4607` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/call_resolver.cryo:4877` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/call_resolver.cryo:4940` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:5312` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:5408` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:5460` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:5508` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:5321` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:5417` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:5469` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:5517` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/lambda_synth.cryo:112` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/method_binding.cryo:513` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/method_binding.cryo:857` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
@@ -374,7 +371,7 @@ Population **300** - J 97 · N 117 · S 16 · B 49 · C 19 · F 2 · W 0
 | `compiler/sema/sema.cryo:1566` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/sema.cryo:2353` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/sema.cryo:2605` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/sema.cryo:3877` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/sema.cryo:3878` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/symbolic_checker.cryo:179` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/passes/type_resolution.cryo:2329` | `TraitType::add_assoc_type` | `adecl.name` | N | a write: the trait's own associated-type name recorded on the trait type |
 | `compiler/passes/type_resolution.cryo:445` | `DeclarationIndex::lookup_type` | `owner_key` | S | a type by a canonical name derived from a stamp |
@@ -387,7 +384,7 @@ Population **300** - J 97 · N 117 · S 16 · B 49 · C 19 · F 2 · W 0
 | `compiler/sema/call_resolver.cryo:4219` | `TypeUtils::lookup_type_exact` | `lookup_sym` | S | a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`) |
 | `compiler/sema/call_resolver.cryo:4264` | `TypeUtils::lookup_type_exact` | `owner_key` | S | a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`) |
 | `compiler/sema/call_resolver.cryo:5049` | `TypeUtils::lookup_type_exact` | `lookup_sym` | S | a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`) |
-| `compiler/sema/call_resolver.cryo:5732` | `TypeUtils::lookup_type_exact` | `lookup_sym` | S | a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`) |
+| `compiler/sema/call_resolver.cryo:5741` | `TypeUtils::lookup_type_exact` | `lookup_sym` | S | a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`) |
 | `compiler/sema/diagnostics.cryo:282` | `TypeUtils::lookup_type_exact` | `type_sym` | S | a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`) |
 | `compiler/sema/method_binding.cryo:392` | `TypeUtils::lookup_type_exact` | `tr.identity()` | S | a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`) |
 | `compiler/sema/method_binding.cryo:445` | `TypeUtils::lookup_type_exact` | `tr.identity()` | S | a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`) |

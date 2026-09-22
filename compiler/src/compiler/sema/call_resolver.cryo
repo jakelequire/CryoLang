@@ -5076,7 +5076,7 @@ type struct CallResolver {
         // own argument types determine the instantiation, so recover it from
         // them whenever nothing else supplied one.
         if (promoted.id == type_ref.id) {
-            const inferred: TypeRef = this.infer_variant_instantiation(type_ref, scope.member_name, call);
+            const inferred: TypeRef = this.infer_variant_instantiation(type_ref, scope, call);
             if (inferred.is_valid()) { scope.set_resolved_type(inferred); return inferred; }
         }
         scope.set_resolved_type(promoted);
@@ -5093,15 +5093,24 @@ type struct CallResolver {
     /// pattern-binding move-check needs concretised; otherwise `TypeRef::invalid()`
     /// so the caller keeps the generic base (Copy/plain payloads and generic
     /// template bodies stay on the existing path).
-    infer_variant_instantiation(mut &this, base_ref: TypeRef, member: SymbolStr,
+    infer_variant_instantiation(mut &this, base_ref: TypeRef, scope: ScopeResolutionNode*,
                                 call: CallExprNode*) -> TypeRef {
         if (call == null || this.ctx.generic_registry == null) { return TypeRef::invalid(); }
         const tmpl: TemplateEntry* = this.ctx.generic_registry.get_template_by_type_id(base_ref.id);
         if (tmpl == null || tmpl.param_count == 0) { return TypeRef::invalid(); }
         const base_t: Type* = this.arena.lookup(base_ref.id);
         if (base_t == null || base_t.kind != TypeKind::Enum) { return TypeRef::invalid(); }
-        const variant: EnumVariantInfo* = (base_t as EnumType*).get_variant(member);
-        if (variant == null) { return TypeRef::invalid(); }
+        const et: EnumType* = base_t as EnumType*;
+        // The variant is the one this call's payload lookup already found
+        // and pinned on the path (`lookup_scope_variant_payload_types`);
+        // the ordinal is the same in the template and every instantiation.
+        mut ordinal: i64 = -1;
+        match (scope.resolved_member) {
+            MemberPin::Variant(v) => { ordinal = v; }
+            _                     => { }
+        }
+        if (ordinal < 0 || ordinal >= et.variants.length) { return TypeRef::invalid(); }
+        const variant: EnumVariantInfo* = &et.variants[ordinal];
         if (variant.payload_types.length != call.arguments.length) { return TypeRef::invalid(); }
 
         mut bindings: TypeRef[] = [];

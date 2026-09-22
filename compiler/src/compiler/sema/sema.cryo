@@ -118,7 +118,7 @@ import compiler::sema::state::{ SemaState };
 import compiler::sema::symbolic_checker::{ SymbolicChecker };
 import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
-import compiler::types::checker::{ TypeChecker, TypeCheckResult, TypeCompatibility };
+import compiler::types::checker::{ FieldLookup, TypeChecker, TypeCheckResult, TypeCompatibility };
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType, TupleType };
 import compiler::types::generic::{ BoundedParamType, InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
@@ -2951,26 +2951,27 @@ public:
         for (mut i: i64 = 0; i < lit.field_inits.length; i++) {
             const field_init: FieldInit = lit.field_inits[i];
             const value_expr: ExpressionNode* = field_init.value;
-            // A struct literal names a field directly, so it must obey the same
-            // type-scoped visibility as a `.field` access: a `private`/`protected`
-            // field may only be initialized from within the declaring type's own
-            // methods (E0353).  Without this, external code could fabricate a
-            // private field and bypass whatever invariant it protects.
-            if (struct_ref.is_valid()) {
-                this.member.enforce_field_visibility(struct_ref, field_init.field_name, field_init.span);
-            }
             mut field_type: TypeRef = TypeRef::invalid();
             // The field this initializer names, by its coordinates in the
             // literal's type - a class's base fields included, walked
             // derived-first as `check_field_access` walks them - recorded
             // on the initializer so codegen stores at those coordinates.
+            // A struct literal names a field directly, so it obeys the same
+            // type-scoped visibility as a `.field` access (E0353), asked of
+            // the entry this one walk found.
             mut f_depth: i64 = -1;
             mut f_index: i64 = -1;
             if (struct_t != null
                 && (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class)) {
+                mut fl: FieldLookup = FieldLookup::none();
                 const found: TypeCheckResult = this.checker.check_field_access(
-                    struct_ref, field_init.field_name, &f_depth, &f_index);
+                    struct_ref, field_init.field_name, &fl);
                 if (found.success && found.result_type.is_valid()) { field_type = found.result_type; }
+                if (fl.found()) {
+                    f_depth = fl.depth;
+                    f_index = fl.index;
+                    this.member.enforce_field_visibility(fl.field, fl.owner, field_init.field_name, field_init.span);
+                }
             }
             // A literal of the generic OWNER inside its own body (`String {
             // buffer: RawBuffer::new(), .. }` in `String<A>::new`): the arena
