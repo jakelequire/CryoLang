@@ -98,6 +98,27 @@ public:
         this.spec_typeref      = spec_typeref;
     }
 
+    /// Drop a callee pin, which - unlike a member pin - cannot cross a
+    /// substitution.  A `CalleePin::Family` holds the MANGLED SYMBOL of one
+    /// specialization, and a body cloned from a template carries whichever
+    /// sibling specialized first: `Request::write_to<W>` calls
+    /// `this.headers.write_to(writer)`, the nested `Headers::write_to<W>` is
+    /// pinned to `<TcpStream>` the first time it specializes, and the clone
+    /// takes that pin into `write_to<TlsStream>` - a `TlsStream*` passed to
+    /// the TcpStream implementation.  The symbol is not a coordinate inside a
+    /// declaration the way a field index is; until a pin names the template
+    /// and the substitution instead, dropping it is the only correct answer
+    /// and the monomorphizer's discovery re-infers this body's callee.  A pin
+    /// leaves a clone through this door and no other.
+    drop_stale_callee_pin(&this, node: CallExprNode*) -> void {
+        node.set_resolved_callee(CalleePin::None);
+    }
+
+    /// The same drop for a path's callee - see the overload above.
+    drop_stale_callee_pin(&this, node: ScopeResolutionNode*) -> void {
+        node.set_resolved_callee(CalleePin::None);
+    }
+
     /// The slot of the parameter `sym`, or -1 when it is none of this
     /// substitution's - including an invalid symbol, which names nothing.
     param_slot(&this, sym: SymbolID) -> i64 {
@@ -579,20 +600,12 @@ public:
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
         }
-        // Specialization changes the concrete types of this call's receiver
-        // and arguments, so a `resolved_callee` / `resolved_method` pinned for
-        // the pre-substitution template (or copied by the cloner from a SIBLING
-        // specialization) is stale for THIS instantiation.  The classic break:
-        // `Request::write_to<W>` calls `this.headers.write_to(writer)`; the
-        // nested `Headers::write_to<W>` got pinned to `<TcpStream>` the first
-        // time `write_to` specialized, and the cloner copies that pin into
-        // every later `write_to<S>` body - so `write_to<TlsStream>` wrongly
-        // calls `Headers::write_to<TcpStream>` (passing a `TlsStream*` to the
-        // TcpStream impl: garbage fd, EBADF, plaintext on the wire).  Clear the
-        // pins so the monomorphizer's discovery re-infers the right spec for
-        // this body; codegen's resolver re-derives any discovery doesn't pin.
+        // A callee pin does not cross a substitution - `drop_stale_callee_pin`
+        // says why - and neither does the method node beside it, which is one
+        // sibling specialization's declaration.  The monomorphizer's discovery
+        // re-infers both for this body.
         node.resolved_method = null;
-        node.set_resolved_callee(CalleePin::None);
+        this.drop_stale_callee_pin(node);
         // `resolved_type_args` is sema's stash of this call's generic type-arg
         // bindings, expressed in the TEMPLATE's params (e.g. `H`/`W`).  Unlike
         // the pins above it is NEVER a stale sibling's concrete value (only sema
@@ -649,10 +662,10 @@ public:
         if (node.struct_init != null) {
             node.struct_init.accept(this);
         }
-        // The same reason a call's pin is cleared: the type this `new` names
-        // may now be another instantiation, and sema's walk over this body
-        // answers the variant again.
-        node.set_resolved_member(MemberPin::None);
+        // A variant's ordinal is the same in every instantiation of the enum,
+        // so the pin crosses the substitution; the mark records that the walk
+        // over this clone did not produce it.
+        node.carry_resolved_member();
     }
 
     override visit(node: StructLiteralNode*) -> void {
@@ -686,10 +699,9 @@ public:
             if (val != null) {
                 val.accept(this);
             }
-            // Cleared as a call's pin is: sema's walk over this body answers
-            // the field again, and a pin left standing could only hide a
-            // node that walk never reached.
-            node.field_inits[i].pin = MemberPin::None;
+            // A field's position in its owner is the same in every
+            // instantiation, so the pin crosses the substitution.
+            node.field_inits[i].pin_carried = node.field_inits[i].pin.is_some();
         }
     }
 
@@ -701,6 +713,10 @@ public:
         const is_self: boolean = node.scope_name.equals(this.base_name)
             && (node.scope_generic_args.length == 0
                 || this.args_are_outer_param_refs(node.scope_generic_args));
+        // True when the else-branch below retargets the scope segment at a
+        // DIFFERENT declaration (a generic param bound to a concrete type),
+        // which is the one rewrite a carried member pin cannot survive.
+        mut rewrote_owner: boolean = false;
         if (is_self) {
             node.scope_name = this.spec_name;
             // The id beside the name, as a written annotation gets: the
@@ -719,6 +735,7 @@ public:
             // segment now means that is not a spelling to be looked up.
             const si: i64 = this.param_slot(node.scope_res.relative_param_sym());
             if (si >= 0) {
+                rewrote_owner = true;
                 node.scope_name = this.type_arg_displays[si];
                 const arg_ref: TypeRef = this.resolved_arg_typeref(si);
                 if (arg_ref.is_valid()) { node.spec_owner = arg_ref; }
@@ -737,8 +754,18 @@ public:
         // The same reason a call's pin is cleared: the scope segment above may
         // now name a different owner than the one the template's walk pinned
         // the function for, and sema's walk over this body pins it again.
-        node.set_resolved_callee(CalleePin::None);
-        node.set_resolved_member(MemberPin::None);
+        this.drop_stale_callee_pin(node);
+        // The member pin crosses the substitution - a variant's ordinal and a
+        // global's slot are the same in every instantiation - EXCEPT where the
+        // branch above retargeted the scope segment at another declaration
+        // (`T::m` with `T` bound to a concrete type): there the coordinates
+        // belong to the old owner and name nothing in the new one.  That
+        // branch runs, and no path reaching it has ever carried a member pin.
+        if (rewrote_owner) {
+            node.set_resolved_member(MemberPin::None);
+        } else {
+            node.carry_resolved_member();
+        }
     }
 
     override visit(node: SizeofExprNode*) -> void {
@@ -972,21 +999,20 @@ public:
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
         }
-        // Cleared as a call's pin is; sema's walk over this body answers the
-        // field again, so a pin left standing could only hide a node that
-        // walk never reached.  A `Field` pin would survive substitution
-        // correctly - a field's position is the same in every instantiation
-        // - but the clearing is what lets codegen refuse an unwalked node,
-        // and mono's own reads before that walk (`derive_receiver_type`)
-        // therefore find no pin and ask the specialized type by leaf.
-        node.set_resolved_member(MemberPin::None);
+        // A field's position in its owner is the same in the template and in
+        // every instantiation of it, so the pin crosses the substitution and
+        // mono's own reads before the post-monomorphization walk
+        // (`derive_receiver_type`) find it.
+        node.carry_resolved_member();
     }
 
     override visit(node: EnumPatternNode*) -> void {
         if (node.enum_name.equals(this.base_name)) {
             node.enum_name = this.spec_name;
         }
-        node.set_resolved_member(MemberPin::None);
+        // The enum is the same declaration under another instantiation, so the
+        // variant's ordinal still names the same variant.
+        node.carry_resolved_member();
         // Recurse into nested sub-patterns (`Some(Some(n))`, `Branch(Leaf(x),
         // r)`) so their enum_name is substituted too. Without this, a nested
         // pattern in a generic body kept the unsubstituted (template) name.

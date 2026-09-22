@@ -41,8 +41,8 @@ import compiler::types::type_base::{
 };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
-    ClassType, EnumType, EnumVariantInfo, FunctionTemplateType, StructType, TraitType,
-    TypeAliasType
+    ClassType, EnumType, EnumVariantInfo, FieldInfo, FunctionTemplateType, StructType,
+    TraitType, TypeAliasType
 };
 
 
@@ -1098,6 +1098,43 @@ type struct TypeArena {
             }
         }
         return false;
+    }
+
+    /// The class `depth` steps up `leaf`'s base chain (`leaf` itself at 0),
+    /// or null when the chain is shorter.
+    class_at_depth(&this, leaf: ClassType*, depth: i64) -> ClassType* {
+        mut walk: ClassType* = leaf;
+        mut d: i64 = 0;
+        while (walk != null && d < depth) {
+            if (!walk.has_base || !walk.base_class.is_valid()) { return null; }
+            const base_t: Type* = this.lookup(walk.base_class.id);
+            if (base_t == null || base_t.kind != TypeKind::Class) { return null; }
+            walk = base_t as ClassType*;
+            d += 1;
+        }
+        return walk;
+    }
+
+    /// The field at `(depth, index)` in `t` - the coordinates a `MemberPin`
+    /// holds: `index` into the field list of the class `depth` steps up the
+    /// base chain, or of the struct itself.  Null when the coordinates name
+    /// nothing in `t`.  The one reader of those coordinates; a base chain is
+    /// a chain of `TypeRef`s, so only something holding the arena can follow
+    /// it.
+    pinned_field(&this, t: Type*, depth: i64, index: i64) -> FieldInfo* {
+        if (t == null || depth < 0 || index < 0) { return null; }
+        if (t.kind == TypeKind::Struct) {
+            if (depth != 0) { return null; }
+            const st: StructType* = t as StructType*;
+            if (index >= st.fields.length) { return null; }
+            return &st.fields[index];
+        }
+        if (t.kind == TypeKind::Class) {
+            const owner: ClassType* = this.class_at_depth(t as ClassType*, depth);
+            if (owner == null || index >= owner.fields.length) { return null; }
+            return &owner.fields[index];
+        }
+        return null;
     }
 
     /// Get the qualified name for a user-defined type by TypeRef.

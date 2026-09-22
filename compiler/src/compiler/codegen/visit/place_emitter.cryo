@@ -75,10 +75,12 @@ type struct PlaceEmitter {
 
     /// Generate a GEP to a struct/class field.  The field is the one sema
     /// pinned on the node (`pin`, its coordinates in the receiver's type);
-    /// `member` is its spelling, for the diagnostic alone.  `site_span` is
+    /// `member` is its spelling, for the diagnostic alone, and `pin_carried`
+    /// says whether the pin came through a substituted clone rather than from
+    /// a walk over the node, which the refusal below names.  `site_span` is
     /// the source span of the access expression in the caller; used only to
     /// attach a source snippet to any diagnostic we emit.
-    codegen_member_access(mut &this, object_ptr: LValue, object_type: TypeRef, object_is_lvalue: boolean, member: SymbolStr, pin: MemberPin, site_span: SourceSpan) -> void {
+    codegen_member_access(mut &this, object_ptr: LValue, object_type: TypeRef, object_is_lvalue: boolean, member: SymbolStr, pin: MemberPin, pin_carried: boolean, site_span: SourceSpan) -> void {
         // Auto-deref: if the object is a pointer/reference (e.g., `node: ExprStmtNode*`
         // stored in an alloca), load the pointer value so we can GEP into the struct.
         // This matches C/Rust behavior where `node.field` on a pointer is an implicit
@@ -190,12 +192,24 @@ type struct PlaceEmitter {
             // Dynamic array { T*, i64 }: length is field 1.
             field_idx = 1;
         }
-        if ((tk == TypeKind::Tuple || tk == TypeKind::Struct || tk == TypeKind::Class)
-                && pin_index < 0) {
-            this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
-                fmt::format("codegen: member access `%s` on `%s` carries no field pin: no sema walk answered it, and the pass that minted it owes it the answer",
-                    this.cg.resolve(member), t.display_name()),
-                site_span);
+        if (tk == TypeKind::Tuple || tk == TypeKind::Struct || tk == TypeKind::Class) {
+            if (pin_index < 0) {
+                this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
+                    fmt::format("codegen: member access `%s` on `%s` carries no field pin: no sema walk answered it, and the pass that minted it owes it the answer",
+                        this.cg.resolve(member), t.display_name()),
+                    site_span);
+            } else if (field_idx < 0) {
+                // The pin names coordinates this type does not have.  A pin
+                // that CROSSED a substitution is the shape that can go wrong
+                // here - the coordinates are read off the owner the template
+                // was walked against - so the report says which kind it was
+                // rather than leaving the access to emit no IR at all.
+                this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
+                    fmt::format("codegen: member access `%s` is pinned at field %d, %d steps up, which `%s` does not have (the pin was %s)",
+                        this.cg.resolve(member), pin_index, pin_depth, t.display_name(),
+                        if (pin_carried) { "carried across a substitution" } else { "written by a sema walk" }),
+                    site_span);
+            }
         }
 
         if (field_idx < 0) {

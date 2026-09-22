@@ -75,7 +75,7 @@ measurement that decided it on the row.
 | D29 | **`implement trait Tick for struct Holder<S>` with `S` undeclared KEEPS E0302** (Jake, 2026-09-19). E0203 was put to him as Rust's answer (E0412, the same code as any undeclared type name) and REJECTED: "too generic of an error for this situation". No dedicated code proposed: the message is already the situation's own ("this impl head names `S`, which is declared nowhere", with the head spelled as it must be written), and E0302's family - the head's parameter list disagreeing with its target - is where a reader looks for it; a code for one message would widen the table for no search. The nesting asymmetry stands and is recorded: `Holder<Vec<S>>` is E0203 from the general refusal, the top-level `S` is E0302 | **RULED - the question CLOSED** | `grep -c 'E0302_GENERIC_PARAM_MISMATCH' compiler/src/compiler/resolver/name_resolution.cryo` → **1**; `ls tests/tests/negative/E0302_trait_head_undeclared_param.cryo \| wc -l` → **1** | §8.258, §8.267 |
 | D30 | **A generic parameter that SHADOWS an enclosing one is REFUSED** (Jake, 2026-09-19), Cryo's E0403: `type struct Box<T> { size_of_param<T>(&this, x: T) -> u64 { sizeof(T) } }` refuses the method's `T` against the owner's; `do_something<K>` beside an owner `T` is untouched. Today the OWNER's `T` silently wins - `Box<u8>::new(1).size_of_param<i64>(5)` answers 1 - because the substitution tables are keyed by the parameter's SPELLING, so two parameters of one name are one slot. In-tree population **0** (no method redeclares its owner's parameter), so the refusal breaks nothing. **Rides with audit 14's `GenericParam` identity fix**: the resolver binds each parameter to a `SymbolID` (`name_resolution.cryo`'s `GenericParam` arm answers `Res::GenericParam(s.name)` and discards `sym_id`); stamp the id, key the substitution tables by it, and the shadowing is then a second declaration in a scope that holds the first - the refusal is the resolver's, at the declaration, as Rust's E0403 is (Cryo's E0403 is "Missing Return"; the code for this is the builder's to propose and Jake's to confirm) | **The refusal BUILT (§8.268) as `E0311_GENERIC_PARAM_SHADOWED` - a number PROPOSED, not confirmed: the generics family E03xx, the next free code after E0310** - `declare_generics` asks the scope chain before declaring each parameter and a `GenericParam` answer is the error at the parameter's span with the first declaration labelled; a method's `<T>` in `struct Box<T>`, a trait method's in `trait Conv<T>`, an impl method's in `implement<T>`, and `<T, T>` in one list are the four refused shapes (Rust's E0403 covers the same four); a parameter beside a TYPE or a value parameter of its spelling is not one. **The identity half BUILT (§8.272)**: `Res::GenericParam` and `ResBase::GenericParam` carry the `SymbolID` the declaration bound (`GenericParamNode.sym_id`, stamped by the resolver, copied by the cloner; every writer, the async lowering's synthesized head included, §8.268), and the substitution chain is keyed by it end to end: `TemplateEntry.param_syms` beside the names, `ResolutionContext.generic_bindings` a `GenericBinding { sym, name, ty }` written by `add_binding(sym, name, ty)` and read by `lookup_binding(sym)` alone (`resolve_named` asks by the stamp's `generic_param_sym`, a flat `I::Item` by its `relative_param_sym`), `This::Member` in its own `assoc_bindings` table (an associated type is no symbol), `ImplBlockNode.derived_param_syms`, `ASTTypeSubstituter.param_syms` matched against `NamedAnnotation::param_sym` / a scope segment's `relative_param_sym`, `TraitBound.subject_sym` stamped by `stamp_trait_bounds`; an impl block is specialized under ITS OWN parameters (`ASTSpecializer::impl_substituter`, each bound to the argument at the head position it is written), the async lowering stamps every parameter it spells, and the mono fallback that re-resolved a signature under name-keyed bindings is deleted (0 entries over the LSP's 264 modules, 0 resolutions over the six-half corpus). `ArrayLiteralNode.element_type` deleted (no writer but the substituter, no reader but the dumper). **Left keyed by spelling, by design**: the arena's `GenericParamType.param_name` against `TemplateEntry.param_names` (4 compares in `call_resolver.cryo`) and a bound's subject against the arena substitution (`lookup_subst_for_param`, 5 callers) - **the type layer's own identity is the SPELLING ALONE** (`TypeArena::create_generic_param` caches by the name; the index is the first creation's - §8.275 corrects §8.272's "name+index") and carries no symbol. Control: a trait default's own `<U>` copied under `implement<U> trait Conv for struct Holder<U>` - `h.conv<i64>(5)` answered sizeof(u8) = 1 and answers 8; in-tree population 2 (`Iterator`'s `chain<J>` / `zip<J>` under `ChainIter<I, J>` / `ZipIter<I, J>`), never demanded through the conflation, 0 objects moved. **The arena half (§8.275)**: with the AST tables keyed by symbol, `a.chain(b).chain(c)` on a `ChainIter` receiver - E0636 "no method 'chain'" before, and NOT a separate defect as §8.272 said - RUNS when `c`'s type is the impl's `J` (`chain_default_same_param`, exit 25) and is REFUSED when it is not (`chain_default_param_conflict`, E0636 "cannot resolve 'ChainIter::new'"): the two `J`s are one arena type with two answers, and `TypeSubstitution::get` answers nothing for a parameter bound to two different types rather than whichever was added first - which rebuilt `This` as `ChainIter<Range, TakeIter>` and iterated over garbage (`.objcmp/rd-ctl2.log`, `chained=0`, under c596a14b's compiler). **The arena keyed by symbol is Jake's design unit**; that project becomes a run project exiting 25 when it lands | `grep -c 'E0311_GENERIC_PARAM_SHADOWED' compiler/src/compiler/resolver/name_resolution.cryo` → **1**; `ls tests/tests/negative/E0311_*.cryo \| wc -l` → **1**; `grep -c 'Res::GenericParam(s.name)' compiler/src/compiler/resolver/name_resolution.cryo` → **0**; `grep -rhoE 'GenericParam\(SymbolID\)' compiler/src/compiler/resolver/res.cryo \| wc -l` → **2**; `grep -c 'sym_id' compiler/src/compiler/AST/declaration.cryo` → **4**; `grep -c 'sym: SymbolID, name: SymbolStr, bound_type: TypeRef' compiler/src/compiler/types/resolver.cryo` → **1**; `grep -rho 'lookup_binding(' compiler/src --include=*.cryo \| wc -l` → **7**; `grep -rhoE -e 'lookup_binding\([a-z_.]*name\)' -e 'lookup_binding\([a-z_.]*param\)' -e 'lookup_binding\([a-z_.]*type_parameter\)' -e 'lookup_binding\([a-z_.]*prefix_sym\)' -e 'lookup_binding\([a-z_.]*member\)' compiler/src --include=*.cryo \| wc -l` → **0** (5 at §8.271: no reader asks by a spelling); `grep -rho 'subject_sym' compiler/src --include=*.cryo \| wc -l` → **13**; `grep -rho 'param_syms' compiler/src --include=*.cryo \| wc -l` → **92** (89 at §8.272; +3 in §8.279, the three copy loops that ran over the deleted `ASTTypeSubstituter.param_names` now run over `param_syms`); `grep -rn 'param_names\[.*\]\.equals' compiler/src --include=*.cryo \| wc -l` → **4** (10 at §8.271; the arena-name residual); `grep -c 'element_type' compiler/src/compiler/AST/expression.cryo` → **0**; `grep -c 'Fallback resolution with substitution-derived bindings' compiler/src/compiler/mono/ast_resolver.cryo` → **0**; `ls -d tests/tests/projects/default_param_keyed_by_symbol \| wc -l` → **1**; `ls -d tests/tests/projects/chain_default_*/test.json \| wc -l` → **2**; `grep -c 'if (found.id != this.replacements\[i\].id) { return TypeRef::invalid(); }' compiler/src/compiler/types/substitution.cryo` → **1** | §8.267, §8.268, §8.272, §8.275 |
 | D31 | **The turbofish is REQUIRED for generic arguments in expression position** (Jake, 2026-09-19): `foo::<i32>(y)` opens type arguments; `g(LIMIT < x, MAXV > (y))` is two comparisons, always. **The rule: `<` immediately after `::` opens generic arguments; `<` anywhere else is a comparison.** The shape is `foo::<i32>(y)` - as Rust's `Vec::<i32>::new()`, where every `::` after the turbofish is an ordinary path step; there is no `::()` form. It RETIRES the parser's `ident <` lookahead tables (`parser_base.cryo` 872–912: is-a-local / is-a-global / is-declared-generic / binds-a-value, read from the module's OWN declarations; `expr_parser.cryo` ~1190, the identifier's `Name<T, U>` guess), which by their own comment cannot see an import - so one expression means two things by where its constants came from. **Source-breaking, population UNMEASURED: the first task of whoever builds it is the count of bare generic arguments in expression position over the stdlib, the projects, the examples and the compiler's own source** (`f<T>(..)`, `Type<T>::m(..)`, `Type<T> { .. }` as the parser reads them today, module by module), and Jake wants that number before it lands. **MEASURED in §8.269 (the population Jake asked for), NOT BUILT: 1,364 generic-argument lists in expression position across 272 files** - stdlib 480 (64 of 154 files), compiler/src 165, tests/unit 571, tests/projects 61, tests/negative 26, tools/CryoLSP 53, examples 8; by shape `Name<T>::m` 586, `Name<T> { .. }` 219, `f<T>(..)` 142, `f<T>` as a value 8, `obj.m<T>(..)` 172, `Scope::m<T>(..)` 237, `new Type<T>(..)` 0 (confirmed by grep); **567 of the 955 identifier-headed sites were decided by the token scan alone** - the name is declared generic in no table the writing module has (an import: `Array` 172, `PendingThenReady` 90, `HashMap` 75, `Pair` 63, `Atomic` 38, `BufStream` 36, `Box` 24). Every site is a rewrite of the same one shape, `Name<` → `Name::<`, and the probe's location list (`scripts/ns-migration/8.269/`, `probe_d31.py apply` / `tally`; `population.md` is the tally) is the migration's input; the landing is the parser change, the four sites' lexical rule, the retired tables, and that script - one unit, source-breaking by 1,364 edits. **AUTHORISED by Jake on the 1,364-site figure (2026-09-19, §8.272): the turbofish lands.** Not built here - a source-breaking change across the stdlib, the tests, the compiler and the examples plus the parser change wants a dedicated session with a full budget. The landing: the lexical rule (`<` opens generic arguments only after `::`), `is_generic_call_ahead` ×6 and the `parser_base.cryo` 872–912 tables retired, and the 1,364 rewrites produced by a COMMITTED GENERATOR run over `population.md` - never a hand edit - so the migration is reproducible and auditable; 567 of the 955 identifier-headed sites are decided by the token scan alone today, so the generator's list, not the parser's tables, is what says where they are. **BUILT in three landings: §8.277 the parser reads the turbofish beside the lookahead and the population is re-verified at 1,368 sites / 271 files (§8.269's 1,364 double-counted two sites under a capitalised path; +6 in a project added since); the pin refreshed from that compiler; §8.278 the tree rewritten by `scripts/ns-migration/8.278/turbofish.py` over `8.277/sites.tsv` + `8.278/sites-extra.tsv` (1,376 sites, 274 files, a second run edits nothing) and the lookahead retired - `is_generic_call_ahead`, the three module tables with `scan_module_names`, the `generic_angle_guessed` flag and its two notes; 0 of 154 stdlib, 0 of 2,893 test, 0 of 1,126 example objects moved.** `new Type<T>(..)` and type position open `<` outright (no comparison can stand after a type name); `a < b > c` stays the chained comparison it was; the old spelling's leading E0102 names the turbofish | **TAKEN** (§8.277, §8.278; two open shapes on §8.278's "For Jake": `new Type::<T>` and refusing chained comparisons) | `grep -c 'is_generic_call_ahead' compiler/src/compiler/parser/expr_parser.cryo` → **0**; `grep -c 'at_turbofish' compiler/src/compiler/parser/expr_parser.cryo` → **4** (the one method and its three askers - the control for the zero beside it); `grep -c -e binds_a_value -e scan_module_names -e generic_decl_names compiler/src/compiler/parser/parser_base.cryo` → **0**; `git grep -l generic_angle_guessed -- compiler/src \| wc -l` → **0**; `grep -c . scripts/ns-migration/8.277/sites.tsv` → **1368** and `grep -vc '^#' scripts/ns-migration/8.278/sites-extra.tsv` → **8** (the rewrite's input; `turbofish.py check` over both reads every site as `::<` at the parent of §8.278's commit after `apply` and before `retire_lookahead.py`, which shifts one compiler/src site's line - so the check is the recipe's audit, not a row); `grep -c '^D31 population: 1368 distinct sites' scripts/ns-migration/8.277/population.md` → **1**; `grep -c '^D31 population: 1364 distinct sites' scripts/ns-migration/8.269/population.md` → **1** (the superseded figure, kept as written) | §8.267, §8.269, §8.277, §8.278 |
-| D32 | **The migration's COMPLETION CRITERION - the gate on merging `naming-impl` to `main`** (Jake, 2026-09-19): the migration is complete when there are **ZERO name-keyed reads outside an ENUMERATED, JUSTIFIED residue** - every member of the residue named, each carrying a one-line reason it is correct where it is (member lookup inside an owner is the canonical member: a struct's field or method by its name off the owner's type, name-keyed in Rust too), and the residue **PINNED BY COUNT** so it cannot grow. "Complete" means complete - not "correct with known items rowed". The by-design sites are "the maximum allowed": a residue that lands ABOVE the by-design set either moves the ceiling with a justification per extra site or converts those sites. **The count is NOT yet fixed and is not to be pinned on any recollection**: "about sixteen" was a paraphrase of audit 12's bucket D, and audit 14 remeasured the whole population at 55 sites with the buckets redistributed, so the true justified residue may be more or fewer. It is set by ENUMERATING the residue - one list, each site with its justification - and Jake rules on the final number. **The enumeration LANDED (§8.281)**: `scripts/ns-migration/residue.md`, every site derived from the lane gate's own parser (`residue.py`: the stores and the member-table array owners, a key type in parameter position, a read, the receiver placed by declared type) and classified with its reason by `residue_classify.py` - **J** justified by design (member-in-owner 43, language-named 23, module-by-path 24, primitive 1, extern 1, hint 1 - the member tables of the user-defined types, arrays of records with the name in each, entered the population in §8.284 with 43 sites, 36 of them member-in-owner and 7 language-named; §8.286 retired four of the seven (`?` asks the enum's identity, not its variants) and added two `wellknown` reads; §8.288 added two more, `Poll` and `Option` asked by the async lowering for the identities its synthesized nodes carry; §8.289 moved the 14 `lookup_method_return` readers from S into member-in-owner, the store keyed by the owner's arena id; §8.290 retired the 13 codegen re-derivations of a field, a variant and a global - sema's answer now rides on the node as a `MemberPin` - and moved 3 sema-side reads through the doors (+2 `field_index`, −2 `get_field`, +1 `variant_index`); §8.291 retired the field enforcer's two `get_field` re-lookups and `resolve_call`'s second `get_variant`, each answered by what the first lookup already held; §8.292 retired the two reads of the async frame's receiver slot by its minted spelling and the impl-side re-mint of `<Method>Fut` - the lowering records the slot on the struct, the desugar records the associated type on the method; §8.293 reached the reads written as LOOPS - the door's body at the caller, rule 1c: 156 rows the population never held, 141 of them J (member 39 → 129, lang 25 → 72 - 47 of them the receiver found by its `this` spelling - module 24 → 26, extern 1 → 3), and eleven with no predicate of their own converted to doors: member 129, lang 72, module 26, prim 1, extern 3, hint 1 = 232), **N** not a key (a label beside a `DefId`, a path, a literal's text, a constructor's source file), and the convertible remainder **S** stamp-derived, **B** the registry's canonical keys (Jake's re-key unit), **C** composed, **F** visibility, **W** written; the list is matched to the tree by (file, method, key text) in both directions, every row's class is re-derived from the classifier (§8.283: a check that read the letters as written let a J flipped to N by hand pass), and the row pins the counts | **RULED - the criterion; the enumeration LANDED with J = 52, then 95 once the record-array member tables were reached (§8.284), 93 after §8.286, 95 after §8.288, 109 after §8.289 - `method_returns` keyed by the owner's identity moved its 14 readers from S to member-in-owner, S 26 → 16 and convertible 96 → 86 - 97 after §8.290 (the 13 codegen re-derivations carried on the node instead) 94 after §8.291 (three same-pass second lookups handed the first lookup's answer) and 91 after §8.292 (three minted-name round trips carried from the mint; convertible unchanged); **232 after §8.293 - not a conversion but the instrument reaching a shape it was blind to: a name-keyed read written as a loop instead of a method call, 156 rows, S 16 → 26, B 49 → 51, W 0 → 2, convertible 86 → 100** - the count TO BE RULED by Jake** (the migration is complete when S + B + C + F + W = 0 and J is at or below the ceiling he sets; the J sub-kinds are grouped so `module` or `lang` can be ruled convertible by count) | `python3 scripts/ns-migration/residue.py --check \| grep -c '^residue: OK'` → **1** (the list and the tree agree, no row unclassified); `python3 scripts/ns-migration/residue.py --count` → **450** (the population: method calls and inline scans); `python3 scripts/ns-migration/residue.py --check \| grep -o 'J [0-9]*' \| cut -d' ' -f2` → **232** (the justified residue); `python3 scripts/ns-migration/residue.py --check \| grep -o 'convertible [0-9]*' \| cut -d' ' -f2` → **100** (S + B + C + F + W, the remainder that reaches 0 when the migration is complete) | §8.276, §8.281, §8.283, §8.293 |
+| D32 | **The migration's COMPLETION CRITERION - the gate on merging `naming-impl` to `main`** (Jake, 2026-09-19): the migration is complete when there are **ZERO name-keyed reads outside an ENUMERATED, JUSTIFIED residue** - every member of the residue named, each carrying a one-line reason it is correct where it is (member lookup inside an owner is the canonical member: a struct's field or method by its name off the owner's type, name-keyed in Rust too), and the residue **PINNED BY COUNT** so it cannot grow. "Complete" means complete - not "correct with known items rowed". The by-design sites are "the maximum allowed": a residue that lands ABOVE the by-design set either moves the ceiling with a justification per extra site or converts those sites. **The count is NOT yet fixed and is not to be pinned on any recollection**: "about sixteen" was a paraphrase of audit 12's bucket D, and audit 14 remeasured the whole population at 55 sites with the buckets redistributed, so the true justified residue may be more or fewer. It is set by ENUMERATING the residue - one list, each site with its justification - and Jake rules on the final number. **The enumeration LANDED (§8.281)**: `scripts/ns-migration/residue.md`, every site derived from the lane gate's own parser (`residue.py`: the stores and the member-table array owners, a key type in parameter position, a read, the receiver placed by declared type) and classified with its reason by `residue_classify.py` - **J** justified by design (member-in-owner 43, language-named 23, module-by-path 24, primitive 1, extern 1, hint 1 - the member tables of the user-defined types, arrays of records with the name in each, entered the population in §8.284 with 43 sites, 36 of them member-in-owner and 7 language-named; §8.286 retired four of the seven (`?` asks the enum's identity, not its variants) and added two `wellknown` reads; §8.288 added two more, `Poll` and `Option` asked by the async lowering for the identities its synthesized nodes carry; §8.289 moved the 14 `lookup_method_return` readers from S into member-in-owner, the store keyed by the owner's arena id; §8.290 retired the 13 codegen re-derivations of a field, a variant and a global - sema's answer now rides on the node as a `MemberPin` - and moved 3 sema-side reads through the doors (+2 `field_index`, −2 `get_field`, +1 `variant_index`); §8.291 retired the field enforcer's two `get_field` re-lookups and `resolve_call`'s second `get_variant`, each answered by what the first lookup already held; §8.292 retired the two reads of the async frame's receiver slot by its minted spelling and the impl-side re-mint of `<Method>Fut` - the lowering records the slot on the struct, the desugar records the associated type on the method; §8.293 reached the reads written as LOOPS - the door's body at the caller, rule 1c: 156 rows the population never held, 141 of them J (member 39 → 129, lang 25 → 72 - 47 of them the receiver found by its `this` spelling - module 24 → 26, extern 1 → 3), and eleven with no predicate of their own converted to doors: member 129, lang 72, module 26, prim 1, extern 3, hint 1 = 232), **N** not a key (a label beside a `DefId`, a path, a literal's text, a constructor's source file), and the convertible remainder **S** stamp-derived, **B** the registry's canonical keys (Jake's re-key unit), **C** composed, **F** visibility, **W** written; the list is matched to the tree by (file, method, key text) in both directions, every row's class is re-derived from the classifier (§8.283: a check that read the letters as written let a J flipped to N by hand pass), and the row pins the counts | **RULED - the criterion; the enumeration LANDED with J = 52, then 95 once the record-array member tables were reached (§8.284), 93 after §8.286, 95 after §8.288, 109 after §8.289 - `method_returns` keyed by the owner's identity moved its 14 readers from S to member-in-owner, S 26 → 16 and convertible 96 → 86 - 97 after §8.290 (the 13 codegen re-derivations carried on the node instead) 94 after §8.291 (three same-pass second lookups handed the first lookup's answer) and 91 after §8.292 (three minted-name round trips carried from the mint; convertible unchanged); **232 after §8.293 - not a conversion but the instrument reaching a shape it was blind to: a name-keyed read written as a loop instead of a method call, 156 rows, S 16 → 26, B 49 → 51, W 0 → 2, convertible 86 → 100** - **230 after §8.299**: a `MemberPin` crosses substitution, so `derive_receiver_type` reads the coordinates instead of asking the specialized struct by leaf, and `StructType::get_field` / `ClassType::get_field` are deleted with their last callers (convertible unchanged at 100) - the count TO BE RULED by Jake** (the migration is complete when S + B + C + F + W = 0 and J is at or below the ceiling he sets; the J sub-kinds are grouped so `module` or `lang` can be ruled convertible by count) | `python3 scripts/ns-migration/residue.py --check \| grep -c '^residue: OK'` → **1** (the list and the tree agree, no row unclassified); `python3 scripts/ns-migration/residue.py --count` → **448** (the population: method calls and inline scans); `python3 scripts/ns-migration/residue.py --check \| grep -o 'J [0-9]*' \| cut -d' ' -f2` → **230** (the justified residue); `python3 scripts/ns-migration/residue.py --check \| grep -o 'convertible [0-9]*' \| cut -d' ' -f2` → **100** (S + B + C + F + W, the remainder that reaches 0 when the migration is complete) | §8.276, §8.281, §8.283, §8.293, §8.299 |
 
 **D18's keyword half is RULED and UNBUILT - built once and backed out at a parse fork the ruling did not cover (§8.295: `x as u32 < y`), and waiting on that one ruling - and D32 is the criterion it is built toward** (D5 was, until §8.206; D2 and D9 were,
 until §8.213; D24 was, until §8.233 - this line kept naming it for forty-six entries after its row said TAKEN, §8.280; Q2 was, until §8.259; D25 was, until §8.263; D30's refusal was, until §8.268; D28 was, until §8.270; D30's identity half was, until §8.272; D31 was, until §8.278). Each was decided by Jake - D18 and D2 then re-parked as open
@@ -37540,3 +37540,171 @@ disambiguation latch above is the lead).  The projects that assert the
 compiler's output must NOT contain a name (`visibility_gate` and five
 others) fail under the intern dump, as the audit-stream trap records;
 their build halves pass.
+
+### 8.299 A member pin crosses substitution: the coordinates a walk wrote on a node survive the clone, marked as carried, and `derive_receiver_type` reads them instead of asking the specialized struct by leaf - 306,366 pins were being discarded on every clone, the one site that retargets its owner carries none of them (52 entries, 0 pins), codegen reads a carried pin 0 times in 543,083 field accesses so its coverage control is untouched, and `StructType::get_field` / `ClassType::get_field` are deleted with their last callers; residue 450 -> 448, J 232 -> 230, 0 of 4,128 objects moved - 2026-09-22
+
+> **Status:** BUILT.  Jake ruled (this session's brief): pins cross
+> substitution as identities rather than the pipeline order moving, because
+> a pin surviving substitution is the more correct model and the reorder
+> would not give the property - the next AST clone would lose the stamps
+> again.  This entry is the MEMBER half of that ruling.  The CALLEE half
+> (`CalleePin::Instance { template_entry, substs }`) is measured here and
+> not built; the last section says what it is worth, and it is less than
+> the brief predicted.
+
+#### What a pin is, and why it survives
+
+`MemberPin::Field(depth, index)` are coordinates, not a name: `index` into
+the field list of the class `depth` steps up the base chain, or of the
+struct itself.  A variant is its ordinal, a global its registration slot.
+Every one of those is the same in a template and in every instantiation of
+it, because specialization changes what the fields are made of and never
+how many there are or what order they sit in:
+
+```cryo
+type struct Pair<T> { first: T; second: T; }
+
+implement<T> Pair<T> {
+    sum(&this) -> T { return this.first + this.second; }
+}
+```
+
+`this.first` is field 0 of `Pair<T>`, of `Pair<i32>` and of
+`Pair<String>`.  The walk over the template answers it once; the clone the
+monomorphizer makes for `Pair<i32>` was throwing that answer away.
+
+#### Measured before the change
+
+A shadow at each of the substituter's five clear sites
+(`SHADOW-SUBPIN\t<site>\t<kind>\t<depth>\t<index>`), `corpus2.sh sp1` over
+the six halves, 0 failing halves:
+
+| site | pins discarded |
+|---|---|
+| `ScopeResolutionNode`, owner unchanged | 175,111 |
+| `MemberAccessNode` | 108,408 |
+| `StructLiteralNode` field initializer | 22,846 |
+| `EnumPatternNode` | 1 |
+| `NewExprNode` | 0 |
+| `ScopeResolutionNode`, owner RETARGETED | **0** |
+| total | **306,366** |
+
+The last row is the hazard.  A `ScopeResolutionNode`'s substituter visit
+has two branches: the self-collapse, which rewrites `Pair<T>::new` to the
+clone of the SAME declaration, and a branch that retargets the segment at
+a DIFFERENT declaration - `T::default()` under `where T: Default` becomes
+`i32::default()` when `T` is bound.  Coordinates inside `T` mean nothing
+inside `i32`, so a pin cannot cross that one.  It never has to: the branch
+runs 52 times over the six halves and not one of those nodes carries a
+member pin.  (The 52 is the control on the zero: the branch is entered, so
+the zero is a measurement and not an unvisited path.)
+
+#### Built
+
+* `MemberPin`'s doc states the carriage rule.  `MemberAccessNode`,
+  `NewExprNode`, `ScopeResolutionNode`, `EnumPatternNode` and `FieldInit`
+  carry `pin_carried` beside the pin; `set_resolved_member` clears it (a
+  walk's answer supersedes a carried one), `carry_resolved_member()` sets
+  it, and the cloner copies it with the pin.
+* `ASTTypeSubstituter` carries the pin at all five sites and clears only at
+  the retargeting branch, where the comment says why.  A callee pin leaves
+  a clone through `drop_stale_callee_pin` and no other door, and that
+  door's docstring holds the reason the member pins no longer need one:
+  a `CalleePin::Family` is the MANGLED SYMBOL of one sibling
+  specialization, not a coordinate inside a declaration.
+* `TypeArena::pinned_field(t, depth, index)` and `class_at_depth` are the
+  one home for reading those coordinates - a base is a `TypeRef`, so only
+  something holding the arena can follow the chain.  `TypeMapper`'s two
+  copies forward to them.
+* `CallSpecializer::derive_receiver_type` reads the pin.  Its two
+  `get_field(ma.member)` calls were the last callers of
+  `StructType::get_field` and `ClassType::get_field` anywhere in
+  `compiler/src`, `tools` or `tests`, and both doors are deleted with
+  them.
+* `place_emitter`'s coverage control gains a second arm (below).
+
+#### Measured after the change
+
+`corpus2.sh sp2` and `sp3`, 0 failing halves, `OVERALL PASS (unit: ok;
+compile-fail: 213 passed; projects: 73 passed)` - the same as the
+pre-change run:
+
+* **`derive_receiver_type`: 80 asks, every one answered by a CARRIED pin,
+  and the field it names is the field the leaf lookup finds at every one**
+  (`SHADOW-DERIVE\tstruct\tagree\tcarried` x80; 44 unit, 28 projects, 7
+  examples, 1 LSP - the same 80 asks §8.294 measured with a pin at none of
+  them).  0 `PIN-MISSING`, 0 `DIFFER`, class arm still never entered.
+* **Codegen reads a carried pin 0 times in 543,083 field accesses**
+  (`SHADOW-CGPIN`: 543,083 `walked mapped`, 0 `carried`).  The
+  post-monomorphization sema walk re-answers every member access before
+  codegen sees it, so E0622's "no sema walk answered this node" refuses
+  exactly the population it refused before.  The brief's worry that a
+  carried pin would look like a walked one at that control is a measured
+  zero, not an argument.
+* 0 of 4,128 objects moved (`hash-tree.sh x1` vs `v1b`: examples 0 of
+  1,126, tests 0 of 3,002).  346 warnings, unchanged.
+
+#### The control, as a pair
+
+The coverage control at `place_emitter.cryo` refused a member access whose
+pin was `None`.  A pin whose coordinates the type does NOT have fell past
+it: `field_idx` stayed -1, the access emitted a null place, and the
+half-written function was stripped later.  That arm is now a refusal too,
+and it names whether the pin was walked or carried.
+
+Mutation: `member_resolver.cryo` writes `MemberPin::Field(depth, index +
+1000)` at the one site that answers an ordinary field access.
+
+* **Old control** (the `field_idx < 0` arm disabled, everything else as
+  built) over that tree: `error: codegen failed for module std::core::ptr`
+  and twenty more like it, **0 occurrences of E0622** - a failure naming a
+  whole module, with no code, no span, no member and no reason.
+* **New control** over the same tree:
+
+  ```
+  error[E0622]: codegen: member access `ptr` is pinned at field 1000, 0 steps up,
+                which `std::core::ptr::NonNull<u8>` does not have
+                (the pin was written by a sema walk)
+   --> stdlib/core/ptr.cryo:24:16
+  ```
+
+A second mutation, run alone: `carry_resolved_member` offsets the carried
+index by 1000, so only pins that CROSSED a substitution are wrong.  The
+suite stops at `GenericMethodNestedDispatch`, `this.h.relay(w)` - "codegen:
+no method 'relay' found on type `Inner`" - which is `derive_receiver_type`
+failing to reconstruct the receiver, at the exact nested-dispatch shape the
+substituter's comment has always named.  The reader's answer comes from the
+carried pin and from nothing else.
+
+#### The callee half, measured and not built
+
+The brief predicted that carrying identities across substitution converts
+**C 19 + F 2 = 21** rows.  It does not, and the reason is worth writing
+down: only two of the nineteen C rows are downstream of a pin.
+
+| C row | what it does | retired by `CalleePin::Instance`? |
+|---|---|---|
+| `call_emitter.cryo:1148` `family_is_intrinsic` | reads the `CalleePin::Family` arm | yes |
+| `call_resolver.cryo:958` `lookup_func_type` | reads the `CalleePin::Family` arm | yes |
+| `symbol_resolver.cryo:227` `lookup_family_entries` | inside `family_answer`, reached from `resolve_pinned` AND from `resolve_function`, the ten names codegen writes itself (D6) | no - the second caller keeps it |
+| the other 16 (`lookup_family_entries` x5, `lookup_func_type_overloads` x2, `signature_refused` x2, `get_template` x3, `lookup_func_type_exact` x4) | sema composing `Owner::member` or `ns::name` and asking the index, BEFORE any pin exists | no |
+
+The same holds for F: `enforce_callee_visibility(callee: SymbolStr, ...)`
+has three callers, each holding a canonical name and no entry.  Converting
+those sixteen and the two F rows is a DOOR-TYPE change (the endgame
+review's §3 stages 2-4: the door takes an identity and the callers fail to
+compile) and is independent of what a pin holds.  The board's own note that
+item 1 "unblocks C 19 + F 2" bundles a second thing with the pin - a
+`entry_in_module(DefId, leaf) -> OverloadId` door - and that door is itself
+a member-in-owner read, so those rows would move from C to **J**, raising
+the ceiling by about sixteen while zeroing C.  Jake asked for reduction by
+conversion and not by reclassification; whether a composed string becoming
+a typed `(module identity, leaf)` pair counts as one or the other is his
+call, and nothing here assumes an answer.
+
+What the callee half is worth on its own: **152,775 callee pins are dropped
+on clones over the six halves** (`SHADOW-SUBPIN callee`), 9 writers, and it
+would retire 2 C rows.  The drop is correct today - the pin is one
+sibling's mangled symbol - and `drop_stale_callee_pin` is now the single
+door it leaves through, so the writer of an `Instance` pin has one place to
+change.

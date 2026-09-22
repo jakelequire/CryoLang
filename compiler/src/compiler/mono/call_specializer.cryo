@@ -18,8 +18,8 @@ namespace compiler::mono::call_specializer;
 
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, node, NodeKind, pattern, statement, TraitBound, TraitRef,
-    TypeAnnotation
+    declaration, expression, MemberPin, node, NodeKind, pattern, statement, TraitBound,
+    TraitRef, TypeAnnotation
 };
 import compiler::types::{
     generic, user_defined, compound, type_base, arena, type_ref, substitution, resolver, generic_registry, ownership, TypeKind, RefMutability
@@ -707,7 +707,10 @@ type struct MonoCallSpecializer {
     /// cloner has reset the receiver expression's `resolved_type`.  A pure
     /// structural READ over sema-given types: any expression sema typed returns
     /// that type as-is; a member access resolves its object's type, unwraps to the
-    /// underlying struct/class, and reads the named field's DECLARED type.  This is
+    /// underlying struct/class, and reads the DECLARED type of the field at the
+    /// coordinates sema pinned on the access - which the clone carries, because
+    /// a field's position is the same in the template and in every
+    /// instantiation of it.  An access with no pin is not reconstructible.  This is
     /// not inference and it does NOT concretize via the substitution - applying
     /// the subst would mint untracked arena instantiations as a side effect, even
     /// on calls that later bail.  Concretization isn't needed for the cases this
@@ -742,12 +745,12 @@ type struct MonoCallSpecializer {
             depth += 1;
         }
         if (bt == null) { return TypeRef::invalid(); }
-        if (bt.kind == TypeKind::Struct) {
-            const fi: FieldInfo* = (bt as StructType*).get_field(ma.member);
-            if (fi != null) { return fi.field_type; }
-        } else if (bt.kind == TypeKind::Class) {
-            const fi: FieldInfo* = (bt as ClassType*).get_field(ma.member);
-            if (fi != null) { return fi.field_type; }
+        match (ma.resolved_member) {
+            MemberPin::Field(d, i) => {
+                const fi: FieldInfo* = this.arena.pinned_field(bt, d, i);
+                if (fi != null) { return fi.field_type; }
+            }
+            _ => { }
         }
         return TypeRef::invalid();
     }
