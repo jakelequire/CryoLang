@@ -198,6 +198,7 @@ three, and its row carries the count. Read each zero off its own row.
 | the `DefaultRegistry` (`passes/default_expansion.cryo`: the default-expansion pass's table of all-default generic templates keyed by the template's BARE leaf, built on the pass's stack, first-registered-wins, fed from the process-global registry regardless of imports, matched by written spelling with the stamp copied across and ignored) | **DELETED** (§8.254) — the store §8.253's rule found; the pass asks the generic registry by the annotation's stamp (`template_of(def)`, `defaults_of`), the enclosing declarations are held by `DefId`, and a generic parameter needs no scope entry because its stamp is `GenericParam`. The bug it carried - `import std::fs::path;` beside the user's own non-generic `struct PathBuf`, and `p.n` refused E0204 - is pinned by the project `default_expansion_by_stamp` (runs, exit 7, under this compiler; E0204 twice under the pin `db5af63c`). Both rewrite sites are D23 doors: the named annotation through `require`, the scope segment through `require_scope_res`; the name layer stamps the `static match` scrutinee it had left for the type resolver, which was every Pending slot at the site on a green program (2,517 of 2,531 over the six halves; the other 14 are refused programs' undeclared names) | — | `grep -c 'DefaultRegistry' compiler/src/compiler/passes/default_expansion.cryo` → **0**; `grep -c 'template_of(d)' compiler/src/compiler/passes/default_expansion.cryo` → **1**; `grep -c 'this.stamp_annotation(node.scrutinee);' compiler/src/compiler/resolver/name_resolution.cryo` → **2**; `grep -c '"outcome": "run"' tests/tests/projects/default_expansion_by_stamp/test.json` → **1** | §8.253, §8.254 |
 | the tree's other map owners, EXCLUDED under the store rule with a reason each (`InternTable`, `Scope`, `ResolutionMap`, `ModuleLoader`, `Monomorphizer`, `MonoState`, `SemaState`, `MoveChecker`, `DeadCodeChecker`, `FunctionRegistry`, `GlobalRegistry`, `TypeMapperCache`, `DiagRenderer`, `DiagnosticSink`, `Runner`) | **MEASURED, NOT STORES** (§8.241 for the context's members; §8.253 for the population as the tree gives it) — the rule is "a type that owns a map", read from the tree on every `lane-check` run: 21 owners: 6 stores and 15 exclusions (the seventh store, `TypeUtils`, is the funnel and owns no map; 22 and 7 at §8.253, before §8.254 deleted the `DefaultRegistry` the rule had found). Each exclusion's reason is in the script's `EXCLUDED` table and falls into four kinds: keyed by SOURCE POSITION (`ResolutionMap`, `DeadCodeChecker`: `make_key(span)`), by an OUTPUT name after resolution has answered (`FunctionRegistry`/`GlobalRegistry` by the linker symbol codegen minted, `Monomorphizer`/`MonoState` by the mangled spec symbol, `SemaState.closure_spec_map` by a `DefId`), by a FILE PATH, a namespace at discovery, diagnostic text or a subcommand (`DiagRenderer`, `ModuleLoader`, `DiagnosticSink`, `Runner`), or a pass's OWN RIB of the locals it just bound (`SemaState`, `MoveChecker`, and `Scope`, the resolver's, with 0 `Scope`-typed receivers outside `compiler/resolver/`) - the population `LOOKUP_LOCAL` counts calls on. `TypeResolver`, `TypeChecker`, `PhaseArtifacts`, `DirectiveRegistry` own no map and are not candidates. The resolver's asks from outside its pass stay `REENTRY` (11; 12 at §8.241, the two by-spelling asks type resolution made of the cursor's scope deleted in §8.244, the facade search's `Resolver::ns_written_as` in §8.258; +2 in §8.301, one door each for the async lowering and the closure synthesis, which DECLARE bindings and take their identities from the allocator that hands them out - the only increase this ratchet has been re-pinned for, ruled by Jake 2026-09-22). **Rule 1b's array owners (§8.279, widened to arrays of RECORDS in §8.284): 47 types owning no map, an array of names or of records carrying a key-typed field, and a name-taking method, every one an exclusion in `EXCLUDED_ARRAYS` with its reason** - AST nodes' own written segments (`ImportDeclNode`, `ModuleDeclNode`, `LambdaExprNode`, `AsmBlockStmtNode`, `ExternBlockNode`), a pass's own rib (`AsyncLower`, `BindingCapture`, `BindingRename`), file paths, flags and texts (`CompilationContext`, `ProjectConfig`, `PhaseArtifacts`, `VendorEntry`, `ModuleKeyTable`, `ParsedArgs`, `ParserBase`, `ErrorType`, `ImportReport`, `Importer`, `DiagSink`, `StringCache`), displays beside a symbol key (`ASTTypeSubstituter`, `TemplateEntry` - whose `param_names` the 8 spelling compares in `call_resolver` still read, the arena unit's residue), a member table inside its owner (`ImplBlockNode`, `TraitType`, `ResolutionContext`'s `This::Member` bindings, and since §8.284 the user-defined types' own members - `StructType`, `ClassType`, `EnumType`, `TraitDeclNode`'s associated types), the graph's namespace symbols (`ModuleInfo`), one path's segments (`QualifiedName`), and the 16 record-array owners §8.284 placed - seven AST nodes' own written members, `Diagnostic`/`Suggestion`/`TokenStream`/`Parser`/`Command`/`Lockfile`/`VendorRegistry`/`DirectiveRegistry` texts, flags and file paths, `DropInserter`'s own rib; 0 stores among them | — | `python3 scripts/lane-gate.py --row REENTRY` → **11**; `python3 scripts/lane-gate.py --names \| grep -c '^  [A-Za-z]* *excluded: '` → **15**; `python3 scripts/lane-gate.py --names \| grep -c '^  [A-Za-z]* *STORE$'` → **6**; `python3 scripts/lane-gate.py --names \| grep -c '^  [A-Za-z]* *excluded (array): '` → **47**; `python3 scripts/lane-gate.py --names \| grep -c '^array owners (47)'` → **1** | §8.241, §8.253, §8.254, §8.279 |
 | move state keyed by how a binding is SPELLED (`MoveChecker`: `moved_keys`, `polled_keys`, `carried_keys`, `captured_decl_keys`, the `types` map and the partial-move owner, all pushed and tested by the interned name, reset at function entry with no scope pop) - two bindings of one spelling in one function were ONE slot, which refused a correct program with the other binding's move underlined AND, where a branch declared the shadow, dropped the outer binding's move from the join union and ACCEPTED a double free | **DELETED** - the sets take the `SymbolID` the resolver stamped on the declaration and answers a use with (`Res::Local`); `alloc_synthetic_binding` gives one to every binding a pass synthesizes after name resolution (the async lowering's 6 sites, the closure synthesis's 1), and where such a pass writes a USE of its own declaration the identity is passed to the builder (`ident_bound`) rather than looked up - a table from spelling to binding was built there first and the probe broke it, 5 rebinds in the LSP build (`c$L6$p` twice), because a carried local's per-state shadow is re-declared under one spelling in every resume block. `pat_binding_keys` stays by spelling with its reason at the field: a `PatternBinding` carries no identity and the `?` desugaring builds two of them after resolution. **`DropInserter` is NOT converted**: it keys the same sets the same way, its own comment accepts the resulting leak, and the leak is reproduced (one binding renamed is the whole difference) | the pin accepts the double free and the new compiler refuses it: `grep -c '^error\[E0452\]'` over `cryo check tests/tests/negative/E0452_shadow_declaration_hid_outer_move.cryo` is **0** under `bin/cryo.exe` and **1** under the built compiler; 0 of 4,128 objects moved | `grep -c 'name\.id' compiler/src/compiler/passes/move_check.cryo` → **3** (all three the pattern-binding set; the dot is escaped because an unescaped one matches prose); `grep -c 'moved_keys:  u64\[\]' compiler/src/compiler/passes/move_check.cryo` → **1**; `grep -c 'local_sym' compiler/src/compiler/resolver/res.cryo` → **3**; `grep -rho 'alloc_synthetic_binding' compiler/src --include=*.cryo \| wc -l` → **12**; `ls tests/tests/negative/E0452_shadow_declaration_hid_outer_move.cryo \| wc -l` → **1**; `grep -c 'moved_keys' compiler/src/compiler/passes/drop_insertion.cryo` → **20** (the mirror pass, still by spelling) | §8.301 |
+| a bare-leaf search over the whole type arena that the residue does not count (`sema/diagnostics.cryo`'s `find_shadowed_type_candidates`: every `arena.types[i]`, its qualified name resolved to a `string`, `QualifiedName::leaf_of` compared against the needle - the four member lookups INSIDE the loop are rowed J, the loop is in nothing) | **MEASURED, NOT WIDENED** - rule 1c recognises a name-keyed loop by the ELEMENT'S OWN interned field compared with `.equals(`, `==` or `!=`, and this comparison is on a derived `string`, so nothing matches and `SCANNED_ARRAYS` never gets asked; adding the array to that table would not reach it. A SECOND shape is uncounted for a third reason - `name_resolution.cryo:524` scans `Scope.symbols` and hands each resolved spelling to `CompilationContext::modules_written_as`, a door the lane gate does not list. **Widening rule 1c is Jake's**, because it moves D32's pinned counts: predicted population 448 → 449, J 230 → 231 (the `hint` class - both callers only attach a did-you-mean to a diagnostic already being emitted, `call_resolver.cryo:3425` / `:3649`), convertible unchanged at 100 | the instrument carries its own control, because one hit reads exactly like a parser that matched nothing | `python3 scripts/ns-migration/derived-name-scans.py \| tail -1` → **1** (the row is read off the last field); `python3 scripts/ns-migration/derived-name-scans.py --selftest \| grep -c '^selftest: OK'` → **1**; `grep -c 'modules_written_as' scripts/lane-gate.py` → **0** | §8.302 |
 
 **The arena holds no leaf index of either kind.** §8.121 deleted the LOOKUP
 LANE; the diagnostic map that survived it (the E0203 did-you-mean pool, E0155
@@ -37951,3 +37952,83 @@ in this commit, pin integrity); `test-census` OK - 2,140 unit, 214 compile-fail,
 73 projects, every pinned entry accounted for; `lsp-check` OK (264 modules, 0
 errors); `cross-check` OK (`x86_64-pc-linux-gnu`, 0 errors); object hashes
 against §8.299's `x1` baseline, 0 unexplained movers.
+
+---
+
+### 8.302 The residue counts the member lookups INSIDE a bare-leaf search over the whole type arena and calls each one justified, while the search itself is outside the population: rule 1c reads a comparison on the element's interned field, and this one compares a name resolved into a `string` first - one site, measured, with the instrument and its control committed; no count moved, because the count is Jake's - 2026-09-22
+
+`find_shadowed_type_candidates` (`compiler/src/compiler/sema/diagnostics.cryo`)
+walks every type in the arena and keeps the ones whose LEAF matches a spelling:
+
+```cryo
+for (mut i: i64 = 0; i < n; i++) {
+    const t: Type* = this.arena.types[i];
+    ...
+    const qstr: string = this.intern.resolve(qname);
+    const leaf: string = QualifiedName::leaf_of(qstr);
+    if (leaf != needle) { continue; }        // a bare-leaf search over the arena
+}
+```
+
+The residue holds four rows from inside that loop -
+`compiler/sema/diagnostics.cryo:310`, `:314`, `:319` twice - each a member
+lookup classified **J**, "a struct's method by its leaf off the `StructType` in
+hand". The owner in hand is every type in the arena, reached by scanning for a
+leaf. **The scan is not in the population at all.**
+
+#### Why rule 1c cannot see it
+
+Rule 1c finds a name-keyed read written as a loop by looking for the ELEMENT'S
+OWN interned field compared with `.equals(`, `==` or `!=`. This loop resolves
+the name to a `string` first and compares that, so there is no interned field in
+the comparison and nothing matches. The array being absent from `SCANNED_ARRAYS`
+is downstream of that: adding `TypeArena.types` to the table would not make this
+loop counted, because the table is consulted only once a scan has been
+RECOGNISED.
+
+The measurement:
+`python3 scripts/ns-migration/derived-name-scans.py` → **1**, and
+`--selftest` → `OK -- 2 derived-name scans seen, 3 near-misses refused`. The
+self-test is the control and is the point: one hit reads exactly like a parser
+that matched nothing, which is how this tree has been fooled before. The three
+shapes it must refuse are a derivation outside any loop, a comparison on the
+interned field (rule 1c's own shape, which must not be double-counted), and a
+derivation after the loop closed.
+
+#### A second, different blind spot in the same area
+
+The scan over `Scope.symbols` at
+`compiler/src/compiler/resolver/name_resolution.cryo:524` is uncounted for a
+THIRD reason: it neither compares an interned field nor a derived string - it
+hands the resolved spelling to a door, `CompilationContext::modules_written_as`,
+which is not among the doors the lane gate counts
+(`grep -c 'modules_written_as' scripts/lane-gate.py` → **0**, against 7 mentions
+in `compiler/src`). So the two examples that prompted this look alike and are
+not: one is a comparison the pattern cannot match, the other is a door nobody
+listed.
+
+#### What this predicts, and what is Jake's
+
+Widening rule 1c to a comparison on a derived name adds **one** site. Both its
+callers use it only to attach a did-you-mean suggestion to a diagnostic already
+being emitted (`call_resolver.cryo:3425` and `:3649`, each followed by
+`attach_shadow_import_suggestions`), and it decides no resolution, so it belongs
+in the residue's existing `hint` class - text in, text out, beside
+`find_trait_defining_method`. Predicted: population **448 → 449**, J **230 →
+231**, convertible unchanged at **100**.
+
+**Not done here.** Moving what the residue counts moves D32's pinned numbers,
+and D32's count is Jake's (§8.276, and the ruling in §8.300 that the ceiling
+comes down by conversion rather than by relabelling applies in both directions).
+The instrument is committed so the number can be re-derived rather than
+recalled; the widening, the classification and the re-pin are one decision and
+it is his.
+
+#### The pattern this makes six of
+
+A hand-maintained list in this tree has now been found incomplete six times.
+What this round adds is that the list was the wrong thing to look at: the
+omission was in the RECOGNISER, and a list can only be complete about what the
+recogniser hands it. §8.301, landed the same day, is the same lesson from the
+other side - a table from spelling to binding inside the async lowering looked
+correct and was broken by a probe on the first try.
