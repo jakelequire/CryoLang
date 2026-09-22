@@ -37407,3 +37407,136 @@ OK; `cross-check` OK; `test-census` OK.  One miss: the first build read
 `int` against an `i64` length (W0005), copied from the loop beside it,
 which carries the same warning; the counter is `i64` and the count is 478
 again.
+
+### 8.298 Audit round W, the write side: every name-keyed registration into a declaration-holding store recorded with its key and the declaration's own identity, 2,207,836 registrations over 318 processes - no single-valued store ever received two declarations under one key except the three overlapping impls D28 refuses, no declaration was registered under two keys except the clone pair §8.216 documents and C symbols declared in two extern blocks, a bare clone identifier never held two symbols (and with the disambiguation disabled it does, and the compiler refuses the program); the round's one finding is outside the stores it instrumented - two source files claiming one namespace, the later silently replacing the earlier in the loader's map, `E0504` declared and emitted by nothing - 2026-09-22
+
+> **Status:** LANDED (instruments; no compiler change).
+> `scripts/ns-migration/8.298/` - `instrument_registrars.py` (on/off: the
+> 19 registrars print `SHADOW W <door> <key> <identity>`),
+> `instrument_intern_dump.py` (every new symbol printed once, so a key is
+> spelled per process), `write_side.py` (collisions and aliases per door,
+> per process), `signatures.py` (the overload registry's questions),
+> `mutation_no_disambiguation.py` (the inversion).  §0's decisions block
+> in the handoff gains the namespace finding.
+
+#### The attack, stated before it ran
+
+Every audit round so far - the hand list of stores (§8.241, §8.253), the
+name-pattern readers (§8.241), the `string`-keyed readers, the record
+arrays (§8.284), the inline loops (§8.293) - audited READERS.  This round
+asks the writers: for every name-keyed registration into a store that
+holds declarations, what is the key, and what was registered under it?
+Two questions no read-side audit can ask: **collision** - one key given
+two different declarations in one program (last-writer-wins, the shape
+the deleted bare-leaf maps had, invisible to a reader that gets one
+answer and cannot know there was another); **aliasing** - one declaration
+registered under two keys (the shape `method_returns` had until §8.246, a
+second spelling a reader keyed by the first never matches).  The identity
+is what the key is not: the arena id for a type (`t<id>`), the AST node's
+address for an impl block, trait declaration, inherent owner or a
+constant's initializer (`n<addr>`), the mangled symbol at its span for a
+signature (`s<symbol>@file:line`).  A repeat of the same identity under
+the same key is neither and is counted apart.  Nineteen registrars on the
+four stores: the declaration index (`register_type`,
+`register_type_reverse_only`, `register_signature`,
+`register_global_with_module`), the registry (`register_impl_block`,
+`register_inherent_impl_block`, `register_trait_impl`,
+`register_trait_decl`, `register_inherent_owner`, `register_coherence`),
+the arena's six creators, the constant table's two.  Over `corpus2.sh
+ws`'s six halves, one process at a time (the intern dump's first symbol
+marks a process: 318 of them; 2,207,836 registrations).
+
+#### What it found in the stores: nothing that a reader could not see
+
+| door | asks | repeats | collisions | aliases | reading |
+|---|---|---|---|---|---|
+| `register_type` | 386,843 | 314,887 | **0** | **0** | idempotent re-registration across walks; one type per key |
+| the arena's six creators | 64,538 | 0 | **0** | **0** | create-or-retrieve by qualified name; one type per name |
+| `const_register` / `_enum` | 265,381 | 0 | **0** | **0** | |
+| `register_trait_decl`, `register_inherent_owner`, `register_type_reverse_only` | 43,813 | 0 | **0** | **0** | |
+| `register_coherence` | 80,853 | 0 | **3** | 0 | the three `E0308` negatives - D28's overlapping heads, refused at this door; the detector's control |
+| `register_impl_block`, `register_inherent_impl_block`, `register_trait_impl` | 302,312 | 100,015 | 15,385 | 0 | sets by design: a type's blocks, heads under one `(trait, target)` selected by unification; repeats deduplicated by block identity |
+| `register_signature` | 810,214 | 791 | 19,097 | 8,385 | a family is the overload set by design; the questions that survive are asked of the SYMBOL, below |
+| `register_global_with_module` | 253,882 | 0 | 0 | (2,862) | the door takes no node; its identity here is the global's TYPE, which globals share - not measured at this door; a second global under one `(namespace, leaf)` is refused where it is declared |
+
+The signature registry, by symbol (`signatures.py`): **a bare family key
+- a monomorphized clone's identifier, the `CalleePin::Family` key - holding
+two symbols: 0.**  A symbol registered from two spans: 877 = 863 C-linkage
+symbols declared in two extern blocks (`malloc` as an intrinsic and in
+`libc`; a test's own `extern strlen` beside `libc`'s - a C symbol's only
+identity is its link name, and W0011 covers a differing signature) + 8
+in the `E0308` negatives (refused) + 2 template methods of two heads of
+one trait on one generic owner (`Show for Wrap<T, Alpha>` and `Show for
+Wrap<T, Beta>`: the template's symbol carries no head arguments and is
+never emitted; the specializations' symbols differ) + 4 stdout
+interleaving artefacts of the negatives' capture.  A symbol under two
+family keys: 8,391 the pair `type_resolution.cryo` writes for a clone that
+is not a source declaration (its bare identifier, the Family key, and the
+module-qualified form - §8.216's "What this leaves", retired by
+`Instance { def, substs }`, decision 2) + 862 the same C-linkage symbols
+under `intrinsics::malloc` and `libc::malloc`; Cryo-mangled otherwise: 0.
+
+**The zero's control.**  A clone's bare identifier is unique by a
+name-keyed scan: `finalize_disambiguation` flags two free-function
+templates with one leaf in different modules once, at the first
+`process_all`, and `spec_base_name` folds the module into the flagged
+ones' identifiers (`9app_a_tag$Li$G`, `9app_b_tag$Li$G`); an unflagged
+leaf's clone is bare (`6offset$Lh$G`).  With the flagging disabled
+(`mutation_no_disambiguation.py`), the two-module probe registers both
+clones under `3tag$Li$G` - `signatures.py` reports **1** - and the
+compiler refuses the program: `E0900: codegen: `3tag$Li$G` names several
+functions and the call was not pinned to one of them`.  So the poisoned
+write is caught at the read (§8.216's `family_answer`), and the zero is a
+measured one.  The scan's latch is worth a line: a free-function template
+registered AFTER the first `process_all` (the LSP's long-lived registry
+across edits is the candidate) is never flagged; the corpus builds every
+program whole and holds none.
+
+#### The finding, outside the stores: one namespace, two files
+
+The round's first probe asked the write side of the one store the
+instrument did not reach - the loader's namespace map, a DATA placement
+(file paths) under rule 1b - and it answered:
+
+```cryo
+// src/a.cryo
+namespace app::shared;
+type struct Thing { x: i32; }
+implement Thing { static make() -> Thing { return Thing { x: 1 }; } }
+
+// src/b.cryo
+namespace app::shared;
+type struct Thing { x: i64; y: i64; }
+implement Thing { static build() -> Thing { return Thing { x: 20, y: 300 }; } }
+
+// src/main.cryo
+import app::shared;
+import app::shared::{ Thing };
+function main() -> i32 {
+    const t: Thing = Thing::build();   // b.cryo's; compiles, exit 64 (320 & 255)
+    const u: Thing = Thing::make();    // E0233: cannot find `Thing::make` - a.cryo was never compiled
+    return (t.x + t.y) as i32;
+}
+```
+
+`ModuleLoader::scan_file_namespace` does `ns_map.insert(namespace_name,
+file_path)` - `HashMap.insert` is last-wins, the comment beside it says so
+for re-scans of one path - and a second FILE under one namespace replaces
+the first with no diagnostic; the first file is never loaded, so nothing
+downstream can see the collision (the arena's create-or-retrieve would
+hand both files' `Thing` one type, but only one file ever reaches it).
+`E0504_NAMESPACE_CONFLICT` is declared in `diag/_module.cryo` and emitted
+by nothing.  The fix is a refusal at the map with that code, and its
+wording is Jake's (the handoff's decisions block, item 8).  In D32's
+terms this is the module lane's store poisoned at registration: every
+`module` J row reads a map that was silently overwritten.
+
+#### Not measured this round
+
+`register_global_with_module` (no node at the door), the resolver's
+`declare_*` scope writes (a pass's own rib, refused on redeclaration where
+written), and the LSP as a writer (one registry across edits: the
+disambiguation latch above is the lead).  The projects that assert the
+compiler's output must NOT contain a name (`visibility_gate` and five
+others) fail under the intern dump, as the audit-stream trap records;
+their build halves pass.
