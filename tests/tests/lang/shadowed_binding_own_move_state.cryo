@@ -1,0 +1,79 @@
+///! A binding declared in an inner block is a NEW binding even when it is
+///! spelled like one already moved in the enclosing scope, so it starts Live
+///! and may be read and consumed.
+///!
+///! Regression: the move set was keyed by the interned spelling, so the two
+///! bindings shared one move-state slot and the inner one was born Moved.
+///! Consuming it was refused with E0452, and the diagnostic pointed at the
+///! OUTER binding's move - a correct program rejected, with a span naming a
+///! line that has nothing to do with it.  Renaming the inner binding was the
+///! entire difference.
+///!
+///! The drop counts are what make this more than a "it compiles" test: each
+///! allocation must be released exactly once, so a fix that merely stopped
+///! the diagnostic while leaving the two bindings sharing state would show up
+///! here as a missing or doubled release.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::ShadowedBindingOwnMoveState;
+
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::drop;
+import std::core::drop::{ Drop };
+import std::test::error;
+import std::test::error::{ TestError };
+import std::test::assert;
+import std::test::assert::{ expect_eq };
+
+mut g_dropped: i32 = 0;
+function reset() -> void { g_dropped = 0; }
+function dropped() -> i32 { return g_dropped; }
+
+type struct Res {
+    tag: i32;
+}
+implement trait Drop for struct Res {
+    drop(mut &this) -> void { g_dropped = g_dropped + 1; }
+}
+
+function consume(r: Res) -> i32 {
+    // by-value owning parameter: drops `r` at function exit.
+    return r.tag;
+}
+
+![test]
+function inner_shadow_starts_live_after_outer_was_moved() -> Result<(), TestError> {
+    reset();
+    mut total: i32 = 0;
+    mut r: Res = Res { tag: 1 };
+    total = total + consume(r);          // moves the outer `r`
+    if (total == 1) {
+        mut r: Res = Res { tag: 20 };    // a different binding, freshly live
+        total = total + consume(r);      // legal: nothing has moved THIS one
+    }
+    match (expect_eq(total, 21)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    // Two allocations, two releases: one per binding, neither shared.
+    return expect_eq(dropped(), 2);
+}
+
+![test]
+function sibling_blocks_reusing_one_spelling_each_release_once()
+        -> Result<(), TestError> {
+    reset();
+    mut total: i32 = 0;
+    if (1 > 0) {
+        mut r: Res = Res { tag: 3 };
+        total = total + consume(r);
+    }
+    if (1 > 0) {
+        mut r: Res = Res { tag: 4 };     // a third binding, same spelling again
+        total = total + consume(r);
+    }
+    match (expect_eq(total, 7)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(dropped(), 2);
+}

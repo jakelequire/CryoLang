@@ -29,6 +29,7 @@ import compiler::resolver::{
 };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, Res, ResBase, ResSlot };
+import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::ast;
@@ -354,6 +355,10 @@ type struct AsyncLower {
     arena:    TypeArena*;
     intern:   InternTable*;
     ctx:      CompilationContext*;
+    /// The allocator a synthesized binding's identity comes from.  This
+    /// lowering builds bodies after name resolution ran, so nothing else can
+    /// say that two locals it declares are two locals.
+    resolver: Resolver*;
     // Borrowed sema peer: re-derives a `match`-arm pattern binding's payload
     // type (`resolve_variant_payload_types`) and answers `match_is_exhaustive`,
     // neither of which is cached on the AST. Used only by the `match`-arm await
@@ -418,6 +423,11 @@ type struct AsyncLower {
     // ordinary use-after-move, so `E0452` is reported by the existing pass
     // rather than re-derived here.
     subst_hoist_name: SymbolStr;
+    // The binding `subst_hoist_name` spells.  Carried beside the spelling
+    // because every later mention in the run is rebound to THIS declaration,
+    // and that is what makes the give-away and the later read one binding's
+    // move and use rather than two unrelated expressions.
+    subst_hoist_sym:  SymbolID;
     subst_hoist_stmt: StatementNode*;
     subst_hoist_seq:  i64;
     // Nonzero inside a position that is only CONDITIONALLY evaluated, or one
@@ -432,7 +442,8 @@ type struct AsyncLower {
     subst_can_hoist: boolean;
 
     static null() -> AsyncLower {
-        return AsyncLower { arena: null, intern: null, ctx: null, patterns: null, counter: 0,
+        return AsyncLower { arena: null, intern: null, ctx: null, resolver: null,
+                            patterns: null, counter: 0,
                             frame_locals: [], frame_local_src: [], pending: [],
                             edge_from: [], edge_to: [],
                             this_sym: SymbolStr::empty(), this_amp_sym: SymbolStr::empty(),
@@ -442,6 +453,7 @@ type struct AsyncLower {
                             subst_carrier_struct: TypeRef::invalid(),
                             subst_carrier_takes: false,
                             subst_hoist_name: SymbolStr::empty(),
+                            subst_hoist_sym: SymbolID::invalid(),
                             subst_hoist_stmt: null, subst_hoist_seq: 0,
                             subst_cond_depth: 0, subst_can_hoist: false };
     }
@@ -513,6 +525,10 @@ type struct AsyncLower {
         this.intern   = intern;
         this.ctx      = ctx;
         this.patterns = patterns;
+        // Held from here rather than asked for at each mint: this lowering
+        // declares bindings, and a binding's identity comes from the one
+        // allocator that hands them out.  One door, wired once.
+        this.resolver = ctx.get_resolver();
         this.this_sym     = intern.intern("this");
         this.this_amp_sym = intern.intern("&this");
         this.recv_sym     = intern.intern("this$recv");
@@ -1351,9 +1367,24 @@ type struct AsyncLower {
         return ti as ExpressionNode*;
     }
 
+    /// A use of a name this lowering did not bind - the receiver, a field, the
+    /// poll context.  Whoever bound it says what it refers to.
     ident(&this, name: SymbolStr, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        return this.ident_bound(name, SymbolID::invalid(), ty, span);
+    }
+
+    /// A use of a binding THIS lowering declared, named by that binding.
+    ///
+    /// The caller passes the symbol rather than looking one up by spelling,
+    /// because a spelling does not identify a synthesized binding either: a
+    /// carried local's per-state shadow is re-declared under one renamed
+    /// spelling in every resume block, so a table from spelling to binding
+    /// hands an earlier use the LAST declaration's identity.
+    ident_bound(&this, name: SymbolStr, sym: SymbolID, ty: TypeRef,
+                span: SourceSpan) -> ExpressionNode* {
         mut id: IdentifierNode* = new IdentifierNode(name, span);
         id.set_resolved_type(ty);
+        if (sym.is_valid()) { id.set_res(Res::Local(sym)); }
         return id as ExpressionNode*;
     }
 
@@ -1464,9 +1495,22 @@ type struct AsyncLower {
         return scope as ExpressionNode*;
     }
 
-    var_decl_stmt(&this, name: SymbolStr, mutable: boolean, ty: TypeRef,
+    /// Declare a synthetic local nothing needs to name by identity afterwards.
+    var_decl_stmt(mut &this, name: SymbolStr, mutable: boolean, ty: TypeRef,
                   init: ExpressionNode*, span: SourceSpan) -> StatementNode* {
+        return this.var_decl_stmt_bound(
+            name, this.resolver.alloc_synthetic_binding(),
+            mutable, ty, init, span);
+    }
+
+    /// Declare a synthetic local under a binding the CALLER holds, so the uses
+    /// it goes on to write (through `ident_bound`) name this declaration and
+    /// not a later one that reuses the spelling.
+    var_decl_stmt_bound(mut &this, name: SymbolStr, sym: SymbolID,
+                        mutable: boolean, ty: TypeRef,
+                        init: ExpressionNode*, span: SourceSpan) -> StatementNode* {
         mut vd: VarDeclNode* = new VarDeclNode(name, span);
+        vd.set_sym_id(sym);
         vd.set_mutable(mutable);
         vd.set_resolved_type(ty);
         vd.set_initializer(init);
@@ -1505,6 +1549,7 @@ type struct AsyncLower {
                 this_ref as ExpressionNode*, fname, span, span);
             access.set_resolved_type(slot_ty);
             mut shadow: VarDeclNode* = new VarDeclNode(fname, span);
+            shadow.set_sym_id(this.resolver.alloc_synthetic_binding());
             shadow.set_mutable(false);
             shadow.set_resolved_type(slot_ty);
             shadow.set_initializer(access as ExpressionNode*);
@@ -1773,9 +1818,11 @@ type struct AsyncLower {
             fmt::format("%s$gv%lld", this.intern.resolve(name), this.subst_hoist_seq));
         this.subst_hoist_seq  = this.subst_hoist_seq + 1;
         this.subst_hoist_name = gv;
-        this.subst_hoist_stmt = this.var_decl_stmt(
-            gv, true, ty, this.subst_giveaway_target(ty, use_span), use_span);
-        return this.ident(gv, ty, use_span);
+        this.subst_hoist_sym  = this.resolver.alloc_synthetic_binding();
+        this.subst_hoist_stmt = this.var_decl_stmt_bound(
+            gv, this.subst_hoist_sym, true, ty,
+            this.subst_giveaway_target(ty, use_span), use_span);
+        return this.ident_bound(gv, this.subst_hoist_sym, ty, use_span);
     }
 
     /// `this.<carrier>` — the carrier field as a place.
@@ -1822,7 +1869,8 @@ type struct AsyncLower {
                     // position spells it the same way: a by-value mention here
                     // is a second move of that local and a borrow is a use of
                     // it after the move - exactly what MoveCheck needs to see.
-                    target = this.ident(this.subst_hoist_name, ty, use_span);
+                    target = this.ident_bound(this.subst_hoist_name,
+                                              this.subst_hoist_sym, ty, use_span);
                 } else if (by_value && this.subst_carrier_takes) {
                     target = this.hoist_giveaway(name, ty, use_span, span);
                 } else {
@@ -2004,6 +2052,7 @@ type struct AsyncLower {
         if (s == null) { return; }
         const absorbs: boolean = (s.kind == NodeKind::BlockStatement);
         const saved: SymbolStr = this.subst_hoist_name;
+        const saved_sym: SymbolID = this.subst_hoist_sym;
         this.subst_hoist_name = SymbolStr::empty();
         if (!absorbs) { this.subst_cond_depth = this.subst_cond_depth + 1; }
         this.subst_name_stmt(s, name, field, struct_ref, ty, span);
@@ -2012,6 +2061,7 @@ type struct AsyncLower {
             this.subst_hoist_name = SymbolStr::empty();
         } else {
             this.subst_hoist_name = saved;
+            this.subst_hoist_sym  = saved_sym;
         }
     }
 
@@ -2890,11 +2940,13 @@ type struct AsyncLower {
         // sub-future's address is the field's and holds still for as long as the
         // enclosing future does.
         const subp_sym: SymbolStr = this.intern.intern(fmt::format("__subp_%lld", k));
+        const subp_id:  SymbolID  = this.resolver.alloc_synthetic_binding();
         const fi_ptr: TypeRef = this.arena.get_pointer_to(fi);
         mut subp_call: ExpressionNode* = this.method_call0(
             this.member(this.this_ident(sm.struct_ref, span), fut_sym, fut_opt, span),
             "unwrap_ptr", fi_ptr, span);
-        sm.blocks[resume].add_statement(this.var_decl_stmt(subp_sym, true, fi_ptr, subp_call, span));
+        sm.blocks[resume].add_statement(
+            this.var_decl_stmt_bound(subp_sym, subp_id, true, fi_ptr, subp_call, span));
 
         // The sub-future recorded the ADDRESS of its receiver when it was built.
         // No poll trusts that address: the receiver is re-addressed from this
@@ -2905,7 +2957,8 @@ type struct AsyncLower {
         // whose storage did move would otherwise be read and written through a
         // stale pointer from the second poll onwards, silently.
         if (!this.emit_recv_refresh(sm, resume, aw.operand,
-                                    this.ident(subp_sym, fi_ptr, span), aw.span, span)) {
+                                    this.ident_bound(subp_sym, subp_id, fi_ptr, span),
+                                    aw.span, span)) {
             sm.ok = false; return cur;
         }
 
@@ -2918,10 +2971,12 @@ type struct AsyncLower {
         const sub_poll_out: TypeRef =
             this.ctx.generic_registry.instantiate(sm.poll_base, &sub_poll_args);
         const poll_sym: SymbolStr = this.intern.intern(fmt::format("__poll_%lld", k));
+        const poll_id:  SymbolID  = this.resolver.alloc_synthetic_binding();
         mut poll_call: ExpressionNode* = this.method_call1(
-            this.ident(subp_sym, fi_ptr, span), "poll",
+            this.ident_bound(subp_sym, subp_id, fi_ptr, span), "poll",
             this.ident(sm.cx_sym, sm.ctx_ptr_ty, span), sub_poll_out, span);
-        sm.blocks[resume].add_statement(this.var_decl_stmt(poll_sym, true, sub_poll_out, poll_call, span));
+        sm.blocks[resume].add_statement(
+            this.var_decl_stmt_bound(poll_sym, poll_id, true, sub_poll_out, poll_call, span));
 
         // Suspending leaves the sub-future in its field untouched, so both the
         // state it accumulated and its address survive to the next poll.
@@ -2930,7 +2985,8 @@ type struct AsyncLower {
             this.u32_lit(resume as u64, span), span));
         pend.add_statement(new ReturnStmtNode(this.poll_pending(sm.poll_out, span), span) as StatementNode*);
         sm.blocks[resume].add_statement(new IfStmtNode(
-            this.method_call0(this.ident(poll_sym, sub_poll_out, span), "is_pending", this.arena.get_bool(), span),
+            this.method_call0(this.ident_bound(poll_sym, poll_id, sub_poll_out, span),
+                              "is_pending", this.arena.get_bool(), span),
             pend as StatementNode*, null, span) as StatementNode*);
 
         // A completed sub-future is moved out of its field so its destructor runs
@@ -2945,10 +3001,12 @@ type struct AsyncLower {
         sm.blocks[resume].add_statement(this.var_decl_stmt(done_sym, true, fut_opt, done_take, span));
 
         const await_sym: SymbolStr = this.intern.intern(fmt::format("__await_%lld", k));
-        sm.blocks[resume].add_statement(this.var_decl_stmt(await_sym, false, ao,
-            this.method_call0(this.ident(poll_sym, sub_poll_out, span), "into_ready", ao, span), span));
+        const await_id:  SymbolID  = this.resolver.alloc_synthetic_binding();
+        sm.blocks[resume].add_statement(this.var_decl_stmt_bound(await_sym, await_id, false, ao,
+            this.method_call0(this.ident_bound(poll_sym, poll_id, sub_poll_out, span),
+                              "into_ready", ao, span), span));
 
-        this.rewrite_carrier_await(stmt, this.ident(await_sym, ao, span));
+        this.rewrite_carrier_await(stmt, this.ident_bound(await_sym, await_id, ao, span));
         this.rewrite_returns(stmt, sm.poll_out, span);
         sm.blocks[resume].add_statement(stmt);
         return resume;
@@ -6491,6 +6549,7 @@ type struct AsyncLower {
         mut ex_new: CallExprNode* = new CallExprNode(
             ex_scope as ExpressionNode*, span);
         mut ex_decl: VarDeclNode* = new VarDeclNode(ex_sym, span);
+        ex_decl.set_sym_id(this.resolver.alloc_synthetic_binding());
         ex_decl.set_mutable(true);
         ex_decl.set_type_annotation(this.make_type_ann(exec_ty, span));
         ex_decl.set_initializer(ex_new as ExpressionNode*);
@@ -6521,6 +6580,7 @@ type struct AsyncLower {
             // is otherwise reachable only through its where-bound.
             const out_sym: SymbolStr = this.intern.intern("main$out");
             mut out_decl: VarDeclNode* = new VarDeclNode(out_sym, span);
+            out_decl.set_sym_id(this.resolver.alloc_synthetic_binding());
             out_decl.set_mutable(false);
             out_decl.set_type_annotation(this.make_type_ann(i32_ty, span));
             out_decl.set_initializer(drive as ExpressionNode*);
@@ -6677,6 +6737,7 @@ type struct AsyncLower {
             }
             if (recv == null) {
                 recv = new VarDeclNode(this.this_amp_sym, span);
+                recv.set_sym_id(this.resolver.alloc_synthetic_binding());
                 recv.set_mutable(false);
                 // The receiver leads the parameter list, which is where the
                 // consumers that index rather than search expect it.
@@ -6779,6 +6840,7 @@ type struct AsyncLower {
                 this.poll_type_ann(this.output_type_ann(&d, span), span));
         }
         mut cx_param: VarDeclNode* = new VarDeclNode(this.intern.intern("cx"), span);
+        cx_param.set_sym_id(this.resolver.alloc_synthetic_binding());
         cx_param.set_resolved_type(ctx_ptr_ty);
         if (generic) {
             // Concrete, but the specialized clone drops every `resolved_type`, so
