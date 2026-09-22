@@ -545,59 +545,10 @@ edit("compiler/src/compiler/resolver/name_resolution.cryo", [
 """),
 ])
 
-# An intrinsic's parameter and return annotations were never stamped: as
-# keyword primitives they needed no stamp, and the walk skipped them.  As
-# Named annotations they are answered like every other.
-edit("compiler/src/compiler/resolver/name_resolution.cryo", [
-    ("""    override visit(node: IntrinsicDeclNode*) -> void {
-        // Already forward-declared; visit parameters/body if needed.
-        if (node.has_body()) {""",
-     """    override visit(node: IntrinsicDeclNode*) -> void {
-        // Already forward-declared.  The signature's annotations are stamped
-        // here as a function's are: a primitive (`void*`, `u32*`) is a
-        // written name the name layer answers, not a token that needs no
-        // answer.
-        for (mut pi: int = 0; pi < node.parameters.length; pi++) {
-            this.stamp_annotation(node.parameters[pi].type_annotation);
-        }
-        this.stamp_annotation(node.return_type_annotation);
-        if (node.has_body()) {"""),
-])
-
-# An enum's discriminant annotation (`type enum Whence : i32`) was never
-# stamped either: a keyword primitive needed no stamp, and the walk
-# declared the variants and moved on.
-edit("compiler/src/compiler/resolver/name_resolution.cryo", [
-    ("""        // Declare generic params
-        this.declare_generics(node.generic_params);
-        this.stamp_trait_bounds(&node.where_bounds);
-
-        // Declare variants
-        for (mut i: int = 0; i < node.variants.length; i++) {
-            const variant: EnumVariantNode* = node.variants[i];
-            this.resolver.declare_enum_variant(variant.name, variant.span);""",
-     """        // Declare generic params
-        this.declare_generics(node.generic_params);
-        this.stamp_trait_bounds(&node.where_bounds);
-        // The discriminant's type is a written name (`: i32`, `: u8`),
-        // answered like every other.
-        this.stamp_annotation(node.discriminant_annotation);
-
-        // Declare variants
-        for (mut i: int = 0; i < node.variants.length; i++) {
-            const variant: EnumVariantNode* = node.variants[i];
-            this.resolver.declare_enum_variant(variant.name, variant.span);"""),
-])
-
-edit("compiler/src/compiler/resolver/res.cryo", [
-    ("""            || name.eq("f64")
-            || name.eq("never");
-    }""",
-     """            || name.eq("f64")
-            || name.eq("never")
-            || name.eq("va_list");
-    }"""),
-])
+# The two walk holes (an intrinsic's signature, an enum's discriminant)
+# and `va_list` in `is_primitive_spelling` landed ahead of this in
+# §8.297 (`scripts/ns-migration/8.297/d18_prep.py`), with the ten
+# `x as u32 < y` sites parenthesized; this script assumes that tree.
 
 # -- the type layer ------------------------------------------------------------
 edit("compiler/src/compiler/passes/type_resolution.cryo", [

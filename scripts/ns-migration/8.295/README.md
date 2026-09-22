@@ -10,9 +10,12 @@ The two scripts here apply the keyword half to the tree, in order:
    arm reads the `PrimTy` stamp), every synthesizer mints a `Named` stamped
    at birth, the name layer answers a primitive spelling AFTER every scope
    declines it, the type layer reads the stamp instead of the spelling, the
-   constant table records the annotation and reads its stamp when it folds,
-   the two annotations the walk never stamped (an intrinsic's signature, an
-   enum's discriminant) are stamped, `va_list` joins `is_primitive_spelling`.
+   constant table records the annotation and reads its stamp when it folds.
+   (The two annotations the walk never stamped - an intrinsic's signature,
+   an enum's discriminant - `va_list` in `is_primitive_spelling`, and the
+   parentheses on the ten `x as u32 < y` sites landed ahead of this in
+   §8.297, `scripts/ns-migration/8.297/d18_prep.py`; this script assumes
+   that tree.)
 
 Applied at `f547ba30`, the tree builds (a clean `make cryo`), the unit
 suite passes (2,138 unit, 213 compile-fail, 73 projects), every project,
