@@ -710,10 +710,15 @@ type struct AsyncLower {
         if (!leaf.is_valid()) { return; }
         const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(leaf);
         if (tdecl == null) { return; }
-        const assoc: SymbolStr =
-            TypeResolutionPasses::async_fut_assoc_name(this.ctx, node.name);
+        // The trait's own declaration of this method carries the associated
+        // type its desugar minted (and declared on the trait); an impl method
+        // the trait declares no `async` method for binds nothing.
+        mut assoc: SymbolStr = SymbolStr::empty();
+        for (mut i: i64 = 0; i < tdecl.methods.length; i++) {
+            const tf: FunctionDeclNode* = tdecl.methods[i];
+            if (tf != null && tf.is_async && tf.name.equals(node.name)) { assoc = tf.async_fut_assoc; break; }
+        }
         if (!assoc.is_valid()) { return; }
-        if (tdecl.lookup_assoc_type(assoc) == null) { return; }
         if (owner.impl_node.lookup_assoc_binding(assoc) != null) { return; }
         owner.impl_node.add_assoc_binding(assoc, fut_ann);
     }
@@ -2448,7 +2453,8 @@ type struct AsyncLower {
         }
         if (t == null || t.kind != TypeKind::Struct) { return TypeRef::invalid(); }
         const st: StructType* = t as StructType*;
-        mut f: FieldInfo* = st.get_field(this.recv_sym);
+        // The receiver slot the lowering recorded when it minted the frame.
+        const f: FieldInfo* = st.async_recv_field();
         if (f == null) { return TypeRef::invalid(); }
         const ft: Type* = this.arena.lookup(f.field_type.id);
         if (ft == null || ft.kind != TypeKind::Pointer) { return TypeRef::invalid(); }
@@ -2493,9 +2499,6 @@ type struct AsyncLower {
         const t: Type* = this.arena.lookup(e.resolved_type.id);
         if (t == null || t.kind != TypeKind::AssocProjection) { return false; }
         const ap: AssocProjectionType* = t as AssocProjectionType*;
-        const want: SymbolStr =
-            TypeResolutionPasses::async_fut_assoc_name(this.ctx, mname);
-        if (!want.is_valid() || !ap.member.equals(want)) { return false; }
 
         // The trait's declaration settles the receiver form, which the abstract
         // future cannot.  The projection names its trait: the desugar that
@@ -2506,9 +2509,12 @@ type struct AsyncLower {
         if (this.ctx.generic_registry == null) { return false; }
         const tdecl: TraitDeclNode* = this.ctx.generic_registry.trait_decl_of(ap.owning_trait);
         if (tdecl == null) { return false; }
+        // The awaited projection is this method's future when its member is
+        // the associated type the trait's declaration of the method carries.
         for (mut i: i64 = 0; i < tdecl.methods.length; i++) {
             const f: FunctionDeclNode* = tdecl.methods[i];
             if (f == null || !f.is_async || !f.name.equals(mname)) { continue; }
+            if (!f.async_fut_assoc.is_valid() || !ap.member.equals(f.async_fut_assoc)) { continue; }
             for (mut j: i64 = 0; j < f.parameters.length; j++) {
                 const p: VarDeclNode* = f.parameters[j];
                 if (p == null || !p.name.is_valid()) { continue; }
@@ -7090,6 +7096,9 @@ type struct AsyncLower {
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const p: VarDeclNode* = node.parameters[i];
             if (!this.param_has_slot(&this.pending[pi], p)) { continue; }
+            // The receiver's slot is recorded on the declaration as the field
+            // is minted: a reader asks for it by the slot, not by its name.
+            if (this.is_receiver_param(p)) { struct_decl.set_async_recv_slot(struct_decl.fields.length); }
             if (!this.add_future_field(struct_decl, this.param_field_name(p),
                     this.param_field_type(&sm, this.param_slot_type(&this.pending[pi], p)),
                     &this.pending[pi], span)) {
@@ -7124,6 +7133,7 @@ type struct AsyncLower {
             for (mut i: i64 = 0; i < node.parameters.length; i++) {
                 const p: VarDeclNode* = node.parameters[i];
                 if (!this.param_has_slot(&this.pending[pi], p)) { continue; }
+                if (this.is_receiver_param(p)) { st.set_async_recv_slot(infos.length); }
                 infos.push(FieldInfo::new(this.param_field_name(p),
                     this.param_field_type(&sm, this.param_slot_type(&this.pending[pi], p)),
                     true, false, false));

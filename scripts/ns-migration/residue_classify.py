@@ -232,10 +232,6 @@ SITE_OVERRIDES = {
         ("J", "lang: the call protocol's `__call__`, the method leaf the language fixes for a callable struct"),
     ("compiler/types/checker.cryo", "StructType::get_method", " ..."):
         ("J", "lang: the call protocol's `__call__` (the argument continues on the next line), asked when a struct converts to a function type"),
-    ("compiler/sema/member_resolver.cryo", "StructType::get_field", 'this.intern.intern("this$recv")'):
-        ("J", "member: the receiver field the async lowering minted on the frame struct, asked back by the spelling it minted"),
-    ("compiler/sema/async_lower.cryo", "StructType::get_field", "this.recv_sym"):
-        ("J", "member: the receiver field the lowering minted on the frame struct, asked back by the spelling it minted"),
 }
 
 CLASSES = "JNSBCFW"

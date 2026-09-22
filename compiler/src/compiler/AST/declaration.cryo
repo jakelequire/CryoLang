@@ -380,6 +380,12 @@ public:
     /// that define a same-named method for the same type mangle identically
     /// and collide at link time.  See `MangledName::for_method_or_trait_impl`.
     origin_trait:           SymbolStr;
+    /// The associated type an `async` TRAIT method's future is bound through
+    /// (`read` -> `ReadFut`), recorded by the desugar that minted it on the
+    /// trait's declaration - the one place the name is made.  Empty on every
+    /// other function.  A reader that needs it reads it here rather than
+    /// minting the name again from the method's leaf.
+    async_fut_assoc:        SymbolStr;
     /// Concrete type arguments of a generic-METHOD specialization (`m<T>` with
     /// `T = i64`), set by the monomorphizer's `specialize_method` on the cloned
     /// spec.  Empty on every template / non-spec function.  Folded into the
@@ -439,6 +445,7 @@ public:
         this.return_type_annotation = null;
         this.resolved_return_type   = TypeRef::invalid();
         this.origin_trait           = SymbolStr::empty();
+        this.async_fut_assoc        = SymbolStr::empty();
         this.spec_type_args         = [];
         this.overload_entry         = OverloadId::invalid();
         this.is_specialization      = false;
@@ -476,6 +483,7 @@ public:
     set_return_type_annotation(a: TypeAnnotation*) -> void  { this.return_type_annotation = a; }
     set_resolved_return_type(t: TypeRef) -> void             { this.resolved_return_type = t; }
     set_origin_trait(t: SymbolStr) -> void                   { this.origin_trait = t; }
+    set_async_fut_assoc(a: SymbolStr) -> void                { this.async_fut_assoc = a; }
     set_spec_type_args(a: TypeRef[]) -> void                 { this.spec_type_args = a; }
     set_overload_entry(e: OverloadId) -> void                { this.overload_entry = e; }
 
@@ -751,6 +759,12 @@ public:
     repr_packed:      boolean;
     repr_transparent: boolean;
     min_alignment:    u64;
+    /// The index of the field the async lowering stores an `async` method's
+    /// receiver in, on the future struct it mints for that method; -1 on
+    /// every other declaration.  The lowering held the field when it
+    /// minted it, and this is how a reader gets it back - by the slot,
+    /// never by the spelling the lowering happened to give it.
+    async_recv_slot:  i64;
     /// `public` (the default at top level) vs `private`. Drives cross-module
     /// visibility: a `private` type is only nameable within its own module.
     is_public:        boolean;
@@ -786,6 +800,7 @@ public:
         this.repr_packed       = false;
         this.repr_transparent  = false;
         this.min_alignment     = 0;
+        this.async_recv_slot   = -1;
         this.is_public         = true;
         this.binding_namespace = SymbolStr::empty();
         this.where_bounds      = [];
@@ -800,6 +815,7 @@ public:
     add_where_bound(mut &this, bound: TraitBound) -> void { this.where_bounds.push(bound); }
     set_name(n: SymbolStr) -> void { this.name = n; }
     set_public(p: boolean) -> void { this.is_public = p; }
+    set_async_recv_slot(slot: i64) -> void { this.async_recv_slot = slot; }
 
     add_generic_param(param: GenericParamNode*) -> void {
         this.generic_params.push(param);
