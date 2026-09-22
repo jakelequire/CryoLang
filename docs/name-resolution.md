@@ -37264,3 +37264,98 @@ session applies it in two commands once the ruling is in.
   is emitted bare.  `vendor-check` was not run under the attempt.
 * `docs/cryo.md` and `docs/grammar.md` carry the keyword list and are not
   touched here; `docs/cryo.md` holds Jake's uncommitted edit.
+
+### 8.296 Rule 1c cross-checked against the review board's independent count (`docs/name-resolution-endgame.md` §4, `inline_loops.py`): over the tree it measured, every one of its 33 hits is a rule 1c scan and rule 1c sees 220 lines more, 199 of them the one shape the board's pattern cannot see - the element bound to a local before the compare; the board's 13 consumer-side sites are 9 converted in §8.293 and 4 rows; its rule-1b-extension proposal judged and not taken, with the reason; §8.216 read again for unit 3: the C/F blocker is `CalleePin::Family`'s timing, as the board says, and §8.294's root is the same timing on `MemberPin` - 2026-09-22
+
+> **Status:** LANDED (instruments; no compiler change).
+> `scripts/ns-migration/8.296/inline_loops.py` (the board's, verbatim but
+> for a tree argument), `crosscheck.py` (both over one tree, every
+> difference named by shape); the count in §8.293 corrected below.
+
+#### The two counts
+
+Both instruments over `b1be2eb3`, the tree the board measured
+(`crosscheck.py <that tree>`):
+
+| | board | rule 1c |
+|---|---|---|
+| hits / scans | 33 (`inline_loops.py`) | 262 scans on 253 lines |
+| board hits that are not a rule 1c scan | | **0** |
+| rule 1c lines the board does not see | | **220** |
+
+The 220, by the shape that hides them from a pattern requiring `[i].name`
+on the compare line under a `for` within six lines: **199 through a local
+bound to the element** (`const m: MethodNode* = d.methods[i]; ..
+m.func.name.equals(n)`, the parameter loops among them), 11 a key field
+not spelled `name` (`key`, `triple`, `kind`, `target_key`,
+`type_parameter`), 5 `.eq(` rather than `.equals(`, 4 with no `for`
+header within six lines, 1 with the element on the right of the compare.
+So the two instruments agree on everything the narrower one can see, and
+their difference is not a number but a list of shapes - the alias form is
+the population.  A control: a loop written `something(this.rows)[i].name.equals(n)`
+(a receiver rule 1c refuses to place) is a board hit and not a scan, and
+`crosscheck.py` names it as a hole.  Over HEAD: 25 board hits (the nine
+the board listed that §8.293 converted are gone; `lookup_method`'s body
+is new), 252 scans, 0 unseen by rule 1c, 218 unseen by the board.
+
+§8.293 wrote "263 scans"; the instrument over the tree before the
+conversions says **262**, and 252 after (−11 loops, +2 door bodies, −1
+`lookup_assoc_type`'s old body).  The rows (156 → 145) were right.
+
+#### The board's 13 consumer-side sites
+
+Nine were converted in §8.293: the five `lookup_assoc_type` copies (as
+`assoc_type_index` - all five compute the POSITION, which the sugar's
+positional arguments are indexed by, so the door is the index and
+`lookup_assoc_type` reads through it), `sema.cryo`'s three `get_method`
+scans and its `get_variant` scan.  Four are rows and stand: `ir_generator.cryo:909`
+and `sema.cryo:1414` (a destructure binding's field by `name.id` through a
+`&FieldInfo[]` local - a `MemberPin` shape, as the board says: the
+binding could carry the index), `drop_insertion.cryo:3427` (the projection
+table keyed by field name id), `declaration_emitter.cryo:844` (a vtable
+slot by method leaf, `local::VTableSlot[]`).  The board's seven "text
+boundaries" are five DATA placements here (vendor, module loader, the
+registry's own duplicate check, the two door bodies it counted apart) and
+**three the two instruments class differently**: `parser.cryo:2274` (the
+parser's duplicate generic-parameter check over the written list) and
+`importer.cryo:1736`, `:1808` (the C importer asking whether it emitted a
+function of this C symbol) are J rows here (`member`, `extern`) and text
+boundaries there.  Neither reading moves the convertible count; the J
+ceiling is Jake's, and the three are named so the ruling can place them.
+
+#### The board's proposal, judged
+
+"A `for` over a record array whose body compares the key field is a read
+of that owner's door - place the loop as a call to `get_field` /
+`lookup_assoc_type` would be."  Not taken, for three reasons the tree
+gives: (1) most scanned arrays have no door to be placed as - the AST
+declarations' `fields` / `methods` / `variants` / `parameters`,
+`TraitDeclNode.methods` until §8.293 added one, and the twelve local
+tables whose owner is out of view; a rule keyed by the ARRAY is total
+where a rule keyed by a door name needs one to exist or a name to
+invent.  (2) A loop with a predicate beside the leaf (`has_body`,
+`is_async`, an arity) is not the door's read where the owner overloads
+the leaf, so "placed as the door" would misdescribe 145 of the 156.
+(3) The residue's output already treats the two shapes as one thing: a
+scan is a row with a class and a reason exactly as a call is, keyed
+`Owner::field[]` beside `Owner::method`; only the parser's pattern
+differs, and the placement discipline (every scanned array a TABLE or
+DATA, refused in neither) is rule 1b's.  What the proposal gets right is
+kept: the loop and the call are the same read to the counter.
+
+#### Unit 3 against §8.216
+
+The board: the C/F blocker is not the bootstrap pin `bin/cryo.exe` but
+`CalleePin::Family`'s timing - "mono's clone identifiers" pinned by a
+spelled mangling before the clone is registered (§8.216's "What this
+leaves"; 9 writers today, `grep -rn 'CalleePin::Family(' compiler/src
+--include=*.cryo | grep -v '=> {' | wc -l` → 9).  Read again: §8.216
+says exactly that, and neither the brief nor §8.294 attributed anything
+to the bootstrap pin.  §8.294's two sites are `MemberPin`, not
+`CalleePin`, but the root it names - mono asks a type question on a
+cleared clone before the walk that would pin it - is the same timing the
+board names for `Family`, and the board's `Instance { def, substs }` (pin
+the template's entry and the substitution, mint the symbol when the clone
+exists) is the callee-side form of the choice §8.294 left to Jake for
+fields (a `Field` pin from the template is instantiation-invariant and
+could cross).  One ruling covers both.
