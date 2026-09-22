@@ -37076,3 +37076,81 @@ exactly the three D32 rows and nothing else.
   `trait_decl_nodes` for a member by leaf: an OWNER chosen by a member's
   spelling.  The residue sees the inner member read (J member); the outer
   choice is the language question above.
+
+### 8.294 The two mono `get_field` reads measured and LEFT: `derive_receiver_type` asks the specialized struct by leaf 80 times over the six halves and finds a `MemberPin` at none of them, because the substituter clears every pin on a clone and the mono walk runs before the post-mono sema walk that would pin it again; a `Field` pin would survive substitution correctly, but the clearing is codegen's control that the walk reached the node, and trading it for two J rows is a design choice the entry records for Jake; the class arm is never entered; 0 compiler changes - 2026-09-22
+
+> **Status:** MEASURED, NOT CONVERTED.  `mono/call_specializer.cryo:746`
+> and `:749` stand (both J member rows of `StructType::get_field` /
+> `ClassType::get_field` in `residue.md`); `AST/substituter.cryo`'s
+> `MemberAccessNode` visit carries the invariant in its comment.
+
+#### The question
+
+§8.290 made sema's answer for a field ride on the node as
+`MemberPin::Field(depth, index)`, and codegen refuses a node with no pin
+(E0900).  Two readers were left asking a struct by leaf:
+`CallSpecializer::derive_receiver_type`, which reconstructs a method-call
+receiver's type in a specialized body after the cloner reset the
+expression's `resolved_type` - it walks `ma.object`'s type to the struct or
+class and asks `get_field(ma.member)` for the declared field type.  The
+previous session's warning: the substituter clears the pin on every
+cloned `MemberAccessNode`, and this reader runs in the mono walk, before
+the post-mono sema walk that pins the clone again - so the pin is most
+likely `None` there, and the question is whether `Field` pins should
+survive substitution.
+
+#### Measured
+
+A shadow at both sites (`SHADOW\tU3-<struct|class>\t<verdict>\t<found|miss>`,
+the verdict `none` / `field-agree` / `field-DISAGREE` against
+`field_index(ma.member)`), `corpus2.sh w3s` over the six halves, 0
+failing halves:
+
+| half | asks | pin | found |
+|---|---|---|---|
+| unit suite | 44 | `none` ×44 | `found` ×44 |
+| projects (`async_main`, `async_main_void`, `async_main_params` ×6 each; ten `collect` projects' own tests ×1) | 28 | `none` | `found` |
+| examples (`11-http-server` ×6, `14-threads` ×1) | 7 | `none` | `found` |
+| LSP | 1 | `none` | `found` |
+| **struct arm** | **80** | **`none` ×80** | **`found` ×80** |
+| **class arm** | **0** | - | - |
+
+The struct lane is ENTERED and answers every time; the pin is ABSENT at
+every ask, as the substituter's clearing predicts; the class lane is
+never entered.  `field-DISAGREE` was never printed, and neither was
+`field-agree`: there is no pin to agree with.
+
+#### Why it stays
+
+A `Field` pin is instantiation-invariant by construction - a field's
+position is the same in every specialization of the struct, and
+`derive_receiver_type` indexes the SPECIALIZED type, so `spec.fields[index]`
+is the right field.  Carrying it across substitution would answer both
+sites from the pin.  What it would cost: the clearing is the post-mono
+walk's coverage control.  Codegen reports a `MemberAccessNode` with no pin
+as a node sema's walk never reached (§8.290's E0900), and a `Field` pin
+carried from the template would satisfy that check on a clone the walk
+missed - exactly the class of node §8.290's miscompiles hid in.  The
+control is worth more than two rows that are already justified (a struct's
+field by leaf off the specialized type in hand).  The root is not the pin:
+it is that mono asks a type question on a cleared clone before the walk
+that answers it, which is the pipeline order (the parked reorder thread),
+and `derive_receiver_type` exists only because of it.  Jake's call whether
+the pins cross or the order moves; neither is this session's.
+
+#### What a program can do to the site
+
+The 80 asks are all `found`, and the read is by leaf on the specialized
+type, so the one way to a wrong answer is a base field shadowed by a
+derived class's (§8.290's shape) - the class arm, which is never entered.
+No reachable consequence today; the lane is entered and answers, not
+starved and not absent.
+
+#### Findings
+
+* The stdlib's `.bin` archive can go missing under a CONCURRENT `make
+  cryo`: a poll loop that read a stale `CRYO_DONE` from the previous
+  build's log launched a second `make cryo` beside the first, the
+  `stdlib` target's removal of the flat archive raced the first's link, and
+  the link failed with `cannot find stdlib/.bin/libcryo.a`.  A fresh log
+  file per build; the tree was not at fault.
