@@ -183,8 +183,13 @@ CLASS_OF_METHOD = {
         ("J", "member: a struct's or class's fields held by reference in a local, by leaf"),
     "local::FieldDeclNode[]":
         ("J", "member: a declaration's written fields held in a local, by leaf (the duplicate-field check)"),
+    # RULED (Jake, 2026-09-22): this site stays in the population, read as a
+    # rule 1c scan.  The review board read it as a text boundary outside D32;
+    # outside the population does not mean clean, it means UNWATCHED - a J row
+    # is enumerated, carries a written reason and the gate sees it drift,
+    # while a site ruled outside D32 is governed by nothing.
     "local::GenericParamNode[]":
-        ("J", "member: a declaration's written generic parameters held in a local, by leaf (the parser's duplicate check)"),
+        ("J", "member: a declaration's own written generic parameters, scanned for a repeated spelling as the parser builds the list. The question IS about spellings - two parameters written `<T, T>` are a redeclaration - and at parse time there is no identity to ask instead: the resolver stamps a `SymbolID` on each parameter only after the list exists. Rust refuses the same shape the same way, by comparing idents in the parameter list"),
     "local::TraitBound[]":
         ("S", "`where` bounds held in a local, by the bounded parameter's leaf read off the arena's `GenericParamType.param_name`"),
     "local::ImplBlockNode[]":
@@ -324,8 +329,10 @@ SITE_OVERRIDES = {
     ("compiler/types/checker.cryo", "StructType::get_method", " ..."):
         ("J", "lang: the call protocol's `__call__` (the argument continues on the next line), asked when a struct converts to a function type"),
     # The inline scans whose key is not the table's usual one.
+    # RULED (Jake, 2026-09-22): these two sites stay in the population, read as
+    # rule 1c scans, for the reason above `local::GenericParamNode[]`.
     ("compiler/bindgen/importer.cryo", "ExternBlockNode::functions[]", "sym"):
-        ("J", "extern: the C importer asks whether it already emitted a function of this C symbol, the only identity a C symbol has"),
+        ("J", "extern: whether this extern block already declares the C function of this LINK NAME, asked as the importer emits it. A C symbol's link name is the whole of its identity - C has no declaration to key on, and two C declarations sharing a link name are one entity by the linkage rule - so there is no stamp this could ask instead, and the leaf it compares is the mangling the linker will use"),
     ("compiler/mono/dispatch_annotator.cryo", "FunctionDeclNode::parameters[]", "id.name"):
         ("W", "an identifier matched to the function's parameter by spelling; the identifier's own stamp is not asked"),
     ("compiler/sema/async_lower.cryo", "FunctionDeclNode::parameters[]", "(val as IdentifierNode*).name"):
