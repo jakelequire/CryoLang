@@ -18,7 +18,7 @@ import compiler::types::{
 };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::ast;
-import compiler::ast::{ declaration, expression, node, NodeKind, TypeAnnotation, visitor };
+import compiler::ast::{ declaration, expression, MemberPin, node, NodeKind, TypeAnnotation, visitor };
 import compiler::lex;
 import compiler::lex::{ Token, TokenType };
 import compiler::diag;
@@ -106,10 +106,12 @@ type struct MemberResolver {
         // method): resolve the field off the owner template's AST.  Checked BEFORE
         // the unresolved bail (the owner self-instantiation carries abstract params).
         if (this.symbolic.symbolic_is_generic_owner_receiver(obj_type)) {
+            mut owner_idx: i64 = -1;
             const owner_field: TypeRef =
-                this.symbolic.symbolic_resolve_owner_field(obj_type, member.member);
+                this.symbolic.symbolic_resolve_owner_field(obj_type, member.member, &owner_idx);
             if (owner_field.is_valid()) {
                 member.set_resolved_type(owner_field);
+                member.set_resolved_member(MemberPin::Field(0, owner_idx));
                 return owner_field;
             }
         }
@@ -160,17 +162,22 @@ type struct MemberResolver {
                            idx, tup.elements.length), m_span);
                 return TypeRef::invalid();
             }
+            member.set_resolved_member(MemberPin::Field(0, idx));
             return tup.elements[idx];
         }
 
         // Struct/class field access via TypeChecker.
-        const result: TypeCheckResult = this.checker.check_field_access(obj_type, member.member);
+        mut f_depth: i64 = -1;
+        mut f_index: i64 = -1;
+        const result: TypeCheckResult =
+            this.checker.check_field_access(obj_type, member.member, &f_depth, &f_index);
         if (result.success) {
             const acc_span: SourceSpan = if (member.member_span.has_location()) {
                 member.member_span
             } else {
                 member.span
             };
+            member.set_resolved_member(MemberPin::Field(f_depth, f_index));
             this.enforce_field_visibility(obj_type, member.member, acc_span);
             // Mono-after-sema: substitute the receiver's type_args so a template
             // field types concretely (`.second -> i64`).
@@ -179,8 +186,12 @@ type struct MemberResolver {
 
         // Mono-after-sema: read the field off the generic BASE template's AST and
         // substitute the receiver's type_args (`Pair<u32,i64>` pre-mono).
-        const field_ret: TypeRef = this.resolve_field_via_template(obj_type, member.member);
-        if (field_ret.is_valid()) { return field_ret; }
+        mut t_index: i64 = -1;
+        const field_ret: TypeRef = this.resolve_field_via_template(obj_type, member.member, &t_index);
+        if (field_ret.is_valid()) {
+            member.set_resolved_member(MemberPin::Field(0, t_index));
+            return field_ret;
+        }
 
         // Symbolic walk: an unwrapped `void`/abstract receiver - defer.
         if (this.symbolic.symbolic_type_unresolved(walk_ty)) { return TypeRef::invalid(); }
@@ -307,14 +318,22 @@ type struct MemberResolver {
             member.span
         };
         // Field.
-        const result: TypeCheckResult = this.checker.check_field_access(obj_type, member.member);
+        mut f_depth: i64 = -1;
+        mut f_index: i64 = -1;
+        const result: TypeCheckResult =
+            this.checker.check_field_access(obj_type, member.member, &f_depth, &f_index);
         if (result.success) {
+            member.set_resolved_member(MemberPin::Field(f_depth, f_index));
             this.enforce_field_visibility(obj_type, member.member, acc_span);
             return this.binding.subst_method_return_from_receiver(obj_type, result.result_type);
         }
         // Generic base-template field.
-        const field_ret: TypeRef = this.resolve_field_via_template(obj_type, member.member);
-        if (field_ret.is_valid()) { return field_ret; }
+        mut t_index: i64 = -1;
+        const field_ret: TypeRef = this.resolve_field_via_template(obj_type, member.member, &t_index);
+        if (field_ret.is_valid()) {
+            member.set_resolved_member(MemberPin::Field(0, t_index));
+            return field_ret;
+        }
         // Method (from the dereferenced receiver symbol).
         mut walk_ty: TypeRef = obj_type;
         mut walk_t: Type* = this.arena.lookup(walk_ty.id);
@@ -353,7 +372,12 @@ type struct MemberResolver {
 
     /// Mono-after-sema: resolve a FIELD off the generic BASE template's AST when
     /// the receiver is an unresolved generic instantiation, substituting type_args.
-    resolve_field_via_template(mut &this, recv_type: TypeRef, field: SymbolStr) -> TypeRef {
+    /// `*out_index` is the field's position in the template's field list, which
+    /// is its position in every instantiation's (the specialized declaration is
+    /// a clone of the template's, field for field).
+    resolve_field_via_template(mut &this, recv_type: TypeRef, field: SymbolStr,
+                               out_index: i64*) -> TypeRef {
+        *out_index = -1;
         if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
         const inst: InstantiatedType* = this.types.peel_to_instantiation(recv_type);
         if (inst == null) { return TypeRef::invalid(); }
@@ -367,6 +391,7 @@ type struct MemberResolver {
                 const f: FieldDeclNode* = sn.fields[i];
                 if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
                     abstract_field = f.resolved_type;
+                    *out_index = i;
                     break;
                 }
             }
@@ -376,6 +401,7 @@ type struct MemberResolver {
                 const f: FieldDeclNode* = un.fields[i];
                 if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
                     abstract_field = f.resolved_type;
+                    *out_index = i;
                     break;
                 }
             }
@@ -385,6 +411,7 @@ type struct MemberResolver {
                 const f: FieldDeclNode* = cn.fields[i];
                 if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
                     abstract_field = f.resolved_type;
+                    *out_index = i;
                     break;
                 }
             }
@@ -406,34 +433,25 @@ type struct MemberResolver {
             check_t = this.arena.lookup((check_t as ReferenceType*).referent.id);
             if (check_t == null) { return TypeRef::invalid(); }
         }
+        mut f_type: TypeRef = TypeRef::invalid();
+        mut f_index: i64 = -1;
         if (check_t.kind == TypeKind::Struct) {
             const st: StructType* = check_t as StructType*;
-            for (mut i: i64 = 0; i < st.fields.length; i++) {
-                if (st.fields[i].name.id == field_name.id) {
-                    const f_type: TypeRef = st.fields[i].field_type;
-                    const ft: Type* = this.arena.lookup(f_type.id);
-                    if (ft != null && ft.kind == TypeKind::Function) {
-                        if (member != null) { member.set_resolved_type(f_type); }
-                        return (ft as FunctionType*).return_type;
-                    }
-                    return TypeRef::invalid();
-                }
-            }
+            f_index = st.field_index(field_name);
+            if (f_index >= 0) { f_type = st.fields[f_index].field_type; }
         } else if (check_t.kind == TypeKind::Class) {
             const ct: ClassType* = check_t as ClassType*;
-            for (mut i: i64 = 0; i < ct.fields.length; i++) {
-                if (ct.fields[i].name.id == field_name.id) {
-                    const f_type: TypeRef = ct.fields[i].field_type;
-                    const ft: Type* = this.arena.lookup(f_type.id);
-                    if (ft != null && ft.kind == TypeKind::Function) {
-                        if (member != null) { member.set_resolved_type(f_type); }
-                        return (ft as FunctionType*).return_type;
-                    }
-                    return TypeRef::invalid();
-                }
-            }
+            f_index = ct.field_index(field_name);
+            if (f_index >= 0) { f_type = ct.fields[f_index].field_type; }
         }
-        return TypeRef::invalid();
+        if (f_index < 0) { return TypeRef::invalid(); }
+        const ft: Type* = this.arena.lookup(f_type.id);
+        if (ft == null || ft.kind != TypeKind::Function) { return TypeRef::invalid(); }
+        if (member != null) {
+            member.set_resolved_type(f_type);
+            member.set_resolved_member(MemberPin::Field(0, f_index));
+        }
+        return (ft as FunctionType*).return_type;
     }
 
 

@@ -31,9 +31,10 @@ import compiler::diag::{ diagnostic, ErrorCode, source_span };
 import compiler::types;
 import compiler::types::{ arena, compound, type_base, type_ref, TypeKind, user_defined };
 import compiler::ast;
-import compiler::ast::{ expression, LiteralKind, node, NodeKind, visitor };
+import compiler::ast::{ expression, LiteralKind, MemberPin, node, NodeKind, visitor };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::types::generic;
+import std::fmt;
 import compiler::types::generic::{ InstantiatedType };
 import std::ffi::libc;
 import compiler::ast::expression::{ ArrayAccessNode, LiteralNode };
@@ -41,7 +42,6 @@ import compiler::ast::node::{ ASTNode };
 import compiler::ast::visitor::{ ASTVisitor };
 import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{ LBasicBlock, LIntPredicate, LType, LTypeKind, LValue };
-import compiler::codegen::util::{ CodegenUtil };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType, TupleType };
@@ -73,10 +73,12 @@ type struct PlaceEmitter {
 
     // Member access (obj.field)
 
-    /// Generate a GEP to a struct/class field.  `site_span` is the source span
-    /// of the access expression in the caller; used only to attach a source
-    /// snippet to any diagnostic we emit.
-    codegen_member_access(mut &this, object_ptr: LValue, object_type: TypeRef, object_is_lvalue: boolean, member: SymbolStr, site_span: SourceSpan) -> void {
+    /// Generate a GEP to a struct/class field.  The field is the one sema
+    /// pinned on the node (`pin`, its coordinates in the receiver's type);
+    /// `member` is its spelling, for the diagnostic alone.  `site_span` is
+    /// the source span of the access expression in the caller; used only to
+    /// attach a source snippet to any diagnostic we emit.
+    codegen_member_access(mut &this, object_ptr: LValue, object_type: TypeRef, object_is_lvalue: boolean, member: SymbolStr, pin: MemberPin, site_span: SourceSpan) -> void {
         // Auto-deref: if the object is a pointer/reference (e.g., `node: ExprStmtNode*`
         // stored in an alloca), load the pointer value so we can GEP into the struct.
         // This matches C/Rust behavior where `node.field` on a pointer is an implicit
@@ -146,40 +148,54 @@ type struct PlaceEmitter {
         const tk: TypeKind = t.kind;
         mut field_idx: i64 = -1;
 
+        // The field sema pinned: a tuple's element and a struct's field are
+        // their own index; a class member's slot is computed from the
+        // coordinates by the routine the flattened body was built from.
+        // Nothing here searches a field table by the spelling: a node with
+        // no pin is one no sema walk answered, reported as such.
+        mut pin_depth: i64 = -1;
+        mut pin_index: i64 = -1;
+        match (pin) {
+            MemberPin::Field(d, i) => { pin_depth = d; pin_index = i; }
+            _                      => { }
+        }
         if (tk == TypeKind::Tuple) {
-            // Tuple positional access: parse member SymbolStr as decimal index.
-            // Sema already validated bounds; codegen trusts the resolved_type
-            // path and just GEPs slot N.
-            const member_str: string = this.cg.resolve(member);
-            const idx: i64 = CodegenUtil::parse_tuple_member_index(member_str);
-            if (idx >= 0) {
-                const tup: TupleType* = t as TupleType*;
-                if (idx < tup.elements.length) {
-                    field_idx = idx;
-                }
+            const tup: TupleType* = t as TupleType*;
+            if (pin_depth == 0 && pin_index >= 0 && pin_index < tup.elements.length) {
+                field_idx = pin_index;
             }
         } else if (tk == TypeKind::Struct) {
+            // The field-list index; the body element it maps to is computed
+            // below, where a padding element may sit before it.
             const st: StructType* = t as StructType*;
-            field_idx = st.field_index(member);
+            if (pin_depth == 0 && pin_index >= 0 && pin_index < st.fields.length) {
+                field_idx = pin_index;
+            }
         } else if (tk == TypeKind::Class) {
             // A class body is flattened - vtable slot, then ancestors' fields,
             // then its own - so a member's slot is not its index in any one
-            // field list.  `member_element_index` owns that arithmetic and is
-            // the same routine the body was built from.
-            field_idx = this.cg.type_mapper.member_element_index(t, member);
+            // field list; the coordinates are mapped by the routine the body
+            // was built from.
+            field_idx = this.cg.type_mapper.pinned_element_index(t, pin_depth, pin_index);
         } else if (tk == TypeKind::Array) {
+            // An array's one member is its length, which is what sema admits
+            // on the type; the type says which layout carries it.
             const arr_t: ArrayType* = t as ArrayType*;
-            const length_sym: SymbolStr = this.cg.intern_str("length");
-            if (member.id == length_sym.id) {
-                if (arr_t.is_fixed()) {
-                    // Fixed array: length is a compile-time constant.
-                    this.state.last_value = LType::const_int(LType::i64(), arr_t.size as u64, false);
-                    this.state.last_is_lvalue = false;
-                    return;
-                }
-                // Dynamic array { T*, i64 }: length is field 1.
-                field_idx = 1;
+            if (arr_t.is_fixed()) {
+                // Fixed array: length is a compile-time constant.
+                this.state.last_value = LType::const_int(LType::i64(), arr_t.size as u64, false);
+                this.state.last_is_lvalue = false;
+                return;
             }
+            // Dynamic array { T*, i64 }: length is field 1.
+            field_idx = 1;
+        }
+        if ((tk == TypeKind::Tuple || tk == TypeKind::Struct || tk == TypeKind::Class)
+                && pin_index < 0) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
+                fmt::format("codegen: member access `%s` on `%s` carries no field pin: no sema walk answered it, and the pass that minted it owes it the answer",
+                    this.cg.resolve(member), t.display_name()),
+                site_span);
         }
 
         if (field_idx < 0) {

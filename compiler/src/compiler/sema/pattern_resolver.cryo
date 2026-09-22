@@ -17,11 +17,11 @@ import compiler::types::{
 };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::resolver::res;
-import compiler::resolver::res::{ Res };
+import compiler::resolver::res::{ Res, ResSlot };
 import compiler::ast;
 import compiler::ast::{
-    expression, LiteralKind, node, NodeKind, pattern, PatternBinding, PatternElement,
-    PatternKind, statement
+    expression, LiteralKind, MemberPin, node, NodeKind, pattern, PatternBinding,
+    PatternElement, PatternKind, statement
 };
 import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, source_span, suggestion };
@@ -165,10 +165,25 @@ type struct PatternResolver {
         if (enum_ty == null || enum_ty.kind != TypeKind::Enum) { return payload_types; }
 
         const et: EnumType* = enum_ty as EnumType*;
-        const variant: EnumVariantInfo* = et.get_variant(enum_pat.variant_name);
-        if (variant == null) {
+        // The pattern's own stamp names the enum the SOURCE wrote; the enum
+        // above is the subject's.  A variant leaf both declare would match
+        // the subject through a pattern of another enum, so the two are
+        // held to the same definition before the leaf is read.  Refused on
+        // the committed walk only: the symbolic walk may check a pattern
+        // against a type that is not its own.
+        if (!this.state.in_symbolic_check && !this.pattern_names_enum(enum_pat, et)) {
+            return payload_types;
+        }
+        const vi: i64 = et.variant_index(enum_pat.variant_name);
+        if (vi < 0) {
             this.report_unknown_variant(et, enum_pat);
             return payload_types;
+        }
+        const variant: EnumVariantInfo* = &et.variants[vi];
+        // The ordinal codegen reads the tag and the payload layout by; the
+        // symbolic walk's answer is not recorded, for the reason above.
+        if (!this.state.in_symbolic_check) {
+            enum_pat.set_resolved_member(MemberPin::Variant(vi));
         }
         payload_types = sema_copy_type_refs(&variant.payload_types);
 
@@ -187,6 +202,45 @@ type struct PatternResolver {
             }
         }
         return payload_types;
+    }
+
+    /// Whether the enum `enum_pat`'s stamp names is the definition `subject`
+    /// is an instance of; true as well when the stamp makes no enum claim
+    /// (a pattern the name layer could not answer is diagnosed there, and a
+    /// synthesized one without a stamp asserts nothing).  A pattern naming
+    /// another enum is refused: its variant leaf may be one the subject's
+    /// enum also declares, and reading the leaf off the subject would match.
+    pattern_names_enum(mut &this, enum_pat: EnumPatternNode*, subject: EnumType*) -> boolean {
+        mut named: TypeRef = TypeRef::invalid();
+        match (enum_pat.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(q) => { named = this.ctx.decl_index.type_of_def(q); }
+                    _           => { }
+                }
+            }
+            _ => { }
+        }
+        if (!named.is_valid()) { return true; }
+        const named_t: Type* = this.types.unwrap_to_enum(named);
+        if (named_t == null || named_t.kind != TypeKind::Enum) { return true; }
+        const named_def: u64 = PatternResolver::enum_definition_id(named_t as EnumType*);
+        const subject_def: u64 = PatternResolver::enum_definition_id(subject);
+        if (named_def == subject_def) { return true; }
+        const want: string = this.intern.resolve(subject.qualified_name);
+        const got: string = this.intern.resolve((named_t as EnumType*).qualified_name);
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0200_TYPE_MISMATCH,
+            fmt::format("pattern names enum `%s`, but the value matched is `%s`", got, want));
+        diag = diag.at_with_label(enum_pat.enum_span, fmt::format("expected `%s`", want));
+        this.ctx.emit_diagnostic(diag);
+        return false;
+    }
+
+    /// The definition an enum type is an instance of: its template's arena
+    /// id for an instantiation, its own otherwise.
+    static enum_definition_id(et: EnumType*) -> u64 {
+        if (et.generic_base.is_valid()) { return et.generic_base.id; }
+        return et.id;
     }
 
     /// Report a pattern naming a variant the enum does not have.

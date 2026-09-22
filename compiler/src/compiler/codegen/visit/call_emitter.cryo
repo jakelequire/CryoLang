@@ -19,6 +19,7 @@ namespace compiler::codegen::visit::call_emitter;
 
 import compiler::codegen;
 import compiler::codegen::{ abi, context, llvm, llvm_types, type_map, util };
+import compiler::codegen::util::{ CodegenUtil };
 import compiler::codegen::state::visitor_state;
 import compiler::codegen::state::visitor_state::{ VisitorState };
 import compiler::codegen::visit::{ expr_dispatch, enum_variant_emitter };
@@ -37,7 +38,7 @@ import compiler::types::{
 };
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, LiteralKind, node, NodeKind, statement, visitor
+    declaration, expression, LiteralKind, MemberPin, node, NodeKind, statement, visitor
 };
 import compiler::lex;
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name };
@@ -398,7 +399,8 @@ type struct CallEmitter {
             // value is synthesized inline.  The enum is the one sema
             // resolved the call TO (`node.resolved_type`, through any chain
             // of instantiations), never the one the scope segment spells: a
-            // generic variant's spelling names the template.
+            // generic variant's spelling names the template; the variant is
+            // the ordinal sema pinned on the path.
             if (!callee_val.is_valid()) {
                 mut real_ref: TypeRef = node.resolved_type;
                 mut real_t: Type* = this.cg.lookup_type_by_id(real_ref.id);
@@ -415,7 +417,7 @@ type struct CallEmitter {
                 }
                 if (real_t != null && real_t.kind == TypeKind::Enum) {
                     const et: EnumType* = real_t as EnumType*;
-                    const variant: EnumVariantInfo* = et.get_variant(sr.member_name);
+                    const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(et, sr.resolved_member);
                     if (variant != null) {
                         // Codegen the arguments first.
                         mut vargs: LValue[] = [];
@@ -1474,6 +1476,8 @@ type struct CallEmitter {
             mut elem_access: MemberAccessNode* = new MemberAccessNode(
                 receiver, idx_sym, receiver.span, receiver.span);
             elem_access.set_resolved_type(elem_type);
+            // Minted after the last sema walk: the element is the i-th.
+            elem_access.set_resolved_member(MemberPin::Field(0, i));
             mut drop_access: MemberAccessNode* = new MemberAccessNode(
                 elem_access as ExpressionNode*, drop_sym,
                 receiver.span, receiver.span);
@@ -1538,6 +1542,9 @@ type struct CallEmitter {
             mut field_access: MemberAccessNode* = new MemberAccessNode(
                 receiver, f.name, receiver.span, receiver.span);
             field_access.set_resolved_type(f.field_type);
+            // Minted after the last sema walk: the field is the i-th of the
+            // aggregate's own list, which is the list walked here.
+            field_access.set_resolved_member(MemberPin::Field(0, i));
             mut drop_access: MemberAccessNode* = new MemberAccessNode(
                 field_access as ExpressionNode*, drop_sym,
                 receiver.span, receiver.span);

@@ -6,7 +6,7 @@ namespace compiler::ast::expression;
 
 import compiler::diag;
 import compiler::ast;
-import compiler::ast::{ ArgBinding, LiteralKind, NodeKind, TypeAnnotation };
+import compiler::ast::{ ArgBinding, LiteralKind, MemberPin, NodeKind, TypeAnnotation };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::lex;
@@ -498,10 +498,17 @@ public:
     /// no trailing segment and `TypeRelative` never appears here.
     res:          ResSlot;
 
+    /// The variant `variant_name` names inside the enum `res` stamps
+    /// (`Variant(ordinal)`), as sema found it; codegen builds the boxed
+    /// variant from it.  `None` on a plain class `new`, and on a variant
+    /// `new` sema refused.
+    resolved_member: MemberPin;
+
     NewExprNode(type_name: SymbolStr, span: SourceSpan)
         : ExpressionNode(NodeKind::NewExpression, span) {
         this.type_name    = type_name;
         this.variant_name = SymbolStr::empty();
+        this.resolved_member = MemberPin::None;
         this.generic_args = [];
         this.arguments    = [];
         this.array_size   = null;
@@ -518,6 +525,10 @@ public:
     has_array_size() -> boolean { return this.array_size != null; }
     has_struct_init() -> boolean { return this.struct_init != null; }
     has_variant() -> boolean { return this.variant_name.is_valid(); }
+
+    set_resolved_member(pin: MemberPin) -> void {
+        this.resolved_member = pin;
+    }
 
     add_argument(arg: ExpressionNode*) -> void {
         this.arguments.push(arg);
@@ -623,6 +634,12 @@ type struct FieldInit {
     field_name: SymbolStr;
     value:      ExpressionNode*;
     span:       SourceSpan;
+    /// The field `field_name` names inside the literal's type, as sema
+    /// found it (`Field(depth, index)` - see `MemberPin`); codegen stores
+    /// the value at those coordinates and searches no field table.  `None`
+    /// until a sema walk answers it, or on a literal minted after the last
+    /// walk whose minter did not - which codegen reports.
+    pin:        MemberPin;
 }
 
 type class StructLiteralNode : ExpressionNode {
@@ -861,14 +878,23 @@ public:
     /// a leaf here would let whichever registered first answer for both.
     resolved_trait: SymbolStr;
 
+    /// The FIELD this access names, as sema found it in the receiver's type:
+    /// `Field(depth, index)`, the coordinates codegen addresses the slot by.
+    /// `None` for a method access (a call's callee, answered by the call's
+    /// own pin) and for a node no sema walk reached.  Written by every walk
+    /// that resolves the member, last answer standing, so the post-mono walk
+    /// - the one codegen reads - is the one that counts.
+    resolved_member: MemberPin;
+
     MemberAccessNode(object: ExpressionNode*, member: SymbolStr,
                      member_span: SourceSpan, span: SourceSpan)
         : ExpressionNode(NodeKind::MemberAccess, span) {
-        this.object         = object;
-        this.member         = member;
-        this.member_span    = member_span;
-        this.generic_args   = [];
-        this.resolved_trait = SymbolStr::empty();
+        this.object          = object;
+        this.member          = member;
+        this.member_span     = member_span;
+        this.generic_args    = [];
+        this.resolved_trait  = SymbolStr::empty();
+        this.resolved_member = MemberPin::None;
     }
 
     set_generic_args(args: TypeAnnotation*[]) -> void {
@@ -877,6 +903,10 @@ public:
 
     set_resolved_trait(t: SymbolStr) -> void {
         this.resolved_trait = t;
+    }
+
+    set_resolved_member(pin: MemberPin) -> void {
+        this.resolved_member = pin;
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -915,9 +945,16 @@ public:
     /// or `Module::fn` as a function pointer), pinned by sema - the mangled
     /// symbol of a static method, the canonical name of a free function -
     /// exactly as a `CallExprNode`'s pin is.  `None` when the path names no
-    /// function: an enum variant answers through `resolved_type`, a global
-    /// through `scope_res` and the member leaf.
+    /// function; a variant or a global is then `resolved_member`'s.
     resolved_callee:    CalleePin;
+
+    /// The MEMBER this path names when it is not a function: an enum
+    /// variant (`Variant(ordinal)`, inside the enum `resolved_type` names)
+    /// or a global (`Global(slot)`, the declaration index's registration
+    /// slot).  Written by sema; codegen builds the variant or loads the
+    /// global from it and looks nothing up by the member leaf.  `None` on a
+    /// path naming a function (see `resolved_callee`), a type, or nothing.
+    resolved_member:    MemberPin;
 
     /// The SPECIALIZATION the scope segment denotes, recorded by the
     /// substituter when it collapses a template's self-reference
@@ -956,6 +993,7 @@ public:
         this.member_span        = span;
         this.scope_res          = ResSlot::Pending;
         this.resolved_callee    = CalleePin::None;
+        this.resolved_member    = MemberPin::None;
         this.spec_owner         = TypeRef::invalid();
         this.impl_trait         = null;
         this.resolved_trait     = SymbolStr::empty();
@@ -971,6 +1009,10 @@ public:
 
     set_resolved_callee(pin: CalleePin) -> void {
         this.resolved_callee = pin;
+    }
+
+    set_resolved_member(pin: MemberPin) -> void {
+        this.resolved_member = pin;
     }
 
     set_segment_spans(scope_span: SourceSpan, member_span: SourceSpan) -> void {

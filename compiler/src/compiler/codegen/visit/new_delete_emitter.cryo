@@ -19,6 +19,7 @@ namespace compiler::codegen::visit::new_delete_emitter;
 
 import compiler::codegen;
 import compiler::codegen::{ context, llvm, llvm_types, type_map, util };
+import compiler::codegen::util::{ CodegenUtil };
 import compiler::codegen::state::visitor_state;
 import compiler::codegen::state::visitor_state::{ VisitorState };
 import compiler::codegen::visit::{ expr_dispatch, enum_variant_emitter };
@@ -33,7 +34,7 @@ import compiler::types::{
     user_defined
 };
 import compiler::ast;
-import compiler::ast::{ node, visitor, expression, statement };
+import compiler::ast::{ MemberPin, node, visitor, expression, statement };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name };
 import std::collections::pair;
 import std::collections::pair::{ Pair };
@@ -154,13 +155,14 @@ type struct NewDeleteEmitter {
             return;
         }
 
-        // Heap-allocated enum variant.  INCOMPLETE.
+        // Heap-allocated enum variant: the one sema pinned inside the enum
+        // the stamp names (a leaf the enum lacks was refused there).
         if (t.kind == TypeKind::Enum && node.has_variant()) {
             const et: EnumType* = t as EnumType*;
-            const variant: EnumVariantInfo* = et.get_variant(node.variant_name);
+            const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(et, node.resolved_member);
             if (variant == null) {
                 this.cg.diag.emit_error_at_span(ErrorCode::E0635_TYPE_CONSTRUCTOR_UNDEFINED,
-                    "codegen: enum variant not found in `new T::V(...)`",
+                    "codegen: `new T::V(...)` carries no variant pin: no sema walk answered it",
                     node.span);
                 this.state.last_value = LValue::null();
                 this.state.last_is_lvalue = false;
@@ -265,7 +267,12 @@ type struct NewDeleteEmitter {
             const st: StructType* = t as StructType*;
             for (mut sfi: i64 = 0; sfi < lit.field_inits.length; sfi++) {
                 const finit: FieldInit = lit.field_inits[sfi];
-                const sf_fidx: i64 = st.field_index(finit.field_name);
+                // The field is the one sema pinned on the initializer.
+                mut sf_fidx: i64 = -1;
+                match (finit.pin) {
+                    MemberPin::Field(_, ix) => { if (ix < st.fields.length) { sf_fidx = ix; } }
+                    _                       => { }
+                }
                 if (sf_fidx >= 0) {
                     const gep: LValue = this.cg.field_gep(t, mapped, obj_ptr, sf_fidx, "field");
                     mut val: LValue = this.dispatch.codegen_rvalue(visitor,finit.value);

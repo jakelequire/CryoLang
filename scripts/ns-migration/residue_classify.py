@@ -94,6 +94,8 @@ CLASS_OF_METHOD = {
         ("J", "member: a class's method by its leaf off the `ClassType` in hand"),
     "EnumType::get_variant":
         ("J", "member: an enum's variant by its leaf off the `EnumType` in hand"),
+    "EnumType::variant_index":
+        ("J", "member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen"),
     "EnumType::get_method":
         ("J", "member: an enum's method by its leaf off the `EnumType` in hand"),
     "TraitDeclNode::lookup_assoc_type":

@@ -43,7 +43,7 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, sink, snapshot, source_span };
 import compiler::ast;
 import compiler::ast::{
-    ArgBinding, declaration, expression, LiteralKind, node, NodeKind, pattern,
+    ArgBinding, declaration, expression, LiteralKind, MemberPin, node, NodeKind, pattern,
     PatternBinding, PatternKind, statement
 };
 import compiler::passes::pass_id;
@@ -2301,7 +2301,7 @@ type struct DropInserter {
             // Moved out: the source no longer owns it - do NOT drop.
             if (this.pm_has(key, f.name.id)) { continue; }
             const drop_stmt: StatementNode* = this.make_field_drop_call(
-                name, ty, f.name, f.field_type, span);
+                name, ty, f.name, i, f.field_type, span);
             out.push(drop_stmt);
             this.inserted += 1;
         }
@@ -2312,13 +2312,16 @@ type struct DropInserter {
     /// but with an intervening field projection; all nodes carry resolved
     /// types (codegen won't re-run type resolution).
     make_field_drop_call(mut &this, name: SymbolStr, ty: TypeRef,
-                         field_name: SymbolStr, field_ty: TypeRef,
+                         field_name: SymbolStr, field_index: i64, field_ty: TypeRef,
                          span: SourceSpan) -> StatementNode* {
         const ident: IdentifierNode* = new IdentifierNode(name, span);
         ident.set_resolved_type(ty);
         const field_access: MemberAccessNode* = new MemberAccessNode(
             ident as ExpressionNode*, field_name, span, span);
         field_access.set_resolved_type(field_ty);
+        // A node minted after the last sema walk carries its own answer:
+        // the field is the `field_index`-th of the aggregate's own list.
+        field_access.set_resolved_member(MemberPin::Field(0, field_index));
         const drop_access: MemberAccessNode* = new MemberAccessNode(
             field_access as ExpressionNode*, this.drop_sym, span, span);
         const call: CallExprNode* = new CallExprNode(
@@ -2858,8 +2861,9 @@ type struct DropInserter {
             mut mty: TypeRef = ty;
             mut ok: boolean = true;
             for (mut k: i64 = 0; k < plen; k++) {
+                mut unused_index: i64 = -1;
                 mty = this.project_type(mty, this.pw_proj_kind[pstart + k],
-                                             this.pw_proj_key[pstart + k]);
+                                             this.pw_proj_key[pstart + k], &unused_index);
                 if (!mty.is_valid()) { ok = false; }
                 if (!ok) { break; }
             }
@@ -2956,12 +2960,16 @@ type struct DropInserter {
         for (mut k: i64 = 0; k < len; k++) {
             const pkind: u8  = kind[start + k];
             const pkey:  u32 = key[start + k];
-            const next_ty: TypeRef = this.project_type(cur_ty, pkind, pkey);
+            mut next_index: i64 = -1;
+            const next_ty: TypeRef = this.project_type(cur_ty, pkind, pkey, &next_index);
             if (!next_ty.is_valid()) { return null as ExpressionNode*; }
             if (pkind == (0 as u8)) {
                 const ma: MemberAccessNode* = new MemberAccessNode(
                     cur, SymbolStr::from_id(pkey), span, span);
                 ma.set_resolved_type(next_ty);
+                // Minted after the last sema walk: the field's coordinates
+                // are the projection's own answer.
+                ma.set_resolved_member(MemberPin::Field(0, next_index));
                 cur = ma as ExpressionNode*;
             } else {
                 const idx_lit: LiteralNode* = new LiteralNode(
@@ -3376,7 +3384,8 @@ type struct DropInserter {
                   start: i64, len: i64) -> TypeRef {
         mut cur: TypeRef = base_ty;
         for (mut k: i64 = 0; k < len; k++) {
-            cur = this.project_type(cur, kind[start + k], key[start + k]);
+            mut unused_index: i64 = -1;
+            cur = this.project_type(cur, kind[start + k], key[start + k], &unused_index);
             if (!cur.is_valid()) { return TypeRef::invalid(); }
         }
         return cur;
@@ -3387,7 +3396,8 @@ type struct DropInserter {
     /// reference at this level (whatever it addresses belongs to whoever it
     /// came from), a dynamic array (its elements live in a heap buffer), a
     /// field the type does not have, or a type the arena cannot resolve.
-    project_type(&this, ty: TypeRef, kind: u8, key: u32) -> TypeRef {
+    project_type(&this, ty: TypeRef, kind: u8, key: u32, out_index: i64*) -> TypeRef {
+        *out_index = -1;
         if (!ty.is_valid() || this.arena == null) { return TypeRef::invalid(); }
         if (this.is_ptr_or_ref(ty)) { return TypeRef::invalid(); }
         if (kind == (1 as u8)) {
@@ -3414,7 +3424,10 @@ type struct DropInserter {
             &(agg as ClassType*).fields
         };
         for (mut i: i64 = 0; i < fields.length; i++) {
-            if (fields[i].name.id == key) { return fields[i].field_type; }
+            if (fields[i].name.id == key) {
+                *out_index = i;
+                return fields[i].field_type;
+            }
         }
         return TypeRef::invalid();
     }

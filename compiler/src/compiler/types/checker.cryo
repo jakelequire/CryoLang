@@ -991,9 +991,18 @@ type struct TypeChecker {
         return TypeCheckResult::ok(fn_type.return_type);
     }
 
-    /// Check field access on a type.
-    check_field_access(&this, base: TypeRef, field_name: SymbolStr) -> TypeCheckResult {
+    /// Check field access on a type.  On success `*out_depth` / `*out_index`
+    /// are the field's coordinates in the receiver's type: `out_index` into
+    /// the field list of the class `out_depth` steps up the base chain (0
+    /// for a struct or a class's own field) - the answer this walk found,
+    /// handed to the caller so no later stage finds it again by the name.
+    /// A derived class's own field wins over a base's of the same name,
+    /// which is the order this walk searches in.
+    check_field_access(&this, base: TypeRef, field_name: SymbolStr,
+                       out_depth: i64*, out_index: i64*) -> TypeCheckResult {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeChecker] check_field_access() base=%lu field_id=%u", base.id, field_name.id);
+        *out_depth = -1;
+        *out_index = -1;
         mut base_type: Type* = this.arena.lookup(base.id);
         if (base_type == null) {
             return TypeCheckResult::fail("Type lookup failed for field access");
@@ -1029,9 +1038,11 @@ type struct TypeChecker {
 
         if (base_type.kind == TypeKind::Struct) {
             mut st: StructType* = base_type as StructType*;
-            mut field: FieldInfo* = st.get_field(field_name);
-            if (field != null) {
-                return TypeCheckResult::ok(field.field_type);
+            const fi: i64 = st.field_index(field_name);
+            if (fi >= 0) {
+                *out_depth = 0;
+                *out_index = fi;
+                return TypeCheckResult::ok(st.fields[fi].field_type);
             }
             return TypeCheckResult::fail(fmt::format("Struct '%s' has no field '%s'",
                 st.display_name(), st.intern_table.resolve(field_name)));
@@ -1041,16 +1052,20 @@ type struct TypeChecker {
             mut ct: ClassType* = base_type as ClassType*;
             // Walk the inheritance chain for field lookup
             mut current: ClassType* = ct;
+            mut depth: i64 = 0;
             while (current != null) {
-                mut field: FieldInfo* = current.get_field(field_name);
-                if (field != null) {
-                    return TypeCheckResult::ok(field.field_type);
+                const fi: i64 = current.field_index(field_name);
+                if (fi >= 0) {
+                    *out_depth = depth;
+                    *out_index = fi;
+                    return TypeCheckResult::ok(current.fields[fi].field_type);
                 }
                 // Walk to parent class
                 if (current.has_base && current.base_class.is_valid()) {
                     const parent_t: Type* = this.arena.lookup(current.base_class.id);
                     if (parent_t != null && parent_t.kind == TypeKind::Class) {
                         current = parent_t as ClassType*;
+                        depth += 1;
                     } else {
                         current = null;
                     }

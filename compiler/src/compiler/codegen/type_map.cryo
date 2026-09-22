@@ -288,36 +288,56 @@ type struct TypeMapper {
         return field_idx;
     }
 
-    /// Element index of the member named `member`, searching a class's base
-    /// chain root-first so a base field wins a name a derived class reuses -
-    /// the order the flattened body itself is built in.  -1 when `t` has no
-    /// such member.
-    member_element_index(&this, t: Type*, member: SymbolStr) -> i64 {
-        if (t == null) { return -1; }
+    /// The class `depth` steps up `leaf`'s base chain (`leaf` itself at 0),
+    /// or null when the chain is shorter.
+    class_at_depth(&this, leaf: ClassType*, depth: i64) -> ClassType* {
+        mut walk: ClassType* = leaf;
+        mut d: i64 = 0;
+        while (walk != null && d < depth) {
+            if (!walk.has_base || !walk.base_class.is_valid()) { return null; }
+            const base_t: Type* = this.arena.lookup(walk.base_class.id);
+            if (base_t == null || base_t.kind != TypeKind::Class) { return null; }
+            walk = base_t as ClassType*;
+            d += 1;
+        }
+        return walk;
+    }
+
+    /// The field at `(depth, index)` in `t` - the coordinates sema pinned:
+    /// `index` into the field list of the class `depth` steps up the base
+    /// chain, or of the struct itself.  Null when the coordinates name
+    /// nothing in `t`.
+    pinned_field(&this, t: Type*, depth: i64, index: i64) -> FieldInfo* {
+        if (t == null || depth < 0 || index < 0) { return null; }
         if (t.kind == TypeKind::Struct) {
+            if (depth != 0) { return null; }
             const st: StructType* = t as StructType*;
-            return this.field_element_index(t, st.field_index(member));
+            if (index >= st.fields.length) { return null; }
+            return &st.fields[index];
+        }
+        if (t.kind == TypeKind::Class) {
+            const owner: ClassType* = this.class_at_depth(t as ClassType*, depth);
+            if (owner == null || index >= owner.fields.length) { return null; }
+            return &owner.fields[index];
+        }
+        return null;
+    }
+
+    /// Element index in `t`'s body of the field at `(depth, index)` (see
+    /// `pinned_field`).  -1 when the coordinates name nothing in `t`.
+    pinned_element_index(&this, t: Type*, depth: i64, index: i64) -> i64 {
+        if (t == null || depth < 0 || index < 0) { return -1; }
+        if (t.kind == TypeKind::Struct) {
+            if (depth != 0) { return -1; }
+            const st: StructType* = t as StructType*;
+            if (index >= st.fields.length) { return -1; }
+            return this.field_element_index(t, index);
         }
         if (t.kind == TypeKind::Class) {
             const cls: ClassType* = t as ClassType*;
-            mut chain: ClassType*[] = [];
-            mut walk: ClassType* = cls;
-            mut depth: i32 = 0;
-            while (walk != null && depth < 16) {
-                chain.push(walk);
-                if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-                const base_t: Type* = this.arena.lookup(walk.base_class.id);
-                if (base_t == null || base_t.kind != TypeKind::Class) { break; }
-                walk = base_t as ClassType*;
-                depth += 1;
-            }
-            for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
-                const link: ClassType* = chain[ci];
-                const local_idx: i64 = link.field_index(member);
-                if (local_idx >= 0) {
-                    return this.class_field_element_index(cls, link, local_idx);
-                }
-            }
+            const owner: ClassType* = this.class_at_depth(cls, depth);
+            if (owner == null) { return -1; }
+            return this.class_field_element_index(cls, owner, index);
         }
         return -1;
     }

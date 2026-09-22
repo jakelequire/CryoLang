@@ -19,6 +19,7 @@ import compiler::codegen::visit::{
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::decl_index;
+import compiler::decl_index::{ GlobalEntry };
 import compiler::module_graph;
 import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, source_span };
@@ -29,7 +30,7 @@ import compiler::types::{
 };
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, LiteralKind, node, NodeKind, pattern, statement,
+    declaration, expression, LiteralKind, MemberPin, node, NodeKind, pattern, statement,
     TypeAnnotation, visitor
 };
 import compiler::lex;
@@ -1090,7 +1091,7 @@ public:
     /// Materialize a struct literal `{ field: value, ... }` into a stack alloca
     /// and store each field.  Writes the alloca's address to `this.state.last_value`
     /// with `this.state.last_is_lvalue=true`; rvalue users load through it.
-    codegen_struct_literal(mut &this, struct_type: TypeRef, field_names: SymbolStr[], field_values: LValue[], site_span: SourceSpan) -> void {
+    codegen_struct_literal(mut &this, struct_type: TypeRef, field_names: SymbolStr[], field_pins: MemberPin[], field_values: LValue[], site_span: SourceSpan) -> void {
         const ty: LType = this.cg.type_mapper.map_type(struct_type);
         if (!ty.is_valid()) {
             this.state.last_value = LValue::null();
@@ -1129,7 +1130,13 @@ public:
             const ust: StructType* = ult as StructType*;
             if (ust.is_union) {
                 if (field_names.length == 1) {
-                    const ufidx: i64 = ust.field_index(field_names[0]);
+                    // The active member is the one sema pinned on the
+                    // initializer.
+                    mut ufidx: i64 = -1;
+                    match (field_pins[0]) {
+                        MemberPin::Field(_, ui) => { if (ui < ust.fields.length) { ufidx = ui; } }
+                        _                       => { }
+                    }
                     if (ufidx >= 0) {
                         const uft: TypeRef = ust.fields[ufidx].field_type;
                         const uflty: LType = this.cg.type_mapper.map_type(uft);
@@ -1155,52 +1162,26 @@ public:
         // store writes only the first few bytes of the field, leaving the
         // rest uninitialised, and downstream `provisions[k]` reads garbage.
         const t: Type* = this.cg.lookup_type_by_id(struct_type.id);
-        // Collect the field info and a parallel slot-index map.  Structs are
-        // 1:1 with their LLVM-struct slots (slot = fidx).  Classes are
-        // flattened by `map_class`: slot 0 holds a vtable pointer if any
-        // class in the chain has virtual methods, then every ancestor's
-        // fields precede this class's own fields in root -> derived order.
-        // To support literals that name INHERITED fields (e.g. a `Derived`
-        // literal that writes a field declared on `Base`), we must walk the
-        // chain here, build a unified field list in the SAME order as
-        // `map_class`, and look up each named field across the whole chain.
-        // Without this walk, leaf-only `cls.fields` misses inherited names
-        // and the literal silently drops their initializer stores.
-        mut fields: FieldInfo[] = [];
-        mut field_slot: i64[] = [];  // parallel slot index per fields[i]
+        // Each initializer carries the coordinates of the field it names -
+        // `(depth, index)`, a base class's field included - and the slot is
+        // computed from them by the routine the body was built from
+        // (`map_class` flattens a class: a vtable slot when any class in the
+        // chain has virtual methods, then every ancestor's fields root ->
+        // derived).  Nothing here searches a field list by the name.
         mut any_virtual: boolean = false;
         mut leaf_cls: ClassType* = null;
-        if (t != null && t.kind == TypeKind::Struct) {
-            const st: StructType* = t as StructType*;
-            for (mut sfi: i64 = 0; sfi < st.fields.length; sfi++) {
-                fields.push(st.fields[sfi]);
-                field_slot.push(this.cg.type_mapper.field_element_index(t, sfi));
-            }
-        } else if (t != null && t.kind == TypeKind::Class) {
+        if (t != null && t.kind == TypeKind::Class) {
             const cls: ClassType* = t as ClassType*;
             leaf_cls = cls;
-            // Walk the base chain root-last (chain[0] = leaf, chain[N-1] = root).
-            mut chain: ClassType*[] = [];
             mut walk: ClassType* = cls;
             mut depth: i32 = 0;
             while (walk != null && depth < 16) {
-                chain.push(walk);
                 if (walk.has_virtual_methods) { any_virtual = true; }
                 if (!walk.has_base || !walk.base_class.is_valid()) { break; }
                 const base_t: Type* = this.cg.lookup_type_by_id(walk.base_class.id);
                 if (base_t == null || base_t.kind != TypeKind::Class) { break; }
                 walk = base_t as ClassType*;
                 depth += 1;
-            }
-            // Root -> derived, the order the flattened body is built in; each
-            // slot comes from the routine that built it rather than from a
-            // second count kept in step here.
-            for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
-                const link: ClassType* = chain[ci];
-                for (mut li: i64 = 0; li < link.fields.length; li++) {
-                    fields.push(link.fields[li]);
-                    field_slot.push(this.cg.type_mapper.class_field_element_index(cls, link, li));
-                }
             }
         }
 
@@ -1232,38 +1213,34 @@ public:
         }
 
         for (mut i: i64 = 0; i < field_names.length; i++) {
-            mut fidx: i64 = -1;
-            for (mut fi: i64 = 0; fi < fields.length; fi++) {
-                if (fields[fi].name.equals(field_names[i])) {
-                    fidx = fi;
-                    break;
-                }
+            mut p_depth: i64 = -1;
+            mut p_index: i64 = -1;
+            match (field_pins[i]) {
+                MemberPin::Field(d, ix) => { p_depth = d; p_index = ix; }
+                _                       => { }
             }
-            if (fidx < 0) {
-                // The literal names a field the resolved struct layout
-                // doesn't carry.  In practice this only happens when
-                // `struct_type` failed to monomorphize to a concrete spec
-                // and resolved to the bare generic template instead (whose
-                // arena `fields` list is empty - fields are only populated
-                // on concrete specializations).  Silently `continue`-ing
-                // here emits the alloca with NO field stores, so the caller
-                // reads uninitialized stack as the field values (a silent
-                // value-corruption miscompile).  Sema already validates
-                // every literal field against the struct, so a miss at
-                // codegen is always an upstream resolution/monomorphization
-                // bug - fail loud instead of corrupting silently.
+            const pin_slot: i64 = this.cg.type_mapper.pinned_element_index(t, p_depth, p_index);
+            const pin_field: FieldInfo* = this.cg.type_mapper.pinned_field(t, p_depth, p_index);
+            if (pin_slot < 0 || pin_field == null) {
+                // The initializer's coordinates name no slot in the resolved
+                // layout: a literal no sema walk answered (the pass that
+                // minted it owes it the pin), or a type that did not
+                // monomorphize to a concrete layout (a bare template's arena
+                // `fields` list is empty).  Silently `continue`-ing here
+                // emits the alloca with NO field stores, so the caller reads
+                // uninitialized stack as the field values - fail loud instead.
                 this.cg.diag.emit_error_at_span(
                     ErrorCode::E0638_INVALID_STRUCT_INITIALIZATION,
-                    fmt::format("codegen: struct literal field '%s' has no slot in the resolved struct type (type did not monomorphize to a concrete layout); upstream monomorphization bug",
+                    fmt::format("codegen: struct literal field '%s' has no slot in the resolved struct type (no field pin from sema, or the type did not monomorphize to a concrete layout)",
                            this.cg.resolve(field_names[i])),
                     site_span);
                 continue;
             }
-            const slot: u32 = field_slot[fidx] as u32;
+            const slot: u32 = pin_slot as u32;
             const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, slot, "field");
             mut val: LValue = field_values[i];
             if (val.is_valid()) {
-                val = this.cg.expr_ops.coerce_fixed_array_to_fat_ptr(val, fields[fidx].field_type);
+                val = this.cg.expr_ops.coerce_fixed_array_to_fat_ptr(val, pin_field.field_type);
                 // Widen/narrow integer literals to the field's declared
                 // width before storing.  `HashMap { len: 0, cap: 0, ... }`
                 // arrives with each `0` as `i32 0` (codegen_literal defaults
@@ -1293,7 +1270,7 @@ public:
                         // a positive i64).  Mirrors the local-var fix.
                         mut signed_target: boolean = false;
                         const field_t: Type* = this.cg.lookup_type_by_id(
-                            fields[fidx].field_type.id);
+                            pin_field.field_type.id);
                         if (field_t != null && field_t.kind == TypeKind::Int) {
                             const ft_int: IntType* = field_t as IntType*;
                             signed_target = ft_int.int_kind.is_signed();
@@ -1377,7 +1354,7 @@ public:
         const obj_is_lvalue: boolean = this.state.last_is_lvalue;
         this.places.codegen_member_access(obj, node.object.resolved_type,
                                           obj_is_lvalue, node.member,
-                                          node.span);
+                                          node.resolved_member, node.span);
     }
 
     override visit(mut &this, node: ArrayAccessNode*) -> void {
@@ -1553,13 +1530,15 @@ public:
         // the spelling again.
         const type_ref: TypeRef = node.resolved_type;
         mut field_names: SymbolStr[] = [];
+        mut field_pins: MemberPin[] = [];
         mut field_values: LValue[] = [];
         for (mut i: i64 = 0; i < node.field_inits.length; i++) {
             const init: FieldInit = node.field_inits[i];
             field_names.push(init.field_name);
+            field_pins.push(init.pin);
             field_values.push(this.dispatch.codegen_rvalue(this,init.value));
         }
-        this.codegen_struct_literal(type_ref, field_names, field_values, node.span);
+        this.codegen_struct_literal(type_ref, field_names, field_pins, field_values, node.span);
     }
 
     /// Array literal: delegate to ArrayLitEmitter, which handles all three
@@ -1600,20 +1579,21 @@ public:
         // an enum reference at all.
         if (this.try_emit_enum_variant(node)) { return; }
 
-        // 3. A global.  The qualifier's stamp names the module - a graph
-        // module, or an `extern module` alias's (`<mod>::cit`) - and the
-        // global is that module's, under the member leaf: two modules may
-        // each declare the same leaf with different values and types
-        // (`libc::FIONBIO` is a Linux ioctl number, `syscall::FIONBIO` the
-        // Winsock one), which is why the leaf alone can never answer.  A
-        // stamp naming no module (a type-relative one) names no global.
-        const global: LValue = this.cg.resolver.resolve_global_in_module(
-            node.member_name,
-            node.require_scope_res("codegen: scope-resolution value").def_id());
-        if (global.is_valid()) {
-            this.state.last_value    = global;
-            this.state.last_is_lvalue = true;
-            return;
+        // 3. A global: the registration slot sema pinned, read back from
+        // the index by the slot.  Sema found it under the module the
+        // qualifier's stamp names and the member leaf - two modules may each
+        // declare the same leaf (`libc::FIONBIO`, `syscall::FIONBIO`) - and
+        // that answer is carried here rather than derived again.
+        match (node.resolved_member) {
+            MemberPin::Global(slot) => {
+                const global: LValue = this.cg.resolver.resolve_global_at(slot);
+                if (global.is_valid()) {
+                    this.state.last_value    = global;
+                    this.state.last_is_lvalue = true;
+                    return;
+                }
+            }
+            _ => { }
         }
 
         this.state.last_value    = LValue::null();
@@ -1641,7 +1621,7 @@ public:
         if (real_t == null || real_t.kind != TypeKind::Enum) { return false; }
 
         const et: EnumType* = real_t as EnumType*;
-        const variant: EnumVariantInfo* = et.get_variant(node.member_name);
+        const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(et, node.resolved_member);
         if (variant == null) { return false; }
 
         mut no_args: LValue[] = [];

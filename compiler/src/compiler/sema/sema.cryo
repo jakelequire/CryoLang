@@ -33,7 +33,7 @@ import compiler::const_table::{ ConstEval };
 import compiler::ast;
 import compiler::ast::{
     cloner, declaration, expression, GenericAnnotation, ImplTraitAnnotation, LiteralKind,
-    NamedAnnotation, node, node_locator, NodeKind, pattern, PatternBinding, PatternElement,
+    MemberPin, NamedAnnotation, node, node_locator, NodeKind, pattern, PatternBinding, PatternElement,
     statement, TraitRef, TypeAnnotation, visitor
 };
 import compiler::passes::pass_id;
@@ -2721,7 +2721,7 @@ public:
     /// rejects a mismatch) but not necessarily on instantiation, and only the
     /// returned one is what the synthesized reference refers to.
     build_try_desugar(mut &this, node: TryExprNode*, is_result: boolean,
-                      ret_ty: TypeRef) -> MatchExprNode* {
+                      operand_ty: TypeRef, ret_ty: TypeRef) -> MatchExprNode* {
         const span: SourceSpan = node.span;
         this.state.try_counter += 1;
         const enum_name: SymbolStr = this.intern.intern(if (is_result) { "Result" } else { "Option" });
@@ -2733,6 +2733,7 @@ public:
         mut ok_pat: EnumPatternNode* = new EnumPatternNode(span);
         ok_pat.set_enum_name(enum_name);
         ok_pat.set_variant_name(ok_variant);
+        ok_pat.set_res(Res::Def(this.ctx.definition_id_of(operand_ty)));
         const ok_pb: PatternBinding* = new PatternBinding { name: ok_bind, span: span };
         ok_pat.add_element(PatternElement::Binding(ok_pb));
         mut ok_arm: MatchArmNode* = new MatchArmNode(span);
@@ -2747,6 +2748,7 @@ public:
         mut err_pat: EnumPatternNode* = new EnumPatternNode(span);
         err_pat.set_enum_name(enum_name);
         err_pat.set_variant_name(err_variant);
+        err_pat.set_res(Res::Def(this.ctx.definition_id_of(operand_ty)));
         mut ret_value: ExpressionNode* = null;
         if (is_result) {
             const err_bind: SymbolStr = this.intern.intern(fmt::format("__cryo_try_err_%u", this.state.try_counter));
@@ -2840,7 +2842,7 @@ public:
             this.ctx.emit_diagnostic(diag);
             return TypeRef::invalid();
         }
-        mut desugared: MatchExprNode* = this.build_try_desugar(node, operand_shape == 1, fn_ret);
+        mut desugared: MatchExprNode* = this.build_try_desugar(node, operand_shape == 1, operand_type, fn_ret);
         node.set_desugared(desugared as ExpressionNode*);
         return this.resolve_expr(desugared as ExpressionNode*);
     }
@@ -2958,12 +2960,17 @@ public:
                 this.member.enforce_field_visibility(struct_ref, field_init.field_name, field_init.span);
             }
             mut field_type: TypeRef = TypeRef::invalid();
-            if (value_expr != null && struct_t != null
+            // The field this initializer names, by its coordinates in the
+            // literal's type - a class's base fields included, walked
+            // derived-first as `check_field_access` walks them - recorded
+            // on the initializer so codegen stores at those coordinates.
+            mut f_depth: i64 = -1;
+            mut f_index: i64 = -1;
+            if (struct_t != null
                 && (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class)) {
-                mut finfo: FieldInfo* = null;
-                if (struct_t.kind == TypeKind::Struct) { finfo = (struct_t as StructType*).get_field(field_init.field_name); }
-                else { finfo = (struct_t as ClassType*).get_field(field_init.field_name); }
-                if (finfo != null && finfo.field_type.is_valid()) { field_type = finfo.field_type; }
+                const found: TypeCheckResult = this.checker.check_field_access(
+                    struct_ref, field_init.field_name, &f_depth, &f_index);
+                if (found.success && found.result_type.is_valid()) { field_type = found.result_type; }
             }
             // A literal of the generic OWNER inside its own body (`String {
             // buffer: RawBuffer::new(), .. }` in `String<A>::new`): the arena
@@ -2972,9 +2979,15 @@ public:
             // value then has an expected type to bind its own owner arguments
             // from; without one a generic-owner static call in the field
             // position stashes nothing and is never pinned.
-            if (!field_type.is_valid() && value_expr != null) {
-                field_type = this.symbolic.symbolic_resolve_owner_field(struct_ref, field_init.field_name);
+            if (!field_type.is_valid()) {
+                mut o_index: i64 = -1;
+                field_type = this.symbolic.symbolic_resolve_owner_field(struct_ref, field_init.field_name, &o_index);
+                if (field_type.is_valid()) { f_depth = 0; f_index = o_index; }
             }
+            if (f_index >= 0) {
+                lit.field_inits[i].pin = MemberPin::Field(f_depth, f_index);
+            }
+            if (value_expr == null) { field_type = TypeRef::invalid(); }
             if (field_type.is_valid()) { this.state.expected_type = field_type; }
             else { this.state.expected_type = TypeRef::invalid(); }
             const value_type: TypeRef = this.resolve_expr(value_expr);
@@ -3031,7 +3044,7 @@ public:
                     // field-init so codegen materializes it.  Only an omitted field
                     // WITHOUT a default is a missing-field error (E0355).
                     if (fields_ptr[k].has_default()) {
-                        this.fill_field_default(lit, &fields_ptr[k], decl_name);
+                        this.fill_field_default(lit, &fields_ptr[k], k, decl_name);
                     } else {
                         missing_names.push(decl_name);
                     }
@@ -3063,7 +3076,7 @@ public:
     /// it to the literal as a synthetic field-init so codegen fills the field.
     /// The default is a standalone expression - it never sees the other fields.
     fill_field_default(mut &this, lit: StructLiteralNode*, field: FieldInfo*,
-                       name: SymbolStr) -> void {
+                       index: i64, name: SymbolStr) -> void {
         if (field.default_value == null) { return; }
         mut cloner: ASTCloner = ASTCloner();
         const cloned: ExpressionNode* = cloner.clone_expr(field.default_value);
@@ -3088,6 +3101,7 @@ public:
             field_name: name,
             value:      cloned,
             span:       lit.span,
+            pin:        MemberPin::Field(0, index),
         });
     }
 
@@ -3213,7 +3227,14 @@ public:
         const t: Type* = this.arena.lookup(scope_ty.id);
         if (t == null || t.kind != TypeKind::Enum) { return; }
         const et: EnumType* = t as EnumType*;
-        if (et.get_variant(scope.member_name) != null) { return; }
+        const vi: i64 = et.variant_index(scope.member_name);
+        if (vi >= 0) {
+            // The ordinal is the same in the template and in every
+            // instantiation, so a value's node carries it whichever the
+            // qualifier resolved to here.
+            scope.set_resolved_member(MemberPin::Variant(vi));
+            return;
+        }
         for (mut i: i64 = 0; i < et.methods.length; i++) {
             if (et.methods[i].name.equals(scope.member_name)) { return; }
         }
@@ -3240,8 +3261,34 @@ public:
         // records the instantiation's arena id on the node, and
         // `resolve_expr` returns that before this runs.
         const base: TypeRef = this.types.spelling_type(new_expr.res);
-        if (base.is_valid()) { return this.arena.get_pointer_to(base); }
-        return TypeRef::invalid();
+        if (!base.is_valid()) { return TypeRef::invalid(); }
+        // `new E::V(..)`: the variant is found here, once, inside the enum the
+        // stamp names, and its ordinal recorded for codegen to build from.  A
+        // leaf the enum does not declare is refused as `E::V` in value
+        // position is (`validate_enum_scope_member`).
+        if (new_expr.has_variant()) {
+            const e: Type* = this.types.unwrap_to_enum(base);
+            if (e != null && e.kind == TypeKind::Enum) {
+                const et: EnumType* = e as EnumType*;
+                const vi: i64 = et.variant_index(new_expr.variant_name);
+                if (vi >= 0) {
+                    new_expr.set_resolved_member(MemberPin::Variant(vi));
+                } else {
+                    const enum_name: string = this.intern.resolve(new_expr.type_name);
+                    const member: string = this.intern.resolve(new_expr.variant_name);
+                    mut cands: string[] = [];
+                    for (mut i: i64 = 0; i < et.variants.length; i++) { cands.push(this.intern.resolve(et.variants[i].name)); }
+                    const best: string = find_best_candidate(member, cands);
+                    mut d: Diagnostic = Diagnostic::error(ErrorCode::E0640_INVALID_ENUM_VARIANT_ACCESS,
+                        fmt::format("enum `%s` has no variant `%s`", enum_name, member));
+                    d = d.at_with_label(new_expr.span, "unknown variant");
+                    if (best.length() > 0) { d = d.help(fmt::format("did you mean `%s::%s`?", enum_name, best)); }
+                    this.ctx.diagnostics.emit(d);
+                    return TypeRef::invalid();
+                }
+            }
+        }
+        return this.arena.get_pointer_to(base);
     }
 
     expected_is_dynamic_array(&this) -> boolean {

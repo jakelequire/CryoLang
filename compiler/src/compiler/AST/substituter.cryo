@@ -16,7 +16,7 @@ import compiler::diag;
 import compiler::ast;
 import compiler::ast::{
     ArrayAnnotation, declaration, expression, FunctionAnnotation, GenericAnnotation,
-    NamedAnnotation, node, pattern, PatternElement, PatternKind, PointerAnnotation,
+    MemberPin, NamedAnnotation, node, pattern, PatternElement, PatternKind, PointerAnnotation,
     PrimitiveAnnotation, ProjectionAnnotation, statement, TupleAnnotation, TypeAnnotation,
     visitor
 };
@@ -649,6 +649,10 @@ public:
         if (node.struct_init != null) {
             node.struct_init.accept(this);
         }
+        // The same reason a call's pin is cleared: the type this `new` names
+        // may now be another instantiation, and sema's walk over this body
+        // answers the variant again.
+        node.set_resolved_member(MemberPin::None);
     }
 
     override visit(node: StructLiteralNode*) -> void {
@@ -682,6 +686,10 @@ public:
             if (val != null) {
                 val.accept(this);
             }
+            // Cleared as a call's pin is: sema's walk over this body answers
+            // the field again, and a pin left standing could only hide a
+            // node that walk never reached.
+            node.field_inits[i].pin = MemberPin::None;
         }
     }
 
@@ -730,6 +738,7 @@ public:
         // now name a different owner than the one the template's walk pinned
         // the function for, and sema's walk over this body pins it again.
         node.set_resolved_callee(CalleePin::None);
+        node.set_resolved_member(MemberPin::None);
     }
 
     override visit(node: SizeofExprNode*) -> void {
@@ -963,12 +972,17 @@ public:
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
         }
+        // Cleared as a call's pin is; sema's walk over this body answers the
+        // field again, so a pin left standing could only hide a node that
+        // walk never reached.
+        node.set_resolved_member(MemberPin::None);
     }
 
     override visit(node: EnumPatternNode*) -> void {
         if (node.enum_name.equals(this.base_name)) {
             node.enum_name = this.spec_name;
         }
+        node.set_resolved_member(MemberPin::None);
         // Recurse into nested sub-patterns (`Some(Some(n))`, `Branch(Leaf(x),
         // r)`) so their enum_name is substituted too. Without this, a nested
         // pattern in a generic body kept the unsubstituted (template) name.
