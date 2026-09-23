@@ -37,7 +37,7 @@ import compiler::types::{
 };
 import compiler::resolver::{ intern_table, symbol_str, resolver };
 import compiler::resolver::res;
-import compiler::resolver::res::{ OverloadId, Res, ResBase, ResSlot };
+import compiler::resolver::res::{ DefId, OverloadId, Res, ResBase, ResSlot };
 import std::core::mem;
 import utils::logger;
 import utils::logger::{ cdebug, LOG_DEBUG, LogComponent };
@@ -433,17 +433,16 @@ type struct TypeResolutionRunner {
     /// DeclarationCollection FunctionSignature pass resolves these methods
     /// before the owning type is registered, so its owner lookup returns
     /// invalid and a by-value `this` receiver (which carries no annotation)
-    /// is left without a resolved_type.  `owner_key` is the declaration's own
-    /// key (`decl_type_key`), the one the type-declaration stage registered
-    /// it under, so the receiver back-fill in
-    /// `Resolver::resolve_method_signatures` runs.  Idempotent for
-    /// already-resolved return/param types.
-    resolve_inline_method_signatures(&this, owner_key: SymbolStr,
+    /// is left without a resolved_type.  `owner` is the declaration's own
+    /// definition, the one the type-declaration stage registered it under,
+    /// so the receiver back-fill in `Resolver::resolve_method_signatures`
+    /// runs.  Idempotent for already-resolved return/param types.
+    resolve_inline_method_signatures(&this, owner: DefId,
                                      methods: &MethodNode*[],
                                      res_ctx: ResolutionContext*) -> void {
-        const owner: TypeRef = this.ctx.decl_index.lookup_type(owner_key);
-        if (owner.is_invalid()) { return; }
-        this.resolver.resolve_method_signatures(methods, res_ctx, owner, owner_key);
+        const owner_ty: TypeRef = this.ctx.decl_index.type_of_def(owner);
+        if (owner_ty.is_invalid()) { return; }
+        this.resolver.resolve_method_signatures(methods, res_ctx, owner_ty, owner.qualified_name());
     }
 
     /// Resolves all function signatures (FunctionDeclNode*[]) on a trait.
@@ -2677,9 +2676,7 @@ type struct TypeResolutionPasses {
                     // same repair here, or a consuming method (`fn m(mut this)`)
                     // reaches drop-insertion with an unresolved receiver and its
                     // by-value `this` is never dropped - a leak on every call.
-                    runner.resolve_inline_method_signatures(
-                        ctx.decl_type_key(node.name, node.binding_namespace, node.span.file),
-                        node.methods, &struct_ctx);
+                    runner.resolve_inline_method_signatures(node.def, node.methods, &struct_ctx);
                     runner.emit_method_signature_diagnostics(node.methods);
                 }
                 NodeKind::UnionDeclaration => {
@@ -2688,9 +2685,7 @@ type struct TypeResolutionPasses {
                         node.generic_params, &runner.res_ctx);
                     runner.resolve_fields(node.fields, &union_ctx);
                     field_count += node.fields.length;
-                    runner.resolve_inline_method_signatures(
-                        ctx.decl_type_key(node.name, node.binding_namespace, node.span.file),
-                        node.methods, &union_ctx);
+                    runner.resolve_inline_method_signatures(node.def, node.methods, &union_ctx);
                     runner.emit_method_signature_diagnostics(node.methods);
                 }
                 NodeKind::ClassDeclaration => {
@@ -2699,9 +2694,7 @@ type struct TypeResolutionPasses {
                         node.generic_params, &runner.res_ctx);
                     runner.resolve_fields(node.fields, &class_ctx);
                     field_count += node.fields.length;
-                    runner.resolve_inline_method_signatures(
-                        ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file),
-                        node.methods, &class_ctx);
+                    runner.resolve_inline_method_signatures(node.def, node.methods, &class_ctx);
                     runner.emit_method_signature_diagnostics(node.methods);
                 }
                 NodeKind::ImplementationBlock => {

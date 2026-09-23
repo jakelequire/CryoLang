@@ -25,7 +25,7 @@ import compiler::types::type_ref::{ TypeRef };
 import compiler::resolver::symbol_str;
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res;
-import compiler::resolver::res::{ Res, ResSlot };
+import compiler::resolver::res::{ DefId, Res, ResSlot };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::intern_table;
@@ -386,16 +386,21 @@ implement enum TypeAnnotation {
     /// generic parameter, a primitive, or a failure. That is a routing fact
     /// about this annotation, never a licence to search for the name.
     static trait_identity(ann: TypeAnnotation*) -> SymbolStr {
-        if (ann == null) { return SymbolStr::empty(); }
+        return TypeAnnotation::trait_def(ann).qualified_name();
+    }
+
+    /// The definition `trait_identity` names, for a consumer that asks the
+    /// index about the trait rather than keying a name-keyed store.
+    static trait_def(ann: TypeAnnotation*) -> DefId {
+        if (ann == null) { return DefId::invalid(); }
         return match (*ann) {
             TypeAnnotation::Named(n) => {
-                n.res.require("TypeAnnotation::trait_identity")
-                     .def_id().qualified_name()
+                n.res.require("TypeAnnotation::trait_identity").def_id()
             }
-            TypeAnnotation::Generic(g)   => { TypeAnnotation::trait_identity(g.base) }
-            TypeAnnotation::Reference(r) => { TypeAnnotation::trait_identity(r.inner) }
-            TypeAnnotation::Pointer(p)   => { TypeAnnotation::trait_identity(p.inner) }
-            _ => { SymbolStr::empty() }
+            TypeAnnotation::Generic(g)   => { TypeAnnotation::trait_def(g.base) }
+            TypeAnnotation::Reference(r) => { TypeAnnotation::trait_def(r.inner) }
+            TypeAnnotation::Pointer(p)   => { TypeAnnotation::trait_def(p.inner) }
+            _ => { DefId::invalid() }
         };
     }
 
@@ -795,9 +800,9 @@ type struct TraitRef {
     /// traits fold to one name, and impl heads that differ only in their
     /// bounds then render identically.
     ///
-    /// Empty until TypeResolution stamps it; consumers asking WHICH trait a
-    /// bound names read this field.
-    resolved_name: SymbolStr;
+    /// Invalid until the name layer stamps it; consumers asking WHICH trait
+    /// a bound names read it through `definition()` or `identity()`.
+    resolved: DefId;
     type_args: TypeAnnotation*[];
     span:      SourceSpan;
 
@@ -805,7 +810,7 @@ type struct TraitRef {
     /// TypeAnnotation* handles are Copy), so a clone can be stored in a
     /// second owner without aliasing this one's buffers.
     ///
-    /// `resolved_name` IS copied: specializing an impl rewrites which types a
+    /// `resolved` IS copied: specializing an impl rewrites which types a
     /// bound is applied to, never which trait the bound names, so the
     /// template's identity is the clone's. Copying it also keeps the answer
     /// pinned to the module that wrote the bound once the clone is re-visited
@@ -815,7 +820,7 @@ type struct TraitRef {
         mut args_c: TypeAnnotation*[] = [];
         for (mut i: i64 = 0; i < this.path.length; i++)      { path_c.push(this.path[i]); }
         for (mut i: i64 = 0; i < this.type_args.length; i++) { args_c.push(this.type_args[i]); }
-        return TraitRef { path: path_c, resolved_name: this.resolved_name,
+        return TraitRef { path: path_c, resolved: this.resolved,
                           type_args: args_c, span: this.span };
     }
 
@@ -829,9 +834,15 @@ type struct TraitRef {
     /// consumer stops as it would for a bound nothing satisfies; the build is
     /// refused at its end if nothing else reported it.
     identity(&this) -> SymbolStr {
-        if (this.resolved_name.is_valid()) { return this.resolved_name; }
+        return this.definition().qualified_name();
+    }
+
+    /// The trait's definition, for a consumer that asks the index about it
+    /// rather than keying a name-keyed store; `identity()` is its name.
+    definition(&this) -> DefId {
+        if (this.resolved.is_valid()) { return this.resolved; }
         compiler::resolver::res::record_pending_bug("trait bound identity");
-        return SymbolStr::empty();
+        return DefId::invalid();
     }
 
     /// The last segment of the SPELLING, which is a search key and not an
