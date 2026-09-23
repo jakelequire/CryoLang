@@ -1,7 +1,7 @@
 # The Cryo Language Reference
 
 > **Version:** 1.0.0 \
-> **Last revised:** July 2026
+> **Last revised:** September 2026
 
 Cryo is a statically-typed, compiled systems language. It targets native machine code through LLVM 20, has a self-hosted compiler, and ships a standard library written entirely in itself. Three principles shape the language:
 
@@ -285,6 +285,8 @@ mut &int           // exclusive reference to int
 ```
 
 The receiver shape on a method is part of its signature: a `&this` method may not modify the receiver; a `mut &this` method may. Callers see this distinction without reading the body.
+
+Reading the value a reference refers to is explicit in arithmetic and comparison: `*x == 7`, `*x % 2`. Writing `x == 7` or `x % 2` with `x: &int` is an error, never a comparison of the reference itself ([section 5.2](#52-comparison)). Member access reads through the reference: `h.tag` with `h: &Heap`.
 
 ### 2.4 Array Types
 
@@ -797,6 +799,17 @@ This is a defined deterministic result, not undefined behavior, but it is *silen
 | `<=>`             | Three-way comparison (spaceship); yields an `Ordering` (`Less` / `Equal` / `Greater`) |
 
 Comparison operators return `boolean`. On numeric types and pointers they emit native instructions; on user-defined types that implement `Eq`/`Ord` they are **overloaded** - `a == b` becomes `a.equals(&b)` and `a < b` becomes `a.compare(&b).is_lt()` (see operator overloading, [section 11.6](#116-operator-overloading)).
+
+**A reference is not compared with a plain value.** When one operand is a reference and the other is a number, `boolean`, `char`, string or enum, the comparison is refused (E0229) - the same rule arithmetic follows, where `x % 2` with `x: &int` is already an error. Dereference explicitly:
+
+```cryo
+function is_seven(x: &i32) -> boolean {
+    return x == 7;     // error[E0229]: a reference compared with a value
+    return *x == 7;    // compares the value x refers to
+}
+```
+
+The alternative - quietly dereferencing - was rejected because the comparison did not previously dereference: it compared the reference's *address* with `7`, which compiled and was silently false. Refusing it makes the one meaning explicit at the call site. What stays allowed: two references compared with each other (by value when the referent implements `Eq`/`Ord`, by identity otherwise), and a reference compared with `null`.
 
 ### 5.3 Logical
 

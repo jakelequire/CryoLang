@@ -96,8 +96,9 @@ type trait Iterator {
     }
 
     /// Yield only the elements for which `pred` returns `true`. `pred` must be
-    /// a non-capturing function.
-    filter(this, pred: (This::Item) -> boolean) -> FilterIter<This> {
+    /// a non-capturing function.  It BORROWS each element: the element it
+    /// keeps is the one yielded, so it cannot also be handed to `pred`.
+    filter(this, pred: (&This::Item) -> boolean) -> FilterIter<This> {
         return FilterIter::new(this, pred);
     }
 
@@ -149,8 +150,9 @@ type trait Iterator {
     }
 
     /// The first element for which `pred` holds, or `None`. Consumes
-    /// elements up to and including the match.
-    find(mut &this, pred: (This::Item) -> boolean) -> Option<This::Item> {
+    /// elements up to and including the match.  `pred` borrows each element,
+    /// since the one it accepts is returned.
+    find(mut &this, pred: (&This::Item) -> boolean) -> Option<This::Item> {
         loop {
             match (this.next()) {
                 Option::Some(value) => {
@@ -289,9 +291,9 @@ where I: Iterator {
 /// Adapter yielding only the elements of `inner` for which `pred` holds.
 type struct FilterIter<I> {
     inner: I;
-    pred:  (I::Item) -> boolean;
+    pred:  (&I::Item) -> boolean;
 
-    static new(inner: I, pred: (I::Item) -> boolean) -> FilterIter<I> {
+    static new(inner: I, pred: (&I::Item) -> boolean) -> FilterIter<I> {
         return FilterIter::<I> { inner: inner, pred: pred };
     }
 }
@@ -299,10 +301,13 @@ type struct FilterIter<I> {
 implement<I> trait Iterator<I::Item> for struct FilterIter<I>
 where I: Iterator {
     next(mut &this) -> Option<I::Item> {
+        // Called through a local: a call through the field itself leaves its
+        // argument unclassified, which the move checker reads as a transfer.
+        const pred: (&I::Item) -> boolean = this.pred;
         loop {
             match (this.inner.next()) {
                 Option::Some(value) => {
-                    if (this.pred(value)) {
+                    if (pred(value)) {
                         return Option::Some(value);
                     }
                 }

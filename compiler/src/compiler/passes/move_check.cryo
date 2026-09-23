@@ -160,11 +160,12 @@ type struct MoveChecker {
     /// in `Some(pair) => ...`).  These are by-value payload bindings the
     /// pattern MOVED out of the (drop-glued) subject, so - exactly like a
     /// `let` local - moving a non-Copy FIELD out of one leaves the source's
-    /// scope-exit glue to drop that field a second time.  They are NOT put in
-    /// the `types` map (that would fold them into whole-binding move tracking
-    /// and change behaviour broadly); this narrow set only teaches
-    /// `is_owned_value_place` to recognise them so `check_field_move_out`
-    /// fires.  Pushed around each arm body's walk, truncated after the join.
+    /// scope-exit glue to drop that field a second time.  Each is also in the
+    /// `types` map, so a payload given away twice is refused like a local;
+    /// this set is what `partial_move_allowed` reads to keep a field moved out
+    /// of a payload refused, since the subject's glue suppression is
+    /// whole-payload only.  Pushed around each arm body's walk, truncated
+    /// after the join.
     /// Keyed by the binding the pattern declares, as every set in this pass is.
     pat_binding_keys: u64[];
 
@@ -341,6 +342,10 @@ type struct MoveChecker {
             if (pb != null) {
                 if (this.require_identity(pb.sym_id, pb.name, pb.span)) {
                     this.pat_binding_keys.push(pb.sym_id.id);
+                    // The payload is a by-value copy the pattern took out of
+                    // the subject: giving it away twice releases it twice,
+                    // exactly as for a declared local.
+                    this.register_binding(pb.sym_id, pb.resolved_type, pb.name, pb.span);
                 }
                 continue;
             }
@@ -1634,15 +1639,6 @@ type struct MoveChecker {
             const decl_ty: TypeRef = this.lookup_type(id.res.local_sym());
             if (decl_ty.is_valid()) {
                 return !this.is_ptr_or_ref(decl_ty);
-            }
-            // Not a `let`/param local.  An enum/match PATTERN payload binding
-            // (`Some(pair) => ...`) is a by-value owned place too - it was
-            // moved out of the drop-glued subject - but it never entered the
-            // `types` map (see `pat_binding_keys`).  Pattern bindings carry no
-            // `&this` auto-deref subtlety, so the node's resolved type is the
-            // binding's own type: value => owned place, ptr/ref => a borrow.
-            if (this.is_pat_binding(id.res.local_sym().id)) {
-                return !this.is_ptr_or_ref(obj.resolved_type);
             }
             return false;
         }

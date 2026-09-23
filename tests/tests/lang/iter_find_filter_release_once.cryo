@@ -1,0 +1,75 @@
+// `find` and `filter` hand each element to the predicate by REFERENCE: the
+// element the predicate accepts is the one returned or yielded, so it cannot
+// also have been given to the predicate, which would release it on return.
+// With a by-value predicate an element with a destructor was released twice -
+// once by the predicate, once by whoever received it.
+![config(testing)]
+namespace CryoTests::Tests::Lang::IterFindFilterReleaseOnce;
+
+import std::test;
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::iter;
+import std::core::iter::{ Iterator };
+import std::test::assert::{ expect_eq };
+import std::test::error::{ TestError };
+
+mut ff_drops: i32 = 0;
+
+type struct Item {
+    tag: i32;
+
+    drop(mut &this) -> void {
+        ff_drops = ff_drops + 1;
+    }
+}
+
+// Yields Item 1, 2, 3.
+type struct Three {
+    n: i32;
+}
+
+implement trait Iterator<Item> for struct Three {
+    next(mut &this) -> Option<Item> {
+        if (this.n >= 3) { return Option::None; }
+        this.n = this.n + 1;
+        return Option::Some(Item { tag: this.n });
+    }
+}
+
+function is_two(it: &Item) -> boolean { return it.tag == 2; }
+function is_odd(it: &Item) -> boolean { return it.tag % 2 == 1; }
+
+function found_tag(r: Option<Item>) -> i32 {
+    match (r) {
+        Option::Some(it) => { return it.tag; }
+        Option::None => { return 0; }
+    }
+}
+
+![test]
+function find_releases_each_element_once() -> Result<(), TestError> {
+    ff_drops = 0;
+    mut t: Three = Three { n: 0 };
+    const tag: i32 = found_tag(t.find(is_two));
+    match (expect_eq(tag, 2)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    // Item 1 rejected and released by `find`; Item 2 released by `found_tag`.
+    return expect_eq(ff_drops, 2);
+}
+
+![test]
+function filter_releases_each_element_once() -> Result<(), TestError> {
+    ff_drops = 0;
+    mut kept: i32 = 0;
+    for (it in Three { n: 0 }.filter(is_odd)) { kept = kept + it.tag; }
+    match (expect_eq(kept, 4)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(ff_drops, 3);
+}
