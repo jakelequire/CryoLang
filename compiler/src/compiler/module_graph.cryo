@@ -20,6 +20,8 @@ import std::ffi::libc;
 import std::fmt;
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::module_path;
+import compiler::resolver::module_path::{ ModulePath };
 
 /// Where a module's source originates, driving which per-package subtree
 /// (`std/`, `local/`, or `<depname>/`) its object/IR output lands in.
@@ -282,9 +284,9 @@ type struct ModuleGraph {
         return &this.modules[index];
     }
 
-    /// Find a module's index by its name SymbolStr.  Returns -1 if not found.
-    find_module_index(&this, name: SymbolStr) -> i64 {
-        const key: u32 = name.id;
+    /// Find a module's index by its path.  Returns -1 if not found.
+    find_module_index(&this, name: ModulePath) -> i64 {
+        const key: u32 = name.as_sym().id;
         return match (this.name_index.get(&key)) {
             Option::Some(val) => { val as i64 }
             Option::None      => { -1 }
@@ -304,7 +306,7 @@ type struct ModuleGraph {
     /// present is never appended again - which is what terminates the walk.
     /// It cannot terminate on the graph being acyclic, because mutual
     /// re-export is legal by design.
-    reexport_closure(&this, ns: SymbolStr) -> SymbolStr[] {
+    reexport_closure(&this, ns: ModulePath) -> SymbolStr[] {
         mut out: SymbolStr[] = [];
         const start: i64 = this.find_module_index(ns);
         if (start < 0) { return out; }
@@ -316,12 +318,12 @@ type struct ModuleGraph {
         while (wi < out.length) {
             const via: SymbolStr = out[wi];
             wi = wi + 1;
-            const vidx: i64 = this.find_module_index(via);
+            const vidx: i64 = this.find_module_index(ModulePath::of(via));
             if (vidx < 0) { continue; }
             const vinfo: ModuleInfo* = this.get_module(vidx);
             for (mut ri: i64 = 0; ri < vinfo.reexports.length; ri++) {
                 const nxt: SymbolStr = vinfo.reexports[ri];
-                if (nxt.id == ns.id) { continue; }
+                if (nxt.id == ns.as_sym().id) { continue; }
                 mut seen: boolean = false;
                 for (mut qi: i64 = 0; qi < out.length; qi++) {
                     if (out[qi].id == nxt.id) { seen = true; }
@@ -433,7 +435,7 @@ type struct ModuleGraph {
                 const deps: &SymbolStr[] = &this.modules[i].dependencies;
                 mut all_ready: boolean = true;
                 for (mut d: i64 = 0; d < deps.length; d++) {
-                    const dep_idx: i64 = this.find_module_index(deps[d]);
+                    const dep_idx: i64 = this.find_module_index(ModulePath::of(deps[d]));
                     if (dep_idx >= 0 && !ModuleGraph::topo_contains(order, dep_idx as u32)) {
                         all_ready = false;
                     }
@@ -460,7 +462,8 @@ type struct ModuleGraph {
                     // Read deps in place - a value copy of `cinfo` would alias
                     // its owning arrays and double-free at scope exit.
                     for (mut cd: i64 = 0; cd < cinfo.dependencies.length; cd++) {
-                        const cdep_idx: i64 = this.find_module_index(cinfo.dependencies[cd]);
+                        const cdep_idx: i64 =
+                            this.find_module_index(ModulePath::of(cinfo.dependencies[cd]));
                         if (cdep_idx >= 0 && !ModuleGraph::topo_contains(order, cdep_idx as u32)) {
                             cdebug("    -> blocked by [%lld] %s\n",
                                 cdep_idx, this.modules[cdep_idx].file_path);
@@ -509,7 +512,7 @@ type struct ModuleGraph {
             head = head + 1;
             const info: ModuleInfo* = &this.modules[cur];
             for (mut d: i64 = 0; d < info.dependencies.length; d++) {
-                const didx: i64 = this.find_module_index(info.dependencies[d]);
+                const didx: i64 = this.find_module_index(ModulePath::of(info.dependencies[d]));
                 if (didx < 0 || didx >= n as i64) {
                     if (out_incomplete != null) { *out_incomplete = true; }
                     continue;

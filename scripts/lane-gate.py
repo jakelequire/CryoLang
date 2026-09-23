@@ -247,7 +247,14 @@ LOOKUPS = (
 
 # The types whose presence in a signature makes a method name-keyed.  Matched
 # as whole tokens: `SymbolStr[]` and `string*` count, `StringBuilder` does not.
-KEY_TYPES = ("SymbolStr", "string")
+#
+# `ModulePath` is a module's canonical path in a type of its own, so a module
+# door refuses a leaf; it is still a path the graph looks a module up BY, and
+# typing the parameter changes what the door accepts, not what kind of read it
+# is.  Counted here so that giving a door the type moves no pinned number:
+# whether a door taking one leaves D32's population is a ruling, not a
+# side effect of the rename.
+KEY_TYPES = ("SymbolStr", "string", "ModulePath")
 KEY_RE = re.compile(r"\b(?:%s)\b" % "|".join(KEY_TYPES))
 
 
@@ -758,7 +765,8 @@ RECORD_ARRAY_RE = re.compile(
 # A key type in PARAMETER position: `name: SymbolStr`, `s: string`, `&SymbolStr`,
 # never `SymbolStr[]` (an array handed in is a table, not a key).  Rule 1b's
 # signature test, the half of rule 2's that says "the caller hands a name in".
-KEY_PARAM_RE = re.compile(r":\s*&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*(?:SymbolStr|string)\b(?!\s*\[)")
+KEY_PARAM_RE = re.compile(r":\s*&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*(?:%s)\b(?!\s*\[)"
+                          % "|".join(KEY_TYPES))
 RETURN_RE = re.compile(r"\)\s*->\s*&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*([A-Za-z_][A-Za-z_0-9]*)")
 # A receiver: segments joined by `.`, each an identifier optionally followed
 # by `()` (a zero-argument accessor, placed by its declared return type) or

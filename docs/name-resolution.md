@@ -56,7 +56,7 @@ measurement that decided it on the row.
 | D11 | **Remove `resolve_counter.cryo` completely** - the counter, its audit streams, `scripts/b1-gate.py` and `tests/b1-baseline.txt` (Jake, 2026-09-15: "I want this instrumentation to be removed completely"; §7.2 mechanism 3 amended, §8.202) | **TAKEN** (§8.203) — the module (1,302 lines), its 100 `bump()` sites and 54 audit emitters, the five audit streams and `CRYO_RESOLVE_COUNTER`, `HomeOrigin` and `ResolutionContext`'s `FILE, LINE` provenance, the `door`/`site`/`table` parameters that carried a site name to an emitter, `b1-gate.py`, `retire-counter-sites.py`, `b1-baseline.txt`, `make b1-check` and its two CI steps. 0 of 3,478 objects moved over `examples/` and `tests/`. `lane-check`, the negative tests and the mutation projects are the regrowth guard | `git ls-files \| grep -c -e 'resolve_counter' -e 'b1-gate' -e 'b1-baseline'` → **0**; `grep -rho -e 'resolve_counter' -e 'HomeOrigin' compiler/src tools --include=*.cryo \| wc -l` → **0** | §8.66, §8.80, §8.139, §8.174, §8.183, §8.188, §8.193, §8.202, §8.203 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -v '^\s*//' compiler/src/compiler/resolver/name_resolution.cryo \| grep -c 'module_offering'` → **5** (3 before §8.258: `module_offerings`, the plural form the walk reads so its E0155 can name both declarations, and `module_offering` is its first-and-count) | §8.138, §8.144, §8.151, §8.258 |
-| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **599** (+1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194, §8.195 and §8.197, projects; +2 in §8.199, a project's two files; -1 in §8.203, `resolve_counter.cryo`; -1 in §8.206, a `collect` project's test file, the project being a `compile_fail` now; -1 in §8.207, `bare_intrinsic_priority.cryo`, a negative now; +1 in §8.209, a negative; +1 in §8.213, a unit test; +2 in §8.217, two projects' `beta_text.cryo`; +2 in §8.242, the consequence repro's two sources under `scripts/ns-migration/8.242/tick-ctl/`; +1 in §8.244, a negative; +1 in §8.256, a unit test; +2 in §8.275, the two `chain_default_*` projects; +1 in §8.277, a unit test; +1 in §8.286, a negative; +1 in §8.287, a unit test; +1 in §8.301, a unit test; +1 in §8.303, a unit test) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **600** (+1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194, §8.195 and §8.197, projects; +2 in §8.199, a project's two files; -1 in §8.203, `resolve_counter.cryo`; -1 in §8.206, a `collect` project's test file, the project being a `compile_fail` now; -1 in §8.207, `bare_intrinsic_priority.cryo`, a negative now; +1 in §8.209, a negative; +1 in §8.213, a unit test; +2 in §8.217, two projects' `beta_text.cryo`; +2 in §8.242, the consequence repro's two sources under `scripts/ns-migration/8.242/tick-ctl/`; +1 in §8.244, a negative; +1 in §8.256, a unit test; +2 in §8.275, the two `chain_default_*` projects; +1 in §8.277, a unit test; +1 in §8.286, a negative; +1 in §8.287, a unit test; +1 in §8.301, a unit test; +1 in §8.303, a unit test; +1 in §8.304, `resolver/module_path.cryo`) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `python3 scripts/lane-gate.py --row LOOKUP_ROUTED` → **55** (54 before §8.256 deleted sema's `new` spelling step; 53 before §8.259 deleted the callee hint's `bare_sym` door and sema's `alias_global`; 51 before §8.263's two `lookup_type_exact` by a canonical name - the impl-qualified head's trait, asked whether it IS a trait, and its owner for the E0306 report; 53 before §8.289 re-keyed `method_returns` by the owner's arena id: `resolve_method_owner` and `lookup_method_return_raw` deleted, `lookup_type_sym` left two readers that hold the owner ref, and the five readers holding a stamp's name ask `lookup_type_exact` for the owner first) | §8.99, §8.107 |
 | D16 | **An impl head writes EVERY parameter of the template it names, or names a concrete instantiation; an elided parameter is an error** - whether all of them default (`implement trait Display for String` with `String<A = GlobalAlloc>`) or only the trailing ones (`implement<T> trait Display for Array<T>` with `Array<T, A = GlobalAlloc>`). Write `implement<A> trait Display for String<A>` or `implement trait Display for String<GlobalAlloc>`. Rust's model: `impl Display for Vec` is missing its parameters and is not given a default meaning, and `impl<T> Trait for Vec<T>` is not written either | **TAKEN** (ruled by Jake 2026-09-13 for the bare form, 2026-09-14 for every elided parameter; built in §8.190) — E0302 from `refuse_elided_template_params` where type resolution attaches a WRITTEN head to its template, naming the template, both counts and both spellings, the parameter form first; the 11 heads rewritten as the instantiation each meant; a head's `target_args` is what it writes after the target on EVERY kind of head (an inherent head's list also declares its names); sema's writer-module lookup deleted. The concrete spelling is HONOURED by impl selection since §8.233: a head's written target arguments unify with the subject's, a `Def`/`PrimTy`-stamped one filtering, so `for Wrap<T, Alpha>` is not selected for `Wrap<i32, Beta>` and two heads differing in that argument are two heads (`impl_concrete_arg_filters_impl` E0358, `impl_concrete_arg_selects_impl` 12 - both RED from §8.223 to §8.233) | `python3 scripts/impl-head-elided-params.py --count` → **bare=0,partial=0,unmatched=0**; `grep -c 'refuse_elided_template_params' compiler/src/compiler/passes/type_resolution.cryo` → **2**; `ls tests/tests/negative/E0302*.cryo \| wc -l` → **3** (2 at §8.190; +1 in §8.210, D22's head); `ls -d tests/tests/projects/impl_concrete_arg_*/test.json \| wc -l` → **2** (green since §8.233) | §8.180, §8.181, §8.187, §8.190, §8.223 |
 | D17 | **An `extern "C"` function is public unless marked `private`** — the extern-visibility default `docs/cryo.md` §18.1 states | **RULED** (Jake, 2026-09-14) — built in §8.167 by a worker and carried as unconfirmed until ratified; the spec text is normative, not provisional | `grep -c 'mut ext_public: boolean = true;' compiler/src/compiler/parser/parser.cryo` → **1**; `grep -c 'unless written .private function' docs/cryo.md` → **1** | §8.167, §8.187 |
@@ -199,6 +199,7 @@ three, and its row carries the count. Read each zero off its own row.
 | the tree's other map owners, EXCLUDED under the store rule with a reason each (`InternTable`, `Scope`, `ResolutionMap`, `ModuleLoader`, `Monomorphizer`, `MonoState`, `SemaState`, `MoveChecker`, `DeadCodeChecker`, `FunctionRegistry`, `GlobalRegistry`, `TypeMapperCache`, `DiagRenderer`, `DiagnosticSink`, `Runner`) | **MEASURED, NOT STORES** (§8.241 for the context's members; §8.253 for the population as the tree gives it) — the rule is "a type that owns a map", read from the tree on every `lane-check` run: 21 owners: 6 stores and 15 exclusions (the seventh store, `TypeUtils`, is the funnel and owns no map; 22 and 7 at §8.253, before §8.254 deleted the `DefaultRegistry` the rule had found). Each exclusion's reason is in the script's `EXCLUDED` table and falls into four kinds: keyed by SOURCE POSITION (`ResolutionMap`, `DeadCodeChecker`: `make_key(span)`), by an OUTPUT name after resolution has answered (`FunctionRegistry`/`GlobalRegistry` by the linker symbol codegen minted, `Monomorphizer`/`MonoState` by the mangled spec symbol, `SemaState.closure_spec_map` by a `DefId`), by a FILE PATH, a namespace at discovery, diagnostic text or a subcommand (`DiagRenderer`, `ModuleLoader`, `DiagnosticSink`, `Runner`), or a pass's OWN RIB of the locals it just bound (`SemaState`, `MoveChecker`, and `Scope`, the resolver's, with 0 `Scope`-typed receivers outside `compiler/resolver/`) - the population `LOOKUP_LOCAL` counts calls on. `TypeResolver`, `TypeChecker`, `PhaseArtifacts`, `DirectiveRegistry` own no map and are not candidates. The resolver's asks from outside its pass stay `REENTRY` (13; 12 at §8.241, the two by-spelling asks type resolution made of the cursor's scope deleted in §8.244, the facade search's `Resolver::ns_written_as` in §8.258; +2 in §8.301, one door each for the async lowering and the closure synthesis, which DECLARE bindings and take their identities from the allocator that hands them out - the only increase this ratchet has been re-pinned for; COMMITTED FIRST and RATIFIED AFTER - Jake ruled it on 2026-09-22 through the orchestrator, after `abfce55c` had landed claiming a ruling that had not been given, see §8.301's last section; +2 in §8.303, one door each for sema's `?` desugaring and drop insertion, which declare bindings after name resolution - committed on the WORKER'S JUDGEMENT as the same case the 9 → 11 ruling decided, and NOT yet ratified by Jake). **Rule 1b's array owners (§8.279, widened to arrays of RECORDS in §8.284): 47 types owning no map, an array of names or of records carrying a key-typed field, and a name-taking method, every one an exclusion in `EXCLUDED_ARRAYS` with its reason** - AST nodes' own written segments (`ImportDeclNode`, `ModuleDeclNode`, `LambdaExprNode`, `AsmBlockStmtNode`, `ExternBlockNode`), a pass's own rib (`AsyncLower`, `BindingCapture`, `BindingRename`), file paths, flags and texts (`CompilationContext`, `ProjectConfig`, `PhaseArtifacts`, `VendorEntry`, `ModuleKeyTable`, `ParsedArgs`, `ParserBase`, `ErrorType`, `ImportReport`, `Importer`, `DiagSink`, `StringCache`), displays beside a symbol key (`ASTTypeSubstituter`, `TemplateEntry` - whose `param_names` the 8 spelling compares in `call_resolver` still read, the arena unit's residue), a member table inside its owner (`ImplBlockNode`, `TraitType`, `ResolutionContext`'s `This::Member` bindings, and since §8.284 the user-defined types' own members - `StructType`, `ClassType`, `EnumType`, `TraitDeclNode`'s associated types), the graph's namespace symbols (`ModuleInfo`), one path's segments (`QualifiedName`), and the 16 record-array owners §8.284 placed - seven AST nodes' own written members, `Diagnostic`/`Suggestion`/`TokenStream`/`Parser`/`Command`/`Lockfile`/`VendorRegistry`/`DirectiveRegistry` texts, flags and file paths, `DropInserter`'s own rib; 0 stores among them | — | `python3 scripts/lane-gate.py --row REENTRY` → **13**; `python3 scripts/lane-gate.py --names \| grep -c '^  [A-Za-z]* *excluded: '` → **15**; `python3 scripts/lane-gate.py --names \| grep -c '^  [A-Za-z]* *STORE$'` → **6**; `python3 scripts/lane-gate.py --names \| grep -c '^  [A-Za-z]* *excluded (array): '` → **47**; `python3 scripts/lane-gate.py --names \| grep -c '^array owners (47)'` → **1** | §8.241, §8.253, §8.254, §8.279 |
 | move state keyed by how a binding is SPELLED (`MoveChecker`: `moved_keys`, `polled_keys`, `carried_keys`, `captured_decl_keys`, the `types` map and the partial-move owner, all pushed and tested by the interned name, reset at function entry with no scope pop) - two bindings of one spelling in one function were ONE slot, which refused a correct program with the other binding's move underlined AND, where a branch declared the shadow, dropped the outer binding's move from the join union and ACCEPTED a double free | **DELETED in BOTH passes** - every set in `MoveChecker` and `DropInserter` takes the `SymbolID` the resolver stamped on the declaration and answers a use with (`Res::Local`), the pattern-payload set included (§8.303); `DropInserter`'s spelling array survives only as the text a synthesized `<name>.drop()` is written with, read by slot and never searched. Every binding and use either pass meets carries an identity: `alloc_synthetic_binding` for a binding a pass declares after name resolution (the async lowering, the closure synthesis, sema's `?` desugaring, drop insertion's own hoists), `PatternBinding.sym_id` / `DestructureBinding.sym_id` / `LambdaExprNode.captured_syms` from the name layer, a closure's capture shadow taking the captured binding's identity, and a finished `poll` body re-stamped scope by scope by `rebind_poll_locals` (§8.303) | the pin leaks an inner shadow of a moved binding and the new compiler releases it (`lang/shadowed_binding_own_drop`: 3 of its 7 tests fail under `004ffc8c`'s compiler, the three shadow shapes); §8.301's conversion had made three shapes ACCEPTED double frees that the pin refuses - each `E0452_closure_capture_then_use`, `E0452_async_parameter_used_after_move`, `E0452_closure_body_use_after_move` answers `grep -c '^error\[E0452\]'` **1** under `bin/cryo.exe`, **0** under `004ffc8c`'s compiler, **1** under this one; 0 of 1,126 example, 264 LSP and 154 stdlib objects moved | `grep -c 'name\.id' compiler/src/compiler/passes/move_check.cryo` → **0** (the dot is escaped because an unescaped one matches prose); `grep -c 'moved_keys:  u64\[\]' compiler/src/compiler/passes/move_check.cryo` → **1**; `grep -c 'moved_keys:  u64\[\]' compiler/src/compiler/passes/drop_insertion.cryo` → **1**; `grep -c 'local_sym' compiler/src/compiler/resolver/res.cryo` → **3**; `grep -rho 'alloc_synthetic_binding' compiler/src --include=*.cryo \| wc -l` → **22**; `ls tests/tests/negative/E0452_shadow_declaration_hid_outer_move.cryo \| wc -l` → **1**; `grep -c 'moved_keys' compiler/src/compiler/passes/drop_insertion.cryo` → **18**; `grep -c 'rebind_poll_locals' compiler/src/compiler/sema/async_lower.cryo` → **4** | §8.301, §8.303 |
 | a bare-leaf search over the whole type arena that the residue does not count (`sema/diagnostics.cryo`'s `find_shadowed_type_candidates`: every `arena.types[i]`, its qualified name resolved to a `string`, `QualifiedName::leaf_of` compared against the needle - the four member lookups INSIDE the loop are rowed J, the loop is in nothing) | **MEASURED, NOT WIDENED** - rule 1c recognises a name-keyed loop by the ELEMENT'S OWN interned field compared with `.equals(`, `==` or `!=`, and this comparison is on a derived `string`, so nothing matches and `SCANNED_ARRAYS` never gets asked; adding the array to that table would not reach it. A SECOND shape is uncounted for a third reason - `name_resolution.cryo:524` scans `Scope.symbols` and hands each resolved spelling to `CompilationContext::modules_written_as`, a door the lane gate does not list. **Widening rule 1c is Jake's**, because it moves D32's pinned counts: predicted population 448 → 449, J 230 → 231 (the `hint` class - both callers only attach a did-you-mean to a diagnostic already being emitted, `call_resolver.cryo:3425` / `:3649`), convertible unchanged at 100 | the instrument carries its own control, because one hit reads exactly like a parser that matched nothing | `python3 scripts/ns-migration/derived-name-scans.py \| tail -1` → **1** (the row is read off the last field); `python3 scripts/ns-migration/derived-name-scans.py --selftest \| grep -c '^selftest: OK'` → **1**; `grep -c 'modules_written_as' scripts/lane-gate.py` → **0** | §8.302 |
+| the module doors taking any spelling (`ModuleGraph::find_module_index`, `reexport_closure`, `Resolver::find_module_scope`, `DeclarationIndex::is_prelude_ns`, `ns_imports` accepting a `SymbolStr` - a leaf, a composed path and a module's canonical path alike) | **TYPED** - each takes a `ModulePath`, a module's canonical path in a type of its own (`resolver/module_path.cryo`); `ModulePath::of` asserts the caller already holds one. `source_file_for_owner_key` keeps its `SymbolStr`: its key is a module path OR a file path. `ModulePath` is one of D32's KEY TYPES, so the 21 residue rows through these doors stay in the population - whether a typed door leaves it is Jake's (448 → 427, J 230 → 209 if it does) | the compiler flagged 38 arguments (34 calls) with the doors typed and no call site touched, the 34 a grep predicted; 0 of 1,126 example, 3,004 test, 265 LSP and 154 stdlib objects moved | `grep -rhoE '\(&this, [a-z_]+: ModulePath' compiler/src/compiler/module_graph.cryo compiler/src/compiler/decl_index.cryo compiler/src/compiler/resolver/resolver.cryo \| wc -l` → **5**; `grep -rho 'ModulePath::of(' compiler/src --include=*.cryo \| wc -l` → **37**; `grep -c '"ModulePath")' scripts/lane-gate.py` → **1** | §8.304 |
 
 **The arena holds no leaf index of either kind.** §8.121 deleted the LOOKUP
 LANE; the diagnostic map that survived it (the E0203 did-you-mean pool, E0155
@@ -38283,3 +38284,151 @@ hard internal error is a diagnostic question and is Jake's.
   binding's use after move is unchecked. Pre-existing.
 * The three `lane-gate.py` "own rib by binding name" exclusions §8.301 named
   are still unprobed.
+
+---
+
+### 8.304 The module doors take a `ModulePath`, run as a measurement of what a door-type change costs: the compiler flagged exactly the 34 calls a grep predicted and nothing else, the residue script listed 21 of them, no call passed a leaf, one site threw a module identity away and re-derived it by string surgery, one of the six doors named for the change is not a module door, and the population instrument would have dropped all 21 rows by accident; 0 objects moved - 2026-09-23
+
+#### What changed
+
+A module's canonical path (`std::fs`) is its identity (D5), but the doors that
+look a module up took a plain `SymbolStr` - the same type as a leaf (`fs`) or a
+composed path (`Outer::inner`). `ModulePath` (`resolver/module_path.cryo`) is a
+type of its own, and five doors take it:
+
+```cryo
+// before - any interned spelling compiles
+ns_imports(&this, use_site_ns: SymbolStr, target_ns: SymbolStr) -> boolean
+
+// after - a caller holding a leaf does not compile
+ns_imports(&this, use_site_ns: ModulePath, target_ns: ModulePath) -> boolean
+```
+
+The five: `ModuleGraph::find_module_index`, `ModuleGraph::reexport_closure`,
+`Resolver::find_module_scope`, `DeclarationIndex::is_prelude_ns`,
+`DeclarationIndex::ns_imports`. `ModulePath::of(sym)` is the one way in, and it
+is not a lookup: it asserts the caller already holds a module's path.
+
+The name the brief used, `Namespace`, is taken - it is the resolver's lookup
+namespace (`namespace_kind.cryo`, Type/Value, D2). `ModulePath` is this
+entry's choice, internal to the compiler, and a one-line rename if another is
+wanted.
+
+#### The experiment: predict by grep, then let the compiler say
+
+**Predicted before the type changed**, by `grep -rnE '\b<door>\('` over
+`compiler/src`, `tools`, `stdlib` and `tests`, comments and definitions
+excluded: **34 calls in 11 files, none outside `compiler/src`** - 25 from
+outside the doors' own stores, 9 inside them (a tenth internal call,
+`reexport_closure` handing its own parameter to `find_module_index`, is typed
+by the change itself).
+
+**Flagged by the compiler** with the five signatures changed and no call site
+touched: `Project compilation failed (38 errors)`, all `E0214 mismatched
+types`. The 38 are ARGUMENT positions: the four `ns_imports` calls pass two
+spellings each. As calls, **34 - the grep's 34, site for site. No call the
+grep missed, no grep hit the compiler disagreed with.**
+
+**The script-based population listed 21 of the 34** (62%): the residue's
+`module` rows through these five doors. The other 13 are the stores' own 9
+calls, which the residue excludes by design, and **4 calls routed through the
+resolver** (`find_module_scope` from the monomorphizer, from sema, and twice in
+`name_resolution.cryo`) that the residue does not list as module rows at all.
+
+**So the gap the experiment measures is between the residue and the tree, not
+between the grep and the compiler: 4 of 25 external calls (16%) were outside
+the listed population.** For this door the compiler's type check and a
+word-boundary grep agree completely; the residue does not.
+
+#### What each flagged call was passing
+
+| class | calls | where the value comes from |
+|---|---|---|
+| a module path by construction | 23 | a graph field (`ModuleInfo.name`, `.dependencies[]`, `.reexports[]`), the writing file's module (`module_ns_sym_of_file`), a template's recorded module, a runtime module the compiler names |
+| a written import or export path, resolved by this very lookup | 6 | the loader and the registry; since D20 an import path names a registered module or is an error, so the lookup IS the path's resolution |
+| a child path composed from a canonical one, to ask whether that module exists | 3 | `<module>::<leaf>` - canonical by construction |
+| an identity in hand, discarded and re-derived by spelling | 2 (one site) | below |
+
+**No call passed a leaf.** The genuine defect:
+
+```cryo
+// type_declarers_of_leaf: for each module `info` in the graph ...
+out.push(this.resolver.qualified_name_of(&s));     // `Mod::Type` - `info.name` discarded
+// ... and the caller rebuilds the module from the TEXT:
+const owner: string = QualifiedName::parent_of(decl_str);
+const owner_ns: SymbolStr = intern.intern(owner);
+... is_prelude_ns(owner_ns) || ns_imports(use_ns, owner_ns) ...
+```
+
+The loop holds each module's path and threw it away; the E0240 diagnostic's
+reachability test then re-derived it by cutting the last segment off a
+canonical name. For a top-level type that gives the same answer, so it is not
+observable today - but it is the shape the migration exists to remove, and the
+new type is what made it visible: `ns_imports` would not take a string cut from
+another string without the caller writing `ModulePath::of` around it. The
+declarers' owners now travel with them.
+
+#### Two findings that do not generalise, or that a larger door change will meet
+
+**One of the six doors the review named is not a module door.**
+`source_file_for_owner_key(key)` takes "a namespace name, OR a source-file path
+for modules without a namespace" - two kinds of key through one parameter.
+Typing it `ModulePath` would be a false claim, so it keeps its `SymbolStr`. A
+`DefId` door change will meet the same thing: a door whose parameter is two
+keys can only be split, not typed.
+
+**The population instrument would have dropped every row the change touched.**
+D32's population is "a method taking a KEY TYPE in parameter position", and the
+key types were a hand-written list - held TWICE, `KEY_TYPES` and a regex
+(`KEY_PARAM_RE`) spelling them again. With the doors typed, the enumerator
+read `tree 427, list 448`: 21 rows gone, J 230 → 209, by a rename. Jake has
+ruled that the ceiling comes down by conversion and not by relabelling, and a
+typed door is still a lookup of a module BY ITS PATH. So `ModulePath` is a key
+type (with the reason at `KEY_TYPES`), the regex is derived from the list, and
+the count is 448. **Whether a door taking a `ModulePath` leaves D32's
+population is Jake's.** If it does: 448 → 427, J 230 → 209, convertible
+unchanged at 100.
+
+That is the generalisable part: **a door-type change moves D32's count through
+the INSTRUMENT, not through the code**, and a `DefId` door leaves the
+population by construction (`DefId` is not a key type). Every later stage of
+the endgame's plan has to decide, per door, whether the new type makes the
+read an identity read, and that decision should be made before the change and
+not discovered in the drift.
+
+#### The cost
+
+| what | count |
+|---|---|
+| doors given the type | 5 (of the 6 named) |
+| calls flagged / edited | 34 (38 arguments) |
+| files touched in `compiler/src` | 10, plus the new `module_path.cryo` |
+| lines in `compiler/src` (`git diff --stat`) | 79 insertions, 52 deletions, and 49 new |
+| `ModulePath::of(` in the tree (`grep -rho \| wc -l`) | 37: the 36 flagged arguments that hold a module path, and the declarers' owners |
+| genuine defects | 1 site (2 calls) |
+| instrument defects | 1 (the key-type list held twice) |
+| residue rows re-rendered | 105 (line numbers, both this commit's and §8.303's, and the module rows' key text); `(file, door, class)` unchanged for every row |
+
+The wrap at the call site is the cheap half. Giving the SOURCES the type - the
+`ModuleInfo` fields, `module_ns_sym_of_file`'s return - would take the mints to
+the few places a module is registered, at the cost of every other reader of
+those fields: `.namespace_name` alone is read at 45 lines (`grep -rn
+'\.namespace_name\b' compiler/src tools --include=*.cryo`), `.dependencies` 21,
+`.reexports` 12. Not done here. `ModulePath::of` has no lane row, so a new
+mint is visible to a grep and to review but not to a gate; `DefId::of_definition`
+has one (DEFID_MINT). Adding one is a gate change, and Jake's.
+
+#### What moved
+
+| population | objects | moved |
+|---|---|---|
+| examples (`ex-u1` → `ex-u2`) | 1,126 | **0** |
+| tests (`t-u1` → `t-u2`) | 3,004 | **0** |
+| LSP, §8.303's compiler vs this one over one tree | 265 | **0** |
+| stdlib, same | 154 | **0** |
+
+Control on the LSP zero: §8.303's compiler over §8.303's tree against the same
+compiler over this one differs in exactly 11 objects, the ten modules edited
+and the new one. `lane-check` unchanged (REENTRY 13, GRAPH_READ 31); residue
+448, J 230; `test-census` 2,147 unit, 217 compile-fail, 73 projects;
+`lsp-check` 265 modules, 0 errors; `cross-check` 0 errors.
