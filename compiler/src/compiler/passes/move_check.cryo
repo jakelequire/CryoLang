@@ -286,13 +286,14 @@ type struct MoveChecker {
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null) { continue; }
-            this.register_binding(param.sym_id, param.resolved_type);
+            this.register_binding(param.sym_id, param.resolved_type, param.name, param.span);
         }
     }
 
 
-    register_binding(mut &this, sym: SymbolID, ty: TypeRef) -> void {
-        if (!sym.is_valid()) { return; }
+    register_binding(mut &this, sym: SymbolID, ty: TypeRef, name: SymbolStr,
+                     span: SourceSpan) -> void {
+        if (!this.require_identity(sym, name, span)) { return; }
         this.types.insert(sym.id, ty);
         // During a loop body's discovery walk, record bindings declared
         // inside the body so they're excluded from the carried set: a
@@ -301,6 +302,21 @@ type struct MoveChecker {
         if (this.capture_decls) {
             this.captured_decl_keys.push(sym.id);
         }
+    }
+
+    /// A binding with no identity is one no use can name, so the pass could
+    /// not see it moved: a second release of it would be accepted.  The name
+    /// layer and every pass that declares a binding give it one, so a binding
+    /// arriving without is a compiler defect, reported rather than skipped.
+    require_identity(mut &this, sym: SymbolID, name: SymbolStr,
+                     span: SourceSpan) -> boolean {
+        if (sym.is_valid()) { return true; }
+        this.ctx.ice_at(fmt::format(
+            "binding '%s' reached the move checker with no identity",
+            this.intern.resolve(name)), span);
+        this.fired += 1;
+        this.fatal += 1;
+        return false;
     }
 
     /// Record an arm's enum-pattern payload binding names (direct + nested)
@@ -322,8 +338,10 @@ type struct MoveChecker {
         if (epat == null) { return; }
         for (mut pos: i64 = 0; pos < epat.elements.length; pos++) {
             const pb: PatternBinding* = epat.binding_at(pos);
-            if (pb != null && pb.sym_id.is_valid()) {
-                this.pat_binding_keys.push(pb.sym_id.id);
+            if (pb != null) {
+                if (this.require_identity(pb.sym_id, pb.name, pb.span)) {
+                    this.pat_binding_keys.push(pb.sym_id.id);
+                }
                 continue;
             }
             const sub: PatternNode* = epat.sub_at(pos);
@@ -1055,7 +1073,7 @@ type struct MoveChecker {
             this.walk_expr_move(vd.initializer, true);
         }
         if (!vd.is_global) {
-            this.register_binding(vd.sym_id, vd.resolved_type);
+            this.register_binding(vd.sym_id, vd.resolved_type, vd.name, vd.span);
         }
     }
 
@@ -1073,7 +1091,7 @@ type struct MoveChecker {
         }
         for (mut i: i64 = 0; i < dd.bindings.length; i++) {
             const b: DestructureBinding = dd.bindings[i];
-            this.register_binding(b.sym_id, b.resolved_type);
+            this.register_binding(b.sym_id, b.resolved_type, b.local_name, b.span);
         }
     }
 

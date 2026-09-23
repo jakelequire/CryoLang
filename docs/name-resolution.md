@@ -201,9 +201,11 @@ three, and its row carries the count. Read each zero off its own row.
 | a bare-leaf search over the whole type arena that the residue does not count (`sema/diagnostics.cryo`'s `find_shadowed_type_candidates`: every `arena.types[i]`, its qualified name resolved to a `string`, `QualifiedName::leaf_of` compared against the needle - the four member lookups INSIDE the loop are rowed J, the loop is in nothing) | **MEASURED, NOT WIDENED** - rule 1c recognises a name-keyed loop by the ELEMENT'S OWN interned field compared with `.equals(`, `==` or `!=`, and this comparison is on a derived `string`, so nothing matches and `SCANNED_ARRAYS` never gets asked; adding the array to that table would not reach it. A SECOND shape is uncounted for a third reason - `name_resolution.cryo:524` scans `Scope.symbols` and hands each resolved spelling to `CompilationContext::modules_written_as`, a door the lane gate does not list. **Widening rule 1c is Jake's**, because it moves D32's pinned counts: predicted population 448 → 449, J 230 → 231 (the `hint` class - both callers only attach a did-you-mean to a diagnostic already being emitted, `call_resolver.cryo:3425` / `:3649`), convertible unchanged at 100 | the instrument carries its own control, because one hit reads exactly like a parser that matched nothing | `python3 scripts/ns-migration/derived-name-scans.py \| tail -1` → **1** (the row is read off the last field); `python3 scripts/ns-migration/derived-name-scans.py --selftest \| grep -c '^selftest: OK'` → **1**; `grep -c 'modules_written_as' scripts/lane-gate.py` → **0** | §8.302 |
 | the module doors taking any spelling (`ModuleGraph::find_module_index`, `reexport_closure`, `Resolver::find_module_scope`, `DeclarationIndex::is_prelude_ns`, `ns_imports` accepting a `SymbolStr` - a leaf, a composed path and a module's canonical path alike) | **TYPED** - each takes a `ModulePath`, a module's canonical path in a type of its own (`resolver/module_path.cryo`); `ModulePath::of` asserts the caller already holds one. `source_file_for_owner_key` keeps its `SymbolStr`: its key is a module path OR a file path. `ModulePath` is one of D32's KEY TYPES, so the 21 residue rows through these doors stay in the population - whether a typed door leaves it is Jake's (448 → 427, J 230 → 209 if it does) | the compiler flagged 38 arguments (34 calls) with the doors typed and no call site touched, the 34 a grep predicted; 0 of 1,126 example, 3,004 test, 265 LSP and 154 stdlib objects moved | `grep -rhoE '\(&this, [a-z_]+: ModulePath' compiler/src/compiler/module_graph.cryo compiler/src/compiler/decl_index.cryo compiler/src/compiler/resolver/resolver.cryo \| wc -l` → **5**; `grep -rho 'ModulePath::of(' compiler/src --include=*.cryo \| wc -l` → **37**; `grep -c '"ModulePath")' scripts/lane-gate.py` → **1** | §8.304 |
 | a method's receiver found by comparing a parameter's SPELLING with `this` / `&this` (47 residue rows on 41 lines in 13 files, and 10 comparisons of a resolved string or of one parameter handed in that no residue row counted) | **DELETED** - a parameter carries `VarDeclNode.receiver` (`ReceiverForm`: not a receiver, by reference, by value), set where a receiver is minted (the parser's two branches, the async lowering's synthesized `&this`, the C++ importer), copied by the cloner and cleared by a rename; every site asks `is_receiver()`, `is_ref_receiver()` or `is_value_receiver()`. What still compares the spelling asks whether an IDENTIFIER USE is the keyword `this` - sema 5, the LSP 6 - and a use has no declaration to carry a mark | residue 448 → 401, J 230 → 183; a shadow at every converted site over six halves, 0 disagreements (each mark suppressed alone: 9,790, 800, 25); 0 of 1,126 example, 3,004 test, 265 LSP and 154 stdlib objects moved | `grep -rho 'set_receiver(ReceiverForm::' compiler/src --include=*.cryo \| wc -l` → **4**; `python3 scripts/ns-migration/receiver-spelling-sites.py 2>/dev/null \| wc -l` → **11** (62 over the tree before §8.305) | §8.305 |
-| a destructure unseen by the move checker (`MoveChecker::walk_stmt` handling a declaration statement only when it held one variable: the initializer never walked as a move, the field bindings never registered) - a destructured field given away twice, and a destructure's source used after its fields were taken, were both ACCEPTED double frees, on the pin too | **DELETED** - `MoveChecker::walk_destructure_decl` walks the initializer as a move and registers each binding by `DestructureBinding.sym_id`, as `DropInserter::walk_destructure_decl` does. A match-arm PAYLOAD binding is still unregistered (`consume(x); consume(x);` in one arm is accepted, pin too) - open, §8.306 | `E0452_destructured_binding_moved_twice` and `E0452_destructure_source_used_after` fail under `46d0acb8`'s compiler and pass under this one; each half of the fix removed alone fails exactly one of them; 0 of 1,126 example objects moved | `grep -c 'this\.walk_destructure_decl(' compiler/src/compiler/passes/move_check.cryo` → **1** (the call; the dot escaped); `ls tests/tests/negative/E0452_destructure*.cryo \| wc -l` → **2** | §8.306 |
+| a destructure unseen by the move checker (`MoveChecker::walk_stmt` handling a declaration statement only when it held one variable: the initializer never walked as a move, the field bindings never registered) - a destructured field given away twice, and a destructure's source used after its fields were taken, were both ACCEPTED double frees, on the pin too | **DELETED** - `MoveChecker::walk_destructure_decl` walks the initializer as a move and registers each binding by `DestructureBinding.sym_id`, as `DropInserter::walk_destructure_decl` does. A match-arm PAYLOAD binding is still unregistered (`consume(x); consume(x);` in one arm is accepted, pin too) - open, §8.309 | `E0452_destructured_binding_moved_twice` and `E0452_destructure_source_used_after` fail under `46d0acb8`'s compiler and pass under this one; each half of the fix removed alone fails exactly one of them; 0 of 1,126 example objects moved | `grep -c 'this\.walk_destructure_decl(' compiler/src/compiler/passes/move_check.cryo` → **1** (the call; the dot escaped); `ls tests/tests/negative/E0452_destructure*.cryo \| wc -l` → **2** | §8.306 |
 | an identifier USE asked whether it is the receiver by its spelling (`sema.cryo`: 5 sites comparing `ident.name` with `this`; the LSP's 6 are Jake's) | **MEASURED, NOT CONVERTIBLE** - in a `&this` method a `this` use carries the identity of a second binding the name layer declares and discards (the `receiver_of == node` block in `name_resolution.cryo` drops `declare_parameter`'s result), and the async lowering's own `this` uses carry none; over six halves 85,147 asks could be converted, 1,332,567 name the discarded binding, 39,811 name nothing. Blocked on the name layer recording that identity and the lowering stamping its uses - neither done | instrument `scripts/ns-migration/8.307/` with a two-method control (+2 / +2) | `grep -c '^\s*this\.resolver\.declare_parameter(this\.this_sym' compiler/src/compiler/resolver/name_resolution.cryo` → **1** (a statement whose value is dropped: the discarded identity) | §8.307 |
 | the async lowering's rename skipping a destructure (`AsyncLower::rn_stmt` renames only a single-variable declaration: a destructure's bindings keep their spelling and stay out of `frame_locals`, its initializer is never walked) - the premise of the `frame_locals` own-rib exclusion | **OPEN, a live miscompile** - an async function reads a parameter where the source names a shadowing local (7 for 50, 7 for 100), and an address of a destructured local held across a suspend is accepted where a plain local is E0455; pin and HEAD alike. The two match-arm ribs (`BindingCapture`, `BindingRename`) HOLD, each probe shown failing under a mutation of the rename it relies on | the probe runner in `scripts/ns-migration/8.308/` reports 3 of its 9 probes WRONG under the pin and under `2790cea2`'s compiler, 4 under the rename mutation that is its control (it needs a build, so it is evidence and not a row check) | `grep -c 'DestructureDeclaration' compiler/src/compiler/sema/async_lower.cryo` → **1** (the post-lowering rebind alone) | §8.308 |
+| a match-arm PAYLOAD binding unseen by the move checker (`register_arm_pat_bindings` feeds only the field-move-out set, never the type map, so a payload given away twice, used after it was given away, or given away in a loop is ACCEPTED; pin too) | **OPEN, BLOCKED on a signature ruling** - the fix (register the payload by `PatternBinding.sym_id` with a type sema stamps) is built and measured: over six halves it tracks 167,117 payloads, 0 untyped, 0 without identity, and refuses exactly three places - `Iterator::find`, `FilterIter::next` (each hands an element to a by-value predicate and then returns it: a double free, reproduced on the pin) and one test. Every program reaches the first, so the fix cannot land until those two change signature - Jake's; and the borrowing signature meets the defect that `x == 7` with `x: &i32` compares the address. The catch-all arm binding (`y => ...`) releases its subject twice on ONE use and is a separate hole | the shadow run's refusal list, `.objcmp/pp-lines.txt`; the patch, `.objcmp/s37u1-fix.patch` | `ls scripts/ns-migration/8.309/payload-move-shadow.py \| wc -l` → **1**; `grep -c 'pb.resolved_type' compiler/src/compiler/sema/pattern_resolver.cryo` → **0** (the fix not in the tree) | §8.309 |
+| a binding reaching the move checker or drop insertion with NO identity (skipped at five entry points: untracked by the one, released regardless by the other, a payload's subject released too) | **DELETED** - an internal compiler error, E0900 at the binding (`require_identity` in each pass, `CompilationContext::ice_at`), Jake's ruling. Measured at 0 over six halves before building | two mutations, each removing one identity in the name layer: without the check each program silently frees a value twice, with it each is refused E0900 | `grep -c 'require_identity(' compiler/src/compiler/passes/move_check.cryo` → **3**; `grep -c 'require_identity(' compiler/src/compiler/passes/drop_insertion.cryo` → **4** | §8.310 |
 
 **The arena holds no leaf index of either kind.** §8.121 deleted the LOOKUP
 LANE; the diagnostic map that survived it (the E0203 did-you-mean pool, E0155
@@ -38870,5 +38872,179 @@ luck may start refusing or carrying - which is the stated task of no unit
 this session. Recorded as the next unit.
 
 No count moved; nothing in `compiler/src` changed.
+
+---
+
+### 8.309 The match-arm payload double free is fixed and measured, and NOT landed: the fix refuses the standard library's own `Iterator::find` and `Iterator::filter`, which release an element twice whenever it has a destructor - on the pin as on HEAD; making them correct changes their public signature, and the obvious new signature walks into a second defect, where comparing a `&i32` with `7` compares an address - 2026-09-23
+
+#### What a user could write
+
+```cryo
+match (o) {
+    Option::Some(x) => { consume(x); consume(x); }   // accepted; "drop tag=1" twice
+    Option::None    => { }
+}
+```
+
+The same program with `x` a plain local is refused with E0452. Five more
+shapes, all accepted by the pin and by `a2d81f6e`: the payload used after it
+was given away, a nested payload (`Some(Some(x))`) given away twice, the
+match-expression form, a payload given away inside a loop in its arm (three
+releases), and a catch-all arm `y => { consume_opt(y); }`, which releases
+the value twice on a SINGLE use (below). Probes: `.objcmp/pp/mk.py`.
+
+#### The fix, as built
+
+The move checker registers each enum-pattern payload by the identity the name
+layer stamps on it (`PatternBinding.sym_id`), with its type. The type had
+nowhere to live - sema computes each payload's type in
+`PatternResolver::bind_enum_pattern` and throws it away - so `PatternBinding`
+gains `resolved_type`, stamped there, never copied by the cloner (a clone is
+typed when its own body is checked, as `DestructureBinding.resolved_type`
+is). With every payload in the type map, `is_owned_value_place`'s
+pattern-binding fallback is unreachable and goes. The patch is kept at
+`.objcmp/s37u1-fix.patch` (119 lines, 8 files).
+
+#### What the fix refuses, over the whole tree
+
+A shadow build (`scripts/ns-migration/8.309/payload-move-shadow.py`) prints
+every refusal the fix would make instead of making it, so one refusal does
+not stop the build and hide the next. Six halves, 0 failing,
+`.objcmp/pp-lines.txt`:
+
+| measured | count |
+|---|---|
+| payload bindings registered | 167,117 |
+| ... with no type sema stamped | 0 |
+| ... with no identity | 0 |
+| `is_owned_value_place`'s fallback reached | 0 |
+| distinct places the fix refuses | **3** |
+
+The three places:
+
+1. **`Iterator::find`** (`stdlib/core/iter.cryo:157`) - `if (pred(value)) {
+   return Option::Some(value); }`. The predicate takes the element BY
+   VALUE, so the predicate owns it and releases it; `find` then returns
+   the same element. Measured on the pin with an iterator of `Heap`:
+   `drop tag=2` inside the predicate, `found 2`, `drop tag=2` again when the
+   caller's result goes out of scope. **A real double free, shipped.**
+2. **`FilterIter::next`** (`:306`, the adapter `filter` returns) - the same
+   shape, `if (this.pred(value)) { return Option::Some(value); }`.
+3. `tests/stdlib/iter_where_generic.cryo:45` - `Pair::<A, A> { first: v,
+   second: v }` from one generic `A`: a double free for any `A` with a
+   destructor; the test instantiates it with `i32`.
+
+Every program trips the first: a trait's default methods are materialized
+for each concrete iterator the standard library itself declares, and the
+refused instances include `Iterator<DirEntry>` (`fs::dir::ReadDir`),
+`Iterator<String>` and many `Pair<..>` element types (`Pair` has a `Drop`
+impl, so even `Pair<u64, u32>` counts as releasable; its drop is empty, so
+those particular instances are harmless in practice and still refused).
+An empty `main` compiled with the fix fails at `iter.cryo:157`.
+
+#### Why it stops here
+
+Correcting `find` and `filter` changes their signature, and a public
+signature is a ruling. The obvious signature is Rust's - the predicate
+BORROWS the element:
+
+```cryo
+find(mut &this, pred: (&This::Item) -> boolean) -> Option<This::Item>
+```
+
+and a caller's predicate becomes `function is_seven(x: &i32) -> boolean`.
+That runs into a second defect, measured on the pin and on HEAD:
+
+```cryo
+function eq_plain(x: &i32) -> boolean { return x == 7; }   // 0 for 7: compares the ADDRESS
+function eq_deref(x: &i32) -> boolean { return *x == 7; }  // 1
+function rem(x: &i32) -> i32 { return x % 2; }             // refused, E0229
+```
+
+Arithmetic on a reference is refused; COMPARISON is accepted and compares
+the pointer - silently wrong, for named functions and lambdas alike. A
+borrowing predicate would hand every caller exactly that trap. The
+decisions are recorded for Jake in the handoff; the options measured:
+
+* borrow the element (`&This::Item`), after the comparison defect is fixed
+  (either auto-dereference a reference operand of `==` / `<`, or refuse it
+  as `%` is refused) - the Rust shape; 11 call sites in the tree would
+  change (`grep -rn '\.filter(\|\.find(' tests` less the string `find`s),
+  all in tests, all a named predicate over `i32`;
+* hand the predicate a pointer (`This::Item*`) - explicit, ugly, no trap;
+* require `Item: Clone` and hand the predicate a clone - a new bound on
+  two widely-used methods.
+
+The test at (3) would need `where A: Copy` or a clone either way.
+
+#### The catch-all binding, separately
+
+```cryo
+match (o) {
+    y => { consume_opt(y); }   // one use; the pin prints the release TWICE
+}
+```
+
+An identifier pattern binds the whole subject. The name layer declares it
+and discards the identity (`visit(PatternNode*)` calls `declare_variable`
+and keeps nothing; `PatternNode` has no field to keep it in), so neither the
+move checker nor drop insertion can see it - `consume_opt(y)` releases the
+value and the subject's own scope-exit release runs as well. Not touched:
+the fix needs a field on `PatternNode`, drop insertion linking the binding
+to its subject as it links a payload, and whether it is in scope is Jake's.
+
+No count moved; nothing in `compiler/src` changed by this entry.
+
+---
+
+### 8.310 A binding that reaches the move checker or drop insertion with no identity is now an internal compiler error (E0900) at the binding, where it was silently left untracked - the silence that hid a double free twice; the tree has none, measured over six halves, and each of two mutations that remove an identity is shown silently freeing twice without the check and refused with it; 0 objects moved - 2026-09-23
+
+#### What changed
+
+Both passes keep their state by the identity the name layer stamps on each
+binding. A binding arriving with none used to be skipped: the move checker
+did not track it, so a second release was accepted; drop insertion did not
+register it, so it was released regardless of what happened to it, and a
+pattern payload's consumption went unseen, so its subject was released
+too. Jake ruled that this should be a hard error.
+
+Five entry points now report instead of skipping, through one helper per
+pass (`require_identity`) and one on the compilation context (`ice_at`:
+E0900, at the binding's span, "please report this bug", reported with the
+program's other errors rather than aborting):
+
+* move checker: `register_binding` (parameters, locals, destructured
+  fields) and a match-arm payload;
+* drop insertion: `register_binding`, `register_param_type`, and a
+  match-arm payload.
+
+#### Measured before building
+
+The shadow build of §8.309 printed a line at each of these points for a
+binding with no identity: **0** over six halves, 0 failing. So the check
+refuses nothing in the tree, and the prediction was 0 objects moved.
+
+#### The pairs
+
+Each mutation alone, each a clean rebuild, run on a program that gives a
+value away once or twice:
+
+| mutation | without the check (`a2d81f6e` + mutation) | with the check |
+|---|---|---|
+| the name layer stops recording a payload's identity (`visit(EnumPatternNode*)`) | `Some(x) => { consume(x); }` runs and prints `drop tag=1` **twice**: the payload's release unseen, the subject released too | E0900 at every payload, first `binding 'value' reached the move checker with no identity` at `stdlib/core/result.cryo:47` |
+| the name layer stops recording a local's identity (`visit(VarDeclNode*)`) | `const x = ...; consume(x); consume(x);` runs, `drop tag=1` **twice**: the second release accepted | E0900 (`binding 'n' ...`) |
+
+#### What moved
+
+| what | before | after |
+|---|---|---|
+| objects, examples (`ex-s36u1.s` → `ex-s37u4.s`) | 1,126 | 1,126, **0 moved** |
+| objects, tests (`t-s36u1.txt` → `t-s37u4.txt`) | 3,005 | 3,005, **0 moved** |
+| warnings, clean `make cryo` | 346 | 346 |
+| roster (`test-census`) | 2,151 unit, 219 compile-fail, 76 projects | unchanged |
+
+`lsp-check` OK (265 modules, 0 errors); `cross-check` OK (0 errors);
+`test-census` OK. No negative test: no program can reach an internal error
+on a correct compiler, so the pairs above are the evidence.
 
 ---

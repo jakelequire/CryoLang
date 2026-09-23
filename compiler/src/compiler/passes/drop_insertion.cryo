@@ -515,12 +515,10 @@ type struct DropInserter {
     /// `definit` records whether the declaration itself made the whole value
     /// live (an initializer was present).  See `binding_definit`.
     ///
-    /// A binding with no identity is not registered: nothing could ask for it,
-    /// so it would be dropped at scope exit whatever happened to it on the way.
     register_binding(mut &this, name: SymbolStr, sym: SymbolID, ty: TypeRef,
                      span: SourceSpan, definit: boolean) -> void {
         if (!name.is_valid()) { return; }
-        if (!sym.is_valid()) { return; }
+        if (!this.require_identity(sym, name, span)) { return; }
         // A freshly declared binding starts live.  `pop_scope` does not clear
         // the moved-set, and one declaration can be walked into scope more
         // than once (a lowering that re-emits a body), so a move left over
@@ -549,10 +547,26 @@ type struct DropInserter {
     /// scope_stack push).  Used for function parameters, which aren't
     /// auto-dropped at function exit but should still resolve via
     /// lookup_type for use-after-move analysis.
-    register_param_type(mut &this, name: SymbolStr, sym: SymbolID, ty: TypeRef) -> void {
-        if (!sym.is_valid()) { return; }
+    register_param_type(mut &this, name: SymbolStr, sym: SymbolID, ty: TypeRef,
+                        span: SourceSpan) -> void {
+        if (!this.require_identity(sym, name, span)) { return; }
         this.types_keys.push(sym.id);
         this.types_refs.push(ty);
+    }
+
+    /// A binding with no identity is one no use can name: its moves go
+    /// unseen, so it is released at scope exit whatever happened to it on the
+    /// way - or, for a pattern payload, its subject is.  The name layer and
+    /// every pass that declares a binding give it one, so a binding arriving
+    /// without is a compiler defect, reported rather than skipped.
+    require_identity(mut &this, sym: SymbolID, name: SymbolStr,
+                     span: SourceSpan) -> boolean {
+        if (sym.is_valid()) { return true; }
+        this.ctx.ice_at(fmt::format(
+            "binding '%s' reached drop insertion with no identity",
+            this.intern.resolve(name)), span);
+        this.fired += 1;
+        return false;
     }
 
     // ---- move tracking ---------------------------------------------------
@@ -798,7 +812,7 @@ type struct DropInserter {
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const p: VarDeclNode* = func.parameters[i];
             if (p == null) { continue; }
-            this.register_param_type(p.name, p.sym_id, p.resolved_type);
+            this.register_param_type(p.name, p.sym_id, p.resolved_type, p.span);
             if (p.name.is_valid() && p.sym_id.is_valid()
                     && this.type_needs_drop(p.resolved_type)
                     && this.param_drop_well_formed(p.resolved_type)) {
@@ -1375,12 +1389,8 @@ type struct DropInserter {
         for (mut pos: i64 = 0; pos < epat.elements.length; pos++) {
             const pb: PatternBinding* = epat.binding_at(pos);
             if (pb != null && pb.name.is_valid()) {
-                // Every site that builds a pattern gives its payload bindings an
-                // identity.  One that did not would name nothing here: its
-                // consumption would go unseen and the subject's glue would
-                // release the payload a second time.
-                if (!pb.sym_id.is_valid()) { continue; }
-                this.register_param_type(pb.name, pb.sym_id, proxy_ty);
+                if (!this.require_identity(pb.sym_id, pb.name, pb.span)) { continue; }
+                this.register_param_type(pb.name, pb.sym_id, proxy_ty, pb.span);
                 this.link_payload.push(pb.sym_id.id);
                 this.link_subject.push(subject_id);
                 count = count + 1;
