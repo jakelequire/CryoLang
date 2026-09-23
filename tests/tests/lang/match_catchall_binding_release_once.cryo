@@ -1,0 +1,140 @@
+// A catch-all arm's binding (`y => ...`) is a copy of the whole subject.
+// Giving it away gives the subject away, so the subject's own release at its
+// scope exit must not run as well: each value here is released exactly once,
+// whether the arm gives the binding away, lends it, or gives it away on only
+// one of its paths.
+![config(testing)]
+namespace CryoTests::Tests::Lang::MatchCatchallBindingReleaseOnce;
+
+import std::test;
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::option;
+import std::core::option::{ Option };
+import std::future;
+import std::future::{ PendingThenReady };
+import std::test::assert::{ expect_eq };
+import std::test::error::{ TestError };
+
+mut ca_drops: i32 = 0;
+
+type struct Item {
+    tag: i32;
+
+    drop(mut &this) -> void {
+        ca_drops = ca_drops + 1;
+    }
+}
+
+function consume(o: Option<Item>) -> void { }
+
+function lend(o: &Option<Item>) -> i32 { return 1; }
+
+function make(tag: i32) -> Option<Item> { return Option::Some(Item { tag: tag }); }
+
+function give_away() -> void {
+    const o: Option<Item> = make(1);
+    match (o) { y => { consume(y); } }
+}
+
+function lend_only() -> void {
+    const o: Option<Item> = make(1);
+    match (o) { y => { lend(&y); } }
+}
+
+function give_away_on_one_path(c: boolean) -> void {
+    const o: Option<Item> = make(1);
+    match (o) { y => { if (c) { consume(y); } } }
+}
+
+function after_other_arm() -> void {
+    const o: Option<Item> = make(1);
+    match (o) {
+        Option::None => { }
+        y => { consume(y); }
+    }
+}
+
+function under_guard() -> void {
+    const o: Option<Item> = make(1);
+    match (o) {
+        y if (lend(&y) == 1) => { consume(y); }
+        _ => { }
+    }
+}
+
+function as_value() -> i32 {
+    const o: Option<Item> = make(1);
+    return match (o) { y => { consume(y); 1 } };
+}
+
+function unnamed_subject() -> void {
+    match (make(1)) { y => { consume(y); } }
+}
+
+async function in_async(o: Option<Item>) -> i64 {
+    match (o) {
+        y => {
+            const _z: i64 = await PendingThenReady::<i64>::new(2, 1);
+            consume(y);
+        }
+    }
+    return 0;
+}
+
+![test]
+function given_away_released_once() -> Result<(), TestError> {
+    ca_drops = 0;
+    give_away();
+    return expect_eq(ca_drops, 1);
+}
+
+![test]
+function lent_released_once() -> Result<(), TestError> {
+    ca_drops = 0;
+    lend_only();
+    return expect_eq(ca_drops, 1);
+}
+
+![test]
+function given_away_on_one_path_released_once() -> Result<(), TestError> {
+    ca_drops = 0;
+    give_away_on_one_path(true);
+    give_away_on_one_path(false);
+    return expect_eq(ca_drops, 2);
+}
+
+![test]
+function after_other_arm_released_once() -> Result<(), TestError> {
+    ca_drops = 0;
+    after_other_arm();
+    return expect_eq(ca_drops, 1);
+}
+
+![test]
+function under_guard_released_once() -> Result<(), TestError> {
+    ca_drops = 0;
+    under_guard();
+    return expect_eq(ca_drops, 1);
+}
+
+![test]
+function match_expression_released_once() -> Result<(), TestError> {
+    ca_drops = 0;
+    as_value();
+    return expect_eq(ca_drops, 1);
+}
+
+![test]
+function unnamed_subject_released_once() -> Result<(), TestError> {
+    ca_drops = 0;
+    unnamed_subject();
+    return expect_eq(ca_drops, 1);
+}
+
+![test]
+function async_released_once() -> Result<(), TestError> {
+    ca_drops = 0;
+    future::block_on(in_async(make(1)));
+    return expect_eq(ca_drops, 1);
+}

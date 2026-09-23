@@ -320,7 +320,8 @@ type struct MoveChecker {
         return false;
     }
 
-    /// Record an arm's enum-pattern payload binding names (direct + nested)
+    /// Record an arm's bindings - enum-pattern payloads (direct + nested), or a
+    /// catch-all binding of the whole subject -
     /// as pattern-bound owned places for the duration of the arm walk, so
     /// `check_field_move_out` catches a field moved out of one.  Mirrors
     /// `drop_insertion::register_enum_pattern_bindings` (which registers the
@@ -330,7 +331,20 @@ type struct MoveChecker {
         if (arm == null) { return; }
         for (mut p: i64 = 0; p < arm.patterns.length; p++) {
             const pat: PatternNode* = arm.patterns[p];
-            if (pat == null || pat.pattern_kind != PatternKind::Enum) { continue; }
+            if (pat == null) { continue; }
+            if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
+                // The binding IS the subject, taken by value: giving it away
+                // twice releases it twice, as for a declared local, and a field
+                // moved out of it is refused as out of a payload, the subject's
+                // glue suppression being whole-value only.
+                if (this.require_identity(pat.binding_sym, pat.binding_name, pat.span)) {
+                    this.pat_binding_keys.push(pat.binding_sym.id);
+                    this.register_binding(pat.binding_sym, pat.binding_type,
+                                          pat.binding_name, pat.span);
+                }
+                continue;
+            }
+            if (pat.pattern_kind != PatternKind::Enum) { continue; }
             this.register_enum_pat_bindings(pat as EnumPatternNode*);
         }
     }

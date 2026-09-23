@@ -1363,7 +1363,8 @@ type struct DropInserter {
     /// the failure arm of the `?` desugar) the cumulative drops of every
     /// live local, so a droppable local live across `expr?` is freed on
     /// the error path instead of leaked.
-    /// Register an arm's enum-pattern payload bindings in the types map
+    /// Register an arm's bindings - an enum pattern's payloads, or a catch-all
+    /// binding of the whole subject - in the types map
     /// (detection only - never the scope, so no drop is synthesized for
     /// them) using `proxy_ty` as a stand-in non-Copy type.  Returns the
     /// count registered so the caller can check + unregister them.
@@ -1372,7 +1373,18 @@ type struct DropInserter {
         mut count: i64 = 0;
         for (mut p: i64 = 0; p < arm.patterns.length; p++) {
             const pat: PatternNode* = arm.patterns[p];
-            if (pat == null || pat.pattern_kind != PatternKind::Enum) { continue; }
+            if (pat == null) { continue; }
+            if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
+                // The binding is a copy of the whole subject: consuming it
+                // moves the subject, as consuming a payload does.
+                if (!this.require_identity(pat.binding_sym, pat.binding_name, pat.span)) { continue; }
+                this.register_param_type(pat.binding_name, pat.binding_sym, proxy_ty, pat.span);
+                this.link_payload.push(pat.binding_sym.id);
+                this.link_subject.push(subject_id);
+                count = count + 1;
+                continue;
+            }
+            if (pat.pattern_kind != PatternKind::Enum) { continue; }
             count = count + this.register_enum_pattern_bindings(
                 pat as EnumPatternNode*, proxy_ty, subject_id);
         }
