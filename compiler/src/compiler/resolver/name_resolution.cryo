@@ -83,9 +83,6 @@ public:
     /// set while descending into its function so the list can be resolved in
     /// the parameter scope that only the function visitor opens.
     pending_base_ctor: MethodNode*;
-    /// The function whose rib binds a receiver - an instance method's, set by
-    /// the visitor that knows the method is not static - or null.
-    receiver_of: FunctionDeclNode*;
     /// The identifier a call being visited names as its callee, while that
     /// callee is visited: an unbound one is refused as a function that does
     /// not exist rather than as a value.
@@ -105,7 +102,6 @@ public:
         this.resolver = resolver;
         this.ctx      = ctx;
         this.pending_base_ctor = null;
-        this.receiver_of       = null;
         this.callee_ident      = null;
         this.defining_type     = SymbolStr::empty();
         this.type_noun         = "type";
@@ -583,7 +579,11 @@ public:
                     break;
                 }
             }
-            const param_sym: SymbolID = this.resolver.declare_parameter(param.name, param.span);
+            // The receiver binds as `this` whatever its written form: `&this`
+            // is a spelling no use can write, and every use of `this` in the
+            // body names this parameter.
+            const bound_as: SymbolStr = if (param.is_receiver()) { this.this_sym } else { param.name };
+            const param_sym: SymbolID = this.resolver.declare_parameter(bound_as, param.span);
             this.resolver.record_resolution(param.span, param_sym);
             param.set_sym_id(param_sym);
             // After `declare_generics`, so a parameter spelled `T` is answered
@@ -592,23 +592,6 @@ public:
         }
         this.stamp_annotation(node.return_type_annotation);
         this.stamp_trait_bounds(&node.trait_bounds);
-
-        // The receiver of an instance method is a parameter of the method
-        // whether or not it was written (`&this` is written as a parameter
-        // spelled `&this`, which no use spells; a by-value `this` is a
-        // parameter spelled `this` and is already declared above).  It binds
-        // here, at the function's own rib, so `this` in the body resolves as
-        // any parameter does; in a static method or a free function it binds
-        // nowhere and is refused as any unbound name is.
-        if (this.receiver_of == node) {
-            mut written_this: boolean = false;
-            for (mut i: i64 = 0; i < node.parameters.length; i++) {
-                if (node.parameters[i].is_value_receiver()) { written_this = true; }
-            }
-            if (!written_this) {
-                this.resolver.declare_parameter(this.this_sym, node.span);
-            }
-        }
 
         // The base-constructor initializer list, if this function is the
         // constructor one was written on.  Resolved here, after the parameters
@@ -647,10 +630,7 @@ public:
             // because that is the one place the parameter scope is open, and
             // opening a second one would put the same names in two scopes.
             this.pending_base_ctor = node;
-            const outer_receiver: FunctionDeclNode* = this.receiver_of;
-            this.receiver_of = if (node.is_static) { null } else { node.func };
             node.func.accept(this);
-            this.receiver_of = outer_receiver;
             this.pending_base_ctor = null;
         }
     }
@@ -842,13 +822,8 @@ public:
         // it spells to be re-derived from wherever the compiler is standing at
         // instantiation time.  A method with no default has no body, and
         // `visit(FunctionDeclNode*)` already walks one only when it exists.
-        // A trait's method is its function node, so the receiver is decided
-        // here from the function's own flag.
         for (mut i: int = 0; i < node.methods.length; i++) {
-            const outer_receiver: FunctionDeclNode* = this.receiver_of;
-            this.receiver_of = if (node.methods[i].is_static) { null } else { node.methods[i] };
             node.methods[i].accept(this);
-            this.receiver_of = outer_receiver;
         }
 
         this.resolver.exit_scope();

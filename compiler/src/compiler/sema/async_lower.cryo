@@ -6766,7 +6766,9 @@ type struct AsyncLower {
         this.rb_enter(&ctx);
         for (mut i: i64 = 0; i < poll_fn.parameters.length; i++) {
             const p: VarDeclNode* = poll_fn.parameters[i];
-            if (p != null) { this.rb_bind(&ctx, p.name, p.sym_id); }
+            if (p == null) { continue; }
+            // The receiver is bound as `this`, the spelling its uses carry.
+            this.rb_bind(&ctx, if (p.is_receiver()) { this.this_sym } else { p.name }, p.sym_id);
         }
         this.rb_stmt(&ctx, poll_fn.body);
         this.rb_leave(&ctx);
@@ -7129,13 +7131,10 @@ type struct AsyncLower {
         if (generic) { this.arena.set_symbolic_no_demand(true); }
 
         // The receiver, which the future has to hold for the body to reach it
-        // after a suspend. `&this` / `mut &this` are one parameter literally
-        // named `"&this"`, already resolved to `T*`; a by-value `this` is named
-        // `"this"` and type resolution leaves its type unset, so the owner
-        // supplies it. A non-static method with NEITHER has an implicit `&this`
-        // (see `method_receiver_kind`) and so no parameter node for the field
-        // walks to find — one is synthesized, which is what the implicit form
-        // already means to every consumer downstream.
+        // after a suspend. `&this` / `mut &this` is already resolved to `T*`; a
+        // by-value `this` is left with its type unset by type resolution, so
+        // the owner supplies it.  Every instance method has the parameter,
+        // written or synthesized by the parser.
         mut recv_field: SymbolStr = SymbolStr::empty();
         mut recv_ptr: boolean = false;
         if (owner.method != null && !owner.method.is_static && owner.ty.is_valid()) {
@@ -7144,25 +7143,17 @@ type struct AsyncLower {
                 if (this.is_receiver_param(node.parameters[i])) { recv = node.parameters[i]; }
             }
             if (recv == null) {
-                recv = new VarDeclNode(this.this_amp_sym, span);
-                recv.set_receiver(ReceiverForm::ByReference);
-                recv.set_sym_id(this.resolver.alloc_synthetic_binding());
-                recv.set_mutable(false);
-                // The receiver leads the parameter list, which is where the
-                // consumers that index rather than search expect it.
-                node.add_parameter(recv);
-                for (mut i: i64 = node.parameters.length - 1; i > 0; i--) {
-                    node.parameters[i] = node.parameters[i - 1];
+                this.ctx.ice_at("an instance method reached the async lowering with no receiver parameter",
+                                node.span);
+            } else {
+                recv_ptr = recv.is_ref_receiver();
+                if (!recv.resolved_type.is_valid()) {
+                    recv.set_resolved_type(if (recv_ptr) {
+                        this.arena.get_pointer_to(owner.ty)
+                    } else { owner.ty });
                 }
-                node.parameters[0] = recv;
+                recv_field = this.recv_sym;
             }
-            recv_ptr = recv.is_ref_receiver();
-            if (!recv.resolved_type.is_valid()) {
-                recv.set_resolved_type(if (recv_ptr) {
-                    this.arena.get_pointer_to(owner.ty)
-                } else { owner.ty });
-            }
-            recv_field = this.recv_sym;
         }
 
         mut poll_args: TypeRef[] = [output_ref];
@@ -7248,6 +7239,14 @@ type struct AsyncLower {
             poll_fn.set_return_type_annotation(
                 this.poll_type_ann(this.output_type_ann(&d, span), span));
         }
+        // `poll` is a method of the future: its receiver is the future, and
+        // every `this` the lowering writes into the body names it.
+        mut poll_recv: VarDeclNode* = new VarDeclNode(this.this_amp_sym, span);
+        poll_recv.set_receiver(ReceiverForm::ByReference);
+        poll_recv.set_sym_id(this.resolver.alloc_synthetic_binding());
+        poll_recv.set_mutable(false);
+        poll_recv.set_resolved_type(this.arena.get_pointer_to(struct_ref));
+        poll_fn.add_parameter(poll_recv);
         mut cx_param: VarDeclNode* = new VarDeclNode(this.intern.intern("cx"), span);
         cx_param.set_sym_id(this.resolver.alloc_synthetic_binding());
         cx_param.set_resolved_type(ctx_ptr_ty);

@@ -905,6 +905,7 @@ public:
         this.state.payload_binding_ids = [];
         this.state.alias_binding_ids = [];
         this.state.this_is_by_ref = false;
+        this.state.receiver_sym = SymbolID::invalid();
         this.state.param_ids = [];
         this.state.in_lambda_depth     = 0;
         this.state.lambda_outer_locals = HashMap::<u32, TypeRef>::new();
@@ -923,6 +924,7 @@ public:
                        && param.type_annotation == null) {
                 ty = this.arena.get_pointer_to(this.arena.get_void());
             }
+            if (param.is_receiver()) { this.state.receiver_sym = param.sym_id; }
             if (param.is_ref_receiver()) {
                 this.state.this_is_mut = param.is_mutable;
                 this.state.this_is_by_ref = true;
@@ -1601,8 +1603,18 @@ public:
 
     // -- Expression resolvers kept on the main visitor --
 
+    /// Whether `id` is a use of the receiver of the method being checked: the
+    /// binding it names is the receiver parameter's.  Every instance method
+    /// has that parameter, written or synthesized, and the name layer binds
+    /// it as `this`, so the identity answers where the spelling would also
+    /// answer for a local or capture that happens to be spelled `this`.
+    names_receiver(&this, id: IdentifierNode*) -> boolean {
+        if (id == null || !this.state.receiver_sym.is_valid()) { return false; }
+        return id.res.local_sym().id == this.state.receiver_sym.id;
+    }
+
     resolve_identifier(mut &this, ident: IdentifierNode*) -> TypeRef {
-        if (ident.name.equals(this.this_sym)) {
+        if (this.names_receiver(ident)) {
             if (this.state.this_type.is_valid()) { return this.state.this_type; }
             if (ident.resolved_type.is_valid()) { return ident.resolved_type; }
         }
@@ -2179,7 +2191,7 @@ public:
         match (lhs.kind) {
             NodeKind::Identifier => {
                 const id: IdentifierNode* = lhs as IdentifierNode*;
-                if (id.name.equals(this.this_sym)) { return; }
+                if (this.names_receiver(id)) { return; }
                 match (this.state.local_muts.get(&id.name.id)) {
                     Option::Some(is_mut) => {
                         if (!is_mut) {
@@ -2281,7 +2293,7 @@ public:
         }
         if (unary.op.lexeme == "*" && unary.operand != null && unary.operand.kind == NodeKind::Identifier) {
             const id: IdentifierNode* = unary.operand as IdentifierNode*;
-            if (id.name.equals(this.this_sym)) { return operand_type; }
+            if (this.names_receiver(id)) { return operand_type; }
         }
         const result: TypeCheckResult = this.checker.check_unary_op(unary.op.lexeme, operand_type);
         if (!result.success) {
@@ -2401,7 +2413,7 @@ public:
         if (expr == null || !this.state.this_is_by_ref) { return false; }
         const n: ASTNode* = expr as ASTNode*;
         if (n.kind != NodeKind::Identifier) { return false; }
-        return (expr as IdentifierNode*).name.equals(this.this_sym);
+        return this.names_receiver(expr as IdentifierNode*);
     }
 
     /// True when a cast crosses between a memory aggregate and a scalar/pointer
@@ -3751,7 +3763,7 @@ public:
         const k: NodeKind = e.kind;
         if (k == NodeKind::Identifier) {
             const id: IdentifierNode* = e as IdentifierNode*;
-            if (id.name.id == this.this_sym.id) { return this.state.this_is_by_ref; }
+            if (this.names_receiver(id)) { return this.state.this_is_by_ref; }
             if (!this.scopes.is_param(id.name)) { return false; }
             return this.type_is_indirect(id.resolved_type);
         }

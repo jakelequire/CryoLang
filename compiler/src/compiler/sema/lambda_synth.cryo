@@ -37,8 +37,8 @@ import std::collections::hashmap::{ HashMap, HashMapIter };
 import std::fmt;
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
-    DeclarationNode, FieldDeclNode, FunctionDeclNode, MethodNode, StructDeclNode,
-    VarDeclNode
+    DeclarationNode, FieldDeclNode, FunctionDeclNode, MethodNode, ReceiverForm,
+    StructDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
     CalleePin,
@@ -293,6 +293,17 @@ type struct LambdaSynth {
         return this.intern.intern(fmt::format("%s::__Closure_%lld", ns_str, idx as i64));
     }
 
+    /// The receiver of a method synthesized on a closure struct: the struct by
+    /// reference, with a binding of its own, as every method's receiver is.
+    closure_receiver(mut &this, struct_ref: TypeRef, span: SourceSpan) -> VarDeclNode* {
+        mut recv: VarDeclNode* = new VarDeclNode(this.intern.intern("&this"), span);
+        recv.set_receiver(ReceiverForm::ByReference);
+        recv.set_sym_id(this.resolver.alloc_synthetic_binding());
+        recv.set_mutable(false);
+        recv.set_resolved_type(this.arena.get_pointer_to(struct_ref));
+        return recv;
+    }
+
     /// Synthesise the closure-struct + `__call__` (+ `drop` for non-Copy captures)
     /// for a capturing lambda; returns the closure struct's TypeRef.
     synthesize_closure_struct(mut &this, lambda: LambdaExprNode*) -> TypeRef {
@@ -331,10 +342,13 @@ type struct LambdaSynth {
             st.set_fields(infos);
         }
 
-        // 3. `__call__` FunctionDeclNode (implicit receiver).
+        // 3. `__call__` FunctionDeclNode: the closure struct by reference, then
+        // the lambda's own parameters.
         const call_name: SymbolStr = intern_ptr.intern("__call__");
         mut call_fn: FunctionDeclNode* = new FunctionDeclNode(call_name, span);
         call_fn.set_resolved_return_type(lambda.return_type);
+        const call_recv: VarDeclNode* = this.closure_receiver(struct_ref, span);
+        call_fn.add_parameter(call_recv);
         for (mut i: i64 = 0; i < lambda.parameters.length; i++) {
             call_fn.add_parameter(lambda.parameters[i]);
         }
@@ -349,6 +363,7 @@ type struct LambdaSynth {
 
             mut this_ident: IdentifierNode* = new IdentifierNode(this_ident_sym, span);
             this_ident.set_resolved_type(struct_ref);
+            this_ident.set_res(Res::Local(call_recv.sym_id));
             mut access: MemberAccessNode* = new MemberAccessNode(
                 this_ident as ExpressionNode*, cap_name, span, span);
             access.set_resolved_type(cap_ty);
@@ -406,6 +421,7 @@ type struct LambdaSynth {
             const drop_name: SymbolStr = intern_ptr.intern("drop");
             mut drop_fn: FunctionDeclNode* = new FunctionDeclNode(drop_name, span);
             drop_fn.set_resolved_return_type(arena_ptr.get_void());
+            drop_fn.add_parameter(this.closure_receiver(struct_ref, span));
 
             // The body is deliberately EMPTY: the captures are ordinary fields
             // of the closure struct, and field glue releases them after this
@@ -431,7 +447,8 @@ type struct LambdaSynth {
             mut method_param_types: TypeRef[] = [];
             for (mut pi: i64 = 0; pi < call_fn.parameters.length; pi++) {
                 const pp: VarDeclNode* = call_fn.parameters[pi];
-                if (pp != null && pp.resolved_type.is_valid()) {
+                // A method's entry lists what a call passes: not the receiver.
+                if (pp != null && !pp.is_receiver() && pp.resolved_type.is_valid()) {
                     method_param_types.push(pp.resolved_type);
                 }
             }

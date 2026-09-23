@@ -980,40 +980,11 @@ type struct DeclarationEmitter {
 
         const is_instance: boolean = !node.is_static;
 
-        // Detect whether the method already declares an explicit self parameter.
-        // Cryo allows three forms: `&this` / `mut &this` (reference, default),
-        // and `this` (by-value).  `&this` is stored in `parameters` with the
-        // literal name "&this"; `this` by-value is stored with the literal name
-        // "this".  In EITHER case we must NOT prepend an extra implicit `this`
-        // slot; the explicit param already accounts for the self argument.
-        // Only when the method has no self-param at all (e.g., some elaborated
-        // methods) should we synthesize the `&this` pointer prefix.
-        mut explicit_self_name: string = "";  // "", "&this", "this", or "typed-this"
-        for (mut pc0: u32 = 0; pc0 < func.parameters.length as u32; pc0++) {
-            const pp0: VarDeclNode* = func.parameters[pc0];
-            if (pp0 == null) { continue; }
-            if (pp0.is_ref_receiver()) {
-                explicit_self_name = "&this";
-                break;
-            }
-            if (pp0.is_value_receiver()) {
-                // Distinguish parser-synthesized by-value `this` (no annotation)
-                // from user-written `this: Lexer*` (explicit annotation).  Both
-                // count as "self" so we skip the implicit-prefix synthesis, but
-                // the LLVM param type comes from different sources: bare `this`
-                // uses the struct by value; typed `this` uses the annotation.
-                if (pp0.type_annotation == null) {
-                    explicit_self_name = "this";
-                } else {
-                    explicit_self_name = "typed-this";
-                }
-                break;
-            }
-        }
-
         // Look up the target type.  `&this` forms want `T*`; by-value `this`
-        // wants the struct `T` directly.  If there's no explicit self we'll
-        // synthesize `T*` as the implicit prefix.
+        // wants the struct `T` directly.  Every instance method has its
+        // receiver among its parameters - written, or given to it by the
+        // parser, the async lowering or the closure synthesis - so the slot
+        // comes from that parameter below.
         mut target_mapped: LType = LType::null();
         mut this_ty: LType = LType::null();
         if (is_instance) {
@@ -1028,11 +999,9 @@ type struct DeclarationEmitter {
             }
         }
 
-        const prepend_implicit_this: boolean = is_instance && explicit_self_name.length() == 0;
-
         // Count user parameters.  `&this` contributes a ptr slot via the
         // existing param; by-value `this` contributes a struct slot via the
-        // existing param; implicit missing self is handled by prepend_implicit_this.
+        // existing param.
         // For variadic methods (`args...`), skip the trailing name-only param;
         // LLVM's `...` marker covers it.
         const fixed_user_count: u32 = CodegenUtil::fixed_param_count(func);
@@ -1111,9 +1080,7 @@ type struct DeclarationEmitter {
             }
         }
 
-        const total_params: u32 = total_user_slots
-            + (if (prepend_implicit_this) { 1 } else { 0 } as u32)
-            + sret_inc;
+        const total_params: u32 = total_user_slots + sret_inc;
 
         const buf: void* = libc::malloc(total_params as u64 * 8);
         const slots: void** = buf as void**;
@@ -1130,10 +1097,6 @@ type struct DeclarationEmitter {
         mut idx: u32 = 0;
         if (has_sret_slot) {
             slots[idx] = LType::pointer_to(LType::i8()).raw;
-            idx += 1;
-        }
-        if (prepend_implicit_this) {
-            slots[idx] = this_ty.raw;
             idx += 1;
         }
 
@@ -2061,11 +2024,11 @@ type struct DeclarationEmitter {
         const is_sret_method: boolean = this.abi.sret_pointee_of(fn_val).is_valid();
         const sret_off: u32 = if (is_sret_method) { 1 } else { 0 } as u32;
 
-        // Detect which of the three self forms (if any) this method uses.
-        //   `&this` / `mut &this`: param named "&this", semantically a T*
-        //   `this`               : param named "this", semantically a by-value T
-        //   (none)               : implicit `&this`; `declare_method` synthesized
-        //                           a leading T* in the LLVM function signature
+        // Detect which receiver form an instance method has; every one has a
+        // receiver parameter, written or synthesized.
+        //   `&this` / `mut &this`: semantically a T*
+        //   `this`               : semantically a by-value T
+        //   `this: T*`           : a user-typed receiver
         // The LLVM parameter layout depends on which case we're in; matches the
         // logic in declare_method so named_values and LLVM params line up.
         mut explicit_ref_idx: i64 = -1;    // parameters[i] is "&this"
@@ -2173,7 +2136,7 @@ type struct DeclarationEmitter {
                 // directly to that value, same as the `&this` path.
                 this.values.set(this_sym, arg0);
             } else {
-                // `&this` (explicit or implicit): LLVM param 0 is already a ptr.
+                // `&this`: LLVM param 0 is already a ptr.
                 // Store the raw pointer directly in named_values (no alloca).
                 this.values.set(this_sym, arg0);
             }

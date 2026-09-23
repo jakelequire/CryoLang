@@ -855,6 +855,96 @@ public:
         return params;
     }
 
+    /// The type of a by-reference receiver of the type being parsed: inside a
+    /// struct/class/impl it is `&CurrentType`; inside a trait declaration it
+    /// is `&This`, a placeholder that impl-method resolution rewrites to each
+    /// concrete impl target.  A written `&this` and the receiver given to a
+    /// method that wrote none are typed by this one method.
+    receiver_type_annotation(is_mutable: boolean, span: SourceSpan) -> TypeAnnotation* {
+        mut inner: TypeAnnotation* = null;
+        if (this.current_type_name != "") {
+            const type_name: SymbolStr = this.ctx.intern(this.current_type_name);
+            // The receiver of `implement string { ... }` denotes the
+            // primitive, not a name to look up.  This synthesis runs from
+            // the impl target's TEXT rather than its token, so the token
+            // test that shapes every written annotation cannot be reached
+            // from here; asking the keyword table restores it.  Without
+            // this the receiver is a named annotation no scope can answer,
+            // and it resolves only by falling through a name lookup into
+            // the same primitive table the keyword names directly.
+            if (TokenType::from_keyword(this.current_type_name).is_primitive_type()) {
+                const prim_ann: PrimitiveAnnotation* = new PrimitiveAnnotation {
+                    name: type_name,
+                    span: span,
+                };
+                inner = new TypeAnnotation::Primitive(prim_ann);
+            } else if (this.current_type_name == "()") {
+                // The unit target is spelled `()`, which is not a keyword,
+                // so the primitive test above cannot reach it.  A WRITTEN
+                // `()` parses as the empty tuple, and the unit type has no
+                // named form - `ASTTypeSubstituter::rewrite_to_unit` states
+                // the same rule for substitution.  Synthesizing a name here
+                // would give `implement trait Drop for ()` a receiver that
+                // no scope can answer, purely because the receiver is typed
+                // from the target's TEXT rather than its syntax.
+                mut unit_elems: TypeAnnotation*[] = [];
+                const tup_ann: TupleAnnotation* = new TupleAnnotation {
+                    elements: unit_elems,
+                    span:     span,
+                };
+                inner = new TypeAnnotation::Tuple(tup_ann);
+            } else {
+                const named_ann: NamedAnnotation* = new NamedAnnotation {
+                    name: type_name,
+                    span: span,
+                    pre_resolved: TypeRef::invalid(),
+                    res: ResSlot::Pending,
+                };
+                inner = new TypeAnnotation::Named(named_ann);
+            }
+        } else {
+            const tt_ann: ThisTypeAnnotation* = new ThisTypeAnnotation { span: span };
+            inner = new TypeAnnotation::ThisType(tt_ann);
+        }
+        const ref_ann: ReferenceAnnotation* = new ReferenceAnnotation {
+            inner:      inner,
+            is_mutable: is_mutable,
+            span:       span,
+        };
+        return new TypeAnnotation::Reference(ref_ann);
+    }
+
+    /// Give a non-static method the receiver its source did not write.  Every
+    /// instance method takes one - a constructor's is the storage being
+    /// initialized - and a method that writes none takes it by reference, as
+    /// `&this`; synthesizing it here makes that one parameter, declared once,
+    /// instead of a case every later stage re-derives.  Its span is zero-width
+    /// at the method's name: a report about it points at the method, and it
+    /// covers no written text.
+    give_receiver(func: FunctionDeclNode*, is_static: boolean) -> void {
+        if (func == null || is_static) { return; }
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            if (func.parameters[i].is_receiver()) { return; }
+        }
+        const at: SourceSpan = if (func.name_span.has_location()) { func.name_span } else { func.span };
+        const span: SourceSpan = SourceSpan::new(at.file, at.start_line, at.start_col,
+                                                 at.start_line, at.start_col);
+        mut param: VarDeclNode* = new VarDeclNode(this.ctx.intern("&this"), span);
+        param.set_mutable(false);
+        param.set_receiver(ReceiverForm::ByReference);
+        param.set_type_annotation(this.receiver_type_annotation(false, span));
+        func.parameters.insert(0, param);
+    }
+
+    /// `give_receiver` over every method of a type body or an impl block, once
+    /// each method's `static` is known.
+    give_receivers(methods: &MethodNode*[]) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m != null) { this.give_receiver(m.func, m.is_static); }
+        }
+    }
+
     /// Parse a single parameter: [mut] name: Type [= default]
     parse_parameter() -> VarDeclNode* {
         const start: Token = this.current();
@@ -888,58 +978,7 @@ public:
             // later stage asks the mark.
             param.set_receiver(ReceiverForm::ByReference);
 
-            mut inner: TypeAnnotation* = null;
-            if (this.current_type_name != "") {
-                const type_name: SymbolStr = this.ctx.intern(this.current_type_name);
-                // The receiver of `implement string { ... }` denotes the
-                // primitive, not a name to look up.  This synthesis runs from
-                // the impl target's TEXT rather than its token, so the token
-                // test that shapes every written annotation cannot be reached
-                // from here; asking the keyword table restores it.  Without
-                // this the receiver is a named annotation no scope can answer,
-                // and it resolves only by falling through a name lookup into
-                // the same primitive table the keyword names directly.
-                if (TokenType::from_keyword(this.current_type_name).is_primitive_type()) {
-                    const prim_ann: PrimitiveAnnotation* = new PrimitiveAnnotation {
-                        name: type_name,
-                        span: span,
-                    };
-                    inner = new TypeAnnotation::Primitive(prim_ann);
-                } else if (this.current_type_name == "()") {
-                    // The unit target is spelled `()`, which is not a keyword,
-                    // so the primitive test above cannot reach it.  A WRITTEN
-                    // `()` parses as the empty tuple, and the unit type has no
-                    // named form - `ASTTypeSubstituter::rewrite_to_unit` states
-                    // the same rule for substitution.  Synthesizing a name here
-                    // would give `implement trait Drop for ()` a receiver that
-                    // no scope can answer, purely because the receiver is typed
-                    // from the target's TEXT rather than its syntax.
-                    mut unit_elems: TypeAnnotation*[] = [];
-                    const tup_ann: TupleAnnotation* = new TupleAnnotation {
-                        elements: unit_elems,
-                        span:     span,
-                    };
-                    inner = new TypeAnnotation::Tuple(tup_ann);
-                } else {
-                    const named_ann: NamedAnnotation* = new NamedAnnotation {
-                        name: type_name,
-                        span: span,
-                        pre_resolved: TypeRef::invalid(),
-                        res: ResSlot::Pending,
-                    };
-                    inner = new TypeAnnotation::Named(named_ann);
-                }
-            } else {
-                const tt_ann: ThisTypeAnnotation* = new ThisTypeAnnotation { span: span };
-                inner = new TypeAnnotation::ThisType(tt_ann);
-            }
-            const ref_ann: ReferenceAnnotation* = new ReferenceAnnotation {
-                inner:      inner,
-                is_mutable: is_mutable,
-                span:       span,
-            };
-            param.set_type_annotation(new TypeAnnotation::Reference(ref_ann));
-
+            param.set_type_annotation(this.receiver_type_annotation(is_mutable, span));
             return param;
         }
 
@@ -1403,6 +1442,9 @@ public:
             this.advance();
         }
 
+        if (struct_node != null) { this.give_receivers(&struct_node.methods); }
+        if (class_node != null)  { this.give_receivers(&class_node.methods); }
+        if (union_node != null)  { this.give_receivers(&union_node.methods); }
     }
 
     /// Parse a constructor: ClassName(params) [: BaseClass(args)] { body }
@@ -1799,6 +1841,7 @@ public:
                 if (func != null) {
                     if (is_static) { func.set_static(true); }
                     if (trait_mods.is_async) { func.set_async(true); }
+                    this.give_receiver(func, is_static);
                     node.add_method(func);
                 }
             } else {
@@ -2388,6 +2431,7 @@ public:
         }
 
         this.consume(TokenType::RBrace, "'}'");
+        this.give_receivers(&node.methods);
         this.current_type_name = "";
         node.span = this.span_from(start);
         return node;
