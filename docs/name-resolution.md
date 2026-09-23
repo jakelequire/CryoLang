@@ -56,7 +56,7 @@ measurement that decided it on the row.
 | D11 | **Remove `resolve_counter.cryo` completely** - the counter, its audit streams, `scripts/b1-gate.py` and `tests/b1-baseline.txt` (Jake, 2026-09-15: "I want this instrumentation to be removed completely"; §7.2 mechanism 3 amended, §8.202) | **TAKEN** (§8.203) — the module (1,302 lines), its 100 `bump()` sites and 54 audit emitters, the five audit streams and `CRYO_RESOLVE_COUNTER`, `HomeOrigin` and `ResolutionContext`'s `FILE, LINE` provenance, the `door`/`site`/`table` parameters that carried a site name to an emitter, `b1-gate.py`, `retire-counter-sites.py`, `b1-baseline.txt`, `make b1-check` and its two CI steps. 0 of 3,478 objects moved over `examples/` and `tests/`. `lane-check`, the negative tests and the mutation projects are the regrowth guard | `git ls-files \| grep -c -e 'resolve_counter' -e 'b1-gate' -e 'b1-baseline'` → **0**; `grep -rho -e 'resolve_counter' -e 'HomeOrigin' compiler/src tools --include=*.cryo \| wc -l` → **0** | §8.66, §8.80, §8.139, §8.174, §8.183, §8.188, §8.193, §8.202, §8.203 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -v '^\s*//' compiler/src/compiler/resolver/name_resolution.cryo \| grep -c 'module_offering'` → **5** (3 before §8.258: `module_offerings`, the plural form the walk reads so its E0155 can name both declarations, and `module_offering` is its first-and-count) | §8.138, §8.144, §8.151, §8.258 |
-| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **601** (+1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194, §8.195 and §8.197, projects; +2 in §8.199, a project's two files; -1 in §8.203, `resolve_counter.cryo`; -1 in §8.206, a `collect` project's test file, the project being a `compile_fail` now; -1 in §8.207, `bare_intrinsic_priority.cryo`, a negative now; +1 in §8.209, a negative; +1 in §8.213, a unit test; +2 in §8.217, two projects' `beta_text.cryo`; +2 in §8.242, the consequence repro's two sources under `scripts/ns-migration/8.242/tick-ctl/`; +1 in §8.244, a negative; +1 in §8.256, a unit test; +2 in §8.275, the two `chain_default_*` projects; +1 in §8.277, a unit test; +1 in §8.286, a negative; +1 in §8.287, a unit test; +1 in §8.301, a unit test; +1 in §8.303, a unit test; +1 in §8.304, `resolver/module_path.cryo`; +1 in §8.306, a unit test) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **603** (+1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194, §8.195 and §8.197, projects; +2 in §8.199, a project's two files; -1 in §8.203, `resolve_counter.cryo`; -1 in §8.206, a `collect` project's test file, the project being a `compile_fail` now; -1 in §8.207, `bare_intrinsic_priority.cryo`, a negative now; +1 in §8.209, a negative; +1 in §8.213, a unit test; +2 in §8.217, two projects' `beta_text.cryo`; +2 in §8.242, the consequence repro's two sources under `scripts/ns-migration/8.242/tick-ctl/`; +1 in §8.244, a negative; +1 in §8.256, a unit test; +2 in §8.275, the two `chain_default_*` projects; +1 in §8.277, a unit test; +1 in §8.286, a negative; +1 in §8.287, a unit test; +1 in §8.301, a unit test; +1 in §8.303, a unit test; +1 in §8.304, `resolver/module_path.cryo`; +1 in §8.306, a unit test; +2 in §8.311, a unit test and a negative) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `python3 scripts/lane-gate.py --row LOOKUP_ROUTED` → **55** (54 before §8.256 deleted sema's `new` spelling step; 53 before §8.259 deleted the callee hint's `bare_sym` door and sema's `alias_global`; 51 before §8.263's two `lookup_type_exact` by a canonical name - the impl-qualified head's trait, asked whether it IS a trait, and its owner for the E0306 report; 53 before §8.289 re-keyed `method_returns` by the owner's arena id: `resolve_method_owner` and `lookup_method_return_raw` deleted, `lookup_type_sym` left two readers that hold the owner ref, and the five readers holding a stamp's name ask `lookup_type_exact` for the owner first) | §8.99, §8.107 |
 | D16 | **An impl head writes EVERY parameter of the template it names, or names a concrete instantiation; an elided parameter is an error** - whether all of them default (`implement trait Display for String` with `String<A = GlobalAlloc>`) or only the trailing ones (`implement<T> trait Display for Array<T>` with `Array<T, A = GlobalAlloc>`). Write `implement<A> trait Display for String<A>` or `implement trait Display for String<GlobalAlloc>`. Rust's model: `impl Display for Vec` is missing its parameters and is not given a default meaning, and `impl<T> Trait for Vec<T>` is not written either | **TAKEN** (ruled by Jake 2026-09-13 for the bare form, 2026-09-14 for every elided parameter; built in §8.190) — E0302 from `refuse_elided_template_params` where type resolution attaches a WRITTEN head to its template, naming the template, both counts and both spellings, the parameter form first; the 11 heads rewritten as the instantiation each meant; a head's `target_args` is what it writes after the target on EVERY kind of head (an inherent head's list also declares its names); sema's writer-module lookup deleted. The concrete spelling is HONOURED by impl selection since §8.233: a head's written target arguments unify with the subject's, a `Def`/`PrimTy`-stamped one filtering, so `for Wrap<T, Alpha>` is not selected for `Wrap<i32, Beta>` and two heads differing in that argument are two heads (`impl_concrete_arg_filters_impl` E0358, `impl_concrete_arg_selects_impl` 12 - both RED from §8.223 to §8.233) | `python3 scripts/impl-head-elided-params.py --count` → **bare=0,partial=0,unmatched=0**; `grep -c 'refuse_elided_template_params' compiler/src/compiler/passes/type_resolution.cryo` → **2**; `ls tests/tests/negative/E0302*.cryo \| wc -l` → **3** (2 at §8.190; +1 in §8.210, D22's head); `ls -d tests/tests/projects/impl_concrete_arg_*/test.json \| wc -l` → **2** (green since §8.233) | §8.180, §8.181, §8.187, §8.190, §8.223 |
 | D17 | **An `extern "C"` function is public unless marked `private`** — the extern-visibility default `docs/cryo.md` §18.1 states | **RULED** (Jake, 2026-09-14) — built in §8.167 by a worker and carried as unconfirmed until ratified; the spec text is normative, not provisional | `grep -c 'mut ext_public: boolean = true;' compiler/src/compiler/parser/parser.cryo` → **1**; `grep -c 'unless written .private function' docs/cryo.md` → **1** | §8.167, §8.187 |
@@ -203,7 +203,7 @@ three, and its row carries the count. Read each zero off its own row.
 | a method's receiver found by comparing a parameter's SPELLING with `this` / `&this` (47 residue rows on 41 lines in 13 files, and 10 comparisons of a resolved string or of one parameter handed in that no residue row counted) | **DELETED** - a parameter carries `VarDeclNode.receiver` (`ReceiverForm`: not a receiver, by reference, by value), set where a receiver is minted (the parser's two branches, the async lowering's synthesized `&this`, the C++ importer), copied by the cloner and cleared by a rename; every site asks `is_receiver()`, `is_ref_receiver()` or `is_value_receiver()`. What still compares the spelling asks whether an IDENTIFIER USE is the keyword `this` - sema 5, the LSP 6 - and a use has no declaration to carry a mark | residue 448 → 401, J 230 → 183; a shadow at every converted site over six halves, 0 disagreements (each mark suppressed alone: 9,790, 800, 25); 0 of 1,126 example, 3,004 test, 265 LSP and 154 stdlib objects moved | `grep -rho 'set_receiver(ReceiverForm::' compiler/src --include=*.cryo \| wc -l` → **4**; `python3 scripts/ns-migration/receiver-spelling-sites.py 2>/dev/null \| wc -l` → **11** (62 over the tree before §8.305) | §8.305 |
 | a destructure unseen by the move checker (`MoveChecker::walk_stmt` handling a declaration statement only when it held one variable: the initializer never walked as a move, the field bindings never registered) - a destructured field given away twice, and a destructure's source used after its fields were taken, were both ACCEPTED double frees, on the pin too | **DELETED** - `MoveChecker::walk_destructure_decl` walks the initializer as a move and registers each binding by `DestructureBinding.sym_id`, as `DropInserter::walk_destructure_decl` does. A match-arm PAYLOAD binding is still unregistered (`consume(x); consume(x);` in one arm is accepted, pin too) - open, §8.309 | `E0452_destructured_binding_moved_twice` and `E0452_destructure_source_used_after` fail under `46d0acb8`'s compiler and pass under this one; each half of the fix removed alone fails exactly one of them; 0 of 1,126 example objects moved | `grep -c 'this\.walk_destructure_decl(' compiler/src/compiler/passes/move_check.cryo` → **1** (the call; the dot escaped); `ls tests/tests/negative/E0452_destructure*.cryo \| wc -l` → **2** | §8.306 |
 | an identifier USE asked whether it is the receiver by its spelling (`sema.cryo`: 5 sites comparing `ident.name` with `this`; the LSP's 6 are Jake's) | **MEASURED, NOT CONVERTIBLE** - in a `&this` method a `this` use carries the identity of a second binding the name layer declares and discards (the `receiver_of == node` block in `name_resolution.cryo` drops `declare_parameter`'s result), and the async lowering's own `this` uses carry none; over six halves 85,147 asks could be converted, 1,332,567 name the discarded binding, 39,811 name nothing. Blocked on the name layer recording that identity and the lowering stamping its uses - neither done | instrument `scripts/ns-migration/8.307/` with a two-method control (+2 / +2) | `grep -c '^\s*this\.resolver\.declare_parameter(this\.this_sym' compiler/src/compiler/resolver/name_resolution.cryo` → **1** (a statement whose value is dropped: the discarded identity) | §8.307 |
-| the async lowering's rename skipping a destructure (`AsyncLower::rn_stmt` renames only a single-variable declaration: a destructure's bindings keep their spelling and stay out of `frame_locals`, its initializer is never walked) - the premise of the `frame_locals` own-rib exclusion | **OPEN, a live miscompile** - an async function reads a parameter where the source names a shadowing local (7 for 50, 7 for 100), and an address of a destructured local held across a suspend is accepted where a plain local is E0455; pin and HEAD alike. The two match-arm ribs (`BindingCapture`, `BindingRename`) HOLD, each probe shown failing under a mutation of the rename it relies on | the probe runner in `scripts/ns-migration/8.308/` reports 3 of its 9 probes WRONG under the pin and under `2790cea2`'s compiler, 4 under the rename mutation that is its control (it needs a build, so it is evidence and not a row check) | `grep -c 'DestructureDeclaration' compiler/src/compiler/sema/async_lower.cryo` → **1** (the post-lowering rebind alone) | §8.308 |
+| the async lowering's rename skipping a destructure (`AsyncLower::rn_stmt` renames only a single-variable declaration: a destructure's bindings keep their spelling and stay out of `frame_locals`, its initializer is never walked) - the premise of the `frame_locals` own-rib exclusion | **DELETED** (§8.311) - `rn_destructure` renames a destructure's initializer and fields like `rn_var_decl`; `split_destructures` turns each typed destructure into `const __ds = <init>;`, the destructure over temporaries, and one declaration a field (the binding's identity kept), so fields are carried and address-checked like locals; `decl_stmt_init` lets nine walkers (the `await` counter among them) see a destructure's initializer. A destructure of a GENERIC type in a generic body is renamed, not split: a field of it read across a suspend is still E0201 (`a$L1` in the message). The two match-arm ribs (`BindingCapture`, `BindingRename`) HOLD (§8.308) | the probe runner in `scripts/ns-migration/8.308/`: 3 of 9 WRONG under the pin and `bfa0ab60`, 0 under §8.311; each of the three parts removed alone fails a probe or the new test (§8.311) | `grep -c 'DestructureDeclaration' compiler/src/compiler/sema/async_lower.cryo` → **5**; `grep -c 'this.split_destructures(blk);' compiler/src/compiler/sema/async_lower.cryo` → **1** | §8.308, §8.311 |
 | a match-arm PAYLOAD binding unseen by the move checker (`register_arm_pat_bindings` feeds only the field-move-out set, never the type map, so a payload given away twice, used after it was given away, or given away in a loop is ACCEPTED; pin too) | **OPEN, BLOCKED on a signature ruling** - the fix (register the payload by `PatternBinding.sym_id` with a type sema stamps) is built and measured: over six halves it tracks 167,117 payloads, 0 untyped, 0 without identity, and refuses exactly three places - `Iterator::find`, `FilterIter::next` (each hands an element to a by-value predicate and then returns it: a double free, reproduced on the pin) and one test. Every program reaches the first, so the fix cannot land until those two change signature - Jake's; and the borrowing signature meets the defect that `x == 7` with `x: &i32` compares the address. The catch-all arm binding (`y => ...`) releases its subject twice on ONE use and is a separate hole | the shadow run's refusal list, `.objcmp/pp-lines.txt`; the patch, `.objcmp/s37u1-fix.patch` | `ls scripts/ns-migration/8.309/payload-move-shadow.py \| wc -l` → **1**; `grep -c 'pb.resolved_type' compiler/src/compiler/sema/pattern_resolver.cryo` → **0** (the fix not in the tree) | §8.309 |
 | a binding reaching the move checker or drop insertion with NO identity (skipped at five entry points: untracked by the one, released regardless by the other, a payload's subject released too) | **DELETED** - an internal compiler error, E0900 at the binding (`require_identity` in each pass, `CompilationContext::ice_at`), Jake's ruling. Measured at 0 over six halves before building | two mutations, each removing one identity in the name layer: without the check each program silently frees a value twice, with it each is refused E0900 | `grep -c 'require_identity(' compiler/src/compiler/passes/move_check.cryo` → **3**; `grep -c 'require_identity(' compiler/src/compiler/passes/drop_insertion.cryo` → **4** | §8.310 |
 
@@ -252,7 +252,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: lane-check lane-selftest' Makefile` → **1**
 * `ls -d tests/tests/projects/*/test.json | wc -l` → **76**
-* `ls tests/tests/negative/*.cryo | wc -l` → **219**
+* `ls tests/tests/negative/*.cryo | wc -l` → **220** (+1 in §8.311)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
 * `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -39046,5 +39046,155 @@ value away once or twice:
 `lsp-check` OK (265 modules, 0 errors); `cross-check` OK (0 errors);
 `test-census` OK. No negative test: no program can reach an internal error
 on a correct compiler, so the pairs above are the evidence.
+
+---
+
+### 8.311 An `async function` holding a destructure no longer reads the wrong variable: the lowering renames a destructure's fields like any other local and splits it into one declaration per field, so a field is carried across a suspend and an address of one held across a suspend is refused; nothing in the tree compiled a destructure in an async body, so no existing program changes - 2026-09-23
+
+#### What a user could write
+
+On the pin and on every compiler since, silently:
+
+```cryo
+async function h(x: i64) -> i64 {
+    const _z: i64 = await PendingThenReady::<i64>::new(2, 1);
+    mut r: i64 = 0;
+    {
+        const x: i64 = 50;
+        const {a, b}: Pair = Pair { a: x, b: 0 };
+        r = a + b;
+    }
+    return r;          // returned 7, the PARAMETER; now 50
+}
+
+async function g(a: i64) -> i64 {
+    mut r: i64 = 0;
+    {
+        const {a, b}: Pair = Pair { a: 100, b: 2 };
+        const _z: i64 = await PendingThenReady::<i64>::new(2, 1);
+        r = a;         // read the parameter: 7; now 100
+    }
+    return r;
+}
+
+async function f() -> i64 {
+    const {a, b}: Pair = Pair { a: 1, b: 2 };
+    const p: i64* = &a;              // accepted; now E0455, as for a plain local
+    const _z: i64 = await PendingThenReady::<i64>::new(2, 1);
+    return *p;                       // dangling
+}
+```
+
+And loudly, three more shapes that now compile and run: both fields read
+after a suspend (`E0201: cannot find value 'b'` - a destructured field was
+never carried), a destructure whose initializer IS an `await` (`E0900:
+unresolved generic instantiation` - the lowering never saw that `await` at
+all), and a destructure in a generic `async function` (`E0201` at the
+initializer's parameter).
+
+#### Why
+
+The lowering flattens the body into states and finds each local by its
+spelling, which is sound only after `disambiguate_locals` gives every local a
+spelling of its own. That rename handled a declaration statement only when it
+held one variable (§8.308), so a destructure kept its source spellings and
+its initializer was never walked. And every walker that asks what a
+statement reads, suspends on or diverges through looked into a variable's
+initializer and not a destructure's: the one counting `await`s did not see
+one there, which is why the awaited shape was never lowered.
+
+#### The fix, in three parts
+
+1. **The initializer is seen.** `decl_stmt_init` answers a declaration
+   statement's initializer for either kind, and the nine walkers that asked
+   `VariableDeclaration` only - the `await` counter, the read / first-use /
+   last-use / address-of / divergence / free-edge walkers, the `return`
+   rewrite and the `await` hoisting - ask it.
+2. **The rename covers a destructure** (`rn_destructure`): the initializer
+   renamed in the enclosing scope, then each field's local minted, exactly as
+   `rn_var_decl` does, which also registers each as a frame local for the
+   address-of check.
+3. **The destructure is split** (`split_destructures`, run as the rename
+   enters each block), because every pass after it carries a local across a
+   suspend one `VarDecl` at a time:
+
+   ```cryo
+   const {a, b}: Pair = <init>;
+   // becomes
+   const __ds: Pair = <init>;              // an `await` here is an ordinary carrier
+   const {a: a$D, b: b$D}: Pair = __ds;    // taken apart into temporaries
+   const a: i64 = a$D;                     // one declaration a field,
+   const b: i64 = b$D;                     // with the binding's own identity
+   ```
+
+   The temporaries are read by the next statements, so no suspend falls
+   between. Every value is released as before: `__ds` and each temporary
+   are moved from, each field's declaration releases its field.
+
+   A destructure whose fields sema has not typed is renamed where it stands
+   and not split: in a generic body a destructure of a GENERIC type has
+   none until it is specialized (sema defers them), and a declaration made
+   from one could not say what it holds. So a field of `Two<T>` read across
+   a suspend is still refused, loudly, as `E0201: cannot find value 'a$L1'`
+   - the lowering's own spelling in the message. Recorded, not fixed.
+
+#### Blast radius, measured
+
+Nothing in the tree changes: no `async` body in `stdlib`, `tests`,
+`examples`, `tools` or `compiler/src` contains a destructure (`grep -rlE
+"async " ... | xargs grep -lE "(const|mut) *\{"` finds one file, whose
+destructure is in a non-async function), and the object comparison below
+moved nothing outside the new test. No test or example depended on the
+wrong answer. For a user: the two silent shapes change value (correctly),
+the address-of shape becomes E0455, and three refused shapes compile.
+
+#### Each part shown to matter alone
+
+Each mutation alone, each a clean rebuild; the probe runner is
+`scripts/ns-migration/8.308/async-rib-probes.py` (3 of 9 WRONG under the
+pin and `bfa0ab60`, 0 of 9 under this commit):
+
+| mutation | probe runner | `lang/async_destructure_locals` |
+|---|---|---|
+| no rename arm (the split stays) | **2 of 9 WRONG**, silently: the split's temporaries go unrenamed and the fields read garbage (`954600520192` for 100, `140727522192905` for 50) | E0614 in codegen, `renamed_and_mut_fields` |
+| no split (the rename arm stays) | 1 of 9 WRONG: a field read after a suspend is E0201 | E0600, the destructure of an awaited value |
+| the `await` counter asks a variable's initializer only | 0 of 9 | E0900, the future of the awaited destructure never lowered |
+
+The first row is a prediction missed: I expected only the generic test to
+fail. The split's temporaries are ordinary locals of the body, and a local
+the rename does not reach is the defect this entry fixes.
+
+#### Tests, and the pair
+
+* `lang/async_destructure_locals.cryo`, 9 tests (the three shapes above as
+  values, both fields across a suspend, an awaited initializer, a renamed and
+  a `mut` field, two fields with destructors each released once, and three
+  generic shapes). Under `bfa0ab60`'s compiler the file does not compile:
+  E0201 eight times, E0900 once.
+* `negative/E0455_async_destructured_local_address.cryo`, annotated at the
+  `&a`. Under `bfa0ab60`'s compiler it COMPILES (exit 0); under this one it
+  is E0455.
+
+#### Found alongside, not touched
+
+A generic function destructuring a generic struct that nothing else
+instantiates is refused - `function g<T>(x: T, z: T) -> T { const {a, b}:
+Two<T> = Two::<T> { a: x, b: z }; ... }` called as `g::<i64>` is `E0361:
+cannot destructure non-struct type 'Two<i64>'` - on the pin as on HEAD, not
+async-specific. The test above instantiates `Two<i64>` elsewhere so its
+generic shapes are not blocked by it.
+
+#### What moved
+
+| what | before | after |
+|---|---|---|
+| objects, examples (`ex-s37u4.s` → `ex-s37u2.s`) | 1,126 | 1,126, **0 moved** |
+| objects, tests (`t-s37u4.txt` → `t-s37u2.txt`) | 3,005 | 3,006: the new test's object and the generated test main, nothing else |
+| roster (`test-census`) | 2,151 unit, 219 compile-fail, 76 projects | 2,160 unit, 220 compile-fail, 76 projects (`--merge`: 10 added, 0 removed) |
+| warnings, clean `make cryo` | 346 | 346 |
+
+Predicted before building: the probe runner 3 → 0 WRONG, 0 example objects
+moved, the tests population +1 object and the test main. All held.
+`lsp-check` OK (265 modules, 0 errors); `cross-check` OK; `test-census` OK.
 
 ---

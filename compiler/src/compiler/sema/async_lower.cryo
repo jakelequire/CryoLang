@@ -56,8 +56,9 @@ import compiler::types::generic::{
 };
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
-    DeclarationNode, DestructureDeclNode, FieldDeclNode, FunctionDeclNode, GenericParamNode,
-    ImplBlockNode, MethodNode, ReceiverForm, StructDeclNode, TraitDeclNode, VarDeclNode
+    DeclarationNode, DestructureBinding, DestructureDeclNode, FieldDeclNode, FunctionDeclNode,
+    GenericParamNode, ImplBlockNode, MethodNode, ReceiverForm, StructDeclNode, TraitDeclNode,
+    VarDeclNode
 };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode, CallExprNode,
@@ -940,10 +941,7 @@ type struct AsyncLower {
             return;
         }
         if (stmt.kind == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                this.rewrite_returns_expr((ds.declaration as VarDeclNode*).initializer, poll_out, span);
-            }
+            this.rewrite_returns_expr(this.decl_stmt_init(stmt as DeclStmtNode*), poll_out, span);
             return;
         }
         if (stmt.kind == NodeKind::BlockStatement) {
@@ -1235,11 +1233,7 @@ type struct AsyncLower {
             return this.expr_await_count((stmt as ReturnStmtNode*).expression);
         }
         if (k == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                return this.expr_await_count((ds.declaration as VarDeclNode*).initializer);
-            }
-            return 0;
+            return this.expr_await_count(this.decl_stmt_init(stmt as DeclStmtNode*));
         }
         if (k == NodeKind::BlockStatement) {
             return this.block_await_count(stmt as BlockStmtNode*);
@@ -1698,11 +1692,7 @@ type struct AsyncLower {
             return this.name_read_in_expr((s as ReturnStmtNode*).expression, name);
         }
         if (k == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = s as DeclStmtNode*;
-            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                return this.name_read_in_expr((ds.declaration as VarDeclNode*).initializer, name);
-            }
-            return false;
+            return this.name_read_in_expr(this.decl_stmt_init(s as DeclStmtNode*), name);
         }
         if (k == NodeKind::BlockStatement) {
             const blk: BlockStmtNode* = s as BlockStmtNode*;
@@ -2215,6 +2205,30 @@ type struct AsyncLower {
             return null;
         }
         return ds.declaration as VarDeclNode*;
+    }
+
+    /// The expression a declaration statement evaluates where it stands: a
+    /// variable's initializer or a destructure's.  A walker asking what a
+    /// statement reads, suspends on or diverges through asks this, so that a
+    /// destructure is not a statement it cannot see into.
+    decl_stmt_init(&this, ds: DeclStmtNode*) -> ExpressionNode* {
+        if (ds == null || ds.declaration == null) { return null; }
+        if (ds.declaration.kind == NodeKind::VariableDeclaration) {
+            return (ds.declaration as VarDeclNode*).initializer;
+        }
+        if (ds.declaration.kind == NodeKind::DestructureDeclaration) {
+            return (ds.declaration as DestructureDeclNode*).initializer;
+        }
+        return null;
+    }
+
+    set_decl_stmt_init(&this, ds: DeclStmtNode*, init: ExpressionNode*) -> void {
+        if (ds == null || ds.declaration == null) { return; }
+        if (ds.declaration.kind == NodeKind::VariableDeclaration) {
+            (ds.declaration as VarDeclNode*).initializer = init;
+        } else if (ds.declaration.kind == NodeKind::DestructureDeclaration) {
+            (ds.declaration as DestructureDeclNode*).initializer = init;
+        }
     }
 
     /// A promoted cross-await local must sit in a struct field the constructor
@@ -3684,11 +3698,7 @@ type struct AsyncLower {
             return this.expr_diverges((stmt as ExprStmtNode*).expression);
         }
         if (k == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                return this.expr_diverges((ds.declaration as VarDeclNode*).initializer);
-            }
-            return false;
+            return this.expr_diverges(this.decl_stmt_init(stmt as DeclStmtNode*));
         }
         if (k == NodeKind::BlockStatement) {
             const blk: BlockStmtNode* = stmt as BlockStmtNode*;
@@ -3817,11 +3827,7 @@ type struct AsyncLower {
             return this.expr_has_free_edge((stmt as ReturnStmtNode*).expression, break_only);
         }
         if (k == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                return this.expr_has_free_edge((ds.declaration as VarDeclNode*).initializer, break_only);
-            }
-            return false;
+            return this.expr_has_free_edge(this.decl_stmt_init(stmt as DeclStmtNode*), break_only);
         }
         // While/For/Loop/DoWhile capture their own break/continue — not free here.
         return false;
@@ -3945,13 +3951,12 @@ type struct AsyncLower {
         const k: NodeKind = s.kind;
         if (k == NodeKind::DeclarationStatement) {
             const ds: DeclStmtNode* = s as DeclStmtNode*;
+            // The initializer runs before the name exists, so a mention of
+            // the name in it refers to an outer binding and is a read.
+            const r: i64 = this.expr_first_use(this.decl_stmt_init(ds), name);
+            if (r != 0) { return r; }
             if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
-                // The initializer runs before the name exists, so a mention of
-                // the name in it refers to an outer binding and is a read.
-                const r: i64 = this.expr_first_use(vd.initializer, name);
-                if (r != 0) { return r; }
-                if (vd.name.equals(name)) { return 2; }
+                if ((ds.declaration as VarDeclNode*).name.equals(name)) { return 2; }
             }
             return 0;
         }
@@ -4182,10 +4187,7 @@ type struct AsyncLower {
         if (s == null) { return; }
         const k: NodeKind = s.kind;
         if (k == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = s as DeclStmtNode*;
-            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                this.mark_last_use_expr((ds.declaration as VarDeclNode*).initializer, name, true, out);
-            }
+            this.mark_last_use_expr(this.decl_stmt_init(s as DeclStmtNode*), name, true, out);
             return;
         }
         if (k == NodeKind::ExpressionStatement) {
@@ -5069,11 +5071,7 @@ type struct AsyncLower {
             return this.frame_addr_root_expr(sm, (s as ReturnStmtNode*).expression);
         }
         if (k == NodeKind::DeclarationStatement) {
-            const ds: DeclStmtNode* = s as DeclStmtNode*;
-            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                return this.frame_addr_root_expr(sm, (ds.declaration as VarDeclNode*).initializer);
-            }
-            return SymbolStr::empty();
+            return this.frame_addr_root_expr(sm, this.decl_stmt_init(s as DeclStmtNode*));
         }
         if (k == NodeKind::BlockStatement) {
             const blk: BlockStmtNode* = s as BlockStmtNode*;
@@ -5937,10 +5935,7 @@ type struct AsyncLower {
 
         if (k == NodeKind::DeclarationStatement) {
             const ds: DeclStmtNode* = s as DeclStmtNode*;
-            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                mut vd: VarDeclNode* = ds.declaration as VarDeclNode*;
-                vd.initializer = this.hoist_toplevel(vd.initializer, &pre);
-            }
+            this.set_decl_stmt_init(ds, this.hoist_toplevel(this.decl_stmt_init(ds), &pre));
         } else if (k == NodeKind::ReturnStatement) {
             mut rs: ReturnStmtNode* = s as ReturnStmtNode*;
             rs.expression = this.hoist_toplevel(rs.expression, &pre);
@@ -6076,9 +6071,90 @@ type struct AsyncLower {
         this.rc_bind(ctx, orig, fresh);
     }
 
+    /// Rename a destructure: its initializer first, in the enclosing scope,
+    /// then each field's local, exactly as `rn_var_decl` renames one.
+    rn_destructure(mut &this, ctx: RenameCtx*, dd: DestructureDeclNode*) -> void {
+        if (dd == null) { return; }
+        this.rn_expr(ctx, dd.initializer);
+        for (mut i: i64 = 0; i < dd.bindings.length; i++) {
+            mut b: DestructureBinding = dd.bindings[i];
+            const orig: SymbolStr = b.local_name;
+            const fresh: SymbolStr = this.mint_local(orig);
+            b.local_name = fresh;
+            dd.bindings[i] = b;
+            this.rc_bind(ctx, orig, fresh);
+        }
+    }
+
+    /// A destructure declares several locals from one value, while the passes
+    /// after the rename carry a local across a suspend one `VarDecl` at a
+    /// time: a field read in a later state has to be a declaration they can
+    /// move into the future.  So each destructure in a block becomes
+    ///
+    ///     const __ds: T = <init>;                   // the value, where it was
+    ///     const {f: f$D, g: g$D}: T = __ds;         // taken apart
+    ///     const f: F = f$D;  mut g: G = g$D;        // one declaration a field
+    ///
+    /// Each field's declaration keeps the identity the name layer gave the
+    /// binding; the temporaries are read once, by the next statements, so no
+    /// suspend falls between their declaration and their use.  The value is
+    /// released exactly as before: `__ds` and each temporary are moved from,
+    /// and each field's declaration releases its field at scope exit.
+    split_destructures(mut &this, blk: BlockStmtNode*) -> void {
+        mut out: StatementNode*[] = [];
+        mut split: boolean = false;
+        for (mut i: i64 = 0; i < blk.statements.length; i++) {
+            const s: StatementNode* = blk.statements[i];
+            if (s == null || s.kind != NodeKind::DeclarationStatement) { out.push(s); continue; }
+            const ds: DeclStmtNode* = s as DeclStmtNode*;
+            if (ds.declaration == null
+                    || ds.declaration.kind != NodeKind::DestructureDeclaration) {
+                out.push(s); continue;
+            }
+            mut dd: DestructureDeclNode* = ds.declaration as DestructureDeclNode*;
+            if (dd.initializer == null || !this.destructure_typed(dd)) { out.push(s); continue; }
+            const span: SourceSpan = (s as ASTNode*).span;
+            const src: SymbolStr = this.intern.intern("__ds");
+            out.push(this.var_decl_stmt(src, false, dd.resolved_type, dd.initializer, span));
+            dd.initializer = this.ident(src, dd.resolved_type, span);
+            mut fields: StatementNode*[] = [];
+            for (mut j: i64 = 0; j < dd.bindings.length; j++) {
+                mut b: DestructureBinding = dd.bindings[j];
+                const tmp: SymbolStr = this.intern.intern(
+                    fmt::format("%s$D", this.intern.resolve(b.local_name)));
+                fields.push(this.var_decl_stmt_bound(
+                    b.local_name, b.sym_id, b.is_mutable || dd.is_mutable, b.resolved_type,
+                    this.ident(tmp, b.resolved_type, b.span), b.span));
+                b.local_name = tmp;
+                b.sym_id = SymbolID::invalid();
+                b.is_mutable = false;
+                dd.bindings[j] = b;
+            }
+            dd.is_mutable = false;
+            out.push(s);
+            for (mut j: i64 = 0; j < fields.length; j++) { out.push(fields[j]); }
+            split = true;
+        }
+        if (split) { blk.statements = out; }
+    }
+
+    /// Whether sema gave the destructure and every field it binds a type: a
+    /// declaration the split makes has to say what it holds.  In a generic
+    /// body a destructure of a generic type has none until it is specialized
+    /// - sema defers its fields - so it is renamed where it stands and not
+    /// split, and a field of it read across a suspend is not carried.
+    destructure_typed(&this, dd: DestructureDeclNode*) -> boolean {
+        if (!dd.resolved_type.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < dd.bindings.length; i++) {
+            if (!dd.bindings[i].resolved_type.is_valid()) { return false; }
+        }
+        return true;
+    }
+
     /// Walk a block in its own scope.
     rn_block(mut &this, ctx: RenameCtx*, blk: BlockStmtNode*) -> void {
         if (blk == null) { return; }
+        this.split_destructures(blk);
         this.rc_enter(ctx);
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
             this.rn_stmt(ctx, blk.statements[i]);
@@ -6313,6 +6389,9 @@ type struct AsyncLower {
             const ds: DeclStmtNode* = s as DeclStmtNode*;
             if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
                 this.rn_var_decl(ctx, ds.declaration as VarDeclNode*);
+            } else if (ds.declaration != null &&
+                       ds.declaration.kind == NodeKind::DestructureDeclaration) {
+                this.rn_destructure(ctx, ds.declaration as DestructureDeclNode*);
             }
             return;
         }

@@ -1,0 +1,185 @@
+// A destructure inside an `async function` declares its fields as locals like
+// any other declaration: each is renamed apart from a parameter or an outer
+// local of the same spelling, carried across a suspend when a later state
+// reads it, and released once.
+//
+// The lowering flattens the body into states and finds a local by its
+// spelling, which is sound only once every local has a spelling of its own.
+// A destructure it did not rename kept the source spelling, so a field read
+// after a suspend found the PARAMETER of that spelling instead, and a use
+// inside the destructure's initializer missed the rename of the local it
+// named - both silently, with the wrong value.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncDestructureLocals;
+
+import std::test;
+import std::core::result;
+import std::core::result::{ Result };
+import std::future;
+import std::future::ready::{ PendingThenReady };
+import std::test::assert::{ expect_eq };
+import std::test::error::{ TestError };
+
+type struct Pair {
+    a: i64;
+    b: i64;
+}
+
+mut ad_drops: i32 = 0;
+
+type struct Tag {
+    id: i64;
+
+    drop(mut &this) -> void {
+        ad_drops = ad_drops + 1;
+    }
+}
+
+type struct TagPair {
+    a: Tag;
+    b: Tag;
+}
+
+type struct Two<T> {
+    a: T;
+    b: T;
+}
+
+// In a generic body a destructure of a generic type is renamed where it
+// stands: its initializer still reads the local that shadows the parameter.
+async function generic_init_reads_shadowing_local<T>(x: T, y: T, z: T) -> T {
+    const _z: i64 = await PendingThenReady::<i64>::new(2, 1);
+    {
+        const x: T = y;
+        const {a, b}: Two<T> = Two::<T> { a: x, b: z };
+        return a;
+    }
+}
+
+async function generic_destructure_after_suspend<T>(t: Two<T>) -> T {
+    const _z: i64 = await PendingThenReady::<i64>::new(2, 1);
+    const {a, b}: Two<T> = t;
+    return a;
+}
+
+// A destructure of a concrete type inside a generic body, carried.
+async function concrete_destructure_in_generic<T>(x: T) -> i64 {
+    const {a, b}: Pair = Pair { a: 100, b: 2 };
+    const _z: i64 = await PendingThenReady::<i64>::new(2, 1);
+    return a + b;
+}
+
+// The initializer names a local that shadows the parameter; the field must
+// read the local.
+async function init_reads_shadowing_local(x: i64) -> i64 {
+    const _z: i64 = await PendingThenReady::<i64>::new(2, 1);
+    mut r: i64 = 0;
+    {
+        const x: i64 = 50;
+        const {a, b}: Pair = Pair { a: x, b: 0 };
+        r = a + b;
+    }
+    return r;
+}
+
+// A field spelled like a parameter, read after a suspend, is the field.
+async function field_shadows_parameter(a: i64) -> i64 {
+    mut r: i64 = 0;
+    {
+        const {a, b}: Pair = Pair { a: 100, b: 2 };
+        const _z: i64 = await PendingThenReady::<i64>::new(2, 1);
+        r = a;
+    }
+    return r;
+}
+
+// Both fields live across a suspend.
+async function both_fields_after_suspend() -> i64 {
+    const {a, b}: Pair = Pair { a: 100, b: 2 };
+    const _z: i64 = await PendingThenReady::<i64>::new(2, 1);
+    return a + b;
+}
+
+// The value being taken apart is itself awaited.
+async function awaited_initializer() -> i64 {
+    const {a, b}: Pair = await PendingThenReady::<Pair>::new(2, Pair { a: 30, b: 4 });
+    return a * 10 + b;
+}
+
+// A renamed field and a `mut` field, written after the suspend.
+async function renamed_and_mut_fields() -> i64 {
+    const {a: first, mut b}: Pair = Pair { a: 7, b: 1 };
+    const _z: i64 = await PendingThenReady::<i64>::new(2, 1);
+    b = b + first;
+    return b;
+}
+
+// Fields with destructors, carried across a suspend: each released once.
+async function droppable_fields_carried() -> i64 {
+    const {a, b}: TagPair = TagPair { a: Tag { id: 3 }, b: Tag { id: 4 } };
+    const _z: i64 = await PendingThenReady::<i64>::new(2, 1);
+    return a.id * 10 + b.id;
+}
+
+function ad_check(got: i64, want: i64, want_drops: i32) -> Result<(), TestError> {
+    match (expect_eq(got, want)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(ad_drops, want_drops);
+}
+
+![test]
+function destructure_initializer_reads_the_shadowing_local() -> Result<(), TestError> {
+    ad_drops = 0;
+    return ad_check(future::block_on(init_reads_shadowing_local(7)), 50, 0);
+}
+
+![test]
+function destructured_field_is_not_the_parameter() -> Result<(), TestError> {
+    ad_drops = 0;
+    return ad_check(future::block_on(field_shadows_parameter(7)), 100, 0);
+}
+
+![test]
+function destructured_fields_survive_a_suspend() -> Result<(), TestError> {
+    ad_drops = 0;
+    return ad_check(future::block_on(both_fields_after_suspend()), 102, 0);
+}
+
+![test]
+function destructure_of_an_awaited_value() -> Result<(), TestError> {
+    ad_drops = 0;
+    return ad_check(future::block_on(awaited_initializer()), 304, 0);
+}
+
+![test]
+function destructured_renamed_and_mut_fields() -> Result<(), TestError> {
+    ad_drops = 0;
+    return ad_check(future::block_on(renamed_and_mut_fields()), 8, 0);
+}
+
+![test]
+function destructured_droppable_fields_released_once() -> Result<(), TestError> {
+    ad_drops = 0;
+    return ad_check(future::block_on(droppable_fields_carried()), 34, 2);
+}
+
+![test]
+function generic_destructure_initializer_reads_the_shadowing_local() -> Result<(), TestError> {
+    ad_drops = 0;
+    return ad_check(future::block_on(generic_init_reads_shadowing_local::<i64>(7, 60, 5)), 60, 0);
+}
+
+![test]
+function generic_destructure_after_a_suspend() -> Result<(), TestError> {
+    ad_drops = 0;
+    return ad_check(future::block_on(generic_destructure_after_suspend::<i64>(
+        Two::<i64> { a: 42, b: 2 })), 42, 0);
+}
+
+![test]
+function concrete_destructure_carried_in_a_generic_function() -> Result<(), TestError> {
+    ad_drops = 0;
+    return ad_check(future::block_on(concrete_destructure_in_generic::<i64>(9)), 102, 0);
+}
