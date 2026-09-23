@@ -613,6 +613,8 @@ SCANNED_ARRAYS = {
                                           "the lowering's OWN RIB: the poll state machine's frame slots by the names it minted"),
     "RenameCtx.orig":             Scanned("compiler/sema/async_lower.cryo", "SymbolStr", DATA,
                                           "the lowering's OWN RIB: the names a rename pass replaces"),
+    "RebindCtx.names":            Scanned("compiler/sema/async_lower.cryo", "SymbolStr", DATA,
+                                          "the lowering's OWN RIB: a finished `poll` body's own declarations, scope by scope, read once to give each local use the binding its scope declares - the answer codegen reads the same body by"),
     "DeclarationNode.attached_directives": Scanned("compiler/AST/declaration.cryo", "DirectiveNode", DATA,
                                                    "a declaration's attached directives by kind: spellings the language fixes, TEXTS"),
     "DirectiveRegistry.records":  Scanned("compiler/passes/directive_processing.cryo", "DirectiveRecord", DATA,

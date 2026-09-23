@@ -1,0 +1,31 @@
+// E0452: an `async` function's by-value parameter, once moved, may not be
+// used again - inside the lowered state machine exactly as in the source.
+//
+// Regression test for uses that name no binding of the body they live in.
+// The async lowering moves the body into `poll` and reads each parameter
+// through a shadow it declares from the future's field.  The moved uses still
+// named the PARAMETER, which is not a declaration of `poll`, so the move
+// checker - keyed by the binding a use names - saw neither move, accepted this
+// program, and the value was released twice.  Every use in a finished `poll`
+// now names the declaration its scope holds.
+![config(testing)]
+![config(negative, E0452)]
+namespace CryoTests::Negative::AsyncParameterUsedAfterMove;
+import std::future;
+
+type struct Res {
+    tag: i32;
+    drop(mut &this) -> void { }
+}
+
+function consume(r: Res) -> i32 { return r.tag; }
+
+async function twice(r: Res) -> i32 {
+    consume(r);
+    return consume(r);
+    //~^ ERROR[E0452] use of moved value 'r'
+}
+
+function main() -> int {
+    return future::block_on(twice(Res { tag: 5 }));
+}

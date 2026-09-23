@@ -100,6 +100,8 @@ import compiler::diag::suggestion::{ Applicability, Suggestion };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::sema::async_lower::{ AsyncLower, AsyncOwner };
 import compiler::sema::call_resolver::{ CallResolver };
 import compiler::sema::diagnostics::{ Diagnostics };
@@ -215,6 +217,11 @@ public:
     intern:   InternTable*;
     ctx:      CompilationContext*;
     this_sym: SymbolStr;
+    /// The allocator the `?` desugaring takes its bindings' identities from.
+    /// That desugaring declares two bindings after name resolution has run,
+    /// and a binding's identity comes from the one allocator that hands them
+    /// out.  Held from `wire()`, one door; never asked by name.
+    resolver: Resolver*;
 
     // -- Shared mutable per-pass state (shared by pointer) --
     state: SemaState;
@@ -239,6 +246,7 @@ public:
         this.intern   = intern;
         this.ctx      = ctx;
         this.this_sym = intern.intern("this");
+        this.resolver = null;
         this.state    = SemaState::new();
         this.scopes   = ScopeManager::null();
         this.types    = TypeUtils::null();
@@ -263,6 +271,7 @@ public:
     /// Two-phase init step 2: set every collaborator's back-pointers.  MUST run
     /// AFTER this visitor is at its stable heap address (see run_sema's leak()).
     wire(mut &this) -> void {
+        this.resolver = this.ctx.get_resolver();
         this.scopes.wire(&this.state);
         this.types.wire(this.arena, this.intern, this.ctx, &this.checker);
         this.literals.wire(this.arena, this.ctx, &this.state);
@@ -2734,11 +2743,18 @@ public:
         ok_pat.set_enum_name(enum_name);
         ok_pat.set_variant_name(ok_variant);
         ok_pat.set_res(Res::Def(this.ctx.definition_id_of(operand_ty)));
-        const ok_pb: PatternBinding* = new PatternBinding { name: ok_bind, span: span };
+        // Both bindings are declared here, after name resolution ran, so each
+        // takes its identity from the allocator and every use this builds
+        // carries it: a later pass tracking the payload's move asks by it.
+        const ok_sym: SymbolID = this.resolver.alloc_synthetic_binding();
+        const ok_pb: PatternBinding* = new PatternBinding {
+            name: ok_bind, span: span, sym_id: ok_sym
+        };
         ok_pat.add_element(PatternElement::Binding(ok_pb));
         mut ok_arm: MatchArmNode* = new MatchArmNode(span);
         ok_arm.add_pattern(ok_pat as PatternNode*);
         const ok_ident: IdentifierNode* = new IdentifierNode(ok_bind, span);
+        ok_ident.set_res(Res::Local(ok_sym));
         const ok_stmt: ExprStmtNode* = new ExprStmtNode(ok_ident as ExpressionNode*, span);
         mut ok_block: BlockStmtNode* = new BlockStmtNode(span);
         ok_block.add_statement(ok_stmt as StatementNode*);
@@ -2752,12 +2768,17 @@ public:
         mut ret_value: ExpressionNode* = null;
         if (is_result) {
             const err_bind: SymbolStr = this.intern.intern(fmt::format("__cryo_try_err_%u", this.state.try_counter));
-            const err_pb: PatternBinding* = new PatternBinding { name: err_bind, span: span };
+            const err_sym: SymbolID = this.resolver.alloc_synthetic_binding();
+            const err_pb: PatternBinding* = new PatternBinding {
+                name: err_bind, span: span, sym_id: err_sym
+            };
             err_pat.add_element(PatternElement::Binding(err_pb));
             mut err_scope: ScopeResolutionNode* = new ScopeResolutionNode(enum_name, err_variant, span);
             err_scope.set_synthesized_ref(ret_ty, this.ctx.definition_id_of(ret_ty));
             mut err_call: CallExprNode* = new CallExprNode(err_scope as ExpressionNode*, span);
-            err_call.add_argument(new IdentifierNode(err_bind, span) as ExpressionNode*);
+            const err_ident: IdentifierNode* = new IdentifierNode(err_bind, span);
+            err_ident.set_res(Res::Local(err_sym));
+            err_call.add_argument(err_ident as ExpressionNode*);
             ret_value = err_call as ExpressionNode*;
         } else {
             mut bare_err: ScopeResolutionNode* =

@@ -1,13 +1,10 @@
-///! Sibling-scope move state - pin that the drop-insertion moved-set (keyed by
-///! intern name id in passes/drop_insertion.cryo) does not leak across sibling
-///! scopes that reuse a binding name.
+///! Sibling-scope move state - pin that the drop-insertion moved-set does not
+///! leak across scopes that reuse a binding name.
 ///!
-///! `pop_scope` truncates the per-scope binding arrays; the moved-set must
-///! also be cleared, or a name moved in one block would suppress the drop of
-///! a freshly-declared same-named binding in a later sibling block (a leak).
-///! `register_binding` clears stale move state for a genuinely-fresh
-///! re-declaration, while PRESERVING it when the new binding shadows a still-
-///! live outer one - reviving an already-moved outer would double-free it.
+///! The moved-set is keyed by the binding the name layer declared, so two
+///! declarations of one spelling never share an entry: a move in one block
+///! cannot suppress the drop of a later sibling's binding (a leak), and an
+///! inner shadow's own drop cannot revive a moved outer one (a double free).
 ///!
 ///! Observable side-effect: each `Probe::drop()` bumps a module-level counter.
 ///! Bindings are moved into a same-scope sink (not a by-value parameter, whose
@@ -81,12 +78,11 @@ function sibling_reuse_inside_branch_drops() -> Result<(), TestError> {
     return expect_eq(drop_count(), 2);
 }
 
-// Safety: when an inner block re-declares a name whose OUTER binding was
-// moved, the outer's move state must survive - otherwise the moved outer is
-// revived and double-freed. The outer value is moved into a same-scope sink
-// that drops exactly once; the inner shadow leaks fail-safe (documented).
-// Exactly ONE drop proves no double-free (the buggy unconditional-clear path
-// would drop the outer value twice plus the inner, giving 3).
+// When an inner block re-declares a name whose OUTER binding was moved, the
+// two are separate values: the outer's move must survive (reviving it drops the
+// moved value a second time) and the inner must still be released.  The outer
+// value is moved into a same-scope sink that drops it once; the inner drops
+// once.  TWO drops: 3 is the double free, 1 is the inner shadow leaked.
 ![test]
 function outer_shadow_does_not_double_free() -> Result<(), TestError> {
     reset_drop_count();
@@ -98,5 +94,5 @@ function outer_shadow_does_not_double_free() -> Result<(), TestError> {
         const sink: Probe = c;        // c moved -> sink owns the value
         { const c: Probe = Probe::new(2); }
     }
-    return expect_eq(drop_count(), 1);
+    return expect_eq(drop_count(), 2);
 }

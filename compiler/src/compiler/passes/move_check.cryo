@@ -40,6 +40,8 @@ import compiler::types::{
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::resolver::res;
+import compiler::resolver::res::{ Res };
 import utils::logger;
 import utils::logger::{ cdebug };
 import std::core::option;
@@ -162,15 +164,8 @@ type struct MoveChecker {
     /// and change behaviour broadly); this narrow set only teaches
     /// `is_owned_value_place` to recognise them so `check_field_move_out`
     /// fires.  Pushed around each arm body's walk, truncated after the join.
-    ///
-    /// Still keyed by the spelling, and alone in this pass in being so: a
-    /// `PatternBinding` carries no identity, and two of the sites that build
-    /// one - the `?` desugaring's `Ok`/`Err` arms - run after name resolution,
-    /// so for those bindings there is no identity to carry.  The question this
-    /// set answers is narrower than the move set's ("is a place rooted in a
-    /// pattern payload"), and a collision here costs a field-move-out check,
-    /// not a move slot.
-    pat_binding_keys: u32[];
+    /// Keyed by the binding the pattern declares, as every set in this pass is.
+    pat_binding_keys: u64[];
 
     /// Partial-move set: parallel arrays recording a non-Copy *droppable*
     /// FIELD moved out of a non-`Drop` owned local (the Rust partial-move
@@ -326,8 +321,8 @@ type struct MoveChecker {
         if (epat == null) { return; }
         for (mut pos: i64 = 0; pos < epat.elements.length; pos++) {
             const pb: PatternBinding* = epat.binding_at(pos);
-            if (pb != null && pb.name.is_valid()) {
-                this.pat_binding_keys.push(pb.name.id);
+            if (pb != null && pb.sym_id.is_valid()) {
+                this.pat_binding_keys.push(pb.sym_id.id);
                 continue;
             }
             const sub: PatternNode* = epat.sub_at(pos);
@@ -341,7 +336,8 @@ type struct MoveChecker {
         while (this.pat_binding_keys.length > n) { this.pat_binding_keys.pop(); }
     }
 
-    is_pat_binding(&this, key: u32) -> boolean {
+    is_pat_binding(&this, key: u64) -> boolean {
+        if (key == 0) { return false; }
         for (mut i: i64 = 0; i < this.pat_binding_keys.length; i++) {
             if (this.pat_binding_keys[i] == key) { return true; }
         }
@@ -1208,9 +1204,12 @@ type struct MoveChecker {
             if (this.is_copy(cap_ty)) { continue; }
             // Synthesize an IdentifierNode at the capture's recorded span so
             // handle_ident's existing use-after-move and loop-carried logic
-            // applies uniformly with any other move site.
+            // applies uniformly with any other move site.  It carries the
+            // binding the capture names: minted from the spelling alone it
+            // names nothing, and the capture's move silently goes unrecorded.
             mut id: IdentifierNode* = new IdentifierNode(cap_name,
                 lam.captured_spans[i]);
+            id.set_res(Res::Local(lam.captured_syms[i]));
             id.set_resolved_type(cap_ty);
             this.handle_ident(id, true, true);
         }
@@ -1537,7 +1536,7 @@ type struct MoveChecker {
         // only), so their field moves stay rejected.
         const decl_ty: TypeRef = this.lookup_type(id.res.local_sym());
         if (!decl_ty.is_valid()) { return false; }
-        if (this.is_pat_binding(id.name.id)) { return false; }
+        if (this.is_pat_binding(id.res.local_sym().id)) { return false; }
         // Owned value place (not a borrow), non-`Drop`, and a struct/class whose
         // fields we can drop individually.
         if (this.is_ptr_or_ref(decl_ty)) { return false; }
@@ -1602,7 +1601,7 @@ type struct MoveChecker {
             // `types` map (see `pat_binding_keys`).  Pattern bindings carry no
             // `&this` auto-deref subtlety, so the node's resolved type is the
             // binding's own type: value => owned place, ptr/ref => a borrow.
-            if (this.is_pat_binding(id.name.id)) {
+            if (this.is_pat_binding(id.res.local_sym().id)) {
                 return !this.is_ptr_or_ref(obj.resolved_type);
             }
             return false;

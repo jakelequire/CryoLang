@@ -56,8 +56,8 @@ import compiler::types::generic::{
 };
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
-    DeclarationNode, FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
-    MethodNode, StructDeclNode, TraitDeclNode, VarDeclNode
+    DeclarationNode, DestructureDeclNode, FieldDeclNode, FunctionDeclNode, GenericParamNode,
+    ImplBlockNode, MethodNode, StructDeclNode, TraitDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode, CallExprNode,
@@ -186,6 +186,16 @@ type struct PollSm {
 type struct RenameCtx {
     orig:  SymbolStr[];
     repl:  SymbolStr[];
+    marks: i64[];
+}
+
+/// The scopes of a finished `poll` body, for `rebind_poll_locals`: each
+/// declaration's spelling beside the binding it declares, and each scope's
+/// start index, exactly as `RenameCtx` keeps them.  A use answers from the top
+/// (innermost declaration first); a spelling in no frame is left as it was.
+type struct RebindCtx {
+    names: SymbolStr[];
+    syms:  SymbolID[];
     marks: i64[];
 }
 
@@ -1367,8 +1377,9 @@ type struct AsyncLower {
         return ti as ExpressionNode*;
     }
 
-    /// A use of a name this lowering did not bind - the receiver, a field, the
-    /// poll context.  Whoever bound it says what it refers to.
+    /// A use inside a `poll` body, placed under the declaration it means by
+    /// scope; `rebind_poll_locals` gives it that declaration's identity once
+    /// the body is finished.  A use written anywhere else takes `ident_bound`.
     ident(&this, name: SymbolStr, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
         return this.ident_bound(name, SymbolID::invalid(), ty, span);
     }
@@ -6370,6 +6381,320 @@ type struct AsyncLower {
         this.rn_block(&ctx, node.body as BlockStmtNode*);
     }
 
+    // ---- post-lowering binding identities ----
+    //
+    // The lowering moves the body's code into `poll` and places it under
+    // declarations it made itself: a parameter is read through the shadow the
+    // prelude declares from the future's field, a carried value is re-declared
+    // in every state that takes it, a temporary is declared where an `await`
+    // was.  A moved use still carries the binding the name layer answered in
+    // the function it was written in, which is not a declaration of `poll`;
+    // a use the lowering wrote itself carries none.  Every pass after this one
+    // that keeps per-binding state - the move checker, drop insertion - asks
+    // by that identity, and a use naming no declaration of the body it lives
+    // in is invisible to both: a move nothing records, a value released twice.
+    //
+    // The lowering places every use under the declaration it means by
+    // SCOPE - codegen reads these bodies by name, and the rename that runs
+    // before flattening made every local's spelling unique so that it could -
+    // so the body's own scopes are what says which declaration a use names.
+    // This walk gives each use that identity, once the body is finished.
+
+    rb_enter(&this, ctx: RebindCtx*) -> void { ctx.marks.push(ctx.names.length); }
+
+    rb_leave(&this, ctx: RebindCtx*) -> void {
+        if (ctx.marks.length == 0) { return; }
+        const m: i64 = ctx.marks[ctx.marks.length - 1];
+        ctx.marks.pop();
+        while (ctx.names.length > m) { ctx.names.pop(); ctx.syms.pop(); }
+    }
+
+    /// Declare `name` in the innermost scope.  A declaration this lowering
+    /// minted with no identity is given one here, so every binding the body
+    /// holds is distinct.
+    rb_bind(mut &this, ctx: RebindCtx*, name: SymbolStr, sym: SymbolID) -> void {
+        ctx.names.push(name);
+        ctx.syms.push(sym);
+    }
+
+    /// The binding the innermost declaration of `name` declares; `found` is
+    /// false for a spelling no scope of the body declares.
+    rb_lookup(&this, ctx: RebindCtx*, name: SymbolStr, found: boolean*) -> SymbolID {
+        mut i: i64 = ctx.names.length - 1;
+        while (i >= 0) {
+            if (ctx.names[i].equals(name)) { *found = true; return ctx.syms[i]; }
+            i -= 1;
+        }
+        *found = false;
+        return SymbolID::invalid();
+    }
+
+    rb_var_decl(mut &this, ctx: RebindCtx*, vd: VarDeclNode*) -> void {
+        if (vd == null) { return; }
+        this.rb_expr(ctx, vd.initializer);
+        if (!vd.sym_id.is_valid()) { vd.set_sym_id(this.resolver.alloc_synthetic_binding()); }
+        this.rb_bind(ctx, vd.name, vd.sym_id);
+    }
+
+    rb_block(mut &this, ctx: RebindCtx*, blk: BlockStmtNode*) -> void {
+        if (blk == null) { return; }
+        this.rb_enter(ctx);
+        for (mut i: i64 = 0; i < blk.statements.length; i++) {
+            this.rb_stmt(ctx, blk.statements[i]);
+        }
+        this.rb_leave(ctx);
+    }
+
+    rb_scoped(mut &this, ctx: RebindCtx*, s: StatementNode*) -> void {
+        if (s == null) { return; }
+        if (s.kind == NodeKind::BlockStatement) { this.rb_block(ctx, s as BlockStmtNode*); return; }
+        this.rb_enter(ctx);
+        this.rb_stmt(ctx, s);
+        this.rb_leave(ctx);
+    }
+
+    /// An identifier pattern carries no identity of its own, so it is declared
+    /// with none: a use of it then finds that declaration and keeps its answer,
+    /// rather than reaching past it to an outer binding of the spelling.
+    rb_pattern(mut &this, ctx: RebindCtx*, pat: PatternNode*) -> void {
+        if (pat == null) { return; }
+        if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
+            this.rb_bind(ctx, pat.binding_name, SymbolID::invalid());
+            return;
+        }
+        if (pat.pattern_kind != PatternKind::Enum) { return; }
+        const epat: EnumPatternNode* = pat as EnumPatternNode*;
+        for (mut j: i64 = 0; j < epat.elements.length; j++) {
+            mut pb: PatternBinding* = epat.binding_at(j);
+            if (pb != null && pb.name.is_valid()) {
+                if (!pb.sym_id.is_valid()) { pb.sym_id = this.resolver.alloc_synthetic_binding(); }
+                this.rb_bind(ctx, pb.name, pb.sym_id);
+                continue;
+            }
+            const sub: PatternNode* = epat.sub_at(j);
+            if (sub != null) { this.rb_pattern(ctx, sub); }
+        }
+    }
+
+    rb_arm(mut &this, ctx: RebindCtx*, arm: MatchArmNode*) -> void {
+        if (arm == null) { return; }
+        this.rb_enter(ctx);
+        for (mut i: i64 = 0; i < arm.patterns.length; i++) {
+            this.rb_pattern(ctx, arm.patterns[i]);
+        }
+        this.rb_expr(ctx, arm.guard);
+        this.rb_stmt(ctx, arm.body);
+        this.rb_leave(ctx);
+    }
+
+    /// A lambda's captures name bindings of the body around it, and the move
+    /// that builds the closure is recorded against them.  Its own body is not
+    /// walked: it became `__call__`, a function of its own, whose capture
+    /// shadows carry the identities the body's uses already name.
+    rb_lambda(mut &this, ctx: RebindCtx*, lam: LambdaExprNode*) -> void {
+        if (lam == null) { return; }
+        for (mut i: i64 = 0; i < lam.captured_names.length; i++) {
+            mut found: boolean = false;
+            const s: SymbolID = this.rb_lookup(ctx, lam.captured_names[i], &found);
+            if (found && s.is_valid()) { lam.captured_syms[i] = s; }
+        }
+    }
+
+    rb_expr(mut &this, ctx: RebindCtx*, e: ExpressionNode*) -> void {
+        if (e == null) { return; }
+        const k: NodeKind = (e as ASTNode*).kind;
+        if (k == NodeKind::Identifier) {
+            mut id: IdentifierNode* = e as IdentifierNode*;
+            mut found: boolean = false;
+            const s: SymbolID = this.rb_lookup(ctx, id.name, &found);
+            if (found && s.is_valid()) { id.rebind_local(s); }
+            return;
+        }
+        if (k == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = e as BinaryExprNode*;
+            this.rb_expr(ctx, b.left);
+            this.rb_expr(ctx, b.right);
+            this.rb_expr(ctx, b.desugared_call);
+            return;
+        }
+        if (k == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = e as UnaryExprNode*;
+            this.rb_expr(ctx, u.operand);
+            this.rb_expr(ctx, u.desugared_call);
+            return;
+        }
+        if (k == NodeKind::TernaryExpression) {
+            const t: TernaryExprNode* = e as TernaryExprNode*;
+            this.rb_expr(ctx, t.condition);
+            this.rb_expr(ctx, t.true_expr);
+            this.rb_expr(ctx, t.false_expr);
+            return;
+        }
+        if (k == NodeKind::IfExpression) {
+            const ie: IfExprNode* = e as IfExprNode*;
+            this.rb_expr(ctx, ie.condition);
+            this.rb_expr(ctx, ie.then_expr);
+            this.rb_expr(ctx, ie.else_expr);
+            return;
+        }
+        if (k == NodeKind::CallExpression) {
+            const c: CallExprNode* = e as CallExprNode*;
+            this.rb_expr(ctx, c.callee);
+            for (mut i: i64 = 0; i < c.arguments.length; i++) { this.rb_expr(ctx, c.arguments[i]); }
+            return;
+        }
+        if (k == NodeKind::NewExpression) {
+            const ne: NewExprNode* = e as NewExprNode*;
+            for (mut i: i64 = 0; i < ne.arguments.length; i++) { this.rb_expr(ctx, ne.arguments[i]); }
+            if (ne.has_array_size()) { this.rb_expr(ctx, ne.array_size); }
+            if (ne.has_struct_init()) { this.rb_expr(ctx, ne.struct_init as ExpressionNode*); }
+            return;
+        }
+        if (k == NodeKind::CastExpression) {
+            this.rb_expr(ctx, (e as CastExprNode*).expression); return;
+        }
+        if (k == NodeKind::StructLiteral) {
+            const sl: StructLiteralNode* = e as StructLiteralNode*;
+            for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                this.rb_expr(ctx, sl.field_inits[i].value);
+            }
+            return;
+        }
+        if (k == NodeKind::ArrayLiteral) {
+            const al: ArrayLiteralNode* = e as ArrayLiteralNode*;
+            for (mut i: i64 = 0; i < al.elements.length; i++) { this.rb_expr(ctx, al.elements[i]); }
+            if (al.repeat_count_expr != null) { this.rb_expr(ctx, al.repeat_count_expr); }
+            return;
+        }
+        if (k == NodeKind::TupleLiteral) {
+            const tl: TupleLiteralNode* = e as TupleLiteralNode*;
+            for (mut i: i64 = 0; i < tl.elements.length; i++) { this.rb_expr(ctx, tl.elements[i]); }
+            return;
+        }
+        if (k == NodeKind::ArrayAccess) {
+            const a: ArrayAccessNode* = e as ArrayAccessNode*;
+            this.rb_expr(ctx, a.array);
+            this.rb_expr(ctx, a.index);
+            this.rb_expr(ctx, a.desugared_call);
+            return;
+        }
+        if (k == NodeKind::MemberAccess) {
+            this.rb_expr(ctx, (e as MemberAccessNode*).object); return;
+        }
+        if (k == NodeKind::TypeofExpression) {
+            this.rb_expr(ctx, (e as TypeofExprNode*).operand); return;
+        }
+        if (k == NodeKind::DeleteExpression) {
+            this.rb_expr(ctx, (e as DeleteExprNode*).operand); return;
+        }
+        if (k == NodeKind::AwaitExpression) {
+            this.rb_expr(ctx, (e as AwaitExprNode*).operand); return;
+        }
+        if (k == NodeKind::TryExpression) {
+            this.rb_expr(ctx, this.try_live(e));
+            return;
+        }
+        if (k == NodeKind::MatchExpression) {
+            const me: MatchExprNode* = e as MatchExprNode*;
+            this.rb_expr(ctx, me.subject);
+            for (mut i: i64 = 0; i < me.arms.length; i++) { this.rb_arm(ctx, me.arms[i]); }
+            return;
+        }
+        if (k == NodeKind::LambdaExpression) {
+            this.rb_lambda(ctx, e as LambdaExprNode*); return;
+        }
+    }
+
+    rb_stmt(mut &this, ctx: RebindCtx*, s: StatementNode*) -> void {
+        if (s == null) { return; }
+        const k: NodeKind = s.kind;
+        if (k == NodeKind::ExpressionStatement) {
+            this.rb_expr(ctx, (s as ExprStmtNode*).expression); return;
+        }
+        if (k == NodeKind::ReturnStatement) {
+            this.rb_expr(ctx, (s as ReturnStmtNode*).expression); return;
+        }
+        if (k == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = s as DeclStmtNode*;
+            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                this.rb_var_decl(ctx, ds.declaration as VarDeclNode*);
+            } else if (ds.declaration != null &&
+                       ds.declaration.kind == NodeKind::DestructureDeclaration) {
+                mut dd: DestructureDeclNode* = ds.declaration as DestructureDeclNode*;
+                this.rb_expr(ctx, dd.initializer);
+                for (mut i: i64 = 0; i < dd.bindings.length; i++) {
+                    if (!dd.bindings[i].sym_id.is_valid()) {
+                        dd.bindings[i].sym_id = this.resolver.alloc_synthetic_binding();
+                    }
+                    this.rb_bind(ctx, dd.bindings[i].local_name, dd.bindings[i].sym_id);
+                }
+            }
+            return;
+        }
+        if (k == NodeKind::BlockStatement) { this.rb_block(ctx, s as BlockStmtNode*); return; }
+        if (k == NodeKind::UnsafeBlockStatement) {
+            this.rb_block(ctx, (s as UnsafeBlockStmtNode*).block); return;
+        }
+        if (k == NodeKind::IfStatement) {
+            const iff: IfStmtNode* = s as IfStmtNode*;
+            this.rb_expr(ctx, iff.condition);
+            this.rb_scoped(ctx, iff.then_stmt);
+            this.rb_scoped(ctx, iff.else_stmt);
+            return;
+        }
+        if (k == NodeKind::WhileStatement) {
+            const w: WhileStmtNode* = s as WhileStmtNode*;
+            this.rb_expr(ctx, w.condition);
+            this.rb_scoped(ctx, w.body);
+            return;
+        }
+        if (k == NodeKind::DoWhileStatement) {
+            const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
+            this.rb_scoped(ctx, d.body);
+            this.rb_expr(ctx, d.condition);
+            return;
+        }
+        if (k == NodeKind::ForStatement) {
+            const f: ForStmtNode* = s as ForStmtNode*;
+            this.rb_enter(ctx);
+            if (f.init != null) {
+                if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                    this.rb_var_decl(ctx, f.init as VarDeclNode*);
+                } else {
+                    this.rb_expr(ctx, f.init as ExpressionNode*);
+                }
+            }
+            this.rb_expr(ctx, f.condition);
+            this.rb_expr(ctx, f.update);
+            this.rb_scoped(ctx, f.body);
+            this.rb_leave(ctx);
+            return;
+        }
+        if (k == NodeKind::LoopStatement) {
+            this.rb_scoped(ctx, (s as LoopStmtNode*).body); return;
+        }
+        if (k == NodeKind::MatchStatement) {
+            const m: MatchStmtNode* = s as MatchStmtNode*;
+            this.rb_expr(ctx, m.subject);
+            for (mut i: i64 = 0; i < m.arms.length; i++) { this.rb_arm(ctx, m.arms[i]); }
+            return;
+        }
+    }
+
+    /// Give every local use in `poll_fn`'s finished body the binding its scope
+    /// declares.  The parameters (`cx`) are the outermost scope.
+    rebind_poll_locals(mut &this, poll_fn: FunctionDeclNode*) -> void {
+        if (poll_fn == null || poll_fn.body == null) { return; }
+        mut ctx: RebindCtx = RebindCtx { names: [], syms: [], marks: [] };
+        this.rb_enter(&ctx);
+        for (mut i: i64 = 0; i < poll_fn.parameters.length; i++) {
+            const p: VarDeclNode* = poll_fn.parameters[i];
+            if (p != null) { this.rb_bind(&ctx, p.name, p.sym_id); }
+        }
+        this.rb_stmt(&ctx, poll_fn.body);
+        this.rb_leave(&ctx);
+    }
+
     /// Build the state-machine `poll` body for a body with >= 1 `await`: the
     /// arg-shadow prelude, then `loop { match (this.state) { i => <block i>,
     /// _ => Poll::Pending } }`. Returns null (after a diagnostic) for an
@@ -6537,7 +6862,9 @@ type struct AsyncLower {
             // cannot lower and skip the entry point's body entirely.
             cp.set_resolved_type(p.resolved_type);
             wrapper.add_parameter(cp);
-            fwd.push(new IdentifierNode(p.name, span) as ExpressionNode*);
+            mut fwd_use: IdentifierNode* = new IdentifierNode(p.name, span);
+            fwd_use.set_res(Res::Local(cp.sym_id));
+            fwd.push(fwd_use as ExpressionNode*);
         }
 
         mut body: BlockStmtNode* = new BlockStmtNode(span);
@@ -6564,8 +6891,10 @@ type struct AsyncLower {
             this.ctx.decl_fn_key(inner_sym, span.file))));
         mut root: CallExprNode* = new CallExprNode(root_callee as ExpressionNode*, span);
         for (mut i: i64 = 0; i < fwd.length; i++) { root.add_argument(fwd[i]); }
+        mut ex_use: IdentifierNode* = new IdentifierNode(ex_sym, span);
+        ex_use.set_res(Res::Local(ex_decl.sym_id));
         mut drive: CallExprNode* = new CallExprNode(
-            new MemberAccessNode(new IdentifierNode(ex_sym, span) as ExpressionNode*,
+            new MemberAccessNode(ex_use as ExpressionNode*,
                                  this.intern.intern("block_on"), span, span) as ExpressionNode*, span);
         drive.add_argument(root as ExpressionNode*);
 
@@ -6585,8 +6914,10 @@ type struct AsyncLower {
             out_decl.set_type_annotation(this.make_type_ann(i32_ty, span));
             out_decl.set_initializer(drive as ExpressionNode*);
             body.add_statement(new DeclStmtNode(out_decl as DeclarationNode*, span) as StatementNode*);
+            mut out_use: IdentifierNode* = new IdentifierNode(out_sym, span);
+            out_use.set_res(Res::Local(out_decl.sym_id));
             body.add_statement(new ReturnStmtNode(
-                new IdentifierNode(out_sym, span) as ExpressionNode*, span) as StatementNode*);
+                out_use as ExpressionNode*, span) as StatementNode*);
         }
         wrapper.set_body(body);
         // Name resolution has already run, so the resolution map holds no entry
@@ -7211,6 +7542,7 @@ type struct AsyncLower {
 
         // ---- 3. poll body into the signature `declare` registered ----
         poll_fn.set_body(body_block);
+        this.rebind_poll_locals(poll_fn);
 
         // ---- 4. Inject so mono/codegen walk the struct + impl ----
         if (this.ctx.artifacts.ast.root != null) {
@@ -7237,16 +7569,19 @@ type struct AsyncLower {
             // The receiver is not readable by its parameter name (`&this` is
             // not an identifier), and a pointer receiver has to be the ADDRESS
             // of the caller's object rather than a copy of it — this body still
-            // runs as the method, so `this` is that object.
+            // runs as the method, so `this` is that object.  Each use names the
+            // parameter it reads: the literal moves it into the future, and a
+            // move that names no binding is one nothing records.
             mut pval: ExpressionNode* = if (this.is_receiver_param(p)) {
                 if (this.pending[pi].recv_ptr) {
-                    this.addr_of(this.ident(this.this_sym, this.pending[pi].recv_ty, span),
+                    this.addr_of(this.ident_bound(this.this_sym, p.sym_id,
+                                                  this.pending[pi].recv_ty, span),
                                  slot_ty, span)
                 } else {
-                    this.ident(this.this_sym, slot_ty, span)
+                    this.ident_bound(this.this_sym, p.sym_id, slot_ty, span)
                 }
             } else {
-                this.ident(p.name, slot_ty, span)
+                this.ident_bound(p.name, p.sym_id, slot_ty, span)
             };
             const pfty: TypeRef = this.param_field_type(&sm, slot_ty);
             if (this.param_is_carried(&sm, slot_ty)) {

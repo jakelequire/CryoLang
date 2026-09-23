@@ -1,0 +1,177 @@
+///! Each binding is released exactly once, including a binding spelled like
+///! one that was already moved in an enclosing scope.
+///!
+///! Regression: drop insertion recorded "this value has been given away"
+///! against the SPELLING of a binding.  When an inner declaration shadowed an
+///! outer binding that had already been moved, the two shared one record, the
+///! inner binding read as moved too, and its release was never emitted.
+///! Inside a loop that leaked once per iteration.  Renaming the inner binding
+///! was the whole difference.
+///!
+///! The other tests pin the places where a binding reaches drop insertion by
+///! a route other than the name layer's answer: a `?` payload, a match
+///! subject the pass hoists into a local of its own, an `async` function's
+///! parameter read inside its lowered `poll`.  Each counts releases, because
+///! a use that names no binding the pass tracks is a move it cannot see -
+///! the value is released by its new owner AND at its old scope's exit.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::ShadowedBindingOwnDrop;
+
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::drop;
+import std::core::drop::{ Drop };
+import std::future;
+import std::test::error;
+import std::test::error::{ TestError };
+import std::test::assert;
+import std::test::assert::{ expect_eq };
+
+mut g_dropped: i32 = 0;
+function reset() -> void { g_dropped = 0; }
+function dropped() -> i32 { return g_dropped; }
+
+type struct Res {
+    tag: i32;
+}
+implement trait Drop for struct Res {
+    drop(mut &this) -> void { g_dropped = g_dropped + 1; }
+}
+
+function consume(r: Res) -> i32 {
+    // by-value owning parameter: drops `r` at function exit.
+    return r.tag;
+}
+
+![test]
+function inner_shadow_of_a_moved_binding_is_released() -> Result<(), TestError> {
+    reset();
+    {
+        mut a: Res = Res { tag: 1 };
+        const _t: i32 = consume(a);           // moves the outer `a`: one release
+        if (_t == 1) {
+            mut a: Res = Res { tag: 2 };      // a different binding: released here
+        }
+    }
+    return expect_eq(dropped(), 2);
+}
+
+![test]
+function inner_shadow_in_a_loop_is_released_every_iteration() -> Result<(), TestError> {
+    reset();
+    {
+        mut a: Res = Res { tag: 1 };
+        const _t: i32 = consume(a);
+        for (mut i: i32 = 0; i < 3; i++) {
+            mut a: Res = Res { tag: 100 + i };
+        }
+    }
+    // One for the outer binding, one per iteration: nothing accumulates.
+    return expect_eq(dropped(), 4);
+}
+
+type struct Pair {
+    a: Res;
+    b: Res;
+}
+
+![test]
+function destructured_shadow_of_a_moved_binding_is_released() -> Result<(), TestError> {
+    reset();
+    {
+        mut a: Res = Res { tag: 1 };
+        const _t: i32 = consume(a);
+        if (_t == 1) {
+            const {a, b}: Pair = Pair { a: Res { tag: 2 }, b: Res { tag: 3 } };
+        }
+    }
+    // The outer `a`, then both destructured fields - the new `a` included.
+    return expect_eq(dropped(), 3);
+}
+
+function unwrap_or_fail(r: Result<Res, i32>) -> Result<i32, i32> {
+    const v: Res = r?;                        // the payload moves out of `r`
+    return Result::Ok(consume(v));
+}
+
+![test]
+function try_payload_is_released_once() -> Result<(), TestError> {
+    reset();
+    match (unwrap_or_fail(Result::Ok(Res { tag: 7 }))) {
+        Result::Ok(n)  => { match (expect_eq(n, 7)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } } }
+        Result::Err(_) => { }
+    }
+    return expect_eq(dropped(), 1);
+}
+
+// `?` on an `Option`: its failure arm binds nothing, so the success arm's
+// payload is the only thing that says the operand was consumed.
+function unwrap_or_none(o: Option<Res>) -> Option<i32> {
+    const v: Res = o?;
+    return Option::Some(consume(v));
+}
+
+![test]
+function option_try_payload_is_released_once() -> Result<(), TestError> {
+    reset();
+    match (unwrap_or_none(Option::Some(Res { tag: 8 }))) {
+        Option::Some(n) => { match (expect_eq(n, 8)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } } }
+        Option::None    => { }
+    }
+    return expect_eq(dropped(), 1);
+}
+
+mut g_next: i32 = 0;
+function next_res() -> Option<Res> {
+    g_next = g_next + 1;
+    if (g_next > 4) { return Option::None; }
+    return Option::Some(Res { tag: g_next });
+}
+
+// Four values produced; the even ones replace `best` (releasing the previous
+// one), the odd ones are released where the arm keeps them.  The inner match's
+// subject is a call, so drop insertion holds it in a local of its own, and the
+// payload moves out of that local on SOME paths of its arm only.
+function best_even() -> i32 {
+    match (next_res()) {
+        Option::None => { return 0; }
+        Option::Some(first) => {
+            mut best: Res = first;
+            loop {
+                match (next_res()) {
+                    Option::Some(value) => {
+                        if (value.tag % 2 == 0) { best = value; }
+                    }
+                    Option::None => { return consume(best); }
+                }
+            }
+        }
+    }
+}
+
+![test]
+function conditionally_consumed_match_subject_is_released_once() -> Result<(), TestError> {
+    reset();
+    g_next = 0;
+    match (expect_eq(best_even(), 4)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(dropped(), 4);
+}
+
+async function forward(r: Res) -> i32 {
+    return consume(r);                        // the parameter moves out of `poll`
+}
+
+![test]
+function async_parameter_moved_in_poll_is_released_once() -> Result<(), TestError> {
+    reset();
+    const n: i32 = future::block_on(forward(Res { tag: 9 }));
+    match (expect_eq(n, 9)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(dropped(), 1);
+}

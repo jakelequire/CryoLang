@@ -249,7 +249,8 @@ type struct LambdaSynth {
                 const cap_name: SymbolStr = node.captured_names[ci];
                 if (!this.scopes.lookup_local(cap_name).is_valid()) {
                     const cap_ty: TypeRef = node.captured_types[ci];
-                    saved_current_lam.add_capture(cap_name, cap_ty, node.captured_spans[ci]);
+                    saved_current_lam.add_capture(cap_name, node.captured_syms[ci],
+                                                  cap_ty, node.captured_spans[ci]);
                     if (!OwnershipQuery::is_copy(this.arena, prop_registry, this.intern, cap_ty)) {
                         saved_current_lam.is_move = true;
                     }
@@ -274,7 +275,8 @@ type struct LambdaSynth {
         }
         this.scopes.register_local(ident.name, outer_ty);
         if (this.state.current_lambda != null) {
-            this.state.current_lambda.add_capture(ident.name, outer_ty, ident.span);
+            this.state.current_lambda.add_capture(ident.name, ident.res.local_sym(),
+                                                  outer_ty, ident.span);
         }
         return outer_ty;
     }
@@ -350,8 +352,17 @@ type struct LambdaSynth {
             mut access: MemberAccessNode* = new MemberAccessNode(
                 this_ident as ExpressionNode*, cap_name, span, span);
             access.set_resolved_type(cap_ty);
+            // The shadow is the captured binding inside `__call__`: the body
+            // moved in below still names that binding in every use it holds, so
+            // the shadow takes its identity.  With a fresh one, a move of the
+            // capture inside the body names no declaration of `__call__`, and
+            // the checks keyed by binding never see it.
             mut shadow: VarDeclNode* = new VarDeclNode(cap_name, span);
-            shadow.set_sym_id(this.resolver.alloc_synthetic_binding());
+            shadow.set_sym_id(if (lambda.captured_syms[i].is_valid()) {
+                lambda.captured_syms[i]
+            } else {
+                this.resolver.alloc_synthetic_binding()
+            });
             shadow.set_mutable(false);
             shadow.set_resolved_type(cap_ty);
             shadow.set_initializer(access as ExpressionNode*);

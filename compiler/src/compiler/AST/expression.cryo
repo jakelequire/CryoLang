@@ -19,6 +19,8 @@ import compiler::resolver::symbol_str;
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, OverloadId, Res, ResBase, ResSlot };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::ast::declaration;
 import compiler::ast::declaration::{ VarDeclNode };
 import compiler::ast::pattern;
@@ -174,6 +176,29 @@ public:
     /// that WROTE the name can see.
     set_res(r: Res) -> void {
         this.res.answer(r);
+    }
+
+    /// Name a different LOCAL binding than the one this use was answered with.
+    ///
+    /// For a lowering that moves a use into a body where another declaration
+    /// stands for the binding the writer named - the async lowering's `poll`,
+    /// where a parameter is read through a shadow declared from the future's
+    /// field, and a carried local is re-declared in every state that needs it.
+    /// A binding is one declaration's storage, so after the move the use names
+    /// the stand-in; left on the original, it names nothing in the body it now
+    /// lives in.  A use answered with anything but a local is not a binding
+    /// and keeps its answer.
+    rebind_local(sym: SymbolID) -> void {
+        match (this.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Local(_) => { }
+                    _             => { return; }
+                }
+            }
+            ResSlot::Pending => { }
+        }
+        this.res = ResSlot::Answered(Res::Local(sym));
     }
 
     set_global_reference(v: boolean) -> void {
@@ -775,6 +800,11 @@ public:
     // Spans point at the *use* site that first triggered the capture (for
     // future diagnostics, e.g. non-Copy capture rejection).
     captured_names:  SymbolStr[];
+    // The outer binding each capture names, as the resolver answered the use
+    // that triggered it.  A pass that records the capture as a move keys on
+    // this: a spelling names no binding by itself, and an identifier minted
+    // from `captured_names` alone carries no answer at all.
+    captured_syms:   SymbolID[];
     captured_types:  TypeRef[];
     captured_spans:  SourceSpan[];
     // `move (...) -> T { ... }` opts the closure into capture-by-move
@@ -790,6 +820,7 @@ public:
         this.return_type_ann = null;
         this.body            = null;
         this.captured_names  = [];
+        this.captured_syms   = [];
         this.captured_types  = [];
         this.captured_spans  = [];
         this.is_move         = false;
@@ -814,11 +845,12 @@ public:
     /// Record a free-variable use of an outer-scope binding.  Idempotent:
     /// a name already in `captured_names` is not re-added (the body may
     /// reference the same outer local multiple times).
-    add_capture(name: SymbolStr, ty: TypeRef, span: SourceSpan) -> void {
+    add_capture(name: SymbolStr, sym: SymbolID, ty: TypeRef, span: SourceSpan) -> void {
         for (mut i: i64 = 0; i < this.captured_names.length; i++) {
             if (this.captured_names[i].id == name.id) { return; }
         }
         this.captured_names.push(name);
+        this.captured_syms.push(sym);
         this.captured_types.push(ty);
         this.captured_spans.push(span);
     }
