@@ -202,6 +202,8 @@ three, and its row carries the count. Read each zero off its own row.
 | the module doors taking any spelling (`ModuleGraph::find_module_index`, `reexport_closure`, `Resolver::find_module_scope`, `DeclarationIndex::is_prelude_ns`, `ns_imports` accepting a `SymbolStr` - a leaf, a composed path and a module's canonical path alike) | **TYPED** - each takes a `ModulePath`, a module's canonical path in a type of its own (`resolver/module_path.cryo`); `ModulePath::of` asserts the caller already holds one. `source_file_for_owner_key` keeps its `SymbolStr`: its key is a module path OR a file path. `ModulePath` is one of D32's KEY TYPES, so the 21 residue rows through these doors stay in the population - whether a typed door leaves it is Jake's (448 → 427, J 230 → 209 if it does) | the compiler flagged 38 arguments (34 calls) with the doors typed and no call site touched, the 34 a grep predicted; 0 of 1,126 example, 3,004 test, 265 LSP and 154 stdlib objects moved | `grep -rhoE '\(&this, [a-z_]+: ModulePath' compiler/src/compiler/module_graph.cryo compiler/src/compiler/decl_index.cryo compiler/src/compiler/resolver/resolver.cryo \| wc -l` → **5**; `grep -rho 'ModulePath::of(' compiler/src --include=*.cryo \| wc -l` → **37**; `grep -c '"ModulePath")' scripts/lane-gate.py` → **1** | §8.304 |
 | a method's receiver found by comparing a parameter's SPELLING with `this` / `&this` (47 residue rows on 41 lines in 13 files, and 10 comparisons of a resolved string or of one parameter handed in that no residue row counted) | **DELETED** - a parameter carries `VarDeclNode.receiver` (`ReceiverForm`: not a receiver, by reference, by value), set where a receiver is minted (the parser's two branches, the async lowering's synthesized `&this`, the C++ importer), copied by the cloner and cleared by a rename; every site asks `is_receiver()`, `is_ref_receiver()` or `is_value_receiver()`. What still compares the spelling asks whether an IDENTIFIER USE is the keyword `this` - sema 5, the LSP 6 - and a use has no declaration to carry a mark | residue 448 → 401, J 230 → 183; a shadow at every converted site over six halves, 0 disagreements (each mark suppressed alone: 9,790, 800, 25); 0 of 1,126 example, 3,004 test, 265 LSP and 154 stdlib objects moved | `grep -rho 'set_receiver(ReceiverForm::' compiler/src --include=*.cryo \| wc -l` → **4**; `python3 scripts/ns-migration/receiver-spelling-sites.py 2>/dev/null \| wc -l` → **11** (62 over the tree before §8.305) | §8.305 |
 | a destructure unseen by the move checker (`MoveChecker::walk_stmt` handling a declaration statement only when it held one variable: the initializer never walked as a move, the field bindings never registered) - a destructured field given away twice, and a destructure's source used after its fields were taken, were both ACCEPTED double frees, on the pin too | **DELETED** - `MoveChecker::walk_destructure_decl` walks the initializer as a move and registers each binding by `DestructureBinding.sym_id`, as `DropInserter::walk_destructure_decl` does. A match-arm PAYLOAD binding is still unregistered (`consume(x); consume(x);` in one arm is accepted, pin too) - open, §8.306 | `E0452_destructured_binding_moved_twice` and `E0452_destructure_source_used_after` fail under `46d0acb8`'s compiler and pass under this one; each half of the fix removed alone fails exactly one of them; 0 of 1,126 example objects moved | `grep -c 'this\.walk_destructure_decl(' compiler/src/compiler/passes/move_check.cryo` → **1** (the call; the dot escaped); `ls tests/tests/negative/E0452_destructure*.cryo \| wc -l` → **2** | §8.306 |
+| an identifier USE asked whether it is the receiver by its spelling (`sema.cryo`: 5 sites comparing `ident.name` with `this`; the LSP's 6 are Jake's) | **MEASURED, NOT CONVERTIBLE** - in a `&this` method a `this` use carries the identity of a second binding the name layer declares and discards (the `receiver_of == node` block in `name_resolution.cryo` drops `declare_parameter`'s result), and the async lowering's own `this` uses carry none; over six halves 85,147 asks could be converted, 1,332,567 name the discarded binding, 39,811 name nothing. Blocked on the name layer recording that identity and the lowering stamping its uses - neither done | instrument `scripts/ns-migration/8.307/` with a two-method control (+2 / +2) | `grep -c '^\s*this\.resolver\.declare_parameter(this\.this_sym' compiler/src/compiler/resolver/name_resolution.cryo` → **1** (a statement whose value is dropped: the discarded identity) | §8.307 |
+| the async lowering's rename skipping a destructure (`AsyncLower::rn_stmt` renames only a single-variable declaration: a destructure's bindings keep their spelling and stay out of `frame_locals`, its initializer is never walked) - the premise of the `frame_locals` own-rib exclusion | **OPEN, a live miscompile** - an async function reads a parameter where the source names a shadowing local (7 for 50, 7 for 100), and an address of a destructured local held across a suspend is accepted where a plain local is E0455; pin and HEAD alike. The two match-arm ribs (`BindingCapture`, `BindingRename`) HOLD, each probe shown failing under a mutation of the rename it relies on | the probe runner in `scripts/ns-migration/8.308/` reports 3 of its 9 probes WRONG under the pin and under `2790cea2`'s compiler, 4 under the rename mutation that is its control (it needs a build, so it is evidence and not a row check) | `grep -c 'DestructureDeclaration' compiler/src/compiler/sema/async_lower.cryo` → **1** (the post-lowering rebind alone) | §8.308 |
 
 **The arena holds no leaf index of either kind.** §8.121 deleted the LOOKUP
 LANE; the diagnostic map that survived it (the E0203 did-you-mean pool, E0155
@@ -38655,5 +38657,218 @@ but whether a payload is tracked as an owned local interacts with the
 whole-payload glue suppression `is_owned_value_place` and
 `partial_move_allowed` reason about, and it was not the unit. Recorded for
 the next session.
+
+---
+
+### 8.307 Sema's five "is this identifier the keyword `this`" sites are NOT a conversion yet: in a `&this` method a use of `this` carries the identity of a binding the name layer declares and then throws away, so nothing sema holds can say it is the receiver - measured at every site over six halves, 1,332,567 asks of that kind against 85,147 that could be converted; what would have to change first is recorded, and nothing was changed - 2026-09-23
+
+#### The question
+
+§8.305 made a PARAMETER say whether it is the receiver. What is left is the
+mirror on the use side - five sites in sema that ask whether an identifier
+USE is the receiver by comparing its spelling:
+
+```cryo
+// sema.cryo, e.g. resolve_identifier
+if (ident.name.equals(this.this_sym)) { ... }
+```
+
+(`sema.cryo` `resolve_identifier`, `check_assignment_lvalue`, the `*this`
+arm of the unary check, `cast_operand_is_byref_receiver`,
+`subject_is_caller_backed`; the six in the LSP are Jake's, post-migration.)
+A conversion would ask the use's identity instead: does `ident.res` name the
+receiver parameter's binding? That is a conversion only if the answer is
+already carried by the time sema runs.
+
+#### What the name layer does with `this`
+
+A method's receiver is written two ways and bound two ways:
+
+```cryo
+type struct Cell {
+    v: i64;
+    by_ref(&this) -> i64 { return this.v; }   // parameter spelled `&this`
+}
+implement struct Cell {
+    by_val(this) -> i64 { return this.v; }     // parameter spelled `this`
+}
+```
+
+For `by_val` the parameter IS the binding a use of `this` names: the name
+layer declares it under `this` and records its identity on the parameter.
+For `by_ref` the parameter is declared under the spelling `&this`, which no
+use can write, and the name layer then declares a SECOND binding under `this`
+for the uses to find (`name_resolution.cryo`, the `receiver_of == node` block:
+`this.resolver.declare_parameter(this.this_sym, node.span);`). That call's
+return value - the identity every `this` in the body resolves to - is
+dropped. The receiver parameter carries the `&this` binding's identity, the
+uses carry the other one, and no node records the second.
+
+#### Measured
+
+An instrument at each of the five sites (`scripts/ns-migration/8.307/`,
+applied to a clean tree, never committed applied) classified every ask whose
+spelling says "receiver" by the use's own identity, against the identity of
+the parameter marked `is_receiver()`. Six halves, 0 failing,
+`.objcmp/s36rc-lines.txt`:
+
+| site | use's identity = the receiver parameter's | a Local, but not the receiver parameter's | no Local identity at all |
+|---|---|---|---|
+| `resolve_identifier` | 85,015 | 1,133,376 | 32,018 |
+| `check_assignment_lvalue` | 132 | 25,446 | 6,084 |
+| the `*this` arm | 0 | 10,038 | 0 |
+| `cast_operand_is_byref_receiver` | 0 | 24,776 | 0 |
+| `subject_is_caller_backed` | 0 | 138,931 | 1,709 |
+
+and 0 uses anywhere whose identity is the receiver parameter's under another
+spelling.
+
+* **The middle column is the `&this` case** - the discarded second binding.
+  Control: a two-method program (`by_ref`/`by_val` above) against the same
+  program with both bodies returning `1` moves the first column by +2 and the
+  middle by +2 and nothing else (each body is checked twice). So the equality
+  test answers true when the identities match, and the middle column is not an
+  instrument that never matches.
+* **The last column is the async lowering's own writing**: every such ask
+  sits on the declaration line of an `async` method (`stdlib/net/http/
+  conn.cryo:69`, `async read_request(mut &this)`; `:108`;
+  `net/http/server.cryo:245`), in a function carrying no parameter marked as
+  the receiver - uses the lowering synthesizes with no identity at all.
+* The "0 under another spelling" is not load-bearing and has no control.
+
+#### What would have to change first
+
+Two things, neither of which is a conversion, so this unit stopped:
+
+1. **The name layer records the identity of the `this` binding it declares
+   for a `&this` method** - on the receiver parameter or on the method - so a
+   pass has something to compare a use against. Which node carries it, and
+   whether the `&this` parameter's own binding survives at all, is a design
+   choice (the parameter's binding is never named by any use).
+2. **The async lowering's synthesized `this` uses carry an identity** - the
+   39,811 asks in the last column. Which binding they should name depends on
+   (1): in the lowered future the receiver is the future's own `&this`.
+
+With both, the five sites become "does `ident.res.local_sym()` equal the
+recorded receiver identity", and the middle and last columns move to the
+first; the instrument above is the measurement that would show it.
+
+No count moved; nothing in `compiler/src` changed.
+
+---
+
+### 8.308 Probing the async lowering's three "own rib by binding name" exclusions: one BREAKS - the rename every rib depends on skips a destructure, so an async function silently reads the wrong variable and a dangling address across a suspend is accepted; the two match-arm ribs hold, each with the probe that would have caught it failing under a mutation - 2026-09-23
+
+#### What the exclusions claim
+
+`scripts/lane-gate.py` excludes three types in `sema/async_lower.cryo` from
+the store rule as "the lowering's OWN RIB" - tables keyed by a local's
+SPELLING:
+
+* `AsyncLower.frame_locals` - every local the lowering minted, read by the
+  check that refuses an address of a frame local held across a suspend
+  (E0455);
+* `BindingCapture` - one `match` arm's distinct bindings, promoted to fields
+  when read across a suspend;
+* `BindingRename` - one arm's bindings paired with the fresh spellings they
+  are renamed to.
+
+All three are sound only because `disambiguate_locals` first renames every
+local in the body to a unique minted spelling (`x` → `x$L6`). A spelling
+table over unique spellings is an identity table; over spellings the rename
+missed, it is the defect §8.301 and §8.303 fixed elsewhere.
+
+#### What breaks: the rename has no destructure arm
+
+`AsyncLower::rn_stmt` renames a declaration statement only when it holds a
+single variable. A destructure is skipped whole: its bindings keep their
+source spelling and never enter `frame_locals`, and its INITIALIZER is never
+walked, so a use inside it keeps a spelling the rename has already moved
+elsewhere. (`grep -c 'DestructureDeclaration' compiler/src/compiler/sema/
+async_lower.cryo` → 1, the post-lowering rebind; the rename and the state
+building have none.) Three consequences, each on the pin as on HEAD:
+
+```cryo
+// silently reads the PARAMETER: prints 7, the source says 50
+async function h(x: i64) -> i64 {
+    const _z: i64 = await PendingThenReady::<i64>::new(2, 1);
+    mut r: i64 = 0;
+    {
+        const x: i64 = 50;                      // renamed x$L..
+        const {a, b}: Pair = Pair { a: x, b: 0 };  // `x` here is NOT renamed
+        r = a + b;
+    }
+    return r;
+}
+```
+
+```cryo
+// silently reads the PARAMETER: prints 7, the source says 100
+async function g(a: i64) -> i64 {
+    mut r: i64 = 0;
+    {
+        const {a, b}: Pair = Pair { a: 100, b: 2 };
+        const _z: i64 = await PendingThenReady::<i64>::new(2, 1);
+        r = a;     // after the suspend, `a` finds the parameter's shadow
+    }
+    return r;
+}
+```
+
+```cryo
+// ACCEPTED: the address of a frame local held across a suspend
+async function f() -> i64 {
+    const {a, b}: Pair = Pair { a: 1, b: 2 };
+    const p: i64* = &a;                         // `a` is not in frame_locals
+    const _z: i64 = await PendingThenReady::<i64>::new(2, 1);
+    return *p;                                  // dangling; happens to print 1
+}
+```
+
+Each has a control written with plain declarations that the rename does
+handle: the first two print 50 and 100, the third is refused with E0455.
+Reading BOTH destructured fields after the suspend in the second shape is
+loud instead (`E0201: cannot find value 'b'`) - the lowering does not carry a
+destructured local across a suspend at all, and `a` compiles only because a
+parameter happens to share its spelling.
+
+The broken exclusion is `frame_locals`', and the table's keying is not the
+fault: the rename it depends on - `RenameCtx`, itself listed as an own rib -
+never registers the binding. The same shape as §8.306: a variable the pass
+never registers is a variable it cannot track.
+
+#### What holds, and the probe that would have shown otherwise
+
+The match-arm ribs hold on three probes - an arm binding and a nested arm's
+binding of one spelling each read across a suspend (21), a local shadowing
+an arm binding and initialized from it (6), an or-pattern's shared binding
+(9). Each was shown able to fail by breaking the rename it depends on, each
+mutation alone and rebuilt clean:
+
+| mutation | probe result |
+|---|---|
+| arm bindings keep their spelling (no fresh mint in `rn_arm`) | nested arms: **40** instead of 21 - the two `v`s promoted into one slot; the other two unchanged |
+| a declaration bound before its initializer is renamed (`rn_var_decl`) | shadow-from-self: **E0201**; the other two unchanged |
+| an or-pattern's binding not de-duplicated (`BindingRename.push_orig`) | or-pattern: **E0201**; the other two unchanged |
+
+#### The probes
+
+`scripts/ns-migration/8.308/async-rib-probes.py <compiler>` builds all nine
+(three probes, their three controls, the three holding shapes) and prints
+`ok`/`WRONG` against what each program MEANS: `3 of 9 WRONG` under
+`bin/cryo.exe` and under `2790cea2`'s compiler; `4 of 9 WRONG` under the
+first mutation above (its control). Not a gate; there is no xfail here, so
+the three stay visible in the script's output rather than in the suite.
+
+#### Not done, and why
+
+The fix is in the lowering, not in a rib: a destructure arm in `rn_stmt`
+(rename the initializer, mint each binding) and in whatever decides which
+locals a state carries. It changes what existing programs compile to - two
+silent wrong answers become right, and a program that compiles today by
+luck may start refusing or carrying - which is the stated task of no unit
+this session. Recorded as the next unit.
+
+No count moved; nothing in `compiler/src` changed.
 
 ---
