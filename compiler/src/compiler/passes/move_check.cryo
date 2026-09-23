@@ -54,8 +54,9 @@ import compiler::types::user_defined;
 import compiler::types::user_defined::{ StructType };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, FunctionDeclNode, ImplBlockNode, MethodNode, StructDeclNode,
-    TraitDeclNode, UnionDeclNode, VarDeclNode
+    ClassDeclNode, DestructureBinding, DestructureDeclNode, FunctionDeclNode,
+    ImplBlockNode, MethodNode, StructDeclNode, TraitDeclNode, UnionDeclNode,
+    VarDeclNode
 };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayLiteralNode, BinaryExprNode, CallExprNode, CastExprNode,
@@ -892,9 +893,12 @@ type struct MoveChecker {
             }
             NodeKind::DeclarationStatement => {
                 const ds: DeclStmtNode* = stmt as DeclStmtNode*;
-                if (ds.declaration != null &&
-                    ds.declaration.kind == NodeKind::VariableDeclaration) {
-                    this.walk_var_decl(ds.declaration as VarDeclNode*);
+                if (ds.declaration != null) {
+                    if (ds.declaration.kind == NodeKind::VariableDeclaration) {
+                        this.walk_var_decl(ds.declaration as VarDeclNode*);
+                    } else if (ds.declaration.kind == NodeKind::DestructureDeclaration) {
+                        this.walk_destructure_decl(ds.declaration as DestructureDeclNode*);
+                    }
                 }
             }
             NodeKind::IfStatement => {
@@ -1052,6 +1056,24 @@ type struct MoveChecker {
         }
         if (!vd.is_global) {
             this.register_binding(vd.sym_id, vd.resolved_type);
+        }
+    }
+
+    /// A destructure consumes its right-hand side whole (sema refuses one
+    /// that leaves a field unbound) and binds each field to a fresh owned
+    /// local.  Both halves must be seen: an unwalked initializer leaves the
+    /// source usable after its fields were taken, and an unregistered field
+    /// local can be given away twice - either way a value is released twice.
+    /// `DropInserter::walk_destructure_decl` records the same move and the
+    /// same bindings.
+    walk_destructure_decl(mut &this, dd: DestructureDeclNode*) -> void {
+        if (dd == null) { return; }
+        if (dd.initializer != null) {
+            this.walk_expr_move(dd.initializer, true);
+        }
+        for (mut i: i64 = 0; i < dd.bindings.length; i++) {
+            const b: DestructureBinding = dd.bindings[i];
+            this.register_binding(b.sym_id, b.resolved_type);
         }
     }
 
