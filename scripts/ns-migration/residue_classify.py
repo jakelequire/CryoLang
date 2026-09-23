@@ -130,8 +130,6 @@ CLASS_OF_METHOD = {
         ("S", "the impl's `where` bound by the bounded parameter's leaf, the leaf read off the arena's `GenericParamType.param_name` - the type layer's only identity for a parameter until the arena is keyed by symbol"),
     "FunctionDeclNode::trait_bounds[]":
         ("S", "the function's `where` bound by the bounded parameter's leaf, read off the arena's `GenericParamType.param_name` (see `ImplBlockNode::where_bounds[]`)"),
-    "FunctionDeclNode::parameters[]":
-        ("J", "lang: the receiver parameter, `this` / `&this`, by the spelling the language fixes; asked at every site that skips or finds the receiver"),
     "StructDeclNode::fields[]":
         ("J", "member: a struct declaration's field by its leaf off the node in hand, scanned inline"),
     "StructDeclNode::methods[]":

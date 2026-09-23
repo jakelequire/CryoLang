@@ -57,7 +57,7 @@ import compiler::types::generic::{
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     DeclarationNode, DestructureDeclNode, FieldDeclNode, FunctionDeclNode, GenericParamNode,
-    ImplBlockNode, MethodNode, StructDeclNode, TraitDeclNode, VarDeclNode
+    ImplBlockNode, MethodNode, ReceiverForm, StructDeclNode, TraitDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode, CallExprNode,
@@ -552,8 +552,8 @@ type struct AsyncLower {
     /// the future can use, and neither is the name the body reads the receiver
     /// by, so every parameter walk routes the receiver through `recv_field`.
     is_receiver_param(&this, p: VarDeclNode*) -> boolean {
-        if (p == null || !p.name.is_valid()) { return false; }
-        return p.name.equals(this.this_amp_sym) || p.name.equals(this.this_sym);
+        if (p == null) { return false; }
+        return p.is_receiver();
     }
 
     /// The future field backing parameter `p`, and the name the poll body binds
@@ -2581,7 +2581,7 @@ type struct AsyncLower {
                 if (p == null || !p.name.is_valid()) { continue; }
                 // Only the by-pointer spelling keeps a pointer; a by-value
                 // `this` holds the object itself and cannot go stale.
-                if (p.name.equals(this.this_amp_sym)) { return true; }
+                if (p.is_ref_receiver()) { return true; }
             }
         }
         return false;
@@ -2679,7 +2679,7 @@ type struct AsyncLower {
         // this cannot vouch for.
         if (fd.parameters.length > 0) {
             const p0: VarDeclNode* = fd.parameters[0];
-            if (p0 != null && (p0.name.equals(this.this_sym) || p0.name.equals(this.this_amp_sym))) {
+            if (p0 != null && p0.is_receiver()) {
                 return SymbolStr::empty();
             }
         }
@@ -6072,7 +6072,7 @@ type struct AsyncLower {
         this.rn_expr(ctx, vd.initializer);
         const orig: SymbolStr = vd.name;
         const fresh: SymbolStr = this.mint_local(orig);
-        vd.name = fresh;
+        vd.set_name(fresh);
         this.rc_bind(ctx, orig, fresh);
     }
 
@@ -7068,6 +7068,7 @@ type struct AsyncLower {
             }
             if (recv == null) {
                 recv = new VarDeclNode(this.this_amp_sym, span);
+                recv.set_receiver(ReceiverForm::ByReference);
                 recv.set_sym_id(this.resolver.alloc_synthetic_binding());
                 recv.set_mutable(false);
                 // The receiver leads the parameter list, which is where the
@@ -7078,7 +7079,7 @@ type struct AsyncLower {
                 }
                 node.parameters[0] = recv;
             }
-            recv_ptr = recv.name.equals(this.this_amp_sym);
+            recv_ptr = recv.is_ref_receiver();
             if (!recv.resolved_type.is_valid()) {
                 recv.set_resolved_type(if (recv_ptr) {
                     this.arena.get_pointer_to(owner.ty)

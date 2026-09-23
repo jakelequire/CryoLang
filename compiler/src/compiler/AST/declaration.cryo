@@ -135,6 +135,27 @@ public:
 
 // Concrete Declaration Nodes
 
+/// Whether a parameter is the method's RECEIVER, and in which form.  The
+/// language names the receiver by its spelling - `&this` for a borrow, `this`
+/// for a by-value one - and the parser is where that spelling is read; every
+/// later stage asks the mark, because a parameter's role is a property of the
+/// declaration and not of the characters it was written with.
+type enum ReceiverForm {
+    NotReceiver;
+    ByReference;
+    ByValue;
+}
+
+implement enum ReceiverForm {
+    is_receiver(&this) -> boolean {
+        return match (&this) {
+            ReceiverForm::NotReceiver => { false }
+            _                         => { true }
+        };
+    }
+}
+
+
 type class VarDeclNode : DeclarationNode {
 public:
     name:            SymbolStr;
@@ -197,6 +218,9 @@ public:
     /// Invalid on a global (which is a definition reached by canonical name,
     /// not a binding) and on a declaration no resolver walked.
     sym_id:           SymbolID;
+    /// Whether this parameter is the enclosing method's receiver - see
+    /// `ReceiverForm`.  `NotReceiver` on every local and every other parameter.
+    receiver:         ReceiverForm;
 
     VarDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::VariableDeclaration, span) {
@@ -215,6 +239,37 @@ public:
         this.is_extern_import = false;
         this.link_name        = "";
         this.sym_id           = SymbolID::invalid();
+        this.receiver         = ReceiverForm::NotReceiver;
+    }
+
+    /// Record that this parameter is the enclosing method's receiver.
+    set_receiver(form: ReceiverForm) -> void { this.receiver = form; }
+
+    /// Whether this parameter is the receiver, in either form.
+    is_receiver(&this) -> boolean { return this.receiver.is_receiver(); }
+
+    /// Whether this parameter is a BORROWING receiver (`&this`), as opposed
+    /// to a by-value one (`this`) or no receiver at all.
+    is_ref_receiver(&this) -> boolean {
+        return match (&this.receiver) {
+            ReceiverForm::ByReference => { true }
+            _                         => { false }
+        };
+    }
+
+    /// Whether this parameter is a BY-VALUE receiver (`this`).
+    is_value_receiver(&this) -> boolean {
+        return match (&this.receiver) {
+            ReceiverForm::ByValue => { true }
+            _                     => { false }
+        };
+    }
+
+    /// Rename this declaration.  The receiver mark goes with the spelling:
+    /// a renamed parameter is no longer the one the language named.
+    set_name(n: SymbolStr) -> void {
+        this.name     = n;
+        this.receiver = ReceiverForm::NotReceiver;
     }
 
     has_initializer() -> boolean     { return this.initializer != null; }
