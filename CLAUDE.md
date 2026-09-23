@@ -305,7 +305,15 @@ answer may well be "do it anyway", which is a decision rather than a drift.
 
 ## Ask instead of assuming
 
-Use the question tool. Do not guess on any of these:
+**Ask in plain text, in the report or in `HANDOFF.md`.** An in-session question
+dialog does not reach Jake - he works from the orchestrator's summaries, usually
+on a phone and away from the Code tab - so a question raised there is the same
+as a question not asked, except that it may hand you an answer you then
+attribute to him. That has happened: a gate re-pin was asked for through the
+dialog, answered, recorded as his ruling in the ledger and the commit message,
+and committed on, before he had seen the question.
+
+Do not guess on any of these:
 
 - A design question a spec leaves open. If its open-questions section does not
   answer it, it is not yours to decide.
