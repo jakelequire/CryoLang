@@ -3810,11 +3810,19 @@ type struct CallResolver {
         if (fits.length == 0) { fits = this.select_static_overload(entries, &arg_types, true); }
         if (fits.length != 1) { return false; }
         call.set_resolved_callee(CalleePin::Decl(fits[0]));
-        const ft: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(fits[0]).id);
+        this.type_from_delivered_entry(scope, fits[0]);
+        return true;
+    }
+
+    /// A call through a trait's path has the selected implementation's
+    /// return type: the trait declaration's names `This` and `This::Item`,
+    /// which stand for no type at the call (`Dup::dup(&r)` is `Count`, not
+    /// `This`; `Peek::peek(&r)` is `Option<i32>`, not `Option<This::Out>`).
+    type_from_delivered_entry(mut &this, scope: ScopeResolutionNode*, entry: OverloadId) -> void {
+        const ft: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entry).id);
         if (ft != null && ft.kind == TypeKind::Function) {
             scope.set_resolved_type((ft as FunctionType*).return_type);
         }
-        return true;
     }
 
     /// The trait an impl-qualified path's head names, by identity, when the
@@ -4177,6 +4185,15 @@ type struct CallResolver {
             }
             scope.set_resolved_type(resolved);
             this.pin_scope_callee_combined(call, scope, owner_sym, scope.member_name);
+            // A call through a trait's own path (`Dup::dup(&r)`) has the
+            // selected implementation's return on EVERY walk of the body: the
+            // first walk's pin sets it, and a later walk finds the call already
+            // pinned and would otherwise keep the trait declaration's `This`.
+            const owner_t: Type* = this.arena.lookup(owner_ref.id);
+            const pinned: OverloadId = call.resolved_callee.decl_entry();
+            if (owner_t != null && owner_t.kind == TypeKind::Trait && pinned.is_valid()) {
+                this.type_from_delivered_entry(scope, pinned);
+            }
             return scope.resolved_type;
         }
         // The TEMPLATE's own method, when the specialization the scope names
