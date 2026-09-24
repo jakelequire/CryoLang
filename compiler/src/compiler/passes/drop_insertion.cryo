@@ -251,6 +251,14 @@ type struct DropInserter {
     /// walks each branch independently, and merges via intersection.
     moved_keys:  u64[];
     moved_lines: i32[];
+    /// Parallel to `moved_keys`: the move's drop-flag write is already in
+    /// place on every path that made it - a simple statement's own write
+    /// (`append_move_flag_writes`), or a join's per-branch writes for a move
+    /// made on some branches only.  An enclosing join splices `<flag> = true`
+    /// at the end of a branch only for a move that is not, because forcing
+    /// the flag there would claim "moved" on the paths through the branch
+    /// that kept the value.
+    moved_gov:   boolean[];
 
     /// Payload-binding -> owning-subject links, active only while walking a
     /// match's arms.  When a match payload binding (e.g. `s` in
@@ -339,6 +347,11 @@ type struct DropInserter {
     /// Flag id gating the release, or 0 when the destination is definitely
     /// live and the release is unconditional.
     pend_assign_guard: u32;
+    /// The guard is the destination's move flag, which is set where the
+    /// value was moved OUT, so the release runs where it is clear; an init
+    /// flag is set where the value was written, so its release runs where
+    /// it is set.
+    pend_assign_guard_moved: boolean;
     pend_assign_ty:    TypeRef;
     /// The destination place, kept as base binding + projection chain so the
     /// copy is rebuilt from types this pass derived rather than from the
@@ -351,6 +364,16 @@ type struct DropInserter {
     /// Monotonic counter for naming the hidden locals that hold a displaced
     /// value between the store and its release (see `emit_assign_drop`).
     assign_seq:   i64;
+
+    /// The moved-set length when the simple statement being walked began, so
+    /// the moves it made are the entries after it (`append_move_flag_writes`,
+    /// `record_assign_drop`).
+    stmt_move_snap: i64;
+    /// True while the expression of a simple statement (an expression, a
+    /// declaration, a `return`) is walked, and false inside any compound
+    /// statement nested in it: a move recorded while it is set is one the
+    /// statement writes to its binding's flag when it ends.
+    stmt_writes_flags: boolean;
 
     /// Monotonic counter for naming hidden locals synthesized to hold and
     /// drop discarded owning temporaries (see emit_discarded_temp_drop).
@@ -406,15 +429,19 @@ type struct DropInserter {
             binding_definit: [],
             pend_assign_node:  null,
             pend_assign_guard: 0,
+            pend_assign_guard_moved: false,
             pend_assign_ty:    TypeRef::invalid(),
             pend_assign_base:    0,
             pend_assign_base_ty: TypeRef::invalid(),
             pend_assign_kind:    [],
             pend_assign_key:     [],
             assign_seq:      0,
+            stmt_move_snap:  0,
+            stmt_writes_flags: false,
             loop_boundary:   [],
             moved_keys:      [],
             moved_lines:     [],
+            moved_gov:       [],
             link_payload:    [],
             link_subject:    [],
             binding_dropflags: [],
@@ -589,9 +616,19 @@ type struct DropInserter {
 
     mark_moved(mut &this, sym: SymbolID, span: SourceSpan) -> void {
         if (!sym.is_valid()) { return; }
+        // Inside a simple statement, a flagged binding's move is written by
+        // the statement itself once it ends.
+        this.mark_moved_gov(sym, span,
+            this.stmt_writes_flags && this.get_drop_flag(sym.id).is_valid());
+    }
+
+    /// `mark_moved`, with whether the move's flag write is in place given.
+    mark_moved_gov(mut &this, sym: SymbolID, span: SourceSpan, gov: boolean) -> void {
+        if (!sym.is_valid()) { return; }
         if (this.is_moved(sym)) { return; }
         this.moved_keys.push(sym.id);
         this.moved_lines.push(span.start_line as i32);
+        this.moved_gov.push(gov);
         // Propagate to a linked match subject: consuming a payload binding
         // moves-from the subject it was extracted from, so the subject's glue
         // must not also drop that payload.  Bounded recursion handles nested
@@ -639,6 +676,7 @@ type struct DropInserter {
         while (this.moved_keys.length > checkpoint) {
             this.moved_keys.pop();
             this.moved_lines.pop();
+            this.moved_gov.pop();
         }
     }
 
@@ -659,12 +697,34 @@ type struct DropInserter {
         return out;
     }
 
+    moves_since_gov(&this, snapshot: i64) -> boolean[] {
+        mut out: boolean[] = [];
+        for (mut i: i64 = snapshot; i < this.moved_keys.length; i++) {
+            out.push(this.moved_gov[i]);
+        }
+        return out;
+    }
+
+    /// Whether every move of `key` among `keys` is governed (`gov`), and
+    /// there is at least one.
+    all_governed(&this, keys: &u64[], gov: &boolean[], key: u64) -> boolean {
+        mut any: boolean = false;
+        for (mut i: i64 = 0; i < keys.length; i++) {
+            if (keys[i] != key) { continue; }
+            if (!gov[i]) { return false; }
+            any = true;
+        }
+        return any;
+    }
+
     /// Replace the moved-set tail (after `snapshot`) with the given keys.
-    set_moves_tail(mut &this, snapshot: i64, keys: u64[], lines: i32[]) -> void {
+    set_moves_tail(mut &this, snapshot: i64, keys: u64[], lines: i32[],
+                   gov: boolean[]) -> void {
         this.restore_moves(snapshot);
         for (mut i: i64 = 0; i < keys.length; i++) {
             this.moved_keys.push(keys[i]);
             this.moved_lines.push(lines[i]);
+            this.moved_gov.push(gov[i]);
         }
     }
 
@@ -768,6 +828,7 @@ type struct DropInserter {
         this.loop_boundary   = [];
         this.moved_keys  = [];
         this.moved_lines = [];
+        this.moved_gov   = [];
         this.binding_dropflags = [];
         this.flag_seq         = 0;
         this.pm_binding       = [];
@@ -980,10 +1041,24 @@ type struct DropInserter {
     /// program reaching this point cannot fall through to the next
     /// statement in the enclosing block).
     walk_stmt_into(mut &this, stmt: StatementNode*, out: StatementNode*[]*) -> boolean {
+        const outer_writes: boolean = this.stmt_writes_flags;
+        this.stmt_writes_flags = false;
+        const d: boolean = this.walk_stmt_kind(stmt, out);
+        this.stmt_writes_flags = outer_writes;
+        return d;
+    }
+
+    walk_stmt_kind(mut &this, stmt: StatementNode*, out: StatementNode*[]*) -> boolean {
         return match (stmt.kind) {
             NodeKind::ReturnStatement => {
                 const r: ReturnStmtNode* = stmt as ReturnStmtNode*;
+                const ret_snap: i64 = this.snapshot_moves();
+                this.stmt_writes_flags = true;
                 if (r.expression != null) { this.walk_expr_move(r.expression); }
+                this.stmt_writes_flags = false;
+                // A flagged binding the return expression gave away is gone
+                // on this path, and the drops below read its flag.
+                this.append_move_flag_writes(ret_snap, null, &r.synth_drops, stmt.span);
                 // Cumulative drops across every live scope, innermost
                 // first.  These cannot be emitted as preceding statements
                 // because the return *expression* runs at the return-stmt
@@ -1012,7 +1087,11 @@ type struct DropInserter {
             NodeKind::ExpressionStatement => {
                 const e: ExprStmtNode* = stmt as ExprStmtNode*;
                 this.pend_assign_node = null;
+                const outer_snap: i64 = this.stmt_move_snap;
+                this.stmt_move_snap = this.snapshot_moves();
+                this.stmt_writes_flags = true;
                 if (e.expression != null) { this.walk_expr_read(e.expression); }
+                this.stmt_writes_flags = false;
                 // A discarded owning temporary (e.g. `make_owned();` or
                 // `Res { id: 1 };`) is never bound, so without this it is
                 // never dropped - a leak. Materialize it into a hidden local
@@ -1042,6 +1121,8 @@ type struct DropInserter {
                         out.push(this.make_drop_flag_set(iflag, stmt.span));
                     }
                 }
+                this.append_move_flag_writes(this.stmt_move_snap, e.expression, out, stmt.span);
+                this.stmt_move_snap = outer_snap;
                 this.pend_assign_node = null;
                 false
             }
@@ -1049,6 +1130,8 @@ type struct DropInserter {
                 const ds: DeclStmtNode* = stmt as DeclStmtNode*;
                 mut init_flag: SymbolStr = SymbolStr::empty();
                 mut flag_decls: StatementNode*[] = [];
+                const decl_snap: i64 = this.snapshot_moves();
+                this.stmt_writes_flags = true;
                 if (ds.declaration != null) {
                     if (ds.declaration.kind == NodeKind::VariableDeclaration) {
                         const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
@@ -1078,6 +1161,7 @@ type struct DropInserter {
                         this.walk_destructure_decl(ds.declaration as DestructureDeclNode*);
                     }
                 }
+                this.stmt_writes_flags = false;
                 out.push(stmt);
                 if (init_flag.is_valid()) {
                     out.push(this.make_drop_flag_decl(init_flag, ds.span));
@@ -1085,6 +1169,7 @@ type struct DropInserter {
                 for (mut fi: i64 = 0; fi < flag_decls.length; fi++) {
                     out.push(flag_decls[fi]);
                 }
+                this.append_move_flag_writes(decl_snap, null, out, ds.span);
                 false
             }
             NodeKind::BlockStatement => {
@@ -1223,6 +1308,7 @@ type struct DropInserter {
         }
         const then_keys:  u64[] = this.moves_since_keys(snap);
         const then_lines: i32[] = this.moves_since_lines(snap);
+        const then_gov:   boolean[] = this.moves_since_gov(snap);
         this.restore_moves(snap);
 
         mut else_diverges: boolean = false;
@@ -1232,6 +1318,7 @@ type struct DropInserter {
         }
         const else_keys:  u64[] = this.moves_since_keys(snap);
         const else_lines: i32[] = this.moves_since_lines(snap);
+        const else_gov:   boolean[] = this.moves_since_gov(snap);
         this.restore_moves(snap);
 
         // Branch join.  A diverging branch's moves don't escape the if
@@ -1242,8 +1329,8 @@ type struct DropInserter {
         const has_else: boolean = it.else_stmt != null;
         const both_diverge: boolean = then_diverges && has_else && else_diverges;
         this.merge_branches_if(it, out, snap,
-            then_keys, then_lines, then_diverges,
-            else_keys, else_lines, has_else, else_diverges);
+            then_keys, then_lines, then_gov, then_diverges,
+            else_keys, else_lines, else_gov, has_else, else_diverges);
         this.branch_depth -= 1;
         return both_diverge;
     }
@@ -1512,6 +1599,7 @@ type struct DropInserter {
         // moves begin; arm_move_starts[arm_count] is the total length.
         mut arm_move_keys:   u64[] = [];
         mut arm_move_lines:  i32[] = [];
+        mut arm_move_gov:    boolean[] = [];
         mut arm_move_starts: i64[] = [];
         const arm_count: i64 = arms.length;
         mut live_arms:   i64 = 0;
@@ -1557,6 +1645,9 @@ type struct DropInserter {
             } else {
                 this.walk_stmt_in_place(arm.body)
             };
+            const arm_keys:  u64[] = this.moves_since_keys(snap);
+            const arm_lines: i32[] = this.moves_since_lines(snap);
+            const arm_gov:   boolean[] = this.moves_since_gov(snap);
             // A consumed payload binding means the subject was moved-from on
             // this path; suppress its glue.  Checked before restore_moves so
             // the in-arm move is still visible.  Always unregisters.
@@ -1567,13 +1658,16 @@ type struct DropInserter {
             // the arms the flag is forced on below: that would release nothing
             // on the paths that kept the payload, and it would set the flag
             // ahead of its own declaration, which that join placed inside this
-            // arm.
+            // arm.  Nor is an arm whose every move of the subject is already
+            // flag-written where it happened.
             if (reg_count > 0) {
                 if (this.check_and_unregister_arm_bindings(reg_count, link_mark)) {
                     subject_consumed = true;
                     const made_flag: boolean = !flag_before &&
                         this.get_drop_flag(subj_sym.id).is_valid();
-                    if (!made_flag) { consumed_arm_idx.push(a); }
+                    if (!made_flag && !this.all_governed(&arm_keys, &arm_gov, subj_sym.id)) {
+                        consumed_arm_idx.push(a);
+                    }
                 }
             }
             if (arm_div) {
@@ -1582,8 +1676,6 @@ type struct DropInserter {
                 continue;
             }
             live_arms += 1;
-            const arm_keys:  u64[] = this.moves_since_keys(snap);
-            const arm_lines: i32[] = this.moves_since_lines(snap);
             for (mut i: i64 = 0; i < arm_keys.length; i++) {
                 mut in_outer: boolean = false;
                 for (mut o: i64 = 0; o < outer_syms.length; o++) {
@@ -1594,6 +1686,7 @@ type struct DropInserter {
                 // the specific arms that performed the move.
                 arm_move_keys.push(arm_keys[i]);
                 arm_move_lines.push(arm_lines[i]);
+                arm_move_gov.push(arm_gov[i]);
                 mut found: boolean = false;
                 for (mut j: i64 = 0; j < all_keys.length; j++) {
                     if (all_keys[j] == arm_keys[i]) {
@@ -1621,15 +1714,26 @@ type struct DropInserter {
 
         mut def_keys:  u64[] = [];
         mut def_lines: i32[] = [];
+        mut def_gov:   boolean[] = [];
         for (mut i: i64 = 0; i < all_keys.length; i++) {
             const cond_move: boolean = all_counts[i] < live_arms;
+            mut gov: boolean = this.all_governed(&arm_move_keys, &arm_move_gov, all_keys[i]);
             if (cond_move && m != null) {
                 // Flag synthesis: a binding moved on some arms but not
                 // all live arms.  Hoist a single flag before the match,
                 // splice `<flag>=true` into every arm that moved it.
                 this.synth_flag_for_match_arms(m, out,
                     all_lines[i], arms, arm_count,
-                    arm_move_keys, arm_move_starts, all_keys[i]);
+                    arm_move_keys, arm_move_gov, arm_move_starts, all_keys[i]);
+                gov = true;
+            } else if (!cond_move && !gov && m != null
+                       && this.get_drop_flag(all_keys[i]).is_valid()) {
+                // Moved on every arm, conditionally on some: the flag those
+                // arms write has to be written by the others too.
+                this.synth_flag_for_match_arms(m, out,
+                    all_lines[i], arms, arm_count,
+                    arm_move_keys, arm_move_gov, arm_move_starts, all_keys[i]);
+                gov = true;
             } else if (cond_move) {
                 // Expression-position match (out == null): no place to
                 // hoist a flag-decl, so fall back to the historical
@@ -1641,15 +1745,19 @@ type struct DropInserter {
             }
             def_keys.push(all_keys[i]);
             def_lines.push(all_lines[i]);
+            def_gov.push(gov);
         }
-        this.set_moves_tail(snap, def_keys, def_lines);
+        this.set_moves_tail(snap, def_keys, def_lines, def_gov);
         // A payload binding was consumed by some arm -> the owning subject is
         // moved-from after the match.  Mark it so drop-insertion suppresses
         // its scope-exit glue (preventing a double-free of the payload the
         // arm already released).  Safe even when only one arm consumes: the
         // non-consuming arms (e.g. `None`) carry no payload to leak.
         if (subj_sym.is_valid() && subject_consumed && subject != null) {
-            this.mark_moved(subj_sym, subject.span);
+            // A flagged subject's flag is written on every consuming path
+            // (below, or where each arm consumed).
+            this.mark_moved_gov(subj_sym, subject.span,
+                this.get_drop_flag(subj_sym.id).is_valid());
             // If the subject already had a drop flag (it was conditionally
             // moved/assigned earlier - typically reassigned inside a loop),
             // marking it moved in the static set is not enough: its scope-exit
@@ -1737,13 +1845,14 @@ type struct DropInserter {
     /// `out` (the enclosing block buffer) BEFORE the if-stmt; the
     /// flag-set is spliced at the END of the moving branch's body so
     /// any drop synthesized at scope exit observes the flag's true
-    /// state on the moved control-flow path.  Falls back to the
-    /// original merge_branches semantics (add to def_keys, no flag) for
-    /// any binding where flag synthesis isn't applicable.
+    /// state on the moved control-flow path.  A binding moved on both
+    /// branches and flag-written on neither is definitely moved, and gets
+    /// no flag.
     merge_branches_if(mut &this, it: IfStmtNode*,
                        out: StatementNode*[]*, snap: i64,
-                       then_keys: u64[], then_lines: i32[], then_diverges: boolean,
-                       else_keys: u64[], else_lines: i32[],
+                       then_keys: u64[], then_lines: i32[], then_gov: boolean[],
+                       then_diverges: boolean,
+                       else_keys: u64[], else_lines: i32[], else_gov: boolean[],
                        has_else: boolean, else_diverges: boolean) -> void {
         const live_then: boolean = !then_diverges;
         const live_else: boolean = has_else && !else_diverges;
@@ -1763,8 +1872,14 @@ type struct DropInserter {
             // reaches post-if on the false path, so the move is
             // unconditional from post-if's perspective - no flag
             // needed.
+            mut tail_gov: boolean[] = [];
+            for (mut i: i64 = 0; i < then_gov.length; i++) { tail_gov.push(then_gov[i]); }
             if (!has_else) {
-                this.synth_flags_for_then_only_moves(it, out, then_keys, then_lines);
+                this.synth_flags_for_then_only_moves(it, out, &then_keys, &then_lines, &then_gov);
+                // Every then-move of an outer binding is flag-written now.
+                for (mut i: i64 = 0; i < then_keys.length; i++) {
+                    if (this.binding_in_outer_scope(then_keys[i])) { tail_gov[i] = true; }
+                }
             }
             // Surviving (then) path's moves carry past the if for
             // subsequent analysis.  set_moves_tail also keeps the
@@ -1772,7 +1887,7 @@ type struct DropInserter {
             // for any code that follows the if; with the flag in
             // place, maybe_append_drop still emits the conditional
             // drop because get_drop_flag wins before is_moved_id.
-            this.set_moves_tail(snap, then_keys, then_lines);
+            this.set_moves_tail(snap, then_keys, then_lines, tail_gov);
             return;
         }
         if (!live_then && live_else) {
@@ -1783,7 +1898,7 @@ type struct DropInserter {
             // for control-flow paths where neither branch was taken,
             // which doesn't happen for `if`.  No flag needed here;
             // just propagate the else-branch moves forward.
-            this.set_moves_tail(snap, else_keys, else_lines);
+            this.set_moves_tail(snap, else_keys, else_lines, else_gov);
             return;
         }
 
@@ -1794,52 +1909,77 @@ type struct DropInserter {
         // was moved.  Definitely-moved bindings (in both arms) need
         // no flag - they are unconditionally moved, so the existing
         // moved_keys path suppresses their scope-exit drop.
+        //
+        // A move a branch made only on some of ITS paths is already
+        // flag-written on exactly those paths (`all_governed`), so the flag
+        // is spliced into a branch only for a move that is not; and a binding
+        // moved on both branches still needs its flag written where one
+        // branch moved it definitely, once the other branch's conditional
+        // move has given it a flag.
         mut def_keys:  u64[] = [];
         mut def_lines: i32[] = [];
+        mut def_gov:   boolean[] = [];
         for (mut i: i64 = 0; i < then_keys.length; i++) {
-            if (!this.binding_in_outer_scope(then_keys[i])) { continue; }
+            const k: u64 = then_keys[i];
+            if (k == 0 || !this.binding_in_outer_scope(k)) { continue; }
             mut in_else: boolean = false;
             for (mut j: i64 = 0; j < else_keys.length; j++) {
-                if (then_keys[i] == else_keys[j]) { in_else = true; }
+                if (k == else_keys[j]) { in_else = true; }
             }
+            const gov_then: boolean = this.all_governed(&then_keys, &then_gov, k);
             if (in_else) {
-                // Definitely moved on both branches.
-                def_keys.push(then_keys[i]);
+                const gov_else: boolean = this.all_governed(&else_keys, &else_gov, k);
+                mut gov: boolean = gov_then && gov_else;
+                if (!gov && this.get_drop_flag(k).is_valid()) {
+                    // Moved on both branches, conditionally on one of them.
+                    if (!gov_then) {
+                        this.synth_flag_for_branch(it, out, k, then_lines[i], true, true);
+                    }
+                    if (!gov_else) {
+                        this.synth_flag_for_branch(it, out, k, then_lines[i], false, true);
+                    }
+                    gov = true;
+                }
+                def_keys.push(k);
                 def_lines.push(then_lines[i]);
+                def_gov.push(gov);
             } else {
                 // Then-only conditional move.  Flag + flag-set in then.
-                this.synth_flag_for_branch(it, out, then_keys[i], then_lines[i],
-                    /*branch_is_then=*/true);
-                def_keys.push(then_keys[i]);
+                this.synth_flag_for_branch(it, out, k, then_lines[i], true, !gov_then);
+                def_keys.push(k);
                 def_lines.push(then_lines[i]);
+                def_gov.push(true);
             }
         }
         for (mut j: i64 = 0; j < else_keys.length; j++) {
-            if (!this.binding_in_outer_scope(else_keys[j])) { continue; }
+            const k: u64 = else_keys[j];
+            if (k == 0 || !this.binding_in_outer_scope(k)) { continue; }
             mut in_then: boolean = false;
             for (mut i: i64 = 0; i < then_keys.length; i++) {
-                if (then_keys[i] == else_keys[j]) { in_then = true; }
+                if (then_keys[i] == k) { in_then = true; }
             }
             if (!in_then) {
                 // Else-only conditional move.  Flag + flag-set in else.
-                this.synth_flag_for_branch(it, out, else_keys[j], else_lines[j],
-                    /*branch_is_then=*/false);
-                def_keys.push(else_keys[j]);
+                const gov_else: boolean = this.all_governed(&else_keys, &else_gov, k);
+                this.synth_flag_for_branch(it, out, k, else_lines[j], false, !gov_else);
+                def_keys.push(k);
                 def_lines.push(else_lines[j]);
+                def_gov.push(true);
             }
         }
-        this.set_moves_tail(snap, def_keys, def_lines);
+        this.set_moves_tail(snap, def_keys, def_lines, def_gov);
     }
 
     /// Helper: synthesize a drop flag for a single binding moved in
     /// the given branch (true = then, false = else).  Hoists the
     /// flag-decl into `out` and splices `<flag>=true;` into the
-    /// branch's body.  Records the binding -> flag mapping so
+    /// branch's body unless `splice` is false (the branch already writes it
+    /// on the paths that moved).  Records the binding -> flag mapping so
     /// maybe_append_drop emits a conditional drop later.
     synth_flag_for_branch(mut &this, it: IfStmtNode*,
                             out: StatementNode*[]*,
                             binding: u64, move_line: i32,
-                            branch_is_then: boolean) -> void {
+                            branch_is_then: boolean, splice: boolean) -> void {
         // Already has a flag? Idempotent re-use - just splice the
         // flag-set into this branch.
         mut flag: SymbolStr = this.get_drop_flag(binding);
@@ -1852,6 +1992,7 @@ type struct DropInserter {
             out.push(this.make_drop_flag_decl(flag, decl_span));
             this.register_drop_flag(binding, flag);
         }
+        if (!splice) { return; }
         // Splice `<flag>=true;` at the end of the moving branch.
         const set_span: SourceSpan = this.line_only_span(move_line, it.span);
         if (branch_is_then) {
@@ -1875,6 +2016,7 @@ type struct DropInserter {
                                 move_line: i32,
                                 arms: &MatchArmNode*[], arm_count: i64,
                                 arm_move_keys: &u64[],
+                                arm_move_gov: &boolean[],
                                 arm_move_starts: &i64[],
                                 key: u64) -> void {
         mut flag: SymbolStr = this.get_drop_flag(key);
@@ -1890,11 +2032,18 @@ type struct DropInserter {
         for (mut a: i64 = 0; a < arm_count; a++) {
             const beg: i64 = arm_move_starts[a];
             const end: i64 = arm_move_starts[a + 1];
+            // An arm whose every move of `key` is already flag-written (made
+            // on some of the arm's own paths, or by a simple statement)
+            // keeps its writes.
             mut moved_here: boolean = false;
+            mut unwritten: boolean = false;
             for (mut j: i64 = beg; j < end; j++) {
-                if (arm_move_keys[j] == key) { moved_here = true; }
+                if (arm_move_keys[j] == key) {
+                    moved_here = true;
+                    if (!arm_move_gov[j]) { unwritten = true; }
+                }
             }
-            if (!moved_here) { continue; }
+            if (!moved_here || !unwritten) { continue; }
             const arm: MatchArmNode* = arms[a];
             if (arm == null || arm.body == null) { continue; }
             arm.body = this.splice_flag_set_into_branch(arm.body, flag, set_span);
@@ -1907,11 +2056,13 @@ type struct DropInserter {
     synth_flags_for_then_only_moves(mut &this, it: IfStmtNode*,
                                       out: StatementNode*[]*,
                                       then_keys: &u64[],
-                                      then_lines: &i32[]) -> void {
+                                      then_lines: &i32[],
+                                      then_gov: &boolean[]) -> void {
         for (mut i: i64 = 0; i < then_keys.length; i++) {
-            if (!this.binding_in_outer_scope(then_keys[i])) { continue; }
-            this.synth_flag_for_branch(it, out, then_keys[i], then_lines[i],
-                /*branch_is_then=*/true);
+            const k: u64 = then_keys[i];
+            if (k == 0 || !this.binding_in_outer_scope(k)) { continue; }
+            this.synth_flag_for_branch(it, out, k, then_lines[i], true,
+                !this.all_governed(then_keys, then_gov, k));
         }
     }
 
@@ -1935,107 +2086,6 @@ type struct DropInserter {
         return SourceSpan::new(this.ctx.source_file,
             line as u32, 1 as u32,
             line as u32, 1 as u32);
-    }
-
-    /// Original branch-join helper for match (and any non-if caller).
-    /// Same intersection/symmetric-difference logic that
-    /// merge_branches_if uses, but without drop-flag synthesis -
-    /// possibly-moved bindings still get E0456 here, pending the same
-    /// treatment for match arms in a follow-up.
-    merge_branches(mut &this, snap: i64,
-                   then_keys: u64[], then_lines: i32[], then_diverges: boolean,
-                   else_keys: u64[], else_lines: i32[],
-                   has_else: boolean, else_diverges: boolean) -> void {
-        // A diverging branch's moves don't escape; drop its
-        // contribution from the join.  This eliminates the
-        // `if (c) { use(b); return; }` false-positive where `b` would
-        // otherwise look conditionally moved.
-        const live_then: boolean = !then_diverges;
-        const live_else: boolean = has_else && !else_diverges;
-
-        // Effective branches after diverge filtering.  When neither is
-        // live (both diverge), the post-join state is unreachable and
-        // the moved-set doesn't matter.
-        if (!live_then && !live_else) {
-            this.restore_moves(snap);
-            return;
-        }
-        if (live_then && !live_else) {
-            // Only the then-branch falls through past the if.  Two shapes
-            // land here, distinguished by has_else:
-            //
-            //  - No explicit else (`if (c) { consume(x); }`): the implicit
-            //    fall-through else moves nothing, so a then-only move of an
-            //    outer-scope binding is genuinely *conditional* - `x` is moved
-            //    on the true path but survives the false path, where the
-            //    fail-safe under-drop below suppresses its drop: a
-            //    memory-safe leak.  Warn (E0456) for each such binding.
-            //
-            //  - Diverging else (`if (c) { consume(x); } else { return; }`):
-            //    the else path never reaches post-if, so the then-branch is
-            //    the only surviving path and its move is *unconditional* -
-            //    not a leak.  Don't warn.
-            //
-            // Reassignment (`x = f(x)`) never reaches here as a live move:
-            // read_binary unmarks the lhs after the rhs move, tombstoning it
-            // (id 0) out of then_keys; binding_in_outer_scope rejects id 0 and
-            // any branch-local binding, so neither false-positives.
-            if (!has_else) {
-                for (mut i: i64 = 0; i < then_keys.length; i++) {
-                    if (this.binding_in_outer_scope(then_keys[i])) {
-                        this.emit_conditional_move_by_id(then_keys[i], then_lines[i]);
-                    }
-                }
-            }
-            // The surviving (then) path's moves carry past the if.  With a
-            // diverging else this is exact; with no else it's the fail-safe
-            // under-drop on the false path - the leak just warned about.
-            this.set_moves_tail(snap, then_keys, then_lines);
-            return;
-        }
-        if (!live_then && live_else) {
-            // Only the else-branch falls through.  When there's no
-            // explicit else, live_else can't be true, so this only
-            // fires for `if (c) { ... return; } else { ... }`.
-            this.set_moves_tail(snap, else_keys, else_lines);
-            return;
-        }
-
-        // Both branches fall through: definitely-moved is the
-        // intersection; possibly-moved is the symmetric difference.
-        // Branch-local bindings (declared inside the then or else
-        // body) are filtered out: they don't exist past the if-stmt
-        // and shouldn't drive the cross-branch join.
-        mut def_keys:  u64[] = [];
-        mut def_lines: i32[] = [];
-        for (mut i: i64 = 0; i < then_keys.length; i++) {
-            if (!this.binding_in_outer_scope(then_keys[i])) { continue; }
-            mut in_else: boolean = false;
-            for (mut j: i64 = 0; j < else_keys.length; j++) {
-                if (then_keys[i] == else_keys[j]) { in_else = true; }
-            }
-            if (in_else) {
-                def_keys.push(then_keys[i]);
-                def_lines.push(then_lines[i]);
-            } else {
-                this.emit_conditional_move_by_id(then_keys[i], then_lines[i]);
-                def_keys.push(then_keys[i]);
-                def_lines.push(then_lines[i]);
-            }
-        }
-        for (mut j: i64 = 0; j < else_keys.length; j++) {
-            if (!this.binding_in_outer_scope(else_keys[j])) { continue; }
-            mut in_then: boolean = false;
-            for (mut i: i64 = 0; i < then_keys.length; i++) {
-                if (then_keys[i] == else_keys[j]) { in_then = true; }
-            }
-            if (!in_then) {
-                this.emit_conditional_move_by_id(else_keys[j], else_lines[j]);
-                def_keys.push(else_keys[j]);
-                def_lines.push(else_lines[j]);
-            }
-        }
-        this.set_moves_tail(snap, def_keys, def_lines);
     }
 
     emit_conditional_move_by_id(mut &this, key: u64, line: i32) -> void {
@@ -2498,6 +2548,7 @@ type struct DropInserter {
     /// release is a double free.
     record_assign_drop(mut &this, b: BinaryExprNode*) -> void {
         this.pend_assign_node = null;
+        this.pend_assign_guard_moved = false;
         if (b == null || b.left == null) { return; }
         // The destination must be storage this frame owns.  The chain is read
         // syntactically and then typed from the BINDING down (`place_type_of`),
@@ -2517,11 +2568,24 @@ type struct DropInserter {
         const place_ty: TypeRef = this.place_type_of(
             this.binding_types[slot], &kind, &key, 0, kind.length);
         if (!this.type_needs_drop(place_ty)) { return; }
+        // Moved out on some paths: the binding's move flag says, at run time,
+        // whether the destination still holds its value, and every statement
+        // that moves the binding sets it (`append_move_flag_writes`) - so the
+        // displaced value is released where the flag is clear.  A move by
+        // THIS statement's right-hand side (`t = takes_it(t)`) has not written
+        // the flag yet, and is known here to have taken the value.  A member
+        // destination, or a binding that is also conditionally initialized,
+        // is not described by the one flag, and declines.
+        const move_flag: u32 = this.binding_dropflags[slot];
+        if (move_flag != (0 as u32)) {
+            if (kind.length != 0 || this.slot_has_members(slot)) { return; }
+            if (this.binding_definit[slot] != (1 as u8)) { return; }
+            if (this.moved_since(this.stmt_move_snap, root.id)) { return; }
+            this.pend_assign_guard_moved = true;
+            this.pend_assign(b, slot, move_flag, place_ty, kind, key);
+            return;
+        }
         if (this.is_moved(root)) { return; }
-        // Conditionally moved out on some path: whether the destination still
-        // holds a value is decided at run time by a flag whose polarity this
-        // site does not track.
-        if (this.binding_dropflags[slot] != (0 as u32)) { return; }
 
         const root_live:  boolean = this.binding_definit[slot] == (1 as u8);
         const root_flag:  u32     = this.binding_initflags[slot];
@@ -2557,6 +2621,13 @@ type struct DropInserter {
                 return;
             }
         }
+        this.pend_assign(b, slot, guard, place_ty, kind, key);
+    }
+
+    /// Stash the release `record_assign_drop` decided on for the enclosing
+    /// expression statement to emit.
+    pend_assign(mut &this, b: BinaryExprNode*, slot: i64, guard: u32,
+                place_ty: TypeRef, kind: u8[], key: u32[]) -> void {
         this.pend_assign_node  = b as ExpressionNode*;
         this.pend_assign_guard = guard;
         this.pend_assign_ty    = place_ty;
@@ -2564,6 +2635,60 @@ type struct DropInserter {
         this.pend_assign_base_ty = this.binding_types[slot];
         this.pend_assign_kind    = kind;
         this.pend_assign_key     = key;
+    }
+
+    /// Whether `key` entered the moved-set after `snapshot` and is still
+    /// there (a revive tombstones its entry).
+    moved_since(&this, snapshot: i64, key: u64) -> boolean {
+        if (key == 0) { return false; }
+        for (mut i: i64 = snapshot; i < this.moved_keys.length; i++) {
+            if (this.moved_keys[i] == key) { return true; }
+        }
+        return false;
+    }
+
+    /// Keep the move flags true to what their bindings hold after a simple
+    /// statement: a flagged binding the statement moved out is set moved,
+    /// and a flagged binding the statement assigns (`x = ...`) holds a value
+    /// again and is set clear - in that order, so `x = f(x)` ends clear.
+    ///
+    /// A flag is created where a branch join finds a binding moved on some
+    /// paths only, and the join sets it in the moving branches.  That covers
+    /// the join and nothing after it: a later `x = make();` left the flag
+    /// saying "moved", and the scope-exit `if (!flag) x.drop()` never
+    /// released the new value; a later `consume(x);` left it saying "not
+    /// moved" on the path that had not moved it, and the value was released
+    /// twice.
+    append_move_flag_writes(mut &this, snapshot: i64, expr: ExpressionNode*,
+                            out: StatementNode*[]*, span: SourceSpan) -> void {
+        mut written: u64[] = [];
+        for (mut i: i64 = snapshot; i < this.moved_keys.length; i++) {
+            const k: u64 = this.moved_keys[i];
+            if (k == 0 || !this.moved_gov[i]) { continue; }
+            mut seen: boolean = false;
+            for (mut w: i64 = 0; w < written.length; w++) {
+                if (written[w] == k) { seen = true; }
+            }
+            if (seen) { continue; }
+            written.push(k);
+            const flag: SymbolStr = this.get_drop_flag(k);
+            if (flag.is_valid()) { out.push(this.make_drop_flag_write(flag, true, span)); }
+        }
+        const target: SymbolStr = this.move_flag_for_assignment_target(expr);
+        if (target.is_valid()) { out.push(this.make_drop_flag_write(target, false, span)); }
+    }
+
+    /// The move flag of the binding a plain `<ident> = ...` assigns as a
+    /// whole, or an invalid SymbolStr.  A member assignment leaves the
+    /// binding's whole-value state as it was.
+    move_flag_for_assignment_target(&this, expr: ExpressionNode*) -> SymbolStr {
+        if (expr == null || expr.kind != NodeKind::BinaryExpression) { return SymbolStr::empty(); }
+        const b: BinaryExprNode* = expr as BinaryExprNode*;
+        if (b.op.kind != TokenType::Equal || b.left == null) { return SymbolStr::empty(); }
+        if (b.left.kind != NodeKind::Identifier) { return SymbolStr::empty(); }
+        const sym: SymbolID = (b.left as IdentifierNode*).res.local_sym();
+        if (!sym.is_valid()) { return SymbolStr::empty(); }
+        return this.get_drop_flag(sym.id);
     }
 
     /// Rewrite `<place> = <rhs>;` so the value `<place>` held is released:
@@ -2610,8 +2735,12 @@ type struct DropInserter {
         } else {
             mut core: StatementNode*[] = [];
             core.push(drop_stmt);
-            out.push(this.wrap_in_init_guard(
-                SymbolStr::from_id(this.pend_assign_guard), core, span));
+            const guard: SymbolStr = SymbolStr::from_id(this.pend_assign_guard);
+            if (this.pend_assign_guard_moved) {
+                out.push(this.wrap_in_move_guard(guard, core, span));
+            } else {
+                out.push(this.wrap_in_init_guard(guard, core, span));
+            }
         }
         this.inserted += 1;
     }
@@ -2752,14 +2881,21 @@ type struct DropInserter {
         return ds as StatementNode*;
     }
 
-    /// Build `<flag> = true;` as an ExprStmt wrapping a BinaryExpr with
-    /// the bare `=` token.  Drop-flag locals are always `mut` (see
-    /// `make_drop_flag_decl`), so this is a legal assignment target.
+    /// Build `<flag> = true;`.
     make_drop_flag_set(mut &this, flag_name: SymbolStr,
                         span: SourceSpan) -> StatementNode* {
+        return this.make_drop_flag_write(flag_name, true, span);
+    }
+
+    /// Build `<flag> = <value>;` as an ExprStmt wrapping a BinaryExpr with
+    /// the bare `=` token.  Drop-flag locals are always `mut` (see
+    /// `make_drop_flag_decl`), so this is a legal assignment target.
+    make_drop_flag_write(mut &this, flag_name: SymbolStr, value: boolean,
+                         span: SourceSpan) -> StatementNode* {
         const lhs: IdentifierNode* = new IdentifierNode(flag_name, span);
         lhs.set_resolved_type(this.arena.get_bool());
-        const rhs: LiteralNode* = new LiteralNode("true", LiteralKind::Boolean, span);
+        const text: string = if (value) { "true" } else { "false" };
+        const rhs: LiteralNode* = new LiteralNode(text, LiteralKind::Boolean, span);
         rhs.set_resolved_type(this.arena.get_bool());
         const eq_tok: Token = Token::new(TokenType::Equal, "=",
             span.start_line as int, span.start_col as int);

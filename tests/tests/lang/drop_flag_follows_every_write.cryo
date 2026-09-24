@@ -1,0 +1,251 @@
+// A binding moved out on some paths only is released at scope exit under a
+// flag that says whether it was moved.  The flag has to follow every later
+// write of the binding, not only the branch that created it: a refill makes
+// the binding own a value again (and releases the one it displaced, where
+// there was one), and a later move gives the value away.  An enclosing
+// branch must not claim "moved" for a move its inner branch made only on
+// some paths.
+//
+// Each case releases every value it made exactly once.  `rel_count` alone
+// cannot tell a double free from a leak (two frees of one value and none of
+// another count the same), so each release also adds its tag to `rel_sum`,
+// and every case's tags are distinct powers of ten.
+![config(testing)]
+namespace CryoTests::Tests::Lang::DropFlagFollowsEveryWrite;
+
+import std::test;
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::option;
+import std::core::option::{ Option };
+import std::test::assert::{ expect_eq };
+import std::test::error::{ TestError };
+
+mut rel_count: i32 = 0;
+mut rel_sum: i32 = 0;
+
+type struct Item {
+    tag: i32;
+
+    drop(mut &this) -> void {
+        rel_count = rel_count + 1;
+        rel_sum = rel_sum + this.tag;
+    }
+}
+
+function consume(i: Item) -> void { }
+
+function consume_opt(o: Option<Item>) -> void { }
+
+function tag_of(o: Option<Item>) -> i32 {
+    return match (o) { Option::Some(x) => { x.tag } Option::None => { 0 } };
+}
+
+function make(tag: i32) -> Option<Item> { return Option::Some(Item { tag: tag }); }
+
+function reset() -> void {
+    rel_count = 0;
+    rel_sum = 0;
+}
+
+function released(count: i32, sum: i32) -> Result<(), TestError> {
+    match (expect_eq(rel_count, count)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(rel_sum, sum);
+}
+
+// The payload given away in a loop whose subject is refilled each pass:
+// the value made last is released at the end.
+function loop_takes_payload_then_refills() -> void {
+    mut o: Option<Item> = make(1);
+    mut i: i32 = 0;
+    while (i < 3) {
+        match (o) { Option::Some(x) => { consume(x); } Option::None => { } }
+        o = make(if (i == 0) { 10 } else { if (i == 1) { 100 } else { 1000 } });
+        i = i + 1;
+    }
+}
+
+// The same without a loop.
+function take_payload_then_refill() -> void {
+    mut o: Option<Item> = make(1);
+    match (o) { Option::Some(x) => { consume(x); } Option::None => { } }
+    o = make(10);
+}
+
+// The arm keeps its payload on this path: the refill displaces a live value.
+function arm_keeps_payload_then_refill() -> void {
+    mut o: Option<Item> = make(1);
+    match (o) { Option::Some(x) => { if (x.tag > 5) { consume(x); } } Option::None => { } }
+    o = make(10);
+}
+
+// Moved on one path, refilled: the displaced value is live on the other.
+function refill_after_conditional_move(c: boolean) -> void {
+    mut o: Option<Item> = make(1);
+    if (c) { consume_opt(o); }
+    o = make(10);
+}
+
+// Moved on one path, refilled, then given away on every path.
+function refill_then_move(c: boolean) -> void {
+    mut o: Option<Item> = make(1);
+    if (c) { consume_opt(o); }
+    o = make(10);
+    consume_opt(o);
+}
+
+// ... given away by the return expression.
+function refill_then_return(c: boolean) -> i32 {
+    mut o: Option<Item> = make(1);
+    if (c) { consume_opt(o); }
+    o = make(10);
+    return tag_of(o);
+}
+
+// ... moved into another binding.
+function refill_then_bind(c: boolean) -> void {
+    mut o: Option<Item> = make(1);
+    if (c) { consume_opt(o); }
+    o = make(10);
+    const p: Option<Item> = o;
+}
+
+// The shape of the HTTP/2 header loop (`std::net::http2::connection`): a
+// repeated header's previous value is released by hand in a match, the new
+// one stored, and with no method the value goes to a cleanup before the
+// return.  The return's release has to see that the cleanup took it.
+function replace_in_loop_then_give_away(headers: i32) -> i32 {
+    mut path: Option<Item> = Option::None;
+    mut i: i32 = 0;
+    while (i < headers) {
+        if (i >= 0) {
+            match (path) { Option::Some(mut p) => { p.drop(); } Option::None => { } }
+            path = make(if (i == 0) { 10 } else { 100 });
+        }
+        i = i + 1;
+    }
+    consume_opt(path);
+    return -1;
+}
+
+// A move inside a branch of a branch.
+function nested_branch_move(a: boolean, b: boolean) -> void {
+    mut o: Option<Item> = make(1);
+    if (a) {
+        if (b) { consume_opt(o); }
+    }
+}
+
+![test]
+function payload_taken_in_loop_releases_last_refill() -> Result<(), TestError> {
+    reset();
+    loop_takes_payload_then_refills();
+    return released(4, 1111);
+}
+
+![test]
+function payload_taken_then_refilled_releases_refill() -> Result<(), TestError> {
+    reset();
+    take_payload_then_refill();
+    return released(2, 11);
+}
+
+![test]
+function arm_that_keeps_payload_then_refill_releases_both() -> Result<(), TestError> {
+    reset();
+    arm_keeps_payload_then_refill();
+    return released(2, 11);
+}
+
+![test]
+function refill_after_conditional_move_releases_displaced() -> Result<(), TestError> {
+    reset();
+    refill_after_conditional_move(false);
+    match (released(2, 11)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    reset();
+    refill_after_conditional_move(true);
+    return released(2, 11);
+}
+
+![test]
+function refill_then_move_releases_each_once() -> Result<(), TestError> {
+    reset();
+    refill_then_move(false);
+    match (released(2, 11)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    reset();
+    refill_then_move(true);
+    return released(2, 11);
+}
+
+![test]
+function refill_then_return_releases_each_once() -> Result<(), TestError> {
+    reset();
+    match (expect_eq(refill_then_return(false), 10)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (released(2, 11)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    reset();
+    match (expect_eq(refill_then_return(true), 10)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return released(2, 11);
+}
+
+![test]
+function refill_then_bind_releases_each_once() -> Result<(), TestError> {
+    reset();
+    refill_then_bind(false);
+    match (released(2, 11)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    reset();
+    refill_then_bind(true);
+    return released(2, 11);
+}
+
+![test]
+function replaced_value_given_away_is_released_once() -> Result<(), TestError> {
+    reset();
+    replace_in_loop_then_give_away(1);
+    match (released(1, 10)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    reset();
+    replace_in_loop_then_give_away(2);
+    return released(2, 110);
+}
+
+![test]
+function nested_branch_move_releases_once() -> Result<(), TestError> {
+    reset();
+    nested_branch_move(true, false);
+    match (released(1, 1)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    reset();
+    nested_branch_move(true, true);
+    match (released(1, 1)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    reset();
+    nested_branch_move(false, false);
+    return released(1, 1);
+}
