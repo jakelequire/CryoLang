@@ -102,7 +102,7 @@ is one the language fixes (`__call__`, `Ready`, `Ok`/`Err`, `Some`/`None`).
 ## The table
 
 <!-- residue-table:begin -->
-Population **333** - J 149 · N 116 · S 18 · B 27 · C 19 · F 2 · W 2
+Population **329** - J 149 · N 116 · S 16 · B 27 · C 19 · F 2 · W 0
 
 | site | read | key as written | class | reason |
 |---|---|---|---|---|
@@ -166,7 +166,7 @@ Population **333** - J 149 · N 116 · S 18 · B 27 · C 19 · F 2 · W 2
 | `compiler/sema/sema.cryo:3209` | `ClassType::get_method` | `scope.member_name` | J | member: a class's method by its leaf off the `ClassType` in hand |
 | `compiler/codegen/ops/declaration_emitter.cryo:780` | `ClassType::methods[]` | `slot_name` | J | member: a class's method by its leaf off the `ClassType` in hand, scanned inline (the vtable's slot walk; an arity predicate) |
 | `compiler/sema/call_resolver.cryo:449` | `ClassType::methods[]` | `member.member` | J | member: a class's method by its leaf off the `ClassType` in hand, scanned inline (the vtable's slot walk; an arity predicate) |
-| `compiler/passes/type_resolution.cryo:2463` | `DeclarationIndex::extern_symbol_conflict` | `ext_link_sym, func_type_ref` | J | extern: a C symbol by its link name, the only identity a C symbol has |
+| `compiler/passes/type_resolution.cryo:2460` | `DeclarationIndex::extern_symbol_conflict` | `ext_link_sym, func_type_ref` | J | extern: a C symbol by its link name, the only identity a C symbol has |
 | `compiler/sema/type_utils.cryo:152` | `DeclarationIndex::global_entry_in_module` | `scope.member_name, seen.def_id()` | J | member: a global's leaf inside the module the qualifier's stamp names (a `DefId`) |
 | `compiler/compilation_context.cryo:524` | `DeclarationIndex::is_prelude_ns` | `ModulePath::of(cand_ns)` | J | module: a namespace asked whether it is the prelude's; a module's identity is its path |
 | `compiler/resolver/name_resolution.cryo:1475` | `DeclarationIndex::is_prelude_ns` | `owner_path` | J | module: a namespace asked whether it is the prelude's; a module's identity is its path |
@@ -309,9 +309,9 @@ Population **333** - J 149 · N 116 · S 18 · B 27 · C 19 · F 2 · W 2
 | `compiler/codegen/ops/declaration_emitter.cryo:641` | `DeclarationIndex::impl_owner` | `node, "codegen/declare impl"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
 | `compiler/codegen/visit/decl_visit_emitter.cryo:217` | `DeclarationIndex::impl_owner` | `node, "codegen/impl bodies"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
 | `compiler/passes/type_resolution.cryo:1214` | `DeclarationIndex::impl_owner` | `node, "type_resolution/register impl methods"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:2397` | `DeclarationIndex::impl_owner` | `node, "type_resolution/impl methods"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:2732` | `DeclarationIndex::impl_owner` | `node, "type_resolution/impl methods"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:3441` | `DeclarationIndex::impl_owner` | `node, "type_resolution/struct field sync"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:2394` | `DeclarationIndex::impl_owner` | `node, "type_resolution/impl methods"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:2729` | `DeclarationIndex::impl_owner` | `node, "type_resolution/impl methods"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:3438` | `DeclarationIndex::impl_owner` | `node, "type_resolution/struct field sync"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
 | `compiler/sema/sema.cryo:392` | `DeclarationIndex::impl_owner` | `ib, "sema/async declare"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
 | `compiler/sema/sema.cryo:642` | `DeclarationIndex::impl_owner` | `node, "sema/visit:ImplBlockNode"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
 | `compiler/sema/sema.cryo:674` | `DeclarationIndex::impl_owner` | `node, "sema/visit:ImplBlockNode"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
@@ -337,14 +337,14 @@ Population **333** - J 149 · N 116 · S 18 · B 27 · C 19 · F 2 · W 2
 | `compiler/passes/type_resolution.cryo:979` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/register union methods"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
 | `compiler/passes/type_resolution.cryo:983` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/register class methods"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
 | `compiler/passes/type_resolution.cryo:2252` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/struct methods"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:2261` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/union methods"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:2270` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/class methods"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:2302` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/trait populate"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:2633` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/alias target"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:3076` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/struct field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:3151` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/union field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:3211` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/class field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
-| `compiler/passes/type_resolution.cryo:3326` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/enum field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:2260` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/union methods"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:2268` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/class methods"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:2299` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/trait populate"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:2630` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/alias target"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:3073` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/struct field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:3148` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/union field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:3208` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/class field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
+| `compiler/passes/type_resolution.cryo:3323` | `DeclarationIndex::type_of_decl` | `node.def, "type_resolution/enum field sync"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
 | `compiler/sema/sema.cryo:374` | `DeclarationIndex::type_of_decl` | `s.def, "sema/async declare struct"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
 | `compiler/sema/sema.cryo:379` | `DeclarationIndex::type_of_decl` | `u.def, "sema/async declare union"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
 | `compiler/sema/sema.cryo:384` | `DeclarationIndex::type_of_decl` | `c.def, "sema/async declare class"` | N | keyed by the `DefId`; the string is the diagnostic label of the asking site |
@@ -386,7 +386,7 @@ Population **333** - J 149 · N 116 · S 18 · B 27 · C 19 · F 2 · W 2
 | `compiler/mono/state.cryo:346` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/mono/state.cryo:408` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/passes/type_resolution.cryo:114` | `ResolutionContext::new` | `ctx.source_file` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/passes/type_resolution.cryo:3348` | `ResolutionContext::new` | `ctx.source_file` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/passes/type_resolution.cryo:3345` | `ResolutionContext::new` | `ctx.source_file` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/call_resolver.cryo:657` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/call_resolver.cryo:1423` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/call_resolver.cryo:1555` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
@@ -418,7 +418,7 @@ Population **333** - J 149 · N 116 · S 18 · B 27 · C 19 · F 2 · W 2
 | `compiler/sema/sema.cryo:2645` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/sema.cryo:3923` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/symbolic_checker.cryo:179` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/passes/type_resolution.cryo:2322` | `TraitType::add_assoc_type` | `adecl.name` | N | a write: the trait's own associated-type name recorded on the trait type |
+| `compiler/passes/type_resolution.cryo:2319` | `TraitType::add_assoc_type` | `adecl.name` | N | a write: the trait's own associated-type name recorded on the trait type |
 | `compiler/sema/method_binding.cryo:1105` | `FunctionDeclNode::trait_bounds[]` | `pname` | S | the function's `where` bound by the bounded parameter's leaf, read off the arena's `GenericParamType.param_name` (see `ImplBlockNode::where_bounds[]`) |
 | `compiler/sema/method_binding.cryo:1094` | `ImplBlockNode::where_bounds[]` | `pname` | S | the impl's `where` bound by the bounded parameter's leaf, the leaf read off the arena's `GenericParamType.param_name` - the type layer's only identity for a parameter until the arena is keyed by symbol |
 | `compiler/sema/symbolic_checker.cryo:129` | `SemaState::symbolic_method_param_nodes[]` | `sym` | S | the method's generic parameters under symbolic check, asked whether a parameter TYPE's spelling is one of them (see the owner's) |
@@ -426,8 +426,6 @@ Population **333** - J 149 · N 116 · S 18 · B 27 · C 19 · F 2 · W 2
 | `compiler/sema/call_resolver.cryo:580` | `TemplateEntry::param_names[]` | `gp.param_name` | S | the template's parameter DISPLAYS compared by spelling with a parameter type's name - the compares the arena keyed by symbol retires |
 | `compiler/sema/call_resolver.cryo:681` | `TemplateEntry::param_names[]` | `pname` | S | the template's parameter DISPLAYS compared by spelling with a parameter type's name - the compares the arena keyed by symbol retires |
 | `compiler/sema/call_resolver.cryo:5149` | `TemplateEntry::param_names[]` | `pname` | S | the template's parameter DISPLAYS compared by spelling with a parameter type's name - the compares the arena keyed by symbol retires |
-| `compiler/types/resolver.cryo:1159` | `TypeArena::is_self_growing_instantiation` | ` ...` | S | the owner's qualified name off the impl target, compared with instantiation names in the arena |
-| `compiler/types/resolver.cryo:1168` | `TypeArena::is_self_growing_instantiation` | ` ...` | S | the owner's qualified name off the impl target, compared with instantiation names in the arena |
 | `compiler/sema/call_resolver.cryo:2602` | `TypeUtils::lookup_type_exact` | `scope_sym` | S | a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`) |
 | `compiler/sema/call_resolver.cryo:3640` | `TypeUtils::lookup_type_exact` | `scope_sym` | S | a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`) |
 | `compiler/sema/call_resolver.cryo:3953` | `TypeUtils::lookup_type_exact` | `owner_sym` | S | a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`) |
@@ -437,8 +435,6 @@ Population **333** - J 149 · N 116 · S 18 · B 27 · C 19 · F 2 · W 2
 | `compiler/sema/call_resolver.cryo:5751` | `TypeUtils::lookup_type_exact` | `lookup_sym` | S | a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`) |
 | `compiler/sema/method_binding.cryo:359` | `local::TraitBound[]` | `param` | S | `where` bounds held in a local, by the bounded parameter's leaf read off the arena's `GenericParamType.param_name` |
 | `compiler/sema/method_binding.cryo:417` | `local::TraitBound[]` | `param` | S | `where` bounds held in a local, by the bounded parameter's leaf read off the arena's `GenericParamType.param_name` |
-| `compiler/mono/dispatch_annotator.cryo:155` | `FunctionDeclNode::parameters[]` | `id.name` | W | an identifier matched to the function's parameter by spelling; the identifier's own stamp is not asked |
-| `compiler/sema/async_lower.cryo:2710` | `FunctionDeclNode::parameters[]` | `(val as IdentifierNode*).name` | W | a struct literal's identifier value matched to the async function's parameter by spelling; the identifier's own stamp is not asked |
 <!-- residue-table:end -->
 
 ## Elsewhere: population names on types that hold nothing

@@ -265,8 +265,6 @@ CLASS_OF_METHOD = {
     "Resolver::find_module_scope":
         ("J", "module: a module's scope by its namespace path, to stand in it while a template is instantiated"),
     # -- the arena and the constant table --
-    "TypeArena::is_self_growing_instantiation":
-        ("S", "the owner's qualified name off the impl target, compared with instantiation names in the arena"),
     "ConstantTable::intern_qualified":
         ("N", "a key MINTED at the constant's declaration (`ns::name`) for its registration; the write side"),
     "ConstantTable::parse_int_literal":
@@ -315,10 +313,6 @@ SITE_OVERRIDES = {
     # rule 1c scans, for the reason above `local::GenericParamNode[]`.
     ("compiler/bindgen/importer.cryo", "ExternBlockNode::functions[]", "sym"):
         ("J", "extern: whether this extern block already declares the C function of this LINK NAME, asked as the importer emits it. A C symbol's link name is the whole of its identity - C has no declaration to key on, and two C declarations sharing a link name are one entity by the linkage rule - so there is no stamp this could ask instead, and the leaf it compares is the mangling the linker will use"),
-    ("compiler/mono/dispatch_annotator.cryo", "FunctionDeclNode::parameters[]", "id.name"):
-        ("W", "an identifier matched to the function's parameter by spelling; the identifier's own stamp is not asked"),
-    ("compiler/sema/async_lower.cryo", "FunctionDeclNode::parameters[]", "(val as IdentifierNode*).name"):
-        ("W", "a struct literal's identifier value matched to the async function's parameter by spelling; the identifier's own stamp is not asked"),
     ("compiler/resolver/name_resolution.cryo", "FunctionDeclNode::parameters[]", "param.name.id"):
         ("J", "member: the resolver's duplicate-parameter check, a parameter by leaf inside the function being bound"),
     ("compiler/AST/dumper.cryo", "DestructureDeclNode::bindings[]", "b.local_name.id"):
