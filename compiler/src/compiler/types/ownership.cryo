@@ -336,7 +336,7 @@ type struct OwnershipQuery {
         // structural field walk.
         if (k == TypeKind::Struct) {
             const st: StructType* = t as StructType*;
-            if (OwnershipQuery::is_thread_safety_denied(arena, intern, ty)) {
+            if (OwnershipQuery::is_thread_safety_denied(arena, registry, intern, ty)) {
                 return false;
             }
             return OwnershipQuery::all_fields_thread_safe(arena, registry, intern,
@@ -344,7 +344,7 @@ type struct OwnershipQuery {
         }
         if (k == TypeKind::Class) {
             const ct: ClassType* = t as ClassType*;
-            if (OwnershipQuery::is_thread_safety_denied(arena, intern, ty)) {
+            if (OwnershipQuery::is_thread_safety_denied(arena, registry, intern, ty)) {
                 return false;
             }
             return OwnershipQuery::all_fields_thread_safe(arena, registry, intern,
@@ -352,7 +352,7 @@ type struct OwnershipQuery {
         }
         if (k == TypeKind::Enum) {
             const et: EnumType* = t as EnumType*;
-            if (OwnershipQuery::is_thread_safety_denied(arena, intern, ty)) {
+            if (OwnershipQuery::is_thread_safety_denied(arena, registry, intern, ty)) {
                 return false;
             }
             return OwnershipQuery::all_variants_thread_safe(arena, registry, intern,
@@ -370,7 +370,7 @@ type struct OwnershipQuery {
             const inst: InstantiatedType* = t as InstantiatedType*;
             // Deny-list check on the template's canonical identity catches
             // `Rc<T>` even when its type_args[0] is itself thread-safe.
-            if (OwnershipQuery::is_thread_safety_denied(arena, intern, ty)) {
+            if (OwnershipQuery::is_thread_safety_denied(arena, registry, intern, ty)) {
                 return false;
             }
             if (inst.has_resolved_type()) {
@@ -522,20 +522,24 @@ type struct OwnershipQuery {
     ///     same thread that acquired the lock, so a guard cannot
     ///     cross threads.
     ///
-    /// Keyed on the target's canonical QUALIFIED-NAME identity (via
-    /// `named_qualified_id`, peeling an `InstantiatedType` to its template), NOT
-    /// the bare leaf: a USER type merely NAMED `Rc` must not be denied Send/Sync.
-    /// Conservative direction (a false deny is over-restrictive, not unsound),
-    /// but keyed precisely so only the actual stdlib types are denied.
-    static is_thread_safety_denied(arena: TypeArena*, intern: InternTable*,
-                                   ty: TypeRef) -> boolean {
-        if (arena == null || intern == null) { return false; }
+    /// Keyed on the target's canonical identity (via `named_qualified_id`,
+    /// peeling an `InstantiatedType` to its template) against the identities
+    /// those declarations claimed, NOT the bare leaf: a USER type merely NAMED
+    /// `Rc` must not be denied Send/Sync.  Conservative direction (a false
+    /// deny is over-restrictive, not unsound), but keyed precisely so only the
+    /// actual stdlib types are denied.
+    static is_thread_safety_denied(arena: TypeArena*, registry: GenericRegistry*,
+                                   intern: InternTable*, ty: TypeRef) -> boolean {
+        if (arena == null || registry == null || intern == null) { return false; }
         const qid: u64 = OwnershipQuery::named_qualified_id(arena, intern, ty);
         if (qid == 0) { return false; }
-        if (qid == intern.intern("std::alloc::rc::Rc").id as u64) { return true; }
-        if (qid == intern.intern("std::sync::mutex::MutexGuard").id as u64) { return true; }
-        if (qid == intern.intern("std::sync::rwlock::RwLockReadGuard").id as u64) { return true; }
-        if (qid == intern.intern("std::sync::rwlock::RwLockWriteGuard").id as u64) { return true; }
+        const denied: LangItem[] = [
+            LangItem::Rc, LangItem::MutexGuard, LangItem::RwLockReadGuard, LangItem::RwLockWriteGuard,
+        ];
+        for (mut i: i64 = 0; i < denied.length; i++) {
+            const id: SymbolStr = registry.wellknown(denied[i]);
+            if (id.is_valid() && qid == id.id as u64) { return true; }
+        }
         return false;
     }
 

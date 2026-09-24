@@ -85,6 +85,8 @@ import compiler::resolver::module_path;
 import compiler::resolver::module_path::{ ModulePath };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::type_ref::{ TypeRef };
+import compiler::types::generic_registry;
+import compiler::types::generic_registry::{ LangModule };
 
 
 // PassStats: Per-pass execution statistics
@@ -897,6 +899,11 @@ type struct PassRegistry {
                     const struct_ref: TypeRef =
                         arena.create_struct(qualified_sym, struct_module_sym);
                     node.def = ctx.decl_index.register_type(qualified_sym, struct_ref, node.is_public);
+                    // Whether this IS the language's `Array`, `Slice`, `Rc`, ...
+                    // is decided by the identity, claimed where it is minted.
+                    if (ctx.generic_registry != null) {
+                        ctx.generic_registry.claim_wellknown(qualified_sym, ctx.intern_table);
+                    }
                     // A C-imported type (binding_namespace set) is reachable
                     // ONLY via its alias (`cit::Vec2`); registering its bare
                     // name globally would pollute the namespace and shadow
@@ -948,6 +955,9 @@ type struct PassRegistry {
                     const class_ref: TypeRef =
                         arena.create_class(qualified_sym, module_sym);
                     node.def = ctx.decl_index.register_type(qualified_sym, class_ref, node.is_public);
+                    if (ctx.generic_registry != null) {
+                        ctx.generic_registry.claim_wellknown(qualified_sym, ctx.intern_table);
+                    }
                     if (!qualified_sym.equals(node.name)) {
                         ctx.decl_index.register_name_mapping(node.name, qualified_sym);
                     }
@@ -1104,7 +1114,7 @@ type struct PassRegistry {
         // de-duplicated during name resolution.
         if (root.uses_fstring) {
             const interp_import: ImportDeclNode* = new ImportDeclNode(
-                "std::fmt::interp", ImportStyle::Wildcard, SourceSpan::none());
+                LangModule::Interp.path(), ImportStyle::Wildcard, SourceSpan::none());
             mut with_interp: ASTNode*[] = [];
             with_interp.push(interp_import as ASTNode*);
             for (mut fi: i64 = 0; fi < root.statements.length; fi++) {
@@ -1123,7 +1133,7 @@ type struct PassRegistry {
         // wildcard that binds nothing looks exactly like a module that exports
         // nothing, so it would present as thousands of unresolved names with
         // no diagnostic of its own.
-        const prelude_path: string = "std::prelude";
+        const prelude_path: string = LangModule::Prelude.path();
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
             if (stmt != null && stmt.kind == NodeKind::ImportDeclaration) {

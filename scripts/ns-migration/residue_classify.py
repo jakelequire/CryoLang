@@ -216,7 +216,7 @@ CLASS_OF_METHOD = {
     "DeclarationIndex::lookup_method_return":
         ("J", "member: a method's return by its leaf off the owner `TypeRef` in hand; the store is keyed by the owner's arena id"),
     "DeclarationIndex::lookup_sole_entry":
-        ("J", "lang: the test runner's entry points `std::env::set_args` / `set_env` / `std::test::runner::run_all`, named by the language's own paths"),
+        ("J", "lang: the test runner's entry points `set_args` / `set_env` / `run_all`, by the identity each declaration claimed (`wellknown(LangItem::...)`)"),
     "DeclarationIndex::namespace_of":
         ("F", "`enforce_callee_visibility` asks the callee's module by the callee's name"),
     "DeclarationIndex::is_candidate_public":
@@ -287,9 +287,9 @@ CLASS_OF_METHOD = {
 # key comes from somewhere the method's other callers' do not.
 SITE_OVERRIDES = {
     ("compiler/mono/monomorphizer.cryo", "GenericRegistry::get_template", "array_sym"):
-        ("J", "lang: `std::collections::array::Array`, the type the language lowers `T[]` to, by its own path"),
+        ("J", "lang: `Array`, the type the language lowers `T[]` to, by the identity its declaration claimed (`wellknown(LangItem::Array)`)"),
     ("compiler/mono/state.cryo", "GenericRegistry::get_template", "array_sym"):
-        ("J", "lang: `std::collections::array::Array`, the type the language lowers `T[]` to, by its own path"),
+        ("J", "lang: `Array`, the type the language lowers `T[]` to, by the identity its declaration claimed (`wellknown(LangItem::Array)`)"),
     ("compiler/mono/call_specializer.cryo", "GenericRegistry::get_template", "this.intern_table.intern(q_str)"):
         ("C", "`ns::name` composed from a namespace and a leaf"),
     ("compiler/sema/call_resolver.cryo", "GenericRegistry::get_template", "csym"):
@@ -299,7 +299,7 @@ SITE_OVERRIDES = {
     ("compiler/passes/type_resolution.cryo", "DeclarationIndex::lookup_type", "n"):
         ("J", "prim: `Res::PrimTy(n)` - the primitive's identity is the spelling the stamp carries"),
     ("compiler/sema/async_lower.cryo", "DeclarationIndex::lookup_type", "qualified"):
-        ("J", "lang: `lookup_future_type` - `Context` and `Executor` by their own paths; `Poll` and `Option` by the identity each declaration claimed (`wellknown`)"),
+        ("J", "lang: `lookup_future_type` - `Context`, `Executor`, `Poll` and `Option` by the identity each declaration claimed (`wellknown`)"),
     ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_type", "name"):
         ("N", "the funnel's own forwarding body (`lookup_type_exact`); its callers are the sites"),
     ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_func_type", "name"):

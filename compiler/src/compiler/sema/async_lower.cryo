@@ -87,16 +87,6 @@ import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ ClassType, FieldInfo, MethodInfo, StructType };
 
-/// The canonical name of the type that drives an `async function main`. The
-/// wrapper synthesized around it is spelled with this: the wrapper lands in
-/// the user's entry-point module, so a type of the same name declared beside
-/// `main` is precisely the one a bare spelling would find.  `Poll` and
-/// `Option`, the two types the state machine is built out of, are not
-/// spelled here at all: each is the identity its declaration claimed
-/// (`poll_identity`, `option_identity`), and every synthesized `Poll::…` /
-/// `Option::…` node carries that identity as its scope, not a bare leaf a
-/// later stage would resolve against the module it was lowered INTO.
-const EXECUTOR_TYPE: string = "std::future::executor::Executor";
 
 /// The state-machine builder's accumulator for lowering one `async function`
 /// body with >= 1 `await`. `lower` seeds the configuration; the recursive
@@ -6892,7 +6882,14 @@ type struct AsyncLower {
         // `declare` reports that with the message naming the missing import; bow
         // out silently rather than reporting one cause twice.
         if (!this.lookup_future_type(this.poll_identity()).is_valid()) { return false; }
-        const exec_ty: TypeRef = this.lookup_future_type(this.intern.intern(EXECUTOR_TYPE));
+        // The type that drives an `async function main`, by the identity its
+        // declaration claimed.  The wrapper lands in the user's entry-point
+        // module, so a type of the same name declared beside `main` is
+        // precisely the one a spelling would find; `Poll` and `Option`, the
+        // types the state machine is built out of, are asked the same way
+        // (`poll_identity`, `option_identity`).
+        const exec_id: SymbolStr = this.ctx.generic_registry.wellknown(LangItem::Executor);
+        const exec_ty: TypeRef = this.lookup_future_type(exec_id);
         if (!exec_ty.is_valid()) {
             this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
                 "`async function main` is driven by an `Executor`; add `import std::future;`",
@@ -6953,7 +6950,7 @@ type struct AsyncLower {
 
         // `mut ex: Executor = Executor::new();`
         mut ex_scope: ScopeResolutionNode* = new ScopeResolutionNode(
-            this.intern.intern(EXECUTOR_TYPE), this.intern.intern("new"), span);
+            exec_id, this.intern.intern("new"), span);
         ex_scope.set_synthesized_ref(exec_ty, this.ctx.definition_id_of(exec_ty));
         mut ex_new: CallExprNode* = new CallExprNode(
             ex_scope as ExpressionNode*, span);
@@ -7070,7 +7067,7 @@ type struct AsyncLower {
         // names below are canonical, so the only way they miss is that nothing
         // imports the module declaring them and it was never compiled.
         const poll_base: TypeRef = this.lookup_future_type(this.poll_identity());
-        const ctx_ref:   TypeRef = this.lookup_future_type(this.intern.intern("std::future::waker::Context"));
+        const ctx_ref:   TypeRef = this.lookup_future_type(this.ctx.generic_registry.wellknown(LangItem::Context));
         if (!poll_base.is_valid() || !ctx_ref.is_valid()) {
             this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
                 "an `async function` requires the future types in scope; add `import std::future;`",

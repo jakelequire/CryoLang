@@ -42,6 +42,8 @@ import std::collections::pair;
 import std::collections::pair::{ Pair };
 import compiler::types::generic;
 import compiler::types::generic::{ InstantiatedType };
+import compiler::types::generic_registry;
+import compiler::types::generic_registry::{ GenericRegistry, LangItem };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::node::{ ASTNode };
@@ -233,6 +235,14 @@ type struct ExprOps {
         const c: CompilationContext* = this.ctx;
         const i: InternTable* = c.intern_table;
         return i.intern(text);
+    }
+
+    /// The function generated code calls for `item` - the allocator's entry
+    /// points - by the identity its declaration claimed; invalid when that
+    /// declaration is not in this program.
+    lang_function(&this, item: LangItem) -> LValue {
+        const c: CompilationContext* = this.ctx;
+        return this.resolver.resolve_function(c.generic_registry.wellknown(item));
     }
 
     resolve(&this, sym: SymbolStr) -> string {
@@ -2248,7 +2258,7 @@ type struct ExprOps {
         this.builder.build_store(val, src);
 
         // malloc(N * sizeof(T)) for the fat-pointer's owned buffer.
-        const malloc_fn: LValue = this.resolver.resolve_function(this.intern_str("std::core::intrinsics::malloc"));
+        const malloc_fn: LValue = this.lang_function(LangItem::Malloc);
         if (!malloc_fn.is_valid()) { return val; }
         const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
         mut malloc_args: Pair<LValue, TypeRef>[] = [];
@@ -2325,8 +2335,7 @@ type struct ExprOps {
             return this.codegen_call(arena_fn, arena_ty, arena_args, label);
         }
 
-        const raw_fn: LValue = this.resolver.resolve_function(
-            this.intern_str("std::alloc::allocator::alloc"));
+        const raw_fn: LValue = this.lang_function(LangItem::Alloc);
         if (raw_fn.is_valid()) {
             const raw_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(raw_fn.raw) };
             mut raw_args: Pair<LValue, TypeRef>[] = [];
@@ -2351,7 +2360,7 @@ type struct ExprOps {
             }
         }
 
-        const malloc_fn: LValue = this.resolver.resolve_function(this.intern_str("std::core::intrinsics::malloc"));
+        const malloc_fn: LValue = this.lang_function(LangItem::Malloc);
         if (!malloc_fn.is_valid()) {
             this.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
                 fmt::format("codegen: %s: `intrinsics::malloc` not declared", what), span);
@@ -2397,11 +2406,10 @@ type struct ExprOps {
             }
         }
 
-        mut free_fn: LValue = this.resolver.resolve_function(
-            this.intern_str("std::alloc::allocator::free"));
+        mut free_fn: LValue = this.lang_function(LangItem::Dealloc);
         const free_via_shim: boolean = free_fn.is_valid();
         if (!free_via_shim) {
-            free_fn = this.resolver.resolve_function(this.intern_str("std::core::intrinsics::free"));
+            free_fn = this.lang_function(LangItem::Free);
         }
         if (!free_fn.is_valid() || !ptr.is_valid()) { return; }
 
@@ -2739,7 +2747,7 @@ type struct ExprOps {
                 fn, "ret.src", LType { raw: got_ty_raw });
             this.builder.build_store(val, src_alloca);
 
-            const malloc_fn: LValue = this.resolver.resolve_function(this.intern_str("std::core::intrinsics::malloc"));
+            const malloc_fn: LValue = this.lang_function(LangItem::Malloc);
             if (!malloc_fn.is_valid()) {
                 return val;
             }

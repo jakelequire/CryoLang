@@ -245,9 +245,14 @@ type struct HeadBinding {
 /// A declaration the language itself reasons about by identity: the
 /// structural markers, `Drop`, `Future`, the traits an operator desugars to,
 /// the two enums `?` desugars through, and the one the async lowering
-/// completes its state machines with.  `a + b` is `std::core::ops::Add::add`,
-/// as Rust's `+` is `core::ops::Add` - a user trait spelled `Add` does not
-/// overload the operator; `x?` is on `std::core::result::Result` or
+/// completes its state machines with; the structs a lowering builds or a
+/// rule singles out (`Array` behind `T[]`, `Slice` and `Range` behind `for`
+/// and `a..b`, the types never `Send`, the executor and waker context an
+/// `async` program is driven by); and the functions generated code calls
+/// (the allocator, the entry point's `set_args`/`set_env`, the test runner).
+/// `a + b` is `std::core::ops::Add::add`, as Rust's `+` is
+/// `core::ops::Add` - a user trait spelled `Add` does not overload the
+/// operator; `x?` is on `std::core::result::Result` or
 /// `std::core::option::Option`, and an enum spelling `Ok`/`Err` is another
 /// enum.
 ///
@@ -280,6 +285,23 @@ type enum LangItem {
     Option;
     Poll;
     Iterator;
+    Array;
+    Slice;
+    Range;
+    RangeInclusive;
+    Rc;
+    MutexGuard;
+    RwLockReadGuard;
+    RwLockWriteGuard;
+    Context;
+    Executor;
+    Malloc;
+    Free;
+    Alloc;
+    Dealloc;
+    SetArgs;
+    SetEnv;
+    RunAll;
 }
 
 implement enum LangItem {
@@ -313,6 +335,23 @@ implement enum LangItem {
             LangItem::Option => { "std::core::option::Option" }
             LangItem::Poll   => { "std::future::poll::Poll" }
             LangItem::Iterator => { "std::core::iter::Iterator" }
+            LangItem::Array    => { "std::collections::array::Array" }
+            LangItem::Slice    => { "std::core::slice::Slice" }
+            LangItem::Range    => { "std::core::ops::Range" }
+            LangItem::RangeInclusive   => { "std::core::ops::RangeInclusive" }
+            LangItem::Rc               => { "std::alloc::rc::Rc" }
+            LangItem::MutexGuard       => { "std::sync::mutex::MutexGuard" }
+            LangItem::RwLockReadGuard  => { "std::sync::rwlock::RwLockReadGuard" }
+            LangItem::RwLockWriteGuard => { "std::sync::rwlock::RwLockWriteGuard" }
+            LangItem::Context  => { "std::future::waker::Context" }
+            LangItem::Executor => { "std::future::executor::Executor" }
+            LangItem::Malloc   => { "std::core::intrinsics::malloc" }
+            LangItem::Free     => { "std::core::intrinsics::free" }
+            LangItem::Alloc    => { "std::alloc::allocator::alloc" }
+            LangItem::Dealloc  => { "std::alloc::allocator::free" }
+            LangItem::SetArgs  => { "std::env::set_args" }
+            LangItem::SetEnv   => { "std::env::set_env" }
+            LangItem::RunAll   => { "std::test::runner::run_all" }
         };
     }
 
@@ -338,7 +377,35 @@ implement enum LangItem {
             LangItem::BitOr, LangItem::BitXor, LangItem::Shl, LangItem::Shr,
             LangItem::Deref, LangItem::Index, LangItem::Result,
             LangItem::Option, LangItem::Poll, LangItem::Iterator,
+            LangItem::Array, LangItem::Slice, LangItem::Range,
+            LangItem::RangeInclusive, LangItem::Rc, LangItem::MutexGuard,
+            LangItem::RwLockReadGuard, LangItem::RwLockWriteGuard,
+            LangItem::Context, LangItem::Executor, LangItem::Malloc,
+            LangItem::Free, LangItem::Alloc, LangItem::Dealloc,
+            LangItem::SetArgs, LangItem::SetEnv, LangItem::RunAll,
         ];
+    }
+}
+
+/// A module the compiler itself imports or looks for: the prelude every
+/// module is given, and the formatting runtime an f-string desugars into.
+///
+/// Not a `LangItem`, and never claimed: a module's path IS its identity - the
+/// module graph registers every module under exactly one path - and the
+/// compiler needs these before any declaration exists, to write the import
+/// that loads them.  So the path is named here, the one place it is spelled,
+/// and asked of the graph (`ModulePath`) or written into an import.
+type enum LangModule {
+    Prelude;
+    Interp;
+}
+
+implement enum LangModule {
+    path(&this) -> string {
+        return match (&this) {
+            LangModule::Prelude => { "std::prelude" }
+            LangModule::Interp  => { "std::fmt::interp" }
+        };
     }
 }
 
@@ -1337,8 +1404,9 @@ type struct GenericRegistry {
     }
 
     /// Record `qname` when it is the path of a `LangItem`. Called once per
-    /// trait and per enum declaration, at the registration site, where the
-    /// name has already been import-resolved.
+    /// trait, enum, struct and class declaration and per function signature,
+    /// at the registration site, where the name has already been
+    /// import-resolved.
     ///
     /// Every consumer asks by the `LangItem` and gets back the identity
     /// recorded here, so no consumer needs to know the path - which is what
