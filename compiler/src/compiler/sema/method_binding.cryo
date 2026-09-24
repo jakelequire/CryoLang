@@ -1629,55 +1629,6 @@ type struct MethodBinding {
 
     // -- Associated-type projection reduction --
 
-    /// Concrete trait-arg list a base type binds for the trait `trait_id`,
-    /// including associated-type bindings.  `Range<i32>` over `Iterator`
-    /// yields `[i32]`.  Read off the WRITTEN head, whose trait arguments the
-    /// subject's own arguments substitute into.
-    proj_concrete_trait_args_for(mut &this, subject: TypeRef,
-                                 trait_id: SymbolStr) -> TypeRef[] {
-        mut out: TypeRef[] = [];
-        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return out; }
-        const impl_node: ImplBlockNode* =
-            this.ctx.generic_registry.template_head_for(trait_id, subject, this.intern);
-        if (impl_node == null) { return out; }
-        const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
-        if (trait_ann == null) { return out; }
-
-        mut rc: ResolutionContext = ResolutionContext::new("");
-        // Arg count via the view: a bare `kind == InstantiatedType` test would skip
-        // the impl's target-arg bindings for every post-mono concrete subject
-        // (which the removed carrier swap used to paper over).
-        const subj_nargs: i64 = this.arena.inst_type_arg_count(subject);
-        if (subj_nargs > 0) {
-            mut subst: TypeSubstitution = TypeSubstitution::empty();
-            if (impl_node.target_args.length == subj_nargs) {
-                for (mut i: i64 = 0; i < impl_node.target_args.length; i++) {
-                    const ta: TypeAnnotation* = impl_node.target_args[i];
-                    if (ta == null) { continue; }
-                    match (*ta) {
-                        TypeAnnotation::Named(n) => {
-                            rc.add_binding(n.param_sym(), n.name, this.arena.inst_type_arg_at(subject, i));
-                            const gp_ref: TypeRef = this.arena.create_generic_param(n.name, i as u64);
-                            subst.add(gp_ref.id, this.arena.inst_type_arg_at(subject, i));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            this.proj_derive_impl_where_generics(impl_node, &subst, &rc);
-        }
-
-        match (*trait_ann) {
-            TypeAnnotation::Generic(g) => {
-                for (mut i: i64 = 0; i < g.args.length; i++) {
-                    out.push(this.ctx.type_resolver.resolve(g.args[i], &rc));
-                }
-            }
-            _ => {}
-        }
-        return out;
-    }
-
     /// Bind impl-introduced generic params the Self type doesn't determine
     /// (`A`/`O` in `ZipIter<I,J> where I: Iterator<A>, J: Iterator<O>`) into `res_ctx`.
     proj_derive_impl_where_generics(mut &this, impl_node: ImplBlockNode*,
@@ -1692,8 +1643,8 @@ type struct MethodBinding {
             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                 const tr: TraitRef* = &bound.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
-                const concrete_args: TypeRef[] = this.proj_concrete_trait_args_for(subject, tr.identity());
-                if (concrete_args.length != tr.type_args.length) { continue; }
+                const concrete_args: TypeRef[] = this.ctx.type_resolver.concrete_trait_slots(subject, tr.identity());
+                if (tr.type_args.length > concrete_args.length) { continue; }
                 for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
                     const ta: TypeAnnotation* = tr.type_args[ai];
                     if (ta == null) { continue; }

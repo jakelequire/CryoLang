@@ -1150,6 +1150,12 @@ public:
         return -1;
     }
 
+    /// How many positional slots the trait has: its generic parameters, then
+    /// its associated types.
+    slot_count(&this) -> i64 {
+        return this.generic_params.length + this.assoc_types.length;
+    }
+
     /// The associated-type decl named `n`, or null if the trait has none such.
     lookup_assoc_type(&this, n: SymbolStr) -> AssocTypeDeclNode* {
         const i: i64 = this.assoc_type_index(n);
@@ -1571,6 +1577,32 @@ public:
             }
         }
         return null;
+    }
+
+    /// The annotation this impl gives `tdecl`'s positional slot `slot`: the
+    /// trait's generic parameters first, then its associated types in
+    /// declaration order - the order a bound's trait arguments are written in
+    /// (`where I: Iterator<A>` names `Item` at slot 0).  An associated slot is
+    /// the header's argument when the header writes one (`Iterator<i32>`),
+    /// else the body's `type Item = i32;`; both are the one binding, spelled
+    /// in either of the two places the language allows.  Reading the header
+    /// alone left a body-bound impl with no answer, so an adapter over it
+    /// (`TakeIter<Count>`) derived nothing and was never specialized.
+    trait_slot_annotation(&this, tdecl: TraitDeclNode*, slot: i64) -> TypeAnnotation* {
+        if (tdecl == null || slot < 0) { return null; }
+        if (this.trait_annotation != null) {
+            match (*this.trait_annotation) {
+                TypeAnnotation::Generic(g) => {
+                    if (slot < g.args.length) { return g.args[slot]; }
+                }
+                _ => {}
+            }
+        }
+        const assoc_idx: i64 = slot - tdecl.generic_params.length;
+        if (assoc_idx < 0 || assoc_idx >= tdecl.assoc_types.length) { return null; }
+        const adecl: AssocTypeDeclNode* = tdecl.assoc_types[assoc_idx];
+        if (adecl == null) { return null; }
+        return this.lookup_assoc_binding(adecl.name);
     }
 }
 

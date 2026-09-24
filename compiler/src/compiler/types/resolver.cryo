@@ -535,19 +535,8 @@ type struct TypeResolver {
                     this.generic_registry.trait_decl_keys[i], base_ty, this.intern_table);
             if (impl_node == null) { continue; }
 
-            // The binding annotation: positional trait arg (sugar) at
-            // generic-params + assoc index, else an explicit body binding.
-            mut ann: TypeAnnotation* = null;
-            const idx: i64 = tdecl.generic_params.length + assoc_pos;
-            if (impl_node.trait_annotation != null) {
-                match (*impl_node.trait_annotation) {
-                    TypeAnnotation::Generic(g) => {
-                        if (idx < g.args.length) { ann = g.args[idx]; }
-                    }
-                    _ => {}
-                }
-            }
-            if (ann == null) { ann = impl_node.lookup_assoc_binding(member); }
+            const ann: TypeAnnotation* = impl_node.trait_slot_annotation(
+                tdecl, tdecl.generic_params.length + assoc_pos);
             if (ann == null) { continue; }
 
             // Resolve the binding with the impl's target params bound to the
@@ -611,6 +600,46 @@ type struct TypeResolver {
         const tdecl: TraitDeclNode* = this.generic_registry.trait_decl_of(trait_ty);
         if (tdecl == null || tdecl.assoc_type_index(member) < 0) { return TypeRef::invalid(); }
         return trait_ty;
+    }
+
+    /// The concrete trait arguments `subject`'s impl of `trait_id` gives, one
+    /// per trait slot (generic parameters, then associated types in
+    /// declaration order - the order a bound's trait arguments are written
+    /// in), read off the WRITTEN impl with its target parameters bound to the
+    /// subject's arguments and its own where-derived parameters derived.  A
+    /// slot the impl leaves unbound is invalid; empty when `subject` has no
+    /// impl of the trait.  `Count` with `type Item = i32;` in its impl body
+    /// and `Range<i32>` with `Iterator<T>` in its head both answer `[i32]`.
+    concrete_trait_slots(&this, subject: TypeRef, trait_id: SymbolStr) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        if (this.generic_registry == null) { return out; }
+        const impl_node: ImplBlockNode* =
+            this.generic_registry.template_head_for(trait_id, subject, this.intern_table);
+        if (impl_node == null) { return out; }
+        const tdecl: TraitDeclNode* = this.generic_registry.get_trait_decl(trait_id);
+        if (tdecl == null) { return out; }
+        // `ann` is the impl block's own text; its scope is the file that
+        // block is written in, never the subject's or the asker's.
+        mut bctx: ResolutionContext = ResolutionContext::new("");
+        const nargs: i64 = this.arena.inst_type_arg_count(subject);
+        if (nargs > 0 && impl_node.target_args.length == nargs) {
+            for (mut ti: i64 = 0; ti < nargs; ti++) {
+                const ta: TypeAnnotation* = impl_node.target_args[ti];
+                if (ta == null) { continue; }
+                match (*ta) {
+                    TypeAnnotation::Named(n) => {
+                        bctx.add_binding(n.param_sym(), n.name, this.arena.inst_type_arg_at(subject, ti));
+                    }
+                    _ => {}
+                }
+            }
+            this.derive_where_assoc_bindings(impl_node, &bctx);
+        }
+        for (mut slot: i64 = 0; slot < tdecl.slot_count(); slot++) {
+            const ann: TypeAnnotation* = impl_node.trait_slot_annotation(tdecl, slot);
+            out.push(if (ann == null) { TypeRef::invalid() } else { this.resolve(ann, &bctx) });
+        }
+        return out;
     }
 
     /// Bind impl where-clause-derived generics into `bctx` for projection

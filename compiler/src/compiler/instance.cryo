@@ -2206,6 +2206,16 @@ type struct CompilerInstance {
             mut cg_pos:  u32[] = [];
 
             for (mut i: u32 = 0; i < n; i++) {
+                // An error reported while generating an earlier module fails
+                // the build and says why.  Every later module would skip IR
+                // generation on that error and come back empty, so going on
+                // reports each of them as a codegen failure of its own - a
+                // line per module, none of them true, printed ahead of the
+                // one error that is.
+                if (ctx.diagnostics.has_errors()) {
+                    cg_failed = true;
+                    break;
+                }
                 const _mi: ModuleInfo* = &ctx.module_graph.modules[order[i]];
                 const _mn: string = ctx.intern_table.resolve(_mi.name);
                 cdebug("[Compiler] Codegen: module %u/%u (%s)\n", i, n, _mn);
@@ -2254,8 +2264,12 @@ type struct CompilerInstance {
 
                 if (!ctx.artifacts.ir.is_valid()) {
                     // IR generation failed for this module.  The fresh context
-                    // has no module to emit; reclaim it now.
-                    fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, i)}");
+                    // has no module to emit; reclaim it now.  An error this
+                    // module reported already names the failure; the line is
+                    // for a module that came back empty without one.
+                    if (!ctx.diagnostics.has_errors()) {
+                        fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, i)}");
+                    }
                     cg_failed = true;
                     compiler::codegen::llvm_types::dispose_codegen_context();
                     pipeline.reset();
