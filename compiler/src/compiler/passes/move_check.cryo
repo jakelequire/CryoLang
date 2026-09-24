@@ -985,6 +985,7 @@ type struct MoveChecker {
                     }
                 }
                 this.merge_branches(arm_bodies);
+                this.move_subject_of_taken_payload(m.subject, pat_snap);
                 this.truncate_pat_bindings(pat_snap);
             }
             NodeKind::StaticMatchStatement => {
@@ -1491,8 +1492,38 @@ type struct MoveChecker {
             }
         }
         this.merge_branches(arm_bodies);
+        this.move_subject_of_taken_payload(m.subject, pat_snap);
         this.truncate_pat_bindings(pat_snap);
         return;
+    }
+
+    /// An arm that gave away what its pattern bound has given away the
+    /// subject's contents, so after the match the subject is moved on every
+    /// path through that arm.  A payload binding is a bitwise copy out of the
+    /// subject; giving it away hands its storage to someone else while the
+    /// subject still holds the same storage, and drop insertion already
+    /// withholds the subject's own release for that reason.  Without the
+    /// subject marked here, a use after the match - passing it on, returning
+    /// it, matching it again - releases that storage a second time.  An arm
+    /// that only reads its binding leaves the subject whole.
+    ///
+    /// `pat_snap` is where this match's bindings begin in `pat_binding_keys`;
+    /// a binding moved on a path that falls through is in the moved set after
+    /// the join, one moved only on a path that diverges is not.  Only a
+    /// subject that is a local names anything to mark - the subjects drop
+    /// insertion links a payload to.
+    move_subject_of_taken_payload(mut &this, subject: ExpressionNode*, pat_snap: i64) -> void {
+        if (subject == null || subject.kind != NodeKind::Identifier) { return; }
+        const subj: SymbolID = (subject as IdentifierNode*).res.local_sym();
+        if (!subj.is_valid()) { return; }
+        for (mut i: i64 = pat_snap; i < this.pat_binding_keys.length; i++) {
+            const key: u64 = this.pat_binding_keys[i];
+            for (mut j: i64 = 0; j < this.moved_keys.length; j++) {
+                if (this.moved_keys[j] != key) { continue; }
+                this.mark_moved(subj, this.moved_spans[j], this.moved_real[j]);
+                break;
+            }
+        }
     }
 
     read_new(mut &this, n: NewExprNode*) -> void {

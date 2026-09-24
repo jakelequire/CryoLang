@@ -1,0 +1,72 @@
+// A match subject stays usable after an arm that only READS the payload it
+// bound, and after the subject is given a new value: the refusal of a
+// subject used after an arm took its payload (see the E0452 negatives beside
+// this suite) keys on the payload being given away, not on it being bound.
+// Each value here is released exactly once.
+![config(testing)]
+namespace CryoTests::Tests::Lang::MatchSubjectAfterPayloadRead;
+
+import std::test;
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::option;
+import std::core::option::{ Option };
+import std::test::assert::{ expect_eq };
+import std::test::error::{ TestError };
+
+mut sp_drops: i32 = 0;
+
+type struct Item {
+    tag: i32;
+
+    drop(mut &this) -> void {
+        sp_drops = sp_drops + 1;
+    }
+}
+
+function consume(i: Item) -> void { }
+
+function consume_opt(o: Option<Item>) -> void { }
+
+function make(tag: i32) -> Option<Item> { return Option::Some(Item { tag: tag }); }
+
+// The arm reads `x`; the subject is passed on whole afterwards.
+function read_then_pass_on() -> i32 {
+    const o: Option<Item> = make(4);
+    mut seen: i32 = 0;
+    match (o) {
+        Option::Some(x) => { seen = x.tag; }
+        Option::None    => { }
+    }
+    consume_opt(o);
+    return seen;
+}
+
+// The arm gives `x` away; the subject is given a new value before its next use.
+function take_then_refill() -> void {
+    mut o: Option<Item> = make(1);
+    match (o) {
+        Option::Some(x) => { consume(x); }
+        Option::None    => { }
+    }
+    o = make(2);
+    consume_opt(o);
+}
+
+![test]
+function read_arm_leaves_subject_whole() -> Result<(), TestError> {
+    sp_drops = 0;
+    const seen: i32 = read_then_pass_on();
+    match (expect_eq(seen, 4)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(sp_drops, 1);
+}
+
+![test]
+function taken_then_refilled_released_once_each() -> Result<(), TestError> {
+    sp_drops = 0;
+    take_then_refill();
+    return expect_eq(sp_drops, 2);
+}

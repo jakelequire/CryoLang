@@ -56,7 +56,7 @@ measurement that decided it on the row.
 | D11 | **Remove `resolve_counter.cryo` completely** - the counter, its audit streams, `scripts/b1-gate.py` and `tests/b1-baseline.txt` (Jake, 2026-09-15: "I want this instrumentation to be removed completely"; §7.2 mechanism 3 amended, §8.202) | **TAKEN** (§8.203) — the module (1,302 lines), its 100 `bump()` sites and 54 audit emitters, the five audit streams and `CRYO_RESOLVE_COUNTER`, `HomeOrigin` and `ResolutionContext`'s `FILE, LINE` provenance, the `door`/`site`/`table` parameters that carried a site name to an emitter, `b1-gate.py`, `retire-counter-sites.py`, `b1-baseline.txt`, `make b1-check` and its two CI steps. 0 of 3,478 objects moved over `examples/` and `tests/`. `lane-check`, the negative tests and the mutation projects are the regrowth guard | `git ls-files \| grep -c -e 'resolve_counter' -e 'b1-gate' -e 'b1-baseline'` → **0**; `grep -rho -e 'resolve_counter' -e 'HomeOrigin' compiler/src tools --include=*.cryo \| wc -l` → **0** | §8.66, §8.80, §8.139, §8.174, §8.183, §8.188, §8.193, §8.202, §8.203 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -v '^\s*//' compiler/src/compiler/resolver/name_resolution.cryo \| grep -c 'module_offering'` → **5** (3 before §8.258: `module_offerings`, the plural form the walk reads so its E0155 can name both declarations, and `module_offering` is its first-and-count) | §8.138, §8.144, §8.151, §8.258 |
-| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **613** (+1 in §8.320, a unit test; +2 in §8.318, a unit test and a negative; +1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194, §8.195 and §8.197, projects; +2 in §8.199, a project's two files; -1 in §8.203, `resolve_counter.cryo`; -1 in §8.206, a `collect` project's test file, the project being a `compile_fail` now; -1 in §8.207, `bare_intrinsic_priority.cryo`, a negative now; +1 in §8.209, a negative; +1 in §8.213, a unit test; +2 in §8.217, two projects' `beta_text.cryo`; +2 in §8.242, the consequence repro's two sources under `scripts/ns-migration/8.242/tick-ctl/`; +1 in §8.244, a negative; +1 in §8.256, a unit test; +2 in §8.275, the two `chain_default_*` projects; +1 in §8.277, a unit test; +1 in §8.286, a negative; +1 in §8.287, a unit test; +1 in §8.301, a unit test; +1 in §8.303, a unit test; +1 in §8.304, `resolver/module_path.cryo`; +1 in §8.306, a unit test; +2 in §8.311, a unit test and a negative; +3 in §8.312, a unit test and two negatives; +2 in §8.313, a unit test and a negative; +1 in §8.314, a unit test; +1 in §8.316, a unit test) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **616** (+3 in §8.321, a unit test and two negatives; +1 in §8.320, a unit test; +2 in §8.318, a unit test and a negative; +1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194, §8.195 and §8.197, projects; +2 in §8.199, a project's two files; -1 in §8.203, `resolve_counter.cryo`; -1 in §8.206, a `collect` project's test file, the project being a `compile_fail` now; -1 in §8.207, `bare_intrinsic_priority.cryo`, a negative now; +1 in §8.209, a negative; +1 in §8.213, a unit test; +2 in §8.217, two projects' `beta_text.cryo`; +2 in §8.242, the consequence repro's two sources under `scripts/ns-migration/8.242/tick-ctl/`; +1 in §8.244, a negative; +1 in §8.256, a unit test; +2 in §8.275, the two `chain_default_*` projects; +1 in §8.277, a unit test; +1 in §8.286, a negative; +1 in §8.287, a unit test; +1 in §8.301, a unit test; +1 in §8.303, a unit test; +1 in §8.304, `resolver/module_path.cryo`; +1 in §8.306, a unit test; +2 in §8.311, a unit test and a negative; +3 in §8.312, a unit test and two negatives; +2 in §8.313, a unit test and a negative; +1 in §8.314, a unit test; +1 in §8.316, a unit test) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `python3 scripts/lane-gate.py --row LOOKUP_ROUTED` → **49** (50 before §8.320, whose one was the `for` loop's `next` found by spelling on the scrutinee's type; 55 before §8.315, whose five were type lookups by a name the caller derived from a definition it held - three trait bounds, an impl-qualified head's trait, the method-not-found hint's receiver - now asked of the index by that definition or type; 54 before §8.256 deleted sema's `new` spelling step; 53 before §8.259 deleted the callee hint's `bare_sym` door and sema's `alias_global`; 51 before §8.263's two `lookup_type_exact` by a canonical name - the impl-qualified head's trait, asked whether it IS a trait, and its owner for the E0306 report; 53 before §8.289 re-keyed `method_returns` by the owner's arena id: `resolve_method_owner` and `lookup_method_return_raw` deleted, `lookup_type_sym` left two readers that hold the owner ref, and the five readers holding a stamp's name ask `lookup_type_exact` for the owner first) | §8.99, §8.107 |
 | D16 | **An impl head writes EVERY parameter of the template it names, or names a concrete instantiation; an elided parameter is an error** - whether all of them default (`implement trait Display for String` with `String<A = GlobalAlloc>`) or only the trailing ones (`implement<T> trait Display for Array<T>` with `Array<T, A = GlobalAlloc>`). Write `implement<A> trait Display for String<A>` or `implement trait Display for String<GlobalAlloc>`. Rust's model: `impl Display for Vec` is missing its parameters and is not given a default meaning, and `impl<T> Trait for Vec<T>` is not written either | **TAKEN** (ruled by Jake 2026-09-13 for the bare form, 2026-09-14 for every elided parameter; built in §8.190) — E0302 from `refuse_elided_template_params` where type resolution attaches a WRITTEN head to its template, naming the template, both counts and both spellings, the parameter form first; the 11 heads rewritten as the instantiation each meant; a head's `target_args` is what it writes after the target on EVERY kind of head (an inherent head's list also declares its names); sema's writer-module lookup deleted. The concrete spelling is HONOURED by impl selection since §8.233: a head's written target arguments unify with the subject's, a `Def`/`PrimTy`-stamped one filtering, so `for Wrap<T, Alpha>` is not selected for `Wrap<i32, Beta>` and two heads differing in that argument are two heads (`impl_concrete_arg_filters_impl` E0358, `impl_concrete_arg_selects_impl` 12 - both RED from §8.223 to §8.233) | `python3 scripts/impl-head-elided-params.py --count` → **bare=0,partial=0,unmatched=0**; `grep -c 'refuse_elided_template_params' compiler/src/compiler/passes/type_resolution.cryo` → **2**; `ls tests/tests/negative/E0302*.cryo \| wc -l` → **3** (2 at §8.190; +1 in §8.210, D22's head); `ls -d tests/tests/projects/impl_concrete_arg_*/test.json \| wc -l` → **2** (green since §8.233) | §8.180, §8.181, §8.187, §8.190, §8.223 |
 | D17 | **An `extern "C"` function is public unless marked `private`** — the extern-visibility default `docs/cryo.md` §18.1 states | **RULED** (Jake, 2026-09-14) — built in §8.167 by a worker and carried as unconfirmed until ratified; the spec text is normative, not provisional | `grep -c 'mut ext_public: boolean = true;' compiler/src/compiler/parser/parser.cryo` → **1**; `grep -c 'unless written .private function' docs/cryo.md` → **1** | §8.167, §8.187 |
@@ -205,7 +205,8 @@ three, and its row carries the count. Read each zero off its own row.
 | an identifier USE asked whether it is the receiver by its spelling (`sema.cryo`: 5 sites comparing `ident.name` with `this`; the LSP's 6 are Jake's) - blocked, until §8.314, because a `&this` method's uses named a second binding the name layer declared and discarded, a method with no written receiver had no parameter at all, and the async lowering's own `this` uses named nothing | **DELETED** (§8.314, Jake's ruling: a receiver parameter for every method) - the parser gives every non-static method that wrote none a `&this` parameter (`Parser::give_receiver`, constructors included), as do the async lowering's `poll` and the closure synthesis's `__call__` and `drop`; the name layer binds every receiver parameter as `this` and keeps its identity on it, the second binding and `receiver_of` deleted; sema asks `names_receiver` (the use's binding is the receiver parameter's) at the five sites. The "no receiver parameter" cases deleted with them: codegen's implicit-prefix slot, the declaration index's synthesized `T*`, `method_receiver_kind`'s implicit arm, the async lowering's own synthesis (now an E0900) | six halves: the five sites asked both ways disagreed 0 times, and none of the six "no receiver" paths was entered, each instrument shown firing with the parser's synthesis switched off (`scripts/ns-migration/8.314/`); two false refusals of a method with no written receiver fixed (`this as void*` E0208, `&payload` of `match (this)` E0455), `lang/unwritten_receiver_is_a_reference` refused by `108a184d` and passing here; 0 of 1,126 example objects moved | `grep -c '^\s*this\.resolver\.declare_parameter(this\.this_sym' compiler/src/compiler/resolver/name_resolution.cryo` → **0** (1 before §8.314: the discarded second binding); `grep -c 'names_receiver(' compiler/src/compiler/sema/sema.cryo` → **6** (the definition and the five sites); `grep -c 'receiver_of' compiler/src/compiler/resolver/name_resolution.cryo` → **0**; `grep -c 'prepend_implicit_this' compiler/src/compiler/codegen/ops/declaration_emitter.cryo` → **0** | §8.307, §8.314 |
 | the async lowering's rename skipping a destructure (`AsyncLower::rn_stmt` renames only a single-variable declaration: a destructure's bindings keep their spelling and stay out of `frame_locals`, its initializer is never walked) - the premise of the `frame_locals` own-rib exclusion | **DELETED** (§8.311) - `rn_destructure` renames a destructure's initializer and fields like `rn_var_decl`; `split_destructures` turns each typed destructure into `const __ds = <init>;`, the destructure over temporaries, and one declaration a field (the binding's identity kept), so fields are carried and address-checked like locals; `decl_stmt_init` lets nine walkers (the `await` counter among them) see a destructure's initializer. A destructure of a GENERIC type in a generic body is renamed, not split: a field of it read across a suspend is still E0201 (`a$L1` in the message). The two match-arm ribs (`BindingCapture`, `BindingRename`) HOLD (§8.308) | the probe runner in `scripts/ns-migration/8.308/`: 3 of 9 WRONG under the pin and `bfa0ab60`, 0 under §8.311; each of the three parts removed alone fails a probe or the new test (§8.311) | `grep -c 'DestructureDeclaration' compiler/src/compiler/sema/async_lower.cryo` → **5**; `grep -c 'this.split_destructures(blk);' compiler/src/compiler/sema/async_lower.cryo` → **1** | §8.308, §8.311 |
 | a match-arm PAYLOAD binding unseen by the move checker (`register_arm_pat_bindings` fed only the field-move-out set, never the type map, so a payload given away twice, used after it was given away, or given away in a loop was ACCEPTED; pin too) | **DELETED** (§8.312, on Jake's ruling of §8.309's decision) - each payload is registered by `PatternBinding.sym_id` with the type sema stamps (`PatternBinding.resolved_type`); `is_owned_value_place`'s pattern fallback deleted. It needed `find`/`filter` to BORROW the element (`(&Item) -> boolean`): each handed it to a by-value predicate and then returned it, a double free the pin ships. The catch-all arm binding (`y => ...`) releasing its subject twice on ONE use was a separate hole, closed in §8.313 (the row below) | `negative/E0452_match_payload_moved_twice`, `_used_after_move` compile under `0a63b2f1` and are refused here; `lang/iter_find_filter_release_once` counts one release per element | `grep -c 'pb.resolved_type' compiler/src/compiler/sema/pattern_resolver.cryo` → **1**; `grep -c '(&This::Item) -> boolean' stdlib/core/iter.cryo` → **2** | §8.309, §8.312 |
-| a catch-all match-arm binding unseen by both ownership passes (`match (o) { y => { consume(y); } }`: the name layer declared `y` and kept no identity - `PatternNode` had no field for it - so the move checker never tracked `y` and drop insertion never linked it to its subject; ONE use released the subject twice, two uses three times, on the pin as on HEAD) | **DELETED** (§8.313, Jake's ruling) - `PatternNode.binding_sym` is the binding the name layer declares and every use of `y` names, copied by the cloner and given to the async lowering's rebind; `PatternNode.binding_type` is the type sema binds it with. The move checker registers the binding like a payload (so a second use is E0452, a field moved out of it E0453); drop insertion links it to the subject like a payload (so giving it away suppresses the subject's own release). Using the SUBJECT again after an arm gave its contents away - a payload or a catch-all binding - is still released twice, pin too: open | census before landing, six halves: the only catch-all bindings over a value that needs releasing are the 8 in the new test (all 8 reported, 7 given away), 0 elsewhere; `negative/E0452_match_catchall_binding_moved_twice` compiles under `948afd8d` and is refused here; `lang/match_catchall_binding_release_once` fails 7 of 8 under `948afd8d` and passes here; each of the three parts removed alone fails a test (§8.313); 0 of 1,126 example objects moved | `grep -c 'binding_sym' compiler/src/compiler/AST/pattern.cryo` → **3**; `ls tests/tests/negative/E0452_match_catchall*.cryo \| wc -l` → **1**; `grep -c 'pat.binding_sym' compiler/src/compiler/passes/drop_insertion.cryo` → **3** | §8.313 |
+| a catch-all match-arm binding unseen by both ownership passes (`match (o) { y => { consume(y); } }`: the name layer declared `y` and kept no identity - `PatternNode` had no field for it - so the move checker never tracked `y` and drop insertion never linked it to its subject; ONE use released the subject twice, two uses three times, on the pin as on HEAD) | **DELETED** (§8.313, Jake's ruling) - `PatternNode.binding_sym` is the binding the name layer declares and every use of `y` names, copied by the cloner and given to the async lowering's rebind; `PatternNode.binding_type` is the type sema binds it with. The move checker registers the binding like a payload (so a second use is E0452, a field moved out of it E0453); drop insertion links it to the subject like a payload (so giving it away suppresses the subject's own release). Using the SUBJECT again after an arm gave its contents away - a payload or a catch-all binding - was released twice, pin too, until §8.321 (the row below) | census before landing, six halves: the only catch-all bindings over a value that needs releasing are the 8 in the new test (all 8 reported, 7 given away), 0 elsewhere; `negative/E0452_match_catchall_binding_moved_twice` compiles under `948afd8d` and is refused here; `lang/match_catchall_binding_release_once` fails 7 of 8 under `948afd8d` and passes here; each of the three parts removed alone fails a test (§8.313); 0 of 1,126 example objects moved | `grep -c 'binding_sym' compiler/src/compiler/AST/pattern.cryo` → **3**; `ls tests/tests/negative/E0452_match_catchall*.cryo \| wc -l` → **1**; `grep -c 'pat.binding_sym' compiler/src/compiler/passes/drop_insertion.cryo` → **3** | §8.313 |
+| a match SUBJECT used after an arm gave away what its pattern bound (`match (o) { Some(x) => { consume(x); } None => { } } consume_opt(o);` - the payload released by `consume`, then again with `o`; in a loop, the same payload given away twice; pin too) | **DELETED** (§8.321, Jake's ruling: refuse it, as Rust does) - the move checker marks a local subject moved when a binding of the match is moved on a path that falls through, as drop insertion already withheld the subject's release; the use is E0452, in a loop the loop-carried E0452. An arm that only READS its binding leaves the subject usable. Cryo has no binding modes, so `match (&o)` binds the payload by value too: giving it away there is still released twice, and is not this row (§8.321) | census before building, six halves plus the stdlib for both OSes: 48 matches take a payload, 0 use the subject afterwards, 0 programs refused; both negatives compile under `8bd70e67` and are refused here; 0 of 1,126 example and 0 of 3,013 test objects moved | `grep -c 'move_subject_of_taken_payload(' compiler/src/compiler/passes/move_check.cryo` → **3**; `ls tests/tests/negative/E0452_match_subject_used_after_payload_taken.cryo tests/tests/negative/E0452_match_payload_taken_in_loop.cryo \| wc -l` → **2** | §8.321 |
 | a reference compared with a plain value (`x == 7` with `x: &i32`: `check_binary_op` passed any comparison with a reference operand, so it compared the ADDRESS - silently false - while `x % 2` was already E0229) | **DELETED** (§8.312, Jake's ruling) - refused as E0229, "dereference the reference"; reference with reference, pointer, `null`, class or function unchanged. Written into `docs/cryo.md` sections 2.3 and 5.2 | census before building, six halves: 4 comparisons with a reference operand in the tree, all reference-with-reference, 0 with a plain value (the instrument shown to report the probe's one) | `grep -c 'dereference the reference to compare the value it refers to' compiler/src/compiler/types/checker.cryo` → **1**; `ls tests/tests/negative/E0229_reference_compared_with_value.cryo \| wc -l` → **1** | §8.312 |
 | a binding reaching the move checker or drop insertion with NO identity (skipped at five entry points: untracked by the one, released regardless by the other, a payload's subject released too) | **DELETED** - an internal compiler error, E0900 at the binding (`require_identity` in each pass, `CompilationContext::ice_at`), Jake's ruling. Measured at 0 over six halves before building | two mutations, each removing one identity in the name layer: without the check each program silently frees a value twice, with it each is refused E0900 | `grep -c 'require_identity(' compiler/src/compiler/passes/move_check.cryo` → **4** (+1 in §8.313, the catch-all binding); `grep -c 'require_identity(' compiler/src/compiler/passes/drop_insertion.cryo` → **5** (+1 in §8.313, the same) | §8.310 |
 | an associated type answered by REGISTRATION ORDER when a projection names no trait (`resolve_concrete_member` with no owner: the first registered trait the base implements that declares a member of that spelling - `This::Item` in a trait's own default body read `Iterator`'s `Item` on a type implementing both, and refused a correct program) | **DELETED** (§8.318) - no trait named, no answer. `This::Member` carries the trait `This` stands for (`ProjectionAnnotation.owner_trait`, stamped by the name layer; a synthesized future keeps its arena projection's), `await` asks `Future` by its `LangItem`, and the stdlib's `FilterIter`/`MapIter` write `where I: Iterator`. Population over six halves before: 29,882 answers; with the deletion in place: 0 | - | `grep -c 'if (owner == null) { return TypeRef::invalid(); }' compiler/src/compiler/types/resolver.cryo` → **1**; `grep -c 'pj.owner_trait = this.this_trait' compiler/src/compiler/resolver/name_resolution.cryo` → **1**; `grep -c '^type struct [A-Za-z]*<[A-Z, ]*> where I: Iterator {' stdlib/core/iter.cryo` → **2** | §8.316, §8.318 |
@@ -255,7 +256,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: lane-check lane-selftest' Makefile` → **1**
 * `ls -d tests/tests/projects/*/test.json | wc -l` → **76**
-* `ls tests/tests/negative/*.cryo | wc -l` → **226** (+1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306)
+* `ls tests/tests/negative/*.cryo | wc -l` → **228** (+1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
 * `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -40364,5 +40365,118 @@ modules it does not recompile; it is not a count to read.
   `Option<AssocProjection>`, so `t + v` on its payload is E0229 "Cannot
   apply '+' to Int and AssocProjection" (HEAD and tree). The loop does
   not use that form for this reason.
+
+---
+
+### 8.321 A match subject used after an arm gave away what its pattern bound is refused (E0452), as Rust refuses it; an arm that only reads its binding leaves the subject usable; 0 programs in the tree refused; 0 objects moved - 2026-09-24
+
+#### The defect
+
+```cryo
+match (o) {
+    Option::Some(x) => { consume(x); }   // the payload is given away
+    Option::None    => { }
+}
+consume_opt(o);                          // accepted; released twice
+```
+
+Run on the pinned tip (`8bd70e67`), with a `Res` whose `drop` prints:
+`consume 1`, `drop 1`, `consume_opt`, `drop 1` - one value, released twice.
+In a loop it is worse: the second iteration hands `consume` the storage the
+first already freed.
+
+A payload binding is a bitwise copy out of the subject. Drop insertion
+already knows this: when an arm gives a binding away it withholds the
+subject's own release at scope exit (`walk_match_arms`, "Borrow-only arms
+leave the subject live"). The move checker never marked the subject, so a
+USE of it after the match - which releases it again - was accepted.
+
+#### Does Cryo distinguish "borrow the payload" from "take it"? - measured
+
+Jake ruled for Rust's behaviour, where a match that binds by reference
+leaves the subject usable. Four programs on the pinned compiler:
+
+| program | output | |
+|---|---|---|
+| `match (o)`, arm gives `x` away, then `consume_opt(o)` | drop 1 twice | double free |
+| `match (o)`, arm reads `x.id`, then `consume_opt(o)` | drop 1 once | correct |
+| `match (&o)`, arm gives `x` away, then `consume_opt(o)` | drop 1 twice | double free |
+| `match (&o)`, arm gives `x` away, nothing after | drop 1 twice | double free |
+
+**Cryo has no binding modes**: `match (&o)` binds the payload BY VALUE
+exactly as `match (o)` does (`consume(x)` type-checks with `x: Res`), and
+there is no `ref`. What it has is a distinction by what the arm DOES: an
+arm that gives its binding away takes the subject's contents; an arm that
+only reads it leaves them. Drop insertion is built on that distinction,
+and the refusal uses it - nothing new is invented. It is narrower than
+Rust, which treats `Some(x)` binding a non-`Copy` payload by value as a
+move whether or not the arm then gives it away; in Cryo the second row
+stays accepted and is correct at run time.
+
+#### The change
+
+`MoveChecker::move_subject_of_taken_payload`, called after the arms are
+merged in both the statement and the expression form: when the subject is
+a local and any binding this match registered is moved on a path that
+falls through, the subject is marked moved, with that binding's move
+span. The existing E0452 does the rest - "use of moved value 'o'" with
+"value moved here" at `consume(x)`, and in a loop "value 'o' moved inside a
+loop is used again on the next iteration". Re-assigning the subject
+revives it as for any local.
+
+#### Blast radius, measured before landing
+
+The change with a probe line where it fires, over the six-half corpus
+(`.objcmp/s41b-lines.txt`, 0 failing halves), and the stdlib compiled for
+both OSes with the compiler under test (`scripts/cross-check.py --project
+stdlib`, default and `--triple x86_64-pc-windows-gnu`, 0 errors each):
+**48 distinct matches** in the tree give a payload away (the stdlib's test
+runner, executor, HTTP server and HTTP/2 connection, `process::command`,
+the LSP's `jsonrpc` and `server`, and tests); **none uses its subject
+afterwards; 0 programs are refused.**
+
+#### Controls
+
+Both new negatives compile under `8bd70e67` and are refused here:
+`E0452_match_subject_used_after_payload_taken` (line 27) and
+`E0452_match_payload_taken_in_loop` (line 22). `lang/match_subject_after_payload_read`
+pins the other side: a subject passed on after a read-only arm, and one
+refilled after its payload was taken, each value released exactly once.
+
+#### Measured
+
+| what | before | after |
+|---|---|---|
+| objects, examples (`objcmp.sh`) | 1,126 | **0 moved** |
+| objects, tests (`objcmp.sh`) | 3,013 | **0 moved** |
+| residue, lane gate | 365, unchanged | unchanged (no name read added or removed) |
+| census | 2,182 unit, 226 compile-fail | **2,184, 228** |
+
+`lsp-check` OK (265 modules, 0 errors), `cross-check` OK.
+
+#### Findings, not fixed
+
+* **`match (&o)` gives the payload away by value**, and the subject is
+  released again at its own scope exit with nothing after the match at all
+  (fourth row above). Rust refuses "cannot move out of a shared reference".
+  Refusing it needs a rule for what a reference subject binds, which is a
+  language question for Jake: bind payloads through a reference as
+  references (Rust's default binding mode), or refuse giving one away.
+* **A payload given away inside a loop whose subject is refilled leaks
+  the last value** - drop insertion, HEAD and pin alike:
+
+  ```cryo
+  mut o: Option<Item> = make(1);
+  while (i < 3) {
+      match (o) { Option::Some(x) => { consume(x); } Option::None => { } }
+      o = make(i + 2);
+      i = i + 1;
+  }
+  // drops 1, 2, 3; the Item made last (4) is never released
+  ```
+
+  The same loop with `consume_opt(o)` in place of the match releases all
+  four. It was a case in the new positive test; it is left out of it, not
+  marked, because it fails for a reason this unit does not touch.
 
 ---
