@@ -1,0 +1,98 @@
+///! `This::Item` in a trait's body is that trait's `Item`, and in an
+///! `implement trait` block the implemented trait's - whatever else the type
+///! implements.  `Both` implements `Iterator` too, whose associated type is
+///! spelled `Item` as well; a projection that took the first trait declaring
+///! something spelled `Item` read `Iterator`'s (`i32`) inside `Source`'s
+///! default `fetch` and refused its `return v` (`i64`).
+///!
+///! The adapters `filter` and `map` build (`FilterIter<I>`, `MapIter<I, O>`)
+///! write `where I: Iterator` on the declaration, so `I::Item` in their
+///! fields is `Iterator`'s for a type implementing both.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::ThisProjectionAsksTheEnclosingTrait;
+
+import std::core::result;
+import std::core::result::{ Result };
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::iter;
+import std::core::iter::{ Iterator };
+import std::test::error;
+import std::test::error::{ TestError };
+import std::test::assert;
+import std::test::assert::{ expect_eq };
+
+type trait Source {
+    type Item;
+    get(&this) -> This::Item;
+    fetch(&this) -> This::Item {
+        const v: This::Item = this.get();
+        return v;
+    }
+}
+
+type struct Both {
+    n: i32;
+}
+
+implement trait Iterator<i32> for struct Both {
+    next(mut &this) -> Option<i32> {
+        if (this.n >= 5) { return Option::None; }
+        this.n = this.n + 1;
+        return Option::Some(this.n);
+    }
+}
+
+implement trait Source for struct Both {
+    type Item = i64;
+    get(&this) -> i64 { return 5000000000; }
+}
+
+function via<S>(s: &S) -> i64 where S: Source {
+    return s.fetch();
+}
+
+function is_odd(x: &i32) -> boolean { return *x % 2 == 1; }
+
+function doubled(x: i32) -> i32 { return x * 2; }
+
+![test]
+function default_body_reads_its_own_traits_item() -> Result<(), TestError> {
+    const b: Both = Both { n: 0 };
+    return expect_eq(b.fetch(), 5000000000);
+}
+
+![test]
+function default_body_through_a_bound() -> Result<(), TestError> {
+    const b: Both = Both { n: 0 };
+    return expect_eq(via::<Both>(&b), 5000000000);
+}
+
+![test]
+function filter_reads_iterators_item() -> Result<(), TestError> {
+    const b: Both = Both { n: 0 };
+    mut f = b.filter(is_odd);
+    mut total: i32 = 0;
+    loop {
+        match (f.next()) {
+            Option::Some(v) => { total = total + v; }
+            Option::None    => { break; }
+        }
+    }
+    return expect_eq(total, 9);
+}
+
+![test]
+function map_reads_iterators_item() -> Result<(), TestError> {
+    const b: Both = Both { n: 0 };
+    mut m = b.map(doubled);
+    mut total: i32 = 0;
+    loop {
+        match (m.next()) {
+            Option::Some(v) => { total = total + v; }
+            Option::None    => { break; }
+        }
+    }
+    return expect_eq(total, 30);
+}

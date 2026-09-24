@@ -96,6 +96,10 @@ public:
     type_noun: string;
     /// The spelling of the receiver binding.
     this_sym: SymbolStr;
+    /// The trait `This` stands for in the body being walked: a trait
+    /// declaration's own, or the trait an `implement trait` block
+    /// implements.  Invalid everywhere else, an inherent impl included.
+    this_trait: DefId;
 
     NameResolver(resolver: Resolver*, ctx: CompilationContext*)
         : BaseASTVisitor() {
@@ -106,6 +110,7 @@ public:
         this.defining_type     = SymbolStr::empty();
         this.type_noun         = "type";
         this.this_sym          = resolver.intern_table.intern("this");
+        this.this_trait        = DefId::invalid();
     }
 
     /// Declare a declaration's generic parameters in the current scope, each
@@ -284,6 +289,7 @@ public:
                 const trait_node: TraitDeclNode* = node as TraitDeclNode*;
                 const sym_id: SymbolID = this.resolver.declare_type(
                     trait_node.name, trait_node.span, true);
+                trait_node.sym_id = sym_id;
                 this.resolver.export_symbol(sym_id);
             }
             NodeKind::TypeAliasDeclaration => {
@@ -793,6 +799,11 @@ public:
     override visit(node: TraitDeclNode*) -> void {
         LOG_DEBUG(LogComponent::General, "[NameResolver] visit(TraitDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
         this.resolver.enter_scope(ScopeKind::Trait, this.resolver.intern_table.resolve(node.name), node.span);
+        const outer_trait: DefId = this.this_trait;
+        this.this_trait = match (this.bare_name_res(node.sym_id)) {
+            ResSlot::Answered(r) => { r.def_id() }
+            _                    => { DefId::invalid() }
+        };
 
         // Declare generic params
         this.declare_generics(node.generic_params);
@@ -826,6 +837,7 @@ public:
             node.methods[i].accept(this);
         }
 
+        this.this_trait = outer_trait;
         this.resolver.exit_scope();
     }
 
@@ -865,6 +877,8 @@ public:
         this.stamp_annotation(trait_head);
         this.type_noun = "type";
         this.stamp_annotation(node.trait_annotation);
+        const outer_trait: DefId = this.this_trait;
+        this.this_trait = TypeAnnotation::trait_def(node.trait_annotation);
         // What the head writes AFTER the target: a parameter of its own, or
         // a declaration (`Array<T, GlobalAlloc>`), and only a stamp can say
         // which.  Read after `declare_generics` for the reason the trait
@@ -890,6 +904,7 @@ public:
             method.accept(this);
         }
 
+        this.this_trait = outer_trait;
         this.resolver.exit_scope();
     }
 
@@ -2058,7 +2073,13 @@ public:
                 // that fold to read but the spelling.
                 if (a.size_expr != null) { a.size_expr.accept(this); }
             }
-            TypeAnnotation::Projection(pj) => { this.stamp_annotation(pj.base); }
+            TypeAnnotation::Projection(pj) => {
+                this.stamp_annotation(pj.base);
+                match (*pj.base) {
+                    TypeAnnotation::ThisType(_t) => { pj.owner_trait = this.this_trait; }
+                    _                            => { }
+                }
+            }
             TypeAnnotation::Function(f)    => {
                 for (mut i: i64 = 0; i < f.parameters.length; i++) {
                     this.stamp_annotation(f.parameters[i]);

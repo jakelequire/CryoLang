@@ -419,12 +419,18 @@ type struct TypeResolver {
     /// looks up that type's impl binding (wired in Stage 3b).
     project_from_base(base_ty: TypeRef, proj: ProjectionAnnotation*,
                       ctx: ResolutionContext*) -> TypeRef {
-        const owning: TypeRef = if (proj.rooted_at.is_valid()) {
-            this.bound_declaring(proj.rooted_at, proj.member)
-        } else {
-            TypeRef::invalid()
-        };
-        return this.project_member(base_ty, proj.member, owning, ctx);
+        return this.project_member(base_ty, proj.member, this.projection_trait(proj), ctx);
+    }
+
+    /// The trait a written projection names: `I::Item` names the one among
+    /// `I`'s bounds that declares `Item`, `This::Item` the trait `This`
+    /// stands for where it was written.  Invalid when the source names none -
+    /// a projection written on a type, or `This` in an inherent impl.
+    projection_trait(&this, proj: ProjectionAnnotation*) -> TypeRef {
+        if (proj == null) { return TypeRef::invalid(); }
+        if (proj.rooted_at.is_valid()) { return this.bound_declaring(proj.rooted_at, proj.member); }
+        if (proj.owner_trait.is_valid()) { return this.trait_declaring(proj.owner_trait, proj.member); }
+        return TypeRef::invalid();
     }
 
     /// Project associated type `member` of the trait `owning_trait` (invalid:
@@ -450,14 +456,12 @@ type struct TypeResolver {
         return this.arena.create_assoc_projection(base_ty, member, owning_trait);
     }
 
-    /// `member` of the trait `owning_trait` (invalid: the projection names no
-    /// trait) read off the concrete `base_ty`'s impl, or invalid.  A named
-    /// trait with no declaration answers nothing; it does not widen into
-    /// "whichever trait declares the member".
+    /// `member` of the trait `owning_trait` read off the concrete `base_ty`'s
+    /// impl, or invalid - as it is when `owning_trait` is invalid (the
+    /// projection names no trait) or names no registered trait.
     concrete_projection(&this, base_ty: TypeRef, member: SymbolStr, owning_trait: TypeRef) -> TypeRef {
         if (this.generic_registry == null) { return TypeRef::invalid(); }
         const owner: TraitDeclNode* = this.generic_registry.trait_decl_of(owning_trait);
-        if (owning_trait.is_valid() && owner == null) { return TypeRef::invalid(); }
         mut rc: ResolutionContext = ResolutionContext::new("");
         return this.resolve_concrete_member(base_ty, member, owner, &rc);
     }
@@ -490,13 +494,11 @@ type struct TypeResolver {
     /// body binding), instantiated against `Base`'s own type arguments.
     ///
     /// `owner` is the trait the projection names - the bound of the parameter
-    /// it was written on, or the trait a caller is asking about - and only
-    /// that trait answers.  Null means the source names none: `Both::Item`
-    /// written on a type, or `I::Item` on a parameter nothing bounds (a type
-    /// declaration's parameters have no bound syntax).  Then the answer is the
-    /// first trait, in registration order, that `Base` implements, declares
-    /// `member` and binds it - a choice the source does not make when two
-    /// traits qualify.  Invalid when nothing applies.
+    /// it was written on, the trait `This` stands for, or the trait a caller
+    /// is asking about - and only that trait answers.  Null means the source
+    /// names none, and then there is no answer: which of `Base`'s traits
+    /// declaring something spelled `member` was meant is not a question a
+    /// search can settle.  Invalid when nothing applies.
     resolve_concrete_member(&this, base_ty_in: TypeRef, member: SymbolStr,
                             owner: TraitDeclNode*, ctx: ResolutionContext*) -> TypeRef {
         if (this.generic_registry == null) { return TypeRef::invalid(); }
@@ -508,6 +510,7 @@ type struct TypeResolver {
         const bt: Type* = this.arena.lookup(base_ty.id);
         if (bt == null) { return TypeRef::invalid(); }
         if (!this.arena.template_key_of(base_ty, this.intern_table).is_valid()) { return TypeRef::invalid(); }
+        if (owner == null) { return TypeRef::invalid(); }
 
         // Element-wise copy, NOT a by-value array assignment: that would alias the
         // type's owning `type_args` buffer, and dropping the local at function exit
@@ -523,8 +526,7 @@ type struct TypeResolver {
 
         for (mut i: i64 = 0; i < this.generic_registry.trait_decl_nodes.length; i++) {
             const tdecl: TraitDeclNode* = this.generic_registry.trait_decl_nodes[i];
-            if (tdecl == null) { continue; }
-            if (owner != null && tdecl != owner) { continue; }
+            if (tdecl != owner) { continue; }
             const assoc_pos: i64 = tdecl.assoc_type_index(member);
             if (assoc_pos < 0) { continue; }
             // The WRITTEN head, whose positional trait arguments carry the
@@ -590,19 +592,26 @@ type struct TypeResolver {
     /// associated type `member`, as the trait's type; invalid when none of
     /// its bounds does, or when two do and the projection names neither.
     bound_declaring(&this, param: SymbolID, member: SymbolStr) -> TypeRef {
-        if (this.name_resolver == null || this.decl_index == null || this.generic_registry == null) {
-            return TypeRef::invalid();
-        }
+        if (this.name_resolver == null) { return TypeRef::invalid(); }
         const bounds: DefId[] = this.name_resolver.bounds_of_param(param);
         mut found: TypeRef = TypeRef::invalid();
         for (mut i: i64 = 0; i < bounds.length; i++) {
-            const trait_ty: TypeRef = this.decl_index.type_of_def(bounds[i]);
-            const tdecl: TraitDeclNode* = this.generic_registry.trait_decl_of(trait_ty);
-            if (tdecl == null || tdecl.assoc_type_index(member) < 0) { continue; }
+            const trait_ty: TypeRef = this.trait_declaring(bounds[i], member);
+            if (!trait_ty.is_valid()) { continue; }
             if (found.is_valid() && found.id != trait_ty.id) { return TypeRef::invalid(); }
             found = trait_ty;
         }
         return found;
+    }
+
+    /// The trait `trait_def` as a type, when it declares the associated type
+    /// `member`; invalid when it does not.
+    trait_declaring(&this, trait_def: DefId, member: SymbolStr) -> TypeRef {
+        if (this.decl_index == null || this.generic_registry == null) { return TypeRef::invalid(); }
+        const trait_ty: TypeRef = this.decl_index.type_of_def(trait_def);
+        const tdecl: TraitDeclNode* = this.generic_registry.trait_decl_of(trait_ty);
+        if (tdecl == null || tdecl.assoc_type_index(member) < 0) { return TypeRef::invalid(); }
+        return trait_ty;
     }
 
     /// Bind impl where-clause-derived generics into `bctx` for projection
