@@ -33,7 +33,7 @@ import compiler::types::compound::{
     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
 };
 import compiler::types::generic::{
-    AssocProjectionType, BoundedParamType, ErrorType, GenericParamType, InstantiatedType
+    AssocProjectionType, ErrorType, GenericParamType, InstantiatedType
 };
 import compiler::types::type_base::{
     BoolType, CharType, FloatType, IntType, NeverType, StringType, Type, UnitType,
@@ -133,8 +133,7 @@ type struct TypeArena {
     // Deliberately NOT used for:
     //   * nominal types (Struct/Class/Enum/Trait/Alias) - keyed by qualified
     //     name; see the file header on why module-prefixed keys are wrong.
-    //   * GenericParam / BoundedParam - keyed by NAME ONLY, dropping `index`
-    //     and `bounds`.  That is a correctness fix, not an oversight: see
+    //   * GenericParam - keyed by NAME ONLY, dropping `index`.  That is a correctness fix, not an oversight: see
     //     `create_generic_param`.  Re-including them here would regress it.
     intern_entries: InternEntry[];
     intern_ops:     TypeRef[];          // flat operand pool, sliced by InternEntry
@@ -156,7 +155,6 @@ type struct TypeArena {
     // `Hash`/`Eq for string`; verified empirically).  An older comment claiming
     // raw `string` equality is pointer-compare was stale (pre-`Eq for string`).
     generic_param_cache:   HashMap<u64, TypeRef>;
-    bounded_param_cache:   HashMap<u64, TypeRef>;
 
     /// Create a new TypeArena and initialize all 20 primitive singletons.
     static new(intern_table: InternTable*) -> TypeArena {
@@ -199,7 +197,6 @@ type struct TypeArena {
             alias_cache:         HashMap::<u32, TypeRef>::new(),
             func_template_cache: HashMap::<u32, TypeRef>::new(),
             generic_param_cache: HashMap::<u64, TypeRef>::new(),
-            bounded_param_cache: HashMap::<u64, TypeRef>::new(),
         };
 
         arena.init_primitives();
@@ -663,21 +660,6 @@ type struct TypeArena {
         return ref;
     }
 
-    /// Get or create a bounded generic parameter type, deduplicated by NAME
-    /// (see `create_generic_param` for why leaves are name-canonical).  The
-    /// bounds and `param_index` from the FIRST creation win; the checker already
-    /// compares BoundedParams by name alone, so this is consistent.
-    create_bounded_param(mut &this, name: SymbolStr, index: u64, bounds: TypeRef[]) -> TypeRef {
-        const key: u64 = name.id as u64;
-
-        const cached: Option<TypeRef> = this.bounded_param_cache.get(&key);
-        if (cached.is_some()) { return cached.unwrap(); }
-
-        mut ref: TypeRef = this.alloc_type(new BoundedParamType(this.next_id, name, index, bounds));
-        this.bounded_param_cache.insert(key, ref);
-        return ref;
-    }
-
     /// Get or create a symbolic associated-type projection `Base::Member`.
     /// Deduplicated by (base.id, member.id, owning_trait.id) so the same
     /// projection always shares one arena slot - important so the
@@ -963,8 +945,8 @@ type struct TypeArena {
         return wrapper_ref;
     }
 
-    /// Recursively check whether a type contains any GenericParam or
-    /// BoundedParam at any depth.  THE single authority for this query - 
+    /// Recursively check whether a type contains any GenericParam at any
+    /// depth.  THE single authority for this query - 
     /// monomorphization, the live sema symbolic walk, and the generic-validation
     /// pass all call it, so they can never drift out of sync and silently
     /// under-recurse.  It lives on the arena because the arena owns every Type
@@ -980,7 +962,6 @@ type struct TypeArena {
         const t: Type* = this.lookup(ty.id);
         if (t == null) { return false; }
         if (t.kind == TypeKind::GenericParam) { return true; }
-        if (t.kind == TypeKind::BoundedParam) { return true; }
         if (t.kind == TypeKind::AssocProjection) {
             // An unresolved associated-type projection (`I::Item`, or `This::Item`
             // in a trait-decl signature) is not yet concrete - treat it like a
@@ -1091,8 +1072,7 @@ type struct TypeArena {
             const arg: TypeRef = inst.type_args[i];
             const at: Type* = this.lookup(arg.id);
             if (at == null) { continue; }
-            const bare_param: boolean = at.kind == TypeKind::GenericParam
-                                     || at.kind == TypeKind::BoundedParam;
+            const bare_param: boolean = at.kind == TypeKind::GenericParam;
             if (!bare_param && this.contains_generic_param(arg)) {
                 return true;
             }
@@ -1259,10 +1239,6 @@ type struct TypeArena {
                 const gp: GenericParamType* = ty as GenericParamType*;
                 return this.intern_table.resolve(gp.param_name);
             }
-            TypeKind::BoundedParam => {
-                const bp: BoundedParamType* = ty as BoundedParamType*;
-                return this.intern_table.resolve(bp.param_name);
-            }
             TypeKind::AssocProjection => {
                 // `Base::Member` (e.g. `This::Item`).  The class-level
                 // `display_name` can only reach raw ids (`488::489`) - it
@@ -1359,10 +1335,6 @@ type struct TypeArena {
                 const gp: GenericParamType* = ty as GenericParamType*;
                 return this.intern_table.resolve(gp.param_name);
             }
-            TypeKind::BoundedParam => {
-                const bp: BoundedParamType* = ty as BoundedParamType*;
-                return this.intern_table.resolve(bp.param_name);
-            }
             TypeKind::AssocProjection => {
                 // `Base::Member` (e.g. `This::Item`) - see the long-form
                 // `format_display` for why this can't live on the class's
@@ -1436,8 +1408,7 @@ type struct TypeArena {
                 t.kind == TypeKind::TypeAlias) {
                 n_user += 1;
             }
-            if (t.kind == TypeKind::GenericParam || t.kind == TypeKind::BoundedParam ||
-                t.kind == TypeKind::FunctionTemplate) {
+            if (t.kind == TypeKind::GenericParam || t.kind == TypeKind::FunctionTemplate) {
                 n_generic += 1;
             }
             if (t.kind == TypeKind::InstantiatedType) {
@@ -1462,8 +1433,7 @@ type struct TypeArena {
         // recoverable from the type census above.
         cdebug("  Structural interner: %lld entries | canonical-identity violations: %lld\n",
             this.intern_entries.length, this.verify_canonical_identity());
-        cdebug("  GenericParam: %lld | BoundedParam: %lld\n",
-            this.generic_param_cache.length(), this.bounded_param_cache.length());
+        cdebug("  GenericParam: %lld\n", this.generic_param_cache.length());
         cdebug("  Struct: %lld | Class: %lld | Enum: %lld | Trait: %lld | Alias: %lld\n",
             this.struct_cache.length(), this.class_cache.length(),
             this.enum_cache.length(), this.trait_cache.length(),
@@ -1506,7 +1476,6 @@ type struct TypeArena {
     ///   Function:     "3p"     (params)
     ///   Tuple:        "2e"     (elements)
     ///   InstType:     "2a"     (type args)
-    ///   BoundedParam: "1b"     (bounds)
     get_type_members(&this, ty: Type*) -> string {
         if (ty.kind == TypeKind::Struct) {
             const st: StructType* = ty as StructType*;
@@ -1535,10 +1504,6 @@ type struct TypeArena {
         if (ty.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = ty as InstantiatedType*;
             return fmt::format("%llda", inst.type_args.length);
-        }
-        if (ty.kind == TypeKind::BoundedParam) {
-            const bp: BoundedParamType* = ty as BoundedParamType*;
-            return fmt::format("%lldb", bp.bounds.length);
         }
         return "";
     }
@@ -1571,8 +1536,7 @@ type struct TypeArena {
             for (mut j: i64 = 0; j < inst.type_args.length; j++) {
                 const arg_ty: Type* = this.lookup(inst.type_args[j].id);
                 if (arg_ty != null) {
-                    if (arg_ty.kind == TypeKind::GenericParam ||
-                        arg_ty.kind == TypeKind::BoundedParam) {
+                    if (arg_ty.kind == TypeKind::GenericParam) {
                         return "template-internal";
                     }
                 }
@@ -1587,10 +1551,6 @@ type struct TypeArena {
         if (ty.kind == TypeKind::GenericParam) {
             const gp: GenericParamType* = ty as GenericParamType*;
             return fmt::format("idx=%lu", gp.param_index);
-        }
-        if (ty.kind == TypeKind::BoundedParam) {
-            const bp: BoundedParamType* = ty as BoundedParamType*;
-            return fmt::format("idx=%lu", bp.param_index);
         }
         if (ty.kind == TypeKind::Reference) {
             const r: ReferenceType* = ty as ReferenceType*;

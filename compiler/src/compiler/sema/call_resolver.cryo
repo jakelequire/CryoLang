@@ -99,7 +99,7 @@ import compiler::types::checker::{ TypeChecker, TypeCompatibility };
 import compiler::types::compound::{
     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType
 };
-import compiler::types::generic::{ BoundedParamType, GenericParamType, InstantiatedType };
+import compiler::types::generic::{ GenericParamType, InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::types::generic_registry::{ LangItem };
 import compiler::types::inference::{ InferCtx };
@@ -460,17 +460,6 @@ type struct CallResolver {
                 const m: MethodInfo* = &et.methods[i];
                 if (m.name.equals(member.member) && m.param_types.length == arg_count) { found.push(m); }
             }
-        } else if (base_t.kind == TypeKind::BoundedParam) {
-            const bp: BoundedParamType* = base_t as BoundedParamType*;
-            for (mut bi: i64 = 0; bi < bp.bounds.length; bi++) {
-                const bt: Type* = this.arena.lookup(bp.bounds[bi].id);
-                if (bt == null || bt.kind != TypeKind::Trait) { continue; }
-                const tt: TraitType* = bt as TraitType*;
-                for (mut mi: i64 = 0; mi < tt.required_methods.length; mi++) {
-                    const m: MethodInfo* = &tt.required_methods[mi];
-                    if (m.name.equals(member.member) && m.param_types.length == arg_count) { found.push(m); }
-                }
-            }
         } else if (base_t.kind == TypeKind::GenericParam) {
             // A parameter bounded by a WHERE clause rather than inline stays a
             // plain `GenericParam` — its bounds live on the enclosing function
@@ -591,13 +580,6 @@ type struct CallResolver {
                     if (entry.param_names[p].equals(gp.param_name)) { substituted = type_args[p]; break; }
                 }
                 result.push(substituted);
-            } else if (pt.kind == TypeKind::BoundedParam) {
-                const bp: BoundedParamType* = pt as BoundedParamType*;
-                mut substituted: TypeRef = payload[i];
-                for (mut p: i64 = 0; p < entry.param_count; p++) {
-                    if (entry.param_names[p].equals(bp.param_name)) { substituted = type_args[p]; break; }
-                }
-                result.push(substituted);
             } else {
                 result.push(payload[i]);
             }
@@ -693,16 +675,8 @@ type struct CallResolver {
             if (!param_types[i].is_valid()) { continue; }
             const pt: Type* = this.arena.lookup(param_types[i].id);
             if (pt == null) { continue; }
-            mut pname: SymbolStr = SymbolStr::empty();
-            mut named: boolean = false;
-            if (pt.kind == TypeKind::GenericParam) {
-                pname = (pt as GenericParamType*).param_name;
-                named = true;
-            } else if (pt.kind == TypeKind::BoundedParam) {
-                pname = (pt as BoundedParamType*).param_name;
-                named = true;
-            }
-            if (!named) { continue; }
+            if (pt.kind != TypeKind::GenericParam) { continue; }
+            const pname: SymbolStr = (pt as GenericParamType*).param_name;
             for (mut p: i64 = 0; p < tmpl.param_names.length; p++) {
                 if (!tmpl.param_names[p].equals(pname)) { continue; }
                 // Inside the owner's own template body the argument is still the
@@ -1378,7 +1352,6 @@ type struct CallResolver {
         const ty: Type* = this.arena.lookup(t.id);
         if (ty == null) { return false; }
         if (ty.kind == TypeKind::GenericParam)     { return false; }
-        if (ty.kind == TypeKind::BoundedParam)     { return false; }
         if (ty.kind == TypeKind::FunctionTemplate) { return false; }
         if (ty.kind == TypeKind::Function)         { return false; }
         if (ty.kind == TypeKind::Unit)             { return false; }
@@ -3241,14 +3214,12 @@ type struct CallResolver {
             // A receiver with no type symbol names no type, so there is no
             // method set to search and this is a failure, not a search.
             //
-            // Four rescue lookups used to run here first - through a
-            // BoundedParam's bounds, through a projection's bounds, through a
-            // generic return, and through the owner template.  Every receiver
-            // shape they could answer for is already answered ABOVE, by the
-            // generic-owner and abstract-receiver arms, so reaching this point
-            // means those arms declined; re-asking the same sources with less
-            // information cannot turn that into an answer.  They only spent
-            // four lookups before the failure below.
+            // Every abstract receiver shape - a bounded parameter, a
+            // projection, a generic return, the owner template - is answered
+            // ABOVE, by the generic-owner and abstract-receiver arms, so
+            // reaching this point means those arms declined; re-asking the
+            // same sources with less information cannot turn that into an
+            // answer.
             return TypeRef::invalid();
         }
 
@@ -3299,15 +3270,6 @@ type struct CallResolver {
             final_ret = this.binding.finalize_assoc_return(obj_type, member, final_ret);
             member.set_resolved_type(final_ret);
             return final_ret;
-        }
-
-        if (base_t != null && base_t.kind == TypeKind::BoundedParam) {
-            const trait_ret: TypeRef = this.binding.lookup_method_through_bounds(
-                base_t as BoundedParamType*, lookup_ref, member.member);
-            if (trait_ret.is_valid()) {
-                member.set_resolved_type(trait_ret);
-                return trait_ret;
-            }
         }
 
         const inherited: TypeRef = this.binding.lookup_method_through_trait_impls(lookup_ref, member.member);
@@ -5087,7 +5049,6 @@ type struct CallResolver {
             // Only the direct `T` payload shape (the position IS a bare param).
             mut pname: SymbolStr = SymbolStr::empty();
             if (pt.kind == TypeKind::GenericParam) { pname = (pt as GenericParamType*).param_name; }
-            else if (pt.kind == TypeKind::BoundedParam) { pname = (pt as BoundedParamType*).param_name; }
             else { continue; }
             const arg: ExpressionNode* = call.arguments[i];
             if (arg == null || !arg.has_resolved_type()) { continue; }

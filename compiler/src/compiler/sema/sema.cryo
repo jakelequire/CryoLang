@@ -124,7 +124,7 @@ import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::checker::{ FieldLookup, TypeChecker, TypeCheckResult, TypeCompatibility };
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType, TupleType };
-import compiler::types::generic::{ BoundedParamType, InstantiatedType };
+import compiler::types::generic::{ InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::types::generic_registry::{ LangItem };
 import compiler::types::resolver::{ ResolutionContext };
@@ -1760,29 +1760,6 @@ public:
         return call as ExpressionNode*;
     }
 
-    /// True when `bound` resolves to the trait whose identity is `trait_id`,
-    /// or (transitively, to bounded depth) to one that has it as a
-    /// super-trait.  Covers `T: Ord` satisfying `Eq` (`Ord : Eq`).
-    ///
-    /// The comparison is by identity, never by leaf: a user trait spelled
-    /// `Add` is a different trait, and a bound naming it does not make `+`
-    /// overload - the concrete-operand path asks `wellknown` and selects by
-    /// identity, and the two paths must agree on what a bound means.
-    trait_ref_matching(&this, bound: TypeRef, trait_id: SymbolStr, depth: i32) -> boolean {
-        if (depth > 4) { return false; }
-        const bt: Type* = this.arena.lookup(bound.id);
-        if (bt == null || bt.kind != TypeKind::Trait) { return false; }
-        const tt: TraitType* = bt as TraitType*;
-        if (tt.qualified_name.equals(trait_id)) { return true; }
-        for (mut i: i64 = 0; i < tt.super_traits.length; i++) {
-            if (this.trait_ref_matching(tt.super_traits[i], trait_id, depth + 1)) { return true; }
-        }
-        return false;
-    }
-
-    /// True when a generic `BoundedParam`'s declared bounds (or their
-    /// super-traits) include the trait whose identity is `trait_id`, so an
-    /// operator on that param overloads.
     /// The type a `for` scrutinee's `next` is called on: a pointer or
     /// reference auto-derefs to what it points at, and an instantiation to
     /// the type it resolved to.
@@ -1815,26 +1792,15 @@ public:
         const subject: TypeRef = this.for_scrutinee_subject(ty);
         const t: Type* = this.arena.lookup(subject.id);
         if (t == null) { return false; }
-        if (t.kind == TypeKind::BoundedParam) {
-            return this.bounded_param_trait(t as BoundedParamType*, iterator_id);
-        }
         return this.trait_checker().type_satisfies_opaque_bound(subject, iterator_id);
-    }
-
-    bounded_param_trait(&this, bp: BoundedParamType*, trait_id: SymbolStr) -> boolean {
-        if (!trait_id.is_valid()) { return false; }
-        for (mut i: i64 = 0; i < bp.bounds.length; i++) {
-            if (this.trait_ref_matching(bp.bounds[i], trait_id, 0)) { return true; }
-        }
-        return false;
     }
 
     /// Decide whether operand type `ty` overloads `map`'s operator and, if so,
     /// build + resolve the trait-method call, returning the resolved desugar
     /// expression (its `resolved_type` set) for the caller to attach.  Returns
     /// null when no overload applies (caller keeps the primitive path or errors).
-    /// Phase 1: a concrete user type (Struct/Class/Enum/Instantiated) with a
-    /// registered trait impl.  Phase 2: a generic param bounded by the trait.
+    /// Only a concrete user type (Struct/Class/Enum/Instantiated) with a
+    /// registered trait impl overloads.
     operator_overload_expr(mut &this, receiver: ExpressionNode*, ty: TypeRef,
                            rhs: ExpressionNode*, map: OperatorTraitMap,
                            op_tok: Token, span: SourceSpan,
@@ -1867,25 +1833,17 @@ public:
             }
             if (t == null) { return null; }
         }
-        const is_bounded: boolean = t.kind == TypeKind::BoundedParam;
         const is_user: boolean = t.kind == TypeKind::Struct || t.kind == TypeKind::Class
                               || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType;
-        if (!is_bounded && !is_user) { return null; }
+        if (!is_user) { return null; }
         // The operator's trait is the language's (`std::core::ops::Add` for
         // `+`, as Rust's `+` is `core::ops::Add`), by the identity its
         // declaration claimed; the table spells the leaf and nothing else.
-        // A parameter overloads when a bound names that trait, a concrete
-        // type when it has an impl of it; a user trait of the same spelling
-        // is neither, on either path.
+        // A type overloads when it has an impl of that trait; a user trait
+        // of the same spelling is not it.
         const trait_id: SymbolStr = this.ctx.generic_registry.wellknown(map.lang);
         if (!trait_id.is_valid()) { return null; }
-        mut overloads: boolean = false;
-        if (is_bounded) {
-            overloads = this.bounded_param_trait(t as BoundedParamType*, trait_id);
-        } else {
-            overloads = this.trait_checker().select_impl(trait_id, base_ty, 0) != null;
-        }
-        if (!overloads) { return null; }
+        if (this.trait_checker().select_impl(trait_id, base_ty, 0) == null) { return null; }
         const method_sym: SymbolStr = this.intern.intern(map.method);
         mut desugared: ExpressionNode* =
             this.build_operator_call(receiver, method_sym, trait_id, rhs, op_tok, span);
@@ -2692,7 +2650,7 @@ public:
         if (!scrut_ref.is_valid()) { return save; }
         const st: Type* = this.arena.lookup(scrut_ref.id);
         if (st == null) { return save; }
-        if (st.kind != TypeKind::GenericParam && st.kind != TypeKind::BoundedParam) { return save; }
+        if (st.kind != TypeKind::GenericParam) { return save; }
 
         const arm_ref: TypeRef = this.ctx.type_resolver.resolve(arm.type_patterns[0], &rc);
         if (!arm_ref.is_valid() || this.arena.contains_generic_param(arm_ref)) { return save; }

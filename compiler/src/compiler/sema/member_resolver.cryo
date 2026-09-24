@@ -53,7 +53,7 @@ import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::checker::{ FieldLookup, TypeChecker, TypeCheckResult };
 import compiler::types::compound::{ FunctionType, PointerType, ReferenceType, TupleType };
-import compiler::types::generic::{ BoundedParamType, InstantiatedType };
+import compiler::types::generic::{ InstantiatedType };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
@@ -576,16 +576,11 @@ type struct MemberResolver {
         // parameter is bounded by it or a type implements it.
         const index_id: SymbolStr = this.ctx.generic_registry.wellknown(LangItem::Index);
         if (!index_id.is_valid()) { return null; }
-        mut overloads: boolean = false;
-        if (t.kind == TypeKind::BoundedParam) {
-            overloads = this.bounded_param_has_index(t as BoundedParamType*, index_id);
-        } else if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class
-                || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType) {
-            overloads = this.trait_checker().select_impl(index_id, base_ty, 0) != null;
-        } else {
+        if (t.kind != TypeKind::Struct && t.kind != TypeKind::Class
+                && t.kind != TypeKind::Enum && t.kind != TypeKind::InstantiatedType) {
             return null;
         }
-        if (!overloads) { return null; }
+        if (this.trait_checker().select_impl(index_id, base_ty, 0) == null) { return null; }
 
         // Build `*(a.index(i))`.  The index expression is passed BY VALUE - the
         // trait is `index(&this, idx: Idx)`, not `&Idx` - so no synthetic `&`.
@@ -602,32 +597,6 @@ type struct MemberResolver {
         const rty: TypeRef = this.dispatch.resolve_expr(visitor, de);
         if (!rty.is_valid()) { return null; }
         return de;
-    }
-
-    /// True when a generic `BoundedParam`'s bounds (or their super-traits, to
-    /// bounded depth) include the trait whose identity is `index_id`, so
-    /// `a[i]` on that param overloads.
-    bounded_param_has_index(&this, bp: BoundedParamType*, index_id: SymbolStr) -> boolean {
-        for (mut i: i64 = 0; i < bp.bounds.length; i++) {
-            if (this.trait_bound_names(bp.bounds[i], index_id, 0)) { return true; }
-        }
-        return false;
-    }
-
-    /// True when `bound` resolves to the `TraitType` whose identity is
-    /// `trait_id`, or (transitively, to bounded depth) to one that has it as
-    /// a super-trait.  By identity, never by leaf: a user trait spelled
-    /// `Index` is another trait.
-    trait_bound_names(&this, bound: TypeRef, trait_id: SymbolStr, depth: i32) -> boolean {
-        if (depth > 4) { return false; }
-        const bt: Type* = this.arena.lookup(bound.id);
-        if (bt == null || bt.kind != TypeKind::Trait) { return false; }
-        const tt: TraitType* = bt as TraitType*;
-        if (tt.qualified_name.equals(trait_id)) { return true; }
-        for (mut i: i64 = 0; i < tt.super_traits.length; i++) {
-            if (this.trait_bound_names(tt.super_traits[i], trait_id, depth + 1)) { return true; }
-        }
-        return false;
     }
 
     /// When `[]` hits a user type lacking an `Index` impl, emit a diagnostic that

@@ -58,7 +58,7 @@ import compiler::types::compound::{
     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
 };
 import compiler::types::generic::{
-    AssocProjectionType, BoundedParamType, GenericParamType, InstantiatedType
+    AssocProjectionType, GenericParamType, InstantiatedType
 };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::types::inference::{ InferCtx };
@@ -221,21 +221,6 @@ type struct MethodBinding {
 
     // -- Bound / trait-impl method lookup --
 
-    /// Bound-aware method dispatch: when the receiver is a `BoundedParamType`
-    /// (`T: Display`), the concrete impl isn't known but each bound trait's decl
-    /// determines the signature; return the first bound trait's method return.
-    lookup_method_through_bounds(mut &this, bp: BoundedParamType*, recv: TypeRef,
-                                 method_name: SymbolStr) -> TypeRef {
-        if (bp == null) { return TypeRef::invalid(); }
-        for (mut i: i64 = 0; i < bp.bounds.length; i++) {
-            const bound_t: Type* = this.arena.lookup(bp.bounds[i].id);
-            if (bound_t == null || bound_t.kind != TypeKind::Trait) { continue; }
-            const ret: TypeRef = this.types.lookup_method_return(bp.bounds[i], method_name);
-            if (ret.is_valid()) { return this.subst_this_in_trait_return(ret, recv); }
-        }
-        return TypeRef::invalid();
-    }
-
     /// Rebase a trait-declared method return onto the ACTUAL receiver by
     /// substituting the trait's canonical `This` placeholder.
     ///
@@ -265,7 +250,7 @@ type struct MethodBinding {
     }
 
     /// Projection-bounded dispatch: the associated-type-projection sibling of
-    /// `lookup_method_through_bounds`. When the receiver is an `AssocProjection`
+    /// `lookup_method_through_param_bounds`. When the receiver is an `AssocProjection`
     /// (`This::Item`) and an enclosing where-bound constrains that same
     /// projection (`where This::Item: Ord`), resolve `method_name` through the
     /// bound trait(s). The bound is matched to the receiver by the projected
@@ -321,13 +306,6 @@ type struct MethodBinding {
             return this.lookup_method_through_projection_bounds(
                 t as AssocProjectionType*, walk, method_name);
         }
-        if (t.kind == TypeKind::BoundedParam) {
-            const bp_ret: TypeRef = this.lookup_method_through_bounds(
-                t as BoundedParamType*, walk, method_name);
-            if (bp_ret.is_valid()) { return bp_ret; }
-            return this.lookup_method_through_param_bounds(
-                (t as BoundedParamType*).param_name, walk, method_name);
-        }
         if (t.kind == TypeKind::GenericParam) {
             return this.lookup_method_through_param_bounds(
                 (t as GenericParamType*).param_name, walk, method_name);
@@ -349,11 +327,9 @@ type struct MethodBinding {
     /// Resolve `method_name` through the where-clause bounds naming the generic
     /// parameter `param` (`where S: AsyncRead`).
     ///
-    /// A parameter constrained by a WHERE clause rather than inline stays a plain
-    /// `GenericParam`: its bounds live on the enclosing function/impl node, not
-    /// on the type, so `lookup_method_through_bounds` — which reads a
-    /// `BoundedParamType`'s own bound list — never sees them. The bare-parameter
-    /// sibling of `lookup_method_through_projection_bounds`.
+    /// A parameter's bounds live on the enclosing function/impl node, not on
+    /// its type, so they are read there. The bare-parameter sibling of
+    /// `lookup_method_through_projection_bounds`.
     lookup_method_through_param_bounds(mut &this, param: SymbolStr, recv: TypeRef,
                                        method_name: SymbolStr) -> TypeRef {
         if (!param.is_valid()) { return TypeRef::invalid(); }
@@ -1106,16 +1082,9 @@ type struct MethodBinding {
         }
         if (t == null) { return rc; }
 
-        mut pname: SymbolStr = SymbolStr::from_id(0);
-        mut have_pname: boolean = false;
-        if (t.kind == TypeKind::GenericParam) {
-            pname = (t as GenericParamType*).param_name;
-            have_pname = true;
-        } else if (t.kind == TypeKind::BoundedParam) {
-            pname = (t as BoundedParamType*).param_name;
-            have_pname = true;
-        }
-        if (!have_pname || !pname.is_valid()) { return rc; }
+        if (t.kind != TypeKind::GenericParam) { return rc; }
+        const pname: SymbolStr = (t as GenericParamType*).param_name;
+        if (!pname.is_valid()) { return rc; }
 
         mut bound_leaves: SymbolStr[] = [];
         if (this.state.symbolic_impl_node != null) {
