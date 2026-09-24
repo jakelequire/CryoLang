@@ -225,8 +225,8 @@ CLASS_OF_METHOD = {
         ("J", "module: a namespace asked whether it is the prelude's; a module's identity is its path"),
     "DeclarationIndex::ns_imports":
         ("J", "module: two namespaces asked whether one imports the other; module identities"),
-    "DeclarationIndex::family_is_intrinsic":
-        ("C", "a family by its key string, asked whether every entry is an intrinsic (the `CalleePin::Family` arm; the `Decl` arm reads the mark off the entry)"),
+    "DeclarationIndex::family_intrinsic_kind":
+        ("C", "a family by its key string, asked the intrinsic kind its entries share (the `CalleePin::Family` arm; the `Decl` arm reads the kind off the entry)"),
     "DeclarationIndex::extern_symbol_conflict":
         ("J", "extern: a C symbol by its link name, the only identity a C symbol has"),
     # -- the funnel --

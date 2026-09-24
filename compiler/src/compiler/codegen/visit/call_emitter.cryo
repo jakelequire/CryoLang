@@ -23,8 +23,8 @@ import compiler::codegen::util::{ CodegenUtil };
 import compiler::codegen::state::visitor_state;
 import compiler::codegen::state::visitor_state::{ VisitorState };
 import compiler::codegen::visit::{ expr_dispatch, enum_variant_emitter };
-import compiler::codegen::ops::intrinsics_codegen;
-import compiler::codegen::ops::intrinsics_codegen::{ IntrinsicKind };
+import compiler::intrinsic_kind;
+import compiler::intrinsic_kind::{ IntrinsicKind };
 import compiler::compilation_context;
 import compiler::decl_index;
 import compiler::decl_index::{ DeclarationIndex };
@@ -1123,30 +1123,22 @@ type struct CallEmitter {
     /// the hosted raising funnel applies; the plain-call fast-path (empty
     /// schedule / abort mode / freestanding trap) stays byte-identical through
     /// `emit_panic_call`.
-    /// The leaf of the INTRINSIC a call is pinned to, or "" when the call
-    /// is a function call.  The pin decides, by the mark the intrinsic's
-    /// registration put on its entry: any other pin - the exported
-    /// `std::core::panic` wrapper, a user's `rotl32`, an `extern "C"`
-    /// declaration whose C symbol IS the leaf - is a real function with a
-    /// body, whatever its leaf or its symbol; and a call with NO pin is a
-    /// call through a VALUE - a parameter, a local or a field holding a
-    /// function pointer - which is never an intrinsic, whatever the value
-    /// is named (a parameter `bswap32: (u32) -> u32` called through the
-    /// pointer was inlined as the byte swap).  The kind is then selected by
-    /// the pinned declaration's own leaf, never by the written one.  A leaf
-    /// test in front of the pin inlined every `core::panic(...)` in the
-    /// stdlib against a spelling that named the wrapper, and a symbol test
-    /// after it would take `libc::malloc` for the intrinsic.
-    pinned_intrinsic_leaf(&this, node: CallExprNode*) -> string {
+    /// The kind of the INTRINSIC a call is pinned to, or `Call` when the
+    /// call is a function call.  The pin decides, by the kind the
+    /// intrinsic's registration put on its entry: any other pin - the
+    /// exported `std::core::panic` wrapper, a user's `rotl32`, an `extern
+    /// "C"` declaration whose C symbol IS an intrinsic's leaf - is a real
+    /// function with a body, whatever its leaf or its symbol; and a call
+    /// with NO pin is a call through a VALUE - a parameter, a local or a
+    /// field holding a function pointer - which is never an intrinsic,
+    /// whatever the value is named.  No spelling is read here.
+    pinned_intrinsic_kind(&this, node: CallExprNode*) -> IntrinsicKind {
         const di: DeclarationIndex* = this.cg.get_decl_index();
-        mut key: SymbolStr = SymbolStr::empty();
-        match (&node.resolved_callee) {
-            CalleePin::None      => { }
-            CalleePin::Family(f) => { if (di.family_is_intrinsic(f)) { key = f; } }
-            CalleePin::Decl(e)   => { if (di.entry_is_intrinsic(e)) { key = di.entry_key(e); } }
-        }
-        if (!key.is_valid()) { return ""; }
-        return QualifiedName::leaf_of(this.cg.get_intern().resolve(key));
+        return match (&node.resolved_callee) {
+            CalleePin::None      => { IntrinsicKind::Call }
+            CalleePin::Family(f) => { di.family_intrinsic_kind(f) }
+            CalleePin::Decl(e)   => { di.entry_intrinsic_kind(e) }
+        };
     }
 
     /// Lower a call pinned to an intrinsic inline, for both callee shapes
@@ -1155,17 +1147,16 @@ type struct CallEmitter {
     /// declines (an arity it does not take), which then goes through the
     /// pin as a call.
     emit_pinned_intrinsic(mut &this, visitor: ASTVisitor*, node: CallExprNode*) -> boolean {
-        const leaf: string = this.pinned_intrinsic_leaf(node);
-        if (leaf.length() == 0) { return false; }
+        const kind: IntrinsicKind = this.pinned_intrinsic_kind(node);
+        if (kind == IntrinsicKind::Call) { return false; }
         // `try_catch(body, data)` - the catch_unwind primitive.  Needs an
         // `invoke` + a catch-all landing pad + a phi (control flow the
         // generic `try_emit` inline path cannot build), so it is special-
-        // lowered here rather than through `IntrinsicKind`.
-        if (leaf.eq("try_catch")) {
+        // lowered here rather than by the inline dispatcher.
+        if (kind == IntrinsicKind::TryCatch) {
             this.emit_catch_unwind(visitor, node);
             return true;
         }
-        if (!IntrinsicKind::is_name(leaf)) { return false; }
         // `args` is scoped to this call: it is built and moved into
         // `try_emit` unconditionally, so nothing is left conditionally
         // moved past the if.
@@ -1179,7 +1170,7 @@ type struct CallEmitter {
         // path bypasses the invoke-swap and leaks them).  Gated on a hosted
         // unwind build WITH live locals; every other case falls through to
         // the byte-identical `try_emit` plain-call path below.
-        if (leaf.eq("panic")
+        if (kind == IntrinsicKind::Panic
             && this.cg.ctx.project_panic_unwind
             && !this.cg.intrinsics.no_runtime
             && (node.unwind_cleanup.length > 0
@@ -1188,7 +1179,7 @@ type struct CallEmitter {
             this.emit_panic_unwind(visitor, node, args[0], args[1], args[2]);
             return true;
         }
-        return match (this.cg.intrinsics.try_emit(leaf, args)) {
+        return match (this.cg.intrinsics.try_emit(kind, args)) {
             Option::Some(v) => {
                 this.state.last_value = v;
                 this.state.last_is_lvalue = false;

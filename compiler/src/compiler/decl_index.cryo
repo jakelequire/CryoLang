@@ -41,6 +41,8 @@ import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
+import compiler::intrinsic_kind;
+import compiler::intrinsic_kind::{ IntrinsicKind };
 
 
 /// Outcome of import-scoped bare-leaf name resolution
@@ -228,10 +230,12 @@ type struct DeclarationIndex {
                                       // and signature is told apart here, so a
                                       // `Type::method` path can prefer the
                                       // inherent one as Rust does.
-    overload_func_intrinsic: boolean[]; // the entry is an `intrinsic function`
-                                      // declaration, one codegen lowers inline
-                                      // (memcpy, ptr_diff, panic, atomic_*, ...).
-                                      // The mark is on the ENTRY, so a pin to
+    overload_func_intrinsic: IntrinsicKind[]; // how a call pinned to the entry
+                                      // lowers: an `intrinsic function` codegen
+                                      // lowers inline (ptr_diff, panic, atomic_*,
+                                      // ...), else `Call`.  The kind is on the
+                                      // ENTRY, read from the declaration where it
+                                      // was registered, so a pin to
                                       // a function sharing the intrinsic's
                                       // leaf or its C symbol (`libc::malloc`
                                       // beside `intrinsics::malloc`) is not
@@ -448,7 +452,7 @@ type struct DeclarationIndex {
         this.overload_func_owner.push(owner.id);
         this.overload_func_trait.push(trait_sym.id);
         this.overload_func_span.push(span);
-        this.overload_func_intrinsic.push(false);
+        this.overload_func_intrinsic.push(IntrinsicKind::Call);
         const slot: u32[]* = this.overload_index.get_or_insert(name.id, []);
         (*slot).push(new_pos);
         return OverloadId::at_position(new_pos);
@@ -508,34 +512,34 @@ type struct DeclarationIndex {
         return entries[0];
     }
 
-    /// Mark entry `id` as an `intrinsic function` declaration.  Its leaf is
-    /// a key in no function table: an intrinsic is reached through its
-    /// module (`intrinsics::free`) like every declaration, and its bare
-    /// spelling is an error where it is declared in no scope.  Codegen
-    /// reads the mark off the pin to tell the intrinsic from a function
-    /// sharing its leaf (`callee_is_intrinsic`).
-    mark_intrinsic(mut &this, id: OverloadId) -> void {
+    /// Record the kind an `intrinsic function` declaration's entry `id`
+    /// lowers as.  Its leaf is a key in no function table: an intrinsic is
+    /// reached through its module (`intrinsics::free`) like every
+    /// declaration, and its bare spelling is an error where it is declared
+    /// in no scope.  Codegen reads the kind off the pin, so a function
+    /// sharing an intrinsic's leaf is never taken for it.
+    mark_intrinsic(mut &this, id: OverloadId, kind: IntrinsicKind) -> void {
         if (!id.is_valid()) { return; }
-        this.overload_func_intrinsic[id.position() as i64] = true;
+        this.overload_func_intrinsic[id.position() as i64] = kind;
     }
 
-    /// Whether entry `id` is an `intrinsic function` declaration; false for
-    /// an invalid id.
-    entry_is_intrinsic(&this, id: OverloadId) -> boolean {
-        if (!id.is_valid()) { return false; }
+    /// How a call pinned to entry `id` lowers; `Call` for an invalid id.
+    entry_intrinsic_kind(&this, id: OverloadId) -> IntrinsicKind {
+        if (!id.is_valid()) { return IntrinsicKind::Call; }
         return this.overload_func_intrinsic[id.position() as i64];
     }
 
-    /// Whether every entry under key `name` is an intrinsic: a call pinned
-    /// to a FAMILY rather than an entry names the intrinsic only when the
-    /// family holds nothing else.  False for a key with no entries.
-    family_is_intrinsic(&this, name: SymbolStr) -> boolean {
+    /// How a call pinned to the FAMILY `name` lowers: the kind its entries
+    /// share, when every entry has the same one; `Call` otherwise, and for a
+    /// key with no entries.
+    family_intrinsic_kind(&this, name: SymbolStr) -> IntrinsicKind {
         const entries: OverloadId[] = this.lookup_family_entries(name);
-        if (entries.length == 0) { return false; }
-        for (mut k: i64 = 0; k < entries.length; k++) {
-            if (!this.entry_is_intrinsic(entries[k])) { return false; }
+        if (entries.length == 0) { return IntrinsicKind::Call; }
+        const kind: IntrinsicKind = this.entry_intrinsic_kind(entries[0]);
+        for (mut k: i64 = 1; k < entries.length; k++) {
+            if (this.entry_intrinsic_kind(entries[k]) != kind) { return IntrinsicKind::Call; }
         }
-        return true;
+        return kind;
     }
 
     /// The signature of every entry under `name`, in registration order

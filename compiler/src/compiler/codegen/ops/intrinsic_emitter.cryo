@@ -8,9 +8,9 @@
 /// `@format` runtime helpers as `linkonce_odr` definitions so the linker
 /// can collapse copies across translation units.
 ///
-/// Methods are kind-driven: `try_emit(name, args)` runs
-/// `IntrinsicKind::from_name` from `IntrinsicsCodegen`, validates arity,
-/// and dispatches to a per-kind LLVM emission path.  Returns
+/// Methods are kind-driven: `try_emit(kind, args)` takes the kind the
+/// pinned declaration was registered with, validates arity, and
+/// dispatches to a per-kind LLVM emission path.  Returns
 /// `Option::None` when the call should fall through to the regular
 /// function-resolution path.
 ///
@@ -30,8 +30,8 @@ import compiler::codegen::llvm_types::{
 };
 import compiler::codegen::abi;
 import compiler::codegen::abi::{ AbiClassifier };
-import compiler::codegen::ops::intrinsics_codegen;
-import compiler::codegen::ops::intrinsics_codegen::{ IntrinsicKind };
+import compiler::intrinsic_kind;
+import compiler::intrinsic_kind::{ IntrinsicKind };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import std::ffi::libc;
@@ -414,17 +414,57 @@ type struct IntrinsicEmitter {
 
     // Dispatcher
 
-    /// Inline-lower a bare-name function call to LLVM IR.  Returns
-    /// `Option::Some(value)` if `name` matches a known intrinsic, or
-    /// `Option::None` if the call should fall through to the normal
-    /// function-resolution path.
-    try_emit(mut &this, name: string, args: LValue[]) -> Option<LValue> {
-        const kind: IntrinsicKind = IntrinsicKind::from_name(name);
+    /// The value type a unary intrinsic's first argument is loaded as when
+    /// the caller passes a pointer to it (`intrinsic(&this)`), or a null
+    /// type when that argument is not auto-dereferenced.
+    static src_type_of(kind: IntrinsicKind) -> LType {
+        return match (kind) {
+            // Bit ops: source is the same width as the operation
+            IntrinsicKind::Bswap16    => { LType::i16() }
+            IntrinsicKind::Bswap32    => { LType::i32() }
+            IntrinsicKind::Bswap64    => { LType::i64() }
+            IntrinsicKind::Popcount32 => { LType::i32() }
+            IntrinsicKind::Popcount64 => { LType::i64() }
+            IntrinsicKind::Clz32      => { LType::i32() }
+            IntrinsicKind::Clz64      => { LType::i64() }
+            IntrinsicKind::Ctz32      => { LType::i32() }
+            IntrinsicKind::Ctz64      => { LType::i64() }
+            IntrinsicKind::Rotl32     => { LType::i32() }
+            IntrinsicKind::Rotl64     => { LType::i64() }
+            IntrinsicKind::Rotr32     => { LType::i32() }
+            IntrinsicKind::Rotr64     => { LType::i64() }
+            // fpclass consumes an f64 by value (arg0); the i32 test mask
+            // (arg1) is handled directly in the emitter, not auto-deref'd.
+            IntrinsicKind::FpClass       => { LType::f64() }
+            // Cheap fp math: arg0 is a float by value.  The extra value
+            // args of copysign64/fma64 are auto-deref'd in their match
+            // arms, not here.
+            IntrinsicKind::Fabs64        => { LType::f64() }
+            IntrinsicKind::Fabs32        => { LType::f32() }
+            IntrinsicKind::Floor64       => { LType::f64() }
+            IntrinsicKind::Ceil64        => { LType::f64() }
+            IntrinsicKind::FTrunc64      => { LType::f64() }
+            IntrinsicKind::Round64       => { LType::f64() }
+            IntrinsicKind::Copysign64    => { LType::f64() }
+            IntrinsicKind::Sqrt64        => { LType::f64() }
+            IntrinsicKind::Sqrt32        => { LType::f32() }
+            IntrinsicKind::Fma64         => { LType::f64() }
+            // Pointer args (atomic_fence's i32 order, dirent's void*): no
+            // auto-deref needed; handled directly by the match arm.
+            _ => { LType::null() }
+        };
+    }
+
+    /// Inline-lower a call to the intrinsic `kind`.  Returns
+    /// `Option::Some(value)`, or `Option::None` when `kind` is not lowered
+    /// here or `args` is not its arity, and the call is an ordinary call.
+    try_emit(mut &this, kind: IntrinsicKind, args: LValue[]) -> Option<LValue> {
 
         // Argument-count checks: every recognized intrinsic has a fixed
         // arity, so this is a single guard.
         const expected: i64 = match (kind) {
-            IntrinsicKind::NotIntrinsic => { -1 }
+            IntrinsicKind::Call         => { -1 }
+            IntrinsicKind::TryCatch     => { -1 }
             IntrinsicKind::PtrDiff      => { 2 }
             IntrinsicKind::Rotl32       => { 2 }
             IntrinsicKind::Rotl64       => { 2 }
@@ -483,7 +523,7 @@ type struct IntrinsicEmitter {
         // pervasive `intrinsic(&this)` pattern in stdlib's
         // primitives.cryo.  No-op for the pointer-arg intrinsic
         // (PtrDiff) since src_type returns null for it.
-        const src_ty: LType = kind.src_type();
+        const src_ty: LType = IntrinsicEmitter::src_type_of(kind);
         // Guard args[0]: zero-arg intrinsics (trap/debugtrap) have no args[0].
         mut a0: LValue = if (args.length >= 1) { args[0] } else { LValue::null() };
         if (src_ty.is_valid() && a0.is_valid()) {
@@ -503,74 +543,12 @@ type struct IntrinsicEmitter {
         }
 
         mut out_value: LValue = match (kind) {
-            IntrinsicKind::NotIntrinsic => { LValue::null() }   // unreachable
+            IntrinsicKind::Call     => { LValue::null() }   // declined above
+            IntrinsicKind::TryCatch => { LValue::null() }   // declined above
 
             // -- Pointer arithmetic (no auto-deref of args[0]; this
             //    intentionally accepts pointers and produces a count). --
             IntrinsicKind::PtrDiff => { this.emit_ptr_diff(args[0], args[1]) }
-
-            // -- Signed widening (sext) --
-            IntrinsicKind::SExt8To16   => { this.builder.build_sext(a0, LType::i16(), "sext") }
-            IntrinsicKind::SExt8To32   => { this.builder.build_sext(a0, LType::i32(), "sext") }
-            IntrinsicKind::SExt8To64   => { this.builder.build_sext(a0, LType::i64(), "sext") }
-            IntrinsicKind::SExt16To32  => { this.builder.build_sext(a0, LType::i32(), "sext") }
-            IntrinsicKind::SExt16To64  => { this.builder.build_sext(a0, LType::i64(), "sext") }
-            IntrinsicKind::SExt32To64  => { this.builder.build_sext(a0, LType::i64(), "sext") }
-
-            // -- Signed narrowing (trunc) --
-            IntrinsicKind::Trunc64To32 => { this.builder.build_trunc(a0, LType::i32(), "trunc") }
-            IntrinsicKind::Trunc64To16 => { this.builder.build_trunc(a0, LType::i16(), "trunc") }
-            IntrinsicKind::Trunc64To8  => { this.builder.build_trunc(a0, LType::i8(),  "trunc") }
-            IntrinsicKind::Trunc32To16 => { this.builder.build_trunc(a0, LType::i16(), "trunc") }
-            IntrinsicKind::Trunc32To8  => { this.builder.build_trunc(a0, LType::i8(),  "trunc") }
-            IntrinsicKind::Trunc16To8  => { this.builder.build_trunc(a0, LType::i8(),  "trunc") }
-
-            // -- Unsigned widening (zext) --
-            IntrinsicKind::ZExt8To16   => { this.builder.build_zext(a0, LType::i16(), "zext") }
-            IntrinsicKind::ZExt8To32   => { this.builder.build_zext(a0, LType::i32(), "zext") }
-            IntrinsicKind::ZExt8To64   => { this.builder.build_zext(a0, LType::i64(), "zext") }
-            IntrinsicKind::ZExt16To32  => { this.builder.build_zext(a0, LType::i32(), "zext") }
-            IntrinsicKind::ZExt16To64  => { this.builder.build_zext(a0, LType::i64(), "zext") }
-            IntrinsicKind::ZExt32To64  => { this.builder.build_zext(a0, LType::i64(), "zext") }
-
-            // -- Unsigned narrowing (trunc; LLVM doesn't distinguish
-            //    signed from unsigned at the type level, so this emits
-            //    the same instruction as the signed variants above) --
-            IntrinsicKind::UTrunc64To32 => { this.builder.build_trunc(a0, LType::i32(), "trunc") }
-            IntrinsicKind::UTrunc64To16 => { this.builder.build_trunc(a0, LType::i16(), "trunc") }
-            IntrinsicKind::UTrunc64To8  => { this.builder.build_trunc(a0, LType::i8(),  "trunc") }
-            IntrinsicKind::UTrunc32To16 => { this.builder.build_trunc(a0, LType::i16(), "trunc") }
-            IntrinsicKind::UTrunc32To8  => { this.builder.build_trunc(a0, LType::i8(),  "trunc") }
-            IntrinsicKind::UTrunc16To8  => { this.builder.build_trunc(a0, LType::i8(),  "trunc") }
-
-            // -- Same-width sign conversions (no-op) --
-            IntrinsicKind::SignBitcast8  => { a0 }
-            IntrinsicKind::SignBitcast32 => { a0 }
-            IntrinsicKind::SignBitcast64 => { a0 }
-
-            // -- Float widening / narrowing --
-            IntrinsicKind::FpExt32To64   => { this.builder.build_fp_ext(a0, LType::f64(), "fpext") }
-            IntrinsicKind::FpTrunc64To32 => { this.builder.build_fp_trunc(a0, LType::f32(), "fptrunc") }
-
-            // -- Signed int -> float --
-            IntrinsicKind::SiToF32         => { this.builder.build_si_to_fp(a0, LType::f32(), "sitofp") }
-            IntrinsicKind::SiToF64Fromi32  => { this.builder.build_si_to_fp(a0, LType::f64(), "sitofp") }
-            IntrinsicKind::SiToF64Fromi64  => { this.builder.build_si_to_fp(a0, LType::f64(), "sitofp") }
-
-            // -- Unsigned int -> float --
-            IntrinsicKind::UiToF32         => { this.builder.build_ui_to_fp(a0, LType::f32(), "uitofp") }
-            IntrinsicKind::UiToF64Fromu32  => { this.builder.build_ui_to_fp(a0, LType::f64(), "uitofp") }
-            IntrinsicKind::UiToF64Fromu64  => { this.builder.build_ui_to_fp(a0, LType::f64(), "uitofp") }
-
-            // -- Float -> signed int --
-            IntrinsicKind::FpToSi32Fromf32 => { this.builder.build_fp_to_si(a0, LType::i32(), "fptosi") }
-            IntrinsicKind::FpToSi32Fromf64 => { this.builder.build_fp_to_si(a0, LType::i32(), "fptosi") }
-            IntrinsicKind::FpToSi64Fromf64 => { this.builder.build_fp_to_si(a0, LType::i64(), "fptosi") }
-
-            // -- Float -> unsigned int --
-            IntrinsicKind::FpToUi32Fromf32 => { this.builder.build_fp_to_ui(a0, LType::i32(), "fptoui") }
-            IntrinsicKind::FpToUi32Fromf64 => { this.builder.build_fp_to_ui(a0, LType::i32(), "fptoui") }
-            IntrinsicKind::FpToUi64Fromf64 => { this.builder.build_fp_to_ui(a0, LType::i64(), "fptoui") }
 
             // -- Bit operations --
             IntrinsicKind::Bswap16    => { this.emit_unary_llvm("llvm.bswap.i16", LType::i16(), a0, false, "bswap") }
