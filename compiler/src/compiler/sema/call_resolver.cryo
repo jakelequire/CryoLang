@@ -3796,8 +3796,10 @@ type struct CallResolver {
     /// passes every static pin uses, and type the path from that entry:
     /// the implementation's signature, not the trait declaration's, which
     /// may spell it in terms the impl decides.  Answers whether one was
-    /// pinned; an argument with no type yet, or a fit count other than one,
-    /// pins nothing and leaves the report to the caller.
+    /// pinned.  An argument with no type yet, or a fit count other than one,
+    /// pins nothing; a wrong count or a wrong type is reported by the
+    /// argument checks, and the one mismatch those accept - a shared
+    /// reference where the parameter is exclusive - is reported here.
     pin_trait_delivered_call(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
                              entries: &OverloadId[]) -> boolean {
         mut arg_types: TypeRef[] = [];
@@ -3808,6 +3810,7 @@ type struct CallResolver {
         }
         mut fits: OverloadId[] = this.select_static_overload(entries, &arg_types, false);
         if (fits.length == 0) { fits = this.select_static_overload(entries, &arg_types, true); }
+        if (fits.length == 0) { this.report_shared_for_exclusive(call, scope, entries, &arg_types); }
         if (fits.length != 1) { return false; }
         call.set_resolved_callee(CalleePin::Decl(fits[0]));
         this.type_from_delivered_entry(scope, fits[0]);
@@ -3818,6 +3821,70 @@ type struct CallResolver {
     /// return type: the trait declaration's names `This` and `This::Item`,
     /// which stand for no type at the call (`Dup::dup(&r)` is `Count`, not
     /// `This`; `Peek::peek(&r)` is `Option<i32>`, not `Option<This::Out>`).
+    /// A call through a trait's path that no entry accepts because an
+    /// argument is a SHARED reference where the parameter is an EXCLUSIVE
+    /// one - `Iterator::next(&r)` against `next(mut &this)`.  A path call
+    /// does not re-borrow its arguments, as Rust's `Iterator::next(&r)` does
+    /// not, so the argument is refused, naming the parameter; the help
+    /// gives the spelling that borrows exclusively.  Cryo writes no
+    /// exclusive borrow as an expression: passing the value itself does,
+    /// as the method form `r.next()` does.  Reported only when an entry
+    /// accepts every argument once the mutability of a reference is set
+    /// aside; a wrong count or type is the argument checks' to report.
+    /// Silent during a symbolic generic-body walk.
+    report_shared_for_exclusive(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
+                                entries: &OverloadId[], arg_types: &TypeRef[]) -> void {
+        if (this.state.in_symbolic_check) { return; }
+        for (mut ei: i64 = 0; ei < entries.length; ei++) {
+            const et: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entries[ei]).id);
+            if (et == null || et.kind != TypeKind::Function) { continue; }
+            const fn_ty: FunctionType* = et as FunctionType*;
+            if (fn_ty.param_types.length != arg_types.length) { continue; }
+            mut first_shared: i64 = -1;
+            mut rest_fit: boolean = true;
+            for (mut pi: i64 = 0; pi < arg_types.length; pi++) {
+                if (this.overload_param_matches_arg(fn_ty.param_types[pi], arg_types[pi])) { continue; }
+                const pt: Type* = this.arena.lookup(fn_ty.param_types[pi].id);
+                const at: Type* = this.arena.lookup(arg_types[pi].id);
+                const shared_for_exclusive: boolean = pt != null && at != null
+                    && pt.kind == TypeKind::Reference && at.kind == TypeKind::Reference
+                    && (pt as ReferenceType*).is_mutable() && !(at as ReferenceType*).is_mutable()
+                    && (pt as ReferenceType*).referent.id == (at as ReferenceType*).referent.id;
+                if (!shared_for_exclusive) { rest_fit = false; break; }
+                if (first_shared < 0) { first_shared = pi; }
+            }
+            if (!rest_fit || first_shared < 0) { continue; }
+            const member: string = this.intern.resolve(scope.member_name);
+            const arg: ExpressionNode* = call.arguments[first_shared];
+            // The borrowed binding's name, when the argument is `&name`.
+            mut borrowed: string = "";
+            if ((arg as ASTNode*).kind == NodeKind::UnaryExpression) {
+                const operand: ExpressionNode* = (arg as UnaryExprNode*).operand;
+                if (operand != null && (operand as ASTNode*).kind == NodeKind::Identifier) {
+                    borrowed = this.intern.resolve((operand as IdentifierNode*).name);
+                }
+            }
+            const what: string = if (first_shared == 0) { "its receiver" } else {
+                fmt::format("argument %lld", first_shared + 1)
+            };
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0214_ARGUMENT_MISMATCH,
+                fmt::format("`%s` takes %s as an exclusive reference (`mut &`), and this is a shared one",
+                    member, what));
+            d = d.at_with_label(arg.span, "a shared reference; the parameter is `mut &`");
+            if (borrowed.length() == 0) {
+                d = d.help("pass the value itself: a call borrows it exclusively where the parameter is `mut &`");
+            } else if (first_shared == 0) {
+                const rest: string = if (call.arguments.length == 1) { "" } else { "..." };
+                d = d.help(fmt::format("pass `%s` itself, which the call borrows exclusively, or call the method: `%s.%s(%s)`",
+                    borrowed, borrowed, member, rest));
+            } else {
+                d = d.help(fmt::format("pass `%s` itself, which the call borrows exclusively", borrowed));
+            }
+            this.ctx.emit_diagnostic(d);
+            return;
+        }
+    }
+
     type_from_delivered_entry(mut &this, scope: ScopeResolutionNode*, entry: OverloadId) -> void {
         const ft: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entry).id);
         if (ft != null && ft.kind == TypeKind::Function) {

@@ -56,7 +56,7 @@ measurement that decided it on the row.
 | D11 | **Remove `resolve_counter.cryo` completely** - the counter, its audit streams, `scripts/b1-gate.py` and `tests/b1-baseline.txt` (Jake, 2026-09-15: "I want this instrumentation to be removed completely"; §7.2 mechanism 3 amended, §8.202) | **TAKEN** (§8.203) — the module (1,302 lines), its 100 `bump()` sites and 54 audit emitters, the five audit streams and `CRYO_RESOLVE_COUNTER`, `HomeOrigin` and `ResolutionContext`'s `FILE, LINE` provenance, the `door`/`site`/`table` parameters that carried a site name to an emitter, `b1-gate.py`, `retire-counter-sites.py`, `b1-baseline.txt`, `make b1-check` and its two CI steps. 0 of 3,478 objects moved over `examples/` and `tests/`. `lane-check`, the negative tests and the mutation projects are the regrowth guard | `git ls-files \| grep -c -e 'resolve_counter' -e 'b1-gate' -e 'b1-baseline'` → **0**; `grep -rho -e 'resolve_counter' -e 'HomeOrigin' compiler/src tools --include=*.cryo \| wc -l` → **0** | §8.66, §8.80, §8.139, §8.174, §8.183, §8.188, §8.193, §8.202, §8.203 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -v '^\s*//' compiler/src/compiler/resolver/name_resolution.cryo \| grep -c 'module_offering'` → **5** (3 before §8.258: `module_offerings`, the plural form the walk reads so its E0155 can name both declarations, and `module_offering` is its first-and-count) | §8.138, §8.144, §8.151, §8.258 |
-| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **620** (+1 in §8.327, a unit test; +1 in §8.326, a unit test; -1 in §8.325, `intrinsics_codegen.cryo` deleted with its table moved to `intrinsic_kind.cryo`, which imports nothing; +1 in §8.324, a unit test; +2 in §8.322, a unit test and a negative; +3 in §8.321, a unit test and two negatives; +1 in §8.320, a unit test; +2 in §8.318, a unit test and a negative; +1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194, §8.195 and §8.197, projects; +2 in §8.199, a project's two files; -1 in §8.203, `resolve_counter.cryo`; -1 in §8.206, a `collect` project's test file, the project being a `compile_fail` now; -1 in §8.207, `bare_intrinsic_priority.cryo`, a negative now; +1 in §8.209, a negative; +1 in §8.213, a unit test; +2 in §8.217, two projects' `beta_text.cryo`; +2 in §8.242, the consequence repro's two sources under `scripts/ns-migration/8.242/tick-ctl/`; +1 in §8.244, a negative; +1 in §8.256, a unit test; +2 in §8.275, the two `chain_default_*` projects; +1 in §8.277, a unit test; +1 in §8.286, a negative; +1 in §8.287, a unit test; +1 in §8.301, a unit test; +1 in §8.303, a unit test; +1 in §8.304, `resolver/module_path.cryo`; +1 in §8.306, a unit test; +2 in §8.311, a unit test and a negative; +3 in §8.312, a unit test and two negatives; +2 in §8.313, a unit test and a negative; +1 in §8.314, a unit test; +1 in §8.316, a unit test) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **621** (+1 in §8.328, a negative; +1 in §8.327, a unit test; +1 in §8.326, a unit test; -1 in §8.325, `intrinsics_codegen.cryo` deleted with its table moved to `intrinsic_kind.cryo`, which imports nothing; +1 in §8.324, a unit test; +2 in §8.322, a unit test and a negative; +3 in §8.321, a unit test and two negatives; +1 in §8.320, a unit test; +2 in §8.318, a unit test and a negative; +1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194, §8.195 and §8.197, projects; +2 in §8.199, a project's two files; -1 in §8.203, `resolve_counter.cryo`; -1 in §8.206, a `collect` project's test file, the project being a `compile_fail` now; -1 in §8.207, `bare_intrinsic_priority.cryo`, a negative now; +1 in §8.209, a negative; +1 in §8.213, a unit test; +2 in §8.217, two projects' `beta_text.cryo`; +2 in §8.242, the consequence repro's two sources under `scripts/ns-migration/8.242/tick-ctl/`; +1 in §8.244, a negative; +1 in §8.256, a unit test; +2 in §8.275, the two `chain_default_*` projects; +1 in §8.277, a unit test; +1 in §8.286, a negative; +1 in §8.287, a unit test; +1 in §8.301, a unit test; +1 in §8.303, a unit test; +1 in §8.304, `resolver/module_path.cryo`; +1 in §8.306, a unit test; +2 in §8.311, a unit test and a negative; +3 in §8.312, a unit test and two negatives; +2 in §8.313, a unit test and a negative; +1 in §8.314, a unit test; +1 in §8.316, a unit test) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `python3 scripts/lane-gate.py --row LOOKUP_ROUTED` → **48** (49 before §8.323, whose one was a method's return read off each bound of a `BoundedParamType`, deleted with the kind nothing constructed; 50 before §8.320, whose one was the `for` loop's `next` found by spelling on the scrutinee's type; 55 before §8.315, whose five were type lookups by a name the caller derived from a definition it held - three trait bounds, an impl-qualified head's trait, the method-not-found hint's receiver - now asked of the index by that definition or type; 54 before §8.256 deleted sema's `new` spelling step; 53 before §8.259 deleted the callee hint's `bare_sym` door and sema's `alias_global`; 51 before §8.263's two `lookup_type_exact` by a canonical name - the impl-qualified head's trait, asked whether it IS a trait, and its owner for the E0306 report; 53 before §8.289 re-keyed `method_returns` by the owner's arena id: `resolve_method_owner` and `lookup_method_return_raw` deleted, `lookup_type_sym` left two readers that hold the owner ref, and the five readers holding a stamp's name ask `lookup_type_exact` for the owner first) | §8.99, §8.107 |
 | D16 | **An impl head writes EVERY parameter of the template it names, or names a concrete instantiation; an elided parameter is an error** - whether all of them default (`implement trait Display for String` with `String<A = GlobalAlloc>`) or only the trailing ones (`implement<T> trait Display for Array<T>` with `Array<T, A = GlobalAlloc>`). Write `implement<A> trait Display for String<A>` or `implement trait Display for String<GlobalAlloc>`. Rust's model: `impl Display for Vec` is missing its parameters and is not given a default meaning, and `impl<T> Trait for Vec<T>` is not written either | **TAKEN** (ruled by Jake 2026-09-13 for the bare form, 2026-09-14 for every elided parameter; built in §8.190) — E0302 from `refuse_elided_template_params` where type resolution attaches a WRITTEN head to its template, naming the template, both counts and both spellings, the parameter form first; the 11 heads rewritten as the instantiation each meant; a head's `target_args` is what it writes after the target on EVERY kind of head (an inherent head's list also declares its names); sema's writer-module lookup deleted. The concrete spelling is HONOURED by impl selection since §8.233: a head's written target arguments unify with the subject's, a `Def`/`PrimTy`-stamped one filtering, so `for Wrap<T, Alpha>` is not selected for `Wrap<i32, Beta>` and two heads differing in that argument are two heads (`impl_concrete_arg_filters_impl` E0358, `impl_concrete_arg_selects_impl` 12 - both RED from §8.223 to §8.233) | `python3 scripts/impl-head-elided-params.py --count` → **bare=0,partial=0,unmatched=0**; `grep -c 'refuse_elided_template_params' compiler/src/compiler/passes/type_resolution.cryo` → **2**; `ls tests/tests/negative/E0302*.cryo \| wc -l` → **3** (2 at §8.190; +1 in §8.210, D22's head); `ls -d tests/tests/projects/impl_concrete_arg_*/test.json \| wc -l` → **2** (green since §8.233) | §8.180, §8.181, §8.187, §8.190, §8.223 |
 | D17 | **An `extern "C"` function is public unless marked `private`** — the extern-visibility default `docs/cryo.md` §18.1 states | **RULED** (Jake, 2026-09-14) — built in §8.167 by a worker and carried as unconfirmed until ratified; the spec text is normative, not provisional | `grep -c 'mut ext_public: boolean = true;' compiler/src/compiler/parser/parser.cryo` → **1**; `grep -c 'unless written .private function' docs/cryo.md` → **1** | §8.167, §8.187 |
@@ -216,6 +216,7 @@ three, and its row carries the count. Read each zero off its own row.
 | an intrinsic's KIND re-derived by codegen from the pinned declaration's LEAF (`pinned_intrinsic_leaf` spelled the leaf, `IntrinsicKind::is_name` and `try_emit` looked it up in `from_name` twice, `leaf.eq("try_catch")` and `leaf.eq("panic")` compared it), and 44 names / 41 kinds in that table that duplicate `as` and that no declaration names | **CONVERTED / DELETED** (§8.325) - the table moved out of codegen to `compiler/intrinsic_kind.cryo`; type resolution reads the spelling ONCE, where it registers the declaration, and stores the kind on the index entry (`DeclarationIndex::mark_intrinsic(entry, kind)`); codegen reads the kind off the pin (`pinned_intrinsic_kind`) and never sees a string; `try_catch` is `IntrinsicKind::TryCatch`. The 41 conversion kinds are deleted with their arms. The 13 bit operations (`bswap*`, `popcount*`, `clz*`, `ctz*`, `rot*`) keep their kinds and are still declared by nothing - declaring them is new public API, left for Jake | the registration forced to `Call` (one mutation, alone): `intrinsics::fabs64` and the allocator's atomics become undefined references at link; 0 of 1,126 example and 0 of 3,015 test objects moved | `ls compiler/src/compiler/codegen/ops/intrinsics_codegen.cryo 2>/dev/null \| wc -l` → **0**; `python3 scripts/ns-migration/8.325/intrinsics_census.py \| grep -o 'declared by nothing [0-9]*' \| cut -d' ' -f4` → **13** (57 at `4462e86a`); `grep -rho 'IntrinsicKind::is_name' compiler/src --include=*.cryo \| wc -l` → **0** | §8.287, §8.325 |
 | a call through a trait's own path typed by the trait DECLARATION's return (`Dup::dup(&r)` typed `This`, `Peek::peek(&r)` typed `Option<This::Out>`, refused as E0200 / E0229) whenever the body was walked a second time: the first walk's pin set the implementation's return, the second found the call pinned and kept the declaration's | **FIXED** (§8.326) - `try_resolve_static_method` re-reads the pinned entry's return on every walk when the path's owner is a trait (`type_from_delivered_entry`, `CalleePin::decl_entry`). `Iterator::next(&r)` is a different case and is NOT fixed: `&r` does not fit `next(mut &this)`, no entry is pinned, and the miss is silent - whether it is accepted (as `r.next()` is) or refused is Jake's | the file `lang/trait_path_call_types_as_implementation` is refused by `3e9bb622` (E0200, E0229) and passes here | `grep -c 'type_from_delivered_entry(' compiler/src/compiler/sema/call_resolver.cryo` → **3** (the definition, the first walk's pin, every later walk); `ls tests/tests/lang/trait_path_call_types_as_implementation.cryo \| wc -l` → **1** | §8.224, §8.320, §8.326 |
 | an adapter's element type derived from its inner iterator's impl HEADER only (`implement<I, A> trait Iterator<A> for struct TakeIter<I> where I: Iterator<A>` read `A` off `I`'s written `Iterator<...>`; an impl binding `type Item = i32;` in its body gave nothing, `TakeIter<Count>::next` was never specialized, and a program implementing `Iterator` that way did not build - E0636 in the trait's defaults, behind 43 false "codegen failed for module" lines), in two hand-copies (the monomorphizer's, sema's) of a reader the type resolver already had right | **FIXED** (§8.327) - one reader, `TypeResolver::concrete_trait_slots`, one entry per trait slot through `ImplBlockNode::trait_slot_annotation` (the header's argument when written, else the body's binding); both copies deleted. The driver stops generating code at the first module that reported an error and prints "codegen failed" only for a module that failed without one | `lang/iter_adapters_over_body_bound_item` (6) is refused by `4157cf8f` and passes here; `chain_default_param_conflict`'s tightened `output_excludes` fails over `4157cf8f` and passes here | `grep -rho -e 'concrete_trait_args_for' -e 'proj_concrete_trait_args_for' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'concrete_trait_slots(' compiler/src --include=*.cryo \| wc -l` → **3** (the home, the monomorphizer's call, sema's); `grep -c 'trait_slot_annotation(' compiler/src/compiler/types/resolver.cryo` → **2**; `grep -c 'codegen failed for module' tests/tests/projects/chain_default_param_conflict/test.json` → **1** | §8.327 |
+| a call through a trait's path or an impl-qualified path handing a SHARED reference where the parameter is exclusive (`Iterator::next(&r)` against `next(mut &this)`): no entry fit, the give-up was dropped by its callers, the argument checks do not compare reference mutability, and the call failed in code generation as `cannot resolve 'Iterator::next'`, naming nothing | **REFUSED** (§8.328, Jake's ruling: refuse, as Rust's fully-qualified form does) - E0214 at the argument naming the parameter, the help giving Cryo's exclusive spelling (the value itself, or the method form). Measured first over six halves: 0 green programs reach it; the only no-fit give-ups were 4 count mismatches in negatives, already reported. That NO call form checks reference mutability (`bump(&r)` into `mut &Count`, a `const` binding mutated through `mut &this`) is recorded in §8.328 as Jake's | `negative/E0214_trait_path_shared_for_exclusive` fails over `32be5028` (`expected E0214`) and passes here | `grep -c 'report_shared_for_exclusive(' compiler/src/compiler/sema/call_resolver.cryo` → **2** (the definition, the give-up in `pin_trait_delivered_call`); `ls tests/tests/negative/E0214_trait_path_shared_for_exclusive.cryo \| wc -l` → **1** | §8.326, §8.328 |
 
 **The arena holds no leaf index of either kind.** §8.121 deleted the LOOKUP
 LANE; the diagnostic map that survived it (the E0203 did-you-mean pool, E0155
@@ -262,7 +263,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: lane-check lane-selftest' Makefile` → **1**
 * `ls -d tests/tests/projects/*/test.json | wc -l` → **76**
-* `ls tests/tests/negative/*.cryo | wc -l` → **229** (+1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
+* `ls tests/tests/negative/*.cryo | wc -l` → **230** (+1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
 * `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -41103,5 +41104,135 @@ spelling-keyed copies it replaced disagreed somewhere.
   resolution context is empty by design (`ast_resolver.cryo`
   `resolve_specialized_ast`), so moving the derivation to the identity-keyed
   one means seeding it, which is a unit of its own.
+
+---
+
+### 8.328 A call through a trait's path, or an impl-qualified path, that hands a shared reference where the method takes an exclusive one is refused where it is written (E0214), naming the argument and giving the spelling that borrows exclusively; it was the one mismatch nothing reported, and it failed later in code generation as "cannot resolve"; 0 objects moved - 2026-09-24
+
+#### The class, measured first
+
+```cryo
+mut r: Count = Count { n: 0 };            // Count implements Iterator
+const a = Iterator::next(&r);             // next(mut &this): refused now
+const b = (Iterator for Count)::next(&r); // same, impl-qualified: refused now
+const c = Iterator::next(r);              // accepted: borrows r exclusively
+const d = r.next();                       // accepted: the method form
+```
+
+The brief's premise was "no error, no result". Measured, it was not silent end
+to end: sema said nothing, the call reached code generation unpinned, and the
+build failed there with E0636 `codegen: cannot resolve 'Iterator::next'`
+(`(Iterator for Count)::next(&r)`: `cannot resolve 'Count::next'`), before
+§8.327 buried under 43 false "codegen failed for module" lines. Nothing named
+the receiver.
+
+Where the silence came from: a call through a trait's path pins the entry its
+arguments select (`pin_trait_delivered_call`), and the selector compares
+argument and parameter types exactly - a shared reference `&Count` is not a
+`mut &Count`. When no entry fits it answers false and "leaves the report to
+the caller", and two of its three callers (`pin_trait_qualified_call`,
+`pin_impl_qualified_call`) dropped that answer. Other mismatches are reported
+anyway, by the argument checks that run after (E0215 for a count, E0214 for a
+type); a mutability-only one is not, because those checks do not compare
+reference mutability at all (see "found on the way").
+
+Instrumented before fixing (a print at every give-up of
+`pin_trait_delivered_call`: the reason, and whether some entry fits once
+reference mutability is set aside; not committed). Controls first, one
+program per shape: `Iterator::next(&r)` and `(Iterator for Count)::next(&r)`
+gave up with `fits=0 blind=1`; an extra argument, a wrong-type argument and an
+impl-qualified extra argument gave up with `fits=0 blind=0` and were reported
+(E0215, E0214, E0215). Then the corpus (`scripts/objcmp/corpus2.sh s43u2`, six
+halves, 0 failing halves, `.objcmp/s43u2-lines.txt`):
+
+| give-up | count | where |
+|---|---|---|
+| no entry fits, a mutability-only difference | **0** | - |
+| no entry fits, a count or type difference | 4 | all in negatives (`E0215_impl_qualified_arity` ×3, `E0233_trait_qualified_unselected` ×1), each reported |
+| several entries fit | **0** | - |
+| an argument with no type | **0** | - |
+
+So the silent class is exactly one mismatch, in any argument position and in
+both path forms: an argument that differs from its parameter only in being a
+shared reference where the parameter is exclusive. No program in the tree
+reaches it.
+
+#### What is there now (`sema/call_resolver.cryo`)
+
+`pin_trait_delivered_call` reports that mismatch itself when no entry fits
+(`report_shared_for_exclusive`): it looks for an entry every argument fits
+once a shared-for-exclusive reference is set aside, and refuses the first such
+argument as E0214, the existing "Argument Mismatch" code:
+
+```text
+error[E0214]: `next` takes its receiver as an exclusive reference (`mut &`), and this is a shared one
+    const v: Option<i32> = Iterator::next(&r);
+                                          ^~ a shared reference; the parameter is `mut &`
+ help: pass `r` itself, which the call borrows exclusively, or call the method: `r.next()`
+```
+
+Any other no-fit is left to the argument checks, as before, so nothing is
+reported twice. Silent during a symbolic generic-body walk, as every report
+in this family is.
+
+Jake's ruling (2026-09-24, relayed in plain text): refuse, as Rust does -
+Rust's fully-qualified `Iterator::next(&r)` does not auto-reference and a
+shared reference where `&mut` is wanted is a type error. Accepting `&r` is off
+the table.
+
+**The spelling the help gives is Cryo's, not Rust's.** Cryo has no expression
+for an exclusive borrow: `&` is the only borrow operator (`expr_parser.cryo`
+`parse_unary`), and nothing in the tree writes `mut &x` or `&mut x` as an
+expression. Passing the value itself is what borrows exclusively in the path
+form - the selector's auto-reference pass admits a value for a reference
+parameter - and it borrows rather than moves: `Iterator::next(r)` twice
+yields 2 and leaves `r.n == 2`.
+
+#### Controls
+
+* `negative/E0214_trait_path_shared_for_exclusive` pins three refusals - the
+  trait path, the impl-qualified path, and an argument after the receiver
+  (`Fill::fill(&s, &t)` with `into: mut &Tally`) - and compiles the three
+  spellings that are accepted beside them. **`32be5028`'s compiler fails it
+  (`[FAIL] (expected E0214)`); this tree passes it.**
+* The shapes reported by the argument checks are unchanged: E0215 for an extra
+  argument in either path form, E0214 `mismatched types` for a wrong-type one.
+
+#### Measured
+
+Predicted: 0 objects move - no program in the tree reaches the new report.
+
+| what | result |
+|---|---|
+| objects (`objcmp.sh`) | **0 of 1,126** examples, **0 of 3,017** tests; `OVERALL PASS` |
+| residue, lane gate | unchanged: residue 359, J 150, convertible 93; lane gate OK (the report asks the index for an entry's signature by the entry id it already holds) |
+| roster | +1 compile-fail (3 annotations) |
+| `lsp-check`, `cross-check` | OK, OK |
+
+#### Found on the way, not acted on (Jake's)
+
+**No call form checks reference mutability.** Each of these compiles and runs
+on this tree, pin and HEAD alike:
+
+```cryo
+function bump(c: mut &Count) -> void { c.n = c.n + 1; }
+implement struct Count {
+    static poke(c: mut &Count) -> void { c.n = 5; }
+    bump2(mut &this) -> void { this.n = 5; }
+}
+
+bump(&r);              // a shared reference into `mut &Count`: accepted
+Count::poke(&r);       // the same through a type's path: accepted
+Count::bump2(&r);      // a method through the type's path: accepted
+
+const k: Count = Count { n: 0 };
+k.next();              // a `const` binding mutated through `mut &this`: accepted
+Iterator::next(k);     // likewise, through the trait's path
+```
+
+The trait path was the only form where the absence showed, because its
+selector happens to compare exactly. Refusing these is a language rule (what
+`const` and `&` promise), source-breaking at an unmeasured scale, and not this
+unit's.
 
 ---

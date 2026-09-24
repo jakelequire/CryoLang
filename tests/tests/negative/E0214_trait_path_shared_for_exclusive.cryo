@@ -1,0 +1,50 @@
+// E0214: a call through a trait's path, or an impl-qualified path, does not
+// re-borrow its arguments.  `next` takes `mut &this`; `&r` is a shared
+// reference, so no implementation accepts it and the argument is refused,
+// naming the parameter.  The method form `r.next()` borrows exclusively, and
+// so does the path form given the value itself, `Iterator::next(r)`; both
+// are accepted below.  The same holds for an argument after the receiver.
+// Before this was refused, the path calls reached code generation unpinned
+// and failed there as "cannot resolve 'Iterator::next'".
+![config(testing)]
+![config(negative, E0214)]
+namespace CryoTests::Negative::TraitPathSharedForExclusive;
+
+import std::core::option;
+import std::core::option::{ Option };
+import std::core::iter;
+import std::core::iter::{ Iterator };
+
+type struct Count { n: i32; }
+
+implement trait Iterator<i32> for struct Count {
+    next(mut &this) -> Option<i32> {
+        this.n = this.n + 1;
+        return Option::Some(this.n);
+    }
+}
+
+type struct Tally { total: i32; }
+
+type trait Fill {
+    fill(&this, into: mut &Tally) -> void;
+}
+
+type struct Source { v: i32; }
+
+implement trait Fill for struct Source {
+    fill(&this, into: mut &Tally) -> void { into.total = into.total + this.v; }
+}
+
+function main() -> int {
+    mut r: Count = Count { n: 0 };
+    const a: Option<i32> = Iterator::next(&r);             //~ ERROR[E0214] `next` takes its receiver as an exclusive reference (`mut &`), and this is a shared one
+    const b: Option<i32> = (Iterator for Count)::next(&r); //~ ERROR[E0214] `next` takes its receiver as an exclusive reference (`mut &`), and this is a shared one
+    const c: Option<i32> = Iterator::next(r);
+    const d: Option<i32> = r.next();
+    const s: Source = Source { v: 3 };
+    mut t: Tally = Tally { total: 0 };
+    Fill::fill(&s, &t);                                    //~ ERROR[E0214] `fill` takes argument 2 as an exclusive reference (`mut &`), and this is a shared one
+    Fill::fill(&s, t);
+    return t.total;
+}
