@@ -351,7 +351,7 @@ type struct CallResolver {
         } else {
             return [];
         }
-        const tmpl: TemplateEntry* = greg.get_template(owner);
+        const tmpl: TemplateEntry* = greg.template_of_type(base);
         if (tmpl == null) { return []; }
 
         if (tmpl.ast_node != null) {
@@ -565,7 +565,7 @@ type struct CallResolver {
                              type_args: &TypeRef[]) -> TypeRef[] {
         if (this.ctx.generic_registry == null) { return sema_copy_type_refs(payload); }
         const entry: TemplateEntry* =
-            this.ctx.generic_registry.get_template_by_type_id(template_ref.id);
+            this.ctx.generic_registry.template_of_type(template_ref);
         if (entry == null) { return sema_copy_type_refs(payload); }
         if (entry.param_count != type_args.length) { return sema_copy_type_refs(payload); }
         mut result: TypeRef[] = [];
@@ -645,7 +645,7 @@ type struct CallResolver {
             // are peeled for free.
             const base: TypeRef = this.types.view_generic_base(recv);
             if (!base.is_valid()) { return out; }
-            tmpl = this.ctx.generic_registry.get_template_by_type_id(base.id);
+            tmpl = this.ctx.generic_registry.template_of_type(base);
             owner_args = this.types.view_type_args_copy(recv);
         } else if (callee_node.kind == NodeKind::ScopeResolution) {
             const sr: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
@@ -1405,6 +1405,7 @@ type struct CallResolver {
     /// E0307, stash the bindings, and return the CONCRETE substituted return type.
     /// Invalid when not a generic free call, a binding stays abstract, or a
     /// diagnostic fired.  `resolved_callee` is left unpinned (mono specializes).
+
     check_generic_free_call(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> TypeRef {
         if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return TypeRef::invalid(); }
         const entry: TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length);
@@ -1414,7 +1415,7 @@ type struct CallResolver {
         if (entry.param_type_ids.length == 0) { return TypeRef::invalid(); }
         // Record WHICH template won, not just the type args: only sema has the
         // caller's import scope, so mono can't re-derive this choice.
-        call.set_resolved_template(entry.qualified_name);
+        call.set_resolved_template(entry.base_type);
 
         mut bindings: TypeRef[] = [];
         for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) { bindings.push(TypeRef::invalid()); }
@@ -2008,7 +2009,7 @@ type struct CallResolver {
             // names.  The scope segment holds the owner's BARE name - the
             // converter registry stores it that way - so the `Res` is derived
             // from the type rather than read off the spelling.
-            sr.set_synthesized_ref(to_ty, this.ctx.definition_id_of(to_ty));
+            sr.set_synthesized_ref(to_ty, this.ctx.decl_index.def_of(to_ty, this.ctx.type_arena));
             // Generic-identity view: a post-mono concrete target still needs its
             // type_args stamped onto the synthesized scope, or the converter call
             // resolves against the bare generic scope name.
@@ -2569,7 +2570,8 @@ type struct CallResolver {
         // name does not, and nothing yet selects one for a value.
         mut is_fn_template: boolean = false;
         if (this.ctx.generic_registry != null) {
-            const tmpl: TemplateEntry* = this.ctx.generic_registry.get_template(q_sym);
+            const tmpl: TemplateEntry* = this.ctx.generic_registry.template_in(
+                ResBase::Def(scope.require_scope_res("scope value template").def_id()), scope.member_name);
             if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) { is_fn_template = true; }
         }
         if (!is_fn_template && !scope.resolved_callee.is_some()) { scope.set_resolved_callee(CalleePin::Family(q_sym)); }
@@ -3396,7 +3398,7 @@ type struct CallResolver {
         }
         if (t == null || t.kind != TypeKind::InstantiatedType) { return false; }
         const inst: InstantiatedType* = t as InstantiatedType*;
-        const tmpl: TemplateEntry* = reg.get_template_by_type_id(inst.generic_base.id);
+        const tmpl: TemplateEntry* = reg.template_of_type(inst.generic_base);
         if (tmpl == null || tmpl.ast_node == null) { return false; }
         if (tmpl.param_names.length != inst.type_args.length) { return false; }
         const func: FunctionDeclNode* = this.find_template_method(tmpl.ast_node, member.member);
@@ -3454,7 +3456,7 @@ type struct CallResolver {
         }
         if (t == null || t.kind != TypeKind::InstantiatedType) { return false; }
         const inst: InstantiatedType* = t as InstantiatedType*;
-        const tmpl: TemplateEntry* = reg.get_template_by_type_id(inst.generic_base.id);
+        const tmpl: TemplateEntry* = reg.template_of_type(inst.generic_base);
         if (tmpl == null || tmpl.ast_node == null) { return false; }
         if (tmpl.param_names.length != inst.type_args.length) { return false; }
         const iter_fn: FunctionDeclNode* = this.find_template_method(tmpl.ast_node, this.intern.intern("iter"));
@@ -3721,7 +3723,7 @@ type struct CallResolver {
         if (!qual.is_valid()) { return false; }
         const qt: Type* = this.arena.lookup(qual.id);
         if (qt == null || qt.kind != TypeKind::Trait) { return false; }
-        const trait_sym: DefId = this.ctx.definition_id_of(qual);
+        const trait_sym: DefId = this.ctx.decl_index.def_of(qual, this.ctx.type_arena);
         // No argument selects an implementation: a static trait method, or
         // a method called with nothing.  Refused here, where the path is
         // known to be a trait's, rather than left for codegen to fail to
@@ -4314,13 +4316,15 @@ type struct CallResolver {
     /// names; null when no such template is registered.
     find_static_method_template(&this, scope: ScopeResolutionNode*) -> TemplateEntry* {
         if (this.ctx.generic_registry == null) { return null; }
-        const member_str: string = this.intern.resolve(scope.member_name);
+        // A specialization owns no template of its own: its static methods
+        // are specialized with it, so a segment spelled as one names none.
         mut entry: TemplateEntry* = null;
-        if (this.ctx.decl_index != null) {
-            const q: SymbolStr = this.scope_owner_key(scope);
-            if (q.is_valid()) {
-                const qstr: string = this.intern.resolve(q) + "::" + member_str;
-                entry = this.ctx.generic_registry.get_template(this.intern.intern(qstr));
+        if (!scope.spec_owner.is_valid()) {
+            match (scope.require_scope_res("static-method template owner")) {
+                Res::TypeRelative(b, _) => {
+                    entry = this.ctx.generic_registry.template_in(b, scope.member_name);
+                }
+                _ => { }
             }
         }
         return entry;
@@ -4407,7 +4411,7 @@ type struct CallResolver {
             for (mut i: i64 = 0; i < binds.length; i++) { stash.push(binds[i]); }
             call.set_resolved_type_args(stash);
         }
-        call.set_resolved_template(entry.qualified_name);
+        call.set_resolved_template(entry.base_type);
         const ret: TypeRef = this.subst_free_call_return(entry, &binds, tmpl.resolved_return_type);
         if (!ret.is_valid()) { return TypeRef::invalid(); }
         scope.set_resolved_type(ret);
@@ -5107,7 +5111,7 @@ type struct CallResolver {
     infer_variant_instantiation(mut &this, base_ref: TypeRef, scope: ScopeResolutionNode*,
                                 call: CallExprNode*) -> TypeRef {
         if (call == null || this.ctx.generic_registry == null) { return TypeRef::invalid(); }
-        const tmpl: TemplateEntry* = this.ctx.generic_registry.get_template_by_type_id(base_ref.id);
+        const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(base_ref);
         if (tmpl == null || tmpl.param_count == 0) { return TypeRef::invalid(); }
         const base_t: Type* = this.arena.lookup(base_ref.id);
         if (base_t == null || base_t.kind != TypeKind::Enum) { return TypeRef::invalid(); }
@@ -5275,7 +5279,8 @@ type struct CallResolver {
         mut is_fn_template: boolean = false;
         mut tmpl: TemplateEntry* = null;
         if (this.ctx.generic_registry != null) {
-            tmpl = this.ctx.generic_registry.get_template(q_sym);
+            tmpl = this.ctx.generic_registry.template_in(
+                ResBase::Def(scope.require_scope_res("module function template").def_id()), member_name);
             if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) { is_fn_template = true; }
         }
         if (is_fn_template && call != null) {
@@ -5474,7 +5479,7 @@ type struct CallResolver {
         }
         if (generic_args.length == 0) { return base; }
         const tmpl: TemplateEntry* =
-            this.ctx.generic_registry.get_template_by_type_id(base.id);
+            this.ctx.generic_registry.template_of_type(base);
         if (tmpl == null) { return TypeRef::invalid(); }
         mut res_ctx: ResolutionContext = ResolutionContext::new("");
         // Inside a template body an argument may name the enclosing generic
@@ -5637,7 +5642,7 @@ type struct CallResolver {
             // no signature under `Trait::m`).
             const qt: Type* = this.arena.lookup(this.types.scope_qualifier_type(scope).id);
             if (qt != null && qt.kind == TypeKind::Trait) {
-                this.check_trait_qualified_args(visitor, this.ctx.definition_id_of(this.types.scope_qualifier_type(scope)), scope, call);
+                this.check_trait_qualified_args(visitor, this.ctx.decl_index.def_of(this.types.scope_qualifier_type(scope), this.ctx.type_arena), scope, call);
                 return;
             }
             combined = this.intern.intern(fmt::format("%s::%s", scope_str, member_str));

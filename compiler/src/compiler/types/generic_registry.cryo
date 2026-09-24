@@ -26,7 +26,7 @@ import compiler::resolver::symbol_str;
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId };
-import compiler::resolver::res::{ Res };
+import compiler::resolver::res::{ Res, ResBase };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::ast::{ TypeAnnotation, GenericAnnotation };
@@ -644,8 +644,10 @@ type struct GenericRegistry {
         }
     }
 
-    /// Associate an impl block with a registered template.
-    /// Caller must provide the qualified name of the target type.
+    /// Associate an impl block with the template its head's target names.
+    /// `target` is the head's stamp (`ImplBlockNode::target_def`); a
+    /// primitive or a monomorphized clone carries none and names no
+    /// template, so nothing is attached.
     /// Uses pointer-based access to avoid value-copy semantics on the
     /// array subscript; without this, push() would modify a temporary.
     ///
@@ -656,8 +658,9 @@ type struct GenericRegistry {
     /// TypeResolution, where every template exists - and whether the first
     /// offer took is a fact of the entry, not of any name the caller could
     /// compute.
-    register_impl_block(mut &this, qualified_name: SymbolStr, block: ImplBlockNode*) -> void {
-        const opt: Option<i64> = this.name_index.get(&qualified_name.id);
+    register_impl_block(mut &this, target: DefId, block: ImplBlockNode*) -> void {
+        if (!target.is_valid()) { return; }
+        const opt: Option<i64> = this.name_index.get(&target.qualified_name().id);
         if (opt.is_some()) {
             const idx: i64 = opt.unwrap();
             mut entry_ptr: TemplateEntry* = &this.entries[idx];
@@ -1437,15 +1440,6 @@ type struct GenericRegistry {
         return this.get_trait_decl(this.wellknown(item));
     }
 
-    /// The declaration of the trait `trait_ty` names, or null when `trait_ty`
-    /// is not a registered trait's type.  A trait's type and its declaration
-    /// are registered under one identity (the declaration's canonical name),
-    /// so the type answers the declaration without a scan.
-    trait_decl_of(&this, trait_ty: TypeRef) -> TraitDeclNode* {
-        if (!trait_ty.is_valid() || this.arena == null) { return null; }
-        return this.get_trait_decl(DefId::of_definition(this.arena.get_qualified_name(trait_ty)));
-    }
-
     /// Walk all registered trait decls looking for one that defines a
     /// method named `method_name`. Returns the trait's IDENTITY, or
     /// `SymbolStr::empty()` when no trait declares the method.  A HINT, not
@@ -1508,21 +1502,54 @@ type struct GenericRegistry {
         return null;
     }
 
-    /// The template a resolved definition IS, or null when that definition is
-    /// not a template.
-    ///
-    /// The registry is keyed by canonical name and a `DefId` is one, so this
-    /// is `get_template` with the unwrap in one place: a reader of a `Res`
-    /// hands over the answer it holds rather than turning it back into a name
-    /// to key a lookup with.
+    /// The template a definition IS, or null when that definition is not a
+    /// template (or is invalid: a primitive, a clone).  The store is keyed by
+    /// the definition's canonical name, and the unwrap happens here, once.
     template_of(&this, def: DefId) -> TemplateEntry* {
-        return this.get_template(def.qualified_name());
+        if (!def.is_valid()) { return null; }
+        const opt: Option<i64> = this.name_index.get(&def.qualified_name().id);
+        if (opt.is_some()) {
+            return &this.entries[opt.unwrap()];
+        }
+        return null;
     }
 
-    /// Look up a template entry by its base TypeID.  Used by the Monomorphizer
-    /// since InstantiatedType stores the base type's ID, not its name.
-    get_template_by_type_id(&this, type_id: u64) -> TemplateEntry* {
-        const opt: Option<i64> = this.type_index.get(&type_id);
+    /// The template named `member` inside `container` - a generic free
+    /// function in a module, or a generic static method on a type - or null.
+    /// `container` is what a path's segment resolved to; the member is the
+    /// leaf written after it, read inside its owner as a field is.  A type
+    /// parameter contains no template.
+    template_in(&this, container: ResBase, member: SymbolStr) -> TemplateEntry* {
+        if (!member.is_valid() || this.arena == null) { return null; }
+        const owner: SymbolStr = match (container) {
+            ResBase::Def(d)          => { d.qualified_name() }
+            ResBase::PrimTy(n)       => { n }
+            ResBase::GenericParam(_) => { SymbolStr::empty() }
+        };
+        if (!owner.is_valid()) { return null; }
+        const key: SymbolStr = GenericRegistry::member_template_key(
+            this.arena.intern_table, owner, member);
+        const opt: Option<i64> = this.name_index.get(&key.id);
+        if (opt.is_some()) {
+            return &this.entries[opt.unwrap()];
+        }
+        return null;
+    }
+
+    /// The key a template declared as a member of `owner` is registered
+    /// under, `<owner>::<member>`.  One home for the composition, shared by
+    /// the registration and `template_in`, so the two cannot drift.
+    static member_template_key(table: InternTable*, owner: SymbolStr,
+                               member: SymbolStr) -> SymbolStr {
+        return table.intern(table.resolve(owner) + "::" + table.resolve(member));
+    }
+
+    /// The template whose uninstantiated type is `ty`, or null when `ty` is
+    /// not a template's own type.  An instantiation of a template is not the
+    /// template: a caller that holds `Option<i32>` asks with its generic base.
+    template_of_type(&this, ty: TypeRef) -> TemplateEntry* {
+        if (!ty.is_valid()) { return null; }
+        const opt: Option<i64> = this.type_index.get(&ty.id);
         if (opt.is_some()) {
             return &this.entries[opt.unwrap()];
         }

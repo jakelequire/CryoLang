@@ -249,6 +249,10 @@ CLASS_OF_METHOD = {
         ("B", "`(owner, method)`: the owner a canonical name off a `TypeRef`, the method a leaf inside it"),
     "GenericRegistry::find_inherent_impl_generic_method":
         ("B", "`(owner, method)`: the owner a canonical name off a `TypeRef`, the method a leaf inside it"),
+    "GenericRegistry::template_in":
+        ("J", "member: a template declared inside its container - a module's generic function, a type's generic static method - by the leaf written after the path segment; the container is the segment's resolved identity (`ResBase`), never a spelling"),
+    "GenericRegistry::member_template_key":
+        ("N", "a key MINTED at the member template's declaration (`Owner::method`) for its registration; the write side of `template_in`"),
     "GenericRegistry::find_trait_defining_method":
         ("J", "hint: the did-you-mean asks which trait declares a method of this leaf; the spelling is the question"),
     # -- the module graph and the resolver's module scopes --
@@ -274,16 +278,8 @@ CLASS_OF_METHOD = {
 # {(file, "Holder::method", argument text): (class, reason)} - a site whose
 # key comes from somewhere the method's other callers' do not.
 SITE_OVERRIDES = {
-    ("compiler/mono/monomorphizer.cryo", "GenericRegistry::get_template", "array_sym"):
-        ("J", "lang: `Array`, the type the language lowers `T[]` to, by the identity its declaration claimed (`wellknown(LangItem::Array)`)"),
-    ("compiler/mono/state.cryo", "GenericRegistry::get_template", "array_sym"):
-        ("J", "lang: `Array`, the type the language lowers `T[]` to, by the identity its declaration claimed (`wellknown(LangItem::Array)`)"),
-    ("compiler/mono/call_specializer.cryo", "GenericRegistry::get_template", "this.intern_table.intern(q_str)"):
-        ("C", "`ns::name` composed from a namespace and a leaf"),
     ("compiler/sema/call_resolver.cryo", "GenericRegistry::get_template", "csym"):
         ("C", "`scope::member` composed from the owner key and the written member"),
-    ("compiler/sema/call_resolver.cryo", "GenericRegistry::get_template", "this.intern.intern(qstr)"):
-        ("C", "`owner::member` composed from `scope_owner_key` and the written member"),
     ("compiler/passes/type_resolution.cryo", "DeclarationIndex::lookup_type", "n"):
         ("J", "prim: `Res::PrimTy(n)` - the primitive's identity is the spelling the stamp carries"),
     ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_type", "name"):
@@ -296,10 +292,6 @@ SITE_OVERRIDES = {
         ("C", "the `CalleePin::Family` key string"),
     ("compiler/sema/sema.cryo", "TypeUtils::lookup_method_return", 'owner_ref, this.intern.intern("iter")'):
         ("J", "member: the for-in protocol's `iter` off a collection that does not implement `Iterator`"),
-    ("compiler/mono/call_specializer.cryo", "GenericRegistry::get_template", "call.resolved_template"):
-        ("B", "the call's pinned template KEY, a registry key string sema recorded"),
-    ("compiler/sema/async_lower.cryo", "GenericRegistry::get_template", "c.resolved_template"):
-        ("B", "the call's pinned template KEY, a registry key string sema recorded"),
     # The member tables asked with a leaf the LANGUAGE fixes rather than one
     # the program wrote: the protocols' own variant and method names.
     ("compiler/sema/sema.cryo", "EnumType::get_variant", 'this.intern.intern("Ready")'):

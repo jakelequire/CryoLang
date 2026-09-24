@@ -210,7 +210,7 @@ type struct SpecializationPasses {
                     const node: FunctionDeclNode* = stmt as FunctionDeclNode*;
                     if (node.is_generic()) {
                         SpecializationPasses::register_generic_template(node.name, node.generic_params,
-                            stmt, NodeKind::FunctionDeclaration, DefId::invalid(), registry, arena, ctx);
+                            stmt, NodeKind::FunctionDeclaration, node.def, registry, arena, ctx);
                     }
                 }
                 NodeKind::TraitDeclaration => {
@@ -792,11 +792,12 @@ type struct SpecializationPasses {
     /// `name` and `generic_params` are the common fields every generic
     /// declaration shares.  `ast_node` is the original declaration cast to
     /// ASTNode*.  `node_kind` identifies which declaration type it is.
-    /// `def` is the id the type-declaration stage stamped on a TYPE
-    /// declaration: its canonical name is the registry's key and the index
-    /// answers the base type by it.  A function template carries no stamp at
-    /// this stage (its signature registers later) and is keyed by its
-    /// declaration key with a placeholder base.
+    /// `def` is the id the declaration was stamped with - by the
+    /// type-declaration stage for a type, by the name layer for a function -
+    /// and its canonical name is the registry's key.  A type's base type is
+    /// the index's answer for it; a function's is a placeholder.  An
+    /// unstamped declaration is a missed stamp, recorded, and registers
+    /// nothing: no second key is derived for it from the name and the file.
     static register_generic_template(name: SymbolStr, generic_params: &GenericParamNode*[],
                                        ast_node: ASTNode*, node_kind: NodeKind,
                                        def: DefId,
@@ -804,11 +805,11 @@ type struct SpecializationPasses {
                                        ctx: CompilationContext*) -> void {
         if (generic_params.length == 0) { return; }
 
-        const qualified_sym: SymbolStr = if (def.is_valid()) {
-            def.qualified_name()
-        } else {
-            ctx.decl_fn_key(name, ast_node.span.file)
-        };
+        if (!def.is_valid()) {
+            compiler::resolver::res::record_pending_bug("register_generic_template: unstamped declaration");
+            return;
+        }
+        const qualified_sym: SymbolStr = def.qualified_name();
         // Use the namespace (not file path) as the module name so that
         // the monomorphizer's ResolutionContext can qualify type lookups
         // correctly (e.g., "std::core::option" not "./core/option.cryo").
@@ -877,7 +878,6 @@ type struct SpecializationPasses {
                                               ctx: CompilationContext*) -> void {
         if (methods.length == 0) { return; }
 
-        const owner_qstr: string = ctx.intern_table.resolve(owner_key);
         const module_sym: SymbolStr = if (ctx.has_namespace()) {
             ctx.namespace_str
         } else {
@@ -890,9 +890,8 @@ type struct SpecializationPasses {
             if (!m.is_static) { continue; }
             if (!m.func.is_generic()) { continue; }
 
-            const method_str: string = ctx.intern_table.resolve(m.func.name);
-            const qualified_str: string = owner_qstr + "::" + method_str;
-            const qualified_sym: SymbolStr = ctx.intern_table.intern(qualified_str);
+            const qualified_sym: SymbolStr = GenericRegistry::member_template_key(
+                ctx.intern_table, owner_key, m.func.name);
 
             const refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
                 m.func.generic_params, arena);
@@ -957,8 +956,8 @@ type struct SpecializationPasses {
         // module's type (`Display for Option<T>` in `fmt::display`) keyed a
         // name no template carries and was attached to none.
         const qualified_sym: SymbolStr = node.target_key(ctx.type_arena);
-        if (registry.get_template(qualified_sym) != null) {
-            registry.register_impl_block(qualified_sym, node);
+        if (registry.template_of(node.target_def()) != null) {
+            registry.register_impl_block(node.target_def(), node);
         } else if (!node.is_trait_impl()) {
             // Non-generic target: there is no TemplateEntry to hang the block
             // on, so an inherent `implement T { ... }` block would otherwise be
