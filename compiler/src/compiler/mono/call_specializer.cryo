@@ -65,6 +65,7 @@ import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::res::{ OverloadId, Res, ResBase, ResSlot };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::res::{ DefId };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
@@ -910,11 +911,11 @@ type struct MonoCallSpecializer {
         }
         if (orig_method == null) {
             orig_method = this.find_spec_impl_trait_method(
-                recv_type, ma.member, SymbolStr::empty(), &impl_node);
+                recv_type, ma.member, DefId::invalid(), &impl_node);
         }
         if (orig_method == null) {
             orig_method = this.find_trait_impl_method_for_target(
-                recv_type, ma.member, SymbolStr::empty(), &impl_node);
+                recv_type, ma.member, DefId::invalid(), &impl_node);
         }
         if (orig_method == null) { return; }
         if (impl_node == null && inherent_owner_ast == null) { return; }
@@ -1762,7 +1763,7 @@ type struct MonoCallSpecializer {
     /// the ambiguity sema refuses; picking among them by the order the
     /// blocks were placed would bind a body the source never chose.
     find_spec_impl_trait_method(&this, target_type: TypeRef, method_name: SymbolStr,
-                                only_trait: SymbolStr,
+                                only_trait: DefId,
                                 out_impl: ImplBlockNode**) -> MethodNode* {
         mut sole_m: MethodNode* = null;
         mut sole_impl: ImplBlockNode* = null;
@@ -1851,7 +1852,7 @@ type struct MonoCallSpecializer {
     /// are two keys, and the answer for one was the other's.
     find_trait_impl_method_for_target(&this, recv_type: TypeRef,
                                       method_name: SymbolStr,
-                                      only_trait: SymbolStr,
+                                      only_trait: DefId,
                                       out_impl: ImplBlockNode**) -> MethodNode* {
         if (this.generic_registry == null) { return null; }
         mut sole_m: MethodNode* = null;
@@ -2282,7 +2283,7 @@ type struct MonoCallSpecializer {
         const type_qname: QualifiedName = QualifiedName::from_symbol(qualified_target);
         const method_param_refs: TypeRef[] = DeclarationIndex::method_non_receiver_params(func, this.intern_table);
         const mangled: MangledName = MangledName::for_method_or_trait_impl(
-            this.intern_table, this.arena, type_qname, func.origin_trait, func.name,
+            this.intern_table, this.arena, type_qname, func.origin_trait.qualified_name(), func.name,
             DeclarationIndex::method_receiver_kind(func, spec_method.is_static, this.intern_table),
             method_param_refs, func.resolved_return_type, func.is_variadic);
         // Disambiguate generic-method specs whose signature doesn't depend on the
@@ -2298,11 +2299,11 @@ type struct MonoCallSpecializer {
 
     /// Peel a type annotation to its head Named name (for bound-directed dispatch).
     /// Whether `impl_node` is an impl of the trait `trait_id` names - by
-    /// identity: the call's stamp and the head's `qualified_trait_name` are
-    /// both the trait's canonical name.  Two traits can share a leaf, and
+    /// identity: the call's stamp and the head's `trait_def` both name the
+    /// trait's canonical definition.  Two traits can share a leaf, and
     /// the head annotation's leaf would pick whichever registered first.
-    impl_provides_trait(&this, impl_node: ImplBlockNode*, trait_id: SymbolStr) -> boolean {
-        return impl_node.qualified_trait_name.equals(trait_id);
+    impl_provides_trait(&this, impl_node: ImplBlockNode*, trait_id: DefId) -> boolean {
+        return impl_node.trait_def.equals(trait_id);
     }
 
     /// Build a qualified specialized name from the template's qualified name + the
@@ -2465,7 +2466,7 @@ type struct MonoCallSpecializer {
                 if (tref.path.length == 0) { continue; }
                 // Identity for the check; the diagnostic keeps the spelling.
                 const trait_name: SymbolStr = tref.path[tref.path.length - 1];
-                if (!this.trait_spec.type_implements_trait(concrete, tref.identity(), 0)) {
+                if (!this.trait_spec.type_implements_trait(concrete, tref.definition(), 0)) {
                     this.emit_call_bound_failure(call, tmpl_func, tref, concrete, trait_name);
                     return false;
                 }

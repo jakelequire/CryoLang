@@ -596,8 +596,6 @@ SCANNED_ARRAYS = {
                                           "a declaration's written generic parameters, held in a local, by leaf"),
     "local.TraitBound":           Scanned(None, "TraitBound", TABLE,
                                           "`where` bounds, held in a local, by the bounded parameter's leaf"),
-    "local.ImplBlockNode":        Scanned(None, "ImplBlockNode", TABLE,
-                                          "impl blocks, held in a local, by the trait's qualified name"),
     "local.VTableSlot":           Scanned(None, "VTableSlot", TABLE,
                                           "a class's vtable slots, held in a local, by the method's leaf"),
     "local.NegDiag":              Scanned(None, "NegDiag", DATA,

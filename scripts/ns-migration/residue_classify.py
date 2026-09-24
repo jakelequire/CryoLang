@@ -190,8 +190,6 @@ CLASS_OF_METHOD = {
         ("J", "member: a declaration's own written generic parameters, scanned for a repeated spelling as the parser builds the list. The question IS about spellings - two parameters written `<T, T>` are a redeclaration - and at parse time there is no identity to ask instead: the resolver stamps a `SymbolID` on each parameter only after the list exists. Rust refuses the same shape the same way, by comparing idents in the parameter list"),
     "local::TraitBound[]":
         ("S", "`where` bounds held in a local, by the bounded parameter's leaf read off the arena's `GenericParamType.param_name`"),
-    "local::ImplBlockNode[]":
-        ("B", "impl blocks held in a local, selected by the trait's qualified name - the registry's canonical key"),
     "local::VTableSlot[]":
         ("J", "member: a class's vtable slots held in a local, by the method's leaf (the override walk)"),
     # -- the declaration index --
@@ -239,14 +237,6 @@ CLASS_OF_METHOD = {
     # -- the generic registry --
     "GenericRegistry::get_template":
         ("B", "a template by the canonical name of a stamped type (`target_key`, `get_qualified_name`, a `Def` stamp, the call's pinned template key)"),
-    "GenericRegistry::get_trait_decl":
-        ("B", "a trait declaration by its identity string (`tr.identity()`, `trait_identity(ann)`, `qualified_trait_name`)"),
-    "GenericRegistry::heads_for":
-        ("B", "the impl heads of a trait identity for a subject `TypeRef`"),
-    "GenericRegistry::template_head_for":
-        ("B", "the written head of a trait identity for a subject `TypeRef`"),
-    "GenericRegistry::select_trait_impl":
-        ("B", "the selected head of a trait identity for a subject `TypeRef`"),
     "GenericRegistry::overlapping_head":
         ("B", "a head that overlaps `(trait identity, target key)` at registration"),
     "GenericRegistry::lookup_inherent_owner":
@@ -298,8 +288,6 @@ SITE_OVERRIDES = {
         ("C", "`owner::member` composed from `scope_owner_key` and the written member"),
     ("compiler/passes/type_resolution.cryo", "DeclarationIndex::lookup_type", "n"):
         ("J", "prim: `Res::PrimTy(n)` - the primitive's identity is the spelling the stamp carries"),
-    ("compiler/sema/async_lower.cryo", "DeclarationIndex::lookup_type", "qualified"):
-        ("J", "lang: `lookup_future_type` - `Context`, `Executor`, `Poll` and `Option` by the identity each declaration claimed (`wellknown`)"),
     ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_type", "name"):
         ("N", "the funnel's own forwarding body (`lookup_type_exact`); its callers are the sites"),
     ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_func_type", "name"):

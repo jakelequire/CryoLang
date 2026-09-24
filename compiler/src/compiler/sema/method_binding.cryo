@@ -47,6 +47,7 @@ import compiler::ast::node::{ ASTNode };
 import compiler::ast::node_locator::{ NodeLocator };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::res::{ DefId };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::sema::helpers::{ sema_expr_has_numeric_suffix };
@@ -485,7 +486,7 @@ type struct MethodBinding {
                            tr: TraitRef*) -> TypeRef {
         if (this.ctx.generic_registry == null) { return ret; }
         if (this.ctx.type_resolver == null)    { return ret; }
-        const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(tr.identity());
+        const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(tr.definition());
         if (tdecl == null || tdecl.assoc_types.length == 0) { return ret; }
         mut rc: ResolutionContext = ResolutionContext::new("");
         this.symbolic.symbolic_bind_params(&rc);
@@ -685,7 +686,7 @@ type struct MethodBinding {
         const blocks: ImplBlockNode*[] = this.ctx.generic_registry.template_trait_impls_of(recv_type, this.intern);
         for (mut ti: i64 = 0; ti < blocks.length; ti++) {
             const dimpl: ImplBlockNode* = blocks[ti];
-            const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(dimpl.qualified_trait_name);
+            const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(dimpl.trait_def);
             if (tdecl == null) { continue; }
             // The trait's default-bodied method of this name, if projection-bounded.
             mut mfunc: FunctionDeclNode* = null;
@@ -744,7 +745,7 @@ type struct MethodBinding {
             for (mut ri: i64 = 0; ri < b.trait_refs.length; ri++) {
                 const tr: TraitRef* = &b.trait_refs[ri];
                 if (tr.path.length == 0) { continue; }
-                if (this.ctx.generic_registry.select_trait_impl(tr.identity(), item_ty, this.intern) == null) {
+                if (this.ctx.generic_registry.select_trait_impl(tr.definition(), item_ty, this.intern) == null) {
                     return true;
                 }
             }
@@ -764,7 +765,7 @@ type struct MethodBinding {
         const blocks: ImplBlockNode*[] = this.ctx.generic_registry.trait_impls_of(subject, this.intern);
         for (mut k: i64 = 0; k < blocks.length; k++) {
             const ret: TypeRef = this.types.lookup_method_return(
-                this.types.lookup_type_exact(blocks[k].qualified_trait_name), method_name);
+                this.ctx.decl_index.type_of_def(blocks[k].trait_def), method_name);
             if (ret.is_valid()) { return ret; }
         }
         return TypeRef::invalid();
@@ -1013,7 +1014,7 @@ type struct MethodBinding {
         if (this.ctx.generic_registry == null) { return null; }
         const blocks: ImplBlockNode*[] = this.ctx.generic_registry.template_trait_impls_of(recv_type, this.intern);
         for (mut i: i64 = 0; i < blocks.length; i++) {
-            const td: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(blocks[i].qualified_trait_name);
+            const td: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(blocks[i].trait_def);
             if (td == null) { continue; }
             for (mut k: i64 = 0; k < td.methods.length; k++) {
                 const f: FunctionDeclNode* = td.methods[k];
@@ -1036,13 +1037,13 @@ type struct MethodBinding {
     /// until then any candidate's signature serves; which body is bound is
     /// decided where the stamp is read.
     find_generic_method_in_trait_impls(&this, owner_ref: TypeRef, method_name: SymbolStr,
-                                       only_trait: SymbolStr,
+                                       only_trait: DefId,
                                        out_impl: ImplBlockNode**) -> MethodNode* {
         if (this.ctx.generic_registry == null) { return null; }
         const blocks: ImplBlockNode*[] = this.ctx.generic_registry.trait_impls_of(owner_ref, this.intern);
         for (mut i: i64 = 0; i < blocks.length; i++) {
             const impl_node: ImplBlockNode* = blocks[i];
-            if (only_trait.is_valid() && !impl_node.qualified_trait_name.equals(only_trait)) { continue; }
+            if (only_trait.is_valid() && !impl_node.trait_def.equals(only_trait)) { continue; }
             const m: MethodNode* = this.find_generic_method_in(&impl_node.methods, method_name);
             if (m == null) { continue; }
             *out_impl = impl_node;
@@ -1086,7 +1087,7 @@ type struct MethodBinding {
         const pname: SymbolStr = (t as GenericParamType*).param_name;
         if (!pname.is_valid()) { return rc; }
 
-        mut bound_leaves: SymbolStr[] = [];
+        mut bound_leaves: DefId[] = [];
         if (this.state.symbolic_impl_node != null) {
             for (mut bi: i64 = 0; bi < this.state.symbolic_impl_node.where_bounds.length; bi++) {
                 const bound: TraitBound* = &this.state.symbolic_impl_node.where_bounds[bi];
@@ -1094,7 +1095,7 @@ type struct MethodBinding {
                 for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                     const tr: TraitRef* = &bound.trait_refs[ti];
                     if (tr.path.length == 0) { continue; }
-                    bound_leaves.push(tr.identity());
+                    bound_leaves.push(tr.definition());
                 }
             }
         }
@@ -1105,7 +1106,7 @@ type struct MethodBinding {
                 for (mut ti: i64 = 0; ti < wb.trait_refs.length; ti++) {
                     const tr: TraitRef* = &wb.trait_refs[ti];
                     if (tr.path.length == 0) { continue; }
-                    bound_leaves.push(tr.identity());
+                    bound_leaves.push(tr.definition());
                 }
             }
         }
@@ -1346,7 +1347,7 @@ type struct MethodBinding {
         }
         if (found == null) {
             found = this.find_generic_method_in_trait_impls(
-                recv_type, member.member, SymbolStr::empty(), &trait_impl_block);
+                recv_type, member.member, DefId::invalid(), &trait_impl_block);
             if (found != null && trait_impl_block != null) {
                 owner_params = &trait_impl_block.generic_params;
             }
@@ -1643,7 +1644,7 @@ type struct MethodBinding {
             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                 const tr: TraitRef* = &bound.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
-                const concrete_args: TypeRef[] = this.ctx.type_resolver.concrete_trait_slots(subject, tr.identity());
+                const concrete_args: TypeRef[] = this.ctx.type_resolver.concrete_trait_slots(subject, tr.definition());
                 if (tr.type_args.length > concrete_args.length) { continue; }
                 for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
                     const ta: TypeAnnotation* = tr.type_args[ai];

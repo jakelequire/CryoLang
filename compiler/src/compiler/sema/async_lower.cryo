@@ -588,9 +588,9 @@ type struct AsyncLower {
     ///
     /// Invalid when the declaration is absent from the program, which is the
     /// case the callers' "add `import std::future;`" diagnostics report.
-    lookup_future_type(&this, qualified: SymbolStr) -> TypeRef {
+    lookup_future_type(&this, qualified: DefId) -> TypeRef {
         if (!qualified.is_valid()) { return TypeRef::invalid(); }
-        return this.ctx.decl_index.lookup_type(qualified);
+        return this.ctx.decl_index.type_of_def(qualified);
     }
 
     /// The identity of the language's `Poll` - `std::future::poll::Poll`,
@@ -599,14 +599,14 @@ type struct AsyncLower {
     /// `std::future` import.  Never a spelling: a user enum named `Poll`
     /// beside an `async function` is another enum.
     poll_identity(&this) -> SymbolStr {
-        return this.ctx.generic_registry.wellknown(LangItem::Poll);
+        return this.ctx.generic_registry.wellknown(LangItem::Poll).qualified_name();
     }
 
     /// The identity of the language's `Option`, the type every carried value
     /// the state machine may not yet hold is wrapped in; empty when absent
     /// from the program, which `lower` reports.
     option_identity(&this) -> SymbolStr {
-        return this.ctx.generic_registry.wellknown(LangItem::Option);
+        return this.ctx.generic_registry.wellknown(LangItem::Option).qualified_name();
     }
 
     mint_bare(mut &this, base: string) -> SymbolStr {
@@ -723,8 +723,8 @@ type struct AsyncLower {
         if (owner == null || node == null || fut_ann == null) { return; }
         if (owner.impl_node == null || !owner.impl_node.is_trait_impl()) { return; }
         if (this.ctx.generic_registry == null) { return; }
-        const leaf: SymbolStr =
-            TypeAnnotation::trait_identity(owner.impl_node.trait_annotation);
+        const leaf: DefId =
+            TypeAnnotation::trait_def(owner.impl_node.trait_annotation);
         if (!leaf.is_valid()) { return; }
         const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(leaf);
         if (tdecl == null) { return; }
@@ -6877,14 +6877,14 @@ type struct AsyncLower {
         // Without `std::future` the module has no future types at all, and
         // `declare` reports that with the message naming the missing import; bow
         // out silently rather than reporting one cause twice.
-        if (!this.lookup_future_type(this.poll_identity()).is_valid()) { return false; }
+        if (!this.lookup_future_type(this.ctx.generic_registry.wellknown(LangItem::Poll)).is_valid()) { return false; }
         // The type that drives an `async function main`, by the identity its
         // declaration claimed.  The wrapper lands in the user's entry-point
         // module, so a type of the same name declared beside `main` is
         // precisely the one a spelling would find; `Poll` and `Option`, the
         // types the state machine is built out of, are asked the same way
         // (`poll_identity`, `option_identity`).
-        const exec_id: SymbolStr = this.ctx.generic_registry.wellknown(LangItem::Executor);
+        const exec_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Executor);
         const exec_ty: TypeRef = this.lookup_future_type(exec_id);
         if (!exec_ty.is_valid()) {
             this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
@@ -7062,7 +7062,7 @@ type struct AsyncLower {
         // Absent from the PROGRAM, not merely from this module's imports: the
         // names below are canonical, so the only way they miss is that nothing
         // imports the module declaring them and it was never compiled.
-        const poll_base: TypeRef = this.lookup_future_type(this.poll_identity());
+        const poll_base: TypeRef = this.lookup_future_type(this.ctx.generic_registry.wellknown(LangItem::Poll));
         const ctx_ref:   TypeRef = this.lookup_future_type(this.ctx.generic_registry.wellknown(LangItem::Context));
         if (!poll_base.is_valid() || !ctx_ref.is_valid()) {
             this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
@@ -7221,7 +7221,7 @@ type struct AsyncLower {
         // stamp and the mangler read - is the IDENTITY, the same canonical
         // name a written `implement trait Future` is stamped with.
         const future_leaf: SymbolStr = this.intern.intern("Future");
-        const future_id: SymbolStr = this.ctx.generic_registry.wellknown(LangItem::Future);
+        const future_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Future);
 
         // `poll`'s signature, whose body `lower` supplies.
         mut poll_fn: FunctionDeclNode* = new FunctionDeclNode(this.intern.intern("poll"), span);
@@ -7288,12 +7288,12 @@ type struct AsyncLower {
         // synthesizer that holds the definition records it.
         impl_node.res.answer(Res::Def(DefId::of_definition(q_name)));
         mut gen: GenericAnnotation* = new GenericAnnotation {
-            base: this.named_ann_def(future_leaf, DefId::of_definition(future_id), span),
+            base: this.named_ann_def(future_leaf, future_id, span),
             args: [this.output_type_ann(&d, span)],
             span: span,
         };
         impl_node.set_trait_annotation(new TypeAnnotation::Generic(gen));
-        impl_node.qualified_trait_name = future_id;
+        impl_node.trait_def = future_id;
         impl_node.add_assoc_binding(this.intern.intern("Output"), this.output_type_ann(&d, span));
         impl_node.add_method(poll_method);
         if (generic) {
@@ -7531,7 +7531,7 @@ type struct AsyncLower {
         // parameter has to move out of its field on the single poll, and only a
         // slot that can be left empty records that the future no longer owns it.
         mut body_block: BlockStmtNode* = null;
-        sm.opt_base = this.lookup_future_type(this.option_identity());
+        sm.opt_base = this.lookup_future_type(this.ctx.generic_registry.wellknown(LangItem::Option));
         if (!sm.opt_base.is_valid()
             && (total_await > 0 || this.params_need_carrier(&this.pending[pi], node))) {
             this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,

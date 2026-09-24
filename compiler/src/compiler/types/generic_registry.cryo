@@ -228,7 +228,7 @@ type struct TemplateEntry {
 /// One `implement trait Tr for Target<...>` head, under the key it was
 /// registered by.  See `GenericRegistry::trait_heads`.
 type struct TraitImplHead {
-    trait_id:   SymbolStr;
+    trait_id:   DefId;
     target_key: SymbolStr;
     block:      ImplBlockNode*;
 }
@@ -484,7 +484,7 @@ type struct GenericRegistry {
     // `trait_decl_nodes`. A node's own `name` is its written leaf, so a scan
     // that finds a node by walking cannot hand its caller a key this table
     // accepts without it.
-    trait_decl_keys:    SymbolStr[];
+    trait_decl_keys:    DefId[];
 
     // -- Inherent-owner registry --
     // Maps a qualified type name (SymbolStr.id) to the StructDeclNode* /
@@ -528,7 +528,7 @@ type struct GenericRegistry {
     // An absent entry means that declaration is not in this program's module
     // graph.  It is NOT "no type satisfies this": answering "no" off an absent
     // entry reclassifies every type at once, so callers distinguish the two.
-    wellknown_claims: Pair<LangItem, SymbolStr>[];
+    wellknown_claims: Pair<LangItem, DefId>[];
 
 
     static new(arena: TypeArena*) -> GenericRegistry {
@@ -766,11 +766,11 @@ type struct GenericRegistry {
         return null;
     }
 
-    /// Pack a `(trait_name, target_name)` pair into a single u64 key. Both
-    /// SymbolStr ids fit in the lower/upper 32-bit halves so collisions are
-    /// only possible when two pairs alias both ids, which is practically zero.
-    static trait_impl_key(trait_name: SymbolStr, target_name: SymbolStr) -> u64 {
-        return ((trait_name.id as u64) << 32) | ((target_name.id as u64) & 0xFFFFFFFF);
+    /// Pack a `(trait, target_name)` pair into a single u64 key: the trait's
+    /// interned canonical name in the upper half, the target key's in the
+    /// lower, so two pairs collide only when both ids do.
+    static trait_impl_key(trait_def: DefId, target_name: SymbolStr) -> u64 {
+        return ((trait_def.qualified_name().id as u64) << 32) | ((target_name.id as u64) & 0xFFFFFFFF);
     }
 
 
@@ -817,7 +817,7 @@ type struct GenericRegistry {
     /// that key is not pushed twice: a head is offered by TemplateRegistration
     /// and again by TypeResolution, and once more by the specialization walk
     /// under its clone's key, and whether an offer took is a fact of the table.
-    register_trait_impl(mut &this, trait_id: SymbolStr, target_key: SymbolStr,
+    register_trait_impl(mut &this, trait_id: DefId, target_key: SymbolStr,
                         block: ImplBlockNode*) -> void {
         if (block == null || !trait_id.is_valid() || !target_key.is_valid()) { return; }
         const key: u64 = GenericRegistry::trait_impl_key(trait_id, target_key);
@@ -830,7 +830,7 @@ type struct GenericRegistry {
     }
 
     /// The heads under `(trait_id, target_key)`, in registration order.
-    heads_under(&this, trait_id: SymbolStr, target_key: SymbolStr) -> ImplBlockNode*[] {
+    heads_under(&this, trait_id: DefId, target_key: SymbolStr) -> ImplBlockNode*[] {
         mut out: ImplBlockNode*[] = [];
         if (!trait_id.is_valid() || !target_key.is_valid()) { return out; }
         const key: u64 = GenericRegistry::trait_impl_key(trait_id, target_key);
@@ -861,7 +861,7 @@ type struct GenericRegistry {
     /// arm) - a registration-time report, not one per use - so the first
     /// registered answering here is the only head in a program that
     /// compiles.
-    select_trait_impl(&this, trait_id: SymbolStr, subject: TypeRef,
+    select_trait_impl(&this, trait_id: DefId, subject: TypeRef,
                       intern: InternTable*) -> ImplBlockNode* {
         const heads: ImplBlockNode*[] = this.heads_for(trait_id, subject, intern);
         if (heads.length == 0) { return null; }
@@ -873,7 +873,7 @@ type struct GenericRegistry {
     /// heads that unify.  Several answer when the trait is generic and the
     /// subject implements it at several arguments (`From<i8>` and `From<u8>`
     /// for `u64`), which is one trait identity and as many impls.
-    heads_for(&this, trait_id: SymbolStr, subject: TypeRef,
+    heads_for(&this, trait_id: DefId, subject: TypeRef,
               intern: InternTable*) -> ImplBlockNode*[] {
         mut out: ImplBlockNode*[] = [];
         if (!trait_id.is_valid() || !subject.is_valid() || intern == null) { return out; }
@@ -902,7 +902,7 @@ type struct GenericRegistry {
         if (!subject.is_valid() || intern == null) { return out; }
         const tkey: SymbolStr = this.arena.template_key_of(subject, intern);
         const own: SymbolStr = this.arena.get_qualified_name(subject);
-        mut seen: SymbolStr[] = [];
+        mut seen: DefId[] = [];
         for (mut i: i64 = 0; i < this.trait_heads.length; i++) {
             const h: TraitImplHead* = &this.trait_heads[i];
             const under_own: boolean = own.is_valid() && h.target_key.equals(own);
@@ -924,7 +924,7 @@ type struct GenericRegistry {
     /// template key whose arguments unify - never a placed clone.  For the
     /// readers that substitute the head's WRITTEN trait and target arguments
     /// against the subject's own, which a clone has already substituted away.
-    template_head_for(&this, trait_id: SymbolStr, subject: TypeRef,
+    template_head_for(&this, trait_id: DefId, subject: TypeRef,
                       intern: InternTable*) -> ImplBlockNode* {
         if (!trait_id.is_valid() || !subject.is_valid() || intern == null) { return null; }
         const tkey: SymbolStr = this.arena.template_key_of(subject, intern);
@@ -1063,7 +1063,7 @@ type struct GenericRegistry {
     /// template heads' overlap seen again.  The first such head is the
     /// answer, so a third overlapping head is reported against the first
     /// and not once per pair.
-    overlapping_head(&this, trait_id: SymbolStr, target_key: SymbolStr,
+    overlapping_head(&this, trait_id: DefId, target_key: SymbolStr,
                      block: ImplBlockNode*) -> ImplBlockNode* {
         if (block == null || block.spec_owner.is_valid()) { return null; }
         const heads: ImplBlockNode*[] = this.heads_under(trait_id, target_key);
@@ -1375,9 +1375,9 @@ type struct GenericRegistry {
     /// this table was last-write-wins over a search key, so two same-leaf
     /// traits in different modules collapsed to one entry and which body a
     /// program got depended on import order in an unrelated file.
-    register_trait_decl(mut &this, name: SymbolStr, node: TraitDeclNode*) -> void {
+    register_trait_decl(mut &this, name: DefId, node: TraitDeclNode*) -> void {
         if (node == null || !name.is_valid()) { return; }
-        const existing: Option<i64> = this.trait_decl_index.get(&name.id);
+        const existing: Option<i64> = this.trait_decl_index.get(&name.qualified_name().id);
         if (existing.is_some()) {
             this.trait_decl_nodes[existing.unwrap()] = node;
             return;
@@ -1385,18 +1385,15 @@ type struct GenericRegistry {
         const idx: i64 = this.trait_decl_nodes.length;
         this.trait_decl_nodes.push(node);
         this.trait_decl_keys.push(name);
-        this.trait_decl_index.insert(name.id, idx);
+        this.trait_decl_index.insert(name.qualified_name().id, idx);
     }
 
-    /// Look up a trait declaration's AST by its canonical identity. Returns
-    /// null when no such trait was registered.
-    ///
-    /// `name` must be the qualified identity a resolver stamped, never a
-    /// written leaf: the table is keyed that way precisely so two same-leaf
-    /// traits in different modules stay distinct. Passing a leaf misses.
-    get_trait_decl(&this, name: SymbolStr) -> TraitDeclNode* {
+    /// Look up a trait declaration's AST by the trait's definition. Returns
+    /// null when no such trait was registered.  Two same-leaf traits in
+    /// different modules are two definitions, so they stay distinct.
+    get_trait_decl(&this, name: DefId) -> TraitDeclNode* {
         if (!name.is_valid()) { return null; }
-        const opt: Option<i64> = this.trait_decl_index.get(&name.id);
+        const opt: Option<i64> = this.trait_decl_index.get(&name.qualified_name().id);
         if (opt.is_some()) {
             return this.trait_decl_nodes[opt.unwrap()];
         }
@@ -1418,20 +1415,20 @@ type struct GenericRegistry {
         for (mut i: i64 = 0; i < items.length; i++) {
             if (items[i].path() != s) { continue; }
             if (!this.wellknown(items[i]).is_valid()) {
-                this.wellknown_claims.push(Pair::<LangItem, SymbolStr>::new(items[i], qname));
+                this.wellknown_claims.push(Pair::<LangItem, DefId>::new(items[i], DefId::of_definition(qname)));
             }
             return;
         }
     }
 
-    /// The identity of the declaration that claimed `item`, or an empty
-    /// SymbolStr when no such declaration is in this program's module graph.
-    /// Absence is not a "no" - see the field comment.
-    wellknown(&this, item: LangItem) -> SymbolStr {
+    /// The definition that claimed `item`, or an invalid id when no such
+    /// declaration is in this program's module graph.  Absence is not a
+    /// "no" - see the field comment.
+    wellknown(&this, item: LangItem) -> DefId {
         for (mut i: i64 = 0; i < this.wellknown_claims.length; i++) {
             if (this.wellknown_claims[i].first == item) { return this.wellknown_claims[i].second; }
         }
-        return SymbolStr::empty();
+        return DefId::invalid();
     }
 
     /// The declaration of the trait that claimed `item`, or null when no such
@@ -1446,7 +1443,7 @@ type struct GenericRegistry {
     /// so the type answers the declaration without a scan.
     trait_decl_of(&this, trait_ty: TypeRef) -> TraitDeclNode* {
         if (!trait_ty.is_valid() || this.arena == null) { return null; }
-        return this.get_trait_decl(this.arena.get_qualified_name(trait_ty));
+        return this.get_trait_decl(DefId::of_definition(this.arena.get_qualified_name(trait_ty)));
     }
 
     /// Walk all registered trait decls looking for one that defines a
@@ -1464,7 +1461,7 @@ type struct GenericRegistry {
             if (td.lookup_method(method_name) != null) {
                 // The registration key, not `td.name`: the node's own name
                 // is the written leaf, which this table no longer accepts.
-                return this.trait_decl_keys[i];
+                return this.trait_decl_keys[i].qualified_name();
             }
         }
         return SymbolStr::empty();

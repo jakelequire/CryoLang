@@ -33,6 +33,7 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::res::{ DefId };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ PointerType };
 import compiler::types::generic::{ GenericParamType };
@@ -79,7 +80,7 @@ type struct TraitChecker {
     ///
     /// The trait-impl registry is keyed by that identity too, so one name
     /// asks both questions.
-    type_implements_trait(&this, ty: TypeRef, trait_name: SymbolStr, depth: i32) -> boolean {
+    type_implements_trait(&this, ty: TypeRef, trait_name: DefId, depth: i32) -> boolean {
         if (depth >= 16) {
             // Depth budget exhausted on a deep or cyclic impl/where-clause
             // chain. Return false (unchanged) so an unsatisfiable bound never
@@ -92,7 +93,7 @@ type struct TraitChecker {
             // untouched because this receiver is `&this`; emit() records the
             // error in the sink (the same `&this` diagnostics.emit pattern used
             // elsewhere - e.g. resolver.cryo's resolve()).
-            const tn: string = this.intern_table.resolve(trait_name);
+            const tn: string = this.intern_table.resolve(trait_name.qualified_name());
             this.diagnostics.emit(Diagnostic::error(
                 ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 fmt::format("trait-bound resolution exceeded the recursion limit (16) while checking `%s`; the impl or where-clause chain may be cyclic", tn)));
@@ -104,7 +105,7 @@ type struct TraitChecker {
         // registry. The marker trait declared in core/marker.cryo
         // intentionally has no impl blocks; the compiler is the single
         // source of truth for "is this type bitwise-duplicable".
-        const copy_name: SymbolStr = this.generic_registry.wellknown(LangItem::Copy);
+        const copy_name: DefId = this.generic_registry.wellknown(LangItem::Copy);
         if (copy_name.is_valid() && trait_name.equals(copy_name)) {
             return OwnershipQuery::is_copy(this.arena, this.generic_registry,
                                             this.intern_table, ty);
@@ -114,12 +115,12 @@ type struct TraitChecker {
         // as `Copy`: the compiler decides via a type walk, not via
         // `implement trait Send for T { ... }` lookups.  See
         // OwnershipQuery::is_send / is_sync for the rules.
-        const send_name: SymbolStr = this.generic_registry.wellknown(LangItem::Send);
+        const send_name: DefId = this.generic_registry.wellknown(LangItem::Send);
         if (send_name.is_valid() && trait_name.equals(send_name)) {
             return OwnershipQuery::is_send(this.arena, this.generic_registry,
                                             this.intern_table, ty);
         }
-        const sync_name: SymbolStr = this.generic_registry.wellknown(LangItem::Sync);
+        const sync_name: DefId = this.generic_registry.wellknown(LangItem::Sync);
         if (sync_name.is_valid() && trait_name.equals(sync_name)) {
             return OwnershipQuery::is_sync(this.arena, this.generic_registry,
                                             this.intern_table, ty);
@@ -131,7 +132,7 @@ type struct TraitChecker {
         // stdlib/core/drop.cryo, while pointers to user types still require
         // the pointee to `implement trait Drop`. Avoids needing a parser
         // extension to support pointer impl targets like `for u8*`.
-        const drop_name: SymbolStr = this.generic_registry.wellknown(LangItem::Drop);
+        const drop_name: DefId = this.generic_registry.wellknown(LangItem::Drop);
         if (drop_name.is_valid() && trait_name.equals(drop_name)) {
             // Pointers/references are non-owning aliases.  Delegate
             // `T*: Drop` to `T: Drop` so primitive pointers auto-pass while
@@ -194,7 +195,7 @@ type struct TraitChecker {
     /// subject's arguments.  Null when no head unifies or every one that
     /// does is refused by its bounds - Rust's selection, candidate assembly
     /// then confirmation, in one place.
-    select_impl(&this, trait_id: SymbolStr, subject: TypeRef, depth: i32) -> ImplBlockNode* {
+    select_impl(&this, trait_id: DefId, subject: TypeRef, depth: i32) -> ImplBlockNode* {
         if (this.generic_registry == null) { return null; }
         const heads: ImplBlockNode*[] = this.generic_registry.heads_for(trait_id, subject, this.intern_table);
         for (mut i: i64 = 0; i < heads.length; i++) {
@@ -291,7 +292,7 @@ type struct TraitChecker {
     /// with the type at all (a genuinely unrelated type has none).  A truly
     /// unsatisfied bound still surfaces at the first trait-method call on
     /// the concrete type.
-    type_satisfies_opaque_bound(&this, ty: TypeRef, trait_name: SymbolStr) -> boolean {
+    type_satisfies_opaque_bound(&this, ty: TypeRef, trait_name: DefId) -> boolean {
         if (this.type_implements_trait(ty, trait_name, 0)) { return true; }
         if (this.generic_registry == null) { return false; }
         return this.generic_registry.heads_for(trait_name, ty, this.intern_table).length > 0;
@@ -319,8 +320,8 @@ type struct TraitChecker {
                 }
             }
             if (!has_method) { continue; }
-            if (!this.type_implements_trait(receiver, impl_block.qualified_trait_name, 0)) {
-                return impl_block.qualified_trait_name;
+            if (!this.type_implements_trait(receiver, impl_block.trait_def, 0)) {
+                return impl_block.trait_def.qualified_name();
             }
         }
         return SymbolStr::empty();
@@ -356,7 +357,7 @@ type struct TraitChecker {
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
                 const tref: TraitRef* = &bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
-                if (!this.type_implements_trait(concrete, tref.identity(), 0)) {
+                if (!this.type_implements_trait(concrete, tref.definition(), 0)) {
                     return false;
                 }
             }
@@ -382,7 +383,7 @@ type struct TraitChecker {
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
                 const tref: TraitRef* = &bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
-                if (this.type_implements_trait(concrete, tref.identity(), 0)) { continue; }
+                if (this.type_implements_trait(concrete, tref.definition(), 0)) { continue; }
                 *out_concrete = concrete;
                 return tref;
             }
@@ -408,7 +409,7 @@ type struct TraitChecker {
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
                 const tref: TraitRef* = &bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
-                if (!this.type_implements_trait(concrete, tref.identity(), depth)) {
+                if (!this.type_implements_trait(concrete, tref.definition(), depth)) {
                     return false;
                 }
             }

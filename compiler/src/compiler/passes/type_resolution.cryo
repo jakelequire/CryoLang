@@ -167,7 +167,7 @@ type struct TypeResolutionRunner {
         // returns the owning node, not a droppable copy of its args).
         const gen: GenericAnnotation* = TypeResolutionPasses::peel_to_generic(trait_ann);
         if (gen == null || gen.args.length == 0) { return; }
-        const trait_id: SymbolStr = TypeAnnotation::trait_identity(trait_ann);
+        const trait_id: DefId = TypeAnnotation::trait_def(trait_ann);
         if (!trait_id.is_valid()) { return; }
         const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_id);
         if (trait_decl == null) { return; }
@@ -233,7 +233,7 @@ type struct TypeResolutionRunner {
         if (this.ctx.generic_registry == null) { return; }
         const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
         if (trait_ann == null) { return; }
-        const trait_id: SymbolStr = TypeAnnotation::trait_identity(trait_ann);
+        const trait_id: DefId = TypeAnnotation::trait_def(trait_ann);
         if (!trait_id.is_valid()) { return; }
         const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_id);
         if (trait_decl == null) { return; }
@@ -1049,7 +1049,7 @@ type struct TypeResolutionPasses {
                     // index refuses non-intrinsic overwrites of them.
                     if (!is_source_decl && !q_name.equals(func.name)) {
                         ctx.decl_index.register_signature(
-                            func.name, func_type_ref, q_name, ctx.decl_index.entry_symbol(entry), SymbolStr::empty(),
+                            func.name, func_type_ref, q_name, ctx.decl_index.entry_symbol(entry), DefId::invalid(),
                             ctx.decl_index.entry_span(entry));
                     }
                 }
@@ -1085,17 +1085,17 @@ type struct TypeResolutionPasses {
                 // stamp is what tells them apart; a head with no stamp is a
                 // defect the door records, never a leaf to search for.
                 if (node.is_trait_impl()) {
-                    const ot_trait: SymbolStr = TypeResolutionPasses::head_named_slot(node.trait_annotation)
-                        .require("type_resolution:trait-impl head").def_id().qualified_name();
-                    if (ot_trait.is_valid()) {
+                    const ot_def: DefId = TypeResolutionPasses::head_named_slot(node.trait_annotation)
+                        .require("type_resolution:trait-impl head").def_id();
+                    if (ot_def.is_valid()) {
                         // Carry the same answer on the block itself: a caller
                         // asking WHICH trait this impl provides must not have to
                         // re-derive it from the registry's bare leaf key.
-                        node.qualified_trait_name = ot_trait;
+                        node.trait_def = ot_def;
                         for (mut omi: i64 = 0; omi < node.methods.length; omi++) {
                             const om: MethodNode* = node.methods[omi];
                             if (om != null && om.func != null) {
-                                om.func.set_origin_trait(ot_trait);
+                                om.func.set_origin_trait(ot_def);
                             }
                         }
                     }
@@ -1129,7 +1129,7 @@ type struct TypeResolutionPasses {
                         // registry keeps one, and a clone routed here after
                         // that pass is registered here alone.
                         ctx.generic_registry.register_trait_impl(
-                            node.qualified_trait_name, canonical_target, node);
+                            node.trait_def, canonical_target, node);
                     }
                 }
                 // Trait-impl coherence (same file AND across modules).  A
@@ -1184,7 +1184,7 @@ type struct TypeResolutionPasses {
                         // bounds disjoint.
                         const over: ImplBlockNode* =
                             ctx.generic_registry.overlapping_head(
-                                node.qualified_trait_name, canonical_target, node);
+                                node.trait_def, canonical_target, node);
                         if (over != null) {
                             const this_head: string = node.spell_head(ctx.intern_table);
                             const that_head: string = over.spell_head(ctx.intern_table);
@@ -1822,7 +1822,7 @@ type struct TypeResolutionPasses {
             for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
                 const tr: TraitRef* = &b.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
-                if (ctx.generic_registry.select_trait_impl(tr.identity(), item_ty, ctx.intern_table) == null) {
+                if (ctx.generic_registry.select_trait_impl(tr.definition(), item_ty, ctx.intern_table) == null) {
                     return false;
                 }
             }
@@ -2042,7 +2042,7 @@ type struct TypeResolutionPasses {
         if (!impl_node.is_trait_impl()) { return 0; }
         if (ctx.generic_registry == null) { return 0; }
 
-        const trait_name: SymbolStr = TypeAnnotation::trait_identity(
+        const trait_name: DefId = TypeAnnotation::trait_def(
             impl_node.trait_annotation);
         if (!trait_name.is_valid()) { return 0; }
 
@@ -2281,8 +2281,7 @@ type struct TypeResolutionPasses {
                         // may share it.  Whether it IS the language's
                         // `Copy`/`Drop`/... was claimed when the identity was
                         // minted (the type-declaration stage).
-                        const trait_id: SymbolStr = ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
-                        ctx.generic_registry.register_trait_decl(trait_id, node);
+                        ctx.generic_registry.register_trait_decl(node.def, node);
                     }
 
                     mut trait_ctx: ResolutionContext = runner.make_generic_context(

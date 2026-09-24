@@ -2170,10 +2170,10 @@ type struct CallResolver {
     /// impl block was resolved.  Returned verbatim: the stamp is already the
     /// identity, and re-folding it through a program-wide leaf search would
     /// reintroduce a dependence on no other declaration sharing the leaf.
-    method_origin_trait(&this, m: &MethodInfo) -> SymbolStr {
-        if (m.ast_node == null) { return SymbolStr::empty(); }
+    method_origin_trait(&this, m: &MethodInfo) -> DefId {
+        if (m.ast_node == null) { return DefId::invalid(); }
         const mn: MethodNode* = m.ast_node as MethodNode*;
-        if (mn.func == null) { return SymbolStr::empty(); }
+        if (mn.func == null) { return DefId::invalid(); }
         return mn.func.origin_trait;
     }
 
@@ -2264,11 +2264,11 @@ type struct CallResolver {
         mut found:     boolean = false;
         mut ambiguous: boolean = false;
         mut trait_ambiguous: boolean = false;
-        mut found_trait: SymbolStr = SymbolStr::empty();
-        mut other_trait: SymbolStr = SymbolStr::empty();
+        mut found_trait: DefId = DefId::invalid();
+        mut other_trait: DefId = DefId::invalid();
         // Every trait candidate at the call's arity, with where it is
         // declared, for the tie report.
-        mut tie_traits: SymbolStr[] = [];
+        mut tie_traits: DefId[] = [];
         mut tie_spans: SourceSpan[] = [];
         mut variadic_ok: boolean = false;
         mut chosen:    TypeRef[] = [];
@@ -2306,7 +2306,7 @@ type struct CallResolver {
                 for (mut mi: i64 = 0; mi < cur.length; mi++) {
                     const m: &MethodInfo = &cur[mi];
                     if (!m.name.equals(member.member)) { continue; }
-                    const m_origin: SymbolStr = this.method_origin_trait(m);
+                    const m_origin: DefId = this.method_origin_trait(m);
                     if (pass == 1 && m_origin.is_valid()) { continue; }
                     if (pass == 2 && !m_origin.is_valid()) { continue; }
                     if (this.method_type_is_variadic(m.function_type)) { variadic_ok = true; continue; }
@@ -2387,11 +2387,11 @@ type struct CallResolver {
                         if (!found) {
                             found = true;
                             chosen = tparams;
-                            found_trait = block.qualified_trait_name;
+                            found_trait = block.trait_def;
                         } else {
                             const same: boolean = this.types.same_param_sig(chosen.as_slice(), tparams.as_slice());
                             tparams.drop();
-                            const cand_trait: SymbolStr = block.qualified_trait_name;
+                            const cand_trait: DefId = block.trait_def;
                             if (found_trait.is_valid() && cand_trait.is_valid()
                                     && !cand_trait.equals(found_trait)) {
                                 trait_ambiguous = true;
@@ -2834,15 +2834,15 @@ type struct CallResolver {
         // is stamped `Drop` and binds an inherent `drop` when that is what
         // the receiver has.  Compared by identity: the stamp is the trait's
         // canonical name, and so is a method's `origin_trait` and an impl
-        // head's `qualified_trait_name`.  Two traits can share a leaf, and
+        // head's `trait_def`.  Two traits can share a leaf, and
         // a leaf comparison binds whichever of them registered first.
-        const want_trait: SymbolStr = member.resolved_trait;
+        const want_trait: DefId = member.resolved_trait;
         if (want_trait.is_valid()) {
             if (this.select_method(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
                     owner_str, &arg_types, want_trait)) { return; }
         }
         this.select_method(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
-            owner_str, &arg_types, SymbolStr::empty());
+            owner_str, &arg_types, DefId::invalid());
     }
 
     /// One pass of selection over every candidate set, each tier before the
@@ -2854,7 +2854,7 @@ type struct CallResolver {
     /// when the call was bound.
     select_method(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
                   base_ref: TypeRef, base_t: Type*, start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
-                  owner_str: string, arg_types: &TypeRef[], only_trait: SymbolStr) -> boolean {
+                  owner_str: string, arg_types: &TypeRef[], only_trait: DefId) -> boolean {
         // The receiver's own list holds its inherent methods and the methods
         // its trait impls deliver, in declaration order.  They are two sets,
         // the inherent one first: the order two `implement` blocks were
@@ -2900,7 +2900,7 @@ type struct CallResolver {
         for (mut ti: i64 = 0; ti < blocks.length; ti++) {
             const block: ImplBlockNode* = blocks[ti];
             // WHICH trait the block provides is the head's stamped identity.
-            if (only_trait.is_valid() && !block.qualified_trait_name.equals(only_trait)) { continue; }
+            if (only_trait.is_valid() && !block.trait_def.equals(only_trait)) { continue; }
             if (this.bind_on_impl_block(visitor, call, member, block, owner_str, arg_types)) { return true; }
         }
         return false;
@@ -2914,7 +2914,7 @@ type struct CallResolver {
     /// found on and the tier it bound at.
     pick_own_method(mut &this, call: CallExprNode*, member: MemberAccessNode*,
                     start_cls: ClassType*, methods_ref: Slice<MethodInfo>, owner_str: string,
-                    arg_types: &TypeRef[], only_trait: SymbolStr, from_trait: boolean,
+                    arg_types: &TypeRef[], only_trait: DefId, from_trait: boolean,
                     out_owner: string*, out_tier: i32*) -> MethodInfo* {
         for (mut tier: i32 = 0; tier <= 3; tier++) {
             if (tier == 3 && this.state.in_implicit_conversion) { break; }
@@ -2950,7 +2950,7 @@ type struct CallResolver {
     /// Whether `mn` is the named trait's method, i.e. sits in an
     /// `implement trait T for ..` block for `T` - by identity: `trait_id` and
     /// `origin_trait` are both the trait's canonical name.
-    method_provided_by(&this, mn: MethodNode*, trait_id: SymbolStr) -> boolean {
+    method_provided_by(&this, mn: MethodNode*, trait_id: DefId) -> boolean {
         if (mn == null || mn.func == null || !mn.func.origin_trait.is_valid()) { return false; }
         return mn.func.origin_trait.equals(trait_id);
     }
@@ -3412,7 +3412,7 @@ type struct CallResolver {
                 const tref: &TraitRef = &bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
                 const trait_name: SymbolStr = tref.path[tref.path.length - 1];
-                if (this.trait_checker().type_implements_trait(concrete, tref.identity(), 0)) { continue; }
+                if (this.trait_checker().type_implements_trait(concrete, tref.definition(), 0)) { continue; }
                 const method_str: string = this.intern.resolve(member.member);
                 const trait_str:  string = this.intern.resolve(trait_name);
                 const param_str:  string = this.intern.resolve(bound.type_parameter);
@@ -3423,7 +3423,7 @@ type struct CallResolver {
                     fmt::format("the trait bound `%s: %s` is not satisfied", conc_str, trait_str));
                 d = d.at(primary);
                 d = d.with_note(fmt::format("method `%s` requires `%s: %s`", method_str, param_str, trait_str));
-                if (tref.identity().equals(this.ctx.generic_registry.wellknown(LangItem::Copy))) {
+                if (tref.definition().equals(this.ctx.generic_registry.wellknown(LangItem::Copy))) {
                     d = d.help(fmt::format(
                         "`%s` owns resources, so it isn't `Copy`; borrow the element in place with `get_ref` instead of copying it out with `%s`",
                         conc_str, method_str));
@@ -3469,7 +3469,7 @@ type struct CallResolver {
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
                 const tref: &TraitRef = &bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
-                if (!tref.identity().equals(reg.wellknown(LangItem::Copy))) { continue; }
+                if (!tref.definition().equals(reg.wellknown(LangItem::Copy))) { continue; }
                 if (OwnershipQuery::is_copy(this.arena, reg, this.intern, concrete)) { continue; }
                 const coll_str: string = this.types.type_display_name(obj_type);
                 const elem_str: string = this.types.type_display_name(concrete);
@@ -3579,7 +3579,7 @@ type struct CallResolver {
         // member its implementation lacks - not as a bare path's miss.
         if (scope.impl_trait != null) {
             const owner_key: SymbolStr = this.scope_owner_key(scope);
-            const trait_sym: SymbolStr = this.impl_qualified_trait(scope);
+            const trait_sym: DefId = this.impl_qualified_trait(scope);
             if (owner_key.is_valid() && trait_sym.is_valid()) {
                 this.report_impl_qualified_miss(scope, owner_key, trait_sym, scope.member_name);
             }
@@ -3690,7 +3690,7 @@ type struct CallResolver {
             const directed: OverloadId[] = this.trait_delivered_entries(scope_sym, scope.resolved_trait, member_sym);
             if (directed.length > 0 && this.pin_trait_delivered_call(call, scope, &directed)) { return; }
         }
-        if (this.pin_trait_qualified_call(call, scope, scope_sym, member_sym)) { return; }
+        if (this.pin_trait_qualified_call(call, scope, member_sym)) { return; }
         const sym: SymbolStr = this.intern.intern(fmt::format("%s::%s", scope_str, member_str));
         if (this.try_pin_static_method_overload(call, scope, sym)) { return; }
         // Single-entry static method: pin the entry, consistent with
@@ -3716,11 +3716,12 @@ type struct CallResolver {
     /// and no other selector applies to it.  A static trait method takes no
     /// receiver and selects nothing here.
     pin_trait_qualified_call(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
-                             trait_sym: SymbolStr, member_sym: SymbolStr) -> boolean {
+                             member_sym: SymbolStr) -> boolean {
         const qual: TypeRef = this.types.scope_qualifier_type(scope);
         if (!qual.is_valid()) { return false; }
         const qt: Type* = this.arena.lookup(qual.id);
         if (qt == null || qt.kind != TypeKind::Trait) { return false; }
+        const trait_sym: DefId = this.ctx.definition_id_of(qual);
         // No argument selects an implementation: a static trait method, or
         // a method called with nothing.  Refused here, where the path is
         // known to be a trait's, rather than left for codegen to fail to
@@ -3764,10 +3765,10 @@ type struct CallResolver {
     /// static method through the trait's own path has no receiver to select
     /// by, which is what the impl-qualified path exists for.  Silent during
     /// a symbolic generic-body walk.
-    report_trait_qualified_unselected(mut &this, scope: ScopeResolutionNode*, trait_sym: SymbolStr,
+    report_trait_qualified_unselected(mut &this, scope: ScopeResolutionNode*, trait_sym: DefId,
                                       member_sym: SymbolStr, call: CallExprNode*) -> void {
         if (this.state.in_symbolic_check) { return; }
-        const trait_leaf: string = QualifiedName::leaf_of(this.intern.resolve(trait_sym));
+        const trait_leaf: string = QualifiedName::leaf_of(this.intern.resolve(trait_sym.qualified_name()));
         const member_str: string = this.intern.resolve(member_sym);
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0233_UNDEFINED_SYMBOL,
             fmt::format("`%s::%s()` selects no implementation: a call through a trait's path selects by its first argument's type, and there is none",
@@ -3780,7 +3781,7 @@ type struct CallResolver {
     /// The entries of `owner`'s family `member` that `trait_sym`'s
     /// implementation delivers - the candidates a call naming the trait
     /// selects among, in registration order.
-    trait_delivered_entries(&this, owner_sym: SymbolStr, trait_sym: SymbolStr,
+    trait_delivered_entries(&this, owner_sym: SymbolStr, trait_sym: DefId,
                             member_sym: SymbolStr) -> OverloadId[] {
         const family: SymbolStr = this.intern.intern(fmt::format("%s::%s",
             this.intern.resolve(owner_sym), this.intern.resolve(member_sym)));
@@ -3897,23 +3898,22 @@ type struct CallResolver {
     /// here: a head naming no trait selects no implementation, and the path
     /// would otherwise fall to the bare `Type::member` reading and answer
     /// for a trait the writer did not name.
-    impl_qualified_trait(mut &this, scope: ScopeResolutionNode*) -> SymbolStr {
-        if (TypeAnnotation::refused(scope.impl_trait)) { return SymbolStr::empty(); }
+    impl_qualified_trait(mut &this, scope: ScopeResolutionNode*) -> DefId {
+        if (TypeAnnotation::refused(scope.impl_trait)) { return DefId::invalid(); }
         const trait_def: DefId = TypeAnnotation::trait_def(scope.impl_trait);
-        const trait_sym: SymbolStr = TypeAnnotation::trait_identity(scope.impl_trait);
         mut is_trait: boolean = false;
         if (trait_def.is_valid()) {
             const tt: Type* = this.arena.lookup(this.ctx.decl_index.type_of_def(trait_def).id);
             is_trait = tt != null && tt.kind == TypeKind::Trait;
         }
-        if (is_trait) { return trait_sym; }
-        if (this.state.in_symbolic_check) { return SymbolStr::empty(); }
+        if (is_trait) { return trait_def; }
+        if (this.state.in_symbolic_check) { return DefId::invalid(); }
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0233_UNDEFINED_SYMBOL,
             fmt::format("`%s` is not a trait", TypeAnnotation::spell(scope.impl_trait, this.intern)));
         d = d.at_with_label(scope.scope_span,
             "`(Trait for Type)::member` names the member of the trait's implementation for the type");
         this.ctx.emit_diagnostic(d);
-        return SymbolStr::empty();
+        return DefId::invalid();
     }
 
     /// A call written through an impl-qualified path, `(Beta for P)::make()`
@@ -3931,7 +3931,7 @@ type struct CallResolver {
     /// static call's are, from the pin's absence.
     pin_impl_qualified_call(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
                             owner_sym: SymbolStr, member_sym: SymbolStr) -> void {
-        const trait_sym: SymbolStr = this.impl_qualified_trait(scope);
+        const trait_sym: DefId = this.impl_qualified_trait(scope);
         if (!trait_sym.is_valid()) { return; }
         const entries: OverloadId[] = this.trait_delivered_entries(owner_sym, trait_sym, member_sym);
         if (entries.length > 0) {
@@ -3946,10 +3946,10 @@ type struct CallResolver {
     /// implementation has no method of that name.  Silent during a symbolic
     /// generic-body walk: the concrete instantiation reports.
     report_impl_qualified_miss(mut &this, scope: ScopeResolutionNode*, owner_sym: SymbolStr,
-                               trait_sym: SymbolStr, member_sym: SymbolStr) -> void {
+                               trait_sym: DefId, member_sym: SymbolStr) -> void {
         if (this.state.in_symbolic_check) { return; }
         const owner_str: string = this.intern.resolve(owner_sym);
-        const trait_leaf: string = QualifiedName::leaf_of(this.intern.resolve(trait_sym));
+        const trait_leaf: string = QualifiedName::leaf_of(this.intern.resolve(trait_sym.qualified_name()));
         const owner_ref: TypeRef = this.types.lookup_type_exact(owner_sym);
         if (owner_ref.is_valid()
                 && !this.trait_checker().type_implements_trait(owner_ref, trait_sym, 0)) {
@@ -3996,7 +3996,7 @@ type struct CallResolver {
         const owner_sym: SymbolStr = this.ctx.decl_index.lookup_type_name(owner);
         if (!owner_sym.is_valid()) { return method_ft; }
         if (scope.impl_trait != null) {
-            const trait_sym: SymbolStr = this.impl_qualified_trait(scope);
+            const trait_sym: DefId = this.impl_qualified_trait(scope);
             if (!trait_sym.is_valid()) { return TypeRef::invalid(); }
             const entries: OverloadId[] = this.trait_delivered_entries(owner_sym, trait_sym, scope.member_name);
             if (entries.length == 0) {
@@ -4069,7 +4069,7 @@ type struct CallResolver {
     /// call form's arguments are the receiver the trait-qualified call keeps.
     report_static_path_tie(mut &this, fits: &OverloadId[], path: ScopeResolutionNode*,
                            call: CallExprNode*) -> void {
-        mut traits: SymbolStr[] = [];
+        mut traits: DefId[] = [];
         mut spans: SourceSpan[] = [];
         for (mut i: i64 = 0; i < fits.length; i++) {
             traits.push(this.ctx.decl_index.entry_trait(fits[i]));
@@ -4108,7 +4108,7 @@ type struct CallResolver {
     /// it), a static method, and a method taken as a value.  Silent during
     /// a symbolic generic-body walk: the concrete instantiation reports.
     report_trait_method_tie(mut &this, span: SourceSpan, member: SymbolStr, owner_display: string,
-                            traits: &SymbolStr[], decl_spans: &SourceSpan[],
+                            traits: &DefId[], decl_spans: &SourceSpan[],
                             args_text: string, is_call: boolean) -> void {
         if (this.state.in_symbolic_check) { return; }
         const member_str: string = this.intern.resolve(member);
@@ -4124,12 +4124,12 @@ type struct CallResolver {
         mut leaf_collides: boolean = false;
         for (mut a: i64 = 0; a < traits.length; a++) {
             for (mut b: i64 = a + 1; b < traits.length; b++) {
-                if (QualifiedName::leaf_of(this.intern.resolve(traits[a])) == QualifiedName::leaf_of(this.intern.resolve(traits[b]))) { leaf_collides = true; }
+                if (QualifiedName::leaf_of(this.intern.resolve(traits[a].qualified_name())) == QualifiedName::leaf_of(this.intern.resolve(traits[b].qualified_name()))) { leaf_collides = true; }
             }
         }
         mut help: string = "";
         for (mut i: i64 = 0; i < traits.length; i++) {
-            const trait_str: string = this.intern.resolve(traits[i]);
+            const trait_str: string = this.intern.resolve(traits[i].qualified_name());
             const leaf: string = if (leaf_collides) { trait_str } else { QualifiedName::leaf_of(trait_str) };
             const note: string = fmt::format("candidate #%d: `%s::%s`, from `implement trait %s for %s`",
                 (i + 1) as i32, leaf, member_str, trait_str, owner_display);
@@ -4435,7 +4435,7 @@ type struct CallResolver {
                 const tref: TraitRef* = &bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
                 const trait_name: SymbolStr = tref.path[tref.path.length - 1];
-                if (!this.trait_checker().type_implements_trait(concrete, tref.identity(), 0)) {
+                if (!this.trait_checker().type_implements_trait(concrete, tref.definition(), 0)) {
                     this.emit_free_call_bound_failure(call, tmpl, tref, concrete, trait_name);
                     return false;
                 }
@@ -5637,7 +5637,7 @@ type struct CallResolver {
             // no signature under `Trait::m`).
             const qt: Type* = this.arena.lookup(this.types.scope_qualifier_type(scope).id);
             if (qt != null && qt.kind == TypeKind::Trait) {
-                this.check_trait_qualified_args(visitor, lookup_sym, scope, call);
+                this.check_trait_qualified_args(visitor, this.ctx.definition_id_of(this.types.scope_qualifier_type(scope)), scope, call);
                 return;
             }
             combined = this.intern.intern(fmt::format("%s::%s", scope_str, member_str));
@@ -5677,7 +5677,7 @@ type struct CallResolver {
     check_impl_qualified_args(mut &this, visitor: ASTVisitor*, owner_sym: SymbolStr,
                               scope: ScopeResolutionNode*, call: CallExprNode*) -> void {
         if (TypeAnnotation::refused(scope.impl_trait)) { return; }
-        const trait_sym: SymbolStr = TypeAnnotation::trait_identity(scope.impl_trait);
+        const trait_sym: DefId = TypeAnnotation::trait_def(scope.impl_trait);
         if (!trait_sym.is_valid()) { return; }
         const entries: OverloadId[] = this.trait_delivered_entries(owner_sym, trait_sym, scope.member_name);
         this.check_delivered_args(visitor, &entries, scope, call);
@@ -5687,7 +5687,7 @@ type struct CallResolver {
     /// owner is the first argument's type and the trait is the scope's own
     /// stamp.  A call with no argument was refused at the pin; an owner the
     /// index holds no name for is left to codegen, as the pin leaves it.
-    check_trait_qualified_args(mut &this, visitor: ASTVisitor*, trait_sym: SymbolStr,
+    check_trait_qualified_args(mut &this, visitor: ASTVisitor*, trait_sym: DefId,
                                scope: ScopeResolutionNode*, call: CallExprNode*) -> void {
         if (call.arguments.length == 0) { return; }
         const recv: ExpressionNode* = call.arguments[0];

@@ -761,12 +761,12 @@ public:
         if (node == null || !node.is_trait_impl()) { return; }
         if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return; }
         if (!impl_this.is_valid()) { return; }
-        const trait_leaf: SymbolStr = TypeAnnotation::trait_identity(node.trait_annotation);
+        const trait_leaf: DefId = TypeAnnotation::trait_def(node.trait_annotation);
         if (!trait_leaf.is_valid()) { return; }
         const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
         if (tdecl == null) { return; }
         const span: SourceSpan = if (node.target_type_span.has_location()) { node.target_type_span } else { node.span };
-        const trait_str: string = this.intern.resolve(trait_leaf);
+        const trait_str: string = this.intern.resolve(trait_leaf.qualified_name());
         for (mut i: i64 = 0; i < tdecl.assoc_types.length; i++) {
             const adecl: AssocTypeDeclNode* = tdecl.assoc_types[i];
             if (adecl == null || adecl.bounds.length == 0) { continue; }
@@ -781,7 +781,7 @@ public:
                 const tref: TraitRef* = &adecl.bounds[b];
                 if (tref.path.length == 0) { continue; }
                 const bound_trait: SymbolStr = tref.path[tref.path.length - 1];
-                if (this.trait_checker().type_implements_trait(item_ty, tref.identity(), 0)) { continue; }
+                if (this.trait_checker().type_implements_trait(item_ty, tref.definition(), 0)) { continue; }
                 const bound_str: string = this.intern.resolve(bound_trait);
                 this.ctx.emit_error_at(
                     ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
@@ -1233,8 +1233,8 @@ public:
                         // module's own scope holds under that leaf.  A
                         // synthesizer owes its node the definition it refers
                         // to, and this one knows it without a lookup.
-                        sr.set_synthesized_res(DefId::of_definition(
-                            this.ctx.generic_registry.wellknown(LangItem::Slice)));
+                        sr.set_synthesized_res(
+                            this.ctx.generic_registry.wellknown(LangItem::Slice));
                         mut elt_named: NamedAnnotation* = new NamedAnnotation {
                             name: SymbolStr::empty(), span: sp, pre_resolved: at.element,
                             res: ResSlot::Pending,
@@ -1255,7 +1255,7 @@ public:
                 // language's `Iterator` - never because it has a method
                 // spelled `next`.  A collection that is not one is iterated
                 // through its `iter()`.
-                const iterator_id: SymbolStr = this.ctx.generic_registry.wellknown(LangItem::Iterator);
+                const iterator_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Iterator);
                 if (!this.for_scrutinee_iterates(init_type, iterator_id)) {
                     const owner_ref: TypeRef = this.types.method_owner_ref(this.for_scrutinee_subject(init_type));
                     if (owner_ref.is_valid()) {
@@ -1737,7 +1737,7 @@ public:
     /// declares, or the bound's - never the operator table's leaf: two traits
     /// can share a leaf, and a leaf would let the wrong one's method win.
     build_operator_call(mut &this, receiver: ExpressionNode*, method: SymbolStr,
-                        trait_id: SymbolStr, rhs: ExpressionNode*, op_tok: Token,
+                        trait_id: DefId, rhs: ExpressionNode*, op_tok: Token,
                         span: SourceSpan) -> ExpressionNode* {
         const member: MemberAccessNode* = new MemberAccessNode(receiver, method, span, span);
         member.set_resolved_trait(trait_id);
@@ -1787,7 +1787,7 @@ public:
     /// (`CopiedIter<I>`, `where I: Iterator<T*>`) is confirmed when its clone
     /// is placed, so a head that unifies answers here, as for an `implement
     /// Iterator` binding.
-    for_scrutinee_iterates(&this, ty: TypeRef, iterator_id: SymbolStr) -> boolean {
+    for_scrutinee_iterates(&this, ty: TypeRef, iterator_id: DefId) -> boolean {
         if (!iterator_id.is_valid()) { return false; }
         const subject: TypeRef = this.for_scrutinee_subject(ty);
         const t: Type* = this.arena.lookup(subject.id);
@@ -1841,7 +1841,7 @@ public:
         // declaration claimed; the table spells the leaf and nothing else.
         // A type overloads when it has an impl of that trait; a user trait
         // of the same spelling is not it.
-        const trait_id: SymbolStr = this.ctx.generic_registry.wellknown(map.lang);
+        const trait_id: DefId = this.ctx.generic_registry.wellknown(map.lang);
         if (!trait_id.is_valid()) { return null; }
         if (this.trait_checker().select_impl(trait_id, base_ty, 0) == null) { return null; }
         const method_sym: SymbolStr = this.intern.intern(map.method);
@@ -1923,10 +1923,10 @@ public:
         // so a plain `2 * 3`-shaped error never materializes a bogus call.
         const impl_block: ImplBlockNode* = this.trait_checker().select_impl(
             this.ctx.generic_registry.wellknown(map.lang), lhs, 0);
-        if (impl_block == null || !impl_block.qualified_trait_name.is_valid()) { return null; }
+        if (impl_block == null || !impl_block.trait_def.is_valid()) { return null; }
         const method_sym: SymbolStr = this.intern.intern(map.method);
         mut desugared: ExpressionNode* =
-            this.build_operator_call(lhs_expr, method_sym, impl_block.qualified_trait_name, rhs_expr, op_tok, span);
+            this.build_operator_call(lhs_expr, method_sym, impl_block.trait_def, rhs_expr, op_tok, span);
         const rty: TypeRef = this.resolve_expr(desugared);
         if (!rty.is_valid()) { return null; }
         return desugared;
@@ -2705,7 +2705,7 @@ public:
         // `origin_trait` is the trait's identity, so the comparison is against
         // the declaration the language means by `Future` - a user trait that
         // happens to share the leaf is not it.
-        const future_id: SymbolStr = this.ctx.generic_registry.wellknown(LangItem::Future);
+        const future_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Future);
         if (!future_id.is_valid() || !func.origin_trait.equals(future_id)) { return TypeRef::invalid(); }
         if (!func.name.equals(this.intern.intern("poll"))) { return TypeRef::invalid(); }
         // Read the Output off `Poll::Ready`'s payload rather than the return
@@ -2748,10 +2748,10 @@ public:
             const base: Type* = this.arena.lookup(et.generic_base.id);
             if (base != null && base.kind == TypeKind::Enum) { et = base as EnumType*; }
         }
-        const result_id: SymbolStr = this.ctx.generic_registry.wellknown(LangItem::Result);
-        if (result_id.is_valid() && et.qualified_name.equals(result_id)) { return 1; }
-        const option_id: SymbolStr = this.ctx.generic_registry.wellknown(LangItem::Option);
-        if (option_id.is_valid() && et.qualified_name.equals(option_id)) { return 2; }
+        const result_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Result);
+        if (result_id.is_valid() && et.qualified_name.equals(result_id.qualified_name())) { return 1; }
+        const option_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Option);
+        if (option_id.is_valid() && et.qualified_name.equals(option_id.qualified_name())) { return 2; }
         return 0;
     }
 
@@ -3879,7 +3879,7 @@ public:
         for (mut i: i64 = 0; i < imp.bounds.length; i++) {
             const trait_name: SymbolStr = this.trait_leaf_name(imp.bounds[i]);
             if (!trait_name.is_valid()) { continue; }
-            const bound_id: SymbolStr = TypeAnnotation::trait_identity(imp.bounds[i]);
+            const bound_id: DefId = TypeAnnotation::trait_def(imp.bounds[i]);
             if (this.trait_checker().type_satisfies_opaque_bound(
                     concrete, bound_id)) {
                 this.check_opaque_assoc_item(imp.bounds[i], concrete, var_node);
@@ -3909,7 +3909,7 @@ public:
             _ => { return false; }
         }
         if (gen == null || gen.args.length != 1) { return false; }
-        const trait_leaf: SymbolStr = TypeAnnotation::trait_identity(bound_ann);
+        const trait_leaf: DefId = TypeAnnotation::trait_def(bound_ann);
         if (!trait_leaf.is_valid()) { return false; }
         const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
         if (tdecl == null) { return false; }
@@ -3929,7 +3929,7 @@ public:
         if (this.checker.check_compatibility(actual, expected) != TypeCompatibility::Incompatible) { return false; }
         *out_expected = expected;
         *out_actual   = actual;
-        *out_trait    = trait_leaf;
+        *out_trait    = trait_leaf.qualified_name();
         *out_item     = adecl.name;
         return true;
     }
