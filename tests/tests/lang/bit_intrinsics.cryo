@@ -1,0 +1,69 @@
+// The bit-operation intrinsics are declared in `std::core::intrinsics` and
+// lowered inline, each to one LLVM instruction: the kind is decided once,
+// where the declaration registers, and code generation reads it off the
+// call's pin. Each call below is checked against a value worked out by hand,
+// including the edges - a zero input to the counts, a rotate by the full
+// width - so a lowering to the wrong instruction or the wrong width fails
+// here, and a declaration the emitter does not recognise fails to link.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::BitIntrinsics;
+
+import std::core::intrinsics;
+import std::core::result;
+import std::core::result::{ Result };
+import std::test::error;
+import std::test::error::{ TestError };
+import std::test::assert;
+import std::test::assert::{ expect_eq };
+
+![test]
+function bswap_reverses_bytes() -> Result<(), TestError> {
+    const a: u16 = intrinsics::bswap16(0x1234);
+    const b: u32 = intrinsics::bswap32(0x12345678);
+    const c: u64 = intrinsics::bswap64(0x0102030405060708);
+    mut ok: u32 = 0;
+    if (a == 0x3412) { ok = ok + 1; }
+    if (b == 0x78563412) { ok = ok + 1; }
+    if (c == 0x0807060504030201) { ok = ok + 1; }
+    return expect_eq(ok, 3);
+}
+
+![test]
+function popcount_counts_set_bits() -> Result<(), TestError> {
+    const a: u32 = intrinsics::popcount32(0xF0F0);
+    const b: u32 = intrinsics::popcount64(0xFFFFFFFFFFFFFFFF);
+    const z: u32 = intrinsics::popcount32(0);
+    return expect_eq(a * 10000 + b * 100 + z, 8 * 10000 + 64 * 100);
+}
+
+![test]
+function clz_ctz_count_zero_runs() -> Result<(), TestError> {
+    const a: u32 = intrinsics::clz32(1);
+    const b: u32 = intrinsics::clz64(1);
+    const c: u32 = intrinsics::ctz32(8);
+    const d: u32 = intrinsics::ctz64(0x100000000);
+    return expect_eq(a * 1000000 + b * 10000 + c * 100 + d, 31 * 1000000 + 63 * 10000 + 3 * 100 + 32);
+}
+
+// A zero input answers the width, not an undefined value.
+![test]
+function clz_ctz_of_zero_is_the_width() -> Result<(), TestError> {
+    const a: u32 = intrinsics::clz32(0);
+    const b: u32 = intrinsics::clz64(0);
+    const c: u32 = intrinsics::ctz32(0);
+    const d: u32 = intrinsics::ctz64(0);
+    return expect_eq(a * 1000000 + b * 10000 + c * 100 + d, 32 * 1000000 + 64 * 10000 + 32 * 100 + 64);
+}
+
+![test]
+function rotates_wrap_bits_around() -> Result<(), TestError> {
+    mut ok: u32 = 0;
+    if (intrinsics::rotl32(0x80000001, 1) == 0x00000003) { ok = ok + 1; }
+    if (intrinsics::rotr32(0x00000003, 1) == 0x80000001) { ok = ok + 1; }
+    if (intrinsics::rotl64(0x8000000000000001, 4) == 0x0000000000000018) { ok = ok + 1; }
+    if (intrinsics::rotr64(0x0000000000000018, 4) == 0x8000000000000001) { ok = ok + 1; }
+    // A rotate by the full width is the value unchanged.
+    if (intrinsics::rotl32(0x12345678, 32) == 0x12345678) { ok = ok + 1; }
+    return expect_eq(ok, 5);
+}
