@@ -186,36 +186,6 @@ type struct MonoTraitSpecializer {
         return out;
     }
 
-    /// Reduce an associated-type projection over a CONCRETE base to its member
-    /// type: `Range<i32>::Item` -> `i32`.  Returns invalid when the base is still
-    /// symbolic or no such impl/binding exists.
-    resolve_concrete_projection(mut &this, base_ty: TypeRef, member: SymbolStr) -> TypeRef {
-        if (this.generic_registry == null) { return TypeRef::invalid(); }
-        const bt: Type* = this.arena.lookup(base_ty.id);
-        if (bt == null) { return TypeRef::invalid(); }
-        // Only concrete bases reduce here; a generic-param / still-symbolic base
-        // stays a projection (resolved at a later/outer specialization).
-        if (bt.kind == TypeKind::GenericParam || bt.kind == TypeKind::BoundedParam
-                || bt.kind == TypeKind::AssocProjection) {
-            return TypeRef::invalid();
-        }
-        for (mut i: i64 = 0; i < this.generic_registry.trait_decl_nodes.length; i++) {
-            const tdecl: TraitDeclNode* = this.generic_registry.trait_decl_nodes[i];
-            if (tdecl == null) { continue; }
-            // Position of `member` among the trait's associated types.
-            const assoc_pos: i64 = tdecl.assoc_type_index(member);
-            if (assoc_pos < 0) { continue; }
-            // Positional-sugar index: declared generic params come first in the
-            // trait-arg list, then the associated types.
-            const idx: i64 = tdecl.generic_params.length + assoc_pos;
-            const args: TypeRef[] = this.concrete_trait_args_for(base_ty, this.generic_registry.trait_decl_keys[i]);
-            if (idx < args.length && args[idx].is_valid()) {
-                return args[idx];
-            }
-        }
-        return TypeRef::invalid();
-    }
-
     /// Recursively replace concrete-base associated-type projections in `ty` with
     /// their member type (`Option<Range<i32>::Item>` -> `Option<i32>`), caching
     /// the result on each `AssocProjectionType`.
@@ -228,7 +198,7 @@ type struct MonoTraitSpecializer {
                 const proj: AssocProjectionType* = t as AssocProjectionType*;
                 if (proj.resolved_type.is_valid()) { return proj.resolved_type; }
                 const base: TypeRef = this.reduce_projections(proj.base);
-                const reduced: TypeRef = this.resolve_concrete_projection(base, proj.member);
+                const reduced: TypeRef = this.type_resolver.concrete_projection(base, proj.member, proj.owning_trait);
                 if (reduced.is_valid()) {
                     proj.set_resolved_type(reduced);
                     return reduced;
@@ -593,7 +563,7 @@ type struct MonoTraitSpecializer {
             if (!b.has_projection_subject()) { continue; }
             const member: SymbolStr = this.projection_ann_member(b.subject_type);
             if (!member.is_valid()) { continue; }
-            const item: TypeRef = this.resolve_concrete_projection(this_type, member);
+            const item: TypeRef = this.type_resolver.concrete_projection(this_type, member, TypeRef::invalid());
             if (!item.is_valid()) { continue; }   // unreducible -> keep (conservative)
             for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
                 const tr: TraitRef* = &b.trait_refs[ti];
