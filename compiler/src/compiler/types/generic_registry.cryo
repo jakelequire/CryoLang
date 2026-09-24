@@ -242,6 +242,104 @@ type struct HeadBinding {
     term:  TypeAnnotation*;
 }
 
+/// A declaration the language itself reasons about by identity: the
+/// structural markers, `Drop`, `Future`, the traits an operator desugars to,
+/// the two enums `?` desugars through, and the one the async lowering
+/// completes its state machines with.  `a + b` is `std::core::ops::Add::add`,
+/// as Rust's `+` is `core::ops::Add` - a user trait spelled `Add` does not
+/// overload the operator; `x?` is on `std::core::result::Result` or
+/// `std::core::option::Option`, and an enum spelling `Ok`/`Err` is another
+/// enum.
+///
+/// A consumer names the item, never a spelling: a misspelt item does not
+/// compile, where a misspelt leaf silently answered "absent".
+type enum LangItem {
+    Copy;
+    Send;
+    Sync;
+    Drop;
+    Future;
+    Eq;
+    Ord;
+    Add;
+    Sub;
+    Mul;
+    Div;
+    Rem;
+    Neg;
+    Not;
+    BitNot;
+    BitAnd;
+    BitOr;
+    BitXor;
+    Shl;
+    Shr;
+    Deref;
+    Index;
+    Result;
+    Option;
+    Poll;
+}
+
+implement enum LangItem {
+    /// The canonical path the item's declaration is registered under.  The
+    /// one place the compiler knows how these declarations are spelled.
+    path(&this) -> string {
+        return match (&this) {
+            LangItem::Copy   => { "std::core::marker::Copy" }
+            LangItem::Send   => { "std::core::marker::Send" }
+            LangItem::Sync   => { "std::core::marker::Sync" }
+            LangItem::Drop   => { "std::core::drop::Drop" }
+            LangItem::Future => { "std::future::traits::Future" }
+            LangItem::Eq     => { "std::core::cmp::Eq" }
+            LangItem::Ord    => { "std::core::cmp::Ord" }
+            LangItem::Add    => { "std::core::ops::Add" }
+            LangItem::Sub    => { "std::core::ops::Sub" }
+            LangItem::Mul    => { "std::core::ops::Mul" }
+            LangItem::Div    => { "std::core::ops::Div" }
+            LangItem::Rem    => { "std::core::ops::Rem" }
+            LangItem::Neg    => { "std::core::ops::Neg" }
+            LangItem::Not    => { "std::core::ops::Not" }
+            LangItem::BitNot => { "std::core::ops::BitNot" }
+            LangItem::BitAnd => { "std::core::ops::BitAnd" }
+            LangItem::BitOr  => { "std::core::ops::BitOr" }
+            LangItem::BitXor => { "std::core::ops::BitXor" }
+            LangItem::Shl    => { "std::core::ops::Shl" }
+            LangItem::Shr    => { "std::core::ops::Shr" }
+            LangItem::Deref  => { "std::core::ops::Deref" }
+            LangItem::Index  => { "std::core::ops::Index" }
+            LangItem::Result => { "std::core::result::Result" }
+            LangItem::Option => { "std::core::option::Option" }
+            LangItem::Poll   => { "std::future::poll::Poll" }
+        };
+    }
+
+    /// The declaration's own name, the last segment of its path - for a
+    /// diagnostic that names the trait to the user.
+    leaf(&this) -> string {
+        const s: string = this.path();
+        const n: i64 = s.length() as i64;
+        mut leaf_start: i64 = 0;
+        for (mut i: i64 = 0; i + 1 < n; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') { leaf_start = i + 2; }
+        }
+        return s.substr(leaf_start, n - leaf_start);
+    }
+
+    /// Every item, for the registration site to match a declaration against.
+    static all() -> LangItem[] {
+        return [
+            LangItem::Copy, LangItem::Send, LangItem::Sync, LangItem::Drop,
+            LangItem::Future, LangItem::Eq, LangItem::Ord, LangItem::Add,
+            LangItem::Sub, LangItem::Mul, LangItem::Div, LangItem::Rem,
+            LangItem::Neg, LangItem::Not, LangItem::BitNot, LangItem::BitAnd,
+            LangItem::BitOr, LangItem::BitXor, LangItem::Shl, LangItem::Shr,
+            LangItem::Deref, LangItem::Index, LangItem::Result,
+            LangItem::Option, LangItem::Poll,
+        ];
+    }
+}
+
 type struct GenericRegistry {
     arena: TypeArena*;
 
@@ -351,17 +449,17 @@ type struct GenericRegistry {
     // The language names a fixed set of traits itself: the `Copy`/`Send`/`Sync`
     // markers, `Drop`, `Future`, and the operator traits behind `+`, `==`,
     // `[]`, `*` and friends.  A check for one of them asks about a specific
-    // DECLARATION, not about a spelling, so this maps the leaf the compiler
-    // spells to the qualified identity of the declaration that claimed it.
+    // DECLARATION, not about a spelling, so this maps each `LangItem` to the
+    // qualified identity of the declaration that claimed it.
     //
-    // Only a declaration whose qualified name is on the canonical list can
+    // Only a declaration whose qualified name is a `LangItem`'s path can
     // claim an entry, so a user trait sharing a leaf never lands here and
     // therefore cannot answer a question the language asks of its own trait.
     //
     // An absent entry means that declaration is not in this program's module
     // graph.  It is NOT "no type satisfies this": answering "no" off an absent
     // entry reclassifies every type at once, so callers distinguish the two.
-    wellknown_index: HashMap<u32, u32>;
+    wellknown_claims: Pair<LangItem, SymbolStr>[];
 
 
     static new(arena: TypeArena*) -> GenericRegistry {
@@ -389,7 +487,7 @@ type struct GenericRegistry {
             inherent_impl_keys:   [],
             inherent_impl_nodes:  [],
             disambig_finalized:   false,
-            wellknown_index: HashMap::<u32, u32>::new(),
+            wellknown_claims: [],
         };
     }
 
@@ -1236,81 +1334,34 @@ type struct GenericRegistry {
         return null;
     }
 
-    /// Record `qname` when it names a declaration the language itself relies
-    /// on. Called once per trait and per enum declaration, at the
-    /// registration site, where the name has already been import-resolved.
+    /// Record `qname` when it is the path of a `LangItem`. Called once per
+    /// trait and per enum declaration, at the registration site, where the
+    /// name has already been import-resolved.
     ///
-    /// The canonical spellings appear in `is_wellknown_path` and nowhere
-    /// else. Every consumer asks by the leaf IT spells and gets back the
-    /// identity recorded here, so no consumer needs to know the path - which
-    /// is what stops a user declaration from answering by being spelled the
-    /// same.
+    /// Every consumer asks by the `LangItem` and gets back the identity
+    /// recorded here, so no consumer needs to know the path - which is what
+    /// stops a user declaration from answering by being spelled the same.
     claim_wellknown(mut &this, qname: SymbolStr, table: InternTable*) -> void {
         if (!qname.is_valid() || table == null) { return; }
         const s: string = table.resolve(qname);
-        if (!GenericRegistry::is_wellknown_path(s)) { return; }
-        const n: i64 = s.length() as i64;
-        mut leaf_start: i64 = 0;
-        for (mut i: i64 = 0; i + 1 < n; i++) {
-            if (s[i] == ':' && s[i + 1] == ':') { leaf_start = i + 2; }
+        const items: LangItem[] = LangItem::all();
+        for (mut i: i64 = 0; i < items.length; i++) {
+            if (items[i].path() != s) { continue; }
+            if (!this.wellknown(items[i]).is_valid()) {
+                this.wellknown_claims.push(Pair::<LangItem, SymbolStr>::new(items[i], qname));
+            }
+            return;
         }
-        const leaf: SymbolStr = table.intern(s.substr(leaf_start, n - leaf_start));
-        if (!leaf.is_valid()) { return; }
-        this.wellknown_index.insert(leaf.id, qname.id);
     }
 
-    /// The identity of the well-known declaration the compiler spells `leaf`
-    /// (a trait, or one of the enums an operator desugars through), or an
-    /// empty SymbolStr when no such declaration is in this program's module
-    /// graph. Absence is not a "no" - see the field comment.
-    wellknown(&this, leaf: SymbolStr) -> SymbolStr {
-        if (!leaf.is_valid()) { return SymbolStr::empty(); }
-        const o: Option<u32> = this.wellknown_index.get(&leaf.id);
-        if (o.is_none()) { return SymbolStr::empty(); }
-        return SymbolStr::from_id(o.unwrap());
-    }
-
-    /// The qualified names of the declarations the language reasons about by
-    /// identity: the structural markers, `Drop`, `Future`, the traits an
-    /// operator desugars to, the two enums `?` desugars through, and the two
-    /// the async lowering builds its state machines out of.  `a + b` is
-    /// `std::core::ops::Add::add`, as Rust's `+` is `core::ops::Add` - a
-    /// user trait spelled `Add` does not overload the operator, and an
-    /// operator's impl is selected by the trait's identity like any other;
-    /// `x?` is on `std::core::result::Result` or `std::core::option::Option`,
-    /// and an enum spelling `Ok`/`Err` is another enum; a `poll` the
-    /// lowering synthesized completes through `std::future::poll::Poll`, and
-    /// an enum spelling `Ready` is another enum.
-    ///
-    /// This is the one place the compiler knows how these declarations are
-    /// spelled.
-    static is_wellknown_path(s: string) -> boolean {
-        if (s == "std::core::marker::Copy")     { return true; }
-        if (s == "std::core::marker::Send")     { return true; }
-        if (s == "std::core::marker::Sync")     { return true; }
-        if (s == "std::core::drop::Drop")       { return true; }
-        if (s == "std::future::traits::Future") { return true; }
-        if (s == "std::core::cmp::Eq")          { return true; }
-        if (s == "std::core::cmp::Ord")         { return true; }
-        if (s == "std::core::ops::Add")         { return true; }
-        if (s == "std::core::ops::Sub")         { return true; }
-        if (s == "std::core::ops::Mul")         { return true; }
-        if (s == "std::core::ops::Div")         { return true; }
-        if (s == "std::core::ops::Rem")         { return true; }
-        if (s == "std::core::ops::Neg")         { return true; }
-        if (s == "std::core::ops::Not")         { return true; }
-        if (s == "std::core::ops::BitNot")      { return true; }
-        if (s == "std::core::ops::BitAnd")      { return true; }
-        if (s == "std::core::ops::BitOr")       { return true; }
-        if (s == "std::core::ops::BitXor")      { return true; }
-        if (s == "std::core::ops::Shl")         { return true; }
-        if (s == "std::core::ops::Shr")         { return true; }
-        if (s == "std::core::ops::Deref")       { return true; }
-        if (s == "std::core::ops::Index")       { return true; }
-        if (s == "std::core::result::Result")   { return true; }
-        if (s == "std::core::option::Option")   { return true; }
-        if (s == "std::future::poll::Poll")     { return true; }
-        return false;
+    /// The identity of the declaration that claimed `item`, or an empty
+    /// SymbolStr when no such declaration is in this program's module graph.
+    /// Absence is not a "no" - see the field comment.
+    wellknown(&this, item: LangItem) -> SymbolStr {
+        for (mut i: i64 = 0; i < this.wellknown_claims.length; i++) {
+            if (this.wellknown_claims[i].first == item) { return this.wellknown_claims[i].second; }
+        }
+        return SymbolStr::empty();
     }
 
     /// The declaration of the trait `trait_ty` names, or null when `trait_ty`

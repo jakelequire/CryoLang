@@ -261,8 +261,6 @@ CLASS_OF_METHOD = {
         ("B", "`(owner, method)`: the owner a canonical name off a `TypeRef`, the method a leaf inside it"),
     "GenericRegistry::find_trait_defining_method":
         ("J", "hint: the did-you-mean asks which trait declares a method of this leaf; the spelling is the question"),
-    "GenericRegistry::wellknown":
-        ("J", "lang: a declaration the language names by its own leaf (`Drop`, `Copy`, `Send`, `Sync`, `Future`, `Deref`, `Index`, the operator traits, `Result`, `Option`, `Poll`), claimed at its declaration"),
     # -- the module graph and the resolver's module scopes --
     "ModuleGraph::find_module_index":
         ("J", "module: a module by its namespace path"),

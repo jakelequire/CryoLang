@@ -126,6 +126,7 @@ import compiler::types::checker::{ FieldLookup, TypeChecker, TypeCheckResult, Ty
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType, TupleType };
 import compiler::types::generic::{ BoundedParamType, InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::generic_registry::{ LangItem };
 import compiler::types::resolver::{ ResolutionContext };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
@@ -138,7 +139,7 @@ import std::core::option::{ Option };
 import compiler::ast::visitor::{ BaseASTVisitor };
 
 
-/// Operator -> (trait leaf, method) overloading map. `valid == false` means
+/// Operator -> (language trait, method) overloading map. `valid == false` means
 /// the operator is not overloadable; `negate` flags `!=`, which lowers to
 /// `!a.equals(&b)`. `ord_pred` (non-empty only for the relational operators
 /// `< > <= >=`) names an `Ordering` predicate: those lower to
@@ -149,7 +150,7 @@ import compiler::ast::visitor::{ BaseASTVisitor };
 /// Kept in one place so the plain-binary, compound-assignment, and unary sema
 /// paths agree on the mapping.
 type struct OperatorTraitMap {
-    trait_leaf: string;
+    lang:       LangItem;
     method:     string;
     ord_pred:   string;
     negate:     boolean;
@@ -157,43 +158,43 @@ type struct OperatorTraitMap {
     valid:      boolean;
 
     static none() -> OperatorTraitMap {
-        return OperatorTraitMap { trait_leaf: "", method: "", ord_pred: "", negate: false, deref_wrap: false, valid: false };
+        return OperatorTraitMap { lang: LangItem::Add, method: "", ord_pred: "", negate: false, deref_wrap: false, valid: false };
     }
 
-    static mk(t: string, m: string, neg: boolean) -> OperatorTraitMap {
-        return OperatorTraitMap { trait_leaf: t, method: m, ord_pred: "", negate: neg, deref_wrap: false, valid: true };
+    static mk(t: LangItem, m: string, neg: boolean) -> OperatorTraitMap {
+        return OperatorTraitMap { lang: t, method: m, ord_pred: "", negate: neg, deref_wrap: false, valid: true };
     }
 
     /// A relational operator: `a OP b` -> `a.compare(&b).<pred>()` via `Ord`.
     static mk_ord(pred: string) -> OperatorTraitMap {
-        return OperatorTraitMap { trait_leaf: "Ord", method: "compare", ord_pred: pred, negate: false, deref_wrap: false, valid: true };
+        return OperatorTraitMap { lang: LangItem::Ord, method: "compare", ord_pred: pred, negate: false, deref_wrap: false, valid: true };
     }
 
     /// Unary `*` -> `Deref::deref`: `*b` desugars to `*(b.deref())`.
     static mk_deref() -> OperatorTraitMap {
-        return OperatorTraitMap { trait_leaf: "Deref", method: "deref", ord_pred: "", negate: false, deref_wrap: true, valid: true };
+        return OperatorTraitMap { lang: LangItem::Deref, method: "deref", ord_pred: "", negate: false, deref_wrap: true, valid: true };
     }
 
     /// Binary `+ - * / %` (arithmetic), `== !=` (equality via `Eq`), and
     /// `< > <= >=` (relational via `Ord::compare`). Bitwise, shift, and logical
     /// operators are intentionally absent: they are not overloadable in v1.
     static for_binary(op: string) -> OperatorTraitMap {
-        if (op == "+")  { return OperatorTraitMap::mk("Add", "add", false); }
-        if (op == "-")  { return OperatorTraitMap::mk("Sub", "sub", false); }
-        if (op == "*")  { return OperatorTraitMap::mk("Mul", "mul", false); }
-        if (op == "/")  { return OperatorTraitMap::mk("Div", "div", false); }
-        if (op == "%")  { return OperatorTraitMap::mk("Rem", "rem", false); }
-        if (op == "==") { return OperatorTraitMap::mk("Eq", "equals", false); }
-        if (op == "!=") { return OperatorTraitMap::mk("Eq", "equals", true); }
+        if (op == "+")  { return OperatorTraitMap::mk(LangItem::Add, "add", false); }
+        if (op == "-")  { return OperatorTraitMap::mk(LangItem::Sub, "sub", false); }
+        if (op == "*")  { return OperatorTraitMap::mk(LangItem::Mul, "mul", false); }
+        if (op == "/")  { return OperatorTraitMap::mk(LangItem::Div, "div", false); }
+        if (op == "%")  { return OperatorTraitMap::mk(LangItem::Rem, "rem", false); }
+        if (op == "==") { return OperatorTraitMap::mk(LangItem::Eq, "equals", false); }
+        if (op == "!=") { return OperatorTraitMap::mk(LangItem::Eq, "equals", true); }
         if (op == "<")  { return OperatorTraitMap::mk_ord("is_lt"); }
         if (op == ">")  { return OperatorTraitMap::mk_ord("is_gt"); }
         if (op == "<=") { return OperatorTraitMap::mk_ord("is_le"); }
         if (op == ">=") { return OperatorTraitMap::mk_ord("is_ge"); }
-        if (op == "&")  { return OperatorTraitMap::mk("BitAnd", "bitand", false); }
-        if (op == "|")  { return OperatorTraitMap::mk("BitOr",  "bitor",  false); }
-        if (op == "^")  { return OperatorTraitMap::mk("BitXor", "bitxor", false); }
-        if (op == "<<") { return OperatorTraitMap::mk("Shl",    "shl",    false); }
-        if (op == ">>") { return OperatorTraitMap::mk("Shr",    "shr",    false); }
+        if (op == "&")  { return OperatorTraitMap::mk(LangItem::BitAnd, "bitand", false); }
+        if (op == "|")  { return OperatorTraitMap::mk(LangItem::BitOr,  "bitor",  false); }
+        if (op == "^")  { return OperatorTraitMap::mk(LangItem::BitXor, "bitxor", false); }
+        if (op == "<<") { return OperatorTraitMap::mk(LangItem::Shl,    "shl",    false); }
+        if (op == ">>") { return OperatorTraitMap::mk(LangItem::Shr,    "shr",    false); }
         return OperatorTraitMap::none();
     }
 
@@ -201,9 +202,9 @@ type struct OperatorTraitMap {
     /// (dereference) -> `Deref`. All are type-directed and only fire when the
     /// primitive `check_unary_op` rule rejects the operand.
     static for_unary(op: string) -> OperatorTraitMap {
-        if (op == "-") { return OperatorTraitMap::mk("Neg", "neg", false); }
-        if (op == "!") { return OperatorTraitMap::mk("Not", "not", false); }
-        if (op == "~") { return OperatorTraitMap::mk("BitNot", "bitnot", false); }
+        if (op == "-") { return OperatorTraitMap::mk(LangItem::Neg, "neg", false); }
+        if (op == "!") { return OperatorTraitMap::mk(LangItem::Not, "not", false); }
+        if (op == "~") { return OperatorTraitMap::mk(LangItem::BitNot, "bitnot", false); }
         if (op == "*") { return OperatorTraitMap::mk_deref(); }
         return OperatorTraitMap::none();
     }
@@ -1816,7 +1817,7 @@ public:
         // A parameter overloads when a bound names that trait, a concrete
         // type when it has an impl of it; a user trait of the same spelling
         // is neither, on either path.
-        const trait_id: SymbolStr = this.ctx.generic_registry.wellknown(this.intern.intern(map.trait_leaf));
+        const trait_id: SymbolStr = this.ctx.generic_registry.wellknown(map.lang);
         if (!trait_id.is_valid()) { return null; }
         mut overloads: boolean = false;
         if (is_bounded) {
@@ -1892,7 +1893,7 @@ public:
                                      rhs_expr: ExpressionNode*, map: OperatorTraitMap,
                                      op_tok: Token, span: SourceSpan) -> ExpressionNode* {
         if (!map.valid) { return null; }
-        if (map.ord_pred != "" || map.trait_leaf == "Eq") { return null; }
+        if (map.ord_pred != "" || map.lang == LangItem::Eq) { return null; }
         const lt: Type* = this.arena.lookup(lhs.id);
         if (lt == null) { return null; }
         // Only a genuine primitive scalar LHS.  A user / bounded / pointer /
@@ -1900,11 +1901,10 @@ public:
         const is_primitive: boolean = lt.kind == TypeKind::Int || lt.kind == TypeKind::Float
                                    || lt.kind == TypeKind::Char || lt.kind == TypeKind::Bool;
         if (!is_primitive) { return null; }
-        const trait_leaf: SymbolStr = this.intern.intern(map.trait_leaf);
         // Gate on the impl EXISTING on the primitive before building anything,
         // so a plain `2 * 3`-shaped error never materializes a bogus call.
         const impl_block: ImplBlockNode* = this.trait_checker().select_impl(
-            this.ctx.generic_registry.wellknown(trait_leaf), lhs, 0);
+            this.ctx.generic_registry.wellknown(map.lang), lhs, 0);
         if (impl_block == null || !impl_block.qualified_trait_name.is_valid()) { return null; }
         const method_sym: SymbolStr = this.intern.intern(map.method);
         mut desugared: ExpressionNode* =
@@ -1938,7 +1938,7 @@ public:
         const name: string = this.arena.format_display(t);
         this.ctx.emit_error_at(ErrorCode::E0229_INVALID_BINARY_OP,
             fmt::format("`%s` does not implement `%s`; add `implement trait %s ... for %s` to use the `%s` operator on it",
-                name, map.trait_leaf, map.trait_leaf, name, op_lexeme), span);
+                name, map.lang.leaf(), map.lang.leaf(), name, op_lexeme), span);
         return true;
     }
 
@@ -2154,7 +2154,7 @@ public:
                     // and a reference to a primitive or a non-`Eq` type - those make
                     // `operator_overload_expr` return null and fall through here.
                     const succ_deref: boolean =
-                        (map.trait_leaf == "Eq" || map.trait_leaf == "Ord")
+                        (map.lang == LangItem::Eq || map.lang == LangItem::Ord)
                         && this.comparison_unwraps_reference(lhs, rhs);
                     const de: ExpressionNode* = this.operator_overload_expr(
                         bin.left, lhs, bin.right, map, bin.op, bin.span, succ_deref);
@@ -2687,7 +2687,7 @@ public:
         // `origin_trait` is the trait's identity, so the comparison is against
         // the declaration the language means by `Future` - a user trait that
         // happens to share the leaf is not it.
-        const future_id: SymbolStr = this.ctx.generic_registry.wellknown(this.intern.intern("Future"));
+        const future_id: SymbolStr = this.ctx.generic_registry.wellknown(LangItem::Future);
         if (!future_id.is_valid() || !func.origin_trait.equals(future_id)) { return TypeRef::invalid(); }
         if (!func.name.equals(this.intern.intern("poll"))) { return TypeRef::invalid(); }
         // Read the Output off `Poll::Ready`'s payload rather than the return
@@ -2730,9 +2730,9 @@ public:
             const base: Type* = this.arena.lookup(et.generic_base.id);
             if (base != null && base.kind == TypeKind::Enum) { et = base as EnumType*; }
         }
-        const result_id: SymbolStr = this.ctx.generic_registry.wellknown(this.intern.intern("Result"));
+        const result_id: SymbolStr = this.ctx.generic_registry.wellknown(LangItem::Result);
         if (result_id.is_valid() && et.qualified_name.equals(result_id)) { return 1; }
-        const option_id: SymbolStr = this.ctx.generic_registry.wellknown(this.intern.intern("Option"));
+        const option_id: SymbolStr = this.ctx.generic_registry.wellknown(LangItem::Option);
         if (option_id.is_valid() && et.qualified_name.equals(option_id)) { return 2; }
         return 0;
     }
