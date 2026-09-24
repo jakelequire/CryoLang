@@ -28,6 +28,8 @@ import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
+import compiler::types::generic_registry;
+import compiler::types::generic_registry::{ LangItem };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
@@ -3359,6 +3361,10 @@ public:
     ///         }
     ///     }
     ///
+    /// where `next` is `std::core::iter::Iterator`'s and `Option` is
+    /// `std::core::option::Option`, each named by its definition rather than
+    /// by a spelling the user's scope could answer.
+    ///
     /// Each for-in gets a fresh `N` so nested / sibling loops never alias.
     /// The iterator binding carries `is_auto = true`; sema's existing
     /// initializer-type back-fill (same path used for lambda-bound `const`
@@ -3383,22 +3389,21 @@ public:
         const iter_decl_stmt: DeclStmtNode* = new DeclStmtNode(
             iter_decl as DeclarationNode*, full_span);
 
-        // `__cryo_for_iter_N.next()` - match scrutinee.
+        // `__cryo_for_iter_N.next()` - match scrutinee.  The call is
+        // `Iterator::next`: the loop is defined over the language's
+        // `Iterator`, so the member is that trait's, never a method that is
+        // merely spelled `next`.  Sema refuses a scrutinee that does not
+        // implement the trait before this call is bound.
         const iter_ident:  IdentifierNode*    = new IdentifierNode(iter_name, full_span);
         const next_name:   SymbolStr          = this.ctx.intern("next");
-        const next_member: MemberAccessNode*  = new MemberAccessNode(
+        mut next_member:   MemberAccessNode*  = new MemberAccessNode(
             iter_ident as ExpressionNode*, next_name, full_span, full_span);
+        next_member.set_resolved_trait(this.ctx.intern(LangItem::Iterator.path()));
         const next_call:   CallExprNode*      = new CallExprNode(
             next_member as ExpressionNode*, full_span);
 
         // `Option::Some(x) => { body }`
-        const opt_name:  SymbolStr = this.ctx.intern("Option");
-        const some_name: SymbolStr = this.ctx.intern("Some");
-        const none_name: SymbolStr = this.ctx.intern("None");
-
-        mut some_pat: EnumPatternNode* = new EnumPatternNode(iter_span);
-        some_pat.set_enum_name(opt_name);
-        some_pat.set_variant_name(some_name);
+        mut some_pat: EnumPatternNode* = this.lang_variant_pattern(LangItem::Option, "Some", iter_span);
         const pb: PatternBinding* = new PatternBinding {
             name: user_name, span: iter_span, sym_id: SymbolID::invalid(),
             resolved_type: TypeRef::invalid()
@@ -3420,9 +3425,7 @@ public:
         some_arm.set_body(some_body as StatementNode*);
 
         // `Option::None => { break; }`
-        mut none_pat: EnumPatternNode* = new EnumPatternNode(full_span);
-        none_pat.set_enum_name(opt_name);
-        none_pat.set_variant_name(none_name);
+        const none_pat: EnumPatternNode* = this.lang_variant_pattern(LangItem::Option, "None", full_span);
 
         mut none_arm: MatchArmNode* = new MatchArmNode(full_span);
         none_arm.add_pattern(none_pat as PatternNode*);

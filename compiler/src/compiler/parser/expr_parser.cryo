@@ -27,7 +27,7 @@ import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::resolver::{ symbol_str, qualified_name };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, ResSlot };
+import compiler::resolver::res::{ DefId, Res, ResSlot };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::parser::parser_base;
@@ -40,6 +40,8 @@ import compiler::diag::suggestion;
 import compiler::diag::suggestion::{ Suggestion };
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
+import compiler::types::generic_registry;
+import compiler::types::generic_registry::{ LangItem };
 import std::fmt;
 import compiler::ast::declaration::{ VarDeclNode };
 import compiler::ast::expression::{
@@ -243,9 +245,7 @@ public:
         mut match_expr: MatchExprNode* = new MatchExprNode(left, span);
 
         // Some(v) => { v }
-        mut some_pat: EnumPatternNode* = new EnumPatternNode(op_span);
-        some_pat.set_enum_name(this.ctx.intern("Option"));
-        some_pat.set_variant_name(this.ctx.intern("Some"));
+        mut some_pat: EnumPatternNode* = this.lang_variant_pattern(LangItem::Option, "Some", op_span);
         const pb: PatternBinding* = new PatternBinding {
             name: bind_name, span: op_span, sym_id: SymbolID::invalid(),
             resolved_type: TypeRef::invalid()
@@ -261,9 +261,7 @@ public:
         match_expr.add_arm(some_arm);
 
         // None => { b }
-        mut none_pat: EnumPatternNode* = new EnumPatternNode(op_span);
-        none_pat.set_enum_name(this.ctx.intern("Option"));
-        none_pat.set_variant_name(this.ctx.intern("None"));
+        const none_pat: EnumPatternNode* = this.lang_variant_pattern(LangItem::Option, "None", op_span);
         mut none_arm: MatchArmNode* = new MatchArmNode(op_span);
         none_arm.add_pattern(none_pat as PatternNode*);
         const none_stmt: ExprStmtNode* = new ExprStmtNode(right, right.span);
@@ -273,6 +271,23 @@ public:
         match_expr.add_arm(none_arm);
 
         return match_expr as ExpressionNode*;
+    }
+
+    /// `Item::variant` as a pattern, where `item` is an enum the language
+    /// itself desugars through.  The pattern means the language's enum -
+    /// `x ?? d` and `for` are defined over `std::core::option::Option` -
+    /// whatever the writing module's scope holds under that leaf, and the
+    /// desugaring built the node, so it names the definition rather than
+    /// leaving a spelling for the name layer to look up in the user's scope:
+    /// a module declaring its own `Option` would otherwise have its enum
+    /// matched against the language's value and refused.  The leaf stays on
+    /// the node for a diagnostic to print.
+    lang_variant_pattern(item: LangItem, variant: string, span: SourceSpan) -> EnumPatternNode* {
+        mut pat: EnumPatternNode* = new EnumPatternNode(span);
+        pat.set_enum_name(this.ctx.intern(item.leaf()));
+        pat.set_variant_name(this.ctx.intern(variant));
+        pat.set_res(Res::Def(DefId::of_definition(this.ctx.intern(item.path()))));
+        return pat;
     }
 
     /// Parse ternary conditional (right-associative).

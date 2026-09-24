@@ -963,11 +963,11 @@ for (mut i: int = 0; i < 10; i++) {
 }
 ```
 
-`for (x in <expr>)` iterates a sequence. The expression is evaluated exactly once and bound to a hidden mutable local; the parser lowers the loop to a `loop { match (iter.next()) { Some(x) => { ... } None => break; } }`. `break`, `continue`, and `return` inside the body bind to the synthesised loop, and the iterator binding is dropped at the end of the enclosing block.
+`for (x in <expr>)` iterates a sequence. The expression is evaluated exactly once and bound to a hidden mutable local; the parser lowers the loop to a `loop { match (iter.next()) { Some(x) => { ... } None => break; } }`, where `next` is `std::core::iter::Iterator`'s and `Some`/`None` are `std::core::option::Option`'s - a module that declares its own `Option` or `Iterator` changes nothing about the loop. `break`, `continue`, and `return` inside the body bind to the synthesised loop, and the iterator binding is dropped at the end of the enclosing block.
 
 The scrutinee may be:
 
-- An **`Iterator`** directly - anything exposing `next(mut &this) -> Option<T>`, including the stdlib's `Range<T>` / `RangeInclusive<T>` and any type that `implement trait Iterator<T>`.
+- An **`Iterator`** directly - a type that `implement trait Iterator<T>`, including the stdlib's `Range<T>` / `RangeInclusive<T>`, or a type parameter bounded by `Iterator`. A method that is merely spelled `next` does not make a type iterable: the loop refuses it (`E0306`, "does not implement `Iterator`").
 - A **range literal** `a..b` (half-open) or `a..=b` (inclusive). These are sugar for `Range::new(a, b)` / `RangeInclusive::new(a, b)`; see the precedence table in [section 5.7](#57-operator-precedence).
 - An **iterable** that exposes `iter()` returning an iterator - `Array<T>` and `Slice<T>` (their `iter()` is gated `where T: Copy`). The lowering inserts the `.iter()` call.
 - A **fixed-size array** `T[N]`. The lowering views it as a `Slice<T>` over its `N` elements.

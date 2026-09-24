@@ -1250,23 +1250,15 @@ public:
                         init_type = this.resolve_expr(var_node.initializer);
                     }
                 }
-                mut lookup_ref: TypeRef = init_type;
-                mut t: Type* = this.arena.lookup(init_type.id);
-                mut depth: i32 = 0;
-                while (t != null && depth < 5) {
-                    if (t.kind == TypeKind::Pointer) { lookup_ref = (t as PointerType*).pointee; t = this.arena.lookup(lookup_ref.id); }
-                    else if (t.kind == TypeKind::Reference) { lookup_ref = (t as ReferenceType*).referent; t = this.arena.lookup(lookup_ref.id); }
-                    else if (t.kind == TypeKind::InstantiatedType) {
-                        const inst: InstantiatedType* = t as InstantiatedType*;
-                        if (!inst.has_resolved_type()) { break; }
-                        lookup_ref = inst.resolved_type; t = this.arena.lookup(lookup_ref.id);
-                    } else { break; }
-                    depth += 1;
-                }
-                const owner_ref: TypeRef = this.types.method_owner_ref(lookup_ref);
-                if (owner_ref.is_valid()) {
-                    const next_ret: TypeRef = this.types.lookup_method_return(owner_ref, this.intern.intern("next"));
-                    if (!next_ret.is_valid()) {
+                // The loop calls `Iterator::next` on this binding, so the
+                // scrutinee is an iterator when its type implements the
+                // language's `Iterator` - never because it has a method
+                // spelled `next`.  A collection that is not one is iterated
+                // through its `iter()`.
+                const iterator_id: SymbolStr = this.ctx.generic_registry.wellknown(LangItem::Iterator);
+                if (!this.for_scrutinee_iterates(init_type, iterator_id)) {
+                    const owner_ref: TypeRef = this.types.method_owner_ref(this.for_scrutinee_subject(init_type));
+                    if (owner_ref.is_valid()) {
                         const iter_ret: TypeRef = this.types.lookup_method_return(owner_ref, this.intern.intern("iter"));
                         if (iter_ret.is_valid()) {
                             const orig_init: ExpressionNode* = var_node.initializer;
@@ -1276,6 +1268,22 @@ public:
                             var_node.set_initializer(iter_call as ExpressionNode*);
                             init_type = this.resolve_expr(var_node.initializer);
                         }
+                    }
+                    // Refused once, here, at the scrutinee: the binding keeps
+                    // no type, so the `next` call the loop makes on it reports
+                    // nothing further.  An `iter()` that failed has already
+                    // said why.
+                    if (init_type.is_valid() && !this.for_scrutinee_iterates(init_type, iterator_id)) {
+                        if (!this.state.in_symbolic_check) {
+                            const shown: string = this.arena.resolve_display_name_short(
+                                this.for_scrutinee_subject(init_type).id);
+                            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+                                fmt::format("`%s` does not implement `Iterator`", shown));
+                            d = d.at_with_label(var_node.initializer.span,
+                                fmt::format("no `implement trait Iterator for %s` selects an implementation here", shown));
+                            this.ctx.emit_diagnostic(d);
+                        }
+                        init_type = TypeRef::invalid();
                     }
                 }
             }
@@ -1347,6 +1355,12 @@ public:
             // where it was written; bound with NO type, as a parameter is,
             // so a use of it is silent rather than a second report against
             // the initializer's type or `void`.
+            this.scopes.register_local_with_mut(var_node.name, TypeRef::invalid(), var_node.is_mutable);
+        } else if (var_node.is_auto) {
+            // A `for` loop's iterator binding left untyped: its scrutinee was
+            // refused, or failed, where it was written.  Bound with no type,
+            // so the `next` call the loop makes on it is silent rather than
+            // a second report against the scrutinee's type or `void`.
             this.scopes.register_local_with_mut(var_node.name, TypeRef::invalid(), var_node.is_mutable);
         } else if (var_node.has_initializer()) {
             const init_type: TypeRef = var_node.initializer.resolved_type;
@@ -1769,6 +1783,44 @@ public:
     /// True when a generic `BoundedParam`'s declared bounds (or their
     /// super-traits) include the trait whose identity is `trait_id`, so an
     /// operator on that param overloads.
+    /// The type a `for` scrutinee's `next` is called on: a pointer or
+    /// reference auto-derefs to what it points at, and an instantiation to
+    /// the type it resolved to.
+    for_scrutinee_subject(&this, ty: TypeRef) -> TypeRef {
+        mut r: TypeRef = ty;
+        mut t: Type* = this.arena.lookup(r.id);
+        mut depth: i32 = 0;
+        while (t != null && depth < 5) {
+            if (t.kind == TypeKind::Pointer) { r = (t as PointerType*).pointee; t = this.arena.lookup(r.id); }
+            else if (t.kind == TypeKind::Reference) { r = (t as ReferenceType*).referent; t = this.arena.lookup(r.id); }
+            else if (t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                if (!inst.has_resolved_type()) { break; }
+                r = inst.resolved_type; t = this.arena.lookup(r.id);
+            } else { break; }
+            depth += 1;
+        }
+        return r;
+    }
+
+    /// Whether a `for` scrutinee of type `ty` is an iterator: its subject
+    /// implements `iterator_id`, the language's `Iterator` - a parameter by
+    /// a bound naming it, a concrete type by an impl of it.  An impl whose
+    /// where-clause binds a generic the target does not carry
+    /// (`CopiedIter<I>`, `where I: Iterator<T*>`) is confirmed when its clone
+    /// is placed, so a head that unifies answers here, as for an `implement
+    /// Iterator` binding.
+    for_scrutinee_iterates(&this, ty: TypeRef, iterator_id: SymbolStr) -> boolean {
+        if (!iterator_id.is_valid()) { return false; }
+        const subject: TypeRef = this.for_scrutinee_subject(ty);
+        const t: Type* = this.arena.lookup(subject.id);
+        if (t == null) { return false; }
+        if (t.kind == TypeKind::BoundedParam) {
+            return this.bounded_param_trait(t as BoundedParamType*, iterator_id);
+        }
+        return this.trait_checker().type_satisfies_opaque_bound(subject, iterator_id);
+    }
+
     bounded_param_trait(&this, bp: BoundedParamType*, trait_id: SymbolStr) -> boolean {
         if (!trait_id.is_valid()) { return false; }
         for (mut i: i64 = 0; i < bp.bounds.length; i++) {

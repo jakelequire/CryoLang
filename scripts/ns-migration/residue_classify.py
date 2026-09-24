@@ -308,10 +308,8 @@ SITE_OVERRIDES = {
         ("N", "the funnel's own forwarding body (`lookup_method_return`); its callers are the sites"),
     ("compiler/sema/call_resolver.cryo", "DeclarationIndex::lookup_func_type", "fam"):
         ("C", "the `CalleePin::Family` key string"),
-    ("compiler/sema/sema.cryo", "TypeUtils::lookup_method_return", 'owner_ref, this.intern.intern("next")'):
-        ("J", "member: the for-in protocol's `next` off the iterated type's registered owner"),
     ("compiler/sema/sema.cryo", "TypeUtils::lookup_method_return", 'owner_ref, this.intern.intern("iter")'):
-        ("J", "member: the for-in protocol's `iter` off the iterated type's registered owner"),
+        ("J", "member: the for-in protocol's `iter` off a collection that does not implement `Iterator`"),
     ("compiler/mono/call_specializer.cryo", "GenericRegistry::get_template", "call.resolved_template"):
         ("B", "the call's pinned template KEY, a registry key string sema recorded"),
     ("compiler/sema/async_lower.cryo", "GenericRegistry::get_template", "c.resolved_template"):
