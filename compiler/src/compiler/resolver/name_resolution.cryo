@@ -220,8 +220,7 @@ public:
     /// reference to the function resolves to (`Res::Def` off the same
     /// symbol), so the declaration and its uses agree by construction.
     stamp_function_def(&this, fn_node: FunctionDeclNode*, sym_id: SymbolID) -> void {
-        const s: Symbol = this.resolver.get_symbol(sym_id);
-        fn_node.def = DefId::of_definition(this.resolver.qualified_name_of(&s));
+        fn_node.def = this.resolver.get_symbol(sym_id).def;
     }
 
     forward_declare_node(node: ASTNode*) -> void {
@@ -483,19 +482,30 @@ public:
     /// names, and a path spelling one of those is the module lane's
     /// (`modules_written_as`), not this one's.
     alias_module_of(&this, s: &Symbol) -> SymbolStr {
+        const alias: SymbolID = this.alias_of(s);
+        if (!alias.is_valid()) { return SymbolStr::empty(); }
+        const a: Symbol = this.resolver.get_symbol(alias);
+        return this.resolver.qualified_name_of(&a);
+    }
+
+    /// The `extern module` alias symbol a binding names - itself, or what an
+    /// import of it points at - or an invalid id for any other binding.  The
+    /// alias symbol carries the module's identity, so a caller that wants
+    /// the module as a definition reads it off this symbol.
+    alias_of(&this, s: &Symbol) -> SymbolID {
         // An import binds a NAME; what it names is the declaration it points
         // at, reached through the owning module's export set - the alias is
         // exported, so `import compiler::codegen::{ llvm }` binds it here.
         if (s.kind == SymbolKind::Import && s.source_module != "") {
             const decl: SymbolID = this.resolver.lookup_in_module(
                 this.resolver.intern_table.intern(s.source_module), s.name);
-            if (!decl.is_valid()) { return SymbolStr::empty(); }
+            if (!decl.is_valid()) { return SymbolID::invalid(); }
             const target: Symbol = this.resolver.get_symbol(decl);
-            return this.alias_module_of(&target);
+            return this.alias_of(&target);
         }
-        if (s.kind != SymbolKind::Namespace) { return SymbolStr::empty(); }
-        if (s.scope_id.id == this.resolver.global_scope.id) { return SymbolStr::empty(); }
-        return this.resolver.qualified_name_of(s);
+        if (s.kind != SymbolKind::Namespace) { return SymbolID::invalid(); }
+        if (s.scope_id.id == this.resolver.global_scope.id) { return SymbolID::invalid(); }
+        return s.id;
     }
 
     symbol_names_type(&this, s: &Symbol) -> boolean {
@@ -1160,8 +1170,7 @@ public:
             if (s.scope_id.is_valid()) {
                 const sc: Scope* = this.resolver.get_scope(s.scope_id);
                 if (sc.kind.is_module_level()) {
-                    return ResSlot::Answered(
-                        Res::Def(DefId::of_definition(this.resolver.qualified_name_of(&s))));
+                    return ResSlot::Answered(Res::Def(s.def));
                 }
             }
             return ResSlot::Answered(Res::Local(sym_id));
@@ -1170,7 +1179,7 @@ public:
                 || s.kind == SymbolKind::EnumVariant) {
             return ResSlot::Pending;
         }
-        return ResSlot::Answered(Res::Def(DefId::of_definition(this.resolver.qualified_name_of(&s))));
+        return ResSlot::Answered(Res::Def(s.def));
     }
 
     /// The locals and parameters bound along the rib chain from the current
@@ -1664,9 +1673,7 @@ public:
                     const decl: SymbolID = this.resolver.lookup_in_module(
                         alias_ns, this.resolver.intern_table.intern(leaf));
                     if (!decl.is_valid()) { return ResSlot::Pending; }
-                    const ds: Symbol = this.resolver.get_symbol(decl);
-                    return ResSlot::Answered(Res::Def(DefId::of_definition(
-                        this.resolver.qualified_name_of(&ds))));
+                    return ResSlot::Answered(Res::Def(this.resolver.get_symbol(decl).def));
                 }
             }
         }
@@ -1690,9 +1697,7 @@ public:
         const leaf_sym: SymbolStr = this.resolver.intern_table.intern(leaf);
         const offered: SymbolID[] = this.module_offerings(head.found, leaf_sym);
         if (offered.length == 1) {
-            const hs: Symbol = this.resolver.get_symbol(offered[0]);
-            return ResSlot::Answered(Res::Def(DefId::of_definition(
-                this.resolver.qualified_name_of(&hs))));
+            return ResSlot::Answered(Res::Def(this.resolver.get_symbol(offered[0]).def));
         }
         if (offered.length > 1) {
             const a: Symbol = this.resolver.get_symbol(offered[0]);
@@ -1810,7 +1815,7 @@ public:
             if (s.kind == SymbolKind::GenericParam) {
                 base = ResBase::GenericParam(scope_sym);
             } else {
-                base = ResBase::Def(DefId::of_definition(this.resolver.qualified_name_of(&s)));
+                base = ResBase::Def(s.def);
             }
             have_base = true;
         } else if (ResBase::is_primitive_spelling(written)) {
@@ -1853,9 +1858,9 @@ public:
             // An `extern module` alias names a module - the resolver's own,
             // not the graph's - and the member is that module's declaration:
             // the module lane's answer, read through the module lane's doors.
-            const alias_ns: SymbolStr = this.alias_module_of(&bound);
-            if (alias_ns.is_valid()) {
-                node.set_scope_res(Res::Def(DefId::of_definition(alias_ns)));
+            const alias: SymbolID = this.alias_of(&bound);
+            if (alias.is_valid()) {
+                node.set_scope_res(Res::Def(this.resolver.get_symbol(alias).def));
                 return;
             }
         }
@@ -1877,7 +1882,7 @@ public:
             // make `test::expect_eq` name a function `std::test` never
             // declared.  A member two of the facade's children declare is
             // refused, as it is everywhere else.
-            mut owner: SymbolStr = found;
+            mut owner: DefId = m.found_def;
             mut offered: i64 = 0;
             const hit: SymbolID = this.module_offering(found, node.member_name, &offered);
             if (offered > 1) {
@@ -1899,10 +1904,11 @@ public:
                     this.resolver.intern_table.resolve(
                         this.resolver.qualified_name_of(&hs)));
                 if (declared_in.length() > 0) {
-                    owner = this.resolver.intern_table.intern(declared_in);
+                    owner = this.ctx.module_graph.module_def(ModulePath::of(
+                        this.resolver.intern_table.intern(declared_in)));
                 }
             }
-            node.set_scope_res(Res::Def(DefId::of_definition(owner)));
+            node.set_scope_res(Res::Def(owner));
             return;
         }
         if (visible > 1) {
@@ -2204,7 +2210,7 @@ public:
                         QualifiedName::segment_count(written) - 1;
                     mut hb: ResBase = ResBase::GenericParam(hs.id);
                     if (hs.kind == SymbolKind::Type) {
-                        hb = ResBase::Def(DefId::of_definition(this.resolver.qualified_name_of(&hs)));
+                        hb = ResBase::Def(hs.def);
                     }
                     return ResSlot::Answered(Res::TypeRelative(hb, trailing));
                 }

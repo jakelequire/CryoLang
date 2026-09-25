@@ -212,6 +212,19 @@ type struct Resolver {
         return this.alloc_symbol_id();
     }
 
+    /// Put a symbol in the arena, stamped with the definition it names.
+    ///
+    /// The one place a binding's `DefId` is made, and every way into the
+    /// arena comes through it: an answer the name layer gives for a binding
+    /// reads the stamp, so no answer recomposes the path, and two answers for
+    /// one binding cannot name two definitions.
+    admit(mut &this, sym: Symbol) -> void {
+        this.symbols.push(sym);
+        const at: i64 = this.symbols.length - 1;
+        const def: DefId = DefId::of_definition(this.qualified_name_of(&this.symbols[at]));
+        this.symbols[at].def = def;
+    }
+
     /// Insert a symbol into the arena and current scope.
     /// Returns the SymbolID on success.  If the name already exists in the
     /// current scope and is not overloadable, the symbol is still added to
@@ -220,7 +233,7 @@ type struct Resolver {
     declare(mut &this, sym: Symbol) -> SymbolID {
         LOG_DEBUG(LogComponent::Resolver, "declare() symbol id=%lu", sym.id.id);
         const id: SymbolID = sym.id;
-        this.symbols.push(sym);
+        this.admit(sym);
 
         // Insert into current scope (O(1) direct index)
         const allows_overload: boolean = sym.kind.allows_overload();
@@ -247,7 +260,7 @@ type struct Resolver {
         // Intern the module path to get a heap-safe SymbolStr ID
         const new_module_sym: SymbolStr = this.intern_table.intern(sym.source_module);
         const new_module_id: u32 = new_module_sym.id;
-        this.symbols.push(sym);
+        this.admit(sym);
 
         // Get the existing symbol's module ID (if any) so the scope
         // can detect cross-module name conflicts.
@@ -732,13 +745,12 @@ type struct Resolver {
             }
             return Res::GenericParam(sym.id);
         }
-        const qualified: SymbolStr = this.qualified_name_of(sym);
         // The remainder is rooted in what the head named; a type owner needs a
         // receiver type, so it is not finishable here.
         if (trailing > 0) {
-            return Res::TypeRelative(ResBase::Def(DefId::of_definition(qualified)), trailing);
+            return Res::TypeRelative(ResBase::Def(sym.def), trailing);
         }
-        return Res::Def(DefId::of_definition(qualified));
+        return Res::Def(sym.def);
     }
 
 
@@ -825,7 +837,7 @@ type struct Resolver {
         const sym: Symbol = Symbol::namespace_sym(
             id, name, this.global_scope, SourceSpan::none(),
             this.intern_table.resolve(name));
-        this.symbols.push(sym);
+        this.admit(sym);
         this.scopes[g].insert(name, id, false);
     }
 

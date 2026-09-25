@@ -145,8 +145,9 @@ type struct DeclarationIndex {
     // Type name -> TypeRef (for struct, class, enum, trait lookups)
     type_map:       HashMap<u32, TypeRef>;
 
-    // Reverse: TypeRef.id -> SymbolStr.id (for looking up a type's name)
-    type_reverse:   HashMap<u64, u32>;
+    // Reverse: TypeRef.id -> the definition it was registered as, made by the
+    // registration; a type's name is read off the definition.
+    type_reverse:   HashMap<u64, DefId>;
 
     module_global_keys:       u32[];  // SymbolStr.id of global variable
     module_global_modules:    u32[];  // SymbolStr.id of defining module (source_file)
@@ -334,7 +335,7 @@ type struct DeclarationIndex {
             func_type_refs:      HashMap::<u32, TypeRef>::new(),
             method_returns:      HashMap::<u64, TypeRef>::new(),
             type_map:            HashMap::<u32, TypeRef>::new(),
-            type_reverse:        HashMap::<u64, u32>::new(),
+            type_reverse:        HashMap::<u64, DefId>::new(),
             array_elem_to_type:  HashMap::<u64, TypeRef>::new(),
             implicit_converters: HashMap::<u64, u64>::new(),
             generic_converter_methods: [],
@@ -606,10 +607,19 @@ type struct DeclarationIndex {
         if (arena == null || !ty.is_valid()) { return DefId::invalid(); }
         const base: TypeRef = arena.inst_generic_base(ty);
         if (base.is_valid()) {
-            const bn: SymbolStr = this.lookup_type_name(base);
-            if (bn.is_valid()) { return DefId::of_definition(bn); }
+            const bd: DefId = this.registered_def(base);
+            if (bd.is_valid()) { return bd; }
         }
-        return DefId::of_definition(this.lookup_type_name(ty));
+        return this.registered_def(ty);
+    }
+
+    /// The definition `ty` was registered as, or an invalid id when it was
+    /// never registered here.
+    registered_def(&this, ty: TypeRef) -> DefId {
+        return match (this.type_reverse.get(&ty.id)) {
+            Option::Some(d) => { d }
+            Option::None    => { DefId::invalid() }
+        };
     }
 
     /// Register a method's return type on the type `owner`, by the type's
@@ -636,10 +646,10 @@ type struct DeclarationIndex {
     register_type(mut &this, qualified_name: SymbolStr, ty: TypeRef, is_public: boolean) -> DefId {
         this.type_map.insert(qualified_name.id, ty);
 
-        // Reverse map: TypeRef.id -> qualified name
-        this.type_reverse.insert(ty.id, qualified_name.id);
+        const def: DefId = DefId::of_definition(qualified_name);
+        this.type_reverse.insert(ty.id, def);
         this.decl_visibility.insert(qualified_name.id, is_public);
-        return DefId::of_definition(qualified_name);
+        return def;
     }
 
     /// Register the concrete `Array<T>` specialization a dynamic `T[]`
@@ -669,7 +679,7 @@ type struct DeclarationIndex {
     /// (e.g., InstantiatedType, ArrayType) resolvable to an already-
     /// registered concrete type's qualified name.
     register_type_reverse_only(mut &this, qualified_name: SymbolStr, ty: TypeRef) -> void {
-        this.type_reverse.insert(ty.id, qualified_name.id);
+        this.type_reverse.insert(ty.id, DefId::of_definition(qualified_name));
     }
 
     /// Register a global with its defining module so codegen can walk the
@@ -1055,10 +1065,7 @@ type struct DeclarationIndex {
 
     /// Reverse-lookup: get the SymbolStr for a TypeRef.
     lookup_type_name(&this, ty: TypeRef) -> SymbolStr {
-        return match (this.type_reverse.get(&ty.id)) {
-            Option::Some(val) => { SymbolStr::from_id(val) }
-            Option::None      => { SymbolStr::empty() }
-        };
+        return this.registered_def(ty).qualified_name();
     }
 
     /// Register a free function's signature under its key `name`, emitted

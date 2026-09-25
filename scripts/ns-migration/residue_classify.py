@@ -248,6 +248,8 @@ CLASS_OF_METHOD = {
     # -- the module graph and the resolver's module scopes --
     "ModuleGraph::find_module_index":
         ("J", "module: a module by its namespace path"),
+    "ModuleGraph::module_def":
+        ("J", "module: a module's definition by its namespace path, the id the graph made when it discovered the module"),
     "ModuleGraph::reexport_closure":
         ("J", "module: a module's re-export closure by its namespace path"),
     "ModuleGraph::source_file_for_owner_key":

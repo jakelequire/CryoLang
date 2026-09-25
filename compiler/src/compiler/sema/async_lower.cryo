@@ -701,7 +701,7 @@ type struct AsyncLower {
     future_type_ann(mut &this, d: AsyncDecl*, span: SourceSpan) -> TypeAnnotation* {
         if (!d.generic) { return this.make_type_ann(d.struct_ref, span); }
         mut gen: GenericAnnotation* = new GenericAnnotation {
-            base: this.named_ann_def(d.q_name, DefId::of_definition(d.q_name), span),
+            base: this.named_ann_def(d.q_name, d.struct_decl.def, span),
             args: this.generic_param_anns(d.fut_params, span),
             span: span,
         };
@@ -828,7 +828,8 @@ type struct AsyncLower {
                 args.push(arg);
             }
             return new TypeAnnotation::Generic(new GenericAnnotation {
-                base: this.named_ann_def(base_q, DefId::of_definition(base_q), span),
+                base: this.named_ann_def(base_q,
+                    this.ctx.decl_index.def_of(inst.generic_base, this.ctx.type_arena), span),
                 args: args, span: span,
             });
         }
@@ -843,7 +844,8 @@ type struct AsyncLower {
     poll_type_ann(mut &this, arg: TypeAnnotation*, span: SourceSpan) -> TypeAnnotation* {
         const poll_q: SymbolStr = this.poll_identity();
         mut gen: GenericAnnotation* = new GenericAnnotation {
-            base: this.named_ann_def(poll_q, DefId::of_definition(poll_q), span),
+            base: this.named_ann_def(poll_q,
+                this.ctx.generic_registry.wellknown(LangItem::Poll), span),
             args: [arg],
             span: span,
         };
@@ -7201,6 +7203,12 @@ type struct AsyncLower {
             self_ty = this.ctx.generic_registry.instantiate(struct_ref, &param_refs);
         }
 
+        // Registered before anything below names the struct, so every
+        // reference the lowering builds to it - the impl's head, the future's
+        // annotation, the constructor literal - carries the id this
+        // registration made.
+        struct_decl.def = this.ctx.decl_index.register_type(q_name, struct_ref, true);
+
         // The record is completed in place below: the annotation builders read
         // `generic` / `q_name` / `self_ty` off it, so it has to exist first.
         mut d: AsyncDecl = AsyncDecl {
@@ -7284,10 +7292,10 @@ type struct AsyncLower {
         // `implement trait Future<Output> for struct <Q>`, its head stamped
         // with the declaration a written one's would resolve to.
         mut impl_node: ImplBlockNode* = new ImplBlockNode(q_name, span);
-        // The head names the struct minted above, under the name it was
-        // registered by; a synthesized node is walked by no resolver, so the
-        // synthesizer that holds the definition records it.
-        impl_node.res.answer(Res::Def(DefId::of_definition(q_name)));
+        // The head names the struct registered above; a synthesized node is
+        // walked by no resolver, so the synthesizer that holds the definition
+        // records it.
+        impl_node.res.answer(Res::Def(struct_decl.def));
         mut gen: GenericAnnotation* = new GenericAnnotation {
             base: this.named_ann_def(future_leaf, future_id, span),
             args: [this.output_type_ann(&d, span)],
@@ -7312,8 +7320,7 @@ type struct AsyncLower {
         d.impl_node = impl_node;
         this.bind_async_trait_assoc(&owner, node, this.future_type_ann(&d, span));
 
-        // Register struct + trait impl.
-        struct_decl.def = this.ctx.decl_index.register_type(q_name, struct_ref, true);
+        // Register the struct's method + trait impl.
         mut method_arr: MethodNode*[] = [poll_method];
         this.ctx.decl_index.register_methods(
             struct_ref, method_arr, this.intern, this.arena, "async/future poll");
@@ -7628,10 +7635,8 @@ type struct AsyncLower {
         // Body: `return <Q> { state: 0, p0: p0, …, fut_k: Option::None, … };`
         mut ctor_lit: StructLiteralNode* = new StructLiteralNode(q_name, span);
         // The literal is built after name resolution, so nothing else can
-        // answer for it.  `q_name` is the name the future struct was registered
-        // under just above, which is exactly what a consumer looking the
-        // template up is keyed by.
-        ctor_lit.set_synthesized_res(DefId::of_definition(q_name));
+        // answer for it: it names the future struct `declare` registered.
+        ctor_lit.set_synthesized_res(struct_decl.def);
         mut zero: LiteralNode* = new LiteralNode("0", LiteralKind::Integer, span);
         zero.set_resolved_type(u32_ty);
         ctor_lit.add_field_init(FieldInit { field_name: state_sym, value: zero as ExpressionNode*, span: span,
