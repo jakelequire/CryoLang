@@ -356,7 +356,7 @@ Checks for this section, one per line so each can be copied whole:
 * `python3 scripts/lane-gate.py --rows` → **16** (17 before §8.346 deleted `DEFID_MINT`)
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: lane-check lane-selftest' Makefile` → **1**
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **81** (+3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **82** (+1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
@@ -43399,5 +43399,71 @@ message, whose text a test pins; the old code built the same name by
 string composition, which the gate could not see.  Re-pinning a ratchet
 upward is relaxing a gate, which is Jake's: approve the re-pin, or rule
 that the visibility store is keyed by `DefId` first.
+
+---
+
+### 8.352 A receiver whose arguments are the caller's parameters substitutes them: a generic caller spelling its parameter unlike the owner's compiles - 0 objects moved; the arena flip then stops one layer further down - 2026-09-26
+
+§8.350's live bug, taken as Jake answered in plain text ("if scoping it out
+unblocks completing unit 2, sure" - read as: in scope because it unblocks
+the flip; said back to him).
+
+```cryo
+async function run<X>(x: X) -> i64 where X: Tick {
+    mut h: Holder<X> = Holder::<X> { inner: x };    // Holder is `Holder<S>`
+    const a: i64 = await h.drain();
+    return a;
+}
+// before: E0600 - the awaited future typed `Holder$drain$Future_0<S>`
+// after:  typed with `X`; builds, exits 42
+```
+
+`MethodBinding::subst_method_return_from_receiver` gave up when the
+receiver's arguments were abstract and handed back the callee owner's own
+parameters.  They are the CALLER's parameters, so they are substituted like
+any others; for a concrete receiver an answer that stays abstract still
+yields the return unchanged, as before.
+
+#### Evidence
+
+- Project `generic_caller_receiver_args` (exit 42): E0600 under the
+  compiler without the change, 42 with it.  Spelled `S` like the owner,
+  the same program builds under both.  Roster merged (+1).
+- Objects against `58963767`: **0 of 1,126 example and 0 of 3,234 test
+  objects** (the suite before the project was added); suite `OVERALL PASS`.
+  lsp-check OK (478 warnings), cross-check OK.
+
+#### The flip, measured again: the next layer
+
+The combined compiler (§8.348's, plus §8.349 and this) under
+`B_STRICT=all`, six halves: the 27 E0600 are gone; every project builds
+but the canary `chain_default_param_conflict`, which compiles (the
+predicted mover); one error in the unit suite:
+
+```cryo
+implement struct GenConn<S> {
+    async wrapped(mut &this, n: i64) -> i64 where S: GenTick {
+        const v: i64 = await GenCombine::boxed(0, this.pump(n));
+// error[E0636]: codegen: cannot resolve 'GenCombine::boxed'
+//   (tests/lang/async_receiver_refresh.cryo:282)
+```
+
+The same root as §8.348's three consumer-side translations: sema walks a
+generic impl's methods with `this` typed as the bare TEMPLATE, so a type
+computed from `this` - a field, and here a method's return - names the
+OWNER's parameters.  `boxed`'s `F` is inferred as `pump`'s future over
+`GenConn`'s `S`; keyed by declaration, the monomorphizer binds the impl's
+`S` and not the owner's, the call's bindings stay abstract, and `boxed` is
+never specialized.  This is §8.343's `impl_substituter` /
+`specialize_with_entry` pair's E0636, now with a mechanism.  The fix it
+points at is typing `this` in a generic impl as its head's instantiation
+(`GenConn<S>` over the impl's own `S`), which would make §8.348's
+owner-to-head translations unnecessary.  Not built: a change to how sema
+walks every generic impl, a layer §8.343 did not count, recorded as the
+brief requires.
+
+Reproduce: `git apply scripts/ns-migration/8.348/combined.patch`
+on `cf230067`, then this commit's and §8.349's compiler diffs, `make cryo`,
+and `B_STRICT=all bash scripts/objcmp/corpus2.sh all`.
 
 ---
