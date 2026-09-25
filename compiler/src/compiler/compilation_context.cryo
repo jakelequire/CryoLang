@@ -21,7 +21,9 @@ import compiler::mono::monomorphizer;
 import compiler::mono::monomorphizer::{ Monomorphizer };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, resolver };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId };
+import compiler::resolver::res::{ DefId, DefTable, DefKind };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
 import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::env;
@@ -144,6 +146,11 @@ public:
     // -- Interned strings (heap-allocated, lives for the entire compilation) --
     intern_table: InternTable*;
 
+    // -- Every definition of this compilation (heap-allocated) --
+    // The one place a `DefId` is made and its path composed; every store
+    // that needs a definition's path asks it here.
+    defs: DefTable*;
+
     // -- Declaration index (heap-allocated) --
     decl_index: DeclarationIndex*;
 
@@ -158,6 +165,28 @@ public:
     // queried by sema to switch to the template's module scope.
     injected_ast_ptrs:    u64[];
     injected_ast_modules: u32[];
+
+    // -- Language-item references the parser wrote --
+    // A desugaring names a language item before any declaration is
+    // registered, so its slot holds the item (`ResSlot::Lang`) and the node
+    // is listed here, by pointer as u64, until the item is claimed; the
+    // type-declaration stage then answers it with the claimed id
+    // (`PassRegistry::settle_lang_refs`).  Parallel arrays.
+    lang_ref_nodes: u64[];
+    lang_ref_items: LangItem[];
+
+    // -- References a C import makes to its own records --
+    // The importer builds a declaration's field and alias types before the
+    // name layer has declared anything, so each such reference is listed
+    // here with the import's alias and the C tag it names; the importer
+    // then pins each to the declaration it emitted for that tag
+    // (`c_ref_decls`, a node pointer as u64, 0 when it emitted none), and
+    // the name layer answers it with that declaration's id once declared
+    // (`NameDeclarationPass::settle_c_refs`).  Parallel arrays.
+    c_ref_anns:  u64[];
+    c_ref_alias: SymbolStr[];
+    c_ref_tags:  SymbolStr[];
+    c_ref_decls: u64[];
 
     // -- Inactive-region tracking (LSP tooling) --
     // Source spans of top-level declarations, methods, and inline `![dir] { }`
@@ -266,6 +295,15 @@ public:
         const _box_intern: Box<InternTable>       = Box::<InternTable>::new(InternTable::new());
         const _box_decl: Box<DeclarationIndex>    = Box::<DeclarationIndex>::new(DeclarationIndex::new());
         const _box_consts: Box<ConstantTable>     = Box::<ConstantTable>::new(ConstantTable::new());
+        const intern_ptr: InternTable* = _box_intern.leak();
+        const _box_defs: Box<DefTable>            = Box::<DefTable>::new(DefTable::new(intern_ptr));
+        const defs_ptr: DefTable* = _box_defs.leak();
+        const graph_ptr: ModuleGraph* = _box_module_graph.leak();
+        graph_ptr.defs = defs_ptr;
+        const decl_ptr: DeclarationIndex* = _box_decl.leak();
+        decl_ptr.defs = defs_ptr;
+        const consts_ptr: ConstantTable* = _box_consts.leak();
+        consts_ptr.defs = defs_ptr;
 
         const diag_ptr: DiagnosticSink* = _box_diag.leak();
         const diag_config_ptr: DiagConfig* = _box_diag_config.leak();
@@ -287,12 +325,19 @@ public:
             diag_renderer: renderer,
             diag_config:   diag_config_ptr,
             provisions:    ProvisionSet::empty(),
-            module_graph:  _box_module_graph.leak(),
-            intern_table:  _box_intern.leak(),
-            decl_index:    _box_decl.leak(),
-            const_table:   _box_consts.leak(),
+            module_graph:  graph_ptr,
+            intern_table:  intern_ptr,
+            defs:          defs_ptr,
+            decl_index:    decl_ptr,
+            const_table:   consts_ptr,
             injected_ast_ptrs:    [],
             injected_ast_modules: [],
+            lang_ref_nodes:       [],
+            lang_ref_items:       [],
+            c_ref_anns:           [],
+            c_ref_alias:          [],
+            c_ref_tags:           [],
+            c_ref_decls:          [],
             inactive_spans:       [],
             type_arena:    null,
 
@@ -592,6 +637,21 @@ public:
     /// without the clone carrying its module a second way.  The registration,
     /// the emitted definition's symbol and every reader that walks a root for
     /// a declaration derive the key here, so they cannot disagree.
+    /// Register a declaration the compiler synthesizes - an async future, a
+    /// closure's struct, the body an `async main` is renamed to - under the
+    /// module `ns` names (invalid parent when `ns` is empty).  The
+    /// synthesizer creates the declaration, so this is its one registration,
+    /// and every reference it builds copies the id.
+    register_in_module(mut &this, ns: SymbolStr, leaf: SymbolStr, kind: DefKind,
+                       span: SourceSpan) -> DefId {
+        const parent: DefId = if (ns.is_valid()) {
+            this.module_graph.module_def(ModulePath::of(ns))
+        } else {
+            DefId::invalid()
+        };
+        return this.defs.register(parent, leaf, kind, span);
+    }
+
     decl_fn_key(mut &this, name: SymbolStr, span_file: string) -> SymbolStr {
         return this.qualify_symbol_sym_home(name, span_file);
     }
@@ -650,6 +710,7 @@ public:
         if (this.type_arena == null) {
             const _box_arena: Box<TypeArena> = Box::<TypeArena>::new(TypeArena::new(this.intern_table));
             this.type_arena = _box_arena.leak();
+            this.type_arena.defs = this.defs;
         }
 
         // Create the GenericRegistry early so that the TypeResolver can route
@@ -685,6 +746,8 @@ public:
         if (this.resolver == null) {
             const _box_res: Box<Resolver> = Box::<Resolver>::new(Resolver::new(this.intern_table));
             this.resolver = _box_res.leak();
+            this.resolver.defs = this.defs;
+            this.resolver.graph = this.module_graph;
         }
         // The scope walk's outermost tier, installed here because this runs
         // after the prelude set is derived and before any pass resolves a name.

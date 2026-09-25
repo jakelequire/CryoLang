@@ -187,14 +187,15 @@ public:
     /// which kind it is; four copies of it would drift the moment one kind
     /// gained a case.
     declare_c_imported(&this, alias: SymbolStr, name: SymbolStr,
-                       span: SourceSpan) -> void {
-        if (alias.is_empty() || !name.is_valid()) { return; }
+                       span: SourceSpan) -> SymbolID {
+        if (alias.is_empty() || !name.is_valid()) { return SymbolID::invalid(); }
         const saved_module: SymbolStr = this.resolver.current_module_sym();
         const saved_scope: u64 = this.resolver.get_current_scope_id();
         this.resolver.set_module(alias);
         const sym_id: SymbolID = this.resolver.declare_type(name, span, true);
         this.resolver.export_symbol(sym_id);
         this.resolver.restore_scope(saved_module, saved_scope);
+        return sym_id;
     }
 
     /// Declare a C-imported global in its alias's module, as the module's
@@ -223,6 +224,15 @@ public:
         fn_node.def = this.resolver.get_symbol(sym_id).def;
     }
 
+    /// The definition a type declaration's binding was registered as, for
+    /// the declaration node: the type-declaration stage registers the type
+    /// under this id rather than making a second one.  Invalid when nothing
+    /// was declared.
+    type_def_of(&this, sym_id: SymbolID) -> DefId {
+        if (!sym_id.is_valid()) { return DefId::invalid(); }
+        return this.resolver.get_symbol(sym_id).def;
+    }
+
     forward_declare_node(node: ASTNode*) -> void {
         match (node.kind) {
             NodeKind::FunctionDeclaration => {
@@ -249,12 +259,13 @@ public:
                     const sym_id: SymbolID = this.resolver.declare_type(
                         struct_node.name, struct_node.span,
                         struct_node.is_public);
+                    struct_node.def = this.type_def_of(sym_id);
                     if (struct_node.is_public) {
                         this.resolver.export_symbol(sym_id);
                     }
                 } else {
-                    this.declare_c_imported(struct_node.binding_namespace,
-                                            struct_node.name, struct_node.span);
+                    struct_node.def = this.type_def_of(this.declare_c_imported(
+                        struct_node.binding_namespace, struct_node.name, struct_node.span));
                 }
             }
             NodeKind::UnionDeclaration => {
@@ -263,12 +274,13 @@ public:
                 if (union_node.binding_namespace.is_empty()) {
                     const sym_id: SymbolID = this.resolver.declare_type(
                         union_node.name, union_node.span, union_node.is_public);
+                    union_node.def = this.type_def_of(sym_id);
                     if (union_node.is_public) {
                         this.resolver.export_symbol(sym_id);
                     }
                 } else {
-                    this.declare_c_imported(union_node.binding_namespace,
-                                            union_node.name, union_node.span);
+                    union_node.def = this.type_def_of(this.declare_c_imported(
+                        union_node.binding_namespace, union_node.name, union_node.span));
                 }
             }
             NodeKind::EnumDeclaration => {
@@ -277,18 +289,20 @@ public:
                 if (enum_node.binding_namespace.is_empty()) {
                     const sym_id: SymbolID = this.resolver.declare_type(
                         enum_node.name, enum_node.span, enum_node.is_public);
+                    enum_node.def = this.type_def_of(sym_id);
                     if (enum_node.is_public) {
                         this.resolver.export_symbol(sym_id);
                     }
                 } else {
-                    this.declare_c_imported(enum_node.binding_namespace,
-                                            enum_node.name, enum_node.span);
+                    enum_node.def = this.type_def_of(this.declare_c_imported(
+                        enum_node.binding_namespace, enum_node.name, enum_node.span));
                 }
             }
             NodeKind::ClassDeclaration => {
                 const class_node: ClassDeclNode* = node as ClassDeclNode*;
                 const sym_id: SymbolID = this.resolver.declare_type(
                     class_node.name, class_node.span, class_node.is_public);
+                class_node.def = this.type_def_of(sym_id);
                 if (class_node.is_public) {
                     this.resolver.export_symbol(sym_id);
                 }
@@ -298,6 +312,7 @@ public:
                 const sym_id: SymbolID = this.resolver.declare_type(
                     trait_node.name, trait_node.span, true);
                 trait_node.sym_id = sym_id;
+                trait_node.def = this.type_def_of(sym_id);
                 this.resolver.export_symbol(sym_id);
             }
             NodeKind::TypeAliasDeclaration => {
@@ -305,11 +320,11 @@ public:
                 if (alias_node.binding_namespace.is_empty()) {
                     const sym_id: SymbolID = this.resolver.declare_type(
                         alias_node.alias_name, alias_node.span, true);
+                    alias_node.def = this.type_def_of(sym_id);
                     this.resolver.export_symbol(sym_id);
                 } else {
-                    this.declare_c_imported(alias_node.binding_namespace,
-                                            alias_node.alias_name,
-                                            alias_node.span);
+                    alias_node.def = this.type_def_of(this.declare_c_imported(
+                        alias_node.binding_namespace, alias_node.alias_name, alias_node.span));
                 }
             }
             NodeKind::VariableDeclaration => {
@@ -399,6 +414,8 @@ public:
                         QualifiedName::parent_of(this.resolver.intern_table.resolve(canon)));
                     this.resolver.declare(ns_sym);
                     this.resolver.export_symbol(ns_id);
+                    this.ctx.module_graph.bind_c_import_module(
+                        ModulePath::of(canon), this.resolver.get_symbol(ns_id).def);
 
                     const saved_module: SymbolStr = this.resolver.current_module_sym();
                     const saved_scope: u64 = this.resolver.get_current_scope_id();
@@ -3375,8 +3392,47 @@ type struct NameDeclarationPass {
 
         const visitor: NameResolver = NameResolver(ctx.resolver, ctx);
         visitor.forward_declare(root);
+        NameDeclarationPass::settle_c_refs(ctx);
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
+    }
+
+    /// Answer each reference a C import made to one of its own records,
+    /// once that record is declared: with the id its declaration was given,
+    /// read off the declaration node the importer pinned.  A reference whose
+    /// declaration is not declared yet - a later module's - waits; one the
+    /// importer could not pin is never answered.
+    static settle_c_refs(ctx: CompilationContext*) -> void {
+        mut kept: i64 = 0;
+        for (mut i: i64 = 0; i < ctx.c_ref_anns.length; i++) {
+            const def: DefId = NameDeclarationPass::type_decl_def(ctx.c_ref_decls[i] as ASTNode*);
+            if (!def.is_valid()) {
+                ctx.c_ref_anns[kept]  = ctx.c_ref_anns[i];
+                ctx.c_ref_alias[kept] = ctx.c_ref_alias[i];
+                ctx.c_ref_tags[kept]  = ctx.c_ref_tags[i];
+                ctx.c_ref_decls[kept] = ctx.c_ref_decls[i];
+                kept++;
+                continue;
+            }
+            const n: NamedAnnotation* = ctx.c_ref_anns[i] as NamedAnnotation*;
+            n.res.answer(Res::Def(def));
+        }
+        while (ctx.c_ref_anns.length > kept) {
+            ctx.c_ref_anns.pop();
+            ctx.c_ref_alias.pop();
+            ctx.c_ref_tags.pop();
+            ctx.c_ref_decls.pop();
+        }
+    }
+
+    /// The id a type declaration node was declared under; invalid for none.
+    static type_decl_def(node: ASTNode*) -> DefId {
+        if (node == null) { return DefId::invalid(); }
+        if (node.kind == NodeKind::StructDeclaration)    { return (node as StructDeclNode*).def; }
+        if (node.kind == NodeKind::UnionDeclaration)     { return (node as UnionDeclNode*).def; }
+        if (node.kind == NodeKind::EnumDeclaration)      { return (node as EnumDeclNode*).def; }
+        if (node.kind == NodeKind::TypeAliasDeclaration) { return (node as TypeAliasDeclNode*).def; }
+        return DefId::invalid();
     }
 }
 

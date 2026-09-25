@@ -101,7 +101,8 @@ import compiler::types::compound::{
 };
 import compiler::types::generic::{ GenericParamType, InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
-import compiler::types::generic_registry::{ LangItem };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::inference::{ InferCtx };
 import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::resolver::{ ResolutionContext };
@@ -223,7 +224,7 @@ type struct CallResolver {
     /// by their stamp like every other name).
     callee_family(&this, ident: IdentifierNode*) -> SymbolStr {
         return match (ident.res) {
-            ResSlot::Answered(r) => { r.def_id().qualified_name() }
+            ResSlot::Answered(r) => { this.ctx.defs.path_of(r.def_id()) }
             _                    => { SymbolStr::empty() }
         };
     }
@@ -3536,7 +3537,7 @@ type struct CallResolver {
         return match (scope.require_scope_res("scope-call owner key")) {
             Res::TypeRelative(b, _) => {
                 match (b) {
-                    ResBase::Def(d)          => { d.qualified_name() }
+                    ResBase::Def(d)          => { this.ctx.defs.path_of(d) }
                     ResBase::PrimTy(n)       => { n }
                     ResBase::GenericParam(_) => { SymbolStr::empty() }
                 }
@@ -3777,7 +3778,7 @@ type struct CallResolver {
     report_trait_qualified_unselected(mut &this, scope: ScopeResolutionNode*, trait_sym: DefId,
                                       member_sym: SymbolStr, call: CallExprNode*) -> void {
         if (this.state.in_symbolic_check) { return; }
-        const trait_leaf: string = QualifiedName::leaf_of(this.intern.resolve(trait_sym.qualified_name()));
+        const trait_leaf: string = QualifiedName::leaf_of(this.intern.resolve(this.ctx.defs.path_of(trait_sym)));
         const member_str: string = this.intern.resolve(member_sym);
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0233_UNDEFINED_SYMBOL,
             fmt::format("`%s::%s()` selects no implementation: a call through a trait's path selects by its first argument's type, and there is none",
@@ -3958,7 +3959,7 @@ type struct CallResolver {
                                owner: TypeRef, trait_sym: DefId, member_sym: SymbolStr) -> void {
         if (this.state.in_symbolic_check) { return; }
         const owner_str: string = this.intern.resolve(owner_sym);
-        const trait_leaf: string = QualifiedName::leaf_of(this.intern.resolve(trait_sym.qualified_name()));
+        const trait_leaf: string = QualifiedName::leaf_of(this.intern.resolve(this.ctx.defs.path_of(trait_sym)));
         const owner_ref: TypeRef = owner;
         if (owner_ref.is_valid()
                 && !this.trait_checker().type_implements_trait(owner_ref, trait_sym, 0)) {
@@ -4133,12 +4134,12 @@ type struct CallResolver {
         mut leaf_collides: boolean = false;
         for (mut a: i64 = 0; a < traits.length; a++) {
             for (mut b: i64 = a + 1; b < traits.length; b++) {
-                if (QualifiedName::leaf_of(this.intern.resolve(traits[a].qualified_name())) == QualifiedName::leaf_of(this.intern.resolve(traits[b].qualified_name()))) { leaf_collides = true; }
+                if (QualifiedName::leaf_of(this.intern.resolve(this.ctx.defs.path_of(traits[a]))) == QualifiedName::leaf_of(this.intern.resolve(this.ctx.defs.path_of(traits[b])))) { leaf_collides = true; }
             }
         }
         mut help: string = "";
         for (mut i: i64 = 0; i < traits.length; i++) {
-            const trait_str: string = this.intern.resolve(traits[i].qualified_name());
+            const trait_str: string = this.intern.resolve(this.ctx.defs.path_of(traits[i]));
             const leaf: string = if (leaf_collides) { trait_str } else { QualifiedName::leaf_of(trait_str) };
             const note: string = fmt::format("candidate #%d: `%s::%s`, from `implement trait %s for %s`",
                 (i + 1) as i32, leaf, member_str, trait_str, owner_display);
@@ -5217,9 +5218,8 @@ type struct CallResolver {
     resolve_module_qualified_symbol(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
                                     scope: ScopeResolutionNode*) -> SymbolStr {
         if (scope == null) { return SymbolStr::empty(); }
-        const stamped_ns: SymbolStr =
-            scope.require_scope_res("resolve_module_qualified_symbol")
-                 .def_id().qualified_name();
+        const stamped_ns: SymbolStr = this.ctx.defs.path_of(
+            scope.require_scope_res("resolve_module_qualified_symbol").def_id());
         if (!stamped_ns.is_valid()) { return SymbolStr::empty(); }
 
         const member_str: string = this.intern.resolve(member_name);

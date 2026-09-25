@@ -20,10 +20,12 @@ import std::ffi::libc;
 import std::fmt;
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::diag::source_span;
+import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::module_path;
 import compiler::resolver::module_path::{ ModulePath };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId };
+import compiler::resolver::res::{ DefId, DefTable, DefKind };
 
 /// Where a module's source originates, driving which per-package subtree
 /// (`std/`, `local/`, or `<depname>/`) its object/IR output lands in.
@@ -93,10 +95,10 @@ type struct ModuleInfo {
     // into this module's AST (populated during GenericExpressionResolution).
     specializations:   i64[];
 
-    /// The module as a definition, made when the module is discovered: the
-    /// one place a module's `DefId` comes from, so a path answered as naming
-    /// this module reads it here rather than recomposing the namespace.
-    /// Invalid for a module with no namespace.
+    /// The module as a definition, registered when the graph adds it
+    /// (`add_module`): the one place a module's `DefId` comes from, so a
+    /// path answered as naming this module reads it here rather than
+    /// recomposing the namespace.  Invalid for a module with no namespace.
     def:               DefId;
 
     static new(name: SymbolStr, path: string) -> ModuleInfo {
@@ -129,7 +131,7 @@ type struct ModuleInfo {
             origin:             ModuleOrigin::Local,
             origin_name:        "",
             specializations:    [],
-            def:                if (ns.is_valid()) { DefId::of_definition(ns) } else { DefId::invalid() },
+            def:                DefId::invalid(),
         };
     }
 
@@ -206,6 +208,9 @@ type struct ModuleInfo {
 /// Tracks modules and their dependency relationships for multi-module and
 /// stdlib batch compilation.
 type struct ModuleGraph {
+    /// The compilation's definitions, for a definition's path.  Borrowed;
+    /// set by `CompilationContext`, which owns it.
+    defs: DefTable*;
     modules:          ModuleInfo[];
     topo_order:       u32[];
     /// Modules `compute_order()` could not place, set only when it returns
@@ -221,6 +226,13 @@ type struct ModuleGraph {
 
     // Module name -> index lookup (SymbolStr.id -> module index)
     name_index: HashMap<u32, u32>;
+
+    /// Every module's definition, by the module's path (`SymbolStr.id`):
+    /// each module of this graph as it is added, and each module a C import
+    /// declares (`extern module cit := "C" { .. }`), which is a module the
+    /// name layer makes and no file holds.  The one table a declaration's
+    /// parent module is asked of.
+    module_defs: HashMap<u32, DefId>;
 
     // Saved resolver scope per module: raw pointer to avoid array[i]=x codegen bug
     // Parallel with modules[]. 0 means "not saved yet".
@@ -241,6 +253,7 @@ type struct ModuleGraph {
         libc::memset(ast_buf, 0, buf_size);
 
         return ModuleGraph {
+            defs: null,
             modules:          [],
             topo_order:       [],
             topo_unplaced:    [],
@@ -248,6 +261,7 @@ type struct ModuleGraph {
             module_ast_cap:   initial_cap,
             module_sources:   [],
             name_index:       HashMap::<u32, u32>::new(),
+            module_defs:      HashMap::<u32, DefId>::new(),
             uses_fstring:     false,
         };
     }
@@ -259,6 +273,15 @@ type struct ModuleGraph {
         // Read the (Copy) file_path before `info` is moved into `this.modules`.
         this.module_sources.push(info.file_path);
         this.modules.push(info);
+        // A module's identity is made here, where the graph first holds it:
+        // a root of the definition tree, named by the path its namespace
+        // declaration writes.
+        const ns: SymbolStr = this.modules[idx as i64].namespace_name;
+        if (ns.is_valid()) {
+            this.modules[idx as i64].def = this.defs.register(
+                DefId::invalid(), ns, DefKind::Module, SourceSpan::none());
+            this.module_defs.insert(ns.id, this.modules[idx as i64].def);
+        }
 
         // If we exceed pre-allocated capacity, grow the raw buffers.
         // This should be rare (>128 modules).
@@ -303,12 +326,20 @@ type struct ModuleGraph {
         };
     }
 
-    /// The definition a module in this graph is, or an invalid id when the
-    /// graph holds no such module.
+    /// The definition the module at path `m` is, or an invalid id when no
+    /// module has that path.
     module_def(&this, m: ModulePath) -> DefId {
-        const idx: i64 = this.find_module_index(m);
-        if (idx < 0) { return DefId::invalid(); }
-        return this.modules[idx].def;
+        return match (this.module_defs.get(&m.as_sym().id)) {
+            Option::Some(d) => { d }
+            Option::None    => { DefId::invalid() }
+        };
+    }
+
+    /// Record the module a C import declares: `def` is the binding the name
+    /// layer made for the import's alias, and `m` the namespace its
+    /// declarations are declared in.
+    bind_c_import_module(mut &this, m: ModulePath, def: DefId) -> void {
+        this.module_defs.insert(m.as_sym().id, def);
     }
 
     /// Every namespace reachable from `ns` by `export` edges, transitively,

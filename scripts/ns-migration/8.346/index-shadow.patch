@@ -1,0 +1,460 @@
+diff --git b/compiler/src/compiler/compilation_context.cryo a/compiler/src/compiler/compilation_context.cryo
+index 0e6b3355..1ad1faa9 100644
+--- b/compiler/src/compiler/compilation_context.cryo
++++ a/compiler/src/compiler/compilation_context.cryo
+@@ -298,6 +298,7 @@ public:
+         const intern_ptr: InternTable* = _box_intern.leak();
+         const _box_defs: Box<DefTable>            = Box::<DefTable>::new(DefTable::new(intern_ptr));
+         const defs_ptr: DefTable* = _box_defs.leak();
++        res::probe_set_table(defs_ptr);   // PROBE
+         const graph_ptr: ModuleGraph* = _box_module_graph.leak();
+         graph_ptr.defs = defs_ptr;
+         const decl_ptr: DeclarationIndex* = _box_decl.leak();
+diff --git b/compiler/src/compiler/instance.cryo a/compiler/src/compiler/instance.cryo
+index 66d086d3..5218db26 100644
+--- b/compiler/src/compiler/instance.cryo
++++ a/compiler/src/compiler/instance.cryo
+@@ -2603,6 +2603,7 @@ type struct CompilerInstance {
+         // Spelled in full because the namespace `compiler::resolver::res` and
+         // the enum `Res` it declares share a spelling, and a bare `Res::`
+         // qualifier binds the type.
++        compiler::resolver::res::probe_summary();   // PROBE
+         const pending: u64 = compiler::resolver::res::pending_bug_count();
+         if (!ctx.diagnostics.has_errors() && pending > 0) {
+             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+diff --git b/compiler/src/compiler/module_graph.cryo a/compiler/src/compiler/module_graph.cryo
+index 439b6f15..c26cdad9 100644
+--- b/compiler/src/compiler/module_graph.cryo
++++ a/compiler/src/compiler/module_graph.cryo
+@@ -95,10 +95,10 @@ type struct ModuleInfo {
+     // into this module's AST (populated during GenericExpressionResolution).
+     specializations:   i64[];
+ 
+-    /// The module as a definition, registered when the graph adds it
+-    /// (`add_module`): the one place a module's `DefId` comes from, so a
+-    /// path answered as naming this module reads it here rather than
+-    /// recomposing the namespace.  Invalid for a module with no namespace.
++    /// The module as a definition, made when the module is discovered: the
++    /// one place a module's `DefId` comes from, so a path answered as naming
++    /// this module reads it here rather than recomposing the namespace.
++    /// Invalid for a module with no namespace.
+     def:               DefId;
+ 
+     static new(name: SymbolStr, path: string) -> ModuleInfo {
+@@ -278,6 +278,7 @@ type struct ModuleGraph {
+         // declaration writes.
+         const ns: SymbolStr = this.modules[idx as i64].namespace_name;
+         if (ns.is_valid()) {
++            res::probe_mint(10, ns);   // PROBE
+             this.modules[idx as i64].def = this.defs.register(
+                 DefId::invalid(), ns, DefKind::Module, SourceSpan::none());
+             this.module_defs.insert(ns.id, this.modules[idx as i64].def);
+diff --git b/compiler/src/compiler/mono/monomorphizer.cryo a/compiler/src/compiler/mono/monomorphizer.cryo
+index 2527b6da..58bf7176 100644
+--- b/compiler/src/compiler/mono/monomorphizer.cryo
++++ a/compiler/src/compiler/mono/monomorphizer.cryo
+@@ -664,6 +664,7 @@ type struct Monomorphizer {
+         if (concrete_type.is_valid()) {
+             // An instantiation is registered beside its template, in the
+             // template's parent, under the specialization's own leaf.
++            res::probe_mint(60, qualified_spec_sym);   // PROBE
+             const spec_def: DefId = this.decl_index.defs.register(
+                 this.decl_index.defs.parent_of(this.decl_index.registered_def(entry.base_type)),
+                 spec_name_sym, DefKind::Instance, SourceSpan::none());
+diff --git b/compiler/src/compiler/parser/expr_parser.cryo a/compiler/src/compiler/parser/expr_parser.cryo
+index 7d8c82dd..1f2a82ec 100644
+--- b/compiler/src/compiler/parser/expr_parser.cryo
++++ a/compiler/src/compiler/parser/expr_parser.cryo
+@@ -278,9 +278,8 @@ public:
+     /// itself desugars through.  The pattern means the language's enum -
+     /// `x ?? d` and `for` are defined over `std::core::option::Option` -
+     /// whatever the writing module's scope holds under that leaf, and the
+-    /// desugaring built the node, so it names the language item rather than
+-    /// leaving a spelling for the name layer to look up in the user's scope
+-    /// (`ResSlot::Lang`, answered once the item is claimed):
++    /// desugaring built the node, so it names the definition rather than
++    /// leaving a spelling for the name layer to look up in the user's scope:
+     /// a module declaring its own `Option` would otherwise have its enum
+     /// matched against the language's value and refused.  The leaf stays on
+     /// the node for a diagnostic to print.
+diff --git b/compiler/src/compiler/passes/pass_registry.cryo a/compiler/src/compiler/passes/pass_registry.cryo
+index 028fbd7c..8fa0a281 100644
+--- b/compiler/src/compiler/passes/pass_registry.cryo
++++ a/compiler/src/compiler/passes/pass_registry.cryo
+@@ -905,6 +905,7 @@ type struct PassRegistry {
+                     // TypeResolution's to own.
+                     const struct_ref: TypeRef =
+                         arena.create_struct(qualified_sym, struct_module_sym);
++                    res::probe_reg(ctx.defs, node.def, qualified_sym, 20);   // PROBE
+                     ctx.decl_index.register_type(node.def, struct_ref, node.is_public);
+                     // Whether this IS the language's `Array`, `Slice`, `Rc`, ...
+                     // is decided by the identity, claimed where it is minted.
+@@ -929,6 +930,7 @@ type struct PassRegistry {
+                     const union_module_sym: SymbolStr = if (!node.binding_namespace.is_empty()) { node.binding_namespace } else { module_sym };
+                     const union_ref: TypeRef =
+                         arena.create_union(qualified_sym, union_module_sym);
++                    res::probe_reg(ctx.defs, node.def, qualified_sym, 20);   // PROBE
+                     ctx.decl_index.register_type(node.def, union_ref, node.is_public);
+                     if (!qualified_sym.equals(node.name) && node.binding_namespace.is_empty()) {
+                         ctx.decl_index.register_name_mapping(node.name, qualified_sym);
+@@ -944,6 +946,7 @@ type struct PassRegistry {
+                     const enum_module_sym: SymbolStr = if (!node.binding_namespace.is_empty()) { node.binding_namespace } else { module_sym };
+                     const enum_ref: TypeRef =
+                         arena.create_enum(qualified_sym, enum_module_sym);
++                    res::probe_reg(ctx.defs, node.def, qualified_sym, 20);   // PROBE
+                     ctx.decl_index.register_type(node.def, enum_ref, node.is_public);
+                     // Whether this IS the language's `Result`/`Option` - the enums
+                     // `?` desugars through - is decided by the identity, claimed
+@@ -961,6 +964,7 @@ type struct PassRegistry {
+                     const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
+                     const class_ref: TypeRef =
+                         arena.create_class(qualified_sym, module_sym);
++                    res::probe_reg(ctx.defs, node.def, qualified_sym, 20);   // PROBE
+                     ctx.decl_index.register_type(node.def, class_ref, node.is_public);
+                     if (ctx.generic_registry != null) {
+                         ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
+@@ -976,6 +980,7 @@ type struct PassRegistry {
+                     const trait_ref: TypeRef =
+                         arena.create_trait(qualified_sym, module_sym);
+                     // A trait carries no visibility modifier: public.
++                    res::probe_reg(ctx.defs, node.def, qualified_sym, 20);   // PROBE
+                     ctx.decl_index.register_type(node.def, trait_ref, true);
+                     // Whether this IS the language's `Drop`/`Copy`/`Add`/... is
+                     // decided by the identity, and claimed here, where the identity
+@@ -1008,6 +1013,7 @@ type struct PassRegistry {
+                     // aliases by qualified name during TypeResolution Phase 3
+                     // (before Phase 4 populates the index for other types).
+                     // An alias carries no visibility modifier: public.
++                    res::probe_reg(ctx.defs, node.def, qualified_alias, 20);   // PROBE
+                     ctx.decl_index.register_type(node.def, alias_ref, true);
+                     type_count++;
+                 }
+@@ -1077,6 +1083,7 @@ type struct PassRegistry {
+     /// the leaf.
+     static primitive_def(ctx: CompilationContext*, spelling: string) -> DefId {
+         const leaf: SymbolStr = ctx.intern(spelling);
++        res::probe_mint(30, leaf);   // PROBE
+         return ctx.defs.register(DefId::invalid(), leaf, DefKind::Primitive, SourceSpan::none());
+     }
+ 
+@@ -1098,6 +1105,7 @@ type struct PassRegistry {
+                 kept++;
+                 continue;
+             }
++            res::probe_reg(ctx.defs, id, ctx.intern(item.path()), 40);   // PROBE
+             const node: ASTNode* = ctx.lang_ref_nodes[i] as ASTNode*;
+             if (node.kind == NodeKind::EnumPattern) {
+                 (node as EnumPatternNode*).res.settle(Res::Def(id));
+diff --git b/compiler/src/compiler/passes/specialization.cryo a/compiler/src/compiler/passes/specialization.cryo
+index dc3dc78d..1b5c565a 100644
+--- b/compiler/src/compiler/passes/specialization.cryo
++++ a/compiler/src/compiler/passes/specialization.cryo
+@@ -642,6 +642,7 @@ type struct SpecializationPasses {
+         if (entry.instantiated_type.is_valid() && entry.specialized_type.is_valid()) {
+             const conc_qname: SymbolStr = arena.get_qualified_name(entry.specialized_type);
+             if (conc_qname.is_valid()) {
++                res::probe_reg(ctx.defs, ctx.decl_index.registered_def(entry.specialized_type), conc_qname, 70);   // PROBE
+                 ctx.decl_index.register_type_reverse_only(
+                     ctx.decl_index.registered_def(entry.specialized_type), entry.instantiated_type);
+ 
+diff --git b/compiler/src/compiler/resolver/name_resolution.cryo a/compiler/src/compiler/resolver/name_resolution.cryo
+index a0dfa895..54d8b087 100644
+--- b/compiler/src/compiler/resolver/name_resolution.cryo
++++ a/compiler/src/compiler/resolver/name_resolution.cryo
+@@ -3415,6 +3415,7 @@ type struct NameDeclarationPass {
+                 continue;
+             }
+             const n: NamedAnnotation* = ctx.c_ref_anns[i] as NamedAnnotation*;
++            res::probe_reg(ctx.defs, def, n.name, 90);   // PROBE
+             n.res.answer(Res::Def(def));
+         }
+         while (ctx.c_ref_anns.length > kept) {
+diff --git b/compiler/src/compiler/resolver/res.cryo a/compiler/src/compiler/resolver/res.cryo
+index 3f6c52c5..321ea157 100644
+--- b/compiler/src/compiler/resolver/res.cryo
++++ a/compiler/src/compiler/resolver/res.cryo
+@@ -57,6 +57,7 @@ import compiler::resolver::lang_item;
+ import compiler::resolver::lang_item::{ LangItem };
+ import compiler::diag::source_span;
+ import compiler::diag::source_span::{ SourceSpan };
++import std::ffi::libc;   // PROBE
+ 
+ /// The identity of a declaration, as resolution answered it: a position in
+ /// the compilation's `DefTable`, and nothing else.
+@@ -86,23 +87,33 @@ type struct DefId {
+ private:
+     /// Position in the table's parallel arrays; `0xFFFFFFFF` for none.
+     index: u32;
++    qn: SymbolStr;   // PROBE
+ 
+ public:
+     /// The id naming no definition, for a slot that must hold one before an
+     /// answer exists.  Distinct from `Res::Err`, which is an ANSWER: this is
+     /// the absence of one and never reaches a `Res`.
+     static invalid() -> DefId {
+-        return DefId { index: 4294967295 };
++        return DefId {
++            index: 4294967295,
++            qn: SymbolStr::empty(),   // PROBE
++        };
+     }
+ 
+     /// Whether this names a definition at all.
+     is_valid(&this) -> boolean {
++        if (probe_site_of(this.index) == 5) { probe_count(701); }   // PROBE
+         return this.index != 4294967295;
+     }
+ 
+     /// Identity: one registration, one id.  Two declarations that share a
+     /// path - two overloads of `f`, two impls' `mul` - are two ids.
+     equals(&this, other: DefId) -> boolean {
++        const by_index: boolean = this.index == other.index;   // PROBE
++        if (probe_site_of(this.index) == 5 || probe_site_of(other.index) == 5) { probe_count(700); }   // PROBE
++        const by_name: boolean = this.qn.equals(other.qn);       // PROBE
++        if (by_index != by_name) { probe_eq_differs(this.index, other.index, this.qn, other.qn); }   // PROBE
++        return by_name;   // PROBE
+         return this.index == other.index;
+     }
+ }
+@@ -118,6 +129,9 @@ type enum DefKind {
+     Function;
+     /// A constant or a global variable.
+     Value;
++    /// A binding a declaration introduces that is not one of the above:
++    /// locals, parameters, generic parameters, fields, variants, imports.
++    Binding;
+     /// A primitive type: declared nowhere, registered by the compiler with
+     /// its spelling as the leaf.
+     Primitive;
+@@ -136,8 +150,8 @@ type enum DefKind {
+ /// that holds the declaration it registers, and every other holder of an id
+ /// copies it.
+ ///
+-/// There is deliberately no "find by path": it would turn a spelling back
+-/// into an existing id, which is the door this table exists to close.
++/// There is deliberately no "find by path".  That door would be
++/// `DefId::of_definition` again under another name.
+ type struct DefTable {
+ private:
+     intern:  InternTable*;
+@@ -146,9 +160,11 @@ private:
+     kinds:   DefKind[];
+     paths:   SymbolStr[];
+     spans:   SourceSpan[];
++    sites:   u32[];   // PROBE
+ 
+ public:
+     static new(intern: InternTable*) -> DefTable {
++        g_probe_intern = intern;   // PROBE
+         return DefTable {
+             intern:  intern,
+             parents: [],
+@@ -156,6 +172,7 @@ public:
+             kinds:   [],
+             paths:   [],
+             spans:   [],
++            sites:   [],   // PROBE
+         };
+     }
+ 
+@@ -177,7 +194,17 @@ public:
+         this.kinds.push(kind);
+         this.paths.push(path);
+         this.spans.push(span);
+-        return DefId { index: at };
++        this.sites.push(g_probe_site);   // PROBE
++        const probe_old: SymbolStr = SymbolStr::from_id(g_probe_old);   // PROBE
++        probe_count(g_probe_site as i64);   // PROBE
++        if (g_probe_site != 0 && !probe_old.equals(path)) { probe_count((100 + g_probe_site) as i64); if (probe_detail()) { fmt::printf("SHADOW\tmint-differs\t%u\t%s\t%s\n", g_probe_site, this.intern.resolve(path), this.intern.resolve(probe_old)); } }   // PROBE
++        if (g_probe_site == 0 && probe_detail()) { fmt::printf("SHADOW\tmint-unlabelled\t%s\n", this.intern.resolve(path)); }   // PROBE
++        g_probe_site = 0;   // PROBE
++        g_probe_old = 0;   // PROBE
++        return DefId {
++            index: at,
++            qn: probe_old,   // PROBE
++        };
+     }
+ 
+     /// The canonical path of `d`: its parent's path and its leaf.  For a
+@@ -185,6 +212,9 @@ public:
+     /// Empty for the invalid id.
+     path_of(&this, d: DefId) -> SymbolStr {
+         if (!d.is_valid()) { return SymbolStr::empty(); }
++        probe_count((200 + this.sites[d.index as i64]) as i64);   // PROBE
++        if (!this.paths[d.index as i64].equals(d.qn)) { probe_count((300 + this.sites[d.index as i64]) as i64); if (probe_detail()) fmt::printf("SHADOW\tpath-differs\t%u\t%s\t%s\n", this.sites[d.index as i64], this.intern.resolve(this.paths[d.index as i64]), this.intern.resolve(d.qn)); }   // PROBE
++        return d.qn;   // PROBE
+         return this.paths[d.index as i64];
+     }
+ 
+@@ -206,6 +236,20 @@ public:
+     }
+ }
+ 
++mut g_probe_site: u32 = 0;   // PROBE
++mut g_probe_old: u32 = 0;   // PROBE
++mut g_probe_intern: InternTable* = null;   // PROBE
++mut g_probe_table: DefTable* = null;   // PROBE
++mut g_probe_counts: u64* = null;   // PROBE
++mut g_probe_details: u64 = 0;   // PROBE
++public function probe_set_table(t: DefTable*) -> void { g_probe_table = t; }   // PROBE
++public function probe_mint(site: u32, old: SymbolStr) -> void { g_probe_site = site; g_probe_old = old.id; }   // PROBE
++public function probe_count(key: i64) -> void { if (g_probe_counts == null) { g_probe_counts = libc::calloc(8000, 8) as u64*; } if (key >= 0 && key < 8000) { g_probe_counts[key] = g_probe_counts[key] + 1; } }   // PROBE
++public function probe_detail() -> boolean { g_probe_details = g_probe_details + 1; return g_probe_details <= 200; }   // PROBE
++public function probe_site_of(i: u32) -> u32 { if (g_probe_table == null || i == 4294967295) { return 0; } return g_probe_table.sites[i as i64]; }   // PROBE
++public function probe_eq_differs(a: u32, b: u32, qa: SymbolStr, qb: SymbolStr) -> void { const sa: u32 = probe_site_of(a); const sb: u32 = probe_site_of(b); probe_count((1000 + sa * 100 + sb) as i64); if (probe_detail()) { fmt::printf("SHADOW\teq-differs\t%u\t%u\t%s\t%s\n", sa, sb, g_probe_intern.resolve(qa), g_probe_intern.resolve(qb)); } }   // PROBE
++public function probe_reg(t: DefTable*, d: DefId, old: SymbolStr, site: u32) -> void { probe_count((400 + site) as i64); if (!d.is_valid()) { probe_count((500 + site) as i64); if (probe_detail()) { fmt::printf("SHADOW\treg-invalid\t%u\t%s\n", site, t.intern.resolve(old)); } return; } if (!t.paths[d.index as i64].equals(old)) { probe_count((600 + site) as i64); if (probe_detail()) { fmt::printf("SHADOW\treg-differs\t%u\t%s\t%s\n", site, t.intern.resolve(t.paths[d.index as i64]), t.intern.resolve(old)); } } }   // PROBE
++public function probe_summary() -> void { if (g_probe_counts == null) { return; } for (mut k: i64 = 0; k < 8000; k++) { if (g_probe_counts[k] != 0) { fmt::printf("SHADOW\tcount\t%lld\t%llu\n", k, g_probe_counts[k]); } } }   // PROBE
+ 
+ /// One signature of one declaration: an entry of the declaration index's
+ /// function registry, which holds a key, a function type and the linker
+diff --git b/compiler/src/compiler/resolver/resolver.cryo a/compiler/src/compiler/resolver/resolver.cryo
+index 0ec4400f..2d0aad14 100644
+--- b/compiler/src/compiler/resolver/resolver.cryo
++++ a/compiler/src/compiler/resolver/resolver.cryo
+@@ -224,64 +224,53 @@ type struct Resolver {
+ 
+     /// Put a declaring symbol in the arena, stamped with the definition it is.
+     ///
+-    /// The one place the name layer registers a definition: every
+-    /// declaration enters the arena through it, and an import enters carrying
+-    /// the id of the declaration it binds (`declare_import`), so an answer the
+-    /// name layer gives for any binding reads a stamp, and two answers for one
+-    /// binding cannot name two definitions.
+-    ///
+-    /// A binding a body introduces - a local, a parameter, a generic
+-    /// parameter - is not a definition and keeps `DefId::invalid()`: it is
+-    /// named by its `SymbolID`, and an answer for one is `Res::Local` or
+-    /// `Res::GenericParam`, never `Res::Def`.
++    /// The one place a binding's `DefId` is made: every declaration enters
++    /// the arena through it, and an import enters carrying the id of the
++    /// declaration it binds (`declare_import`), so an answer the name layer
++    /// gives for any binding reads a stamp, no answer recomposes the path,
++    /// and two answers for one binding cannot name two definitions.
+     admit(mut &this, sym: Symbol) -> void {
+         this.symbols.push(sym);
+         const at: i64 = this.symbols.length - 1;
+-        if (!this.is_definition(&this.symbols[at])) { return; }
+-        this.symbols[at].def = this.defs.register(
++        const kind: DefKind = this.def_kind_of(&this.symbols[at]);
++        res::probe_mint(this.probe_site_of(kind), this.qualified_name_of(&this.symbols[at]));   // PROBE
++        const def: DefId = this.defs.register(
+             this.declaring_module_def(&this.symbols[at]), this.symbols[at].name,
+-            this.def_kind_of(&this.symbols[at]), this.symbols[at].declaring_span);
++            kind, this.symbols[at].declaring_span);
++        this.symbols[at].def = def;
+     }
+ 
+-    /// The definition of the module `sym` is declared in; invalid for a
+-    /// symbol declared in no module.
++    /// The definition of the module `sym` is declared in, as the module
++    /// graph registered it; invalid for a symbol that names no module.
+     ///
+     /// A module is named by its path - the namespace declaration writes the
+-    /// whole of it - so this is the module graph's module-by-path question,
+-    /// the one every module-rooted path already asks.
++    /// whole of it - so this is the graph's module-by-path question, the one
++    /// every module-rooted path already asks.
+     declaring_module_def(&this, sym: &Symbol) -> DefId {
+         if (sym.source_module == "") { return DefId::invalid(); }
+         return this.graph.module_def(ModulePath::of(this.intern_table.intern(sym.source_module)));
+     }
+ 
+-    /// Whether a declaring symbol is a definition: an item a path can name
+-    /// from outside the body that declares it.  A variable is one only at
+-    /// module scope, where it is a global.
+-    is_definition(&this, sym: &Symbol) -> boolean {
++    /// What kind of definition a declaring symbol is.
++    def_kind_of(&this, sym: &Symbol) -> DefKind {
+         if (sym.kind == SymbolKind::Variable) {
+-            return this.scopes[(sym.scope_id.id - 1) as i64].kind == ScopeKind::Module;
++            if (this.scopes[(sym.scope_id.id - 1) as i64].kind == ScopeKind::Module) { return DefKind::Value; }
++            return DefKind::Binding;
+         }
+-        return sym.kind == SymbolKind::Namespace
+-            || sym.kind == SymbolKind::Function
+-            || sym.kind == SymbolKind::Method
+-            || sym.kind == SymbolKind::Intrinsic
+-            || sym.kind == SymbolKind::Type
+-            || sym.kind == SymbolKind::TypeAlias
+-            || sym.kind == SymbolKind::Constant;
+-    }
+-
+-    /// What kind of definition a declaring symbol is; `is_definition` holds.
+-    def_kind_of(&this, sym: &Symbol) -> DefKind {
+         return match (sym.kind) {
+             SymbolKind::Namespace => { DefKind::Module }
++            SymbolKind::Function  => { DefKind::Function }
++            SymbolKind::Method    => { DefKind::Function }
++            SymbolKind::Intrinsic => { DefKind::Function }
+             SymbolKind::Type      => { DefKind::Type }
+             SymbolKind::TypeAlias => { DefKind::Type }
+-            SymbolKind::Variable  => { DefKind::Value }
+             SymbolKind::Constant  => { DefKind::Value }
+-            _                     => { DefKind::Function }
++            _ => { DefKind::Binding }
+         };
+     }
+ 
++    probe_site_of(&this, k: DefKind) -> u32 { return match (k) { DefKind::Module => { 1 } DefKind::Type => { 2 } DefKind::Function => { 3 } DefKind::Value => { 4 } _ => { 5 } }; }   // PROBE
++
+     /// Insert a symbol into the arena and current scope.
+     /// Returns the SymbolID on success.  If the name already exists in the
+     /// current scope and is not overloadable, the symbol is still added to
+diff --git b/compiler/src/compiler/sema/async_lower.cryo a/compiler/src/compiler/sema/async_lower.cryo
+index 3c7ae06b..cd415f9f 100644
+--- b/compiler/src/compiler/sema/async_lower.cryo
++++ a/compiler/src/compiler/sema/async_lower.cryo
+@@ -6923,6 +6923,7 @@ type struct AsyncLower {
+         node.set_name(inner_sym);
+         // The renamed body is a declaration the lowering makes: registered
+         // here, and the call the wrapper builds to it names this id.
++        res::probe_mint(52, this.ctx.decl_fn_key(inner_sym, span.file));   // PROBE
+         const inner_def: DefId = this.ctx.register_in_module(
+             this.ctx.module_ns_sym_of_file(span.file), inner_sym, DefKind::Function, span);
+ 
+@@ -6966,8 +6967,9 @@ type struct AsyncLower {
+         body.add_statement(new DeclStmtNode(ex_decl as DeclarationNode*, span) as StatementNode*);
+ 
+         // `ex.block_on(main$async(<forwarded>))`.  Nothing name-resolves a
+-        // synthesized identifier, so the call names the renamed body by the
+-        // id registered where it was renamed.
++        // synthesized identifier, and the renamed function is declared in this
++        // file's own module, so its canonical name is the writer's module and
++        // the new leaf - recorded here, where the referent is known.
+         mut root_callee: IdentifierNode* = new IdentifierNode(inner_sym, span);
+         root_callee.res.answer(Res::Def(inner_def));
+         mut root: CallExprNode* = new CallExprNode(root_callee as ExpressionNode*, span);
+@@ -7105,6 +7107,7 @@ type struct AsyncLower {
+         // `mint_bare` is per module, so the module is what keeps one
+         // trait's fifteen implementations' futures apart.
+         const mint_file: string = if (owner.impl_node != null) { owner.impl_node.span.file } else { node.span.file };
++        res::probe_mint(51, this.ctx.decl_type_key(bare, SymbolStr::empty(), mint_file));   // PROBE
+         const fut_def: DefId = this.ctx.register_in_module(
+             this.ctx.module_ns_sym_of_file(mint_file), bare, DefKind::Type, span);
+         const q_name: SymbolStr = this.ctx.defs.path_of(fut_def);
+diff --git b/compiler/src/compiler/sema/lambda_synth.cryo a/compiler/src/compiler/sema/lambda_synth.cryo
+index 3f8b171b..a12a0bd5 100644
+--- b/compiler/src/compiler/sema/lambda_synth.cryo
++++ a/compiler/src/compiler/sema/lambda_synth.cryo
+@@ -288,6 +288,12 @@ type struct LambdaSynth {
+     mint_closure_def(mut &this, span: SourceSpan) -> DefId {
+         const idx: u64 = this.state.closure_counter;
+         this.state.closure_counter += 1;
++        const ns_str: string = if (this.ctx.has_namespace()) {   // PROBE
++            this.ctx.namespace_display()   // PROBE
++        } else {   // PROBE
++            this.ctx.source_file   // PROBE
++        };   // PROBE
++        res::probe_mint(50, this.intern.intern(fmt::format("%s::__Closure_%lld", ns_str, idx as i64)));   // PROBE
+         if (this.ctx.has_namespace()) {
+             return this.ctx.register_in_module(this.ctx.namespace_str,
+                 this.intern.intern(fmt::format("__Closure_%lld", idx as i64)), DefKind::Type, span);
+@@ -716,7 +722,7 @@ type struct LambdaSynth {
+     /// The identifier of a closure-arg specialization of `orig`: the
+     /// specialization encoding over the closure types, through the one
+     /// mangler every specialization goes through.  A closure type's name is
+-    /// its module and a per-build counter (`mint_closure_def`), so the
++    /// its module and a per-build counter (`mint_closure_name`), so the
+     /// identifier is a function of the source; an arena id is not, and a
+     /// symbol spelling one moves whenever an unrelated type is created
+     /// earlier.

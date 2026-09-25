@@ -41,7 +41,8 @@ import compiler::diag::suggestion::{ Suggestion };
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::generic_registry;
-import compiler::types::generic_registry::{ LangItem };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
 import std::fmt;
 import compiler::ast::declaration::{ VarDeclNode };
 import compiler::ast::expression::{
@@ -277,8 +278,9 @@ public:
     /// itself desugars through.  The pattern means the language's enum -
     /// `x ?? d` and `for` are defined over `std::core::option::Option` -
     /// whatever the writing module's scope holds under that leaf, and the
-    /// desugaring built the node, so it names the definition rather than
-    /// leaving a spelling for the name layer to look up in the user's scope:
+    /// desugaring built the node, so it names the language item rather than
+    /// leaving a spelling for the name layer to look up in the user's scope
+    /// (`ResSlot::Lang`, answered once the item is claimed):
     /// a module declaring its own `Option` would otherwise have its enum
     /// matched against the language's value and refused.  The leaf stays on
     /// the node for a diagnostic to print.
@@ -286,7 +288,9 @@ public:
         mut pat: EnumPatternNode* = new EnumPatternNode(span);
         pat.set_enum_name(this.ctx.intern(item.leaf()));
         pat.set_variant_name(this.ctx.intern(variant));
-        pat.set_res(Res::Def(DefId::of_definition(this.ctx.intern(item.path()))));
+        pat.res = ResSlot::Lang(item);
+        this.ctx.lang_ref_nodes.push(pat as u64);
+        this.ctx.lang_ref_items.push(item);
         return pat;
     }
 
@@ -421,7 +425,9 @@ public:
                 const new_name: SymbolStr = this.ctx.intern("new");
                 mut sr: ScopeResolutionNode* = new ScopeResolutionNode(
                     ctor_scope, new_name, span);
-                sr.set_synthesized_res(DefId::of_definition(this.ctx.intern(range_item.path())));
+                sr.scope_res = ResSlot::Lang(range_item);
+                this.ctx.lang_ref_nodes.push(sr as u64);
+                this.ctx.lang_ref_items.push(range_item);
                 mut call: CallExprNode* =
                     new CallExprNode(sr as ExpressionNode*, span);
                 call.add_argument(left);

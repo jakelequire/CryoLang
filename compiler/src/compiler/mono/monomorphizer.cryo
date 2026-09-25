@@ -55,7 +55,9 @@ import compiler::mono::state::{ MonomorphRequest, MonoState, SpecializationEntry
 import compiler::mono::trait_specializer::{ MonoTraitSpecializer };
 import compiler::mono::type_populator::{ MonoTypePopulator };
 import compiler::resolver::intern_table::{ InternTable };
-import compiler::resolver::res::{ DefId };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, DefKind };
+import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::module_path;
 import compiler::resolver::module_path::{ ModulePath };
@@ -63,7 +65,8 @@ import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ ArrayType };
 import compiler::types::generic::{ InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
-import compiler::types::generic_registry::{ LangItem };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::resolver::{ ResolutionContext, TypeResolver };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::trait_checker::{ TraitChecker };
@@ -659,9 +662,14 @@ type struct Monomorphizer {
         // and its clone registers as a declaration with the module that
         // places it.
         if (concrete_type.is_valid()) {
-            Monomorphizer::stamp_def(result.specialized_ast,
-                this.decl_index.register_type(qualified_spec_sym, concrete_type,
-                    Monomorphizer::node_is_public(result.specialized_ast)));
+            // An instantiation is registered beside its template, in the
+            // template's parent, under the specialization's own leaf.
+            const spec_def: DefId = this.decl_index.defs.register(
+                this.decl_index.defs.parent_of(this.decl_index.registered_def(entry.base_type)),
+                spec_name_sym, DefKind::Instance, SourceSpan::none());
+            this.decl_index.register_type(spec_def, concrete_type,
+                Monomorphizer::node_is_public(result.specialized_ast));
+            Monomorphizer::stamp_def(result.specialized_ast, spec_def);
             // The bare spec identifier maps to the canonical name: the
             // substituter rewrites a clone body's self-references to the
             // bare spelling, and the LSP's completion resolves it through

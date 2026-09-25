@@ -93,22 +93,27 @@ type struct CTypeMapper {
         return ann;
     }
 
-    /// Heap-allocate a NamedAnnotation (a reference to an emitted record/enum).
-    /// `qualified` is the canonical name (`<mod>::probe::Point`): the type is
-    /// declared in the alias's module, and that name is the key every index
-    /// holds it under.
+    /// Heap-allocate a NamedAnnotation naming the record or enum this
+    /// import emits for the C tag `tag`, spelled `<alias>::<tag>` - the name
+    /// every index holds it under, since it is declared in the alias's module.
     ///
-    /// Stamped with the definition it names.  The stamp has to come from
-    /// here: a synthesized node carries no span, so the name layer cannot
-    /// tell which module wrote it and refuses to stamp it, and a consumer
-    /// then has nothing but the spelling to search under.
-    named(&this, qualified: SymbolStr) -> TypeAnnotation* {
+    /// The reference is built before the name layer has declared anything, so
+    /// it cannot carry the declaration's id yet, and the name layer cannot
+    /// answer it by looking the spelling up (it has no span, so no writing
+    /// module).  It is listed on the context instead: the importer pins it to
+    /// the declaration it emitted for `tag`, and the name layer answers it
+    /// with that declaration's id once it is declared.
+    named(&this, tag: SymbolStr) -> TypeAnnotation* {
         const n: NamedAnnotation* = new NamedAnnotation {
-            name: qualified, span: SourceSpan::none(), pre_resolved: TypeRef::invalid(),
-            res: ResSlot::Answered(Res::Def(DefId::of_definition(qualified))),
+            name: this.qualify_under_alias(tag), span: SourceSpan::none(), pre_resolved: TypeRef::invalid(),
+            res: ResSlot::Pending,
         };
         const ann: TypeAnnotation* = libc::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
         *ann = TypeAnnotation::Named(n);
+        this.ctx.c_ref_anns.push(n as u64);
+        this.ctx.c_ref_alias.push(this.alias);
+        this.ctx.c_ref_tags.push(tag);
+        this.ctx.c_ref_decls.push(0);
         return ann;
     }
 
@@ -291,7 +296,7 @@ type struct CTypeMapper {
             // Reference to an emitted record: name it, qualified under the alias.
             const tag: SymbolStr = this.tag_name(c);
             if (!tag.is_empty() && !this.alias.is_empty()) {
-                return this.named(this.qualify_under_alias(tag));
+                return this.named(tag);
             }
             return this.ptr(this.prim("void"), false);
         }
@@ -299,7 +304,7 @@ type struct CTypeMapper {
         if (k == clang::TK_Enum) {
             const tag: SymbolStr = this.tag_name(c);
             if (!tag.is_empty() && !this.alias.is_empty()) {
-                return this.named(this.qualify_under_alias(tag));
+                return this.named(tag);
             }
             // Enums with no emittable name still round-trip as their integer width.
             return this.prim("i32");

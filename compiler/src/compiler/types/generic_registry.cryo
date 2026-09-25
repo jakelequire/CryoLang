@@ -24,8 +24,10 @@ import compiler::types;
 import compiler::types::{ generic, type_base, arena, type_ref };
 import compiler::resolver::symbol_str;
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId };
+import compiler::resolver::res::{ DefId, DefTable };
 import compiler::resolver::res::{ Res, ResBase };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
@@ -240,173 +242,6 @@ type struct TraitImplHead {
 type struct HeadBinding {
     param: SymbolID;
     term:  TypeAnnotation*;
-}
-
-/// A declaration the language itself reasons about by identity: the
-/// structural markers, `Drop`, `Future`, the traits an operator desugars to,
-/// the two enums `?` desugars through, and the one the async lowering
-/// completes its state machines with; the structs a lowering builds or a
-/// rule singles out (`Array` behind `T[]`, `Slice` and `Range` behind `for`
-/// and `a..b`, the types never `Send`, the executor and waker context an
-/// `async` program is driven by); and the functions generated code calls
-/// (the allocator, the entry point's `set_args`/`set_env`, the test runner).
-/// `a + b` is `std::core::ops::Add::add`, as Rust's `+` is
-/// `core::ops::Add` - a user trait spelled `Add` does not overload the
-/// operator; `x?` is on `std::core::result::Result` or
-/// `std::core::option::Option`, and an enum spelling `Ok`/`Err` is another
-/// enum.
-///
-/// A consumer names the item, never a spelling: a misspelt item does not
-/// compile, where a misspelt leaf silently answered "absent".
-type enum LangItem {
-    Copy;
-    Send;
-    Sync;
-    Drop;
-    Future;
-    Eq;
-    Ord;
-    Add;
-    Sub;
-    Mul;
-    Div;
-    Rem;
-    Neg;
-    Not;
-    BitNot;
-    BitAnd;
-    BitOr;
-    BitXor;
-    Shl;
-    Shr;
-    Deref;
-    Index;
-    Result;
-    Option;
-    Poll;
-    Iterator;
-    Array;
-    Slice;
-    Range;
-    RangeInclusive;
-    Rc;
-    MutexGuard;
-    RwLockReadGuard;
-    RwLockWriteGuard;
-    Context;
-    Executor;
-    Malloc;
-    Free;
-    Alloc;
-    Dealloc;
-    SetArgs;
-    SetEnv;
-    RunAll;
-}
-
-implement enum LangItem {
-    /// The canonical path the item's declaration is registered under.  The
-    /// one place the compiler knows how these declarations are spelled.
-    path(&this) -> string {
-        return match (&this) {
-            LangItem::Copy   => { "std::core::marker::Copy" }
-            LangItem::Send   => { "std::core::marker::Send" }
-            LangItem::Sync   => { "std::core::marker::Sync" }
-            LangItem::Drop   => { "std::core::drop::Drop" }
-            LangItem::Future => { "std::future::traits::Future" }
-            LangItem::Eq     => { "std::core::cmp::Eq" }
-            LangItem::Ord    => { "std::core::cmp::Ord" }
-            LangItem::Add    => { "std::core::ops::Add" }
-            LangItem::Sub    => { "std::core::ops::Sub" }
-            LangItem::Mul    => { "std::core::ops::Mul" }
-            LangItem::Div    => { "std::core::ops::Div" }
-            LangItem::Rem    => { "std::core::ops::Rem" }
-            LangItem::Neg    => { "std::core::ops::Neg" }
-            LangItem::Not    => { "std::core::ops::Not" }
-            LangItem::BitNot => { "std::core::ops::BitNot" }
-            LangItem::BitAnd => { "std::core::ops::BitAnd" }
-            LangItem::BitOr  => { "std::core::ops::BitOr" }
-            LangItem::BitXor => { "std::core::ops::BitXor" }
-            LangItem::Shl    => { "std::core::ops::Shl" }
-            LangItem::Shr    => { "std::core::ops::Shr" }
-            LangItem::Deref  => { "std::core::ops::Deref" }
-            LangItem::Index  => { "std::core::ops::Index" }
-            LangItem::Result => { "std::core::result::Result" }
-            LangItem::Option => { "std::core::option::Option" }
-            LangItem::Poll   => { "std::future::poll::Poll" }
-            LangItem::Iterator => { "std::core::iter::Iterator" }
-            LangItem::Array    => { "std::collections::array::Array" }
-            LangItem::Slice    => { "std::core::slice::Slice" }
-            LangItem::Range    => { "std::core::ops::Range" }
-            LangItem::RangeInclusive   => { "std::core::ops::RangeInclusive" }
-            LangItem::Rc               => { "std::alloc::rc::Rc" }
-            LangItem::MutexGuard       => { "std::sync::mutex::MutexGuard" }
-            LangItem::RwLockReadGuard  => { "std::sync::rwlock::RwLockReadGuard" }
-            LangItem::RwLockWriteGuard => { "std::sync::rwlock::RwLockWriteGuard" }
-            LangItem::Context  => { "std::future::waker::Context" }
-            LangItem::Executor => { "std::future::executor::Executor" }
-            LangItem::Malloc   => { "std::core::intrinsics::malloc" }
-            LangItem::Free     => { "std::core::intrinsics::free" }
-            LangItem::Alloc    => { "std::alloc::allocator::alloc" }
-            LangItem::Dealloc  => { "std::alloc::allocator::free" }
-            LangItem::SetArgs  => { "std::env::set_args" }
-            LangItem::SetEnv   => { "std::env::set_env" }
-            LangItem::RunAll   => { "std::test::runner::run_all" }
-        };
-    }
-
-    /// The declaration's own name, the last segment of its path - for a
-    /// diagnostic that names the trait to the user.
-    leaf(&this) -> string {
-        const s: string = this.path();
-        const n: i64 = s.length() as i64;
-        mut leaf_start: i64 = 0;
-        for (mut i: i64 = 0; i + 1 < n; i++) {
-            if (s[i] == ':' && s[i + 1] == ':') { leaf_start = i + 2; }
-        }
-        return s.substr(leaf_start, n - leaf_start);
-    }
-
-    /// Every item, for the registration site to match a declaration against.
-    static all() -> LangItem[] {
-        return [
-            LangItem::Copy, LangItem::Send, LangItem::Sync, LangItem::Drop,
-            LangItem::Future, LangItem::Eq, LangItem::Ord, LangItem::Add,
-            LangItem::Sub, LangItem::Mul, LangItem::Div, LangItem::Rem,
-            LangItem::Neg, LangItem::Not, LangItem::BitNot, LangItem::BitAnd,
-            LangItem::BitOr, LangItem::BitXor, LangItem::Shl, LangItem::Shr,
-            LangItem::Deref, LangItem::Index, LangItem::Result,
-            LangItem::Option, LangItem::Poll, LangItem::Iterator,
-            LangItem::Array, LangItem::Slice, LangItem::Range,
-            LangItem::RangeInclusive, LangItem::Rc, LangItem::MutexGuard,
-            LangItem::RwLockReadGuard, LangItem::RwLockWriteGuard,
-            LangItem::Context, LangItem::Executor, LangItem::Malloc,
-            LangItem::Free, LangItem::Alloc, LangItem::Dealloc,
-            LangItem::SetArgs, LangItem::SetEnv, LangItem::RunAll,
-        ];
-    }
-}
-
-/// A module the compiler itself imports or looks for: the prelude every
-/// module is given, and the formatting runtime an f-string desugars into.
-///
-/// Not a `LangItem`, and never claimed: a module's path IS its identity - the
-/// module graph registers every module under exactly one path - and the
-/// compiler needs these before any declaration exists, to write the import
-/// that loads them.  So the path is named here, the one place it is spelled,
-/// and asked of the graph (`ModulePath`) or written into an import.
-type enum LangModule {
-    Prelude;
-    Interp;
-}
-
-implement enum LangModule {
-    path(&this) -> string {
-        return match (&this) {
-            LangModule::Prelude => { "std::prelude" }
-            LangModule::Interp  => { "std::fmt::interp" }
-        };
-    }
 }
 
 type struct GenericRegistry {
@@ -661,7 +496,7 @@ type struct GenericRegistry {
     /// compute.
     register_impl_block(mut &this, target: DefId, block: ImplBlockNode*) -> void {
         if (!target.is_valid()) { return; }
-        const opt: Option<i64> = this.name_index.get(&target.qualified_name().id);
+        const opt: Option<i64> = this.name_index.get(&this.arena.defs.path_of(target).id);
         if (opt.is_some()) {
             const idx: i64 = opt.unwrap();
             mut entry_ptr: TemplateEntry* = &this.entries[idx];
@@ -773,8 +608,8 @@ type struct GenericRegistry {
     /// Pack a `(trait, target)` pair into a single u64 key: the trait's
     /// identity in the upper half, the target type's arena id in the lower,
     /// so two pairs collide only when both ids do.
-    static trait_impl_key(trait_def: DefId, target: TypeRef) -> u64 {
-        return ((trait_def.qualified_name().id as u64) << 32) | (target.id & 0xFFFFFFFF);
+    static trait_impl_key(defs: DefTable*, trait_def: DefId, target: TypeRef) -> u64 {
+        return ((defs.path_of(trait_def).id as u64) << 32) | (target.id & 0xFFFFFFFF);
     }
 
 
@@ -824,7 +659,7 @@ type struct GenericRegistry {
     register_trait_impl(mut &this, trait_id: DefId, target: TypeRef,
                         block: ImplBlockNode*) -> void {
         if (block == null || !trait_id.is_valid() || !target.is_valid()) { return; }
-        const key: u64 = GenericRegistry::trait_impl_key(trait_id, target);
+        const key: u64 = GenericRegistry::trait_impl_key(this.arena.defs, trait_id, target);
         const slot: i64[]* = this.trait_head_index.get_or_insert(key, []);
         for (mut i: i64 = 0; i < (*slot).length; i++) {
             if (this.trait_heads[(*slot)[i]].block == block) { return; }
@@ -837,7 +672,7 @@ type struct GenericRegistry {
     heads_under(&this, trait_id: DefId, target: TypeRef) -> ImplBlockNode*[] {
         mut out: ImplBlockNode*[] = [];
         if (!trait_id.is_valid() || !target.is_valid()) { return out; }
-        const key: u64 = GenericRegistry::trait_impl_key(trait_id, target);
+        const key: u64 = GenericRegistry::trait_impl_key(this.arena.defs, trait_id, target);
         match (this.trait_head_index.get_ref(&key)) {
             Option::Some(slot) => {
                 for (mut i: i64 = 0; i < (*slot).length; i++) {
@@ -1020,7 +855,7 @@ type struct GenericRegistry {
                     Res::GenericParam(_) => { return true; }
                     Res::Def(d)          => {
                         const k: SymbolStr = arena.template_key_of(arg, intern);
-                        return k.is_valid() && k.equals(d.qualified_name());
+                        return k.is_valid() && k.equals(arena.defs.path_of(d));
                     }
                     Res::PrimTy(p)       => {
                         const k: SymbolStr = arena.template_key_of(arg, intern);
@@ -1384,7 +1219,7 @@ type struct GenericRegistry {
     /// program got depended on import order in an unrelated file.
     register_trait_decl(mut &this, name: DefId, node: TraitDeclNode*) -> void {
         if (node == null || !name.is_valid()) { return; }
-        const existing: Option<i64> = this.trait_decl_index.get(&name.qualified_name().id);
+        const existing: Option<i64> = this.trait_decl_index.get(&this.arena.defs.path_of(name).id);
         if (existing.is_some()) {
             this.trait_decl_nodes[existing.unwrap()] = node;
             return;
@@ -1392,7 +1227,7 @@ type struct GenericRegistry {
         const idx: i64 = this.trait_decl_nodes.length;
         this.trait_decl_nodes.push(node);
         this.trait_decl_keys.push(name);
-        this.trait_decl_index.insert(name.qualified_name().id, idx);
+        this.trait_decl_index.insert(this.arena.defs.path_of(name).id, idx);
     }
 
     /// Look up a trait declaration's AST by the trait's definition. Returns
@@ -1400,7 +1235,7 @@ type struct GenericRegistry {
     /// different modules are two definitions, so they stay distinct.
     get_trait_decl(&this, name: DefId) -> TraitDeclNode* {
         if (!name.is_valid()) { return null; }
-        const opt: Option<i64> = this.trait_decl_index.get(&name.qualified_name().id);
+        const opt: Option<i64> = this.trait_decl_index.get(&this.arena.defs.path_of(name).id);
         if (opt.is_some()) {
             return this.trait_decl_nodes[opt.unwrap()];
         }
@@ -1417,7 +1252,7 @@ type struct GenericRegistry {
     /// stops a user declaration from answering by being spelled the same.
     claim_wellknown(mut &this, def: DefId, table: InternTable*) -> void {
         if (!def.is_valid() || table == null) { return; }
-        const s: string = table.resolve(def.qualified_name());
+        const s: string = table.resolve(this.arena.defs.path_of(def));
         const items: LangItem[] = LangItem::all();
         for (mut i: i64 = 0; i < items.length; i++) {
             if (items[i].path() != s) { continue; }
@@ -1459,7 +1294,7 @@ type struct GenericRegistry {
             if (td.lookup_method(method_name) != null) {
                 // The registration key, not `td.name`: the node's own name
                 // is the written leaf, which this table no longer accepts.
-                return this.trait_decl_keys[i].qualified_name();
+                return this.arena.defs.path_of(this.trait_decl_keys[i]);
             }
         }
         return SymbolStr::empty();
@@ -1502,7 +1337,7 @@ type struct GenericRegistry {
     /// the definition's canonical name, and the unwrap happens here, once.
     template_of(&this, def: DefId) -> TemplateEntry* {
         if (!def.is_valid()) { return null; }
-        const opt: Option<i64> = this.name_index.get(&def.qualified_name().id);
+        const opt: Option<i64> = this.name_index.get(&this.arena.defs.path_of(def).id);
         if (opt.is_some()) {
             return &this.entries[opt.unwrap()];
         }
@@ -1517,7 +1352,7 @@ type struct GenericRegistry {
     template_in(&this, container: ResBase, member: SymbolStr) -> TemplateEntry* {
         if (!member.is_valid() || this.arena == null) { return null; }
         const owner: SymbolStr = match (container) {
-            ResBase::Def(d)          => { d.qualified_name() }
+            ResBase::Def(d)          => { this.arena.defs.path_of(d) }
             ResBase::PrimTy(n)       => { n }
             ResBase::GenericParam(_) => { SymbolStr::empty() }
         };

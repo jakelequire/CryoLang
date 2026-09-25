@@ -7,10 +7,12 @@
 
 namespace compiler::resolver::resolver;
 
+import compiler::module_graph;
+import compiler::module_graph::{ ModuleGraph };
 import compiler::resolver;
 import compiler::resolver::{ symbol_id, symbol_str, intern_table, symbol, scope, resolution_map };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, Res, ResBase };
+import compiler::resolver::res::{ DefId, Res, ResBase, DefTable, DefKind };
 import compiler::resolver::namespace_kind;
 import compiler::resolver::namespace_kind::{ Namespace };
 import compiler::diag;
@@ -33,6 +35,12 @@ import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
 
 type struct Resolver {
+    /// The compilation's definitions, for a definition's path.  Borrowed;
+    /// set by `CompilationContext`, which owns it.
+    defs: DefTable*;
+    /// The module graph, for the definition a declaring symbol's module is:
+    /// a declaration's id is registered under its module's.
+    graph: ModuleGraph*;
     // Intern table: borrowed pointer, owned by CompilationContext
     intern_table:       InternTable*;
 
@@ -109,6 +117,8 @@ type struct Resolver {
         );
 
         return Resolver {
+            defs: null,
+            graph: null,
             intern_table:         table,
             symbols:              [],
             next_symbol_id:       1,
@@ -214,16 +224,62 @@ type struct Resolver {
 
     /// Put a declaring symbol in the arena, stamped with the definition it is.
     ///
-    /// The one place a binding's `DefId` is made: every declaration enters
-    /// the arena through it, and an import enters carrying the id of the
-    /// declaration it binds (`declare_import`), so an answer the name layer
-    /// gives for any binding reads a stamp, no answer recomposes the path,
-    /// and two answers for one binding cannot name two definitions.
+    /// The one place the name layer registers a definition: every
+    /// declaration enters the arena through it, and an import enters carrying
+    /// the id of the declaration it binds (`declare_import`), so an answer the
+    /// name layer gives for any binding reads a stamp, and two answers for one
+    /// binding cannot name two definitions.
+    ///
+    /// A binding a body introduces - a local, a parameter, a generic
+    /// parameter - is not a definition and keeps `DefId::invalid()`: it is
+    /// named by its `SymbolID`, and an answer for one is `Res::Local` or
+    /// `Res::GenericParam`, never `Res::Def`.
     admit(mut &this, sym: Symbol) -> void {
         this.symbols.push(sym);
         const at: i64 = this.symbols.length - 1;
-        const def: DefId = DefId::of_definition(this.qualified_name_of(&this.symbols[at]));
-        this.symbols[at].def = def;
+        if (!this.is_definition(&this.symbols[at])) { return; }
+        this.symbols[at].def = this.defs.register(
+            this.declaring_module_def(&this.symbols[at]), this.symbols[at].name,
+            this.def_kind_of(&this.symbols[at]), this.symbols[at].declaring_span);
+    }
+
+    /// The definition of the module `sym` is declared in; invalid for a
+    /// symbol declared in no module.
+    ///
+    /// A module is named by its path - the namespace declaration writes the
+    /// whole of it - so this is the module graph's module-by-path question,
+    /// the one every module-rooted path already asks.
+    declaring_module_def(&this, sym: &Symbol) -> DefId {
+        if (sym.source_module == "") { return DefId::invalid(); }
+        return this.graph.module_def(ModulePath::of(this.intern_table.intern(sym.source_module)));
+    }
+
+    /// Whether a declaring symbol is a definition: an item a path can name
+    /// from outside the body that declares it.  A variable is one only at
+    /// module scope, where it is a global.
+    is_definition(&this, sym: &Symbol) -> boolean {
+        if (sym.kind == SymbolKind::Variable) {
+            return this.scopes[(sym.scope_id.id - 1) as i64].kind == ScopeKind::Module;
+        }
+        return sym.kind == SymbolKind::Namespace
+            || sym.kind == SymbolKind::Function
+            || sym.kind == SymbolKind::Method
+            || sym.kind == SymbolKind::Intrinsic
+            || sym.kind == SymbolKind::Type
+            || sym.kind == SymbolKind::TypeAlias
+            || sym.kind == SymbolKind::Constant;
+    }
+
+    /// What kind of definition a declaring symbol is; `is_definition` holds.
+    def_kind_of(&this, sym: &Symbol) -> DefKind {
+        return match (sym.kind) {
+            SymbolKind::Namespace => { DefKind::Module }
+            SymbolKind::Type      => { DefKind::Type }
+            SymbolKind::TypeAlias => { DefKind::Type }
+            SymbolKind::Variable  => { DefKind::Value }
+            SymbolKind::Constant  => { DefKind::Value }
+            _                     => { DefKind::Function }
+        };
     }
 
     /// Insert a symbol into the arena and current scope.

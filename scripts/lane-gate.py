@@ -389,6 +389,8 @@ EXCLUDED_ARRAYS = {
                                    "the lowering's OWN RIB: the captured binding names of one lambda body"),
     "BindingRename":      Excluded("compiler/sema/async_lower.cryo",
                                    "the lowering's OWN RIB: original binding names beside the fresh ones it minted"),
+    "DefTable":           Excluded("compiler/resolver/res.cryo",
+                                   "the definition table: every array is indexed by a DefId's position and none is searched; `register` takes the LEAF a declaration was written with, to compose its path, and no method finds an entry by name"),
     "ClassDeclNode":      Excluded("compiler/AST/declaration.cryo",
                                    "the declaration's OWN WRITTEN members - its parameters, fields, methods, variants and `where` bounds as spelled; resolution stamps them, and the name-taking methods are writes onto the node"),
     "ClassType":          Excluded("compiler/types/user_defined.cryo",
@@ -652,6 +654,12 @@ SCANNED_ARRAYS = {
                                           "the C importer's bookkeeping of the struct tags it emitted"),
     "Importer.type_names":        Scanned("compiler/bindgen/importer.cryo", "SymbolStr", DATA,
                                           "the C importer's bookkeeping of the typedef spellings it emitted"),
+    "Importer.type_decl_tags":    Scanned("compiler/bindgen/importer.cryo", "SymbolStr", DATA,
+                                          "the C importer's own type declarations by the C TAG it emitted each for: "
+                                          "the header's namespace, which libclang hands over as text and no Cryo lookup reaches"),
+    "CompilationContext.c_ref_alias": Scanned("compiler/compilation_context.cryo", "SymbolStr", DATA,
+                                          "which C import made each pending record reference: the import's alias, "
+                                          "compared by that import to find its own"),
     "Lockfile.packages":          Scanned("compiler/deps/lockfile.cryo", "LockedDep", DATA,
                                           "the lockfile's packages by name: FILE-level records"),
     "Lockfile.vendor":            Scanned("compiler/deps/lockfile.cryo", "LockedVendor", DATA,
@@ -695,13 +703,17 @@ SCANNED_ARRAYS = {
 # only in that module - and only while one of its fields IS private.  Fields
 # are public by default, so the seal is a property of the field list: a
 # refactor that drops the last private field reopens construction to every
-# module, with no error and no change at any caller, and the mint rows below
-# would go on counting a door that is no longer the only one.  Each entry:
+# module, with no error and no change at any caller.  Each entry:
 # (declaring file, why nothing outside that module may build one).
 SEALED_TYPES = {
     "DefId": ("compiler/resolver/res.cryo",
-              "a definition's identity: built anywhere, it could be made to name a definition "
-              "nothing registered, or one its holder never resolved to"),
+              "a definition's identity, a position in the DefTable: built anywhere, an "
+              "in-range number silently names some real definition - one nothing "
+              "registered for its holder, or one its holder never resolved to"),
+    "DefTable": ("compiler/resolver/res.cryo",
+                 "the table every DefId indexes: with its arrays public, any module could "
+                 "append an entry or rewrite a path, and an existing id would then name "
+                 "something its registrar never declared"),
     "OverloadId": ("compiler/resolver/res.cryo",
                    "a signature's position in the index's registry: built anywhere, it names "
                    "whichever entry sits at the position it was given"),
@@ -767,14 +779,13 @@ REENTRY_RE = re.compile(r"\bget_resolver\s*\(\s*\)")
 # The driver legitimately owns the resolver and may ask for it.
 REENTRY_OWNERS = STORES["Resolver"].owners
 
-# The one door that turns a name into a resolution answer, and the one that
-# turns an answer back into a name.  `DefId`'s field is private, so the literal
-# cannot be written outside the type and every crossing goes through these two.
-DEFID_MINT_RE = re.compile(r"DefId::of_definition\s*\(")
-# The leading dot is what keeps the MODULE `compiler::resolver::qualified_name`
-# out: a module is reached with `::` and an import names it bare, so neither
-# can match, while a receiver can only be a value.
-DEFID_UNWRAP_RE = re.compile(r"\.qualified_name\s*\(")
+# The door that turns an identity back into a name: `DefTable::path_of`.  A
+# `DefId` holds only a position, so its path is a lookup in the table and
+# every such crossing is this call.  (No row counts the other direction: only
+# `DefTable::register` builds an id, the language refuses a literal outside
+# `res.cryo`, and `register` takes a parent id and a leaf - it has no door
+# that turns a path into an existing id.)
+DEFID_PATH_RE = re.compile(r"\.path_of\s*\(")
 
 # A ResolutionContext being told which module its annotations were WRITTEN
 # in.  Every writer is a place where a stage re-resolves syntax away from the
@@ -789,7 +800,7 @@ KINDS = ("LOOKUP", "LOOKUP_OTHER", "REGISTER", "LOOKUP_ROUTED", "LOOKUP_LOCAL",
          "ARENA_READ", "ARENA_WRITE",
          "REGISTRY_READ", "REGISTRY_WRITE", "GRAPH_READ", "GRAPH_WRITE",
          "CONST_READ", "CONST_WRITE",
-         "REENTRY", "HOME_WRITE", "DEFID_MINT", "DEFID_UNWRAP")
+         "REENTRY", "HOME_WRITE", "DEFID_PATH")
 
 
 def strip_comment(line):
@@ -1628,8 +1639,7 @@ def scan(src):
             if not STORES["Resolver"].owns(rel):
                 tally["REENTRY"] += len(REENTRY_RE.findall(line))
             tally["HOME_WRITE"] += len(HOME_WRITE_RE.findall(line))
-            tally["DEFID_MINT"] += len(DEFID_MINT_RE.findall(line))
-            tally["DEFID_UNWRAP"] += len(DEFID_UNWRAP_RE.findall(line))
+            tally["DEFID_PATH"] += len(DEFID_PATH_RE.findall(line))
         for kind in KINDS:
             if tally[kind]:
                 found[kind][rel] = tally[kind]
@@ -1698,21 +1708,11 @@ HEADER = [
     "#               a bare name binds to, so a writer that hands over the",
     "#               ambient cursor binds by where the compiler stands. A new",
     "#               writer is a new such decision and must be placed.",
-    "# DEFID_MINT    DefId::of_definition() -- where a name BECOMES a resolution",
-    "#               answer. Legitimate only where the referent is known for a",
-    "#               reason other than the spelling in front of it: a resolver",
-    "#               that just walked to the declaration, or a read of the",
-    "#               declaration index.",
-    "# DEFID_UNWRAP  DefId::qualified_name() -- where an answer becomes a name",
+    "# DEFID_PATH    DefTable::path_of() -- where an identity becomes a name",
     "#               again. Legitimate where the output IS text (a diagnostic, a",
-    "#               mangled symbol); a re-keyed lookup here has re-derived what",
-    "#               it was handed, and should take the DefId instead.",
-    "#",
-    "# Those two exist because Cryo's visibility is scoped to the declaring TYPE",
-    "# rather than to a module: a constructor private enough to exclude codegen",
-    "# excludes the resolver too, so DefId cannot be made mintable by the resolver",
-    "# ALONE. The private field still buys one named door in each direction, and",
-    "# these rows are what make the traffic through them countable.",
+    "#               mangled symbol) or a store is still keyed by the path; a",
+    "#               lookup keyed by it has re-derived what it was handed, and",
+    "#               should take the DefId instead.",
     "#",
     "# Every row is asserted exactly, both directions. For LOOKUP and REENTRY an",
     "# increase is regrowth and a decrease is progress that must still be re-pinned",

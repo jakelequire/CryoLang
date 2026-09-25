@@ -28,7 +28,7 @@ import compiler::resolver::{
     symbol_str, intern_table, qualified_name, mangled_name, resolver
 };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, Res, ResBase, ResSlot };
+import compiler::resolver::res::{ DefId, Res, ResBase, ResSlot, DefKind };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
@@ -81,7 +81,8 @@ import compiler::sema::pattern_resolver::{ PatternResolver };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType };
 import compiler::types::generic_registry::{ TemplateEntry };
-import compiler::types::generic_registry::{ LangItem };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
@@ -599,14 +600,14 @@ type struct AsyncLower {
     /// `std::future` import.  Never a spelling: a user enum named `Poll`
     /// beside an `async function` is another enum.
     poll_identity(&this) -> SymbolStr {
-        return this.ctx.generic_registry.wellknown(LangItem::Poll).qualified_name();
+        return this.ctx.defs.path_of(this.ctx.generic_registry.wellknown(LangItem::Poll));
     }
 
     /// The identity of the language's `Option`, the type every carried value
     /// the state machine may not yet hold is wrapped in; empty when absent
     /// from the program, which `lower` reports.
     option_identity(&this) -> SymbolStr {
-        return this.ctx.generic_registry.wellknown(LangItem::Option).qualified_name();
+        return this.ctx.defs.path_of(this.ctx.generic_registry.wellknown(LangItem::Option));
     }
 
     mint_bare(mut &this, base: string) -> SymbolStr {
@@ -6920,6 +6921,10 @@ type struct AsyncLower {
         const inner_sym: SymbolStr = this.intern.intern("main$async");
         const ex_sym: SymbolStr = this.intern.intern("ex");
         node.set_name(inner_sym);
+        // The renamed body is a declaration the lowering makes: registered
+        // here, and the call the wrapper builds to it names this id.
+        const inner_def: DefId = this.ctx.register_in_module(
+            this.ctx.module_ns_sym_of_file(span.file), inner_sym, DefKind::Function, span);
 
         mut wrapper: FunctionDeclNode* = new FunctionDeclNode(main_sym, span);
         wrapper.set_resolved_return_type(i32_ty);
@@ -6961,12 +6966,10 @@ type struct AsyncLower {
         body.add_statement(new DeclStmtNode(ex_decl as DeclarationNode*, span) as StatementNode*);
 
         // `ex.block_on(main$async(<forwarded>))`.  Nothing name-resolves a
-        // synthesized identifier, and the renamed function is declared in this
-        // file's own module, so its canonical name is the writer's module and
-        // the new leaf - recorded here, where the referent is known.
+        // synthesized identifier, so the call names the renamed body by the
+        // id registered where it was renamed.
         mut root_callee: IdentifierNode* = new IdentifierNode(inner_sym, span);
-        root_callee.res.answer(Res::Def(DefId::of_definition(
-            this.ctx.decl_fn_key(inner_sym, span.file))));
+        root_callee.res.answer(Res::Def(inner_def));
         mut root: CallExprNode* = new CallExprNode(root_callee as ExpressionNode*, span);
         for (mut i: i64 = 0; i < fwd.length; i++) { root.add_argument(fwd[i]); }
         mut ex_use: IdentifierNode* = new IdentifierNode(ex_sym, span);
@@ -7102,7 +7105,9 @@ type struct AsyncLower {
         // `mint_bare` is per module, so the module is what keeps one
         // trait's fifteen implementations' futures apart.
         const mint_file: string = if (owner.impl_node != null) { owner.impl_node.span.file } else { node.span.file };
-        const q_name: SymbolStr = this.ctx.decl_type_key(bare, SymbolStr::empty(), mint_file);
+        const fut_def: DefId = this.ctx.register_in_module(
+            this.ctx.module_ns_sym_of_file(mint_file), bare, DefKind::Type, span);
+        const q_name: SymbolStr = this.ctx.defs.path_of(fut_def);
 
         const state_sym: SymbolStr = this.intern.intern("state");
         const u32_ty: TypeRef = this.arena.get_u32();
@@ -7207,7 +7212,8 @@ type struct AsyncLower {
         // reference the lowering builds to it - the impl's head, the future's
         // annotation, the constructor literal - carries the id this
         // registration made.
-        struct_decl.def = this.ctx.decl_index.register_type(q_name, struct_ref, true);
+        struct_decl.def = fut_def;
+        this.ctx.decl_index.register_type(fut_def, struct_ref, true);
 
         // The record is completed in place below: the annotation builders read
         // `generic` / `q_name` / `self_ty` off it, so it has to exist first.

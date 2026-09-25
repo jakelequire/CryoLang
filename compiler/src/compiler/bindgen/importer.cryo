@@ -197,6 +197,10 @@ type struct Importer {
     /// cursor (libclang visits `struct Foo;` then `struct Foo {...}`).
     struct_names:   SymbolStr[];
     struct_nodes:   StructDeclNode*[];
+    /// Every type declaration this import emitted, by its C tag - the
+    /// import's own namespace - for pinning the references it made to them.
+    type_decl_tags:  SymbolStr[];
+    type_decl_nodes: ASTNode*[];
     /// CXType -> Cryo annotation mapper, built once per TU (carries ctx+alias).
     types:          CTypeMapper;
     /// Transient targets for the nested walks (set just before the synchronous
@@ -306,6 +310,8 @@ type struct Importer {
             seen_names:     [],
             struct_names:   [],
             struct_nodes:   [],
+            type_decl_tags:  [],
+            type_decl_nodes: [],
             types:          CTypeMapper::new(ctx, alias),
             cur_enum:       null,
             cur_enum_int:   null,
@@ -483,6 +489,38 @@ type struct Importer {
     /// through TypeDeclaration -> TypeResolution -> codegen like any source decl.
     emit_top_level(mut &this, node: ASTNode*) -> void {
         this.ctx.artifacts.ast.root.statements.push(node);
+        const tag: SymbolStr = Importer::type_decl_tag(node);
+        if (tag.is_valid()) {
+            this.type_decl_tags.push(tag);
+            this.type_decl_nodes.push(node);
+        }
+    }
+
+    /// The C tag a type declaration this import emits is bound under, or an
+    /// invalid one for a node that declares no type.
+    static type_decl_tag(node: ASTNode*) -> SymbolStr {
+        if (node.kind == NodeKind::StructDeclaration)    { return (node as StructDeclNode*).name; }
+        if (node.kind == NodeKind::UnionDeclaration)     { return (node as UnionDeclNode*).name; }
+        if (node.kind == NodeKind::EnumDeclaration)      { return (node as EnumDeclNode*).name; }
+        if (node.kind == NodeKind::TypeAliasDeclaration) { return (node as TypeAliasDeclNode*).alias_name; }
+        return SymbolStr::empty();
+    }
+
+    /// Pin each reference this import made to one of its own records to the
+    /// declaration it emitted for the reference's tag.  The C tags are this
+    /// import's namespace and it emitted every declaration in it, so this is
+    /// the importer answering its own names; a tag it emitted nothing for
+    /// (a filtered or functions-only import) stays unpinned and unanswered.
+    pin_record_refs(mut &this) -> void {
+        for (mut i: i64 = 0; i < this.ctx.c_ref_anns.length; i++) {
+            if (this.ctx.c_ref_decls[i] != 0 || !this.ctx.c_ref_alias[i].equals(this.alias)) { continue; }
+            for (mut j: i64 = 0; j < this.type_decl_tags.length; j++) {
+                if (this.type_decl_tags[j].equals(this.ctx.c_ref_tags[i])) {
+                    this.ctx.c_ref_decls[i] = this.type_decl_nodes[j] as u64;
+                    break;
+                }
+            }
+        }
     }
 
     /// Wrap an INTEGER-literal initializer in an explicit cast to the const's
@@ -1192,7 +1230,7 @@ type struct Importer {
             const dname: SymbolStr = this.cur_enum_dup_names[i];
             const dval:  i64       = this.cur_enum_dup_values[i];
             const ty: TypeAnnotation* =
-                this.types.named(this.types.qualify_under_alias(name_sym));
+                this.types.named(name_sym);
             mut lit: LiteralNode* = new LiteralNode(
                 fmt::format("%llu", dval as u64), LiteralKind::Integer, SourceSpan::none());
             this.emit_alias_const(dname, ty, lit as ExpressionNode*);
@@ -1757,7 +1795,7 @@ type struct Importer {
             const ty: TypeAnnotation* = if (tag.is_empty()) {
                 this.types.prim("i32")
             } else {
-                this.types.named(this.types.qualify_under_alias(tag))
+                this.types.named(tag)
             };
             mut lit: LiteralNode* =
                 new LiteralNode(fmt::format("%llu", value as u64), LiteralKind::Integer, SourceSpan::none());
@@ -1782,7 +1820,7 @@ type struct Importer {
             if (!this.type_names[i].equals(tsym)) { continue; }
             mut anode: TypeAliasDeclNode* = new TypeAliasDeclNode(name_sym, SourceSpan::none());
             anode.binding_namespace = this.alias;
-            anode.target_annotation = this.types.named(this.types.qualify_under_alias(tsym));
+            anode.target_annotation = this.types.named(tsym);
             this.seen_names.push(name_sym);
             this.type_names.push(name_sym);
             this.emit_top_level(anode as ASTNode*);
@@ -1929,7 +1967,7 @@ type struct Importer {
                 pin_carried: false,
             });
         }
-        this.emit_alias_const(name_sym, this.types.named(qualified), slit as ExpressionNode*);
+        this.emit_alias_const(name_sym, this.types.named(struct_node.name), slit as ExpressionNode*);
         return true;
     }
 
@@ -2381,6 +2419,7 @@ type struct Importer {
         // it only ever ADDS bindings - a macro that already bound keeps the
         // form it bound with.
         imp.probe_macro_constants(index, source_filename, unsaved, num_unsaved, &args);
+        imp.pin_record_refs();
         if (out_report != null) { imp.report.merge_into(out_report); }
         else                    { imp.report.summary(label); }
 

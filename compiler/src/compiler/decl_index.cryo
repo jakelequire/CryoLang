@@ -22,7 +22,7 @@ import compiler::types;
 import compiler::types::{ arena, compound, type_base, type_ref, TypeKind };
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, OverloadId, Res, ResSlot };
+import compiler::resolver::res::{ DefId, OverloadId, Res, ResSlot, DefTable };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import std::core::option;
@@ -136,6 +136,9 @@ type struct GlobalEntry {
 
 
 type struct DeclarationIndex {
+    /// The compilation's definitions, for a definition's path.  Borrowed;
+    /// set by `CompilationContext`, which owns it.
+    defs: DefTable*;
     // Function name -> FunctionType TypeRef (full signature in the arena)
     func_type_refs: HashMap<u32, TypeRef>;
 
@@ -332,6 +335,7 @@ type struct DeclarationIndex {
 
     static new() -> DeclarationIndex {
         return DeclarationIndex {
+            defs: null,
             func_type_refs:      HashMap::<u32, TypeRef>::new(),
             method_returns:      HashMap::<u64, TypeRef>::new(),
             type_map:            HashMap::<u32, TypeRef>::new(),
@@ -632,24 +636,20 @@ type struct DeclarationIndex {
         this.method_returns.insert(key, return_type);
     }
 
-    /// Register a named type (struct, class, enum, trait) under its
-    /// qualified name (e.g. "Module::Point"), with its visibility verdict.
-    /// Callers must qualify the name before calling.  The verdict is
+    /// Register the named type (struct, class, enum, trait, alias) that the
+    /// definition `def` is, with its visibility verdict.  The verdict is
     /// recorded here, with the key, so no registered type is ever asked
     /// about before it has one.
     ///
-    /// Returns the definition's id, which the caller stamps on the
-    /// declaration it registered: the registration is the one place that
-    /// knows the referent by construction, so the id is minted here and a
-    /// reader holding the node asks by it (`type_of_def`) rather than
-    /// re-deriving the key.
-    register_type(mut &this, qualified_name: SymbolStr, ty: TypeRef, is_public: boolean) -> DefId {
+    /// `def` is the id the declaration was given where it was declared - the
+    /// name layer's binding, a synthesizer's registration - and this makes
+    /// none of its own: a second id for one declaration would compare unequal
+    /// to the first.  The store stays keyed by the definition's path.
+    register_type(mut &this, def: DefId, ty: TypeRef, is_public: boolean) -> void {
+        const qualified_name: SymbolStr = this.defs.path_of(def);
         this.type_map.insert(qualified_name.id, ty);
-
-        const def: DefId = DefId::of_definition(qualified_name);
         this.type_reverse.insert(ty.id, def);
         this.decl_visibility.insert(qualified_name.id, is_public);
-        return def;
     }
 
     /// Register the concrete `Array<T>` specialization a dynamic `T[]`
@@ -678,8 +678,8 @@ type struct DeclarationIndex {
     /// touching the forward type_map.  Used to make additional TypeRefs
     /// (e.g., InstantiatedType, ArrayType) resolvable to an already-
     /// registered concrete type's qualified name.
-    register_type_reverse_only(mut &this, qualified_name: SymbolStr, ty: TypeRef) -> void {
-        this.type_reverse.insert(ty.id, DefId::of_definition(qualified_name));
+    register_type_reverse_only(mut &this, def: DefId, ty: TypeRef) -> void {
+        this.type_reverse.insert(ty.id, def);
     }
 
     /// Register a global with its defining module so codegen can walk the
@@ -751,7 +751,7 @@ type struct DeclarationIndex {
     /// do, so no caller projects a module's identity to a string to ask by.
     global_entry_in_module(&this, name: SymbolStr, module_id: DefId) -> GlobalEntry {
         if (!module_id.is_valid()) { return GlobalEntry::none(); }
-        return this.global_entry_at(this.global_slot(name, module_id.qualified_name()));
+        return this.global_entry_at(this.global_slot(name, this.defs.path_of(module_id)));
     }
 
     /// The `(leaf, namespace)` pair a global's registration slot is keyed
@@ -778,7 +778,7 @@ type struct DeclarationIndex {
         if (!d.is_valid()) { return GlobalEntry::none(); }
         mut leaf: SymbolStr = SymbolStr::empty();
         mut ns: SymbolStr = SymbolStr::empty();
-        DeclarationIndex::split_global_key(d.qualified_name(), intern, &leaf, &ns);
+        DeclarationIndex::split_global_key(this.defs.path_of(d), intern, &leaf, &ns);
         return this.global_entry_at(this.global_slot(leaf, ns));
     }
 
@@ -892,7 +892,7 @@ type struct DeclarationIndex {
                 func, intern);
             const method_sym: SymbolStr = func.name;
             const mangled_base: MangledName = MangledName::for_method_or_trait_impl(
-                intern, arena, type_qname, func.origin_trait.qualified_name(), method_sym, receiver_kind,
+                intern, arena, type_qname, this.defs.path_of(func.origin_trait), method_sym, receiver_kind,
                 method_param_refs, func.resolved_return_type, func.is_variadic);
             // Fold in a generic-method spec's type args (`$MG...`) so the DI stores
             // the same disambiguated symbol the codegen definition + mono pin use;
@@ -957,7 +957,7 @@ type struct DeclarationIndex {
     /// rather than turning it back into a name to key a lookup with.
     func_type_of_def(&this, d: DefId) -> TypeRef {
         if (!d.is_valid()) { return TypeRef::invalid(); }
-        return this.lookup_func_type(d.qualified_name());
+        return this.lookup_func_type(this.defs.path_of(d));
     }
 
     /// The TYPE the stamp `r` names, or invalid when it names no definition
@@ -1024,7 +1024,7 @@ type struct DeclarationIndex {
     /// definition is not a type.  Sibling of `func_type_of_def`.
     type_of_def(&this, d: DefId) -> TypeRef {
         if (!d.is_valid()) { return TypeRef::invalid(); }
-        return this.lookup_type(d.qualified_name());
+        return this.lookup_type(this.defs.path_of(d));
     }
 
     /// The return type of the method `method_sym` declared on the type
@@ -1065,7 +1065,7 @@ type struct DeclarationIndex {
 
     /// Reverse-lookup: get the SymbolStr for a TypeRef.
     lookup_type_name(&this, ty: TypeRef) -> SymbolStr {
-        return this.registered_def(ty).qualified_name();
+        return this.defs.path_of(this.registered_def(ty));
     }
 
     /// Register a free function's signature under its key `name`, emitted
@@ -1189,7 +1189,7 @@ type struct DeclarationIndex {
     /// the key its registration would have used.
     signature_refused_of_def(&this, d: DefId) -> boolean {
         if (!d.is_valid()) { return false; }
-        return this.signature_refused(d.qualified_name());
+        return this.signature_refused(this.defs.path_of(d));
     }
 
     /// `signature_refused` for a module's function named through the
@@ -1200,7 +1200,7 @@ type struct DeclarationIndex {
                                 intern: InternTable*) -> boolean {
         if (!module_id.is_valid()) { return false; }
         return this.signature_refused(intern.intern(fmt::format("%s::%s",
-            intern.resolve(module_id.qualified_name()), intern.resolve(member))));
+            intern.resolve(this.defs.path_of(module_id)), intern.resolve(member))));
     }
 
     /// Whether `func`'s written signature carries a name the name layer

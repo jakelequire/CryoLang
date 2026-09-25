@@ -46,7 +46,7 @@ import compiler::ast;
 import compiler::ast::{ declaration, expression, LiteralKind, node, NodeKind, TypeAnnotation };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::resolver::res;
-import compiler::resolver::res::{ Res, ResBase, ResSlot };
+import compiler::resolver::res::{ Res, ResBase, ResSlot, DefTable };
 import compiler::types::{ type_ref, arena };
 import compiler::types::type_base;
 import compiler::types::type_base::{ Type };
@@ -111,6 +111,9 @@ type struct ConstEntry {
 
 
 type struct ConstantTable {
+    /// The compilation's definitions, for a definition's path.  Borrowed;
+    /// set by `CompilationContext`, which owns it.
+    defs: DefTable*;
     entries: ConstEntry[];
     /// Qualified name id -> index into `entries`.
     by_qualified: HashMap<u32, i64>;
@@ -124,6 +127,7 @@ type struct ConstantTable {
 
     static new() -> ConstantTable {
         return ConstantTable {
+            defs: null,
             entries:            [],
             by_qualified:       HashMap::<u32, i64>::new(),
             enums:              [],
@@ -483,7 +487,7 @@ type struct ConstEval {
             ResSlot::Answered(r) => {
                 match (r) {
                     Res::Def(d) => {
-                        match (this.table.by_qualified.get(&d.qualified_name().id)) {
+                        match (this.table.by_qualified.get(&this.table.defs.path_of(d).id)) {
                             Option::Some(i) => { i }
                             Option::None    => { -1 }
                         }
@@ -533,7 +537,7 @@ type struct ConstEval {
         return match (r) {
             Res::Def(ns) => {
                 const key: SymbolStr = ConstantTable::intern_qualified(
-                    this.intern, ns.qualified_name(), member);
+                    this.intern, this.table.defs.path_of(ns), member);
                 if (!key.is_valid()) { return false; }
                 return match (this.table.by_qualified.get(&key.id)) {
                     Option::Some(i) => { this.fold_entry(i, out) }
@@ -546,7 +550,7 @@ type struct ConstEval {
                 if (trailing != 1) { return false; }
                 return match (base) {
                     ResBase::Def(q) => {
-                        const qn: SymbolStr = q.qualified_name();
+                        const qn: SymbolStr = this.table.defs.path_of(q);
                         return match (this.table.enums_by_qualified.get(&qn.id)) {
                             Option::Some(ei) => {
                                 ConstEval::variant_tag_of(
@@ -635,7 +639,7 @@ type struct ConstEval {
         return match (r) {
             Res::Def(ns) => {
                 const key: SymbolStr = ConstantTable::intern_qualified(
-                    this.intern, ns.qualified_name(), sr.member_name);
+                    this.intern, this.table.defs.path_of(ns), sr.member_name);
                 if (!key.is_valid()) { return false; }
                 return match (this.table.by_qualified.get(&key.id)) {
                     Option::Some(i) => { this.fold_entry_real(i, out) }

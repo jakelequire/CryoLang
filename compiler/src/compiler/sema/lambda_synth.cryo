@@ -53,7 +53,8 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
-import compiler::resolver::res::{ OverloadId, Res, ResSlot };
+import compiler::resolver::res;
+import compiler::resolver::res::{ OverloadId, Res, ResSlot, DefId, DefKind };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::sema::dispatch::{ SemaDispatch };
 import compiler::sema::scope_manager::{ ScopeManager };
@@ -281,16 +282,19 @@ type struct LambdaSynth {
         return outer_ty;
     }
 
-    /// Mint a unique closure type name `<ns>::__Closure_<N>`.
-    mint_closure_name(mut &this) -> SymbolStr {
+    /// Register the definition of a new closure struct, `<ns>::__Closure_<N>`,
+    /// in the module being lowered.  The synthesizer creates the declaration,
+    /// so this is its one registration; its name is the definition's path.
+    mint_closure_def(mut &this, span: SourceSpan) -> DefId {
         const idx: u64 = this.state.closure_counter;
         this.state.closure_counter += 1;
-        const ns_str: string = if (this.ctx.has_namespace()) {
-            this.ctx.namespace_display()
-        } else {
-            this.ctx.source_file
-        };
-        return this.intern.intern(fmt::format("%s::__Closure_%lld", ns_str, idx as i64));
+        if (this.ctx.has_namespace()) {
+            return this.ctx.register_in_module(this.ctx.namespace_str,
+                this.intern.intern(fmt::format("__Closure_%lld", idx as i64)), DefKind::Type, span);
+        }
+        return this.ctx.register_in_module(SymbolStr::empty(),
+            this.intern.intern(fmt::format("%s::__Closure_%lld", this.ctx.source_file, idx as i64)),
+            DefKind::Type, span);
     }
 
     /// The receiver of a method synthesized on a closure struct: the struct by
@@ -311,9 +315,10 @@ type struct LambdaSynth {
         const intern_ptr: InternTable* = this.intern;
         const arena_ptr: TypeArena* = this.arena;
 
-        const qual_name: SymbolStr = this.mint_closure_name();
-        const module_sym: SymbolStr = intern_ptr.intern(ctx_ptr.source_file);
         const span: SourceSpan = lambda.span;
+        const closure_def: DefId = this.mint_closure_def(span);
+        const qual_name: SymbolStr = ctx_ptr.defs.path_of(closure_def);
+        const module_sym: SymbolStr = intern_ptr.intern(ctx_ptr.source_file);
 
         // 1. StructDeclNode + FieldDeclNodes.
         mut struct_decl: StructDeclNode* = new StructDeclNode(qual_name, span);
@@ -487,7 +492,8 @@ type struct LambdaSynth {
         }
 
         // 7. DeclarationIndex registration.
-        struct_decl.def = ctx_ptr.decl_index.register_type(qual_name, struct_ref, true);
+        struct_decl.def = closure_def;
+        ctx_ptr.decl_index.register_type(closure_def, struct_ref, true);
         mut method_arr: MethodNode*[] = [method];
         if (drop_method != null) { method_arr.push(drop_method); }
         ctx_ptr.decl_index.register_methods(
@@ -562,7 +568,7 @@ type struct LambdaSynth {
             ResSlot::Answered(r) => { callee_res = r; }
             _ => {}
         }
-        const callee_q: SymbolStr = callee_res.def_id().qualified_name();
+        const callee_q: SymbolStr = this.ctx.defs.path_of(callee_res.def_id());
         if (!callee_q.is_valid()) {
             // A local fn-pointer cannot receive a closure struct: there is no
             // declaration to specialize, and the indirect call would treat
@@ -710,7 +716,7 @@ type struct LambdaSynth {
     /// The identifier of a closure-arg specialization of `orig`: the
     /// specialization encoding over the closure types, through the one
     /// mangler every specialization goes through.  A closure type's name is
-    /// its module and a per-build counter (`mint_closure_name`), so the
+    /// its module and a per-build counter (`mint_closure_def`), so the
     /// identifier is a function of the source; an arena id is not, and a
     /// symbol spelling one moves whenever an unrelated type is created
     /// earlier.

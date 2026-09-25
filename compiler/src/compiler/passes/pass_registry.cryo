@@ -86,7 +86,14 @@ import compiler::resolver::module_path::{ ModulePath };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::generic_registry;
-import compiler::types::generic_registry::{ LangModule };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangModule, LangItem };
+import compiler::resolver::res;
+import compiler::resolver::res::{ DefId, DefKind, Res, ResBase };
+import compiler::ast::expression;
+import compiler::ast::expression::{ ScopeResolutionNode, MemberAccessNode };
+import compiler::ast::pattern;
+import compiler::ast::pattern::{ EnumPatternNode };
 
 
 // PassStats: Per-pass execution statistics
@@ -898,7 +905,7 @@ type struct PassRegistry {
                     // TypeResolution's to own.
                     const struct_ref: TypeRef =
                         arena.create_struct(qualified_sym, struct_module_sym);
-                    node.def = ctx.decl_index.register_type(qualified_sym, struct_ref, node.is_public);
+                    ctx.decl_index.register_type(node.def, struct_ref, node.is_public);
                     // Whether this IS the language's `Array`, `Slice`, `Rc`, ...
                     // is decided by the identity, claimed where it is minted.
                     if (ctx.generic_registry != null) {
@@ -922,7 +929,7 @@ type struct PassRegistry {
                     const union_module_sym: SymbolStr = if (!node.binding_namespace.is_empty()) { node.binding_namespace } else { module_sym };
                     const union_ref: TypeRef =
                         arena.create_union(qualified_sym, union_module_sym);
-                    node.def = ctx.decl_index.register_type(qualified_sym, union_ref, node.is_public);
+                    ctx.decl_index.register_type(node.def, union_ref, node.is_public);
                     if (!qualified_sym.equals(node.name) && node.binding_namespace.is_empty()) {
                         ctx.decl_index.register_name_mapping(node.name, qualified_sym);
                     }
@@ -937,7 +944,7 @@ type struct PassRegistry {
                     const enum_module_sym: SymbolStr = if (!node.binding_namespace.is_empty()) { node.binding_namespace } else { module_sym };
                     const enum_ref: TypeRef =
                         arena.create_enum(qualified_sym, enum_module_sym);
-                    node.def = ctx.decl_index.register_type(qualified_sym, enum_ref, node.is_public);
+                    ctx.decl_index.register_type(node.def, enum_ref, node.is_public);
                     // Whether this IS the language's `Result`/`Option` - the enums
                     // `?` desugars through - is decided by the identity, claimed
                     // here where it is first minted, as a trait's is below.
@@ -954,7 +961,7 @@ type struct PassRegistry {
                     const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
                     const class_ref: TypeRef =
                         arena.create_class(qualified_sym, module_sym);
-                    node.def = ctx.decl_index.register_type(qualified_sym, class_ref, node.is_public);
+                    ctx.decl_index.register_type(node.def, class_ref, node.is_public);
                     if (ctx.generic_registry != null) {
                         ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
                     }
@@ -969,7 +976,7 @@ type struct PassRegistry {
                     const trait_ref: TypeRef =
                         arena.create_trait(qualified_sym, module_sym);
                     // A trait carries no visibility modifier: public.
-                    node.def = ctx.decl_index.register_type(qualified_sym, trait_ref, true);
+                    ctx.decl_index.register_type(node.def, trait_ref, true);
                     // Whether this IS the language's `Drop`/`Copy`/`Add`/... is
                     // decided by the identity, and claimed here, where the identity
                     // is first minted: an ownership query of a module resolved
@@ -1001,7 +1008,7 @@ type struct PassRegistry {
                     // aliases by qualified name during TypeResolution Phase 3
                     // (before Phase 4 populates the index for other types).
                     // An alias carries no visibility modifier: public.
-                    node.def = ctx.decl_index.register_type(qualified_alias, alias_ref, true);
+                    ctx.decl_index.register_type(node.def, alias_ref, true);
                     type_count++;
                 }
                 _ => {
@@ -1017,32 +1024,37 @@ type struct PassRegistry {
         // qualified name ("std::core::primitives::i32") so that codegen's
         // declare_method / codegen_method_prologue can resolve the target type
         // after qualify_symbol_sym prepends the namespace.
-        ctx.decl_index.register_type(ctx.intern("void"), arena.get_void(), true);
-        // Unit type `()`, registered under its display name so trait
-        // impls (`implement trait Drop for () { ... }`) resolve through the
-        // same canonical-target path as the other primitives.  Without
-        // this, TypeResolution falls through to `qualify_symbol_sym` and
-        // over-qualifies the impl with the impl-body's defining namespace
-        // (e.g. `std::core::drop::()`), producing a mangled name the call
-        // site can't reconstruct from a bare receiver.
-        ctx.decl_index.register_type(ctx.intern("()"), arena.get_unit(), true);
-        ctx.decl_index.register_type(ctx.intern("boolean"), arena.get_bool(), true);
-        ctx.decl_index.register_type(ctx.intern("char"), arena.get_char(), true);
-        ctx.decl_index.register_type(ctx.intern("string"), arena.get_string(), true);
-        ctx.decl_index.register_type(ctx.intern("i8"), arena.get_i8(), true);
-        ctx.decl_index.register_type(ctx.intern("i16"), arena.get_i16(), true);
-        ctx.decl_index.register_type(ctx.intern("i32"), arena.get_i32(), true);
-        ctx.decl_index.register_type(ctx.intern("i64"), arena.get_i64(), true);
-        ctx.decl_index.register_type(ctx.intern("i128"), arena.get_i128(), true);
-        ctx.decl_index.register_type(ctx.intern("u8"), arena.get_u8(), true);
-        ctx.decl_index.register_type(ctx.intern("u16"), arena.get_u16(), true);
-        ctx.decl_index.register_type(ctx.intern("u32"), arena.get_u32(), true);
-        ctx.decl_index.register_type(ctx.intern("u64"), arena.get_u64(), true);
-        ctx.decl_index.register_type(ctx.intern("u128"), arena.get_u128(), true);
-        ctx.decl_index.register_type(ctx.intern("isize"), arena.get_isize(), true);
-        ctx.decl_index.register_type(ctx.intern("usize"), arena.get_usize(), true);
-        ctx.decl_index.register_type(ctx.intern("f32"), arena.get_f32(), true);
-        ctx.decl_index.register_type(ctx.intern("f64"), arena.get_f64(), true);
+        // A primitive is declared nowhere, so its definition is made here -
+        // once per compilation, since this stage runs per module and a
+        // second registration would be a second id for one primitive.
+        if (!ctx.decl_index.registered_def(arena.get_void()).is_valid()) {
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "void"), arena.get_void(), true);
+            // Unit type `()`, registered under its display name so trait
+            // impls (`implement trait Drop for () { ... }`) resolve through the
+            // same canonical-target path as the other primitives.  Without
+            // this, TypeResolution falls through to `qualify_symbol_sym` and
+            // over-qualifies the impl with the impl-body's defining namespace
+            // (e.g. `std::core::drop::()`), producing a mangled name the call
+            // site can't reconstruct from a bare receiver.
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "()"), arena.get_unit(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "boolean"), arena.get_bool(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "char"), arena.get_char(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "string"), arena.get_string(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "i8"), arena.get_i8(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "i16"), arena.get_i16(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "i32"), arena.get_i32(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "i64"), arena.get_i64(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "i128"), arena.get_i128(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "u8"), arena.get_u8(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "u16"), arena.get_u16(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "u32"), arena.get_u32(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "u64"), arena.get_u64(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "u128"), arena.get_u128(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "isize"), arena.get_isize(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "usize"), arena.get_usize(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "f32"), arena.get_f32(), true);
+            ctx.decl_index.register_type(PassRegistry::primitive_def(ctx, "f64"), arena.get_f64(), true);
+        }
         // The alias keywords (`int`, `double`) register nothing: a name
         // written with one folds to the primitive it spells before any
         // index is asked (`ResBase::primitive_of_alias`), so no key holds
@@ -1053,12 +1065,54 @@ type struct PassRegistry {
                 type_count, arena.type_count());
         }
 
+        PassRegistry::settle_lang_refs(ctx);
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }
 
 
     // DirectiveProcessing: see compiler/passes/directive_processing.cryo.
 
+
+    /// A primitive's definition: a root of the definition tree, its spelling
+    /// the leaf.
+    static primitive_def(ctx: CompilationContext*, spelling: string) -> DefId {
+        const leaf: SymbolStr = ctx.intern(spelling);
+        return ctx.defs.register(DefId::invalid(), leaf, DefKind::Primitive, SourceSpan::none());
+    }
+
+    /// Answer every language-item reference the parser wrote whose item has
+    /// been claimed.  Run at the end of each module's type declarations: an
+    /// item is claimed by the stage that registers its declaration, and a
+    /// reference can precede its item in module order, so an unclaimed one
+    /// waits for a later module.  One claimed id answers every reference to
+    /// the item; none is made here.
+    static settle_lang_refs(ctx: CompilationContext*) -> void {
+        if (ctx.generic_registry == null) { return; }
+        mut kept: i64 = 0;
+        for (mut i: i64 = 0; i < ctx.lang_ref_nodes.length; i++) {
+            const item: LangItem = ctx.lang_ref_items[i];
+            const id: DefId = ctx.generic_registry.wellknown(item);
+            if (!id.is_valid()) {
+                ctx.lang_ref_nodes[kept] = ctx.lang_ref_nodes[i];
+                ctx.lang_ref_items[kept] = item;
+                kept++;
+                continue;
+            }
+            const node: ASTNode* = ctx.lang_ref_nodes[i] as ASTNode*;
+            if (node.kind == NodeKind::EnumPattern) {
+                (node as EnumPatternNode*).res.settle(Res::Def(id));
+            } else if (node.kind == NodeKind::ScopeResolution) {
+                (node as ScopeResolutionNode*).scope_res.settle(
+                    Res::TypeRelative(ResBase::Def(id), 1));
+            } else if (node.kind == NodeKind::MemberAccess) {
+                (node as MemberAccessNode*).set_resolved_trait(id);
+            }
+        }
+        while (ctx.lang_ref_nodes.length > kept) {
+            ctx.lang_ref_nodes.pop();
+            ctx.lang_ref_items.pop();
+        }
+    }
 
     // AutoImport Pass
 

@@ -249,7 +249,7 @@ CLASS_OF_METHOD = {
     "ModuleGraph::find_module_index":
         ("J", "module: a module by its namespace path"),
     "ModuleGraph::module_def":
-        ("J", "module: a module's definition by its namespace path, the id the graph made when it discovered the module"),
+        ("J", "module: a module's definition by its namespace path - the id the graph registered when it added the module, or the name layer's for a C import's module; a declaration asks it for its parent"),
     "ModuleGraph::reexport_closure":
         ("J", "module: a module's re-export closure by its namespace path"),
     "ModuleGraph::source_file_for_owner_key":

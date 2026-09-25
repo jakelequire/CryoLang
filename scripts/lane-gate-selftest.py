@@ -302,7 +302,15 @@ def _sealed_block(name):
 
 
 for _name, (_defn, _reason) in sorted(GATE_MOD.SEALED_TYPES.items()):
-    FILES[_defn] = FILES.get(_defn, "") + _sealed_block(_name)
+    _existing = FILES.get(_defn, "")
+    _head = "type struct %s {\n" % _name
+    if _head in _existing:
+        # A stub of that name is already there (a sealed type that is also an
+        # array exclusion, `DefTable`): it gains the private field rather than
+        # a twin, which the sealed check would read first.
+        FILES[_defn] = _existing.replace(_head, _head + "private:\n    slot: u32;\n", 1)
+    else:
+        FILES[_defn] = _existing + _sealed_block(_name)
 FIRST_SEALED = sorted(GATE_MOD.SEALED_TYPES)[0]
 _SEALED_DEFN = GATE_MOD.SEALED_TYPES[FIRST_SEALED][0]
 
@@ -324,7 +332,7 @@ BASELINE = {
     "REGISTRY_READ": 0, "REGISTRY_WRITE": 0, "GRAPH_READ": 0, "GRAPH_WRITE": 0,
     "CONST_READ": 0, "CONST_WRITE": 0,
     "REENTRY": 0, "HOME_WRITE": 0,
-    "DEFID_MINT": 0, "DEFID_UNWRAP": 0,
+    "DEFID_PATH": 0,
 }
 # The first exclusion in the gate's table, for the stale-exclusion mutation.
 FIRST_EXCLUDED = sorted(GATE_MOD.EXCLUDED)[0]
