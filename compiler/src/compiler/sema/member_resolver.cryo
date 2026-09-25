@@ -33,7 +33,7 @@ import compiler::types::generic_registry;
 import compiler::types::generic_registry::{ TemplateEntry };
 import compiler::types::generic_registry::{ LangItem };
 import compiler::ast::declaration::{
-    ClassDeclNode, FieldDeclNode, ImplBlockNode, StructDeclNode, UnionDeclNode
+    ClassDeclNode, FieldDeclNode, ImplBlockNode, MethodNode, StructDeclNode, UnionDeclNode
 };
 import compiler::ast::expression::{
     ArrayAccessNode, CallExprNode, ExpressionNode, MemberAccessNode, UnaryExprNode
@@ -44,6 +44,8 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res::{ DefId };
+import compiler::resolver::module_path;
+import compiler::resolver::module_path::{ ModulePath };
 import compiler::sema::diagnostics::{ Diagnostics };
 import compiler::sema::dispatch::{ SemaDispatch };
 import compiler::sema::helpers::{ parse_tuple_index, sema_const_int_index };
@@ -628,94 +630,62 @@ type struct MemberResolver {
 
     // -- Visibility enforcement --
 
-    /// True when `candidate` is `ancestor_id` or descends from it through the
-    /// class base chain (depth-guarded).  Permits `protected` access from subclasses.
-    is_subclass_of(mut &this, candidate: Type*, ancestor_id: u64) -> boolean {
-        mut cur: Type* = candidate;
-        mut depth: i32 = 0;
-        while (cur != null && depth < 32) {
-            if (cur.id == ancestor_id) { return true; }
-            if (cur.kind != TypeKind::Class) { return false; }
-            const cc: ClassType* = cur as ClassType*;
-            if (cc.has_base && cc.base_class.is_valid()) {
-                cur = this.arena.lookup(cc.base_class.id);
-            } else {
-                return false;
-            }
-            depth += 1;
-        }
-        return false;
+    /// Whether code written at `span` may reach a member declared in module
+    /// `decl`.  A `private` member is reachable from its declaring module
+    /// only; a `protected` one from that module and every module nested
+    /// under it.  Which module the code is in is the module that owns the
+    /// syntax's own file - never the type the walk is inside - so an
+    /// `implement` block written in another module is outside however it
+    /// names the type, a free function beside the type is inside, and a
+    /// lowered `async` body, whose statements keep the spans they were
+    /// written with, keeps the access of where it was written.
+    ///
+    /// An unknown use site or declaring module is not judged: reading "I do
+    /// not know where this was written" as "somewhere else" is the false
+    /// positive the callee gate was reverted for.
+    member_reachable(&this, decl: ModulePath, is_protected: boolean,
+                     span: SourceSpan) -> boolean {
+        const use_site: ModulePath = ModulePath::of(this.ctx.module_ns_sym_of_file(span.file));
+        if (!use_site.is_valid() || !decl.is_valid()) { return true; }
+        if (use_site.equals(decl)) { return true; }
+        return is_protected && use_site.is_within(decl, this.intern);
     }
 
-    /// The type whose method body a generated `async` future carries, or null
-    /// when `owner` is not such a future.
-    ///
-    /// Lowering an `async` METHOD moves its statements verbatim into the `poll`
-    /// of a synthesized future struct.  From that point the enclosing type is the
-    /// future rather than the method's owner, so a body that reads its own type's
-    /// private fields would be judged an outsider (E0353) - even though nothing
-    /// about it left the type, and the very same statements passed the check
-    /// before lowering.  Granting the future its origin's access is what keeps
-    /// `async` from being a visibility downgrade.
-    ///
-    /// The origin is read off the receiver slot the future stores it in - the
-    /// slot the lowering recorded on the struct when it minted the field
-    /// (`StructType.async_recv_slot`); no user-written struct carries one, and
-    /// a free `async function`'s future has no receiver slot, so it inherits
-    /// nothing.
-    async_origin_owner(&this, owner: TypeRef) -> Type* {
-        mut t: Type* = this.arena.lookup(owner.id);
-        if (t != null && t.kind != TypeKind::Struct) {
-            // A future generic in its owner arrives as an `InstantiatedType`
-            // whose fields specialization has not filled in yet; the template it
-            // came from is what carries the slot.
-            const base: TypeRef = this.arena.inst_generic_base(owner);
-            t = if (base.is_valid()) { this.arena.lookup(base.id) } else { null };
-        }
-        if (t == null || t.kind != TypeKind::Struct) { return null; }
-        const st: StructType* = t as StructType*;
-        const recv: FieldInfo* = st.async_recv_field();
-        if (recv == null) { return null; }
-        // The slot is a pointer for a `&this` receiver and the owner by value
-        // otherwise; either way this peels to the owner itself.
-        return this.types.unwrap_to_base_type(recv.field_type);
+    /// The module a user-defined type is declared in.
+    type_module(&this, t: Type*) -> ModulePath {
+        if (t == null) { return ModulePath::none(); }
+        if (t.kind == TypeKind::Struct) { return ModulePath::of((t as StructType*).module_name); }
+        if (t.kind == TypeKind::Class) { return ModulePath::of((t as ClassType*).module_name); }
+        return ModulePath::none();
     }
 
-    /// Emit E0353 when a private/protected field is accessed outside its declaring
-    /// type (allowing `protected` from subclasses).  No-op for public/non-aggregate.
-    /// `field` and `declaring_t` are the entry and the declaring type the
-    /// caller's lookup found (`check_field_access`); `field_name` is the
-    /// spelling, for the diagnostic alone.  Nothing here finds the field
-    /// again.
+    /// Emit E0353 when a private or protected field is reached from outside
+    /// the module that may reach it (`member_reachable`).  A field is
+    /// declared where its type is.  `field` and `declaring_t` are the entry
+    /// and the declaring type the caller's lookup found (`check_field_access`);
+    /// `field_name` is the spelling, for the diagnostic alone.  Nothing here
+    /// finds the field again.
     enforce_field_visibility(mut &this, field: FieldInfo*, declaring_t: Type*,
                              field_name: SymbolStr, span: SourceSpan) -> void {
         if (field == null || declaring_t == null) { return; }
-        const declaring_name: string = declaring_t.display_name();
         if (field.is_public) { return; }
+        const decl: ModulePath = this.type_module(declaring_t);
+        if (this.member_reachable(decl, field.is_protected, span)) { return; }
 
-        if (this.state.current_owner_type.is_valid()) {
-            const owner: Type* = this.types.unwrap_to_base_type(this.state.current_owner_type);
-            if (owner != null && declaring_t != null) {
-                if (owner.id == declaring_t.id) { return; }
-                if (field.is_protected && this.is_subclass_of(owner, declaring_t.id)) { return; }
-            }
-            const origin: Type* = this.async_origin_owner(this.state.current_owner_type);
-            if (origin != null && declaring_t != null) {
-                if (origin.id == declaring_t.id) { return; }
-                if (field.is_protected && this.is_subclass_of(origin, declaring_t.id)) { return; }
-            }
-        }
-
+        const declaring_name: string = declaring_t.display_name();
         const vis_word: string = if (field.is_protected) { "protected" } else { "private" };
         const field_str: string = this.intern.resolve(field_name);
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
             fmt::format("field `%s` of `%s` is %s", field_str, declaring_name, vis_word));
-        d = d.at_with_label(span, fmt::format("%s field accessed outside `%s`", vis_word, declaring_name));
+        d = d.at_with_label(span, fmt::format("%s field reached outside module `%s`",
+            vis_word, this.intern.resolve(decl.as_sym())));
         this.ctx.emit_diagnostic(d);
     }
 
-    /// Method-call counterpart to `enforce_field_visibility` (E0353).
+    /// Method-call counterpart to `enforce_field_visibility` (E0353).  A
+    /// method is declared where its declaration is written, which for one in
+    /// an `implement` block is the block's module, not its type's.
     ///
     /// Reached from both lanes that offer a method: a member access and a
     /// static `Type::method()` path.  The static lane reached no gate at all
@@ -727,19 +697,17 @@ type struct MemberResolver {
         if (base == null) { return; }
 
         mut method: MethodInfo* = null;
-        mut declaring_t: Type* = null;
         mut declaring_name: string = "";
 
         if (base.kind == TypeKind::Struct) {
             mut st: StructType* = base as StructType*;
             method = st.get_method(method_name);
-            if (method != null) { declaring_t = base; declaring_name = st.display_name(); }
+            if (method != null) { declaring_name = st.display_name(); }
         } else if (base.kind == TypeKind::Class) {
             mut current: ClassType* = base as ClassType*;
             while (current != null) {
                 method = current.get_method(method_name);
                 if (method != null) {
-                    declaring_t = current as Type*;
                     declaring_name = current.display_name();
                     break;
                 }
@@ -758,26 +726,20 @@ type struct MemberResolver {
 
         if (method == null) { return; }
         if (method.is_public) { return; }
-
-        if (this.state.current_owner_type.is_valid()) {
-            const owner: Type* = this.types.unwrap_to_base_type(this.state.current_owner_type);
-            if (owner != null && declaring_t != null) {
-                if (owner.id == declaring_t.id) { return; }
-                if (method.is_protected && this.is_subclass_of(owner, declaring_t.id)) { return; }
-            }
-            const origin: Type* = this.async_origin_owner(this.state.current_owner_type);
-            if (origin != null && declaring_t != null) {
-                if (origin.id == declaring_t.id) { return; }
-                if (method.is_protected && this.is_subclass_of(origin, declaring_t.id)) { return; }
-            }
-        }
+        // A method no declaration was written for has no module to be
+        // private to.
+        const node: MethodNode* = method.ast_node as MethodNode*;
+        if (node == null) { return; }
+        const decl: ModulePath = ModulePath::of(this.ctx.module_ns_sym_of_file(node.span.file));
+        if (this.member_reachable(decl, method.is_protected, span)) { return; }
 
         const vis_word: string = if (method.is_protected) { "protected" } else { "private" };
         const method_str: string = this.intern.resolve(method_name);
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
             fmt::format("method `%s` of `%s` is %s", method_str, declaring_name, vis_word));
-        d = d.at_with_label(span, fmt::format("%s method called outside `%s`", vis_word, declaring_name));
+        d = d.at_with_label(span, fmt::format("%s method called outside module `%s`",
+            vis_word, this.intern.resolve(decl.as_sym())));
         this.ctx.emit_diagnostic(d);
     }
 

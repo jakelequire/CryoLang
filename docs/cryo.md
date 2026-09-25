@@ -1243,21 +1243,39 @@ type struct Point {
 
 ### 8.2 Fields and Visibility
 
-Struct fields are **public by default** - readable and writable wherever the struct itself is visible. Restrict a field with `private`; a private field is then accessible only from within the declaring type's own methods (enforced as `E0353`), so it is hidden even from free functions in the same module. Visibility blocks group fields that share an access level:
+Struct fields are **public by default** - readable and writable wherever the struct itself is visible. Restrict a field with `private`; a private field is then accessible only from the **module that declares the struct** (enforced as `E0353`). Which module code is in is the module whose file it is written in, not the type it belongs to: a free function beside the struct may read the field, and an `implement` block written in another module may not, however it names the type. Visibility blocks group fields that share an access level:
 
 ```cryo
 type struct Rect {
 private:
-    cached_area: int;   // only Rect's own methods may touch this
+    cached_area: int;   // only code in Rect's own module may touch this
 public:
     width:  int;
     height: int;
 }
 ```
 
-Visibility may also be declared per-field with a leading `private` / `public`. Within a struct, only `public:` and `private:` blocks are valid; `protected:` is reserved for classes (where it extends access to subclasses). Class members carry **no default** - every field and method must appear inside an explicit visibility block.
+A struct literal sets every field of the struct, including the ones it leaves to their defaults, so **a literal may be written only where every field is visible**. One private field and code outside the module cannot write the literal at all; it goes through a constructor the module provides. Setting a private field is the more dangerous operation, not the less: reading one leaks information, while setting one breaks the invariant the field exists to protect, so there is no exception for construction.
 
-> Field visibility (a `private` *field* -> type-scoped, `E0353`) is a different axis from a top-level type being `private` (module-scoped, `E0503` - see [section 14.4](#144-visibility)). A `public` struct may have `private` fields, and a `private` struct's fields are public to the rest of its own module.
+```cryo
+// module app::money
+type struct Cents {
+private:
+    n: i64;
+public:
+    static of(n: i64) -> Cents { return Cents { n: n }; }   // the module builds it
+}
+
+// module app::report
+const c: Cents = Cents { n: 5 };       // E0353: field `n` of `Cents` is private
+const d: Cents = Cents::of(5);         // fine
+```
+
+Visibility may also be declared per-field with a leading `private` / `public`. Within a struct, only `public:` and `private:` blocks are valid; `protected:` is reserved for classes, where it reaches the declaring module **and every module nested under it** (`app::net::tcp` is under `app::net`). Class members carry **no default** - every field and method must appear inside an explicit visibility block.
+
+A method is declared in the module its declaration is written in: a `private` method in an `implement` block is private to the block's module, not to the module of the type it extends.
+
+> Field visibility (a `private` *field*, `E0353`) is a different axis from a top-level type being `private` (`E0503` - see [section 14.4](#144-visibility)); both are scoped to the declaring module. A `public` struct may have `private` fields, and a `private` struct's fields are public to the rest of its own module.
 
 Fields may declare **default values** with `= <expr>`. When a struct literal
 omits a field that has a default, the default is used; a field with no default
@@ -2309,8 +2327,8 @@ Wildcard imports are convenient but can cause name collisions; prefer the brace 
 | Modifier            | Meaning                                                                                  |
 | ------------------- | ---------------------------------------------------------------------------------------- |
 | *(none)* / `public` | Accessible to any module that imports this one. This is the default for top-level items. |
-| `private`           | Accessible only within the same module.                                                  |
-| `protected`         | Class-only; accessible to the class and its subclasses.                                  |
+| `private`           | Accessible only within the declaring module - for items and members alike.               |
+| `protected`         | Class members only; accessible within the declaring module and every module under it.    |
 
 Top-level items are **public by default**; mark an item `private` to confine it to its own module. For top-level types (`struct` / `class` / `enum`), `private` is enforced across modules: naming a `private` type from another module - in a type annotation, a struct literal, or a function signature - is rejected with `E0503`. A `private` type remains fully usable within its own module.
 
