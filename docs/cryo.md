@@ -82,6 +82,13 @@ A member position is never a declaration or an operator, so the keyword is unamb
 
 The exceptions are the keywords a member position reads *first*: `public`, `private` and `protected` open a visibility label, and `static`, `virtual`, `override` and `async` are member modifiers. A field with one of those seven names cannot be declared, and a C struct carrying one still needs a `![repr(C)]` shadow struct.
 
+A **binding** is the other way round. A statement that begins with a keyword opening a declaration is parsed as that declaration, so a local named by one could never be assigned or called through: `module = q;` is not an assignment. The 19 keywords that open a declaration - `function`, `const`, `mut`, `type`, `struct`, `class`, `enum`, `trait`, `import`, `module`, `extern`, `implement`, `public`, `private`, `protected`, `namespace`, `intrinsic`, `static`, `async` - therefore cannot name a variable, a parameter, a pattern binding or a destructured local (`E0100`), as keywords are not identifiers in Rust. Keywords that open nothing (`default`, `string`) remain legal names, and a destructuring shorthand over a field named by one of the 19 needs a rename: `const { type: t }: S = s;`.
+
+```cryo
+const module: i32 = 42;                  // E0100: expected a variable name, found `module`, which is a reserved word
+match (r) { R::D(static) => { .. } }     // E0100: expected a binding name
+```
+
 | Control flow | Declarations    |             | Modifiers   | Operator keywords | Special values | Reserved for future use |
 | ------------ | --------------- | ----------- | ----------- | ----------------- | -------------- | ----------------------- |
 | `if`         | `function`      | `from`      | `const`     | `new`             | `true`         | `yield`                 |
