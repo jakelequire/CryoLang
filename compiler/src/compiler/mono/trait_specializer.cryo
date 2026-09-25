@@ -398,7 +398,7 @@ type struct MonoTraitSpecializer {
     /// surviving impls, drop any methods
     /// whose own where-bounds don't hold.  Returns the pruned impl-AST array.
     filter_bounds_violating_impls(mut &this, impl_asts: &ASTNode*[],
-                                   subst: TypeSubstitution*, type_args: &TypeRef[]) -> ASTNode*[] {
+                                   type_args: &TypeRef[]) -> ASTNode*[] {
         mut kept: ASTNode*[] = [];
         for (mut i: i64 = 0; i < impl_asts.length; i++) {
             const impl_ast: ASTNode* = impl_asts[i];
@@ -412,19 +412,28 @@ type struct MonoTraitSpecializer {
                     && !GenericRegistry::head_matches_args(impl_node, type_args, this.arena, this.intern_table)) {
                 continue;
             }
-            // The impl's bounds are written on its own parameters, bound
-            // through its head - not on the template's, which the impl may
-            // spell differently.
-            mut head: TypeSubstitution = TypeSubstitution::empty();
-            this.trait_checker.add_head_param_bindings(impl_node, type_args, &head);
+            // The impl's bounds, and its methods', are written on its own
+            // parameters, bound through its head - not on the template's,
+            // which the impl may spell differently.
+            mut head: TypeSubstitution = this.head_bindings(impl_node, type_args);
             if (!this.bounds_satisfied(impl_node.where_bounds, &head)) {
                 continue;
             }
-            mut impl_filtered: MethodNode*[] = this.filter_methods(impl_node.methods, subst);
+            mut impl_filtered: MethodNode*[] = this.filter_methods(impl_node.methods, &head);
             swap(&impl_node.methods, &impl_filtered);
             kept.push(impl_ast);
         }
         return kept;
+    }
+
+    /// An implement block's own parameters bound to an instantiation's
+    /// arguments through its head (`U` in `implement<U> .. for Wrap<U>`,
+    /// for `Wrap<Num>`, to `Num`): the substitution everything written
+    /// inside the block is read under.
+    head_bindings(&this, impl_node: ImplBlockNode*, type_args: &TypeRef[]) -> TypeSubstitution {
+        mut head: TypeSubstitution = TypeSubstitution::empty();
+        this.trait_checker.add_head_param_bindings(impl_node, type_args, &head);
+        return head;
     }
 
     /// Keep only methods whose per-method where-bounds are satisfied by `subst`.

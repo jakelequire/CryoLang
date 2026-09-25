@@ -37,7 +37,7 @@ import compiler::resolver::res::{ DefId };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ PointerType };
 import compiler::types::generic::{ GenericParamType };
-import compiler::types::generic_registry::{ GenericRegistry };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::ownership::{ OwnershipQuery };
@@ -283,19 +283,75 @@ type struct TraitChecker {
         if (impl_block == null || subst == null) { return; }
         if (impl_block.target_args.length != args.length) { return; }
         for (mut gi: i64 = 0; gi < impl_block.target_args.length; gi++) {
-            const ta: TypeAnnotation* = impl_block.target_args[gi];
-            if (ta == null) { continue; }
-            match (*ta) {
-                TypeAnnotation::Named(n) => {
-                    // `lookup_subst_for_param` keys by the GenericParam's
-                    // name, so the index here only has to make a GenericParam
-                    // TypeRef; the name is what matters.
-                    const gp_ref: TypeRef = this.arena.create_generic_param(n.name, gi as u64);
-                    subst.add(gp_ref.id, args[gi]);
-                }
-                _ => {}
-            }
+            const gp_ref: TypeRef = this.head_param_type(impl_block, gi);
+            if (gp_ref.is_valid()) { subst.add(gp_ref.id, args[gi]); }
         }
+    }
+
+    /// The type of the parameter an implement block's head writes at
+    /// position `index` (`U` in `.. for Wrap<U>`, at 0), or invalid where
+    /// the head writes a type there.
+    head_param_type(&this, impl_block: ImplBlockNode*, index: i64) -> TypeRef {
+        if (impl_block == null || index < 0 || index >= impl_block.target_args.length) {
+            return TypeRef::invalid();
+        }
+        const ta: TypeAnnotation* = impl_block.target_args[index];
+        if (ta == null) { return TypeRef::invalid(); }
+        match (*ta) {
+            TypeAnnotation::Named(n) => {
+                if (n.param_sym().is_valid()) {
+                    return this.arena.create_generic_param(n.name, index as u64);
+                }
+            }
+            _ => {}
+        }
+        return TypeRef::invalid();
+    }
+
+    /// The inverse of `add_head_param_bindings` over the owner's own
+    /// parameters: the owner's parameter at each position (`owner_params`,
+    /// the template's parameter types in declaration order) read as the
+    /// impl's parameter the head writes there.  A generic impl's body is
+    /// walked with `this` typed as the template, so a type computed from a
+    /// field names the owner's parameters while the impl's bounds name its
+    /// own; this is the substitution between them.  A position is skipped
+    /// where the owner's parameter type is also the head's parameter at
+    /// another position (`.. for Pair<B, A>` over `Pair<A, B>`): while two
+    /// parameters spelled alike are one type, a type there cannot say which
+    /// of the two it means.
+    add_owner_to_head_bindings(&this, impl_block: ImplBlockNode*, owner_params: &u64[],
+                               subst: TypeSubstitution*) -> void {
+        if (impl_block == null || subst == null) { return; }
+        if (impl_block.target_args.length != owner_params.length) { return; }
+        for (mut gi: i64 = 0; gi < owner_params.length; gi++) {
+            const head_t: TypeRef = this.head_param_type(impl_block, gi);
+            if (!head_t.is_valid() || head_t.id == owner_params[gi]) { continue; }
+            mut crossed: boolean = false;
+            for (mut gj: i64 = 0; gj < owner_params.length; gj++) {
+                if (gj == gi) { continue; }
+                const other: TypeRef = this.head_param_type(impl_block, gj);
+                if (other.is_valid() && other.id == owner_params[gi]) { crossed = true; break; }
+            }
+            if (crossed) { continue; }
+            subst.add(owner_params[gi], head_t);
+        }
+    }
+
+    /// `ty`, computed in the body of `impl_block`, with the owner's
+    /// parameters read as the impl's (`add_owner_to_head_bindings`).  The
+    /// owner is the template the head's stamp names.  Unchanged when `ty`
+    /// mentions no parameter or the head names no template.
+    owner_type_through_head(&this, impl_block: ImplBlockNode*, ty: TypeRef) -> TypeRef {
+        if (impl_block == null || !ty.is_valid() || this.generic_registry == null) { return ty; }
+        if (!this.arena.contains_generic_param(ty)) { return ty; }
+        const tmpl: TemplateEntry* = this.generic_registry.template_of(impl_block.target_def());
+        if (tmpl == null) { return ty; }
+        mut subst: TypeSubstitution = TypeSubstitution::empty();
+        this.add_owner_to_head_bindings(impl_block, &tmpl.param_type_ids, &subst);
+        if (subst.param_ids.length == 0) { return ty; }
+        const out: TypeRef = subst.apply(ty, this.arena);
+        if (!out.is_valid()) { return ty; }
+        return out;
     }
 
     /// Lenient "does `ty` implement `trait_name`" check for verifying an

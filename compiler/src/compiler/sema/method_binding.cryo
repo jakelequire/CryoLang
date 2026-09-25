@@ -133,6 +133,28 @@ type struct MethodBinding {
         return out;
     }
 
+    /// `ty` as the enclosing implement block reads it.  A generic impl's
+    /// body is walked with `this` typed as the template, so a type computed
+    /// from a field names the owner's parameters (`BufStream`'s `S`), while
+    /// the impl's bounds - its own and its methods' - are written on the
+    /// impl's parameters; the owner's parameter at each position is read as
+    /// the one the head writes there.  Unchanged outside an impl.
+    through_impl_head(mut &this, ty: TypeRef) -> TypeRef {
+        const impl_node: ImplBlockNode* = this.state.symbolic_impl_node;
+        if (impl_node == null) { return ty; }
+        return this.trait_checker().owner_type_through_head(impl_node, ty);
+    }
+
+    /// The spelling of the generic parameter `ty` names, read through the
+    /// enclosing impl's head (`through_impl_head`); empty when `ty` is not a
+    /// parameter.
+    param_name_through_impl_head(mut &this, ty: TypeRef) -> SymbolStr {
+        const seen: TypeRef = this.through_impl_head(ty);
+        const t: Type* = this.arena.lookup(seen.id);
+        if (t == null || t.kind != TypeKind::GenericParam) { return SymbolStr::empty(); }
+        return (t as GenericParamType*).param_name;
+    }
+
     /// Mono-after-sema keystone (method path): substitute a concrete receiver
     /// instantiation's type_args into a method's still-abstract bare-lookup return
     /// (`Slice<u8>::get -> Option<u8>`).  Returns `ret` unchanged when it's already
@@ -308,8 +330,7 @@ type struct MethodBinding {
                 t as AssocProjectionType*, walk, method_name);
         }
         if (t.kind == TypeKind::GenericParam) {
-            return this.lookup_method_through_param_bounds(
-                (t as GenericParamType*).param_name, walk, method_name);
+            return this.lookup_method_through_param_bounds(walk, walk, method_name);
         }
         // A generic owner instantiated at a still-abstract argument (`H<S>` built
         // inside a generic function) is "unresolved" only in its ARGUMENTS: the
@@ -331,8 +352,9 @@ type struct MethodBinding {
     /// A parameter's bounds live on the enclosing function/impl node, not on
     /// its type, so they are read there. The bare-parameter sibling of
     /// `lookup_method_through_projection_bounds`.
-    lookup_method_through_param_bounds(mut &this, param: SymbolStr, recv: TypeRef,
+    lookup_method_through_param_bounds(mut &this, param_ty: TypeRef, recv: TypeRef,
                                        method_name: SymbolStr) -> TypeRef {
+        const param: SymbolStr = this.param_name_through_impl_head(param_ty);
         if (!param.is_valid()) { return TypeRef::invalid(); }
         if (this.state.symbolic_current_func != null) {
             const r: TypeRef = this.scan_param_bounds(
@@ -390,8 +412,9 @@ type struct MethodBinding {
     /// A parameter constrained by a WHERE clause rather than inline stays a
     /// plain `GenericParam` whose bounds live on the enclosing function/impl
     /// node, so the receiver's own type cannot answer this.
-    param_types_through_param_bounds(mut &this, param: SymbolStr, method_name: SymbolStr,
+    param_types_through_param_bounds(mut &this, param_ty: TypeRef, method_name: SymbolStr,
                                      arg_count: i64) -> TypeRef[] {
+        const param: SymbolStr = this.param_name_through_impl_head(param_ty);
         if (!param.is_valid()) { return []; }
         if (this.state.symbolic_current_func != null) {
             const r: TypeRef[] = this.scan_param_bound_param_types(

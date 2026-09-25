@@ -120,7 +120,7 @@ instrument condition one's list is drawn from; its J count is not a target.
 Checks:
 
 * `python3 scripts/ns-migration/done.py --outstanding | wc -l` → **14** (23 before §8.333-§8.335: the six owner doors asked by the self type's name and both `get_template` lines, B and C, are gone, and `lookup_type_exact` is called only inside the funnel's own file; 25 before §8.331 converted the self-growth check and the two written-name scans; condition one's list, one line per function or hand-written scan and class - `get_template` is on two lines, B and C; 30 before §8.330 converted the four trait lookups and one scan)
-* `python3 scripts/ns-migration/done.py --name-taking | wc -l` → **1098** (condition two's population, all of it unplaced; 1,099 before §8.339, where `claim_wellknown` stopped taking a name; 1,109 before §8.333-§8.335: eleven functions - the owner and scope-segment doors and their helpers - stopped taking a name or were deleted, and the parser's `refuse_declaration_keyword_name` takes a diagnostic label; 1,110 before §8.332, where `register_impl_block`, `refuse_elided_template_params` and `set_resolved_template` stopped taking a name and `template_in` / `member_template_key` take the member's leaf; 1,113 before §8.331; 1,136 before §8.330, whose trait carriers stopped taking a name in 23 functions)
+* `python3 scripts/ns-migration/done.py --name-taking | wc -l` → **1099** (condition two's population, all of it unplaced; 1,098 before §8.348, which added `register_methods_through`, taking a diagnostic `site` label as `register_methods` does; 1,099 before §8.339, where `claim_wellknown` stopped taking a name; 1,109 before §8.333-§8.335: eleven functions - the owner and scope-segment doors and their helpers - stopped taking a name or were deleted, and the parser's `refuse_declaration_keyword_name` takes a diagnostic label; 1,110 before §8.332, where `register_impl_block`, `refuse_elided_template_params` and `set_resolved_template` stopped taking a name and `template_in` / `member_template_key` take the member's leaf; 1,113 before §8.331; 1,136 before §8.330, whose trait carriers stopped taking a name in 23 functions)
 
 ### 0.1 Decisions
 
@@ -169,7 +169,7 @@ measurement that decided it on the row.
 | D36 | **A receiver is written explicitly in user source**, as in Rust; no implicit receiver. A method the compiler generates (a closure's call operator, ..) still gets one synthesized. Its own unit (Jake, relayed in plain text 2026-09-26) | **RULED** | `no check` — not built | §8.344 |
 | D37 | **The reference-mutability check waits until after merge**, and when it lands it runs BEFORE the async lowering, which turns an async method's `this` into a raw pointer so that a check after it cannot see the declared receiver (Jake, relayed in plain text 2026-09-26) | **RULED** | `no check` — not built | §8.344 |
 | D38 | **The bare-leaf store goes before merge; the eight bare-name finders wait until after, as a written exception** lifted by a test harness for the editor's answers (Jake, relayed in plain text 2026-09-26; condition one above carries the exception and its reason) | **RULED** | `no check` — not built | §8.345 |
-| D39 | **The generic-parameter converge work starts**: an implement block's parameters bind through its head (option B), one place per step, each step flipping one kind of program from refused to accepted (Jake, relayed in plain text 2026-09-26) | **RULED; step one TAKEN (§8.347)** - the monomorphizer's filter of kept impls binds through the head; eight places and the seven comparisons remain | `grep -c 'add_head_param_bindings(impl_node' compiler/src/compiler/mono/trait_specializer.cryo` → **1** | §8.343, §8.347 |
+| D39 | **The generic-parameter converge work starts**: an implement block's parameters bind through its head (option B), one place per step, each step flipping one kind of program from refused to accepted (Jake, relayed in plain text 2026-09-26) | **RULED; the nine head-binding places TAKEN (§8.347, §8.348)** - every place §8.343 counted binds an impl's parameters through its head (to an instantiation's arguments, to the owner's own parameters for the declaration index, and the owner's read as the impl's in a body walked with `this` as the template); the seven comparisons and the arena flip remain | `grep -rho -e 'add_head_param_bindings(' -e 'add_owner_to_head_bindings(' compiler/src \| wc -l` → **6** (the two definitions; the trait checker's nested check, the monomorphizer's head bindings, the declaration index's returns, the owner's parameters read as the impl's) | §8.343, §8.347, §8.348 |
 
 **D18's keyword half is RULED and UNBUILT - built once and backed out at a parse fork the ruling did not cover (§8.295: `x as u32 < y`), and waiting on that one ruling - and D32 is the criterion it is built toward** (D5 was, until §8.206; D2 and D9 were,
 until §8.213; D24 was, until §8.233 - this line kept naming it for forty-six entries after its row said TAKEN, §8.280; Q2 was, until §8.259; D25 was, until §8.263; D30's refusal was, until §8.268; D28 was, until §8.270; D30's identity half was, until §8.272; D31 was, until §8.278). Each was decided by Jake - D18 and D2 then re-parked as open
@@ -305,7 +305,7 @@ three, and its row carries the count. Read each zero off its own row.
 | a binding reaching the move checker or drop insertion with NO identity (skipped at five entry points: untracked by the one, released regardless by the other, a payload's subject released too) | **DELETED** - an internal compiler error, E0900 at the binding (`require_identity` in each pass, `CompilationContext::ice_at`), Jake's ruling. Measured at 0 over six halves before building | two mutations, each removing one identity in the name layer: without the check each program silently frees a value twice, with it each is refused E0900 | `grep -c 'require_identity(' compiler/src/compiler/passes/move_check.cryo` → **4** (+1 in §8.313, the catch-all binding); `grep -c 'require_identity(' compiler/src/compiler/passes/drop_insertion.cryo` → **5** (+1 in §8.313, the same) | §8.310 |
 | an associated type answered by REGISTRATION ORDER when a projection names no trait (`resolve_concrete_member` with no owner: the first registered trait the base implements that declares a member of that spelling - `This::Item` in a trait's own default body read `Iterator`'s `Item` on a type implementing both, and refused a correct program) | **DELETED** (§8.318) - no trait named, no answer. `This::Member` carries the trait `This` stands for (`ProjectionAnnotation.owner_trait`, stamped by the name layer; a synthesized future keeps its arena projection's), `await` asks `Future` by its `LangItem`, and the stdlib's `FilterIter`/`MapIter` write `where I: Iterator`. Population over six halves before: 29,882 answers; with the deletion in place: 0 | - | `grep -c 'if (owner == null) { return TypeRef::invalid(); }' compiler/src/compiler/types/resolver.cryo` → **1**; `grep -c 'pj.owner_trait = this.this_trait' compiler/src/compiler/resolver/name_resolution.cryo` → **1**; `grep -c '^type struct [A-Za-z]*<[A-Z, ]*> where I: Iterator {' stdlib/core/iter.cryo` → **2** | §8.316, §8.318 |
 | standard-library declarations the compiler named by SPELLING a path (26 `"std::..."` literals in code outside the `LangItem` table: `Array` ×3, `Slice`, `Rc` and the three lock guards, `Context`, `Executor`, `malloc` ×3, `free` ×2, `alloc`, `set_args`/`set_env` ×2 each, `run_all`, the prelude ×3, the f-string module ×2) - a misspelt path compiled and answered "absent", and the range literal's `Range` and the loop's `Option` were spellings a user's same-named type answered | **CONVERTED** (§8.320, §8.322, Jake's ruling that claims extend to structs, functions and modules) - `LangItem` holds the structs and functions, claimed where each registers (the struct, class and function-signature arms, as traits and enums already were); every reader asks `wellknown(LangItem::...)`; the parser names `Option` and `Range`/`RangeInclusive` by definition. A module is not claimed - its path is its identity, and it is needed before any declaration exists - so `LangModule` names the prelude and the f-string module in one place. **This is a DECISION, not an unfinished job: modules are out of scope for claims BY DESIGN (Jake, 2026-09-24, ruled after being shown that Rust's language items cover types, traits and functions and not modules). The reason is bootstrap: a claim is recorded when a declaration registers, and the prelude is the module that must be loaded, by a path the compiler writes into an import, before any declaration exists to claim anything - so the two paths in `LangModule` are the one place the compiler spells a module, and are not to be "converted"** | the four never-`Send` types had no test (the comment saying so pointed at a file that did not exist): `negative/E0306_send_denied_std_types` pins them, accepted with the deny-list emptied; function claims removed, the suite fails to build (`intrinsics::malloc` not declared); 0 of 1,126 example and 0 of 3,013 test objects moved | `grep -rnE '"std::[A-Za-z_]+(::[A-Za-z_]+)*"' compiler/src --include=*.cryo \| grep -v lang_item.cryo \| grep -v '//' \| wc -l` → **0** (26 at `36ea5dee`; the `LangItem` table moved from `generic_registry.cryo` to `resolver/lang_item.cryo` in §8.346) | §8.322 |
-| `BoundedParamType` - a generic parameter carrying its trait bounds on the TYPE, and 97 lines across 24 files handling it (mangling, codegen's type map, mono's worklist, sema's method, index and operator lookups through its bounds, the substitution, the display, the LSP's hover) | **DELETED** (§8.323) - nothing constructed one: the only `new BoundedParamType` was inside `TypeArena::create_bounded_param`, which had no caller, and every `Type` constructor passes a literal kind, so no other path could produce `TypeKind::BoundedParam`. Its only producer was the inline `<T: Bound>` form deleted in §8.116; a bound lives on the enclosing function or impl as a `where` clause (D9), read there. With it went the two supertrait walks only its arms called (`trait_ref_matching`, `trait_bound_names`) | 0 of 1,126 example and 0 of 3,014 test objects moved; residue 365 → 362 (three reads inside the deleted arms) | `grep -rn BoundedParam --include=*.cryo compiler/src tools \| wc -l` → **0** (97 at `4ff24ea3`); `grep -rn 'TypeKind::GenericParam' --include=*.cryo compiler/src \| wc -l` → **34** (the kind that stays, the control for the zero beside it; 35 at `4ff24ea3`, the async lowering's two-kind test is one read now) | §8.116, §8.237, §8.323 |
+| `BoundedParamType` - a generic parameter carrying its trait bounds on the TYPE, and 97 lines across 24 files handling it (mangling, codegen's type map, mono's worklist, sema's method, index and operator lookups through its bounds, the substitution, the display, the LSP's hover) | **DELETED** (§8.323) - nothing constructed one: the only `new BoundedParamType` was inside `TypeArena::create_bounded_param`, which had no caller, and every `Type` constructor passes a literal kind, so no other path could produce `TypeKind::BoundedParam`. Its only producer was the inline `<T: Bound>` form deleted in §8.116; a bound lives on the enclosing function or impl as a `where` clause (D9), read there. With it went the two supertrait walks only its arms called (`trait_ref_matching`, `trait_bound_names`) | 0 of 1,126 example and 0 of 3,014 test objects moved; residue 365 → 362 (three reads inside the deleted arms) | `grep -rn BoundedParam --include=*.cryo compiler/src tools \| wc -l` → **0** (97 at `4ff24ea3`); `grep -rn 'TypeKind::GenericParam' --include=*.cryo compiler/src \| wc -l` → **35** (the kind that stays, the control for the zero beside it; 34 before §8.348, whose `MethodBinding::param_name_through_impl_head` asks it; 35 at `4ff24ea3`, the async lowering's two-kind test is one read now) | §8.116, §8.237, §8.323 |
 | a drop flag written only by the join that created it (`x = make()` after a conditional move left it "moved", a later `consume(x)` left it "not moved", and an enclosing join forced "moved" over a branch that moved only on some of its paths) | **FIXED** (§8.324) - a simple statement writes the flags it changes (`append_move_flag_writes`: an expression statement, a declaration, a `return`), an assignment over a flagged binding releases the displaced value under `if (!flag)`, and each moved-set entry records whether its write is in place (`moved_gov`) so a join splices only where it is not. Two leaks and a double free closed; the double free was in `std::net::http2::connection` (a request with `:path` and no `:method`) | `9dbe5992` fails all nine tests of `lang/drop_flag_follows_every_write`, the tree passes them; 0 of 1,126 example objects moved, 4 of 3,015 test objects, each explained in §8.324 | `grep -c 'append_move_flag_writes(' compiler/src/compiler/passes/drop_insertion.cryo` → **4** (the definition and the three simple statements); `grep -c 'merge_branches(' compiler/src/compiler/passes/drop_insertion.cryo` → **0**; `ls tests/tests/lang/drop_flag_follows_every_write.cryo \| wc -l` → **1** | §8.321, §8.324 |
 | an intrinsic's KIND re-derived by codegen from the pinned declaration's LEAF (`pinned_intrinsic_leaf` spelled the leaf, `IntrinsicKind::is_name` and `try_emit` looked it up in `from_name` twice, `leaf.eq("try_catch")` and `leaf.eq("panic")` compared it), and 44 names / 41 kinds in that table that duplicate `as` and that no declaration names | **CONVERTED / DELETED** (§8.325) - the table moved out of codegen to `compiler/intrinsic_kind.cryo`; type resolution reads the spelling ONCE, where it registers the declaration, and stores the kind on the index entry (`DeclarationIndex::mark_intrinsic(entry, kind)`); codegen reads the kind off the pin (`pinned_intrinsic_kind`) and never sees a string; `try_catch` is `IntrinsicKind::TryCatch`. The 41 conversion kinds are deleted with their arms. The 13 bit operations (`bswap*`, `popcount*`, `clz*`, `ctz*`, `rot*`) keep their kinds and are still declared by nothing - declaring them is new public API, left for Jake | the registration forced to `Call` (one mutation, alone): `intrinsics::fabs64` and the allocator's atomics become undefined references at link; 0 of 1,126 example and 0 of 3,015 test objects moved | `ls compiler/src/compiler/codegen/ops/intrinsics_codegen.cryo 2>/dev/null \| wc -l` → **0**; `python3 scripts/ns-migration/8.325/intrinsics_census.py \| grep -o 'declared by nothing [0-9]*' \| cut -d' ' -f4` → **0** (57 at `4462e86a`; 13 at §8.325, the bit operations, declared in §8.329); `grep -rho 'IntrinsicKind::is_name' compiler/src --include=*.cryo \| wc -l` → **0** | §8.287, §8.325 |
 | a call through a trait's own path typed by the trait DECLARATION's return (`Dup::dup(&r)` typed `This`, `Peek::peek(&r)` typed `Option<This::Out>`, refused as E0200 / E0229) whenever the body was walked a second time: the first walk's pin set the implementation's return, the second found the call pinned and kept the declaration's | **FIXED** (§8.326) - `try_resolve_static_method` re-reads the pinned entry's return on every walk when the path's owner is a trait (`type_from_delivered_entry`, `CalleePin::decl_entry`). `Iterator::next(&r)` is a different case and is NOT fixed: `&r` does not fit `next(mut &this)`, no entry is pinned, and the miss is silent - whether it is accepted (as `r.next()` is) or refused is Jake's | the file `lang/trait_path_call_types_as_implementation` is refused by `3e9bb622` (E0200, E0229) and passes here | `grep -c 'type_from_delivered_entry(' compiler/src/compiler/sema/call_resolver.cryo` → **3** (the definition, the first walk's pin, every later walk); `ls tests/tests/lang/trait_path_call_types_as_implementation.cryo \| wc -l` → **1** | §8.224, §8.320, §8.326 |
@@ -356,7 +356,7 @@ Checks for this section, one per line so each can be copied whole:
 * `python3 scripts/lane-gate.py --rows` → **16** (17 before §8.346 deleted `DEFID_MINT`)
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: lane-check lane-selftest' Makefile` → **1**
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **78** (+1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **81** (+3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
@@ -43106,5 +43106,168 @@ them by itself.
 
 Reproduce: `bash scripts/objcmp/objcmp.sh`; the project alone with
 `cryo build tests/tests/projects/impl_param_bound_through_head`.
+
+---
+
+### 8.348 Converge, the other eight places: an implement block's parameters are read through its head everywhere §8.343 counted, and three more kinds of program go from refused to compiled - 2026-09-26
+
+The rest of §8.343's table, taken as Jake ruled (§0.1 D39) and as one
+mechanism: an implement block's parameters are its own and relate to its
+owner's only through the head, so every place that related them by
+spelling now relates them by position in the head.
+
+```cryo
+type struct Wrap<T> { inner: T; }
+
+implement<U> trait Make for struct Wrap<U> where U: Make {
+    static make() -> Wrap<U> { return Wrap::<U> { inner: U::make() }; }
+}
+const w: Wrap<Num> = Wrap::<Num>::make();
+// before: error[E0200]: expected `Wrap<Num>`, found `Wrap<U>` - the turbofish
+//         bound Wrap's `T`, and nothing related `T` to the impl's `U`
+// after:  `U` is `T`'s position in the head `Wrap<U>`, so the return is Wrap<Num>
+```
+
+#### The mechanism, three directions of one relation
+
+`TraitChecker::head_param_type(impl, i)` - the parameter the head writes
+at position `i` - is the one creator; everything below goes through it.
+
+1. **The impl's parameters bound to an instantiation's arguments**
+   (`add_head_param_bindings`, step one's helper).  The monomorphizer
+   (`MonoTraitSpecializer::head_bindings`) now filters an impl's METHODS by
+   it as well as the impl, and resolves each kept impl's clone under it
+   rather than under the template's substitution - which is all
+   `derive_impl_where_generics` ever read.  Places:
+   `MonoTraitSpecializer::derive_impl_where_generics`,
+   `Monomorphizer::specialize_with_entry`.  `ASTSpecializer::impl_substituter`
+   already bound through the head; its pair's miss was the other half, now
+   gone.
+2. **The impl's parameters bound to the owner's own**, for the declaration
+   index.  A method's return is written in the impl's parameters and every
+   reader of the index substitutes the OWNER's into it (a receiver's
+   arguments, a turbofish).  `TypeResolutionPasses::register_returns_through_head`
+   re-registers each return with the impl's parameters bound to the owner's
+   through the head - after the block's methods are registered, and again
+   after the `async` lowering re-registers a method with its future type
+   (`repoint_method`), which is the half the first build missed (below).
+   Places: `MethodBinding::subst_method_return_from_receiver`,
+   `CallResolver::try_resolve_generic_return`.
+3. **The owner's parameters read as the impl's**
+   (`add_owner_to_head_bindings`, `owner_type_through_head`).  Sema walks a
+   generic impl's methods with `this` typed as the bare TEMPLATE
+   (`Sema::visit(ImplBlockNode*)`: `impl_owner(node)`), so a type computed
+   from a field of `this` names the owner's parameters while the impl's
+   bounds - its own and its methods' - name the impl's:
+
+   ```cryo
+   implement<S> trait AsyncWrite for struct BufStream<S> {
+       async flush(mut &this) -> .. where S: AsyncTransport {
+           await this.inner.write_from(out);   // this.inner: BufStream's S
+   ```
+
+   The two bound scans and the `async` lowering's frame fields read such a
+   type through the head first.  Places: `MethodBinding::scan_param_bounds`,
+   `MethodBinding::scan_param_bound_param_types` (both entered through
+   `lookup_method_through_param_bounds` / `param_types_through_param_bounds`,
+   which now take the parameter's TYPE, not its spelling), and
+   `AsyncLower::param_spelled` (through `through_owner_head`, the record
+   carrying the owning block).  Retyping `this` as `Wrap<U>` in sema is the
+   upstream alternative; it was not taken - it changes every generic body's
+   field types, not only an impl's.
+
+   One ambiguity is left in place while parameters are keyed by spelling: a
+   head that SWAPS them (`implement<B, A> .. for Pair<B, A>` over
+   `Pair<A, B>`) makes the arena type `A` both the owner's first parameter
+   and the impl's second, and no type can say which it means.  Such a
+   position is skipped (the reading stays as before); after the arena flip
+   the two are two types and nothing is skipped.
+
+#### Evidence
+
+- **Shapes** (`scripts/ns-migration/8.348/shapes`, each with a
+  same-spelling control): refused before only because the impl spells its
+  parameter unlike the type, compiled after - `i` (static return through a
+  turbofish, E0200), `j` (a parameter derived from the where-clause,
+  `implement<I, A> Iterator<A> for Skip<I> where I: Iterator<A>` over
+  `Skip<J>`, E0636 no method `next`), `l` (a method's `where U: Show` that
+  fails for `Wrap<Plain>`, never called, E0358 - step one's shape, one
+  level in).  `g`, `h`, `k` (a method bound's call, a trait return in `U`,
+  an `async` method) built before with either spelling and still do; every
+  control is unchanged.
+- **Projects**, one per kind that flips: `impl_static_return_through_head`
+  (exit 42), `impl_derived_param_through_head` (24),
+  `impl_method_bound_through_head` (7).  Each refused by the compiler
+  without this change (E0200 / E0636 / E0358), run with it.  Roster merged
+  (+3).
+- **Each place by identity.**  §8.343's probe, rebased onto `cf230067`
+  (`probe-cf23.patch`), alone: the control reproduces §8.343's table on this
+  tip (01-hello fails with `derive`, `subst_method_return`, both scans or
+  `param_spelled` answering by identity; shape `f` with
+  `try_resolve_generic_return`).  The probe plus this change
+  (`combined.patch`): **every one of the eight places answering by identity
+  alone builds 01-hello and shapes a, c, f, i, j, l, and so do all nine
+  together** (step one's filter included).
+- **A miss, found and explained before it was fixed.**  The first build
+  left `subst_method_return_from_receiver` failing by identity at
+  `net/http/server.cryo:266`.  An instrument at the place's abstract answer
+  printed the returns it was handed: `BufStream$read_request$Future_0<S>`
+  and `BufStream$flush$Future_7<S>`, each with the IMPL's `S` - the `async`
+  lowering re-registers the method's return as its future type after type
+  resolution.  The same re-registration there cleared it.
+- `objcmp.sh` `cf230067` -> tree (the second build): **0 of 1,126 example
+  objects**; test objects 3,073 -> 3,234, and all 163 differing lines are
+  in the three new projects (54 objects each on the tree side; the base
+  compiler leaves one object in `impl_derived_param_through_head` before it
+  fails) - predicted exactly that.  Suite `OVERALL FAIL (unit: failed;
+  compile-fail: 227 passed; projects: 78 passed)`: the one red is
+  `ProcessAsync::two_children_join_concurrently` ("two joined children
+  should overlap, not serialize"), the wall-clock bound an earlier entry
+  already recorded as a load flake; its object is byte-identical on both
+  sides and it passed 3 of 3 alone.  The base side's `projects: 75 passed,
+  3 failed` are the three new projects.
+- The final build moves the returns' rewrite INTO the index
+  (`register_methods_through`) instead of re-registering after it: the
+  second build added one name-keyed read, one registration and one door
+  call, which `lane-check` and the residue refused (LOOKUP, REGISTER,
+  LOOKUP_OTHER each +1; residue 311 -> 313).  The final build leaves every
+  lane row and the residue where they were.  Its objects against the
+  second build's: **0 of 1,126 example and 0 of 3,234 test objects
+  differ** (`ex-hash.sh`, `tests-hash.sh`), suite `OVERALL PASS (unit: ok;
+  compile-fail: 227 passed; projects: 78 passed)`.
+- `lsp-check` OK (0 errors, 478 warnings) and `cross-check` OK, on the
+  second build and again on the final one.  Compiler warnings 346 on the
+  final build, as before.  One intermediate build printed 342: four
+  unused-variable warnings (W0001, 9 -> 5) missing from files this change
+  does not touch (`declaration_emitter.cryo:433, 434, 1620`,
+  `call_specializer.cryo:2043`), every other class identical, between two
+  builds that differ only in `type_resolution.cryo` and `async_lower.cryo`.
+  The W0001 total is not a stable instrument.
+- Rows: `lane-check` and the residue unchanged; condition one's list 14,
+  unchanged (this entry retires none of its lines); condition two's
+  population 1,098 -> 1,099 (`register_methods_through`, whose `site`
+  label counts as `register_methods`'s does - `lookup_method_through_param_bounds`
+  and `param_types_through_param_bounds` stopped taking the parameter's
+  spelling but still take the method's name, so they stay); projects
+  78 -> 81; `TypeKind::GenericParam` 34 -> 35
+  (`param_name_through_impl_head`).
+
+#### Where converge stands
+
+All nine head-binding places bind through the head.  Left: the seven
+comparisons §8.343 lists and the arena flip, which retires condition one's
+six parameter-scan lines (`TemplateEntry::param_names[]` and the rest) -
+this entry retires none of them by itself.
+
+Reproduce: `bash scripts/ns-migration/8.348/run-shapes.sh <compiler> g h i j k l`;
+the per-place table: `git apply scripts/ns-migration/8.348/combined.patch`
+on `cf230067`, `make cryo`, copy the compiler out, then
+`bash scripts/ns-migration/8.348/per-place.sh <compiler> <outdir> <B_STRICT tags>`
+(an empty tag is the all-spelling control; `probe-cf23.patch` alone gives
+§8.343's table on this tip).  `combined.patch` is `probe-cf23.patch`, then
+this commit's compiler diff applied with `git apply --3way` taking the
+change's side of its three conflicts, then `adapt-combined.py`.  Taking
+that side drops the probe's substitution tag at `impl_bounds_hold`; the
+bound lookups there keep their own tags.
 
 ---

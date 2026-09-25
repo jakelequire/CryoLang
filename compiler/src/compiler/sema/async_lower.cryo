@@ -84,6 +84,8 @@ import compiler::types::generic_registry::{ TemplateEntry };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::ownership::{ OwnershipQuery };
+import compiler::types::trait_checker::{ TraitChecker };
+import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ ClassType, FieldInfo, MethodInfo, StructType };
@@ -322,6 +324,11 @@ type struct AsyncDecl {
     // The parameters the future is generic in: the owner's followed by the
     // function's own. Empty when `generic` is false.
     fut_params:  GenericParamNode*[];
+    // The implement block the method is written in, or null: a type the
+    // body computed from a field of `this` names the OWNER's parameters,
+    // which the block's `fut_params` are not, so it is read through the
+    // block's head.
+    owner_impl:  ImplBlockNode*;
 
     // Null when this is a free function. Non-null makes `lower` capture the
     // receiver and skip the free-function overload rebuild, which a method has
@@ -740,6 +747,18 @@ type struct AsyncLower {
         if (!assoc.is_valid()) { return; }
         if (owner.impl_node.lookup_assoc_binding(assoc) != null) { return; }
         owner.impl_node.add_assoc_binding(assoc, fut_ann);
+    }
+
+    /// `ty`, a type the method's body computed, as its implement block reads
+    /// it: the body was typed with `this` as the owner template, so a type
+    /// from a field names the owner's parameters, and the future is generic
+    /// in the block's (`TraitChecker::owner_type_through_head`).  Unchanged
+    /// for a method not written in an implement block.
+    through_owner_head(mut &this, d: AsyncDecl*, ty: TypeRef) -> TypeRef {
+        if (d.owner_impl == null) { return ty; }
+        const tc: TraitChecker = TraitChecker::new(this.arena, this.ctx.generic_registry,
+                                                   this.intern, this.ctx.diagnostics);
+        return tc.owner_type_through_head(d.owner_impl, ty);
     }
 
     /// An annotation for the `Future`'s `Output` — the declared return type, or
@@ -7078,7 +7097,8 @@ type struct AsyncLower {
                 node: node, ok: false,
                 q_name: SymbolStr::empty(),
                 struct_ref: TypeRef::invalid(), self_ty: TypeRef::invalid(),
-                generic: false, fut_params: [], method: owner.method,
+                generic: false, fut_params: [],
+                owner_impl: owner.impl_node, method: owner.method,
                 recv_field: SymbolStr::empty(), recv_ptr: false,
                 recv_ty: TypeRef::invalid(), output_ref: output_ref,
                 declared_ref: declared_ref, poll_out: TypeRef::invalid(),
@@ -7221,7 +7241,8 @@ type struct AsyncLower {
             node: node, ok: true,
             q_name: q_name,
             struct_ref: struct_ref, self_ty: self_ty, generic: generic,
-            fut_params: fut_params, method: owner.method,
+            fut_params: fut_params,
+            owner_impl: owner.impl_node, method: owner.method,
             recv_field: recv_field, recv_ptr: recv_ptr, recv_ty: owner.ty,
             output_ref: output_ref, declared_ref: declared_ref,
             poll_out: poll_out, poll_base: poll_base, ctx_ptr_ty: ctx_ptr_ty,
@@ -7423,8 +7444,13 @@ type struct AsyncLower {
 
         mut arr: MethodNode*[] = [owner.method];
         this.ctx.decl_index.reset_method_overloads(owner.decl, node.name, this.intern);
-        this.ctx.decl_index.register_methods(
-            owner.decl, arr, this.intern, this.arena, "async_lower/repoint method");
+        // A method written in an implement block returns a future generic
+        // in the block's parameters; stored in the owner's, as the block's
+        // other returns are.
+        mut head: TypeSubstitution = TypeResolutionPasses::impl_params_to_owner(
+            owner.impl_node, this.ctx, this.arena);
+        this.ctx.decl_index.register_methods_through(
+            owner.decl, arr, &head, this.intern, this.arena, "async_lower/repoint method");
     }
 
     /// Append one field to the generated future's declaration.
@@ -7441,7 +7467,7 @@ type struct AsyncLower {
         f.set_visibility(Visibility::Public);
         f.set_resolved_type(ty);
         if (d.generic) {
-            mut ann: TypeAnnotation* = this.type_ann_for(ty, &d.fut_params, span);
+            mut ann: TypeAnnotation* = this.type_ann_for(this.through_owner_head(d, ty), &d.fut_params, span);
             if (ann == null) {
                 this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                     fmt::format("async: a generic `async function` cannot carry a value of type `%s` across a suspend; give it a concrete type",

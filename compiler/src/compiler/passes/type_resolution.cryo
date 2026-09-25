@@ -81,6 +81,8 @@ import compiler::types::arena::{ TypeArena };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::resolver::{ ResolutionContext, TypeResolver };
+import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::intrinsic_kind;
@@ -1211,10 +1213,12 @@ type struct TypeResolutionPasses {
                         }
                     }
                 }
-                // The head's methods under the owner the index names.
-                ctx.decl_index.register_methods(
+                // The head's methods under the owner the index names, their
+                // returns in the owner's parameters.
+                mut head: TypeSubstitution = TypeResolutionPasses::impl_params_to_owner(node, ctx, arena);
+                ctx.decl_index.register_methods_through(
                     ctx.decl_index.impl_owner(node, "type_resolution/register impl methods"),
-                    node.methods, ctx.intern_table, arena, "type_resolution/register impl methods");
+                    node.methods, &head, ctx.intern_table, arena, "type_resolution/register impl methods");
             }
             _ => {}
         }
@@ -1927,6 +1931,27 @@ type struct TypeResolutionPasses {
             TypeAnnotation::ThisType(_) => { "This" }
             _ => { "_" }
         };
+    }
+
+    /// An implement block's parameters bound to its OWNER's own parameters
+    /// through the head (`U` in `implement<U> .. for Wrap<U>` to `Wrap`'s
+    /// `T`): what a return written in the block's parameters is stored
+    /// under (`DeclarationIndex::register_methods_through`).  Empty for a
+    /// block whose target is no template, or `node` null.
+    static impl_params_to_owner(node: ImplBlockNode*, ctx: CompilationContext*,
+                                arena: TypeArena*) -> TypeSubstitution {
+        mut head: TypeSubstitution = TypeSubstitution::empty();
+        if (node == null || ctx.generic_registry == null) { return head; }
+        const tmpl: TemplateEntry* = ctx.generic_registry.template_of(node.target_def());
+        if (tmpl == null) { return head; }
+        mut owner_params: TypeRef[] = [];
+        for (mut i: i64 = 0; i < tmpl.param_type_ids.length; i++) {
+            owner_params.push(TypeRef::new(tmpl.param_type_ids[i], arena));
+        }
+        const tc: TraitChecker = TraitChecker::new(arena, ctx.generic_registry,
+                                                   ctx.intern_table, ctx.diagnostics);
+        tc.add_head_param_bindings(node, &owner_params, &head);
+        return head;
     }
 
     /// Build the canonical impl-head signature for a trait impl: the

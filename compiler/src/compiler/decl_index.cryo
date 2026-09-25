@@ -37,6 +37,7 @@ import compiler::resolver::module_path;
 import compiler::resolver::module_path::{ ModulePath };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ FunctionType };
+import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import std::collections::hashmap::{ HashMap };
@@ -810,6 +811,19 @@ type struct DeclarationIndex {
     /// a second registration under a name no reader asks.
     register_methods(mut &this, owner: TypeRef, methods: &MethodNode*[],
                      intern: InternTable*, arena: TypeArena*, site: string) -> void {
+        this.register_methods_through(owner, methods, null, intern, arena, site);
+    }
+
+    /// `register_methods` for an implement block's methods.  A return is
+    /// written in the block's own parameters, and every reader of the
+    /// returns this index holds substitutes the OWNER's into it (a
+    /// receiver's arguments, a turbofish on the owner), so each is stored
+    /// with `head` applied - the block's parameters bound to the owner's
+    /// through its head (`TraitChecker::add_head_param_bindings`).  Null or
+    /// empty `head` stores the return as written.
+    register_methods_through(mut &this, owner: TypeRef, methods: &MethodNode*[],
+                             head: TypeSubstitution*, intern: InternTable*,
+                             arena: TypeArena*, site: string) -> void {
         const type_sym: SymbolStr = this.lookup_type_name(owner);
         if (!type_sym.is_valid()) {
             compiler::resolver::res::record_unregistered_def(site);
@@ -839,7 +853,12 @@ type struct DeclarationIndex {
                 continue;
             }
 
-            this.register_method(owner, func.name, func.resolved_return_type);
+            mut ret: TypeRef = func.resolved_return_type;
+            if (head != null && head.param_ids.length > 0 && ret.is_valid()) {
+                const owned: TypeRef = head.apply(ret, arena);
+                if (owned.is_valid()) { ret = owned; }
+            }
+            this.register_method(owner, func.name, ret);
 
             // Build full FunctionType.  A non-static method's receiver is one
             // of its parameters, written or synthesized: `&this` /
