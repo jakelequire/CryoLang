@@ -2586,23 +2586,13 @@ type struct CallResolver {
     /// all.  A `scope_sym` that names a MODULE rather than a type resolves to no
     /// type, finds no method, and falls out without a verdict - module-qualified
     /// free functions keep their own door.
-    enforce_static_method_visibility(mut &this, scope: ScopeResolutionNode*, scope_sym: SymbolStr,
-                                     member_sym: SymbolStr, span: SourceSpan) -> void {
+    enforce_static_method_visibility(mut &this, owner: TypeRef, member_sym: SymbolStr,
+                                     span: SourceSpan) -> void {
         if (this.state.in_symbolic_check) { return; }
-        // The qualifier's stamp answers for the path as WRITTEN, a clone's
-        // substituted segment through the id the substituter left beside it.
-        // Three of this function's callers pass a name they have already
-        // resolved - a canonical owner, a specialization, a DI key - and for
-        // those the stamp names the generic template rather than the type that
-        // call is about, so the name is what the index is asked for.  A
-        // written qualifier the stamp makes no type claim for names a module,
-        // which owns no method to gate.
-        mut owner: TypeRef = TypeRef::invalid();
-        if (scope != null && scope_sym.id == scope.scope_name.id) {
-            owner = this.types.scope_qualifier_type(scope);
-        } else {
-            owner = this.types.lookup_type_exact(scope_sym);
-        }
+        // `owner` is the type the call binds against, as its caller holds it -
+        // the segment's own type, a specialization, a DI key's type - never a
+        // name to look up again.  A written qualifier that makes no type claim
+        // names a module, which owns no method to gate.
         if (!owner.is_valid()) { return; }
         this.member.enforce_method_visibility(owner, member_sym, span);
     }
@@ -2882,14 +2872,13 @@ type struct CallResolver {
         }
 
         if (this.ctx.generic_registry == null) { return false; }
-        const owner_sym: SymbolStr = this.intern.intern(owner_str);
 
         // A primitive's inherent methods: the `implement string { }` blocks the
-        // registry indexes under its spelling.  A declared type's blocks were
+        // registry indexes under its type.  A declared type's blocks were
         // folded into its method set above.
         if (!only_trait.is_valid() && start_cls == null
                 && base_t.kind != TypeKind::Struct && base_t.kind != TypeKind::Enum) {
-            const blocks: ImplBlockNode*[] = this.ctx.generic_registry.inherent_impl_blocks(owner_sym);
+            const blocks: ImplBlockNode*[] = this.ctx.generic_registry.inherent_impl_blocks(base_ref);
             for (mut bi: i64 = 0; bi < blocks.length; bi++) {
                 if (this.bind_on_impl_block(visitor, call, member, blocks[bi], owner_str, arg_types)) { return true; }
             }
@@ -3493,6 +3482,33 @@ type struct CallResolver {
 
     // -- Scope-resolution call resolution (Type::method / Module::func / variant) --
 
+    /// The type a scope segment's owner IS: the handle `scope_owner_key`
+    /// names.  A specialization the substituter recorded on the node, by its
+    /// arena id; otherwise the type the segment's stamp names.  Invalid
+    /// where the key is empty - a type parameter no clone has substituted,
+    /// a module - because nothing there owns a member.
+    scope_owner_base_type(&this, scope: ScopeResolutionNode*) -> TypeRef {
+        if (scope.spec_owner.is_valid()
+                && this.ctx.decl_index.lookup_type_name(scope.spec_owner).is_valid()) {
+            return scope.spec_owner;
+        }
+        return this.types.scope_qualifier_type(scope);
+    }
+
+    /// The type a scope segment denotes as written: the instantiation its
+    /// written arguments make of the template the stamp names
+    /// (`Array<i32>::new`), interned from the pair, else the owner itself.
+    /// The instantiation exists before monomorphization builds it, which is
+    /// what a type question about the segment is asked of.
+    scope_owner_type(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
+        if (scope.scope_generic_args.length > 0) {
+            const inst: TypeRef = this.resolve_generic_scope_type(
+                this.types.scope_qualifier_type(scope), scope.scope_generic_args, scope.span);
+            if (inst.is_valid()) { return inst; }
+        }
+        return this.scope_owner_base_type(scope);
+    }
+
     /// The registered name of the TYPE the scope segment names, or empty
     /// when the segment names no type owner.
     ///
@@ -3558,9 +3574,10 @@ type struct CallResolver {
                         scope.require_scope_res("scope-call spec name")));
                 if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
             }
-            const method_ret: TypeRef = this.try_resolve_static_method(scope, lookup_sym, call);
+            const owner_ty: TypeRef = this.scope_owner_type(scope);
+            const method_ret: TypeRef = this.try_resolve_static_method(scope, lookup_sym, owner_ty, call);
             if (method_ret.is_valid()) { return method_ret; }
-            const type_ret: TypeRef = this.try_resolve_type_or_variant(scope, lookup_sym, call);
+            const type_ret: TypeRef = this.try_resolve_type_or_variant(scope, lookup_sym, owner_ty, call);
             if (type_ret.is_valid()) { return type_ret; }
         }
 
@@ -3583,7 +3600,7 @@ type struct CallResolver {
             const owner_key: SymbolStr = this.scope_owner_key(scope);
             const trait_sym: DefId = this.impl_qualified_trait(scope);
             if (owner_key.is_valid() && trait_sym.is_valid()) {
-                this.report_impl_qualified_miss(scope, owner_key, trait_sym, scope.member_name);
+                this.report_impl_qualified_miss(scope, owner_key, this.scope_owner_base_type(scope), trait_sym, scope.member_name);
             }
             if (owner_key.is_valid() || !trait_sym.is_valid()) { return TypeRef::invalid(); }
         }
@@ -3620,32 +3637,20 @@ type struct CallResolver {
         return this.ctx.decl_index.signature_refused(combined);
     }
 
-    /// True when `scope_sym` - a registered name: the owner that won
-    /// resolution, or a specialization's registered name - is a generic
-    /// template, owns the static-method template `Owner::method`, or is an
-    /// instantiation.  Sema then leaves the callee unpinned for mono.
-    scope_is_generic_template(&this, scope_sym: SymbolStr, member_sym: SymbolStr) -> boolean {
-        if (this.ctx.generic_registry == null) { return false; }
-        // `scope_sym` is a registered name - the owner that won resolution, or
-        // a specialization's registered name - so the template and the
-        // `Owner::method` static-method template are exact lookups, and an
-        // instantiation is one too.
-        const scope_entry: TemplateEntry* = this.ctx.generic_registry.get_template(scope_sym);
-        if (scope_entry != null) { return true; }
-        const scope_str: string = this.intern.resolve(scope_sym);
-        const member_str: string = this.intern.resolve(member_sym);
-        if (member_sym.is_valid()) {
-            const csym: SymbolStr = this.intern.intern(fmt::format("%s::%s", scope_str, member_str));
-            if (this.ctx.generic_registry.get_template(csym) != null) { return true; }
+    /// True when `owner` - the type that won resolution, or a written
+    /// specialization's instantiation - is a generic template, owns the
+    /// static-method template `Owner::method`, or is an instantiation not yet
+    /// built.  Sema then leaves the callee unpinned for mono.
+    scope_is_generic_template(&this, owner: TypeRef, member_sym: SymbolStr) -> boolean {
+        if (this.ctx.generic_registry == null || !owner.is_valid()) { return false; }
+        if (this.ctx.generic_registry.template_of_type(owner) != null) { return true; }
+        const owner_def: DefId = this.ctx.decl_index.def_of(owner, this.ctx.type_arena);
+        if (owner_def.is_valid() && member_sym.is_valid()
+                && this.ctx.generic_registry.template_in(ResBase::Def(owner_def), member_sym) != null) {
+            return true;
         }
-        if (this.ctx.decl_index != null) {
-            const type_ref: TypeRef = this.types.lookup_type_exact(scope_sym);
-            if (type_ref.is_valid()) {
-                const t: Type* = this.arena.lookup(type_ref.id);
-                if (t != null && t.kind == TypeKind::InstantiatedType) { return true; }
-            }
-        }
-        return false;
+        const t: Type* = this.arena.lookup(owner.id);
+        return t != null && t.kind == TypeKind::InstantiatedType;
     }
 
     /// The generic OWNER template a static call's scope segment names, or
@@ -3665,23 +3670,24 @@ type struct CallResolver {
             scope.require_scope_res("static-call owner template"));
     }
 
-    pin_scope_callee_combined(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*, scope_sym: SymbolStr, member_sym: SymbolStr) -> void {
+    pin_scope_callee_combined(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*, scope_sym: SymbolStr,
+                              owner: TypeRef, member_sym: SymbolStr) -> void {
         if (call == null) { return; }
         // Judge BEFORE the early returns below: a call whose callee is already
         // pinned, or whose owner is a generic template, is still a call to a
         // method the use site may not name.  `scope_sym` is the owner that won
         // resolution, so the verdict is about the method that actually binds.
         if (member_sym.is_valid() && scope_sym.is_valid()) {
-            this.enforce_static_method_visibility(scope, scope_sym, member_sym, call.span);
+            this.enforce_static_method_visibility(owner, member_sym, call.span);
         }
         if (call.resolved_callee.is_some()) { return; }
         if (!scope_sym.is_valid() || !member_sym.is_valid()) { return; }
-        if (this.scope_is_generic_template(scope_sym, member_sym)) { return; }
+        if (this.scope_is_generic_template(owner, member_sym)) { return; }
         const scope_str: string = this.intern.resolve(scope_sym);
         const member_str: string = this.intern.resolve(member_sym);
         if (scope_str.length() == 0 || member_str.length() == 0) { return; }
         if (scope.impl_trait != null) {
-            this.pin_impl_qualified_call(call, scope, scope_sym, member_sym);
+            this.pin_impl_qualified_call(call, scope, scope_sym, owner, member_sym);
             return;
         }
         // A path a bound directs (`T::make()` under `where T: Beta`, the
@@ -3734,11 +3740,12 @@ type struct CallResolver {
         }
         const recv: ExpressionNode* = call.arguments[0];
         if (recv == null || !recv.resolved_type.is_valid()) { return true; }
-        const owner_sym: SymbolStr = this.trait_qualified_owner(recv.resolved_type);
+        const owner_ty: TypeRef = this.trait_qualified_owner(recv.resolved_type);
+        const owner_sym: SymbolStr = this.ctx.decl_index.lookup_type_name(owner_ty);
         if (!owner_sym.is_valid()) { return true; }
         const entries: OverloadId[] = this.trait_delivered_entries(owner_sym, trait_sym, member_sym);
         if (entries.length == 0) {
-            this.report_impl_qualified_miss(scope, owner_sym, trait_sym, member_sym);
+            this.report_impl_qualified_miss(scope, owner_sym, owner_ty, trait_sym, member_sym);
             return true;
         }
         this.pin_trait_delivered_call(call, scope, &entries);
@@ -3749,7 +3756,7 @@ type struct CallResolver {
     /// argument selects the implementation by: the argument's type behind
     /// any reference or pointer.  Empty for a type the index holds no name
     /// for (a primitive's impl, left to codegen's refusal as before).
-    trait_qualified_owner(&this, recv_type: TypeRef) -> SymbolStr {
+    trait_qualified_owner(&this, recv_type: TypeRef) -> TypeRef {
         mut owner_ref: TypeRef = recv_type;
         mut hops: i32 = 0;
         while (hops < 4) {
@@ -3760,7 +3767,7 @@ type struct CallResolver {
             else { break; }
             hops = hops + 1;
         }
-        return this.ctx.decl_index.lookup_type_name(owner_ref);
+        return owner_ref;
     }
 
     /// `Trait::m()` with no argument: nothing selects an implementation.  A
@@ -3932,7 +3939,7 @@ type struct CallResolver {
     /// rule out.  Arguments no delivered entry accepts are reported as any
     /// static call's are, from the pin's absence.
     pin_impl_qualified_call(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
-                            owner_sym: SymbolStr, member_sym: SymbolStr) -> void {
+                            owner_sym: SymbolStr, owner: TypeRef, member_sym: SymbolStr) -> void {
         const trait_sym: DefId = this.impl_qualified_trait(scope);
         if (!trait_sym.is_valid()) { return; }
         const entries: OverloadId[] = this.trait_delivered_entries(owner_sym, trait_sym, member_sym);
@@ -3940,7 +3947,7 @@ type struct CallResolver {
             this.pin_trait_delivered_call(call, scope, &entries);
             return;
         }
-        this.report_impl_qualified_miss(scope, owner_sym, trait_sym, member_sym);
+        this.report_impl_qualified_miss(scope, owner_sym, owner, trait_sym, member_sym);
     }
 
     /// `(Trait for Type)::member` where `Trait`'s implementation for `Type`
@@ -3948,11 +3955,11 @@ type struct CallResolver {
     /// implementation has no method of that name.  Silent during a symbolic
     /// generic-body walk: the concrete instantiation reports.
     report_impl_qualified_miss(mut &this, scope: ScopeResolutionNode*, owner_sym: SymbolStr,
-                               trait_sym: DefId, member_sym: SymbolStr) -> void {
+                               owner: TypeRef, trait_sym: DefId, member_sym: SymbolStr) -> void {
         if (this.state.in_symbolic_check) { return; }
         const owner_str: string = this.intern.resolve(owner_sym);
         const trait_leaf: string = QualifiedName::leaf_of(this.intern.resolve(trait_sym.qualified_name()));
-        const owner_ref: TypeRef = this.types.lookup_type_exact(owner_sym);
+        const owner_ref: TypeRef = owner;
         if (owner_ref.is_valid()
                 && !this.trait_checker().type_implements_trait(owner_ref, trait_sym, 0)) {
             mut d: Diagnostic = Diagnostic::error(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
@@ -4002,7 +4009,7 @@ type struct CallResolver {
             if (!trait_sym.is_valid()) { return TypeRef::invalid(); }
             const entries: OverloadId[] = this.trait_delivered_entries(owner_sym, trait_sym, scope.member_name);
             if (entries.length == 0) {
-                this.report_impl_qualified_miss(scope, owner_sym, trait_sym, scope.member_name);
+                this.report_impl_qualified_miss(scope, owner_sym, owner, trait_sym, scope.member_name);
                 return TypeRef::invalid();
             }
             // Several delivered entries are one implementation's overloads
@@ -4207,7 +4214,7 @@ type struct CallResolver {
     /// GATED (R1): try Scope::Member as a static method (specialized -> base -> DI
     /// -> template).  The template path carries pre-mono re-derivation.
     try_resolve_static_method(mut &this, scope: ScopeResolutionNode*, lookup_sym: SymbolStr,
-                              call: CallExprNode*) -> TypeRef {
+                              owner_ty: TypeRef, call: CallExprNode*) -> TypeRef {
         // A GENERIC static method on a GENERIC owner (`Wrap<A>::make<T>`,
         // `String<A>::from<T>`) is the static analogue of the instance
         // generic-method path: sema infers the method's OWN `<T>` + stashes it,
@@ -4237,10 +4244,10 @@ type struct CallResolver {
         // expected-type-unify source can recover an owner param the args don't
         // determine.  Idempotent (no-op once `resolved_type_args` is set).
         this.stash_static_owner_bindings_for(scope, call);
-        // `lookup_sym` is the owner's registered name (the stamp's, or the
-        // specialization's), so the type under it is the owner the method
-        // was registered on; the pin carries that same name.
-        const owner_ref: TypeRef = this.types.lookup_type_exact(lookup_sym);
+        // `owner_ty` is the type the segment denotes - the owner the method
+        // was registered on - and `lookup_sym` its registered name, which
+        // the pin carries.
+        const owner_ref: TypeRef = owner_ty;
         const owner_sym: SymbolStr = lookup_sym;
         mut method_ret: TypeRef = TypeRef::invalid();
         if (owner_ref.is_valid()) {
@@ -4253,7 +4260,7 @@ type struct CallResolver {
                 if (inferred.is_valid() && !this.types.contains_generic_param(inferred)) { resolved = inferred; }
             }
             scope.set_resolved_type(resolved);
-            this.pin_scope_callee_combined(call, scope, owner_sym, scope.member_name);
+            this.pin_scope_callee_combined(call, scope, owner_sym, owner_ref, scope.member_name);
             // A call through a trait's own path (`Dup::dup(&r)`) has the
             // selected implementation's return on EVERY walk of the body: the
             // first walk's pin sets it, and a later walk finds the call already
@@ -4272,15 +4279,15 @@ type struct CallResolver {
         // the template only when it is the bare leaf, by a widening a
         // module-qualified path cannot take.
         const owner_key: SymbolStr = this.scope_owner_key(scope);
-        if (owner_key.is_valid() && lookup_sym.id != owner_key.id) {
-            const base_ret: TypeRef = this.types.lookup_method_return(
-                this.types.lookup_type_exact(owner_key), scope.member_name);
+        const base_ty: TypeRef = this.scope_owner_base_type(scope);
+        if (base_ty.is_valid() && !owner_ty.equals(base_ty)) {
+            const base_ret: TypeRef = this.types.lookup_method_return(base_ty, scope.member_name);
             if (base_ret.is_valid()) {
                 const resolved: TypeRef = this.try_resolve_generic_return(base_ret, scope.scope_name, scope.member_name, scope);
                 scope.set_resolved_type(resolved);
                 // The owner, not the spelling: the pin stands down for a
-                // generic owner, and it recognizes one by its registered name.
-                this.pin_scope_callee_combined(call, scope, owner_key, scope.member_name);
+                // generic owner, and it recognizes one by its type.
+                this.pin_scope_callee_combined(call, scope, owner_key, base_ty, scope.member_name);
                 return resolved;
             }
         }
@@ -5060,8 +5067,8 @@ type struct CallResolver {
     }
 
     try_resolve_type_or_variant(mut &this, scope: ScopeResolutionNode*, lookup_sym: SymbolStr,
-                                call: CallExprNode*) -> TypeRef {
-        const type_ref: TypeRef = this.types.lookup_type_exact(lookup_sym);
+                                owner_ty: TypeRef, call: CallExprNode*) -> TypeRef {
+        const type_ref: TypeRef = owner_ty;
         if (!type_ref.is_valid()) { return TypeRef::invalid(); }
         const di_name: SymbolStr = this.ctx.decl_index.lookup_type_name(type_ref);
         if (di_name.is_valid()) {
@@ -5069,7 +5076,7 @@ type struct CallResolver {
             if (di_method_ret.is_valid()) {
                 const resolved: TypeRef = this.try_resolve_generic_return(di_method_ret, scope.scope_name, scope.member_name, scope);
                 scope.set_resolved_type(resolved);
-                this.pin_scope_callee_combined(call, scope, di_name, scope.member_name);
+                this.pin_scope_callee_combined(call, scope, di_name, type_ref, scope.member_name);
                 return resolved;
             }
         }
@@ -5629,7 +5636,8 @@ type struct CallResolver {
                         scope.require_scope_res("scope-call spec name")));
                 if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
             }
-            if (this.scope_is_generic_template(lookup_sym, scope.member_name)) { return; }
+            const owner_ty: TypeRef = this.scope_owner_type(scope);
+            if (this.scope_is_generic_template(owner_ty, scope.member_name)) { return; }
             const scope_str:  string = this.intern.resolve(lookup_sym);
             const member_str: string = this.intern.resolve(scope.member_name);
             if (scope_str.length() == 0 || member_str.length() == 0) { return; }
@@ -5668,7 +5676,7 @@ type struct CallResolver {
         // A module owns no static methods; only a type segment has an
         // inherent gather to defer to.
         if (names_module) { return; }
-        this.check_static_scope_method_args(visitor, lookup_sym, scope, call);
+        this.check_static_scope_method_args(visitor, scope, call);
     }
 
     /// Argument check for an impl-qualified call, `(Beta for P)::go(&p)`:
@@ -5697,7 +5705,7 @@ type struct CallResolver {
         if (call.arguments.length == 0) { return; }
         const recv: ExpressionNode* = call.arguments[0];
         if (recv == null || !recv.resolved_type.is_valid()) { return; }
-        const owner_sym: SymbolStr = this.trait_qualified_owner(recv.resolved_type);
+        const owner_sym: SymbolStr = this.ctx.decl_index.lookup_type_name(this.trait_qualified_owner(recv.resolved_type));
         if (!owner_sym.is_valid()) { return; }
         const entries: OverloadId[] = this.trait_delivered_entries(owner_sym, trait_sym, scope.member_name);
         this.check_delivered_args(visitor, &entries, scope, call);
@@ -5744,16 +5752,16 @@ type struct CallResolver {
     /// Argument type-check for a `Type::method(args)` static call whose callee is
     /// an inherent static method (registered as MethodInfo); checks only when a
     /// single static signature of the call's arity is found.
-    check_static_scope_method_args(mut &this, visitor: ASTVisitor*, lookup_sym: SymbolStr,
+    check_static_scope_method_args(mut &this, visitor: ASTVisitor*,
                                    scope: ScopeResolutionNode*, call: CallExprNode*) -> void {
         // The pair first, for the same reason as the sibling site above; then
-        // the owner key the caller resolved, which names the type by identity
-        // (a specialization, a DI key) where the written qualifier does not.
+        // the owner the segment names, which is the type by identity (a
+        // specialization, a DI key) where the written qualifier is not.
         mut type_ref: TypeRef = this.resolve_generic_scope_type(
             this.types.scope_qualifier_type(scope), scope.scope_generic_args,
             scope.span);
         if (!type_ref.is_valid()) {
-            type_ref = this.types.lookup_type_exact(lookup_sym);
+            type_ref = this.scope_owner_base_type(scope);
         }
         if (!type_ref.is_valid()) { return; }
         mut t: Type* = this.arena.lookup(type_ref.id);

@@ -57,7 +57,7 @@ LANE = load(os.path.join(ROOT, "scripts", "lane-gate-selftest.py"), "lane_gate_s
 FILES = dict(LANE.FILES)
 
 # The caller: one call per class the fixture can reach through the real
-# classifier - S (the index, the funnel), J module (the graph), B (the
+# classifier - S (the index, the funnel), J module (the graph), J hint (the
 # registry) - one call on a type that holds nothing (the scope manager: the
 # elsewhere table's one row), and one turbofish static on a non-holder
 # (`new` is a population name, `ResolutionContext::new`'s; a static pattern
@@ -72,7 +72,7 @@ type struct Sema {
         this.ctx.decl_index.lookup_type(name);
         this.types.lookup_type_exact(name);
         this.ctx.module_graph.find_module_index(name);
-        this.ctx.generic_registry.get_template(name);
+        this.ctx.generic_registry.find_trait_defining_method(name);
         this.scopes.lookup_type(name);
         this.pairs.push(Pair::<SymbolStr, TypeRef>::new(name, t));
     }
@@ -95,6 +95,11 @@ FILES["compiler/types/resolver.cryo"] = FILES["compiler/types/resolver.cryo"].re
     "    index_of(&this, name: SymbolStr) -> i64 { return -1; }\n",
     "    index_of(&this, name: SymbolStr) -> i64 { return -1; }\n"
     "    static new(source_file: string) -> ResolutionContext { return ResolutionContext { names: [] }; }\n", 1)
+# The registry read the caller makes, declared as the tree declares it.
+FILES["compiler/types/generic_registry.cryo"] = FILES["compiler/types/generic_registry.cryo"].replace(
+    "    register_impl_block(",
+    "    find_trait_defining_method(&this, method_name: SymbolStr) -> SymbolStr { return method_name; }\n"
+    "    register_impl_block(", 1)
 
 # What the fixture must produce: 5 call sites (the funnel's own forwarding
 # call into the index is the fifth, N by override), plus one inline scan
@@ -105,7 +110,7 @@ GATE_MOD = residue.load_gate()
 LOCAL_TABLES = sorted(label.split(".", 1)[1] for label, sc in GATE_MOD.SCANNED_ARRAYS.items()
                       if label.startswith(GATE_MOD.LOCAL + ".") and sc.kind == GATE_MOD.TABLE)
 BASE_SITES = 5 + len(LOCAL_TABLES)
-BASE_CLASSES = {"S": 2, "N": 1, "J": 1, "B": 1}
+BASE_CLASSES = {"S": 2, "N": 1, "J": 2}
 for _elem in LOCAL_TABLES:
     _cls = rc.CLASS_OF_METHOD["%s::%s[]" % (GATE_MOD.LOCAL, _elem)][0]
     BASE_CLASSES[_cls] = BASE_CLASSES.get(_cls, 0) + 1

@@ -257,6 +257,17 @@ def _scan_block(owner, field, elem):
             "}\n" % (owner, field, owner, field, field, key))
 
 
+def _id_scan_block(owner, field):
+    """A scan of `o.<field>` by the element's identity-typed `key`."""
+    return ("type struct IdScan_%s_%s {\n"
+            "    scan(&this, t: TypeRef, o: %s*) -> void {\n"
+            "        for (mut i: i64 = 0; i < o.%s.length; i++) {\n"
+            "            if (o.%s[i].key.equals(t)) { return; }\n"
+            "        }\n"
+            "    }\n"
+            "}\n" % (owner, field, owner, field, field))
+
+
 SCAN_LOCALS_FILE = "compiler/scan_locals.cryo"
 for _label, _sc in sorted(GATE_MOD.SCANNED_ARRAYS.items()):
     _owner, _field = _label.split(".", 1)
@@ -267,6 +278,9 @@ for _label, _sc in sorted(GATE_MOD.SCANNED_ARRAYS.items()):
             FILES[_where[0]] = _insert_field(FILES[_where[0]], _ehead, "    name: SymbolStr;\n")
         else:
             FILES[SCAN_ELEMS_FILE] = FILES.get(SCAN_ELEMS_FILE, "") + _ehead + "    name: SymbolStr;\n}\n"
+    if _sc.kind == GATE_MOD.IDENTITY:
+        _where = [r for r, t in FILES.items() if "type struct %s {\n" % _sc.elem in t]
+        FILES[_where[0]] = _insert_field(FILES[_where[0]], "type struct %s {\n" % _sc.elem, "    key: TypeRef;\n")
     if _owner == GATE_MOD.LOCAL:
         FILES[SCAN_LOCALS_FILE] = FILES.get(SCAN_LOCALS_FILE, "") + _scan_block(_owner, _field, _sc.elem)
         continue
@@ -276,10 +290,19 @@ for _label, _sc in sorted(GATE_MOD.SCANNED_ARRAYS.items()):
         FILES[_sc.defn] = _insert_field(_existing, _ohead, "    %s: %s[];\n" % (_field, _sc.elem))
     else:
         FILES[_sc.defn] = _existing + _ohead + "    %s: %s[];\n}\n" % (_field, _sc.elem)
-    FILES[_sc.defn] += _scan_block(_owner, _field, _sc.elem)
+    if _sc.kind == GATE_MOD.IDENTITY:
+        FILES[_sc.defn] += _id_scan_block(_owner, _field)
+    else:
+        FILES[_sc.defn] += _scan_block(_owner, _field, _sc.elem)
 
 # The first scanned array in the gate's table, for the stale-entry mutation.
-FIRST_SCANNED = sorted(GATE_MOD.SCANNED_ARRAYS)[0]
+FIRST_SCANNED = sorted(l for l, sc in GATE_MOD.SCANNED_ARRAYS.items() if sc.kind != GATE_MOD.IDENTITY)[0]
+# The first array keyed by identity, for the two identity mutations: a scan
+# of it by name, and the identity scan gone.
+FIRST_IDENTITY = sorted(l for l, sc in GATE_MOD.SCANNED_ARRAYS.items() if sc.kind == GATE_MOD.IDENTITY)[0]
+_ID_OWNER, _ID_FIELD = FIRST_IDENTITY.split(".", 1)
+_ID_DEFN = GATE_MOD.SCANNED_ARRAYS[FIRST_IDENTITY].defn
+_ID_ELEM = GATE_MOD.SCANNED_ARRAYS[FIRST_IDENTITY].elem
 
 # LOOKUP is 2: the caller's one, and the funnel's call INTO the index in
 # type_utils.cryo, which is counted - only a store's own file is excluded
@@ -598,6 +621,14 @@ MUTATIONS = [
               _scan_block(*(FIRST_SCANNED.split(".", 1) + [GATE_MOD.SCANNED_ARRAYS[FIRST_SCANNED].elem])), "", 1)},
      1, "`%s` is listed in SCANNED_ARRAYS but nothing in the tree scans it inline: a stale entry"
         % FIRST_SCANNED),
+    ("an array keyed by identity, scanned by a name, is refused though it is listed",
+     {_ID_DEFN: FILES[_ID_DEFN] + _scan_block(_ID_OWNER, _ID_FIELD, _ID_ELEM)},
+     1, "`%s` is listed in SCANNED_ARRAYS as keyed by identity (DefId / TypeRef) but is scanned by a name"
+        % FIRST_IDENTITY),
+    ("an array keyed by identity that nothing scans by identity any more is a stale entry, refused",
+     {_ID_DEFN: FILES[_ID_DEFN].replace(_id_scan_block(_ID_OWNER, _ID_FIELD), "", 1)},
+     1, "`%s` is listed in SCANNED_ARRAYS as keyed by identity but nothing in the tree scans it by an identity"
+        % FIRST_IDENTITY),
 ]
 
 

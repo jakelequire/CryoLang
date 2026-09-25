@@ -477,6 +477,12 @@ EXCLUDED_ARRAYS = {
 
 TABLE = "table"
 DATA = "data"
+IDENTITY = "identity"
+
+# The types a row is keyed by when it is keyed by what a declaration IS
+# rather than how it is spelled.  Only an IDENTITY entry's array is read
+# for them: a compare of two `TypeRef`s anywhere else is ordinary code.
+IDENTITY_TYPES = ("DefId", "TypeRef")
 
 
 class Scanned(object):
@@ -487,7 +493,15 @@ class Scanned(object):
     the array is a member table (the declarations of an owner in hand, by
     their leaf - D32's population, exactly as a call to the owner's door
     would be) or DATA when what is compared is a text, a flag, a file path
-    or a triple, which names no declaration."""
+    or a triple, which names no declaration.
+
+    IDENTITY is a store's table whose rows are keyed by an identity
+    (IDENTITY_TYPES) and scanned by it.  The entry stays watched rather
+    than being deleted when its key stops being a name: the array must
+    still be scanned by an identity-typed field, or the entry is stale,
+    and a scan of it by a NAME is refused outright - where an array in no
+    entry could be placed as a TABLE by adding one, the identity entry
+    has to be changed first, which is the regression made visible."""
 
     def __init__(self, defn, elem, kind, reason):
         self.defn = defn
@@ -657,8 +671,8 @@ SCANNED_ARRAYS = {
     # -- the stores' own rows, scanned only in their own files --
     "GenericRegistry.entries":    Scanned("compiler/types/generic_registry.cryo", "TemplateEntry", TABLE,
                                           "the registry's template rows by name and module"),
-    "GenericRegistry.trait_heads": Scanned("compiler/types/generic_registry.cryo", "TraitImplHead", TABLE,
-                                           "the registry's trait-impl heads by target key and trait identity"),
+    "GenericRegistry.trait_heads": Scanned("compiler/types/generic_registry.cryo", "TraitImplHead", IDENTITY,
+                                           "the registry's trait-impl heads by target type and trait identity"),
     "ModuleGraph.modules":        Scanned("compiler/module_graph.cryo", "ModuleInfo", TABLE,
                                           "the graph's modules by namespace"),
     # -- texts, flags, file paths and triples: no declaration --
@@ -870,7 +884,7 @@ def operand_after(line, start):
     return line[start:i].strip()
 
 
-def key_chain(tree, elem, chain):
+def key_chain(tree, elem, chain, key_types=KEY_TYPES):
     """Whether `.a.b.c` walked from `elem` through the tree's declared fields
     ends on a KEY-typed field.  A hop the tree does not declare (a field
     inherited from a base class, an accessor) is unknown, and unknown is not
@@ -879,21 +893,21 @@ def key_chain(tree, elem, chain):
     ty = elem
     segs = [s for s in chain.split(".") if s]
     if not segs:
-        return elem in KEY_TYPES
+        return elem in key_types
     for n, s in enumerate(segs):
         # `.name.id`: the interned id IS the symbol, compared as a number.
-        if s == "id" and ty == "SymbolStr" and n == len(segs) - 1:
+        if s == "id" and ty == "SymbolStr" and "SymbolStr" in key_types and n == len(segs) - 1:
             return True
         f = tree.fields.get(ty, {}).get(s)
         if f is None:
             return False
         if n == len(segs) - 1:
-            return f in KEY_TYPES
+            return f in key_types
         ty = f
     return False
 
 
-def inline_scans(tree):
+def inline_scans(tree, key_types=KEY_TYPES):
     """Rule 1c's reads: [(rel, lineno, owner, field, elem, chain, key text)]
     for every comparison of a typed array element's key-typed field, read
     directly (`st.methods[i].name.equals(n)`) or through a local bound to
@@ -906,7 +920,10 @@ def inline_scans(tree):
     A LOCAL TABLE - a local or parameter annotated as an array of records
     (`mut fields: &FieldInfo[] = &st.fields;`, `slots: MethodInfo[]`) and
     indexed - is the same scan with the owner out of view; it is placed
-    by its element under the owner `local` (`local.FieldInfo`)."""
+    by its element under the owner `local` (`local.FieldInfo`).
+
+    `key_types` is what a compared field must be to count: the name types
+    for rule 1c's placement, IDENTITY_TYPES for an IDENTITY entry's check."""
     elem_of = {}
     for owner, arrays in tree.typed_arrays.items():
         for _rel, field, elem in arrays:
@@ -915,12 +932,12 @@ def inline_scans(tree):
     # typed array above): the element is the key itself.
     for owner, arrays in tree.array_owners.items():
         for _rel, field, elem in arrays:
-            if elem in KEY_TYPES:
+            if elem in key_types:
                 elem_of[(owner, field)] = elem
     # A record is any declared type with a key-typed field; a key type is
     # its own record.
-    records = {ty for ty, fs in tree.fields.items() if any(t in KEY_TYPES for t in fs.values())}
-    records |= set(KEY_TYPES)
+    records = {ty for ty, fs in tree.fields.items() if any(t in key_types for t in fs.values())}
+    records |= set(key_types)
     rows = []
     for rel in tree.rels:
         depth = 0
@@ -958,22 +975,22 @@ def inline_scans(tree):
             for pat, owner, field, elem in cands:
                 # `elem.key.equals(X)` / `.eq(X)`: keyed by X.
                 for cm in re.finditer(pat + chain + r"\.(?:equals|eq)\s*\(", code):
-                    if key_chain(tree, elem, cm.group(1)):
+                    if key_chain(tree, elem, cm.group(1), key_types):
                         found.append((cm.end() - 1, 0, owner, field, elem, cm.group(1),
                                       argument_text(code, cm.end() - 1)))
                 # `X.equals(elem.key)`: keyed by X, the receiver.
                 for cm in re.finditer(r"\.(?:equals|eq)\s*\(\s*" + pat + chain + r"\s*\)", code):
-                    if key_chain(tree, elem, cm.group(1)):
+                    if key_chain(tree, elem, cm.group(1), key_types):
                         found.append((code.index("(", cm.start()), 1, owner, field, elem, cm.group(1),
                                       operand_before(code, cm.start())))
                 # `elem.key == X` / `!= X`: keyed by X.
                 for cm in re.finditer(pat + chain + r"\s*(==|!=)\s*", code):
-                    if key_chain(tree, elem, cm.group(1)):
+                    if key_chain(tree, elem, cm.group(1), key_types):
                         found.append((cm.start(2), 0, owner, field, elem, cm.group(1),
                                       operand_after(code, cm.end())))
                 # `X == elem.key`: keyed by X.
                 for cm in re.finditer(r"(?<![=!<>])(==|!=)\s*" + pat + chain, code):
-                    if key_chain(tree, elem, cm.group(2)):
+                    if key_chain(tree, elem, cm.group(2), key_types):
                         found.append((cm.start(1), 1, owner, field, elem, cm.group(2),
                                       operand_before(code, cm.start(1))))
             # One row per comparison, keyed at the operator's position: the
@@ -1023,8 +1040,26 @@ def place_inline_scans(tree):
         if entry.defn not in declared:
             problems.append("  `%s` is listed in SCANNED_ARRAYS at %s but declared in %s"
                             % (label, entry.defn, ", ".join(declared) or "no file"))
+    # An IDENTITY entry: its array is scanned by an identity-typed field, and
+    # never by a name.
+    by_identity = {}
+    for rel, lineno, owner, field, elem, chain, key in inline_scans(tree, IDENTITY_TYPES):
+        by_identity.setdefault((owner, field), []).append((rel, lineno, elem, chain))
     for label, entry in sorted(SCANNED_ARRAYS.items()):
         owner, field = label.split(".", 1)
+        if entry.kind == IDENTITY:
+            if (owner, field) in seen:
+                rel, lineno, _elem, chain = seen[(owner, field)][0]
+                problems.append(
+                    "  `%s` is listed in SCANNED_ARRAYS as keyed by identity (%s) but is scanned by a name\n"
+                    "      (%s:%d `%s`, %d site%s): compare the row's identity, or change the entry's kind\n"
+                    "      and say why its key went back to a spelling"
+                    % (label, " / ".join(IDENTITY_TYPES), rel, lineno, chain, len(seen[(owner, field)]),
+                       "" if len(seen[(owner, field)]) == 1 else "s"))
+            if (owner, field) not in by_identity:
+                problems.append("  `%s` is listed in SCANNED_ARRAYS as keyed by identity but nothing in the tree scans it"
+                                " by an identity (%s): a stale entry" % (label, " / ".join(IDENTITY_TYPES)))
+            continue
         if (owner, field) not in seen:
             problems.append("  `%s` is listed in SCANNED_ARRAYS but nothing in the tree scans it inline: a stale entry"
                             % label)

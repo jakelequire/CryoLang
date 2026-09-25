@@ -150,8 +150,6 @@ CLASS_OF_METHOD = {
         ("S", "the method's generic parameters under symbolic check, asked whether a parameter TYPE's spelling is one of them (see the owner's)"),
     "GenericRegistry::entries[]":
         ("B", "the registry's template rows by name and module, scanned in the registry's own file only"),
-    "GenericRegistry::trait_heads[]":
-        ("B", "the registry's trait-impl heads by target key and trait identity, scanned in the registry's own file only"),
     "ModuleGraph::modules[]":
         ("J", "module: the graph's modules by namespace, scanned inline"),
     "ModuleInfo::reexports[]":
@@ -235,20 +233,12 @@ CLASS_OF_METHOD = {
     "TypeUtils::lookup_method_return":
         ("J", "member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name)"),
     # -- the generic registry --
-    "GenericRegistry::get_template":
-        ("B", "a template by the canonical name of a stamped type (`target_key`, `get_qualified_name`, a `Def` stamp, the call's pinned template key)"),
-    "GenericRegistry::overlapping_head":
-        ("B", "a head that overlaps `(trait identity, target key)` at registration"),
-    "GenericRegistry::lookup_inherent_owner":
-        ("B", "the declaring node of a type by the canonical name off its `TypeRef`"),
-    "GenericRegistry::inherent_impl_blocks":
-        ("B", "a primitive's `implement` blocks by the spelling the stamp carries (`scope_owner_key`)"),
     "GenericRegistry::inherent_impl_has_method":
-        ("B", "`(owner, method)`: the owner a canonical name off a `TypeRef`, the method a leaf inside it"),
+        ("J", "member: a method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand"),
     "GenericRegistry::find_inherent_impl_method":
-        ("B", "`(owner, method)`: the owner a canonical name off a `TypeRef`, the method a leaf inside it"),
+        ("J", "member: a method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand"),
     "GenericRegistry::find_inherent_impl_generic_method":
-        ("B", "`(owner, method)`: the owner a canonical name off a `TypeRef`, the method a leaf inside it"),
+        ("J", "member: a generic method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand"),
     "GenericRegistry::template_in":
         ("J", "member: a template declared inside its container - a module's generic function, a type's generic static method - by the leaf written after the path segment; the container is the segment's resolved identity (`ResBase`), never a spelling"),
     "GenericRegistry::member_template_key":
@@ -278,8 +268,6 @@ CLASS_OF_METHOD = {
 # {(file, "Holder::method", argument text): (class, reason)} - a site whose
 # key comes from somewhere the method's other callers' do not.
 SITE_OVERRIDES = {
-    ("compiler/sema/call_resolver.cryo", "GenericRegistry::get_template", "csym"):
-        ("C", "`scope::member` composed from the owner key and the written member"),
     ("compiler/passes/type_resolution.cryo", "DeclarationIndex::lookup_type", "n"):
         ("J", "prim: `Res::PrimTy(n)` - the primitive's identity is the spelling the stamp carries"),
     ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_type", "name"):

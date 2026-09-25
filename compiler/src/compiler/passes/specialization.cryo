@@ -167,7 +167,8 @@ type struct SpecializationPasses {
                         // type rather than scope-qualified name; record the
                         // owner AST here so try_infer_method_call can find
                         // its `methods[]` from a receiver TypeRef.
-                        SpecializationPasses::register_inherent_owner(owner_key, stmt, registry);
+                        SpecializationPasses::register_inherent_owner(
+                            ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
                     }
                 }
                 NodeKind::UnionDeclaration => {
@@ -183,7 +184,8 @@ type struct SpecializationPasses {
                         const owner_key: SymbolStr = node.def.qualified_name();
                         SpecializationPasses::register_static_method_templates(owner_key, node.methods,
                             registry, arena, ctx);
-                        SpecializationPasses::register_inherent_owner(owner_key, stmt, registry);
+                        SpecializationPasses::register_inherent_owner(
+                            ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
                     }
                 }
                 NodeKind::EnumDeclaration => {
@@ -203,7 +205,8 @@ type struct SpecializationPasses {
                         const owner_key: SymbolStr = node.def.qualified_name();
                         SpecializationPasses::register_static_method_templates(owner_key, node.methods,
                             registry, arena, ctx);
-                        SpecializationPasses::register_inherent_owner(owner_key, stmt, registry);
+                        SpecializationPasses::register_inherent_owner(
+                            ctx.decl_index.type_of_decl(node.def, "specialization/inherent owner"), stmt, registry);
                     }
                 }
                 NodeKind::FunctionDeclaration => {
@@ -667,7 +670,7 @@ type struct SpecializationPasses {
         }
         // Each cloned impl block is rewritten to target the specialization
         // by its qualified name and recorded as a head under the
-        // specialization's key; its methods were registered under the type
+        // specialization's type; its methods were registered under the type
         // when the entry was placed.
         const impl_qname: SymbolStr = if (entry.specialized_type.is_valid()) {
             arena.get_qualified_name(entry.specialized_type)
@@ -682,11 +685,11 @@ type struct SpecializationPasses {
             if (impl_qname.is_valid() && impl_node != null) {
                 impl_node.set_target_type(impl_qname);
                 impl_node.spec_owner = entry.specialized_type;
-                // The clone under the SPECIALIZATION's key: a subject with a
-                // name of its own selects among the clones placed under it.
+                // The clone under the SPECIALIZATION: a subject that is a type
+                // of its own selects among the clones placed under it.
                 if (impl_node.is_trait_impl()) {
                     ctx.generic_registry.register_trait_impl(
-                        impl_node.trait_def, impl_qname, impl_node);
+                        impl_node.trait_def, entry.specialized_type, impl_node);
                 }
             } else {
                 SpecInjector::register_injected_decl(entry.impl_nodes[j], ctx);
@@ -937,14 +940,13 @@ type struct SpecializationPasses {
     /// are specialized as part of struct/class monomorphization rather than
     /// per-call.
     static register_inherent_owner(
-            owner_key: SymbolStr, owner_ast: ASTNode*,
+            owner: TypeRef, owner_ast: ASTNode*,
             registry: GenericRegistry*) -> void {
         if (owner_ast == null) { return; }
-        // Under the declaration's own key - its stamp's name - and nothing
-        // else.  A bare leaf as a second key is last-writer-wins across every
-        // module declaring the leaf, and a reader that reached it by a
-        // receiver's leaf was handed some other module's declaration.
-        registry.register_inherent_owner(owner_key, owner_ast);
+        // Under the declaration's own type and nothing else: two modules'
+        // same-leaf declarations are two types, so a reader holding a
+        // receiver is never handed some other module's declaration.
+        registry.register_inherent_owner(owner, owner_ast);
     }
 
     static register_impl_block(node: ImplBlockNode*, registry: GenericRegistry*,
@@ -962,9 +964,10 @@ type struct SpecializationPasses {
             // Non-generic target: there is no TemplateEntry to hang the block
             // on, so an inherent `implement T { ... }` block would otherwise be
             // invisible to ownership classification.  Recorded under the
-            // target's key - a declared type's canonical name, a primitive's
-            // spelling - which is what every reader derives from a receiver.
-            registry.register_inherent_impl_block(qualified_sym, node);
+            // type the head names - a declared type's, a primitive's - which
+            // is what every reader holds as a receiver.
+            registry.register_inherent_impl_block(
+                ctx.decl_index.impl_owner(node, "specialization/inherent impl"), node);
             // A generic static method on a non-generic target needs its own
             // template entry, exactly as when it is written inside the type's
             // body (see the StructDeclaration arm of `run_template_registration`).
@@ -982,14 +985,14 @@ type struct SpecializationPasses {
         }
 
         // A trait impl goes into the trait-impl registry under the trait's
-        // identity and the target's key, both stamped by the name layer.
+        // identity and the target's type, both off the name layer's stamps.
         // Coherence is not checked here: the single check lives in
         // TypeResolution, once `canonical_target` is stamped, and covers
         // same-file and cross-module duplicates uniformly.
         if (node.is_trait_impl()) {
             registry.register_trait_impl(
                 TypeAnnotation::trait_def(node.trait_annotation),
-                node.target_key(ctx.type_arena), node);
+                ctx.decl_index.impl_owner(node, "specialization/trait impl"), node);
         }
     }
 
