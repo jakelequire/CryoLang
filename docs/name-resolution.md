@@ -51,6 +51,10 @@ instrument condition one's list is drawn from; its J count is not a target.
    and hand-written scans classed convertible (S, B, C, F, W; D32 row).
    **NOT MET.** The list, one line per function or scan with its class and
    call-site count: `python3 scripts/ns-migration/done.py --outstanding`.
+   Its two F lines (`is_candidate_public`, `namespace_of`) are **BLOCKED on
+   Jake** (§8.340): a module-qualified call can hand the visibility gate the
+   callee's identity only once intrinsic functions are offered by their
+   module, which is the question §8.340 puts.
    Outside that population, and therefore NOT on the list although they are
    lookups by spelling: `lookup_subst_for_param` (a where-bound's subject by
    its parameter's spelling, in `mono/trait_specializer.cryo` and
@@ -42348,5 +42352,127 @@ git grep -n "DefId::of_definition(" -- compiler/src | grep -v "static of_definit
 python3 scripts/lane-gate.py --row DEFID_MINT                                                                 # 9
 python scripts/ns-migration/8.339/mint-move-shadow.py && rm -rf compiler/build && make cryo && bash scripts/objcmp/corpus2.sh mint
 ```
+
+---
+
+### 8.340 `Module::f` cannot yet be named by the name layer's binding: intrinsic functions have none, and a private member's refusal depends on the name sema composes - BLOCKED on Jake, measured, nothing built - 2026-09-26
+
+Condition one's two visibility lines (`DeclarationIndex::is_candidate_public`
+and `namespace_of`, both called from `CallResolver::enforce_callee_visibility`)
+convert only if a module-qualified call hands the gate the function's
+identity. The unit tried the direct route: the name layer already finds the
+member when it stamps the scope segment (the symbol the module offers under
+the leaf, whose stamp is `Symbol.def` since §8.339), so it records it on the
+node, and sema reads it instead of composing a name.
+
+```cryo
+// today - sema glues the module's stamp to the written leaf
+const q: SymbolStr = intern(stamped_ns + "::" + member);      // std::core::mem::swap
+// tried - the binding the name layer made for `mem::swap`
+const callee: DefId = scope.member_def;
+```
+
+The patch (`.objcmp/u3/unit3.patch`, on `46466528`: `ScopeResolutionNode
+.member_def`, stamped beside the scope segment; `resolve_module_qualified_def`
+in place of `resolve_module_qualified_symbol`; `enforce_callee_visibility`,
+`enforce_value_ref_visibility` taking a `DefId`, with `namespace_of_def` /
+`is_public_def` in the index) builds, and then **every program that calls an
+intrinsic by path fails**: `examples/05-todo-cli` stops with E0233 "cannot
+find `intrinsics::fpclass`" and 452 like it.
+
+#### Measured (`scripts/ns-migration/8.340/member-def-shadow.py`, six halves, the OLD answer returned so the build is the tree's)
+
+At every module-qualified function the call resolver names, the binding
+against the composed name (`.objcmp/u3/u3-lines.txt`):
+
+| outcome | count |
+|---|---|
+| both name the same function | 277,526 |
+| neither names a function | 22,720 |
+| they name different functions | **0** |
+| no binding, but the composed name is a function | **15,872** |
+
+The 15,872 are two populations, and nothing else:
+
+1. **15,849 intrinsic functions** (`std::core::intrinsics::…`). The name
+   layer declares an intrinsic function and never exports it
+   (`name_resolution.cryo`, the `IntrinsicDeclaration` arm has no
+   `export_symbol`; the `IntrinsicConstDeclaration` arm does), so the module
+   offers nothing under the leaf and `intrinsics::f` resolves today only
+   because sema composes `std::core::intrinsics::f` and finds the signature
+   the declaration index registered. §8.65 tried exporting them: it
+   ambiguated 87 leaves and broke the build on `panic` (an intrinsic and a
+   real function share the leaf), and the endgame plan's §1 treats the
+   intrinsics as a design of their own.
+2. **Private members called by path** - `VisibilityGate::Vault::latch` (6),
+   `PrivExt::Ffi::llabs` (3), `VisibilityValueGate::Vault::tapped` (1): the
+   three negative projects that pin E0353 "is private and cannot be called".
+   The module offers only public members, so the refusal they pin fires only
+   because the composed name reaches a declaration the name layer did not
+   bind. Keeping it needs the name layer to bind the private declaration
+   (`Resolver::private_declaration`, which imports already use) and leave the
+   refusal to sema's gate - an answer the tree gives, not a question.
+
+**Question for Jake:** should an intrinsic function be offered by its module
+- reachable as `intrinsics::f` through the name layer's binding - and if so,
+by being exported (so a glob import brings it, which §8.65 showed collides),
+or by path only (a set a path reaches that an import does not)? Until one of
+those holds, condition one's two F lines cannot be converted without minting
+the callee's id from the composed name, which §8.339 just removed.
+
+#### Also measured: the probe's instrument caveat
+
+One project failed under the probe and none under the tree: `visibility_gate`
+asserts its output does not contain `VisibilityGate::Vault::door`, and the
+probe prints the names it compares. The same caveat §5 of the identity-index
+plan recorded for its mint probe.
+
+---
+
+### 8.341 A generated `implement` block is told from a written one by `spec_owner`, already: every instantiation clone carries it, no written block does - measured, nothing changed - 2026-09-26
+
+An audit found the compiler places `implement` blocks for generic
+instantiations into the same statement lists that bare-name finders walk,
+242 of them unstamped beside 312 written and stamped, and no mark to skip the
+generated ones by. Whether converting those finders needs a mark ADDED
+decides that later unit's shape.
+
+**It does not: the mark exists.** `scripts/ns-migration/8.341/impl-origin-probe.py`
+tags each `ImplBlockNode` with where it was created (a field for the
+measurement only) and prints, just before code generation, every block in
+each compiled module's top-level statement list with the fields a consumer
+could tell them apart by. Six halves (`.objcmp/u3/u3-lines.txt`; the
+population counts one block once per module compilation that holds it):
+
+| created by | blocks | head stamped | `spec_owner` set | `target_type_span` set |
+|---|---|---|---|---|
+| the parser (written) | 23,065 | all: 9,817 a definition, 13,248 a primitive (`implement … for i32`) | **0** | all |
+| the AST cloner (the monomorphizer's instantiation blocks) | 24,857 | **none** | **all** | none |
+| the async lowering (a future's `Future` impl) | 733 | all | 0 | none |
+| the C++ binding importer | 0 (no corpus reaches it) | | | |
+
+```cryo
+// what a finder that must pass over instantiation blocks asks
+if (ib.spec_owner.is_valid()) { continue; }   // the block is a clone placed for an instantiation
+```
+
+- `spec_owner` splits the population exactly: set on 24,857 of 24,857
+  clones, on 0 of 23,798 others. It is the designed carrier: the
+  monomorphizer sets it on every kept clone as soon as the concrete type is
+  decided (`monomorphizer.cryo`, before `resolve_specialized_ast`), and the
+  placement pass sets it again when the clone goes into a module
+  (`specialization.cryo`). From the code (not measured at the finders' own
+  point): both writes precede the clone's arrival in any statement list.
+- The head stamp splits it too, and by design: the cloner withholds `res`
+  (`cloner.cryo`, the `ImplBlockNode` visit), so a stamp-keyed finder never
+  matches a clone at all.
+- `target_type_span` does NOT: the async lowering's blocks lack it as well.
+
+So the audit's "no mark" held for the fields it looked at, not for the
+node: nothing needs adding, and a finder converted to stamps can skip
+generated blocks by `spec_owner`, or needs nothing when it matches by stamp.
+The measurement point is code generation, after every placement; the
+audit's populations (242, 312) were counted elsewhere and are not comparable
+one to one.
 
 ---
