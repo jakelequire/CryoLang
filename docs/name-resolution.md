@@ -169,7 +169,7 @@ measurement that decided it on the row.
 | D36 | **A receiver is written explicitly in user source**, as in Rust; no implicit receiver. A method the compiler generates (a closure's call operator, ..) still gets one synthesized. Its own unit (Jake, relayed in plain text 2026-09-26) | **RULED** | `no check` — not built | §8.344 |
 | D37 | **The reference-mutability check waits until after merge**, and when it lands it runs BEFORE the async lowering, which turns an async method's `this` into a raw pointer so that a check after it cannot see the declared receiver (Jake, relayed in plain text 2026-09-26) | **RULED** | `no check` — not built | §8.344 |
 | D38 | **The bare-leaf store goes before merge; the eight bare-name finders wait until after, as a written exception** lifted by a test harness for the editor's answers (Jake, relayed in plain text 2026-09-26; condition one above carries the exception and its reason) | **RULED** | `no check` — not built | §8.345 |
-| D39 | **The generic-parameter converge work starts**: an implement block's parameters bind through its head (option B), one place per step, each step flipping one kind of program from refused to accepted (Jake, relayed in plain text 2026-09-26) | **RULED** | `no check` — not built | §8.343 |
+| D39 | **The generic-parameter converge work starts**: an implement block's parameters bind through its head (option B), one place per step, each step flipping one kind of program from refused to accepted (Jake, relayed in plain text 2026-09-26) | **RULED; step one TAKEN (§8.347)** - the monomorphizer's filter of kept impls binds through the head; eight places and the seven comparisons remain | `grep -c 'add_head_param_bindings(impl_node' compiler/src/compiler/mono/trait_specializer.cryo` → **1** | §8.343, §8.347 |
 
 **D18's keyword half is RULED and UNBUILT - built once and backed out at a parse fork the ruling did not cover (§8.295: `x as u32 < y`), and waiting on that one ruling - and D32 is the criterion it is built toward** (D5 was, until §8.206; D2 and D9 were,
 until §8.213; D24 was, until §8.233 - this line kept naming it for forty-six entries after its row said TAKEN, §8.280; Q2 was, until §8.259; D25 was, until §8.263; D30's refusal was, until §8.268; D28 was, until §8.270; D30's identity half was, until §8.272; D31 was, until §8.278). Each was decided by Jake - D18 and D2 then re-parked as open
@@ -356,7 +356,7 @@ Checks for this section, one per line so each can be copied whole:
 * `python3 scripts/lane-gate.py --rows` → **16** (17 before §8.346 deleted `DEFID_MINT`)
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: lane-check lane-selftest' Makefile` → **1**
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **77** (+1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **78** (+1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
@@ -43040,5 +43040,71 @@ git grep -n "of_definition\|\.qualified_name()" -- compiler/src      # nothing
 python3 scripts/lane-gate.py --row DEFID_PATH                            # 61
 git apply scripts/ns-migration/8.346/index-shadow.patch && rm -rf compiler/build && make cryo && bash scripts/objcmp/corpus2.sh idx
 ```
+
+---
+
+### 8.347 The monomorphizer's filter of kept implement blocks checks an impl's `where` bounds against the parameters its own head binds - converge step one of nine, one kind of program goes from refused to compiled - 2026-09-26
+
+The first place §8.343 priced, taken as Jake ruled (§0.1 D39): an implement
+block's parameters are its own and relate to the type's only through the
+block's head.
+
+```cryo
+type struct Wrap<T> { inner: T; }
+
+implement<U> trait Show for struct Wrap<U>     // U is the impl's own
+where U: Show {
+    show(&this) -> i32 { return this.inner.show() + 1; }
+}
+
+const p: Wrap<Plain> = ...;   // Plain has no Show; nothing calls p.show()
+// before: error[E0358]: no method named `show` found on type `Plain`
+//         (the filter looked `U` up among Wrap's parameter NAMES, found no
+//         `U`, read the bound as vacuous, and kept the impl for Wrap<Plain>)
+// after:  U is bound to Plain through the head `Wrap<U>`, the bound fails,
+//         and the impl is dropped for Wrap<Plain> - kept for Wrap<Num>
+```
+
+Spelled `T` like the type's parameter, the same program always compiled:
+the filter's bindings were the type's, and a same-spelled impl parameter
+happened to find them.
+
+- `TraitChecker::add_head_param_bindings(impl, args, subst)`: each
+  parameter the head writes as a target argument, bound to the
+  instantiation's argument in that position. The trait checker's own
+  nested check (`impl_bounds_hold`) already bound this way, inline; it now
+  calls the helper.
+- `MonoTraitSpecializer::filter_bounds_violating_impls` checks
+  `impl.where_bounds` against those bindings instead of the template's
+  substitution.
+
+Parameters are still keyed by spelling (the arena flip has not happened),
+so for a head spelling its parameters as the type does, the bindings are the
+ones the template's substitution gave - nothing that compiled can move. What
+can change is the other spelling, from refused to compiled.
+
+#### Evidence
+
+- New project `tests/tests/projects/impl_param_bound_through_head` (the
+  program above plus a `Wrap<Num>` whose `show()` runs; `run`, exit 7).
+  Under the compiler without this change: `E0358 no method named show found
+  on type Plain`. With it: builds, exits 7. Roster golden merged, +1
+  (`make roster-check ARGS=--merge`).
+- `objcmp.sh` `88be88be` → tree: **0 of 1,126 example objects**; test
+  objects: 54 changed, **every one the new project's own** (the old
+  compiler cannot build it); suite `OVERALL PASS (unit: ok; compile-fail:
+  227 passed; projects: 75 passed)`. Predicted exactly that.
+- `lsp-check` OK (0 errors, 478 warnings); `cross-check` OK; 346 compiler
+  warnings.
+
+#### Where converge stands
+
+Eight places of §8.343's nine remain, then the seven comparisons, then the
+arena flip that retires condition one's six parameter scans
+(`TemplateEntry::param_names[]` and the rest). This step retires none of
+them by itself.
+
+Reproduce: `bash scripts/objcmp/objcmp.sh`; the project alone with
+`cryo build tests/tests/projects/impl_param_bound_through_head`.
 
 ---

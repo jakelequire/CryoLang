@@ -262,7 +262,26 @@ type struct TraitChecker {
         if (impl_block.target_args.length != subj_nargs) {
             return false;
         }
+        mut args: TypeRef[] = [];
+        for (mut gi: i64 = 0; gi < subj_nargs; gi++) {
+            args.push(this.arena.inst_type_arg_at(subject, gi));
+        }
         mut nested: TypeSubstitution = TypeSubstitution::empty();
+        this.add_head_param_bindings(impl_block, &args, &nested);
+        return this.bounds_satisfied_at_depth(impl_block.where_bounds, &nested, depth + 1);
+    }
+
+    /// Bind the parameters an implement block's head writes to an
+    /// instantiation's arguments: `U` in `implement<U> .. for Wrap<U>`, for
+    /// `Wrap<Plain>`, to `Plain`.  An impl's parameters are its own; they
+    /// relate to the type's only through the head, so a bound the impl
+    /// writes (`where U: Show`) is checked against these bindings and never
+    /// against the type's parameters, which may be spelled differently.  A
+    /// head whose argument count differs from `args` binds nothing.
+    add_head_param_bindings(&this, impl_block: ImplBlockNode*, args: &TypeRef[],
+                            subst: TypeSubstitution*) -> void {
+        if (impl_block == null || subst == null) { return; }
+        if (impl_block.target_args.length != args.length) { return; }
         for (mut gi: i64 = 0; gi < impl_block.target_args.length; gi++) {
             const ta: TypeAnnotation* = impl_block.target_args[gi];
             if (ta == null) { continue; }
@@ -272,12 +291,11 @@ type struct TraitChecker {
                     // name, so the index here only has to make a GenericParam
                     // TypeRef; the name is what matters.
                     const gp_ref: TypeRef = this.arena.create_generic_param(n.name, gi as u64);
-                    nested.add(gp_ref.id, this.arena.inst_type_arg_at(subject, gi));
+                    subst.add(gp_ref.id, args[gi]);
                 }
                 _ => {}
             }
         }
-        return this.bounds_satisfied_at_depth(impl_block.where_bounds, &nested, depth + 1);
     }
 
     /// Lenient "does `ty` implement `trait_name`" check for verifying an
