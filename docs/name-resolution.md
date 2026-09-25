@@ -42669,3 +42669,155 @@ first eight places of the table (the pair's `specialize_with_entry` left
 answering by identity), and compared it to the probe's own hash.
 
 ---
+
+### 8.344 Reference mutability at a call, priced: no written code passes a shared reference where an exclusive one is wanted; 171 places would need the new borrow operator, about 30 hand-written calls mutate through an immutable receiver, and the async lowering writes several hundred more - measured, nothing built - 2026-09-26
+
+Nothing checks reference mutability at a call. Jake asked for the blast
+radius before deciding whether the check and its operator are a unit or a
+project. Cryo has the type `mut &T` but no expression that borrows
+exclusively, so the operator and the check land together; this measures
+what both would meet.
+
+```cryo
+function bump(c: mut &Count) -> void { c.n = c.n + 1; }
+
+const k: Count = Count { n: 0 };
+bump(&k);      // accepted: `&k` is shared, the parameter exclusive
+k.next();      // accepted: `next(mut &this)` on a const binding
+```
+
+#### The instrument
+
+`scripts/ns-migration/8.344/mutref-probe.patch` (on `0aa16644`) prints one
+`SHADOW MUTREF` line, with the source position, for:
+
+- `arg` - an argument checked against a `mut &T` parameter whose type is a
+  SHARED reference (`&x` is typed shared at a call, so this is where
+  `bump(&k)` lands), with what `x` is;
+- `recv` - a call of a `mut &this` method, with what its receiver is;
+- `amp` - `&x` typed `mut &T` from an expected `mut &T` (never fired).
+
+A place is classed by its root binding: a `mut` or `const` local, a shared
+or exclusive reference, a raw pointer, a field of one of those. The control,
+`scripts/ns-migration/8.344/control/`, has every shape once and is classed
+correctly: `bump(&k)` const, `bump(&m)` mut, `bump(r)` with `r: &Count`,
+`k.next()`, `r.next()`, `this.next()` in a `&this` and in a `mut &this`
+method.
+
+Population: the compiler compiled by the probe (`compiler/`, which the LSP
+also links) and the six-half corpus (LSP, unit suite, projects, project
+tests, examples, negatives; every program compiles the stdlib it imports).
+`OVERALL FAIL` in the corpus's `make test` half is the probe's own output
+tripping `projection_bound_leaf_collision`'s `output_excludes` ("iter.cryo");
+built alone it passes, and the run reports 0 failing halves.
+Tally: `mutref-tally.py`, distinct source positions, the populations that
+compile one file merged.
+
+#### What it found
+
+| what the check would meet | distinct places |
+|---|---|
+| a shared-reference VARIABLE passed for `mut &T` (`bump(r)`) | **0** |
+| `&x` of an immutable binding passed for `mut &T` (`bump(&k)`) | **0** |
+| `&x` of a mutable place passed for `mut &T` - legal, but needs the new operator | **171** (compiler 11, stdlib 56, tests 102, examples 12, LSP 54 before merging) |
+| a written call mutating through an immutable receiver | **30**: 15 in methods that write no receiver (the parser supplies `&this`), 9 in methods written `&this`, 6 on a `const` local or a shared reference |
+| explicit `x.drop()` on a binding read as immutable | **73** (some are `mut` pattern bindings the probe cannot see as mutable; all are W0015's explicit destructor calls) |
+| calls the async lowering synthesizes on an immutable receiver | **541**, plus 155 unclear |
+| unclear (raw-pointer deref, call results, indexing, globals) | 113 |
+
+```cryo
+// the 15: a method with no receiver written gets `&this` from the parser
+collect_doc_comments() -> void {     // compiler/src/compiler/parser/parser_base.cryo
+    this.push_doc(tok);              // push_doc(mut &this)
+}
+// the 9: written `&this`, mutating anyway
+advance(&this) -> char {             // compiler/src/compiler/lex/lexer.cryo
+    this.current_location.increment_char(c);   // increment_char(mut &this)
+}
+```
+
+The split between those two rows reads each method's header line with a
+regex and is approximate; the 24 together are the measurement.
+
+The 541 are not 541 edits: they are the calls the async lowering writes
+into poll bodies (the probe gives them the nearest source span - an `async`
+header, an `await` operand, even a comment). And the 74 `field<deref<ptr>>`
+places are written code inside `async` methods (`this.conn.queue_frame(..)`),
+where the lowering has already turned `this` into a raw pointer - a check
+run after lowering cannot see the method's declared receiver at all.
+
+#### What it means
+
+- The core hole Jake named - a shared reference accepted for an exclusive
+  one - occurs in NO written code measured: 0 `bump(r)` shapes, 0
+  `bump(&k)` shapes.
+- The operator is 171 rewrites, mechanical.
+- The check itself meets three things that are not edits: what a method
+  with no written receiver means (15 places, all in the compiler - a
+  language question), the async lowering (its synthesized receivers, and
+  checking an `async` method's body before `this` becomes a pointer), and
+  `x.drop()` (73, already slated by W0015). Around 30 hand-written calls
+  need a receiver or binding made `mut`.
+- So it is a project, not a unit - for the async lowering and the implicit
+  receiver, not for the edit count.
+
+Classifier limits, measured on the control and the samples: a `mut this`
+by-value receiver reads as const (3 places, set aside), and a `mut` pattern
+binding reads as const (inside the 73). Places no program here compiles are
+not measured.
+
+---
+
+### 8.345 The eight bare-name finders are convertible without a definition table, but every caller is in the editor's handlers - assessed, not converted, BLOCKED on Jake - 2026-09-26
+
+Eight functions in `compiler/src/compiler/AST/node_locator.cryo` find a
+declaration by the LAST segment of its name, first match wins; with `Item`
+declared in two modules, go-to-definition on one lands on the other's. They
+were blocked on a "declaration from this identity" lookup.
+
+```cryo
+// module A: type struct Item { .. }     module B: type struct Item { .. }
+const x: B::Item = ...;   // hover / go-to-definition on `Item`
+// find_type_decl_in_modules(graph, intern, "B::Item") matches the leaf
+// "Item" and returns whichever module's declaration it walks first
+```
+
+Read, not probed (the counts are greps: `grep -rn "<finder>(" tools/CryoLSP
+compiler/src --include=*.cryo`):
+
+- The eight: `find_type_decl_in_modules` (16 calls), `find_method_in_modules`
+  (6), `find_field_in_modules` (5), `find_function_in_modules` (2),
+  `find_const_in_modules`, `find_trait_method_in_modules`,
+  `find_impls_of_type`, `find_impls_of_trait` (1 each) - **33 calls, every
+  one in `tools/CryoLSP/src/handlers/`** (`definition.cryo`, `hover.cryo`,
+  `code_lens.cryo`); none in `compiler/src`. The ninth copy of the matcher is
+  `HoverEngine::format_impl_methods` (`hover.cryo`).
+- **No DefId -> declaration table is needed.** Every type and function
+  declaration carries its own `.def` (stamped at registration), so a finder
+  keeps its walk and matches `d.def.equals(def)`; a method or field matches
+  its owner by `def` (an implement block by `target_def()`) and the member by
+  its name within that one owner. Generated implement blocks drop out by
+  construction (the cloner withholds the head's resolution), except for
+  `find_impls_of_trait`, which must skip a block with `spec_owner` set -
+  §8.341's mark.
+- **Most callers hold an identity already**: a member access's receiver type
+  answers `DeclarationIndex::def_of`; a scope segment carries `scope_res`; a
+  named annotation, an enum pattern and a struct literal carry their
+  resolution; an implement head has `target_def()`; code lens holds the
+  declaration node.
+- **Not mechanical**: about seven hover fallbacks whose name has no identity
+  behind it (a generic parameter's spelling, annotation text, the owner
+  returned as a name by `find_enclosing_method_owner`),
+  `find_function_in_modules` (the callee's identity would come from an
+  `OverloadId`, not checked), and `find_const_in_modules`, called for a
+  fresh match-arm binding with no referent at all.
+
+**Why nothing was converted.** Changing a finder's parameter from a name to
+an identity changes all 33 call sites, and they are the editor's own
+handlers - which Jake ruled out of scope until the compiler's migration is
+done - and whether the finders land before merge at all is an open question
+of his. Converting the finders alone would leave identity-taking functions
+nobody calls. The lookup the earlier sessions were waiting for is not the
+obstacle any more; the scope ruling is.
+
+---
