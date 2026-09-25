@@ -295,6 +295,17 @@ for _label, _sc in sorted(GATE_MOD.SCANNED_ARRAYS.items()):
     else:
         FILES[_sc.defn] += _scan_block(_owner, _field, _sc.elem)
 
+# One stub per SEALED type, private field and all, in the file the gate's
+# table names; the first one is the sealed-type mutations' subject.
+def _sealed_block(name):
+    return "type struct %s {\nprivate:\n    slot: u32;\n}\n" % name
+
+
+for _name, (_defn, _reason) in sorted(GATE_MOD.SEALED_TYPES.items()):
+    FILES[_defn] = FILES.get(_defn, "") + _sealed_block(_name)
+FIRST_SEALED = sorted(GATE_MOD.SEALED_TYPES)[0]
+_SEALED_DEFN = GATE_MOD.SEALED_TYPES[FIRST_SEALED][0]
+
 # The first scanned array in the gate's table, for the stale-entry mutation.
 FIRST_SCANNED = sorted(l for l, sc in GATE_MOD.SCANNED_ARRAYS.items() if sc.kind != GATE_MOD.IDENTITY)[0]
 # The first array keyed by identity, for the two identity mutations: a scan
@@ -629,6 +640,17 @@ MUTATIONS = [
      {_ID_DEFN: FILES[_ID_DEFN].replace(_id_scan_block(_ID_OWNER, _ID_FIELD), "", 1)},
      1, "`%s` is listed in SCANNED_ARRAYS as keyed by identity but nothing in the tree scans it by an identity"
         % FIRST_IDENTITY),
+    ("a sealed identity type whose private label is dropped - every field public - is refused",
+     {_SEALED_DEFN: FILES[_SEALED_DEFN].replace(
+         _sealed_block(FIRST_SEALED), _sealed_block(FIRST_SEALED).replace("private:\n", ""), 1)},
+     1, "`%s` (%s) has no private field" % (FIRST_SEALED, _SEALED_DEFN)),
+    ("the same field made private inline instead of under a label is accepted",
+     {_SEALED_DEFN: FILES[_SEALED_DEFN].replace(
+         _sealed_block(FIRST_SEALED), "type struct %s {\n    private slot: u32;\n}\n" % FIRST_SEALED, 1)},
+     0, "lane-gate: OK"),
+    ("a sealed-type entry whose type is no longer declared is stale, refused",
+     {_SEALED_DEFN: FILES[_SEALED_DEFN].replace(_sealed_block(FIRST_SEALED), "", 1)},
+     1, "`%s` is listed in SEALED_TYPES but %s declares no such type" % (FIRST_SEALED, _SEALED_DEFN)),
 ]
 
 

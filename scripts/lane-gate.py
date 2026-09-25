@@ -690,6 +690,79 @@ SCANNED_ARRAYS = {
                                           "the vendored libraries by key and name: FILE PATHS and FLAGS"),
 }
 
+# The types whose construction is sealed.  A member field is private to the
+# module that declares its type, so a literal of one of these can be written
+# only in that module - and only while one of its fields IS private.  Fields
+# are public by default, so the seal is a property of the field list: a
+# refactor that drops the last private field reopens construction to every
+# module, with no error and no change at any caller, and the mint rows below
+# would go on counting a door that is no longer the only one.  Each entry:
+# (declaring file, why nothing outside that module may build one).
+SEALED_TYPES = {
+    "DefId": ("compiler/resolver/res.cryo",
+              "a definition's identity: built anywhere, it could be made to name a definition "
+              "nothing registered, or one its holder never resolved to"),
+    "OverloadId": ("compiler/resolver/res.cryo",
+                   "a signature's position in the index's registry: built anywhere, it names "
+                   "whichever entry sits at the position it was given"),
+}
+
+SEALED_HEAD_RE = re.compile(r"^\s*(?:public\s+|private\s+)?type\s+(?:struct|class)\s+(\w+)\b")
+SEALED_LABEL_RE = re.compile(r"^\s*(public|private|protected)\s*:\s*")
+SEALED_FIELD_RE = re.compile(r"^\s*(?:(public|private|protected)\s+)?(?:mut\s+)?[A-Za-z_]\w*\s*:\s*[^;()]+;")
+
+
+def private_fields(lines, head):
+    """The fields declared private in the type block opening at `lines[head]`:
+    under a `private:` label or with a leading `private`.  A struct's
+    members are public until a label says otherwise."""
+    out = []
+    depth = 0
+    opened = False
+    section = "public"
+    for raw in lines[head:]:
+        code = strip_comment(raw)
+        if depth == 1:
+            rest = code
+            m = SEALED_LABEL_RE.match(rest)
+            if m is not None:
+                section = m.group(1)
+                rest = rest[m.end():]
+            f = SEALED_FIELD_RE.match(rest)
+            if f is not None and (f.group(1) or section) == "private":
+                out.append(rest.strip())
+        depth += code.count("{") - code.count("}")
+        opened = opened or depth > 0
+        if opened and depth <= 0:
+            break
+    return out
+
+
+def check_sealed_types(tree):
+    """Every SEALED_TYPES entry is declared in its file and keeps at least
+    one private field.  Refuses with every problem listed."""
+    problems = []
+    for name, (defn, reason) in sorted(SEALED_TYPES.items()):
+        lines = tree.files.get(defn)
+        head = None
+        for i, raw in enumerate(lines or []):
+            m = SEALED_HEAD_RE.match(strip_comment(raw))
+            if m is not None and m.group(1) == name:
+                head = i
+                break
+        if head is None:
+            problems.append("  `%s` is listed in SEALED_TYPES but %s declares no such type: a stale entry"
+                            % (name, defn))
+            continue
+        if not private_fields(lines, head):
+            problems.append("  `%s` (%s) has no private field, so any module can write its literal and\n"
+                            "      its construction is no longer sealed; it must stay sealed because it is\n"
+                            "      %s" % (name, defn, reason))
+    if problems:
+        raise SystemExit("lane-gate: sealed types - an identity type is constructible outside its module:\n"
+                         + "\n".join(problems))
+
+
 REENTRY_RE = re.compile(r"\bget_resolver\s*\(\s*\)")
 # The driver legitimately owns the resolver and may ask for it.
 REENTRY_OWNERS = STORES["Resolver"].owners
@@ -1483,6 +1556,7 @@ def scan(src):
     place_map_owners(tree)
     place_array_owners(tree)
     scans = place_inline_scans(tree)
+    check_sealed_types(tree)
     sets = {name: store_methods(tree, name, st.defn) for name, st in STORES.items()}
     # Control on the parser: the LOOKUP row is the per-kind names, and they
     # are declared on the index.  A parser that cannot see them cannot see
