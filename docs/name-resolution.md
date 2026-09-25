@@ -124,7 +124,7 @@ measurement that decided it on the row.
 | D11 | **Remove `resolve_counter.cryo` completely** - the counter, its audit streams, `scripts/b1-gate.py` and `tests/b1-baseline.txt` (Jake, 2026-09-15: "I want this instrumentation to be removed completely"; §7.2 mechanism 3 amended, §8.202) | **TAKEN** (§8.203) — the module (1,302 lines), its 100 `bump()` sites and 54 audit emitters, the five audit streams and `CRYO_RESOLVE_COUNTER`, `HomeOrigin` and `ResolutionContext`'s `FILE, LINE` provenance, the `door`/`site`/`table` parameters that carried a site name to an emitter, `b1-gate.py`, `retire-counter-sites.py`, `b1-baseline.txt`, `make b1-check` and its two CI steps. 0 of 3,478 objects moved over `examples/` and `tests/`. `lane-check`, the negative tests and the mutation projects are the regrowth guard | `git ls-files \| grep -c -e 'resolve_counter' -e 'b1-gate' -e 'b1-baseline'` → **0**; `grep -rho -e 'resolve_counter' -e 'HomeOrigin' compiler/src tools --include=*.cryo \| wc -l` → **0** | §8.66, §8.80, §8.139, §8.174, §8.183, §8.188, §8.193, §8.202, §8.203 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -v '^\s*//' compiler/src/compiler/resolver/name_resolution.cryo \| grep -c 'module_offering'` → **5** (3 before §8.258: `module_offerings`, the plural form the walk reads so its E0155 can name both declarations, and `module_offering` is its first-and-count) | §8.138, §8.144, §8.151, §8.258 |
-| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **627** (+5 in §8.336: six files of `projects/visibility_module_private`, less the deleted `E0353_private_field_async_foreign.cryo`; +1 in §8.329, a unit test; +1 in §8.328, a negative; +1 in §8.327, a unit test; +1 in §8.326, a unit test; -1 in §8.325, `intrinsics_codegen.cryo` deleted with its table moved to `intrinsic_kind.cryo`, which imports nothing; +1 in §8.324, a unit test; +2 in §8.322, a unit test and a negative; +3 in §8.321, a unit test and two negatives; +1 in §8.320, a unit test; +2 in §8.318, a unit test and a negative; +1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194, §8.195 and §8.197, projects; +2 in §8.199, a project's two files; -1 in §8.203, `resolve_counter.cryo`; -1 in §8.206, a `collect` project's test file, the project being a `compile_fail` now; -1 in §8.207, `bare_intrinsic_priority.cryo`, a negative now; +1 in §8.209, a negative; +1 in §8.213, a unit test; +2 in §8.217, two projects' `beta_text.cryo`; +2 in §8.242, the consequence repro's two sources under `scripts/ns-migration/8.242/tick-ctl/`; +1 in §8.244, a negative; +1 in §8.256, a unit test; +2 in §8.275, the two `chain_default_*` projects; +1 in §8.277, a unit test; +1 in §8.286, a negative; +1 in §8.287, a unit test; +1 in §8.301, a unit test; +1 in §8.303, a unit test; +1 in §8.304, `resolver/module_path.cryo`; +1 in §8.306, a unit test; +2 in §8.311, a unit test and a negative; +3 in §8.312, a unit test and two negatives; +2 in §8.313, a unit test and a negative; +1 in §8.314, a unit test; +1 in §8.316, a unit test) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **628** (+1 in §8.343, shape `f`'s source under `scripts/ns-migration/8.343/shapes/`; +5 in §8.336: six files of `projects/visibility_module_private`, less the deleted `E0353_private_field_async_foreign.cryo`; +1 in §8.329, a unit test; +1 in §8.328, a negative; +1 in §8.327, a unit test; +1 in §8.326, a unit test; -1 in §8.325, `intrinsics_codegen.cryo` deleted with its table moved to `intrinsic_kind.cryo`, which imports nothing; +1 in §8.324, a unit test; +2 in §8.322, a unit test and a negative; +3 in §8.321, a unit test and two negatives; +1 in §8.320, a unit test; +2 in §8.318, a unit test and a negative; +1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194, §8.195 and §8.197, projects; +2 in §8.199, a project's two files; -1 in §8.203, `resolve_counter.cryo`; -1 in §8.206, a `collect` project's test file, the project being a `compile_fail` now; -1 in §8.207, `bare_intrinsic_priority.cryo`, a negative now; +1 in §8.209, a negative; +1 in §8.213, a unit test; +2 in §8.217, two projects' `beta_text.cryo`; +2 in §8.242, the consequence repro's two sources under `scripts/ns-migration/8.242/tick-ctl/`; +1 in §8.244, a negative; +1 in §8.256, a unit test; +2 in §8.275, the two `chain_default_*` projects; +1 in §8.277, a unit test; +1 in §8.286, a negative; +1 in §8.287, a unit test; +1 in §8.301, a unit test; +1 in §8.303, a unit test; +1 in §8.304, `resolver/module_path.cryo`; +1 in §8.306, a unit test; +2 in §8.311, a unit test and a negative; +3 in §8.312, a unit test and two negatives; +2 in §8.313, a unit test and a negative; +1 in §8.314, a unit test; +1 in §8.316, a unit test) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `python3 scripts/lane-gate.py --row LOOKUP_ROUTED` → **38** (47 before §8.333-§8.334: seven `lookup_type_exact` of a scope segment's owner by a rebuilt name, now the segment's type, and method binding's two `lookup_type_sym` owner retries, now one question on the receiver's type; 48 before §8.330, whose one was an impl's trait type asked by the trait's name, now by its `DefId`; 49 before §8.323, whose one was a method's return read off each bound of a `BoundedParamType`, deleted with the kind nothing constructed; 50 before §8.320, whose one was the `for` loop's `next` found by spelling on the scrutinee's type; 55 before §8.315, whose five were type lookups by a name the caller derived from a definition it held - three trait bounds, an impl-qualified head's trait, the method-not-found hint's receiver - now asked of the index by that definition or type; 54 before §8.256 deleted sema's `new` spelling step; 53 before §8.259 deleted the callee hint's `bare_sym` door and sema's `alias_global`; 51 before §8.263's two `lookup_type_exact` by a canonical name - the impl-qualified head's trait, asked whether it IS a trait, and its owner for the E0306 report; 53 before §8.289 re-keyed `method_returns` by the owner's arena id: `resolve_method_owner` and `lookup_method_return_raw` deleted, `lookup_type_sym` left two readers that hold the owner ref, and the five readers holding a stamp's name ask `lookup_type_exact` for the owner first) | §8.99, §8.107 |
 | D16 | **An impl head writes EVERY parameter of the template it names, or names a concrete instantiation; an elided parameter is an error** - whether all of them default (`implement trait Display for String` with `String<A = GlobalAlloc>`) or only the trailing ones (`implement<T> trait Display for Array<T>` with `Array<T, A = GlobalAlloc>`). Write `implement<A> trait Display for String<A>` or `implement trait Display for String<GlobalAlloc>`. Rust's model: `impl Display for Vec` is missing its parameters and is not given a default meaning, and `impl<T> Trait for Vec<T>` is not written either | **TAKEN** (ruled by Jake 2026-09-13 for the bare form, 2026-09-14 for every elided parameter; built in §8.190) — E0302 from `refuse_elided_template_params` where type resolution attaches a WRITTEN head to its template, naming the template, both counts and both spellings, the parameter form first; the 11 heads rewritten as the instantiation each meant; a head's `target_args` is what it writes after the target on EVERY kind of head (an inherent head's list also declares its names); sema's writer-module lookup deleted. The concrete spelling is HONOURED by impl selection since §8.233: a head's written target arguments unify with the subject's, a `Def`/`PrimTy`-stamped one filtering, so `for Wrap<T, Alpha>` is not selected for `Wrap<i32, Beta>` and two heads differing in that argument are two heads (`impl_concrete_arg_filters_impl` E0358, `impl_concrete_arg_selects_impl` 12 - both RED from §8.223 to §8.233) | `python3 scripts/impl-head-elided-params.py --count` → **bare=0,partial=0,unmatched=0**; `grep -c 'refuse_elided_template_params' compiler/src/compiler/passes/type_resolution.cryo` → **2**; `ls tests/tests/negative/E0302*.cryo \| wc -l` → **3** (2 at §8.190; +1 in §8.210, D22's head); `ls -d tests/tests/projects/impl_concrete_arg_*/test.json \| wc -l` → **2** (green since §8.233) | §8.180, §8.181, §8.187, §8.190, §8.223 |
 | D17 | **An `extern "C"` function is public unless marked `private`** — the extern-visibility default `docs/cryo.md` §18.1 states | **RULED** (Jake, 2026-09-14) — built in §8.167 by a worker and carried as unconfirmed until ratified; the spec text is normative, not provisional | `grep -c 'mut ext_public: boolean = true;' compiler/src/compiler/parser/parser.cryo` → **1**; `grep -c 'unless written .private function' docs/cryo.md` → **1** | §8.167, §8.187 |
@@ -42517,5 +42517,155 @@ println("x");   // Res::Def(<the declaration's id>) either way; now by copy
   `cross-check` OK, 346 compiler warnings, `test-census` OK.
 - Rows: `lane-check` unchanged (predicted: the mint in `admit` stays, it runs
   for fewer symbols); residue and `done.py` unchanged.
+
+---
+
+### 8.343 Option B priced: nine places read an implement block's own parameters through the type's, seven more compare by spelling, and the bottom is visible - measured, nothing landed - 2026-09-26
+
+Jake ruled option B (§8.332's re-key review, `docs/name-resolution-rekey.md`
+§9): a parameter an `implement` block writes is the block's own, related to
+the type's parameter only through the block's head, as in Rust. The type
+table still gives every parameter spelled `T` one type, so today the block's
+`T` and the type's `T` ARE one type, and code relating them works without
+ever looking at the head. The approved route is converge first, flip last,
+and his gate was a count of the places before any flip. This is that count,
+measured rather than grepped.
+
+```cryo
+type struct Wrap<T> { inner: T; }
+
+implement<T> trait Show for struct Wrap<T>   // this T is the impl's own
+where T: Show {
+    show(&this) -> i32 { return this.inner.show() + 1; }
+}
+// Wrap<Num>: every place below that asks "what is the impl's T?" today
+// finds Wrap's T bound to Num - by spelling, never through the head.
+```
+
+#### The instrument
+
+`scripts/ns-migration/8.343/option-b-probe.patch` (applies to `0aa16644`):
+
+- the flip itself - the forty-fourth session's arena keyed by the
+  parameter's declaration (`create_generic_param(sym, name, index)`,
+  `GenericParamType.param_sym`, every creator passing its symbol), taken
+  from its saved patch WITHOUT its two consumer fixes;
+- every lookup the flip makes answer by identity answers by SPELLING
+  instead - the answer the table gave before the flip - and prints
+  `SHADOW BSPELL <kind> <place>` wherever the identity answer differs. That
+  is the substitution (`TypeSubstitution::get`, tagged with the function
+  that built the substitution), `lookup_subst_for_param` (tagged with its
+  caller), and the ten scans the flip converted from spelling to symbol;
+- env `B_STRICT` makes named places answer by identity instead (a list,
+  `-list` for all but, or `all`), so each place can be flipped alone.
+
+#### What it measured
+
+1. Six halves under the probe, every place by spelling: **0 failing halves**,
+   `OVERALL PASS (unit: ok; compile-fail: 227 passed; projects: 74 passed)`,
+   185,175 BSPELL lines in 14 rows (substitutions by the function that
+   built them, `lookup_subst_for_param` as one row; split by caller below).
+   `objcmp`, tip against the probe:
+   **0 of 1,126 example objects, 0 of 3,018 test objects moved.** So the
+   types really are distinct (the lines prove the identity answers differ)
+   and nothing but these lookups depends on their being one type: interning,
+   id equality and everything else the flip touches changed no object.
+   **The bottom is visible** - in this corpus there is no layer below these
+   places.
+2. Controls, each alone, over the 14 examples: every substitution by
+   identity - 14 of 14 fail (E0200 at `net/http/server.cryo:245,266`,
+   `json/parser.cryo:326`); every scan by identity - 14 of 14 fail (E0306
+   at `io/buf.cryo:541,593`, E0600 at `net/http/conn.cryo:69,108`). These
+   are the forty-fourth session's eight locations in its shapes.
+3. Each place by identity alone (`per-place.sh`, 01-hello and the shapes),
+   then the rest together by `objcmp`'s hash over both populations.
+
+**Places that must bind through the head** - identity breaks a build or
+moves an object:
+
+| place (function) | alone by identity |
+|---|---|
+| `TraitChecker::bounds_satisfied`, fed the template's substitution by the monomorphizer's filter of kept impls | every program fails (`core/result.cryo:190`, `fmt/display.cryo:584`: an impl whose `where T: Eq` fails is kept) |
+| `MonoTraitSpecializer::derive_impl_where_generics` | every program fails (`collections/array.cryo:926`) |
+| `MethodBinding::subst_method_return_from_receiver` | 01-hello fails (`server.cryo:245`: a combinator's `O` stays abstract) |
+| `MethodBinding::scan_param_bounds` | 01-hello fails (`buf.cryo:541`) |
+| `MethodBinding::scan_param_bound_param_types` | 01-hello fails (`buf.cryo:541`) |
+| `AsyncLower::param_bound_by` (`param_spelled`) | 01-hello fails (`conn.cryo:69`) |
+| `CallResolver::try_resolve_generic_return` | `Array::<i32>::default()` fails (shape `f`) |
+| `ASTSpecializer::impl_substituter` | builds; with the next, E0636 in `async_receiver_refresh` |
+| `Monomorphizer::specialize_with_entry`, its substitution applied to kept impls | moves `AsyncReceiverRefresh.o`; with the previous, E0636 |
+
+The last two are one question answered twice: either alone covers the
+other's miss. That is the forty-fourth session's "each layer exposed
+another" in miniature, and why a flip-first attempt could not see where it
+stood.
+
+**Places that need only their comparison switched** - identity answers
+differently, no object moves (all together, hash `x9`: examples 0 of 1,126;
+tests: only `AsyncReceiverRefresh.o`, the pair above, and the canary):
+`MonoTraitSpecializer::bind_where_arg_param`,
+`MonoCallSpecializer::specialize_method_call`,
+`MethodBinding::find_generic_method_on_receiver_bounds` (two scans),
+`SymbolicChecker::symbolic_name_is_generic_param`, the call resolver's owner
+numeric hints, and `MonoCallSpecializer::specialize_method` - whose
+identity answer is the intended fix: `chain_default_param_conflict` stops
+failing E0636 and builds (its 45 objects are the only other movers).
+
+Listed by the static census (`rekey.md` §9) and never entered by this
+corpus: `for_specialization`, `args_are_outer_param_refs`,
+`substitute_derived_params_in_method_bodies`, `refuse_elided_template_params`,
+`synthesize_default_trait_methods`, `TemplateEntry::new`,
+`resolve_trait_impl_method_return`, `ASTSpecializer::specialize`. Absent, not
+starved - no identity answer differed there; that they need nothing is not
+shown.
+
+#### A live bug the ruling fixes
+
+```cryo
+type struct Wrap<T> { inner: T; }
+implement<U> trait Show for struct Wrap<U>
+where U: Show {
+    show(&this) -> i32 { return this.inner.show(); }
+}
+const w: Wrap<Plain> = ...;   // Plain has no Show; nothing calls show()
+```
+
+fails E0358 (`no method named show found on type Plain`) with the pin; the
+same program spelling the impl's parameter `T` compiles (shapes `d`, `e`).
+The where-clause filter reads the impl's bound through the TYPE's parameter
+names, so a different spelling makes the bound vacuous and the impl is kept
+for a type it excludes. Under option B the first place in the table binds
+`U` through the head and the filter drops the impl.
+
+#### What the count means for the plan
+
+- The flip, from the saved patch: about 150 lines added and 130 removed in
+  15 compiler files, mechanical (every parameter creator passes its symbol).
+- Converge: nine places to bind through the head. Two of them
+  (`scan_param_bounds`, `scan_param_bound_param_types`) and two of the
+  seven below (the `find_generic_method_on_receiver_bounds` scans) share
+  one shape - a field of `this` typed with the TYPE's parameter, a bound
+  written on the impl's - and may have one upstream fix: `this` inside an
+  impl body typed through the head. That is a hypothesis; the table is the
+  measurement.
+- Seven places switch their comparison to the symbol at the flip. The
+  `lookup_subst_for_param` callers never seen in 01-hello and the shapes
+  (`unsatisfied_trait_ref`, `bounds_satisfied_at_depth`, method binding's
+  two) answered by identity in the hash runs and moved nothing.
+- A converge step can land while parameters are keyed by spelling: binding
+  the impl's parameter through the head gives the same type the spelling
+  gave, so a program spelling both alike cannot move. A program spelling
+  them differently (the bug above) CAN change - from refused to compiled.
+
+Population caveat: the corpus is the six halves; a place no program here
+reaches is not measured.
+
+Reproduce: `git apply scripts/ns-migration/8.343/option-b-probe.patch`,
+`make cryo`, copy the compiler out, run the corpus
+(`scripts/objcmp/corpus2.sh`), `objcmp.sh`, and
+`scripts/ns-migration/8.343/per-place.sh <compiler> <B_STRICT values>`.
+The "seven" hash ran `hash-tree.sh` under `B_STRICT=-` followed by the
+first eight places of the table (the pair's `specialize_with_entry` left
+answering by identity), and compared it to the probe's own hash.
 
 ---

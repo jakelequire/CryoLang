@@ -1,0 +1,1095 @@
+diff --git a/compiler/src/compiler/mono/ast_resolver.cryo b/compiler/src/compiler/mono/ast_resolver.cryo
+index 952f7380..b6ed98b1 100644
+--- a/compiler/src/compiler/mono/ast_resolver.cryo
++++ b/compiler/src/compiler/mono/ast_resolver.cryo
+@@ -533,7 +533,7 @@ type struct MonoAstResolver {
+                     const gp: GenericParamNode* = method.func.generic_params[j];
+                     if (gp == null) { continue; }
+                     const gp_ref: TypeRef = this.arena.create_generic_param(
+-                        gp.name, j as u64);
++                        gp.sym_id, gp.name, j as u64);
+                     method_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
+                 }
+                 this.resolve_func_and_body(method.func, &method_ctx, m_this);
+diff --git a/compiler/src/compiler/mono/call_specializer.cryo b/compiler/src/compiler/mono/call_specializer.cryo
+index 86f8c4ad..cda64650 100644
+--- a/compiler/src/compiler/mono/call_specializer.cryo
++++ b/compiler/src/compiler/mono/call_specializer.cryo
+@@ -953,11 +953,13 @@ type struct MonoCallSpecializer {
+         if (n_method_params == 0) { return; }
+         mut bindings: TypeRef[] = [];
+         mut method_param_names: SymbolStr[] = [];
++        mut method_param_syms: SymbolID[] = [];
+         for (mut i: i64 = 0; i < n_method_params; i++) {
+             const gp: GenericParamNode* = orig_func.generic_params[i];
+             if (gp == null) { return; }
+             bindings.push(TypeRef::invalid());
+             method_param_names.push(gp.name);
++            method_param_syms.push(gp.sym_id);
+         }
+ 
+         // Method-level bindings come SOLELY from sema's stash (declaration order).
+@@ -1171,6 +1173,7 @@ type struct MonoCallSpecializer {
+         // and the nested generic call specializes against the right spec.
+         if (spec_method.func != null && spec_method.func.body != null) {
+             mut rw_ctx: ResolutionContext = ResolutionContext::new("");
++            TypeSubstitution::b_site("call_specializer:specialize_method_call:1176");
+             mut owner_subst: TypeSubstitution = TypeSubstitution::empty();
+             this.add_owner_param_bindings(&owner_subst, recv_type);
+             // Also bind THIS method's own generic params (`m<W>`) to their concrete
+@@ -1183,7 +1186,7 @@ type struct MonoCallSpecializer {
+             // Same 0-based method-position index the substituter + resolve_func_and_body
+             // path use (see ~line 1400).
+             for (mut mbi: i64 = 0; mbi < method_param_names.length && mbi < bindings.length; mbi++) {
+-                const mpref: TypeRef = this.arena.create_generic_param(method_param_names[mbi], mbi as u64);
++                const mpref: TypeRef = this.arena.create_generic_param(method_param_syms[mbi], method_param_names[mbi], mbi as u64);
+                 owner_subst.add(mpref.id, bindings[mbi]);
+             }
+             if (owner_subst.is_empty()) {
+@@ -1548,6 +1551,7 @@ type struct MonoCallSpecializer {
+         // resolve against the owner spec.
+         if (spec_method.func.body != null) {
+             mut rw_ctx: ResolutionContext = ResolutionContext::new("");
++            TypeSubstitution::b_site("call_specializer:finish_generic_static_method_spec:1553");
+             mut owner_subst: TypeSubstitution = TypeSubstitution::empty();
+             this.add_owner_param_bindings(&owner_subst, recv_type);
+             // Publish the owner context so walk_expr can stamp owner-constructing
+@@ -1693,7 +1697,7 @@ type struct MonoCallSpecializer {
+             if (gp == null) { continue; }
+             const arg_i: TypeRef = this.arena.inst_type_arg_at(owner_src, i);
+             if (this.arena.contains_generic_param(arg_i)) { continue; }
+-            const pref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
++            const pref: TypeRef = this.arena.create_generic_param(gp.sym_id, gp.name, i as u64);
+             subst.add(pref.id, arg_i);
+         }
+     }
+@@ -1948,9 +1952,10 @@ type struct MonoCallSpecializer {
+ 
+         mut param_ids: u64[] = [];
+         for (mut i: i64 = 0; i < param_names.length; i++) {
+-            const gp_ref: TypeRef = this.arena.create_generic_param(param_names[i], i as u64);
++            const gp_ref: TypeRef = this.arena.create_generic_param(param_syms[i], param_names[i], i as u64);
+             param_ids.push(gp_ref.id);
+         }
++        TypeSubstitution::b_site("call_specializer:specialize_method:1956");
+         mut subst_val: TypeSubstitution = TypeSubstitution::from_params(param_ids, args);
+         // Also concretize the owner's generic params (`A` in `Box<A>::add<T>`) from
+         // the concrete receiver, so the cloned body's owner-typed receivers
+@@ -1968,7 +1973,7 @@ type struct MonoCallSpecializer {
+             for (mut di: i64 = 0; di < owner_impl.derived_param_names.length; di++) {
+                 if (!owner_impl.derived_param_types[di].is_valid()) { continue; }
+                 const dp_ref: TypeRef = this.arena.create_generic_param(
+-                    owner_impl.derived_param_names[di], di as u64);
++                    owner_impl.derived_param_syms[di], owner_impl.derived_param_names[di], di as u64);
+                 subst_val.add(dp_ref.id, owner_impl.derived_param_types[di]);
+             }
+             // The impl's target is written in the impl's OWN parameter names
+@@ -1984,7 +1989,9 @@ type struct MonoCallSpecializer {
+                         TypeAnnotation::Named(n) => {
+                             const arg_t: TypeRef = this.arena.inst_type_arg_at(owner_type, ti);
+                             if (!arg_t.is_valid() || this.arena.contains_generic_param(arg_t)) { continue; }
+-                            const tp_ref: TypeRef = this.arena.create_generic_param(n.name, ti as u64);
++                            // A concrete argument written in the head is no parameter.
++                            if (!n.param_sym().is_valid()) { continue; }
++                            const tp_ref: TypeRef = this.arena.create_generic_param(n.param_sym(), n.name, ti as u64);
+                             subst_val.add(tp_ref.id, arg_t);
+                         }
+                         _ => {}
+diff --git a/compiler/src/compiler/mono/monomorphizer.cryo b/compiler/src/compiler/mono/monomorphizer.cryo
+index 142bb6e0..f809ac69 100644
+--- a/compiler/src/compiler/mono/monomorphizer.cryo
++++ b/compiler/src/compiler/mono/monomorphizer.cryo
+@@ -468,6 +468,7 @@ type struct Monomorphizer {
+         const qualified_spec_sym: SymbolStr = this.qualify_spec_name(entry, result.spec_name);
+ 
+         // Create concrete type in arena based on node kind
++        TypeSubstitution::b_site("monomorphizer:specialize_with_entry:471");
+         const subst: TypeSubstitution = TypeSubstitution::from_params(
+             entry.param_type_ids, request.type_args
+         );
+diff --git a/compiler/src/compiler/mono/specializer.cryo b/compiler/src/compiler/mono/specializer.cryo
+index 1eaefb94..fe8ecd90 100644
+--- a/compiler/src/compiler/mono/specializer.cryo
++++ b/compiler/src/compiler/mono/specializer.cryo
+@@ -128,6 +128,7 @@ type struct ASTSpecializer {
+         const spec_name: string = this.intern_table.resolve(spec_sym);
+ 
+         // 2. Build substitution (borrows + copies `type_args`).
++        TypeSubstitution::b_site("specializer:specialize:131");
+         const subst: TypeSubstitution = TypeSubstitution::from_params(
+             entry.param_type_ids, type_args
+         );
+@@ -275,7 +276,7 @@ type struct ASTSpecializer {
+                     if (seen) { continue; }
+                     syms.push(sym);
+                     displays.push(arg_syms[ti]);
+-                    arena_ids.push(this.arena.create_generic_param(named.name, ti as u64).id);
++                    arena_ids.push(this.arena.create_generic_param(sym, named.name, ti as u64).id);
+                     replacements.push(type_args[ti]);
+                 }
+                 _ => {}
+@@ -283,6 +284,7 @@ type struct ASTSpecializer {
+         }
+         const subst_ptr: TypeSubstitution* =
+             allocator::alloc(sizeof(TypeSubstitution), 16) as TypeSubstitution*;
++        TypeSubstitution::b_site("specializer:impl_substituter:286");
+         *subst_ptr = TypeSubstitution::from_params(&arena_ids, &replacements);
+         return new ASTTypeSubstituter(
+             subst_ptr, this.arena, this.intern_table,
+diff --git a/compiler/src/compiler/mono/trait_specializer.cryo b/compiler/src/compiler/mono/trait_specializer.cryo
+index b94ef4a1..a4334d0b 100644
+--- a/compiler/src/compiler/mono/trait_specializer.cryo
++++ b/compiler/src/compiler/mono/trait_specializer.cryo
+@@ -219,8 +219,8 @@ type struct MonoTraitSpecializer {
+         if (impl_node.where_bounds.length == 0) { return; }
+         for (mut bi: i64 = 0; bi < impl_node.where_bounds.length; bi++) {
+             const bound: TraitBound* = &impl_node.where_bounds[bi];
+-            const subject: TypeRef = this.lookup_subst_for_param(
+-                bound.type_parameter, subst);
++            const subject: TypeRef = this.lookup_subst_for_param("ls.ts.where_bindings",
++                bound.subject_sym, bound.type_parameter, subst);
+             if (!subject.is_valid()) { continue; }
+             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
+                 const tr: TraitRef* = &bound.trait_refs[ti];
+@@ -280,9 +280,10 @@ type struct MonoTraitSpecializer {
+             }
+             arg_displays.push(this.intern_table.intern(display));
+             const gp_ref: TypeRef = this.arena.create_generic_param(
+-                decl.derived_param_names[i], i as u64);
++                decl.derived_param_syms[i], decl.derived_param_names[i], i as u64);
+             param_ids.push(gp_ref.id);
+         }
++        TypeSubstitution::b_site("trait_specializer:substitute_derived_params_in_method_bodies:286");
+         const subst_val: TypeSubstitution = TypeSubstitution::from_params(
+             &param_ids, &decl.derived_param_types);
+         // Heap-allocate the subst: ASTTypeSubstituter holds the pointer and
+@@ -322,7 +323,7 @@ type struct MonoTraitSpecializer {
+         if (ta == null || !concrete.is_valid()) { return; }
+         match (*ta) {
+             TypeAnnotation::Named(n) => {
+-                if (this.lookup_subst_for_param(n.name, subst).is_invalid()
++                if (this.lookup_subst_for_param("ls.ts.bind_where_arg_param", n.param_sym(), n.name, subst).is_invalid()
+                         && res_ctx.lookup_binding(n.param_sym()).is_invalid()) {
+                     res_ctx.add_binding(n.param_sym(), n.name, concrete);
+                 }
+@@ -531,9 +532,10 @@ type struct MonoTraitSpecializer {
+         return this.trait_checker.type_implements_trait(ty, trait_name, depth);
+     }
+ 
+-    /// Find the substituted concrete TypeRef for a generic param by name.
+-    lookup_subst_for_param(&this, name: SymbolStr, subst: TypeSubstitution*) -> TypeRef {
+-        return this.trait_checker.lookup_subst_for_param(name, subst);
++    /// The replacement `subst` holds for the parameter whose declaration
++    /// bound `sym`.
++    lookup_subst_for_param(&this, who: string, sym: SymbolID, name: SymbolStr, subst: TypeSubstitution*) -> TypeRef {
++        return this.trait_checker.lookup_subst_for_param(who, sym, name, subst);
+     }
+ 
+     /// The key a trait impl for `ty` is registered under - see
+diff --git a/compiler/src/compiler/passes/type_resolution.cryo b/compiler/src/compiler/passes/type_resolution.cryo
+index 0b7e5103..3b078d86 100644
+--- a/compiler/src/compiler/passes/type_resolution.cryo
++++ b/compiler/src/compiler/passes/type_resolution.cryo
+@@ -936,7 +936,7 @@ type struct TypeResolutionPasses {
+         mut refs: TypeRef[] = [];
+         for (mut i: i64 = 0; i < generic_params.length; i++) {
+             const gp: GenericParamNode* = generic_params[i];
+-            refs.push(arena.create_generic_param(gp.name, i as u64));
++            refs.push(arena.create_generic_param(gp.sym_id, gp.name, i as u64));
+         }
+         return refs;
+     }
+@@ -1701,8 +1701,7 @@ type struct TypeResolutionPasses {
+     static desugar_async_trait_methods(node: TraitDeclNode*, ctx: CompilationContext*,
+                                        arena: TypeArena*, trait_ref: TypeRef) -> void {
+         if (node == null || ctx == null || arena == null) { return; }
+-        const this_ty: TypeRef = arena.create_generic_param(
+-            ctx.intern("This"), 0xFFFFFFFF as u64);
++        const this_ty: TypeRef = arena.this_placeholder(ctx.intern("This"));
+         if (!this_ty.is_valid()) { return; }
+         for (mut i: i64 = 0; i < node.methods.length; i++) {
+             const func: FunctionDeclNode* = node.methods[i];
+diff --git a/compiler/src/compiler/sema/async_lower.cryo b/compiler/src/compiler/sema/async_lower.cryo
+index b51d5e37..bf4061a1 100644
+--- a/compiler/src/compiler/sema/async_lower.cryo
++++ b/compiler/src/compiler/sema/async_lower.cryo
+@@ -649,18 +649,16 @@ type struct AsyncLower {
+         return new TypeAnnotation::Named(n);
+     }
+ 
+-    /// The parameter among `params` whose arena type spells `name`, or null.
++    /// The parameter among `params` whose declaration bound `sym`, or null.
+     ///
+     /// The lowering rebuilds a frame field's type from the ARENA, whose
+-    /// parameter types carry a spelling and no symbol; the declaration
+-    /// being lowered is the scope that spelling was resolved in, and its
+-    /// parameters (the owner's, then the function's own) are the only ones
+-    /// a type the body computed can mention.  One spelling names one of
+-    /// them: a nested declaration cannot redeclare an enclosing one.
+-    param_spelled(&this, params: &GenericParamNode*[], name: SymbolStr) -> GenericParamNode* {
++    /// parameter types carry the symbol their declaration bound; the
++    /// declaration being lowered owns the parameters (the owner's, then the
++    /// function's own) a type its body computed can mention.
++    param_bound_by(&this, params: &GenericParamNode*[], t: GenericParamType*) -> GenericParamNode* {
+         for (mut i: i64 = 0; i < params.length; i++) {
+             const gp: GenericParamNode* = params[i];
+-            if (gp != null && gp.name.equals(name)) { return gp; }
++            if (gp != null && TypeArena::b_match("async.param_spelled", gp.sym_id, gp.name, t.param_sym, t.param_name)) { return gp; }
+         }
+         return null;
+     }
+@@ -767,8 +765,7 @@ type struct AsyncLower {
+         const t: Type* = this.arena.lookup(ty.id);
+         if (t == null) { return null; }
+         if (t.kind == TypeKind::GenericParam) {
+-            const spelled: SymbolStr = (t as GenericParamType*).param_name;
+-            const gp: GenericParamNode* = this.param_spelled(params, spelled);
++            const gp: GenericParamNode* = this.param_bound_by(params, t as GenericParamType*);
+             if (gp == null) { return null; }
+             return this.named_ann(gp, span);
+         }
+diff --git a/compiler/src/compiler/sema/call_resolver.cryo b/compiler/src/compiler/sema/call_resolver.cryo
+index 66958213..ed629fda 100644
+--- a/compiler/src/compiler/sema/call_resolver.cryo
++++ b/compiler/src/compiler/sema/call_resolver.cryo
+@@ -469,7 +469,7 @@ type struct CallResolver {
+             // `where S: AsyncTransport` stays `Unclassified` and each consumer
+             // guesses its own answer.
+             return this.binding.param_types_through_param_bounds(
+-                (base_t as GenericParamType*).param_name, member.member, arg_count);
++                (base_t as GenericParamType*), member.member, arg_count);
+         } else {
+             return [];
+         }
+@@ -577,7 +577,7 @@ type struct CallResolver {
+                 const gp: GenericParamType* = pt as GenericParamType*;
+                 mut substituted: TypeRef = payload[i];
+                 for (mut p: i64 = 0; p < entry.param_count; p++) {
+-                    if (entry.param_names[p].equals(gp.param_name)) { substituted = type_args[p]; break; }
++                    if (TypeArena::b_match("cr.enum_payload_subst", entry.param_syms[p], entry.param_names[p], gp.param_sym, gp.param_name)) { substituted = type_args[p]; break; }
+                 }
+                 result.push(substituted);
+             } else {
+@@ -676,9 +676,9 @@ type struct CallResolver {
+             const pt: Type* = this.arena.lookup(param_types[i].id);
+             if (pt == null) { continue; }
+             if (pt.kind != TypeKind::GenericParam) { continue; }
+-            const pname: SymbolStr = (pt as GenericParamType*).param_name;
+-            for (mut p: i64 = 0; p < tmpl.param_names.length; p++) {
+-                if (!tmpl.param_names[p].equals(pname)) { continue; }
++            const gpt: GenericParamType* = pt as GenericParamType*;
++            for (mut p: i64 = 0; p < tmpl.param_syms.length; p++) {
++                if (!TypeArena::b_match("cr.owner_numeric_params", tmpl.param_syms[p], tmpl.param_names[p], gpt.param_sym, gpt.param_name)) { continue; }
+                 // Inside the owner's own template body the argument is still the
+                 // symbolic parameter, which is not numeric - so the body's own
+                 // literals keep defaulting, exactly as before.
+@@ -1565,6 +1565,7 @@ type struct CallResolver {
+             if (!bindings[i].is_valid()) { return out; }
+         }
+ 
++        TypeSubstitution::b_site("call_resolver:substitute_explicit_generic_param_types:1568");
+         mut subst: TypeSubstitution = TypeSubstitution::from_params(entry.param_type_ids, bindings);
+         for (mut pi: i64 = 0; pi < out.length; pi++) {
+             if (!out[pi].is_valid()) { continue; }
+@@ -1681,6 +1682,7 @@ type struct CallResolver {
+                 return TypeRef::invalid();
+             }
+         }
++        TypeSubstitution::b_site("call_resolver:subst_free_call_return:1684");
+         mut subst: TypeSubstitution = TypeSubstitution::from_params(entry.param_type_ids, bindings);
+         const out: TypeRef = subst.apply(tmpl_ret, this.arena);
+         if (!out.is_valid()) { return TypeRef::invalid(); }
+@@ -4522,11 +4524,12 @@ type struct CallResolver {
+ 
+         // Resolve the return type: substitute owner params (declaration order) AND
+         // the method's `<T>` (name+index-keyed, matching specialize_method's ids).
++        TypeSubstitution::b_site("call_resolver:try_resolve_generic_static_method:4525");
+         mut subst: TypeSubstitution = TypeSubstitution::from_params(tmpl.param_type_ids, owner_binds);
+         for (mut i: i64 = 0; i < matched.func.generic_params.length; i++) {
+             const gp: GenericParamNode* = matched.func.generic_params[i];
+             if (gp == null) { return TypeRef::invalid(); }
+-            const pref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
++            const pref: TypeRef = this.arena.create_generic_param(gp.sym_id, gp.name, i as u64);
+             subst.add(pref.id, method_binds[i]);
+         }
+         mut ret: TypeRef = subst.apply(matched.func.resolved_return_type, this.arena);
+@@ -4559,7 +4562,7 @@ type struct CallResolver {
+         for (mut i: i64 = 0; i < n; i++) {
+             const gp: GenericParamNode* = func.generic_params[i];
+             if (gp == null) { return empty; }
+-            const pref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
++            const pref: TypeRef = this.arena.create_generic_param(gp.sym_id, gp.name, i as u64);
+             pids.push(pref.id);
+         }
+         // Explicit turbofish on the member (`Wrap::make<i32>(..)`).
+@@ -4726,6 +4729,7 @@ type struct CallResolver {
+         // literal-default return-typing copies (each of which re-ran a subset of
+         // `compute_static_owner_bindings`) into the single authority.
+         if (call != null && call.resolved_type_args.length == tmpl.param_type_ids.length) {
++            TypeSubstitution::b_site("call_resolver:resolve_static_method_return_via_template:4729");
+             mut subst: TypeSubstitution = TypeSubstitution::from_params(tmpl.param_type_ids, call.resolved_type_args);
+             const out: TypeRef = subst.apply(abstract_ret, this.arena);
+             if (out.is_valid() && !this.types.contains_generic_param(out)) { return out; }
+@@ -5142,8 +5146,8 @@ type struct CallResolver {
+             const pt: Type* = this.arena.lookup(variant.payload_types[i].id);
+             if (pt == null) { continue; }
+             // Only the direct `T` payload shape (the position IS a bare param).
+-            mut pname: SymbolStr = SymbolStr::empty();
+-            if (pt.kind == TypeKind::GenericParam) { pname = (pt as GenericParamType*).param_name; }
++            mut gpt: GenericParamType* = null;
++            if (pt.kind == TypeKind::GenericParam) { gpt = pt as GenericParamType*; }
+             else { continue; }
+             const arg: ExpressionNode* = call.arguments[i];
+             if (arg == null || !arg.has_resolved_type()) { continue; }
+@@ -5157,7 +5161,7 @@ type struct CallResolver {
+             // where the enclosing template's specialization binds them later.
+             if (!this.types.arg_type_is_concrete(arg_ty)) { continue; }
+             for (mut p: i64 = 0; p < tmpl.param_count; p++) {
+-                if (tmpl.param_names[p].equals(pname)) { bindings[p] = arg_ty; break; }
++                if (TypeArena::b_match("cr.enum_ctor_payload_bind", tmpl.param_syms[p], tmpl.param_names[p], gpt.param_sym, gpt.param_name)) { bindings[p] = arg_ty; break; }
+             }
+         }
+ 
+@@ -5355,6 +5359,7 @@ type struct CallResolver {
+             for (mut i: i64 = 0; i < arg_refs.length; i++) { stash.push(arg_refs[i]); }
+             call.set_resolved_type_args(stash);
+         }
++        TypeSubstitution::b_site("call_resolver:subst_return_from_call_args:5358");
+         mut subst: TypeSubstitution = TypeSubstitution::from_params(tmpl.param_type_ids, arg_refs);
+         const out: TypeRef = subst.apply(tmpl_ret, this.arena);
+         if (!out.is_valid() || this.types.contains_generic_param(out)) { return TypeRef::invalid(); }
+@@ -5550,6 +5555,7 @@ type struct CallResolver {
+                     resolved_args = this.ctx.type_resolver.expand_default_type_args(tmpl, resolved_args, &res_ctx);
+                 }
+                 if (all_valid && resolved_args.length == tmpl.param_type_ids.length) {
++                    TypeSubstitution::b_site("call_resolver:try_resolve_generic_return:5553");
+                     mut subst: TypeSubstitution = TypeSubstitution::from_params(tmpl.param_type_ids, resolved_args);
+                     const out: TypeRef = subst.apply(ret, this.arena);
+                     if (out.is_valid()) { return out; }
+diff --git a/compiler/src/compiler/sema/method_binding.cryo b/compiler/src/compiler/sema/method_binding.cryo
+index f96a8351..d298822a 100644
+--- a/compiler/src/compiler/sema/method_binding.cryo
++++ b/compiler/src/compiler/sema/method_binding.cryo
+@@ -125,7 +125,8 @@ type struct MethodBinding {
+         }
+         if (!recv.is_valid()) { return ty; }
+         const this_name: SymbolStr = this.intern.intern("This");
+-        const this_ph: TypeRef = this.arena.create_generic_param(this_name, 0xFFFFFFFF as u64);
++        const this_ph: TypeRef = this.arena.this_placeholder(this_name);
++        TypeSubstitution::b_site("method_binding:subst_this_in_type:129");
+         mut subst: TypeSubstitution = TypeSubstitution::empty();
+         subst.add(this_ph.id, recv);
+         const out: TypeRef = subst.apply(ty, this.arena);
+@@ -152,6 +153,7 @@ type struct MethodBinding {
+         for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+             if (this.types.contains_generic_param(inst.type_args[i])) { return ret; }
+         }
++        TypeSubstitution::b_site("method_binding:subst_method_return_from_receiver:155");
+         mut subst: TypeSubstitution = TypeSubstitution::from_params(
+             tmpl.param_type_ids, inst.type_args);
+         const out: TypeRef = subst.apply(ret, this.arena);
+@@ -239,11 +241,11 @@ type struct MethodBinding {
+         if (!this.arena.contains_generic_param(ret)) { return ret; }
+         // Same (name, sentinel index) pair `resolve_trait_method_signatures`
+         // interns; `create_generic_param` dedups, so this finds that entry.
+-        const this_ty: TypeRef = this.arena.create_generic_param(
+-            this.intern.intern("This"), 0xFFFFFFFF as u64);
++        const this_ty: TypeRef = this.arena.this_placeholder(this.intern.intern("This"));
+         if (!this_ty.is_valid() || this_ty.equals(recv)) { return ret; }
+         mut ids: u64[] = [this_ty.id];
+         mut binds: TypeRef[] = [recv];
++        TypeSubstitution::b_site("method_binding:subst_this_in_trait_return:246");
+         mut subst: TypeSubstitution = TypeSubstitution::from_params(&ids, &binds);
+         const out: TypeRef = subst.apply(ret, this.arena);
+         if (!out.is_valid()) { return ret; }
+@@ -309,7 +311,7 @@ type struct MethodBinding {
+         }
+         if (t.kind == TypeKind::GenericParam) {
+             return this.lookup_method_through_param_bounds(
+-                (t as GenericParamType*).param_name, walk, method_name);
++                (t as GenericParamType*), walk, method_name);
+         }
+         // A generic owner instantiated at a still-abstract argument (`H<S>` built
+         // inside a generic function) is "unresolved" only in its ARGUMENTS: the
+@@ -331,9 +333,9 @@ type struct MethodBinding {
+     /// A parameter's bounds live on the enclosing function/impl node, not on
+     /// its type, so they are read there. The bare-parameter sibling of
+     /// `lookup_method_through_projection_bounds`.
+-    lookup_method_through_param_bounds(mut &this, param: SymbolStr, recv: TypeRef,
++    lookup_method_through_param_bounds(mut &this, param: GenericParamType*, recv: TypeRef,
+                                        method_name: SymbolStr) -> TypeRef {
+-        if (!param.is_valid()) { return TypeRef::invalid(); }
++        if (param == null) { return TypeRef::invalid(); }
+         if (this.state.symbolic_current_func != null) {
+             const r: TypeRef = this.scan_param_bounds(
+                 &this.state.symbolic_current_func.trait_bounds, param, method_name, recv);
+@@ -351,12 +353,12 @@ type struct MethodBinding {
+     /// bound trait's method return with the bound's associated-type args
+     /// substituted and `This` rebased onto `recv`. The bare-subject sibling of
+     /// `scan_projection_bounds`.
+-    scan_param_bounds(mut &this, bounds: &TraitBound[], param: SymbolStr,
++    scan_param_bounds(mut &this, bounds: &TraitBound[], param: GenericParamType*,
+                       method_name: SymbolStr, recv: TypeRef) -> TypeRef {
+         for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+             const b: TraitBound* = &bounds[bi];
+             if (b.has_projection_subject()) { continue; }
+-            if (!b.type_parameter.equals(param)) { continue; }
++            if (!TypeArena::b_match("mb.scan_param_bounds", b.subject_sym, b.type_parameter, param.param_sym, param.param_name)) { continue; }
+             for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+                 const tr: TraitRef* = &b.trait_refs[ti];
+                 if (tr.path.length == 0) { continue; }
+@@ -390,9 +392,9 @@ type struct MethodBinding {
+     /// A parameter constrained by a WHERE clause rather than inline stays a
+     /// plain `GenericParam` whose bounds live on the enclosing function/impl
+     /// node, so the receiver's own type cannot answer this.
+-    param_types_through_param_bounds(mut &this, param: SymbolStr, method_name: SymbolStr,
++    param_types_through_param_bounds(mut &this, param: GenericParamType*, method_name: SymbolStr,
+                                      arg_count: i64) -> TypeRef[] {
+-        if (!param.is_valid()) { return []; }
++        if (param == null) { return []; }
+         if (this.state.symbolic_current_func != null) {
+             const r: TypeRef[] = this.scan_param_bound_param_types(
+                 &this.state.symbolic_current_func.trait_bounds, param, method_name, arg_count);
+@@ -409,12 +411,12 @@ type struct MethodBinding {
+     /// Search `bounds` for a BARE-parameter bound on `param` and return the
+     /// first bound trait's declaration of `method_name` taking `arg_count`
+     /// arguments. The parameter-list sibling of `scan_param_bounds`.
+-    scan_param_bound_param_types(mut &this, bounds: &TraitBound[], param: SymbolStr,
++    scan_param_bound_param_types(mut &this, bounds: &TraitBound[], param: GenericParamType*,
+                                  method_name: SymbolStr, arg_count: i64) -> TypeRef[] {
+         for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+             const b: TraitBound* = &bounds[bi];
+             if (b.has_projection_subject()) { continue; }
+-            if (!b.type_parameter.equals(param)) { continue; }
++            if (!TypeArena::b_match("mb.scan_param_bound_param_types", b.subject_sym, b.type_parameter, param.param_sym, param.param_name)) { continue; }
+             for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+                 const tr: TraitRef* = &b.trait_refs[ti];
+                 if (tr.path.length == 0) { continue; }
+@@ -1075,14 +1077,13 @@ type struct MethodBinding {
+         if (t == null) { return rc; }
+ 
+         if (t.kind != TypeKind::GenericParam) { return rc; }
+-        const pname: SymbolStr = (t as GenericParamType*).param_name;
+-        if (!pname.is_valid()) { return rc; }
++        const gpt: GenericParamType* = t as GenericParamType*;
+ 
+         mut bound_leaves: DefId[] = [];
+         if (this.state.symbolic_impl_node != null) {
+             for (mut bi: i64 = 0; bi < this.state.symbolic_impl_node.where_bounds.length; bi++) {
+                 const bound: TraitBound* = &this.state.symbolic_impl_node.where_bounds[bi];
+-                if (!bound.type_parameter.equals(pname)) { continue; }
++                if (!TypeArena::b_match("mb.bound_leaves.impl", bound.subject_sym, bound.type_parameter, gpt.param_sym, gpt.param_name)) { continue; }
+                 for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
+                     const tr: TraitRef* = &bound.trait_refs[ti];
+                     if (tr.path.length == 0) { continue; }
+@@ -1093,7 +1094,7 @@ type struct MethodBinding {
+         if (this.state.symbolic_current_func != null) {
+             for (mut wi: i64 = 0; wi < this.state.symbolic_current_func.trait_bounds.length; wi++) {
+                 const wb: TraitBound* = &this.state.symbolic_current_func.trait_bounds[wi];
+-                if (!wb.type_parameter.equals(pname)) { continue; }
++                if (!TypeArena::b_match("mb.bound_leaves.func", wb.subject_sym, wb.type_parameter, gpt.param_sym, gpt.param_name)) { continue; }
+                 for (mut ti: i64 = 0; ti < wb.trait_refs.length; ti++) {
+                     const tr: TraitRef* = &wb.trait_refs[ti];
+                     if (tr.path.length == 0) { continue; }
+@@ -1453,7 +1454,7 @@ type struct MethodBinding {
+             for (mut i: i64 = 0; i < n_method_params; i++) {
+                 const gp: GenericParamNode* = orig_func.generic_params[i];
+                 if (gp == null) { return []; }
+-                const gp_ref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
++                const gp_ref: TypeRef = this.arena.create_generic_param(gp.sym_id, gp.name, i as u64);
+                 infer_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
+                 method_param_ids.push(gp_ref.id);
+             }
+@@ -1615,8 +1616,8 @@ type struct MethodBinding {
+         if (impl_node.where_bounds.length == 0) { return; }
+         for (mut bi: i64 = 0; bi < impl_node.where_bounds.length; bi++) {
+             const bound: TraitBound* = &impl_node.where_bounds[bi];
+-            const subject: TypeRef = this.trait_checker().lookup_subst_for_param(
+-                bound.type_parameter, subst);
++            const subject: TypeRef = this.trait_checker().lookup_subst_for_param("ls.mb.where_bindings",
++                bound.subject_sym, bound.type_parameter, subst);
+             if (!subject.is_valid()) { continue; }
+             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
+                 const tr: TraitRef* = &bound.trait_refs[ti];
+@@ -1639,7 +1640,7 @@ type struct MethodBinding {
+         if (ta == null || !concrete.is_valid()) { return; }
+         match (*ta) {
+             TypeAnnotation::Named(n) => {
+-                if (this.trait_checker().lookup_subst_for_param(n.name, subst).is_invalid()
++                if (this.trait_checker().lookup_subst_for_param("ls.mb.proj_bind_where_arg_param", n.param_sym(), n.name, subst).is_invalid()
+                         && res_ctx.lookup_binding(n.param_sym()).is_invalid()) {
+                     res_ctx.add_binding(n.param_sym(), n.name, concrete);
+                 }
+@@ -1796,6 +1797,7 @@ type struct MethodBinding {
+         if (ret_ann == null) { return TypeRef::invalid(); }
+ 
+         mut rc: ResolutionContext = ResolutionContext::new("");
++        TypeSubstitution::b_site("method_binding:resolve_trait_impl_method_return:1797");
+         mut subst: TypeSubstitution = TypeSubstitution::empty();
+         if (found_impl.target_args.length == subj_nargs) {
+             for (mut i: i64 = 0; i < found_impl.target_args.length; i++) {
+@@ -1804,7 +1806,9 @@ type struct MethodBinding {
+                 match (*ta) {
+                     TypeAnnotation::Named(n) => {
+                         rc.add_binding(n.param_sym(), n.name, this.arena.inst_type_arg_at(subject_ref, i));
+-                        const gp_ref: TypeRef = this.arena.create_generic_param(n.name, i as u64);
++                        // A concrete argument written in the head is no parameter.
++                        if (!n.param_sym().is_valid()) { continue; }
++                        const gp_ref: TypeRef = this.arena.create_generic_param(n.param_sym(), n.name, i as u64);
+                         subst.add(gp_ref.id, this.arena.inst_type_arg_at(subject_ref, i));
+                     }
+                     _ => {}
+diff --git a/compiler/src/compiler/sema/pattern_resolver.cryo b/compiler/src/compiler/sema/pattern_resolver.cryo
+index b662cd42..cd14b76e 100644
+--- a/compiler/src/compiler/sema/pattern_resolver.cryo
++++ b/compiler/src/compiler/sema/pattern_resolver.cryo
+@@ -193,6 +193,7 @@ type struct PatternResolver {
+         if (peeled_inst != null && gr != null) {
+             const tmpl: TemplateEntry* = gr.template_of_type(peeled_inst.generic_base);
+             if (tmpl != null && tmpl.param_type_ids.length == peeled_inst.type_args.length) {
++                TypeSubstitution::b_site("pattern_resolver:resolve_variant_payload_types:196");
+                 mut subst: TypeSubstitution = TypeSubstitution::from_params(
+                     tmpl.param_type_ids, peeled_inst.type_args);
+                 mut substituted: TypeRef[] = [];
+diff --git a/compiler/src/compiler/sema/sema.cryo b/compiler/src/compiler/sema/sema.cryo
+index d0449ae3..a29fcad3 100644
+--- a/compiler/src/compiler/sema/sema.cryo
++++ b/compiler/src/compiler/sema/sema.cryo
+@@ -617,7 +617,7 @@ public:
+     override visit(mut &this, node: TraitDeclNode*) -> void {
+         if (node.is_generic()) { return; }
+         const this_name: SymbolStr = this.intern.intern("This");
+-        const this_placeholder: TypeRef = this.arena.create_generic_param(this_name, 0xFFFFFFFF as u64);
++        const this_placeholder: TypeRef = this.arena.this_placeholder(this_name);
+         for (mut j: i64 = 0; j < node.methods.length; j++) {
+             const func: FunctionDeclNode* = node.methods[j];
+             if (func == null || func.body == null) { continue; }
+diff --git a/compiler/src/compiler/sema/symbolic_checker.cryo b/compiler/src/compiler/sema/symbolic_checker.cryo
+index 4f59069d..edf2c834 100644
+--- a/compiler/src/compiler/sema/symbolic_checker.cryo
++++ b/compiler/src/compiler/sema/symbolic_checker.cryo
+@@ -112,21 +112,18 @@ type struct SymbolicChecker {
+         };
+     }
+ 
+-    /// True when a parameter TYPE's spelling is one of the parameters in
+-    /// scope for the body under symbolic check.  By spelling because the
+-    /// arena's `GenericParamType` carries a name and an index and no
+-    /// symbol - the type layer's own identity for a parameter
+-    /// is its spelling until the arena is keyed by symbol.  Only meaningful
+-    /// while `state.in_symbolic_check`.
+-    symbolic_name_is_generic_param(&this, sym: SymbolStr) -> boolean {
++    /// True when the parameter whose declaration bound `sym` is one of the
++    /// parameters in scope for the body under symbolic check.  Only
++    /// meaningful while `state.in_symbolic_check`.
++    symbolic_name_is_generic_param(&this, t: GenericParamType*) -> boolean {
+         if (!this.state.in_symbolic_check) { return false; }
+         for (mut i: i64 = 0; i < this.state.symbolic_owner_param_nodes.length; i++) {
+             const p: GenericParamNode* = this.state.symbolic_owner_param_nodes[i];
+-            if (p != null && p.name.equals(sym)) { return true; }
++            if (p != null && TypeArena::b_match("sym.owner_params", p.sym_id, p.name, t.param_sym, t.param_name)) { return true; }
+         }
+         for (mut j: i64 = 0; j < this.state.symbolic_method_param_nodes.length; j++) {
+             const p: GenericParamNode* = this.state.symbolic_method_param_nodes[j];
+-            if (p != null && p.name.equals(sym)) { return true; }
++            if (p != null && TypeArena::b_match("sym.method_params", p.sym_id, p.name, t.param_sym, t.param_name)) { return true; }
+         }
+         return false;
+     }
+@@ -153,7 +150,7 @@ type struct SymbolicChecker {
+     /// is written in a `where` clause on the enclosing declaration, and the
+     /// symbolic walk reads it from there rather than from the param.
+     symbolic_param_ref(&this, p: GenericParamNode*, index: u64) -> TypeRef {
+-        return this.arena.create_generic_param(p.name, index);
++        return this.arena.create_generic_param(p.sym_id, p.name, index);
+     }
+ 
+     /// The true type of `this` during a generic-owner symbolic walk: the owner's
+@@ -394,7 +391,7 @@ type struct SymbolicChecker {
+         if (t == null) { return false; }
+         if (t.kind == TypeKind::GenericParam) {
+             if (this.state.this_type.is_valid() && this.state.this_type.id == ty.id) { return true; }
+-            return this.symbolic_name_is_generic_param((t as GenericParamType*).param_name);
++            return this.symbolic_name_is_generic_param(t as GenericParamType*);
+         }
+         if (t.kind == TypeKind::AssocProjection) {
+             return this.symbolic_type_concretizable((t as AssocProjectionType*).base);
+diff --git a/compiler/src/compiler/types/arena.cryo b/compiler/src/compiler/types/arena.cryo
+index ee370a09..61fca975 100644
+--- a/compiler/src/compiler/types/arena.cryo
++++ b/compiler/src/compiler/types/arena.cryo
+@@ -26,9 +26,14 @@ import std::core::option::{ Option };
+ import std::collections::hashmap;
+ import std::collections::hashmap::{ HashMap };
+ import std::fmt;
++import std::env;
++import std::collections::str;
++import std::collections::string::{ String };
+ import compiler::resolver::intern_table::{ InternTable };
+ import compiler::resolver::qualified_name::{ QualifiedName };
+ import compiler::resolver::symbol_str::{ SymbolStr };
++import compiler::resolver::symbol_id::{ SymbolID };
++import compiler::resolver::res;
+ import compiler::resolver::res::{ DefId };
+ import compiler::types::compound::{
+     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+@@ -75,6 +80,9 @@ type struct InternEntry {
+     ty:        TypeRef;
+ }
+ 
++mut g_b_loaded: boolean = false;
++mut g_b_strict: string = "";
++
+ type struct TypeArena {
+     // -- Ownership --
+     types:   Type*[];           // All types (indexed by allocation order)
+@@ -150,12 +158,10 @@ type struct TypeArena {
+     // -- Function template placeholder cache (SymbolStr.id -> TypeRef) --
+     func_template_cache: HashMap<u32, TypeRef>;
+ 
+-    // -- Generic parameter dedup cache (key: (name.id << 32) | index -> TypeRef) --
+-    // Integer key is a perf choice (no format()/string-hash per lookup), NOT a
+-    // correctness one: `HashMap<string, V>` deduplicates by CONTENT today (see
+-    // `Hash`/`Eq for string`; verified empirically).  An older comment claiming
+-    // raw `string` equality is pointer-compare was stale (pre-`Eq for string`).
++    // -- Generic parameter cache (key: the declaration's SymbolID -> TypeRef) --
+     generic_param_cache:   HashMap<u64, TypeRef>;
++    // The one `This` placeholder (`this_placeholder`).
++    this_param:            TypeRef;
+ 
+     /// Create a new TypeArena and initialize all 20 primitive singletons.
+     static new(intern_table: InternTable*) -> TypeArena {
+@@ -198,6 +204,7 @@ type struct TypeArena {
+             alias_cache:         HashMap::<u32, TypeRef>::new(),
+             func_template_cache: HashMap::<u32, TypeRef>::new(),
+             generic_param_cache: HashMap::<u64, TypeRef>::new(),
++            this_param:          TypeRef::invalid(),
+         };
+ 
+         arena.init_primitives();
+@@ -622,45 +629,84 @@ type struct TypeArena {
+     }
+ 
+ 
+-    // Generic type factories (deduplicated by name + index)
+-
+-    /// Get or create a generic parameter type, deduplicated by NAME so a given
+-    /// logical param (e.g. `T`) is ONE canonical TypeID no matter which sema
+-    /// entry point mints it.  Several paths assign a different positional
+-    /// `index` to the same param (most visibly a generic enum's method resolving
+-    /// the enclosing `T` through a fresh scope), which under an (name, index) key
+-    /// produced distinct TypeIDs.  That mattered because substitution keys by
+-    /// param TypeID (`TypeSubstitution::from_params`): a divergent-index copy was
+-    /// absent from the map and stayed abstract, forcing the checker's name-only
+-    /// structural fallback and the canonicalization mechanisms downstream.  Keying
+-    /// by name collapses them and matches that long-standing name-only equality.
+-    /// `param_index` is still stored (first creation wins) but only feeds
+-    /// `display_name` (`T%lu`); the mangler encodes GenericParam by `param_name`
+-    /// alone, so first-index-wins is display-only and never perturbs emitted
+-    /// symbols.
+-    ///
+-    /// LOAD-BEARING ASSUMPTION: GenericParam ids are canonical PER NAME, not per
+-    /// BINDER.  Two params that share a name are one id even if they belong to
+-    /// different templates.  That is sound only because a name can never be
+-    /// bound twice along one substitution path: names are unique within a
+-    /// template, and Cryo has no construct that nests one binder inside another
+-    /// while allowing the inner to shadow the outer's name.  Adding
+-    /// higher-ranked types, or any nested binder with shadowing names, would
+-    /// break this - the inner and outer `T` would collide on one id and one
+-    /// substitution would silently capture the other.  Such a feature must
+-    /// re-key these leaves by binder identity (NOT by `index`; re-adding
+-    /// `index`/`bounds` to this key reintroduces the divergence above).
+-    create_generic_param(mut &this, name: SymbolStr, index: u64) -> TypeRef {
+-        const key: u64 = name.id as u64;
++    // Generic type factories
++
++    /// The type of the generic parameter whose declaration bound `sym`: one
++    /// type per declaration, so two parameters spelled alike - a method's `J`
++    /// and the `J` of the impl its body was copied under, the `T` of `Option`
++    /// and the `T` of `Array` - are two types, and a substitution binding one
++    /// cannot answer for the other.  Every path that makes a parameter's type
++    /// (registration, signature resolution, the monomorphizer's re-walks)
++    /// hands over the same declaration's symbol, so they agree on one type
++    /// whatever position each assigns; `param_index` is the first creation's
++    /// and feeds only `display_name`.  A parameter with no symbol names no
++    /// declaration: it is recorded as a defect and given no type.
++    create_generic_param(mut &this, sym: SymbolID, name: SymbolStr, index: u64) -> TypeRef {
++        mut key: u64 = sym.id;
++        if (!sym.is_valid()) {
++            fmt::eprintln("SHADOW\tBNOSYM\t" + this.intern_table.resolve(name));
++            key = ((1 as u64) << 62) | (name.id as u64);
++        }
+ 
+         const cached: Option<TypeRef> = this.generic_param_cache.get(&key);
+         if (cached.is_some()) { return cached.unwrap(); }
+ 
+-        mut ref: TypeRef = this.alloc_type(new GenericParamType(this.next_id, name, index));
++        mut ref: TypeRef = this.alloc_type(new GenericParamType(this.next_id, sym, name, index));
+         this.generic_param_cache.insert(key, ref);
+         return ref;
+     }
+ 
++    /// PROBE: the spelling answer a scan gave before the flip; prints a
++    /// BSPELL line where the identity answer differs.
++    static b_match(site: string, a_sym: SymbolID, a_name: SymbolStr,
++                   b_sym: SymbolID, b_name: SymbolStr) -> boolean {
++        const by_sym: boolean = a_sym.is_valid() && a_sym.equals(b_sym);
++        const by_name: boolean = a_name.equals(b_name);
++        if (by_sym != by_name) {
++            mut kind: string = "spell-only";
++            if (by_sym) { kind = "sym-only"; }
++            fmt::eprintln("SHADOW\tBSPELL\tscan\t" + site + "\t" + kind);
++        }
++        if (TypeArena::b_strict(site)) { return by_sym; }
++        return by_name;
++    }
++
++    /// PROBE: whether `site` answers by identity (env `B_STRICT` = the site's
++    /// tag, or `all`) instead of by spelling.
++    static b_strict(site: string) -> boolean {
++        if (!g_b_loaded) {
++            g_b_loaded = true;
++            match (env::var(str::Str::new("B_STRICT"))) {
++                Option::Some(v) => {
++                    mut s: String = v;
++                    g_b_strict = fmt::format("%s", s.as_cstr() as string);
++                }
++                Option::None => {}
++            }
++        }
++        if (g_b_strict == "") { return false; }
++        if (g_b_strict == "all") { return true; }
++        // `a,b,c` = those tags; `-a,b,c` = every tag but those.
++        const hay: str::Str = str::Str::new(fmt::format(",%s,", g_b_strict));
++        const needle: str::Str = str::Str::new(fmt::format(",%s,", site));
++        const neg: str::Str = str::Str::new(fmt::format(",-%s,", site));
++        const dash: str::Str = str::Str::new(",-");
++        const listed: boolean = hay.contains(&needle) || hay.contains(&neg);
++        // exclusion form: the list starts with `-`
++        if (hay.contains(&dash)) { return !listed; }
++        return listed;
++    }
++
++    /// The `This` placeholder a trait's signatures are resolved against before
++    /// any implementing type is known.  Not a declared parameter - no
++    /// declaration binds it - so it has no symbol, and it is one type per
++    /// program.
++    this_placeholder(mut &this, name: SymbolStr) -> TypeRef {
++        if (this.this_param.is_valid()) { return this.this_param; }
++        this.this_param = this.alloc_type(new GenericParamType(this.next_id, SymbolID::invalid(), name, 0xFFFFFFFF as u64));
++        return this.this_param;
++    }
++
+     /// Get or create a symbolic associated-type projection `Base::Member`.
+     /// Deduplicated by (base.id, member.id, owning_trait.id) so the same
+     /// projection always shares one arena slot - important so the
+diff --git a/compiler/src/compiler/types/generic.cryo b/compiler/src/compiler/types/generic.cryo
+index c53cd297..62ecae97 100644
+--- a/compiler/src/compiler/types/generic.cryo
++++ b/compiler/src/compiler/types/generic.cryo
+@@ -12,6 +12,7 @@ import compiler::types;
+ import compiler::types::{ type_ref, TypeKind, user_defined };
+ import compiler::resolver::symbol_str;
+ import compiler::resolver::symbol_str::{ SymbolStr };
++import compiler::resolver::symbol_id::{ SymbolID };
+ import compiler::types::type_base;
+ import std::fmt;
+ import compiler::types::type_ref::{ TypeRef };
+@@ -21,14 +22,19 @@ import compiler::types::type_base::{ Type };
+ // GenericParamType: Unresolved generic type parameter (e.g., T)
+ 
+ /// Represents an unbound generic parameter.
+-/// Identified by INDEX (not name) to prevent "T" collisions across scopes.
++/// Identified by the symbol its declaration bound, so two parameters
++/// spelled alike - a method's `J` and its impl's - are two types.
+ type class GenericParamType : Type {
+ public:
++    /// The symbol the parameter's declaration bound; invalid only on the
++    /// `This` placeholder, which no declaration binds.
++    param_sym:   SymbolID;
+     param_name:  SymbolStr;
+     param_index: u64;
+ 
+-    GenericParamType(id: u64, param_name: SymbolStr, param_index: u64)
++    GenericParamType(id: u64, param_sym: SymbolID, param_name: SymbolStr, param_index: u64)
+         : Type(id, TypeKind::GenericParam) {
++        this.param_sym   = param_sym;
+         this.param_name  = param_name;
+         this.param_index = param_index;
+     }
+diff --git a/compiler/src/compiler/types/ownership.cryo b/compiler/src/compiler/types/ownership.cryo
+index 0ae47117..de1fd70e 100644
+--- a/compiler/src/compiler/types/ownership.cryo
++++ b/compiler/src/compiler/types/ownership.cryo
+@@ -413,6 +413,7 @@ type struct OwnershipQuery {
+             registry.template_of_type(inst.generic_base);
+         if (tmpl == null) { return false; }
+         if (tmpl.param_type_ids.length != inst.type_args.length) { return false; }
++        TypeSubstitution::b_site("ownership:inst_template_thread_safe:417");
+         mut subst: TypeSubstitution =
+             TypeSubstitution::from_params(&tmpl.param_type_ids, &inst.type_args);
+ 
+diff --git a/compiler/src/compiler/types/resolver.cryo b/compiler/src/compiler/types/resolver.cryo
+index 4b517bd3..e0c1b7d5 100644
+--- a/compiler/src/compiler/types/resolver.cryo
++++ b/compiler/src/compiler/types/resolver.cryo
+@@ -1202,7 +1202,7 @@ type struct TypeResolver {
+     /// `GenericParamType` and consumers needing the bound read the clause.
+     create_param_type(&this, gp: GenericParamNode*, index: u64) -> TypeRef {
+         if (gp == null) { return TypeRef::invalid(); }
+-        return this.arena.create_generic_param(gp.name, index);
++        return this.arena.create_generic_param(gp.sym_id, gp.name, index);
+     }
+ 
+     /// Fill missing trailing args from a TemplateEntry's default annotations.
+@@ -1252,8 +1252,7 @@ type struct TypeResolver {
+             // Sentinel index well above any plausible real generic-param
+             // count. arena.create_generic_param dedups by (name.id, index),
+             // so every trait shares this canonical `This` placeholder.
+-            const this_placeholder: TypeRef =
+-                this.arena.create_generic_param(this_name, 0xFFFFFFFF as u64);
++            const this_placeholder: TypeRef = this.arena.this_placeholder(this_name);
+             res_ctx.set_this_type(this_placeholder);
+         }
+ 
+@@ -1571,6 +1570,7 @@ private:
+         if (bounds.length == 0) { return true; }
+         mut arg_copy: TypeRef[] = [];
+         for (mut i: i64 = 0; i < args.length; i++) { arg_copy.push(args[i]); }
++        TypeSubstitution::b_site("resolver:refuse_unsatisfied_type_bounds:1573");
+         const subst: TypeSubstitution = TypeSubstitution::from_params(&entry.param_type_ids, &arg_copy);
+         const checker: TraitChecker = TraitChecker::new(
+             this.arena, this.generic_registry, this.intern_table, this.diagnostics);
+diff --git a/compiler/src/compiler/types/substitution.cryo b/compiler/src/compiler/types/substitution.cryo
+index 10b2c9f6..4b254401 100644
+--- a/compiler/src/compiler/types/substitution.cryo
++++ b/compiler/src/compiler/types/substitution.cryo
+@@ -15,7 +15,8 @@ import compiler::types::arena::{ TypeArena };
+ import compiler::types::compound::{
+     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+ };
+-import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
++import compiler::types::generic::{ AssocProjectionType, GenericParamType, InstantiatedType };
++import std::fmt;
+ import compiler::types::type_base::{ Type };
+ import compiler::types::type_ref::{ TypeRef };
+ import compiler::types::user_defined::{ TypeAliasType };
+@@ -23,11 +24,14 @@ import compiler::types::user_defined::{ TypeAliasType };
+ 
+ // TypeSubstitution: Generic parameter to concrete type mapping
+ 
++mut g_b_site: string = "?";
++
+ /// Maps generic parameter TypeIDs to concrete TypeRef replacements.
+ /// Parallel arrays: param_ids[i] corresponds to replacements[i].
+ type struct TypeSubstitution {
+     param_ids:    u64[];       // GenericParamType TypeIDs
+     replacements: TypeRef[];   // Parallel: the concrete replacements
++    site:         string;
+ 
+ 
+     /// Create a substitution from parallel arrays of param TypeIDs and concrete types.
+@@ -40,17 +44,23 @@ type struct TypeSubstitution {
+         mut args_copy: TypeRef[] = [];
+         for (mut i: i64 = 0; i < param_type_ids.length; i++) { ids_copy.push(param_type_ids[i]); }
+         for (mut i: i64 = 0; i < type_args.length; i++)      { args_copy.push(type_args[i]); }
++        const s: string = g_b_site;
++        g_b_site = "?";
+         return TypeSubstitution {
+             param_ids:    ids_copy,
+             replacements: args_copy,
++            site:         s,
+         };
+     }
+ 
+     /// Create an empty substitution.
+     static empty() -> TypeSubstitution {
++        const s: string = g_b_site;
++        g_b_site = "?";
+         return TypeSubstitution {
+             param_ids:    [],
+             replacements: [],
++            site:         s,
+         };
+     }
+ 
+@@ -66,16 +76,46 @@ type struct TypeSubstitution {
+     /// Returns TypeRef::invalid() if not found - or if found TWICE with two
+     /// different answers.
+     ///
+-    /// The arena hands out one parameter type per SPELLING
+-    /// (`create_generic_param` caches by the name alone), so a method's
+-    /// `<J>` and the `implement<.., J, ..>` its body was copied under are
+-    /// one arena type, and a specialization binding the method's `J` to one
+-    /// type and the impl's to another holds two answers for one question.
+-    /// Answering with whichever was added first rebuilt `This`'s own
+-    /// arguments with the method's, silently; an invalid answer leaves the
+-    /// type it was asked for unresolved, and the call that needed it is
+-    /// reported where its specialization is missed.  A parameter bound
+-    /// twice to the SAME type is one answer and is given.
++    /// The arena hands out one parameter type per DECLARATION, so a
++    /// method's `<J>` and the `implement<.., J, ..>` its body was copied
++    /// under are two types and each has its own answer.  Two different
++    /// answers for one parameter is a substitution built wrong; answering
++    /// with whichever was added first would substitute silently, so the
++    /// answer is invalid and the type it was asked for stays unresolved.  A
++    /// parameter bound twice to the SAME type is one answer and is given.
++    static b_site(s: string) -> void { g_b_site = s; }
++
++    /// PROBE: the spelling-keyed answer (what the arena gave before the
++    /// flip); prints a BSPELL line when it differs from the identity answer.
++    get_probe(&this, param_id: u64, arena: TypeArena*) -> TypeRef {
++        const strict: TypeRef = this.get(param_id);
++        const want: Type* = arena.lookup(param_id);
++        if (want == null || want.kind != TypeKind::GenericParam) { return strict; }
++        const wname: u32 = (want as GenericParamType*).param_name.id;
++        mut found: TypeRef = TypeRef::invalid();
++        mut conflict: boolean = false;
++        for (mut i: i64 = 0; i < this.param_ids.length; i++) {
++            mut hit: boolean = this.param_ids[i] == param_id;
++            if (!hit) {
++                const kt: Type* = arena.lookup(this.param_ids[i]);
++                if (kt != null && kt.kind == TypeKind::GenericParam
++                        && (kt as GenericParamType*).param_name.id == wname) { hit = true; }
++            }
++            if (!hit) { continue; }
++            if (!found.is_valid()) { found = this.replacements[i]; continue; }
++            if (found.id != this.replacements[i].id) { conflict = true; }
++        }
++        if (conflict) { found = TypeRef::invalid(); }
++        if (found.id != strict.id || found.is_valid() != strict.is_valid()) {
++            mut kind: string = "miss";
++            if (strict.is_valid()) { kind = "differ"; }
++            if (!found.is_valid()) { kind = "conflict"; }
++            fmt::eprintln("SHADOW\tBSPELL\tsubst\t" + this.site + "\t" + kind);
++        }
++        if (TypeArena::b_strict(this.site)) { return strict; }
++        return found;
++    }
++
+     get(&this, param_id: u64) -> TypeRef {
+         mut found: TypeRef = TypeRef::invalid();
+         for (mut i: i64 = 0; i < this.param_ids.length; i++) {
+@@ -157,7 +197,7 @@ type struct TypeSubstitution {
+     // Per-kind application helpers
+ 
+     apply_generic_param(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
+-        const replacement: TypeRef = this.get(ty.id);
++        const replacement: TypeRef = this.get_probe(ty.id, arena);
+         if (replacement.is_valid()) {
+             return replacement;
+         }
+diff --git a/compiler/src/compiler/types/trait_checker.cryo b/compiler/src/compiler/types/trait_checker.cryo
+index ee201e8f..3b4bdbbe 100644
+--- a/compiler/src/compiler/types/trait_checker.cryo
++++ b/compiler/src/compiler/types/trait_checker.cryo
+@@ -34,6 +34,7 @@ import compiler::diag::sink::{ DiagnosticSink };
+ import compiler::resolver::intern_table::{ InternTable };
+ import compiler::resolver::symbol_str::{ SymbolStr };
+ import compiler::resolver::res::{ DefId };
++import compiler::resolver::symbol_id::{ SymbolID };
+ import compiler::types::arena::{ TypeArena };
+ import compiler::types::compound::{ PointerType };
+ import compiler::types::generic::{ GenericParamType };
+@@ -261,22 +262,37 @@ type struct TraitChecker {
+         if (impl_block.target_args.length != subj_nargs) {
+             return false;
+         }
++        mut args: TypeRef[] = [];
++        for (mut gi: i64 = 0; gi < subj_nargs; gi++) { args.push(this.arena.inst_type_arg_at(subject, gi)); }
++        TypeSubstitution::b_site("trait_checker:impl_bounds_hold:267");
+         mut nested: TypeSubstitution = TypeSubstitution::empty();
++        this.add_head_param_bindings(impl_block, &args, &nested);
++        return this.bounds_satisfied_at_depth(impl_block.where_bounds, &nested, depth + 1);
++    }
++
++    /// Bind `impl_block`'s own parameters to `args` by the position its head
++    /// writes each at (`implement<T, E> ... for Result<T, E>`: the impl's `T`
++    /// to `args[0]`).  The impl's parameters are its own declarations, not the
++    /// target template's, so a substitution over the template's parameters
++    /// answers nothing for a bound the impl writes.  A concrete argument in
++    /// the head binds nothing; a head whose count differs from `args` binds
++    /// nothing at all.
++    add_head_param_bindings(&this, impl_block: ImplBlockNode*, args: &TypeRef[],
++                            subst: TypeSubstitution*) -> void {
++        if (impl_block == null || subst == null) { return; }
++        if (impl_block.target_args.length != args.length) { return; }
+         for (mut gi: i64 = 0; gi < impl_block.target_args.length; gi++) {
+             const ta: TypeAnnotation* = impl_block.target_args[gi];
+             if (ta == null) { continue; }
+             match (*ta) {
+                 TypeAnnotation::Named(n) => {
+-                    // `lookup_subst_for_param` keys by the GenericParam's
+-                    // name, so the index here only has to make a GenericParam
+-                    // TypeRef; the name is what matters.
+-                    const gp_ref: TypeRef = this.arena.create_generic_param(n.name, gi as u64);
+-                    nested.add(gp_ref.id, this.arena.inst_type_arg_at(subject, gi));
++                    if (!n.param_sym().is_valid()) { continue; }
++                    const gp_ref: TypeRef = this.arena.create_generic_param(n.param_sym(), n.name, gi as u64);
++                    subst.add(gp_ref.id, args[gi]);
+                 }
+                 _ => {}
+             }
+         }
+-        return this.bounds_satisfied_at_depth(impl_block.where_bounds, &nested, depth + 1);
+     }
+ 
+     /// Lenient "does `ty` implement `trait_name`" check for verifying an
+@@ -341,7 +357,7 @@ type struct TraitChecker {
+             // the whole spec. (Crisp projection-level filtering is a future
+             // refinement - see plan risk #1.)
+             if (bound.has_projection_subject()) { continue; }
+-            const concrete: TypeRef = this.lookup_subst_for_param(bound.type_parameter, subst);
++            const concrete: TypeRef = this.lookup_subst_for_param("ls.bounds_satisfied", bound.subject_sym, bound.type_parameter, subst);
+             if (!concrete.is_valid()) {
+                 // No substitution for this param; the bound names a
+                 // generic the caller didn't supply.  This is normal for
+@@ -377,7 +393,7 @@ type struct TraitChecker {
+         for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+             const bound: TraitBound* = &bounds[bi];
+             if (bound.has_projection_subject()) { continue; }
+-            const concrete: TypeRef = this.lookup_subst_for_param(bound.type_parameter, subst);
++            const concrete: TypeRef = this.lookup_subst_for_param("ls.unsatisfied_trait_ref", bound.subject_sym, bound.type_parameter, subst);
+             if (!concrete.is_valid()) { continue; }
+             if (this.arena.contains_generic_param(concrete)) { continue; }
+             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+@@ -404,7 +420,7 @@ type struct TraitChecker {
+             // method body, not filterable by param substitution here. Treat as
+             // satisfied rather than failing the spec (matching `bounds_satisfied`).
+             if (bound.has_projection_subject()) { continue; }
+-            const concrete: TypeRef = this.lookup_subst_for_param(bound.type_parameter, subst);
++            const concrete: TypeRef = this.lookup_subst_for_param("ls.bounds_satisfied_at_depth", bound.subject_sym, bound.type_parameter, subst);
+             if (!concrete.is_valid()) { return false; }
+             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+                 const tref: TraitRef* = &bound.trait_refs[ri];
+@@ -428,18 +444,26 @@ type struct TraitChecker {
+         return this.bounds_satisfied(func.trait_bounds, subst);
+     }
+ 
+-    /// Find the substituted concrete TypeRef for a generic param by name.
+-    lookup_subst_for_param(&this, name: SymbolStr, subst: TypeSubstitution*) -> TypeRef {
++    /// The replacement `subst` holds for the generic parameter whose
++    /// declaration bound `sym`.
++    lookup_subst_for_param(&this, who: string, sym: SymbolID, name: SymbolStr, subst: TypeSubstitution*) -> TypeRef {
+         if (subst == null) { return TypeRef::invalid(); }
++        mut by_sym: TypeRef = TypeRef::invalid();
++        mut by_name: TypeRef = TypeRef::invalid();
+         for (mut i: i64 = 0; i < subst.param_ids.length; i++) {
+             const pt: Type* = this.arena.lookup(subst.param_ids[i]);
+             if (pt == null) { continue; }
+             if (pt.kind == TypeKind::GenericParam) {
+                 const gp: GenericParamType* = pt as GenericParamType*;
+-                if (gp.param_name.equals(name)) { return subst.replacements[i]; }
++                if (!by_sym.is_valid() && sym.is_valid() && gp.param_sym.equals(sym)) { by_sym = subst.replacements[i]; }
++                if (!by_name.is_valid() && gp.param_name.equals(name)) { by_name = subst.replacements[i]; }
+             }
+         }
+-        return TypeRef::invalid();
++        if (by_sym.id != by_name.id || by_sym.is_valid() != by_name.is_valid()) {
++            fmt::eprintln("SHADOW\tBSPELL\tlookup_subst\t" + who + "\t" + subst.site);
++        }
++        if (TypeArena::b_strict(who)) { return by_sym; }
++        return by_name;
+     }
+ 
+     /// The name a trait impl for `ty` is registered under: the arena's
