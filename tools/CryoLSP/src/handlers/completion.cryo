@@ -17,10 +17,9 @@
 ///!     just the last segment, so `types::Foo::` and a bare `Foo::` stay
 ///!     distinct scopes.
 ///!   - Resolves that path to a qualified declaration name: an already-
-///!     qualified path is taken at face value, a bare leaf goes through the
-///!     compiler's own import-scoped resolution
-///!     (`DeclarationIndex::resolve_qualified_scoped`) against the editing
-///!     file's namespace.
+///!     qualified path is taken at face value, a bare leaf is what the name
+///!     layer binds it to in the editing file's module (`Resolver::lookup`
+///!     from that module's scope).
 ///!   - Walks all modules to enumerate static methods (struct/class/impl)
 ///!     and enum variants on that declaration.
 ///!   - When the path names a namespace rather than a type, enumerates the
@@ -60,6 +59,10 @@ import compiler::ast::node_locator;
 import compiler::diag::source_span;
 import compiler::resolver::symbol_str;
 import compiler::resolver::intern_table;
+import compiler::resolver::resolver;
+import compiler::resolver::symbol_id;
+import compiler::resolver::module_path::{ ModulePath };
+import compiler::resolver::scope::{ ScopeID };
 import compiler::types::type_ref;
 import compiler::types::arena;
 import compiler::types;
@@ -304,6 +307,7 @@ type struct CompletionEngine {
     intern: intern_table::InternTable*;
     arena:  arena::TypeArena*;
     decl:   decl_index::DeclarationIndex*;
+    res:    resolver::Resolver*;
 
     static new(ctx: compilation_context::CompilationContext*) -> CompletionEngine {
         return CompletionEngine {
@@ -311,6 +315,7 @@ type struct CompletionEngine {
             intern: ctx.intern_table,
             arena:  ctx.type_arena,
             decl:   ctx.decl_index,
+            res:    ctx.resolver,
         };
     }
 
@@ -319,26 +324,30 @@ type struct CompletionEngine {
 
     /// Resolve the scope path scraped before `::` to the qualified
     /// declaration name it refers to.  An already-qualified path is taken at
-    /// face value; a bare leaf goes through the compiler's own import-scoped
-    /// resolution against `use_site_ns`, so the members offered are the ones
-    /// this file would actually bind.
+    /// face value; a bare leaf is what the name layer binds it to in the
+    /// module `use_site_ns` - that module's own declarations and imports,
+    /// then the prelude - so the members offered are the ones this file
+    /// would actually bind.  The binding is read from the module's scope,
+    /// not from a node at the cursor, so a half-typed `Foo::` that parsed
+    /// into no node still resolves.
     ///
-    /// A miss or an import-visible ambiguity yields the bare name unchanged.
-    /// The collectors key off whether the result carries a qualifier, so an
+    /// A leaf the module does not bind yields the bare name unchanged.  The
+    /// collectors key off whether the result carries a qualifier, so an
     /// unresolved name degrades to a leaf match - the widest list that can be
     /// offered honestly - rather than to nothing.
     resolve_scope_path(&this, path: string, use_site_ns: string) -> symbol_str::SymbolStr {
         if (this.intern == null) { return symbol_str::SymbolStr::empty(); }
         const bare: symbol_str::SymbolStr = this.intern.intern(path);
-        if (this.decl == null || CompletionEngine::has_scope_separator(path)) {
+        if (this.res == null || this.decl == null || CompletionEngine::has_scope_separator(path)) {
             return bare;
         }
-        // Both callers hand over the namespace read from the AST of the module
-        // whose text is being resolved, so a rejection belongs to that source
-        // and not to a module the editor merely happens to be standing in.
-        const ns: symbol_str::SymbolStr = this.intern.intern(use_site_ns);
-        return this.decl.resolve_qualified_scoped(bare, ns, this.intern)
-                        .resolved_or(bare);
+        const sid: u64 = this.res.find_module_scope(ModulePath::of(this.intern.intern(use_site_ns)));
+        if (sid == 0) { return bare; }
+        const bound: symbol_id::SymbolID = this.res.lookup(bare, ScopeID { id: sid });
+        if (!bound.is_valid()) { return bare; }
+        const q: symbol_str::SymbolStr = this.decl.defs.path_of(this.res.get_symbol(bound).def);
+        if (!q.is_valid()) { return bare; }
+        return q;
     }
 
 
@@ -373,7 +382,7 @@ type struct CompletionEngine {
                     this.add_instance_methods(&d.methods, items);
                 } else if (stmt.kind == ast::NodeKind::ImplementationBlock) {
                     const d: declaration::ImplBlockNode* = stmt as declaration::ImplBlockNode*;
-                    if (!this.ref_matches(d.target_type, mod_ns, target, leaf, exact)) { continue; }
+                    if (!this.impl_matches(d, target, leaf, exact)) { continue; }
                     this.add_instance_methods(&d.methods, items);
                 }
             }
@@ -411,7 +420,7 @@ type struct CompletionEngine {
                     this.add_static_methods(&d.methods, items);
                 } else if (stmt.kind == ast::NodeKind::ImplementationBlock) {
                     const d: declaration::ImplBlockNode* = stmt as declaration::ImplBlockNode*;
-                    if (!this.ref_matches(d.target_type, mod_ns, target, leaf, exact)) { continue; }
+                    if (!this.impl_matches(d, target, leaf, exact)) { continue; }
                     this.add_static_methods(&d.methods, items);
                 }
             }
@@ -563,22 +572,26 @@ type struct CompletionEngine {
         return libc::strcmp(dn, target + nl + 2) == 0;
     }
 
-    /// True when a type *reference* written inside module namespace `mod_ns`
-    /// - an `implement` block's target - denotes the declaration `target`
-    /// names.  Unlike a declaration's own name, the reference may be bare and
-    /// bind to a type declared elsewhere, so it is resolved through the same
-    /// import-scoped lookup before comparison.
-    ref_matches(&this, ref_name: symbol_str::SymbolStr, mod_ns: string, target: string,
-                target_leaf: string, exact: boolean) -> boolean {
-        if (this.intern == null) { return false; }
-        const rn: string = this.intern.resolve(ref_name);
+    /// True when an `implement` block is for the declaration `target` names.
+    /// The block's target is the one its head was stamped with when it was
+    /// resolved - a written block's definition, or, for a block the
+    /// monomorphizer placed for an instantiation (which carries no stamp),
+    /// the instantiation's own type.  Either names the target whatever the
+    /// head spelled and wherever the block sits.
+    impl_matches(&this, d: declaration::ImplBlockNode*, target: string,
+                 target_leaf: string, exact: boolean) -> boolean {
+        if (this.intern == null || this.decl == null || d == null) { return false; }
+        mut owner: symbol_str::SymbolStr = this.decl.defs.path_of(d.target_def());
+        if (!owner.is_valid() && d.spec_owner.is_valid()) {
+            owner = this.decl.lookup_type_name(d.spec_owner);
+        }
+        if (!owner.is_valid()) { return false; }
+        const on: string = this.intern.resolve(owner);
         if (!exact) {
             if (libc::strlen(target_leaf) == 0) { return false; }
-            return libc::strcmp(CompletionEngine::leaf_after_separator(rn), target_leaf) == 0;
+            return libc::strcmp(CompletionEngine::leaf_after_separator(on), target_leaf) == 0;
         }
-        const resolved: symbol_str::SymbolStr = this.resolve_scope_path(rn, mod_ns);
-        if (!resolved.is_valid()) { return false; }
-        return libc::strcmp(this.intern.resolve(resolved), target) == 0;
+        return libc::strcmp(on, target) == 0;
     }
 
     /// True when `s` contains a `::` scope separator.

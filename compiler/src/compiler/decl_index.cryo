@@ -46,67 +46,6 @@ import compiler::intrinsic_kind;
 import compiler::intrinsic_kind::{ IntrinsicKind };
 
 
-/// Outcome of import-scoped bare-leaf name resolution
-/// (`DeclarationIndex::resolve_qualified_scoped`).  Distinguishes a clean
-/// unique resolution, a same-module (local) definition, a genuine
-/// import-visible ambiguity (a hard error the caller must diagnose), and a
-/// clean miss.  `Ambiguous` carries no payload; the caller re-fetches the
-/// candidate set via `lookup_qualified_alternatives` for the diagnostic.
-type enum ScopeResolution {
-    NotFound;
-    Unique(SymbolStr);
-    SameModule(SymbolStr);
-    Ambiguous;
-    /// Exactly one candidate exists, and the use site cannot reach it - the
-    /// module that wrote the name neither declares it, imports its module, nor
-    /// gets it from the prelude.  Carries the candidate so the diagnostic can
-    /// name the module that declares it and the import that would fix it.
-    ///
-    /// Distinct from `NotFound`, which means no candidate exists at all: the
-    /// two need different diagnostics because only one of them has a fix to
-    /// suggest.
-    NotReachable(SymbolStr);
-}
-
-implement enum ScopeResolution {
-    /// The resolved qualified name for a clean/local resolution, or `bare`
-    /// unchanged on a miss or ambiguity.  Lets call sites that only want a
-    /// name stay one-liners; ambiguity is surfaced separately via
-    /// `is_ambiguous` at the authoritative
-    /// (type-resolution / sema) sites that own the diagnostic.
-    resolved_or(&this, bare: SymbolStr) -> SymbolStr {
-        match (&this) {
-            ScopeResolution::Unique(q)     => { return q; }
-            ScopeResolution::SameModule(q) => { return q; }
-            // An unreachable candidate still hands back the name it found.
-            // The gate's job is to DIAGNOSE, not to reroute: returning `bare`
-            // here would change which declaration downstream passes bind while
-            // the error is still being reported, so a rejected name would take
-            // a different path through the compiler than an accepted one.
-            ScopeResolution::NotReachable(q) => { return q; }
-            _                              => { return bare; }
-        }
-    }
-
-    is_ambiguous(&this) -> boolean {
-        match (&this) {
-            ScopeResolution::Ambiguous => { return true; }
-            _                          => { return false; }
-        }
-    }
-
-    /// The unreachable candidate, or an invalid symbol for every other
-    /// outcome.  Authoritative sites use this to emit E0240; non-authoritative
-    /// ones never ask and keep the binding they already had.
-    not_reachable(&this) -> SymbolStr {
-        match (&this) {
-            ScopeResolution::NotReachable(q) => { return q; }
-            _                                => { return SymbolStr::empty(); }
-        }
-    }
-
-}
-
 /// One global's registration slot, read by value: the key the slot is
 /// under (its leaf and the namespace of the module that declared it), the
 /// global's type as that module declared it, the module, the linker symbol
@@ -247,10 +186,6 @@ type struct DeclarationIndex {
                                       // mistaken for it: no spelling is
                                       // compared to decide it.
 
-    // Bare-name -> all qualified names ever registered for it.
-    // Populated by `register_name_mapping`.
-    bare_alts:           Pair<u32, u32>[];    // .first = bare SymbolStr.id, .second = qualified SymbolStr.id
-
     // --- O(1) indices over the flat arrays above ---------------------------
     // These map a SymbolStr.id key to the position(s) it occupies in the
     // parallel arrays, so registration de-dup and per-name lookups no longer
@@ -259,15 +194,13 @@ type struct DeclarationIndex {
 
     // Function name SymbolStr.id -> positions in the `overload_func_*` arrays.
     overload_index:      HashMap<u32, u32[]>;
-    // Bare name SymbolStr.id -> positions in `bare_alts`.
-    bare_alts_index:     HashMap<u32, u32[]>;
 
     // C symbol -> (key, function type id) of the FIRST `extern "C"` block
     // declaration carrying it, for W0011: a later extern block declaring the
     // same symbol with another signature is reported against this one.
     extern_symbol_first: HashMap<u32, Pair<u32, u64>>;
 
-    // --- Import-scoped name resolution (resolve_qualified_scoped) -----------
+    // --- Module reachability and declaration visibility --------------------
     // Everything below is keyed on the NAMESPACE identity space (e.g.
     // `std::alloc::rc`, `CryoTests::Tests::Lang::LeafDispatchA`), the one space
     // shared by a type's qualified name (namespace = qualified minus leaf),
@@ -290,35 +223,16 @@ type struct DeclarationIndex {
     prelude_ns:          u32[];
 
     // Qualified declaration-name SymbolStr.id -> is_public, for TYPES and FREE
-    // FUNCTIONS alike.  Lets import-scoped same-leaf resolution
-    // (resolve_qualified_scoped) exclude a PRIVATE cross-module candidate from
-    // the visible set so it can't manufacture a false ambiguity on the E0154
-    // static-call-scope path.  Populated by `register_decl_in_index`
-    // (type_resolution.cryo) alongside `register_name_mapping`, so every name
-    // that can appear as a same-leaf candidate carries a verdict.  A name
-    // absent from this map (single-file / C-import types, which never enter the
-    // alternatives set) is a declaration that never registered, recorded as
-    // such (`is_candidate_public`).
+    // FUNCTIONS alike, recorded by every registration
+    // (`register_decl_in_index`, type_resolution.cryo).  A name absent from
+    // this map is a declaration that never registered, recorded as such
+    // (`is_candidate_public`).
     //
-    // A same-module candidate never reaches this check: both branches of
-    // `resolve_qualified_scoped` compare namespaces first, so a module always
-    // sees its own private items (spec docs/name-resolution.md §4).
-    //
-    // NOTE on the mechanism hierarchy: this is a SECONDARY guard, not the
-    // primary privacy gate.  A bare TYPE NAME is resolved by the NameResolver
-    // first, which today exports types unconditionally (see name_resolution.cryo
-    // declare_type - `private` on a type is not honored there) and owns the
-    // E0203 import-ambiguity diagnostic; the authoritative cross-module privacy
-    // check is the name layer's module-rooted walk (E0503).  So for a pure type-name
-    // collision the NameResolver front-runs this map.  It still does real work
-    // for the import-scoped static-call/template lookups that consult
-    // resolve_qualified_scoped directly, and it makes `is_candidate_public`
-    // honest rather than a permanently-empty stub.
-    //
-    // AND IT DOES NOT GATE BARE FUNCTION CALLS.  A bare `foo()` binds from
-    // its stamp, and the name layer refuses a private declaration at the
-    // import that would have bound it; this map is read for a QUALIFIED
-    // call's callee (`enforce_callee_visibility`).
+    // It does not gate bare function calls.  A bare `foo()` binds from its
+    // stamp, and the name layer refuses a private declaration at the import
+    // that would have bound it; this map is read for a QUALIFIED call's
+    // callee (`enforce_callee_visibility`), where a module's own private
+    // items are never refused because the namespaces are compared first.
     decl_visibility:     HashMap<u32, boolean>;
 
     /// The declarations whose SIGNATURE the name layer refused - a parameter
@@ -357,10 +271,8 @@ type struct DeclarationIndex {
             overload_func_trait:   [],
             overload_func_span:    [],
             overload_func_intrinsic: [],
-            bare_alts:      [],
             overload_index:     HashMap::<u32, u32[]>::new(),
             extern_symbol_first: HashMap::<u32, Pair<u32, u64>>::new(),
-            bare_alts_index:    HashMap::<u32, u32[]>::new(),
             module_imports:     HashMap::<u32, u32[]>::new(),
             prelude_ns:         [],
             decl_visibility:    HashMap::<u32, boolean>::new(),
@@ -1122,31 +1034,6 @@ type struct DeclarationIndex {
     }
 
 
-    /// Register a bare -> qualified name mapping.
-    /// Called by type_resolution when registering both forms.
-    /// Also records the qualified name in the per-bare alternatives list
-    /// so codegen can detect ambiguous bare-name fallbacks.
-    register_name_mapping(mut &this, bare: SymbolStr, qualified: SymbolStr) -> void {
-        // Append to alternatives list, deduped by (bare, qualified) pair --
-        // scoped to this bare name's positions via bare_alts_index.
-        match (this.bare_alts_index.get_ref(&bare.id)) {
-            Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    if (this.bare_alts[(*positions)[k] as i64].second == qualified.id) {
-                        return;
-                    }
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
-        }
-        const new_pos: u32 = this.bare_alts.length as u32;
-        this.bare_alts.push(Pair::<u32, u32>::new(bare.id, qualified.id));
-        const slot: u32[]* = this.bare_alts_index.get_or_insert(bare.id, []);
-        (*slot).push(new_pos);
-    }
-
     // --- Import-scoped resolution: population + query -----------------------
 
     /// Record a module's import list (its `ModuleInfo.dependencies`, which are
@@ -1302,99 +1189,6 @@ type struct DeclarationIndex {
                 true
             }
         };
-    }
-
-    /// Resolve a bare leaf to the qualified name the USE SITE actually means,
-    /// using its namespace + import list.  This is import-aware: it only
-    /// differs from a context-free lookup when a leaf has MORE THAN ONE
-    /// registered qualified form (a same-leaf collision); a unique leaf
-    /// resolves identically and cheaply.
-    ///
-    /// Precedence (a local definition beats imports; a prelude name is special):
-    ///   1. exactly one candidate            -> Unique
-    ///   2. a same-namespace (local) candidate:
-    ///        - also a prelude-name candidate -> Ambiguous  (local vs prelude
-    ///          is a hard conflict; the local must be renamed or qualified)
-    ///        - otherwise                     -> SameModule (local wins)
-    ///   3. no local candidate: keep the public candidates whose namespace is
-    ///      imported (or preluded):
-    ///        - exactly one  -> Unique
-    ///        - two or more  -> Ambiguous  (caller demands qualification)
-    ///        - none visible -> NotFound   (a later "undefined" error owns it)
-    /// `use_site_ns` is only as good as the caller's claim about it.  A caller
-    /// handing over the ambient cursor names a module that did not write the
-    /// syntax, and a rejection judged against it is a false positive of the
-    /// caller rather than a defect in the source.
-    resolve_qualified_scoped(&this, bare: SymbolStr, use_site_ns: SymbolStr,
-                             intern: InternTable*) -> ScopeResolution {
-        const cands: SymbolStr[] = this.lookup_qualified_alternatives(bare);
-        if (cands.length == 0) { return ScopeResolution::NotFound; }
-        if (cands.length == 1) {
-            // A sole candidate is still judged against the use site.  Without
-            // the gate below this answered `Unique` no matter what the use
-            // site could see, which is §1's root cause: a name unique
-            // program-wide resolved from anywhere.  The candidate travels with
-            // the verdict so the diagnostic can name its module.
-            const c0: SymbolStr = cands[0];
-            const c0_ns: SymbolStr = this.namespace_of(c0, intern);
-            if (c0_ns.id != use_site_ns.id) {
-                const c0_reach: boolean =
-                    this.is_prelude_ns(ModulePath::of(c0_ns))
-                        || this.ns_imports(ModulePath::of(use_site_ns), ModulePath::of(c0_ns));
-                if (!c0_reach || !this.is_candidate_public(c0)) {
-                    return ScopeResolution::NotReachable(c0);
-                }
-            }
-            return ScopeResolution::Unique(c0);
-        }
-
-        mut local:   SymbolStr[] = [];
-        mut visible: SymbolStr[] = [];
-        mut prelude_hit: boolean = false;
-        for (mut i: i64 = 0; i < cands.length; i++) {
-            const c: SymbolStr = cands[i];
-            const c_ns: SymbolStr = this.namespace_of(c, intern);
-            if (c_ns.id == use_site_ns.id) {
-                local.push(c);
-                continue;
-            }
-            const c_prelude: boolean = this.is_prelude_ns(ModulePath::of(c_ns));
-            if (c_prelude) { prelude_hit = true; }
-            if ((c_prelude || this.ns_imports(ModulePath::of(use_site_ns), ModulePath::of(c_ns)))
-                && this.is_candidate_public(c)) {
-                visible.push(c);
-            }
-        }
-
-        if (local.length >= 1) {
-            if (prelude_hit)        { return ScopeResolution::Ambiguous; }
-            if (local.length == 1)  { return ScopeResolution::SameModule(local[0]); }
-            return ScopeResolution::Ambiguous;
-        }
-        if (visible.length == 1) { return ScopeResolution::Unique(visible[0]); }
-        if (visible.length == 0) { return ScopeResolution::NotFound; }
-        return ScopeResolution::Ambiguous;
-    }
-
-    /// Return every qualified name registered under the given bare name.
-    /// `length > 1` means dispatching through the bare-name fallback would
-    /// be ambiguous: the overload slot is last-write-wins, so two free
-    /// functions of the same simple name in sibling namespaces collapse
-    /// onto a single LLVM symbol.  Codegen uses this to emit E0154
-    /// (ambiguous call) instead of silently misrouting.
-    lookup_qualified_alternatives(&this, bare: SymbolStr) -> SymbolStr[] {
-        mut result: SymbolStr[] = [];
-        match (this.bare_alts_index.get_ref(&bare.id)) {
-            Option::Some(positions) => {
-                mut k: i64 = 0;
-                while (k < (*positions).length) {
-                    result.push(SymbolStr::from_id(this.bare_alts[(*positions)[k] as i64].second));
-                    k = k + 1;
-                }
-            }
-            Option::None => { }
-        }
-        return result;
     }
 
     /// Combines an owner type's arena id and a method's SymbolStr.id into a
