@@ -42476,3 +42476,46 @@ audit's populations (242, 312) were counted elsewhere and are not comparable
 one to one.
 
 ---
+
+### 8.342 An import carries the identity of the declaration it binds, copied, instead of an identity built from the import's own module and leaf - 0 objects moved - 2026-09-26
+
+§8.337 recorded that an imported name is its own `Symbol`, so under the
+identity index an import's id has to be copied from the declaration: an
+index minted for the import would be a second id for one declaration.
+§8.339 measured that copying is value-identical today; this makes it so.
+
+```cryo
+// module App - `import std::fmt::{ println };`
+// before: the import symbol was admitted like a declaration, and its id built
+//         from its own fields - "std::fmt" + "::" + "println"
+// after:  it carries the stamp std::fmt's own `println` declaration has
+println("x");   // Res::Def(<the declaration's id>) either way; now by copy
+```
+
+- `Symbol::import_sym` takes the `DefId` of the declaration the import binds;
+  the four import forms pass the exported symbol's own stamp (a glob's export,
+  a re-export's, a named entry's - offered by the module or through its
+  `export` closure - and a sub-module's export).
+- `Resolver::declare_import` no longer admits the symbol as a definition;
+  `admit`, the one mint in the name layer, now runs for declarations only.
+- `import M as X` still goes through `declare`, so `X` is admitted and
+  stamped as the declaration of a new name (`M::X`) exactly as before:
+  copying would give it the module's id, and that form is refused downstream,
+  so what it names is not changed here.
+
+#### Evidence
+
+- The value question was measured in §8.339's shadow, at these five sites
+  with the import's own stamp against the declaration's: **88,022 of 88,022
+  agree** (glob 67, named 80,844, sub-module 7,111); the re-export form was
+  never entered, and for it the two are equal by construction (the import's
+  module is the re-exported symbol's own `source_module`, and an exported
+  symbol always has one - only a refused import's binding has none, and it is
+  never exported).
+- Objects: `objcmp.sh` tip → tree, **0 of 1,126 example objects, 0 of 3,018
+  test objects** (predicted 0). `lsp-check` OK (0 errors, 478 warnings),
+  `cross-check` OK, 346 compiler warnings, `test-census` OK.
+- Rows: `lane-check` unchanged (predicted: the mint in `admit` stays, it runs
+  for fewer symbols); residue and `done.py` unchanged.
+
+---
