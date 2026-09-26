@@ -9,6 +9,9 @@ build:
     examples   scripts/examples-gate.py  every examples/ project builds
     lsp        scripts/lsp-gate.py       tools/CryoLSP builds
     cross      scripts/cross-check.py    the other OS's gated half compiles
+    incr       scripts/incremental-instance-check.py
+                                         an edit asking a cached module for a
+                                         new generic instance still links
     fast       make check-fast           lane surface, section 0, pin integrity
 
 They are independent: each writes its own build directory, and nothing here
@@ -36,20 +39,22 @@ instrument can report non-zero, so the object counts are floors: a hash list
 with no objects is a failure, not a clean comparison.
 
 A change that makes a refused program compile makes the baseline's census fail
-on that program's project, by design; so does a change that corrects what a
-program the baseline compiled does.  Such a program is DECLARED, one project
-per line with the reason, committed with the change: in
-`tests/started-compiling` when the baseline refuses it, in
-`tests/started-passing` when the baseline builds it and its run fails.  The
-entries that apply to a run are the ones the working tree's file lists and
-REV's does not, so an entry is inert once the baseline has it, and asserted
-again against any older baseline.  For each, the baseline must REFUSE the
-project with a diagnostic (started-compiling) or BUILD it (started-passing),
-and the tree compiler must build it; the baseline census must fail on exactly
-the declared projects and nothing else; and their objects are left out of the
-comparison and counted.  A declaration is an assertion, never an exemption:
-declaring a program the baseline already passed, one the tree still refuses,
-or one in the file of the other kind, fails the run.
+on that program's project, by design; so does any change that makes a project
+pass that the baseline's run of it failed - a program that ran wrong, a
+refusal whose report was missing what the project expects.  Such a project
+is DECLARED, one per line with the reason, committed with the change: in
+`tests/started-compiling` when the baseline refuses the program and the tree
+builds it, in `tests/started-passing` otherwise.  The entries that apply to a
+run are the ones the working tree's file lists and REV's does not, so an
+entry is inert once the baseline has it, and asserted again against any
+older baseline.  For every one, the baseline census must fail on exactly the
+declared projects and nothing else, and the tree's census passing them is
+the rest of the claim; a started-compiling project must also be REFUSED by
+the baseline with a diagnostic and BUILT by the tree.  Their objects are
+left out of the comparison and counted.  A declaration is an assertion,
+never an exemption: declaring a project the baseline already passed, or a
+started-compiling one the baseline builds or the tree refuses, fails the
+run.
 
 Usage:
     make verify [ARGS="--baseline HEAD"]
@@ -93,6 +98,8 @@ GATES = {
                  r"^examples-gate: "),
     "lsp":      ([PY, "scripts/lsp-gate.py", "--cryo", "{cryo}"], r"^lsp-gate: "),
     "cross":    ([PY, "scripts/cross-check.py", "--cryo", "{cryo}"], r"^cross-check: "),
+    "incr":     ([PY, "scripts/incremental-instance-check.py", "--cryo", "{cryo}"],
+                 r"^incremental-instance-check: "),
     # `ARGS=` on the command line: `make verify ARGS=...` exports ARGS to
     # child makes, and check-fast's lane-check would receive verify's flags.
     "fast":     (["make", "--no-print-directory", "check-fast", "ARGS="], r"check-fast: "),
@@ -400,15 +407,14 @@ def judge_baseline_census(declared, accounted, unit_failed, neg_failed, failed, 
 
 
 def judge_builds(name, base_rc, base_out, tree_rc, tree_out, fixed=False):
-    """Problems with one declared project's two direct builds.  A project the
-    change corrects (`fixed`) is one the baseline BUILDS; any other declared
-    one the baseline refuses."""
+    """Problems with one declared project's two direct builds.  A
+    started-passing (`fixed`) project's claim is its census verdicts, so its
+    builds are reported and not judged; a started-compiling one must be
+    refused by the baseline and built by the tree."""
     problems = []
     if fixed:
-        if base_rc != 0:
-            problems.append("%s: the baseline does not build it (exit %d); a program the "
-                            "baseline refuses belongs in %s" % (name, base_rc, DECLARED))
-    elif base_rc == 0:
+        return problems
+    if base_rc == 0:
         problems.append("%s: the baseline compiler BUILDS it (exit 0); it is not a "
                         "program this change makes compile" % name)
     elif not DIAGNOSTIC.search(base_out):
@@ -446,7 +452,7 @@ def check_declared(declared, base_exe, cryo, logdir, env, fixed=()):
         trc, tout = build_copy(cryo, name, os.path.join(logdir, "declared", "tree", name))
         found = judge_builds(name, brc, bout, trc, tout, is_fixed)
         print("  %-9s %-40s baseline exit %d, tree exit %d  %s"
-              % ("corrected" if is_fixed else "declared", name, brc, trc,
+              % ("passing" if is_fixed else "declared", name, brc, trc,
                  "ok" if not found else "FAIL"))
         problems += found
     return problems
@@ -475,10 +481,10 @@ def selftest():
          judge_builds("p", 3, "segfault", 0, ""), 1),
         ("builds: the tree still refuses it",
          judge_builds("p", 1, "error[E0203]: x", 1, "error[E0203]: x"), 1),
-        ("corrected: built before, builds now",
+        ("started-passing: a program the baseline built",
          judge_builds("p", 0, "", 0, "", True), 0),
-        ("corrected: the baseline refused it",
-         judge_builds("p", 1, "error[E0203]: x", 0, "", True), 1),
+        ("started-passing: a refusal whose report changes",
+         judge_builds("p", 1, "error[E0900]: x", 1, "error[E0900]: x", True), 0),
         ("census: a corrected project fails the baseline",
          judge_baseline_census({}, True, 0, 0, ["q"], {"q"}), 0),
         ("census: a corrected project the baseline passes",

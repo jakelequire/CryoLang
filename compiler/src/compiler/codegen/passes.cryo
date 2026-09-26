@@ -212,6 +212,44 @@ type struct CodegenPasses {
     // unaffected: that link runs in `sh` on the Linux host, so the POSIX forms
     // are correct there.)
 
+    /// Run a toolchain command - the linker, the archiver - with its combined
+    /// output captured to `log_path`, and answer its exit code, the output in
+    /// `*out`.  The output is read back rather than left on the terminal:
+    /// the compiler's diagnostics render after every pass has run, so a
+    /// tool's own reason for failing, printed as the tool ran, would sit
+    /// above all of them, apart from the one error it explains.  A caller
+    /// puts it in that error; a command that succeeds has its output printed
+    /// here, as it would have been (a linker's warnings).  The log is
+    /// removed on success and kept on failure, beside the response file.
+    static run_tool(cmd: string, log_path: string, out: string*) -> i32 {
+        const rc: i32 = Command::shell(fmt::format("%s > %s 2>&1", cmd,
+            CodegenPasses::link_quote(log_path)));
+        mut text: string = "";
+        match (file::read_to_string(Path::from(log_path))) {
+            Result::Ok(t)  => { text = t.into_raw(); }
+            Result::Err(_) => { }
+        }
+        *out = text;
+        if (rc == 0) {
+            if (text.length() > 0) { fmt::eprintf("%s", text); }
+            dir::remove_file(Path::from(log_path));
+        }
+        return rc;
+    }
+
+    /// The error for a toolchain command that failed: what ran, where its
+    /// inputs are kept, and - as a note - what the tool itself reported,
+    /// which is the reason.
+    static tool_failure(what: string, cmd: string, rsp_path: string,
+                        output: string) -> Diagnostic {
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+            fmt::format("%s: %s\n  object list retained at: %s", what, cmd, rsp_path));
+        if (output.length() > 0) {
+            d = d.with_note(fmt::format("the tool reported:\n%s", output));
+        }
+        return d;
+    }
+
     /// Quote one path/argument for the active build host's shell.  POSIX:
     /// `shell_quote`'s secure single-quote form.  Windows: a plain double-quote
     /// wrap - `cmd` honours only double quotes, and build paths never contain
@@ -1669,15 +1707,16 @@ type struct CodegenPasses {
             cdebug("[Codegen] Link command: %s\n", cmd);
         }
 
-        const rc: i32 = Command::shell(cmd);
+        mut link_out: string = "";
+        const rc: i32 = CodegenPasses::run_tool(cmd, fmt::format("%s.log", link_rsp_path), &link_out);
         if (rc != 0) {
             // Keep the response file on the failure path: the command in the
             // diagnostic names it with `@`, so deleting it makes that command
             // unreplayable - the linker just reports the missing file instead
             // of the original error.
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("linker invocation failed (%s exited with %d): %s\n  object list retained at: %s",
-                    link_cfg.driver, rc, cmd, link_rsp_path));
+            ctx.emit_diagnostic(CodegenPasses::tool_failure(
+                fmt::format("linker invocation failed (%s exited with %d)", link_cfg.driver, rc),
+                cmd, link_rsp_path, link_out));
             return PassResult::failure(1);
         }
         // The response file has served its purpose; remove it so it doesn't
@@ -1819,13 +1858,14 @@ type struct CodegenPasses {
             cdebug("[Codegen] Link command: %s\n", cmd);
         }
 
-        const rc: i32 = Command::shell(cmd);
+        mut link_out: string = "";
+        const rc: i32 = CodegenPasses::run_tool(cmd, fmt::format("%s.log", link_rsp_path), &link_out);
         if (rc != 0) {
             // Retained on failure so the reported command can be re-run; see
             // the project link path for the reasoning.
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("linker invocation failed (%s exited with %d): %s\n  object list retained at: %s",
-                    link_cfg.driver, rc, cmd, link_rsp_path));
+            ctx.emit_diagnostic(CodegenPasses::tool_failure(
+                fmt::format("linker invocation failed (%s exited with %d)", link_cfg.driver, rc),
+                cmd, link_rsp_path, link_out));
             return PassResult::failure(1);
         }
         // Discard the response file once the link has consumed it
@@ -1911,13 +1951,13 @@ type struct CodegenPasses {
             cdebug("[Codegen] Bundle command: %s\n", cmd);
         }
 
-        const rc: i32 = Command::shell(cmd);
+        mut ar_out: string = "";
+        const rc: i32 = CodegenPasses::run_tool(cmd, fmt::format("%s.log", rsp_path), &ar_out);
         if (rc != 0) {
             // Retained on failure so the reported command can be re-run; see
             // the project link path for the reasoning.
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("ar invocation failed (exited with %d): %s\n  object list retained at: %s",
-                    rc, cmd, rsp_path));
+            ctx.emit_diagnostic(CodegenPasses::tool_failure(
+                fmt::format("ar invocation failed (exited with %d)", rc), cmd, rsp_path, ar_out));
             return PassResult::failure(1);
         }
         // Drop the response file now the archiver has read it (best-effort).

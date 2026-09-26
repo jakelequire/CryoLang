@@ -136,7 +136,7 @@ instrument condition one's list is drawn from; its J count is not a target.
 Checks:
 
 * `python3 scripts/ns-migration/done.py --outstanding | wc -l` → **0** (5 before §8.360: the five overload-family doors take a `FamilyOwner` - a definition or a type by identity - and the written leaf, and are member reads; 6 before §8.359: `signature_refused` is asked by identity - a function's refusal on its definition, a method's by its owner type and leaf; 8 before §8.358, whose visibility gate asks by the callee's definition: `is_candidate_public` and `namespace_of` are deleted; 14 before §8.357: the six generic-parameter scans - `TemplateEntry::param_names[]`, `local::TraitBound[]`, `FunctionDeclNode::trait_bounds[]`, `ImplBlockNode::where_bounds[]` and the two `SemaState` parameter lists - compare by declaration once the arena keys a parameter by it; 23 before §8.333-§8.335: the six owner doors asked by the self type's name and both `get_template` lines, B and C, are gone, and `lookup_type_exact` is called only inside the funnel's own file; 25 before §8.331 converted the self-growth check and the two written-name scans; condition one's list, one line per function or hand-written scan and class - `get_template` is on two lines, B and C; 30 before §8.330 converted the four trait lookups and one scan)
-* `python3 scripts/ns-migration/done.py --name-taking | wc -l` → **1117** (+2 in §8.361: `DefTable::register_generated`, the registration a synthesizer's declaration goes through, and the `append` both registrations share; 1,114 before §8.360: six no longer take a spelling (`resolve_function` and `lookup_sole_entry` take the definition; `reset_function_overloads`, `reset_method_overloads`, `pin_scope_callee_qsym`, `check_impl_qualified_args` are gone or take an owner) and seven new ones do - `family_slot`, `reset_family`, the three context helpers that name a declaring module's family (`decl_fn_family`, `minted_family`, `module_family`, and `module_def_of` behind them) and the E0900 text's `family_text`; condition two's population, all of it unplaced; 1,115 before §8.359: `mark_signature_refused`, `signature_refused` and `signature_refused_in_module` deleted, `mark_method_signature_refused` and `method_signature_refused` new, each a method's leaf on an owner type; 1,117 before §8.358: five no longer take a spelling (`namespace_of`, `is_candidate_public`, `set_decl_visibility`, `enforce_value_ref_visibility`, `resolve_module_qualified_symbol`) and three new ones do (`Resolver::exports_named`, `NameResolution::export_in` and `private_in`, each a module's member by its leaf in one namespace); 1,120 before §8.357: `symbolic_name_is_generic_param` is deleted, `AsyncLower::param_spelled` and both `lookup_subst_for_param` take a parameter type or a symbol (-4), `TypeArena::this_placeholder(name)` is new (+1); 1,114 before the test runner ran its compile-fail and project suites on a worker pool, which added six functions taking a shell command or a file path, none a spelling: `shell_in_dir` (once per target), `Executor::suite_jobs`, `job_tmp_path`, `project_command` and `project_outcome`; 1,095 before §8.353, whose matcher saw a spelling only by value: +10 taking one by reference, `Resolver::resolve_path(segments: &SymbolStr[], ..)` among them, and +9 taking a `QualifiedName`; 1,099 before §8.349, which deleted `register_name_mapping`, `resolve_qualified_scoped`, `lookup_qualified_alternatives` and `ScopeResolution::resolved_or`; 1,098 before §8.348, which added `register_methods_through`, taking a diagnostic `site` label as `register_methods` does; 1,099 before §8.339, where `claim_wellknown` stopped taking a name; 1,109 before §8.333-§8.335: eleven functions - the owner and scope-segment doors and their helpers - stopped taking a name or were deleted, and the parser's `refuse_declaration_keyword_name` takes a diagnostic label; 1,110 before §8.332, where `register_impl_block`, `refuse_elided_template_params` and `set_resolved_template` stopped taking a name and `template_in` / `member_template_key` take the member's leaf; 1,113 before §8.331; 1,136 before §8.330, whose trait carriers stopped taking a name in 23 functions)
+* `python3 scripts/ns-migration/done.py --name-taking | wc -l` → **1119** (+2 in §8.362: codegen's `run_tool`, which runs a toolchain command with its output captured, and `tool_failure`, the error that carries that output - a command line and a file path, text run and read, not names looked up; +2 in §8.361: `DefTable::register_generated`, the registration a synthesizer's declaration goes through, and the `append` both registrations share; 1,114 before §8.360: six no longer take a spelling (`resolve_function` and `lookup_sole_entry` take the definition; `reset_function_overloads`, `reset_method_overloads`, `pin_scope_callee_qsym`, `check_impl_qualified_args` are gone or take an owner) and seven new ones do - `family_slot`, `reset_family`, the three context helpers that name a declaring module's family (`decl_fn_family`, `minted_family`, `module_family`, and `module_def_of` behind them) and the E0900 text's `family_text`; condition two's population, all of it unplaced; 1,115 before §8.359: `mark_signature_refused`, `signature_refused` and `signature_refused_in_module` deleted, `mark_method_signature_refused` and `method_signature_refused` new, each a method's leaf on an owner type; 1,117 before §8.358: five no longer take a spelling (`namespace_of`, `is_candidate_public`, `set_decl_visibility`, `enforce_value_ref_visibility`, `resolve_module_qualified_symbol`) and three new ones do (`Resolver::exports_named`, `NameResolution::export_in` and `private_in`, each a module's member by its leaf in one namespace); 1,120 before §8.357: `symbolic_name_is_generic_param` is deleted, `AsyncLower::param_spelled` and both `lookup_subst_for_param` take a parameter type or a symbol (-4), `TypeArena::this_placeholder(name)` is new (+1); 1,114 before the test runner ran its compile-fail and project suites on a worker pool, which added six functions taking a shell command or a file path, none a spelling: `shell_in_dir` (once per target), `Executor::suite_jobs`, `job_tmp_path`, `project_command` and `project_outcome`; 1,095 before §8.353, whose matcher saw a spelling only by value: +10 taking one by reference, `Resolver::resolve_path(segments: &SymbolStr[], ..)` among them, and +9 taking a `QualifiedName`; 1,099 before §8.349, which deleted `register_name_mapping`, `resolve_qualified_scoped`, `lookup_qualified_alternatives` and `ScopeResolution::resolved_or`; 1,098 before §8.348, which added `register_methods_through`, taking a diagnostic `site` label as `register_methods` does; 1,099 before §8.339, where `claim_wellknown` stopped taking a name; 1,109 before §8.333-§8.335: eleven functions - the owner and scope-segment doors and their helpers - stopped taking a name or were deleted, and the parser's `refuse_declaration_keyword_name` takes a diagnostic label; 1,110 before §8.332, where `register_impl_block`, `refuse_elided_template_params` and `set_resolved_template` stopped taking a name and `template_in` / `member_template_key` take the member's leaf; 1,113 before §8.331; 1,136 before §8.330, whose trait carriers stopped taking a name in 23 functions)
 * `python3 scripts/ns-migration/done.py --selftest | tail -1` → **14** (the matcher above over declarations it must list - a spelling by value, by reference, as an array, as a `QualifiedName`, wrapped over two lines - and ones it must not; its matcher before §8.353 got 10)
 * `python3 scripts/parse_cache.py --selftest | tail -1` → **8** (the parse the rows share within one `ns-status-check` run: every way it could answer from a stale parse - a changed, added or removed source file, a changed script, a failed computation - driven through a throwaway tree; a key that ignored file contents got 3, §8.354)
 
@@ -377,7 +377,7 @@ Checks for this section, one per line so each can be copied whole:
 * `python3 scripts/lane-gate.py --rows` → **16** (17 before §8.346 deleted `DEFID_MINT`)
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: lane-check lane-selftest' Makefile` → **1**
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **85** (+1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **86** (+1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)* `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -44484,3 +44484,108 @@ but a classification by spelling.
   `register_generated`, no longer a name shared with a store method).
 - §0: name-taking 1,115 -> 1,117 (`register_generated`, `append`);
   projects 84 -> 85.
+
+### 8.362 An incremental build no longer reuses an object that lacks a generic instance an edit newly requires, and a failed link's error carries the linker's own report - reproduced as a verify gate; 0 objects moved - 2026-09-26
+
+```cryo
+import std::thread;
+type struct JobA { n: i32; }
+type struct JobB { m: i64; }                 // added by the edit
+function run_a(j: JobA) -> void { }
+function run_b(j: JobB) -> void { }
+function main() -> i32 {
+    {
+        mut scope: thread::Scope = thread::Scope::new();
+        scope.spawn::<JobA>(JobA { n: 1 }, run_a);
+        scope.spawn::<JobB>(JobB { m: 2 }, run_b);   // added by the edit
+    }
+    return 4;
+}
+```
+
+Built once without the two marked lines, then again incrementally with
+them: the second build failed to link, `undefined reference to
+C$3std.6thread.5Scope-5spawn$F$m_N$L4main.4JobB$G...`, where a clean build
+links and exits 4.  Filed in the fifty-second session with
+`Scope::spawn<ShellJobs>` in the compiler's own build.
+
+#### The cause: a spec method's owning module misattributed
+
+`nm` over a clean build: both `Scope::spawn<JobA>` and `spawn<JobB>` are
+DEFINED in `std/thread.o` and referenced from `main.o` - a generic method
+instantiated on a non-generic owner is emitted with the owner's
+declaration.  The per-module cache keys a module that owns a specialization
+by a digest of every source, and any other module by its import closure
+only (`instance.cryo`, `pm_owns_spec`).  `spawn<C>` is written inside
+`type struct Scope { .. }`, with no impl block, so its specs go through
+`register_spec_method_in_di_inherent` (`mono/call_specializer.cryo`), which
+recorded the owning module as `current_module` - the module whose CALL was
+being walked, `main`.  `std::thread` was never flagged, kept its
+import-closure key, and its object from the first build - without
+`spawn<JobB>` - was reused.  Fix: the owning module is the one whose file
+declares the owner (`owner_ast.span.file`), which is where the definition
+is emitted.  The impl-block path already records the block's own module.
+
+Checked for the right reason: after the fix the second build still reports
+`reusing 37 cached object(s)` (38 in the failing build - `std/thread.o` is
+the one no longer reused, and its timestamp moved), so the cache was in
+effect and the link succeeded because the stale object was rebuilt, not
+because the cache was off.  A key the module graph could not resolve would
+have switched the cache off for the whole build (`pm_active = false`) and
+passed for the wrong reason; the reuse count is what rules that out.
+
+#### The swallowed report
+
+The linker's output was printed as it ran, while the compiler's diagnostics
+render after every pass: the reason (`undefined reference to ...`) sat 290
+lines above the one error, `E0900 linker invocation failed (gcc exited with
+1): <command>`, which did not contain it - and any reader of the last
+screen, or of a log's tail, never saw it.  `CodegenPasses::run_tool` now
+runs a toolchain command with its output captured to a log beside the
+response file, and `tool_failure` puts that output in the error as a note
+(`the tool reported:`); a command that succeeds has its output printed as
+before.  The project link, the single-file link and the archiver go
+through it.
+
+#### Tests
+
+- `tests/fixtures/incremental-new-instance` (the program above, in two
+  steps) and `scripts/incremental-instance-check.py`, a `make verify` gate
+  (`incr`) and `make incremental-instance-check`: the first build must run
+  3, the edited incremental build must link and run 4, and must have
+  reused cached objects.  The project runner builds a program once, so a
+  two-step build cannot be a test project.  Pair: the parent commit's
+  compiler -> `incremental-instance-check: FAIL -- the incremental build
+  after the edit: build exit 1`; this one -> `OK -- ... reused 37 cached
+  object(s), linked and ran 4`.  Under the parent's compiler the gate's own
+  printed tail does not contain the `undefined reference` line - the
+  second half of this entry, seen from the outside.
+- `tests/tests/projects/link_failure_carries_linker_report`: a C function
+  declared and defined nowhere; compile_fail E0900 with `the tool
+  reported:` and the symbol's name in the output.  The parent's compiler
+  printed the symbol too, but outside the error, so the note text is what
+  discriminates: parent 0 notes, this build 1.  Declared in
+  `tests/started-passing`, which now covers any project the baseline's run
+  fails and the tree's passes; a build check stays only on
+  `tests/started-compiling`, where refused-then-built is the claim.
+
+#### Not done
+
+The fix rests on attributing every emitted specialization to the module
+that emits it.  A direct guard - each module's cached key or sidecar
+recording the specialization symbols its object defines, and reuse refused
+when the set now required of it grows - would hold whatever the
+attribution; it would also be a second answer to the question the
+ownership flag answers, so it is not built here.
+
+#### Evidence
+
+- Predicted 0 objects; measured **0 of 3,461 test and 0 of 1,126 example
+  objects moved** against the parent's compiler (`make verify
+  ARGS="--baseline HEAD --require-identical"`; the new project's 54
+  dependency objects left out as declared).  Census, examples, lsp-check
+  (478), cross-check, `incr` and check-fast OK.  346 warnings in a clean
+  build, the same set.
+- Compiler 61+ / 19- in 2 files.  §0: name-taking 1,117 -> 1,119
+  (`run_tool`, `tool_failure`: a command line and a file path, text run and
+  read); projects 85 -> 86.

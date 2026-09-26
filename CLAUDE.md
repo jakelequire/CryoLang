@@ -44,6 +44,8 @@ make verify-freestanding # runtime/ tiers built by the compiler under test
 make examples            # smoke-build every examples/ project (floor: 14)
 make examples-golden     # build AND run them, diff stdout (POSIX only)
 make incremental-check   # incremental build == clean build, per module
+make incremental-instance-check  # an edit asking a cached module for a new generic
+                         # instance still links (a verify gate: `incr`)
 make selfhost-check      # byte-identity fixed point, BOTH OS, ~17 min
 ```
 

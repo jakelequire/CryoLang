@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -611,6 +611,16 @@ lane-selftest:
 # check-fast.
 residue-selftest:
 	@$(PYTHON) scripts/ns-migration/residue_selftest.py
+
+# An incremental build after an edit that asks an unchanged module for a new
+# generic instance must link (tests/fixtures/incremental-new-instance).
+ifeq ($(HOST_OS),windows)
+incremental-instance-check: cryo
+	@$(PYTHON) scripts/incremental-instance-check.py --cryo "$(STAGE2_EXE)"
+else
+incremental-instance-check: cryo
+	@$(PYTHON) scripts/incremental-instance-check.py --cryo "$(STAGE2)"
+endif
 
 # The judges behind verify's tests/started-compiling declarations, driven
 # through every case they must refuse and every case they must allow.
