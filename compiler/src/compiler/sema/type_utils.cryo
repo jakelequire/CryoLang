@@ -45,6 +45,8 @@ import compiler::types::compound::{
     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
 };
 import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 
@@ -424,6 +426,40 @@ type struct TypeUtils {
             return t as InstantiatedType*;
         }
         return null;
+    }
+
+    /// Substitute a receiver instantiation's arguments for its owner's
+    /// parameters in a type declared on the owner - a method's return or a
+    /// field's type: `Slice<u8>::get -> Option<u8>`.  In a generic body the
+    /// receiver's arguments may themselves be parameters - `Holder<X>`
+    /// inside `run<X>`, or `Conn<U>` as `this` in `implement struct
+    /// Conn<U>` over `Conn<S>` - and those are the ones in scope, so they are
+    /// substituted like any other: leaving the owner's `S` in the answer
+    /// hands the body a parameter it does not have.  Returns `ty` unchanged
+    /// when it is already concrete, the receiver is no instantiation, or the
+    /// arity disagrees; for a concrete receiver, also when the answer stays
+    /// abstract (a parameter no receiver argument binds, such as a method's
+    /// own).
+    subst_owner_params_from_receiver(&this, recv_type: TypeRef, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return ty; }
+        if (!this.contains_generic_param(ty)) { return ty; }
+        const inst: InstantiatedType* = this.peel_to_instantiation(recv_type);
+        if (inst == null) { return ty; }
+        const gr: GenericRegistry* = this.ctx.get_generic_registry();
+        if (gr == null) { return ty; }
+        const tmpl: TemplateEntry* = gr.template_of_type(inst.generic_base);
+        if (tmpl == null) { return ty; }
+        if (tmpl.param_type_ids.length != inst.type_args.length) { return ty; }
+        mut abstract_recv: boolean = false;
+        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+            if (this.contains_generic_param(inst.type_args[i])) { abstract_recv = true; }
+        }
+        mut subst: TypeSubstitution = TypeSubstitution::from_params(
+            tmpl.param_type_ids, inst.type_args);
+        const out: TypeRef = subst.apply(ty, this.arena);
+        if (!out.is_valid()) { return ty; }
+        if (!abstract_recv && this.contains_generic_param(out)) { return ty; }
+        return out;
     }
 
     // -- Generic-identity views (carrier-free) ---------------------------------

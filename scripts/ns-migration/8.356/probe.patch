@@ -1,0 +1,300 @@
+diff --git a/compiler/src/compiler/sema/call_resolver.cryo b/compiler/src/compiler/sema/call_resolver.cryo
+index 73007e89..54af9b4b 100644
+--- a/compiler/src/compiler/sema/call_resolver.cryo
++++ b/compiler/src/compiler/sema/call_resolver.cryo
+@@ -3238,7 +3238,7 @@ type struct CallResolver {
+             const refined: TypeRef = if (member.generic_args.length > 0) {
+                 this.binding.resolve_method_return_with_explicit_args(obj_type, member, ret)
+             } else {
+-                this.binding.subst_method_return_from_receiver(obj_type, ret)
++                this.types.subst_owner_params_from_receiver(obj_type, ret)
+             };
+             // When the return is still abstract, resolve it per-call (existing).
+             // Otherwise, if the call targets a generic method whose by-name lookup
+diff --git a/compiler/src/compiler/sema/member_resolver.cryo b/compiler/src/compiler/sema/member_resolver.cryo
+index 0e8b498d..5e40e1da 100644
+--- a/compiler/src/compiler/sema/member_resolver.cryo
++++ b/compiler/src/compiler/sema/member_resolver.cryo
+@@ -187,7 +187,7 @@ type struct MemberResolver {
+             }
+             // Mono-after-sema: substitute the receiver's type_args so a template
+             // field types concretely (`.second -> i64`).
+-            return this.binding.subst_method_return_from_receiver(obj_type, result.result_type);
++            return this.types.subst_owner_params_from_receiver(obj_type, result.result_type);
+         }
+ 
+         // Mono-after-sema: read the field off the generic BASE template's AST and
+@@ -331,7 +331,7 @@ type struct MemberResolver {
+                 member.set_resolved_member(MemberPin::Field(fl.depth, fl.index));
+                 this.enforce_field_visibility(fl.field, fl.owner, member.member, acc_span);
+             }
+-            return this.binding.subst_method_return_from_receiver(obj_type, result.result_type);
++            return this.types.subst_owner_params_from_receiver(obj_type, result.result_type);
+         }
+         // Generic base-template field.
+         mut t_index: i64 = -1;
+@@ -425,7 +425,7 @@ type struct MemberResolver {
+             return TypeRef::invalid();
+         }
+         if (!abstract_field.is_valid()) { return TypeRef::invalid(); }
+-        return this.binding.subst_method_return_from_receiver(recv_type, abstract_field);
++        return this.types.subst_owner_params_from_receiver(recv_type, abstract_field);
+     }
+ 
+     /// If `field_name` on `obj_type` is a Function-typed field, tag the member with
+diff --git a/compiler/src/compiler/sema/method_binding.cryo b/compiler/src/compiler/sema/method_binding.cryo
+index 136a6624..e9775248 100644
+--- a/compiler/src/compiler/sema/method_binding.cryo
++++ b/compiler/src/compiler/sema/method_binding.cryo
+@@ -155,40 +155,6 @@ type struct MethodBinding {
+         return (t as GenericParamType*).param_name;
+     }
+ 
+-    /// Substitute a receiver instantiation's arguments for its owner's
+-    /// parameters in a method's return (or a field's type):
+-    /// `Slice<u8>::get -> Option<u8>`.  In a generic body the receiver's
+-    /// arguments may themselves be parameters - `Holder<X>` inside
+-    /// `run<X>` - and those are the CALLER's, so they are substituted like
+-    /// any other: leaving the owner's `S` in the answer hands the caller a
+-    /// parameter it does not have.  Returns `ret` unchanged when it is
+-    /// already concrete, the receiver is no instantiation, or the arity
+-    /// disagrees; for a concrete receiver, also when the answer stays
+-    /// abstract (a parameter no receiver argument binds, such as the
+-    /// method's own).
+-    subst_method_return_from_receiver(mut &this, recv_type: TypeRef,
+-                                      ret: TypeRef) -> TypeRef {
+-        if (!ret.is_valid()) { return ret; }
+-        if (!this.types.contains_generic_param(ret)) { return ret; }   // already concrete
+-        const inst: InstantiatedType* = this.types.peel_to_instantiation(recv_type);
+-        if (inst == null) { return ret; }
+-        const gr: GenericRegistry* = this.ctx.get_generic_registry();
+-        if (gr == null) { return ret; }
+-        const tmpl: TemplateEntry* = gr.template_of_type(inst.generic_base);
+-        if (tmpl == null) { return ret; }
+-        if (tmpl.param_type_ids.length != inst.type_args.length) { return ret; }
+-        mut abstract_recv: boolean = false;
+-        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+-            if (this.types.contains_generic_param(inst.type_args[i])) { abstract_recv = true; }
+-        }
+-        mut subst: TypeSubstitution = TypeSubstitution::from_params(
+-            tmpl.param_type_ids, inst.type_args);
+-        const out: TypeRef = subst.apply(ret, this.arena);
+-        if (!out.is_valid()) { return ret; }
+-        if (!abstract_recv && this.types.contains_generic_param(out)) { return ret; }
+-        return out;
+-    }
+-
+     /// Mono-after-sema: resolve a method's return type when the receiver is an
+     /// unresolved generic instantiation (`Slice<u8>` pre-mono).  Walks the generic
+     /// BASE template's method list for an unambiguous non-static non-method-generic
+@@ -245,7 +211,7 @@ type struct MethodBinding {
+ 
+         if (found_count != 1 || !abstract_ret.is_valid()) { return TypeRef::invalid(); }
+         const recv_subst: TypeRef =
+-            this.subst_method_return_from_receiver(recv_type, abstract_ret);
++            this.types.subst_owner_params_from_receiver(recv_type, abstract_ret);
+         return this.subst_this_in_type(recv_subst, recv_type);
+     }
+ 
+diff --git a/compiler/src/compiler/sema/sema.cryo b/compiler/src/compiler/sema/sema.cryo
+index 55f63d44..33fa76e1 100644
+--- a/compiler/src/compiler/sema/sema.cryo
++++ b/compiler/src/compiler/sema/sema.cryo
+@@ -1576,6 +1576,7 @@ public:
+             _ => { TypeRef::invalid() }
+         };
+         if (result.is_valid()) { expr.set_resolved_type(result); }
++        if (result.is_valid()) { this.symbolic.probe_report(expr.span, n.kind as i64, result); }
+         return result;
+     }
+ 
+diff --git a/compiler/src/compiler/sema/symbolic_checker.cryo b/compiler/src/compiler/sema/symbolic_checker.cryo
+index 4f59069d..517b4d67 100644
+--- a/compiler/src/compiler/sema/symbolic_checker.cryo
++++ b/compiler/src/compiler/sema/symbolic_checker.cryo
+@@ -57,6 +57,8 @@ import compiler::types::generic_registry::{ TemplateEntry };
+ import compiler::types::resolver::{ ResolutionContext };
+ import compiler::types::type_base::{ Type };
+ import compiler::types::type_ref::{ TypeRef };
++import compiler::diag::source_span::{ SourceSpan };
++import std::fmt;
+ 
+ type struct SymbolicChecker {
+     arena: TypeArena*;
+@@ -241,8 +243,10 @@ type struct SymbolicChecker {
+     }
+ 
+     /// During a generic-owner symbolic walk, resolve `this.<field>` to the field's
+-    /// abstract declared type off the owner template's AST (the arena StructType
+-    /// has no fields for a generic template).  Invalid when not in such a walk,
++    /// declared type off the owner template's AST (the arena StructType has no
++    /// fields for a generic template), read through the receiver's arguments:
++    /// inside `implement struct Conn<U>` over `Conn<S>` a field declared `S` is
++    /// `U`, the parameter the body's bounds are written on.  Invalid when not in such a walk,
+     /// the receiver isn't the owner, or `field` names no field (so a real typo
+     /// still falls through to E0204).
+     symbolic_resolve_owner_field(mut &this, recv_type: TypeRef,
+@@ -261,7 +265,7 @@ type struct SymbolicChecker {
+                 const f: FieldDeclNode* = sn.fields[i];
+                 if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
+                     *out_index = i;
+-                    return f.resolved_type;
++                    return this.types.subst_owner_params_from_receiver(recv_type, f.resolved_type);
+                 }
+             }
+         } else if (tmpl.node_kind == NodeKind::UnionDeclaration) {
+@@ -270,7 +274,7 @@ type struct SymbolicChecker {
+                 const f: FieldDeclNode* = un.fields[i];
+                 if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
+                     *out_index = i;
+-                    return f.resolved_type;
++                    return this.types.subst_owner_params_from_receiver(recv_type, f.resolved_type);
+                 }
+             }
+         } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+@@ -279,15 +283,16 @@ type struct SymbolicChecker {
+                 const f: FieldDeclNode* = cn.fields[i];
+                 if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
+                     *out_index = i;
+-                    return f.resolved_type;
++                    return this.types.subst_owner_params_from_receiver(recv_type, f.resolved_type);
+                 }
+             }
+         }
+         return TypeRef::invalid();
+     }
+ 
+-    /// During a generic-owner symbolic walk, resolve `this.<method>()`'s abstract
+-    /// declared return type off the owner template's AST.  Returns it only when
++    /// During a generic-owner symbolic walk, resolve `this.<method>()`'s declared
++    /// return type off the owner template's AST, read through the receiver's
++    /// arguments as a field's type is.  Returns it only when
+     /// EXACTLY ONE non-static method of that name exists; invalid for 0 or an
+     /// ambiguous overload set (caller defers).  Trait-impl/inherited methods are
+     /// intentionally not resolved here.
+@@ -295,8 +300,8 @@ type struct SymbolicChecker {
+                                          method_name: SymbolStr) -> TypeRef {
+         const f: FunctionDeclNode* = this.symbolic_find_owner_method(recv_type, method_name);
+         if (f == null) { return TypeRef::invalid(); }
+-        if (f.resolved_return_type.is_valid()) { return f.resolved_return_type; }
+-        return TypeRef::invalid();
++        if (!f.resolved_return_type.is_valid()) { return TypeRef::invalid(); }
++        return this.types.subst_owner_params_from_receiver(recv_type, f.resolved_return_type);
+     }
+ 
+     /// Locate the uniquely-named non-static method `method_name` on the generic
+@@ -339,6 +344,60 @@ type struct SymbolicChecker {
+     }
+ 
+ 
++    // PROBE-S53 (temporary): report a parameter not in scope by IDENTITY.
++    probe_in_scope_id(&this, id: u64) -> boolean {
++        for (mut i: i64 = 0; i < this.state.symbolic_owner_param_nodes.length; i++) {
++            const p: GenericParamNode* = this.state.symbolic_owner_param_nodes[i];
++            if (p != null && this.symbolic_param_ref(p, i as u64).id == id) { return true; }
++        }
++        for (mut j: i64 = 0; j < this.state.symbolic_method_param_nodes.length; j++) {
++            const p: GenericParamNode* = this.state.symbolic_method_param_nodes[j];
++            if (p != null && this.symbolic_param_ref(p, j as u64).id == id) { return true; }
++        }
++        return false;
++    }
++    probe_foreign(&this, tref: TypeRef, depth: i32) -> GenericParamType* {
++        if (!tref.is_valid() || depth > 8) { return null; }
++        const t: Type* = this.arena.lookup(tref.id);
++        if (t == null) { return null; }
++        if (t.kind == TypeKind::GenericParam) {
++            const gp: GenericParamType* = t as GenericParamType*;
++            if (this.state.this_type.is_valid() && this.state.this_type.id == tref.id) { return null; }
++            if (gp.param_index == 0xFFFFFFFF as u64) { return null; }
++            if (this.probe_in_scope_id(tref.id)) { return null; }
++            return gp;
++        }
++        if (t.kind == TypeKind::Pointer) { return this.probe_foreign((t as PointerType*).pointee, depth + 1); }
++        if (t.kind == TypeKind::Reference) { return this.probe_foreign((t as ReferenceType*).referent, depth + 1); }
++        if (t.kind == TypeKind::Array) { return this.probe_foreign((t as ArrayType*).element, depth + 1); }
++        if (t.kind == TypeKind::Optional) { return this.probe_foreign((t as OptionalType*).wrapped, depth + 1); }
++        if (t.kind == TypeKind::AssocProjection) { return this.probe_foreign((t as AssocProjectionType*).base, depth + 1); }
++        if (t.kind == TypeKind::Tuple) {
++            const tup: TupleType* = t as TupleType*;
++            for (mut i: i64 = 0; i < tup.elements.length; i++) {
++                const r: GenericParamType* = this.probe_foreign(tup.elements[i], depth + 1);
++                if (r != null) { return r; }
++            }
++        }
++        if (t.kind == TypeKind::InstantiatedType) {
++            const inst: InstantiatedType* = t as InstantiatedType*;
++            for (mut i: i64 = 0; i < inst.type_args.length; i++) {
++                const r: GenericParamType* = this.probe_foreign(inst.type_args[i], depth + 1);
++                if (r != null) { return r; }
++            }
++        }
++        return null;
++    }
++    probe_report(&this, span: SourceSpan, kind: i64, tref: TypeRef) -> void {
++        if (!this.state.in_symbolic_check) { return; }
++        const gp: GenericParamType* = this.probe_foreign(tref, 0);
++        if (gp == null) { return; }
++        const t: Type* = this.arena.lookup(tref.id);
++        const g: Type* = gp as Type*;
++        fmt::printf("FOREIGN %s:%d kind=%d param=%s@%d type=%s\n", span.file, span.start_line as i64,
++            kind, g.display_name(), gp.param_index as i64, t.display_name());
++    }
++
+     // -- Defer predicates (the KEEP cluster; symbolic-only guards) --
+ 
+     /// True when `ty` carries an associated-type projection not yet reduced to a
+diff --git a/compiler/src/compiler/sema/type_utils.cryo b/compiler/src/compiler/sema/type_utils.cryo
+index af9391cc..fd09f15f 100644
+--- a/compiler/src/compiler/sema/type_utils.cryo
++++ b/compiler/src/compiler/sema/type_utils.cryo
+@@ -45,6 +45,8 @@ import compiler::types::compound::{
+     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+ };
+ import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
++import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
++import compiler::types::substitution::{ TypeSubstitution };
+ import compiler::types::type_base::{ Type };
+ import compiler::types::type_ref::{ TypeRef };
+ 
+@@ -426,6 +428,40 @@ type struct TypeUtils {
+         return null;
+     }
+ 
++    /// Substitute a receiver instantiation's arguments for its owner's
++    /// parameters in a type declared on the owner - a method's return or a
++    /// field's type: `Slice<u8>::get -> Option<u8>`.  In a generic body the
++    /// receiver's arguments may themselves be parameters - `Holder<X>`
++    /// inside `run<X>`, or `Conn<U>` as `this` in `implement struct
++    /// Conn<U>` over `Conn<S>` - and those are the ones in scope, so they are
++    /// substituted like any other: leaving the owner's `S` in the answer
++    /// hands the body a parameter it does not have.  Returns `ty` unchanged
++    /// when it is already concrete, the receiver is no instantiation, or the
++    /// arity disagrees; for a concrete receiver, also when the answer stays
++    /// abstract (a parameter no receiver argument binds, such as a method's
++    /// own).
++    subst_owner_params_from_receiver(&this, recv_type: TypeRef, ty: TypeRef) -> TypeRef {
++        if (!ty.is_valid()) { return ty; }
++        if (!this.contains_generic_param(ty)) { return ty; }
++        const inst: InstantiatedType* = this.peel_to_instantiation(recv_type);
++        if (inst == null) { return ty; }
++        const gr: GenericRegistry* = this.ctx.get_generic_registry();
++        if (gr == null) { return ty; }
++        const tmpl: TemplateEntry* = gr.template_of_type(inst.generic_base);
++        if (tmpl == null) { return ty; }
++        if (tmpl.param_type_ids.length != inst.type_args.length) { return ty; }
++        mut abstract_recv: boolean = false;
++        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
++            if (this.contains_generic_param(inst.type_args[i])) { abstract_recv = true; }
++        }
++        mut subst: TypeSubstitution = TypeSubstitution::from_params(
++            tmpl.param_type_ids, inst.type_args);
++        const out: TypeRef = subst.apply(ty, this.arena);
++        if (!out.is_valid()) { return ty; }
++        if (!abstract_recv && this.contains_generic_param(out)) { return ty; }
++        return out;
++    }
++
+     // -- Generic-identity views (carrier-free) ---------------------------------
+     //
+     // These answer "what generic instantiation is this?" for BOTH a pre-mono

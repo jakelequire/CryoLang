@@ -155,7 +155,7 @@ measurement that decided it on the row.
 | D11 | **Remove `resolve_counter.cryo` completely** - the counter, its audit streams, `scripts/b1-gate.py` and `tests/b1-baseline.txt` (Jake, 2026-09-15: "I want this instrumentation to be removed completely"; §7.2 mechanism 3 amended, §8.202) | **TAKEN** (§8.203) — the module (1,302 lines), its 100 `bump()` sites and 54 audit emitters, the five audit streams and `CRYO_RESOLVE_COUNTER`, `HomeOrigin` and `ResolutionContext`'s `FILE, LINE` provenance, the `door`/`site`/`table` parameters that carried a site name to an emitter, `b1-gate.py`, `retire-counter-sites.py`, `b1-baseline.txt`, `make b1-check` and its two CI steps. 0 of 3,478 objects moved over `examples/` and `tests/`. `lane-check`, the negative tests and the mutation projects are the regrowth guard | `git ls-files \| grep -c -e 'resolve_counter' -e 'b1-gate' -e 'b1-baseline'` → **0**; `grep -rho -e 'resolve_counter' -e 'HomeOrigin' compiler/src tools --include=*.cryo \| wc -l` → **0** | §8.66, §8.80, §8.139, §8.174, §8.183, §8.188, §8.193, §8.202, §8.203 |
 | D13 | A `new` path is recorded WHOLE by the parser and classified at resolution — `TypeRelative` means a type owns the tail (a variant), any other answer means the path names the type. Rust never disambiguates a path at parse time, and D5 already implies it | **TAKEN** | `grep -c 'append_path_segments' compiler/src/compiler/parser/expr_parser.cryo` → **3** | §8.143 |
 | D14 | A re-exported name IS reachable through the facade that re-exports it — one item, many paths, canonical identity unchanged. A name two of the facade's children declare is REFUSED, not picked | **TAKEN** — for a `Module::function` call as well since §8.151 | `grep -v '^\s*//' compiler/src/compiler/resolver/name_resolution.cryo \| grep -c 'module_offering'` → **5** (3 before §8.258: `module_offerings`, the plural form the walk reads so its E0155 can name both declarations, and `module_offering` is its first-and-count) | §8.138, §8.144, §8.151, §8.258 |
-| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **629** (+1 in §8.349, the LSP completion fixture's `import Probe::C::{ Formatter };` under `scripts/ns-migration/8.349/lspf/`, which binds a leaf by name; +1 in §8.343, shape `f`'s source under `scripts/ns-migration/8.343/shapes/`; +5 in §8.336: six files of `projects/visibility_module_private`, less the deleted `E0353_private_field_async_foreign.cryo`; +1 in §8.329, a unit test; +1 in §8.328, a negative; +1 in §8.327, a unit test; +1 in §8.326, a unit test; -1 in §8.325, `intrinsics_codegen.cryo` deleted with its table moved to `intrinsic_kind.cryo`, which imports nothing; +1 in §8.324, a unit test; +2 in §8.322, a unit test and a negative; +3 in §8.321, a unit test and two negatives; +1 in §8.320, a unit test; +2 in §8.318, a unit test and a negative; +1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194, §8.195 and §8.197, projects; +2 in §8.199, a project's two files; -1 in §8.203, `resolve_counter.cryo`; -1 in §8.206, a `collect` project's test file, the project being a `compile_fail` now; -1 in §8.207, `bare_intrinsic_priority.cryo`, a negative now; +1 in §8.209, a negative; +1 in §8.213, a unit test; +2 in §8.217, two projects' `beta_text.cryo`; +2 in §8.242, the consequence repro's two sources under `scripts/ns-migration/8.242/tick-ctl/`; +1 in §8.244, a negative; +1 in §8.256, a unit test; +2 in §8.275, the two `chain_default_*` projects; +1 in §8.277, a unit test; +1 in §8.286, a negative; +1 in §8.287, a unit test; +1 in §8.301, a unit test; +1 in §8.303, a unit test; +1 in §8.304, `resolver/module_path.cryo`; +1 in §8.306, a unit test; +2 in §8.311, a unit test and a negative; +3 in §8.312, a unit test and two negatives; +2 in §8.313, a unit test and a negative; +1 in §8.314, a unit test; +1 in §8.316, a unit test) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
+| D15 | Qualify at the USE SITE rather than importing the symbol — `import M;` plus `M::Thing`. A qualified name either resolves or errors where it is written, and reaches a strictly larger set than an import can offer | **STOPPED by ruling** (§8.159) — `io/error`, `utils`, `CLI`, `tools` landed: object-verified at zero where the baseline reaches, `lsp-check` where it does not. `mod::Type<Args>::static()` resolves (§8.150); the sweep over `stdlib` and the rest of `compiler` does not resume without a new ruling | `git ls-files '*.cryo' \| grep -v '^legacy/' \| xargs grep -l '::{' \| wc -l` → **634** (+5 in §8.356: the project `impl_field_method_through_receiver`'s `import std::future::poll::{ Poll };` and four of its evidence shapes under `scripts/ns-migration/8.356/shapes/` (`g`, `g0`, `i`, `i0`); +1 in §8.349, the LSP completion fixture's `import Probe::C::{ Formatter };` under `scripts/ns-migration/8.349/lspf/`, which binds a leaf by name; +1 in §8.343, shape `f`'s source under `scripts/ns-migration/8.343/shapes/`; +5 in §8.336: six files of `projects/visibility_module_private`, less the deleted `E0353_private_field_async_foreign.cryo`; +1 in §8.329, a unit test; +1 in §8.328, a negative; +1 in §8.327, a unit test; +1 in §8.326, a unit test; -1 in §8.325, `intrinsics_codegen.cryo` deleted with its table moved to `intrinsic_kind.cryo`, which imports nothing; +1 in §8.324, a unit test; +2 in §8.322, a unit test and a negative; +3 in §8.321, a unit test and two negatives; +1 in §8.320, a unit test; +2 in §8.318, a unit test and a negative; +1 in §8.190, a unit test; +1 in §8.191, a negative; +1 in §8.193, a project; +1 each in §8.194, §8.195 and §8.197, projects; +2 in §8.199, a project's two files; -1 in §8.203, `resolve_counter.cryo`; -1 in §8.206, a `collect` project's test file, the project being a `compile_fail` now; -1 in §8.207, `bare_intrinsic_priority.cryo`, a negative now; +1 in §8.209, a negative; +1 in §8.213, a unit test; +2 in §8.217, two projects' `beta_text.cryo`; +2 in §8.242, the consequence repro's two sources under `scripts/ns-migration/8.242/tick-ctl/`; +1 in §8.244, a negative; +1 in §8.256, a unit test; +2 in §8.275, the two `chain_default_*` projects; +1 in §8.277, a unit test; +1 in §8.286, a negative; +1 in §8.287, a unit test; +1 in §8.301, a unit test; +1 in §8.303, a unit test; +1 in §8.304, `resolver/module_path.cryo`; +1 in §8.306, a unit test; +2 in §8.311, a unit test and a negative; +3 in §8.312, a unit test and two negatives; +2 in §8.313, a unit test and a negative; +1 in §8.314, a unit test; +1 in §8.316, a unit test) | §8.145, §8.146, §8.147, §8.148, §8.150, §8.159 |
 | D12 | A **public** name-keyed lookup is what the tree requires; privatizing it is inexpressible, and `lane-check` is the enforcement instead | RULED | `python3 scripts/lane-gate.py --row LOOKUP_ROUTED` → **38** (47 before §8.333-§8.334: seven `lookup_type_exact` of a scope segment's owner by a rebuilt name, now the segment's type, and method binding's two `lookup_type_sym` owner retries, now one question on the receiver's type; 48 before §8.330, whose one was an impl's trait type asked by the trait's name, now by its `DefId`; 49 before §8.323, whose one was a method's return read off each bound of a `BoundedParamType`, deleted with the kind nothing constructed; 50 before §8.320, whose one was the `for` loop's `next` found by spelling on the scrutinee's type; 55 before §8.315, whose five were type lookups by a name the caller derived from a definition it held - three trait bounds, an impl-qualified head's trait, the method-not-found hint's receiver - now asked of the index by that definition or type; 54 before §8.256 deleted sema's `new` spelling step; 53 before §8.259 deleted the callee hint's `bare_sym` door and sema's `alias_global`; 51 before §8.263's two `lookup_type_exact` by a canonical name - the impl-qualified head's trait, asked whether it IS a trait, and its owner for the E0306 report; 53 before §8.289 re-keyed `method_returns` by the owner's arena id: `resolve_method_owner` and `lookup_method_return_raw` deleted, `lookup_type_sym` left two readers that hold the owner ref, and the five readers holding a stamp's name ask `lookup_type_exact` for the owner first) | §8.99, §8.107 |
 | D16 | **An impl head writes EVERY parameter of the template it names, or names a concrete instantiation; an elided parameter is an error** - whether all of them default (`implement trait Display for String` with `String<A = GlobalAlloc>`) or only the trailing ones (`implement<T> trait Display for Array<T>` with `Array<T, A = GlobalAlloc>`). Write `implement<A> trait Display for String<A>` or `implement trait Display for String<GlobalAlloc>`. Rust's model: `impl Display for Vec` is missing its parameters and is not given a default meaning, and `impl<T> Trait for Vec<T>` is not written either | **TAKEN** (ruled by Jake 2026-09-13 for the bare form, 2026-09-14 for every elided parameter; built in §8.190) — E0302 from `refuse_elided_template_params` where type resolution attaches a WRITTEN head to its template, naming the template, both counts and both spellings, the parameter form first; the 11 heads rewritten as the instantiation each meant; a head's `target_args` is what it writes after the target on EVERY kind of head (an inherent head's list also declares its names); sema's writer-module lookup deleted. The concrete spelling is HONOURED by impl selection since §8.233: a head's written target arguments unify with the subject's, a `Def`/`PrimTy`-stamped one filtering, so `for Wrap<T, Alpha>` is not selected for `Wrap<i32, Beta>` and two heads differing in that argument are two heads (`impl_concrete_arg_filters_impl` E0358, `impl_concrete_arg_selects_impl` 12 - both RED from §8.223 to §8.233) | `python3 scripts/impl-head-elided-params.py --count` → **bare=0,partial=0,unmatched=0**; `grep -c 'refuse_elided_template_params' compiler/src/compiler/passes/type_resolution.cryo` → **2**; `ls tests/tests/negative/E0302*.cryo \| wc -l` → **3** (2 at §8.190; +1 in §8.210, D22's head); `ls -d tests/tests/projects/impl_concrete_arg_*/test.json \| wc -l` → **2** (green since §8.233) | §8.180, §8.181, §8.187, §8.190, §8.223 |
 | D17 | **An `extern "C"` function is public unless marked `private`** — the extern-visibility default `docs/cryo.md` §18.1 states | **RULED** (Jake, 2026-09-14) — built in §8.167 by a worker and carried as unconfirmed until ratified; the spec text is normative, not provisional | `grep -c 'mut ext_public: boolean = true;' compiler/src/compiler/parser/parser.cryo` → **1**; `grep -c 'unless written .private function' docs/cryo.md` → **1** | §8.167, §8.187 |
@@ -371,7 +371,7 @@ Checks for this section, one per line so each can be copied whole:
 * `python3 scripts/lane-gate.py --rows` → **16** (17 before §8.346 deleted `DEFID_MINT`)
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: lane-check lane-selftest' Makefile` → **1**
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **82** (+1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **83** (+1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)* `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -43774,5 +43774,86 @@ method targets the skipped stage sets and would report unused methods
 falsely.  Because `make cryo` builds the compiler with the pin, a fix
 reaches that build's warnings only after a re-pin.  D40's check reads the
 skip line, so the day it changes the row fails and this entry is re-read.
+
+---
+
+### 8.356 The symbolic walk's owner-field and owner-method readers substitute the receiver's arguments: an implement block spelling its parameter unlike the type's compiles - 0 objects moved - 2026-09-26
+
+```cryo
+type struct Conn<S> {
+    inner: S;
+    async pump(mut &this, n: i64) -> i64 where S: Tick { .. }
+}
+implement struct Conn<U> {
+    async wrapped(mut &this, n: i64) -> i64 where U: Tick {
+        const v: i64 = await Combine::boxed(0, this.pump(n));
+        return v;
+    }
+}
+// before: error[E0636]: codegen: cannot resolve 'Combine::boxed'
+// after:  builds, exits 42.  Spelled `implement struct Conn<S>`, both build.
+```
+
+`SymbolicChecker::symbolic_resolve_owner_field` and
+`symbolic_resolve_owner_method_return` read a field's type or a method's
+return off the owner template's AST and handed it back as declared - in the
+owner's parameters.  Inside `implement struct Conn<U>` the receiver is
+`Conn<U>` (`symbolic_owner_instance`), so `this.pump(n)` was typed with
+`S`, a parameter the body does not have; `boxed`'s `F` was bound to it, the
+call's bindings stayed abstract, and `boxed` was never specialized.  Both
+readers now substitute the receiver instantiation's arguments for the
+owner's parameters.  The substitution already existed as
+`MethodBinding::subst_method_return_from_receiver` (§8.352); it moved to
+`TypeUtils::subst_owner_params_from_receiver` so the symbolic checker, which
+`MethodBinding` holds and cannot hold back, calls the same one.  Its five
+callers follow it.  Compiler: 54+ / 49- in 5 files.
+
+#### Which further sites share the mechanism: measured
+
+The brief's ~15 further unsubstituted sites were found by reading; that
+list is not in the tree, so the population was measured instead.  Probe
+(`scripts/ns-migration/8.356/probe.patch`, reverted): after every
+expression sema types during a symbolic walk, print the expression when its
+type holds a generic parameter whose arena identity is NOT one of the walk's
+in-scope parameters.  Control: shape `g` (the program above) prints 17
+lines at `main.cryo:37-38` under the compiler without the fix and none with
+it.  Corpus (`corpus.sh`: the unit suite and the 14 examples), before and
+after the fix: the SAME **20 sites**, three other mechanisms, none a
+receiver read:
+
+- a trait method reached through a where-bound keeps the trait's own
+  parameter - `x.deref()` with `T: Deref<U>` typed `Target*`, not `U*`
+  (`operator_overload.cryo:40`; `fluent_default_method_combinator.cryo:68-69`);
+- a generic static on a generic owner whose arguments are inferred keeps the
+  owner's parameter - `TakeIter::new(this, n)` in `Iterator`'s defaults
+  (`core/iter.cryo` x7, `fluent_default_method_combinator.cryo:36`);
+- a method-level generic on a bound receiver keeps the method's parameter -
+  `rng.next_range(lo, hi)` typed `T` (`random/distribution.cryo` x8).
+
+None changes what compiles, measured: the first respelled so the trait's
+parameter and the caller's collide by name and position (shapes `h`, `i`,
+`implement<Item, I> trait MyIter<Item> ..` and `deref_ptr<Target, U>`)
+builds and runs 42 under the compiler without the fix, as the controls do;
+monomorphization retypes each.  Not taken.  The probe's blind spot, stated:
+a leaked parameter spelled and positioned like an in-scope one IS the
+in-scope one by today's arena key, so it cannot print - which is exactly
+what the flip changes.  A receiver of the owner with OTHER arguments inside
+the owner's own body (`other.inner` for `other: &Conn<i64>` in `Conn<S>`,
+shapes `j`..`m`) was typed `S` before and `i64` now; every such shape
+compiled both ways.
+
+#### Evidence
+
+- Project `impl_field_method_through_receiver` (exit 42): E0636 under the
+  compiler without the change, 42 with it.  Roster merged (+1).
+- `make verify ARGS="--baseline HEAD"` over the population without the new
+  project (verify refuses a baseline whose census fails, and the baseline
+  compiler refuses this project by design): **0 of 3,299 test and 0 of
+  1,126 example objects moved**; census, examples, lsp (478 warnings),
+  cross, check-fast all OK.  Predicted 0 and 0.  The brief expected a dead
+  duplicate instantiation to disappear; none moved in this population.
+- Warnings, clean builds: 346 before and after.
+- §0: projects 82 -> 83; D15's `::{` count 629 -> 634 (the project's
+  `import std::future::poll::{ Poll };` and four evidence shapes).
 
 ---

@@ -61,7 +61,7 @@ import compiler::types::compound::{
 import compiler::types::generic::{
     AssocProjectionType, GenericParamType, InstantiatedType
 };
-import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::generic_registry::{ TemplateEntry };
 import compiler::types::inference::{ InferCtx };
 import compiler::types::resolver::{ ResolutionContext };
 import compiler::types::substitution::{ TypeSubstitution };
@@ -155,40 +155,6 @@ type struct MethodBinding {
         return (t as GenericParamType*).param_name;
     }
 
-    /// Substitute a receiver instantiation's arguments for its owner's
-    /// parameters in a method's return (or a field's type):
-    /// `Slice<u8>::get -> Option<u8>`.  In a generic body the receiver's
-    /// arguments may themselves be parameters - `Holder<X>` inside
-    /// `run<X>` - and those are the CALLER's, so they are substituted like
-    /// any other: leaving the owner's `S` in the answer hands the caller a
-    /// parameter it does not have.  Returns `ret` unchanged when it is
-    /// already concrete, the receiver is no instantiation, or the arity
-    /// disagrees; for a concrete receiver, also when the answer stays
-    /// abstract (a parameter no receiver argument binds, such as the
-    /// method's own).
-    subst_method_return_from_receiver(mut &this, recv_type: TypeRef,
-                                      ret: TypeRef) -> TypeRef {
-        if (!ret.is_valid()) { return ret; }
-        if (!this.types.contains_generic_param(ret)) { return ret; }   // already concrete
-        const inst: InstantiatedType* = this.types.peel_to_instantiation(recv_type);
-        if (inst == null) { return ret; }
-        const gr: GenericRegistry* = this.ctx.get_generic_registry();
-        if (gr == null) { return ret; }
-        const tmpl: TemplateEntry* = gr.template_of_type(inst.generic_base);
-        if (tmpl == null) { return ret; }
-        if (tmpl.param_type_ids.length != inst.type_args.length) { return ret; }
-        mut abstract_recv: boolean = false;
-        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
-            if (this.types.contains_generic_param(inst.type_args[i])) { abstract_recv = true; }
-        }
-        mut subst: TypeSubstitution = TypeSubstitution::from_params(
-            tmpl.param_type_ids, inst.type_args);
-        const out: TypeRef = subst.apply(ret, this.arena);
-        if (!out.is_valid()) { return ret; }
-        if (!abstract_recv && this.types.contains_generic_param(out)) { return ret; }
-        return out;
-    }
-
     /// Mono-after-sema: resolve a method's return type when the receiver is an
     /// unresolved generic instantiation (`Slice<u8>` pre-mono).  Walks the generic
     /// BASE template's method list for an unambiguous non-static non-method-generic
@@ -245,7 +211,7 @@ type struct MethodBinding {
 
         if (found_count != 1 || !abstract_ret.is_valid()) { return TypeRef::invalid(); }
         const recv_subst: TypeRef =
-            this.subst_method_return_from_receiver(recv_type, abstract_ret);
+            this.types.subst_owner_params_from_receiver(recv_type, abstract_ret);
         return this.subst_this_in_type(recv_subst, recv_type);
     }
 

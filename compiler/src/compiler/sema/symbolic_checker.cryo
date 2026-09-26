@@ -241,8 +241,10 @@ type struct SymbolicChecker {
     }
 
     /// During a generic-owner symbolic walk, resolve `this.<field>` to the field's
-    /// abstract declared type off the owner template's AST (the arena StructType
-    /// has no fields for a generic template).  Invalid when not in such a walk,
+    /// declared type off the owner template's AST (the arena StructType has no
+    /// fields for a generic template), read through the receiver's arguments:
+    /// inside `implement struct Conn<U>` over `Conn<S>` a field declared `S` is
+    /// `U`, the parameter the body's bounds are written on.  Invalid when not in such a walk,
     /// the receiver isn't the owner, or `field` names no field (so a real typo
     /// still falls through to E0204).
     symbolic_resolve_owner_field(mut &this, recv_type: TypeRef,
@@ -261,7 +263,7 @@ type struct SymbolicChecker {
                 const f: FieldDeclNode* = sn.fields[i];
                 if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
                     *out_index = i;
-                    return f.resolved_type;
+                    return this.types.subst_owner_params_from_receiver(recv_type, f.resolved_type);
                 }
             }
         } else if (tmpl.node_kind == NodeKind::UnionDeclaration) {
@@ -270,7 +272,7 @@ type struct SymbolicChecker {
                 const f: FieldDeclNode* = un.fields[i];
                 if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
                     *out_index = i;
-                    return f.resolved_type;
+                    return this.types.subst_owner_params_from_receiver(recv_type, f.resolved_type);
                 }
             }
         } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
@@ -279,15 +281,16 @@ type struct SymbolicChecker {
                 const f: FieldDeclNode* = cn.fields[i];
                 if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
                     *out_index = i;
-                    return f.resolved_type;
+                    return this.types.subst_owner_params_from_receiver(recv_type, f.resolved_type);
                 }
             }
         }
         return TypeRef::invalid();
     }
 
-    /// During a generic-owner symbolic walk, resolve `this.<method>()`'s abstract
-    /// declared return type off the owner template's AST.  Returns it only when
+    /// During a generic-owner symbolic walk, resolve `this.<method>()`'s declared
+    /// return type off the owner template's AST, read through the receiver's
+    /// arguments as a field's type is.  Returns it only when
     /// EXACTLY ONE non-static method of that name exists; invalid for 0 or an
     /// ambiguous overload set (caller defers).  Trait-impl/inherited methods are
     /// intentionally not resolved here.
@@ -295,8 +298,8 @@ type struct SymbolicChecker {
                                          method_name: SymbolStr) -> TypeRef {
         const f: FunctionDeclNode* = this.symbolic_find_owner_method(recv_type, method_name);
         if (f == null) { return TypeRef::invalid(); }
-        if (f.resolved_return_type.is_valid()) { return f.resolved_return_type; }
-        return TypeRef::invalid();
+        if (!f.resolved_return_type.is_valid()) { return TypeRef::invalid(); }
+        return this.types.subst_owner_params_from_receiver(recv_type, f.resolved_return_type);
     }
 
     /// Locate the uniquely-named non-static method `method_name` on the generic

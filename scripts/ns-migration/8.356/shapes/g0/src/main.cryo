@@ -1,0 +1,47 @@
+namespace Main;
+import std::future::poll::{ Poll };
+import std::future::traits::{ Future };
+import std::future::waker::{ Context };
+import std::future;
+type trait Tick { async tick(mut &this, n: i64) -> i64; }
+type struct Leaf { hits: i64; }
+implement trait Tick for Leaf {
+    async tick(mut &this, n: i64) -> i64 { this.hits = this.hits + 1; return this.hits + n; }
+}
+type struct Boxed<F, O> { tally: i64; fut: F; }
+implement<F, O> trait Future<O> for struct Boxed<F, O> where F: Future<O> {
+    poll(mut &this, cx: Context*) -> Poll<O> {
+        match (this.fut.poll(cx)) {
+            Poll::Ready(v) => { return Poll::Ready(v); }
+            Poll::Pending  => { }
+        }
+        this.tally = this.tally + 1;
+        return Poll::Pending;
+    }
+}
+type struct Combine {
+    static boxed<F, O>(pad: i64, fut: F) -> Boxed<F, O> where F: Future<O> {
+        return Boxed::<F, O> { fut: fut, tally: pad };
+    }
+}
+type struct Conn<S> {
+    inner: S;
+    seen: i64;
+    async pump(mut &this, n: i64) -> i64 where S: Tick {
+        const v: i64 = await this.inner.tick(n);
+        this.seen = this.seen + v;
+        return v;
+    }
+}
+implement struct Conn<S> {
+    async wrapped(mut &this, n: i64) -> i64 where S: Tick {
+        const v: i64 = await Combine::boxed(0, this.pump(n));
+        return v;
+    }
+}
+async function drive() -> i64 {
+    mut c: Conn<Leaf> = Conn::<Leaf> { inner: Leaf { hits: 0 }, seen: 0 };
+    const v: i64 = await c.wrapped(41);
+    return v;
+}
+function main() -> int { return future::block_on(drive()) as int; }
