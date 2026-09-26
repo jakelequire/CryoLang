@@ -212,25 +212,44 @@ def population(cryo, tag, logdir, env, names):
 
 # ---- the baseline ----------------------------------------------------------
 
+# What a compiler build reads besides compiler/src.  The baseline compiler's
+# cache key and the clone's sync both use this one list, so the key names
+# exactly the files the baseline was built from.
+BUILD_INPUTS = ["stdlib", "runtime", "bin", "compiler", "Makefile"]
+
+
+def build_inputs(cwd=ROOT):
+    return [f for f in listed(BUILD_INPUTS, cwd=cwd) if not f.startswith("compiler/src/")]
+
+
+def copy_over(a, b):
+    """Copy a -> b, clearing a read-only attribute git may have left on b."""
+    os.makedirs(os.path.dirname(b), exist_ok=True)
+    if os.path.exists(b):
+        os.chmod(b, 0o644)
+    shutil.copyfile(a, b)
+
+
 def sync_clone(src, sha):
-    """Make `src` REV's compiler/src with every other file from the working tree."""
+    """Make `src` REV's compiler/src with the working tree's build inputs."""
     if not os.path.isdir(os.path.join(src, ".git")):
         os.makedirs(os.path.dirname(src), exist_ok=True)
         subprocess.run(["git", "clone", "--quiet", "--no-checkout", ROOT, src], check=True)
     git("fetch", "--quiet", ROOT, sha, cwd=src)
     git("checkout", "--quiet", "--force", "--detach", sha, cwd=src)
-    tree = [f for f in listed(["."]) if not f.startswith("compiler/src/")]
-    have = [f for f in listed(["."], cwd=src) if not f.startswith("compiler/src/")]
+    tree = build_inputs()
+    have = build_inputs(src)
     for f in set(have) - set(tree):
-        os.remove(os.path.join(src, f))
+        p = os.path.join(src, f)
+        os.chmod(p, 0o644)
+        os.remove(p)
     for f in tree:
         a, b = os.path.join(ROOT, f), os.path.join(src, f)
         if not os.path.isfile(a):
             continue
         if os.path.isfile(b) and file_sha(a) == file_sha(b):
             continue
-        os.makedirs(os.path.dirname(b), exist_ok=True)
-        shutil.copyfile(a, b)
+        copy_over(a, b)
     # Ignored inputs the build needs and git does not carry.
     for extra in ("bin", os.path.join(".toolchains", "llvm-win", "lib")):
         s = os.path.join(ROOT, extra)
@@ -240,18 +259,14 @@ def sync_clone(src, sha):
                     a = os.path.join(dirpath, f)
                     b = os.path.join(src, os.path.relpath(a, ROOT))
                     if not os.path.isfile(b) or os.path.getsize(a) != os.path.getsize(b):
-                        os.makedirs(os.path.dirname(b), exist_ok=True)
-                        shutil.copyfile(a, b)
+                        copy_over(a, b)
 
 
 def baseline_compiler(rev, env):
     """Path to a compiler built from REV's compiler/src and the tree's everything else."""
     sha = git("rev-parse", "--verify", rev + "^{commit}").strip()
     src_tree = git("rev-parse", sha + ":compiler/src").strip()
-    # Everything else a compiler build reads, taken from the working tree.
-    rest = [f for f in listed(["stdlib", "runtime", "bin", "compiler", "Makefile"])
-            if not f.startswith("compiler/src/")]
-    key = hashlib.sha256((src_tree + digest(rest).hexdigest()).encode()).hexdigest()[:16]
+    key = hashlib.sha256((src_tree + digest(build_inputs()).hexdigest()).encode()).hexdigest()[:16]
     home = os.path.join(STATE, "baseline", key)
     exe = os.path.join(home, "cryo" + EXE)
     if os.path.isfile(exe):
@@ -262,6 +277,10 @@ def baseline_compiler(rev, env):
           % (rev, src_tree[:12], rel(os.path.join(STATE, "src"))))
     src = os.path.join(STATE, "src")
     sync_clone(src, sha)
+    # Always a clean build: the incremental cache can reuse a module that
+    # owns a generic instance a changed module newly requests, and the link
+    # then fails - or, in a shape nobody has met yet, links stale code.
+    shutil.rmtree(os.path.join(src, "compiler", "build"), ignore_errors=True)
     log = os.path.join(STATE, "baseline-build.log")
     with open(log, "wb") as fh:
         rc = subprocess.run(["make", "--no-print-directory", "cryo"], cwd=src, env=env,
