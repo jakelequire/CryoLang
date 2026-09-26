@@ -4,6 +4,35 @@
 # every project built one by one (`cryo test` swallows a passing project's stderr), a `collect` project's own
 # tests/ files (compiled only by `cryo test`), the examples, and the compile-fail suite (the runner redirects
 # each child's output to a temp file).
+#
+# A half counts only when it reached its OWN completion marker.  The unit suite
+# is one program: a build error aborts it before any test runs, yet it has
+# already printed the SHADOW lines of the modules it got through, so an exit
+# code alone, or a line count, reads a suite that ran nothing as a half with
+# few disagreements.  `corpus2.sh --summarize <dir> <tag>` re-reads a finished
+# run's files and prints the verdict without running anything.
+summarize() { # $1 = output dir, $2 = tag; exits 1 when any half is incomplete
+  local S="$1" T="$2" n=0 why
+  # The suite's OVERALL line folds in the project half, which a canary fails
+  # by design, so the unit half is judged by the `unit: ok` inside it.
+  if ! grep -a 'OVERALL' "$S/$T-test.log" 2>/dev/null | grep -q 'unit: ok'; then
+    why="$(grep -a -o 'Test build failed ([0-9]* errors' "$S/$T-test.log" 2>/dev/null | head -1)"
+    echo "FAIL unit suite: no 'unit: ok' in its OVERALL line${why:+ ($why)} - its tests did not run, and its SHADOW lines are a partial compile"
+    n=$((n + 1))
+  fi
+  if ! grep -a -q '^Compiled -> ' "$S/$T-lsp.log" 2>/dev/null; then
+    echo "FAIL tools/CryoLSP: no 'Compiled ->' line - the direct build did not finish"
+    n=$((n + 1))
+  fi
+  grep -a '^=== ' "$S/$T-fail.log" 2>/dev/null | sed 's#^=== #FAIL #'
+  why="$(grep -a -c '^=== ' "$S/$T-fail.log" 2>/dev/null)"
+  n=$((n + ${why:-0}))
+  echo "failing halves: $n"
+  echo "SHADOW lines per half: $(cut -f1 "$S/$T-lines.txt" | sed -E 's#^tests/tests/projects/.*#projects#; s#^examples/.*#examples#; s#^tests/tests/negative/.*#negatives#; s#^tools/.*#lsp#; s#^tests/unit$#unit#' | sort | uniq -c | awk '{printf "%s %s  ", $2, $1}')"
+  if [ "$n" -ne 0 ]; then echo "CORPUS_INCOMPLETE"; return 1; fi
+  echo "CORPUS_COMPLETE"
+}
+if [ "$1" = "--summarize" ]; then summarize "$2" "$3"; exit $?; fi
 R="$(git rev-parse --show-toplevel)"; S="${OBJCMP_OUT:-$R/.objcmp}"; mkdir -p "$S"; T="$1"; cd "$R" || exit 1
 : > "$S/$T-lines.txt"
 (cd tools/CryoLSP && rm -rf build/gate-direct && CRYO_STDLIB=$R/stdlib CRYO_CC=gcc $R/compiler/build/cryo.exe build --build-dir=build/gate-direct > "$S/$T-lsp.log" 2>&1; echo "lsp direct exit=$?")
@@ -47,6 +76,6 @@ done
 for d in examples/*/; do (cd "$d" && rm -rf build && run_half "$d" zero env CRYO_STDLIB=$R/stdlib CRYO_CC=gcc $R/compiler/build/cryo.exe build .); done
 # The compile-fail suite is EXPECTED to exit non-zero; only its SHADOW lines are read.
 for f in tests/tests/negative/*.cryo; do (cd tests && CRYO_STDLIB=$R/stdlib CRYO_CC=gcc $R/compiler/build/cryo.exe check "${f#tests/}" --stdlib=$R/stdlib 2>&1 | grep -a '^SHADOW' | sed "s#^#$f\t#" >> "$S/$T-lines.txt"); done
-echo "failing halves: $(grep -c '^=== ' "$S/$T-fail.log")"
 echo "SHADOW lines (lsp+suite+projects+project tests+examples+negatives): $(wc -l < "$S/$T-lines.txt")"
-cut -f2,3 "$S/$T-lines.txt" | sort | uniq -c | sort -rn | head; echo CORPUS_DONE
+cut -f2,3 "$S/$T-lines.txt" | sort | uniq -c | sort -rn | head
+summarize "$S" "$T"; rc=$?; echo CORPUS_DONE; exit $rc

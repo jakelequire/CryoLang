@@ -96,9 +96,13 @@ instrument condition one's list is drawn from; its J count is not a target.
 2. **Every function that still takes a name is on an approved list with a
    written reason, and a gate refuses a name-taking function not on it.**
    The population is every function or method declared in `compiler/src`
-   with a `SymbolStr` or `string` parameter (diagnostics, mangling, paths,
-   the resolver itself among them): `python3 scripts/ns-migration/done.py
-   --name-taking`. **NOT MET** - no list exists. The nearest thing,
+   with a parameter that carries a spelling - `SymbolStr` or `string` by
+   value, by reference or as an array, and `QualifiedName`, whose only
+   content is `SymbolStr` segments (diagnostics, mangling, paths, the
+   resolver itself among them): `python3 scripts/ns-migration/done.py
+   --name-taking`. Outside it: `ModulePath` (a module's identity, as in
+   condition one), `MangledName` (an opaque link symbol) and `String` /
+   `str::Str` (text read or written, never looked up) (§8.353). **NOT MET** - no list exists. The nearest thing,
    `residue_classify.py`'s `CLASS_OF_METHOD`, covers the stores' doors only,
    and re-classing a door there passes `residue.py --check` unreviewed.
 3. **Every reason is self-checking**: each approved entry carries a command
@@ -120,7 +124,8 @@ instrument condition one's list is drawn from; its J count is not a target.
 Checks:
 
 * `python3 scripts/ns-migration/done.py --outstanding | wc -l` → **14** (23 before §8.333-§8.335: the six owner doors asked by the self type's name and both `get_template` lines, B and C, are gone, and `lookup_type_exact` is called only inside the funnel's own file; 25 before §8.331 converted the self-growth check and the two written-name scans; condition one's list, one line per function or hand-written scan and class - `get_template` is on two lines, B and C; 30 before §8.330 converted the four trait lookups and one scan)
-* `python3 scripts/ns-migration/done.py --name-taking | wc -l` → **1095** (condition two's population, all of it unplaced; 1,099 before §8.349, which deleted `register_name_mapping`, `resolve_qualified_scoped`, `lookup_qualified_alternatives` and `ScopeResolution::resolved_or`; 1,098 before §8.348, which added `register_methods_through`, taking a diagnostic `site` label as `register_methods` does; 1,099 before §8.339, where `claim_wellknown` stopped taking a name; 1,109 before §8.333-§8.335: eleven functions - the owner and scope-segment doors and their helpers - stopped taking a name or were deleted, and the parser's `refuse_declaration_keyword_name` takes a diagnostic label; 1,110 before §8.332, where `register_impl_block`, `refuse_elided_template_params` and `set_resolved_template` stopped taking a name and `template_in` / `member_template_key` take the member's leaf; 1,113 before §8.331; 1,136 before §8.330, whose trait carriers stopped taking a name in 23 functions)
+* `python3 scripts/ns-migration/done.py --name-taking | wc -l` → **1114** (condition two's population, all of it unplaced; 1,095 before §8.353, whose matcher saw a spelling only by value: +10 taking one by reference, `Resolver::resolve_path(segments: &SymbolStr[], ..)` among them, and +9 taking a `QualifiedName`; 1,099 before §8.349, which deleted `register_name_mapping`, `resolve_qualified_scoped`, `lookup_qualified_alternatives` and `ScopeResolution::resolved_or`; 1,098 before §8.348, which added `register_methods_through`, taking a diagnostic `site` label as `register_methods` does; 1,099 before §8.339, where `claim_wellknown` stopped taking a name; 1,109 before §8.333-§8.335: eleven functions - the owner and scope-segment doors and their helpers - stopped taking a name or were deleted, and the parser's `refuse_declaration_keyword_name` takes a diagnostic label; 1,110 before §8.332, where `register_impl_block`, `refuse_elided_template_params` and `set_resolved_template` stopped taking a name and `template_in` / `member_template_key` take the member's leaf; 1,113 before §8.331; 1,136 before §8.330, whose trait carriers stopped taking a name in 23 functions)
+* `python3 scripts/ns-migration/done.py --selftest | tail -1` → **14** (the matcher above over declarations it must list - a spelling by value, by reference, as an array, as a `QualifiedName`, wrapped over two lines - and ones it must not; its matcher before §8.353 got 10)
 
 ### 0.1 Decisions
 
@@ -339,6 +344,7 @@ evidence for what it covers.
 | `make examples-golden` | example stdout vs committed goldens | **Linux only.** Refuses on Windows (exit 1) rather than reporting success. |
 | `make valgrind-check` | invalid free/read/write and definite leaks | **Linux only**, same refusal. |
 | `make incremental-check` | per-module incremental == clean build | Byte identity only. |
+| the compiler build's `N warnings emitted` | the front end's warnings for every module; the warnings of the stage after monomorphization (the unused-variable, unused-function and unreachable-code lints among them) only for the modules this build recompiled | **An incremental build.** A module reused from cache skips that stage and its warnings are not replayed, so the tip reads 346 clean and 337 after a comment is added to a leaf file. A warning total is evidence only from a build after `rm -rf compiler/build`, and two builds' warnings compare as SETS - code, file, line - not as totals (§8.320 diagnosed it, §8.348 re-described it as noise, §8.353). |
 | `make api-index-check` | `docs/stdlib-api.txt` is not stale | Staleness only; says nothing about the API's shape. |
 | `make vendor-check` | every constant shape survives `cryo vendor` | Constants only. |
 | CI | the gates above, on ubuntu | **Fires only on `main` or `workflow_dispatch`. A branch gets NO automatic CI.** The `windows-native` job exists but its own comment calls it partially validated and not a required check; `windows-smoke` is a cross-build on ubuntu, so no native-Windows run is load-bearing. |
@@ -360,6 +366,7 @@ Checks for this section, one per line so each can be copied whole:
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
+* `grep -c 'if (pm_active && pm_cached\[order\[i\] as i64\]) { continue; }' compiler/src/compiler/instance.cryo` → **1** (the skip that drops a reused module's warnings; when it stops reading 1, re-examine the warning row above)
 * `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
 
 ### 0.4 What no gate covers
@@ -43465,5 +43472,127 @@ brief requires.
 Reproduce: `git apply scripts/ns-migration/8.348/combined.patch`
 on `cf230067`, then this commit's and §8.349's compiler diffs, `make cryo`,
 and `B_STRICT=all bash scripts/objcmp/corpus2.sh all`.
+
+---
+
+### 8.353 Three instruments that lied: the corpus's unit half counted a suite that ran nothing, the name-taking matcher saw a spelling only by value, and a warning total was read off incremental builds - 0 compiler lines - 2026-09-25
+
+Scripts and this ledger only.  Each of the three reported a number that
+could not mean what it was taken to mean.
+
+#### The corpus script's unit half
+
+`scripts/objcmp/corpus2.sh` echoed the unit suite's and the direct LSP
+build's exit codes but counted neither: `failing halves` counted only the
+halves run through `run_half`.  The unit suite is ONE program, so a build
+error aborts it before any test runs - after it has printed the SHADOW
+lines of the modules it got through.  Both saved runs behind §8.350 and
+§8.352 read that way:
+
+| run | `make test` | suite's OVERALL line | unit SHADOW lines | old summary | new summary |
+|---|---|---|---|---|---|
+| `.objcmp/s51/corpus` | exit 2, `Test build failed (27 errors ..)` | none | 186 | `failing halves: 1` | `failing halves: 2` - `FAIL unit suite: no 'unit: ok' in its OVERALL line (Test build failed (27 errors) - its tests did not run ..`; `CORPUS_INCOMPLETE`, exit 1 |
+| `.objcmp/s51/corpus5` | exit 2, `(1 errors ..)` | none | 3,423 | `failing halves: 1` | `failing halves: 2`, same line with `(1 errors)`; exit 1 |
+
+(The other failing half in both is the canary `chain_default_param_conflict`
+compiling, predicted.)  Each half now counts only when it reached its OWN
+completion marker - the unit half by the `unit: ok` inside the suite's
+OVERALL line, not by `OVERALL PASS`, because the canary fails OVERALL by
+design (a first cut keyed on `OVERALL PASS` flagged a run whose unit half
+was fine: `.objcmp/s50a`, OVERALL FAIL with `unit: ok`); the LSP half by
+its `Compiled ->` line.  The script prints SHADOW lines per half, ends with
+`CORPUS_COMPLETE` or `CORPUS_INCOMPLETE` before `CORPUS_DONE`, and exits 1
+when incomplete.  `corpus2.sh --summarize <dir> <tag>` re-reads a finished
+run without running anything, which is how every row here was produced.
+
+Controls: `.objcmp/s50a` - unit half not flagged, only its own recorded
+`ffi_c_import` failure; `.objcmp/s49u1` `b1` and `.objcmp/s44u3` `gp` -
+`failing halves: 0`, `CORPUS_COMPLETE`, exit 0; `b1` with its `Compiled ->`
+line removed - `FAIL tools/CryoLSP ..`, exit 1.
+
+Still open: the compile-fail half accepts ANY non-zero exit, so a compiler
+crash on a negative file reads as the refusal it expected.
+
+#### The name-taking matcher
+
+`done.py --name-taking` (condition two's population) matched a parameter
+typed `SymbolStr` or `string` by value only.  Ten declarations take a
+spelling BY REFERENCE and were not in it:
+
+```cryo
+resolve_path(&this, segments: &SymbolStr[], ns: Namespace,     // resolver.cryo:726 - the resolver's own entry point
+             scope: ScopeID) -> Res {
+release_before_ready(mut &this, sm: PollSm*, s: StatementNode*,
+                     fields: &SymbolStr[], ..) -> void {       // async_lower.cryo:4757 - by field name
+```
+
+(and `specialize`, `refuse_unsatisfied_type_bounds`,
+`method_has_modified_self_type`, `annotation_is_modified_outer`, `run_git`,
+`capture_git`, `proj_first_unmet_requirement`,
+`proj_first_unknown_requirement`, each with a `&string[]`).  This is the
+ninth instrument in this migration found blind to a shape by the running
+count (§0.0 records seven for the residue script alone), and it matters
+more than the others: condition two's gate, which does not exist yet, was
+to be built over this population, and would have been born refusing
+nothing a caller hands in by reference.
+
+`QualifiedName` is IN: its only content is `SymbolStr` segments
+(`qualified_name.cryo:28`), a caller builds one from spellings with no
+resolution, and a door retyped from `SymbolStr` to it would otherwise
+leave the population - the same blind shape one type over.  +9
+(`MangledName::for_free_function`, `for_vtable`, `for_struct_type`,
+`specialized_identifier`, `owner_qname_leaf_or_intern`, and
+`QualifiedName::join`, `equals`, `starts_with`, `ends_with`).  OUT, each a
+type that is not a spelling to look up: `ModulePath` (a module's identity,
+as condition one has it), `MangledName` (an opaque link symbol; one
+function, `equals`) and `String` / `str::Str` (three CLI and diagnostic-
+sink functions that read or write text).
+
+Predicted before the change: 1,095 -> 1,114, the two sets disjoint.
+Measured: 1,114; 19 added, 0 removed.  The matcher is now pinned by
+`done.py --selftest`: 14 declarations, the shapes above in both directions
+plus a call and a comment.  The pair: the matcher before this change gets
+**10 of 14** (`WRONG (missed)` on both by-reference and both
+`QualifiedName` cases); this one gets **14 of 14**.  §0 rows: name-taking
+1,095 -> 1,114; the selftest row added.
+
+#### A compiler warning total is not evidence from an incremental build
+
+`instance.cryo:1989`: a module reused from cache skips the stage after
+monomorphization - generic validation, the move check, the dead-code lint,
+drop insertion - and its warnings are never replayed.  The front end's
+warnings are reported for every module, so only that stage's move.  On
+`3093959d` (a copy outside the repo, the pin building the compiler):
+
+| build | warnings | unused-variable |
+|---|---|---|
+| clean | 346 | 9 |
+| clean again | 346 | 9 |
+| comment added to `diag/_module.cryo` (imported everywhere) | 346 | 9 |
+| comment added to `CLI/commands.cryo` (a leaf) | **337** | **0** |
+
+The count is deterministic per source; what varies is which modules the
+edit made the build recompile.  §8.348's "one intermediate build printed
+342 .. the W0001 total is not a stable instrument" is this, misread: its
+two builds differed in `type_resolution.cryo` and `async_lower.cryo`, and
+the warnings that vanished were in modules that edit did not make it
+recompile (inferred from the mechanism; that build's log is not kept per
+module).  §8.320 had diagnosed it correctly -
+"an incremental build loses warnings of modules it does not recompile; it
+is not a count to read" - and it was lost, because a finding that lives
+only in an entry's prose is not read by the next session.  It now lives
+in §0.3 as a gate row, with a check that reads the skip itself, so the row
+fails the day the skip changes.
+
+Every earlier entry that cites a compiler warning total (§8.60, §8.73,
+§8.299, §8.323, §8.325, §8.329, §8.347, §8.348) rests its conclusion on
+objects moved and the suite, not on the total, so none changes.  The
+editor's totals (478, 486, 490) are clean: `lsp-gate.py` deletes its build
+directory first.
+
+Not fixed here, and not in this unit: an incremental and a clean build
+disagree about the same source for a user too - a comment edited in one
+file and nine real warnings vanish.  Replaying a reused module's warnings
+is a compiler change, and reaches `make cryo` only through a re-pin.
 
 ---
