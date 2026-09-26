@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe facts selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -193,6 +193,7 @@ help:
 	@echo "  make check-fast        lane-check + the two self-tests + ns-status-check + verify-pin (~1 min, no build)"
 	@echo "  make install-hooks     Point git at the tracked hooks (run once per checkout)"
 	@echo "  make lsp-check         Compile tools/CryoLSP against current source"
+	@echo "  make facts             The compiler's --emit=facts report for compiler, stdlib, editor (.facts/)"
 	@echo "                         (installs nothing; the only gate that builds it)"
 	@echo "  make vendor-check      Check every constant shape survives cryo vendor"
 	@echo "  make api-index         Regenerate docs/stdlib-api.txt (the stdlib API index)"
@@ -706,6 +707,19 @@ lsp-check: $(STAGE2_EXE) $(LIBCRYO_A)
 else
 lsp-check: $(STAGE2) $(LIBCRYO_A)
 	@$(PYTHON) scripts/lsp-gate.py --cryo "$(STAGE2)" $(ARGS)
+endif
+
+# ---- the compiler's own report of its calls ----------------------------
+# `cryo build --emit=facts` over the compiler, the stdlib and the editor,
+# with the compiler under test, into `.facts/`: one line per argument a call
+# passes to a parameter taking a name as text, as the body check resolved
+# it.  `scripts/facts.py --check` refuses a missing or stale file.
+ifeq ($(HOST_OS),windows)
+facts: $(STAGE2_EXE) $(LIBCRYO_A)
+	@$(PYTHON) scripts/facts.py --cryo "$(STAGE2_EXE)" $(ARGS)
+else
+facts: $(STAGE2) $(LIBCRYO_A)
+	@$(PYTHON) scripts/facts.py --cryo "$(STAGE2)" $(ARGS)
 endif
 
 # ---- the other OS's config-gated half ----------------------------------

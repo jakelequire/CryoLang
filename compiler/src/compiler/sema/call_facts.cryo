@@ -1,0 +1,459 @@
+/// `--emit=facts`: what each call that passes a spelling bound, and each
+/// comparison of spellings, as sema decided it.
+///
+/// A KEY is a value that names something by its text: `string`,
+/// `SymbolStr`, `QualifiedName` (a path of `SymbolStr` segments) and
+/// `ModulePath`, by value, by reference or as an array.  One record per
+/// argument a call passes to a key parameter, and one per `==` / `!=` whose
+/// operand is a key or a number read out of one.  Each record carries the
+/// key's type, so a consumer takes the population it defines - condition
+/// two's spellings, D32's key types - from the same file.
+///
+/// The records are written from what sema resolved - the call's pinned
+/// declaration and its signature - so they describe the program that
+/// compiled, not a reading of its source.  Tab-separated, one per line:
+///
+///     kind  file  line  col  index  type  provenance  receiver  callee  pin
+///           callee-decl  enclosing  callee-text  enclosing-text
+///
+/// `kind` is `arg`, `cmp`, `noparams` (a call with arguments whose parameter
+/// types sema never had) or `unaligned` (a signature whose parameters could
+/// not be matched to the arguments); a call the instrument cannot see into
+/// is counted rather than dropped.  `index` is the argument's position, the
+/// receiver not counted, or a comparison's operator.  `type` is the key
+/// parameter's type, or the compared key's.  `provenance` is where the
+/// argument's value comes from, and `receiver` where the method's receiver
+/// does (a comparison's right and left operands):
+///
+///     literal                a literal
+///     param:<name>           the enclosing function's own parameter
+///     local:<name>=<prov>    a local, and where its initializer comes from
+///     local:mut <name>=<prov>  the same for a local that can be reassigned
+///     global:<path>          a global or constant
+///     field:<type>.<member><-<prov>  a member read off a value from <prov>
+///     call:<callee-text>     a call's return
+///     element:<prov>         an element of an array from <prov>
+///     sourceloc:<FILE|LINE>  a source-location constant
+///     name:<spelling>        a name sema left unanswered
+///     expr:<kind>            any other expression
+///
+/// read through `&`, `*` and casts.  `callee` and `enclosing` are linker
+/// symbols, the identity a declaration is emitted under, and the `-text`
+/// fields render them for a reader; `callee-decl` is where the callee is
+/// declared.  `pin` says which of sema's answers named the callee: `call`
+/// the call's own pin, `callee` the pin on its callee expression, `method`
+/// the method sema selected, `none` nothing.
+
+namespace compiler::sema::call_facts;
+
+import compiler::ast;
+import compiler::ast::{ NodeKind };
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::declaration::{ FunctionDeclNode, MethodNode, VarDeclNode };
+import compiler::ast::expression::{
+    ArrayAccessNode, BinaryExprNode, CallExprNode, CalleePin, CastExprNode, ExpressionNode,
+    IdentifierNode, MemberAccessNode, ScopeResolutionNode, UnaryExprNode
+};
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::decl_index::{ OverloadId };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResSlot };
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::demangler::{ Demangler };
+import compiler::types;
+import compiler::types::{ TypeKind };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{ ArrayType, FunctionType, ReferenceType };
+import std::fmt;
+import std::fs::dir;
+import std::fs::file;
+import std::fs::path::{ Path };
+import std::collections::string::{ String };
+import compiler::sema::state::{ SemaState };
+
+/// What a record reads besides the node it describes: the compilation, the
+/// function whose body is being checked, and the body check's state, which
+/// holds the initializer of every local declared so far.
+type struct FactsScope {
+    ctx:   CompilationContext*;
+    arena: TypeArena*;
+    func:  FunctionDeclNode*;
+    state: SemaState*;
+}
+
+/// The entry sema bound a call to, and which of its answers named it.
+type struct CalleeAnswer {
+    entry: OverloadId;
+    pin:   string;
+}
+
+type struct CallFacts {
+
+    /// Record `call`'s key arguments.  `params` are the types sema
+    /// classified its arguments against, and `known` whether they belong to
+    /// this call.
+    static record(fs: &FactsScope, call: CallExprNode*, params: &TypeRef[], known: boolean) -> void {
+        if (call == null || call.arguments.length == 0) { return; }
+        const ctx: CompilationContext* = fs.ctx;
+        const arena: TypeArena* = fs.arena;
+        const site: string = CallFacts::site_of(ctx, (call as ASTNode*).span);
+        const answer: CalleeAnswer = CallFacts::callee_entry(ctx, call);
+        const entry: OverloadId = answer.entry;
+        const pin: string = answer.pin;
+        mut callee: string = "?";
+        mut callee_text: string = CallFacts::callee_spelled(ctx, call);
+        mut callee_decl: string = "-";
+        if (entry.is_valid()) {
+            callee = CallFacts::symbol_text(ctx, entry);
+            callee_text = Demangler::demangle(callee);
+            const ds: SourceSpan = ctx.decl_index.entry_span(entry);
+            callee_decl = CallFacts::normalized_path(ctx, ds.file) + ":" + fmt::format("%u", ds.start_line);
+        }
+        mut receiver: string = "-";
+        const cn: ASTNode* = call.callee as ASTNode*;
+        if (cn != null && cn.kind == NodeKind::MemberAccess) {
+            receiver = CallFacts::provenance(fs, (call.callee as MemberAccessNode*).object, 0);
+        }
+        const tail: string = callee + "\t" + pin + "\t" + callee_decl + "\t"
+            + CallFacts::enclosing(fs) + "\t" + callee_text + "\t" + CallFacts::enclosing_text(fs);
+
+        // The parameter types: the pinned declaration's signature when sema
+        // pinned one, the types sema classified the arguments against when
+        // it did not.  A signature lists a method's receiver first, so a
+        // call through a receiver skips it: the offset is how many more
+        // parameters the signature has than the call has arguments, and a
+        // difference other than 0 or 1 (a signature that lost a parameter)
+        // is recorded as unaligned rather than guessed.
+        mut types: TypeRef[] = [];
+        mut offset: i64 = 0;
+        if (entry.is_valid()) {
+            const sig: Type* = arena.lookup(ctx.decl_index.entry_signature(entry).id);
+            if (sig == null || sig.kind != TypeKind::Function) {
+                ctx.facts.push("noparams\t" + site + "\t-\t-\t-\t" + receiver + "\t" + tail);
+                return;
+            }
+            const ft: FunctionType* = sig as FunctionType*;
+            for (mut k: i64 = 0; k < ft.param_types.length; k++) { types.push(ft.param_types[k]); }
+            if (cn != null && cn.kind == NodeKind::MemberAccess) {
+                offset = types.length - call.arguments.length;
+            }
+            if (offset < 0 || offset > 1
+                    || (types.length - offset < call.arguments.length && !ft.is_variadic)) {
+                ctx.facts.push("unaligned\t" + site + "\t-\t-\t-\t" + receiver + "\t" + tail);
+                return;
+            }
+        } else {
+            if (!known || params.length == 0) {
+                ctx.facts.push("noparams\t" + site + "\t-\t-\t-\t" + receiver + "\t" + tail);
+                return;
+            }
+            for (mut k: i64 = 0; k < params.length; k++) { types.push(params[k]); }
+        }
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            if (i + offset >= types.length) { break; }
+            const pt: TypeRef = types[i + offset];
+            if (!CallFacts::carries_key(ctx, arena, pt)) { continue; }
+            ctx.facts.push("arg\t" + site + "\t" + fmt::format("%lld", i) + "\t"
+                + CallFacts::type_text(arena, pt) + "\t"
+                + CallFacts::provenance(fs, call.arguments[i], 0) + "\t" + receiver + "\t" + tail);
+        }
+    }
+
+    /// Record `bin` when it compares keys: an `==` or `!=` whose operand is
+    /// a key, or a number read out of one - a spelling compared by its
+    /// interned id.
+    static record_compare(fs: &FactsScope, bin: BinaryExprNode*) -> void {
+        if (bin == null || bin.left == null || bin.right == null) { return; }
+        if (bin.op.lexeme != "==" && bin.op.lexeme != "!=") { return; }
+        mut key: TypeRef = CallFacts::compared_key(fs, bin.left);
+        if (!key.is_valid()) { key = CallFacts::compared_key(fs, bin.right); }
+        if (!key.is_valid()) { return; }
+        const ctx: CompilationContext* = fs.ctx;
+        ctx.facts.push("cmp\t" + CallFacts::site_of(ctx, (bin as ASTNode*).span) + "\t"
+            + bin.op.lexeme + "\t" + CallFacts::type_text(fs.arena, key) + "\t"
+            + CallFacts::provenance(fs, bin.right, 0) + "\t"
+            + CallFacts::provenance(fs, bin.left, 0) + "\t-\t-\t-\t"
+            + CallFacts::enclosing(fs) + "\t-\t" + CallFacts::enclosing_text(fs));
+    }
+
+    /// The key an operand compares: its own type when that is a key, the
+    /// type of the value it is read out of when it is a number read off a
+    /// key (`name.id`); invalid otherwise.
+    static compared_key(fs: &FactsScope, e: ExpressionNode*) -> TypeRef {
+        if (e == null || !e.resolved_type.is_valid()) { return TypeRef::invalid(); }
+        if (CallFacts::carries_key(fs.ctx, fs.arena, e.resolved_type)) { return e.resolved_type; }
+        const n: ASTNode* = e as ASTNode*;
+        if (n.kind != NodeKind::MemberAccess) { return TypeRef::invalid(); }
+        const t: Type* = fs.arena.lookup(e.resolved_type.id);
+        if (t == null || t.kind != TypeKind::Int) { return TypeRef::invalid(); }
+        const obj: ExpressionNode* = (e as MemberAccessNode*).object;
+        if (obj == null || !obj.resolved_type.is_valid()) { return TypeRef::invalid(); }
+        if (CallFacts::carries_key(fs.ctx, fs.arena, obj.resolved_type)) { return obj.resolved_type; }
+        return TypeRef::invalid();
+    }
+
+    /// Write the recorded facts to `path`, sorted and without repeats: a
+    /// call re-resolved in one build records twice, and the order sema
+    /// visits bodies in is not the order anyone compares them in.
+    static write(ctx: CompilationContext*, path: string) -> boolean {
+        mut lines: string[] = [];
+        for (mut i: i64 = 0; i < ctx.facts.length; i++) {
+            lines.push(CallFacts::sort_key(ctx.facts[i]) + "\n" + ctx.facts[i]);
+        }
+        lines.sort();
+        mut text: String = String::new();
+        mut prev: string = "";
+        for (mut i: i64 = 0; i < lines.length; i++) {
+            const at: i64 = lines[i].find_char('\n' as i8);
+            const rec: string = lines[i].substr(at + 1, lines[i].length() as i64 - at - 1);
+            if (i > 0 && rec == prev) { continue; }
+            text.push(rec);
+            text.push_byte(10 as u8);
+            prev = rec;
+        }
+        dir::create_dir_all(Path::from(path.parent_dir()));
+        return match (file::write(Path::from(path), text.as_bytes())) {
+            Result::Ok(_)  => { true }
+            Result::Err(_) => { false }
+        };
+    }
+
+    /// The record behind its file and its line and column right-aligned, so
+    /// a sort of the keys orders records by file, then line and column as
+    /// numbers.
+    static sort_key(rec: string) -> string {
+        mut fields: string[] = rec.split("\t");
+        if (fields.length < 4) { return rec; }
+        return fields[1] + "\t" + fmt::format("%8s", fields[2]) + "\t"
+            + fmt::format("%6s", fields[3]) + "\t" + rec;
+    }
+
+    /// `file<TAB>line<TAB>col` of a span.
+    static site_of(ctx: CompilationContext*, span: SourceSpan) -> string {
+        return CallFacts::normalized_path(ctx, span.file) + "\t"
+            + fmt::format("%u", span.start_line) + "\t"
+            + fmt::format("%u", span.start_col);
+    }
+
+    /// A source path with forward slashes, so one file is spelled one way
+    /// whichever separator the loader was handed, and a standard library
+    /// file as `<stdlib>` and its path inside the library, so the records
+    /// do not depend on where the library was found.
+    static normalized_path(ctx: CompilationContext*, p: string) -> string {
+        mut f: string = p.replace("\\", "/");
+        if (f.starts_with("./")) { f = f.substr(2, f.length() as i64 - 2); }
+        const root: string = ctx.stdlib_root.replace("\\", "/");
+        const n: i64 = root.length() as i64;
+        if (n > 0 && f.starts_with(root + "/")) {
+            return "<stdlib>" + f.substr(n, f.length() as i64 - n);
+        }
+        return f;
+    }
+
+    // The three ways a record renders an identity as text, one place each:
+    // what it prints is the report, never a key anything is looked up by.
+
+    /// An entry's linker symbol.
+    static symbol_text(ctx: CompilationContext*, e: OverloadId) -> string {
+        return ctx.intern_table.resolve(ctx.decl_index.entry_symbol(e));
+    }
+
+    /// A type as a diagnostic spells it.
+    static type_text(arena: TypeArena*, t: TypeRef) -> string {
+        return arena.resolve_display_name(t.id);
+    }
+
+    /// A definition's path.
+    static def_text(ctx: CompilationContext*, d: DefId) -> string {
+        return ctx.intern_table.resolve(ctx.defs.path_of(d));
+    }
+
+    /// The enclosing function's linker symbol; `-` outside a function and
+    /// `?` for one registered under none.
+    static enclosing(fs: &FactsScope) -> string {
+        if (fs.func == null) { return "-"; }
+        if (!fs.func.overload_entry.is_valid()) { return "?"; }
+        return CallFacts::symbol_text(fs.ctx, fs.func.overload_entry);
+    }
+
+    static enclosing_text(fs: &FactsScope) -> string {
+        if (fs.func == null) { return "-"; }
+        if (!fs.func.overload_entry.is_valid()) { return fs.ctx.intern_table.resolve(fs.func.name); }
+        return Demangler::demangle(CallFacts::enclosing(fs));
+    }
+
+    /// The entry sema bound `call` to, and which of its answers named it.
+    static callee_entry(ctx: CompilationContext*, call: CallExprNode*) -> CalleeAnswer {
+        if (call.resolved_callee.is_some()) {
+            return CalleeAnswer { entry: CallFacts::pinned_entry(ctx, &call.resolved_callee), pin: "call" };
+        }
+        const cn: ASTNode* = call.callee as ASTNode*;
+        if (cn != null && cn.kind == NodeKind::Identifier) {
+            const ident: IdentifierNode* = call.callee as IdentifierNode*;
+            if (ident.resolved_callee.is_some()) {
+                return CalleeAnswer { entry: CallFacts::pinned_entry(ctx, &ident.resolved_callee), pin: "callee" };
+            }
+        }
+        if (cn != null && cn.kind == NodeKind::ScopeResolution) {
+            const scope: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
+            if (scope.resolved_callee.is_some()) {
+                return CalleeAnswer { entry: CallFacts::pinned_entry(ctx, &scope.resolved_callee), pin: "callee" };
+            }
+        }
+        if (call.resolved_method != null) {
+            const m: MethodNode* = call.resolved_method as MethodNode*;
+            if (m.func != null) {
+                return CalleeAnswer { entry: m.func.overload_entry, pin: "method" };
+            }
+        }
+        return CalleeAnswer { entry: OverloadId::invalid(), pin: "none" };
+    }
+
+    /// The entry a pin names: a declaration's own, or a family's only one.
+    static pinned_entry(ctx: CompilationContext*, p: &CalleePin) -> OverloadId {
+        match (p) {
+            CalleePin::Decl(e) => { return e; }
+            CalleePin::Family(owner, leaf) => {
+                const entries: OverloadId[] = ctx.decl_index.lookup_family_entries(owner, leaf);
+                if (entries.length == 1) { return entries[0]; }
+            }
+            _ => { }
+        }
+        return OverloadId::invalid();
+    }
+
+    /// The callee as written, for a record whose callee sema did not pin.
+    static callee_spelled(ctx: CompilationContext*, call: CallExprNode*) -> string {
+        const cn: ASTNode* = call.callee as ASTNode*;
+        if (cn == null) { return "?"; }
+        if (cn.kind == NodeKind::Identifier) {
+            return ctx.intern_table.resolve((call.callee as IdentifierNode*).name);
+        }
+        if (cn.kind == NodeKind::MemberAccess) {
+            return "." + ctx.intern_table.resolve((call.callee as MemberAccessNode*).member);
+        }
+        if (cn.kind == NodeKind::ScopeResolution) {
+            const s: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
+            return ctx.intern_table.resolve(s.scope_name) + "::"
+                + ctx.intern_table.resolve(s.member_name);
+        }
+        return "expr:" + cn.kind.to_string();
+    }
+
+    /// Whether a value of type `t` is a key, under any number of references
+    /// and arrays.  The compiler's own three key types are named by their
+    /// declarations' paths because they are this report's subject, not a
+    /// rule of the language: in a program that declares none of them, only
+    /// `string` qualifies.
+    static carries_key(ctx: CompilationContext*, arena: TypeArena*, t: TypeRef) -> boolean {
+        mut cur: TypeRef = t;
+        for (mut depth: i32 = 0; depth < 8; depth++) {
+            if (!cur.is_valid()) { return false; }
+            const ty: Type* = arena.lookup(cur.id);
+            if (ty == null) { return false; }
+            if (ty.kind == TypeKind::Reference) {
+                cur = (ty as ReferenceType*).referent;
+                continue;
+            }
+            if (ty.kind == TypeKind::Array) {
+                cur = (ty as ArrayType*).element;
+                continue;
+            }
+            if (ty.kind == TypeKind::String) { return true; }
+            if (ty.kind != TypeKind::Struct) { return false; }
+            const d: DefId = ctx.decl_index.registered_def(cur);
+            if (!d.is_valid()) { return false; }
+            const path: string = CallFacts::def_text(ctx, d);
+            return path == "compiler::resolver::symbol_str::SymbolStr"
+                || path == "compiler::resolver::qualified_name::QualifiedName"
+                || path == "compiler::module_graph::ModulePath";
+        }
+        return false;
+    }
+
+    /// Where `e`'s value comes from (the table in this module's header).
+    static provenance(fs: &FactsScope, e: ExpressionNode*, depth: i32) -> string {
+        if (e == null) { return "expr:none"; }
+        if (depth > 8) { return "expr:deep"; }
+        const ctx: CompilationContext* = fs.ctx;
+        const n: ASTNode* = e as ASTNode*;
+        if (n.kind == NodeKind::Literal) { return "literal"; }
+        if (n.kind == NodeKind::Identifier) {
+            const ident: IdentifierNode* = e as IdentifierNode*;
+            const spelled: string = ctx.intern_table.resolve(ident.name);
+            match (ident.res) {
+                ResSlot::Answered(r) => {
+                    match (r) {
+                        Res::Local(sym) => { return CallFacts::local_provenance(fs, sym, spelled, depth); }
+                        Res::Def(d) => {
+                            return "global:" + CallFacts::def_text(ctx, d);
+                        }
+                        Res::SourceLoc(_) => { return "sourceloc:" + spelled; }
+                        _ => { }
+                    }
+                }
+                _ => { }
+            }
+            return "name:" + spelled;
+        }
+        if (n.kind == NodeKind::MemberAccess) {
+            const ma: MemberAccessNode* = e as MemberAccessNode*;
+            mut owner: string = "?";
+            if (ma.object != null && ma.object.resolved_type.is_valid()) {
+                owner = CallFacts::type_text(fs.arena, ma.object.resolved_type);
+            }
+            return "field:" + owner + "." + ctx.intern_table.resolve(ma.member)
+                + "<-" + CallFacts::provenance(fs, ma.object, depth + 1);
+        }
+        if (n.kind == NodeKind::CallExpression) {
+            const inner: CallExprNode* = e as CallExprNode*;
+            const entry: OverloadId = CallFacts::callee_entry(ctx, inner).entry;
+            if (entry.is_valid()) {
+                return "call:" + Demangler::demangle(CallFacts::symbol_text(ctx, entry));
+            }
+            return "call:" + CallFacts::callee_spelled(ctx, inner);
+        }
+        if (n.kind == NodeKind::UnaryExpression) {
+            return CallFacts::provenance(fs, (e as UnaryExprNode*).operand, depth + 1);
+        }
+        if (n.kind == NodeKind::CastExpression) {
+            return CallFacts::provenance(fs, (e as CastExprNode*).expression, depth + 1);
+        }
+        if (n.kind == NodeKind::ArrayAccess) {
+            return "element:" + CallFacts::provenance(fs, (e as ArrayAccessNode*).array, depth + 1);
+        }
+        if (n.kind == NodeKind::ScopeResolution) {
+            const s: ScopeResolutionNode* = e as ScopeResolutionNode*;
+            return "global:" + ctx.intern_table.resolve(s.scope_name) + "::"
+                + ctx.intern_table.resolve(s.member_name);
+        }
+        return "expr:" + n.kind.to_string();
+    }
+
+    /// A local's provenance: a parameter of the enclosing function by its
+    /// name, any other local by its name and its initializer's provenance.
+    /// Only the initializer: a `mut` local says so, since what it holds
+    /// later may come from elsewhere.
+    static local_provenance(fs: &FactsScope, sym: SymbolID, spelled: string, depth: i32) -> string {
+        if (fs.func != null) {
+            for (mut i: i64 = 0; i < fs.func.parameters.length; i++) {
+                const p: VarDeclNode* = fs.func.parameters[i];
+                if (p != null && p.sym_id.equals(sym)) { return "param:" + spelled; }
+            }
+        }
+        match (fs.state.facts_inits.get(&sym.key())) {
+            Option::Some(v) => {
+                const decl: VarDeclNode* = v as VarDeclNode*;
+                const mark: string = if (decl.is_mutable) { "mut " } else { "" };
+                return "local:" + mark + spelled + "="
+                    + CallFacts::provenance(fs, decl.initializer, depth + 1);
+            }
+            Option::None => { }
+        }
+        return "local:" + spelled;
+    }
+}

@@ -54,7 +54,7 @@ import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResSlot, SourceLoc };
 import compiler::sema::{
     state, helpers, scope_manager, type_utils, literal_resolver, diagnostics,
     dispatch, symbolic_checker, method_binding, pattern_resolver,
-    lambda_synth, async_lower, member_resolver, call_resolver
+    lambda_synth, async_lower, member_resolver, call_resolver, call_facts
 };
 import std::core::{ option, mem };
 import std::collections::hashmap;
@@ -104,6 +104,7 @@ import compiler::module_graph::{ ModulePath };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::sema::async_lower::{ AsyncLower, AsyncOwner };
+import compiler::sema::call_facts::{ CallFacts, FactsScope };
 import compiler::sema::call_resolver::{ CallResolver };
 import compiler::sema::diagnostics::{ Diagnostics };
 import compiler::sema::dispatch::{ SemaDispatch };
@@ -908,6 +909,7 @@ public:
         this.state.this_is_by_ref = false;
         this.state.receiver_sym = SymbolID::invalid();
         this.state.param_ids = [];
+        this.state.current_func = func;
         this.state.in_lambda_depth     = 0;
         this.state.lambda_outer_locals = HashMap::<u32, TypeRef>::new();
         this.state.current_lambda      = null;
@@ -1180,6 +1182,10 @@ public:
     /// module-level form - they reach sema through different visitors and must
     /// not answer this differently.
     check_var_decl(mut &this, var_node: VarDeclNode*) -> void {
+        // A record naming this local reads where its value came from.
+        if (this.ctx.emit_facts && var_node.has_initializer() && var_node.sym_id.is_valid()) {
+            this.state.facts_inits.insert(var_node.sym_id.key(), var_node as u64);
+        }
 
         // A type-less binding with no initializer has nothing to infer from.
         // With an initializer, the binding's type is inferred from it below
@@ -1519,6 +1525,36 @@ public:
 
     // -- The authoritative expression dispatch --
 
+    /// Resolve a call, and under `--emit=facts` record what it bound.  Only
+    /// the check before monomorphization records: it walks every module on
+    /// every build, a module reused from the incremental cache included,
+    /// while the check after it skips a cached module.
+    resolve_call_recorded(mut &this, call: CallExprNode*) -> TypeRef {
+        const t: TypeRef = this.calls.resolve_call(this, call);
+        if (this.ctx.emit_facts && !this.state.post_mono_verify) {
+            const known: boolean = this.state.facts_call == call;
+            CallFacts::record(&this.facts_scope(), call, &this.state.facts_params, known);
+        }
+        return t;
+    }
+
+    /// Resolve a binary expression, and under `--emit=facts` record it when
+    /// it compares keys - the same condition as a call's record.
+    resolve_binary_recorded(mut &this, bin: BinaryExprNode*) -> TypeRef {
+        const t: TypeRef = this.resolve_binary(bin);
+        if (this.ctx.emit_facts && !this.state.post_mono_verify) {
+            CallFacts::record_compare(&this.facts_scope(), bin);
+        }
+        return t;
+    }
+
+    facts_scope(mut &this) -> FactsScope {
+        return FactsScope {
+            ctx: this.ctx, arena: this.arena, func: this.state.current_func,
+            state: &this.state,
+        };
+    }
+
     resolve_expr(mut &this, expr: ExpressionNode*) -> TypeRef {
         if (expr == null) { return TypeRef::invalid(); }
         if (expr.has_resolved_type() && !this.state.post_mono_verify) {
@@ -1528,9 +1564,9 @@ public:
         const result: TypeRef = match (n.kind) {
             NodeKind::Literal           => { this.literals.resolve_literal(expr as LiteralNode*) }
             NodeKind::Identifier        => { this.resolve_identifier(expr as IdentifierNode*) }
-            NodeKind::BinaryExpression  => { this.resolve_binary(expr as BinaryExprNode*) }
+            NodeKind::BinaryExpression  => { this.resolve_binary_recorded(expr as BinaryExprNode*) }
             NodeKind::UnaryExpression   => { this.resolve_unary(expr as UnaryExprNode*) }
-            NodeKind::CallExpression    => { this.calls.resolve_call(this, expr as CallExprNode*) }
+            NodeKind::CallExpression    => { this.resolve_call_recorded(expr as CallExprNode*) }
             NodeKind::MemberAccess      => { this.member.resolve_member_access(this, expr as MemberAccessNode*) }
             NodeKind::ArrayAccess       => { this.member.resolve_array_access(this, expr as ArrayAccessNode*) }
             NodeKind::CastExpression    => { this.resolve_cast(expr as CastExprNode*) }
