@@ -21,6 +21,8 @@ import std::fs::dir;
 import std::core::intrinsics;
 import std::process::exec;
 import std::process;
+import std::thread;
+import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::json::parser;
 import std::json::value;
 import std::json::serializer;
@@ -185,6 +187,45 @@ function host_os_name() -> string {
 ![target(macos)]
 function host_os_name() -> string {
     return "macos";
+}
+
+// The platform shell's spelling of "run `cmd` with `dir` as its working
+// directory".  A suite job sets its directory inside its own shell because
+// the process working directory is one value shared by every thread here.
+![target(windows)]
+function shell_in_dir(dir: string, cmd: string) -> string {
+    return fmt::format("cd /d \"%s\" && %s", dir, cmd);
+}
+
+![target(unix)]
+function shell_in_dir(dir: string, cmd: string) -> string {
+    return fmt::format("cd \"%s\" && %s", dir, cmd);
+}
+
+/// One batch of shell commands for a suite's worker pool, moved into each
+/// worker by value.  The pointers alias arrays the suite owns and keeps alive
+/// until its scope has joined every worker.  A worker takes the next index off
+/// `cursor`, runs that command, stores its exit status, and only then
+/// publishes `done` for it (release); the suite reads a result only after
+/// seeing `done` (acquire), and reads them strictly in index order, so what it
+/// prints does not depend on which worker finished first.
+type struct ShellJobs {
+    cursor: Atomic<u64>*;
+    cmds:   string*;
+    n:      u64;
+    status: i32*;
+    done:   Atomic<u32>*;
+}
+
+// Pool worker body.  A free function because it is handed to
+// `Scope::spawn` as a plain function pointer.
+function shell_jobs_worker(ctx: ShellJobs) -> void {
+    loop {
+        const k: u64 = (*ctx.cursor).fetch_add(1, MemoryOrder::Relaxed);
+        if (k >= ctx.n) { break; }
+        ctx.status[k] = exec::shell(ctx.cmds[k]);
+        ctx.done[k].store(1, MemoryOrder::Release);
+    }
 }
 
 /// Per-process scratch path for capturing a negative test's compiler
@@ -1428,10 +1469,13 @@ type struct Executor {
             const proj_root: string = Executor::dir_of(config_path);
             mut pattern: string = "";
             if (args.positional_count() > 0) { pattern = args.input_file(); }
+            mut jobs_value: string = "";
+            if (args.has_arg("jobs")) { jobs_value = args.get_value("jobs"); }
+            const jobs: u32 = Executor::suite_jobs(jobs_value);
             const neg_dir: string = fmt::format("%s/tests/negative", proj_root);
             const neg_res: NegSuiteResult =
                 Executor::run_negative_suite(self_exe, stdlib_abs, neg_dir,
-                                             pattern, fmt_choice, col_choice);
+                                             pattern, fmt_choice, col_choice, jobs);
             neg_ran      = neg_res.ran;
             neg_failures = neg_res.failures;
             if (neg_failures > 0 && exit_code == 0) {
@@ -1445,7 +1489,7 @@ type struct Executor {
             const proj_dir: string = fmt::format("%s/tests/projects", proj_root);
             const proj_res: NegSuiteResult =
                 Executor::run_projects_suite(self_exe, stdlib_abs, proj_dir,
-                                             pattern, fmt_choice, col_choice);
+                                             pattern, fmt_choice, col_choice, jobs);
             proj_ran      = proj_res.ran;
             proj_failures = proj_res.failures;
             if (proj_failures > 0 && exit_code == 0) {
@@ -1838,9 +1882,50 @@ type struct Executor {
     /// runner's positional filter). `fmt_choice` / `col_choice` mirror the
     /// unit runner's `--format=` / `--color=` surface so the two halves of
     /// `cryo test` paint identically.
+    /// Worker count for the compile-fail and project suites, resolved the way
+    /// the unit runner resolves its own: `--jobs=N` (`cli_value`, "" when the
+    /// flag is absent), else `CRYO_TEST_JOBS`; 0, neither, or a value that is
+    /// not a whole number means the CPU count.  `1` runs one child at a time.
+    static suite_jobs(cli_value: string) -> u32 {
+        mut n: u32 = 0;
+        if (cli_value.length() > 0) {
+            match (u32::try_from(str::Str::new(cli_value))) {
+                Result::Ok(v)  => { n = v; }
+                Result::Err(_) => { }
+            }
+        } else {
+            match (env::var(str::Str::new("CRYO_TEST_JOBS"))) {
+                Option::Some(s) => {
+                    match (u32::try_from(s.as_str())) {
+                        Result::Ok(v)  => { n = v; }
+                        Result::Err(_) => { }
+                    }
+                }
+                Option::None => { }
+            }
+        }
+        if (n == 0) { n = thread::available_parallelism(); }
+        if (n == 0) { n = 1; }
+        return n;
+    }
+
+    /// Block until worker `k` of a suite's pool has published its result.
+    static wait_job(done: Atomic<u32>*, k: u64) -> void {
+        while (done[k].load(MemoryOrder::Acquire) == 0) {
+            thread::sleep_ms(1);
+        }
+    }
+
+    /// Each suite job's own capture file: jobs run at once, so one shared
+    /// scratch path would be overwritten by whichever finished last.
+    static job_tmp_path(tmp: string, k: u64) -> string {
+        return fmt::format("%s.%llu", tmp, k);
+    }
+
     static run_negative_suite(self_exe: string, stdlib_abs: string,
                               neg_dir: string, pattern: string,
-                              fmt_choice: string, col_choice: string)
+                              fmt_choice: string, col_choice: string,
+                              jobs: u32)
             -> NegSuiteResult {
         // Pre-pass: count how many entries actually survive the filter.
         // Suppresses the entire compile-fail section (header + body + summary)
@@ -1897,109 +1982,151 @@ type struct Executor {
             fmt::printf("compile-fail                                      ");
         }
 
+        // Collect the entries in directory order first.  Only the `cryo check`
+        // children run on the worker pool; every verdict below is judged and
+        // printed in this order, whatever order the children finish in.
         const tmp: string = neg_tmp_path();
-        mut failures: i32 = 0;
-        mut ran: i32 = 0;
+        mut names:    string[] = [];
+        mut contents: string[] = [];
+        mut expects:  string[] = [];
+        mut job_of:   i64[]    = [];
+        mut cmds:     string[] = [];
         mut entry: void* = libc::readdir(dp);
         while (entry != null) {
-            const name: string = intrinsics::dirent_name(entry);
-            if (name == "." || name == "..") {
-                entry = libc::readdir(dp); continue;
-            }
+            // Copied: the next `readdir` reuses the buffer the name points into.
+            const name: string = fmt::format("%s", intrinsics::dirent_name(entry));
+            entry = libc::readdir(dp);
+            if (name == "." || name == "..") { continue; }
             // No `dirent_type` filter - see the pre-pass note above (mingw has
             // no d_type); the ".cryo" extension check below is the real filter.
             const nlen: u64 = name.length();
-            if (nlen <= 5) { entry = libc::readdir(dp); continue; }
+            if (nlen <= 5) { continue; }
             const ext: string = name + ((nlen - 5) as u64);
-            if (ext != ".cryo") { entry = libc::readdir(dp); continue; }
-            if (pattern != "" && !name.contains(pattern)) {
-                entry = libc::readdir(dp); continue;
-            }
+            if (ext != ".cryo") { continue; }
+            if (pattern != "" && !name.contains(pattern)) { continue; }
 
             const full: string = fmt::format("%s/%s", neg_dir, name);
             const content: string = Executor::read_file_or_empty(full);
             const expected: string = Executor::neg_code_from(content);
-
-            // Per-test prefix: Plain emits `test (negative) NAME ... ` up
-            // front so a hang is visible; Pretty emits `  NAME ... ` with
-            // the same intent; Compact stays silent until the result lands.
-            if (is_pretty) {
-                fmt::printf("  %s ... ", name);
-            } else if (!is_compact) {
-                fmt::printf("test (negative) %s ... ", name);
-            }
-            libc::fflush(null);
-
+            names.push(name);
+            contents.push(content);
+            expects.push(expected);
             if (expected.length() == 0) {
-                if (is_compact) {
-                    fmt::printf("F");
-                } else if (is_pretty) {
-                    Executor::neg_chip_fail(color_on);
-                    fmt::printf("  (no ![config(negative, <code>)] directive)\n");
-                } else {
-                    fmt::printf("FAILED (no ![config(negative, <code>)] directive)\n");
-                }
-                failures += 1; ran += 1; entry = libc::readdir(dp); continue;
-            }
-
-            mut runcmd: string;
-            if (stdlib_abs.length() > 0) {
-                runcmd = fmt::format("%s check %s --stdlib=%s > %s 2>&1",
-                    self_exe, full, stdlib_abs, tmp);
+                job_of.push(-1);
             } else {
-                runcmd = fmt::format("%s check %s > %s 2>&1", self_exe, full, tmp);
-            }
-            libc::fflush(null);
-            exec::shell(runcmd);
-            const out: string = Executor::read_file_or_empty(tmp);
-            // Warning codes (`W....`) render as `warning[Wxxxx]`; everything else
-            // as `error[Exxxx]`.  A warning-only file still exits 0, but the suite
-            // asserts on the rendered marker, not the exit status.
-            mut marker: string = "error";
-            if (expected.length() > 0 && (*(expected as i8*)) == 87) {   // 'W'
-                marker = "warning";
-            }
-            const want: string = fmt::format("%s[%s]", marker, expected);
-            mut passed: boolean = out.contains(want);
-            // When the file carries `//~` annotations, ALSO assert each one's
-            // message text and source line, and that every diagnostic anchored in
-            // the file is annotated (so an unexpected cascade fails).  Files with
-            // no annotations keep the code-presence-only behavior.
-            mut detail: string = "";
-            if (passed) {
-                const anns: NegExpect[] = Executor::parse_neg_expectations(content);
-                if (anns.length > 0) {
-                    detail = Executor::check_annotations(&anns, out, name);
-                    if (detail.length() > 0) { passed = false; }
-                }
-            }
-            if (passed) {
-                if (is_compact) {
-                    fmt::printf(".");
-                } else if (is_pretty) {
-                    Executor::neg_chip_pass(color_on);
-                    fmt::printf("\n");
+                const out_path: string = Executor::job_tmp_path(tmp, cmds.length as u64);
+                job_of.push(cmds.length as i64);
+                if (stdlib_abs.length() > 0) {
+                    cmds.push(fmt::format("%s check %s --stdlib=%s > %s 2>&1",
+                        self_exe, full, stdlib_abs, out_path));
                 } else {
-                    fmt::printf("ok\n");
+                    cmds.push(fmt::format("%s check %s > %s 2>&1", self_exe, full, out_path));
                 }
-            } else {
-                if (is_compact) {
-                    fmt::printf("F");
-                } else if (is_pretty) {
-                    Executor::neg_chip_fail(color_on);
-                    if (detail.length() > 0) { fmt::printf("  (%s)\n", detail); }
-                    else { fmt::printf("  (expected %s)\n", expected); }
-                } else {
-                    if (detail.length() > 0) { fmt::printf("FAILED (%s)\n", detail); }
-                    else { fmt::printf("FAILED (expected %s)\n", expected); }
-                }
-                failures += 1;
             }
-            ran += 1;
-            entry = libc::readdir(dp);
         }
         libc::closedir(dp);
-        dir::remove_file(path::Path::from(tmp));
+
+        const n_jobs: u64 = cmds.length as u64;
+        mut status: i32[] = [];
+        mut done: Atomic<u32>[] = [];
+        for (mut k: u64 = 0; k < n_jobs; k++) {
+            status.push(0);
+            done.push(Atomic::<u32>::new(0));
+        }
+        mut cursor: Atomic<u64> = Atomic::<u64>::new(0);
+        mut failures: i32 = 0;
+        mut ran: i32 = 0;
+        libc::fflush(null);
+        {
+            // Joined when this block ends, after the last verdict is read.
+            mut scope: thread::Scope = thread::Scope::new();
+            mut w: u32 = 0;
+            while (w < jobs && (w as u64) < n_jobs) {
+                scope.spawn::<ShellJobs>(ShellJobs {
+                    cursor: &cursor, cmds: cmds.as_ptr(), n: n_jobs,
+                    status: status.as_ptr(), done: done.as_ptr()
+                }, shell_jobs_worker);
+                w = w + 1;
+            }
+
+            for (mut i: i64 = 0; i < names.length as i64; i++) {
+                const name: string = names[i];
+                const content: string = contents[i];
+                const expected: string = expects[i];
+
+                // Per-test prefix: Plain emits `test (negative) NAME ... ` up
+                // front so a hang is visible; Pretty emits `  NAME ... ` with
+                // the same intent; Compact stays silent until the result lands.
+                if (is_pretty) {
+                    fmt::printf("  %s ... ", name);
+                } else if (!is_compact) {
+                    fmt::printf("test (negative) %s ... ", name);
+                }
+                libc::fflush(null);
+
+                if (expected.length() == 0) {
+                    if (is_compact) {
+                        fmt::printf("F");
+                    } else if (is_pretty) {
+                        Executor::neg_chip_fail(color_on);
+                        fmt::printf("  (no ![config(negative, <code>)] directive)\n");
+                    } else {
+                        fmt::printf("FAILED (no ![config(negative, <code>)] directive)\n");
+                    }
+                    failures += 1; ran += 1; continue;
+                }
+
+                const k: u64 = job_of[i] as u64;
+                Executor::wait_job(done.as_ptr(), k);
+                const out_path: string = Executor::job_tmp_path(tmp, k);
+                const out: string = Executor::read_file_or_empty(out_path);
+                dir::remove_file(path::Path::from(out_path));
+                // Warning codes (`W....`) render as `warning[Wxxxx]`; everything else
+                // as `error[Exxxx]`.  A warning-only file still exits 0, but the suite
+                // asserts on the rendered marker, not the exit status.
+                mut marker: string = "error";
+                if (expected.length() > 0 && (*(expected as i8*)) == 87) {   // 'W'
+                    marker = "warning";
+                }
+                const want: string = fmt::format("%s[%s]", marker, expected);
+                mut passed: boolean = out.contains(want);
+                // When the file carries `//~` annotations, ALSO assert each one's
+                // message text and source line, and that every diagnostic anchored in
+                // the file is annotated (so an unexpected cascade fails).  Files with
+                // no annotations keep the code-presence-only behavior.
+                mut detail: string = "";
+                if (passed) {
+                    const anns: NegExpect[] = Executor::parse_neg_expectations(content);
+                    if (anns.length > 0) {
+                        detail = Executor::check_annotations(&anns, out, name);
+                        if (detail.length() > 0) { passed = false; }
+                    }
+                }
+                if (passed) {
+                    if (is_compact) {
+                        fmt::printf(".");
+                    } else if (is_pretty) {
+                        Executor::neg_chip_pass(color_on);
+                        fmt::printf("\n");
+                    } else {
+                        fmt::printf("ok\n");
+                    }
+                } else {
+                    if (is_compact) {
+                        fmt::printf("F");
+                    } else if (is_pretty) {
+                        Executor::neg_chip_fail(color_on);
+                        if (detail.length() > 0) { fmt::printf("  (%s)\n", detail); }
+                        else { fmt::printf("  (expected %s)\n", expected); }
+                    } else {
+                        if (detail.length() > 0) { fmt::printf("FAILED (%s)\n", detail); }
+                        else { fmt::printf("FAILED (expected %s)\n", expected); }
+                    }
+                    failures += 1;
+                }
+                ran += 1;
+            }
+        }
 
         // Compact: close out the single in-flight line with the tally.
         if (is_compact && ran > 0) {
@@ -2273,7 +2400,8 @@ type struct Executor {
     /// `projects_dir` is a clean no-op (returns {0,0}).
     static run_projects_suite(self_exe: string, stdlib_abs: string,
                               projects_dir: string, pattern: string,
-                              fmt_choice: string, col_choice: string)
+                              fmt_choice: string, col_choice: string,
+                              jobs: u32)
             -> NegSuiteResult {
         // Pre-pass: count projects (subdirs with a readable test.json that
         // pass the filter) so an empty/absent dir prints no section at all.
@@ -2315,27 +2443,29 @@ type struct Executor {
             fmt::printf("projects                                          ");
         }
 
+        // Decide every project in directory order first: its test.json, its
+        // requirements, and - for the ones that run - its command.  Only the
+        // commands run on the worker pool; every verdict below is reported in
+        // this order, whatever order the children finish in.
+        //   verdict_of[i]: 0 run job_of[i], 1 malformed test.json, 2 ignored,
+        //                  3 unknown requirement, 4 unmet requirement,
+        //                  5 project directory missing
         const tmp: string = neg_tmp_path();
-        mut failures: i32 = 0;
-        mut ran: i32 = 0;
+        mut names:      string[]   = [];
+        mut verdict_of: i32[]      = [];
+        mut reason_of:  string[]   = [];
+        mut job_of:     i64[]      = [];
+        mut specs:      ProjSpec[] = [];
+        mut cmds:       string[]   = [];
         mut entry: void* = libc::readdir(dp);
         while (entry != null) {
-            const name: string = intrinsics::dirent_name(entry);
-            if (name == "." || name == "..") {
-                entry = libc::readdir(dp); continue;
-            }
-            if (pattern != "" && !name.contains(pattern)) {
-                entry = libc::readdir(dp); continue;
-            }
+            // Copied: the next `readdir` reuses the buffer the name points into.
+            const name: string = fmt::format("%s", intrinsics::dirent_name(entry));
+            entry = libc::readdir(dp);
+            if (name == "." || name == "..") { continue; }
+            if (pattern != "" && !name.contains(pattern)) { continue; }
             const tj: string = Executor::proj_marker_path(projects_dir, name);
-            if (!metadata::exists(path::Path::from(tj))) { entry = libc::readdir(dp); continue; }
-
-            if (is_pretty) {
-                fmt::printf("  %s ... ", name);
-            } else if (!is_compact) {
-                fmt::printf("test (project) %s ... ", name);
-            }
-            libc::fflush(null);
+            if (!metadata::exists(path::Path::from(tj))) { continue; }
 
             const content: string = Executor::read_file_or_empty(tj);
             mut spec: ProjSpec = ProjSpec {
@@ -2347,58 +2477,126 @@ type struct Executor {
                 Option::Some(s) => { spec = s; parsed_ok = true; }
                 Option::None    => { parsed_ok = false; }
             }
-            if (!parsed_ok) {
-                Executor::proj_report(is_pretty, is_compact, color_on, false,
-                    "malformed test.json");
-                failures += 1; ran += 1; entry = libc::readdir(dp); continue;
-            }
-            if (spec.ignore) {
-                if (is_compact) { fmt::printf("i"); }
-                else if (is_pretty) { fmt::printf("[IGNORED]\n"); }
-                else { fmt::printf("ignored\n"); }
-                entry = libc::readdir(dp); continue;
-            }
-
-            // A `requires` token the harness doesn't recognize is a hard
-            // FAILURE, not a skip: a typo'd requirement would otherwise
-            // silently change semantics from "gated" to "always-run".
-            const unknown_req: string = Executor::proj_first_unknown_requirement(&spec.requires);
-            if (unknown_req.length() > 0) {
-                Executor::proj_report(is_pretty, is_compact, color_on, false,
-                    fmt::format("unknown requires token \"%s\"", unknown_req));
-                failures += 1; ran += 1; entry = libc::readdir(dp); continue;
-            }
-
-            // Environment-gated skip: a project declaring `requires` runs only
-            // where every prerequisite holds (a display, a registered vendor
-            // lib, ...); elsewhere it is skipped WITH A REASON, never counted as
-            // a failure, so a portable `make test` stays green.
-            const unmet: string = Executor::proj_first_unmet_requirement(&spec.requires);
-            if (unmet.length() > 0) {
-                if (is_compact) { fmt::printf("s"); }
-                else if (is_pretty) { fmt::printf("[SKIPPED: requires %s]\n", unmet); }
-                else { fmt::printf("skipped (requires %s)\n", unmet); }
-                entry = libc::readdir(dp); continue;
-            }
-
+            mut verdict: i32 = 0;
+            mut reason: string = "";
             const proj_dir: string = fmt::format("%s/%s", projects_dir, name);
-            const res: ProjOutcome =
-                Executor::dispatch_project(self_exe, stdlib_abs, proj_dir, &spec, tmp);
-            Executor::proj_report(is_pretty, is_compact, color_on, res.passed, res.detail);
-            if (!res.passed) {
-                failures += 1;
-                // Surface the captured subprocess output on failure so the
-                // reason is visible (kept quiet on success).
-                if (!is_compact) {
-                    const out: string = Executor::read_file_or_empty(tmp);
-                    if (out.length() > 0) { fmt::printf("%s\n", out); }
+            if (!parsed_ok) {
+                verdict = 1;
+            } else if (spec.ignore) {
+                verdict = 2;
+            } else {
+                // A `requires` token the harness doesn't recognize is a hard
+                // FAILURE, not a skip: a typo'd requirement would otherwise
+                // silently change semantics from "gated" to "always-run".
+                const unknown_req: string = Executor::proj_first_unknown_requirement(&spec.requires);
+                // Environment-gated skip: a project declaring `requires` runs
+                // only where every prerequisite holds (a display, a registered
+                // vendor lib, ...); elsewhere it is skipped WITH A REASON, never
+                // counted as a failure, so a portable `make test` stays green.
+                if (unknown_req.length() > 0) {
+                    verdict = 3; reason = unknown_req;
+                } else {
+                    const unmet: string = Executor::proj_first_unmet_requirement(&spec.requires);
+                    if (unmet.length() > 0) {
+                        verdict = 4; reason = unmet;
+                    } else if (!metadata::exists(path::Path::from(proj_dir))) {
+                        verdict = 5; reason = proj_dir;
+                    }
                 }
             }
-            ran += 1;
-            entry = libc::readdir(dp);
+            names.push(name);
+            verdict_of.push(verdict);
+            reason_of.push(reason);
+            if (verdict == 0) {
+                const out_path: string = Executor::job_tmp_path(tmp, cmds.length as u64);
+                job_of.push(cmds.length as i64);
+                cmds.push(Executor::project_command(self_exe, stdlib_abs, proj_dir, &spec, out_path));
+            } else {
+                job_of.push(-1);
+            }
+            specs.push(spec);
         }
         libc::closedir(dp);
-        dir::remove_file(path::Path::from(tmp));
+
+        const n_jobs: u64 = cmds.length as u64;
+        mut status: i32[] = [];
+        mut done: Atomic<u32>[] = [];
+        for (mut k: u64 = 0; k < n_jobs; k++) {
+            status.push(0);
+            done.push(Atomic::<u32>::new(0));
+        }
+        mut cursor: Atomic<u64> = Atomic::<u64>::new(0);
+        mut failures: i32 = 0;
+        mut ran: i32 = 0;
+        libc::fflush(null);
+        {
+            // Joined when this block ends, after the last verdict is read.
+            mut scope: thread::Scope = thread::Scope::new();
+            mut w: u32 = 0;
+            while (w < jobs && (w as u64) < n_jobs) {
+                scope.spawn::<ShellJobs>(ShellJobs {
+                    cursor: &cursor, cmds: cmds.as_ptr(), n: n_jobs,
+                    status: status.as_ptr(), done: done.as_ptr()
+                }, shell_jobs_worker);
+                w = w + 1;
+            }
+
+            for (mut i: i64 = 0; i < names.length as i64; i++) {
+                const name: string = names[i];
+                if (is_pretty) {
+                    fmt::printf("  %s ... ", name);
+                } else if (!is_compact) {
+                    fmt::printf("test (project) %s ... ", name);
+                }
+                libc::fflush(null);
+
+                const verdict: i32 = verdict_of[i];
+                if (verdict == 1) {
+                    Executor::proj_report(is_pretty, is_compact, color_on, false,
+                        "malformed test.json");
+                    failures += 1; ran += 1; continue;
+                }
+                if (verdict == 2) {
+                    if (is_compact) { fmt::printf("i"); }
+                    else if (is_pretty) { fmt::printf("[IGNORED]\n"); }
+                    else { fmt::printf("ignored\n"); }
+                    continue;
+                }
+                if (verdict == 3) {
+                    Executor::proj_report(is_pretty, is_compact, color_on, false,
+                        fmt::format("unknown requires token \"%s\"", reason_of[i]));
+                    failures += 1; ran += 1; continue;
+                }
+                if (verdict == 4) {
+                    if (is_compact) { fmt::printf("s"); }
+                    else if (is_pretty) { fmt::printf("[SKIPPED: requires %s]\n", reason_of[i]); }
+                    else { fmt::printf("skipped (requires %s)\n", reason_of[i]); }
+                    continue;
+                }
+                if (verdict == 5) {
+                    Executor::proj_report(is_pretty, is_compact, color_on, false,
+                        fmt::format("cannot chdir to %s", reason_of[i]));
+                    failures += 1; ran += 1; continue;
+                }
+
+                const k: u64 = job_of[i] as u64;
+                Executor::wait_job(done.as_ptr(), k);
+                const out_path: string = Executor::job_tmp_path(tmp, k);
+                const res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path);
+                Executor::proj_report(is_pretty, is_compact, color_on, res.passed, res.detail);
+                if (!res.passed) {
+                    failures += 1;
+                    // Surface the captured subprocess output on failure so the
+                    // reason is visible (kept quiet on success).
+                    if (!is_compact) {
+                        const out: string = Executor::read_file_or_empty(out_path);
+                        if (out.length() > 0) { fmt::printf("%s\n", out); }
+                    }
+                }
+                dir::remove_file(path::Path::from(out_path));
+                ran += 1;
+            }
+        }
 
         if (is_compact && ran > 0) {
             fmt::printf("   %d ok", ran - failures);
@@ -2444,36 +2642,40 @@ type struct Executor {
         }
     }
 
-    /// Drive one project to its declared outcome by running this compiler in
-    /// the project directory (`chdir` in, run, `chdir` back). All paths handed
-    /// to the subprocess (`self_exe`, `stdlib_abs`, `tmp`) are absolute so the
-    /// changed cwd doesn't break them.
-    static dispatch_project(self_exe: string, stdlib_abs: string,
-                            proj_dir: string, spec: &ProjSpec, tmp: string)
-            -> ProjOutcome {
-        mut cwd_buf: i8[4096];
-        const got: i8* = libc::getcwd(&cwd_buf[0] as u8*, 4096) as i8*;
-        const saved_cwd: string = if (got != null) { fmt::format("%s", &cwd_buf[0] as string) } else { "." };
-        if (libc::chdir(proj_dir) != 0) {
-            return ProjOutcome { passed: false, detail: fmt::format("cannot chdir to %s", proj_dir) };
-        }
-
+    /// The shell command that drives one project to its declared outcome: this
+    /// compiler run in the project directory, its combined output captured in
+    /// `tmp`.  The directory is set inside the command's own shell, never by
+    /// `chdir`, because projects run concurrently and the process working
+    /// directory is shared.  All paths handed to the subprocess (`self_exe`,
+    /// `stdlib_abs`, `tmp`) are absolute so the changed cwd doesn't break them.
+    static project_command(self_exe: string, stdlib_abs: string,
+                           proj_dir: string, spec: &ProjSpec, tmp: string) -> string {
         mut std_flag: string = "";
         if (stdlib_abs.length() > 0) { std_flag = fmt::format(" --stdlib=%s", stdlib_abs); }
+        if (spec.outcome == 1 || spec.outcome == 2) {
+            // FIXTURE build (`cryo build`) or run (`cryo run`); both capture the
+            // combined stdout+stderr so the ASSERTIONS in `project_outcome`
+            // can scan it.
+            const verb: string = if (spec.outcome == 1) { "build" } else { "run" };
+            return shell_in_dir(proj_dir,
+                fmt::format("%s %s%s > %s 2>&1", self_exe, verb, std_flag, tmp));
+        }
+        // collect: run the project's own `cryo test`.
+        return shell_in_dir(proj_dir,
+            fmt::format("%s test --format=plain%s > %s 2>&1", self_exe, std_flag, tmp));
+    }
 
+    /// Judge one project from its command's exit status `st` and the output
+    /// captured in `tmp`.
+    static project_outcome(spec: &ProjSpec, st: i32, tmp: string) -> ProjOutcome {
         mut passed: boolean = false;
         mut detail: string = "";
 
         if (spec.outcome == 1 || spec.outcome == 2) {
-            // FIXTURE build (`cryo build`) or run (`cryo run`); both capture the
-            // combined stdout+stderr so the ASSERTIONS below can scan it.  The
-            // fixture and the checks are orthogonal: a failing build is just
-            // build + `fails`, a diagnostic is `fails` + an `output_contains`
-            // marker (both folded in at parse time).
+            // The fixture and the checks are orthogonal: a failing build is
+            // just build + `fails`, a diagnostic is `fails` + an
+            // `output_contains` marker (both folded in at parse time).
             const verb: string = if (spec.outcome == 1) { "build" } else { "run" };
-            const cmd: string = fmt::format("%s %s%s > %s 2>&1", self_exe, verb, std_flag, tmp);
-            libc::fflush(null);
-            const st: i32 = exec::shell(cmd);
             const ec: i64 = st as i64;
             const out: string = Executor::read_file_or_empty(tmp);
 
@@ -2508,9 +2710,6 @@ type struct Executor {
             // expect_* / Result propagation / runner exit codes that converts
             // failures into passes flips the canary's exit to 0 and fails the
             // canary project (and the suite) instead of shipping silently.
-            const cmd: string = fmt::format("%s test --format=plain%s > %s 2>&1", self_exe, std_flag, tmp);
-            libc::fflush(null);
-            const st: i32 = exec::shell(cmd);
             if (spec.fails) {
                 passed = st != 0;
                 if (!passed) { detail = "expected project tests to FAIL (exit non-zero)"; }
@@ -2519,8 +2718,6 @@ type struct Executor {
                 if (!passed) { detail = "project tests failed"; }
             }
         }
-
-        libc::chdir(saved_cwd);
         return ProjOutcome { passed: passed, detail: detail };
     }
 
