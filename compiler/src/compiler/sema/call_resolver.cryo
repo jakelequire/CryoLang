@@ -470,7 +470,7 @@ type struct CallResolver {
             // `where S: AsyncTransport` stays `Unclassified` and each consumer
             // guesses its own answer.
             return this.binding.param_types_through_param_bounds(
-                TypeRef::new(base_t.id, this.arena), member.member, arg_count);
+                base_t as GenericParamType*, member.member, arg_count);
         } else {
             return [];
         }
@@ -578,7 +578,7 @@ type struct CallResolver {
                 const gp: GenericParamType* = pt as GenericParamType*;
                 mut substituted: TypeRef = payload[i];
                 for (mut p: i64 = 0; p < entry.param_count; p++) {
-                    if (entry.param_names[p].equals(gp.param_name)) { substituted = type_args[p]; break; }
+                    if (gp.declared_by(entry.param_syms[p])) { substituted = type_args[p]; break; }
                 }
                 result.push(substituted);
             } else {
@@ -677,9 +677,9 @@ type struct CallResolver {
             const pt: Type* = this.arena.lookup(param_types[i].id);
             if (pt == null) { continue; }
             if (pt.kind != TypeKind::GenericParam) { continue; }
-            const pname: SymbolStr = (pt as GenericParamType*).param_name;
-            for (mut p: i64 = 0; p < tmpl.param_names.length; p++) {
-                if (!tmpl.param_names[p].equals(pname)) { continue; }
+            const gpt: GenericParamType* = pt as GenericParamType*;
+            for (mut p: i64 = 0; p < tmpl.param_syms.length; p++) {
+                if (!gpt.declared_by(tmpl.param_syms[p])) { continue; }
                 // Inside the owner's own template body the argument is still the
                 // symbolic parameter, which is not numeric - so the body's own
                 // literals keep defaulting, exactly as before.
@@ -4527,7 +4527,7 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < matched.func.generic_params.length; i++) {
             const gp: GenericParamNode* = matched.func.generic_params[i];
             if (gp == null) { return TypeRef::invalid(); }
-            const pref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
+            const pref: TypeRef = this.arena.create_generic_param(gp.sym_id, gp.name, i as u64);
             subst.add(pref.id, method_binds[i]);
         }
         mut ret: TypeRef = subst.apply(matched.func.resolved_return_type, this.arena);
@@ -4560,7 +4560,7 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < n; i++) {
             const gp: GenericParamNode* = func.generic_params[i];
             if (gp == null) { return empty; }
-            const pref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
+            const pref: TypeRef = this.arena.create_generic_param(gp.sym_id, gp.name, i as u64);
             pids.push(pref.id);
         }
         // Explicit turbofish on the member (`Wrap::make<i32>(..)`).
@@ -5143,8 +5143,8 @@ type struct CallResolver {
             const pt: Type* = this.arena.lookup(variant.payload_types[i].id);
             if (pt == null) { continue; }
             // Only the direct `T` payload shape (the position IS a bare param).
-            mut pname: SymbolStr = SymbolStr::empty();
-            if (pt.kind == TypeKind::GenericParam) { pname = (pt as GenericParamType*).param_name; }
+            mut gpt: GenericParamType* = null;
+            if (pt.kind == TypeKind::GenericParam) { gpt = pt as GenericParamType*; }
             else { continue; }
             const arg: ExpressionNode* = call.arguments[i];
             if (arg == null || !arg.has_resolved_type()) { continue; }
@@ -5158,7 +5158,7 @@ type struct CallResolver {
             // where the enclosing template's specialization binds them later.
             if (!this.types.arg_type_is_concrete(arg_ty)) { continue; }
             for (mut p: i64 = 0; p < tmpl.param_count; p++) {
-                if (tmpl.param_names[p].equals(pname)) { bindings[p] = arg_ty; break; }
+                if (gpt.declared_by(tmpl.param_syms[p])) { bindings[p] = arg_ty; break; }
             }
         }
 

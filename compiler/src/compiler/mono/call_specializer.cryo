@@ -953,11 +953,13 @@ type struct MonoCallSpecializer {
         if (n_method_params == 0) { return; }
         mut bindings: TypeRef[] = [];
         mut method_param_names: SymbolStr[] = [];
+        mut method_param_syms: SymbolID[] = [];
         for (mut i: i64 = 0; i < n_method_params; i++) {
             const gp: GenericParamNode* = orig_func.generic_params[i];
             if (gp == null) { return; }
             bindings.push(TypeRef::invalid());
             method_param_names.push(gp.name);
+            method_param_syms.push(gp.sym_id);
         }
 
         // Method-level bindings come SOLELY from sema's stash (declaration order).
@@ -1183,7 +1185,7 @@ type struct MonoCallSpecializer {
             // Same 0-based method-position index the substituter + resolve_func_and_body
             // path use (see ~line 1400).
             for (mut mbi: i64 = 0; mbi < method_param_names.length && mbi < bindings.length; mbi++) {
-                const mpref: TypeRef = this.arena.create_generic_param(method_param_names[mbi], mbi as u64);
+                const mpref: TypeRef = this.arena.create_generic_param(method_param_syms[mbi], method_param_names[mbi], mbi as u64);
                 owner_subst.add(mpref.id, bindings[mbi]);
             }
             if (owner_subst.is_empty()) {
@@ -1693,7 +1695,7 @@ type struct MonoCallSpecializer {
             if (gp == null) { continue; }
             const arg_i: TypeRef = this.arena.inst_type_arg_at(owner_src, i);
             if (this.arena.contains_generic_param(arg_i)) { continue; }
-            const pref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
+            const pref: TypeRef = this.arena.create_generic_param(gp.sym_id, gp.name, i as u64);
             subst.add(pref.id, arg_i);
         }
     }
@@ -1948,7 +1950,7 @@ type struct MonoCallSpecializer {
 
         mut param_ids: u64[] = [];
         for (mut i: i64 = 0; i < param_names.length; i++) {
-            const gp_ref: TypeRef = this.arena.create_generic_param(param_names[i], i as u64);
+            const gp_ref: TypeRef = this.arena.create_generic_param(param_syms[i], param_names[i], i as u64);
             param_ids.push(gp_ref.id);
         }
         mut subst_val: TypeSubstitution = TypeSubstitution::from_params(param_ids, args);
@@ -1968,7 +1970,7 @@ type struct MonoCallSpecializer {
             for (mut di: i64 = 0; di < owner_impl.derived_param_names.length; di++) {
                 if (!owner_impl.derived_param_types[di].is_valid()) { continue; }
                 const dp_ref: TypeRef = this.arena.create_generic_param(
-                    owner_impl.derived_param_names[di], di as u64);
+                    owner_impl.derived_param_syms[di], owner_impl.derived_param_names[di], di as u64);
                 subst_val.add(dp_ref.id, owner_impl.derived_param_types[di]);
             }
             // The impl's target is written in the impl's OWN parameter names
@@ -1984,7 +1986,9 @@ type struct MonoCallSpecializer {
                         TypeAnnotation::Named(n) => {
                             const arg_t: TypeRef = this.arena.inst_type_arg_at(owner_type, ti);
                             if (!arg_t.is_valid() || this.arena.contains_generic_param(arg_t)) { continue; }
-                            const tp_ref: TypeRef = this.arena.create_generic_param(n.name, ti as u64);
+                            // A concrete argument written in the head is no parameter.
+                            if (!n.param_sym().is_valid()) { continue; }
+                            const tp_ref: TypeRef = this.arena.create_generic_param(n.param_sym(), n.name, ti as u64);
                             subst_val.add(tp_ref.id, arg_t);
                         }
                         _ => {}

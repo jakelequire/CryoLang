@@ -125,34 +125,12 @@ type struct MethodBinding {
         }
         if (!recv.is_valid()) { return ty; }
         const this_name: SymbolStr = this.intern.intern("This");
-        const this_ph: TypeRef = this.arena.create_generic_param(this_name, 0xFFFFFFFF as u64);
+        const this_ph: TypeRef = this.arena.this_placeholder(this_name);
         mut subst: TypeSubstitution = TypeSubstitution::empty();
         subst.add(this_ph.id, recv);
         const out: TypeRef = subst.apply(ty, this.arena);
         if (!out.is_valid()) { return ty; }
         return out;
-    }
-
-    /// `ty` as the enclosing implement block reads it.  A generic impl's
-    /// body is walked with `this` typed as the template, so a type computed
-    /// from a field names the owner's parameters (`BufStream`'s `S`), while
-    /// the impl's bounds - its own and its methods' - are written on the
-    /// impl's parameters; the owner's parameter at each position is read as
-    /// the one the head writes there.  Unchanged outside an impl.
-    through_impl_head(mut &this, ty: TypeRef) -> TypeRef {
-        const impl_node: ImplBlockNode* = this.state.symbolic_impl_node;
-        if (impl_node == null) { return ty; }
-        return this.trait_checker().owner_type_through_head(impl_node, ty);
-    }
-
-    /// The spelling of the generic parameter `ty` names, read through the
-    /// enclosing impl's head (`through_impl_head`); empty when `ty` is not a
-    /// parameter.
-    param_name_through_impl_head(mut &this, ty: TypeRef) -> SymbolStr {
-        const seen: TypeRef = this.through_impl_head(ty);
-        const t: Type* = this.arena.lookup(seen.id);
-        if (t == null || t.kind != TypeKind::GenericParam) { return SymbolStr::empty(); }
-        return (t as GenericParamType*).param_name;
     }
 
     /// Mono-after-sema: resolve a method's return type when the receiver is an
@@ -233,10 +211,9 @@ type struct MethodBinding {
     subst_this_in_trait_return(mut &this, ret: TypeRef, recv: TypeRef) -> TypeRef {
         if (!ret.is_valid() || !recv.is_valid()) { return ret; }
         if (!this.arena.contains_generic_param(ret)) { return ret; }
-        // Same (name, sentinel index) pair `resolve_trait_method_signatures`
-        // interns; `create_generic_param` dedups, so this finds that entry.
-        const this_ty: TypeRef = this.arena.create_generic_param(
-            this.intern.intern("This"), 0xFFFFFFFF as u64);
+        // The one `This` placeholder `resolve_trait_method_signatures`
+        // resolved the trait's signatures against.
+        const this_ty: TypeRef = this.arena.this_placeholder(this.intern.intern("This"));
         if (!this_ty.is_valid() || this_ty.equals(recv)) { return ret; }
         mut ids: u64[] = [this_ty.id];
         mut binds: TypeRef[] = [recv];
@@ -304,7 +281,8 @@ type struct MethodBinding {
                 t as AssocProjectionType*, walk, method_name);
         }
         if (t.kind == TypeKind::GenericParam) {
-            return this.lookup_method_through_param_bounds(walk, walk, method_name);
+            return this.lookup_method_through_param_bounds(
+                t as GenericParamType*, walk, method_name);
         }
         // A generic owner instantiated at a still-abstract argument (`H<S>` built
         // inside a generic function) is "unresolved" only in its ARGUMENTS: the
@@ -326,10 +304,9 @@ type struct MethodBinding {
     /// A parameter's bounds live on the enclosing function/impl node, not on
     /// its type, so they are read there. The bare-parameter sibling of
     /// `lookup_method_through_projection_bounds`.
-    lookup_method_through_param_bounds(mut &this, param_ty: TypeRef, recv: TypeRef,
+    lookup_method_through_param_bounds(mut &this, param: GenericParamType*, recv: TypeRef,
                                        method_name: SymbolStr) -> TypeRef {
-        const param: SymbolStr = this.param_name_through_impl_head(param_ty);
-        if (!param.is_valid()) { return TypeRef::invalid(); }
+        if (param == null) { return TypeRef::invalid(); }
         if (this.state.symbolic_current_func != null) {
             const r: TypeRef = this.scan_param_bounds(
                 &this.state.symbolic_current_func.trait_bounds, param, method_name, recv);
@@ -347,12 +324,12 @@ type struct MethodBinding {
     /// bound trait's method return with the bound's associated-type args
     /// substituted and `This` rebased onto `recv`. The bare-subject sibling of
     /// `scan_projection_bounds`.
-    scan_param_bounds(mut &this, bounds: &TraitBound[], param: SymbolStr,
+    scan_param_bounds(mut &this, bounds: &TraitBound[], param: GenericParamType*,
                       method_name: SymbolStr, recv: TypeRef) -> TypeRef {
         for (mut bi: i64 = 0; bi < bounds.length; bi++) {
             const b: TraitBound* = &bounds[bi];
             if (b.has_projection_subject()) { continue; }
-            if (!b.type_parameter.equals(param)) { continue; }
+            if (!param.declared_by(b.subject_sym)) { continue; }
             for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
                 const tr: TraitRef* = &b.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
@@ -386,10 +363,9 @@ type struct MethodBinding {
     /// A parameter constrained by a WHERE clause rather than inline stays a
     /// plain `GenericParam` whose bounds live on the enclosing function/impl
     /// node, so the receiver's own type cannot answer this.
-    param_types_through_param_bounds(mut &this, param_ty: TypeRef, method_name: SymbolStr,
+    param_types_through_param_bounds(mut &this, param: GenericParamType*, method_name: SymbolStr,
                                      arg_count: i64) -> TypeRef[] {
-        const param: SymbolStr = this.param_name_through_impl_head(param_ty);
-        if (!param.is_valid()) { return []; }
+        if (param == null) { return []; }
         if (this.state.symbolic_current_func != null) {
             const r: TypeRef[] = this.scan_param_bound_param_types(
                 &this.state.symbolic_current_func.trait_bounds, param, method_name, arg_count);
@@ -406,12 +382,12 @@ type struct MethodBinding {
     /// Search `bounds` for a BARE-parameter bound on `param` and return the
     /// first bound trait's declaration of `method_name` taking `arg_count`
     /// arguments. The parameter-list sibling of `scan_param_bounds`.
-    scan_param_bound_param_types(mut &this, bounds: &TraitBound[], param: SymbolStr,
+    scan_param_bound_param_types(mut &this, bounds: &TraitBound[], param: GenericParamType*,
                                  method_name: SymbolStr, arg_count: i64) -> TypeRef[] {
         for (mut bi: i64 = 0; bi < bounds.length; bi++) {
             const b: TraitBound* = &bounds[bi];
             if (b.has_projection_subject()) { continue; }
-            if (!b.type_parameter.equals(param)) { continue; }
+            if (!param.declared_by(b.subject_sym)) { continue; }
             for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
                 const tr: TraitRef* = &b.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
@@ -1072,14 +1048,13 @@ type struct MethodBinding {
         if (t == null) { return rc; }
 
         if (t.kind != TypeKind::GenericParam) { return rc; }
-        const pname: SymbolStr = (t as GenericParamType*).param_name;
-        if (!pname.is_valid()) { return rc; }
+        const gpt: GenericParamType* = t as GenericParamType*;
 
         mut bound_leaves: DefId[] = [];
         if (this.state.symbolic_impl_node != null) {
             for (mut bi: i64 = 0; bi < this.state.symbolic_impl_node.where_bounds.length; bi++) {
                 const bound: TraitBound* = &this.state.symbolic_impl_node.where_bounds[bi];
-                if (!bound.type_parameter.equals(pname)) { continue; }
+                if (!gpt.declared_by(bound.subject_sym)) { continue; }
                 for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                     const tr: TraitRef* = &bound.trait_refs[ti];
                     if (tr.path.length == 0) { continue; }
@@ -1090,7 +1065,7 @@ type struct MethodBinding {
         if (this.state.symbolic_current_func != null) {
             for (mut wi: i64 = 0; wi < this.state.symbolic_current_func.trait_bounds.length; wi++) {
                 const wb: TraitBound* = &this.state.symbolic_current_func.trait_bounds[wi];
-                if (!wb.type_parameter.equals(pname)) { continue; }
+                if (!gpt.declared_by(wb.subject_sym)) { continue; }
                 for (mut ti: i64 = 0; ti < wb.trait_refs.length; ti++) {
                     const tr: TraitRef* = &wb.trait_refs[ti];
                     if (tr.path.length == 0) { continue; }
@@ -1450,7 +1425,7 @@ type struct MethodBinding {
             for (mut i: i64 = 0; i < n_method_params; i++) {
                 const gp: GenericParamNode* = orig_func.generic_params[i];
                 if (gp == null) { return []; }
-                const gp_ref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
+                const gp_ref: TypeRef = this.arena.create_generic_param(gp.sym_id, gp.name, i as u64);
                 infer_ctx.add_binding(gp.sym_id, gp.name, gp_ref);
                 method_param_ids.push(gp_ref.id);
             }
@@ -1612,8 +1587,7 @@ type struct MethodBinding {
         if (impl_node.where_bounds.length == 0) { return; }
         for (mut bi: i64 = 0; bi < impl_node.where_bounds.length; bi++) {
             const bound: TraitBound* = &impl_node.where_bounds[bi];
-            const subject: TypeRef = this.trait_checker().lookup_subst_for_param(
-                bound.type_parameter, subst);
+            const subject: TypeRef = this.trait_checker().lookup_subst_for_param(bound.subject_sym, subst);
             if (!subject.is_valid()) { continue; }
             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                 const tr: TraitRef* = &bound.trait_refs[ti];
@@ -1636,7 +1610,7 @@ type struct MethodBinding {
         if (ta == null || !concrete.is_valid()) { return; }
         match (*ta) {
             TypeAnnotation::Named(n) => {
-                if (this.trait_checker().lookup_subst_for_param(n.name, subst).is_invalid()
+                if (this.trait_checker().lookup_subst_for_param(n.param_sym(), subst).is_invalid()
                         && res_ctx.lookup_binding(n.param_sym()).is_invalid()) {
                     res_ctx.add_binding(n.param_sym(), n.name, concrete);
                 }
@@ -1801,7 +1775,9 @@ type struct MethodBinding {
                 match (*ta) {
                     TypeAnnotation::Named(n) => {
                         rc.add_binding(n.param_sym(), n.name, this.arena.inst_type_arg_at(subject_ref, i));
-                        const gp_ref: TypeRef = this.arena.create_generic_param(n.name, i as u64);
+                        // A concrete argument written in the head is no parameter.
+                        if (!n.param_sym().is_valid()) { continue; }
+                        const gp_ref: TypeRef = this.arena.create_generic_param(n.param_sym(), n.name, i as u64);
                         subst.add(gp_ref.id, this.arena.inst_type_arg_at(subject_ref, i));
                     }
                     _ => {}

@@ -126,10 +126,6 @@ CLASS_OF_METHOD = {
         ("J", "member: the impl's own method by its leaf off the impl node in hand, scanned inline"),
     "ImplBlockNode::generic_params[]":
         ("J", "member: the impl's own generic parameter by its leaf off the impl node in hand, scanned inline"),
-    "ImplBlockNode::where_bounds[]":
-        ("S", "the impl's `where` bound by the bounded parameter's leaf, the leaf read off the arena's `GenericParamType.param_name` - the type layer's only identity for a parameter until the arena is keyed by symbol"),
-    "FunctionDeclNode::trait_bounds[]":
-        ("S", "the function's `where` bound by the bounded parameter's leaf, read off the arena's `GenericParamType.param_name` (see `ImplBlockNode::where_bounds[]`)"),
     "StructDeclNode::fields[]":
         ("J", "member: a struct declaration's field by its leaf off the node in hand, scanned inline"),
     "StructDeclNode::methods[]":
@@ -144,10 +140,6 @@ CLASS_OF_METHOD = {
         ("J", "member: a class declaration's method by its leaf off the node in hand, scanned inline"),
     "ExternBlockNode::functions[]":
         ("J", "member: an extern block's function by its leaf off the block in hand, scanned inline"),
-    "SemaState::symbolic_owner_param_nodes[]":
-        ("S", "the owner's generic parameters under symbolic check, asked whether a parameter TYPE's spelling is one of them - the arena's `GenericParamType` carries a name and no symbol"),
-    "SemaState::symbolic_method_param_nodes[]":
-        ("S", "the method's generic parameters under symbolic check, asked whether a parameter TYPE's spelling is one of them (see the owner's)"),
     "GenericRegistry::entries[]":
         ("B", "the registry's template rows by name and module, scanned in the registry's own file only"),
     "ModuleGraph::modules[]":
@@ -168,8 +160,6 @@ CLASS_OF_METHOD = {
         ("J", "member: the impl's own `This::Member` binding by the member's leaf (the door's body; own file only)"),
     "LambdaExprNode::captured_names[]":
         ("J", "member: the lambda's captured names, asked whether one is captured (own file only)"),
-    "TemplateEntry::param_names[]":
-        ("S", "the template's parameter DISPLAYS compared by spelling with a parameter type's name - the compares the arena keyed by symbol retires"),
     # -- local tables: the owner out of view, the element says what it is --
     "local::MethodNode[]":
         ("J", "member: an impl's or a declaration's methods held in a local, by leaf"),
@@ -186,8 +176,6 @@ CLASS_OF_METHOD = {
     # while a site ruled outside D32 is governed by nothing.
     "local::GenericParamNode[]":
         ("J", "member: a declaration's own written generic parameters, scanned for a repeated spelling as the parser builds the list. The question IS about spellings - two parameters written `<T, T>` are a redeclaration - and at parse time there is no identity to ask instead: the resolver stamps a `SymbolID` on each parameter only after the list exists. Rust refuses the same shape the same way, by comparing idents in the parameter list"),
-    "local::TraitBound[]":
-        ("S", "`where` bounds held in a local, by the bounded parameter's leaf read off the arena's `GenericParamType.param_name`"),
     "local::VTableSlot[]":
         ("J", "member: a class's vtable slots held in a local, by the method's leaf (the override walk)"),
     # -- the declaration index --

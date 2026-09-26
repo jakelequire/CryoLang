@@ -31,6 +31,7 @@ import std::fmt;
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::res::{ DefId };
 import compiler::types::compound::{
     ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
@@ -155,12 +156,10 @@ type struct TypeArena {
     // -- Function template placeholder cache (SymbolStr.id -> TypeRef) --
     func_template_cache: HashMap<u32, TypeRef>;
 
-    // -- Generic parameter dedup cache (key: (name.id << 32) | index -> TypeRef) --
-    // Integer key is a perf choice (no format()/string-hash per lookup), NOT a
-    // correctness one: `HashMap<string, V>` deduplicates by CONTENT today (see
-    // `Hash`/`Eq for string`; verified empirically).  An older comment claiming
-    // raw `string` equality is pointer-compare was stale (pre-`Eq for string`).
+    // -- Generic parameter cache (key: the declaration's SymbolID -> TypeRef) --
     generic_param_cache:   HashMap<u64, TypeRef>;
+    // The one `This` placeholder (`this_placeholder`).
+    this_param:            TypeRef;
 
     /// Create a new TypeArena and initialize all 20 primitive singletons.
     static new(intern_table: InternTable*) -> TypeArena {
@@ -204,6 +203,7 @@ type struct TypeArena {
             alias_cache:         HashMap::<u32, TypeRef>::new(),
             func_template_cache: HashMap::<u32, TypeRef>::new(),
             generic_param_cache: HashMap::<u64, TypeRef>::new(),
+            this_param:          TypeRef::invalid(),
         };
 
         arena.init_primitives();
@@ -628,43 +628,38 @@ type struct TypeArena {
     }
 
 
-    // Generic type factories (deduplicated by name + index)
+    // Generic type factories
 
-    /// Get or create a generic parameter type, deduplicated by NAME so a given
-    /// logical param (e.g. `T`) is ONE canonical TypeID no matter which sema
-    /// entry point mints it.  Several paths assign a different positional
-    /// `index` to the same param (most visibly a generic enum's method resolving
-    /// the enclosing `T` through a fresh scope), which under an (name, index) key
-    /// produced distinct TypeIDs.  That mattered because substitution keys by
-    /// param TypeID (`TypeSubstitution::from_params`): a divergent-index copy was
-    /// absent from the map and stayed abstract, forcing the checker's name-only
-    /// structural fallback and the canonicalization mechanisms downstream.  Keying
-    /// by name collapses them and matches that long-standing name-only equality.
-    /// `param_index` is still stored (first creation wins) but only feeds
-    /// `display_name` (`T%lu`); the mangler encodes GenericParam by `param_name`
-    /// alone, so first-index-wins is display-only and never perturbs emitted
-    /// symbols.
-    ///
-    /// LOAD-BEARING ASSUMPTION: GenericParam ids are canonical PER NAME, not per
-    /// BINDER.  Two params that share a name are one id even if they belong to
-    /// different templates.  That is sound only because a name can never be
-    /// bound twice along one substitution path: names are unique within a
-    /// template, and Cryo has no construct that nests one binder inside another
-    /// while allowing the inner to shadow the outer's name.  Adding
-    /// higher-ranked types, or any nested binder with shadowing names, would
-    /// break this - the inner and outer `T` would collide on one id and one
-    /// substitution would silently capture the other.  Such a feature must
-    /// re-key these leaves by binder identity (NOT by `index`; re-adding
-    /// `index`/`bounds` to this key reintroduces the divergence above).
-    create_generic_param(mut &this, name: SymbolStr, index: u64) -> TypeRef {
-        const key: u64 = name.id as u64;
+    /// The type of the generic parameter whose declaration bound `sym`: one
+    /// type per declaration, so two parameters spelled alike - a method's `J`
+    /// and the `J` of the impl its body was copied under, the `T` of `Option`
+    /// and the `T` of `Array` - are two types, and a substitution binding one
+    /// cannot answer for the other.  Every path that makes a parameter's type
+    /// (registration, signature resolution, the monomorphizer's re-walks)
+    /// hands over the same declaration's symbol, so they agree on one type
+    /// whatever position each assigns; `param_index` is the first creation's
+    /// and feeds only `display_name`.  A parameter with no symbol names no
+    /// declaration and is given no type.
+    create_generic_param(mut &this, sym: SymbolID, name: SymbolStr, index: u64) -> TypeRef {
+        if (!sym.is_valid()) { return TypeRef::invalid(); }
+        const key: u64 = sym.id;
 
         const cached: Option<TypeRef> = this.generic_param_cache.get(&key);
         if (cached.is_some()) { return cached.unwrap(); }
 
-        mut ref: TypeRef = this.alloc_type(new GenericParamType(this.next_id, name, index));
+        mut ref: TypeRef = this.alloc_type(new GenericParamType(this.next_id, sym, name, index));
         this.generic_param_cache.insert(key, ref);
         return ref;
+    }
+
+    /// The `This` placeholder a trait's signatures are resolved against before
+    /// any implementing type is known.  Not a declared parameter - no
+    /// declaration binds it - so it has no symbol, and it is one type per
+    /// program.
+    this_placeholder(mut &this, name: SymbolStr) -> TypeRef {
+        if (this.this_param.is_valid()) { return this.this_param; }
+        this.this_param = this.alloc_type(new GenericParamType(this.next_id, SymbolID::invalid(), name, 0xFFFFFFFF as u64));
+        return this.this_param;
     }
 
     /// Get or create a symbolic associated-type projection `Base::Member`.

@@ -34,10 +34,11 @@ import compiler::diag::sink::{ DiagnosticSink };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res::{ DefId };
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ PointerType };
 import compiler::types::generic::{ GenericParamType };
-import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+import compiler::types::generic_registry::{ GenericRegistry };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::ownership::{ OwnershipQuery };
@@ -300,58 +301,12 @@ type struct TraitChecker {
         match (*ta) {
             TypeAnnotation::Named(n) => {
                 if (n.param_sym().is_valid()) {
-                    return this.arena.create_generic_param(n.name, index as u64);
+                    return this.arena.create_generic_param(n.param_sym(), n.name, index as u64);
                 }
             }
             _ => {}
         }
         return TypeRef::invalid();
-    }
-
-    /// The inverse of `add_head_param_bindings` over the owner's own
-    /// parameters: the owner's parameter at each position (`owner_params`,
-    /// the template's parameter types in declaration order) read as the
-    /// impl's parameter the head writes there.  A generic impl's body is
-    /// walked with `this` typed as the template, so a type computed from a
-    /// field names the owner's parameters while the impl's bounds name its
-    /// own; this is the substitution between them.  A position is skipped
-    /// where the owner's parameter type is also the head's parameter at
-    /// another position (`.. for Pair<B, A>` over `Pair<A, B>`): while two
-    /// parameters spelled alike are one type, a type there cannot say which
-    /// of the two it means.
-    add_owner_to_head_bindings(&this, impl_block: ImplBlockNode*, owner_params: &u64[],
-                               subst: TypeSubstitution*) -> void {
-        if (impl_block == null || subst == null) { return; }
-        if (impl_block.target_args.length != owner_params.length) { return; }
-        for (mut gi: i64 = 0; gi < owner_params.length; gi++) {
-            const head_t: TypeRef = this.head_param_type(impl_block, gi);
-            if (!head_t.is_valid() || head_t.id == owner_params[gi]) { continue; }
-            mut crossed: boolean = false;
-            for (mut gj: i64 = 0; gj < owner_params.length; gj++) {
-                if (gj == gi) { continue; }
-                const other: TypeRef = this.head_param_type(impl_block, gj);
-                if (other.is_valid() && other.id == owner_params[gi]) { crossed = true; break; }
-            }
-            if (crossed) { continue; }
-            subst.add(owner_params[gi], head_t);
-        }
-    }
-
-    /// `ty`, computed in the body of `impl_block`, with the owner's
-    /// parameters read as the impl's (`add_owner_to_head_bindings`).  The
-    /// owner is the template the head's stamp names.  Unchanged when `ty`
-    /// mentions no parameter or the head names no template.
-    owner_type_through_head(&this, impl_block: ImplBlockNode*, ty: TypeRef) -> TypeRef {
-        if (impl_block == null || !ty.is_valid() || this.generic_registry == null) { return ty; }
-        if (!this.arena.contains_generic_param(ty)) { return ty; }
-        const tmpl: TemplateEntry* = this.generic_registry.template_of(impl_block.target_def());
-        if (tmpl == null) { return ty; }
-        mut subst: TypeSubstitution = TypeSubstitution::empty();
-        this.add_owner_to_head_bindings(impl_block, &tmpl.param_type_ids, &subst);
-        if (subst.param_ids.length == 0) { return ty; }
-        const out: TypeRef = subst.apply(ty, this.arena);
-        if (!out.is_valid()) { return ty; }
-        return out;
     }
 
     /// Lenient "does `ty` implement `trait_name`" check for verifying an
@@ -416,7 +371,7 @@ type struct TraitChecker {
             // the whole spec. (Crisp projection-level filtering is a future
             // refinement - see plan risk #1.)
             if (bound.has_projection_subject()) { continue; }
-            const concrete: TypeRef = this.lookup_subst_for_param(bound.type_parameter, subst);
+            const concrete: TypeRef = this.lookup_subst_for_param(bound.subject_sym, subst);
             if (!concrete.is_valid()) {
                 // No substitution for this param; the bound names a
                 // generic the caller didn't supply.  This is normal for
@@ -452,7 +407,7 @@ type struct TraitChecker {
         for (mut bi: i64 = 0; bi < bounds.length; bi++) {
             const bound: TraitBound* = &bounds[bi];
             if (bound.has_projection_subject()) { continue; }
-            const concrete: TypeRef = this.lookup_subst_for_param(bound.type_parameter, subst);
+            const concrete: TypeRef = this.lookup_subst_for_param(bound.subject_sym, subst);
             if (!concrete.is_valid()) { continue; }
             if (this.arena.contains_generic_param(concrete)) { continue; }
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
@@ -479,7 +434,7 @@ type struct TraitChecker {
             // method body, not filterable by param substitution here. Treat as
             // satisfied rather than failing the spec (matching `bounds_satisfied`).
             if (bound.has_projection_subject()) { continue; }
-            const concrete: TypeRef = this.lookup_subst_for_param(bound.type_parameter, subst);
+            const concrete: TypeRef = this.lookup_subst_for_param(bound.subject_sym, subst);
             if (!concrete.is_valid()) { return false; }
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
                 const tref: TraitRef* = &bound.trait_refs[ri];
@@ -503,16 +458,14 @@ type struct TraitChecker {
         return this.bounds_satisfied(func.trait_bounds, subst);
     }
 
-    /// Find the substituted concrete TypeRef for a generic param by name.
-    lookup_subst_for_param(&this, name: SymbolStr, subst: TypeSubstitution*) -> TypeRef {
+    /// The replacement `subst` holds for the generic parameter whose
+    /// declaration bound `sym`.
+    lookup_subst_for_param(&this, sym: SymbolID, subst: TypeSubstitution*) -> TypeRef {
         if (subst == null) { return TypeRef::invalid(); }
         for (mut i: i64 = 0; i < subst.param_ids.length; i++) {
             const pt: Type* = this.arena.lookup(subst.param_ids[i]);
-            if (pt == null) { continue; }
-            if (pt.kind == TypeKind::GenericParam) {
-                const gp: GenericParamType* = pt as GenericParamType*;
-                if (gp.param_name.equals(name)) { return subst.replacements[i]; }
-            }
+            if (pt == null || pt.kind != TypeKind::GenericParam) { continue; }
+            if ((pt as GenericParamType*).declared_by(sym)) { return subst.replacements[i]; }
         }
         return TypeRef::invalid();
     }

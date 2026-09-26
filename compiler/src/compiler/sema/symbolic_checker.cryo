@@ -112,25 +112,6 @@ type struct SymbolicChecker {
         };
     }
 
-    /// True when a parameter TYPE's spelling is one of the parameters in
-    /// scope for the body under symbolic check.  By spelling because the
-    /// arena's `GenericParamType` carries a name and an index and no
-    /// symbol - the type layer's own identity for a parameter
-    /// is its spelling until the arena is keyed by symbol.  Only meaningful
-    /// while `state.in_symbolic_check`.
-    symbolic_name_is_generic_param(&this, sym: SymbolStr) -> boolean {
-        if (!this.state.in_symbolic_check) { return false; }
-        for (mut i: i64 = 0; i < this.state.symbolic_owner_param_nodes.length; i++) {
-            const p: GenericParamNode* = this.state.symbolic_owner_param_nodes[i];
-            if (p != null && p.name.equals(sym)) { return true; }
-        }
-        for (mut j: i64 = 0; j < this.state.symbolic_method_param_nodes.length; j++) {
-            const p: GenericParamNode* = this.state.symbolic_method_param_nodes[j];
-            if (p != null && p.name.equals(sym)) { return true; }
-        }
-        return false;
-    }
-
     /// Prime a fresh `ResolutionContext` for abstract resolution: bind every
     /// in-scope generic param (owner params first, then the method's own) to its
     /// abstract ref and switch to demand-free mode.  No-op outside a symbolic walk.
@@ -153,7 +134,7 @@ type struct SymbolicChecker {
     /// is written in a `where` clause on the enclosing declaration, and the
     /// symbolic walk reads it from there rather than from the param.
     symbolic_param_ref(&this, p: GenericParamNode*, index: u64) -> TypeRef {
-        return this.arena.create_generic_param(p.name, index);
+        return this.arena.create_generic_param(p.sym_id, p.name, index);
     }
 
     /// The true type of `this` during a generic-owner symbolic walk: the owner's
@@ -381,10 +362,10 @@ type struct SymbolicChecker {
     /// A parameter of ANOTHER template reaches a body only by leaking out of
     /// an answer that was never substituted (`this.buffer.ptr()` typed as the
     /// buffer template's `T*` rather than `u8*`), and a substitution for this
-    /// body has no entry for it.  Parameters are canonical by NAME, so the
-    /// test is by name; a foreign parameter spelled like one in scope is
-    /// indistinguishable here, as it is to every other reader of a symbolic
-    /// type.  An associated projection over an in-scope parameter passes:
+    /// body has no entry for it.  A parameter type carries the symbol of the
+    /// declaration that bound it, so a foreign parameter spelled like one in
+    /// scope is told apart here.  An associated projection over an in-scope
+    /// parameter passes:
     /// the walk reduces it once its base is concrete.
     ///
     /// A trait's default body is walked with `This` as its receiver type, a
@@ -397,7 +378,7 @@ type struct SymbolicChecker {
         if (t == null) { return false; }
         if (t.kind == TypeKind::GenericParam) {
             if (this.state.this_type.is_valid() && this.state.this_type.id == ty.id) { return true; }
-            return this.symbolic_name_is_generic_param((t as GenericParamType*).param_name);
+            return this.symbolic_param_in_scope((t as GenericParamType*).param_sym);
         }
         if (t.kind == TypeKind::AssocProjection) {
             return this.symbolic_type_concretizable((t as AssocProjectionType*).base);

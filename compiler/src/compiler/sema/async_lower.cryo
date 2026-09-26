@@ -657,18 +657,16 @@ type struct AsyncLower {
         return new TypeAnnotation::Named(n);
     }
 
-    /// The parameter among `params` whose arena type spells `name`, or null.
+    /// The parameter among `params` whose declaration bound `sym`, or null.
     ///
     /// The lowering rebuilds a frame field's type from the ARENA, whose
-    /// parameter types carry a spelling and no symbol; the declaration
-    /// being lowered is the scope that spelling was resolved in, and its
-    /// parameters (the owner's, then the function's own) are the only ones
-    /// a type the body computed can mention.  One spelling names one of
-    /// them: a nested declaration cannot redeclare an enclosing one.
-    param_spelled(&this, params: &GenericParamNode*[], name: SymbolStr) -> GenericParamNode* {
+    /// parameter types carry the symbol their declaration bound; the
+    /// declaration being lowered owns the parameters (the owner's, then the
+    /// function's own) a type its body computed can mention.
+    param_bound_by(&this, params: &GenericParamNode*[], t: GenericParamType*) -> GenericParamNode* {
         for (mut i: i64 = 0; i < params.length; i++) {
             const gp: GenericParamNode* = params[i];
-            if (gp != null && gp.name.equals(name)) { return gp; }
+            if (gp != null && t.declared_by(gp.sym_id)) { return gp; }
         }
         return null;
     }
@@ -749,18 +747,6 @@ type struct AsyncLower {
         owner.impl_node.add_assoc_binding(assoc, fut_ann);
     }
 
-    /// `ty`, a type the method's body computed, as its implement block reads
-    /// it: the body was typed with `this` as the owner template, so a type
-    /// from a field names the owner's parameters, and the future is generic
-    /// in the block's (`TraitChecker::owner_type_through_head`).  Unchanged
-    /// for a method not written in an implement block.
-    through_owner_head(mut &this, d: AsyncDecl*, ty: TypeRef) -> TypeRef {
-        if (d.owner_impl == null) { return ty; }
-        const tc: TraitChecker = TraitChecker::new(this.arena, this.ctx.generic_registry,
-                                                   this.intern, this.ctx.diagnostics);
-        return tc.owner_type_through_head(d.owner_impl, ty);
-    }
-
     /// An annotation for the `Future`'s `Output` — the declared return type, or
     /// unit for `-> void`.
     output_type_ann(mut &this, d: AsyncDecl*, span: SourceSpan) -> TypeAnnotation* {
@@ -787,8 +773,7 @@ type struct AsyncLower {
         const t: Type* = this.arena.lookup(ty.id);
         if (t == null) { return null; }
         if (t.kind == TypeKind::GenericParam) {
-            const spelled: SymbolStr = (t as GenericParamType*).param_name;
-            const gp: GenericParamNode* = this.param_spelled(params, spelled);
+            const gp: GenericParamNode* = this.param_bound_by(params, t as GenericParamType*);
             if (gp == null) { return null; }
             return this.named_ann(gp, span);
         }
@@ -7467,7 +7452,7 @@ type struct AsyncLower {
         f.set_visibility(Visibility::Public);
         f.set_resolved_type(ty);
         if (d.generic) {
-            mut ann: TypeAnnotation* = this.type_ann_for(this.through_owner_head(d, ty), &d.fut_params, span);
+            mut ann: TypeAnnotation* = this.type_ann_for(ty, &d.fut_params, span);
             if (ann == null) {
                 this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                     fmt::format("async: a generic `async function` cannot carry a value of type `%s` across a suspend; give it a concrete type",
