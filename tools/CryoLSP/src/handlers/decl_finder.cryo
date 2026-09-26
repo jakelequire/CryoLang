@@ -1,0 +1,383 @@
+///! Declaration finders for the editor's handlers: a type, method, field,
+///! function, constant or impl block found by walking every module's
+///! top-level declarations and comparing NAMES - the written name, or the
+///! last segment of a qualified one.
+///!
+///! This is resolution by spelling, which the compiler must never do: two
+///! modules declaring the same leaf are indistinguishable here, and the
+///! first one walked wins.  The finders live in the editor's tree rather
+///! than beside the node locator because the compiler cannot import the
+///! editor, so no compiler code can call one.  Hover and go-to-definition
+///! still use them where a node carries no resolved identity (a
+///! half-typed path, a hover in a body sema never reached).
+namespace lsp::handlers::decl_finder;
+
+import compiler::ast;
+import compiler::ast::{ NodeKind, TypeAnnotation };
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::node_locator::{ NodeLocator };
+import compiler::ast::declaration::{
+    ClassDeclNode, EnumDeclNode, ExternBlockNode, FieldDeclNode, FunctionDeclNode,
+    ImplBlockNode, MethodNode, StructDeclNode, TraitDeclNode, TypeAliasDeclNode,
+    UnionDeclNode, VarDeclNode
+};
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::module_graph::{ ModuleGraph };
+import compiler::resolver::intern_table::{ InternTable };
+import compiler::resolver::symbol_str::{ SymbolStr };
+
+// Each finder is O(modules x top-level declarations) per call: fine for
+// one hover or one jump, not for a per-keystroke path.
+
+type struct DeclFinder {
+    /// A method named `method_name` on a struct, union, class or impl
+    /// block whose target is named `type_name`, bare (`Str`) or qualified
+    /// (`std::collections::str::Str`); null when none declares one.
+    static find_method_in_modules(graph: ModuleGraph*, intern: InternTable*,
+                                  type_name: SymbolStr,
+                                  method_name: SymbolStr) -> MethodNode* {
+        if (graph == null) { return null; }
+        const type_leaf: string = DeclFinder::leaf_of(intern, type_name);
+        const n: u32 = graph.module_count();
+        for (mut mi: u32 = 0; mi < n; mi++) {
+            const ast: ProgramNode* = graph.get_module_ast(mi);
+            if (ast == null) { continue; }
+            for (mut si: i64 = 0; si < ast.statements.length; si++) {
+                const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+                const found: MethodNode* = DeclFinder::match_methods_on_type(
+                    stmt, intern, type_name, type_leaf, method_name);
+                if (found != null) { return found; }
+            }
+        }
+        return null;
+    }
+
+    /// A top-level function named `name` in any module, an `extern`
+    /// block's declarations included; for a `Module::function` path whose
+    /// scope is a namespace, not a type.
+    static find_function_in_modules(graph: ModuleGraph*,
+                                    name: SymbolStr) -> FunctionDeclNode* {
+        if (graph == null) { return null; }
+        const n: u32 = graph.module_count();
+        for (mut mi: u32 = 0; mi < n; mi++) {
+            const ast: ProgramNode* = graph.get_module_ast(mi);
+            if (ast == null) { continue; }
+            for (mut si: i64 = 0; si < ast.statements.length; si++) {
+                const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+                if (stmt == null) { continue; }
+                if (stmt.kind == NodeKind::ExternBlock) {
+                    const eb: ExternBlockNode* = stmt as ExternBlockNode*;
+                    for (mut fi: i64 = 0; fi < eb.functions.length; fi++) {
+                        const ef: FunctionDeclNode* = eb.functions[fi];
+                        if (ef != null && ef.name.equals(name)) { return ef; }
+                    }
+                    continue;
+                }
+                if (stmt.kind != NodeKind::FunctionDeclaration) { continue; }
+                const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                if (f.name.equals(name)) { return f; }
+            }
+        }
+        return null;
+    }
+
+    /// A global `const`/`mut` named `name` in any module - for a match
+    /// arm's identifier pattern, a fresh binding the resolver maps to no
+    /// constant although the reader wants the constant's value.
+    static find_const_in_modules(graph: ModuleGraph*, name: SymbolStr) -> VarDeclNode* {
+        if (graph == null) { return null; }
+        const n: u32 = graph.module_count();
+        for (mut mi: u32 = 0; mi < n; mi++) {
+            const ast: ProgramNode* = graph.get_module_ast(mi);
+            if (ast == null) { continue; }
+            for (mut si: i64 = 0; si < ast.statements.length; si++) {
+                const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+                if (stmt == null) { continue; }
+                if (stmt.kind != NodeKind::VariableDeclaration) { continue; }
+                const v: VarDeclNode* = stmt as VarDeclNode*;
+                if (v.is_global && v.name.equals(name)) { return v; }
+            }
+        }
+        return null;
+    }
+
+    /// A method named `method_name` declared by a trait named
+    /// `trait_name`; trait methods are bare `FunctionDeclNode`s on the
+    /// trait, not `MethodNode`s.  For `value.fmt()` on a receiver whose
+    /// type is a generic parameter bound by the trait.
+    static find_trait_method_in_modules(graph: ModuleGraph*, intern: InternTable*,
+                                        trait_name: SymbolStr,
+                                        method_name: SymbolStr) -> FunctionDeclNode* {
+        if (graph == null) { return null; }
+        const trait_leaf: string = DeclFinder::leaf_of(intern, trait_name);
+        const n: u32 = graph.module_count();
+        for (mut mi: u32 = 0; mi < n; mi++) {
+            const ast: ProgramNode* = graph.get_module_ast(mi);
+            if (ast == null) { continue; }
+            for (mut si: i64 = 0; si < ast.statements.length; si++) {
+                const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+                if (stmt == null) { continue; }
+                if (stmt.kind != NodeKind::TraitDeclaration) { continue; }
+                const td: TraitDeclNode* = stmt as TraitDeclNode*;
+                if (!DeclFinder::type_name_matches(intern, td.name, trait_name, trait_leaf)) {
+                    continue;
+                }
+                const f: FunctionDeclNode* = td.lookup_method(method_name);
+                if (f != null) { return f; }
+            }
+        }
+        return null;
+    }
+
+    /// Every impl block - inherent or trait - whose target is named
+    /// `type_name`, bare or qualified, in module order.
+    static impls_of_type(graph: ModuleGraph*, intern: InternTable*,
+                         type_name: SymbolStr) -> ImplBlockNode*[] {
+        mut out: ImplBlockNode*[] = [];
+        if (graph == null) { return out; }
+        const type_leaf: string = DeclFinder::leaf_of(intern, type_name);
+        const n: u32 = graph.module_count();
+        for (mut mi: u32 = 0; mi < n; mi++) {
+            const ast: ProgramNode* = graph.get_module_ast(mi);
+            if (ast == null) { continue; }
+            for (mut si: i64 = 0; si < ast.statements.length; si++) {
+                const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+                if (stmt == null) { continue; }
+                if (stmt.kind != NodeKind::ImplementationBlock) { continue; }
+                const impl_blk: ImplBlockNode* = stmt as ImplBlockNode*;
+                if (!DeclFinder::type_name_matches(intern, impl_blk.target_type,
+                                                   type_name, type_leaf)) { continue; }
+                out.push(impl_blk);
+            }
+        }
+        return out;
+    }
+
+    /// A jump span for every impl block targeting a type named
+    /// `type_name`: the "N implementations" lens above a type.
+    static find_impls_of_type(graph: ModuleGraph*, intern: InternTable*,
+                              type_name: SymbolStr) -> SourceSpan[] {
+        mut spans: SourceSpan[] = [];
+        const impls: ImplBlockNode*[] = DeclFinder::impls_of_type(graph, intern, type_name);
+        for (mut i: i64 = 0; i < impls.length; i++) {
+            spans.push(DeclFinder::impl_jump_span(impls[i]));
+        }
+        return spans;
+    }
+
+    /// A jump span for every `implement trait <trait_name> for X` block:
+    /// the "N implementations" lens above a trait.  Inherent impls are
+    /// skipped.
+    static find_impls_of_trait(graph: ModuleGraph*, intern: InternTable*,
+                               trait_name: SymbolStr) -> SourceSpan[] {
+        mut spans: SourceSpan[] = [];
+        if (graph == null) { return spans; }
+        const trait_leaf: string = DeclFinder::leaf_of(intern, trait_name);
+        const n: u32 = graph.module_count();
+        for (mut mi: u32 = 0; mi < n; mi++) {
+            const ast: ProgramNode* = graph.get_module_ast(mi);
+            if (ast == null) { continue; }
+            for (mut si: i64 = 0; si < ast.statements.length; si++) {
+                const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+                if (stmt == null) { continue; }
+                if (stmt.kind != NodeKind::ImplementationBlock) { continue; }
+                const impl_blk: ImplBlockNode* = stmt as ImplBlockNode*;
+                if (impl_blk.trait_annotation == null) { continue; }
+                const impl_trait: SymbolStr =
+                    DeclFinder::annotation_head_name(impl_blk.trait_annotation);
+                if (!impl_trait.is_valid()) { continue; }
+                if (!DeclFinder::type_name_matches(intern, impl_trait,
+                                                   trait_name, trait_leaf)) { continue; }
+                spans.push(DeclFinder::impl_jump_span(impl_blk));
+            }
+        }
+        return spans;
+    }
+
+    /// A field named `field_name` on a struct, union or class named
+    /// `type_name`, bare or qualified.
+    static find_field_in_modules(graph: ModuleGraph*, intern: InternTable*,
+                                 type_name: SymbolStr,
+                                 field_name: SymbolStr) -> FieldDeclNode* {
+        if (graph == null) { return null; }
+        const type_leaf: string = DeclFinder::leaf_of(intern, type_name);
+        const n: u32 = graph.module_count();
+        for (mut mi: u32 = 0; mi < n; mi++) {
+            const ast: ProgramNode* = graph.get_module_ast(mi);
+            if (ast == null) { continue; }
+            for (mut si: i64 = 0; si < ast.statements.length; si++) {
+                const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+                if (stmt == null) { continue; }
+                const found: FieldDeclNode* = DeclFinder::match_fields_on_type(
+                    stmt, intern, type_name, type_leaf, field_name);
+                if (found != null) { return found; }
+            }
+        }
+        return null;
+    }
+
+    /// A struct, union, class, enum, trait or type-alias declaration
+    /// named `type_name`, bare or qualified: the target of a jump from a
+    /// use site.
+    static find_type_decl_in_modules(graph: ModuleGraph*, intern: InternTable*,
+                                     type_name: SymbolStr) -> ASTNode* {
+        if (graph == null) { return null; }
+        const type_leaf: string = DeclFinder::leaf_of(intern, type_name);
+        const n: u32 = graph.module_count();
+        for (mut mi: u32 = 0; mi < n; mi++) {
+            const ast: ProgramNode* = graph.get_module_ast(mi);
+            if (ast == null) { continue; }
+            for (mut si: i64 = 0; si < ast.statements.length; si++) {
+                const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+                if (stmt == null) { continue; }
+                if (DeclFinder::decl_name_matches(stmt, intern, type_name, type_leaf)) {
+                    return stmt;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Head name of a type annotation, through generic, reference and
+    /// pointer wrappers (`&Iterator<T>` -> `Iterator`); empty for a shape
+    /// with no head name.
+    static annotation_head_name(ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        return match (*ann) {
+            TypeAnnotation::Named(n)     => { n.name }
+            TypeAnnotation::Generic(g)   => { DeclFinder::annotation_head_name(g.base) }
+            TypeAnnotation::Reference(r) => { DeclFinder::annotation_head_name(r.inner) }
+            TypeAnnotation::Pointer(p)   => { DeclFinder::annotation_head_name(p.inner) }
+            _                            => { SymbolStr::empty() }
+        };
+    }
+
+    /// The text after the last `::` of `s`, or all of `s`.
+    static leaf_segment_str(s: string) -> string {
+        const len: i64 = s.length() as i64;
+        mut last_sep: i64 = -1;
+        for (mut i: i64 = 0; i + 1 < len; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') { last_sep = i; }
+        }
+        if (last_sep < 0) { return s; }
+        const start: i64 = last_sep + 2;
+        if (start >= len) { return ""; }
+        return s + start;
+    }
+
+    static leaf_of(intern: InternTable*, name: SymbolStr) -> string {
+        if (intern == null) { return ""; }
+        return DeclFinder::leaf_segment_str(intern.resolve(name));
+    }
+
+    /// Whether a declaration named `decl_name` answers `type_name`: the
+    /// same interned name, or - for a qualified `type_name` - the same
+    /// text as its last segment.
+    static type_name_matches(intern: InternTable*, decl_name: SymbolStr,
+                             type_name: SymbolStr, type_leaf: string) -> boolean {
+        if (decl_name.equals(type_name)) { return true; }
+        if (intern == null || type_leaf.length() == 0) { return false; }
+        return intern.resolve(decl_name).eq(type_leaf);
+    }
+
+    /// The span to jump to for an impl block: its head's target-type
+    /// lexeme when the parser recorded one, else the block's own span.
+    static impl_jump_span(impl_blk: ImplBlockNode*) -> SourceSpan {
+        if (impl_blk == null) { return SourceSpan::none(); }
+        if (impl_blk.target_type_span.has_location()) {
+            return impl_blk.target_type_span;
+        }
+        return (impl_blk as ASTNode*).span;
+    }
+
+    static match_methods_on_type(stmt: ASTNode*, intern: InternTable*,
+                                 type_name: SymbolStr, type_leaf: string,
+                                 method_name: SymbolStr) -> MethodNode* {
+        if (stmt == null) { return null; }
+        match (stmt.kind) {
+            NodeKind::StructDeclaration => {
+                const d: StructDeclNode* = stmt as StructDeclNode*;
+                if (!DeclFinder::type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+                return NodeLocator::method_by_name(&d.methods, method_name);
+            }
+            NodeKind::UnionDeclaration => {
+                const d: UnionDeclNode* = stmt as UnionDeclNode*;
+                if (!DeclFinder::type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+                return NodeLocator::method_by_name(&d.methods, method_name);
+            }
+            NodeKind::ClassDeclaration => {
+                const d: ClassDeclNode* = stmt as ClassDeclNode*;
+                if (!DeclFinder::type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+                return NodeLocator::method_by_name(&d.methods, method_name);
+            }
+            NodeKind::ImplementationBlock => {
+                const d: ImplBlockNode* = stmt as ImplBlockNode*;
+                if (!DeclFinder::type_name_matches(intern, d.target_type, type_name, type_leaf)) {
+                    return null;
+                }
+                return NodeLocator::method_by_name(&d.methods, method_name);
+            }
+            _ => { return null; }
+        }
+    }
+
+    static fields_named(fields: &FieldDeclNode*[], field_name: SymbolStr) -> FieldDeclNode* {
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            const f: FieldDeclNode* = fields[i];
+            if (f != null && f.name.equals(field_name)) { return f; }
+        }
+        return null;
+    }
+
+    static match_fields_on_type(stmt: ASTNode*, intern: InternTable*,
+                                type_name: SymbolStr, type_leaf: string,
+                                field_name: SymbolStr) -> FieldDeclNode* {
+        if (stmt.kind == NodeKind::StructDeclaration) {
+            const d: StructDeclNode* = stmt as StructDeclNode*;
+            if (!DeclFinder::type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+            return DeclFinder::fields_named(&d.fields, field_name);
+        }
+        if (stmt.kind == NodeKind::UnionDeclaration) {
+            const d: UnionDeclNode* = stmt as UnionDeclNode*;
+            if (!DeclFinder::type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+            return DeclFinder::fields_named(&d.fields, field_name);
+        }
+        if (stmt.kind == NodeKind::ClassDeclaration) {
+            const d: ClassDeclNode* = stmt as ClassDeclNode*;
+            if (!DeclFinder::type_name_matches(intern, d.name, type_name, type_leaf)) { return null; }
+            return DeclFinder::fields_named(&d.fields, field_name);
+        }
+        return null;
+    }
+
+    static decl_name_matches(stmt: ASTNode*, intern: InternTable*,
+                             type_name: SymbolStr, type_leaf: string) -> boolean {
+        match (stmt.kind) {
+            NodeKind::StructDeclaration => {
+                const d: StructDeclNode* = stmt as StructDeclNode*;
+                return DeclFinder::type_name_matches(intern, d.name, type_name, type_leaf);
+            }
+            NodeKind::UnionDeclaration => {
+                const d: UnionDeclNode* = stmt as UnionDeclNode*;
+                return DeclFinder::type_name_matches(intern, d.name, type_name, type_leaf);
+            }
+            NodeKind::ClassDeclaration => {
+                const d: ClassDeclNode* = stmt as ClassDeclNode*;
+                return DeclFinder::type_name_matches(intern, d.name, type_name, type_leaf);
+            }
+            NodeKind::EnumDeclaration => {
+                const d: EnumDeclNode* = stmt as EnumDeclNode*;
+                return DeclFinder::type_name_matches(intern, d.name, type_name, type_leaf);
+            }
+            NodeKind::TraitDeclaration => {
+                const d: TraitDeclNode* = stmt as TraitDeclNode*;
+                return DeclFinder::type_name_matches(intern, d.name, type_name, type_leaf);
+            }
+            NodeKind::TypeAliasDeclaration => {
+                const d: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
+                return DeclFinder::type_name_matches(intern, d.alias_name, type_name, type_leaf);
+            }
+            _ => { return false; }
+        }
+    }
+}

@@ -102,11 +102,10 @@ is one the language fixes (`__call__`, `Ready`, `Ok`/`Err`, `Some`/`None`).
 ## The table
 
 <!-- residue-table:begin -->
-Population **321** - J 194 · N 127 · S 0 · B 0 · C 0 · F 0 · W 0
+Population **316** - J 189 · N 127 · S 0 · B 0 · C 0 · F 0 · W 0
 
 | site | read | key as written | class | reason |
 |---|---|---|---|---|
-| `compiler/AST/node_locator.cryo:1843` | `ClassDeclNode::fields[]` | `field_name` | J | member: a class declaration's field by its leaf off the node in hand, scanned inline |
 | `compiler/sema/member_resolver.cryo:418` | `ClassDeclNode::fields[]` | `field` | J | member: a class declaration's field by its leaf off the node in hand, scanned inline |
 | `compiler/sema/symbolic_checker.cryo:263` | `ClassDeclNode::fields[]` | `field` | J | member: a class declaration's field by its leaf off the node in hand, scanned inline |
 | `compiler/types/ownership.cryo:1031` | `ClassDeclNode::methods[]` | `method_name` | J | member: a class declaration's method by its leaf off the node in hand, scanned inline |
@@ -151,7 +150,6 @@ Population **321** - J 194 · N 127 · S 0 · B 0 · C 0 · F 0 · W 0
 | `compiler/sema/pattern_resolver.cryo:178` | `EnumType::variant_index` | `enum_pat.variant_name` | J | member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen |
 | `compiler/sema/sema.cryo:3284` | `EnumType::variant_index` | `scope.member_name` | J | member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen |
 | `compiler/sema/sema.cryo:3325` | `EnumType::variant_index` | `new_expr.variant_name` | J | member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen |
-| `compiler/AST/node_locator.cryo:231` | `ExternBlockNode::functions[]` | `name` | J | member: an extern block's function by its leaf off the block in hand, scanned inline |
 | `compiler/bindgen/importer.cryo:1775` | `ExternBlockNode::functions[]` | `sym` | J | extern: whether this extern block already declares the C function of this LINK NAME, asked as the importer emits it. A C symbol's link name is the whole of its identity - C has no declaration to key on, and two C declarations sharing a link name are one entity by the linkage rule - so there is no stamp this could ask instead, and the leaf it compares is the mangling the linker will use |
 | `compiler/bindgen/importer.cryo:1847` | `ExternBlockNode::functions[]` | `sym` | J | extern: whether this extern block already declares the C function of this LINK NAME, asked as the importer emits it. A C symbol's link name is the whole of its identity - C has no declaration to key on, and two C declarations sharing a link name are one entity by the linkage rule - so there is no stamp this could ask instead, and the leaf it compares is the mangling the linker will use |
 | `compiler/resolver/name_resolution.cryo:618` | `FunctionDeclNode::parameters[]` | `param.name.id` | J | member: the resolver's duplicate-parameter check, a parameter by leaf inside the function being bound |
@@ -232,7 +230,6 @@ Population **321** - J 194 · N 127 · S 0 · B 0 · C 0 · F 0 · W 0
 | `compiler/instance.cryo:1468` | `ModuleInfo::reexports[]` | `imi_info.namespace_name.id` | J | module: a module's re-exported namespaces, module identities by path, scanned inline |
 | `compiler/mono/monomorphizer.cryo:607` | `Resolver::find_module_scope` | ` ...` | J | module: a module's scope by its namespace path, to stand in it while a template is instantiated |
 | `compiler/sema/sema.cryo:531` | `Resolver::find_module_scope` | `this.ctx.module_graph.module_named(template_mod)` | J | module: a module's scope by its namespace path, to stand in it while a template is instantiated |
-| `compiler/AST/node_locator.cryo:1825` | `StructDeclNode::fields[]` | `field_name` | J | member: a struct declaration's field by its leaf off the node in hand, scanned inline |
 | `compiler/sema/member_resolver.cryo:398` | `StructDeclNode::fields[]` | `field` | J | member: a struct declaration's field by its leaf off the node in hand, scanned inline |
 | `compiler/sema/symbolic_checker.cryo:245` | `StructDeclNode::fields[]` | `field` | J | member: a struct declaration's field by its leaf off the node in hand, scanned inline |
 | `compiler/types/ownership.cryo:1011` | `StructDeclNode::methods[]` | `method_name` | J | member: a struct declaration's method by its leaf off the node in hand, scanned inline |
@@ -251,7 +248,6 @@ Population **321** - J 194 · N 127 · S 0 · B 0 · C 0 · F 0 · W 0
 | `compiler/types/resolver.cryo:530` | `TraitDeclNode::assoc_type_index` | `member` | J | member: the trait's own associated type's position by its leaf, asked from the trait node in hand - the index the positional trait arguments are read by |
 | `compiler/types/resolver.cryo:602` | `TraitDeclNode::assoc_type_index` | `member` | J | member: the trait's own associated type's position by its leaf, asked from the trait node in hand - the index the positional trait arguments are read by |
 | `compiler/passes/type_resolution.cryo:1722` | `TraitDeclNode::lookup_assoc_type` | `assoc` | J | member: the trait's own associated type by its leaf, asked from the trait node in hand |
-| `compiler/AST/node_locator.cryo:368` | `TraitDeclNode::lookup_method` | `method_name` | J | member: the trait's own method by its leaf, asked from the trait node in hand |
 | `compiler/types/generic_registry.cryo:1294` | `TraitDeclNode::lookup_method` | `method_name` | J | member: the trait's own method by its leaf, asked from the trait node in hand |
 | `compiler/passes/type_resolution.cryo:1674` | `TraitDeclNode::methods[]` | `assoc` | J | member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf) |
 | `compiler/sema/async_lower.cryo:743` | `TraitDeclNode::methods[]` | `node.name` | J | member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf) |
@@ -274,7 +270,6 @@ Population **321** - J 194 · N 127 · S 0 · B 0 · C 0 · F 0 · W 0
 | `compiler/sema/method_binding.cryo:758` | `TypeUtils::lookup_method_return` | ` ...` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
 | `compiler/sema/method_binding.cryo:771` | `TypeUtils::lookup_method_return` | `parent_ref, method_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
 | `compiler/sema/sema.cryo:1262` | `TypeUtils::lookup_method_return` | `owner_ref, this.intern.intern("iter")` | J | member: the for-in protocol's `iter` off a collection that does not implement `Iterator` |
-| `compiler/AST/node_locator.cryo:1834` | `UnionDeclNode::fields[]` | `field_name` | J | member: a union declaration's field by its leaf off the node in hand, scanned inline |
 | `compiler/sema/member_resolver.cryo:408` | `UnionDeclNode::fields[]` | `field` | J | member: a union declaration's field by its leaf off the node in hand, scanned inline |
 | `compiler/sema/symbolic_checker.cryo:254` | `UnionDeclNode::fields[]` | `field` | J | member: a union declaration's field by its leaf off the node in hand, scanned inline |
 | `compiler/types/ownership.cryo:1021` | `UnionDeclNode::methods[]` | `method_name` | J | member: a union declaration's method by its leaf off the node in hand, scanned inline |
@@ -286,7 +281,7 @@ Population **321** - J 194 · N 127 · S 0 · B 0 · C 0 · F 0 · W 0
 | `compiler/sema/call_resolver.cryo:2312` | `local::MethodInfo[]` | `member.member` | J | member: an arena type's methods held in a local, by leaf |
 | `compiler/sema/call_resolver.cryo:5824` | `local::MethodInfo[]` | `scope.member_name` | J | member: an arena type's methods held in a local, by leaf |
 | `compiler/sema/call_resolver.cryo:5843` | `local::MethodInfo[]` | `scope.member_name` | J | member: an arena type's methods held in a local, by leaf |
-| `compiler/AST/node_locator.cryo:1275` | `local::MethodNode[]` | `name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
+| `compiler/AST/node_locator.cryo:927` | `local::MethodNode[]` | `name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
 | `compiler/mono/call_specializer.cryo:1305` | `local::MethodNode[]` | `scope.member_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
 | `compiler/mono/call_specializer.cryo:1601` | `local::MethodNode[]` | `method_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
 | `compiler/mono/call_specializer.cryo:1628` | `local::MethodNode[]` | `method_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
@@ -359,10 +354,10 @@ Population **321** - J 194 · N 127 · S 0 · B 0 · C 0 · F 0 · W 0
 | `compiler/passes/specialization.cryo:899` | `GenericRegistry::member_template_key` | ` ...` | N | a key MINTED at the member template's declaration (`Owner::method`) for its registration; the write side of `template_in` |
 | `compiler/mono/specializer.cryo:234` | `ImplBlockNode::set_target_type` | `spec_sym` | N | a write: the specialized impl's target name stored on the node |
 | `compiler/passes/specialization.cryo:689` | `ImplBlockNode::set_target_type` | `impl_qname` | N | a write: the specialized impl's target name stored on the node |
-| `compiler/AST/node_locator.cryo:326` | `ModuleGraph::find_module_by_path` | `file_path` | N | a module by its FILE PATH |
-| `compiler/AST/node_locator.cryo:465` | `ModuleGraph::find_module_by_path` | `file_path` | N | a module by its FILE PATH |
-| `compiler/AST/node_locator.cryo:497` | `ModuleGraph::find_module_by_path` | `target.span.file` | N | a module by its FILE PATH |
-| `compiler/AST/node_locator.cryo:1431` | `ModuleGraph::find_module_by_path` | `file` | N | a module by its FILE PATH |
+| `compiler/AST/node_locator.cryo:239` | `ModuleGraph::find_module_by_path` | `file_path` | N | a module by its FILE PATH |
+| `compiler/AST/node_locator.cryo:270` | `ModuleGraph::find_module_by_path` | `file_path` | N | a module by its FILE PATH |
+| `compiler/AST/node_locator.cryo:302` | `ModuleGraph::find_module_by_path` | `target.span.file` | N | a module by its FILE PATH |
+| `compiler/AST/node_locator.cryo:1083` | `ModuleGraph::find_module_by_path` | `file` | N | a module by its FILE PATH |
 | `compiler/codegen/passes.cryo:1408` | `ModuleGraph::find_module_by_path` | `ctx.source_file` | N | a module by its FILE PATH |
 | `compiler/instance.cryo:1826` | `ModuleGraph::find_module_by_path` | ` ...` | N | a module by its FILE PATH |
 | `compiler/instance.cryo:1847` | `ModuleGraph::find_module_by_path` | ` ...` | N | a module by its FILE PATH |
