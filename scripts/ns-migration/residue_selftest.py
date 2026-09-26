@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Drive scripts/ns-migration/residue.py --check through a throwaway tree and
-a throwaway list, in both directions: the pair it must accept, and for each
-thing the check asserts one mutation it must refuse, named.
+"""Drive scripts/ns-migration/residue.py --check through a throwaway facts
+file and a throwaway list, in both directions: the pair it must accept, and
+for each thing the check asserts one mutation it must refuse, named.
 
-The check has three inputs - the tree, the list and the classifier - and
-each mutation moves one of them while the other two stand:
+The check has three inputs - the compiler's facts, the list and the
+classifier - and each mutation moves one of them while the other two stand:
 
   * THE LIST.  A row deleted or duplicated is drift.  A row whose class is
     blanked, flipped to another class, or given a letter the classifier does
@@ -12,20 +12,21 @@ each mutation moves one of them while the other two stand:
     the letters as the list wrote them, so a J row flipped to N by hand read
     `OK ... J 51, N 118` and a row marked `X` read `OK ... X 1` - and the
     J count pinned in §0 is a grep over that line.
-  * THE TREE.  A read planted on a placed receiver is drift.  A receiver
-    whose type cannot be read, a receiver no pattern reaches (a
-    parenthesized expression, a call with arguments) and a read method with
-    no class are each refused.  A cast receiver is placed by the cast's
-    type; a turbofish static is placed by its owner.  A receiver misread as
-    a type that holds nothing - a local shadowed by a same-named binding of
-    another type in a closed block above - moves the elsewhere table.
+  * THE FACTS.  A holder read planted is drift; a call into a holder that
+    sema left unpinned, a record of the wrong shape and a read method with
+    no class are refused.  A registrar (`mut &this`), a call in the holder's
+    own file, a call passing no key and a call outside compiler/src are no
+    site.  A comparison reading a TABLE element at the innermost loop is a
+    site (drift); the same element bound outside the innermost loop is the
+    key searched for, and is no site; an element of an array placed as data
+    is no site; two members of one element compared are one site.
   * THE CLASSIFIER.  Its verdict is the one the list is held to, so the
     classifier is not mutated here; the list mutations are its controls.
 
-The fixture is the lane gate's own (scripts/lane-gate-selftest.py's FILES:
-every store with its map, a stub per exclusion), with the caller rewritten
-to reach only methods residue_classify.py classifies, so the classifier's
-real tables decide the fixture's classes.
+Which types hold declarations is placement, read from a source tree: the
+lane gate's own fixture (scripts/lane-gate-selftest.py's FILES, every store
+with its map, a stub per exclusion).  The facts are written here, in the
+compiler's record format, naming methods the real classifier classifies.
 
 Usage:
     python3 scripts/ns-migration/residue_selftest.py
@@ -56,65 +57,48 @@ def load(path, name):
 LANE = load(os.path.join(ROOT, "scripts", "lane-gate-selftest.py"), "lane_gate_selftest")
 FILES = dict(LANE.FILES)
 
-# The caller: one call per class the fixture can reach through the real
-# classifier - S (the index, the funnel), J module (the graph), J hint (the
-# registry) - one call on a type that holds nothing (the scope manager: the
-# elsewhere table's one row), and one turbofish static on a non-holder
-# (`new` is a population name, `ResolutionContext::new`'s; a static pattern
-# that stops at the first `::` reads this as a call it cannot place).
-CALLER = """\
-type struct Sema {
-    ctx:    CompilationContext*;
-    types:  TypeUtils;
-    scopes: ScopeManager;
+SYM = "compiler::resolver::symbol_str::SymbolStr"
+TYREF = "compiler::types::type_ref::TypeRef"
 
-    walk(&this, name: SymbolStr, t: TypeRef) -> void {
-        this.ctx.decl_index.lookup_type(name);
-        this.types.lookup_type_exact(name);
-        this.ctx.module_graph.find_module_index(name);
-        this.ctx.generic_registry.find_trait_defining_method(name);
-        this.scopes.lookup_type(name);
-        this.pairs.push(Pair::<SymbolStr, TypeRef>::new(name, t));
-    }
-}
-"""
-FILES["compiler/sema/sema.cryo"] = CALLER
-# The resolver's driving pass calls nothing by name here: `Resolver::lookup`
-# has no class, and its call from an owner file is not a site anyway.
-FILES["compiler/resolver/name_resolution.cryo"] = """\
-type struct NameResolver {
-    ctx: CompilationContext*;
 
-    bind(mut &this, name: SymbolStr) -> void {}
-}
-"""
-# `ResolutionContext::new(source_file)` is the N-classed constructor whose
-# leaf `new` puts every `Owner::<T>::new(` in the tree under the static
-# pattern; the fixture declares it so the turbofish control is real.
-FILES["compiler/types/resolver.cryo"] = FILES["compiler/types/resolver.cryo"].replace(
-    "    index_of(&this, name: SymbolStr) -> i64 { return -1; }\n",
-    "    index_of(&this, name: SymbolStr) -> i64 { return -1; }\n"
-    "    static new(source_file: string) -> ResolutionContext { return ResolutionContext { names: [] }; }\n", 1)
-# The registry read the caller makes, declared as the tree declares it.
-FILES["compiler/types/generic_registry.cryo"] = FILES["compiler/types/generic_registry.cryo"].replace(
-    "    register_impl_block(",
-    "    find_trait_defining_method(&this, method_name: SymbolStr) -> SymbolStr { return method_name; }\n"
-    "    register_impl_block(", 1)
+def rec(kind, rel, line, callee_text="-", idx="0", ptype=SYM, prov="param:name",
+        recv="param:this", pin="call", depth=0, col=9):
+    """One record in the compiler's format (sema/call_facts.cryo)."""
+    site = rel if rel.startswith("<") else "src/" + rel
+    return "\t".join([kind, site, str(line), str(col), idx, ptype, prov, recv,
+                      "C$fixture", pin, "src/compiler/decl_index.cryo:1", "C$caller",
+                      callee_text, "fixture::Caller.walk(&this) -> void", str(depth)])
 
-# What the fixture must produce: 5 call sites (the funnel's own forwarding
-# call into the index is the fifth, N by override), plus one inline scan
-# per LOCAL table the gate lists (the lane fixture carries a stub scan for
-# each, and a local table has no owner file to be excluded by), each with
-# the class the real classifier gives it; 1 elsewhere row.
-GATE_MOD = residue.load_gate()
-LOCAL_TABLES = sorted(label.split(".", 1)[1] for label, sc in GATE_MOD.SCANNED_ARRAYS.items()
-                      if label.startswith(GATE_MOD.LOCAL + ".") and sc.kind == GATE_MOD.TABLE)
-BASE_SITES = 5 + len(LOCAL_TABLES)
+
+def door(owner, meth, params="&this, " + SYM, ret=TYREF):
+    return "%s.%s(%s) -> %s" % (owner, meth, params, ret)
+
+
+INDEX = "compiler::decl_index::DeclarationIndex"
+FUNNEL = "compiler::sema::type_utils::TypeUtils"
+GRAPH = "compiler::module_graph::ModuleGraph"
+REGISTRY = "compiler::types::generic_registry::GenericRegistry"
+EQUALS = SYM + ".equals(&this, " + SYM + ") -> boolean"
+TRAIT_METHOD = ("field:compiler::ast::declaration::FunctionDeclNode*.name"
+                "<-local:f@1=element@1:field:compiler::ast::declaration::TraitDeclNode*.methods<-param:td")
+LOCAL_METHOD = ("field:compiler::ast::declaration::FunctionDeclNode*.name"
+                "<-field:compiler::ast::declaration::MethodNode*.func<-element@1:param:methods")
+
+# The baseline: five reads by call - two S (the index, the funnel), two J
+# (a module, a hint), the funnel's own forwarding call into the index (N by
+# the classifier's site override) - and one scan of a local method table.
+BASE = [
+    rec("arg", "compiler/sema/sema.cryo", 7, door(INDEX, "lookup_type")),
+    rec("arg", "compiler/sema/sema.cryo", 8, door(FUNNEL, "lookup_type_exact")),
+    rec("arg", "compiler/sema/sema.cryo", 9, door(GRAPH, "find_module_index")),
+    rec("arg", "compiler/sema/sema.cryo", 10, door(REGISTRY, "find_trait_defining_method", ret=SYM)),
+    rec("arg", "compiler/sema/type_utils.cryo", 40, door(INDEX, "lookup_type")),
+    rec("arg", "compiler/sema/sema.cryo", 20, EQUALS, recv=LOCAL_METHOD, depth=1),
+]
+BASE_SITES = 6
 BASE_CLASSES = {"S": 2, "N": 1, "J": 2}
-for _elem in LOCAL_TABLES:
-    _cls = rc.CLASS_OF_METHOD["%s::%s[]" % (GATE_MOD.LOCAL, _elem)][0]
-    BASE_CLASSES[_cls] = BASE_CLASSES.get(_cls, 0) + 1
-BASE_ELSEWHERE = {("ScopeManager", "lookup_type"): 1}
+BASE_CLASSES[rc.CLASS_OF_METHOD["local::MethodNode[]"][0]] = \
+    BASE_CLASSES.get(rc.CLASS_OF_METHOD["local::MethodNode[]"][0], 0) + 1
 DRIFT_ONE = "DRIFT - tree %d, list %d" % (BASE_SITES + 1, BASE_SITES)
 
 LIST_HEAD = """\
@@ -122,25 +106,12 @@ LIST_HEAD = """\
 
 <!-- residue-table:begin -->
 <!-- residue-table:end -->
-
-<!-- residue-elsewhere:begin -->
-<!-- residue-elsewhere:end -->
 """
-
-
-def caller_with(extra_lines):
-    marker = "        this.scopes.lookup_type(name);\n"
-    assert marker in CALLER
-    return CALLER.replace(marker, marker + "".join("        %s\n" % l for l in extra_lines))
 
 
 def write_tree(base, files):
     for rel, content in files.items():
         path = os.path.join(base, rel.replace("/", os.sep))
-        if content is None:
-            if os.path.exists(path):
-                os.remove(path)
-            continue
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(content)
@@ -157,92 +128,78 @@ class Capture(object):
         return "\n".join(self.lines)
 
 
-def run_check(src, list_path):
-    """residue.py --check over `src` against `list_path`, in process: the
+def run_check(src, facts, list_path):
+    """residue.py --check over `facts` against `list_path`, in process: the
     population's refusals arrive as SystemExit, the check's as its code."""
     gate = residue.load_gate()
     cap = Capture()
     try:
-        rows, _sets, elsewhere = residue.population(gate, src)
+        rows, _sets = residue.population(gate, src, facts)
     except SystemExit as e:
         return 1, str(e)
-    code = residue.check(rows, elsewhere, list_path, out=cap)
+    code = residue.check(rows, list_path, out=cap)
     return code, cap.text()
 
 
-# (name, {relpath: content}, expected exit, must-appear-in-output)
-TREE_MUTATIONS = [
-    ("a read planted on a placed receiver is drift",
-     {"compiler/sema/sema.cryo": caller_with(["this.ctx.decl_index.lookup_func_type(name);"])},
-     1, "DeclarationIndex::lookup_func_type (name): tree 1, list 0"),
-    ("a read planted through a local under a new spelling is placed by its annotation, and is drift",
-     {"compiler/sema/sema.cryo": caller_with(["const idx: DeclarationIndex* = this.ctx.decl_index;",
-                                              "idx.lookup_type(name);"])},
+# (name, records added to the baseline, expected exit, must-appear-in-output)
+FACTS_MUTATIONS = [
+    ("a holder read planted is drift",
+     [rec("arg", "compiler/sema/sema.cryo", 30,
+          door(INDEX, "lookup_func_type", "&this, compiler::resolver::res::FamilyOwner, " + SYM))],
+     1, "DeclarationIndex::lookup_func_type (param:name): tree 1, list 0"),
+    ("a static read on a holder is a site, and is drift",
+     [rec("arg", "compiler/sema/sema.cryo", 31,
+          "%s::lookup_type(%s) -> %s" % (INDEX, SYM, TYREF), recv="-")],
      1, DRIFT_ONE),
-    ("a cast receiver is placed by the type the cast names",
-     {"compiler/sema/sema.cryo": caller_with(["(this.ctx.something as DeclarationIndex*).lookup_type(name);"])},
-     1, DRIFT_ONE),
-    ("a receiver whose type cannot be read is refused, not dropped",
-     {"compiler/sema/sema.cryo": caller_with(["const g = mystery();", "g.get_template(name);"])},
-     1, "receiver whose type cannot be read"),
-    ("a parenthesized receiver is one no pattern reaches: refused",
-     {"compiler/sema/sema.cryo": caller_with(["(this.ctx.decl_index).lookup_type(name);"])},
-     1, "no simple receiver"),
-    ("a receiver that is a call with arguments is one no pattern reaches: refused",
-     {"compiler/sema/sema.cryo": caller_with(["this.index_for(name).lookup_type(name);"])},
-     1, "no simple receiver"),
-    ("a cast whose operand carries parentheses is refused, not guessed",
-     {"compiler/sema/sema.cryo": caller_with(["(this.ctx.get_arena() as DeclarationIndex*).lookup_type(name);"])},
-     1, "no simple receiver"),
+    ("a call into a holder that sema left unpinned is refused, not dropped",
+     [rec("noparams", "compiler/sema/sema.cryo", 32, ".lookup_type", idx="-", ptype="-",
+          prov="-", pin="none")],
+     1, "sema left unpinned"),
+    ("a record of the wrong shape is refused",
+     [rec("arg", "compiler/sema/sema.cryo", 33, door(INDEX, "lookup_type")).rsplit("\t", 1)[0]],
+     1, "not 15"),
     ("a read method the classifier has no class for is refused",
-     {"compiler/sema/sema.cryo": caller_with(["this.ctx.type_arena.lookup_by_name(name);"])},
+     [rec("arg", "compiler/sema/sema.cryo", 34, door("compiler::types::arena::TypeArena", "lookup_by_name"))],
      1, "no class in residue_classify.py: TypeArena::lookup_by_name"),
-    ("a receiver shadowed by a same-named binding of another type in a closed block above is "
-     "misread as that type, and the elsewhere table moves",
-     {"compiler/sema/sema.cryo": caller_with(["{ const di: SymbolStr = name; }",
-                                              "const di: DeclarationIndex* = this.ctx.decl_index;",
-                                              "{ const di: TypeRef = t; }",
-                                              "di.lookup_type(name);"])},
-     1, "elsewhere TypeRef::lookup_type: tree 1, list 0"),
-    ("a same-named read on a type that holds nothing, added, moves the elsewhere table",
-     {"compiler/sema/sema.cryo": caller_with(["this.scopes.lookup_type(name);"])},
-     1, "elsewhere ScopeManager::lookup_type: tree 2, list 1"),
+    ("a registrar (`mut &this`) is the write side: no site",
+     [rec("arg", "compiler/sema/sema.cryo", 35, door(INDEX, "lookup_type", "mut &this, " + SYM))],
+     0, "residue: OK"),
     ("a store's own calls are not the surface",
-     {"compiler/decl_index.cryo": FILES["compiler/decl_index.cryo"].replace(
-          "    entry_at(&this, i: i64) -> TypeRef { return this.entries[i]; }",
-          "    entry_at(&this, i: i64) -> TypeRef { return this.lookup_type(this.names[i]); }")},
+     [rec("arg", "compiler/decl_index.cryo", 50, door(INDEX, "lookup_type"))],
      0, "residue: OK"),
-    ("a commented-out call is not counted",
-     {"compiler/sema/sema.cryo": caller_with(["// this.ctx.decl_index.lookup_func_type(name);"])},
+    ("a call passing no key is no site",
+     [rec("arg", "compiler/sema/sema.cryo", 36, door(INDEX, "lookup_type"), ptype=TYREF)],
      0, "residue: OK"),
-    # Rule 1c: a scan over a TABLE array is a site as its door would be; a
-    # scan over DATA is not.
-    ("the door's loop written at the caller over a member table is a site, and is drift",
-     {"compiler/sema/sema.cryo": caller_with(["const td: TraitDeclNode* = null;",
-                                              "for (mut i: i64 = 0; i < td.methods.length; i++) {",
-                                              "    const f: FunctionDeclNode* = td.methods[i];",
-                                              "    if (f.name.equals(name)) { return; }",
-                                              "}"])},
-     1, "TraitDeclNode::methods[] (name): tree 1, list 0"),
-    ("the same loop over an array placed as data (a diagnostic's labels) is no site",
-     {"compiler/sema/sema.cryo": caller_with(["const dg: Diagnostic* = null;",
-                                              "if (dg.labels[0].name.equals(name)) { return; }"])},
+    ("a call outside compiler/src is no site",
+     [rec("arg", "<stdlib>/core/cmp.cryo", 37, door(INDEX, "lookup_type"))],
      0, "residue: OK"),
+    ("a comparison reading a member table's element at the innermost loop is a site, and is drift",
+     [rec("cmp", "compiler/sema/sema.cryo", 38, idx="==", prov="param:name", recv=TRAIT_METHOD, depth=1)],
+     1, "TraitDeclNode::methods[] (param:name): tree 1, list 0"),
+    ("the same element bound outside the innermost loop is the key searched for: no site",
+     [rec("cmp", "compiler/sema/sema.cryo", 39, idx="==", prov="param:name", recv=TRAIT_METHOD, depth=2)],
+     0, "residue: OK"),
+    ("an element of an array placed as data (a diagnostic's labels) is no site",
+     [rec("cmp", "compiler/sema/sema.cryo", 41, idx="==", prov="param:name",
+          recv="field:compiler::diag::diagnostic::Label.name<-element:field:compiler::diag::diagnostic::Diagnostic*.labels<-param:dg")],
+     0, "residue: OK"),
+    ("two members of one element compared are one site",
+     [rec("cmp", "compiler/sema/sema.cryo", 42, idx="==",
+          prov=TRAIT_METHOD.replace(".name<-", ".alias<-"), recv=TRAIT_METHOD, depth=1)],
+     1, DRIFT_ONE),
 ]
 
 # The J row the list mutations edit: the graph's module read.
-J_ROW_KEY = "| `compiler/sema/sema.cryo:9` | `ModuleGraph::find_module_index` | `name` | J |"
+J_ROW_KEY = "| `compiler/sema/sema.cryo:9` | `ModuleGraph::find_module_index` | `param:name` | J |"
 
 
 def list_mutations(text):
     line = [l for l in text.splitlines() if l.startswith(J_ROW_KEY)]
     assert len(line) == 1, "the fixture list has no single J row:\n" + text
     line = line[0]
-    els = "| `ScopeManager::lookup_type` | 1 |"
-    assert text.count(els) == 1
     return [
         ("a row deleted from the list is drift",
-         text.replace(line + "\n", ""), 1, "ModuleGraph::find_module_index (name): tree 1, list 0"),
+         text.replace(line + "\n", ""), 1, "ModuleGraph::find_module_index (param:name): tree 1, list 0"),
         ("a row duplicated in the list is drift",
          text.replace(line + "\n", line + "\n" + line + "\n"), 1, "tree 1, list 2"),
         ("a row's class blanked to `?` is refused as not the classifier's",
@@ -254,13 +211,12 @@ def list_mutations(text):
         ("a class letter the classifier does not define is refused",
          text.replace(line, line.replace("| J |", "| X |")), 1,
          "the list says `X`, which is no class (JNSBCFW)"),
-        ("an elsewhere count edited by hand is refused",
-         text.replace(els, "| `ScopeManager::lookup_type` | 0 |"), 1,
-         "elsewhere ScopeManager::lookup_type: tree 1, list 0"),
-        ("an elsewhere row deleted by hand is refused",
-         text.replace(els + "\n", ""), 1,
-         "elsewhere ScopeManager::lookup_type: tree 1, list 0"),
     ]
+
+
+def write_facts(path, records):
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("".join(r + "\n" for r in records))
 
 
 def main():
@@ -269,6 +225,8 @@ def main():
     try:
         base = os.path.join(work, "base")
         write_tree(base, FILES)
+        facts = os.path.join(work, "base.facts")
+        write_facts(facts, BASE)
         list_path = os.path.join(work, "residue.md")
         io.open(list_path, "w", encoding="utf-8", newline="\n").write(LIST_HEAD)
 
@@ -277,10 +235,10 @@ def main():
         # written to produce.
         gate = residue.load_gate()
         try:
-            rows, _sets, elsewhere = residue.population(gate, base)
+            rows, _sets = residue.population(gate, base, facts)
         except SystemExit as e:
             failures.append("baseline: the population refused the fixture:\n%s" % e)
-            rows, elsewhere = [], {}
+            rows = []
         classified, unknown = rc.classify(rows)
         if unknown or len(rows) != BASE_SITES:
             failures.append("baseline: %d sites (want %d), unknown %s:\n%s"
@@ -290,27 +248,24 @@ def main():
             counts[r[4]] = counts.get(r[4], 0) + 1
         if counts != BASE_CLASSES:
             failures.append("baseline: classes %s, want %s" % (counts, BASE_CLASSES))
-        if elsewhere != BASE_ELSEWHERE:
-            failures.append("baseline: elsewhere %s, want %s" % (elsewhere, BASE_ELSEWHERE))
-        rc.write_list(list_path, classified, elsewhere)
-        code, out = run_check(base, list_path)
-        if code != 0 or "residue: OK -- %d sites" % BASE_SITES not in out or "elsewhere 1" not in out:
+        rc.write_list(list_path, classified)
+        code, out = run_check(base, facts, list_path)
+        if code != 0 or "residue: OK -- %d sites" % BASE_SITES not in out:
             failures.append("baseline: the check did not read OK against the list it wrote:\n%s" % out)
         text = io.open(list_path, encoding="utf-8").read()
 
-        for i, (name, edits, want_code, want_text) in enumerate(TREE_MUTATIONS):
-            tree = os.path.join(work, "t%d" % i)
-            shutil.copytree(base, tree)
-            write_tree(tree, edits)
-            code, out = run_check(tree, list_path)
+        for i, (name, added, want_code, want_text) in enumerate(FACTS_MUTATIONS):
+            mutated = os.path.join(work, "m%d.facts" % i)
+            write_facts(mutated, BASE + added)
+            code, out = run_check(base, mutated, list_path)
             if code != want_code or want_text not in out:
-                failures.append("tree mutation %d (%s): expected exit %d with `%s`, got exit %d:\n%s"
+                failures.append("facts mutation %d (%s): expected exit %d with `%s`, got exit %d:\n%s"
                                 % (i, name, want_code, want_text, code, out))
 
         for i, (name, mutated, want_code, want_text) in enumerate(list_mutations(text)):
             p = os.path.join(work, "list%d.md" % i)
             io.open(p, "w", encoding="utf-8", newline="\n").write(mutated)
-            code, out = run_check(base, p)
+            code, out = run_check(base, facts, p)
             if code != want_code or want_text not in out:
                 failures.append("list mutation %d (%s): expected exit %d with `%s`, got exit %d:\n%s"
                                 % (i, name, want_code, want_text, code, out))
@@ -322,8 +277,8 @@ def main():
         for f in failures:
             sys.stderr.write(f + "\n\n")
         return 1
-    print("residue-selftest: OK -- baseline accepted, %d tree and %d list mutations behaved"
-          % (len(TREE_MUTATIONS), len(list_mutations(text))))
+    print("residue-selftest: OK -- baseline accepted, %d facts and %d list mutations behaved"
+          % (len(FACTS_MUTATIONS), len(list_mutations(text))))
     return 0
 
 

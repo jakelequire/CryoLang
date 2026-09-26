@@ -1,65 +1,58 @@
 #!/usr/bin/env python3
 """Enumerate every name-keyed READ in compiler/src: a call that hands a
-SPELLING (`SymbolStr` / `string`) into a method of a declaration-holding
-type and gets a declaration, a member or a fact about one back.
+SPELLING (`SymbolStr` / `string` / `ModulePath`) into a method of a
+declaration-holding type and gets a declaration, a member or a fact about
+one back, and every loop that searches such a type's member table by one.
 
 This is D32's population (docs/name-resolution.md §0.1): the sites the
 residue `scripts/ns-migration/residue.md` must account for, one by one.
-The population is derived, not listed: the same parser `scripts/lane-gate.py`
-runs on every commit builds it (its stores, the map and array owners it
-places, its receiver placement by declared type), so a reader added under
-any spelling on any store is in the population the moment it is declared.
+
+The sites are READ FROM THE COMPILER, not from the source text: the facts
+`cryo build --emit=facts` writes for the compiler (`make facts`,
+`.facts/compiler.facts`, refused when missing or stale).  Each record is a
+call or a comparison sema resolved, with the callee's identity and where
+every value came from, so a site is found by what it IS - whatever its
+receiver is spelled, however it is parenthesized, cast or reached through a
+local - and not by what a pattern can read off one line.
+
+Which types HOLD declarations is placement, decided over declarations and
+kept from `scripts/lane-gate.py`: every store (a type owning a map) and
+every array owner the gate places as "a member table inside its owner"
+(an impl's or a trait's members by leaf, the user-defined types' member
+records).  An array owner excluded for holding paths, flags, texts or a
+pass's own rib holds no declaration and is outside.
 
 A site is in the population when
-  * the method is declared by a STORE (lane-gate's rule 1 tables: the
-    types that hold declarations under a name) or by an ARRAY OWNER the
-    gate places as "a member table inside its owner" (rule 1b's exclusions
-    of that one kind - an impl's or a trait's own members by leaf, D32's
-    justified class); an array owner excluded for holding paths, flags,
-    texts or a pass's own rib holds no declaration and is outside;
-  * the method takes a key type in PARAMETER position (the caller hands a
-    name in; a method that only RETURNS a name is a display, not a read);
-  * the method is a read (`&this` or static; a `mut &this` registrar is the
-    write side, which D32 does not count);
-  * the call is outside the declaring type's own file (a store's own calls
-    are its machinery, as lane-gate has it).
+  * METHOD: an `arg` record whose parameter type is a key type, whose callee
+    is a method of a holder taking `&this` or a static (a `mut &this`
+    registrar is the write side, which D32 does not count), called outside
+    the holder's own file and outside the files its store owns (a store's
+    own calls are its machinery).  One site per call; its key is the
+    provenance of its key arguments, in order.
+  * SCAN: a `cmp` record, or an `arg` record of a key type's `equals`/`eq`,
+    one of whose operands is a key read off an element of an array the gate
+    places as a TABLE, where the element is read by the INNERMOST loop around
+    the comparison - read at the record's own loop depth, directly or
+    through a local declared at it, or indexed by that loop's counter.  An
+    element bound outside the innermost loop is the source of the key being
+    searched for, not the array being searched.  The site's read is spelled
+    `Owner::field[]` (`local::Elem[]` for a local or parameter array, named
+    by its element type), outside the owner's own file; its key is the other
+    operand's provenance.
 
-The same read WRITTEN INLINE is a site too (lane-gate's rule 1c): a loop
-that compares an array element's key-typed field with a spelling -
-`st.methods[i].name.equals(n)`, through a local bound to the element, by
-`.name.id ==`, over an array of bare names, over a LOCAL array of records
-- is the door's body written at the caller.  The gate places every scanned
-(owner, array) as a TABLE or as DATA and refuses one in neither; a TABLE's
-scans outside the owner's own file are rows whose read is `field[]` on the
-owner (`StructType::methods[]`; a local table `local::MethodNode[]`).  The
-population was 294 method calls while the tree held 156 such scans, and a
-count from a rule blind to a whole shape is not a count.
+A call sema left unpinned is written by the compiler as `noparams` with the
+callee as spelled; one whose spelled method is a holder's read method is
+REFUSED - a site the instrument cannot identify is a site it cannot count.
 
 Every site prints as one tab-separated row:
-    file<TAB>line<TAB>receiver-type<TAB>method<TAB>argument text
+    file<TAB>line<TAB>holder<TAB>method<TAB>key provenance
 `--count` prints the size alone; `--check [residue.md]` reads the residue's
 site table (`residue_classify.py` writes it) and refuses when the tree's
 population and the table differ in either direction - matched by (file,
-method, key text), so a line shift is not drift and a new or re-keyed site
-is - when a row's class is not the one `residue_classify.py` derives for
-that site (a class is a judgement held as code; the list is its rendering,
-and a list that says otherwise is the list that is wrong), or when a class
-letter is one the classifier has no meaning for; on OK it prints the count
-per class FROM THE CLASSIFIER, so the count pinned in §0 is checked against
-the tree, against the list and against the code that decides it.  A list
-whose one J row had been flipped to N by hand read `OK ... J 51, N 118`
-through a check that summed the letters as written.
-
-Two controls the gate has and this enumerator did without, both refused
-now: a call to a population name that neither receiver pattern reaches
-(`(this.ctx.decl_index).lookup_type(`, a receiver with arguments) is
-refused as unplaceable rather than not counted; and every dotted call to a
-population name whose receiver is placed on a type that is NOT a holder
-(`DropInserter::lookup_type`, `ScopeManager::lookup_local`, ...) is
-tallied per (type, method) into the list's second table, so a holder
-misplaced as something else moves a pinned number instead of vanishing -
-the gate's LOOKUP_LOCAL row.  A static call's owner is spelled and cannot
-be misplaced, so statics on non-holders are not tallied.
+method, key), so a line shift is not drift and a new or re-keyed site is -
+when a row's class is not the one `residue_classify.py` derives for that
+site, or when a class letter is one the classifier has no meaning for; on OK
+it prints the count per class FROM THE CLASSIFIER.
 """
 import argparse
 import importlib.util
@@ -72,12 +65,16 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 GATE = os.path.join(ROOT, "scripts", "lane-gate.py")
 DEFAULT_RESIDUE = os.path.join(HERE, "residue.md")
 # lane-gate places an array owner whose array is a MEMBER TABLE inside its
-# owner - an impl's `This::Member` bindings, a trait's own member names -
-# with this phrase in its reason.  Those are D32's justified class and are
-# in the population; an array owner excluded for any other reason (a file
-# path, a flag, a diagnostic text, a pass's own rib) holds no declaration
-# and is not.
+# owner with this phrase in its reason; those hold declarations.
 MEMBER_TABLE = "a member table inside its owner"
+# D32's key types, as the facts spell a parameter or a compared value.
+KEY = re.compile(r"\b(SymbolStr|string|ModulePath)\b")
+# A key type's own comparison, called on one key with another.
+KEY_EQUALS = re.compile(
+    r"^(compiler::resolver::symbol_str::SymbolStr|string|compiler::module_graph::ModulePath)"
+    r"\.(equals|eq)\(")
+LOCAL_AT = re.compile(r"^local:(?:mut )?[A-Za-z_0-9]+@(\d+)=")
+ELEMENT = re.compile(r"^element(?:@(\d+))?:")
 
 
 def load_gate():
@@ -89,8 +86,7 @@ def load_gate():
 
 def read_methods(gate, tree, type_name, defn):
     """{name} of `type_name`'s methods that take a key type as a PARAMETER
-    and are reads (not `mut &this`): lane-gate's rule 2 narrowed to the
-    direction D32 counts, using rule 1b's parameter test."""
+    and are reads (not `mut &this`), as the declarations state them."""
     taking = gate.name_taking_methods(tree, type_name)
     kinds = {}
     head_re = re.compile(r"^type\s+(?:struct|class|union|enum)\s+%s\b" % re.escape(type_name))
@@ -105,37 +101,13 @@ def read_methods(gate, tree, type_name, defn):
     return {n for n in taking if kinds.get(n) in ("read", "static")}
 
 
-def scan_rows(gate, tree, scans):
-    """The inline-scan half of the population: every rule 1c scan over an
-    array placed as a TABLE, outside the owner's own file, as a row whose
-    read is `field[]` on the owner (`StructType::methods[]`) and whose key
-    is the text the element's key field was compared with.  A scan over
-    DATA (a text, a flag, a path) is no read of a declaration and is not a
-    row; a scan in the owner's own file is the door's body, as a store's own
-    calls are its machinery."""
-    rows = []
-    for rel, lineno, owner, field, _elem, _chain, key in scans:
-        entry = gate.SCANNED_ARRAYS["%s.%s" % (owner, field)]
-        if entry.kind != gate.TABLE:
-            continue
-        if rel == entry.defn or (owner in gate.STORES and gate.STORES[owner].owns(rel)):
-            continue
-        rows.append((rel, lineno, owner, field + "[]", key))
-    return rows
-
-
-def population(gate, src):
+def placement(gate, src):
+    """The holders and their declaring files, each holder's read methods as
+    declared, and the tree the placement read."""
     tree = gate.Tree(src)
     gate.place_map_owners(tree)
     gate.place_array_owners(tree)
-    scans = gate.place_inline_scans(tree)
-    argument_text = gate.argument_text
-    # The types that hold something under a name: every store, and every
-    # placed array owner (rule 1b's candidates, each already in
-    # EXCLUDED_ARRAYS with its reason).  Their declaring files.
-    holders = {}
-    for name, st in gate.STORES.items():
-        holders[name] = st.defn
+    holders = {name: st.defn for name, st in gate.STORES.items()}
     members = 0
     for name, (rels, _fields, _methods) in gate.array_candidates(tree).items():
         ex = gate.EXCLUDED_ARRAYS.get(name)
@@ -151,120 +123,206 @@ def population(gate, src):
             sets[name] = read_methods(gate, tree, name, defn)
         except SystemExit:
             sets[name] = set()
-    names = sorted(set().union(*sets.values()), key=len, reverse=True)
-    if not names:
-        raise SystemExit("residue: no name-taking read on any holder; the parser has not measured the tree")
-    seen_re, dotted_re, cast_re, static_re = gate.call_patterns(names)
-    rows = []
-    unplaced = []
-    unreached = []
-    elsewhere = {}
-    for rel in tree.rels:
-        for lineno, raw in enumerate(tree.files[rel], 1):
-            line = gate.strip_comment(raw)
-            if not line.strip():
-                continue
-            seen = len(seen_re.findall(line))
-            accounted = 0
-            placed = [(m, m.group(1), m.group(2), tree.receiver_type(rel, lineno, m.group(1)))
-                      for m in dotted_re.finditer(line)]
-            placed += [(m, m.group(0), m.group(2), m.group(1)) for m in cast_re.finditer(line)]
-            for m, recv, name, ty in placed:
-                accounted += 1
-                if ty is None:
-                    # A call this enumerator cannot place is one it cannot
-                    # count, and a silently dropped one reads as a shorter
-                    # list; lane-gate refuses the same way.
-                    unplaced.append((rel, lineno, recv, name))
-                    continue
-                if ty not in sets:
-                    # A population name on a type that holds nothing: not a
-                    # site, but tallied so a holder misplaced as one shows.
-                    elsewhere[(ty, name)] = elsewhere.get((ty, name), 0) + 1
-                    continue
-                if name not in sets[ty]:
-                    continue
-                if rel == holders[ty] or (ty in gate.STORES and gate.STORES[ty].owns(rel)):
-                    continue
-                rows.append((rel, lineno, ty, name, argument_text(line, m.end() - 1)))
-            for m in static_re.finditer(line):
-                accounted += 1
-                owner, name = m.group(1), m.group(2)
-                if owner not in sets or name not in sets[owner]:
-                    continue
-                if rel == holders[owner] or (owner in gate.STORES and gate.STORES[owner].owns(rel)):
-                    continue
-                rows.append((rel, lineno, owner, name, argument_text(line, m.end() - 1)))
-            # A call to a population name on something no pattern reaches: a
-            # receiver with arguments, a parenthesized expression.  Refused,
-            # as the gate refuses it - unreached is uncounted.
-            for _ in range(seen - accounted):
-                unreached.append((rel, lineno, line.strip()))
-    if unplaced:
-        raise SystemExit("residue: %d call(s) to a read method on a receiver whose type "
-                         "cannot be read, e.g. %s:%d `%s.%s(`; place it or the count is short"
-                         % (len(unplaced), unplaced[0][0], unplaced[0][1], unplaced[0][2], unplaced[0][3]))
-    if unreached:
-        raise SystemExit("residue: %d call(s) to a read method on no simple receiver, "
-                         "e.g. %s:%d `%s`; a call no pattern reaches is a call this "
-                         "enumerator cannot count"
-                         % (len(unreached), unreached[0][0], unreached[0][1], unreached[0][2][:120]))
-    # The inline half: the arrays the gate placed as TABLES, each a read
-    # `field[]` on its owner, so the classifier's stale check and `--methods`
-    # see a scanned table exactly as they see a door.
     for label, entry in gate.SCANNED_ARRAYS.items():
         if entry.kind == gate.TABLE:
             owner, field = label.split(".", 1)
             sets.setdefault(owner, set()).add(field + "[]")
-    rows.extend(scan_rows(gate, tree, scans))
-    return rows, sets, elsewhere
+    return tree, holders, sets
+
+
+def bare_type(t):
+    """`compiler::ast::declaration::MethodNode*` -> `MethodNode`."""
+    t = t.strip().lstrip("&").replace("mut ", "").strip().rstrip("*").strip()
+    depth = 0
+    out = []
+    for ch in t:
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out).rsplit("::", 1)[-1]
+
+
+def split_callee(text):
+    """(owner leaf, method, is_static) of a rendered callee, or None for a
+    free function or a callee the compiler could not name."""
+    head = text.split("(", 1)[0]
+    depth = 0
+    flat = []
+    for ch in head:
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+        elif depth == 0:
+            flat.append(ch)
+    head = "".join(flat)
+    last = head.rsplit("::", 1)[-1]
+    if "." in last:
+        owner, meth = head.rsplit(".", 1)
+        return owner.rsplit("::", 1)[-1], meth, False
+    if "::" in head:
+        owner, meth = head.rsplit("::", 1)
+        return owner.rsplit("::", 1)[-1], meth, True
+    return None
+
+
+def scanned_table(prov, depth):
+    """The TABLE label (`Owner.field`, `local.Elem`) of the nearest array
+    element the key in `prov` is read off, when the innermost loop reads it;
+    None otherwise (a key from a call, a parameter, a local bound outside the
+    innermost loop, no element at all)."""
+    segs = prov.split("<-")
+    cur = depth
+    for i, seg in enumerate(segs):
+        src = seg
+        if src.startswith("local:"):
+            m = LOCAL_AT.match(src)
+            if m:
+                cur = int(m.group(1))
+            eq = src.find("=")
+            src = src[eq + 1:] if eq >= 0 else ""
+        if src.startswith("call:"):
+            return None
+        m = ELEMENT.match(src)
+        if not m:
+            continue
+        if m.group(1) is not None:
+            cur = int(m.group(1))
+        if cur != depth:
+            return None
+        inner = src[m.end():]
+        if inner.startswith("field:"):
+            owner, field = inner[len("field:"):].rsplit(".", 1)
+            return "%s.%s" % (bare_type(owner), field)
+        if i > 0 and segs[i - 1].startswith("field:"):
+            owner = segs[i - 1][len("field:"):].rsplit(".", 1)[0]
+            return "local.%s" % bare_type(owner)
+        return None
+    return None
+
+
+def element_of(prov):
+    """The chain from the nearest array element on - which element a key is
+    read off - or None when there is none."""
+    segs = prov.split("<-")
+    for i, seg in enumerate(segs):
+        src = seg[seg.find("=") + 1:] if seg.startswith("local:") else seg
+        if src.startswith("call:"):
+            return None
+        if ELEMENT.match(src):
+            return "<-".join([src] + segs[i + 1:])
+    return None
+
+
+def population(gate, src, facts):
+    """The population from the facts at `facts`: (rows, sets)."""
+    tree, holders, sets = placement(gate, src)
+    by_lower = {rel.lower(): rel for rel in tree.rels}
+
+    def tree_rel(path):
+        p = path[4:] if path.startswith("src/") else None
+        return by_lower.get(p.lower()) if p is not None else None
+
+    def owned(holder, rel):
+        if rel == holders.get(holder):
+            return True
+        return holder in gate.STORES and gate.STORES[holder].owns(rel)
+
+    read_names = {m for ms in sets.values() for m in ms if not m.endswith("[]")}
+    calls = {}
+    scans = set()
+    unpinned = []
+    with open(facts, encoding="utf-8") as fh:
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            if len(f) != 15:
+                raise SystemExit("residue: %s: a record with %d fields, not 15; the facts "
+                                 "format has changed and this reader has not" % (facts, len(f)))
+            rel = tree_rel(f[1])
+            if rel is None:
+                continue
+            kind, lineno, depth = f[0], int(f[2]), int(f[14])
+            if kind in ("noparams", "unaligned"):
+                spelled = f[12]
+                meth = spelled[1:] if spelled.startswith(".") else spelled.rsplit("::", 1)[-1]
+                if f[9] == "none" and meth in read_names:
+                    unpinned.append((rel, lineno, spelled))
+                continue
+            if kind == "arg" and KEY.search(f[5]):
+                sc = split_callee(f[12])
+                if sc is not None and sc[0] in holders:
+                    holder, meth, static = sc
+                    params = f[12].split("(", 1)[1] if "(" in f[12] else ""
+                    if (static or params.startswith("&this")) and not owned(holder, rel):
+                        calls.setdefault((rel, lineno, f[3], holder, meth), []).append(
+                            (int(f[4]), f[6]))
+            if kind == "cmp" or (kind == "arg" and KEY_EQUALS.match(f[12])):
+                operands = (f[6], f[7])
+                sides = (0, 1)
+                # Two members of ONE element compared with each other
+                # (`b.source_field == b.local_name`) search nothing by a key
+                # from elsewhere: one site, keyed by the first operand.
+                if element_of(operands[0]) is not None and element_of(operands[0]) == element_of(operands[1]):
+                    sides = (1,)
+                for side in sides:
+                    label = scanned_table(operands[side], depth)
+                    if label is None:
+                        continue
+                    entry = gate.SCANNED_ARRAYS.get(label)
+                    if entry is None or entry.kind != gate.TABLE:
+                        continue
+                    owner, field = label.split(".", 1)
+                    if entry.defn and rel == entry.defn:
+                        continue
+                    if owner in gate.STORES and gate.STORES[owner].owns(rel):
+                        continue
+                    scans.add((rel, lineno, owner, field + "[]", operands[1 - side]))
+    if unpinned:
+        raise SystemExit("residue: %d call(s) to a holder's read method that sema left unpinned, "
+                         "e.g. %s:%d `%s`; a site the compiler cannot identify is one this "
+                         "cannot count" % (len(unpinned), unpinned[0][0], unpinned[0][1], unpinned[0][2]))
+    rows = []
+    for (rel, lineno, _col, holder, meth), args in calls.items():
+        rows.append((rel, lineno, holder, meth, ", ".join(p for _i, p in sorted(args))))
+    rows.extend(sorted(scans))
+    rows.sort()
+    return rows, sets
 
 
 # A row of the residue's site table: `file:line` | `Holder::method` | `key` | class | reason.
-# The list is matched to the tree by (file, method, key text), not by line,
-# so an edit that only moves a file's lines does not read as drift; a site
-# added, removed or re-keyed does.  The class letter is one character of any
-# kind, so a letter the classifier does not know is read here and refused
-# there instead of falling out of the table unseen.
+# The list is matched to the tree by (file, method, key), not by line, so an
+# edit that only moves a file's lines does not read as drift; a site added,
+# removed or re-keyed does.  The class letter is one character of any kind,
+# so a letter the classifier does not know is read here and refused there
+# instead of falling out of the table unseen.
 SITE_RE = re.compile(r"^\|\s*`([^`]+):(\d+)`\s*\|\s*`([^`]+)`\s*\|\s*(?:`(.*?)`)?\s*\|\s*(\S+)\s*\|")
-# A row of the list's second table: `Type::method` | calls - the dotted
-# calls to a population name whose receiver is placed on a type that holds
-# nothing (the gate's LOOKUP_LOCAL, pinned here per (type, method)).
-ELSEWHERE_RE = re.compile(r"^\|\s*`([^`]+)::([^`]+)`\s*\|\s*(\d+)\s*\|")
-ELSEWHERE_BEGIN = "<!-- residue-elsewhere:begin -->"
-ELSEWHERE_END = "<!-- residue-elsewhere:end -->"
 
 
 def residue_sites(path):
-    """{(file, method, key): [class, ...]} from the site table and
-    {(type, method): calls} from the elsewhere table, as the list has them."""
+    """{(file, method, key): [class, ...]} from the site table."""
     sites = {}
-    elsewhere = {}
     with open(path, "r", encoding="utf-8") as fh:
         text = fh.read()
-    b, e = text.find(ELSEWHERE_BEGIN), text.find(ELSEWHERE_END)
-    other = text[b:e] if b >= 0 and e > b else ""
     for line in text.splitlines():
         m = SITE_RE.match(line)
         if m:
             key = (m.group(1), m.group(3), (m.group(4) or "").replace("\\|", "|"))
             sites.setdefault(key, []).append(m.group(5))
-    for line in other.splitlines():
-        m = ELSEWHERE_RE.match(line)
-        if m:
-            elsewhere[(m.group(1), m.group(2))] = int(m.group(3))
-    return sites, elsewhere
+    return sites
 
 
-def check(rows, elsewhere, path, out=print):
+def check(rows, path, out=print):
     """The list at `path` against the tree's `rows` and the classifier's
     verdict on each: every site present in both, no more than once each
     way; every row's class the one the classifier derives for it; every
-    class letter one the classifier defines; the elsewhere table equal to
-    the tree's tally.  Prints each disagreement and returns 0 on OK, 1 on
-    any refusal.  The counts it prints on OK are the classifier's."""
+    class letter one the classifier defines.  Prints each disagreement and
+    returns 0 on OK, 1 on any refusal.  The counts it prints on OK are the
+    classifier's."""
     import residue_classify as rc
-    listed, listed_elsewhere = residue_sites(path)
+    listed = residue_sites(path)
     classified, unknown = rc.classify(rows)
     if unknown:
         out("residue: read methods called in the tree with no class in residue_classify.py: %s"
@@ -283,10 +341,7 @@ def check(rows, elsewhere, path, out=print):
         out("residue: DRIFT - tree %d, list %d; re-run residue_classify.py and review the rows it changes"
             % (sum(len(v) for v in tree.values()), sum(len(v) for v in listed.values())))
         return 1
-    # The class is the classifier's; the list only renders it.  Every letter
-    # in the list is checked against the letter the code derives for that
-    # site, so a row edited by hand - flipped, blanked, given a letter the
-    # classes do not include - is refused rather than summed.
+    # The class is the classifier's; the list only renders it.
     mismatched = 0
     for k in sorted(tree):
         want = tree[k][0]
@@ -304,57 +359,45 @@ def check(rows, elsewhere, path, out=print):
         out("residue: %d row(s) whose class is not the classifier's; a class is a judgement held in "
             "residue_classify.py - change it there, with its reason, and regenerate the list" % mismatched)
         return 1
-    moved = False
-    for k in sorted(set(elsewhere) | set(listed_elsewhere)):
-        if elsewhere.get(k, 0) != listed_elsewhere.get(k, 0):
-            moved = True
-            out("residue: elsewhere %s::%s: tree %d, list %d"
-                % (k[0], k[1], elsewhere.get(k, 0), listed_elsewhere.get(k, 0)))
-    if moved:
-        out("residue: ELSEWHERE - a population name on a type that holds nothing moved (tree %d, list %d); "
-            "a holder misplaced as another type lands here - place it, or regenerate the list and say why"
-            % (sum(elsewhere.values()), sum(listed_elsewhere.values())))
-        return 1
     counts = {}
     for row in classified:
         counts[row[4]] = counts.get(row[4], 0) + 1
     # The convertible remainder is every class that is neither justified
     # (J) nor outside D32 (N); the migration is complete at 0.
     convertible = sum(n for c, n in counts.items() if c not in ("J", "N"))
-    out("residue: OK -- %d sites, list, tree and classifier agree; %s; convertible %d; elsewhere %d"
-        % (len(classified), ", ".join("%s %d" % (c, counts[c]) for c in sorted(counts)),
-           convertible, sum(elsewhere.values())))
+    out("residue: OK -- %d sites, list, tree and classifier agree; %s; convertible %d"
+        % (len(classified), ", ".join("%s %d" % (c, counts[c]) for c in sorted(counts)), convertible))
     return 0
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default=os.path.join(ROOT, "compiler", "src"))
+    ap.add_argument("--facts", help="the compiler's facts (default: .facts/compiler.facts, refused when stale)")
     ap.add_argument("--count", action="store_true", help="print the population size alone")
     ap.add_argument("--methods", action="store_true", help="print the read methods per holder")
-    ap.add_argument("--elsewhere", action="store_true",
-                    help="print the population names called on types that hold nothing, per (type, method)")
     ap.add_argument("--check", nargs="?", const=DEFAULT_RESIDUE, metavar="RESIDUE_MD",
                     help="refuse unless the tree's population, the residue's site table and the classifier agree")
     args = ap.parse_args()
     gate = load_gate()
     sys.path.insert(0, os.path.dirname(HERE))
+    facts = args.facts
+    if facts is None:
+        import importlib
+        facts_mod = importlib.import_module("facts")
+        facts = facts_mod.facts_path("compiler")
     import parse_cache
-    rows, sets, elsewhere = parse_cache.memo(
-        "residue-population", [os.path.abspath(__file__), GATE], args.src,
-        lambda: population(gate, args.src))
+    rows, sets = parse_cache.memo(
+        "residue-population", [os.path.abspath(__file__), GATE, facts], args.src,
+        lambda: population(gate, args.src, facts))
     if args.methods:
         for holder in sorted(sets):
             if sets[holder]:
                 print("%s: %s" % (holder, ", ".join(sorted(sets[holder]))))
         return 0
-    if args.elsewhere:
-        for (ty, name), n in sorted(elsewhere.items()):
-            print("%s::%s\t%d" % (ty, name, n))
-        return 0
     if args.check:
         sys.path.insert(0, HERE)
-        return check(rows, elsewhere, args.check)
+        return check(rows, args.check)
     if args.count:
         print(len(rows))
         return 0

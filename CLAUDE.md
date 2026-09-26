@@ -33,7 +33,9 @@ make verify              # build once; census, examples, lsp, cross, check-fast 
 make roster-check        # roster golden: 2113 unit + 46 projects + 179 negative
 make lane-check          # resolution-lane surface ratchet; needs NO build
 make ns-status-check     # run every check docs/name-resolution.md §0 carries
-make check-fast          # lane + §0 + pin, ~1 min, no build. Run before committing.
+make check-fast          # lane + §0 + pin, ~1 min; builds the compiler's facts first when
+                         # stale (§0's residue rows count from them). Run before committing.
+make facts               # cryo build --emit=facts over compiler, stdlib, editor -> .facts/
 make install-hooks       # point git at scripts/git-hooks (ONCE per checkout)
 make lsp-check           # compile tools/CryoLSP with the compiler under test
 make cross-check         # runtime/stdlib/compiler/LSP for the OTHER OS, objects only, ~80s
@@ -59,7 +61,9 @@ only things that run are what a person or an agent runs.
 So:
 
 - **`make check-fast`** before committing. Lane surface, §0, pin integrity;
-  no compiler, no stdlib, no link. About a minute: the ledger's ~400 status
+  one compiled input: §0's residue rows count from the compiler's own
+  `--emit=facts` report, so a stale `.facts/` is rebuilt first (a compiler
+  build plus about 80 s), and a fresh one costs nothing. About a minute: the ledger's ~400 status
   rows run one shell each, concurrently, in Git's bash on Windows (never the
   WSL launcher a bare `bash` resolves to there), and the rows that parse
   `compiler/src` share one parse per run (`scripts/parse_cache.py`). A short

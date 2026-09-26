@@ -14,7 +14,7 @@
 /// compiled, not a reading of its source.  Tab-separated, one per line:
 ///
 ///     kind  file  line  col  index  type  provenance  receiver  callee  pin
-///           callee-decl  enclosing  callee-text  enclosing-text
+///           callee-decl  enclosing  callee-text  enclosing-text  depth
 ///
 /// `kind` is `arg`, `cmp`, `noparams` (a call with arguments whose parameter
 /// types sema never had) or `unaligned` (a signature whose parameters could
@@ -25,14 +25,18 @@
 /// argument's value comes from, and `receiver` where the method's receiver
 /// does (a comparison's right and left operands):
 ///
-///     literal                a literal
+///     literal:<text>         a literal as written, a string quoted
 ///     param:<name>           the enclosing function's own parameter
-///     local:<name>=<prov>    a local, and where its initializer comes from
-///     local:mut <name>=<prov>  the same for a local that can be reassigned
+///     local:<name>@<d>=<prov>  a local declared at loop depth <d>, and where
+///                            its initializer comes from (`local:mut` when
+///                            it can be reassigned)
 ///     global:<path>          a global or constant
 ///     field:<type>.<member><-<prov>  a member read off a value from <prov>
-///     call:<callee-text>     a call's return
+///     call:<callee-text> of <prov>  a call's return, and where its first
+///                            argument comes from
 ///     element:<prov>         an element of an array from <prov>
+///     element@<d>:<prov>     the same, indexed by a local declared at loop
+///                            depth <d> (a counter: the loop it drives)
 ///     sourceloc:<FILE|LINE>  a source-location constant
 ///     name:<spelling>        a name sema left unanswered
 ///     expr:<kind>            any other expression
@@ -42,17 +46,20 @@
 /// fields render them for a reader; `callee-decl` is where the callee is
 /// declared.  `pin` says which of sema's answers named the callee: `call`
 /// the call's own pin, `callee` the pin on its callee expression, `method`
-/// the method sema selected, `none` nothing.
+/// the method sema selected, `none` nothing.  `depth` is how many loops
+/// enclose the record: with a local's own depth it tells an element bound
+/// inside the innermost loop - the array the loop searches - from one bound
+/// outside it, the source of the key searched for.
 
 namespace compiler::sema::call_facts;
 
 import compiler::ast;
-import compiler::ast::{ NodeKind };
+import compiler::ast::{ LiteralKind, NodeKind };
 import compiler::ast::node::{ ASTNode };
 import compiler::ast::declaration::{ FunctionDeclNode, MethodNode, VarDeclNode };
 import compiler::ast::expression::{
     ArrayAccessNode, BinaryExprNode, CallExprNode, CalleePin, CastExprNode, ExpressionNode,
-    IdentifierNode, MemberAccessNode, ScopeResolutionNode, UnaryExprNode
+    IdentifierNode, LiteralNode, MemberAccessNode, ScopeResolutionNode, UnaryExprNode
 };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
@@ -119,7 +126,8 @@ type struct CallFacts {
             receiver = CallFacts::provenance(fs, (call.callee as MemberAccessNode*).object, 0);
         }
         const tail: string = callee + "\t" + pin + "\t" + callee_decl + "\t"
-            + CallFacts::enclosing(fs) + "\t" + callee_text + "\t" + CallFacts::enclosing_text(fs);
+            + CallFacts::enclosing(fs) + "\t" + callee_text + "\t" + CallFacts::enclosing_text(fs)
+            + "\t" + fmt::format("%d", fs.state.loop_depth);
 
         // The parameter types: the pinned declaration's signature when sema
         // pinned one, the types sema classified the arguments against when
@@ -177,12 +185,13 @@ type struct CallFacts {
             + bin.op.lexeme + "\t" + CallFacts::type_text(fs.arena, key) + "\t"
             + CallFacts::provenance(fs, bin.right, 0) + "\t"
             + CallFacts::provenance(fs, bin.left, 0) + "\t-\t-\t-\t"
-            + CallFacts::enclosing(fs) + "\t-\t" + CallFacts::enclosing_text(fs));
+            + CallFacts::enclosing(fs) + "\t-\t" + CallFacts::enclosing_text(fs)
+            + "\t" + fmt::format("%d", fs.state.loop_depth));
     }
 
     /// The key an operand compares: its own type when that is a key, the
-    /// type of the value it is read out of when it is a number read off a
-    /// key (`name.id`); invalid otherwise.
+    /// type of the value it is read out of when it is a number read off one
+    /// key (`name.id`, not an array of them's `length`); invalid otherwise.
     static compared_key(fs: &FactsScope, e: ExpressionNode*) -> TypeRef {
         if (e == null || !e.resolved_type.is_valid()) { return TypeRef::invalid(); }
         if (CallFacts::carries_key(fs.ctx, fs.arena, e.resolved_type)) { return e.resolved_type; }
@@ -192,7 +201,12 @@ type struct CallFacts {
         if (t == null || t.kind != TypeKind::Int) { return TypeRef::invalid(); }
         const obj: ExpressionNode* = (e as MemberAccessNode*).object;
         if (obj == null || !obj.resolved_type.is_valid()) { return TypeRef::invalid(); }
-        if (CallFacts::carries_key(fs.ctx, fs.arena, obj.resolved_type)) { return obj.resolved_type; }
+        mut one: TypeRef = obj.resolved_type;
+        const ot: Type* = fs.arena.lookup(one.id);
+        if (ot != null && ot.kind == TypeKind::Reference) { one = (ot as ReferenceType*).referent; }
+        const kt: Type* = fs.arena.lookup(one.id);
+        if (kt == null || kt.kind == TypeKind::Array) { return TypeRef::invalid(); }
+        if (CallFacts::carries_key(fs.ctx, fs.arena, one)) { return one; }
         return TypeRef::invalid();
     }
 
@@ -381,7 +395,7 @@ type struct CallFacts {
         if (depth > 8) { return "expr:deep"; }
         const ctx: CompilationContext* = fs.ctx;
         const n: ASTNode* = e as ASTNode*;
-        if (n.kind == NodeKind::Literal) { return "literal"; }
+        if (n.kind == NodeKind::Literal) { return "literal:" + CallFacts::literal_text(e as LiteralNode*); }
         if (n.kind == NodeKind::Identifier) {
             const ident: IdentifierNode* = e as IdentifierNode*;
             const spelled: string = ctx.intern_table.resolve(ident.name);
@@ -412,10 +426,12 @@ type struct CallFacts {
         if (n.kind == NodeKind::CallExpression) {
             const inner: CallExprNode* = e as CallExprNode*;
             const entry: OverloadId = CallFacts::callee_entry(ctx, inner).entry;
+            mut head: string = "call:" + CallFacts::callee_spelled(ctx, inner);
             if (entry.is_valid()) {
-                return "call:" + Demangler::demangle(CallFacts::symbol_text(ctx, entry));
+                head = "call:" + Demangler::demangle(CallFacts::symbol_text(ctx, entry));
             }
-            return "call:" + CallFacts::callee_spelled(ctx, inner);
+            if (inner.arguments.length == 0) { return head; }
+            return head + " of " + CallFacts::provenance(fs, inner.arguments[0], depth + 1);
         }
         if (n.kind == NodeKind::UnaryExpression) {
             return CallFacts::provenance(fs, (e as UnaryExprNode*).operand, depth + 1);
@@ -424,7 +440,9 @@ type struct CallFacts {
             return CallFacts::provenance(fs, (e as CastExprNode*).expression, depth + 1);
         }
         if (n.kind == NodeKind::ArrayAccess) {
-            return "element:" + CallFacts::provenance(fs, (e as ArrayAccessNode*).array, depth + 1);
+            const acc: ArrayAccessNode* = e as ArrayAccessNode*;
+            return "element" + CallFacts::index_depth(fs, acc.index) + ":"
+                + CallFacts::provenance(fs, acc.array, depth + 1);
         }
         if (n.kind == NodeKind::ScopeResolution) {
             const s: ScopeResolutionNode* = e as ScopeResolutionNode*;
@@ -432,6 +450,41 @@ type struct CallFacts {
                 + ctx.intern_table.resolve(s.member_name);
         }
         return "expr:" + n.kind.to_string();
+    }
+
+    /// A literal as written, a string's text quoted, with tabs, newlines,
+    /// quotes and backslashes escaped so a record stays one line of fields,
+    /// and cut at 60 characters.
+    static literal_text(lit: LiteralNode*) -> string {
+        mut v: string = lit.value;
+        if (v.length() > 60) { v = v.substr(0, 60) + "..."; }
+        v = v.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r");
+        if (lit.literal_kind == LiteralKind::String) {
+            return "\"" + v.replace("\"", "\\\"") + "\"";
+        }
+        return v;
+    }
+
+    /// `@<d>` when an element's index is a local declared at loop depth <d>
+    /// (a loop counter at the depth of the loop it drives): the element is
+    /// read by that loop, whatever loop the read stands in.  Empty otherwise.
+    static index_depth(fs: &FactsScope, idx: ExpressionNode*) -> string {
+        if (idx == null || (idx as ASTNode*).kind != NodeKind::Identifier) { return ""; }
+        match ((idx as IdentifierNode*).res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Local(sym) => {
+                        match (fs.state.facts_depths.get(&sym.key())) {
+                            Option::Some(d) => { return fmt::format("@%llu", d); }
+                            Option::None => { }
+                        }
+                    }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+        return "";
     }
 
     /// A local's provenance: a parameter of the enclosing function by its
@@ -449,7 +502,12 @@ type struct CallFacts {
             Option::Some(v) => {
                 const decl: VarDeclNode* = v as VarDeclNode*;
                 const mark: string = if (decl.is_mutable) { "mut " } else { "" };
-                return "local:" + mark + spelled + "="
+                mut at: string = "";
+                match (fs.state.facts_depths.get(&sym.key())) {
+                    Option::Some(d) => { at = fmt::format("@%llu", d); }
+                    Option::None => { }
+                }
+                return "local:" + mark + spelled + at + "="
                     + CallFacts::provenance(fs, decl.initializer, depth + 1);
             }
             Option::None => { }

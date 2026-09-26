@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe facts selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe facts facts-fresh selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -190,7 +190,7 @@ help:
 	@echo "  make lane-selftest     Drive lane-gate.py through a throwaway tree, every rule both ways"
 	@echo "  make residue-selftest  Drive residue.py --check through a throwaway tree and list, both ways"
 	@echo "  make ns-status-check   Run every check docs/name-resolution.md §0 carries"
-	@echo "  make check-fast        lane-check + the two self-tests + ns-status-check + verify-pin (~1 min, no build)"
+	@echo "  make check-fast        the facts when stale + lane-check + the self-tests + ns-status-check + verify-pin (~1 min when fresh)"
 	@echo "  make install-hooks     Point git at the tracked hooks (run once per checkout)"
 	@echo "  make lsp-check         Compile tools/CryoLSP against current source"
 	@echo "  make facts             The compiler's --emit=facts report for compiler, stdlib, editor (.facts/)"
@@ -657,13 +657,14 @@ ns-status-check:
 guard-selftest:
 	@$(PYTHON) scripts/ns-guard-selftest.py
 
-# ---- everything that needs no build ------------------------------------
-# The pre-commit sweep.  Every gate here is source- or document-derived, so the
-# whole thing runs in about a minute on a fresh clone with nothing built.
-# A one-minute gate everybody runs is worth more than a twenty-minute one
-# nobody does, which is the same argument that moved lane-check ahead of
-# `make cryo` in CI.
-check-fast: lane-check lane-selftest residue-selftest verify-selftest approved-check ns-status-check verify-pin
+# ---- the pre-commit sweep ----------------------------------------------
+# Every gate here is source- or document-derived except one input: §0's
+# residue rows count from the compiler's own facts, so `facts-fresh` first
+# builds the compiler and writes them when they are missing or stale (about
+# 80 s on top of a build), and does nothing when they are fresh.  With fresh
+# facts the whole sweep runs in about a minute.  A one-minute gate everybody
+# runs is worth more than a twenty-minute one nobody does.
+check-fast: facts-fresh lane-check lane-selftest residue-selftest verify-selftest approved-check ns-status-check verify-pin
 	@echo "check-fast: OK (lane surface and its self-test, the residue check's self-test, verify's declared-program self-test, the approved names' checks and their self-test, section 0, pin integrity)"
 
 # ---- git hooks ---------------------------------------------------------
@@ -714,12 +715,20 @@ endif
 # with the compiler under test, into `.facts/`: one line per argument a call
 # passes to a parameter taking a name as text, as the body check resolved
 # it.  `scripts/facts.py --check` refuses a missing or stale file.
+#
+# `facts-fresh` regenerates only when a facts file is missing or was written
+# from other sources; `check-fast` runs it first, because §0's residue rows
+# count from `.facts/compiler.facts` and refuse a stale one.
 ifeq ($(HOST_OS),windows)
 facts: $(STAGE2_EXE) $(LIBCRYO_A)
 	@$(PYTHON) scripts/facts.py --cryo "$(STAGE2_EXE)" $(ARGS)
+facts-fresh: $(STAGE2_EXE) $(LIBCRYO_A)
+	@$(PYTHON) scripts/facts.py --cryo "$(STAGE2_EXE)" --if-stale
 else
 facts: $(STAGE2) $(LIBCRYO_A)
 	@$(PYTHON) scripts/facts.py --cryo "$(STAGE2)" $(ARGS)
+facts-fresh: $(STAGE2) $(LIBCRYO_A)
+	@$(PYTHON) scripts/facts.py --cryo "$(STAGE2)" --if-stale
 endif
 
 # ---- the other OS's config-gated half ----------------------------------

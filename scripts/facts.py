@@ -107,7 +107,7 @@ def generate(cryo, names):
     return 0
 
 
-def check(names):
+def check(names, quiet=False):
     src = sources_hash()
     bad = 0
     for name, _proj, _produced in PROJECTS:
@@ -124,14 +124,14 @@ def check(names):
         if len(recorded) != 2 or recorded[1] != src:
             print("facts: STALE -- .facts/%s.facts was written from other sources; run `make facts`" % name)
             bad += 1
-    if bad == 0:
+    if bad == 0 and not quiet:
         print("facts: OK -- fresh")
     return 1 if bad else 0
 
 
 def facts_path(name):
     """The facts file `name` names, refused unless it is fresh.  For a gate."""
-    if check([name]) != 0:
+    if check([name], quiet=True) != 0:
         raise SystemExit(1)
     return os.path.join(OUT, name + ".facts")
 
@@ -140,12 +140,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cryo", help="the compiler under test")
     ap.add_argument("--check", action="store_true", help="refuse a missing or stale facts file")
+    ap.add_argument("--if-stale", action="store_true",
+                    help="generate only when a facts file is missing or stale")
     ap.add_argument("names", nargs="*", help="compiler, stdlib, lsp (default: all three)")
     args = ap.parse_args()
     if args.check:
         return check(args.names)
     if not args.cryo:
         ap.error("--cryo is required to generate")
+    if args.if_stale and check(args.names, quiet=True) == 0:
+        print("facts: fresh -- not regenerated")
+        return 0
     return generate(args.cryo, args.names)
 
 

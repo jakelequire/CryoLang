@@ -251,37 +251,46 @@ CLASS_OF_METHOD = {
         ("N", "a literal's text parsed to a value"),
 }
 
-# {(file, "Holder::method", argument text): (class, reason)} - a site whose
-# key comes from somewhere the method's other callers' do not.
+# The importer's check for a C function already declared by its link name,
+# asked at two sites.
+EXTERN_LINK_NAME = ("J", "extern: whether this extern block already declares the C function of this LINK NAME, asked as the importer emits it. A C symbol's link name is the whole of its identity - C has no declaration to key on, and two C declarations sharing a link name are one entity by the linkage rule - so there is no stamp this could ask instead, and the leaf it compares is the mangling the linker will use")
+
+# {(file, "Holder::method", key provenance): (class, reason)} - a site whose
+# key comes from somewhere the method's other callers' do not.  The key is
+# where the compiler reports the key argument's value comes from
+# (`residue.py`, from `cryo build --emit=facts`).
 SITE_OVERRIDES = {
-    ("compiler/passes/type_resolution.cryo", "DeclarationIndex::lookup_type", "n"):
+    ("compiler/passes/type_resolution.cryo", "DeclarationIndex::lookup_type", "local:n"):
         ("J", "prim: `Res::PrimTy(n)` - the primitive's identity is the spelling the stamp carries"),
-    ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_type", "name"):
+    ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_type", "param:name"):
         ("N", "the funnel's own forwarding body (`lookup_type_exact`); its callers are the sites"),
-    ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_func_type", "owner, leaf"):
+    ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_func_type", "param:leaf"):
         ("N", "the funnel's own forwarding body (`lookup_func_type_exact`); its callers are the sites"),
-    ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_method_return", "owner, method_sym"):
+    ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_method_return", "param:method_sym"):
         ("N", "the funnel's own forwarding body (`lookup_method_return`); its callers are the sites"),
-    ("compiler/sema/sema.cryo", "TypeUtils::lookup_method_return", 'owner_ref, this.intern.intern("iter")'):
+    ("compiler/sema/sema.cryo", "TypeUtils::lookup_method_return", 'call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> compiler::resolver::symbol_str::SymbolStr of literal:"iter"'):
         ("J", "member: the for-in protocol's `iter` off a collection that does not implement `Iterator`"),
     # The member tables asked with a leaf the LANGUAGE fixes rather than one
     # the program wrote: the protocols' own variant and method names.
-    ("compiler/sema/sema.cryo", "EnumType::get_variant", 'this.intern.intern("Ready")'):
+    ("compiler/sema/sema.cryo", "EnumType::get_variant", 'call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> compiler::resolver::symbol_str::SymbolStr of literal:"Ready"'):
         ("J", "lang: `Poll::Ready`, the variant the async protocol names, inside the enum a synthesized `poll` returns - the enum matched to the language's `Poll` by the identity its declaration claimed before the variant is read"),
-    ("compiler/sema/lambda_synth.cryo", "StructType::get_method", 'this.intern.intern("__call__")'):
+    ("compiler/sema/lambda_synth.cryo", "StructType::get_method", 'call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> compiler::resolver::symbol_str::SymbolStr of literal:"__call__"'):
         ("J", "lang: the call protocol's `__call__`, the method leaf the language fixes for a callable struct"),
-    ("compiler/types/checker.cryo", "StructType::get_method", " ..."):
+    ("compiler/types/checker.cryo", "StructType::get_method", 'call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> compiler::resolver::symbol_str::SymbolStr of literal:"__call__"'):
         ("J", "lang: the call protocol's `__call__` (the argument continues on the next line), asked when a struct converts to a function type"),
     # The inline scans whose key is not the table's usual one.
     # RULED (Jake, 2026-09-22): these two sites stay in the population, read as
     # rule 1c scans, for the reason above `local::GenericParamNode[]`.
-    ("compiler/bindgen/importer.cryo", "ExternBlockNode::functions[]", "sym"):
-        ("J", "extern: whether this extern block already declares the C function of this LINK NAME, asked as the importer emits it. A C symbol's link name is the whole of its identity - C has no declaration to key on, and two C declarations sharing a link name are one entity by the linkage rule - so there is no stamp this could ask instead, and the leaf it compares is the mangling the linker will use"),
-    ("compiler/resolver/name_resolution.cryo", "FunctionDeclNode::parameters[]", "param.name.id"):
+    ("compiler/bindgen/importer.cryo", "ExternBlockNode::functions[]",
+     "local:sym@0=call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> compiler::resolver::symbol_str::SymbolStr of param:name"):
+        EXTERN_LINK_NAME,
+    ("compiler/bindgen/importer.cryo", "ExternBlockNode::functions[]", "param:sym"):
+        EXTERN_LINK_NAME,
+    ("compiler/resolver/name_resolution.cryo", "FunctionDeclNode::parameters[]", "field:compiler::resolver::symbol_str::SymbolStr.id<-field:compiler::ast::declaration::VarDeclNode*.name<-local:param@1=element@1:field:compiler::ast::declaration::FunctionDeclNode*.parameters<-param:node"):
         ("J", "member: the resolver's duplicate-parameter check, a parameter by leaf inside the function being bound"),
-    ("compiler/AST/dumper.cryo", "DestructureDeclNode::bindings[]", "b.local_name.id"):
+    ("compiler/AST/dumper.cryo", "DestructureDeclNode::bindings[]", "field:compiler::resolver::symbol_str::SymbolStr.id<-field:compiler::ast::declaration::DestructureBinding.local_name<-local:b@1=element@1:field:compiler::ast::declaration::DestructureDeclNode*.bindings<-param:node"):
         ("N", "a display: the binding's own two names compared to print `x` rather than `x: x`"),
-    ("compiler/resolver/name_resolution.cryo", "DestructureDeclNode::bindings[]", "b.local_name.id"):
+    ("compiler/resolver/name_resolution.cryo", "DestructureDeclNode::bindings[]", "field:compiler::resolver::symbol_str::SymbolStr.id<-field:compiler::ast::declaration::DestructureBinding.local_name<-local:b@1=element@1:field:compiler::ast::declaration::DestructureDeclNode*.bindings<-param:node"):
         ("J", "member: the resolver's duplicate-binding check, a binding by its local's leaf inside the destructure being bound"),
 }
 
@@ -315,7 +324,7 @@ def render(classified):
                  % (len(classified), counts["J"], counts["N"], counts["S"], counts["B"],
                     counts["C"], counts["F"], counts["W"]))
     lines.append("")
-    lines.append("| site | read | key as written | class | reason |")
+    lines.append("| site | read | key's provenance | class | reason |")
     lines.append("|---|---|---|---|---|")
     for rel, lineno, key, arg, cls, reason in sorted(classified, key=lambda r: (r[4], r[2], r[0], r[1])):
         arg_md = "`" + arg.replace("|", "\\|") + "`" if arg else ""
@@ -323,37 +332,23 @@ def render(classified):
     return "\n".join(lines) + "\n", counts
 
 
-def render_elsewhere(elsewhere):
-    """The second table: every population name called through a dotted
-    receiver placed on a type that holds nothing, per (type, method) with
-    its count.  Not sites - the type is no holder - but pinned, because a
-    holder the placement rule misreads as another type lands here and
-    nowhere else; the gate's LOOKUP_LOCAL row, by name."""
-    lines = ["Elsewhere **%d** - a population name on a type that holds nothing, per (type, method)"
-             % sum(elsewhere.values()), ""]
-    lines.append("| receiver type and read | calls |")
-    lines.append("|---|---|")
-    for (ty, name), n in sorted(elsewhere.items()):
-        lines.append("| `%s::%s` | %d |" % (ty, name, n))
-    return "\n".join(lines) + "\n"
-
-
-def write_list(path, classified, elsewhere):
-    """Rewrite the two generated tables of the list at `path`, between their
-    markers, leaving the prose around them as it is."""
+def write_list(path, classified):
+    """Rewrite the generated table of the list at `path`, between its
+    markers, leaving the prose around it as it is."""
     table, counts = render(classified)
     text = io.open(path, encoding="utf-8").read()
     b, e = text.index(BEGIN), text.index(END)
     text = text[:b + len(BEGIN)] + "\n" + table + text[e:]
-    b, e = text.index(residue.ELSEWHERE_BEGIN), text.index(residue.ELSEWHERE_END)
-    text = text[:b + len(residue.ELSEWHERE_BEGIN)] + "\n" + render_elsewhere(elsewhere) + text[e:]
     io.open(path, "w", encoding="utf-8", newline="\n").write(text)
     return counts
 
 
 def main():
     gate = residue.load_gate()
-    rows, sets, elsewhere = residue.population(gate, os.path.join(residue.ROOT, "compiler", "src"))
+    sys.path.insert(0, os.path.dirname(HERE))
+    import facts
+    rows, sets = residue.population(gate, os.path.join(residue.ROOT, "compiler", "src"),
+                                    facts.facts_path("compiler"))
     declared = {h + "::" + m for h, ms in sets.items() for m in ms}
     called = {ty + "::" + name for _r, _l, ty, name, _a in rows}
     stale = sorted(k for k in CLASS_OF_METHOD if k not in declared)
@@ -370,10 +365,10 @@ def main():
         raise SystemExit("residue_classify: site overrides that match no call in the tree: "
                          + "; ".join("%s %s (%s)" % k for k in stale_sites))
     path = residue.DEFAULT_RESIDUE
-    counts = write_list(path, classified, elsewhere)
+    counts = write_list(path, classified)
     unread = sorted(declared - called)
-    print("residue_classify: %d sites written to %s (J %d; elsewhere %d); %d read methods declared and called from nowhere: %s"
-          % (len(classified), os.path.relpath(path, residue.ROOT), counts["J"], sum(elsewhere.values()),
+    print("residue_classify: %d sites written to %s (J %d); %d read methods declared and called from nowhere: %s"
+          % (len(classified), os.path.relpath(path, residue.ROOT), counts["J"],
              len(unread), ", ".join(unread) if unread else "-"))
     return 0
 
