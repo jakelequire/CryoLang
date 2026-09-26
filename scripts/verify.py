@@ -63,6 +63,7 @@ if hasattr(sys.stdout, "reconfigure"):
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE = os.path.join(ROOT, ".verify")
 STDLIB = os.path.join(ROOT, "stdlib").replace("\\", "/")
+KEEP_RUNS = 20
 PY = sys.executable
 EXE = ".exe" if os.name == "nt" else ""
 
@@ -344,8 +345,14 @@ def main():
         env.setdefault("CRYO_CC", "gcc")
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    logdir = os.path.join(STATE, "runs", stamp)
+    runs = os.path.join(STATE, "runs")
+    logdir = os.path.join(runs, stamp)
     os.makedirs(logdir)
+    # Keep the newest runs only: each holds a census log and two hash lists,
+    # and an ignored scratch directory that only grows is how `.objcmp/`
+    # reached 15 GB.
+    for old in sorted(os.listdir(runs))[:-KEEP_RUNS]:
+        shutil.rmtree(os.path.join(runs, old), ignore_errors=True)
     t0 = time.monotonic()
     ok = True
 

@@ -175,22 +175,21 @@ with the turn ended is a job whose result nobody reads; this has cost
 seven sessions. The shape that works:
 
 ```bash
-(bash scripts/objcmp/objcmp.sh > .objcmp/run.out 2>&1 &)
+mkdir -p .verify; rm -f .verify/run.out
+(make verify ARGS="--baseline HEAD" > .verify/run.out 2>&1; echo "JOB_EXIT $?" >> .verify/run.out) &
 for i in $(seq 1 19); do
-  grep -q OBJCMP_DONE .objcmp/run.out && break
-  pgrep -f objcmp.sh > /dev/null || { echo "DIED"; break; }
+  grep -q JOB_EXIT .verify/run.out && break
   sleep 30
-done; tail -5 .objcmp/run.out
+done; grep -a "^verify\|^  [a-z]\|JOB_EXIT" .verify/run.out
 ```
 
 - Launch detached, then **poll in a bounded loop in the same call** (under
   the tool's ten-minute limit); chain another bounded loop if it is not
   done. Never end the turn waiting.
-- The poll checks **process liveness as well as the done marker**: a job
-  that dies in its first ten seconds should fail the loop in thirty, not
-  after ten minutes of waiting on a corpse. `pgrep -f <script>` from Git
-  Bash sees the `bash` running it; a Windows-native child needs
-  `tasklist`/`Get-CimInstance` instead.
+- The done marker is written by the wrapper **whatever the job's exit**, so
+  a job that dies in its first ten seconds ends the loop at once instead of
+  after ten minutes of waiting on a corpse. Delete the log before
+  relaunching: a stale marker in a reused log ends the loop immediately.
 - Read the job's OWN summary line at the end, not the loop's exit code.
 - A bare `python -` (or `python - <<EOF`) with nothing on stdin hangs the
   call until the timeout backgrounds it. Every script goes in a file.

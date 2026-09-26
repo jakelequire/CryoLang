@@ -45,9 +45,10 @@ import os
 import re
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))   # scripts/archive/imports
 _spec = importlib.util.spec_from_file_location(
-    "mig", os.path.join(ROOT, "scripts", "migrate-plain-imports.py"))
+    "mig", os.path.join(HERE, "migrate-plain-imports.py"))
 mig = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mig)
 

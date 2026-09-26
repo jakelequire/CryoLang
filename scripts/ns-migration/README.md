@@ -1,6 +1,12 @@
 # Generators and instruments of the name-resolution migration
 
-Each directory is one `docs/name-resolution.md` §8 entry, and holds the
+`checks/` is the exception: scripts a section-0 row RUNS against the current
+tree, so they are gates and must keep working at HEAD. A script that starts
+as one entry's measurement and becomes a row's check moves there (the
+entry's text keeps citing the path it was written at; `git log --follow`
+shows the move). `intrinsics_census.py` came from the §8.325 entry.
+
+Every other directory is one `docs/name-resolution.md` §8 entry, and holds the
 scripts that produced the edits that entry landed or the measurement it
 reports. They exist so a landing can be re-derived from outside the
 session that made it: a change produced by a script is reproducible only
