@@ -136,7 +136,7 @@ instrument condition one's list is drawn from; its J count is not a target.
 Checks:
 
 * `python3 scripts/ns-migration/done.py --outstanding | wc -l` → **0** (5 before §8.360: the five overload-family doors take a `FamilyOwner` - a definition or a type by identity - and the written leaf, and are member reads; 6 before §8.359: `signature_refused` is asked by identity - a function's refusal on its definition, a method's by its owner type and leaf; 8 before §8.358, whose visibility gate asks by the callee's definition: `is_candidate_public` and `namespace_of` are deleted; 14 before §8.357: the six generic-parameter scans - `TemplateEntry::param_names[]`, `local::TraitBound[]`, `FunctionDeclNode::trait_bounds[]`, `ImplBlockNode::where_bounds[]` and the two `SemaState` parameter lists - compare by declaration once the arena keys a parameter by it; 23 before §8.333-§8.335: the six owner doors asked by the self type's name and both `get_template` lines, B and C, are gone, and `lookup_type_exact` is called only inside the funnel's own file; 25 before §8.331 converted the self-growth check and the two written-name scans; condition one's list, one line per function or hand-written scan and class - `get_template` is on two lines, B and C; 30 before §8.330 converted the four trait lookups and one scan)
-* `python3 scripts/ns-migration/done.py --name-taking | wc -l` → **1115** (1,114 before §8.360: six no longer take a spelling (`resolve_function` and `lookup_sole_entry` take the definition; `reset_function_overloads`, `reset_method_overloads`, `pin_scope_callee_qsym`, `check_impl_qualified_args` are gone or take an owner) and seven new ones do - `family_slot`, `reset_family`, the three context helpers that name a declaring module's family (`decl_fn_family`, `minted_family`, `module_family`, and `module_def_of` behind them) and the E0900 text's `family_text`; condition two's population, all of it unplaced; 1,115 before §8.359: `mark_signature_refused`, `signature_refused` and `signature_refused_in_module` deleted, `mark_method_signature_refused` and `method_signature_refused` new, each a method's leaf on an owner type; 1,117 before §8.358: five no longer take a spelling (`namespace_of`, `is_candidate_public`, `set_decl_visibility`, `enforce_value_ref_visibility`, `resolve_module_qualified_symbol`) and three new ones do (`Resolver::exports_named`, `NameResolution::export_in` and `private_in`, each a module's member by its leaf in one namespace); 1,120 before §8.357: `symbolic_name_is_generic_param` is deleted, `AsyncLower::param_spelled` and both `lookup_subst_for_param` take a parameter type or a symbol (-4), `TypeArena::this_placeholder(name)` is new (+1); 1,114 before the test runner ran its compile-fail and project suites on a worker pool, which added six functions taking a shell command or a file path, none a spelling: `shell_in_dir` (once per target), `Executor::suite_jobs`, `job_tmp_path`, `project_command` and `project_outcome`; 1,095 before §8.353, whose matcher saw a spelling only by value: +10 taking one by reference, `Resolver::resolve_path(segments: &SymbolStr[], ..)` among them, and +9 taking a `QualifiedName`; 1,099 before §8.349, which deleted `register_name_mapping`, `resolve_qualified_scoped`, `lookup_qualified_alternatives` and `ScopeResolution::resolved_or`; 1,098 before §8.348, which added `register_methods_through`, taking a diagnostic `site` label as `register_methods` does; 1,099 before §8.339, where `claim_wellknown` stopped taking a name; 1,109 before §8.333-§8.335: eleven functions - the owner and scope-segment doors and their helpers - stopped taking a name or were deleted, and the parser's `refuse_declaration_keyword_name` takes a diagnostic label; 1,110 before §8.332, where `register_impl_block`, `refuse_elided_template_params` and `set_resolved_template` stopped taking a name and `template_in` / `member_template_key` take the member's leaf; 1,113 before §8.331; 1,136 before §8.330, whose trait carriers stopped taking a name in 23 functions)
+* `python3 scripts/ns-migration/done.py --name-taking | wc -l` → **1117** (+2 in §8.361: `DefTable::register_generated`, the registration a synthesizer's declaration goes through, and the `append` both registrations share; 1,114 before §8.360: six no longer take a spelling (`resolve_function` and `lookup_sole_entry` take the definition; `reset_function_overloads`, `reset_method_overloads`, `pin_scope_callee_qsym`, `check_impl_qualified_args` are gone or take an owner) and seven new ones do - `family_slot`, `reset_family`, the three context helpers that name a declaring module's family (`decl_fn_family`, `minted_family`, `module_family`, and `module_def_of` behind them) and the E0900 text's `family_text`; condition two's population, all of it unplaced; 1,115 before §8.359: `mark_signature_refused`, `signature_refused` and `signature_refused_in_module` deleted, `mark_method_signature_refused` and `method_signature_refused` new, each a method's leaf on an owner type; 1,117 before §8.358: five no longer take a spelling (`namespace_of`, `is_candidate_public`, `set_decl_visibility`, `enforce_value_ref_visibility`, `resolve_module_qualified_symbol`) and three new ones do (`Resolver::exports_named`, `NameResolution::export_in` and `private_in`, each a module's member by its leaf in one namespace); 1,120 before §8.357: `symbolic_name_is_generic_param` is deleted, `AsyncLower::param_spelled` and both `lookup_subst_for_param` take a parameter type or a symbol (-4), `TypeArena::this_placeholder(name)` is new (+1); 1,114 before the test runner ran its compile-fail and project suites on a worker pool, which added six functions taking a shell command or a file path, none a spelling: `shell_in_dir` (once per target), `Executor::suite_jobs`, `job_tmp_path`, `project_command` and `project_outcome`; 1,095 before §8.353, whose matcher saw a spelling only by value: +10 taking one by reference, `Resolver::resolve_path(segments: &SymbolStr[], ..)` among them, and +9 taking a `QualifiedName`; 1,099 before §8.349, which deleted `register_name_mapping`, `resolve_qualified_scoped`, `lookup_qualified_alternatives` and `ScopeResolution::resolved_or`; 1,098 before §8.348, which added `register_methods_through`, taking a diagnostic `site` label as `register_methods` does; 1,099 before §8.339, where `claim_wellknown` stopped taking a name; 1,109 before §8.333-§8.335: eleven functions - the owner and scope-segment doors and their helpers - stopped taking a name or were deleted, and the parser's `refuse_declaration_keyword_name` takes a diagnostic label; 1,110 before §8.332, where `register_impl_block`, `refuse_elided_template_params` and `set_resolved_template` stopped taking a name and `template_in` / `member_template_key` take the member's leaf; 1,113 before §8.331; 1,136 before §8.330, whose trait carriers stopped taking a name in 23 functions)
 * `python3 scripts/ns-migration/done.py --selftest | tail -1` → **14** (the matcher above over declarations it must list - a spelling by value, by reference, as an array, as a `QualifiedName`, wrapped over two lines - and ones it must not; its matcher before §8.353 got 10)
 * `python3 scripts/parse_cache.py --selftest | tail -1` → **8** (the parse the rows share within one `ns-status-check` run: every way it could answer from a stale parse - a changed, added or removed source file, a changed script, a failed computation - driven through a throwaway tree; a key that ignored file contents got 3, §8.354)
 
@@ -377,7 +377,7 @@ Checks for this section, one per line so each can be copied whole:
 * `python3 scripts/lane-gate.py --rows` → **16** (17 before §8.346 deleted `DEFID_MINT`)
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: lane-check lane-selftest' Makefile` → **1**
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **84** (+1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **85** (+1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)* `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -44374,3 +44374,113 @@ function main() -> i32 {
 Where the origin must be recorded is therefore the generated DEFINITION,
 not the family key.  That is the next unit; this entry records the
 collision as found.
+
+### 8.361 A definition the compiler generates records its origin, and its path is one no written declaration can have: a program's own `__Closure_0` no longer becomes a closure's struct - 122 objects moved, every one carrying a generated definition's symbol - 2026-09-26
+
+```cryo
+type struct __Closure_0 { v: i32; }
+implement struct __Closure_0 {
+    __call__(&this, x: i32) -> i32 { return 1000; }
+}
+function main() -> i32 {
+    const bias: i32 = 10;
+    const add_bias = (x: i32) -> i32 { return x + bias; };
+    return add_bias(32);        // 42 now; exited 232 (1000 mod 256), no diagnostic
+}
+```
+
+The brief for §8.360 asked that the family key record where its leaf came
+from, so that a name the compiler generates cannot collide with one the
+program wrote.  §8.360 measured that no family key can collide - every
+minted family leaf carries `$` and every synthesized call is stamped - and
+that the one generated name a program can write, the closure's struct,
+collides at the DEFINITION: its path `main::__Closure_0` is a path the
+program can declare, and every store keyed by a path merges the two (the
+arena's struct cache first, `types/arena.cryo:548`).  So the origin is
+recorded where a definition's path is composed.
+
+#### The change
+
+- `NameOrigin` (`resolver/res.cryo`): `Written`, `Generated`.
+  `DefTable::register` records `Written`; `DefTable::register_generated`
+  records `Generated` and composes the path with the leaf marked `$` -
+  `main::$__Closure_0` - which begins no identifier a program can write
+  (`$` lexes as its own token).  `leaf_of` answers the leaf as minted, so a
+  family keyed by the definition's parent and leaf is unchanged.
+  `origin_of(d)` answers the recorded origin; nothing reads it yet.
+- `CompilationContext::register_in_module`, the one registration every
+  synthesizer goes through (a closure's struct, an async function's future,
+  the body `async main` is renamed to), calls `register_generated`.
+- An instantiation still registers through `register`: its leaf is the
+  template's written name mangled with its arguments, not a declaration the
+  lowering minted, and D33 moves instantiations out of the table.  Marking
+  them would rename every generic instance's symbols for no answer changed.
+
+Compiler 46+ / 4- in 2 files.
+
+#### The test, and the inversion
+
+`tests/tests/projects/closure_struct_name_is_generated` (run, exit 42).
+Under the parent commit's compiler it builds and exits **232**; under this
+one, **42**.  Mutation, run alone: `register_generated` composing the path
+unmarked -> the project exits **232** again; restored.
+
+#### Movers, predicted and checked both ways
+
+Predicted: every object whose symbols derive from a generated definition's
+path moves - a capturing closure's struct (`__Closure_N` -> `$__Closure_N`)
+and an async function's future (`<fn>$Future_N` -> `$<fn>$Future_N`, and
+every signature naming it) - and nothing else; the renamed `async main`
+body mangles from its family, not its path, so it does not move.  I
+predicted "many"; measured **89 of 3,407 test and 33 of 1,126 example
+objects**.  Checked two-sided over the tree's objects with `nm`
+(`scripts/ns-migration/8.361/movers.py`): every moved object carries a
+symbol with a marked leaf (tests 90 - the 89 plus the new project's own
+object, left out of the comparison - examples 33), and no unmoved object
+carries one (3,371 and 1,093).  The examples' movers are the stdlib's
+`net/http/server` and `net/socket/tcp` objects every example compiles.
+
+#### The gate: a program the baseline built and ran wrong
+
+This change makes a program the baseline COMPILES produce the right
+answer, so the baseline's census fails on its project - the same by-design
+failure verify's `tests/started-compiling` made declarable for a refused
+program (5d3681b6), with wrong output in place of a refusal.  I extended it the same way, as a
+positive assertion, not an exemption (my extension of that ruling, not a
+separate ruling): `tests/started-passing` declares such a project;
+`verify --baseline` asserts the baseline BUILDS it (a refusal belongs in
+`tests/started-compiling`), the tree builds it, and the baseline census
+fails on exactly the projects the two files declare; the tree's census
+passing it completes the claim.  `verify.py --selftest` 16 cases (5 new).
+Run: `corrected closure_struct_name_is_generated baseline exit 0, tree
+exit 0 ok`.
+
+#### What carrying origin on every identifier would take
+
+Rust carries a syntax context on every identifier.  Here, a synthesized
+REFERENCE already carries the definition it means - 37 sites stamp one
+(`set_synthesized_ref`, `set_synthesized_res`, `alloc_synthetic_binding`),
+so a desugared `Option::Some` or `Poll::Ready` is not resolved by its
+spelling in the program's scope.  What remains spelled is what the
+synthesizers BUILD: 28 `IdentifierNode`, 10 `ScopeResolutionNode` and 26
+`MemberAccessNode` constructions outside the parser.  Carrying origin on
+all of them means an origin field on those nodes, set at each of the 64
+sites, and every lookup that can reach one asking by (leaf, origin);
+today no lookup found a synthesized spelling colliding with a written one
+except through a definition's path, which this entry closes.  Two readers
+still decide "generated" by spelling and would move to `origin_of`: the
+editor's `is_synthesized_closure_name` (the substring `__Closure`,
+`tools/CryoLSP/src/handlers/semantic_tokens.cryo:354`, inside the editor
+exception) and `SpecializationPasses::owner_of_type`, which takes a type
+name containing `$` for a monomorph (`passes/specialization.cryo:532`) -
+harmless for a generated struct, which has no type arguments to look in,
+but a classification by spelling.
+
+#### Evidence
+
+- `make verify ARGS="--baseline HEAD"`: census, examples, lsp-check (478),
+  cross-check, check-fast OK; objects as above.
+- Lane: LOOKUP_LOCAL 55 -> 54 (`register_in_module` calls
+  `register_generated`, no longer a name shared with a store method).
+- §0: name-taking 1,115 -> 1,117 (`register_generated`, `append`);
+  projects 84 -> 85.

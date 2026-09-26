@@ -28,7 +28,8 @@ make verify              # build once; census, examples, lsp, cross, check-fast 
                          # objects hashed; ARGS="--baseline HEAD --require-identical" proves
                          # a change moved no compiled output (baseline built in .verify/, cached);
                          # a change that makes a refused program compile DECLARES its project in
-                         # tests/started-compiling: verify asserts refused before, builds now
+                         # tests/started-compiling (refused before, builds now); one that corrects
+                         # a program the baseline built, in tests/started-passing
 make roster-check        # roster golden: 2113 unit + 46 projects + 179 negative
 make lane-check          # resolution-lane surface ratchet; needs NO build
 make ns-status-check     # run every check docs/name-resolution.md §0 carries

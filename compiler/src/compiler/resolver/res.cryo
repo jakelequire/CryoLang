@@ -129,6 +129,20 @@ type enum DefKind {
     Instance;
 }
 
+/// Where a definition's name came from, recorded by the registrar that
+/// holds the declaration.  `Generated` is a name the compiler minted while
+/// lowering - a closure's struct, an async function's future, the body an
+/// `async main` is renamed to.  A generated definition's path is composed
+/// in a space no written name reaches (`DefTable::register_generated`), so
+/// it never coincides with a declaration the program wrote: every store
+/// keyed by a definition's path, and every symbol mangled from one, keeps
+/// the two apart.  Rust gives a macro-generated identifier its own syntax
+/// context for the same reason.
+type enum NameOrigin {
+    Written;
+    Generated;
+}
+
 /// Whether a definition may be named from outside the module that declares
 /// it, as its registration recorded.  `Unrecorded` until the registrar that
 /// holds the declaration says, so a definition asked about before then is
@@ -160,6 +174,7 @@ private:
     spans:   SourceSpan[];
     visibility: DeclVisibility[];
     refused:    boolean[];
+    origins:    NameOrigin[];
 
 public:
     static new(intern: InternTable*) -> DefTable {
@@ -172,6 +187,7 @@ public:
             spans:   [],
             visibility: [],
             refused:    [],
+            origins:    [],
         };
     }
 
@@ -181,13 +197,38 @@ public:
     /// parent's path and the leaf.
     register(mut &this, parent: DefId, leaf: SymbolStr, kind: DefKind,
              span: SourceSpan) -> DefId {
+        return this.append(parent, leaf, kind, span, NameOrigin::Written);
+    }
+
+    /// Append a definition the compiler generated, under the leaf it minted.
+    /// Its path marks the leaf with `$`, which begins no identifier a program
+    /// can write, so a program declaring the same leaf in the same module
+    /// declares a different path: `main::$__Closure_0`, never
+    /// `main::__Closure_0`.  `leaf_of` answers the leaf as minted.
+    register_generated(mut &this, parent: DefId, leaf: SymbolStr, kind: DefKind,
+                       span: SourceSpan) -> DefId {
+        return this.append(parent, leaf, kind, span, NameOrigin::Generated);
+    }
+
+    /// Where `d`'s name came from, as its registrar recorded it.
+    origin_of(&this, d: DefId) -> NameOrigin {
+        return this.origins[d.index as i64];
+    }
+
+    append(mut &this, parent: DefId, leaf: SymbolStr, kind: DefKind,
+           span: SourceSpan, origin: NameOrigin) -> DefId {
+        const shown: string = match (origin) {
+            NameOrigin::Written   => { this.intern.resolve(leaf) }
+            NameOrigin::Generated => { "$" + this.intern.resolve(leaf) }
+        };
         const path: SymbolStr = if (parent.is_valid()) {
             this.intern.intern(this.intern.resolve(this.paths[parent.index as i64])
-                + "::" + this.intern.resolve(leaf))
+                + "::" + shown)
         } else {
-            leaf
+            this.intern.intern(shown)
         };
         const at: u32 = this.paths.length as u32;
+        this.origins.push(origin);
         this.parents.push(parent);
         this.leaves.push(leaf);
         this.kinds.push(kind);
