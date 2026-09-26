@@ -201,10 +201,6 @@ CLASS_OF_METHOD = {
         ("J", "member: a method's return by its leaf off the owner `TypeRef` in hand; the store is keyed by the owner's arena id"),
     "DeclarationIndex::lookup_sole_entry":
         ("J", "lang: the test runner's entry points `set_args` / `set_env` / `run_all`, by the identity each declaration claimed (`wellknown(LangItem::...)`)"),
-    "DeclarationIndex::namespace_of":
-        ("F", "`enforce_callee_visibility` asks the callee's module by the callee's name"),
-    "DeclarationIndex::is_candidate_public":
-        ("F", "`enforce_callee_visibility` asks the callee's visibility by the callee's name"),
     "DeclarationIndex::is_prelude_ns":
         ("J", "module: a namespace asked whether it is the prelude's; a module's identity is its path"),
     "DeclarationIndex::ns_imports":

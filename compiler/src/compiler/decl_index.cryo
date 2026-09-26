@@ -22,7 +22,7 @@ import compiler::types;
 import compiler::types::{ arena, compound, type_base, type_ref, TypeKind };
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, OverloadId, Res, ResSlot, DefTable };
+import compiler::resolver::res::{ DeclVisibility, DefId, OverloadId, Res, ResSlot, DefTable };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import std::core::option;
@@ -222,18 +222,6 @@ type struct DeclarationIndex {
     // conflict (ambiguous), not a silent shadow.  Populated once.
     prelude_ns:          u32[];
 
-    // Qualified declaration-name SymbolStr.id -> is_public, for TYPES and FREE
-    // FUNCTIONS alike, recorded by every registration
-    // (`register_decl_in_index`, type_resolution.cryo).  A name absent from
-    // this map is a declaration that never registered, recorded as such
-    // (`is_candidate_public`).
-    //
-    // It does not gate bare function calls.  A bare `foo()` binds from its
-    // stamp, and the name layer refuses a private declaration at the import
-    // that would have bound it; this map is read for a QUALIFIED call's
-    // callee (`enforce_callee_visibility`), where a module's own private
-    // items are never refused because the namespaces are compared first.
-    decl_visibility:     HashMap<u32, boolean>;
 
     /// The declarations whose SIGNATURE the name layer refused - a parameter
     /// or return type naming nothing the writer can see - keyed as the
@@ -275,7 +263,6 @@ type struct DeclarationIndex {
             extern_symbol_first: HashMap::<u32, Pair<u32, u64>>::new(),
             module_imports:     HashMap::<u32, u32[]>::new(),
             prelude_ns:         [],
-            decl_visibility:    HashMap::<u32, boolean>::new(),
             refused_signatures: HashMap::<u32, boolean>::new(),
         };
     }
@@ -562,7 +549,7 @@ type struct DeclarationIndex {
         const qualified_name: SymbolStr = this.defs.path_of(def);
         this.type_map.insert(qualified_name.id, ty);
         this.type_reverse.insert(ty.id, def);
-        this.decl_visibility.insert(qualified_name.id, is_public);
+        this.defs.record_visibility(def, is_public);
     }
 
     /// Register the concrete `Array<T>` specialization a dynamic `T[]`
@@ -1071,11 +1058,17 @@ type struct DeclarationIndex {
         }
     }
 
-    /// Record a declaration's visibility (keyed by its qualified name) so
-    /// same-leaf resolution can exclude a private cross-module candidate.
-    /// Covers types AND free functions; both share one identity space here.
-    set_decl_visibility(mut &this, qualified: SymbolStr, is_public: boolean) -> void {
-        this.decl_visibility.insert(qualified.id, is_public);
+    /// Record a function's visibility on its definition: a type's is
+    /// recorded by `register_type`.  A type and a function declared under one
+    /// leaf are two definitions with a verdict each.
+    ///
+    /// It does not gate bare function calls.  A bare `foo()` binds from its
+    /// stamp, and the name layer refuses a private declaration at the import
+    /// that would have bound it; the verdict is read for a QUALIFIED call's
+    /// callee (`hidden_from`), where a module's own private items are never
+    /// refused because the modules are compared first.
+    set_decl_visibility(mut &this, def: DefId, is_public: boolean) -> void {
+        this.defs.record_visibility(def, is_public);
     }
 
     /// Record that the declaration `key` would register under has a
@@ -1127,17 +1120,6 @@ type struct DeclarationIndex {
         return false;
     }
 
-    /// The defining namespace of a qualified name (everything before the leaf),
-    /// re-interned as a SymbolStr in the shared table so its id is comparable
-    /// with the import/prelude/use-site namespace ids.  A bare name (no `::`)
-    /// yields the empty SymbolStr.
-    namespace_of(&this, qualified: SymbolStr, intern: InternTable*) -> SymbolStr {
-        const full: string = intern.resolve(qualified);
-        const qn: QualifiedName = QualifiedName::parse(intern, full);
-        if (qn.depth() <= 1) { return SymbolStr::empty(); }
-        return intern.intern(qn.display_parent(intern));
-    }
-
     /// The namespaces reachable without an import, as recorded.
     ///
     /// The visibility relation and the scope walk's outermost tier are the same
@@ -1174,19 +1156,27 @@ type struct DeclarationIndex {
         return false;
     }
 
-    /// Visibility verdict for a candidate.  Every registration records one
-    /// (a type's with `register_type`, a function's beside its signature),
-    /// so a candidate with none is a declaration that never registered -
-    /// recorded as such, which fails the build; the answer given meanwhile
-    /// is the top-level default rather than a refusal that would report a
-    /// public item as private.
-    is_candidate_public(&this, qualified: SymbolStr) -> boolean {
-        return match (this.decl_visibility.get(&qualified.id)) {
-            Option::Some(v) => { v }
-            Option::None    => {
+    /// Whether the definition `d` is private to a module other than
+    /// `use_module`: declared in another module, and recorded as not public
+    /// by its registration.  False for a definition of `use_module` itself,
+    /// or one declared in no module.
+    ///
+    /// Every registration records a verdict (a type's with `register_type`,
+    /// a function's beside its signature), so a definition with none never
+    /// registered - recorded as such, which fails the build; the answer given
+    /// meanwhile is the top-level default rather than a refusal that would
+    /// report a public item as private.
+    hidden_from(&this, d: DefId, use_module: DefId) -> boolean {
+        if (!d.is_valid() || !use_module.is_valid()) { return false; }
+        const home: DefId = this.defs.module_of(d);
+        if (!home.is_valid() || home.equals(use_module)) { return false; }
+        return match (this.defs.visibility_of(d)) {
+            DeclVisibility::Public     => { false }
+            DeclVisibility::Private    => { true }
+            DeclVisibility::Unrecorded => {
                 compiler::resolver::res::record_unregistered_def(
-                    "decl_index: visibility of a candidate no registration recorded a verdict for");
-                true
+                    "decl_index: visibility of a definition no registration recorded a verdict for");
+                false
             }
         };
     }

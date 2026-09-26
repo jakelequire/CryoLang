@@ -383,7 +383,9 @@ public:
                     this.resolver.current_module);
                 const sym: Symbol = Symbol::intrinsic(id, sym_name,
                     this.resolver.current_scope, intr_node.span, intr_mod);
-                this.resolver.declare(sym);
+                const intr_declared: SymbolID = this.resolver.declare(sym);
+                this.resolver.export_symbol(intr_declared);
+                intr_node.def = this.resolver.get_symbol(intr_declared).def;
             }
             NodeKind::IntrinsicConstDeclaration => {
                 const ic_node: IntrinsicConstDeclNode* = node as IntrinsicConstDeclNode*;
@@ -1712,7 +1714,7 @@ public:
         // children declare is ambiguous here and resolves to neither: saying
         // "cannot find" of it would be false, it is found twice.
         const leaf_sym: SymbolStr = this.resolver.intern_table.intern(leaf);
-        const offered: SymbolID[] = this.module_offerings(head.found, leaf_sym);
+        const offered: SymbolID[] = this.module_offerings(head.found, leaf_sym, Namespace::Type);
         if (offered.length == 1) {
             return ResSlot::Answered(Res::Def(this.resolver.get_symbol(offered[0]).def));
         }
@@ -1740,7 +1742,7 @@ public:
         // as a name that appears not to exist - or, worse, re-derived by a
         // later stage from the spelling, which is registered under exactly
         // this name and would answer it.
-        const hidden: SymbolID = this.resolver.private_declaration(head.found, leaf_sym);
+        const hidden: SymbolID = this.private_in(head.found, leaf_sym, Namespace::Type);
         if (!hidden.is_valid()) { return ResSlot::Pending; }
         const hs: Symbol = this.resolver.get_symbol(hidden);
         const owner: string = this.resolver.intern_table.resolve(head.found);
@@ -1877,7 +1879,11 @@ public:
             // the module lane's answer, read through the module lane's doors.
             const alias: SymbolID = this.alias_of(&bound);
             if (alias.is_valid()) {
-                node.set_scope_res(Res::Def(this.resolver.get_symbol(alias).def));
+                const alias_sym: Symbol = this.resolver.get_symbol(alias);
+                node.set_scope_res(Res::Def(alias_sym.def));
+                const am: SymbolID = this.export_in(
+                    this.resolver.qualified_name_of(&alias_sym), node.member_name, Namespace::Value);
+                if (am.is_valid()) { node.set_member_def(this.resolver.get_symbol(am).def); }
                 return;
             }
         }
@@ -1901,7 +1907,7 @@ public:
             // refused, as it is everywhere else.
             mut owner: DefId = m.found_def;
             mut offered: i64 = 0;
-            const hit: SymbolID = this.module_offering(found, node.member_name, &offered);
+            const hit: SymbolID = this.module_offering(found, node.member_name, Namespace::Value, &offered);
             if (offered > 1) {
                 const leaf_str: string = this.resolver.intern_table.resolve(node.member_name);
                 mut d: Diagnostic = Diagnostic::error(
@@ -1924,6 +1930,15 @@ public:
                     owner = this.ctx.module_graph.module_def(ModulePath::of(
                         this.resolver.intern_table.intern(declared_in)));
                 }
+                node.set_member_def(hs.def);
+            }
+            // A PRIVATE member is offered to no one, and is still the
+            // declaration the path names: it is stamped, so the call is
+            // refused as private (E0353) where visibility is enforced
+            // rather than reported as a name that does not exist.
+            if (offered == 0) {
+                const hidden: SymbolID = this.private_in(found, node.member_name, Namespace::Value);
+                if (hidden.is_valid()) { node.set_member_def(this.resolver.get_symbol(hidden).def); }
             }
             node.set_scope_res(Res::Def(owner));
             return;
@@ -2972,8 +2987,8 @@ public:
     /// `hits` separates "no such name here" from "that name is ambiguous here",
     /// because those call for different diagnostics and a bare invalid cannot
     /// tell them apart.
-    module_offering(&this, m: SymbolStr, name: SymbolStr, hits: i64*) -> SymbolID {
-        const all: SymbolID[] = this.module_offerings(m, name);
+    module_offering(&this, m: SymbolStr, name: SymbolStr, ns: Namespace, hits: i64*) -> SymbolID {
+        const all: SymbolID[] = this.module_offerings(m, name, ns);
         *hits = all.length;
         if (all.length == 0) { return SymbolID::invalid(); }
         return all[0];
@@ -2983,11 +2998,11 @@ public:
     /// each one its re-export closure reaches, a declaration reached by two
     /// routes counted once.  The plural form of `module_offering`, for the
     /// refusal that names the two a facade offers.
-    module_offerings(&this, m: SymbolStr, name: SymbolStr) -> SymbolID[] {
+    module_offerings(&this, m: SymbolStr, name: SymbolStr, ns: Namespace) -> SymbolID[] {
         mut out: SymbolID[] = [];
         // A module that DECLARES the name offers that one.  A re-export cannot
         // displace a declaration, so this is not a first-of-several choice.
-        const own: SymbolID = this.resolver.lookup_in_module(m, name);
+        const own: SymbolID = this.export_in(m, name, ns);
         if (own.is_valid()) {
             out.push(own);
             return out;
@@ -2995,7 +3010,7 @@ public:
         const via: SymbolStr[] = this.ctx.module_graph.reexport_closure(ModulePath::of(m));
         mut seen: SymbolStr[] = [];
         for (mut i: i64 = 0; i < via.length; i++) {
-            const cand: SymbolID = this.resolver.lookup_in_module(via[i], name);
+            const cand: SymbolID = this.export_in(via[i], name, ns);
             if (!cand.is_valid()) { continue; }
             const cs: Symbol = this.resolver.get_symbol(cand);
             const q: SymbolStr = this.resolver.qualified_name_of(&cs);
@@ -3010,6 +3025,27 @@ public:
             out.push(cand);
         }
         return out;
+    }
+
+    /// The public declaration module `m` exports under `name` in the
+    /// namespace `ns`, or an invalid id: `M::f` in an expression names the
+    /// function `f`, never a type `M` also declares as `f`.
+    export_in(&this, m: SymbolStr, name: SymbolStr, ns: Namespace) -> SymbolID {
+        const all: SymbolID[] = this.resolver.exports_named(m, name);
+        for (mut i: i64 = 0; i < all.length; i++) {
+            if (ns.accepts(this.resolver.get_symbol(all[i]).kind)) { return all[i]; }
+        }
+        return SymbolID::invalid();
+    }
+
+    /// The private declaration module `m` holds under `name` in the
+    /// namespace `ns`, or an invalid id.
+    private_in(&this, m: SymbolStr, name: SymbolStr, ns: Namespace) -> SymbolID {
+        const all: SymbolID[] = this.resolver.private_declarations(m, name);
+        for (mut i: i64 = 0; i < all.length; i++) {
+            if (ns.accepts(this.resolver.get_symbol(all[i]).kind)) { return all[i]; }
+        }
+        return SymbolID::invalid();
     }
 
     /// Binds what an `import` - or an `export` - names into the current scope.
@@ -3273,7 +3309,7 @@ public:
                         node.span, offered_src, offered_def);
                     this.resolver.declare_import(import_sym);
                 } else if (!node.is_export
-                           && this.resolver.private_declaration(module_sym, name).is_valid()) {
+                           && this.resolver.private_declarations(module_sym, name).length > 0) {
                     // The module declares the name and marks it `private`.
                     // Visibility is a gate at the point a candidate is
                     // proposed, and the import is where this one is: binding
@@ -3295,7 +3331,7 @@ public:
                     // saying the name does not exist.
                     this.resolver.declare_refused(name, node.span);
                 } else if (node.is_export
-                           && this.resolver.private_declaration(module_sym, name).is_valid()) {
+                           && this.resolver.private_declarations(module_sym, name).length > 0) {
                     // An `export` naming a private declaration is E0241,
                     // reported by the export check once the graph is whole;
                     // it is not a name the module fails to offer.

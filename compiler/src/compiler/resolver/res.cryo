@@ -127,6 +127,16 @@ type enum DefKind {
     Instance;
 }
 
+/// Whether a definition may be named from outside the module that declares
+/// it, as its registration recorded.  `Unrecorded` until the registrar that
+/// holds the declaration says, so a definition asked about before then is
+/// told apart from a private one.
+type enum DeclVisibility {
+    Unrecorded;
+    Public;
+    Private;
+}
+
 /// Every definition of one compilation, in registration order.
 ///
 /// The one place a `DefId` is made and the one place a definition's path is
@@ -146,6 +156,7 @@ private:
     kinds:   DefKind[];
     paths:   SymbolStr[];
     spans:   SourceSpan[];
+    visibility: DeclVisibility[];
 
 public:
     static new(intern: InternTable*) -> DefTable {
@@ -156,6 +167,7 @@ public:
             kinds:   [],
             paths:   [],
             spans:   [],
+            visibility: [],
         };
     }
 
@@ -177,6 +189,7 @@ public:
         this.kinds.push(kind);
         this.paths.push(path);
         this.spans.push(span);
+        this.visibility.push(DeclVisibility::Unrecorded);
         return DefId { index: at };
     }
 
@@ -203,6 +216,34 @@ public:
 
     kind_of(&this, d: DefId) -> DefKind {
         return this.kinds[d.index as i64];
+    }
+
+    /// The module `d` is declared in: `d` itself for a module, else the
+    /// nearest module on its parent chain; invalid when there is none.
+    module_of(&this, d: DefId) -> DefId {
+        mut at: DefId = d;
+        while (at.is_valid()) {
+            if (this.kinds[at.index as i64] == DefKind::Module) { return at; }
+            at = this.parents[at.index as i64];
+        }
+        return DefId::invalid();
+    }
+
+    /// Record `d`'s visibility.  Called by the registrar that holds the
+    /// declaration, which is the one place its `public` / `private` is read.
+    record_visibility(mut &this, d: DefId, is_public: boolean) -> void {
+        if (!d.is_valid()) { return; }
+        this.visibility[d.index as i64] = if (is_public) {
+            DeclVisibility::Public
+        } else {
+            DeclVisibility::Private
+        };
+    }
+
+    /// `d`'s visibility as its registration recorded it.
+    visibility_of(&this, d: DefId) -> DeclVisibility {
+        if (!d.is_valid()) { return DeclVisibility::Unrecorded; }
+        return this.visibility[d.index as i64];
     }
 }
 

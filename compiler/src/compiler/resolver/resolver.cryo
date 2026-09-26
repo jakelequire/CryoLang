@@ -583,35 +583,51 @@ type struct Resolver {
 
     /// Look up a specific name in a module's exports.
     lookup_in_module(&this, module_name: SymbolStr, name: SymbolStr) -> SymbolID {
+        const all: SymbolID[] = this.exports_named(module_name, name);
+        if (all.length == 0) { return SymbolID::invalid(); }
+        return all[0];
+    }
+
+    /// Every public declaration `module_name` exports under `name`, in
+    /// declaration order: a type and a function may share a leaf, and a
+    /// reader that wants one of them chooses by kind.
+    exports_named(&this, module_name: SymbolStr, name: SymbolStr) -> SymbolID[] {
+        mut out: SymbolID[] = [];
         const mod_key: u64 = module_name.id as u64;
         for (mut i: i64 = 0; i < this.exports.length; i++) {
             if (this.exports[i].second == mod_key) {
                 const sym: Symbol = this.get_symbol(this.exports[i].first);
                 if (sym.name.equals(name) && sym.visibility.is_public()) {
-                    return this.exports[i].first;
+                    out.push(this.exports[i].first);
                 }
             }
         }
-        return SymbolID::invalid();
+        return out;
     }
 
-    /// The top-level declaration `module` holds under `name` and marks
-    /// `private`, or an invalid id - the one case a path or an import can
-    /// name a declaration and still be handed nothing, which the writer must
-    /// be told about rather than left to read as "no such name".
+    /// The top-level declarations `module` holds under `name` and marks
+    /// `private` - the one case a path or an import can name a declaration
+    /// and still be handed nothing, which the writer must be told about
+    /// rather than left to read as "no such name".  Every one, in
+    /// declaration order: a type and a function may share a leaf (the second
+    /// sits in the scope's overload set), and a reader that wants one of
+    /// them chooses by kind.
     ///
     /// Read off the module's own scope: the export list holds only what is
     /// public, so a private declaration is exactly what it does not carry.
-    private_declaration(&this, module_name: SymbolStr, name: SymbolStr) -> SymbolID {
+    private_declarations(&this, module_name: SymbolStr, name: SymbolStr) -> SymbolID[] {
+        mut out: SymbolID[] = [];
         const sid: u64 = this.find_module_scope(ModulePath::of(module_name));
-        if (sid == 0) { return SymbolID::invalid(); }
+        if (sid == 0) { return out; }
         const scope: Scope* = this.get_scope(ScopeID { id: sid });
-        const found: SymbolID = scope.find(name);
-        if (!found.is_valid()) { return SymbolID::invalid(); }
-        const sym: Symbol = this.get_symbol(found);
-        if (sym.kind == SymbolKind::Import) { return SymbolID::invalid(); }
-        if (sym.visibility.is_public()) { return SymbolID::invalid(); }
-        return found;
+        const all: SymbolID[] = scope.get_overloads(name);
+        for (mut i: i64 = 0; i < all.length; i++) {
+            const sym: Symbol = this.get_symbol(all[i]);
+            if (sym.kind == SymbolKind::Import) { continue; }
+            if (sym.visibility.is_public()) { continue; }
+            out.push(all[i]);
+        }
+        return out;
     }
 
     /// Get a symbol by its SymbolID.  Indexes by id-1 (IDs start at 1).

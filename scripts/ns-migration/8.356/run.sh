@@ -9,6 +9,6 @@ for v in "$@"; do
   (cd "$d" && rm -rf build && CRYO_STDLIB="$R/stdlib" CRYO_CC=gcc "$C" build . > "$O/$v.log" 2>&1); rc=$?
   run=""
   if [ $rc -eq 0 ]; then (cd "$d" && ./build/shape$v.exe > /dev/null 2>&1); run="/run=$?"; fi
-  rm -rf "$d/build"
+  rm -rf "$d/build" "$d/cryoconfig"
   echo "$v=$rc$run  $(grep -a -m1 '^error' "$O/$v.log")"
 done

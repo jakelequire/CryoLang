@@ -102,28 +102,24 @@ is one the language fixes (`__call__`, `Ready`, `Ok`/`Err`, `Some`/`None`).
 ## The table
 
 <!-- residue-table:begin -->
-Population **301** - J 159 · N 124 · S 0 · B 0 · C 16 · F 2 · W 0
+Population **298** - J 160 · N 124 · S 0 · B 0 · C 14 · F 0 · W 0
 
 | site | read | key as written | class | reason |
 |---|---|---|---|---|
 | `compiler/codegen/visit/call_emitter.cryo:1139` | `DeclarationIndex::family_intrinsic_kind` | `f` | C | a family by its key string, asked the intrinsic kind its entries share (the `CalleePin::Family` arm; the `Decl` arm reads the kind off the entry) |
 | `compiler/codegen/ops/symbol_resolver.cryo:227` | `DeclarationIndex::lookup_family_entries` | `name` | C | a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door |
-| `compiler/sema/call_resolver.cryo:2484` | `DeclarationIndex::lookup_family_entries` | `family` | C | a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door |
-| `compiler/sema/call_resolver.cryo:3711` | `DeclarationIndex::lookup_family_entries` | `sym` | C | a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door |
-| `compiler/sema/call_resolver.cryo:3798` | `DeclarationIndex::lookup_family_entries` | `family` | C | a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door |
-| `compiler/sema/call_resolver.cryo:4048` | `DeclarationIndex::lookup_family_entries` | `family` | C | a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door |
-| `compiler/sema/call_resolver.cryo:4166` | `DeclarationIndex::lookup_family_entries` | `combined_sym` | C | a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door |
-| `compiler/sema/call_resolver.cryo:932` | `DeclarationIndex::lookup_func_type` | `fam` | C | the `CalleePin::Family` key string |
-| `compiler/sema/call_resolver.cryo:1851` | `DeclarationIndex::lookup_func_type_overloads` | `family` | C | a family by its key string (see `lookup_family_entries`) |
-| `compiler/sema/call_resolver.cryo:5658` | `DeclarationIndex::lookup_func_type_overloads` | `combined` | C | a family by its key string (see `lookup_family_entries`) |
-| `compiler/sema/call_resolver.cryo:3333` | `DeclarationIndex::signature_refused` | `this.intern.intern( ...` | C | `Owner::member` composed from the owner key and the written member |
-| `compiler/sema/call_resolver.cryo:3638` | `DeclarationIndex::signature_refused` | `combined` | C | `Owner::member` composed from the owner key and the written member |
-| `compiler/sema/call_resolver.cryo:314` | `TypeUtils::lookup_func_type_exact` | `q_sym` | C | a family or a `module::member` composed by `resolve_module_qualified_symbol` |
-| `compiler/sema/call_resolver.cryo:2564` | `TypeUtils::lookup_func_type_exact` | `q_sym` | C | a family or a `module::member` composed by `resolve_module_qualified_symbol` |
-| `compiler/sema/call_resolver.cryo:2612` | `TypeUtils::lookup_func_type_exact` | `family` | C | a family or a `module::member` composed by `resolve_module_qualified_symbol` |
-| `compiler/sema/call_resolver.cryo:5256` | `TypeUtils::lookup_func_type_exact` | `q_sym` | C | a family or a `module::member` composed by `resolve_module_qualified_symbol` |
-| `compiler/sema/call_resolver.cryo:2530` | `DeclarationIndex::is_candidate_public` | `callee` | F | `enforce_callee_visibility` asks the callee's visibility by the callee's name |
-| `compiler/sema/call_resolver.cryo:2527` | `DeclarationIndex::namespace_of` | `callee, this.intern` | F | `enforce_callee_visibility` asks the callee's module by the callee's name |
+| `compiler/sema/call_resolver.cryo:2485` | `DeclarationIndex::lookup_family_entries` | `family` | C | a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door |
+| `compiler/sema/call_resolver.cryo:3709` | `DeclarationIndex::lookup_family_entries` | `sym` | C | a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door |
+| `compiler/sema/call_resolver.cryo:3796` | `DeclarationIndex::lookup_family_entries` | `family` | C | a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door |
+| `compiler/sema/call_resolver.cryo:4046` | `DeclarationIndex::lookup_family_entries` | `family` | C | a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door |
+| `compiler/sema/call_resolver.cryo:4164` | `DeclarationIndex::lookup_family_entries` | `combined_sym` | C | a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door |
+| `compiler/sema/call_resolver.cryo:933` | `DeclarationIndex::lookup_func_type` | `fam` | C | the `CalleePin::Family` key string |
+| `compiler/sema/call_resolver.cryo:1852` | `DeclarationIndex::lookup_func_type_overloads` | `family` | C | a family by its key string (see `lookup_family_entries`) |
+| `compiler/sema/call_resolver.cryo:5656` | `DeclarationIndex::lookup_func_type_overloads` | `combined` | C | a family by its key string (see `lookup_family_entries`) |
+| `compiler/sema/call_resolver.cryo:3331` | `DeclarationIndex::signature_refused` | `this.intern.intern( ...` | C | `Owner::member` composed from the owner key and the written member |
+| `compiler/sema/call_resolver.cryo:3636` | `DeclarationIndex::signature_refused` | `combined` | C | `Owner::member` composed from the owner key and the written member |
+| `compiler/sema/call_resolver.cryo:315` | `TypeUtils::lookup_func_type_exact` | `q_sym` | C | a family or a `module::member` composed by `resolve_module_qualified_symbol` |
+| `compiler/sema/call_resolver.cryo:2610` | `TypeUtils::lookup_func_type_exact` | `family` | C | a family or a `module::member` composed by `resolve_module_qualified_symbol` |
 | `compiler/AST/node_locator.cryo:1843` | `ClassDeclNode::fields[]` | `field_name` | J | member: a class declaration's field by its leaf off the node in hand, scanned inline |
 | `compiler/sema/member_resolver.cryo:418` | `ClassDeclNode::fields[]` | `field` | J | member: a class declaration's field by its leaf off the node in hand, scanned inline |
 | `compiler/sema/symbolic_checker.cryo:263` | `ClassDeclNode::fields[]` | `field` | J | member: a class declaration's field by its leaf off the node in hand, scanned inline |
@@ -135,19 +131,19 @@ Population **301** - J 159 · N 124 · S 0 · B 0 · C 16 · F 2 · W 0
 | `compiler/sema/sema.cryo:3197` | `ClassType::get_method` | `scope.member_name` | J | member: a class's method by its leaf off the `ClassType` in hand |
 | `compiler/sema/sema.cryo:3214` | `ClassType::get_method` | `scope.member_name` | J | member: a class's method by its leaf off the `ClassType` in hand |
 | `compiler/codegen/ops/declaration_emitter.cryo:781` | `ClassType::methods[]` | `slot_name` | J | member: a class's method by its leaf off the `ClassType` in hand, scanned inline (the vtable's slot walk; an arity predicate) |
-| `compiler/sema/call_resolver.cryo:450` | `ClassType::methods[]` | `member.member` | J | member: a class's method by its leaf off the `ClassType` in hand, scanned inline (the vtable's slot walk; an arity predicate) |
+| `compiler/sema/call_resolver.cryo:451` | `ClassType::methods[]` | `member.member` | J | member: a class's method by its leaf off the `ClassType` in hand, scanned inline (the vtable's slot walk; an arity predicate) |
 | `compiler/passes/type_resolution.cryo:2474` | `DeclarationIndex::extern_symbol_conflict` | `ext_link_sym, func_type_ref` | J | extern: a C symbol by its link name, the only identity a C symbol has |
 | `compiler/sema/type_utils.cryo:154` | `DeclarationIndex::global_entry_in_module` | `scope.member_name, seen.def_id()` | J | member: a global's leaf inside the module the qualifier's stamp names (a `DefId`) |
 | `compiler/compilation_context.cryo:542` | `DeclarationIndex::is_prelude_ns` | `ModulePath::of(cand_ns)` | J | module: a namespace asked whether it is the prelude's; a module's identity is its path |
-| `compiler/resolver/name_resolution.cryo:1512` | `DeclarationIndex::is_prelude_ns` | `owner_path` | J | module: a namespace asked whether it is the prelude's; a module's identity is its path |
+| `compiler/resolver/name_resolution.cryo:1514` | `DeclarationIndex::is_prelude_ns` | `owner_path` | J | module: a namespace asked whether it is the prelude's; a module's identity is its path |
 | `compiler/codegen/test_main_codegen.cryo:351` | `DeclarationIndex::lookup_sole_entry` | `set_args_qualified` | J | lang: the test runner's entry points `set_args` / `set_env` / `run_all`, by the identity each declaration claimed (`wellknown(LangItem::...)`) |
 | `compiler/codegen/test_main_codegen.cryo:352` | `DeclarationIndex::lookup_sole_entry` | `set_env_qualified` | J | lang: the test runner's entry points `set_args` / `set_env` / `run_all`, by the identity each declaration claimed (`wellknown(LangItem::...)`) |
 | `compiler/codegen/test_main_codegen.cryo:353` | `DeclarationIndex::lookup_sole_entry` | `run_all_qualified` | J | lang: the test runner's entry points `set_args` / `set_env` / `run_all`, by the identity each declaration claimed (`wellknown(LangItem::...)`) |
 | `compiler/passes/type_resolution.cryo:1860` | `DeclarationIndex::lookup_type` | `n` | J | prim: `Res::PrimTy(n)` - the primitive's identity is the spelling the stamp carries |
 | `compiler/compilation_context.cryo:543` | `DeclarationIndex::ns_imports` | `ModulePath::of(use_ns), ModulePath::of(cand_ns)` | J | module: two namespaces asked whether one imports the other; module identities |
-| `compiler/resolver/name_resolution.cryo:1513` | `DeclarationIndex::ns_imports` | `ModulePath::of(use_ns), owner_path` | J | module: two namespaces asked whether one imports the other; module identities |
-| `compiler/sema/call_resolver.cryo:3631` | `DeclarationIndex::signature_refused_in_module` | `scope.member_name, ...` | J | member: a function's leaf inside the module the qualifier's stamp names (a `DefId`) |
-| `compiler/resolver/name_resolution.cryo:1063` | `DestructureDeclNode::bindings[]` | `b.local_name.id` | J | member: the resolver's duplicate-binding check, a binding by its local's leaf inside the destructure being bound |
+| `compiler/resolver/name_resolution.cryo:1515` | `DeclarationIndex::ns_imports` | `ModulePath::of(use_ns), owner_path` | J | module: two namespaces asked whether one imports the other; module identities |
+| `compiler/sema/call_resolver.cryo:3629` | `DeclarationIndex::signature_refused_in_module` | `scope.member_name, ...` | J | member: a function's leaf inside the module the qualifier's stamp names (a `DefId`) |
+| `compiler/resolver/name_resolution.cryo:1065` | `DestructureDeclNode::bindings[]` | `b.local_name.id` | J | member: the resolver's duplicate-binding check, a binding by its local's leaf inside the destructure being bound |
 | `compiler/sema/sema.cryo:1423` | `DestructureDeclNode::bindings[]` | `b.source_field.id` | J | member: a destructure's written binding by the source field's leaf (which binding takes a field), scanned inline |
 | `compiler/sema/sema.cryo:1468` | `DestructureDeclNode::bindings[]` | `fields_ptr[k].name.id` | J | member: a destructure's written binding by the source field's leaf (which binding takes a field), scanned inline |
 | `compiler/const_table.cryo:579` | `EnumDeclNode::variants[]` | `member.id` | J | member: an enum declaration's variant by its leaf off the node in hand, scanned inline |
@@ -156,26 +152,26 @@ Population **301** - J 159 · N 124 · S 0 · B 0 · C 16 · F 2 · W 0
 | `compiler/sema/diagnostics.cryo:317` | `EnumType::get_variant` | `member_name` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
 | `compiler/sema/sema.cryo:2728` | `EnumType::get_variant` | `this.intern.intern("Ready")` | J | lang: `Poll::Ready`, the variant the async protocol names, inside the enum a synthesized `poll` returns - the enum matched to the language's `Poll` by the identity its declaration claimed before the variant is read |
 | `compiler/sema/sema.cryo:3771` | `EnumType::get_variant` | `leaf` | J | member: an enum's variant by its leaf off the `EnumType` in hand |
-| `compiler/sema/call_resolver.cryo:462` | `EnumType::methods[]` | `member.member` | J | member: an enum's method by its leaf off the `EnumType` in hand, scanned inline with an arity predicate |
-| `compiler/sema/call_resolver.cryo:539` | `EnumType::variant_index` | `scope.member_name` | J | member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen |
+| `compiler/sema/call_resolver.cryo:463` | `EnumType::methods[]` | `member.member` | J | member: an enum's method by its leaf off the `EnumType` in hand, scanned inline with an arity predicate |
+| `compiler/sema/call_resolver.cryo:540` | `EnumType::variant_index` | `scope.member_name` | J | member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen |
 | `compiler/sema/pattern_resolver.cryo:178` | `EnumType::variant_index` | `enum_pat.variant_name` | J | member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen |
 | `compiler/sema/sema.cryo:3286` | `EnumType::variant_index` | `scope.member_name` | J | member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen |
 | `compiler/sema/sema.cryo:3327` | `EnumType::variant_index` | `new_expr.variant_name` | J | member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen |
 | `compiler/AST/node_locator.cryo:231` | `ExternBlockNode::functions[]` | `name` | J | member: an extern block's function by its leaf off the block in hand, scanned inline |
 | `compiler/bindgen/importer.cryo:1775` | `ExternBlockNode::functions[]` | `sym` | J | extern: whether this extern block already declares the C function of this LINK NAME, asked as the importer emits it. A C symbol's link name is the whole of its identity - C has no declaration to key on, and two C declarations sharing a link name are one entity by the linkage rule - so there is no stamp this could ask instead, and the leaf it compares is the mangling the linker will use |
 | `compiler/bindgen/importer.cryo:1847` | `ExternBlockNode::functions[]` | `sym` | J | extern: whether this extern block already declares the C function of this LINK NAME, asked as the importer emits it. A C symbol's link name is the whole of its identity - C has no declaration to key on, and two C declarations sharing a link name are one entity by the linkage rule - so there is no stamp this could ask instead, and the leaf it compares is the mangling the linker will use |
-| `compiler/resolver/name_resolution.cryo:617` | `FunctionDeclNode::parameters[]` | `param.name.id` | J | member: the resolver's duplicate-parameter check, a parameter by leaf inside the function being bound |
+| `compiler/resolver/name_resolution.cryo:619` | `FunctionDeclNode::parameters[]` | `param.name.id` | J | member: the resolver's duplicate-parameter check, a parameter by leaf inside the function being bound |
 | `compiler/mono/call_specializer.cryo:909` | `GenericRegistry::find_inherent_impl_generic_method` | ` ...` | J | member: a generic method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand |
-| `compiler/sema/method_binding.cryo:1315` | `GenericRegistry::find_inherent_impl_generic_method` | ` ...` | J | member: a generic method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand |
-| `compiler/sema/method_binding.cryo:874` | `GenericRegistry::find_inherent_impl_method` | ` ...` | J | member: a method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand |
-| `compiler/sema/method_binding.cryo:773` | `GenericRegistry::find_trait_defining_method` | `method_name` | J | hint: the did-you-mean asks which trait declares a method of this leaf; the spelling is the question |
+| `compiler/sema/method_binding.cryo:1293` | `GenericRegistry::find_inherent_impl_generic_method` | ` ...` | J | member: a generic method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand |
+| `compiler/sema/method_binding.cryo:852` | `GenericRegistry::find_inherent_impl_method` | ` ...` | J | member: a method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand |
+| `compiler/sema/method_binding.cryo:751` | `GenericRegistry::find_trait_defining_method` | `method_name` | J | hint: the did-you-mean asks which trait declares a method of this leaf; the spelling is the question |
 | `compiler/types/ownership.cryo:826` | `GenericRegistry::inherent_impl_has_method` | `ty, drop_sym` | J | member: a method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand |
 | `compiler/mono/call_specializer.cryo:2358` | `GenericRegistry::template_in` | `ResBase::Def(scope_def), name` | J | member: a template declared inside its container - a module's generic function, a type's generic static method - by the leaf written after the path segment; the container is the segment's resolved identity (`ResBase`), never a spelling |
-| `compiler/sema/async_lower.cryo:2667` | `GenericRegistry::template_in` | `ResBase::Def(owner), sr.member_name` | J | member: a template declared inside its container - a module's generic function, a type's generic static method - by the leaf written after the path segment; the container is the segment's resolved identity (`ResBase`), never a spelling |
-| `compiler/sema/call_resolver.cryo:2574` | `GenericRegistry::template_in` | ` ...` | J | member: a template declared inside its container - a module's generic function, a type's generic static method - by the leaf written after the path segment; the container is the segment's resolved identity (`ResBase`), never a spelling |
-| `compiler/sema/call_resolver.cryo:3650` | `GenericRegistry::template_in` | `ResBase::Def(owner_def), member_sym` | J | member: a template declared inside its container - a module's generic function, a type's generic static method - by the leaf written after the path segment; the container is the segment's resolved identity (`ResBase`), never a spelling |
-| `compiler/sema/call_resolver.cryo:4333` | `GenericRegistry::template_in` | `b, scope.member_name` | J | member: a template declared inside its container - a module's generic function, a type's generic static method - by the leaf written after the path segment; the container is the segment's resolved identity (`ResBase`), never a spelling |
-| `compiler/sema/call_resolver.cryo:5289` | `GenericRegistry::template_in` | ` ...` | J | member: a template declared inside its container - a module's generic function, a type's generic static method - by the leaf written after the path segment; the container is the segment's resolved identity (`ResBase`), never a spelling |
+| `compiler/sema/async_lower.cryo:2655` | `GenericRegistry::template_in` | `ResBase::Def(owner), sr.member_name` | J | member: a template declared inside its container - a module's generic function, a type's generic static method - by the leaf written after the path segment; the container is the segment's resolved identity (`ResBase`), never a spelling |
+| `compiler/sema/call_resolver.cryo:2570` | `GenericRegistry::template_in` | ` ...` | J | member: a template declared inside its container - a module's generic function, a type's generic static method - by the leaf written after the path segment; the container is the segment's resolved identity (`ResBase`), never a spelling |
+| `compiler/sema/call_resolver.cryo:3648` | `GenericRegistry::template_in` | `ResBase::Def(owner_def), member_sym` | J | member: a template declared inside its container - a module's generic function, a type's generic static method - by the leaf written after the path segment; the container is the segment's resolved identity (`ResBase`), never a spelling |
+| `compiler/sema/call_resolver.cryo:4331` | `GenericRegistry::template_in` | `b, scope.member_name` | J | member: a template declared inside its container - a module's generic function, a type's generic static method - by the leaf written after the path segment; the container is the segment's resolved identity (`ResBase`), never a spelling |
+| `compiler/sema/call_resolver.cryo:5287` | `GenericRegistry::template_in` | ` ...` | J | member: a template declared inside its container - a module's generic function, a type's generic static method - by the leaf written after the path segment; the container is the segment's resolved identity (`ResBase`), never a spelling |
 | `compiler/passes/type_resolution.cryo:1835` | `ImplBlockNode::generic_params[]` | `name` | J | member: the impl's own generic parameter by its leaf off the impl node in hand, scanned inline |
 | `compiler/passes/type_resolution.cryo:209` | `ImplBlockNode::lookup_assoc_binding` | `adecl.name` | J | member: the impl's own `This::Member` binding by the member's leaf, asked from inside the block |
 | `compiler/passes/type_resolution.cryo:286` | `ImplBlockNode::lookup_assoc_binding` | `adecl.name` | J | member: the impl's own `This::Member` binding by the member's leaf, asked from inside the block |
@@ -184,14 +180,14 @@ Population **301** - J 159 · N 124 · S 0 · B 0 · C 16 · F 2 · W 0
 | `compiler/mono/call_specializer.cryo:1798` | `ImplBlockNode::methods[]` | `method_name` | J | member: the impl's own method by its leaf off the impl node in hand, scanned inline |
 | `compiler/mono/call_specializer.cryo:1906` | `ImplBlockNode::methods[]` | `method_name` | J | member: the impl's own method by its leaf off the impl node in hand, scanned inline |
 | `compiler/passes/type_resolution.cryo:1676` | `ImplBlockNode::methods[]` | `tfunc.name` | J | member: the impl's own method by its leaf off the impl node in hand, scanned inline |
-| `compiler/sema/call_resolver.cryo:2961` | `ImplBlockNode::methods[]` | `member.member` | J | member: the impl's own method by its leaf off the impl node in hand, scanned inline |
-| `compiler/sema/method_binding.cryo:974` | `ImplBlockNode::methods[]` | `method_name` | J | member: the impl's own method by its leaf off the impl node in hand, scanned inline |
-| `compiler/sema/method_binding.cryo:1780` | `ImplBlockNode::methods[]` | `method_name` | J | member: the impl's own method by its leaf off the impl node in hand, scanned inline |
+| `compiler/sema/call_resolver.cryo:2959` | `ImplBlockNode::methods[]` | `member.member` | J | member: the impl's own method by its leaf off the impl node in hand, scanned inline |
+| `compiler/sema/method_binding.cryo:952` | `ImplBlockNode::methods[]` | `method_name` | J | member: the impl's own method by its leaf off the impl node in hand, scanned inline |
+| `compiler/sema/method_binding.cryo:1758` | `ImplBlockNode::methods[]` | `method_name` | J | member: the impl's own method by its leaf off the impl node in hand, scanned inline |
 | `compiler/types/generic_registry.cryo:549` | `ImplBlockNode::methods[]` | `method_sym` | J | member: the impl's own method by its leaf off the impl node in hand, scanned inline |
 | `compiler/types/generic_registry.cryo:572` | `ImplBlockNode::methods[]` | `method_sym` | J | member: the impl's own method by its leaf off the impl node in hand, scanned inline |
 | `compiler/types/generic_registry.cryo:598` | `ImplBlockNode::methods[]` | `method_sym` | J | member: the impl's own method by its leaf off the impl node in hand, scanned inline |
 | `compiler/types/ownership.cryo:1052` | `ImplBlockNode::methods[]` | `method_name` | J | member: the impl's own method by its leaf off the impl node in hand, scanned inline |
-| `compiler/types/trait_checker.cryo:382` | `ImplBlockNode::methods[]` | `method_name` | J | member: the impl's own method by its leaf off the impl node in hand, scanned inline |
+| `compiler/types/trait_checker.cryo:347` | `ImplBlockNode::methods[]` | `method_name` | J | member: the impl's own method by its leaf off the impl node in hand, scanned inline |
 | `compiler/instance.cryo:895` | `ModuleGraph::find_module_index` | ` ...` | J | module: a module by its namespace path |
 | `compiler/instance.cryo:3037` | `ModuleGraph::find_module_index` | `ModulePath::of(qual)` | J | module: a module by its namespace path |
 | `compiler/module_loader.cryo:646` | `ModuleGraph::find_module_index` | `ModulePath::of(already_name)` | J | module: a module by its namespace path |
@@ -199,18 +195,19 @@ Population **301** - J 159 · N 124 · S 0 · B 0 · C 16 · F 2 · W 0
 | `compiler/module_loader.cryo:836` | `ModuleGraph::find_module_index` | `ModulePath::of(exp_sym)` | J | module: a module by its namespace path |
 | `compiler/module_loader.cryo:893` | `ModuleGraph::find_module_index` | `ModulePath::of(eitem_sym)` | J | module: a module by its namespace path |
 | `compiler/passes/pass_registry.cryo:1263` | `ModuleGraph::find_module_index` | `ModulePath::of(mod_sym)` | J | module: a module by its namespace path |
-| `compiler/resolver/name_resolution.cryo:578` | `ModuleGraph::find_module_index` | `ModulePath::of(canonical)` | J | module: a module by its namespace path |
-| `compiler/resolver/name_resolution.cryo:3157` | `ModuleGraph::find_module_index` | `ModulePath::of(module_sym)` | J | module: a module by its namespace path |
-| `compiler/resolver/name_resolution.cryo:3307` | `ModuleGraph::find_module_index` | `ModulePath::of(sub_sym)` | J | module: a module by its namespace path |
+| `compiler/resolver/name_resolution.cryo:580` | `ModuleGraph::find_module_index` | `ModulePath::of(canonical)` | J | module: a module by its namespace path |
+| `compiler/resolver/name_resolution.cryo:3193` | `ModuleGraph::find_module_index` | `ModulePath::of(module_sym)` | J | module: a module by its namespace path |
+| `compiler/resolver/name_resolution.cryo:3343` | `ModuleGraph::find_module_index` | `ModulePath::of(sub_sym)` | J | module: a module by its namespace path |
 | `compiler/compilation_context.cryo:648` | `ModuleGraph::module_def` | `ModulePath::of(ns)` | J | module: a module's definition by its namespace path - the id the graph registered when it added the module, or the name layer's for a C import's module; a declaration asks it for its parent |
-| `compiler/resolver/name_resolution.cryo:1924` | `ModuleGraph::module_def` | `ModulePath::of( ...` | J | module: a module's definition by its namespace path - the id the graph registered when it added the module, or the name layer's for a C import's module; a declaration asks it for its parent |
+| `compiler/resolver/name_resolution.cryo:1930` | `ModuleGraph::module_def` | `ModulePath::of( ...` | J | module: a module's definition by its namespace path - the id the graph registered when it added the module, or the name layer's for a C import's module; a declaration asks it for its parent |
 | `compiler/resolver/resolver.cryo:254` | `ModuleGraph::module_def` | `ModulePath::of(this.intern_table.intern(sym.source_module))` | J | module: a module's definition by its namespace path - the id the graph registered when it added the module, or the name layer's for a C import's module; a declaration asks it for its parent |
+| `compiler/sema/call_resolver.cryo:2526` | `ModuleGraph::module_def` | `ModulePath::of(use_ns)` | J | module: a module's definition by its namespace path - the id the graph registered when it added the module, or the name layer's for a C import's module; a declaration asks it for its parent |
 | `compiler/instance.cryo:1416` | `ModuleGraph::modules[]` | `prelude_ns_sym.id` | J | module: the graph's modules by namespace, scanned inline |
-| `compiler/resolver/name_resolution.cryo:1408` | `ModuleGraph::reexport_closure` | `ModulePath::of(cand.name)` | J | module: a module's re-export closure by its namespace path |
-| `compiler/resolver/name_resolution.cryo:2947` | `ModuleGraph::reexport_closure` | `ModulePath::of(m)` | J | module: a module's re-export closure by its namespace path |
-| `compiler/resolver/name_resolution.cryo:2995` | `ModuleGraph::reexport_closure` | `ModulePath::of(m)` | J | module: a module's re-export closure by its namespace path |
-| `compiler/resolver/name_resolution.cryo:3044` | `ModuleGraph::reexport_closure` | `ModulePath::of(module_sym)` | J | module: a module's re-export closure by its namespace path |
-| `compiler/resolver/name_resolution.cryo:3203` | `ModuleGraph::reexport_closure` | `ModulePath::of(module_sym)` | J | module: a module's re-export closure by its namespace path |
+| `compiler/resolver/name_resolution.cryo:1410` | `ModuleGraph::reexport_closure` | `ModulePath::of(cand.name)` | J | module: a module's re-export closure by its namespace path |
+| `compiler/resolver/name_resolution.cryo:2962` | `ModuleGraph::reexport_closure` | `ModulePath::of(m)` | J | module: a module's re-export closure by its namespace path |
+| `compiler/resolver/name_resolution.cryo:3010` | `ModuleGraph::reexport_closure` | `ModulePath::of(m)` | J | module: a module's re-export closure by its namespace path |
+| `compiler/resolver/name_resolution.cryo:3080` | `ModuleGraph::reexport_closure` | `ModulePath::of(module_sym)` | J | module: a module's re-export closure by its namespace path |
+| `compiler/resolver/name_resolution.cryo:3239` | `ModuleGraph::reexport_closure` | `ModulePath::of(module_sym)` | J | module: a module's re-export closure by its namespace path |
 | `compiler/instance.cryo:1844` | `ModuleGraph::source_file_for_owner_key` | ` ...` | J | module: a module's source file by its namespace path |
 | `compiler/passes/specialization.cryo:528` | `ModuleGraph::source_file_for_owner_key` | ` ...` | J | module: a module's source file by its namespace path |
 | `compiler/passes/specialization.cryo:604` | `ModuleGraph::source_file_for_owner_key` | ` ...` | J | module: a module's source file by its namespace path |
@@ -230,9 +227,9 @@ Population **301** - J 159 · N 124 · S 0 · B 0 · C 16 · F 2 · W 0
 | `compiler/sema/sema.cryo:3193` | `StructType::get_method` | `scope.member_name` | J | member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too |
 | `compiler/sema/sema.cryo:3213` | `StructType::get_method` | `scope.member_name` | J | member: a struct's method by its leaf off the `StructType` in hand; Rust's method lookup is name-keyed off the owner too |
 | `compiler/types/checker.cryo:351` | `StructType::get_method` | ` ...` | J | lang: the call protocol's `__call__` (the argument continues on the next line), asked when a struct converts to a function type |
-| `compiler/sema/call_resolver.cryo:456` | `StructType::methods[]` | `member.member` | J | member: a struct's method by its leaf off the `StructType` in hand, scanned inline with an arity predicate |
+| `compiler/sema/call_resolver.cryo:457` | `StructType::methods[]` | `member.member` | J | member: a struct's method by its leaf off the `StructType` in hand, scanned inline with an arity predicate |
 | `compiler/passes/type_resolution.cryo:1800` | `TraitDeclNode::assoc_type_index` | `member` | J | member: the trait's own associated type's position by its leaf, asked from the trait node in hand - the index the positional trait arguments are read by |
-| `compiler/sema/method_binding.cryo:718` | `TraitDeclNode::assoc_type_index` | `member` | J | member: the trait's own associated type's position by its leaf, asked from the trait node in hand - the index the positional trait arguments are read by |
+| `compiler/sema/method_binding.cryo:696` | `TraitDeclNode::assoc_type_index` | `member` | J | member: the trait's own associated type's position by its leaf, asked from the trait node in hand - the index the positional trait arguments are read by |
 | `compiler/types/resolver.cryo:530` | `TraitDeclNode::assoc_type_index` | `member` | J | member: the trait's own associated type's position by its leaf, asked from the trait node in hand - the index the positional trait arguments are read by |
 | `compiler/types/resolver.cryo:602` | `TraitDeclNode::assoc_type_index` | `member` | J | member: the trait's own associated type's position by its leaf, asked from the trait node in hand - the index the positional trait arguments are read by |
 | `compiler/passes/type_resolution.cryo:1719` | `TraitDeclNode::lookup_assoc_type` | `assoc` | J | member: the trait's own associated type by its leaf, asked from the trait node in hand |
@@ -240,22 +237,22 @@ Population **301** - J 159 · N 124 · S 0 · B 0 · C 16 · F 2 · W 0
 | `compiler/types/generic_registry.cryo:1294` | `TraitDeclNode::lookup_method` | `method_name` | J | member: the trait's own method by its leaf, asked from the trait node in hand |
 | `compiler/passes/type_resolution.cryo:1671` | `TraitDeclNode::methods[]` | `assoc` | J | member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf) |
 | `compiler/sema/async_lower.cryo:743` | `TraitDeclNode::methods[]` | `node.name` | J | member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf) |
-| `compiler/sema/async_lower.cryo:2601` | `TraitDeclNode::methods[]` | `mname` | J | member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf) |
-| `compiler/sema/async_lower.cryo:2602` | `TraitDeclNode::methods[]` | `ap.member` | J | member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf) |
-| `compiler/sema/method_binding.cryo:690` | `TraitDeclNode::methods[]` | `method_name` | J | member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf) |
-| `compiler/sema/method_binding.cryo:1008` | `TraitDeclNode::methods[]` | `method_name` | J | member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf) |
-| `compiler/sema/method_binding.cryo:1105` | `TraitDeclNode::methods[]` | `member.member` | J | member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf) |
-| `compiler/sema/method_binding.cryo:425` | `TraitType::required_methods[]` | `method_name` | J | member: a trait's required method by its leaf off the `TraitType` in hand, scanned inline |
-| `compiler/sema/call_resolver.cryo:4255` | `TypeUtils::lookup_method_return` | `owner_ref, scope.member_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
-| `compiler/sema/call_resolver.cryo:4285` | `TypeUtils::lookup_method_return` | `base_ty, scope.member_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
-| `compiler/sema/call_resolver.cryo:5076` | `TypeUtils::lookup_method_return` | `type_ref, scope.member_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
-| `compiler/sema/call_resolver.cryo:5577` | `TypeUtils::lookup_method_return` | `exp_ref, member_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
-| `compiler/sema/method_binding.cryo:195` | `TypeUtils::lookup_method_return` | `base_ref, method_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
-| `compiler/sema/method_binding.cryo:363` | `TypeUtils::lookup_method_return` | ` ...` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
-| `compiler/sema/method_binding.cryo:454` | `TypeUtils::lookup_method_return` | ` ...` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
-| `compiler/sema/method_binding.cryo:762` | `TypeUtils::lookup_method_return` | ` ...` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
-| `compiler/sema/method_binding.cryo:780` | `TypeUtils::lookup_method_return` | ` ...` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
-| `compiler/sema/method_binding.cryo:793` | `TypeUtils::lookup_method_return` | `parent_ref, method_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
+| `compiler/sema/async_lower.cryo:2589` | `TraitDeclNode::methods[]` | `mname` | J | member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf) |
+| `compiler/sema/async_lower.cryo:2590` | `TraitDeclNode::methods[]` | `ap.member` | J | member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf) |
+| `compiler/sema/method_binding.cryo:668` | `TraitDeclNode::methods[]` | `method_name` | J | member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf) |
+| `compiler/sema/method_binding.cryo:986` | `TraitDeclNode::methods[]` | `method_name` | J | member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf) |
+| `compiler/sema/method_binding.cryo:1083` | `TraitDeclNode::methods[]` | `member.member` | J | member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf) |
+| `compiler/sema/method_binding.cryo:403` | `TraitType::required_methods[]` | `method_name` | J | member: a trait's required method by its leaf off the `TraitType` in hand, scanned inline |
+| `compiler/sema/call_resolver.cryo:4253` | `TypeUtils::lookup_method_return` | `owner_ref, scope.member_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
+| `compiler/sema/call_resolver.cryo:4283` | `TypeUtils::lookup_method_return` | `base_ty, scope.member_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
+| `compiler/sema/call_resolver.cryo:5074` | `TypeUtils::lookup_method_return` | `type_ref, scope.member_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
+| `compiler/sema/call_resolver.cryo:5575` | `TypeUtils::lookup_method_return` | `exp_ref, member_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
+| `compiler/sema/method_binding.cryo:174` | `TypeUtils::lookup_method_return` | `base_ref, method_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
+| `compiler/sema/method_binding.cryo:342` | `TypeUtils::lookup_method_return` | ` ...` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
+| `compiler/sema/method_binding.cryo:432` | `TypeUtils::lookup_method_return` | ` ...` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
+| `compiler/sema/method_binding.cryo:740` | `TypeUtils::lookup_method_return` | ` ...` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
+| `compiler/sema/method_binding.cryo:758` | `TypeUtils::lookup_method_return` | ` ...` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
+| `compiler/sema/method_binding.cryo:771` | `TypeUtils::lookup_method_return` | `parent_ref, method_name` | J | member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name) |
 | `compiler/sema/sema.cryo:1263` | `TypeUtils::lookup_method_return` | `owner_ref, this.intern.intern("iter")` | J | member: the for-in protocol's `iter` off a collection that does not implement `Iterator` |
 | `compiler/AST/node_locator.cryo:1834` | `UnionDeclNode::fields[]` | `field_name` | J | member: a union declaration's field by its leaf off the node in hand, scanned inline |
 | `compiler/sema/member_resolver.cryo:408` | `UnionDeclNode::fields[]` | `field` | J | member: a union declaration's field by its leaf off the node in hand, scanned inline |
@@ -266,25 +263,25 @@ Population **301** - J 159 · N 124 · S 0 · B 0 · C 16 · F 2 · W 0
 | `compiler/passes/drop_insertion.cryo:3639` | `local::FieldInfo[]` | `key` | J | member: a struct's or class's fields held by reference in a local, by leaf |
 | `compiler/sema/sema.cryo:1442` | `local::FieldInfo[]` | `b.source_field.id` | J | member: a struct's or class's fields held by reference in a local, by leaf |
 | `compiler/parser/parser.cryo:2336` | `local::GenericParamNode[]` | `gp.name` | J | member: a declaration's own written generic parameters, scanned for a repeated spelling as the parser builds the list. The question IS about spellings - two parameters written `<T, T>` are a redeclaration - and at parse time there is no identity to ask instead: the resolver stamps a `SymbolID` on each parameter only after the list exists. Rust refuses the same shape the same way, by comparing idents in the parameter list |
-| `compiler/sema/call_resolver.cryo:2310` | `local::MethodInfo[]` | `member.member` | J | member: an arena type's methods held in a local, by leaf |
-| `compiler/sema/call_resolver.cryo:5791` | `local::MethodInfo[]` | `scope.member_name` | J | member: an arena type's methods held in a local, by leaf |
-| `compiler/sema/call_resolver.cryo:5810` | `local::MethodInfo[]` | `scope.member_name` | J | member: an arena type's methods held in a local, by leaf |
+| `compiler/sema/call_resolver.cryo:2311` | `local::MethodInfo[]` | `member.member` | J | member: an arena type's methods held in a local, by leaf |
+| `compiler/sema/call_resolver.cryo:5789` | `local::MethodInfo[]` | `scope.member_name` | J | member: an arena type's methods held in a local, by leaf |
+| `compiler/sema/call_resolver.cryo:5808` | `local::MethodInfo[]` | `scope.member_name` | J | member: an arena type's methods held in a local, by leaf |
 | `compiler/AST/node_locator.cryo:1275` | `local::MethodNode[]` | `name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
 | `compiler/mono/call_specializer.cryo:1302` | `local::MethodNode[]` | `scope.member_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
 | `compiler/mono/call_specializer.cryo:1602` | `local::MethodNode[]` | `method_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
 | `compiler/mono/call_specializer.cryo:1629` | `local::MethodNode[]` | `method_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
 | `compiler/mono/call_specializer.cryo:1833` | `local::MethodNode[]` | `method_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
-| `compiler/sema/call_resolver.cryo:4493` | `local::MethodNode[]` | `scope.member_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
-| `compiler/sema/call_resolver.cryo:4674` | `local::MethodNode[]` | `scope.member_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
-| `compiler/sema/call_resolver.cryo:4704` | `local::MethodNode[]` | `scope.member_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
-| `compiler/sema/method_binding.cryo:184` | `local::MethodNode[]` | `method_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
-| `compiler/sema/method_binding.cryo:917` | `local::MethodNode[]` | `member.member` | J | member: an impl's or a declaration's methods held in a local, by leaf |
-| `compiler/sema/method_binding.cryo:988` | `local::MethodNode[]` | `name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
+| `compiler/sema/call_resolver.cryo:4491` | `local::MethodNode[]` | `scope.member_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
+| `compiler/sema/call_resolver.cryo:4672` | `local::MethodNode[]` | `scope.member_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
+| `compiler/sema/call_resolver.cryo:4702` | `local::MethodNode[]` | `scope.member_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
+| `compiler/sema/method_binding.cryo:163` | `local::MethodNode[]` | `method_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
+| `compiler/sema/method_binding.cryo:895` | `local::MethodNode[]` | `member.member` | J | member: an impl's or a declaration's methods held in a local, by leaf |
+| `compiler/sema/method_binding.cryo:966` | `local::MethodNode[]` | `name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
 | `compiler/sema/symbolic_checker.cryo:317` | `local::MethodNode[]` | `method_name` | J | member: an impl's or a declaration's methods held in a local, by leaf |
 | `compiler/codegen/ops/declaration_emitter.cryo:745` | `local::VTableSlot[]` | `m.name` | J | member: a class's vtable slots held in a local, by the method's leaf (the override walk) |
 | `compiler/codegen/ops/declaration_emitter.cryo:845` | `local::VTableSlot[]` | `method_name` | J | member: a class's vtable slots held in a local, by the method's leaf (the override walk) |
-| `compiler/resolver/name_resolution.cryo:2901` | `ConstantTable::intern_qualified` | `intern, ns, node.name` | N | a key MINTED at the constant's declaration (`ns::name`) for its registration; the write side |
-| `compiler/resolver/name_resolution.cryo:2931` | `ConstantTable::intern_qualified` | `intern, ns, node.name` | N | a key MINTED at the constant's declaration (`ns::name`) for its registration; the write side |
+| `compiler/resolver/name_resolution.cryo:2916` | `ConstantTable::intern_qualified` | `intern, ns, node.name` | N | a key MINTED at the constant's declaration (`ns::name`) for its registration; the write side |
+| `compiler/resolver/name_resolution.cryo:2946` | `ConstantTable::intern_qualified` | `intern, ns, node.name` | N | a key MINTED at the constant's declaration (`ns::name`) for its registration; the write side |
 | `compiler/passes/drop_insertion.cryo:3538` | `ConstantTable::parse_int_literal` | `text, &v` | N | a literal's text parsed to a value |
 | `compiler/codegen/ops/declaration_emitter.cryo:642` | `DeclarationIndex::impl_owner` | `node, "codegen/declare impl"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
 | `compiler/codegen/visit/decl_visit_emitter.cryo:216` | `DeclarationIndex::impl_owner` | `node, "codegen/impl bodies"` | N | keyed by the impl node; the string is the diagnostic label of the asking site |
@@ -375,30 +372,30 @@ Population **301** - J 159 · N 124 · S 0 · B 0 · C 16 · F 2 · W 0
 | `compiler/mono/state.cryo:407` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/passes/type_resolution.cryo:116` | `ResolutionContext::new` | `ctx.source_file` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/passes/type_resolution.cryo:3359` | `ResolutionContext::new` | `ctx.source_file` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:658` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:1425` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:1557` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:1620` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:1784` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:4382` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:4571` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:4630` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:4900` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:4963` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:5343` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:5439` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:5491` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/call_resolver.cryo:5539` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:659` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:1426` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:1558` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:1621` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:1785` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:4380` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:4569` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:4628` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:4898` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:4961` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:5341` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:5437` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:5489` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/call_resolver.cryo:5537` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/lambda_synth.cryo:119` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/method_binding.cryo:486` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/method_binding.cryo:817` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/method_binding.cryo:878` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/method_binding.cryo:934` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/method_binding.cryo:1050` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/method_binding.cryo:464` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/method_binding.cryo:795` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/method_binding.cryo:856` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/method_binding.cryo:912` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/method_binding.cryo:1028` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/method_binding.cryo:1143` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/method_binding.cryo:1165` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/method_binding.cryo:1187` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/method_binding.cryo:1425` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
-| `compiler/sema/method_binding.cryo:1791` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/method_binding.cryo:1403` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
+| `compiler/sema/method_binding.cryo:1769` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/sema.cryo:774` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/sema.cryo:889` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |
 | `compiler/sema/sema.cryo:1594` | `ResolutionContext::new` | `""` | N | a constructor: the string is the SOURCE FILE the context resolves in |

@@ -77,6 +77,7 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::module_path::{ ModulePath };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::sema::diagnostics::{ Diagnostics };
@@ -2519,16 +2520,12 @@ type struct CallResolver {
     /// candidate from overload selection would silently rebind the call to a
     /// different function, and a wrong bind is a miscompile that every gate in
     /// this repo stays green through (§4.1).  A hard error is the honest one.
-    enforce_callee_visibility(mut &this, callee: SymbolStr, use_ns: SymbolStr,
+    enforce_callee_visibility(mut &this, callee: DefId, use_ns: SymbolStr,
                               span: SourceSpan) -> void {
         if (this.state.in_symbolic_check) { return; }
-        if (!callee.is_valid() || !use_ns.is_valid()) { return; }
-        const di: DeclarationIndex* = this.ctx.decl_index;
-        const c_ns: SymbolStr = di.namespace_of(callee, this.intern);
-        if (!c_ns.is_valid()) { return; }
-        if (c_ns.id == use_ns.id) { return; }
-        if (di.is_candidate_public(callee)) { return; }
-        const callee_str: string = this.intern.resolve(callee);
+        const use_module: DefId = this.ctx.module_graph.module_def(ModulePath::of(use_ns));
+        if (!this.ctx.decl_index.hidden_from(callee, use_module)) { return; }
+        const callee_str: string = this.intern.resolve(this.ctx.defs.path_of(callee));
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
             fmt::format("`%s` is private and cannot be called from `%s`",
@@ -2544,26 +2541,25 @@ type struct CallResolver {
     /// `enforce_callee_visibility` is reached only from call paths, so a
     /// reference that never becomes a call is never offered to it - not a
     /// branch that answered wrong, a lane that was never asked.  This is where
-    /// it asks.  `q` is the stamp's canonical name for the function, which is
-    /// the writer's own answer and needs no resolution against any module.
-    enforce_value_ref_visibility(mut &this, q: SymbolStr, span: SourceSpan) -> void {
-        this.enforce_callee_visibility(q, this.call_use_site_ns(span), span);
+    /// it asks.  `def` is the stamp, the writer's own answer, which needs no
+    /// resolution against any module.
+    enforce_value_ref_visibility(mut &this, def: DefId, span: SourceSpan) -> void {
+        this.enforce_callee_visibility(def, this.call_use_site_ns(span), span);
     }
 
     /// The function a qualified path in VALUE position names, or an invalid
     /// TypeRef when it names none.
     ///
-    /// Resolved through `resolve_module_qualified_symbol` - the same symbol the
-    /// CALL form of this path resolves through - so `Ns::Mod::f` and
+    /// Resolved through `resolve_module_qualified_def` - the same declaration
+    /// the CALL form of this path resolves through - so `Ns::Mod::f` and
     /// `Ns::Mod::f()` cannot disagree about which function they mean.  The
     /// value form is gated here because it reaches no other gate.
     lookup_scope_value_function(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
-        const q_sym: SymbolStr = this.resolve_module_qualified_symbol(
-            scope.scope_name, scope.member_name, scope);
-        if (!q_sym.is_valid()) { return TypeRef::invalid(); }
-        const ft: TypeRef = this.types.lookup_func_type_exact(q_sym);
+        const callee: DefId = this.resolve_module_qualified_def(scope);
+        if (!callee.is_valid()) { return TypeRef::invalid(); }
+        const ft: TypeRef = this.ctx.decl_index.func_type_of_def(callee);
         if (!ft.is_valid()) { return TypeRef::invalid(); }
-        this.enforce_callee_visibility(q_sym, this.call_use_site_ns(scope.span),
+        this.enforce_callee_visibility(callee, this.call_use_site_ns(scope.span),
             scope.span);
         // The pin is the qualified name, as the call form's is: a free
         // function's registry key is its qualified name.  A function TEMPLATE
@@ -2575,7 +2571,9 @@ type struct CallResolver {
                 ResBase::Def(scope.require_scope_res("scope value template").def_id()), scope.member_name);
             if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) { is_fn_template = true; }
         }
-        if (!is_fn_template && !scope.resolved_callee.is_some()) { scope.set_resolved_callee(CalleePin::Family(q_sym)); }
+        if (!is_fn_template && !scope.resolved_callee.is_some()) {
+            scope.set_resolved_callee(CalleePin::Family(this.module_qualified_path(scope)));
+        }
         return ft;
     }
 
@@ -5191,16 +5189,17 @@ type struct CallResolver {
         return TypeRef::invalid();
     }
 
-    /// The fully-qualified `namespace::member` symbol a module-qualified call
-    /// (`intrinsics::frexp`, `mem::swap`) names, or the empty symbol when the
-    /// scope segment does not name a module the writer can see.
+    /// The function a module-qualified call (`intrinsics::frexp`, `mem::swap`)
+    /// names, or an invalid id when the path names no function.
     ///
     /// The written scope may be any whole-segment SUFFIX of the defining
     /// namespace (`mem` for `std::core::mem`), and several modules can share
     /// one suffix, so the spelling alone does not identify the module - the
     /// imports of the file that wrote it do.  NameResolution answers that while
-    /// those imports are still in hand and records it on the node; this reads
-    /// the answer and does not re-derive it.
+    /// those imports are still in hand, binds the member the module offers,
+    /// and records that declaration on the node (`member_def`); this reads the
+    /// answer and does not re-derive it, so the declaration the call names is
+    /// the one the name layer bound and never a `module::member` composed here.
     ///
     /// There is deliberately NO second strategy when the node carries no
     /// answer.  The graph scan that used to stand here matched every namespace
@@ -5215,21 +5214,22 @@ type struct CallResolver {
     /// cannot pick different modules: classifying an argument against one
     /// module's signature while the call resolves to another's would hand the
     /// move passes an ownership answer for a function that is not being called.
-    resolve_module_qualified_symbol(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
-                                    scope: ScopeResolutionNode*) -> SymbolStr {
-        if (scope == null) { return SymbolStr::empty(); }
-        const stamped_ns: SymbolStr = this.ctx.defs.path_of(
-            scope.require_scope_res("resolve_module_qualified_symbol").def_id());
-        if (!stamped_ns.is_valid()) { return SymbolStr::empty(); }
+    resolve_module_qualified_def(&this, scope: ScopeResolutionNode*) -> DefId {
+        if (scope == null) { return DefId::invalid(); }
+        const d: DefId = scope.member_def;
+        // A member the module offers that is not a function - a type, a
+        // global - names no call.
+        if (!this.overload_return_type(this.ctx.decl_index.func_type_of_def(d)).is_valid()) {
+            return DefId::invalid();
+        }
+        return d;
+    }
 
-        const member_str: string = this.intern.resolve(member_name);
-        const q: SymbolStr = this.ctx.intern(
-            this.intern.resolve(stamped_ns) + "::" + member_str);
-        // The module is settled but may not declare the member under its own
-        // name, which a re-export would explain.  Not searched for elsewhere:
-        // looking is what reopens the lane this function exists to keep closed.
-        if (!this.family_return_type(q).is_valid()) { return SymbolStr::empty(); }
-        return q;
+    /// The canonical name of the function a module-qualified path names -
+    /// what codegen's function registry and the owner stash are keyed by -
+    /// or the empty symbol when the path names no function.
+    module_qualified_path(&this, scope: ScopeResolutionNode*) -> SymbolStr {
+        return this.ctx.defs.path_of(this.resolve_module_qualified_def(scope));
     }
 
     /// The declared parameter types of a module-qualified free function, for
@@ -5250,10 +5250,8 @@ type struct CallResolver {
     /// turn a pointer parameter into a by-value one.
     lookup_module_qualified_param_types(mut &this, scope: ScopeResolutionNode*) -> TypeRef[] {
         if (this.ctx.decl_index == null || this.ctx.module_graph == null) { return []; }
-        const q_sym: SymbolStr = this.resolve_module_qualified_symbol(
-            scope.scope_name, scope.member_name, scope);
-        if (!q_sym.is_valid()) { return []; }
-        const ft: TypeRef = this.types.lookup_func_type_exact(q_sym);
+        const ft: TypeRef = this.ctx.decl_index.func_type_of_def(
+            this.resolve_module_qualified_def(scope));
         if (!ft.is_valid()) { return []; }
         const ft_raw: Type* = this.arena.lookup(ft.id);
         if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return []; }
@@ -5267,9 +5265,9 @@ type struct CallResolver {
     /// it, not for choosing the module - that question is already answered.
     resolve_module_qualified_function(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
                                       call: CallExprNode*, scope: ScopeResolutionNode*) -> TypeRef {
-        const q_sym: SymbolStr = this.resolve_module_qualified_symbol(scope_name, member_name, scope);
-        if (!q_sym.is_valid()) { return TypeRef::invalid(); }
-        const ret: TypeRef = this.family_return_type(q_sym);
+        const callee: DefId = this.resolve_module_qualified_def(scope);
+        if (!callee.is_valid()) { return TypeRef::invalid(); }
+        const ret: TypeRef = this.overload_return_type(this.ctx.decl_index.func_type_of_def(callee));
         if (!ret.is_valid()) { return TypeRef::invalid(); }
         // DOOR 1 (spec §8.1e).  A WRITTEN qualified path resolves straight to a
         // symbol here and never meets the bare binder's scope classifier, so it
@@ -5281,7 +5279,7 @@ type struct CallResolver {
         } else {
             if (scope != null) { scope.span } else { SourceSpan::none() }
         };
-        this.enforce_callee_visibility(q_sym, this.call_use_site_ns(q_span), q_span);
+        this.enforce_callee_visibility(callee, this.call_use_site_ns(q_span), q_span);
 
         mut is_fn_template: boolean = false;
         mut tmpl: TemplateEntry* = null;
@@ -5330,7 +5328,7 @@ type struct CallResolver {
             }
             if (subst_ret.is_valid()) { return subst_ret; }
         }
-        if (!is_fn_template) { this.pin_scope_callee_qsym(call, q_sym); }
+        if (!is_fn_template) { this.pin_scope_callee_qsym(call, this.module_qualified_path(scope)); }
         return ret;
     }
 
@@ -5626,7 +5624,7 @@ type struct CallResolver {
         mut lookup_sym: SymbolStr = this.scope_owner_key(scope);
         mut combined: SymbolStr = SymbolStr::empty();
         if (names_module) {
-            combined = this.resolve_module_qualified_symbol(scope.scope_name, scope.member_name, scope);
+            combined = this.module_qualified_path(scope);
             if (!combined.is_valid()) { return; }
         } else {
             if (scope.scope_generic_args.length > 0) {
