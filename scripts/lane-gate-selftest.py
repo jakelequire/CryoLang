@@ -656,6 +656,25 @@ MUTATIONS = [
      {_SEALED_DEFN: FILES[_SEALED_DEFN].replace(
          _sealed_block(FIRST_SEALED), "type struct %s {\n    private slot: u32;\n}\n" % FIRST_SEALED, 1)},
      0, "lane-gate: OK"),
+    ("a sealed identity type publishing a static that builds one from an argument is refused",
+     {_SEALED_DEFN: FILES[_SEALED_DEFN].replace(
+         _sealed_block(FIRST_SEALED), _sealed_block(FIRST_SEALED).replace(
+             "}\n", "public:\n    static make(slot: u32) -> %s {\n        return %s { slot: slot };\n    }\n}\n"
+             % (FIRST_SEALED, FIRST_SEALED), 1), 1)},
+     1, "`%s` (%s) has a public `static make(slot: u32)` returning it" % (FIRST_SEALED, _SEALED_DEFN)),
+    ("the same mint written over two lines is refused",
+     {_SEALED_DEFN: FILES[_SEALED_DEFN].replace(
+         _sealed_block(FIRST_SEALED), _sealed_block(FIRST_SEALED).replace(
+             "}\n", "public:\n    static make(\n        slot: u32) -> %s {\n        return %s { slot: slot };\n    }\n}\n"
+             % (FIRST_SEALED, FIRST_SEALED), 1), 1)},
+     1, "has a public `static make(slot: u32)` returning it"),
+    ("the same static left private, or a public one taking no argument, is accepted",
+     {_SEALED_DEFN: FILES[_SEALED_DEFN].replace(
+         _sealed_block(FIRST_SEALED), _sealed_block(FIRST_SEALED).replace(
+             "}\n", "    static make(slot: u32) -> %s {\n        return %s { slot: slot };\n    }\n"
+             "public:\n    static none() -> %s {\n        return %s { slot: 0 };\n    }\n}\n"
+             % (FIRST_SEALED, FIRST_SEALED, FIRST_SEALED, FIRST_SEALED), 1), 1)},
+     0, "lane-gate: OK"),
     ("a sealed-type entry whose type is no longer declared is stale, refused",
      {_SEALED_DEFN: FILES[_SEALED_DEFN].replace(_sealed_block(FIRST_SEALED), "", 1)},
      1, "`%s` is listed in SEALED_TYPES but %s declares no such type" % (FIRST_SEALED, _SEALED_DEFN)),

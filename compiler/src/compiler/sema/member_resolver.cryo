@@ -45,8 +45,8 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res::{ DefId };
-import compiler::resolver::module_path;
-import compiler::resolver::module_path::{ ModulePath };
+import compiler::module_graph;
+import compiler::module_graph::{ ModulePath };
 import compiler::sema::diagnostics::{ Diagnostics };
 import compiler::sema::dispatch::{ SemaDispatch };
 import compiler::sema::helpers::{ parse_tuple_index, sema_const_int_index };
@@ -646,7 +646,7 @@ type struct MemberResolver {
     /// positive the callee gate was reverted for.
     member_reachable(&this, decl: ModulePath, is_protected: boolean,
                      span: SourceSpan) -> boolean {
-        const use_site: ModulePath = ModulePath::of(this.ctx.module_ns_sym_of_file(span.file));
+        const use_site: ModulePath = this.ctx.module_of_file(span.file);
         if (!use_site.is_valid() || !decl.is_valid()) { return true; }
         if (use_site.equals(decl)) { return true; }
         return is_protected && use_site.is_within(decl, this.intern);
@@ -654,9 +654,13 @@ type struct MemberResolver {
 
     /// The module a user-defined type is declared in.
     type_module(&this, t: Type*) -> ModulePath {
-        if (t == null) { return ModulePath::none(); }
-        if (t.kind == TypeKind::Struct) { return ModulePath::of((t as StructType*).module_name); }
-        if (t.kind == TypeKind::Class) { return ModulePath::of((t as ClassType*).module_name); }
+        if (t == null || this.ctx == null || this.ctx.module_graph == null) { return ModulePath::none(); }
+        if (t.kind == TypeKind::Struct) {
+            return this.ctx.module_graph.module_named((t as StructType*).module_name);
+        }
+        if (t.kind == TypeKind::Class) {
+            return this.ctx.module_graph.module_named((t as ClassType*).module_name);
+        }
         return ModulePath::none();
     }
 
@@ -731,7 +735,7 @@ type struct MemberResolver {
         // private to.
         const node: MethodNode* = method.ast_node as MethodNode*;
         if (node == null) { return; }
-        const decl: ModulePath = ModulePath::of(this.ctx.module_ns_sym_of_file(node.span.file));
+        const decl: ModulePath = this.ctx.module_of_file(node.span.file);
         if (this.member_reachable(decl, method.is_protected, span)) { return; }
 
         const vis_word: string = if (method.is_protected) { "protected" } else { "private" };

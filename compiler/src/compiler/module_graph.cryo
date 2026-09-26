@@ -22,8 +22,6 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
-import compiler::resolver::module_path;
-import compiler::resolver::module_path::{ ModulePath };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, DefTable, DefKind };
 
@@ -37,6 +35,56 @@ type enum ModuleOrigin {
     Stdlib;
     Dep;
     Vendor;
+}
+
+/// A module's canonical namespace path - `std::fs`, `compiler::resolver` -
+/// which is the module's identity: a module and a type can never carry the
+/// same name, and the graph registers every module under exactly one path.
+///
+/// It is a type of its own so that a door asking for a MODULE cannot be
+/// handed a spelling that names something else.  It is minted only in this
+/// module, by the graph that registers modules: a registered module's own
+/// path (`ModuleInfo::path`), the module a source file declares
+/// (`ModuleGraph::module_of_file`), and the one door that turns written
+/// text into a module, `ModuleGraph::module_named`, which answers only a
+/// module the graph holds.  Nothing else can build one from a spelling, so
+/// a path always names a module that exists.
+type struct ModulePath {
+private:
+    sym: SymbolStr;
+
+    static of(sym: SymbolStr) -> ModulePath {
+        return ModulePath { sym: sym };
+    }
+
+public:
+    /// No module.
+    static none() -> ModulePath {
+        return ModulePath { sym: SymbolStr::empty() };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.sym.is_valid();
+    }
+
+    equals(&this, other: ModulePath) -> boolean {
+        return this.sym.equals(other.sym);
+    }
+
+    /// Whether this module is `ancestor` or nested anywhere under it.  A
+    /// module's children are the modules whose path continues its own past a
+    /// `::` - `app::net::tcp` is under `app::net` and `app`, while
+    /// `app::network` is not under `app::net`.
+    is_within(&this, ancestor: ModulePath, intern: InternTable*) -> boolean {
+        if (!this.is_valid() || !ancestor.is_valid()) { return false; }
+        if (this.equals(ancestor)) { return true; }
+        return intern.resolve(this.sym).starts_with(intern.resolve(ancestor.sym) + "::");
+    }
+
+    /// The path as interned text, for a store keyed by it and for display.
+    as_sym(&this) -> SymbolStr {
+        return this.sym;
+    }
 }
 
 /// Metadata about a single compilation module (source file).
@@ -133,6 +181,11 @@ type struct ModuleInfo {
             specializations:    [],
             def:                DefId::invalid(),
         };
+    }
+
+    /// This registered module's own path.
+    path(&this) -> ModulePath {
+        return ModulePath::of(this.name);
     }
 
     /// Output subdirectory name for an origin: `"std"`, `"local"`, or the
@@ -317,6 +370,28 @@ type struct ModuleGraph {
         return &this.modules[index];
     }
 
+    /// The path of the module the namespace `ns` names, when the graph holds
+    /// one under it - discovered, or bound by a C import - and none
+    /// otherwise.  The one door that turns written text into a module: an
+    /// import's path, an export's item, a qualified path's module part, a
+    /// namespace some other store recorded.  It cannot answer a module that
+    /// does not exist.
+    module_named(&this, ns: SymbolStr) -> ModulePath {
+        if (!ns.is_valid()) { return ModulePath::none(); }
+        if (this.name_index.contains_key(&ns.id) || this.module_defs.contains_key(&ns.id)) {
+            return ModulePath::of(ns);
+        }
+        return ModulePath::none();
+    }
+
+    /// The path of the module the source file `file` declares; none for a
+    /// file the graph did not load, or one declaring no namespace.
+    module_of_file(&this, file: string) -> ModulePath {
+        const idx: i64 = this.find_module_by_path(file);
+        if (idx < 0) { return ModulePath::none(); }
+        return ModulePath::of(this.modules[idx].namespace_name);
+    }
+
     /// Find a module's index by its path.  Returns -1 if not found.
     find_module_index(&this, name: ModulePath) -> i64 {
         const key: u32 = name.as_sym().id;
@@ -336,10 +411,11 @@ type struct ModuleGraph {
     }
 
     /// Record the module a C import declares: `def` is the binding the name
-    /// layer made for the import's alias, and `m` the namespace its
-    /// declarations are declared in.
-    bind_c_import_module(mut &this, m: ModulePath, def: DefId) -> void {
-        this.module_defs.insert(m.as_sym().id, def);
+    /// layer made for the import's alias, and `ns` the namespace its
+    /// declarations are declared in - a module registered here, as a
+    /// discovered one is in `add_module`.
+    bind_c_import_module(mut &this, ns: SymbolStr, def: DefId) -> void {
+        this.module_defs.insert(ns.id, def);
     }
 
     /// Every namespace reachable from `ns` by `export` edges, transitively,

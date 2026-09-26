@@ -234,6 +234,10 @@ CLASS_OF_METHOD = {
         ("J", "module: a module's re-export closure by its namespace path"),
     "ModuleGraph::source_file_for_owner_key":
         ("J", "module: a module's source file by its namespace path"),
+    "ModuleGraph::module_named":
+        ("J", "module: the one door from a namespace's text - an import's path, an export's item, a namespace another store recorded - to a module; it answers only a module the graph registered, so it can name a real module and never forge one"),
+    "ModuleGraph::module_of_file":
+        ("N", "the module a source FILE declares, by its FILE PATH"),
     "ModuleGraph::find_module_by_path":
         ("N", "a module by its FILE PATH"),
     "ModuleGraph::ns_sym_of_file":

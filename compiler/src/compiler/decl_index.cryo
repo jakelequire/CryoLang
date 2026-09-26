@@ -22,7 +22,7 @@ import compiler::types;
 import compiler::types::{ arena, compound, type_base, type_ref, TypeKind };
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DeclVisibility, DefId, FamilyOwner, OverloadId, Res, ResSlot, DefTable };
+import compiler::resolver::res::{ DeclVisibility, DefId, FamilyOwner, Res, ResSlot, DefTable };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import std::core::option;
@@ -33,8 +33,8 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName, ReceiverKind };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
-import compiler::resolver::module_path;
-import compiler::resolver::module_path::{ ModulePath };
+import compiler::module_graph;
+import compiler::module_graph::{ ModulePath };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ FunctionType };
 import compiler::types::substitution::{ TypeSubstitution };
@@ -74,6 +74,43 @@ type struct GlobalEntry {
     }
 }
 
+
+/// A signature's position in the index's function registry: the identity of
+/// one registered declaration signature, which a call pins and codegen reads
+/// the symbol and signature off.  Minted only here, by `register_signature`,
+/// and read only here: the position is private to this module, so an id
+/// cannot be built from a number anywhere else - an in-range position would
+/// silently name whichever entry sits there.
+type struct OverloadId {
+private:
+    /// Position in the registry's parallel arrays; `0xFFFFFFFF` for none.
+    pos: u32;
+
+    /// The id of the entry at registry position `pos`.  Registration's mint.
+    static at_position(pos: u32) -> OverloadId {
+        return OverloadId { pos: pos };
+    }
+
+    /// The registry position, for this index's own accessors.
+    position(&this) -> u32 {
+        return this.pos;
+    }
+
+public:
+    /// The id naming no entry, for a slot that must hold one before an
+    /// answer exists.
+    static invalid() -> OverloadId {
+        return OverloadId { pos: 4294967295 };
+    }
+
+    is_valid(&this) -> boolean {
+        return this.pos != 4294967295;
+    }
+
+    equals(&this, other: OverloadId) -> boolean {
+        return this.pos == other.pos;
+    }
+}
 
 type struct DeclarationIndex {
     /// The compilation's definitions, for a definition's path.  Borrowed;

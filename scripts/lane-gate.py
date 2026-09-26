@@ -702,10 +702,32 @@ SEALED_TYPES = {
                  "the table every DefId indexes: with its arrays public, any module could "
                  "append an entry or rewrite a path, and an existing id would then name "
                  "something its registrar never declared"),
-    "OverloadId": ("compiler/resolver/res.cryo",
+    "OverloadId": ("compiler/decl_index.cryo",
                    "a signature's position in the index's registry: built anywhere, it names "
                    "whichever entry sits at the position it was given"),
+    "SymbolID": ("compiler/resolver/symbol_id.cryo",
+                 "a resolver symbol's position in the symbol arena: rebuilt from a stored "
+                 "number, it names whichever symbol sits there, whatever was stored"),
+    "ModulePath": ("compiler/module_graph.cryo",
+                   "a module's identity: built from a spelling, it names a module the graph "
+                   "may never have registered, and every lookup keyed by it answers for text"),
 }
+
+# A private field keeps a type's LITERAL inside its module; it does not stop
+# that module from publishing a door that builds one.  A public static that
+# takes an argument and returns the sealed type is such a door - it turns
+# whatever value it is handed into an identity - so on an identity type it is
+# refused as surely as a public field.  A parameterless one (`invalid()`,
+# `none()`) names a fixed sentinel and is not a mint.
+#
+# The types listed here are STORES, not identities: their public constructor
+# makes a new, empty store, not a value naming an existing entry, so the rule
+# does not apply.  A second store can still hand out ids that collide with the
+# first's positions; that hole is the store's, and is not closed by this gate.
+SEALED_STORES = {"DefTable"}
+
+SEALED_STATIC_RE = re.compile(r"^\s*(?:(public|private|protected)\s+)?static\s+(\w+)\s*(?:<[^>]*>)?\s*\(")
+SEALED_SIG_RE = re.compile(r"\(([^)]*)\)\s*->\s*([\w:]+)")
 
 SEALED_HEAD_RE = re.compile(r"^\s*(?:public\s+|private\s+)?type\s+(?:struct|class)\s+(\w+)\b")
 SEALED_LABEL_RE = re.compile(r"^\s*(public|private|protected)\s*:\s*")
@@ -738,9 +760,46 @@ def private_fields(lines, head):
     return out
 
 
+def public_mints(lines, head, name):
+    """The public statics in the type block opening at `lines[head]` that take
+    at least one argument and return the type itself: `static of(x: T) -> Name`
+    under a `public:` label, or with a leading `public`.  A signature written
+    over several lines is read up to its body's `{`."""
+    out = []
+    depth = 0
+    opened = False
+    section = "public"
+    i = head
+    while i < len(lines):
+        code = strip_comment(lines[i])
+        if depth == 1:
+            rest = code
+            m = SEALED_LABEL_RE.match(rest)
+            if m is not None:
+                section = m.group(1)
+                rest = rest[m.end():]
+            s = SEALED_STATIC_RE.match(rest)
+            if s is not None and (s.group(1) or section) == "public":
+                sig = rest
+                j = i
+                while "{" not in sig and j + 1 < len(lines):
+                    j += 1
+                    sig += " " + strip_comment(lines[j])
+                g = SEALED_SIG_RE.search(sig)
+                if g is not None and g.group(2).split("::")[-1] == name and g.group(1).strip():
+                    out.append("%s(%s)" % (s.group(2), g.group(1).strip()))
+        depth += code.count("{") - code.count("}")
+        opened = opened or depth > 0
+        if opened and depth <= 0:
+            break
+        i += 1
+    return out
+
+
 def check_sealed_types(tree):
-    """Every SEALED_TYPES entry is declared in its file and keeps at least
-    one private field.  Refuses with every problem listed."""
+    """Every SEALED_TYPES entry is declared in its file, keeps at least one
+    private field, and - unless it is a store - publishes no static that
+    builds one from an argument.  Refuses with every problem listed."""
     problems = []
     for name, (defn, reason) in sorted(SEALED_TYPES.items()):
         lines = tree.files.get(defn)
@@ -758,6 +817,11 @@ def check_sealed_types(tree):
             problems.append("  `%s` (%s) has no private field, so any module can write its literal and\n"
                             "      its construction is no longer sealed; it must stay sealed because it is\n"
                             "      %s" % (name, defn, reason))
+        if name not in SEALED_STORES:
+            for mint in public_mints(lines, head, name):
+                problems.append("  `%s` (%s) has a public `static %s` returning it: any module can build\n"
+                                "      one from any value through it, so its construction is not sealed; it\n"
+                                "      must stay sealed because it is %s" % (name, defn, mint, reason))
     if problems:
         raise SystemExit("lane-gate: sealed types - an identity type is constructible outside its module:\n"
                          + "\n".join(problems))

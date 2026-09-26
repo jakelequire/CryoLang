@@ -71,8 +71,7 @@ import compiler::resolver::scope::{ Scope, ScopeEntry, ScopeID, ScopeKind };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::symbol_str::{ SymbolStr };
-import compiler::resolver::module_path;
-import compiler::resolver::module_path::{ ModulePath };
+import compiler::module_graph::{ ModulePath };
 
 
 type class NameResolver : BaseASTVisitor {
@@ -417,7 +416,7 @@ public:
                     this.resolver.declare(ns_sym);
                     this.resolver.export_symbol(ns_id);
                     this.ctx.module_graph.bind_c_import_module(
-                        ModulePath::of(canon), this.resolver.get_symbol(ns_id).def);
+                        canon, this.resolver.get_symbol(ns_id).def);
 
                     const saved_module: SymbolStr = this.resolver.current_module_sym();
                     const saved_scope: u64 = this.resolver.get_current_scope_id();
@@ -577,7 +576,7 @@ public:
                 // the two canonical names are one name.
                 const canonical: SymbolStr =
                     this.resolver.intern_table.intern(ns_str + "::" + name_str);
-                if (this.ctx.module_graph.find_module_index(ModulePath::of(canonical)) >= 0) {
+                if (this.ctx.module_graph.find_module_index(this.ctx.module_graph.module_named(canonical)) >= 0) {
                     clash = canonical;
                 }
             }
@@ -1255,7 +1254,7 @@ public:
         const count: i64 = this.ctx.module_graph.module_count() as i64;
         for (mut m: i64 = 0; m < count; m++) {
             const info: ModuleInfo* = this.ctx.module_graph.get_module(m);
-            const sid: u64 = this.resolver.find_module_scope(ModulePath::of(info.name));
+            const sid: u64 = this.resolver.find_module_scope(info.path());
             if (sid == 0) { continue; }
             const scope: Scope* = this.resolver.get_scope(ScopeID { id: sid });
             const found: SymbolID = scope.find(name);
@@ -1332,7 +1331,7 @@ public:
         const count: i64 = this.ctx.module_graph.module_count() as i64;
         for (mut m: i64 = 0; m < count; m++) {
             const info: ModuleInfo* = this.ctx.module_graph.get_module(m);
-            const sid: u64 = this.resolver.find_module_scope(ModulePath::of(info.name));
+            const sid: u64 = this.resolver.find_module_scope(info.path());
             if (sid == 0) { continue; }
             const scope: Scope* = this.resolver.get_scope(ScopeID { id: sid });
             const found: SymbolID = scope.find(name);
@@ -1340,7 +1339,7 @@ public:
             const s: Symbol = this.resolver.get_symbol(found);
             if (s.kind != SymbolKind::Type && s.kind != SymbolKind::TypeAlias) { continue; }
             out.push(this.resolver.qualified_name_of(&s));
-            owners.push(ModulePath::of(info.name));
+            owners.push(info.path());
         }
         return out;
     }
@@ -1407,7 +1406,7 @@ public:
             const cand: ModuleInfo* = graph.get_module(m);
             if (cand.reexports.length == 0) { continue; }
             if (cand.name.id == decl_ns.id) { continue; }
-            const via: SymbolStr[] = graph.reexport_closure(ModulePath::of(cand.name));
+            const via: SymbolStr[] = graph.reexport_closure(cand.path());
             mut reaches: boolean = false;
             for (mut i: i64 = 0; i < via.length; i++) {
                 if (via[i].id == decl_ns.id) { reaches = true; }
@@ -1512,7 +1511,7 @@ public:
             const owner: string = intern.resolve(owner_ns);
             const reach: boolean = owner_ns.id == use_ns.id
                 || this.ctx.decl_index.is_prelude_ns(owner_path)
-                || this.ctx.decl_index.ns_imports(ModulePath::of(use_ns), owner_path);
+                || this.ctx.decl_index.ns_imports(this.ctx.module_graph.module_of_file(span.file), owner_path);
             const is_public: boolean = this.resolver.lookup_in_module(owner_ns, name).is_valid();
             if (!reach || !is_public) {
                 mut d: Diagnostic = Diagnostic::error(
@@ -1923,13 +1922,8 @@ public:
             }
             if (offered == 1) {
                 const hs: Symbol = this.resolver.get_symbol(hit);
-                const declared_in: string = QualifiedName::parent_of(
-                    this.resolver.intern_table.resolve(
-                        this.resolver.qualified_name_of(&hs)));
-                if (declared_in.length() > 0) {
-                    owner = this.ctx.module_graph.module_def(ModulePath::of(
-                        this.resolver.intern_table.intern(declared_in)));
-                }
+                const declaring: DefId = this.resolver.defs.module_of(hs.def);
+                if (declaring.is_valid()) { owner = declaring; }
                 node.set_member_def(hs.def);
             }
             // A PRIVATE member is offered to no one, and is still the
@@ -2294,7 +2288,7 @@ public:
                     // module's scope, and its canonical name is that
                     // spelling.  A leaf lookup finds nothing here by
                     // construction.
-                    const q_sid: u64 = this.resolver.find_module_scope(ModulePath::of(q_ns));
+                    const q_sid: u64 = this.resolver.find_module_scope(this.ctx.module_graph.module_named(q_ns));
                     if (q_sid != 0) {
                         const alias_slot: ResSlot = this.leaf_in_module_scope(q_sid, name, span);
                         if (!alias_slot.is_pending()) { return alias_slot; }
@@ -2316,7 +2310,7 @@ public:
         if (!use_ns.is_valid()) {
             return ResSlot::Pending;
         }
-        const home_sid: u64 = this.resolver.find_module_scope(ModulePath::of(use_ns));
+        const home_sid: u64 = this.resolver.find_module_scope(this.ctx.module_graph.module_of_file(span.file));
         if (home_sid == 0) {
             return ResSlot::Pending;
         }
@@ -2959,7 +2953,7 @@ public:
     /// union, because an `export` grants an importer what the same path would
     /// grant if it were imported there.
     reexport_offering(&this, m: SymbolStr, name: SymbolStr) -> SymbolStr {
-        const via: SymbolStr[] = this.ctx.module_graph.reexport_closure(ModulePath::of(m));
+        const via: SymbolStr[] = this.ctx.module_graph.reexport_closure(this.ctx.module_graph.module_named(m));
         for (mut i: i64 = 0; i < via.length; i++) {
             if (this.resolver.lookup_in_module(via[i], name).is_valid()) {
                 return via[i];
@@ -3007,7 +3001,7 @@ public:
             out.push(own);
             return out;
         }
-        const via: SymbolStr[] = this.ctx.module_graph.reexport_closure(ModulePath::of(m));
+        const via: SymbolStr[] = this.ctx.module_graph.reexport_closure(this.ctx.module_graph.module_named(m));
         mut seen: SymbolStr[] = [];
         for (mut i: i64 = 0; i < via.length; i++) {
             const cand: SymbolID = this.export_in(via[i], name, ns);
@@ -3077,7 +3071,7 @@ public:
             }
         }
         const rx_all: SymbolStr[] =
-            this.ctx.module_graph.reexport_closure(ModulePath::of(module_sym));
+            this.ctx.module_graph.reexport_closure(this.ctx.module_graph.module_named(module_sym));
         for (mut rx: i64 = 0; rx < rx_all.length; rx++) {
             const rx_exports: SymbolID[] = this.resolver.get_exports(rx_all[rx]);
             for (mut re: i64 = 0; re < rx_exports.length; re++) {
@@ -3190,7 +3184,7 @@ public:
         // form, before the braced form's entries are judged against an
         // offering that does not exist.
         if (this.ctx.module_graph != null
-                && this.ctx.module_graph.find_module_index(ModulePath::of(module_sym)) < 0) {
+                && this.ctx.module_graph.find_module_index(this.ctx.module_graph.module_named(module_sym)) < 0) {
             this.refuse_unknown_module_import(node, module_path);
             return;
         }
@@ -3236,7 +3230,7 @@ public:
             // passed it along: the qualified name is an identity, and routing
             // it through the re-exporter would give the same declaration two.
             const rx_all: SymbolStr[] =
-                this.ctx.module_graph.reexport_closure(ModulePath::of(module_sym));
+                this.ctx.module_graph.reexport_closure(this.ctx.module_graph.module_named(module_sym));
             for (mut rx: i64 = 0; rx < rx_all.length; rx++) {
                 const rx_ns: SymbolStr = rx_all[rx];
                 const rx_str: string = this.resolver.intern_table.resolve(rx_ns);
@@ -3340,7 +3334,7 @@ public:
                     const name_str: string = this.resolver.intern_table.resolve(name);
                     const sub_path: string = fmt::format("%s::%s", resolved_module, name_str);
                     const sub_sym: SymbolStr = this.resolver.intern_table.intern(sub_path);
-                    if (this.ctx.module_graph.find_module_index(ModulePath::of(sub_sym)) < 0) {
+                    if (this.ctx.module_graph.find_module_index(this.ctx.module_graph.module_named(sub_sym)) < 0) {
                         // Neither offered nor a sub-module: the entry names
                         // nothing, and binding nothing in silence leaves a
                         // use site - which may never exist - to say so.  The

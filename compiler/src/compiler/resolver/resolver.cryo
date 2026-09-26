@@ -27,10 +27,9 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::resolution_map::{ ResolutionMap };
 import compiler::resolver::scope::{ Scope, ScopeID, ScopeKind };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
-import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::resolver::symbol_id::{ SymbolID, SymbolIds };
 import compiler::resolver::symbol_str::{ SymbolStr };
-import compiler::resolver::module_path;
-import compiler::resolver::module_path::{ ModulePath };
+import compiler::module_graph::{ ModulePath };
 import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
 
@@ -46,7 +45,7 @@ type struct Resolver {
 
     // Symbol arena
     symbols:            Symbol[];
-    next_symbol_id:     u64;
+    symbol_ids:         SymbolIds;
 
     // Scope tree
     scopes:             Scope[];
@@ -121,7 +120,7 @@ type struct Resolver {
             graph: null,
             intern_table:         table,
             symbols:              [],
-            next_symbol_id:       1,
+            symbol_ids:           SymbolIds::new(),
             scopes:               [global],
             next_scope_id:        2,
             global_scope:         global_id,
@@ -201,9 +200,7 @@ type struct Resolver {
 
     /// Allocate the next monotonic SymbolID.
     alloc_symbol_id(mut &this) -> SymbolID {
-        const id: SymbolID = SymbolID::new(this.next_symbol_id);
-        this.next_symbol_id += 1;
-        return id;
+        return this.symbol_ids.next();
     }
 
     /// The identity of a binding a pass SYNTHESIZED after name resolution ran.
@@ -251,7 +248,7 @@ type struct Resolver {
     /// the one every module-rooted path already asks.
     declaring_module_def(&this, sym: &Symbol) -> DefId {
         if (sym.source_module == "") { return DefId::invalid(); }
-        return this.graph.module_def(ModulePath::of(this.intern_table.intern(sym.source_module)));
+        return this.graph.module_def(this.graph.module_named(this.intern_table.intern(sym.source_module)));
     }
 
     /// Whether a declaring symbol is a definition: an item a path can name
@@ -288,7 +285,7 @@ type struct Resolver {
     /// the arena but NOT indexed in the scope; a debug log is emitted so
     /// the duplicate can be diagnosed without flooding the user.
     declare(mut &this, sym: Symbol) -> SymbolID {
-        LOG_DEBUG(LogComponent::Resolver, "declare() symbol id=%lu", sym.id.id);
+        LOG_DEBUG(LogComponent::Resolver, "declare() symbol id=%lu", sym.id.key());
         const id: SymbolID = sym.id;
         this.admit(sym);
 
@@ -328,7 +325,7 @@ type struct Resolver {
         mut existing_module_id: u32 = 0;
         const existing_id: SymbolID = this.scopes[this.current_scope.id - 1].find(sym.name);
         if (existing_id.is_valid()) {
-            const ex_mod: string = this.symbols[existing_id.id - 1].source_module;
+            const ex_mod: string = this.symbols[existing_id.key() - 1].source_module;
             const ex_mod_sym: SymbolStr = this.intern_table.intern(ex_mod);
             existing_module_id = ex_mod_sym.id;
         }
@@ -617,7 +614,7 @@ type struct Resolver {
     /// public, so a private declaration is exactly what it does not carry.
     private_declarations(&this, module_name: SymbolStr, name: SymbolStr) -> SymbolID[] {
         mut out: SymbolID[] = [];
-        const sid: u64 = this.find_module_scope(ModulePath::of(module_name));
+        const sid: u64 = this.find_module_scope(this.graph.module_named(module_name));
         if (sid == 0) { return out; }
         const scope: Scope* = this.get_scope(ScopeID { id: sid });
         const all: SymbolID[] = scope.get_overloads(name);
@@ -632,7 +629,7 @@ type struct Resolver {
 
     /// Get a symbol by its SymbolID.  Indexes by id-1 (IDs start at 1).
     get_symbol(&this, id: SymbolID) -> Symbol {
-        return this.symbols[id.id - 1];
+        return this.symbols[id.key() - 1];
     }
 
     /// Borrow a scope by its ScopeID.  Indexes by id-1 (IDs start at 1).
@@ -951,6 +948,7 @@ type struct Resolver {
     /// time and all but one of them were empty.  There is one scope now, so
     /// there is nothing to choose between.
     find_module_scope(&this, module_name: ModulePath) -> u64 {
+        if (!module_name.is_valid()) { return 0; }
         const oid: u32 = module_name.as_sym().id;
         return match (this.module_scopes.get(&oid)) {
             Option::Some(sid) => { sid }
@@ -966,7 +964,7 @@ type struct Resolver {
             const sym: Symbol = this.symbols[i];
             const name: string = this.intern_table.resolve(sym.name);
             cdebug("  [%lu] %s (scope %u) module='%s'\n",
-                sym.id.id, name, sym.scope_id.id, sym.source_module);
+                sym.id.key(), name, sym.scope_id.id, sym.source_module);
         }
 
         cdebug("Exports: %lld symbols\n", this.exports.length);

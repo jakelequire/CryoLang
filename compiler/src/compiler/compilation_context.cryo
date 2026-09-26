@@ -47,8 +47,8 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::symbol_str::{ SymbolStr };
-import compiler::resolver::module_path;
-import compiler::resolver::module_path::{ ModulePath };
+import compiler::module_graph;
+import compiler::module_graph::{ ModulePath };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::generic_registry::{ GenericRegistry };
 import compiler::types::resolver::{ TypeResolver };
@@ -518,6 +518,7 @@ public:
             matched: 0,
         };
         if (this.module_graph == null || this.decl_index == null) { return r; }
+        const use_module: ModulePath = this.module_graph.module_named(use_ns);
         const count: i64 = this.module_graph.module_count() as i64;
         for (mut i: i64 = 0; i < count; i++) {
             const cand: ModuleInfo* = this.module_graph.get_module(i);
@@ -539,8 +540,8 @@ public:
             // and it stays unreachable here.
             const reachable: boolean = cand_ns.id == use_ns.id
                 || cand_str.eq(spelling)
-                || this.decl_index.is_prelude_ns(ModulePath::of(cand_ns))
-                || this.decl_index.ns_imports(ModulePath::of(use_ns), ModulePath::of(cand_ns));
+                || this.decl_index.is_prelude_ns(cand.path())
+                || this.decl_index.ns_imports(use_module, cand.path());
             if (!reachable) { continue; }
             r.visible = r.visible + 1;
             if (r.visible == 1) { r.found = cand_ns; r.found_def = cand.def; }
@@ -652,7 +653,14 @@ public:
     /// no namespace, and for one the module graph holds no module under.
     module_def_of(&this, ns: SymbolStr) -> DefId {
         if (!ns.is_valid() || this.module_graph == null) { return DefId::invalid(); }
-        return this.module_graph.module_def(ModulePath::of(ns));
+        return this.module_graph.module_def(this.module_graph.module_named(ns));
+    }
+
+    /// The module the source file `file` declares; none for a file the
+    /// graph did not load.
+    module_of_file(&this, file: string) -> ModulePath {
+        if (this.module_graph == null) { return ModulePath::none(); }
+        return this.module_graph.module_of_file(file);
     }
 
     decl_fn_key(mut &this, name: SymbolStr, span_file: string) -> SymbolStr {
@@ -672,8 +680,8 @@ public:
             return this.module_family(this.intern_table.intern(qn.display_parent(this.intern_table)));
         }
         *out_leaf = name;
-        const home: SymbolStr = this.module_ns_sym_of_file(span_file);
-        if (home.is_valid()) { return this.module_family(home); }
+        const home: ModulePath = this.module_of_file(span_file);
+        if (home.is_valid()) { return FamilyOwner::Def(this.module_graph.module_def(home)); }
         return this.module_family(this.namespace_str);
     }
 

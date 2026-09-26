@@ -555,9 +555,9 @@ type struct DropInserter {
         if (!this.sym_is_live(sym)) {
             this.unmark_moved(sym);
         }
-        this.types_keys.push(sym.id);
+        this.types_keys.push(sym.key());
         this.types_refs.push(ty);
-        this.binding_syms.push(sym.id);
+        this.binding_syms.push(sym.key());
         this.binding_names.push(name.id);
         this.binding_types.push(ty);
         this.binding_spans.push(span);
@@ -577,7 +577,7 @@ type struct DropInserter {
     register_param_type(mut &this, name: SymbolStr, sym: SymbolID, ty: TypeRef,
                         span: SourceSpan) -> void {
         if (!this.require_identity(sym, name, span)) { return; }
-        this.types_keys.push(sym.id);
+        this.types_keys.push(sym.key());
         this.types_refs.push(ty);
     }
 
@@ -600,7 +600,7 @@ type struct DropInserter {
 
     is_moved(&this, sym: SymbolID) -> boolean {
         if (!sym.is_valid()) { return false; }
-        return this.is_moved_id(sym.id);
+        return this.is_moved_id(sym.key());
     }
 
     /// `0` is the tombstone `unmark_moved` leaves and the id of no binding, so
@@ -615,18 +615,27 @@ type struct DropInserter {
 
 
     mark_moved(mut &this, sym: SymbolID, span: SourceSpan) -> void {
-        if (!sym.is_valid()) { return; }
+        this.mark_moved_key(sym.key(), span);
+    }
+
+    /// `mark_moved` by the binding's key, as this pass's tables hold it.
+    mark_moved_key(mut &this, key: u64, span: SourceSpan) -> void {
+        if (key == 0) { return; }
         // Inside a simple statement, a flagged binding's move is written by
         // the statement itself once it ends.
-        this.mark_moved_gov(sym, span,
-            this.stmt_writes_flags && this.get_drop_flag(sym.id).is_valid());
+        this.mark_moved_gov_key(key, span,
+            this.stmt_writes_flags && this.get_drop_flag(key).is_valid());
     }
 
     /// `mark_moved`, with whether the move's flag write is in place given.
     mark_moved_gov(mut &this, sym: SymbolID, span: SourceSpan, gov: boolean) -> void {
-        if (!sym.is_valid()) { return; }
-        if (this.is_moved(sym)) { return; }
-        this.moved_keys.push(sym.id);
+        this.mark_moved_gov_key(sym.key(), span, gov);
+    }
+
+    mark_moved_gov_key(mut &this, key: u64, span: SourceSpan, gov: boolean) -> void {
+        if (key == 0) { return; }
+        if (this.is_moved_id(key)) { return; }
+        this.moved_keys.push(key);
         this.moved_lines.push(span.start_line as i32);
         this.moved_gov.push(gov);
         // Propagate to a linked match subject: consuming a payload binding
@@ -634,8 +643,8 @@ type struct DropInserter {
         // must not also drop that payload.  Bounded recursion handles nested
         // matches (a subject that is itself an outer match's payload).
         for (mut i: i64 = 0; i < this.link_payload.length; i++) {
-            if (this.link_payload[i] == sym.id) {
-                this.mark_moved(SymbolID::new(this.link_subject[i]), span);
+            if (this.link_payload[i] == key) {
+                this.mark_moved_key(this.link_subject[i], span);
             }
         }
     }
@@ -645,7 +654,7 @@ type struct DropInserter {
     sym_is_live(&this, sym: SymbolID) -> boolean {
         if (!sym.is_valid()) { return false; }
         for (mut i: i64 = 0; i < this.binding_syms.length; i++) {
-            if (this.binding_syms[i] == sym.id) { return true; }
+            if (this.binding_syms[i] == sym.key()) { return true; }
         }
         return false;
     }
@@ -659,7 +668,7 @@ type struct DropInserter {
     unmark_moved(mut &this, sym: SymbolID) -> void {
         if (!sym.is_valid()) { return; }
         for (mut i: i64 = 0; i < this.moved_keys.length; i++) {
-            if (this.moved_keys[i] == sym.id) {
+            if (this.moved_keys[i] == sym.key()) {
                 this.moved_keys[i] = 0;
             }
         }
@@ -735,9 +744,14 @@ type struct DropInserter {
     }
 
     lookup_type(&this, sym: SymbolID) -> TypeRef {
-        if (!sym.is_valid()) { return TypeRef::invalid(); }
+        return this.lookup_type_key(sym.key());
+    }
+
+    /// `lookup_type` by the binding's key, as this pass's tables hold it.
+    lookup_type_key(&this, key: u64) -> TypeRef {
+        if (key == 0) { return TypeRef::invalid(); }
         for (mut i: i64 = this.types_keys.length - 1; i >= 0; i--) {
-            if (this.types_keys[i] == sym.id) { return this.types_refs[i]; }
+            if (this.types_keys[i] == key) { return this.types_refs[i]; }
         }
         return TypeRef::invalid();
     }
@@ -877,7 +891,7 @@ type struct DropInserter {
             if (p.name.is_valid() && p.sym_id.is_valid()
                     && this.type_needs_drop(p.resolved_type)
                     && this.param_drop_well_formed(p.resolved_type)) {
-                this.binding_syms.push(p.sym_id.id);
+                this.binding_syms.push(p.sym_id.key());
                 this.binding_names.push(p.name.id);
                 this.binding_types.push(p.resolved_type);
                 this.binding_spans.push(p.span);
@@ -1466,7 +1480,7 @@ type struct DropInserter {
                 // moves the subject, as consuming a payload does.
                 if (!this.require_identity(pat.binding_sym, pat.binding_name, pat.span)) { continue; }
                 this.register_param_type(pat.binding_name, pat.binding_sym, proxy_ty, pat.span);
-                this.link_payload.push(pat.binding_sym.id);
+                this.link_payload.push(pat.binding_sym.key());
                 this.link_subject.push(subject_id);
                 count = count + 1;
                 continue;
@@ -1490,7 +1504,7 @@ type struct DropInserter {
             if (pb != null && pb.name.is_valid()) {
                 if (!this.require_identity(pb.sym_id, pb.name, pb.span)) { continue; }
                 this.register_param_type(pb.name, pb.sym_id, proxy_ty, pb.span);
-                this.link_payload.push(pb.sym_id.id);
+                this.link_payload.push(pb.sym_id.key());
                 this.link_subject.push(subject_id);
                 count = count + 1;
                 continue;
@@ -1627,7 +1641,7 @@ type struct DropInserter {
             const link_mark: i64 = this.link_payload.length;
             mut reg_count: i64 = 0;
             if (subj_sym.is_valid()) {
-                reg_count = this.register_arm_pattern_bindings(arm, subj_ty, subj_sym.id);
+                reg_count = this.register_arm_pattern_bindings(arm, subj_ty, subj_sym.key());
             }
             // The guard runs before the body on this arm's path; walk it as a
             // read (within the per-arm snapshot) so any move it performs is
@@ -1639,7 +1653,7 @@ type struct DropInserter {
             // value, so block-wrapping it would swallow the arm's result.
             if (!is_expr) { arm.body = this.wrap_for_init(arm.body); }
             const flag_before: boolean =
-                subj_sym.is_valid() && this.get_drop_flag(subj_sym.id).is_valid();
+                subj_sym.is_valid() && this.get_drop_flag(subj_sym.key()).is_valid();
             const arm_div: boolean = if (is_expr) {
                 this.walk_stmt_in_place_value(arm.body)
             } else {
@@ -1664,8 +1678,8 @@ type struct DropInserter {
                 if (this.check_and_unregister_arm_bindings(reg_count, link_mark)) {
                     subject_consumed = true;
                     const made_flag: boolean = !flag_before &&
-                        this.get_drop_flag(subj_sym.id).is_valid();
-                    if (!made_flag && !this.all_governed(&arm_keys, &arm_gov, subj_sym.id)) {
+                        this.get_drop_flag(subj_sym.key()).is_valid();
+                    if (!made_flag && !this.all_governed(&arm_keys, &arm_gov, subj_sym.key())) {
                         consumed_arm_idx.push(a);
                     }
                 }
@@ -1757,7 +1771,7 @@ type struct DropInserter {
             // A flagged subject's flag is written on every consuming path
             // (below, or where each arm consumed).
             this.mark_moved_gov(subj_sym, subject.span,
-                this.get_drop_flag(subj_sym.id).is_valid());
+                this.get_drop_flag(subj_sym.key()).is_valid());
             // If the subject already had a drop flag (it was conditionally
             // moved/assigned earlier - typically reassigned inside a loop),
             // marking it moved in the static set is not enough: its scope-exit
@@ -1768,7 +1782,7 @@ type struct DropInserter {
             // already-flagged subject would otherwise leave the flag stale and
             // double-free. Set it on each consuming arm. (No-op when the subject
             // has no flag - the common, unconditional case is unaffected.)
-            const subj_flag: SymbolStr = this.get_drop_flag(subj_sym.id);
+            const subj_flag: SymbolStr = this.get_drop_flag(subj_sym.key());
             if (subj_flag.is_valid()) {
                 for (mut c: i64 = 0; c < consumed_arm_idx.length; c++) {
                     const ai: i64 = consumed_arm_idx[c];
@@ -2199,7 +2213,7 @@ type struct DropInserter {
         for (mut i: i64 = this.pending_arg_ids.length - 1; i >= 0; i--) {
             const key: u64 = this.pending_arg_ids[i];
             if (key == 0) { continue; }
-            const ty:  TypeRef   = this.lookup_type(SymbolID::new(key));
+            const ty:  TypeRef   = this.lookup_type_key(key);
             if (!this.type_needs_drop(ty)) { continue; }
             const name: SymbolStr = this.spelling_of(key);
             if (!name.is_valid()) { continue; }
@@ -2231,7 +2245,7 @@ type struct DropInserter {
         const sym: SymbolID = id.res.local_sym();
         const ty: TypeRef = this.lookup_type(sym);
         if (!this.type_needs_drop(ty)) { return; }
-        this.pending_arg_ids.push(sym.id);
+        this.pending_arg_ids.push(sym.key());
     }
 
     populate_unwind_cleanup(mut &this, c: CallExprNode*) -> void {
@@ -2381,7 +2395,7 @@ type struct DropInserter {
         // field is bitwise-independent and never double-freed.
         if (!this.type_needs_drop(field_ty)) { return; }
         if (!this.partial_move_allowed(ma)) { return; }
-        const owner_id: u64 = (ma.object as IdentifierNode*).res.local_sym().id;
+        const owner_id: u64 = (ma.object as IdentifierNode*).res.local_sym().key();
         const field_id: u32 = ma.member.id;
         if (this.pm_has(owner_id, field_id)) { return; }
         this.pm_binding.push(owner_id);
@@ -2580,7 +2594,7 @@ type struct DropInserter {
         if (move_flag != (0 as u32)) {
             if (kind.length != 0 || this.slot_has_members(slot)) { return; }
             if (this.binding_definit[slot] != (1 as u8)) { return; }
-            if (this.moved_since(this.stmt_move_snap, root.id)) { return; }
+            if (this.moved_since(this.stmt_move_snap, root.key())) { return; }
             this.pend_assign_guard_moved = true;
             this.pend_assign(b, slot, move_flag, place_ty, kind, key);
             return;
@@ -2605,7 +2619,7 @@ type struct DropInserter {
             // A member already moved out of its owner belongs to whoever took
             // it, exactly as `append_partial_drops` reasons at scope exit.
             if (kind.length == 1 && kind[0] == (0 as u8) &&
-                this.pm_has(root.id, key[0])) { return; }
+                this.pm_has(root.key(), key[0])) { return; }
             const midx: i64 = this.member_slot_for_place(b.left);
             if (midx >= 0) {
                 guard = this.mem_flag[midx];
@@ -2688,7 +2702,7 @@ type struct DropInserter {
         if (b.left.kind != NodeKind::Identifier) { return SymbolStr::empty(); }
         const sym: SymbolID = (b.left as IdentifierNode*).res.local_sym();
         if (!sym.is_valid()) { return SymbolStr::empty(); }
-        return this.get_drop_flag(sym.id);
+        return this.get_drop_flag(sym.key());
     }
 
     /// Rewrite `<place> = <rhs>;` so the value `<place>` held is released:
@@ -2841,7 +2855,7 @@ type struct DropInserter {
 
     /// Slot index of the live binding `binding` names, or -1.
     innermost_binding_slot(&this, binding: SymbolID) -> i64 {
-        return this.slot_of(binding.id);
+        return this.slot_of(binding.key());
     }
 
     /// Look up the drop-flag local synthesized for the live declaration
@@ -3015,7 +3029,7 @@ type struct DropInserter {
         // The caller invokes this immediately after register_binding pushed the
         // local as the tail entry.  If that push didn't happen (no identity),
         // the tail is some other binding - never stamp its flag.
-        if (!sym.is_valid() || this.binding_syms[n - 1] != sym.id) {
+        if (!sym.is_valid() || this.binding_syms[n - 1] != sym.key()) {
             return SymbolStr::empty();
         }
         // Element/field/address-initialized locals can't be tracked by a
@@ -3051,7 +3065,7 @@ type struct DropInserter {
     attach_member_flags(mut &this, name: SymbolStr, sym: SymbolID, ty: TypeRef,
                         span: SourceSpan, out: StatementNode*[]*) -> boolean {
         const slot: i64 = this.binding_syms.length - 1;
-        if (!sym.is_valid() || slot < 0 || this.binding_syms[slot] != sym.id) {
+        if (!sym.is_valid() || slot < 0 || this.binding_syms[slot] != sym.key()) {
             return false;
         }
         if (this.is_whole_assigned(sym))    { return false; }
@@ -3060,7 +3074,7 @@ type struct DropInserter {
 
         mut attached: boolean = false;
         for (mut i: i64 = 0; i < this.pw_sym.length; i++) {
-            if (this.pw_sym[i] != sym.id) { continue; }
+            if (this.pw_sym[i] != sym.key()) { continue; }
             const pstart: i64 = this.pw_pstart[i];
             const plen:   i64 = this.pw_plen[i];
             // Walk the chain to the member's type.  A step the arena cannot
@@ -3238,7 +3252,7 @@ type struct DropInserter {
     is_init_disqualified(&this, sym: SymbolID) -> boolean {
         if (!sym.is_valid()) { return true; }
         for (mut i: i64 = 0; i < this.init_disq.length; i++) {
-            if (this.init_disq[i] == sym.id) { return true; }
+            if (this.init_disq[i] == sym.key()) { return true; }
         }
         return false;
     }
@@ -3250,9 +3264,9 @@ type struct DropInserter {
         const sym: SymbolID = id.res.local_sym();
         if (!sym.is_valid()) { return; }
         for (mut i: i64 = 0; i < this.init_disq.length; i++) {
-            if (this.init_disq[i] == sym.id) { return; }
+            if (this.init_disq[i] == sym.key()) { return; }
         }
-        this.init_disq.push(sym.id);
+        this.init_disq.push(sym.key());
     }
 
     /// Flow-insensitive scan of a function body: record every local name whose
@@ -3650,9 +3664,9 @@ type struct DropInserter {
         const sym: SymbolID = id.res.local_sym();
         if (!sym.is_valid()) { return; }
         for (mut i: i64 = 0; i < this.pw_whole.length; i++) {
-            if (this.pw_whole[i] == sym.id) { return; }
+            if (this.pw_whole[i] == sym.key()) { return; }
         }
-        this.pw_whole.push(sym.id);
+        this.pw_whole.push(sym.key());
     }
 
     /// True when the pre-scan recorded any member-granularity initialization
@@ -3660,7 +3674,7 @@ type struct DropInserter {
     has_init_places(&this, sym: SymbolID) -> boolean {
         if (!sym.is_valid()) { return false; }
         for (mut i: i64 = 0; i < this.pw_sym.length; i++) {
-            if (this.pw_sym[i] == sym.id) { return true; }
+            if (this.pw_sym[i] == sym.key()) { return true; }
         }
         return false;
     }
@@ -3668,7 +3682,7 @@ type struct DropInserter {
     is_whole_assigned(&this, sym: SymbolID) -> boolean {
         if (!sym.is_valid()) { return false; }
         for (mut i: i64 = 0; i < this.pw_whole.length; i++) {
-            if (this.pw_whole[i] == sym.id) { return true; }
+            if (this.pw_whole[i] == sym.key()) { return true; }
         }
         return false;
     }
@@ -3687,7 +3701,7 @@ type struct DropInserter {
             }
             return false;
         }
-        this.pw_sym.push(root.id);
+        this.pw_sym.push(root.key());
         this.pw_pstart.push(mark);
         this.pw_plen.push(this.pw_proj_kind.length - mark);
         return true;
@@ -3744,7 +3758,7 @@ type struct DropInserter {
     /// if that binding has none (unconditionally initialized, Copy, or no such
     /// binding).
     get_init_flag_for(&this, sym: SymbolID) -> SymbolStr {
-        const i: i64 = this.slot_of(sym.id);
+        const i: i64 = this.slot_of(sym.key());
         if (i < 0) { return SymbolStr::empty(); }
         const fid: u32 = this.binding_initflags[i];
         if (fid == (0 as u32)) { return SymbolStr::empty(); }
