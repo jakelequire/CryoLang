@@ -20,6 +20,7 @@ and the summary line states the population, so a reader sees "14 projects"
 instead of inferring it from an exit code.
 """
 import argparse, os, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -46,12 +47,21 @@ def main():
     ap.add_argument("--min", type=int, default=14,
                     help="fail if fewer than this many projects are discovered")
     ap.add_argument("--stdlib", default=os.path.join(ROOT, "stdlib"))
+    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 1,
+                    help="projects built at once (default: the CPU count; 1 "
+                         "builds them one after another).  Each project owns "
+                         "its build directory, and results print in project "
+                         "order at any job count")
     args = ap.parse_args()
 
     # Resolved before any chdir: each project is built with cwd set to its own
     # directory, so a relative binary or stdlib path would silently vanish.
     args.cryo = os.path.abspath(args.cryo)
-    args.stdlib = os.path.abspath(args.stdlib)
+    # Forward slashes on every host: objects embed stdlib source paths as the
+    # root is spelled (panic locations), and `abspath` alone would turn
+    # `C:/...` into `C:\...` on Windows, compiling the same source to
+    # different bytes than the object comparison's builds.
+    args.stdlib = os.path.abspath(args.stdlib).replace("\\", "/")
 
     if not os.path.isfile(args.cryo):
         print("examples-gate: FAIL -- compiler binary not found: %s" % args.cryo)
@@ -68,11 +78,16 @@ def main():
     env = dict(os.environ)
     env["CRYO_STDLIB"] = args.stdlib
 
+    def build(d):
+        return subprocess.run([args.cryo, "build", "."], cwd=d, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        results = list(pool.map(build, projects))
+
     failed = []
-    for d in projects:
+    for d, r in zip(projects, results):
         rel = os.path.relpath(d, ROOT).replace(os.sep, "/")
-        r = subprocess.run([args.cryo, "build", "."], cwd=d, env=env,
-                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if r.returncode == 0:
             print("  ok    %s" % rel)
         else:

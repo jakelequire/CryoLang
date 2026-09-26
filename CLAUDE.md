@@ -24,6 +24,9 @@ api-index-check` fails if it is stale.
 make cryo                # build the self-hosted compiler (compiler/build/cryo)
 make test                # unit + compile-fail + project suites
 make test-census         # the same run, with the suite COUNTS asserted
+make verify              # build once; census, examples, lsp, cross, check-fast CONCURRENTLY,
+                         # objects hashed; ARGS="--baseline HEAD --require-identical" proves
+                         # a change moved no compiled output (baseline built in .verify/, cached)
 make roster-check        # roster golden: 2113 unit + 46 projects + 179 negative
 make lane-check          # resolution-lane surface ratchet; needs NO build
 make ns-status-check     # run every check docs/name-resolution.md §0 carries

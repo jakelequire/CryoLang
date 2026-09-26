@@ -35,6 +35,7 @@ when each project stated the population it built (the "N local ..." line)
 and the total clears --min-modules.
 """
 import argparse, os, re, shutil, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -132,17 +133,30 @@ def main():
     env = dict(os.environ)
     env["CRYO_STDLIB"] = os.path.join(ROOT, "stdlib")
 
-    total = 0
-    summary = []
     for project in projects:
         if not os.path.isfile(os.path.join(ROOT, project, "cryoconfig")):
             return fail("no cryoconfig at %s; nothing to build" % project)
+
+    # The projects are independent builds into separate directories, so they
+    # run at once; each is still judged in the order above, and the first to
+    # fail is the one reported.
+    def one(project):
         build_dir = os.path.join(os.path.abspath(args.build_root), triple,
                                  project.replace("/", "_"))
         try:
-            rc, modules, tiers, lines = build(cryo, project, triple, build_dir, env)
+            return build(cryo, project, triple, build_dir, env)
         except RuntimeError as e:
-            return fail(str(e))
+            return e
+
+    with ThreadPoolExecutor(max_workers=len(projects)) as pool:
+        results = list(pool.map(one, projects))
+
+    total = 0
+    summary = []
+    for project, res in zip(projects, results):
+        if isinstance(res, RuntimeError):
+            return fail(str(res))
+        rc, modules, tiers, lines = res
         errors = error_report(lines)
         if rc != 0:
             print("cross-check: %s does not compile for %s" % (project, triple))

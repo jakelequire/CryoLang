@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census roster-check lane-check lane-selftest residue-selftest ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -182,6 +182,9 @@ help:
 	@echo "                         Linux 6-stage chain via WSL."
 	@echo "  make test              Run the repo-level test suite (tests/) via cryo test"
 	@echo "  make test-census       Same run, with the suite COUNTS asserted"
+	@echo "  make verify            Build once; census, examples, lsp, cross, check-fast"
+	@echo "                         concurrently; hash their objects (ARGS=--baseline HEAD"
+	@echo "                         compares them against HEAD's compiler)"
 	@echo "  make test-list         List the discovered test cases without running them"
 	@echo "  make lane-check        Pin the resolution-lane surface against its golden"
 	@echo "  make lane-selftest     Drive lane-gate.py through a throwaway tree, every rule both ways"
@@ -545,6 +548,24 @@ test-census: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runt
 # $CRYO_HOME and leaves nothing on the machine.
 vendor-check: $(STAGE2) $(LIBCRYO_A) runtime-tiers
 	@python3 scripts/vendor-consts-gate.py "$(STAGE2)" $(ARGS)
+endif
+
+# ---- one verification run ----------------------------------------------
+# Build once, then run census, examples, lsp-check, cross-check and check-fast
+# at the same time, and hash the objects the census and examples compiled.
+# ARGS="--baseline HEAD" also compares those objects against a compiler built
+# from HEAD's compiler/src (in a clone under .verify/, cached), which is the
+# evidence that a change moved no compiled output.  See scripts/verify.py.
+#
+# Everything it needs built is a prerequisite HERE, before any gate starts:
+# the gates run concurrently, and a phony prerequisite rebuilt by one of them
+# (the runtime tiers) would be rewritten while another is linking against it.
+ifeq ($(HOST_OS),windows)
+verify: cryo $(TEST_HELPERS_A)
+	@$(PYTHON) scripts/verify.py --cryo "$(STAGE2_EXE)" $(ARGS)
+else
+verify: cryo $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
+	@$(PYTHON) scripts/verify.py --cryo "$(STAGE2)" $(ARGS)
 endif
 
 # ---- resolution-lane surface ratchet -----------------------------------
