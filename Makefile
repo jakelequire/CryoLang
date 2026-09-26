@@ -253,13 +253,19 @@ endif
 # Depends on `runtime-tiers` because linking ANY hosted binary - including this
 # compiler - needs the panic tier to resolve `__cryo_panic`.  Harmless before the
 # pin emits that call; required the moment it does.
+#
+# The stdlib archive is a FILE prerequisite, not the phony `stdlib`: the phony
+# target wipes and rebuilds the archive on every `make cryo` (nine seconds of
+# a no-change build) even though the rebuilt bytes are identical.  The file
+# rule below rebuilds it, through `make stdlib`, whenever it is missing or
+# older than any stdlib source or the pin that compiles it.
 ifeq ($(HOST_OS),windows)
-cryo: stdlib runtime-tiers
+cryo: $(LIBCRYO_A) runtime-tiers
 	@echo "==> Building self-hosted cryo via bin/cryo.exe"
 	@cd compiler && "$(subst /,\,$(PIN_EXE))" build
 	@echo "==> Self-hosted cryo built: $(STAGE2_EXE)"
 else
-cryo: stdlib runtime-tiers
+cryo: $(LIBCRYO_A) runtime-tiers
 	@echo "==> Building self-hosted cryo via bin/cryo"
 	@cd compiler && "$(PIN)" build
 	@echo "==> Self-hosted cryo built: $(STAGE2)"
@@ -280,8 +286,16 @@ $(STAGE2_EXE): $(CRYO_SOURCES)
 # File-target rule for the stdlib static library so `test` rebuilds it
 # when stdlib/.bin has been wiped (e.g. by selfhost-check) but the
 # compiler binary still exists. Without this, `make selfhost-check &&
-# make test` fails at link with "cannot find libcryo.a".
-$(LIBCRYO_A):
+# make test` fails at link with "cannot find libcryo.a".  It is also rebuilt
+# when a stdlib source or the pin is newer than it, which is what lets `cryo`
+# depend on it instead of on the always-rebuilding phony `stdlib`.
+STDLIB_SOURCES := $(call rwildcard,$(ROOT)/stdlib,*.cryo) $(ROOT)/stdlib/cryoconfig
+ifeq ($(HOST_OS),windows)
+STDLIB_PIN := $(PIN_EXE)
+else
+STDLIB_PIN := $(PIN)
+endif
+$(LIBCRYO_A): $(STDLIB_SOURCES) $(STDLIB_PIN)
 	@$(MAKE) --no-print-directory stdlib
 
 # ---- unified pin refresh ----------------------------------------------
