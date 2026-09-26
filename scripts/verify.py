@@ -35,16 +35,31 @@ Every count this relies on is printed.  A zero is only evidence when the
 instrument can report non-zero, so the object counts are floors: a hash list
 with no objects is a failure, not a clean comparison.
 
+A change that makes a refused program compile makes the baseline's census fail
+on that program's project, by design.  Such a program is DECLARED in
+`tests/started-compiling`, one project per line with the reason, committed with
+the change.  The entries that apply to a run are the ones the working tree's
+file lists and REV's does not, so an entry is inert once the baseline has it,
+and asserted again against any older baseline.  For each, the baseline must
+REFUSE the project with a diagnostic and the tree compiler must build it; the
+baseline census must fail on exactly the declared projects and nothing else;
+and their objects, which have no baseline counterpart, are left out of the
+comparison and counted.  A declaration is an assertion, never an exemption:
+declaring a program the baseline already compiled, or one the tree still
+refuses, fails the run.
+
 Usage:
     make verify [ARGS="--baseline HEAD"]
     python scripts/verify.py --cryo compiler/build/cryo.exe [--baseline REV]
                              [--require-identical] [--only census,examples]
+    python scripts/verify.py --selftest
 
 Exit codes: 0 every gate passed (and, with --require-identical, no object
 moved); 1 otherwise.
 """
 import argparse
 import hashlib
+import importlib.util
 import io
 import os
 import re
@@ -307,8 +322,169 @@ def population_key(cryo):
     return h.hexdigest()[:16]
 
 
-def compare(tag_a, a_path, b_path, limit):
+# ---- programs a change makes compile ---------------------------------------
+
+DECLARED = "tests/started-compiling"
+PROJECTS = "tests/tests/projects"
+# A refusal is a rendered diagnostic, not merely a non-zero exit: a crash or a
+# link failure exits non-zero too, and neither is the compiler refusing the
+# program.
+DIAGNOSTIC = re.compile(r"error\[E\d{4}\]")
+PROJ_FAILED = re.compile(r"^test \(project\) (\S+) \.\.\. FAILED")
+
+
+def parse_declared(text):
+    """{project: reason} from a declaration file's text."""
+    out = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, _, reason = line.partition(" ")
+        out[name] = reason.strip()
+    return out
+
+
+def declared_since(sha):
+    """The declarations the working tree carries and revision `sha` does not."""
+    path = os.path.join(ROOT, DECLARED)
+    tree = {}
+    if os.path.isfile(path):
+        with io.open(path, encoding="utf-8") as fh:
+            tree = parse_declared(fh.read())
+    r = subprocess.run(["git", "show", "%s:%s" % (sha, DECLARED)], cwd=ROOT,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    base = parse_declared(r.stdout.decode("utf-8", "replace")) if r.returncode == 0 else {}
+    return {k: v for k, v in tree.items() if k not in base}
+
+
+def census_failures(log):
+    """(verdict accounted?, unit failed, compile-fail failed, failed projects)."""
+    spec = importlib.util.spec_from_file_location(
+        "test_census", os.path.join(ROOT, "scripts", "test-census.py"))
+    census = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(census)
+    with io.open(log, encoding="utf-8", errors="replace") as fh:
+        lines = fh.readlines()
+    blocks, _, _, _ = census.parse(lines)
+    accounted = any(l.startswith("test-census: OK") for l in lines)
+    failed = sorted({m.group(1) for m in map(PROJ_FAILED.match, lines) if m})
+    return (accounted, blocks.get("unit test", {}).get("failed", -1),
+            blocks.get("compile-fail", {}).get("failed", -1), failed)
+
+
+def judge_baseline_census(declared, accounted, unit_failed, neg_failed, failed):
+    """Problems with a baseline census that may fail on declared projects only."""
+    problems = []
+    if not accounted:
+        problems.append("the baseline census did not account for the pinned corpus")
+    if unit_failed != 0 or neg_failed != 0:
+        problems.append("the baseline failed %s unit and %s compile-fail test(s); only "
+                        "declared projects may fail there" % (unit_failed, neg_failed))
+    for p in sorted(set(failed) - set(declared)):
+        problems.append("the baseline fails project %s, which %s does not declare"
+                        % (p, DECLARED))
+    for p in sorted(set(declared) - set(failed)):
+        problems.append("%s is declared as starting to compile, but the baseline census "
+                        "passes it; a program this change makes compile fails the "
+                        "baseline's census" % p)
+    return problems
+
+
+def judge_builds(name, base_rc, base_out, tree_rc, tree_out):
+    """Problems with one declared project's two direct builds."""
+    problems = []
+    if base_rc == 0:
+        problems.append("%s: the baseline compiler BUILDS it (exit 0); it is not a "
+                        "program this change makes compile" % name)
+    elif not DIAGNOSTIC.search(base_out):
+        problems.append("%s: the baseline exits %d with no error diagnostic; a crash or "
+                        "a link failure is not a refusal" % (name, base_rc))
+    if tree_rc != 0:
+        problems.append("%s: the compiler under test does not build it (exit %d)"
+                        % (name, tree_rc))
+    return problems
+
+
+def build_copy(cryo, name, dest):
+    """`cryo build` over a copy of project `name` at `dest`: (exit, output)."""
+    shutil.rmtree(dest, ignore_errors=True)
+    shutil.copytree(os.path.join(ROOT, PROJECTS, name), dest,
+                    ignore=shutil.ignore_patterns("build"))
+    r = subprocess.run([cryo, "build", "--stdlib=" + STDLIB], cwd=dest,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    out = r.stdout.decode("utf-8", "replace")
+    with io.open(dest + ".log", "w", encoding="utf-8") as fh:
+        fh.write(out)
+    return r.returncode, out
+
+
+def check_declared(declared, base_exe, cryo, logdir, env):
+    """Build every declared project with both compilers; the problems found."""
+    problems = []
+    for name in sorted(declared):
+        if not os.path.isfile(os.path.join(ROOT, PROJECTS, name, "test.json")):
+            problems.append("%s: declared in %s but %s/%s is not a test project"
+                            % (name, DECLARED, PROJECTS, name))
+            continue
+        brc, bout = build_copy(base_exe, name, os.path.join(logdir, "declared", "base", name))
+        trc, tout = build_copy(cryo, name, os.path.join(logdir, "declared", "tree", name))
+        found = judge_builds(name, brc, bout, trc, tout)
+        print("  declared  %-40s baseline exit %d, tree exit %d  %s"
+              % (name, brc, trc, "ok" if not found else "FAIL"))
+        problems += found
+    return problems
+
+
+def selftest():
+    """Drive the two judges through every case they must refuse and allow."""
+    cases = [
+        ("census: fails on the declared project only",
+         judge_baseline_census({"p"}, True, 0, 0, ["p"]), 0),
+        ("census: nothing declared, nothing failed",
+         judge_baseline_census({}, True, 0, 0, []), 0),
+        ("census: an undeclared project fails",
+         judge_baseline_census({"p"}, True, 0, 0, ["p", "q"]), 1),
+        ("census: a declared project the baseline passes",
+         judge_baseline_census({"p", "q"}, True, 0, 0, ["p"]), 1),
+        ("census: a unit failure is never declarable",
+         judge_baseline_census({"p"}, True, 1, 0, ["p"]), 1),
+        ("census: the corpus not accounted for",
+         judge_baseline_census({"p"}, False, 0, 0, ["p"]), 1),
+        ("builds: refused before, builds now",
+         judge_builds("p", 1, "error[E0203]: x", 0, ""), 0),
+        ("builds: the baseline builds it too",
+         judge_builds("p", 0, "", 0, ""), 1),
+        ("builds: the baseline crashed, no diagnostic",
+         judge_builds("p", 3, "segfault", 0, ""), 1),
+        ("builds: the tree still refuses it",
+         judge_builds("p", 1, "error[E0203]: x", 1, "error[E0203]: x"), 1),
+        ("declarations: parse skips comments and blanks",
+         [] if parse_declared("# c\n\np why\nq\n") == {"p": "why", "q": ""} else ["bad"], 0),
+    ]
+    bad = 0
+    for label, problems, want in cases:
+        got = len(problems)
+        ok = got == want
+        bad += not ok
+        print("  %-4s %-50s %d problem(s), want %d" % ("ok" if ok else "FAIL", label, got, want))
+    print("verify selftest: %d of %d cases as expected" % (len(cases) - bad, len(cases)))
+    return 1 if bad else 0
+
+
+def compare(tag_a, a_path, b_path, limit, excluded=()):
     a, b = read_hashes(a_path), read_hashes(b_path)
+    if excluded:
+        prefixes = tuple("%s/%s/" % (PROJECTS, n) for n in excluded)
+        drop_a = [p for p in a if p.startswith(prefixes)]
+        drop_b = [p for p in b if p.startswith(prefixes)]
+        for p in drop_a:
+            del a[p]
+        for p in drop_b:
+            del b[p]
+        if drop_a or drop_b:
+            print("  %-9s declared projects' objects left out: baseline %d, tree %d"
+                  % (tag_a, len(drop_a), len(drop_b)))
     moved = sorted(p for p in a.keys() & b.keys() if a[p] != b[p])
     only_a = sorted(a.keys() - b.keys())
     only_b = sorted(b.keys() - a.keys())
@@ -325,7 +501,9 @@ def compare(tag_a, a_path, b_path, limit):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cryo", required=True, help="the compiler under test")
+    ap.add_argument("--cryo", help="the compiler under test")
+    ap.add_argument("--selftest", action="store_true",
+                    help="drive the declared-program judges through their cases")
     ap.add_argument("--baseline", default=None,
                     help="compare objects against a compiler built from this "
                          "revision's compiler/src (e.g. HEAD)")
@@ -336,6 +514,10 @@ def main():
                          % ",".join(GATES))
     ap.add_argument("--list-limit", type=int, default=40)
     args = ap.parse_args()
+    if args.selftest:
+        return selftest()
+    if not args.cryo:
+        ap.error("--cryo is required")
 
     cryo = os.path.abspath(args.cryo)
     if not os.path.isfile(cryo):
@@ -376,12 +558,21 @@ def main():
     ok = True
 
     base_counts = None
+    declared = {}
     if args.baseline:
         exe, home, sha = baseline_compiler(args.baseline, env)
+        declared = declared_since(sha)
+        print("verify: %d program(s) declared as starting to compile since %s%s"
+              % (len(declared), args.baseline,
+                 "".join("\n      %s -- %s" % (n, r) for n, r in sorted(declared.items()))))
         pkey = population_key(exe)
         cached = os.path.join(home, "pop-" + pkey)
         if os.path.isfile(os.path.join(cached, "base.tests.sha256")):
             print("verify: baseline objects cached for this population: %s" % rel(cached))
+            # Cached only after the baseline census was judged, so its verdict
+            # is recorded as the projects it failed on.
+            with io.open(os.path.join(cached, "base.failed"), encoding="utf-8") as fh:
+                census = (True, 0, 0, fh.read().split())
         else:
             print("verify: baseline run (%s) over the working tree's population"
                   % ", ".join(POPULATION_GATES))
@@ -389,14 +580,29 @@ def main():
             os.makedirs(bdir)
             bres, bcounts = population(exe, "base", bdir, env, list(POPULATION_GATES))
             report_gates(bres)
-            if not all(r["ok"] for r in bres) or not all(bcounts.values()):
+            census = census_failures(os.path.join(bdir, "census.log"))
+            # The census may fail on declared projects; every other gate, and
+            # every other suite, must pass outright.
+            complete = all(r["ok"] for r in bres if r["name"] != "census") \
+                and all(bcounts.values()) \
+                and (next(r for r in bres if r["name"] == "census")["ok"] or declared)
+            if not complete:
                 print("verify: FAIL -- the baseline run did not complete; its objects "
                       "are not a baseline (counts %s)" % bcounts)
                 return 1
+        problems = judge_baseline_census(declared, *census)
+        problems += check_declared(declared, exe, cryo, logdir, env)
+        if problems:
+            for p in problems:
+                print("verify: FAIL -- %s" % p)
+            return 1
+        if not os.path.isfile(os.path.join(cached, "base.tests.sha256")):
             os.makedirs(cached, exist_ok=True)
             for base in ("tests", "examples"):
                 shutil.copyfile(os.path.join(bdir, "base.%s.sha256" % base),
                                 os.path.join(cached, "base.%s.sha256" % base))
+            with io.open(os.path.join(cached, "base.failed"), "w", encoding="utf-8") as fh:
+                fh.write("\n".join(census[3]) + "\n")
         base_counts = cached
 
     print("verify: gates over %s: %s" % (rel(cryo), ", ".join(names)))
@@ -417,7 +623,8 @@ def main():
         diff = 0
         for base in ("tests", "examples"):
             diff += compare(base, os.path.join(base_counts, "base.%s.sha256" % base),
-                            os.path.join(logdir, "tree.%s.sha256" % base), args.list_limit)
+                            os.path.join(logdir, "tree.%s.sha256" % base), args.list_limit,
+                            excluded=declared)
         if diff and args.require_identical:
             ok = False
 

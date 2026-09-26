@@ -26,7 +26,9 @@ make test                # unit + compile-fail + project suites
 make test-census         # the same run, with the suite COUNTS asserted
 make verify              # build once; census, examples, lsp, cross, check-fast CONCURRENTLY,
                          # objects hashed; ARGS="--baseline HEAD --require-identical" proves
-                         # a change moved no compiled output (baseline built in .verify/, cached)
+                         # a change moved no compiled output (baseline built in .verify/, cached);
+                         # a change that makes a refused program compile DECLARES its project in
+                         # tests/started-compiling: verify asserts refused before, builds now
 make roster-check        # roster golden: 2113 unit + 46 projects + 179 negative
 make lane-check          # resolution-lane surface ratchet; needs NO build
 make ns-status-check     # run every check docs/name-resolution.md §0 carries
