@@ -70,6 +70,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -149,6 +151,38 @@ def answer(out):
     return toks[-1] if toks else ""
 
 
+def posix_shell():
+    """(the bash the rows run in, None) or (None, why).
+
+    Chosen by RUNNING it.  On Windows, `subprocess.run(["bash", ...])` does not
+    search PATH first: CreateProcess looks in System32 before PATH, and
+    System32's `bash.exe` is the WSL launcher.  Rows run there read the tree
+    through `/mnt/c` with a Linux `python3`, so the check silently depended on
+    WSL being installed and healthy, and read directory order the way WSL's
+    bridge reports it.  The shell is Git's own bash, found from `git
+    --exec-path`, and it is refused unless `uname -s` shows it runs on this
+    host rather than inside a VM.
+    """
+    if os.name != "nt":
+        bash = shutil.which("bash")
+        return (bash, None) if bash else (None, "no bash on PATH")
+    try:
+        exec_path = subprocess.run(["git", "--exec-path"], stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL).stdout.decode().strip()
+    except OSError:
+        return None, "no git on PATH, so Git's bash cannot be located"
+    # <git>/mingw64/libexec/git-core -> <git>/usr/bin/bash.exe
+    git_root = os.path.normpath(os.path.join(exec_path, "..", "..", ".."))
+    bash = os.path.join(git_root, "usr", "bin", "bash.exe")
+    if not os.path.isfile(bash):
+        return None, "Git's bash is not at %s" % bash
+    kind = subprocess.run([bash, "-c", "uname -s"], stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT).stdout.decode("utf-8", "replace").strip()
+    if not kind.startswith(("MINGW", "MSYS", "CYGWIN")):
+        return None, "%s reports `%s`, not a shell running on this host" % (bash, kind)
+    return bash, None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ledger", default=None,
@@ -160,10 +194,15 @@ def main():
                     help="fail if §0 carries fewer checkable rows than this; "
                          "a row losing its check is drift too, and an empty "
                          "extraction otherwise reports as a clean sweep")
+    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 1,
+                    help="rows run at once (default: the CPU count; 1 runs "
+                         "them one after another).  Rows only read the tree, "
+                         "and results are reported in row order either way")
     args = ap.parse_args()
 
-    if shutil.which("bash") is None:
-        print("ns-status-check: FAIL -- no bash on PATH.")
+    bash, why = posix_shell()
+    if bash is None:
+        print("ns-status-check: FAIL -- %s." % why)
         print("  The checks are POSIX one-liners (grep/wc/pipes) written to be")
         print("  copied whole; running them any other way would be running")
         print("  something other than what the row says.")
@@ -205,40 +244,48 @@ def main():
     failed = []
     loose = []
     unusable = []
-    # The rows that parse `compiler/src` share one parse per run
-    # (`scripts/parse_cache.py`): about thirty of them each re-parsed the
-    # whole tree, ~10 s apiece.  The directory lives for this run only, and
-    # is made BY the shell the rows run in: `bash` spawned from a Windows
-    # Python can be WSL's, which cannot open a directory named `C:\..`, and
-    # a cache it cannot open is silently no cache.  WSL passes a Windows
-    # environment variable through only when `WSLENV` names it; any other
-    # bash ignores `WSLENV`.
+    # One directory for this run, deleted afterwards, holding two things:
+    #   * the parse cache the rows that parse `compiler/src` share
+    #     (`scripts/parse_cache.py`) - about thirty of them would otherwise
+    #     each re-parse the whole tree, ~10 s apiece;
+    #   * a `python3` that runs THIS interpreter, first on the rows' PATH.  A
+    #     row's `python3` is otherwise whatever the shell finds, which on
+    #     Windows is an App Execution Alias that prints "Python was not found"
+    #     and exits 49 - a row reading that as its answer is a drift report
+    #     about the host, not the tree.
     env = dict(os.environ)
-    made = subprocess.run(["bash", "-c", "mktemp -d"], cwd=ROOT,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    cache = made.stdout.decode("utf-8", "replace").strip()
-    if made.returncode != 0 or not cache:
-        print("ns-status-check: note -- no parse cache (`mktemp -d` answered %r); "
-              "every row parses the tree itself" % cache)
-        cache = None
-    else:
-        env["CRYO_PARSE_CACHE"] = cache
-        env["WSLENV"] = ":".join(p for p in (env.get("WSLENV"), "CRYO_PARSE_CACHE/u") if p)
-        seen = subprocess.run(["bash", "-c", 'test -d "$CRYO_PARSE_CACHE" && echo visible'],
-                              cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        if seen.stdout.decode("utf-8", "replace").strip() != "visible":
-            print("ns-status-check: note -- the rows' shell cannot see the parse cache %r; "
-                  "every row parses the tree itself" % cache)
-            del env["CRYO_PARSE_CACHE"]
+    scratch = tempfile.mkdtemp(prefix="ns-status-")
     try:
+        cache = os.path.join(scratch, "parse")
+        os.mkdir(cache)
+        shim = os.path.join(scratch, "bin")
+        os.mkdir(shim)
+        with io.open(os.path.join(shim, "python3"), "w", newline="\n") as fh:
+            fh.write('#!/bin/sh\nexec "%s" "$@"\n' % sys.executable.replace("\\", "/"))
+        os.chmod(os.path.join(shim, "python3"), 0o755)
+        env["CRYO_PARSE_CACHE"] = cache
+        prefix = 'PATH="$(cygpath -u "%s" 2>/dev/null || echo "%s"):$PATH"; ' % (
+            shim.replace("\\", "/"), shim.replace("\\", "/"))
+
+        runnable = []
         for cmd, expected in checks:
             why = refused(cmd)
             if why is not None:
                 unusable.append((cmd, why))
                 continue
-            r = subprocess.run(["bash", "-c", cmd], cwd=ROOT, env=env,
+            runnable.append((cmd, expected))
+
+        def run(cmd):
+            r = subprocess.run([bash, "-c", prefix + cmd], cwd=ROOT, env=env,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            out = r.stdout.decode("utf-8", "replace")
+            return r.stdout.decode("utf-8", "replace")
+
+        # Rows only read the tree, so they run concurrently; `map` hands the
+        # outputs back in row order, so every report below reads the same at
+        # any job count.
+        with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+            outs = list(pool.map(run, [cmd for cmd, _ in runnable]))
+        for (cmd, expected), out in zip(runnable, outs):
             got = answer(out)
             if got != expected:
                 failed.append((cmd, expected, got, out.strip()))
@@ -248,8 +295,7 @@ def main():
                 print("  %-5s %-64s %s" % ("ok" if got == expected else "DRIFT",
                                            cmd[:64], got))
     finally:
-        if cache:
-            subprocess.run(["bash", "-c", 'rm -rf -- "$1"', "rm", cache], cwd=ROOT)
+        shutil.rmtree(scratch, ignore_errors=True)
 
     for cmd, why in unusable:
         print("ns-status-check: UNUSABLE CHECK")

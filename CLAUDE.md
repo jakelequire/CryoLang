@@ -27,7 +27,7 @@ make test-census         # the same run, with the suite COUNTS asserted
 make roster-check        # roster golden: 2113 unit + 46 projects + 179 negative
 make lane-check          # resolution-lane surface ratchet; needs NO build
 make ns-status-check     # run every check docs/name-resolution.md §0 carries
-make check-fast          # lane + §0 + pin, ~3.5 min on Windows, no build. Run before committing.
+make check-fast          # lane + §0 + pin, ~1 min, no build. Run before committing.
 make install-hooks       # point git at scripts/git-hooks (ONCE per checkout)
 make lsp-check           # compile tools/CryoLSP with the compiler under test
 make cross-check         # runtime/stdlib/compiler/LSP for the OTHER OS, objects only, ~80s
@@ -51,12 +51,11 @@ only things that run are what a person or an agent runs.
 So:
 
 - **`make check-fast`** before committing. Lane surface, §0, pin integrity;
-  no compiler, no stdlib, no link. It takes about 3.5 minutes on a Windows
-  host (197 s measured): the ledger's ~400 status rows run one shell each -
-  WSL's bash there, since Windows resolves a bare `bash` to it before Git
-  Bash - and the rows that parse `compiler/src` share one parse per run
-  (`scripts/parse_cache.py`). A short gate everybody runs beats a
-  twenty-minute one nobody does.
+  no compiler, no stdlib, no link. About a minute: the ledger's ~400 status
+  rows run one shell each, concurrently, in Git's bash on Windows (never the
+  WSL launcher a bare `bash` resolves to there), and the rows that parse
+  `compiler/src` share one parse per run (`scripts/parse_cache.py`). A short
+  gate everybody runs beats a twenty-minute one nobody does.
 - **`make install-hooks`**, once per checkout. `.git/hooks` is per-checkout and
   a fresh clone inherits nothing, the same trap `.claude/settings.json` carries.
   It installs a `commit-msg` hook that refuses three things: a ledger file

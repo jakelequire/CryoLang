@@ -187,7 +187,7 @@ help:
 	@echo "  make lane-selftest     Drive lane-gate.py through a throwaway tree, every rule both ways"
 	@echo "  make residue-selftest  Drive residue.py --check through a throwaway tree and list, both ways"
 	@echo "  make ns-status-check   Run every check docs/name-resolution.md §0 carries"
-	@echo "  make check-fast        lane-check + the two self-tests + ns-status-check + verify-pin (~10s, no build)"
+	@echo "  make check-fast        lane-check + the two self-tests + ns-status-check + verify-pin (~1 min, no build)"
 	@echo "  make install-hooks     Point git at the tracked hooks (run once per checkout)"
 	@echo "  make lsp-check         Compile tools/CryoLSP against current source"
 	@echo "                         (installs nothing; the only gate that builds it)"
@@ -585,8 +585,8 @@ residue-selftest:
 # goes stale, which is exactly how the archive it replaces got that way, so the
 # rows are executable and this runs them.
 #
-# No compiler, no stdlib, no link: it greps the tree, in about seven seconds on
-# a cold cache.  That matters more than usual here - CI fires on `main` only, so
+# No compiler, no stdlib, no link: it greps the tree, running the rows
+# concurrently, in about half a minute.  That matters more than usual here - CI fires on `main` only, so
 # on a migration branch the enforcement point is somebody running this.
 ns-status-check:
 	@$(PYTHON) scripts/ns-status-check.py $(ARGS)
@@ -601,8 +601,8 @@ guard-selftest:
 
 # ---- everything that needs no build ------------------------------------
 # The pre-commit sweep.  Every gate here is source- or document-derived, so the
-# whole thing runs in about ten seconds on a fresh clone with nothing built.
-# A ten-second gate everybody runs is worth more than a twenty-minute one
+# whole thing runs in about a minute on a fresh clone with nothing built.
+# A one-minute gate everybody runs is worth more than a twenty-minute one
 # nobody does, which is the same argument that moved lane-check ahead of
 # `make cryo` in CI.
 check-fast: lane-check lane-selftest residue-selftest ns-status-check verify-pin
