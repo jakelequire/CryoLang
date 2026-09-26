@@ -338,7 +338,11 @@ def main():
                     help="refuse unless the tree's population, the residue's site table and the classifier agree")
     args = ap.parse_args()
     gate = load_gate()
-    rows, sets, elsewhere = population(gate, args.src)
+    sys.path.insert(0, os.path.dirname(HERE))
+    import parse_cache
+    rows, sets, elsewhere = parse_cache.memo(
+        "residue-population", [os.path.abspath(__file__), GATE], args.src,
+        lambda: population(gate, args.src))
     if args.methods:
         for holder in sorted(sets):
             if sets[holder]:

@@ -1795,7 +1795,10 @@ def main():
         sys.stderr.write("lane-gate: no bucket named %s (%s)\n" % (args.row, ", ".join(KINDS)))
         return 1
 
-    counts, unplaced, sets, (owners, array_owners, scans) = scan(args.src)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import parse_cache
+    counts, unplaced, sets, (owners, array_owners, scans) = parse_cache.memo(
+        "lane-scan", [os.path.abspath(__file__)], args.src, lambda: scan(args.src))
     if args.row is not None:
         # A live total, read from the tree.  Refused on an unplaceable
         # receiver below like every other read, since a count over a tree

@@ -27,7 +27,7 @@ make test-census         # the same run, with the suite COUNTS asserted
 make roster-check        # roster golden: 2113 unit + 46 projects + 179 negative
 make lane-check          # resolution-lane surface ratchet; needs NO build
 make ns-status-check     # run every check docs/name-resolution.md §0 carries
-make check-fast          # lane + §0 + pin, ~10s, no build. Run before committing.
+make check-fast          # lane + §0 + pin, ~3.5 min on Windows, no build. Run before committing.
 make install-hooks       # point git at scripts/git-hooks (ONCE per checkout)
 make lsp-check           # compile tools/CryoLSP with the compiler under test
 make cross-check         # runtime/stdlib/compiler/LSP for the OTHER OS, objects only, ~80s
@@ -51,8 +51,11 @@ only things that run are what a person or an agent runs.
 So:
 
 - **`make check-fast`** before committing. Lane surface, §0, pin integrity;
-  about ten seconds, no compiler, no stdlib, no link. A ten-second gate
-  everybody runs beats a twenty-minute one nobody does.
+  no compiler, no stdlib, no link. It takes about 3.5 minutes on a Windows
+  host (197 s measured): §0's ~400 rows run one shell each, in WSL's bash
+  there, and the rows that parse `compiler/src` share one parse per run
+  (§8.354). A short gate everybody runs beats a twenty-minute one nobody
+  does.
 - **`make install-hooks`**, once per checkout. `.git/hooks` is per-checkout and
   a fresh clone inherits nothing, the same trap `.claude/settings.json` carries.
   It installs a `commit-msg` hook that refuses three things: a ledger file
@@ -89,6 +92,15 @@ So:
 Most of these were, at some point, reporting success for work they had
 not done. The remaining limits are here so nobody rediscovers them:
 
+- **A compiler warning total from an incremental build is not a count.** A
+  module reused from cache skips the stage after monomorphization, and its
+  warnings from that stage (unused variables, unused functions, unreachable
+  code among them) are not replayed: the same source reads 346 warnings
+  clean and 337 after a comment is added to a leaf file. Take a warning
+  total only after `rm -rf compiler/build`, and compare two builds' warnings
+  as SETS (code, file, line), never as totals. It is filed, not fixed
+  (ledger D40; mechanism in §8.355). It was diagnosed once already and lost,
+  because it lived only in an entry's prose.
 - **`make test` passes on an exit code.** A suite that ran nothing prints no
   header, no summary and no explanation, and exits 0 with `OVERALL PASS`.
   Use `make test-census` wherever the run is being taken as evidence; it

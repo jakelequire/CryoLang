@@ -102,12 +102,18 @@ instrument condition one's list is drawn from; its J count is not a target.
    resolver itself among them): `python3 scripts/ns-migration/done.py
    --name-taking`. Outside it: `ModulePath` (a module's identity, as in
    condition one), `MangledName` (an opaque link symbol) and `String` /
-   `str::Str` (text read or written, never looked up) (§8.353). **NOT MET** - no list exists. The nearest thing,
+   `str::Str` (text read or written, never looked up) (§8.353). **NOT MET** - no list exists.
+   Its form is ruled (D41): a file of its own in the repository, one entry
+   per line - the function's signature, the written reason, and the
+   command that checks the reason - and a gate that refuses a name-taking
+   function the file does not list. The nearest thing,
    `residue_classify.py`'s `CLASS_OF_METHOD`, covers the stores' doors only,
    and re-classing a door there passes `residue.py --check` unreviewed.
 3. **Every reason is self-checking**: each approved entry carries a command
-   that fails when the reason stops being true. **NOT MET** - no entry
-   carries one.
+   that fails when the reason stops being true - the third field of the
+   list's line (D41). **NOT MET** - no entry carries one; the only written
+   reasons in the tree, the residue classifier's 73 justifications, carry
+   no command (§8.354).
 4. **Then three consecutive audit rounds come back empty, each attacking a
    surface no earlier round has touched** (Jake, relayed in plain text
    2026-09-24: "3 audits", with the new-surface rule accepted alongside the
@@ -126,6 +132,7 @@ Checks:
 * `python3 scripts/ns-migration/done.py --outstanding | wc -l` → **14** (23 before §8.333-§8.335: the six owner doors asked by the self type's name and both `get_template` lines, B and C, are gone, and `lookup_type_exact` is called only inside the funnel's own file; 25 before §8.331 converted the self-growth check and the two written-name scans; condition one's list, one line per function or hand-written scan and class - `get_template` is on two lines, B and C; 30 before §8.330 converted the four trait lookups and one scan)
 * `python3 scripts/ns-migration/done.py --name-taking | wc -l` → **1114** (condition two's population, all of it unplaced; 1,095 before §8.353, whose matcher saw a spelling only by value: +10 taking one by reference, `Resolver::resolve_path(segments: &SymbolStr[], ..)` among them, and +9 taking a `QualifiedName`; 1,099 before §8.349, which deleted `register_name_mapping`, `resolve_qualified_scoped`, `lookup_qualified_alternatives` and `ScopeResolution::resolved_or`; 1,098 before §8.348, which added `register_methods_through`, taking a diagnostic `site` label as `register_methods` does; 1,099 before §8.339, where `claim_wellknown` stopped taking a name; 1,109 before §8.333-§8.335: eleven functions - the owner and scope-segment doors and their helpers - stopped taking a name or were deleted, and the parser's `refuse_declaration_keyword_name` takes a diagnostic label; 1,110 before §8.332, where `register_impl_block`, `refuse_elided_template_params` and `set_resolved_template` stopped taking a name and `template_in` / `member_template_key` take the member's leaf; 1,113 before §8.331; 1,136 before §8.330, whose trait carriers stopped taking a name in 23 functions)
 * `python3 scripts/ns-migration/done.py --selftest | tail -1` → **14** (the matcher above over declarations it must list - a spelling by value, by reference, as an array, as a `QualifiedName`, wrapped over two lines - and ones it must not; its matcher before §8.353 got 10)
+* `python3 scripts/parse_cache.py --selftest | tail -1` → **8** (the parse the rows share within one `ns-status-check` run: every way it could answer from a stale parse - a changed, added or removed source file, a changed script, a failed computation - driven through a throwaway tree; a key that ignored file contents got 3, §8.354)
 
 ### 0.1 Decisions
 
@@ -175,6 +182,8 @@ measurement that decided it on the row.
 | D37 | **The reference-mutability check waits until after merge**, and when it lands it runs BEFORE the async lowering, which turns an async method's `this` into a raw pointer so that a check after it cannot see the declared receiver (Jake, relayed in plain text 2026-09-26) | **RULED** | `no check` — not built | §8.344 |
 | D38 | **The bare-leaf store goes before merge; the eight bare-name finders wait until after, as a written exception** lifted by a test harness for the editor's answers (Jake, relayed in plain text 2026-09-26; condition one above carries the exception and its reason) | **The store half TAKEN (§8.349)**; the finders' exception stands, RULED | `grep -rho 'bare_alts' compiler/src tools --include=*.cryo \| wc -l` → **0** | §8.345, §8.349 |
 | D39 | **The generic-parameter converge work starts**: an implement block's parameters bind through its head (option B), one place per step, each step flipping one kind of program from refused to accepted (Jake, relayed in plain text 2026-09-26) | **RULED; the nine head-binding places TAKEN (§8.347, §8.348)** - every place §8.343 counted binds an impl's parameters through its head (to an instantiation's arguments, to the owner's own parameters for the declaration index, and the owner's read as the impl's in a body walked with `this` as the template); the seven comparisons and the arena flip remain, and the flip waits on the layer §8.350 found (a method's owner parameters returned unsubstituted when the receiver is abstract) | `grep -rho -e 'add_head_param_bindings(' -e 'add_owner_to_head_bindings(' compiler/src \| wc -l` → **6** (the two definitions; the trait checker's nested check, the monomorphizer's head bindings, the declaration index's returns, the owner's parameters read as the impl's) | §8.343, §8.347, §8.348 |
+| D40 | **An incremental build's lost warnings are FILED, not fixed** (Jake, relayed in plain text 2026-09-25, "option one"): a module reused from cache skips the stage after monomorphization and its warnings are not replayed, so an incremental build and a clean build of one source report different warnings. Until it is fixed, a compiler warning total is evidence only from a clean build, and warnings compare as sets | **RULED** (filed); the skip stands | `grep -c 'if (pm_active && pm_cached\[order\[i\] as i64\]) { continue; }' compiler/src/compiler/instance.cryo` → **1** (reads 0 the day the skip changes; then re-read §8.355 and this row) | §8.320, §8.355 |
+| D41 | **Condition two's approved list is its own file in the repository, one entry per line - the function's signature, the written reason, and the command that checks the reason - and the gate refuses a name-taking function the file does not list** (Jake, relayed in plain text 2026-09-25) | **RULED** | `no check` — the file does not exist yet | §0.0 |
 
 **D18's keyword half is RULED and UNBUILT - built once and backed out at a parse fork the ruling did not cover (§8.295: `x as u32 < y`), and waiting on that one ruling - and D32 is the criterion it is built toward** (D5 was, until §8.206; D2 and D9 were,
 until §8.213; D24 was, until §8.233 - this line kept naming it for forty-six entries after its row said TAKEN, §8.280; Q2 was, until §8.259; D25 was, until §8.263; D30's refusal was, until §8.268; D28 was, until §8.270; D30's identity half was, until §8.272; D31 was, until §8.278). Each was decided by Jake - D18 and D2 then re-parked as open
@@ -344,7 +353,7 @@ evidence for what it covers.
 | `make examples-golden` | example stdout vs committed goldens | **Linux only.** Refuses on Windows (exit 1) rather than reporting success. |
 | `make valgrind-check` | invalid free/read/write and definite leaks | **Linux only**, same refusal. |
 | `make incremental-check` | per-module incremental == clean build | Byte identity only. |
-| the compiler build's `N warnings emitted` | the front end's warnings for every module; the warnings of the stage after monomorphization (the unused-variable, unused-function and unreachable-code lints among them) only for the modules this build recompiled | **An incremental build.** A module reused from cache skips that stage and its warnings are not replayed, so the tip reads 346 clean and 337 after a comment is added to a leaf file. A warning total is evidence only from a build after `rm -rf compiler/build`, and two builds' warnings compare as SETS - code, file, line - not as totals (§8.320 diagnosed it, §8.348 re-described it as noise, §8.353). |
+| the compiler build's `N warnings emitted` | the front end's warnings for every module; the warnings of the stage after monomorphization (the unused-variable, unused-function and unreachable-code lints among them) only for the modules this build recompiled | **An incremental build.** A module reused from cache skips that stage and its warnings are not replayed, so the tip reads 346 clean and 337 after a comment is added to a leaf file. A warning total is evidence only from a build after `rm -rf compiler/build`, and two builds' warnings compare as SETS - code, file, line - not as totals. FILED, not fixed (D40); the mechanism is §8.355 (§8.320 diagnosed it, §8.348 re-described it as noise). |
 | `make api-index-check` | `docs/stdlib-api.txt` is not stale | Staleness only; says nothing about the API's shape. |
 | `make vendor-check` | every constant shape survives `cryo vendor` | Constants only. |
 | CI | the gates above, on ubuntu | **Fires only on `main` or `workflow_dispatch`. A branch gets NO automatic CI.** The `windows-native` job exists but its own comment calls it partially validated and not a required check; `windows-smoke` is a cross-build on ubuntu, so no native-Windows run is load-bearing. |
@@ -365,9 +374,7 @@ Checks for this section, one per line so each can be copied whole:
 * `ls -d tests/tests/projects/*/test.json | wc -l` → **82** (+1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
-* `grep -c '^cross-check:' Makefile` → **2** (one per host branch)
-* `grep -c 'if (pm_active && pm_cached\[order\[i\] as i64\]) { continue; }' compiler/src/compiler/instance.cryo` → **1** (the skip that drops a reused module's warnings; when it stops reading 1, re-examine the warning row above)
-* `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
+* `grep -c '^cross-check:' Makefile` → **2** (one per host branch)* `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
 
 ### 0.4 What no gate covers
 
@@ -401,6 +408,14 @@ Checks for this section, one per line so each can be copied whole:
   written the same way, and `python scripts/ns-migration/8.271/ecode_rows.py`
   lists every row whose count includes a comment hit (expected: only the
   `registration-time report` row, which asserts a sentence in the source).
+
+* **Which shell runs this section's rows.** `ns-status-check` checks that
+  `bash` is on PATH (`shutil.which`, Git Bash on a Windows host) and then
+  runs `bash` through the Windows process search, which finds WSL's first:
+  on this host every row runs in WSL, with Linux `python3`, `grep` and
+  `git` over `/mnt/c` (§8.354). The rows agree with the tree there; nothing
+  checks that they would agree under Git Bash, whose `python3` is a store
+  alias that runs nothing.
 
 ### 0.5 What this section is not
 
@@ -43594,5 +43609,170 @@ Not fixed here, and not in this unit: an incremental and a clean build
 disagree about the same source for a user too - a comment edited in one
 file and nine real warnings vanish.  Replaying a reused module's warnings
 is a compiler change, and reaches `make cryo` only through a re-pin.
+
+---
+
+### 8.354 Section 0's rows share one parse of `compiler/src` per run: `ns-status-check` 305 s -> 120 s, every row's output byte-identical; and the rows run in WSL's bash - 2026-09-25
+
+Approved by Jake (relayed in plain text 2026-09-25) as a script change
+that relaxes nothing.
+
+#### Where the time went
+
+Timed per row (each command `ns-status-check` runs, wall clock, over
+`3840f8c3`): 305.5 s for 411 rows, of which 19 `lane-gate.py` rows, 4
+`residue.py` rows and `done.py --outstanding` (which runs `residue.py
+--check`) each spent ~10 s in the same work - `lane-gate.py`'s `scan()`
+(10.5 s alone: `place_inline_scans` 4.5 s, `place_array_owners` 2.1 s) or
+`residue.py`'s `population()`, over the same unchanged tree.
+
+#### The change
+
+`scripts/parse_cache.py`: `memo(label, scripts, src, compute)` returns
+`compute()`, or the answer an earlier call in the same run computed from
+byte-identical inputs - the key is a SHA-256 over the scripts' bytes and
+every `.cryo` file's path and bytes under the source tree, so a tree or a
+script changed mid-run is parsed afresh.  It is inert unless
+`CRYO_PARSE_CACHE` names a directory; only `ns-status-check` sets it, to a
+directory it makes for the run and deletes after.  `lane-gate.py` memoizes
+`scan()`, `residue.py` memoizes `population()`; nothing else changed in
+either.
+
+#### The rows run in WSL, and the first cut cached nothing
+
+The first cut made the directory with `tempfile.mkdtemp` and measured
+**299.9 s - no faster**.  The cause: `ns-status-check` refuses unless
+`shutil.which("bash")` finds a bash (Git Bash here), then runs
+`subprocess.run(["bash", ..])`, which Windows resolves by its own search
+order - System32 first - to **WSL's** `bash.exe`
+(`uname -sr` from inside: `Linux 6.6.87.2-microsoft-standard-WSL2`;
+`command -v python3`: `/usr/bin/python3`).  Every §0 row on this host runs
+in WSL, over `/mnt/c`.  A Windows environment variable reaches WSL only
+when `WSLENV` names it, so the rows never saw `CRYO_PARSE_CACHE`, and a
+`C:\..` directory would not have opened there anyway.  Now: the directory
+is made by the rows' own shell (`bash -c 'mktemp -d'`), the variable is
+passed with `WSLENV=CRYO_PARSE_CACHE/u` (any other bash ignores
+`WSLENV`), and the run checks that the rows' shell can SEE it
+(`test -d`), printing a note and parsing per row when it cannot - so a
+cache that silently does nothing, which is what the first cut was, now
+says so.  Which shell runs the rows is recorded in §0.4; changing it is
+not this unit.
+
+#### Evidence
+
+Both sides in a clone of `3840f8c3` outside the repository, every row's
+full output recorded (`scripts/ns-migration/8.354/nsdump.py`; `compare.py` beside it diffs two recordings):
+
+| tree | scripts | exit | total | rows | rows whose full output differs |
+|---|---|---|---|---|---|
+| `3840f8c3` | before | 0, `OK -- 411 §0 row(s)` | 305.5 s | 411 | - |
+| `3840f8c3` | after | 0, `OK -- 411 §0 row(s)` | **120.1 s** | 411, same commands in order | **0** |
+| one `defs.path_of(` line deleted from `call_resolver.cryo` | before | **1** (DEFID_PATH row 61 -> 60) | 317.5 s | 411 | - |
+| the same mutation | after | **1** | 122.1 s | 411 | **0** |
+
+The remaining time is two first parses (~11 s each), `impl-head-elided-params.py`
+(3.2 s), one `git ls-files | xargs grep` (2.6 s) and ~0.2 s of WSL start-up
+per row.  `ns-guard-selftest.py` with the new scripts: `OK -- 19 case(s)`.
+
+`parse_cache.py --selftest` (a §0 row): 8 cases - inert without the
+variable, a hit on an identical tree, a miss on a changed / added / removed
+source file and on a changed script, a non-`.cryo` file ignored, a failed
+computation not stored - **8 of 8** under Windows Python and under WSL's
+`python3`.  The pair: the same file with the key hashing file NAMES but not
+contents scores **3 of 8** and exits 1.
+
+#### Condition three's written reasons, counted
+
+`scripts/ns-migration/8.354/classifier_reasons.py`: the residue classifier
+(`residue_classify.py`'s `CLASS_OF_METHOD`) carries 90 written reasons -
+J 63, N 10, S 8, C 6, F 2, B 1 - and **0** name a command that could check
+them.  Control: the pattern it counts by matches a reason written
+"checked by `grep -c x f`" and "`python3 scripts/a.py`", and not "member:
+by leaf off the type".
+
+---
+
+### 8.355 Warnings an incremental build does not report: the mechanism, and why a warning total is evidence only from a clean build - FILED (D40) - 2026-09-25
+
+This is the third description of one defect.  §8.320 found it and said
+"it is not a count to read"; §8.348, twenty-eight entries later, saw it
+again and called the unused-variable total "not a stable instrument" - a
+wrong mechanism (noise) for a deterministic one.  The first description
+lived only in an entry's prose, which the next session did not read.  This
+entry is the mechanism; D40 in §0.1 is the ruling and carries the check;
+§0.3's warning row is the rule, where the gates are read.
+
+#### The mechanism
+
+A project build is incremental per module.  `instance.cryo` computes a key
+for each module (`instance.cryo:1800-1931`): the module's source hash
+folded over the source hashes of its transitive import closure, plus a
+toolchain fingerprint (the compiler, the optimization level, debug info).
+A module is REUSED when the previous build's manifest holds the same key
+and its object file is still on disk (`:1934-1947`); anything the key
+cannot prove - an unattributable specialization, a short import closure -
+disables reuse.
+
+Every module is still parsed, name-resolved and type-checked: the front
+end's warnings are reported for all of them.  The stage after
+monomorphization - `GenericValidation`, `FunctionBodyTypeCheck`,
+`MoveCheck`, `DeadCodeAnalysis`, `DropInsertion`, `TypeLowering`
+(`:1963-1968`) - is SKIPPED for a reused module:
+
+```cryo
+if (pm_active && pm_cached[order[i] as i64]) { continue; }   // instance.cryo:1989
+```
+
+The comment above it is right about errors (a reused module compiled
+clean the build that produced its object) and silent about warnings: the
+warnings that stage emitted for the module in the earlier build are not
+stored, so they are not replayed.  So the unused-variable (W0001),
+unused-function (W0002) and unreachable-code (W0009) lints of
+`passes/dead_code.cryo`, and any warning the other passes of that stage
+emit, are reported ONLY for the modules this build recompiled.
+Measured for W0001; the other passes' warnings are inferred to be lost by
+the same `continue` and were not measured (the tip emits none of them).
+
+#### What it looks like
+
+The pin building `3093959d`'s compiler, in a copy outside the repository:
+
+| build | warnings | W0001 |
+|---|---|---|
+| clean (`rm -rf compiler/build`) | 346 | 9 |
+| clean again | 346 | 9 |
+| incremental, a comment added to `diag/_module.cryo` - in every module's closure, so nothing is reused | 346 | 9 |
+| incremental, a comment added to `CLI/commands.cryo` - in almost no module's closure, so almost everything is reused | **337** | **0** |
+
+The count is deterministic per source; what an edit decides is WHICH
+modules recompile, and so which modules' post-monomorphization warnings
+appear.  The last session's builds read 9, 5, 3 and 0 on sources that
+differed only in files unrelated to the warnings that vanished.
+
+For a user it is the same inconsistency: edit a comment, rebuild, and nine
+real warnings are gone until something in their modules' closures
+changes.  `make incremental-check` does not see it - it compares object
+files, not diagnostics.
+
+#### The rule, until it is fixed
+
+1. **A compiler warning total is evidence only from a clean build** -
+   `rm -rf compiler/build` (or the project's `build/`) first.
+2. **Two builds' warnings compare as SETS** - (code, file, line), e.g.
+   `grep -A1 '^warning\[' LOG | paste - - - | sed -E 's/^warning\[(W[0-9]+)\].*--> ([^:]*:[0-9]+).*/\1 \2/' | sort`
+   - not as totals: a total can hold still while one warning replaces
+   another.
+3. The editor's totals from `lsp-check` are clean builds already
+   (`lsp-gate.py` deletes its build directory first).
+
+#### Filed, not fixed (D40)
+
+The fix is the compiler storing each module's post-monomorphization
+warnings beside its reused object and replaying them on reuse; re-running
+the dead-code lint on a reused module alone would not do, since it reads
+method targets the skipped stage sets and would report unused methods
+falsely.  Because `make cryo` builds the compiler with the pin, a fix
+reaches that build's warnings only after a re-pin.  D40's check reads the
+skip line, so the day it changes the row fails and this entry is re-read.
 
 ---

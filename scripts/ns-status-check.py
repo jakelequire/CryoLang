@@ -205,22 +205,51 @@ def main():
     failed = []
     loose = []
     unusable = []
-    for cmd, expected in checks:
-        why = refused(cmd)
-        if why is not None:
-            unusable.append((cmd, why))
-            continue
-        r = subprocess.run(["bash", "-c", cmd], cwd=ROOT,
-                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        out = r.stdout.decode("utf-8", "replace")
-        got = answer(out)
-        if got != expected:
-            failed.append((cmd, expected, got, out.strip()))
-        elif len(out.split()) > 1:
-            loose.append(cmd)
-        if args.verbose:
-            print("  %-5s %-64s %s" % ("ok" if got == expected else "DRIFT",
-                                       cmd[:64], got))
+    # The rows that parse `compiler/src` share one parse per run
+    # (`scripts/parse_cache.py`): about thirty of them each re-parsed the
+    # whole tree, ~10 s apiece.  The directory lives for this run only, and
+    # is made BY the shell the rows run in: `bash` spawned from a Windows
+    # Python can be WSL's, which cannot open a directory named `C:\..`, and
+    # a cache it cannot open is silently no cache.  WSL passes a Windows
+    # environment variable through only when `WSLENV` names it; any other
+    # bash ignores `WSLENV`.
+    env = dict(os.environ)
+    made = subprocess.run(["bash", "-c", "mktemp -d"], cwd=ROOT,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    cache = made.stdout.decode("utf-8", "replace").strip()
+    if made.returncode != 0 or not cache:
+        print("ns-status-check: note -- no parse cache (`mktemp -d` answered %r); "
+              "every row parses the tree itself" % cache)
+        cache = None
+    else:
+        env["CRYO_PARSE_CACHE"] = cache
+        env["WSLENV"] = ":".join(p for p in (env.get("WSLENV"), "CRYO_PARSE_CACHE/u") if p)
+        seen = subprocess.run(["bash", "-c", 'test -d "$CRYO_PARSE_CACHE" && echo visible'],
+                              cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if seen.stdout.decode("utf-8", "replace").strip() != "visible":
+            print("ns-status-check: note -- the rows' shell cannot see the parse cache %r; "
+                  "every row parses the tree itself" % cache)
+            del env["CRYO_PARSE_CACHE"]
+    try:
+        for cmd, expected in checks:
+            why = refused(cmd)
+            if why is not None:
+                unusable.append((cmd, why))
+                continue
+            r = subprocess.run(["bash", "-c", cmd], cwd=ROOT, env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            out = r.stdout.decode("utf-8", "replace")
+            got = answer(out)
+            if got != expected:
+                failed.append((cmd, expected, got, out.strip()))
+            elif len(out.split()) > 1:
+                loose.append(cmd)
+            if args.verbose:
+                print("  %-5s %-64s %s" % ("ok" if got == expected else "DRIFT",
+                                           cmd[:64], got))
+    finally:
+        if cache:
+            subprocess.run(["bash", "-c", 'rm -rf -- "$1"', "rm", cache], cwd=ROOT)
 
     for cmd, why in unusable:
         print("ns-status-check: UNUSABLE CHECK")
