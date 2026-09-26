@@ -50,7 +50,7 @@ import compiler::types::{
 };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name, resolver };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, Res, ResSlot, SourceLoc };
+import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResSlot, SourceLoc };
 import compiler::sema::{
     state, helpers, scope_manager, type_utils, literal_resolver, diagnostics,
     dispatch, symbolic_checker, method_binding, pattern_resolver,
@@ -1662,7 +1662,6 @@ public:
         // declaration elsewhere - from a module the writer cannot see.
         mut func_ty: TypeRef = TypeRef::invalid();
         mut def_id: DefId = DefId::invalid();
-        mut def_q: SymbolStr = SymbolStr::empty();
         match (ident.res) {
             ResSlot::Answered(r) => {
                 // A source-location pseudo-constant is typed by its kind; the
@@ -1678,16 +1677,13 @@ public:
                 }
                 func_ty = this.ctx.decl_index.func_type_of_res(r);
                 def_id = r.def_id();
-                // The pin below is keyed by the canonical name; the type and
-                // the visibility gate are not.
-                def_q = this.ctx.defs.path_of(def_id);
             }
             _ => { }
         }
         if (func_ty.is_valid()) {
             this.calls.enforce_value_ref_visibility(def_id, ident.span);
-            // The pin, as the scope form's: the qualified name codegen's
-            // registry is keyed by.  A TEMPLATE pins nothing - mono selects
+            // The pin, as the scope form's: the definition's family, its
+            // parent and its leaf.  A TEMPLATE pins nothing - mono selects
             // the instantiation for a turbofished value and refuses to when a
             // pin is already there.
             if (!ident.resolved_callee.is_some() && !this.state.in_symbolic_check) {
@@ -1696,7 +1692,10 @@ public:
                     const tm: TemplateEntry* = this.ctx.generic_registry.template_of(def_id);
                     if (tm != null && tm.node_kind == NodeKind::FunctionDeclaration) { is_tmpl = true; }
                 }
-                if (!is_tmpl) { ident.set_resolved_callee(CalleePin::Family(def_q)); }
+                if (!is_tmpl) {
+                    ident.set_resolved_callee(CalleePin::Family(
+                        FamilyOwner::Def(this.ctx.defs.parent_of(def_id)), this.ctx.defs.leaf_of(def_id)));
+                }
             }
             return func_ty;
         }

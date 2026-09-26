@@ -38,7 +38,7 @@ import compiler::decl_index::{ DeclarationIndex, GlobalEntry };
 import compiler::types;
 import compiler::types::{ arena, compound, generic, type_base, type_ref, TypeKind };
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name, res };
-import compiler::resolver::res::{ DefId, OverloadId };
+import compiler::resolver::res::{ DefId, FamilyOwner, OverloadId };
 import std::fmt;
 import compiler::codegen::abi::{ AbiAttr, AbiClassifier, ArgClass, ParamPlan, SignaturePlan };
 import compiler::codegen::llvm_types::{ LModule, LType, LValue };
@@ -191,8 +191,8 @@ type struct SymbolResolver {
         return this.declare_extern_function_as(di.entry_signature(id), sym);
     }
 
-    /// A function by its FAMILY name - the canonical name every signature of
-    /// one declaration is registered under - when the family names ONE
+    /// A function by its FAMILY - the owner and leaf every signature of one
+    /// declaration is registered under - when the family names ONE
     /// symbol, among its signatures of `arity` when one is given.  A
     /// signature carrying a generic parameter is a template and names none;
     /// two declarations under one leaf that are the same C symbol are one
@@ -200,14 +200,14 @@ type struct SymbolResolver {
     /// name: the arguments select among them, that selection is the front
     /// end's pin, and a name reaching here for such a family is an internal
     /// error, never a choice made here.
-    resolve_family(mut &this, name: SymbolStr, arity: i64) -> LValue {
+    resolve_family(mut &this, owner: FamilyOwner, leaf: SymbolStr, arity: i64) -> LValue {
         mut ft: TypeRef = TypeRef::invalid();
         mut plural: boolean = false;
-        const sym: SymbolStr = this.family_answer(name, arity, &ft, &plural);
+        const sym: SymbolStr = this.family_answer(owner, leaf, arity, &ft, &plural);
         if (plural) {
             this.ctx.emit_error_at(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 fmt::format("codegen: `%s` names several functions and the call was not pinned to one of them",
-                            this.ctx.intern_table.resolve(name)),
+                            this.family_text(owner, leaf)),
                 SourceSpan::none());
             return LValue::null();
         }
@@ -217,14 +217,23 @@ type struct SymbolResolver {
         return this.declare_extern_function_as(ft, sym);
     }
 
-    /// The one symbol the family `name` names among its signatures of
-    /// `arity` (any arity when negative), with that signature in `*out_ft`;
-    /// empty when it names none, and `*out_plural` set when it names several.
-    /// A query: declares nothing, reports nothing.
-    family_answer(&this, name: SymbolStr, arity: i64, out_ft: TypeRef*, out_plural: boolean*) -> SymbolStr {
+    /// The family `(owner, leaf)` as a diagnostic spells it, `Owner::leaf`.
+    family_text(&this, owner: FamilyOwner, leaf: SymbolStr) -> string {
+        const intern: InternTable* = this.ctx.intern_table;
+        const path: SymbolStr = this.ctx.decl_index.family_owner_path(owner);
+        if (!path.is_valid()) { return intern.resolve(leaf); }
+        return fmt::format("%s::%s", intern.resolve(path), intern.resolve(leaf));
+    }
+
+    /// The one symbol the family `(owner, leaf)` names among its signatures
+    /// of `arity` (any arity when negative), with that signature in
+    /// `*out_ft`; empty when it names none, and `*out_plural` set when it
+    /// names several.  A query: declares nothing, reports nothing.
+    family_answer(&this, owner: FamilyOwner, leaf: SymbolStr, arity: i64,
+                  out_ft: TypeRef*, out_plural: boolean*) -> SymbolStr {
         const di: DeclarationIndex* = this.ctx.decl_index;
         const arena: TypeArena* = this.ctx.type_arena;
-        const entries: OverloadId[] = di.lookup_family_entries(name);
+        const entries: OverloadId[] = di.lookup_family_entries(owner, leaf);
         mut sym: SymbolStr = SymbolStr::empty();
         for (mut i: i64 = 0; i < entries.length; i++) {
             const ft: TypeRef = di.entry_signature(entries[i]);
@@ -245,10 +254,13 @@ type struct SymbolResolver {
         return sym;
     }
 
-    /// A function by canonical name, for the calls codegen synthesizes
-    /// itself (the allocator shims, `string::append`, `std::env::set_args`).
-    resolve_function(mut &this, name: SymbolStr) -> LValue {
-        return this.resolve_family(name, -1);
+    /// The function the definition `d` is, for the calls codegen
+    /// synthesizes itself to a declaration it holds the identity of (the
+    /// allocator's entry points, `std::env::set_args`): its family, the
+    /// definition's parent and its leaf.
+    resolve_function(mut &this, d: DefId) -> LValue {
+        if (!d.is_valid()) { return LValue::null(); }
+        return this.resolve_family(FamilyOwner::Def(this.ctx.defs.parent_of(d)), this.ctx.defs.leaf_of(d), -1);
     }
 
     /// The signature of a pinned callee: the declaration's entry, a
@@ -257,10 +269,10 @@ type struct SymbolResolver {
     pinned_signature(&this, pin: CalleePin) -> TypeRef {
         match (pin) {
             CalleePin::Decl(e) => { return this.ctx.decl_index.entry_signature(e); }
-            CalleePin::Family(f) => {
+            CalleePin::Family(o, l) => {
                 mut ft: TypeRef = TypeRef::invalid();
                 mut plural: boolean = false;
-                this.family_answer(f, -1, &ft, &plural);
+                this.family_answer(o, l, -1, &ft, &plural);
                 if (plural) { return TypeRef::invalid(); }
                 return ft;
             }
@@ -276,7 +288,7 @@ type struct SymbolResolver {
     resolve_pinned(mut &this, pin: CalleePin) -> LValue {
         return match (pin) {
             CalleePin::Decl(e)   => { this.resolve_decl(e) }
-            CalleePin::Family(f) => { this.resolve_family(f, -1) }
+            CalleePin::Family(o, l) => { this.resolve_family(o, l, -1) }
             _                    => { LValue::null() }
         };
     }

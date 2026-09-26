@@ -63,7 +63,7 @@ import compiler::mono::trait_specializer::{ MonoTraitSpecializer };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
-import compiler::resolver::res::{ OverloadId, Res, ResBase, ResSlot };
+import compiler::resolver::res::{ FamilyOwner, OverloadId, Res, ResBase, ResSlot };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res::{ DefId };
 import compiler::resolver::symbol_id;
@@ -644,7 +644,9 @@ type struct MonoCallSpecializer {
         const spec_sym: SymbolStr = MangledName::specialized_identifier(
             this.intern_table, this.arena, base_qname, bindings);
         if (!spec_sym.is_valid()) { return; }
-        call.set_resolved_callee(CalleePin::Family(spec_sym));
+        // A function specialization's minted identifier is program-unique:
+        // its family is the root's.
+        call.set_resolved_callee(CalleePin::Family(FamilyOwner::Def(DefId::invalid()), spec_sym));
         const new_inst: TypeRef = this.generic_registry.instantiate_for_module(
             entry.base_type, bindings, this.current_module);
         // Seed mono's pending worklist directly: the registry only tracks
@@ -686,7 +688,7 @@ type struct MonoCallSpecializer {
         const spec_sym: SymbolStr = MangledName::specialized_identifier(
             this.intern_table, this.arena, base_qname, seeded);
         if (!spec_sym.is_valid()) { return; }
-        ident.set_resolved_callee(CalleePin::Family(spec_sym));
+        ident.set_resolved_callee(CalleePin::Family(FamilyOwner::Def(DefId::invalid()), spec_sym));
         const new_inst: TypeRef = this.generic_registry.instantiate_for_module(
             entry.base_type, seeded, this.current_module);
         this.state.enqueue_from_type_ref(new_inst);
@@ -1318,25 +1320,21 @@ type struct MonoCallSpecializer {
                 binds.push(b);
             }
 
-            // Build the spec'd owner name (bare entry.name so it matches how
-            // ASTSpecializer registers the spec'd struct) + the combined callee key.
+            // An argument list the specialization mangling cannot encode
+            // names no instantiation.
             const base_qname: QualifiedName = QualifiedName::from_symbol(entry.name);
             const spec_name_sym: SymbolStr = MangledName::specialized_identifier(
                 this.intern_table, this.arena, base_qname, binds);
             if (!spec_name_sym.is_valid()) { return false; }
-            const spec_name_str: string = this.intern_table.resolve(spec_name_sym);
-            const qualified_owner: SymbolStr = this.qualify_spec_name(entry, spec_name_str);
-            const owner_str: string = this.intern_table.resolve(qualified_owner);
-            const member_str: string = this.intern_table.resolve(scope.member_name);
-            const combined_sym: SymbolStr = this.intern_table.intern(
-                fmt::format("%s::%s", owner_str, member_str));
 
             // Instantiate the owner + enqueue (the drain materializes its methods).
             const inst_ref: TypeRef = registry.instantiate_for_module(
                 entry.base_type, binds, this.current_module);
             if (!inst_ref.is_valid()) { return false; }
             this.state.enqueue_from_type_ref(inst_ref);
-            call.set_resolved_callee(CalleePin::Family(combined_sym));
+            // The member's family is the instantiation's, whose definition is
+            // registered when the drain materializes it.
+            call.set_resolved_callee(CalleePin::Family(FamilyOwner::Type(inst_ref), scope.member_name));
             return true;
         }
 

@@ -47,7 +47,7 @@ import compiler::codegen::llvm_types::{ LType, LTypeKind, LValue };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res;
-import compiler::resolver::res::{ Res, ResSlot };
+import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResSlot };
 import compiler::types::generic_registry::{ GenericRegistry };
 import compiler::types::type_ref::{ TypeRef };
 
@@ -300,26 +300,23 @@ type struct DeclVisitEmitter {
         // written base name is not consulted: it is the same spelling the
         // class declaration wrote, and that one was already answered where
         // its imports were in hand.
-        mut base_qualified: SymbolStr = SymbolStr::empty();
+        mut base_def: DefId = DefId::invalid();
         mut base_type: TypeRef = TypeRef::invalid();
         if (base != null) {
             const r: Res = base.require("base-constructor call");
             base_type = ctx_ptr.decl_index.type_of_res(r);
-            // The constructor symbol is text built from the base's name.
-            base_qualified = ctx_ptr.defs.path_of(r.def_id());
+            // The constructor is the base class's family under its own leaf.
+            base_def = r.def_id();
         }
         if (base_type.is_invalid()) { cdebug("[BCTOR-BAIL] type invalid\n"); return; }
 
-        const base_qualified_str: string = intern.resolve(base_qualified);
-        const base_bare_str: string = intern.resolve(node.base_ctor_name);
-        const ctor_combined: string = fmt::format("%s::%s", base_qualified_str, base_bare_str);
-        const ctor_sym: SymbolStr = intern.intern(ctor_combined);
-
         // Constructor LLVM arity = user args + 1 for the implicit `this`.
         const ctor_arity: u32 = (node.base_ctor_args.length + 1) as u32;
-        const ctor_fn: LValue = this.cg.resolver.resolve_family(ctor_sym, ctor_arity as i64);
+        const ctor_fn: LValue = this.cg.resolver.resolve_family(
+            FamilyOwner::Def(base_def), node.base_ctor_name, ctor_arity as i64);
         if (!ctor_fn.is_valid()) {
-            cdebug("[BCTOR-BAIL] ctor not found: '%s' arity=%u\n", ctor_combined, ctor_arity);
+            cdebug("[BCTOR-BAIL] ctor not found: '%s' arity=%u\n",
+                intern.resolve(node.base_ctor_name), ctor_arity);
             return;
         }
 

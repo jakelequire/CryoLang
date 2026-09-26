@@ -186,32 +186,30 @@ CLASS_OF_METHOD = {
     "DeclarationIndex::global_entry_in_module":
         ("J", "member: a global's leaf inside the module the qualifier's stamp names (a `DefId`)"),
     "DeclarationIndex::lookup_family_entries":
-        ("C", "a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door"),
+        ("J", "member: an overload family's leaf asked inside the owner the caller holds by identity - a module's or a type's definition, or a type's arena id (`FamilyOwner`); the store is keyed by that owner's path and the leaf (`family_slot`), as a definition is its parent and its leaf. Overloading is kept, so a family is the SET one owner declares under one written leaf, and the leaf is the question asked, not a stand-in for an identity - Rust's resolver keys the same set by parent module, ident and namespace"),
     "DeclarationIndex::lookup_func_type_overloads":
-        ("C", "a family by its key string (see `lookup_family_entries`)"),
+        ("J", "member: an overload family's signatures, asked as `lookup_family_entries` is"),
     "DeclarationIndex::lookup_func_type":
-        ("C", "a family by its key string (see `lookup_family_entries`)"),
+        ("J", "member: the signature last registered in an overload family, asked as `lookup_family_entries` is"),
     "DeclarationIndex::lookup_type":
         ("S", "a type by a canonical name derived from a stamp"),
     "DeclarationIndex::lookup_method_return":
         ("J", "member: a method's return by its leaf off the owner `TypeRef` in hand; the store is keyed by the owner's arena id"),
     "DeclarationIndex::method_signature_refused":
         ("J", "member: whether a method's written signature was refused, by its leaf off the owner `TypeRef` in hand; keyed as `lookup_method_return` is"),
-    "DeclarationIndex::lookup_sole_entry":
-        ("J", "lang: the test runner's entry points `set_args` / `set_env` / `run_all`, by the identity each declaration claimed (`wellknown(LangItem::...)`)"),
     "DeclarationIndex::is_prelude_ns":
         ("J", "module: a namespace asked whether it is the prelude's; a module's identity is its path"),
     "DeclarationIndex::ns_imports":
         ("J", "module: two namespaces asked whether one imports the other; module identities"),
     "DeclarationIndex::family_intrinsic_kind":
-        ("C", "a family by its key string, asked the intrinsic kind its entries share (the `CalleePin::Family` arm; the `Decl` arm reads the kind off the entry)"),
+        ("J", "member: the intrinsic kind an overload family's entries share, asked as `lookup_family_entries` is (the `CalleePin::Family` arm; the `Decl` arm reads the kind off the entry)"),
     "DeclarationIndex::extern_symbol_conflict":
         ("J", "extern: a C symbol by its link name, the only identity a C symbol has"),
     # -- the funnel --
     "TypeUtils::lookup_type_exact":
         ("S", "a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`)"),
     "TypeUtils::lookup_func_type_exact":
-        ("C", "a family or a `module::member` composed by `resolve_module_qualified_symbol`"),
+        ("J", "member: the funnel's door onto `DeclarationIndex::lookup_func_type`, an overload family by its owner and leaf"),
     "TypeUtils::lookup_method_return":
         ("J", "member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name)"),
     # -- the generic registry --
@@ -256,12 +254,10 @@ SITE_OVERRIDES = {
         ("J", "prim: `Res::PrimTy(n)` - the primitive's identity is the spelling the stamp carries"),
     ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_type", "name"):
         ("N", "the funnel's own forwarding body (`lookup_type_exact`); its callers are the sites"),
-    ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_func_type", "name"):
+    ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_func_type", "owner, leaf"):
         ("N", "the funnel's own forwarding body (`lookup_func_type_exact`); its callers are the sites"),
     ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_method_return", "owner, method_sym"):
         ("N", "the funnel's own forwarding body (`lookup_method_return`); its callers are the sites"),
-    ("compiler/sema/call_resolver.cryo", "DeclarationIndex::lookup_func_type", "fam"):
-        ("C", "the `CalleePin::Family` key string"),
     ("compiler/sema/sema.cryo", "TypeUtils::lookup_method_return", 'owner_ref, this.intern.intern("iter")'):
         ("J", "member: the for-in protocol's `iter` off a collection that does not implement `Iterator`"),
     # The member tables asked with a leaf the LANGUAGE fixes rather than one

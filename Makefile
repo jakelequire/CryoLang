@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -617,6 +617,13 @@ residue-selftest:
 verify-selftest:
 	@$(PYTHON) scripts/verify.py --selftest
 
+# Every function on the approved list of name-taking functions carries a
+# command that fails when its written reason stops being true; this runs
+# them all, after driving the checker through the cases it must refuse.
+approved-check:
+	@$(PYTHON) scripts/ns-migration/approved.py --selftest
+	@$(PYTHON) scripts/ns-migration/approved.py --check
+
 # ---- name-resolution status gate ---------------------------------------
 # Run every check §0 of docs/name-resolution.md carries and fail on drift.
 #
@@ -645,8 +652,8 @@ guard-selftest:
 # A one-minute gate everybody runs is worth more than a twenty-minute one
 # nobody does, which is the same argument that moved lane-check ahead of
 # `make cryo` in CI.
-check-fast: lane-check lane-selftest residue-selftest verify-selftest ns-status-check verify-pin
-	@echo "check-fast: OK (lane surface and its self-test, the residue check's self-test, verify's declared-program self-test, section 0, pin integrity)"
+check-fast: lane-check lane-selftest residue-selftest verify-selftest approved-check ns-status-check verify-pin
+	@echo "check-fast: OK (lane surface and its self-test, the residue check's self-test, verify's declared-program self-test, the approved names' checks and their self-test, section 0, pin integrity)"
 
 # ---- git hooks ---------------------------------------------------------
 # Point git at the tracked hook directory.  Hooks live in scripts/git-hooks so

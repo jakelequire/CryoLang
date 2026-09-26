@@ -22,7 +22,7 @@ import compiler::types;
 import compiler::types::{ arena, compound, type_base, type_ref, TypeKind };
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DeclVisibility, DefId, OverloadId, Res, ResSlot, DefTable };
+import compiler::resolver::res::{ DeclVisibility, DefId, FamilyOwner, OverloadId, Res, ResSlot, DefTable };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import std::core::option;
@@ -79,8 +79,8 @@ type struct DeclarationIndex {
     /// The compilation's definitions, for a definition's path.  Borrowed;
     /// set by `CompilationContext`, which owns it.
     defs: DefTable*;
-    // Function name -> FunctionType TypeRef (full signature in the arena)
-    func_type_refs: HashMap<u32, TypeRef>;
+    // Family slot (`family_slot`) -> the last signature registered in it
+    func_type_refs: HashMap<u64, TypeRef>;
 
     // Packed(type_id, method_id) -> return type
     method_returns: HashMap<u64, TypeRef>;
@@ -148,18 +148,18 @@ type struct DeclarationIndex {
     // to link against (a non-generic owner like `Str` needs no such help).
     generic_converter_methods: Pair<u32, u32>[];
 
-    // Function registry: one entry per (key, signature, owner, symbol),
+    // Function registry: one entry per (family, signature, alias, symbol),
     // in parallel arrays; an entry's position is its `OverloadId`.  The
-    // key is the family every signature of a declaration is registered
-    // under; `func_type_refs` above keeps only the last signature per key,
-    // which collapses overloads like `String::new()` and `String::new(u64)`.
-    // The symbol is part of the identity: two declarations can share a key
+    // family is the owner and leaf every signature of a declaration is
+    // registered under; `func_type_refs` above keeps only the last signature
+    // per family, which collapses overloads like `String::new()` and
+    // `String::new(u64)`.
+    // The symbol is part of the identity: two declarations can share a family
     // and a signature and be two definitions (`Display::fmt` and
     // `Debug::fmt` on one type, an inherent method beside a trait's, two
     // specializations of a generic method whose signature does not mention
     // its parameter), and a registration carrying a symbol the entry does
     // not already hold appends rather than restamps.
-    overload_func_keys:    u32[];     // SymbolStr.id of the key
     overload_func_types:   TypeRef[]; // FunctionType TypeRef of this entry
     overload_func_mangled: u32[];     // SymbolStr.id of the linker symbol
     overload_func_owner:   u32[];     // SymbolStr.id of the owning declaration's
@@ -192,8 +192,8 @@ type struct DeclarationIndex {
     // linear-scan every function/overload in the whole program.  Maintained
     // in lockstep with each array push.
 
-    // Function name SymbolStr.id -> positions in the `overload_func_*` arrays.
-    overload_index:      HashMap<u32, u32[]>;
+    // Family slot (`family_slot`) -> positions in the `overload_func_*` arrays.
+    overload_index:      HashMap<u64, u32[]>;
 
     // C symbol -> (key, function type id) of the FIRST `extern "C"` block
     // declaration carrying it, for W0011: a later extern block declaring the
@@ -243,7 +243,7 @@ type struct DeclarationIndex {
     static new() -> DeclarationIndex {
         return DeclarationIndex {
             defs: null,
-            func_type_refs:      HashMap::<u32, TypeRef>::new(),
+            func_type_refs:      HashMap::<u64, TypeRef>::new(),
             method_returns:      HashMap::<u64, TypeRef>::new(),
             type_map:            HashMap::<u32, TypeRef>::new(),
             type_reverse:        HashMap::<u64, DefId>::new(),
@@ -256,14 +256,13 @@ type struct DeclarationIndex {
             module_global_modules:    [],
             module_global_namespaces: [],
             module_global_types:      [],
-            overload_func_keys:    [],
             overload_func_types:   [],
             overload_func_mangled: [],
             overload_func_owner:   [],
             overload_func_trait:   [],
             overload_func_span:    [],
             overload_func_intrinsic: [],
-            overload_index:     HashMap::<u32, u32[]>::new(),
+            overload_index:     HashMap::<u64, u32[]>::new(),
             extern_symbol_first: HashMap::<u32, Pair<u32, u64>>::new(),
             module_imports:     HashMap::<u32, u32[]>::new(),
             prelude_ns:         [],
@@ -303,50 +302,71 @@ type struct DeclarationIndex {
             Pair::<u32, u32>::new(type_id, method_id));
     }
 
-    /// Drop every overload position previously registered for `name` so the
-    /// next registration is its sole signature. Needed when a declaration's
-    /// signature is rewritten mid-compile (an `async function` becomes a
-    /// constructor returning its Future struct): the stale Output-return
-    /// overload must not shadow the new struct-return one at call sites, where
-    /// overload resolution enumerates `lookup_func_type_overloads`.
-    reset_function_overloads(mut &this, name: SymbolStr) -> void {
+    /// The slot family `(owner, leaf)` is stored under: the owner's path and
+    /// the leaf, packed.  The path is read here, off the owner's definition,
+    /// and nowhere a caller stands - a `Def`'s own, a `Type`'s the definition
+    /// it was registered as - so a caller hands over the owner it holds and
+    /// never composes a name.  Two owners never share a path: a module and a
+    /// type cannot carry one name, and a definition's path is its parent's
+    /// and its leaf.  0, which no family is stored under, for a type this
+    /// index never registered: it owns no family here.
+    family_slot(&this, owner: FamilyOwner, leaf: SymbolStr) -> u64 {
+        match (owner) {
+            FamilyOwner::Type(t) => {
+                if (!this.registered_def(t).is_valid()) { return 0; }
+            }
+            _ => { }
+        }
+        return ((this.family_owner_path(owner).id as u64) << 32) | (leaf.id as u64);
+    }
+
+    /// The owner's path: a `Def`'s own, a `Type`'s the definition it was
+    /// registered as; empty for the root and for a type never registered.
+    /// For the slot, and for a diagnostic that spells the family.
+    family_owner_path(&this, owner: FamilyOwner) -> SymbolStr {
+        return match (owner) {
+            FamilyOwner::Def(d)  => { this.defs.path_of(d) }
+            FamilyOwner::Type(t) => { this.defs.path_of(this.registered_def(t)) }
+        };
+    }
+
+    /// Drop every overload position previously registered for the family
+    /// `(owner, leaf)` so the next registration is its sole signature.
+    /// Needed when a declaration's signature is rewritten mid-compile (an
+    /// `async function` becomes a constructor returning its Future struct):
+    /// the stale Output-return overload must not shadow the new struct-return
+    /// one at call sites, where overload resolution enumerates
+    /// `lookup_func_type_overloads`.
+    reset_family(mut &this, owner: FamilyOwner, leaf: SymbolStr) -> void {
+        const slot: u64 = this.family_slot(owner, leaf);
+        if (slot == 0) { return; }
         mut empty: u32[] = [];
-        this.overload_index.insert(name.id, empty);
+        this.overload_index.insert(slot, empty);
     }
 
-    /// The same reset for a METHOD of `owner`, whose overloads hang off the
-    /// combined `<owner key>::<method>` key.  The owner is the type; its key
-    /// is this index's to name, and an owner it holds no key for has no
-    /// overloads registered here to drop.
-    reset_method_overloads(mut &this, owner: TypeRef, method: SymbolStr,
-                           intern: InternTable*) -> void {
-        const owner_key: SymbolStr = this.lookup_type_name(owner);
-        if (!owner_key.is_valid()) { return; }
-        const combined: string = fmt::format("%s::%s", intern.resolve(owner_key),
-                                        intern.resolve(method));
-        this.reset_function_overloads(intern.intern(combined));
-    }
-
-    /// Register one signature of a declaration: the entry under key `name`
-    /// with signature `func_type_ref`, owned by `owner` (its qualified name
-    /// when `name` is not that; else empty), emitted under the linker
-    /// `symbol`, implementing `trait_sym` (empty for anything but a
-    /// trait-impl method).  Registering the same four of key, signature,
-    /// owner and symbol again answers the existing entry; a different
-    /// symbol under the same key and signature is a different definition
-    /// and appends its own.  The id is the declaration's identity for every
-    /// later consumer: the registrar stamps it on the node, and a call pins
-    /// it.
-    register_signature(mut &this, name: SymbolStr, func_type_ref: TypeRef,
-                       owner: SymbolStr, symbol: SymbolStr, trait_sym: DefId,
+    /// Register one signature of a declaration: the entry in the family
+    /// `(owner, leaf)` with signature `func_type_ref`, emitted under the
+    /// linker `symbol`, implementing `trait_sym` (empty for anything but a
+    /// trait-impl method).  `alias_of` is the declaration's qualified name
+    /// when this family is not its own (a specialization's clone, registered
+    /// again under its minted identifier at the root); else empty.
+    /// Registering the same signature, `alias_of` and symbol in one family
+    /// again answers the existing entry; a different symbol under the same
+    /// family and signature is a different definition and appends its own.
+    /// The id is the declaration's identity for every later consumer: the
+    /// registrar stamps it on the node, and a call pins it.
+    register_signature(mut &this, owner: FamilyOwner, leaf: SymbolStr, func_type_ref: TypeRef,
+                       alias_of: SymbolStr, symbol: SymbolStr, trait_sym: DefId,
                        span: SourceSpan) -> OverloadId {
-        this.func_type_refs.insert(name.id, func_type_ref);
-        match (this.overload_index.get_ref(&name.id)) {
+        const slot: u64 = this.family_slot(owner, leaf);
+        if (slot == 0) { return OverloadId::invalid(); }
+        this.func_type_refs.insert(slot, func_type_ref);
+        match (this.overload_index.get_ref(&slot)) {
             Option::Some(positions) => {
                 for (mut k: i64 = 0; k < (*positions).length; k++) {
                     const pos: u32 = (*positions)[k];
                     if (this.overload_func_types[pos as i64].id == func_type_ref.id
-                            && this.overload_func_owner[pos as i64] == owner.id
+                            && this.overload_func_owner[pos as i64] == alias_of.id
                             && this.overload_func_mangled[pos as i64] == symbol.id) {
                         return OverloadId::at_position(pos);
                     }
@@ -354,16 +374,15 @@ type struct DeclarationIndex {
             }
             Option::None => { }
         }
-        const new_pos: u32 = this.overload_func_keys.length as u32;
-        this.overload_func_keys.push(name.id);
+        const new_pos: u32 = this.overload_func_types.length as u32;
         this.overload_func_types.push(func_type_ref);
         this.overload_func_mangled.push(symbol.id);
-        this.overload_func_owner.push(owner.id);
+        this.overload_func_owner.push(alias_of.id);
         this.overload_func_trait.push(trait_sym);
         this.overload_func_span.push(span);
         this.overload_func_intrinsic.push(IntrinsicKind::Call);
-        const slot: u32[]* = this.overload_index.get_or_insert(name.id, []);
-        (*slot).push(new_pos);
+        const positions: u32[]* = this.overload_index.get_or_insert(slot, []);
+        (*positions).push(new_pos);
         return OverloadId::at_position(new_pos);
     }
 
@@ -392,16 +411,11 @@ type struct DeclarationIndex {
         return this.overload_func_types[id.position() as i64];
     }
 
-    /// The key entry `id` is registered under.
-    entry_key(&this, id: OverloadId) -> SymbolStr {
-        if (!id.is_valid()) { return SymbolStr::empty(); }
-        return SymbolStr::from_id(this.overload_func_keys[id.position() as i64]);
-    }
-
-    /// Every entry registered under key `name`, in registration order.
-    lookup_family_entries(&this, name: SymbolStr) -> OverloadId[] {
+    /// Every entry of the family `(owner, leaf)`, in registration order.
+    lookup_family_entries(&this, owner: FamilyOwner, leaf: SymbolStr) -> OverloadId[] {
         mut result: OverloadId[] = [];
-        match (this.overload_index.get_ref(&name.id)) {
+        const slot: u64 = this.family_slot(owner, leaf);
+        match (this.overload_index.get_ref(&slot)) {
             Option::Some(positions) => {
                 for (mut k: i64 = 0; k < (*positions).length; k++) {
                     result.push(OverloadId::at_position((*positions)[k]));
@@ -412,11 +426,14 @@ type struct DeclarationIndex {
         return result;
     }
 
-    /// The one entry under key `name`, when it has exactly one; invalid
-    /// when it has none or several.  For a synthesizer naming a declaration
-    /// it knows to carry one signature.
-    lookup_sole_entry(&this, name: SymbolStr) -> OverloadId {
-        const entries: OverloadId[] = this.lookup_family_entries(name);
+    /// The one entry of the definition `d`'s family - its parent and its
+    /// leaf - when it has exactly one; invalid when it has none or several.
+    /// For a synthesizer naming a declaration it holds the identity of and
+    /// knows to carry one signature.
+    lookup_sole_entry(&this, d: DefId) -> OverloadId {
+        if (!d.is_valid()) { return OverloadId::invalid(); }
+        const entries: OverloadId[] = this.lookup_family_entries(
+            FamilyOwner::Def(this.defs.parent_of(d)), this.defs.leaf_of(d));
         if (entries.length != 1) { return OverloadId::invalid(); }
         return entries[0];
     }
@@ -438,11 +455,11 @@ type struct DeclarationIndex {
         return this.overload_func_intrinsic[id.position() as i64];
     }
 
-    /// How a call pinned to the FAMILY `name` lowers: the kind its entries
-    /// share, when every entry has the same one; `Call` otherwise, and for a
-    /// key with no entries.
-    family_intrinsic_kind(&this, name: SymbolStr) -> IntrinsicKind {
-        const entries: OverloadId[] = this.lookup_family_entries(name);
+    /// How a call pinned to the family `(owner, leaf)` lowers: the kind its
+    /// entries share, when every entry has the same one; `Call` otherwise,
+    /// and for a family with no entries.
+    family_intrinsic_kind(&this, owner: FamilyOwner, leaf: SymbolStr) -> IntrinsicKind {
+        const entries: OverloadId[] = this.lookup_family_entries(owner, leaf);
         if (entries.length == 0) { return IntrinsicKind::Call; }
         const kind: IntrinsicKind = this.entry_intrinsic_kind(entries[0]);
         for (mut k: i64 = 1; k < entries.length; k++) {
@@ -451,11 +468,13 @@ type struct DeclarationIndex {
         return kind;
     }
 
-    /// The signature of every entry under `name`, in registration order
-    /// (`lookup_family_entries` gives the entries themselves).
-    lookup_func_type_overloads(&this, name: SymbolStr) -> TypeRef[] {
+    /// The signature of every entry of the family `(owner, leaf)`, in
+    /// registration order (`lookup_family_entries` gives the entries
+    /// themselves).
+    lookup_func_type_overloads(&this, owner: FamilyOwner, leaf: SymbolStr) -> TypeRef[] {
         mut result: TypeRef[] = [];
-        match (this.overload_index.get_ref(&name.id)) {
+        const slot: u64 = this.family_slot(owner, leaf);
+        match (this.overload_index.get_ref(&slot)) {
             Option::Some(positions) => {
                 mut k: i64 = 0;
                 while (k < (*positions).length) {
@@ -732,7 +751,6 @@ type struct DeclarationIndex {
             compiler::resolver::res::record_unregistered_def(site);
             return;
         }
-        const type_str: string = intern.resolve(type_sym);
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null) { continue; }
@@ -743,11 +761,6 @@ type struct DeclarationIndex {
             // template here would hit an invalid TypeRef and ICE.
             if (method.func.is_self_returning_default) { continue; }
             const func: FunctionDeclNode* = method.func;
-
-            // Build combined key "QualifiedType::method".
-            const method_str: string = intern.resolve(func.name);
-            const combined: string = fmt::format("%s::%s", type_str, method_str);
-            const combined_sym: SymbolStr = intern.intern(combined);
 
             // A signature the name layer refused registers nothing under
             // the key - a call finds the refusal there and stays silent.
@@ -840,7 +853,7 @@ type struct DeclarationIndex {
             // a call sema or mono binds to it, a vtable slot - reads the
             // symbol and signature registration wrote, and mangles nothing.
             func.set_overload_entry(this.register_signature(
-                combined_sym, func_type_ref, SymbolStr::empty(), eff_mangled, func.origin_trait,
+                FamilyOwner::Type(owner), func.name, func_type_ref, SymbolStr::empty(), eff_mangled, func.origin_trait,
                 if (func.has_name_span()) { func.name_span } else { func.span }));
         }
     }
@@ -848,11 +861,12 @@ type struct DeclarationIndex {
 
     // Lookups (called by Sema and future passes)
 
-    /// Look up a function's FunctionType TypeRef (full signature).  A
+    /// The signature last registered in the family `(owner, leaf)`.  A
     /// function's return type is this signature's; there is no second map
-    /// keyed by the same name that could answer differently.
-    lookup_func_type(&this, name: SymbolStr) -> TypeRef {
-        return match (this.func_type_refs.get(&name.id)) {
+    /// keyed by the same family that could answer differently.
+    lookup_func_type(&this, owner: FamilyOwner, leaf: SymbolStr) -> TypeRef {
+        const slot: u64 = this.family_slot(owner, leaf);
+        return match (this.func_type_refs.get(&slot)) {
             Option::Some(val) => { val }
             Option::None      => { TypeRef::invalid() }
         };
@@ -874,12 +888,13 @@ type struct DeclarationIndex {
 
     /// The function type of the definition `d`, or invalid when `d` names
     /// none or the definition has no function type.  The definition's
-    /// canonical name is the map's key, so the id is unwrapped HERE and
-    /// nowhere a reader stands: a reader holding a `DefId` hands it over
-    /// rather than turning it back into a name to key a lookup with.
+    /// family - its parent and its leaf - is the map's slot, so the id is
+    /// unwrapped HERE and nowhere a reader stands: a reader holding a `DefId`
+    /// hands it over rather than turning it back into a name to key a
+    /// lookup with.
     func_type_of_def(&this, d: DefId) -> TypeRef {
         if (!d.is_valid()) { return TypeRef::invalid(); }
-        return this.lookup_func_type(this.defs.path_of(d));
+        return this.lookup_func_type(FamilyOwner::Def(this.defs.parent_of(d)), this.defs.leaf_of(d));
     }
 
     /// The TYPE the stamp `r` names, or invalid when it names no definition
@@ -995,12 +1010,20 @@ type struct DeclarationIndex {
     /// name, a `![symbol]` link name, an intrinsic's bare name) and under
     /// the Cryo mangling of the signature otherwise.  Answers the entry,
     /// which the caller stamps on the node.
-    register_function_signature(mut &this, name: SymbolStr,
+    register_function_signature(mut &this, owner: FamilyOwner, leaf: SymbolStr,
                                 return_type: TypeRef, func_type_ref: TypeRef,
                                 intern: InternTable*, arena: TypeArena*,
                                 symbol: SymbolStr, span: SourceSpan) -> OverloadId {
+        // The qualified name the Cryo mangling encodes: the owner's path and
+        // the leaf, as the definition's own path is composed.
+        const owner_path: SymbolStr = this.family_owner_path(owner);
+        const name: SymbolStr = if (owner_path.is_valid()) {
+            intern.intern(intern.resolve(owner_path) + "::" + intern.resolve(leaf))
+        } else {
+            leaf
+        };
         if (symbol.is_valid()) {
-            return this.register_signature(name, func_type_ref, SymbolStr::empty(), symbol, DefId::invalid(), span);
+            return this.register_signature(owner, leaf, func_type_ref, SymbolStr::empty(), symbol, DefId::invalid(), span);
         }
 
         // Compute the mangled symbol name including the full signature.
@@ -1021,7 +1044,7 @@ type struct DeclarationIndex {
         }
         const mangled: MangledName = MangledName::for_free_function(
             intern, arena, qname, params, return_type, is_variadic);
-        return this.register_signature(name, func_type_ref, SymbolStr::empty(), mangled.value, DefId::invalid(), span);
+        return this.register_signature(owner, leaf, func_type_ref, SymbolStr::empty(), mangled.value, DefId::invalid(), span);
     }
 
 

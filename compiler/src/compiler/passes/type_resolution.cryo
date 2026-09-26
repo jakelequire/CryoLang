@@ -37,7 +37,7 @@ import compiler::types::{
 };
 import compiler::resolver::{ intern_table, symbol_str, resolver };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, OverloadId, Res, ResBase, ResSlot };
+import compiler::resolver::res::{ DefId, FamilyOwner, OverloadId, Res, ResBase, ResSlot };
 import std::core::mem;
 import utils::logger;
 import utils::logger::{ cdebug, LOG_DEBUG, LogComponent };
@@ -1024,11 +1024,13 @@ type struct TypeResolutionPasses {
                     const func_type_ref: TypeRef = arena.get_function(
                         func.resolved_return_type, param_types, func.is_variadic);
 
-                    // Under the declaration's own key, in the per-module list
-                    // so cross-module descriptors carry it whole.
+                    // In the declaration's own family - its module and its
+                    // leaf - so cross-module descriptors carry it whole.
                     const q_name: SymbolStr = ctx.decl_fn_key(func.name, func.span.file);
+                    mut leaf: SymbolStr = SymbolStr::empty();
+                    const owner: FamilyOwner = ctx.decl_fn_family(func.name, func.span.file, &leaf);
                     const entry: OverloadId = ctx.decl_index.register_function_signature(
-                        q_name, func.resolved_return_type, func_type_ref, ctx.intern_table, arena,
+                        owner, leaf, func.resolved_return_type, func_type_ref, ctx.intern_table, arena,
                         SymbolStr::empty(), if (func.has_name_span()) { func.name_span } else { func.span });
                     func.set_overload_entry(entry);
                     // Whether this IS a function generated code calls - the
@@ -1052,7 +1054,8 @@ type struct TypeResolutionPasses {
                     // index refuses non-intrinsic overwrites of them.
                     if (!is_source_decl && !q_name.equals(func.name)) {
                         ctx.decl_index.register_signature(
-                            func.name, func_type_ref, q_name, ctx.decl_index.entry_symbol(entry), DefId::invalid(),
+                            FamilyOwner::Def(DefId::invalid()), func.name, func_type_ref, q_name,
+                            ctx.decl_index.entry_symbol(entry), DefId::invalid(),
                             ctx.decl_index.entry_span(entry));
                     }
                 }
@@ -2461,6 +2464,12 @@ type struct TypeResolutionPasses {
                             } else {
                                 ctx.decl_fn_key(fn_node.name, fn_node.span.file)
                             };
+                            mut ext_leaf: SymbolStr = fn_node.name;
+                            const ext_owner: FamilyOwner = if (node.is_c_import()) {
+                                ctx.module_family(node.binding_namespace)
+                            } else {
+                                ctx.decl_fn_family(fn_node.name, fn_node.span.file, &ext_leaf)
+                            };
                             // Two extern blocks declaring one C name with
                             // DIFFERENT Cryo signatures is an ABI hazard the
                             // program carries whichever one a call names - at
@@ -2488,7 +2497,7 @@ type struct TypeResolutionPasses {
                             // pinned declaration through the entry registered
                             // under it, an extern's as any other function's.
                             fn_node.set_overload_entry(ctx.decl_index.register_function_signature(
-                                ext_q_name, fn_node.resolved_return_type, func_type_ref,
+                                ext_owner, ext_leaf, fn_node.resolved_return_type, func_type_ref,
                                 ctx.intern_table, arena, ext_link_sym,
                                 if (fn_node.has_name_span()) { fn_node.name_span } else { fn_node.span }));
                             ctx.decl_index.note_extern_symbol(ext_link_sym, ext_q_name, func_type_ref);
@@ -2539,13 +2548,14 @@ type struct TypeResolutionPasses {
                         const i_func_type_ref: TypeRef = arena.get_function(
                             node.resolved_return_type, i_param_types, node.is_variadic);
 
-                        // Register under the qualified name so cross-module
+                        // Register in its module's family so cross-module
                         // externs pick up intrinsics.
-                        const q_name: SymbolStr = ctx.decl_fn_key(node.name, node.span.file);
+                        mut i_leaf: SymbolStr = SymbolStr::empty();
+                        const i_owner: FamilyOwner = ctx.decl_fn_family(node.name, node.span.file, &i_leaf);
                         // Intrinsics use C linkage; their LLVM symbol is the
                         // bare function name, not the qualified/mangled form.
                         const i_entry: OverloadId = ctx.decl_index.register_function_signature(
-                            q_name, node.resolved_return_type, i_func_type_ref, ctx.intern_table, arena,
+                            i_owner, i_leaf, node.resolved_return_type, i_func_type_ref, ctx.intern_table, arena,
                             node.name, node.span);
 
                         // The ENTRY carries the intrinsic's kind, read from

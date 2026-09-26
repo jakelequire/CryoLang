@@ -21,7 +21,7 @@ import compiler::mono::monomorphizer;
 import compiler::mono::monomorphizer::{ Monomorphizer };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, resolver };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, DefTable, DefKind };
+import compiler::resolver::res::{ DefId, DefTable, DefKind, FamilyOwner };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import utils::logger;
@@ -644,16 +644,58 @@ public:
     /// and every reference it builds copies the id.
     register_in_module(mut &this, ns: SymbolStr, leaf: SymbolStr, kind: DefKind,
                        span: SourceSpan) -> DefId {
-        const parent: DefId = if (ns.is_valid()) {
-            this.module_graph.module_def(ModulePath::of(ns))
-        } else {
-            DefId::invalid()
-        };
-        return this.defs.register(parent, leaf, kind, span);
+        return this.defs.register(this.module_def_of(ns), leaf, kind, span);
+    }
+
+    /// The definition of the module the namespace `ns` names; invalid for
+    /// no namespace, and for one the module graph holds no module under.
+    module_def_of(&this, ns: SymbolStr) -> DefId {
+        if (!ns.is_valid() || this.module_graph == null) { return DefId::invalid(); }
+        return this.module_graph.module_def(ModulePath::of(ns));
     }
 
     decl_fn_key(mut &this, name: SymbolStr, span_file: string) -> SymbolStr {
         return this.qualify_symbol_sym_home(name, span_file);
+    }
+
+    /// The overload family a FUNCTION DECLARATION is registered in: the
+    /// module `decl_fn_key` qualifies it under, and its leaf, written to
+    /// `*out_leaf`.  A name minted already qualified - a synthesized
+    /// declaration placed by name - names its own module and last segment.
+    decl_fn_family(mut &this, name: SymbolStr, span_file: string,
+                   out_leaf: SymbolStr*) -> FamilyOwner {
+        const text: string = this.intern_table.resolve(name);
+        if (QualifiedName::segment_count(text) > 1) {
+            const qn: QualifiedName = QualifiedName::parse(this.intern_table, text);
+            *out_leaf = qn.leaf();
+            return this.module_family(this.intern_table.intern(qn.display_parent(this.intern_table)));
+        }
+        *out_leaf = name;
+        const home: SymbolStr = this.module_ns_sym_of_file(span_file);
+        if (home.is_valid()) { return this.module_family(home); }
+        return this.module_family(this.namespace_str);
+    }
+
+    /// The family a name the compiler MINTED stands for, as the minting
+    /// wrote it: a bare identifier - a function specialization's, which is
+    /// program-unique - is the root's; a qualified one - a type
+    /// specialization placed in its template's module - names that module
+    /// and its last segment.  Its leaf is written to `*out_leaf`.
+    minted_family(mut &this, name: SymbolStr, out_leaf: SymbolStr*) -> FamilyOwner {
+        const text: string = this.intern_table.resolve(name);
+        if (QualifiedName::segment_count(text) > 1) {
+            const qn: QualifiedName = QualifiedName::parse(this.intern_table, text);
+            *out_leaf = qn.leaf();
+            return this.module_family(this.intern_table.intern(qn.display_parent(this.intern_table)));
+        }
+        *out_leaf = name;
+        return FamilyOwner::Def(DefId::invalid());
+    }
+
+    /// The family owner the module namespace `ns` names: the module's
+    /// definition, and the root for no namespace.
+    module_family(&this, ns: SymbolStr) -> FamilyOwner {
+        return FamilyOwner::Def(this.module_def_of(ns));
     }
 
     /// The `(key, namespace)` a GLOBAL is registered under in the declaration
