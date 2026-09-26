@@ -52,10 +52,11 @@ So:
 
 - **`make check-fast`** before committing. Lane surface, §0, pin integrity;
   no compiler, no stdlib, no link. It takes about 3.5 minutes on a Windows
-  host (197 s measured): §0's ~400 rows run one shell each, in WSL's bash
-  there, and the rows that parse `compiler/src` share one parse per run
-  (§8.354). A short gate everybody runs beats a twenty-minute one nobody
-  does.
+  host (197 s measured): the ledger's ~400 status rows run one shell each -
+  WSL's bash there, since Windows resolves a bare `bash` to it before Git
+  Bash - and the rows that parse `compiler/src` share one parse per run
+  (`scripts/parse_cache.py`). A short gate everybody runs beats a
+  twenty-minute one nobody does.
 - **`make install-hooks`**, once per checkout. `.git/hooks` is per-checkout and
   a fresh clone inherits nothing, the same trap `.claude/settings.json` carries.
   It installs a `commit-msg` hook that refuses three things: a ledger file
@@ -98,9 +99,12 @@ not done. The remaining limits are here so nobody rediscovers them:
   code among them) are not replayed: the same source reads 346 warnings
   clean and 337 after a comment is added to a leaf file. Take a warning
   total only after `rm -rf compiler/build`, and compare two builds' warnings
-  as SETS (code, file, line), never as totals. It is filed, not fixed
-  (ledger D40; mechanism in §8.355). It was diagnosed once already and lost,
-  because it lived only in an entry's prose.
+  as SETS (code, file, line), never as totals. The skip is
+  `if (pm_active && pm_cached[...]) { continue; }` in
+  `compiler/src/compiler/instance.cryo`; the fix is to store each reused
+  module's warnings beside its object and replay them, and it is not done.
+  This was diagnosed once already and lost, because it lived only in a
+  ledger entry's prose.
 - **`make test` passes on an exit code.** A suite that ran nothing prints no
   header, no summary and no explanation, and exits 0 with `OVERALL PASS`.
   Use `make test-census` wherever the run is being taken as evidence; it
