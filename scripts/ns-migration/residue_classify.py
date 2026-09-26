@@ -185,10 +185,6 @@ CLASS_OF_METHOD = {
         ("N", "keyed by the impl node; the string is the diagnostic label of the asking site"),
     "DeclarationIndex::global_entry_in_module":
         ("J", "member: a global's leaf inside the module the qualifier's stamp names (a `DefId`)"),
-    "DeclarationIndex::signature_refused_in_module":
-        ("J", "member: a function's leaf inside the module the qualifier's stamp names (a `DefId`)"),
-    "DeclarationIndex::signature_refused":
-        ("C", "`Owner::member` composed from the owner key and the written member"),
     "DeclarationIndex::lookup_family_entries":
         ("C", "a FAMILY by its key string - the overload set under one qualified name; pin-as-declaration retires the family door"),
     "DeclarationIndex::lookup_func_type_overloads":
@@ -199,6 +195,8 @@ CLASS_OF_METHOD = {
         ("S", "a type by a canonical name derived from a stamp"),
     "DeclarationIndex::lookup_method_return":
         ("J", "member: a method's return by its leaf off the owner `TypeRef` in hand; the store is keyed by the owner's arena id"),
+    "DeclarationIndex::method_signature_refused":
+        ("J", "member: whether a method's written signature was refused, by its leaf off the owner `TypeRef` in hand; keyed as `lookup_method_return` is"),
     "DeclarationIndex::lookup_sole_entry":
         ("J", "lang: the test runner's entry points `set_args` / `set_env` / `run_all`, by the identity each declaration claimed (`wellknown(LangItem::...)`)"),
     "DeclarationIndex::is_prelude_ns":

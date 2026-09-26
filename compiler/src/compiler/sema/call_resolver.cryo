@@ -2690,7 +2690,7 @@ type struct CallResolver {
         }
         // Bound to a declaration whose signature was refused where it was
         // written: it has no signature to type the call by, and it exists.
-        if (this.ctx.decl_index.signature_refused_of_def(stamped_r.def_id())) { return TypeRef::invalid(); }
+        if (this.ctx.defs.signature_refused(stamped_r.def_id())) { return TypeRef::invalid(); }
         const name: string = this.intern.resolve(ident.name);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0202_UNDEFINED_FUNCTION,
@@ -3328,8 +3328,8 @@ type struct CallResolver {
 
         // The method is declared and its signature was refused where it was
         // written; it registered none, and the call reports nothing more.
-        if (type_sym.is_valid() && this.ctx.decl_index.signature_refused(this.intern.intern(
-                fmt::format("%s::%s", this.intern.resolve(type_sym), method_name)))) {
+        if (this.ctx.decl_index.method_signature_refused(
+                this.types.method_owner_ref(lookup_ref), member.member)) {
             return TypeRef::invalid();
         }
 
@@ -3621,19 +3621,16 @@ type struct CallResolver {
     }
 
     /// Whether the declaration a `Scope::member` call names has a signature
-    /// the name layer refused: a module's function under its canonical name
-    /// (`names_module`), else the owner's method under `Owner::member`, the
-    /// owner by the key its methods registered under.
+    /// the name layer refused: a module's function, the definition the name
+    /// layer bound for the member (`names_module`), else the owner's method,
+    /// by the owner type its methods registered on and the written leaf.
     scope_callee_signature_refused(mut &this, scope: ScopeResolutionNode*, names_module: boolean) -> boolean {
         if (names_module) {
-            return this.ctx.decl_index.signature_refused_in_module(scope.member_name,
-                scope.require_scope_res("scope-call refused signature").def_id(), this.intern);
+            return this.ctx.defs.signature_refused(scope.member_def);
         }
-        const owner_key: SymbolStr = this.scope_owner_key(scope);
-        if (!owner_key.is_valid()) { return false; }
-        const combined: SymbolStr = this.intern.intern(fmt::format("%s::%s",
-            this.intern.resolve(owner_key), this.intern.resolve(scope.member_name)));
-        return this.ctx.decl_index.signature_refused(combined);
+        mut owner_t: TypeRef = scope.spec_owner;
+        if (!owner_t.is_valid()) { owner_t = this.types.scope_qualifier_type(scope); }
+        return this.ctx.decl_index.method_signature_refused(owner_t, scope.member_name);
     }
 
     /// True when `owner` - the type that won resolution, or a written

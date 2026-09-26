@@ -233,7 +233,11 @@ type struct DeclarationIndex {
     /// reported where the type was written, and "cannot find function" or
     /// "takes 0 arguments" against a declaration that exists is a second
     /// report of the first, stated as something false.
-    refused_signatures:  HashMap<u32, boolean>;
+    // A method whose written signature the name layer refused, by its
+    // owner and leaf as `method_returns` is keyed: it registers no signature,
+    // and a call to it reports nothing more.  A free function's refusal is
+    // recorded on its definition (`DefTable::signature_refused`).
+    refused_methods:     HashMap<u64, boolean>;
 
 
     static new() -> DeclarationIndex {
@@ -263,7 +267,7 @@ type struct DeclarationIndex {
             extern_symbol_first: HashMap::<u32, Pair<u32, u64>>::new(),
             module_imports:     HashMap::<u32, u32[]>::new(),
             prelude_ns:         [],
-            refused_signatures: HashMap::<u32, boolean>::new(),
+            refused_methods:    HashMap::<u64, boolean>::new(),
         };
     }
 
@@ -748,7 +752,7 @@ type struct DeclarationIndex {
             // A signature the name layer refused registers nothing under
             // the key - a call finds the refusal there and stays silent.
             if (DeclarationIndex::signature_is_refused(func)) {
-                this.mark_signature_refused(combined_sym);
+                this.mark_method_signature_refused(owner, func.name);
                 continue;
             }
 
@@ -1071,35 +1075,16 @@ type struct DeclarationIndex {
         this.defs.record_visibility(def, is_public);
     }
 
-    /// Record that the declaration `key` would register under has a
-    /// signature the name layer refused, and so registers none.
-    mark_signature_refused(mut &this, key: SymbolStr) -> void {
-        this.refused_signatures.insert(key.id, true);
+    /// Record that the method `method` of `owner` has a refused signature.
+    mark_method_signature_refused(mut &this, owner: TypeRef, method: SymbolStr) -> void {
+        if (!owner.is_valid()) { return; }
+        this.refused_methods.insert(DeclarationIndex::pack_method_key(owner, method), true);
     }
 
-    /// Whether `key` names a declaration whose signature was refused where
-    /// it was written - the reason a call to it finds no signature, and the
-    /// reason that call reports nothing.
-    signature_refused(&this, key: SymbolStr) -> boolean {
-        return this.refused_signatures.contains_key(&key.id);
-    }
-
-    /// `signature_refused` for a stamp: the definition's canonical name is
-    /// the key its registration would have used.
-    signature_refused_of_def(&this, d: DefId) -> boolean {
-        if (!d.is_valid()) { return false; }
-        return this.signature_refused(this.defs.path_of(d));
-    }
-
-    /// `signature_refused` for a module's function named through the
-    /// module, `Mod::f(..)`: the module is the stamp the qualifier carries
-    /// and the member is written, and the function's key is the two joined
-    /// - composed here, as `global_entry_in_module` composes a global's.
-    signature_refused_in_module(&this, member: SymbolStr, module_id: DefId,
-                                intern: InternTable*) -> boolean {
-        if (!module_id.is_valid()) { return false; }
-        return this.signature_refused(intern.intern(fmt::format("%s::%s",
-            intern.resolve(this.defs.path_of(module_id)), intern.resolve(member))));
+    /// Whether the method `method` of `owner` had its signature refused.
+    method_signature_refused(&this, owner: TypeRef, method: SymbolStr) -> boolean {
+        if (!owner.is_valid()) { return false; }
+        return this.refused_methods.contains_key(&DeclarationIndex::pack_method_key(owner, method));
     }
 
     /// Whether `func`'s written signature carries a name the name layer

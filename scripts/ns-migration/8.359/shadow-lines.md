@@ -1,0 +1,12 @@
+tests/tests/projects/namespace_gate/	SHADOW	REFUSED	module	1	1
+tests/tests/projects/namespace_gate/	SHADOW	REFUSED	static	1	1
+tests/tests/negative/E0203_refused_signature_no_cascade.cryo	SHADOW	REFUSED	def	1	1
+tests/tests/negative/E0203_refused_signature_no_cascade.cryo	SHADOW	REFUSED	def	1	1
+tests/tests/negative/E0203_refused_signature_no_cascade.cryo	SHADOW	REFUSED	module	1	1
+tests/tests/negative/E0203_refused_signature_no_cascade.cryo	SHADOW	REFUSED	static	1	1
+tests/tests/negative/E0203_refused_signature_no_cascade.cryo	SHADOW	REFUSED	method	1	1
+tests/tests/negative/E0203_refused_signature_no_cascade.cryo	SHADOW	REFUSED	method	1	1
+tests/tests/negative/E0203_refused_signature_no_cascade.cryo	SHADOW	REFUSED	def	1	1
+tests/tests/negative/E0203_refused_signature_no_cascade.cryo	SHADOW	REFUSED	def	1	1
+tests/tests/negative/E0203_refused_signature_no_cascade.cryo	SHADOW	REFUSED	module	1	1
+tests/tests/negative/E0203_refused_signature_no_cascade.cryo	SHADOW	REFUSED	static	1	1

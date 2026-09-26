@@ -1,0 +1,168 @@
+diff --git a/compiler/src/compiler/decl_index.cryo b/compiler/src/compiler/decl_index.cryo
+index c2053e16..4b60cc82 100644
+--- a/compiler/src/compiler/decl_index.cryo
++++ b/compiler/src/compiler/decl_index.cryo
+@@ -234,6 +234,7 @@ type struct DeclarationIndex {
+     /// "takes 0 arguments" against a declaration that exists is a second
+     /// report of the first, stated as something false.
+     refused_signatures:  HashMap<u32, boolean>;
++    refused_methods:     HashMap<u64, boolean>;
+ 
+ 
+     static new() -> DeclarationIndex {
+@@ -264,6 +265,7 @@ type struct DeclarationIndex {
+             module_imports:     HashMap::<u32, u32[]>::new(),
+             prelude_ns:         [],
+             refused_signatures: HashMap::<u32, boolean>::new(),
++            refused_methods:    HashMap::<u64, boolean>::new(),
+         };
+     }
+ 
+@@ -749,6 +751,7 @@ type struct DeclarationIndex {
+             // the key - a call finds the refusal there and stays silent.
+             if (DeclarationIndex::signature_is_refused(func)) {
+                 this.mark_signature_refused(combined_sym);
++                this.mark_method_signature_refused(owner, func.name);
+                 continue;
+             }
+ 
+@@ -1088,7 +1091,31 @@ type struct DeclarationIndex {
+     /// the key its registration would have used.
+     signature_refused_of_def(&this, d: DefId) -> boolean {
+         if (!d.is_valid()) { return false; }
+-        return this.signature_refused(this.defs.path_of(d));
++        const old_r: boolean = this.signature_refused(this.defs.path_of(d));
++        DeclarationIndex::shadow_refused("def", old_r, this.defs.signature_refused(d));
++        return old_r;
++    }
++
++    /// Record that the method `method` of `owner` has a refused signature.
++    mark_method_signature_refused(mut &this, owner: TypeRef, method: SymbolStr) -> void {
++        if (!owner.is_valid()) { return; }
++        this.refused_methods.insert(DeclarationIndex::pack_method_key(owner, method), true);
++    }
++
++    /// Whether the method `method` of `owner` had its signature refused.
++    method_signature_refused(&this, owner: TypeRef, method: SymbolStr) -> boolean {
++        if (!owner.is_valid()) { return false; }
++        return this.refused_methods.contains_key(&DeclarationIndex::pack_method_key(owner, method));
++    }
++
++    /// PROBE-S53: the two answers, printed when either is true or they differ.
++    static shadow_refused(site: string, old_r: boolean, new_r: boolean) -> void {
++        if (!old_r && !new_r) { return; }
++        mut o: string = "0";
++        if (old_r) { o = "1"; }
++        mut n: string = "0";
++        if (new_r) { n = "1"; }
++        fmt::eprintln("SHADOW\tREFUSED\t" + site + "\t" + o + "\t" + n);
+     }
+ 
+     /// `signature_refused` for a module's function named through the
+diff --git a/compiler/src/compiler/passes/type_resolution.cryo b/compiler/src/compiler/passes/type_resolution.cryo
+index 7aa55112..51063ee7 100644
+--- a/compiler/src/compiler/passes/type_resolution.cryo
++++ b/compiler/src/compiler/passes/type_resolution.cryo
+@@ -1011,6 +1011,7 @@ type struct TypeResolutionPasses {
+                 if (decl_index::DeclarationIndex::signature_is_refused(func)) {
+                     ctx.decl_index.mark_signature_refused(
+                         ctx.decl_fn_key(func.name, func.span.file));
++                    ctx.defs.record_signature_refused(func.def);
+                 } else if (func.resolved_return_type.is_valid()) {
+                     // Collect resolved param types from AST
+                     mut param_types: TypeRef[] = [];
+diff --git a/compiler/src/compiler/resolver/res.cryo b/compiler/src/compiler/resolver/res.cryo
+index ce20db1d..24e2b8d2 100644
+--- a/compiler/src/compiler/resolver/res.cryo
++++ b/compiler/src/compiler/resolver/res.cryo
+@@ -157,6 +157,7 @@ private:
+     paths:   SymbolStr[];
+     spans:   SourceSpan[];
+     visibility: DeclVisibility[];
++    refused:    boolean[];
+ 
+ public:
+     static new(intern: InternTable*) -> DefTable {
+@@ -168,6 +169,7 @@ public:
+             paths:   [],
+             spans:   [],
+             visibility: [],
++            refused:    [],
+         };
+     }
+ 
+@@ -190,6 +192,7 @@ public:
+         this.paths.push(path);
+         this.spans.push(span);
+         this.visibility.push(DeclVisibility::Unrecorded);
++        this.refused.push(false);
+         return DefId { index: at };
+     }
+ 
+@@ -240,6 +243,19 @@ public:
+         };
+     }
+ 
++    /// Record that `d`'s written signature carries a name the name layer
++    /// refused, so its registration registers no signature for it.
++    record_signature_refused(mut &this, d: DefId) -> void {
++        if (!d.is_valid()) { return; }
++        this.refused[d.index as i64] = true;
++    }
++
++    /// Whether `d`'s signature was refused where it was written.
++    signature_refused(&this, d: DefId) -> boolean {
++        if (!d.is_valid()) { return false; }
++        return this.refused[d.index as i64];
++    }
++
+     /// `d`'s visibility as its registration recorded it.
+     visibility_of(&this, d: DefId) -> DeclVisibility {
+         if (!d.is_valid()) { return DeclVisibility::Unrecorded; }
+diff --git a/compiler/src/compiler/sema/call_resolver.cryo b/compiler/src/compiler/sema/call_resolver.cryo
+index aebe82fb..c17897af 100644
+--- a/compiler/src/compiler/sema/call_resolver.cryo
++++ b/compiler/src/compiler/sema/call_resolver.cryo
+@@ -3328,8 +3328,11 @@ type struct CallResolver {
+ 
+         // The method is declared and its signature was refused where it was
+         // written; it registered none, and the call reports nothing more.
+-        if (type_sym.is_valid() && this.ctx.decl_index.signature_refused(this.intern.intern(
+-                fmt::format("%s::%s", this.intern.resolve(type_sym), method_name)))) {
++        const old_mr: boolean = type_sym.is_valid() && this.ctx.decl_index.signature_refused(this.intern.intern(
++                fmt::format("%s::%s", this.intern.resolve(type_sym), method_name)));
++        DeclarationIndex::shadow_refused("method", old_mr,
++            this.ctx.decl_index.method_signature_refused(this.types.method_owner_ref(lookup_ref), member.member));
++        if (old_mr) {
+             return TypeRef::invalid();
+         }
+ 
+@@ -3626,14 +3629,25 @@ type struct CallResolver {
+     /// owner by the key its methods registered under.
+     scope_callee_signature_refused(mut &this, scope: ScopeResolutionNode*, names_module: boolean) -> boolean {
+         if (names_module) {
+-            return this.ctx.decl_index.signature_refused_in_module(scope.member_name,
++            const old_m: boolean = this.ctx.decl_index.signature_refused_in_module(scope.member_name,
+                 scope.require_scope_res("scope-call refused signature").def_id(), this.intern);
++            DeclarationIndex::shadow_refused("module", old_m,
++                this.ctx.defs.signature_refused(scope.member_def));
++            return old_m;
+         }
++        mut owner_t: TypeRef = scope.spec_owner;
++        if (!owner_t.is_valid()) { owner_t = this.types.scope_qualifier_type(scope); }
++        const new_s: boolean = this.ctx.decl_index.method_signature_refused(owner_t, scope.member_name);
+         const owner_key: SymbolStr = this.scope_owner_key(scope);
+-        if (!owner_key.is_valid()) { return false; }
++        if (!owner_key.is_valid()) {
++            DeclarationIndex::shadow_refused("static-nokey", false, new_s);
++            return false;
++        }
+         const combined: SymbolStr = this.intern.intern(fmt::format("%s::%s",
+             this.intern.resolve(owner_key), this.intern.resolve(scope.member_name)));
+-        return this.ctx.decl_index.signature_refused(combined);
++        const old_s: boolean = this.ctx.decl_index.signature_refused(combined);
++        DeclarationIndex::shadow_refused("static", old_s, new_s);
++        return old_s;
+     }
+ 
+     /// True when `owner` - the type that won resolution, or a written
