@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe facts facts-fresh selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe facts facts-check facts-selftest selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -190,11 +190,12 @@ help:
 	@echo "  make lane-selftest     Drive lane-gate.py through a throwaway tree, every rule both ways"
 	@echo "  make residue-selftest  Drive residue.py --check through a throwaway tree and list, both ways"
 	@echo "  make ns-status-check   Run every check docs/name-resolution.md §0 carries"
-	@echo "  make check-fast        the facts when stale + lane-check + the self-tests + ns-status-check + verify-pin (~1 min when fresh)"
+	@echo "  make check-fast        refuse stale facts + lane-check + the self-tests + ns-status-check + verify-pin (~1 min; builds nothing)"
 	@echo "  make install-hooks     Point git at the tracked hooks (run once per checkout)"
 	@echo "  make lsp-check         Compile tools/CryoLSP against current source"
-	@echo "  make facts             The compiler's --emit=facts report for compiler, stdlib, editor (.facts/)"
 	@echo "                         (installs nothing; the only gate that builds it)"
+	@echo "  make facts             The compiler's --emit=facts report for compiler, stdlib, editor (.facts/);"
+	@echo "                         the only way they are refreshed - every gate reading them refuses stale ones"
 	@echo "  make vendor-check      Check every constant shape survives cryo vendor"
 	@echo "  make api-index         Regenerate docs/stdlib-api.txt (the stdlib API index)"
 	@echo "  make api-index-check   Fail if docs/stdlib-api.txt is stale"
@@ -589,11 +590,12 @@ endif
 # 5).  Privatization cannot stop a NEW public wrapper and deletion cannot
 # stop a reintroduced helper; only a ratchet catches growth.
 #
-# Counts the calls the compiler reports (`.facts/compiler.facts`), so the
-# facts are refreshed first when stale: a compiler build and about 80 s, and
-# nothing when they are fresh.  The stores and tables it places are still read
-# from the source's declarations.
-lane-check: facts-fresh
+# Counts the calls the compiler reports (`.facts/compiler.facts`), and REFUSES
+# when they are missing or stale rather than regenerating them: refreshing is
+# a compiler build and about 80 s, a deliberate `make facts`, never a cost a
+# gate pays silently.  The stores and tables it places are still read from
+# the source's declarations.
+lane-check: facts-check
 	@$(PYTHON) scripts/lane-gate.py $(ARGS)
 
 # The gate's own test: every rule driven through a throwaway source tree,
@@ -659,14 +661,15 @@ guard-selftest:
 	@$(PYTHON) scripts/ns-guard-selftest.py
 
 # ---- the pre-commit sweep ----------------------------------------------
-# Every gate here is source- or document-derived except one input: §0's
-# residue rows count from the compiler's own facts, so `facts-fresh` first
-# builds the compiler and writes them when they are missing or stale (about
-# 80 s on top of a build), and does nothing when they are fresh.  With fresh
-# facts the whole sweep runs in about a minute.  A one-minute gate everybody
-# runs is worth more than a twenty-minute one nobody does.
-check-fast: facts-fresh lane-check lane-selftest residue-selftest verify-selftest approved-check ns-status-check verify-pin
-	@echo "check-fast: OK (lane surface and its self-test, the residue check's self-test, verify's declared-program self-test, the approved names' checks and their self-test, section 0, pin integrity)"
+# Every gate here is source- or document-derived except one input: the lane
+# gate and §0's residue rows count from the compiler's own facts, so
+# `facts-check` refuses first when they are missing or stale, naming `make
+# facts` - which builds the compiler and writes them, about 80 s on top of a
+# build.  This target builds nothing, and runs in about a minute.  A
+# one-minute gate everybody runs is worth more than a twenty-minute one
+# nobody does.
+check-fast: facts-check lane-check lane-selftest facts-selftest residue-selftest verify-selftest approved-check ns-status-check verify-pin
+	@echo "check-fast: OK (fresh facts, lane surface and its self-test, the facts check's self-test, the residue check's self-test, verify's declared-program self-test, the approved names' checks and their self-test, section 0, pin integrity)"
 
 # ---- git hooks ---------------------------------------------------------
 # Point git at the tracked hook directory.  Hooks live in scripts/git-hooks so
@@ -715,22 +718,23 @@ endif
 # `cryo build --emit=facts` over the compiler, the stdlib and the editor,
 # with the compiler under test, into `.facts/`: one line per argument a call
 # passes to a parameter taking a name as text, as the body check resolved
-# it.  `scripts/facts.py --check` refuses a missing or stale file.
+# it.  Generating is the only way the facts are refreshed.
 #
-# `facts-fresh` regenerates only when a facts file is missing or was written
-# from other sources; `check-fast` runs it first, because §0's residue rows
-# count from `.facts/compiler.facts` and refuse a stale one.
+# `facts-check` refuses a facts file that is missing or was written from
+# other sources, and builds nothing; `lane-check` and `check-fast` run it
+# first.  `facts-selftest` drives it both ways, and dry-runs those two
+# targets to show neither regenerates.
 ifeq ($(HOST_OS),windows)
 facts: $(STAGE2_EXE) $(LIBCRYO_A)
 	@$(PYTHON) scripts/facts.py --cryo "$(STAGE2_EXE)" $(ARGS)
-facts-fresh: $(STAGE2_EXE) $(LIBCRYO_A)
-	@$(PYTHON) scripts/facts.py --cryo "$(STAGE2_EXE)" --if-stale
 else
 facts: $(STAGE2) $(LIBCRYO_A)
 	@$(PYTHON) scripts/facts.py --cryo "$(STAGE2)" $(ARGS)
-facts-fresh: $(STAGE2) $(LIBCRYO_A)
-	@$(PYTHON) scripts/facts.py --cryo "$(STAGE2)" --if-stale
 endif
+facts-check:
+	@$(PYTHON) scripts/facts.py --check
+facts-selftest:
+	@$(PYTHON) scripts/facts-selftest.py
 
 # ---- the other OS's config-gated half ----------------------------------
 # Config gating prunes `![config(linux)]` from a Windows build before name

@@ -18,8 +18,10 @@ Beside each goes `<name>.inputs`: a hash over every source file the facts
 could depend on (the compiler's, the stdlib's and the editor's `.cryo` files
 and project configs).  `--check` recomputes it and refuses a missing or
 stale file, so a gate reading `.facts/` cannot count from facts that
-describe some other tree.  The hash does not cover the compiler binary: the
-make target builds it from the same sources first.
+describe some other tree.  A gate refuses; it never regenerates - that is a
+compiler build and minutes, done deliberately with `make facts`.  The hash
+does not cover the compiler binary: the make target builds it from the same
+sources first.
 
 A build is refused unless it states the population it compiled ("Building
 <name> [..]: N local, M std ...") and writes a non-empty facts file: an
@@ -140,17 +142,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cryo", help="the compiler under test")
     ap.add_argument("--check", action="store_true", help="refuse a missing or stale facts file")
-    ap.add_argument("--if-stale", action="store_true",
-                    help="generate only when a facts file is missing or stale")
     ap.add_argument("names", nargs="*", help="compiler, stdlib, lsp (default: all three)")
     args = ap.parse_args()
     if args.check:
         return check(args.names)
     if not args.cryo:
         ap.error("--cryo is required to generate")
-    if args.if_stale and check(args.names, quiet=True) == 0:
-        print("facts: fresh -- not regenerated")
-        return 0
     return generate(args.cryo, args.names)
 
 

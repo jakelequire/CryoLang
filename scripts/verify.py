@@ -563,6 +563,16 @@ def main():
     if args.baseline and not set(POPULATION_GATES) <= set(names):
         print("verify: FAIL -- a baseline comparison needs the census and examples runs")
         return 1
+    # check-fast refuses stale facts and never regenerates them, so a run
+    # whose facts are stale is refused here, before the other gates spend
+    # minutes on a verdict that cannot come out green.
+    if "fast" in names:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import facts as facts_mod
+        if facts_mod.check([], quiet=True) != 0:
+            print("verify: FAIL -- the compiler's facts are stale; `make facts` first "
+                  "(check-fast refuses them), or leave out the fast gate with --only")
+            return 1
 
     # Objects embed stdlib source paths exactly as the stdlib root was spelled
     # (panic locations), so the same source compiles to different bytes under
