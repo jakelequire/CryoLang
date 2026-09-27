@@ -65,7 +65,7 @@ type struct Resolver {
 
 
     // Current context
-    current_module:     SymbolStr;
+    current_module:     ModulePath;
 
     /// The namespaces a file can name WITHOUT importing them.
     ///
@@ -118,7 +118,7 @@ type struct Resolver {
         const global_id: ScopeID = ScopeID::new(1);
         const global: Scope = Scope::new(
             global_id, ScopeKind::Global, ScopeID::invalid(),
-            "", "<global>", SourceSpan::none()
+            "<global>", SourceSpan::none()
         );
 
         return Resolver {
@@ -133,7 +133,7 @@ type struct Resolver {
             current_scope:        global_id,
             resolution_map:       ResolutionMap::new(),
             exports:              [],
-            current_module:       SymbolStr::empty(),
+            current_module:       ModulePath::none(),
             prelude_modules:      [],
             module_scopes:        HashMap::<u32, u64>::new(),
             param_bounds:         [],
@@ -165,12 +165,12 @@ type struct Resolver {
     // Scope management
 
     /// Allocate and register a new scope as a child of the given parent.
-    create_scope(mut &this, kind: ScopeKind, parent: ScopeID, module_name: string,
+    create_scope(mut &this, kind: ScopeKind, parent: ScopeID,
                  owner: string, span: SourceSpan) -> ScopeID {
         const id: ScopeID = ScopeID::new(this.next_scope_id);
         this.next_scope_id += 1;
 
-        const scope: Scope = Scope::new(id, kind, parent, module_name, owner, span);
+        const scope: Scope = Scope::new(id, kind, parent, owner, span);
         this.scopes.push(scope);
 
         // Register as child of parent (O(1) direct index)
@@ -182,14 +182,12 @@ type struct Resolver {
     }
 
     /// The module the ambient scope cursor is currently standing in.
-    current_module_sym(&this) -> SymbolStr { return this.current_module; }
+    current_module_path(&this) -> ModulePath { return this.current_module; }
 
     /// Create a child scope of the current scope and move the cursor into it.
     enter_scope(mut &this, kind: ScopeKind, owner: string, span: SourceSpan) -> ScopeID {
         LOG_DEBUG(LogComponent::General, "[Resolver] enter_scope() kind=%s owner='%s'", kind.to_string(), owner);
-        const mod_str: string = this.intern_table.resolve(this.current_module);
-        const id: ScopeID = this.create_scope(kind, this.current_scope,
-                                               mod_str, owner, span);
+        const id: ScopeID = this.create_scope(kind, this.current_scope, owner, span);
         this.current_scope = id;
         return id;
     }
@@ -250,12 +248,11 @@ type struct Resolver {
     /// The definition of the module `sym` is declared in; invalid for a
     /// symbol declared in no module.
     ///
-    /// A module is named by its path - the namespace declaration writes the
-    /// whole of it - so this is the module graph's module-by-path question,
-    /// the one every module-rooted path already asks.
+    /// The symbol holds its module as the graph's identity, so this is the
+    /// graph's definition for that module and nothing is looked up by text.
     declaring_module_def(&this, sym: &Symbol) -> DefId {
-        if (sym.source_module == "") { return DefId::invalid(); }
-        return this.graph.module_def(this.graph.module_named(this.intern_table.intern(sym.source_module)));
+        if (!sym.source_module.is_valid()) { return DefId::invalid(); }
+        return this.graph.module_def(sym.source_module);
     }
 
     /// Whether a declaring symbol is a definition: an item a path can name
@@ -328,7 +325,7 @@ type struct Resolver {
         const id: SymbolID = sym.id;
         const name: SymbolStr = sym.name;
         // Intern the module path to get a heap-safe SymbolStr ID
-        const new_module_sym: SymbolStr = this.intern_table.intern(sym.source_module);
+        const new_module_sym: SymbolStr = sym.source_module.as_sym();
         const new_module_id: u32 = new_module_sym.id;
         this.symbols.push(sym);
         this.import_targets.insert(id.key(), target);
@@ -339,7 +336,7 @@ type struct Resolver {
         const existing_id: SymbolID = this.scopes[this.current_scope.id - 1].find(name);
         if (existing_id.is_valid()) {
             const ex: Symbol = this.symbols[existing_id.key() - 1];
-            const ex_mod_sym: SymbolStr = this.intern_table.intern(ex.source_module);
+            const ex_mod_sym: SymbolStr = ex.source_module.as_sym();
             existing_module_id = ex_mod_sym.id;
             if (ex.kind == SymbolKind::Import && existing_module_id == new_module_id) {
                 if (!this.import_target_in(this.current_scope, name, target).is_valid()) {
@@ -394,9 +391,8 @@ type struct Resolver {
     declare_variable(mut &this, name: SymbolStr, span: SourceSpan,
                      is_mutable: boolean, is_public: boolean) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
         const sym: Symbol = Symbol::variable(id, name, this.current_scope, span,
-                                              mod_str, is_mutable, is_public);
+                                              this.current_module, is_mutable, is_public);
         return this.declare(sym);
     }
 
@@ -406,33 +402,29 @@ type struct Resolver {
     /// arm is a value pattern, not a fresh binding.
     declare_constant(mut &this, name: SymbolStr, span: SourceSpan) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
         const sym: Symbol = Symbol::constant(id, name, this.current_scope, span,
-                                             mod_str);
+                                             this.current_module);
         return this.declare(sym);
     }
 
     declare_function(mut &this, name: SymbolStr, span: SourceSpan, is_public: boolean) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
         const sym: Symbol = Symbol::function(id, name, this.current_scope, span,
-                                              mod_str, is_public);
+                                              this.current_module, is_public);
         return this.declare(sym);
     }
 
     declare_type(mut &this, name: SymbolStr, span: SourceSpan, is_public: boolean) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
         const sym: Symbol = Symbol::type_sym(id, name, this.current_scope, span,
-                                              mod_str, is_public);
+                                              this.current_module, is_public);
         return this.declare(sym);
     }
 
     declare_parameter(mut &this, name: SymbolStr, span: SourceSpan) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
         const sym: Symbol = Symbol::parameter(id, name, this.current_scope, span,
-                                               mod_str);
+                                               this.current_module);
         return this.declare(sym);
     }
 
@@ -445,25 +437,22 @@ type struct Resolver {
 
     declare_field(mut &this, name: SymbolStr, span: SourceSpan) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
         const sym: Symbol = Symbol::field(id, name, this.current_scope, span,
-                                           mod_str);
+                                           this.current_module);
         return this.declare(sym);
     }
 
     declare_enum_variant(mut &this, name: SymbolStr, span: SourceSpan) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
         const sym: Symbol = Symbol::enum_variant(id, name, this.current_scope, span,
-                                                  mod_str);
+                                                  this.current_module);
         return this.declare(sym);
     }
 
     declare_method(mut &this, name: SymbolStr, span: SourceSpan, is_public: boolean) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
-        const mod_str: string = this.intern_table.resolve(this.current_module);
         const sym: Symbol = Symbol::method(id, name, this.current_scope, span,
-                                            mod_str, is_public);
+                                            this.current_module, is_public);
         return this.declare(sym);
     }
 
@@ -474,7 +463,7 @@ type struct Resolver {
     declare_generic_param(mut &this, name: SymbolStr, span: SourceSpan) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
         const sym: Symbol = Symbol::generic_param(id, name, this.current_scope, span,
-            this.intern_table.resolve(this.current_module));
+            this.current_module);
         return this.declare(sym);
     }
 
@@ -625,7 +614,7 @@ type struct Resolver {
 
     /// Register a symbol as exported from the current module.
     export_symbol(mut &this, sym_id: SymbolID) -> void {
-        this.exports.push(Pair::<SymbolID, u64>::new(sym_id, this.current_module.id as u64));
+        this.exports.push(Pair::<SymbolID, u64>::new(sym_id, this.current_module.as_sym().id as u64));
     }
 
     /// Get all exported symbols from a module.
@@ -778,9 +767,9 @@ type struct Resolver {
     /// makes the name canonical rather than a statement about the route taken
     /// to reach it.
     qualified_name_of(&this, sym: &Symbol) -> SymbolStr {
-        if (sym.source_module == "") { return sym.name; }
+        if (!sym.source_module.is_valid()) { return sym.name; }
         return this.intern_table.intern(
-            sym.source_module + "::" + this.intern_table.resolve(sym.name));
+            this.intern_table.resolve(sym.source_module.as_sym()) + "::" + this.intern_table.resolve(sym.name));
     }
 
     /// THE path-resolution entry point (§5.2).
@@ -922,7 +911,7 @@ type struct Resolver {
     /// symbols/scopes/exports but resets the scope cursor to global.
     reset_for_next_module(mut &this) -> void {
         this.current_scope = this.global_scope;
-        this.current_module = SymbolStr::empty();
+        this.current_module = ModulePath::none();
     }
 
     /// Enter a module: its scope becomes the current one.
@@ -935,9 +924,14 @@ type struct Resolver {
     /// Use this whenever the destination is a MODULE.  `restore_scope` is for
     /// the other half of the model - resuming a scope captured earlier, which
     /// may be a rib inside a module rather than the module itself.
-    set_module(mut &this, name: SymbolStr) -> void {
+    ///
+    /// Answers the module the cursor stood in before, for a caller that
+    /// switches in and must hand it back (`restore_scope`).
+    set_module(mut &this, name: ModulePath) -> ModulePath {
+        const previous: ModulePath = this.current_module;
         this.current_module = name;
         this.current_scope = ScopeID { id: this.module_scope_of(name) };
+        return previous;
     }
 
     /// The scope a module owns, built on first ask and returned unchanged
@@ -948,16 +942,15 @@ type struct Resolver {
     /// restore: the scope a pass left behind is the scope the next pass finds.
     /// The module's `Symbol` is declared with it, so the identity and the
     /// bindings it owns are created together.
-    module_scope_of(mut &this, name: SymbolStr) -> u64 {
-        const oid: u32 = name.id;
+    module_scope_of(mut &this, name: ModulePath) -> u64 {
+        const oid: u32 = name.as_sym().id;
         match (this.module_scopes.get(&oid)) {
             Option::Some(sid) => { return sid; }
             Option::None      => { }
         }
-        const mod_str: string = this.intern_table.resolve(name);
         const fresh: ScopeID = this.create_scope(
             ScopeKind::Module, this.global_scope,
-            mod_str, mod_str, SourceSpan::none());
+            this.intern_table.resolve(name.as_sym()), SourceSpan::none());
         this.module_scopes.insert(oid, fresh.id);
         this.declare_module_symbol(name);
         return fresh.id;
@@ -979,13 +972,13 @@ type struct Resolver {
     /// First-wins: every entry into a module runs through `set_module`, and
     /// the scope it finds persists across all of them, so without this guard
     /// the symbol would be re-declared on every re-entry.
-    declare_module_symbol(mut &this, name: SymbolStr) -> void {
+    declare_module_symbol(mut &this, m: ModulePath) -> void {
         const g: i64 = (this.global_scope.id - 1) as i64;
+        const name: SymbolStr = m.as_sym();
         if (this.scopes[g].find(name).is_valid()) { return; }
         const id: SymbolID = this.alloc_symbol_id();
         const sym: Symbol = Symbol::namespace_sym(
-            id, name, this.global_scope, SourceSpan::none(),
-            this.intern_table.resolve(name));
+            id, name, this.global_scope, SourceSpan::none(), m);
         this.admit(sym);
         this.scopes[g].insert(name, id, false);
     }
@@ -1002,7 +995,7 @@ type struct Resolver {
     /// scope that was just looked up for the same module says "restore" while
     /// meaning "enter", which is how two readings of these call sites were
     /// wrong about what they do.
-    restore_scope(mut &this, name: SymbolStr, saved_scope: u64) -> void {
+    restore_scope(mut &this, name: ModulePath, saved_scope: u64) -> void {
         this.current_module = name;
         if (saved_scope > 0) {
             this.current_scope = ScopeID { id: saved_scope };
@@ -1039,7 +1032,8 @@ type struct Resolver {
             const sym: Symbol = this.symbols[i];
             const name: string = this.intern_table.resolve(sym.name);
             cdebug("  [%lu] %s (scope %u) module='%s'\n",
-                sym.id.key(), name, sym.scope_id.id, sym.source_module);
+                sym.id.key(), name, sym.scope_id.id,
+                this.intern_table.resolve(sym.source_module.as_sym()));
         }
 
         cdebug("Exports: %lld symbols\n", this.exports.length);

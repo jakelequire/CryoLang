@@ -179,6 +179,16 @@ public:
         }
     }
 
+    /// The module a C import's declarations live in, from the namespace the
+    /// importer wrote on each of them.  The graph registered it when this
+    /// pass bound the import's extern block, which precedes them in the
+    /// program: the importer appends what it declares after the block.  The
+    /// namespace is text only because the importer runs before the graph
+    /// holds the module; it is turned into the module once, here.
+    c_import_module(&this, binding_ns: SymbolStr) -> ModulePath {
+        return this.ctx.module_graph.module_named(binding_ns);
+    }
+
     /// Declare a C-imported type under `alias::name`.
     ///
     /// One home for the four declaration kinds an extern block emits, because
@@ -188,9 +198,11 @@ public:
     declare_c_imported(&this, alias: SymbolStr, name: SymbolStr,
                        span: SourceSpan) -> SymbolID {
         if (alias.is_empty() || !name.is_valid()) { return SymbolID::invalid(); }
-        const saved_module: SymbolStr = this.resolver.current_module_sym();
+        const c_module: ModulePath = this.c_import_module(alias);
+        if (!c_module.is_valid()) { return SymbolID::invalid(); }
+        const saved_module: ModulePath = this.resolver.current_module_path();
         const saved_scope: u64 = this.resolver.get_current_scope_id();
-        this.resolver.set_module(alias);
+        this.resolver.set_module(c_module);
         const sym_id: SymbolID = this.resolver.declare_type(name, span, true);
         this.resolver.export_symbol(sym_id);
         this.resolver.restore_scope(saved_module, saved_scope);
@@ -202,9 +214,11 @@ public:
     /// module lane's answer, as `cit::add3` and `cit::Vec2` are.
     declare_c_imported_global(&this, alias: SymbolStr, node: VarDeclNode*) -> void {
         if (alias.is_empty() || !node.name.is_valid()) { return; }
-        const saved_module: SymbolStr = this.resolver.current_module_sym();
+        const c_module: ModulePath = this.c_import_module(alias);
+        if (!c_module.is_valid()) { return; }
+        const saved_module: ModulePath = this.resolver.current_module_path();
         const saved_scope: u64 = this.resolver.get_current_scope_id();
-        this.resolver.set_module(alias);
+        this.resolver.set_module(c_module);
         const sym_id: SymbolID = if (node.is_mutable) {
             this.resolver.declare_variable(node.name, node.span, true, true)
         } else {
@@ -378,10 +392,8 @@ public:
                 // declaration index registers the intrinsic's signature under.
                 // A placeholder here stamps a name nothing is registered
                 // under, and the call is refused as unknown.
-                const intr_mod: string = this.resolver.intern_table.resolve(
-                    this.resolver.current_module);
                 const sym: Symbol = Symbol::intrinsic(id, sym_name,
-                    this.resolver.current_scope, intr_node.span, intr_mod);
+                    this.resolver.current_scope, intr_node.span, this.resolver.current_module);
                 const intr_declared: SymbolID = this.resolver.declare(sym);
                 this.resolver.export_symbol(intr_declared);
                 intr_node.def = this.resolver.get_symbol(intr_declared).def;
@@ -389,9 +401,8 @@ public:
             NodeKind::IntrinsicConstDeclaration => {
                 const ic_node: IntrinsicConstDeclNode* = node as IntrinsicConstDeclNode*;
                 const ic_id: SymbolID = this.resolver.alloc_symbol_id();
-                const mod_str: string = this.resolver.intern_table.resolve(this.resolver.current_module);
                 const ic_sym: Symbol = Symbol::constant(ic_id, ic_node.name,
-                    this.resolver.current_scope, ic_node.span, mod_str);
+                    this.resolver.current_scope, ic_node.span, this.resolver.current_module);
                 const declared_id: SymbolID = this.resolver.declare(ic_sym);
                 this.resolver.export_symbol(declared_id);
             }
@@ -405,22 +416,22 @@ public:
                     // module's declarations.  The alias symbol's qualified
                     // name IS that namespace, so a scope segment or a type
                     // spelling bound to it answers `Def(<mod>::cit)` and its
-                    // members resolve through the doors a module's do.
+                    // members resolve through the doors a module's do.  The
+                    // alias is declared in the module writing the import.
                     const alias: SymbolStr = extern_node.namespace_alias;
                     const canon: SymbolStr = extern_node.binding_namespace;
                     const ns_id: SymbolID = this.resolver.alloc_symbol_id();
                     const ns_sym: Symbol = Symbol::namespace_sym(
                         ns_id, alias, this.resolver.current_scope,
-                        extern_node.span,
-                        QualifiedName::parent_of(this.resolver.intern_table.resolve(canon)));
+                        extern_node.span, this.resolver.current_module);
                     this.resolver.declare(ns_sym);
                     this.resolver.export_symbol(ns_id);
-                    this.ctx.module_graph.bind_c_import_module(
+                    const c_module: ModulePath = this.ctx.module_graph.bind_c_import_module(
                         canon, this.resolver.get_symbol(ns_id).def);
 
-                    const saved_module: SymbolStr = this.resolver.current_module_sym();
+                    const saved_module: ModulePath = this.resolver.current_module_path();
                     const saved_scope: u64 = this.resolver.get_current_scope_id();
-                    this.resolver.set_module(canon);
+                    this.resolver.set_module(c_module);
                     for (mut j: int = 0; j < extern_node.functions.length; j++) {
                         const fn_node: FunctionDeclNode* = extern_node.functions[j];
                         const fn_sym: SymbolID = this.resolver.declare_function(
@@ -550,7 +561,7 @@ public:
     /// named is the entry that completed the pair.
     refuse_module_type_collisions(&this) -> void {
         if (this.ctx == null || this.ctx.module_graph == null) { return; }
-        const ns: SymbolStr = this.resolver.current_module_sym();
+        const ns: SymbolStr = this.resolver.current_module_path().as_sym();
         if (!ns.is_valid()) { return; }
         const ns_str: string = this.resolver.intern_table.resolve(ns);
         const scope: Scope* = this.resolver.get_scope(this.resolver.current_scope);
@@ -3161,17 +3172,18 @@ public:
         // file binding nothing and saying nothing.  Refused here for every
         // form, before the braced form's entries are judged against an
         // offering that does not exist.
-        if (this.ctx.module_graph != null
-                && this.ctx.module_graph.find_module_index(this.ctx.module_graph.module_named(module_sym)) < 0) {
+        // The one place the written path becomes the module: every binding
+        // below carries this identity.
+        const imported: ModulePath = this.ctx.module_graph.module_named(module_sym);
+        if (this.ctx.module_graph.find_module_index(imported) < 0) {
             this.refuse_unknown_module_import(node, module_path);
             return;
         }
 
         const exports: SymbolID[] = this.resolver.get_exports(module_sym);
 
-        // Use the resolved namespace name for source_module on import symbols
-        // so that `qualified_name_of` builds the canonical name (e.g.
-        // "std::core::option::Option", not "core::option::Option").
+        // The module's registered name, for diagnostics and for composing a
+        // sub-module's path as an import writes one.
         const resolved_module: string = this.resolver.intern_table.resolve(module_sym);
 
         // `ImportStyle::Module` - a plain `import M;` - binds no names at all,
@@ -3193,7 +3205,7 @@ public:
                     const id: SymbolID = this.resolver.alloc_symbol_id();
                     const import_sym: Symbol = Symbol::import_sym(
                         id, export_sym.name, this.resolver.current_scope,
-                        node.span, resolved_module, export_sym.def);
+                        node.span, imported, export_sym.def);
                     this.resolver.declare_import(import_sym, exports[i]);
                 }
             }
@@ -3208,21 +3220,19 @@ public:
             // passed it along: the qualified name is an identity, and routing
             // it through the re-exporter would give the same declaration two.
             const rx_all: SymbolStr[] =
-                this.ctx.module_graph.reexport_closure(this.ctx.module_graph.module_named(module_sym));
+                this.ctx.module_graph.reexport_closure(imported);
             for (mut rx: i64 = 0; rx < rx_all.length; rx++) {
-                const rx_ns: SymbolStr = rx_all[rx];
-                const rx_str: string = this.resolver.intern_table.resolve(rx_ns);
-                const rx_exports: SymbolID[] = this.resolver.get_exports(rx_ns);
+                const rx_exports: SymbolID[] = this.resolver.get_exports(rx_all[rx]);
                 for (mut re: i64 = 0; re < rx_exports.length; re++) {
                     const rx_sym: Symbol = this.resolver.get_symbol(rx_exports[re]);
                     if (!rx_sym.visibility.is_public()) { continue; }
-                    const rx_src: string =
-                        if (rx_sym.source_module != "") { rx_sym.source_module }
-                        else { rx_str };
+                    // An export was declared in a module - the one the
+                    // resolver stood in when it exported it - so the binding
+                    // names the module that declared it.
                     const rid: SymbolID = this.resolver.alloc_symbol_id();
                     const rimp: Symbol = Symbol::import_sym(
                         rid, rx_sym.name, this.resolver.current_scope,
-                        node.span, rx_src, rx_sym.def);
+                        node.span, rx_sym.source_module, rx_sym.def);
                     this.resolver.declare_import(rimp, rx_exports[re]);
                 }
             }
@@ -3251,7 +3261,6 @@ public:
                 // the namespace it is used in, not by which one the module
                 // declared first.
                 mut offered: SymbolID[] = this.resolver.exports_named(module_sym, name);
-                mut offered_src: string = resolved_module;
                 mut through_export: boolean = false;
                 if (offered.length == 0) {
                     // Reached through `module_path`'s `export` closure.  The
@@ -3262,16 +3271,14 @@ public:
                     const via: SymbolStr = this.reexport_offering(module_sym, name);
                     if (via.is_valid()) {
                         offered = this.resolver.exports_named(via, name);
-                        offered_src = this.resolver.intern_table.resolve(via);
                         through_export = true;
                     }
                 }
                 if (offered.length > 0) {
                     for (mut k: i64 = 0; k < offered.length; k++) {
                         const osym: Symbol = this.resolver.get_symbol(offered[k]);
-                        const src: string =
-                            if (through_export && osym.source_module != "") { osym.source_module }
-                            else { offered_src };
+                        const src: ModulePath =
+                            if (through_export) { osym.source_module } else { imported };
                         const id: SymbolID = this.resolver.alloc_symbol_id();
                         const import_sym: Symbol = Symbol::import_sym(
                             id, name, this.resolver.current_scope,
@@ -3310,7 +3317,8 @@ public:
                     const name_str: string = this.resolver.intern_table.resolve(name);
                     const sub_path: string = fmt::format("%s::%s", resolved_module, name_str);
                     const sub_sym: SymbolStr = this.resolver.intern_table.intern(sub_path);
-                    if (this.ctx.module_graph.find_module_index(this.ctx.module_graph.module_named(sub_sym)) < 0) {
+                    const sub_module: ModulePath = this.ctx.module_graph.module_named(sub_sym);
+                    if (this.ctx.module_graph.find_module_index(sub_module) < 0) {
                         // Neither offered nor a sub-module: the entry names
                         // nothing, and binding nothing in silence leaves a
                         // use site - which may never exist - to say so.  The
@@ -3322,14 +3330,13 @@ public:
                     }
                     // Import all public exports from the resolved sub-module.
                     const sub_exports: SymbolID[] = this.resolver.get_exports(sub_sym);
-                    const sub_resolved: string = this.resolver.intern_table.resolve(sub_sym);
                     for (mut j: i64 = 0; j < sub_exports.length; j++) {
                         const sub_export_sym: Symbol = this.resolver.get_symbol(sub_exports[j]);
                         if (sub_export_sym.visibility.is_public()) {
                             const id: SymbolID = this.resolver.alloc_symbol_id();
                             const import_sym: Symbol = Symbol::import_sym(
                                 id, sub_export_sym.name, this.resolver.current_scope,
-                                node.span, sub_resolved, sub_export_sym.def);
+                                node.span, sub_module, sub_export_sym.def);
                             this.resolver.declare_import(import_sym, sub_exports[j]);
                         }
                     }
@@ -3346,7 +3353,7 @@ public:
             const alias_id: SymbolID = this.resolver.alloc_symbol_id();
             const alias_sym: Symbol = Symbol::import_sym(
                 alias_id, node.alias, this.resolver.current_scope,
-                node.span, resolved_module, DefId::invalid());
+                node.span, imported, DefId::invalid());
             this.resolver.declare(alias_sym);
         }
     }
@@ -3387,13 +3394,12 @@ type struct NameDeclarationPass {
         if (ctx.active_module_index >= 0
             && ctx.active_module_index < ctx.module_graph.modules.length as i64) {
             const mod_info: ModuleInfo* = &ctx.module_graph.modules[ctx.active_module_index];
-            const mod_name: SymbolStr = mod_info.namespace_name;
-            if (mod_name.is_valid()) {
-                ctx.resolver.set_module(mod_name);
+            if (mod_info.namespace_name.is_valid()) {
+                ctx.resolver.set_module(mod_info.path());
             }
         }
-        if (root.namespace_name != "") {
-            ctx.resolver.set_module(ctx.intern(root.namespace_name));
+        if (root.namespace_name != "" && ctx.current_module().is_valid()) {
+            ctx.resolver.set_module(ctx.current_module());
         }
 
         const visitor: NameResolver = NameResolver(ctx.resolver, ctx);
@@ -3481,12 +3487,11 @@ type struct NameResolutionPass {
         if (ctx.active_module_index >= 0
             && ctx.active_module_index < ctx.module_graph.modules.length as i64) {
             const mod_info: ModuleInfo* = &ctx.module_graph.modules[ctx.active_module_index];
-            const mod_name: SymbolStr = mod_info.namespace_name;
-            if (mod_name.is_valid()) {
-                ctx.resolver.set_module(mod_name);
+            if (mod_info.namespace_name.is_valid()) {
+                ctx.resolver.set_module(mod_info.path());
             }
         } else if (root.namespace_name != "") {
-            ctx.resolver.restore_scope(ctx.intern(root.namespace_name), walk_scope);
+            ctx.resolver.restore_scope(ctx.current_module(), walk_scope);
         }
 
         // Create and run the visitor

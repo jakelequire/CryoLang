@@ -23,6 +23,8 @@ import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId };
+import compiler::module_graph;
+import compiler::module_graph::{ ModulePath };
 
 type enum SymbolKind {
     Variable;
@@ -107,7 +109,10 @@ type struct Symbol {
     visibility:     SymbolVisibility;
     scope_id:       ScopeID;
     declaring_span: SourceSpan;
-    source_module:  string;    // module path metadata; stays string for now
+    /// The module the binding's declaration is in: its own module for a
+    /// declaration, the imported module for an import; none for a binding
+    /// in no module.
+    source_module:  ModulePath;
     is_mutable:     boolean;
     is_generic:     boolean;
     /// The definition this binding names, set by the resolver when the symbol
@@ -120,7 +125,7 @@ type struct Symbol {
     // -- Factory methods --
 
     static variable(id: SymbolID, name: SymbolStr, scope: ScopeID,
-                    span: SourceSpan, module_name: string, is_mutable: boolean,
+                    span: SourceSpan, declared_in: ModulePath, is_mutable: boolean,
                     is_public: boolean) -> Symbol {
         return Symbol {
             id:             id,
@@ -129,7 +134,7 @@ type struct Symbol {
             visibility:     is_public ? SymbolVisibility::Public : SymbolVisibility::Private,
             scope_id:       scope,
             declaring_span: span,
-            source_module:  module_name,
+            source_module:  declared_in,
             is_mutable:     is_mutable,
             is_generic:     false,
             def:            DefId::invalid(),
@@ -137,7 +142,7 @@ type struct Symbol {
     }
 
     static function(id: SymbolID, name: SymbolStr, scope: ScopeID,
-                    span: SourceSpan, module_name: string, is_public: boolean) -> Symbol {
+                    span: SourceSpan, declared_in: ModulePath, is_public: boolean) -> Symbol {
         return Symbol {
             id:             id,
             name:           name,
@@ -145,7 +150,7 @@ type struct Symbol {
             visibility:     is_public ? SymbolVisibility::Public : SymbolVisibility::Private,
             scope_id:       scope,
             declaring_span: span,
-            source_module:  module_name,
+            source_module:  declared_in,
             is_mutable:     false,
             is_generic:     false,
             def:            DefId::invalid(),
@@ -153,7 +158,7 @@ type struct Symbol {
     }
 
     static namespace_sym(id: SymbolID, name: SymbolStr, scope: ScopeID,
-                         span: SourceSpan, module_name: string) -> Symbol {
+                         span: SourceSpan, declared_in: ModulePath) -> Symbol {
         return Symbol {
             id:             id,
             name:           name,
@@ -161,7 +166,7 @@ type struct Symbol {
             visibility:     SymbolVisibility::Public,
             scope_id:       scope,
             declaring_span: span,
-            source_module:  module_name,
+            source_module:  declared_in,
             is_mutable:     false,
             is_generic:     false,
             def:            DefId::invalid(),
@@ -169,7 +174,7 @@ type struct Symbol {
     }
 
     static type_sym(id: SymbolID, name: SymbolStr, scope: ScopeID,
-                    span: SourceSpan, module_name: string, is_public: boolean) -> Symbol {
+                    span: SourceSpan, declared_in: ModulePath, is_public: boolean) -> Symbol {
         return Symbol {
             id:             id,
             name:           name,
@@ -177,7 +182,7 @@ type struct Symbol {
             visibility:     is_public ? SymbolVisibility::Public : SymbolVisibility::Private,
             scope_id:       scope,
             declaring_span: span,
-            source_module:  module_name,
+            source_module:  declared_in,
             is_mutable:     false,
             is_generic:     false,
             def:            DefId::invalid(),
@@ -185,7 +190,7 @@ type struct Symbol {
     }
 
     static parameter(id: SymbolID, name: SymbolStr, scope: ScopeID,
-                     span: SourceSpan, module_name: string) -> Symbol {
+                     span: SourceSpan, declared_in: ModulePath) -> Symbol {
         return Symbol {
             id:             id,
             name:           name,
@@ -193,7 +198,7 @@ type struct Symbol {
             visibility:     SymbolVisibility::Private,
             scope_id:       scope,
             declaring_span: span,
-            source_module:  module_name,
+            source_module:  declared_in,
             is_mutable:     false,
             is_generic:     false,
             def:            DefId::invalid(),
@@ -201,7 +206,7 @@ type struct Symbol {
     }
 
     static field(id: SymbolID, name: SymbolStr, scope: ScopeID,
-                 span: SourceSpan, module_name: string) -> Symbol {
+                 span: SourceSpan, declared_in: ModulePath) -> Symbol {
         return Symbol {
             id:             id,
             name:           name,
@@ -209,7 +214,7 @@ type struct Symbol {
             visibility:     SymbolVisibility::Public,
             scope_id:       scope,
             declaring_span: span,
-            source_module:  module_name,
+            source_module:  declared_in,
             is_mutable:     false,
             is_generic:     false,
             def:            DefId::invalid(),
@@ -217,7 +222,7 @@ type struct Symbol {
     }
 
     static enum_variant(id: SymbolID, name: SymbolStr, scope: ScopeID,
-                        span: SourceSpan, module_name: string) -> Symbol {
+                        span: SourceSpan, declared_in: ModulePath) -> Symbol {
         return Symbol {
             id:             id,
             name:           name,
@@ -225,7 +230,7 @@ type struct Symbol {
             visibility:     SymbolVisibility::Public,
             scope_id:       scope,
             declaring_span: span,
-            source_module:  module_name,
+            source_module:  declared_in,
             is_mutable:     false,
             is_generic:     false,
             def:            DefId::invalid(),
@@ -233,7 +238,7 @@ type struct Symbol {
     }
 
     static method(id: SymbolID, name: SymbolStr, scope: ScopeID,
-                  span: SourceSpan, module_name: string, is_public: boolean) -> Symbol {
+                  span: SourceSpan, declared_in: ModulePath, is_public: boolean) -> Symbol {
         return Symbol {
             id:             id,
             name:           name,
@@ -241,7 +246,7 @@ type struct Symbol {
             visibility:     is_public ? SymbolVisibility::Public : SymbolVisibility::Private,
             scope_id:       scope,
             declaring_span: span,
-            source_module:  module_name,
+            source_module:  declared_in,
             is_mutable:     false,
             is_generic:     false,
             def:            DefId::invalid(),
@@ -249,7 +254,7 @@ type struct Symbol {
     }
 
     static constant(id: SymbolID, name: SymbolStr, scope: ScopeID,
-                    span: SourceSpan, module_name: string) -> Symbol {
+                    span: SourceSpan, declared_in: ModulePath) -> Symbol {
         return Symbol {
             id:             id,
             name:           name,
@@ -257,7 +262,7 @@ type struct Symbol {
             visibility:     SymbolVisibility::Public,
             scope_id:       scope,
             declaring_span: span,
-            source_module:  module_name,
+            source_module:  declared_in,
             is_mutable:     false,
             is_generic:     false,
             def:            DefId::invalid(),
@@ -268,7 +273,7 @@ type struct Symbol {
     /// declaration's own stamp, copied - since an import names a declaration
     /// and is not one.
     static import_sym(id: SymbolID, name: SymbolStr, scope: ScopeID,
-                      span: SourceSpan, module_name: string, def: DefId) -> Symbol {
+                      span: SourceSpan, declared_in: ModulePath, def: DefId) -> Symbol {
         return Symbol {
             id:             id,
             name:           name,
@@ -276,7 +281,7 @@ type struct Symbol {
             visibility:     SymbolVisibility::Private,
             scope_id:       scope,
             declaring_span: span,
-            source_module:  module_name,
+            source_module:  declared_in,
             is_mutable:     false,
             is_generic:     false,
             def:            def,
@@ -293,7 +298,7 @@ type struct Symbol {
             visibility:     SymbolVisibility::Private,
             scope_id:       scope,
             declaring_span: span,
-            source_module:  "",
+            source_module:  ModulePath::none(),
             is_mutable:     false,
             is_generic:     false,
             def:            DefId::invalid(),
@@ -301,7 +306,7 @@ type struct Symbol {
     }
 
     static generic_param(id: SymbolID, name: SymbolStr, scope: ScopeID,
-                         span: SourceSpan, module_name: string) -> Symbol {
+                         span: SourceSpan, declared_in: ModulePath) -> Symbol {
         return Symbol {
             id:             id,
             name:           name,
@@ -309,7 +314,7 @@ type struct Symbol {
             visibility:     SymbolVisibility::Private,
             scope_id:       scope,
             declaring_span: span,
-            source_module:  module_name,
+            source_module:  declared_in,
             is_mutable:     false,
             is_generic:     true,
             def:            DefId::invalid(),
@@ -317,7 +322,7 @@ type struct Symbol {
     }
 
     static intrinsic(id: SymbolID, name: SymbolStr, scope: ScopeID,
-                     span: SourceSpan, module_name: string) -> Symbol {
+                     span: SourceSpan, declared_in: ModulePath) -> Symbol {
         return Symbol {
             id:             id,
             name:           name,
@@ -325,7 +330,7 @@ type struct Symbol {
             visibility:     SymbolVisibility::Public,
             scope_id:       scope,
             declaring_span: span,
-            source_module:  module_name,
+            source_module:  declared_in,
             is_mutable:     false,
             is_generic:     false,
             def:            DefId::invalid(),
