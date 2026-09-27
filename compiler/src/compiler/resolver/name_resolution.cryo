@@ -345,7 +345,7 @@ public:
                             var_node.name, var_node.span)
                     };
                     this.resolver.record_resolution(var_node.span, sym_id);
-                    // The export set is what `lookup_in_module` reads, so a
+                    // The export set is what `exports_named` reads, so a
                     // module-level declaration left out of it cannot be
                     // resolved across modules by the name layer at all - which
                     // is what forces a later stage to key the global map by
@@ -514,9 +514,8 @@ public:
         // An import binds a NAME; what it names is the declaration it points
         // at, reached through the owning module's export set - the alias is
         // exported, so `import compiler::codegen::{ llvm }` binds it here.
-        if (s.kind == SymbolKind::Import && s.source_module != "") {
-            const decl: SymbolID = this.resolver.lookup_in_module(
-                this.resolver.intern_table.intern(s.source_module), s.name);
+        if (s.kind == SymbolKind::Import) {
+            const decl: SymbolID = this.resolver.import_target(s, Namespace::Type);
             if (!decl.is_valid()) { return SymbolID::invalid(); }
             const target: Symbol = this.resolver.get_symbol(decl);
             return this.alias_of(&target);
@@ -528,15 +527,7 @@ public:
 
     symbol_names_type(&this, s: &Symbol) -> boolean {
         if (s.kind == SymbolKind::Type || s.kind == SymbolKind::TypeAlias) { return true; }
-        if (s.kind != SymbolKind::Import) { return false; }
-        const qn: string = this.resolver.intern_table.resolve(
-            this.resolver.qualified_name_of(s));
-        const parent: string = QualifiedName::parent_of(qn);
-        const leaf: string = QualifiedName::leaf_of(qn);
-        if (parent.length() == 0 || leaf.length() == 0) { return false; }
-        const tgt: SymbolID = this.resolver.lookup_in_module(
-            this.resolver.intern_table.intern(parent),
-            this.resolver.intern_table.intern(leaf));
+        const tgt: SymbolID = this.resolver.import_target(s, Namespace::Type);
         if (!tgt.is_valid()) { return false; }
         const ts: Symbol = this.resolver.get_symbol(tgt);
         return ts.kind == SymbolKind::Type || ts.kind == SymbolKind::TypeAlias;
@@ -1230,9 +1221,8 @@ public:
             const scope: Scope* = this.resolver.get_scope(scope_id);
             for (mut i: i64 = 0; i < scope.symbols.length; i++) {
                 mut s: Symbol = this.resolver.get_symbol(scope.symbols[i].sym);
-                if (s.kind == SymbolKind::Import && s.source_module != "") {
-                    const decl: SymbolID = this.resolver.lookup_in_module(
-                        this.resolver.intern_table.intern(s.source_module), s.name);
+                if (s.kind == SymbolKind::Import) {
+                    const decl: SymbolID = this.resolver.import_target(&s, Namespace::Value);
                     if (decl.is_valid()) { s = this.resolver.get_symbol(decl); }
                 }
                 if (s.kind == SymbolKind::Function || s.kind == SymbolKind::Intrinsic) {
@@ -1512,7 +1502,7 @@ public:
             const reach: boolean = owner_ns.id == use_ns.id
                 || this.ctx.decl_index.is_prelude_ns(owner_path)
                 || this.ctx.decl_index.ns_imports(this.ctx.module_graph.module_of_file(span.file), owner_path);
-            const is_public: boolean = this.resolver.lookup_in_module(owner_ns, name).is_valid();
+            const is_public: boolean = this.resolver.exports_named(owner_ns, name).length > 0;
             if (!reach || !is_public) {
                 mut d: Diagnostic = Diagnostic::error(
                     ErrorCode::E0240_NAMESPACE_NOT_REACHABLE,
@@ -1688,8 +1678,8 @@ public:
                 const hb: Symbol = this.resolver.get_symbol(head_bound);
                 const alias_ns: SymbolStr = this.alias_module_of(&hb);
                 if (alias_ns.is_valid()) {
-                    const decl: SymbolID = this.resolver.lookup_in_module(
-                        alias_ns, this.resolver.intern_table.intern(leaf));
+                    const decl: SymbolID = this.resolver.export_in(
+                        alias_ns, this.resolver.intern_table.intern(leaf), Namespace::Type);
                     if (!decl.is_valid()) { return ResSlot::Pending; }
                     return ResSlot::Answered(Res::Def(this.resolver.get_symbol(decl).def));
                 }
@@ -1880,7 +1870,7 @@ public:
             if (alias.is_valid()) {
                 const alias_sym: Symbol = this.resolver.get_symbol(alias);
                 node.set_scope_res(Res::Def(alias_sym.def));
-                const am: SymbolID = this.export_in(
+                const am: SymbolID = this.resolver.export_in(
                     this.resolver.qualified_name_of(&alias_sym), node.member_name, Namespace::Value);
                 if (am.is_valid()) { node.set_member_def(this.resolver.get_symbol(am).def); }
                 return;
@@ -2215,16 +2205,15 @@ public:
             if (head_sym.is_valid()) {
                 mut hs: Symbol = this.resolver.get_symbol(head_sym);
                 // An import binds a NAME; it does not say what kind of thing
-                // the name is. The declaration it points at does, and it is
-                // reached by the same canonical `module::name` the stamp would
-                // record. Reading the binding's own kind instead answers
+                // the name is. The declaration it binds in the type namespace
+                // does - the head of a path owns what follows it, so a
+                // same-leaf function is not it. Reading the binding's own kind
+                // instead answers
                 // `Import` for every imported type, so `Enum::Variant` walked
                 // straight past the type-relative answer and was left for a
                 // later stage to re-derive from the written spelling.
-                if (hs.kind == SymbolKind::Import && hs.source_module != "") {
-                    const decl: SymbolID = this.resolver.lookup_in_module(
-                        this.resolver.intern_table.intern(hs.source_module),
-                        hs.name);
+                if (hs.kind == SymbolKind::Import) {
+                    const decl: SymbolID = this.resolver.import_target(&hs, Namespace::Type);
                     if (decl.is_valid()) { hs = this.resolver.get_symbol(decl); }
                 }
                 if (hs.kind == SymbolKind::GenericParam
@@ -2955,7 +2944,7 @@ public:
     reexport_offering(&this, m: SymbolStr, name: SymbolStr) -> SymbolStr {
         const via: SymbolStr[] = this.ctx.module_graph.reexport_closure(this.ctx.module_graph.module_named(m));
         for (mut i: i64 = 0; i < via.length; i++) {
-            if (this.resolver.lookup_in_module(via[i], name).is_valid()) {
+            if (this.resolver.exports_named(via[i], name).length > 0) {
                 return via[i];
             }
         }
@@ -2996,7 +2985,7 @@ public:
         mut out: SymbolID[] = [];
         // A module that DECLARES the name offers that one.  A re-export cannot
         // displace a declaration, so this is not a first-of-several choice.
-        const own: SymbolID = this.export_in(m, name, ns);
+        const own: SymbolID = this.resolver.export_in(m, name, ns);
         if (own.is_valid()) {
             out.push(own);
             return out;
@@ -3004,7 +2993,7 @@ public:
         const via: SymbolStr[] = this.ctx.module_graph.reexport_closure(this.ctx.module_graph.module_named(m));
         mut seen: SymbolStr[] = [];
         for (mut i: i64 = 0; i < via.length; i++) {
-            const cand: SymbolID = this.export_in(via[i], name, ns);
+            const cand: SymbolID = this.resolver.export_in(via[i], name, ns);
             if (!cand.is_valid()) { continue; }
             const cs: Symbol = this.resolver.get_symbol(cand);
             const q: SymbolStr = this.resolver.qualified_name_of(&cs);
@@ -3019,17 +3008,6 @@ public:
             out.push(cand);
         }
         return out;
-    }
-
-    /// The public declaration module `m` exports under `name` in the
-    /// namespace `ns`, or an invalid id: `M::f` in an expression names the
-    /// function `f`, never a type `M` also declares as `f`.
-    export_in(&this, m: SymbolStr, name: SymbolStr, ns: Namespace) -> SymbolID {
-        const all: SymbolID[] = this.resolver.exports_named(m, name);
-        for (mut i: i64 = 0; i < all.length; i++) {
-            if (ns.accepts(this.resolver.get_symbol(all[i]).kind)) { return all[i]; }
-        }
-        return SymbolID::invalid();
     }
 
     /// The private declaration module `m` holds under `name` in the
@@ -3216,7 +3194,7 @@ public:
                     const import_sym: Symbol = Symbol::import_sym(
                         id, export_sym.name, this.resolver.current_scope,
                         node.span, resolved_module, export_sym.def);
-                    this.resolver.declare_import(import_sym);
+                    this.resolver.declare_import(import_sym, exports[i]);
                 }
             }
             // A re-exported namespace is part of what this module offers, so
@@ -3245,7 +3223,7 @@ public:
                     const rimp: Symbol = Symbol::import_sym(
                         rid, rx_sym.name, this.resolver.current_scope,
                         node.span, rx_src, rx_sym.def);
-                    this.resolver.declare_import(rimp);
+                    this.resolver.declare_import(rimp, rx_exports[re]);
                 }
             }
         } else if (node.style == ImportStyle::Specific) {
@@ -3267,15 +3245,15 @@ public:
             // mode.
             for (mut i: int = 0; i < node.specific_imports.length; i++) {
                 const name: SymbolStr = node.specific_imports[i];
-                mut offered: boolean = false;
-                mut offered_src: string = "";
-                mut offered_def: DefId = DefId::invalid();
-                const found: SymbolID = this.resolver.lookup_in_module(module_sym, name);
-                if (found.is_valid()) {
-                    offered_src = resolved_module;
-                    offered_def = this.resolver.get_symbol(found).def;
-                    offered = true;
-                } else {
+                // Every declaration offered under the name is bound, each by
+                // its own binding: a type and a same-leaf function are two
+                // declarations, and which one a later use means is decided by
+                // the namespace it is used in, not by which one the module
+                // declared first.
+                mut offered: SymbolID[] = this.resolver.exports_named(module_sym, name);
+                mut offered_src: string = resolved_module;
+                mut through_export: boolean = false;
+                if (offered.length == 0) {
                     // Reached through `module_path`'s `export` closure.  The
                     // name keeps the module that DECLARED it, not the one that
                     // passed it along, exactly as the Wildcard branch does: the
@@ -3283,25 +3261,23 @@ public:
                     // re-exporter would give the same declaration two.
                     const via: SymbolStr = this.reexport_offering(module_sym, name);
                     if (via.is_valid()) {
-                        const vid: SymbolID =
-                            this.resolver.lookup_in_module(via, name);
-                        const vsym: Symbol = this.resolver.get_symbol(vid);
-                        const vstr: string =
-                            this.resolver.intern_table.resolve(via);
-                        const vsrc: string =
-                            if (vsym.source_module != "") { vsym.source_module }
-                            else { vstr };
-                        offered_src = vsrc;
-                        offered_def = vsym.def;
-                        offered = true;
+                        offered = this.resolver.exports_named(via, name);
+                        offered_src = this.resolver.intern_table.resolve(via);
+                        through_export = true;
                     }
                 }
-                if (offered) {
-                    const id: SymbolID = this.resolver.alloc_symbol_id();
-                    const import_sym: Symbol = Symbol::import_sym(
-                        id, name, this.resolver.current_scope,
-                        node.span, offered_src, offered_def);
-                    this.resolver.declare_import(import_sym);
+                if (offered.length > 0) {
+                    for (mut k: i64 = 0; k < offered.length; k++) {
+                        const osym: Symbol = this.resolver.get_symbol(offered[k]);
+                        const src: string =
+                            if (through_export && osym.source_module != "") { osym.source_module }
+                            else { offered_src };
+                        const id: SymbolID = this.resolver.alloc_symbol_id();
+                        const import_sym: Symbol = Symbol::import_sym(
+                            id, name, this.resolver.current_scope,
+                            node.span, src, osym.def);
+                        this.resolver.declare_import(import_sym, offered[k]);
+                    }
                 } else if (!node.is_export
                            && this.resolver.private_declarations(module_sym, name).length > 0) {
                     // The module declares the name and marks it `private`.
@@ -3354,7 +3330,7 @@ public:
                             const import_sym: Symbol = Symbol::import_sym(
                                 id, sub_export_sym.name, this.resolver.current_scope,
                                 node.span, sub_resolved, sub_export_sym.def);
-                            this.resolver.declare_import(import_sym);
+                            this.resolver.declare_import(import_sym, sub_exports[j]);
                         }
                     }
                 }

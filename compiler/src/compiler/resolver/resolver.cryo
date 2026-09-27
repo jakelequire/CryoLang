@@ -106,6 +106,12 @@ type struct Resolver {
     /// parameter is not bounded by does not answer it, however it is spelled.
     param_bounds:  Pair<SymbolID, DefId>[];
 
+    /// The declaration each import binding names, by the binding's key.  An
+    /// import of a leaf binds every declaration the module offers under it,
+    /// one binding each, so a type and a same-leaf function arrive as two
+    /// bindings and each one's target is what a namespace chooses between.
+    import_targets: HashMap<u64, SymbolID>;
+
     /// Create a new Resolver with a global scope.
     /// The InternTable pointer must outlive the Resolver (owned by CompilationContext).
     static new(table: InternTable*) -> Resolver {
@@ -131,6 +137,7 @@ type struct Resolver {
             prelude_modules:      [],
             module_scopes:        HashMap::<u32, u64>::new(),
             param_bounds:         [],
+            import_targets:       HashMap::<u64, SymbolID>::new(),
         };
     }
 
@@ -312,27 +319,68 @@ type struct Resolver {
     ///
     /// The symbol carries the id of the declaration it binds, copied by the
     /// import that found it: an import is not a definition, so it is not
-    /// admitted as one.
-    declare_import(mut &this, sym: Symbol) -> SymbolID {
+    /// admitted as one.  `target` is that declaration: one binding names one
+    /// declaration, and a second declaration the same module offers under
+    /// the leaf - a type beside a function - is a second binding of the
+    /// name, held in the scope's overload set as the declaring module's own
+    /// scope holds it.  The same declaration imported again binds nothing new.
+    declare_import(mut &this, sym: Symbol, target: SymbolID) -> SymbolID {
         const id: SymbolID = sym.id;
+        const name: SymbolStr = sym.name;
         // Intern the module path to get a heap-safe SymbolStr ID
         const new_module_sym: SymbolStr = this.intern_table.intern(sym.source_module);
         const new_module_id: u32 = new_module_sym.id;
         this.symbols.push(sym);
+        this.import_targets.insert(id.key(), target);
 
         // Get the existing symbol's module ID (if any) so the scope
         // can detect cross-module name conflicts.
         mut existing_module_id: u32 = 0;
-        const existing_id: SymbolID = this.scopes[this.current_scope.id - 1].find(sym.name);
+        const existing_id: SymbolID = this.scopes[this.current_scope.id - 1].find(name);
         if (existing_id.is_valid()) {
-            const ex_mod: string = this.symbols[existing_id.key() - 1].source_module;
-            const ex_mod_sym: SymbolStr = this.intern_table.intern(ex_mod);
+            const ex: Symbol = this.symbols[existing_id.key() - 1];
+            const ex_mod_sym: SymbolStr = this.intern_table.intern(ex.source_module);
             existing_module_id = ex_mod_sym.id;
+            if (ex.kind == SymbolKind::Import && existing_module_id == new_module_id) {
+                if (!this.import_target_in(this.current_scope, name, target).is_valid()) {
+                    this.scopes[this.current_scope.id - 1].add_overload(name, id);
+                }
+                return id;
+            }
         }
 
         this.scopes[this.current_scope.id - 1]
-            .insert_import(sym.name, id, new_module_id, existing_module_id);
+            .insert_import(name, id, new_module_id, existing_module_id);
         return id;
+    }
+
+    /// The import binding of `name` in `scope` whose target is `target`, or
+    /// an invalid id.
+    import_target_in(&this, scope: ScopeID, name: SymbolStr, target: SymbolID) -> SymbolID {
+        const all: SymbolID[] = this.scopes[scope.id - 1].get_overloads(name);
+        for (mut i: i64 = 0; i < all.length; i++) {
+            const t: Option<SymbolID> = this.import_targets.get(&all[i].key());
+            if (t.is_some() && t.unwrap().equals(target)) { return all[i]; }
+        }
+        return SymbolID::invalid();
+    }
+
+    /// The declaration an import binding names in the namespace `ns`: among
+    /// the bindings its scope holds under its name, the target whose kind
+    /// `ns` accepts, or an invalid id when the module offered nothing under
+    /// the leaf in `ns`.  The binding a lookup returned is one of them, so
+    /// the answer is chosen by namespace, never by which declaration the
+    /// module happened to list first.
+    import_target(&this, s: &Symbol, ns: Namespace) -> SymbolID {
+        if (s.kind != SymbolKind::Import || !s.scope_id.is_valid()) { return SymbolID::invalid(); }
+        const all: SymbolID[] = this.scopes[s.scope_id.id - 1].get_overloads(s.name);
+        for (mut i: i64 = 0; i < all.length; i++) {
+            const t: Option<SymbolID> = this.import_targets.get(&all[i].key());
+            if (!t.is_some()) { continue; }
+            const target: SymbolID = t.unwrap();
+            if (ns.accepts(this.symbols[target.key() - 1].kind)) { return target; }
+        }
+        return SymbolID::invalid();
     }
 
     /// True when `name` is already bound in the CURRENT scope (parents are
@@ -485,7 +533,8 @@ type struct Resolver {
             }
             scope_id = scope.parent_id;
         }
-        return this.lookup_prelude(name);
+        const any_ns: Option<Namespace> = Option::None;
+        return this.lookup_prelude(name, any_ns);
     }
 
     /// The outermost tier of the rib chain: names reachable without an import.
@@ -501,11 +550,24 @@ type struct Resolver {
     /// taken from whichever module the graph happens to list first: picking
     /// would make the meaning of a program depend on module order, which is the
     /// property this subsystem exists to remove.
-    lookup_prelude(&this, name: SymbolStr) -> SymbolID {
+    ///
+    /// Asked in a namespace, a module answers with its declaration in that
+    /// namespace.  Asked in none, a module offering several declarations
+    /// under the leaf - a type and a function - is left unanswered for the
+    /// same reason: which of them it lists first is declaration order.
+    lookup_prelude(&this, name: SymbolStr, ns: Option<Namespace>) -> SymbolID {
         mut found: SymbolID = SymbolID::invalid();
         for (mut i: i64 = 0; i < this.prelude_modules.length; i++) {
-            const hit: SymbolID = this.lookup_in_module(this.prelude_modules[i], name);
-            if (!hit.is_valid()) { continue; }
+            const all: SymbolID[] = this.exports_named(this.prelude_modules[i], name);
+            if (all.length == 0) { continue; }
+            mut hit: SymbolID = SymbolID::invalid();
+            if (ns.is_some()) {
+                hit = this.export_in(this.prelude_modules[i], name, ns.unwrap());
+                if (!hit.is_valid()) { continue; }
+            } else {
+                if (all.length > 1) { return SymbolID::invalid(); }
+                hit = all[0];
+            }
             if (found.is_valid()) { return SymbolID::invalid(); }
             found = hit;
         }
@@ -578,11 +640,15 @@ type struct Resolver {
         return result;
     }
 
-    /// Look up a specific name in a module's exports.
-    lookup_in_module(&this, module_name: SymbolStr, name: SymbolStr) -> SymbolID {
-        const all: SymbolID[] = this.exports_named(module_name, name);
-        if (all.length == 0) { return SymbolID::invalid(); }
-        return all[0];
+    /// The public declaration module `m` exports under `name` in the
+    /// namespace `ns`, or an invalid id: `M::f` in an expression names the
+    /// function `f`, never a type `M` also declares as `f`.
+    export_in(&this, m: SymbolStr, name: SymbolStr, ns: Namespace) -> SymbolID {
+        const all: SymbolID[] = this.exports_named(m, name);
+        for (mut i: i64 = 0; i < all.length; i++) {
+            if (ns.accepts(this.get_symbol(all[i]).kind)) { return all[i]; }
+        }
+        return SymbolID::invalid();
     }
 
     /// Every public declaration `module_name` exports under `name`, in
@@ -765,6 +831,14 @@ type struct Resolver {
                     if (sym.kind == SymbolKind::Import && sc.is_ambiguous(head)) {
                         return Res::Err;
                     }
+                    // An import names the declaration it binds in `ns`.  One
+                    // that binds none there keeps its own answer, and the
+                    // stage that needs the kind reports the mismatch.
+                    const target: SymbolID = this.import_target(&sym, ns);
+                    if (target.is_valid()) {
+                        const tsym: Symbol = this.get_symbol(target);
+                        return this.res_for_head(&tsym, trailing);
+                    }
                     return this.res_for_head(&sym, trailing);
                 }
             }
@@ -782,7 +856,8 @@ type struct Resolver {
         // Filtered by `ns` like every other rib.  Without the filter a question
         // asked in one namespace is answerable by whatever kind a prelude
         // module happens to export under the name.
-        const pre: SymbolID = this.lookup_prelude(head);
+        const asked: Option<Namespace> = Option::Some(ns);
+        const pre: SymbolID = this.lookup_prelude(head, asked);
         if (pre.is_valid()) {
             const psym: Symbol = this.get_symbol(pre);
             if (ns.accepts(psym.kind)) {
