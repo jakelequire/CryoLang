@@ -201,8 +201,8 @@ measurement that decided it on the row.
 | D44 | **An import that binds nothing in the requested namespace keeps its old answer** (`resolve_path`), rather than being an error or walking on (Jake, relayed in plain text 2026-09-27) | **TAKEN (§8.367)** | `no check` — a rule inside the import binding, behaviour-preserving by construction | §8.367, §8.371 |
 | D45 | **`ModuleGraph::module_named(text)` is RULED AGAINST.** Every place that stores a namespace as text holds a module identity instead - the call sites and the stored fields (`StructType.module_name`, `TemplateEntry.module_name`, `Symbol.source_module`, the stored namespace strings); text becomes an identity once, at the edge where source text enters, never through a door callable from anywhere (Jake, relayed in plain text 2026-09-27) | **RULED; BUILT for types and templates (§8.372) for symbols and the resolver's current module (§8.373), for the export questions and the module sets the graph and the name layer hand out (§8.374), for the compilation context's module and every use site (§8.375), for the module graph's edge lists and the prelude list (§8.376), for a C import's declarations and the declaration index's global table (§8.378), and the monomorphizer's stores found to hold files or nothing (§8.379)** - a struct's, class's, enum's and trait's record and a template's entry hold their module as a `ModulePath` (`declared_in`), taken from the declaration's definition or the unit writing it; a symbol's `source_module` and the resolver's `current_module` are `ModulePath`s, an import turning its written path into the module once; never from text. The compilation context's module (the unit being compiled, and the use site of a qualified path or a call) is a `ModulePath` (§8.375). The module graph's edge lists - dependencies, imported namespaces, sub-modules, re-exports - and the prelude list are `ModulePath[]`, turned from the namespaces the loader records once discovery has finished (§8.376). A C import's module is registered by the importer where it composes the namespace, and every declaration it synthesizes carries that module; the global table is keyed by its declaring module (§8.378). The monomorphizer's "current module", the method-spec owner list and an impl block's `source_module` each held a source FILE, and are named for it; the specialization table's origin module and the registry's per-module demand list were written and never read, and are deleted (§8.379). The door stands at 13 calls; still text: the declaration index's overload owner column (a declaration's qualified name, not a module); nothing may add a caller | `grep -rho 'module_named(' compiler/src --include=*.cryo \| wc -l` → **14** (-1 in §8.378: the name layer's C-import door; a C import's declarations carry the module the importer registered; 15 before, 16 after §8.375; §8.376 -2 +1 - the re-export closure and the resolver's prelude list read identities, and the graph's `modules_of` turns the recorded edges once; 19 after §8.374; §8.375 -3 - the spelling match, a call's visibility check and a C-import scope segment read the use site's identity; 20 after §8.373; §8.374 -4 +3 - the re-export walks and `private_declarations` read identities, the prelude list, an `export` path and the graph's recorded re-export lists enter once each; 21 after §8.372, 25 before it: the definition and 24 calls; §8.373 -2 +1 - a symbol's module and an import's re-export walk read identities, a C import's declarations ask once in `c_import_module`) | §8.363, §8.371, §8.372, §8.373, §8.374, §8.375, §8.376 |
 | D46 | **`TypeRef` is sealed, as its OWN project** - at least 500 refusals when tried, and 500 is the compiler's own diagnostic cap, so the true figure is higher; never started inside another unit (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — not built | §8.371 |
-| D47 | **Identities carry a generation tag validated at use** - a stale or forged identity is caught where it is read; this supersedes answering the pointer-cast forgery with a language change (Jake, relayed in plain text 2026-09-27) | **RULED** - its own unit | `no check` — not built | §8.371 |
-| D48 | **One allocator per identity kind, owned by its table**: nothing outside the table can construct a second `SymbolID` allocator or a second `DefTable`, which would hand out colliding identities - sealing stopped forging an identity from a raw number, not minting one from a fresh allocator (Jake, relayed in plain text 2026-09-27) | **RULED; BLOCKED on a decision (§8.377)** - measured: a second `SymbolIds` and a second `DefTable` - minting a `DefId` - both compile from an unrelated module; made private, each constructor refuses its one owner (E0353), because the owner is in another module (`Resolver`, `CompilationContext`) and Cryo's `private` reaches the declaring module only; moving either owner beside its table is an import cycle. The choice - a visibility that reaches one named module, the generation tags of D47 catching a foreign identity where it is read, or the allocator folded into a table type (which closes the second allocator but not a second table) - is not this ledger's | `no check` — not built | §8.371, §8.377 |
+| D47 | **Identities carry a generation tag validated at use** - a stale or forged identity is caught where it is read; this supersedes answering the pointer-cast forgery with a language change (Jake, relayed in plain text 2026-09-27) | **BUILT for definition and symbol identities (§8.380)** - a `DefId` carries the tag of the `DefTable` that made it and a `SymbolID` the tag of the `SymbolIds` that made it; every table a process makes has its own tag, and the table's read path refuses (an internal-error panic) an id another table made or one made before a rebuild, where before it answered whichever entry sat at that index; the resolver also refuses a symbol admitted at an arena slot its id does not name. Shown by `scripts/ns-migration/8.380/tag_harness.py` (6 modes: refused over this tree, answered wrongly and silently over the tree before). Not tagged: `OverloadId`, `TypeRef` and the other arena positions | `grep -c 'd.index as i64' compiler/src/compiler/resolver/res.cryo` → **1** (the table's one position read, `slot`, which checks the tag; 12 reads before §8.380); `grep -rho 'key() - 1' compiler/src --include=*.cryo \| wc -l` → **0** (the resolver's arena is read through `SymbolIds::slot_of`, which checks the tag; 4 before §8.380, one of them a pass indexing the arena directly) | §8.371, §8.380 |
+| D48 | **One allocator per identity kind, owned by its table**: nothing outside the table can construct a second `SymbolID` allocator or a second `DefTable`, which would hand out colliding identities - sealing stopped forging an identity from a raw number, not minting one from a fresh allocator (Jake, relayed in plain text 2026-09-27) | **RULED; BLOCKED on a decision (§8.377)** - measured: a second `SymbolIds` and a second `DefTable` - minting a `DefId` - both compile from an unrelated module; made private, each constructor refuses its one owner (E0353), because the owner is in another module (`Resolver`, `CompilationContext`) and Cryo's `private` reaches the declaring module only; moving either owner beside its table is an import cycle. The choice - a visibility that reaches one named module, the generation tags of D47 catching a foreign identity where it is read, or the allocator folded into a table type (which closes the second allocator but not a second table) - is not this ledger's. **The second is BUILT (§8.380)**: a second allocator or table still COMPILES, but no id it makes is answered by the first - it is refused where it is read. What that leaves of this ruling, construction itself, is the open part | `no check` — construction is not refused | §8.371, §8.377, §8.380 |
 | D49 | **Both a `deprecated` attribute and a deny-by-default lint with a reason-carrying allow**, for their separate jobs - the attribute marks an API on its way out, the lint refuses a construct unless the allow at the site says why (Jake, relayed in plain text 2026-09-27) | **RULED** - the design is not written | `no check` — not built | §8.371 |
 | D50 | **The two disagreeing records are RE-MEASURED rather than reconciled to either document** (Jake, relayed in plain text 2026-09-27). The two: the editor answer-harness figure - 22 wrong or missing of 29 in this ledger and the handoff, 17 of 20 in the editor plan document - and the primitive-keyword ruling, recorded in a handoff and never carried into this ledger (named in the sixtieth session's brief) | **TAKEN (§8.377)** - neither old query set survives, so neither figure can be reproduced; the harness is rebuilt in the tree from the plan document's fixture and reads **18 of 25** wrong or missing (18 of the 20 questions shaped like the plan's; the 5 added all answer right), twice, identically; the ruling is carried into D18 | `no check` — the harness needs the editor server `make lsp-check` links and about two minutes; its reading is pinned in §8.377 | §8.371, §8.377 |
 
@@ -46826,3 +46826,122 @@ left), and 0 objects moved.
 
 12 compiler files (+68/-123), the residue classifier (one entry), the
 residue table, the lane baseline.
+
+### 8.380 Definition and symbol identities carry the tag of the table that made them, and each table refuses, where it reads, an id another table made or one made before a rebuild; the resolver refuses a symbol admitted at a slot its id does not name; 0 objects moved, no measurable cost - 2026-09-27
+
+## The hole
+
+A `DefId` was a bare position in the `DefTable`, and a `SymbolID` a bare
+number from the resolver's `SymbolIds`. §8.377 showed a second allocator
+and a second table both compile from an unrelated module. What that costs
+is a wrong answer, not an error: an id from the second table is a valid
+position in the first, and the first answers whatever it holds there. The
+same holds for an id kept across a table REBUILD. Measured over the tree
+before this change (the harness below, built against the previous
+commit's compiler source):
+
+```
+foreign           exit   0  foreign: 'alpha'            # B's id for 'beta', read by A
+stale             exit   0  stale: 'gamma'              # the id made for 'alpha', read after a rebuild
+sym_foreign       exit   0  sym_foreign: 'x_one'        # resolver 2's id for 'y_two', read by resolver 1
+synth_interleave  exit   0  synth_interleave: 'b_second'   # see below
+```
+
+Every one exits 0 having answered a different declaration.
+
+## What changed
+
+```cryo
+// resolver/res.cryo
+type struct DefId {
+private:
+    index: u32;
+    table: u32;          // the tag of the table that made it; 0 = invalid
+}
+// DefTable: `tag` from a process-wide counter at `new`, stamped by `append`;
+// every read goes through
+slot(&this, d: DefId) -> i64 {
+    if (d.table != this.tag) { DefTable::refuse(d.table, this.tag); }
+    return d.index as i64;
+}
+```
+
+* `DefTable` - `path_of`, `parent_of`, `leaf_of`, `kind_of`, `module_of`,
+  `origin_of`, the visibility and refused-signature reads and writes, and
+  `append`'s read of the parent's path: each indexes through `slot`.
+  `DefId::equals` compares the tag too.
+* `SymbolID` is a 32-bit sequence number and a 32-bit tag (8 bytes, as
+  before); `SymbolIds::slot_of` refuses an id another allocator made and
+  the invalid id. `key()` is unchanged - still the sequence number the
+  passes key their own tables by.
+* The resolver's arena reads (`get_symbol`, the import-target read, the
+  existing-binding read) go through `slot_of`; the dead-code pass, which
+  indexed the arena directly by `key() - 1`, asks `get_symbol`.
+* `Resolver::admit` checks that the symbol it pushes lands at the slot its
+  id names. It did not: an id handed out with no symbol behind it
+  (`alloc_synthetic_binding`) followed by a declaration made every later
+  `get_symbol` read the NEXT symbol - the harness's `synth_interleave`
+  answers `b_second` for `a_first` over the old tree. The corpus never
+  interleaves them (the census passes with the check in place); the check
+  is what keeps that true.
+* A refusal is a panic: `internal compiler error: a definition id made by
+  table 2 was read against table 1 (the invalid id carries 0)`, exit 101.
+
+## Evidence
+
+* `make verify ARGS="--baseline HEAD --require-identical"`: tests 3,515,
+  moved 0; examples 1,126, moved 0; census, examples, editor, other-OS,
+  incremental gates and check-fast OK. Predicted 0: no id reaches output.
+* `cryo check src/main.cryo`: 346 warnings, same (code, file) set.
+* Editor answer harness (`scripts/ns-migration/8.377/editor_answers.py`,
+  the server `make verify` linked): `wrong-or-missing 18 of 25`, the same
+  as §8.377, no panic - the server holds contexts across requests and
+  none reads another's ids.
+* `python3 scripts/ns-migration/8.380/tag_harness.py --cryo <compiler>`
+  builds `harness/` against `compiler/src` and runs each mode alone:
+
+  ```
+  ok    own               exit   0  own: 'alpha'
+  ok    foreign           exit 101  ... a definition id made by table 2 was read against table 1 ...
+  ok    stale             exit 101  ... a definition id made by table 1 was read against table 2 ...
+  ok    sym_own           exit   0  sym_own: 'x_one'
+  ok    sym_foreign       exit 101  ... symbol id 1 made by allocator 2 was read against allocator 1 ...
+  ok    synth_interleave  exit 101  ... symbol admitted at arena slot 0, its id names slot 1
+  tag-harness: OK -- 6 modes: every foreign or stale id refused, every own id answered
+  ```
+
+  The same script over a copy of `harness/` depending on the previous
+  commit's compiler source (`--project`): `tag-harness: FAIL -- 4 of 6
+  modes did not do what they must`, the four wrong answers quoted above.
+  The own-table modes answer on both, which is the control.
+
+## Cost
+
+Whole-compiler type check (`cryo check src/main.cryo`), four rounds
+alternating the previous commit's compiler and this one, each from a clean
+build: median 22.40 s both (min 22.21 s / 22.32 s). One comparison per
+read, and `DefId` grows from 4 to 8 bytes.
+
+A first version kept `SymbolID`'s 64-bit number and added the tag beside
+it, making it 16 bytes: median 22.99 s against 22.29 s, slower in every
+round (+3%). Moving the panic out of the read path changed nothing (23.22
+s against 22.34 s); packing the id back into 8 bytes removed the whole
+difference. The cost was the size, not the comparison.
+
+## What the tags do not do
+
+They do not stop a second table or allocator being BUILT - §8.377's
+mutations still compile. They make every id such a table hands out useless
+against the compiler's own: refused at the first read, not answered. The
+one-allocator ruling asks for construction itself to be refused; whether a
+refusal at use is enough, and so whether a visibility level reaching one
+named module is still wanted, is not this ledger's to decide.
+
+`OverloadId`, `TypeRef` and the other arena positions carry no tag.
+
+## Blast radius
+
+4 compiler files (+110/-34): `res.cryo`, `symbol_id.cryo`, `resolver.cryo`,
+`dead_code.cryo`. New: `scripts/ns-migration/8.380/` (the harness project
+and its runner; no gate runs it - it builds the compiler library, about
+thirty seconds).

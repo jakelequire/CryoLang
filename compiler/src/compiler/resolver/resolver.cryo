@@ -7,6 +7,7 @@
 
 namespace compiler::resolver::resolver;
 
+import std::fmt;
 import compiler::module_graph;
 import compiler::module_graph::{ ModuleGraph };
 import compiler::resolver;
@@ -237,8 +238,13 @@ type struct Resolver {
     /// named by its `SymbolID`, and an answer for one is `Res::Local` or
     /// `Res::GenericParam`, never `Res::Def`.
     admit(mut &this, sym: Symbol) -> void {
+        const at: i64 = this.symbol_ids.slot_of(sym.id);
+        if (at != this.symbols.length) {
+            panic(fmt::format(
+                "internal compiler error: symbol admitted at arena slot %lld, its id names slot %lld",
+                this.symbols.length, at), FILE, LINE);
+        }
         this.symbols.push(sym);
-        const at: i64 = this.symbols.length - 1;
         if (!this.is_definition(&this.symbols[at])) { return; }
         this.symbols[at].def = this.defs.register(
             this.declaring_module_def(&this.symbols[at]), this.symbols[at].name,
@@ -335,7 +341,7 @@ type struct Resolver {
         mut existing_module_id: u32 = 0;
         const existing_id: SymbolID = this.scopes[this.current_scope.id - 1].find(name);
         if (existing_id.is_valid()) {
-            const ex: Symbol = this.symbols[existing_id.key() - 1];
+            const ex: Symbol = this.symbols[this.symbol_ids.slot_of(existing_id)];
             const ex_mod_sym: SymbolStr = ex.source_module.as_sym();
             existing_module_id = ex_mod_sym.id;
             if (ex.kind == SymbolKind::Import && existing_module_id == new_module_id) {
@@ -375,7 +381,7 @@ type struct Resolver {
             const t: Option<SymbolID> = this.import_targets.get(&all[i].key());
             if (!t.is_some()) { continue; }
             const target: SymbolID = t.unwrap();
-            if (ns.accepts(this.symbols[target.key() - 1].kind)) { return target; }
+            if (ns.accepts(this.symbols[this.symbol_ids.slot_of(target)].kind)) { return target; }
         }
         return SymbolID::invalid();
     }
@@ -682,9 +688,9 @@ type struct Resolver {
         return out;
     }
 
-    /// Get a symbol by its SymbolID.  Indexes by id-1 (IDs start at 1).
+    /// Get a symbol by its SymbolID, one this resolver's allocator made.
     get_symbol(&this, id: SymbolID) -> Symbol {
-        return this.symbols[id.key() - 1];
+        return this.symbols[this.symbol_ids.slot_of(id)];
     }
 
     /// Borrow a scope by its ScopeID.  Indexes by id-1 (IDs start at 1).

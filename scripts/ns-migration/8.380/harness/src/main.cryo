@@ -1,0 +1,75 @@
+namespace tagharness;
+
+import std::fmt;
+import std::ffi::libc;
+import compiler::resolver::res;
+import compiler::resolver::intern_table;
+import compiler::resolver::symbol_id;
+import compiler::resolver::resolver;
+import compiler::diag::source_span;
+
+// Drives the compiler's definition table and resolver directly, one mode per
+// run, so each outcome is observed alone.  A mode that must be refused ends
+// in a panic (exit 101); a mode that must be answered prints its answer.
+//   own              - an id read against the table that made it
+//   foreign          - an id a second table made, read against the first
+//   stale            - an id made before its table was rebuilt, read after
+//   sym_own          - a symbol id read against the resolver that made it
+//   sym_foreign      - a symbol id a second resolver made, read against the first
+//   synth_interleave - a symbol admitted after a synthetic id was handed out
+function main(argc: int, argv: string*) -> int {
+    if (argc < 2) { fmt::printf("usage: tagharness <mode>\n"); return 2; }
+    const mode: string = argv[1];
+    const intern: intern_table::InternTable* =
+        libc::malloc(sizeof(intern_table::InternTable)) as intern_table::InternTable*;
+    *intern = intern_table::InternTable::new();
+    const none: res::DefId = res::DefId::invalid();
+    const at: source_span::SourceSpan = source_span::SourceSpan::none();
+
+    if (mode == "own") {
+        mut a: res::DefTable = res::DefTable::new(intern);
+        const id_a: res::DefId = a.register(none, intern.intern("alpha"), res::DefKind::Value, at);
+        fmt::printf("own: '%s'\n", intern.resolve(a.path_of(id_a)));
+        return 0;
+    }
+    if (mode == "foreign") {
+        mut a: res::DefTable = res::DefTable::new(intern);
+        mut b: res::DefTable = res::DefTable::new(intern);
+        a.register(none, intern.intern("alpha"), res::DefKind::Value, at);
+        const id_b: res::DefId = b.register(none, intern.intern("beta"), res::DefKind::Value, at);
+        fmt::printf("foreign: '%s'\n", intern.resolve(a.path_of(id_b)));
+        return 0;
+    }
+    if (mode == "stale") {
+        mut t: res::DefTable = res::DefTable::new(intern);
+        const old_id: res::DefId = t.register(none, intern.intern("alpha"), res::DefKind::Value, at);
+        t = res::DefTable::new(intern);
+        t.register(none, intern.intern("gamma"), res::DefKind::Value, at);
+        fmt::printf("stale: '%s'\n", intern.resolve(t.path_of(old_id)));
+        return 0;
+    }
+    if (mode == "sym_own") {
+        mut r1: resolver::Resolver = resolver::Resolver::new(intern);
+        const s1: symbol_id::SymbolID = r1.declare_variable(intern.intern("x_one"), at, true, false);
+        fmt::printf("sym_own: '%s'\n", intern.resolve(r1.get_symbol(s1).name));
+        return 0;
+    }
+    if (mode == "sym_foreign") {
+        mut r1: resolver::Resolver = resolver::Resolver::new(intern);
+        mut r2: resolver::Resolver = resolver::Resolver::new(intern);
+        r1.declare_variable(intern.intern("x_one"), at, true, false);
+        const s2: symbol_id::SymbolID = r2.declare_variable(intern.intern("y_two"), at, true, false);
+        fmt::printf("sym_foreign: '%s'\n", intern.resolve(r1.get_symbol(s2).name));
+        return 0;
+    }
+    if (mode == "synth_interleave") {
+        mut r: resolver::Resolver = resolver::Resolver::new(intern);
+        r.alloc_synthetic_binding();
+        const a: symbol_id::SymbolID = r.declare_variable(intern.intern("a_first"), at, true, false);
+        r.declare_variable(intern.intern("b_second"), at, true, false);
+        fmt::printf("synth_interleave: '%s'\n", intern.resolve(r.get_symbol(a).name));
+        return 0;
+    }
+    fmt::printf("unknown mode\n");
+    return 2;
+}

@@ -61,7 +61,7 @@ import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 
 /// The identity of a declaration, as resolution answered it: a position in
-/// the compilation's `DefTable`, and nothing else.
+/// the compilation's `DefTable`, and the tag of the table that made it.
 ///
 /// An id says nothing about what it names.  Its path, its parent, its leaf
 /// are the table's to answer (`path_of`, `parent_of`, `leaf_of`) - a lookup,
@@ -83,18 +83,24 @@ import compiler::types::type_ref::{ TypeRef };
 ///
 /// A wrong index is a quieter failure than a wrong name.  A bad name misses
 /// every table; an index in range names SOME real definition.  The seal is
-/// the defence: an id exists only where a declaration was registered.
+/// one defence: an id exists only where a declaration was registered.  The
+/// tag is the other: every table a process makes carries a different one,
+/// each id carries its maker's, and a table refuses - loudly, where it is
+/// read - an id another table made, or one made before this table was
+/// rebuilt, instead of answering whichever definition sits at that index.
 type struct DefId {
 private:
     /// Position in the table's parallel arrays; `0xFFFFFFFF` for none.
     index: u32;
+    /// The tag of the table that made this id; 0 for the invalid id.
+    table: u32;
 
 public:
     /// The id naming no definition, for a slot that must hold one before an
     /// answer exists.  Distinct from `Res::Err`, which is an ANSWER: this is
     /// the absence of one and never reaches a `Res`.
     static invalid() -> DefId {
-        return DefId { index: 4294967295 };
+        return DefId { index: 4294967295, table: 0 };
     }
 
     /// Whether this names a definition at all.
@@ -103,9 +109,10 @@ public:
     }
 
     /// Identity: one registration, one id.  Two declarations that share a
-    /// path - two overloads of `f`, two impls' `mul` - are two ids.
+    /// path - two overloads of `f`, two impls' `mul` - are two ids, and so
+    /// are two tables' registrations at one index.
     equals(&this, other: DefId) -> boolean {
-        return this.index == other.index;
+        return this.index == other.index && this.table == other.table;
     }
 }
 
@@ -164,9 +171,15 @@ type enum DeclVisibility {
 ///
 /// There is deliberately no "find by path": it would turn a spelling back
 /// into an existing id, which is the door this table exists to close.
+///
+/// Every read of an id goes through `slot`, which refuses an id this table
+/// did not make.
 type struct DefTable {
 private:
     intern:  InternTable*;
+    /// This table's tag, distinct from every other table the process made;
+    /// stamped on each id `append` makes and checked by `slot`.
+    tag:     u32;
     parents: DefId[];
     leaves:  SymbolStr[];
     kinds:   DefKind[];
@@ -178,8 +191,10 @@ private:
 
 public:
     static new(intern: InternTable*) -> DefTable {
+        g_def_table_tags = g_def_table_tags + 1;
         return DefTable {
             intern:  intern,
+            tag:     g_def_table_tags,
             parents: [],
             leaves:  [],
             kinds:   [],
@@ -212,7 +227,24 @@ public:
 
     /// Where `d`'s name came from, as its registrar recorded it.
     origin_of(&this, d: DefId) -> NameOrigin {
-        return this.origins[d.index as i64];
+        return this.origins[this.slot(d)];
+    }
+
+    /// The position of `d` in this table's arrays.  An id another table
+    /// made - a second table built beside this one, or this one's
+    /// predecessor before a rebuild - is refused here, and so is the invalid
+    /// id: its index is a position in SOME table, and answering it would
+    /// read whichever definition sits there.
+    slot(&this, d: DefId) -> i64 {
+        if (d.table != this.tag) { DefTable::refuse(d.table, this.tag); }
+        return d.index as i64;
+    }
+
+    /// The refusal `slot` raises, kept out of the read it guards.
+    static refuse(made_by: u32, read_by: u32) -> void {
+        panic(fmt::format(
+            "internal compiler error: a definition id made by table %u was read against table %u (the invalid id carries 0)",
+            made_by, read_by), FILE, LINE);
     }
 
     append(mut &this, parent: DefId, leaf: SymbolStr, kind: DefKind,
@@ -222,7 +254,7 @@ public:
             NameOrigin::Generated => { "$" + this.intern.resolve(leaf) }
         };
         const path: SymbolStr = if (parent.is_valid()) {
-            this.intern.intern(this.intern.resolve(this.paths[parent.index as i64])
+            this.intern.intern(this.intern.resolve(this.paths[this.slot(parent)])
                 + "::" + shown)
         } else {
             this.intern.intern(shown)
@@ -236,7 +268,7 @@ public:
         this.spans.push(span);
         this.visibility.push(DeclVisibility::Unrecorded);
         this.refused.push(false);
-        return DefId { index: at };
+        return DefId { index: at, table: this.tag };
     }
 
     /// The canonical path of `d`: its parent's path and its leaf.  For a
@@ -244,24 +276,24 @@ public:
     /// Empty for the invalid id.
     path_of(&this, d: DefId) -> SymbolStr {
         if (!d.is_valid()) { return SymbolStr::empty(); }
-        return this.paths[d.index as i64];
+        return this.paths[this.slot(d)];
     }
 
     /// The definition `d` is declared in: a module, type or impl; invalid
     /// for a root.
     parent_of(&this, d: DefId) -> DefId {
         if (!d.is_valid()) { return DefId::invalid(); }
-        return this.parents[d.index as i64];
+        return this.parents[this.slot(d)];
     }
 
     /// The name `d` was declared under, as written.
     leaf_of(&this, d: DefId) -> SymbolStr {
         if (!d.is_valid()) { return SymbolStr::empty(); }
-        return this.leaves[d.index as i64];
+        return this.leaves[this.slot(d)];
     }
 
     kind_of(&this, d: DefId) -> DefKind {
-        return this.kinds[d.index as i64];
+        return this.kinds[this.slot(d)];
     }
 
     /// The module `d` is declared in: `d` itself for a module, else the
@@ -269,8 +301,8 @@ public:
     module_of(&this, d: DefId) -> DefId {
         mut at: DefId = d;
         while (at.is_valid()) {
-            if (this.kinds[at.index as i64] == DefKind::Module) { return at; }
-            at = this.parents[at.index as i64];
+            if (this.kinds[this.slot(at)] == DefKind::Module) { return at; }
+            at = this.parents[this.slot(at)];
         }
         return DefId::invalid();
     }
@@ -279,7 +311,7 @@ public:
     /// declaration, which is the one place its `public` / `private` is read.
     record_visibility(mut &this, d: DefId, is_public: boolean) -> void {
         if (!d.is_valid()) { return; }
-        this.visibility[d.index as i64] = if (is_public) {
+        this.visibility[this.slot(d)] = if (is_public) {
             DeclVisibility::Public
         } else {
             DeclVisibility::Private
@@ -290,19 +322,19 @@ public:
     /// refused, so its registration registers no signature for it.
     record_signature_refused(mut &this, d: DefId) -> void {
         if (!d.is_valid()) { return; }
-        this.refused[d.index as i64] = true;
+        this.refused[this.slot(d)] = true;
     }
 
     /// Whether `d`'s signature was refused where it was written.
     signature_refused(&this, d: DefId) -> boolean {
         if (!d.is_valid()) { return false; }
-        return this.refused[d.index as i64];
+        return this.refused[this.slot(d)];
     }
 
     /// `d`'s visibility as its registration recorded it.
     visibility_of(&this, d: DefId) -> DeclVisibility {
         if (!d.is_valid()) { return DeclVisibility::Unrecorded; }
-        return this.visibility[d.index as i64];
+        return this.visibility[this.slot(d)];
     }
 }
 
@@ -682,6 +714,10 @@ implement enum ResSlot {
 /// where the first one was.  Distinct from the `Pending` tally below: a
 /// `Res::Def` IS an answer, so reaching one the index cannot serve means the
 /// declaration never registered, not that a pass never ran.
+/// The tag the next `DefTable` is made with.  Starts above 0, the invalid
+/// id's tag, so no table accepts the invalid id.
+mut g_def_table_tags: u32 = 0;
+
 mut g_unregistered_defs: u64 = 0;
 mut g_unregistered_first_site: string = "";
 
