@@ -29,16 +29,15 @@ A site is in the population when
     the holder's own file and outside the files its store owns (a store's
     own calls are its machinery).  One site per call; its key is the
     provenance of its key arguments, in order.
-  * SCAN: a `cmp` record, or an `arg` record of a key type's `equals`/`eq`,
-    one of whose operands is a key read off an element of an array the gate
-    places as a TABLE, where the element is read by the INNERMOST loop around
-    the comparison - read at the record's own loop depth, directly or
-    through a local declared at it, or indexed by that loop's counter.  An
-    element bound outside the innermost loop is the source of the key being
-    searched for, not the array being searched.  The site's read is spelled
-    `Owner::field[]` (`local::Elem[]` for a local or parameter array, named
-    by its element type), outside the owner's own file; its key is the other
-    operand's provenance.
+  * SCAN: a read the lane gate's rule 1c reports (`facts_scans` in
+    scripts/lane-gate.py, the one definition both use): a comparison of
+    keys one of whose operands is read off an element the INNERMOST loop
+    around it reads - an element bound outside that loop is the key being
+    searched for, not the array being searched - of an array the gate
+    places as a TABLE.  The site's read is spelled `Owner::field[]`
+    (`local::Elem[]` for a local or parameter array, named by its element
+    type), outside the owner's own file; its key is the other operand's
+    provenance.
 
 A call sema left unpinned is written by the compiler as `noparams` with the
 callee as spelled; one whose spelled method is a holder's read method is
@@ -69,12 +68,6 @@ DEFAULT_RESIDUE = os.path.join(HERE, "residue.md")
 MEMBER_TABLE = "a member table inside its owner"
 # D32's key types, as the facts spell a parameter or a compared value.
 KEY = re.compile(r"\b(SymbolStr|string|ModulePath)\b")
-# A key type's own comparison, called on one key with another.
-KEY_EQUALS = re.compile(
-    r"^(compiler::resolver::symbol_str::SymbolStr|string|compiler::module_graph::ModulePath)"
-    r"\.(equals|eq)\(")
-LOCAL_AT = re.compile(r"^local:(?:mut )?[A-Za-z_0-9]+@(\d+)=")
-ELEMENT = re.compile(r"^element(?:@(\d+))?:")
 
 
 def load_gate():
@@ -130,21 +123,6 @@ def placement(gate, src):
     return tree, holders, sets
 
 
-def bare_type(t):
-    """`compiler::ast::declaration::MethodNode*` -> `MethodNode`."""
-    t = t.strip().lstrip("&").replace("mut ", "").strip().rstrip("*").strip()
-    depth = 0
-    out = []
-    for ch in t:
-        if ch == "<":
-            depth += 1
-        elif ch == ">":
-            depth -= 1
-        elif depth == 0:
-            out.append(ch)
-    return "".join(out).rsplit("::", 1)[-1]
-
-
 def split_callee(text):
     """(owner leaf, method, is_static) of a rendered callee, or None for a
     free function or a callee the compiler could not name."""
@@ -166,54 +144,6 @@ def split_callee(text):
     if "::" in head:
         owner, meth = head.rsplit("::", 1)
         return owner.rsplit("::", 1)[-1], meth, True
-    return None
-
-
-def scanned_table(prov, depth):
-    """The TABLE label (`Owner.field`, `local.Elem`) of the nearest array
-    element the key in `prov` is read off, when the innermost loop reads it;
-    None otherwise (a key from a call, a parameter, a local bound outside the
-    innermost loop, no element at all)."""
-    segs = prov.split("<-")
-    cur = depth
-    for i, seg in enumerate(segs):
-        src = seg
-        if src.startswith("local:"):
-            m = LOCAL_AT.match(src)
-            if m:
-                cur = int(m.group(1))
-            eq = src.find("=")
-            src = src[eq + 1:] if eq >= 0 else ""
-        if src.startswith("call:"):
-            return None
-        m = ELEMENT.match(src)
-        if not m:
-            continue
-        if m.group(1) is not None:
-            cur = int(m.group(1))
-        if cur != depth:
-            return None
-        inner = src[m.end():]
-        if inner.startswith("field:"):
-            owner, field = inner[len("field:"):].rsplit(".", 1)
-            return "%s.%s" % (bare_type(owner), field)
-        if i > 0 and segs[i - 1].startswith("field:"):
-            owner = segs[i - 1][len("field:"):].rsplit(".", 1)[0]
-            return "local.%s" % bare_type(owner)
-        return None
-    return None
-
-
-def element_of(prov):
-    """The chain from the nearest array element on - which element a key is
-    read off - or None when there is none."""
-    segs = prov.split("<-")
-    for i, seg in enumerate(segs):
-        src = seg[seg.find("=") + 1:] if seg.startswith("local:") else seg
-        if src.startswith("call:"):
-            return None
-        if ELEMENT.match(src):
-            return "<-".join([src] + segs[i + 1:])
     return None
 
 
@@ -244,7 +174,7 @@ def population(gate, src, facts):
             rel = tree_rel(f[1])
             if rel is None:
                 continue
-            kind, lineno, depth = f[0], int(f[2]), int(f[14])
+            kind, lineno = f[0], int(f[2])
             if kind in ("noparams", "unaligned"):
                 spelled = f[12]
                 meth = spelled[1:] if spelled.startswith(".") else spelled.rsplit("::", 1)[-1]
@@ -259,27 +189,16 @@ def population(gate, src, facts):
                     if (static or params.startswith("&this")) and not owned(holder, rel):
                         calls.setdefault((rel, lineno, f[3], holder, meth), []).append(
                             (int(f[4]), f[6]))
-            if kind == "cmp" or (kind == "arg" and KEY_EQUALS.match(f[12])):
-                operands = (f[6], f[7])
-                sides = (0, 1)
-                # Two members of ONE element compared with each other
-                # (`b.source_field == b.local_name`) search nothing by a key
-                # from elsewhere: one site, keyed by the first operand.
-                if element_of(operands[0]) is not None and element_of(operands[0]) == element_of(operands[1]):
-                    sides = (1,)
-                for side in sides:
-                    label = scanned_table(operands[side], depth)
-                    if label is None:
-                        continue
-                    entry = gate.SCANNED_ARRAYS.get(label)
-                    if entry is None or entry.kind != gate.TABLE:
-                        continue
-                    owner, field = label.split(".", 1)
-                    if entry.defn and rel == entry.defn:
-                        continue
-                    if owner in gate.STORES and gate.STORES[owner].owns(rel):
-                        continue
-                    scans.add((rel, lineno, owner, field + "[]", operands[1 - side]))
+    for rel, lineno, label, _elem, key in gate.facts_scans(tree, facts)[0]:
+        entry = gate.SCANNED_ARRAYS.get(label)
+        if entry is None or entry.kind != gate.TABLE:
+            continue
+        owner, field = label.split(".", 1)
+        if entry.defn and rel == entry.defn:
+            continue
+        if owner in gate.STORES and gate.STORES[owner].owns(rel):
+            continue
+        scans.add((rel, lineno, owner, field + "[]", key))
     if unpinned:
         raise SystemExit("residue: %d call(s) to a holder's read method that sema left unpinned, "
                          "e.g. %s:%d `%s`; a site the compiler cannot identify is one this "

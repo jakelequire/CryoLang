@@ -104,7 +104,7 @@ import compiler::module_graph::{ ModulePath };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::sema::async_lower::{ AsyncLower, AsyncOwner };
-import compiler::sema::call_facts::{ CallFacts, FactsScope };
+import compiler::sema::call_facts::{ CallFacts, FactsScope, LoopCounter };
 import compiler::sema::call_resolver::{ CallResolver };
 import compiler::sema::diagnostics::{ Diagnostics };
 import compiler::sema::dispatch::{ SemaDispatch };
@@ -996,9 +996,16 @@ public:
 
     override visit(mut &this, node: WhileStmtNode*) -> void {
         this.resolve_expr(node.condition);
+        mut counters: LoopCounter[] = [];
+        if (this.ctx.emit_facts) {
+            const stepped: u64[] = CallFacts::stepped_locals(null, node.body);
+            CallFacts::claim_counters(&this.state, node.condition, (this.state.loop_depth + 1) as u64,
+                                      &stepped, &counters);
+        }
         this.state.loop_depth += 1;
         this.dispatch_stmt(node.body);
         this.state.loop_depth -= 1;
+        CallFacts::release_counters(&this.state, &counters);
     }
 
     override visit(mut &this, node: DoWhileStmtNode*) -> void {
@@ -1057,9 +1064,18 @@ public:
                 this.state.facts_depths.insert(counter.sym_id.key(), (this.state.loop_depth + 1) as u64);
             }
         }
+        // A counter the header does not declare (`for (; i < n; i++)`) is
+        // claimed from the condition, as a `while`'s is.
+        mut counters: LoopCounter[] = [];
+        if (this.ctx.emit_facts) {
+            const stepped: u64[] = CallFacts::stepped_locals(node.update, node.body);
+            CallFacts::claim_counters(&this.state, node.condition, (this.state.loop_depth + 1) as u64,
+                                      &stepped, &counters);
+        }
         this.state.loop_depth += 1;
         this.dispatch_stmt(node.body);
         this.state.loop_depth -= 1;
+        CallFacts::release_counters(&this.state, &counters);
         this.scopes.restore_scope(save);
     }
 

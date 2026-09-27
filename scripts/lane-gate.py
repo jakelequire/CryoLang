@@ -60,14 +60,16 @@ THREE RULES, EACH DERIVED FROM A DEFINITION, NONE FROM A LIST OF NAMES.
      One thing a name-keyed READ can be written without is a method: the
      door's loop, written at the caller (`for (i) if
      (st.methods[i].name.equals(n))`), is the same read and mentions no
-     signature.  Rule 1c (SCANNED_ARRAYS, `inline_scans`) reads that shape
-     from the tree - an element of a typed array or of a local array of
-     records, directly or through a local bound to it, whose key-typed
-     field (or the element itself, for an array of names; or its `.id`) is
-     compared with `.equals(` / `.eq(` / `==` / `!=` - and places every
-     scanned (owner, array) as a TABLE or as DATA, refusing one in neither.
-     The tree held 156 such scans, 145 of them outside the owner's file,
-     under a residue of 294 method calls that read OK.
+     signature.  Rule 1c (SCANNED_ARRAYS, `facts_scans`) reads that shape
+     from the compiler's report of each comparison of keys - `==` / `!=`
+     and a key type's `equals` / `eq` - where one operand is read off an
+     element of an array that the innermost loop around the comparison
+     reads, and places every scanned array as a TABLE or as DATA, refusing
+     one in neither.  Read from source text, the rule missed a table whose
+     element is a `Pair`, an array of interned ids compared with a key's
+     `.id`, an array held in a `string[]` local or parameter, a key read
+     through two locals; it counted a read by position outside any loop as
+     a scan, and took the wrong side of a comparison of two elements.
 
   3. WHICH STORE A CALL REACHES.  The declaration the compiler bound the
      call to: every call sema resolves is a `call` record carrying its
@@ -181,9 +183,13 @@ WHAT THE COUNT READS
 --------------------
 The calls come from the compiler's facts for the compiler project, so the
 gate needs a built compiler and fresh facts (`make facts`; `check-fast`
-refreshes them when stale, and a missing or stale file is refused).  The
-placement of stores and tables - rules 1, 1b and 1c - and the sealed-type
-check still read the tree's declarations and its inline scans.
+refreshes them when stale, and a missing or stale file is refused).  So do
+the inline scans rule 1c places.  What stays read from the tree's
+declarations is what is ABOUT declarations, which the facts - a record per
+call and per comparison - do not carry: which types own a map or an array
+of names (rules 1 and 1b), the file a scanned array's owner is declared in
+and the class that declares an inherited array (rule 1c's placement), and
+whether an identity type's construction is sealed.
 
 The facts are what THIS HOST compiled: code gated to another operating
 system (`![target(...)]`) is not in them.  The golden has no per-host
@@ -524,16 +530,14 @@ class Scanned(object):
 # written at the caller: `StructType::get_method` is `for (i) if
 # (this.methods[i].name.equals(name))`, and a caller that writes that loop
 # over `st.methods` itself has read the same table by the same key with no
-# method call for rule 2 to see.  The rule reads the tree: an element of a
-# typed array (`<recv>.<field>[i]`, the receiver placed by declared type, the
-# field one of the owner's `Elem[]` / `Elem*[]` arrays) - or a local bound
-# to one, for the block it is bound in - whose key-typed field (walked through
-# the element's declared fields, `m.func.name`) is compared with `.equals(`
-# or `==` / `!=`, in either operand position.  Every (owner, array) so
-# scanned must be here, and an entry the tree no longer scans is stale.
-# The count of such scans was 0 by construction under rules 1-1b: a grep for
-# `methods[i].name.equals(` found 11 of them in the compiler while the
-# residue read OK, and this table is what the shape reaches in full.
+# method call for rule 2 to see.  The rule reads the compiler's facts
+# (`facts_scans`): a comparison of keys one of whose operands is read off an
+# element the innermost loop reads, however many locals and members it
+# passed through.  Every array so scanned must be here, labelled by the
+# class that declares it (`local.<Element>` for one held in a local), and an
+# entry nothing scans is stale.  The count of such scans was 0 by
+# construction under rules 1-1b: a grep for `methods[i].name.equals(` found
+# 11 of them in the compiler while the residue read OK.
 SCANNED_ARRAYS = {
     # -- the arena's member tables: the doors' own bodies, and callers that
     #    re-wrote a door's loop with a predicate of their own --
@@ -604,8 +608,6 @@ SCANNED_ARRAYS = {
                                           "an arena type's methods, held in a local, by leaf"),
     "local.FieldInfo":            Scanned(None, "FieldInfo", TABLE,
                                           "a struct's or class's fields, held by reference in a local, by leaf"),
-    "local.FieldDeclNode":        Scanned(None, "FieldDeclNode", TABLE,
-                                          "a declaration's written fields, held in a local, by leaf"),
     "local.GenericParamNode":     Scanned(None, "GenericParamNode", TABLE,
                                           "a declaration's written generic parameters, held in a local, by leaf"),
     "local.VTableSlot":           Scanned(None, "VTableSlot", TABLE,
@@ -618,6 +620,35 @@ SCANNED_ARRAYS = {
                                           "a function's own scratch list of names (`seen`, `results`, `tie_traits`), asked whether it already holds one: a dedupe set"),
     "local.DirectiveNode":        Scanned(None, "DirectiveNode", DATA,
                                           "directives held in a local, by kind: spellings the language fixes, TEXTS"),
+    "local.string":               Scanned(None, "string", DATA,
+                                          "a function's own list of TEXTS - command-line arguments, requirement names, "
+                                          "keyword and flag tables, build-manifest keys, emitted C names, did-you-mean "
+                                          "candidates - asked whether it holds one"),
+    "local.NegExpect":            Scanned(None, "NegExpect", DATA,
+                                          "the negative test runner's expectations matched by code and severity: TEXTS"),
+    "local.LockedVendor":         Scanned(None, "LockedVendor", DATA,
+                                          "the lockfile's vendored libraries held in a local, by name: FILE-level records"),
+    # -- ribs, texts and file paths the compiler reports scanned whose element
+    #    is a pair or an interned id, which the owners' placement never
+    #    listed as arrays of names --
+    "Scope.ambig_name_ids":       Scanned("compiler/resolver/scope.cryo", "SymbolStr", DATA,
+                                          "the resolver's rib: the ids of the names one scope binds ambiguously"),
+    "Scope.overloads":            Scanned("compiler/resolver/scope.cryo", "Pair", DATA,
+                                          "the resolver's rib: one scope's overloaded bindings by name id"),
+    "SemaState.param_ids":        Scanned("compiler/sema/state.cryo", "SymbolStr", DATA,
+                                          "sema's own rib: the parameter names of the body being checked, by id"),
+    "SemaState.payload_binding_ids": Scanned("compiler/sema/state.cryo", "SymbolStr", DATA,
+                                             "sema's own rib: the names a match arm's payload binds, by id"),
+    "SemaState.alias_binding_ids": Scanned("compiler/sema/state.cryo", "SymbolStr", DATA,
+                                           "sema's own rib: the names an alias binding introduces, by id"),
+    "ValueTable.persistent_keys": Scanned("compiler/codegen/state/value_table.cryo", "SymbolStr", DATA,
+                                          "codegen's own rib: the bindings whose values persist across a scope, by name id"),
+    "StringCache.entries":        Scanned("compiler/codegen/state/string_cache.cryo", "Pair", DATA,
+                                          "codegen's string constants by their TEXT"),
+    "ModuleLoader.loading":       Scanned("compiler/module_loader.cryo", "Pair", DATA,
+                                          "the files discovery is loading, by FILE PATH, each with whether it is still in progress"),
+    "ParsedArgs.args":            Scanned("CLI/_module.cryo", "Pair", DATA,
+                                          "the command line's options by the flag typed, and their values: TEXTS"),
     # -- the ribs, texts, file paths and C spellings rule 1b already placed
     #    on their owners, scanned inline --
     "AsyncLower.frame_locals":    Scanned("compiler/sema/async_lower.cryo", "SymbolStr", DATA,
@@ -666,8 +697,6 @@ SCANNED_ARRAYS = {
                                           "the files already loaded: FILE PATHS"),
     "ModuleLoader.used_vendor_keys": Scanned("compiler/module_loader.cryo", "string", DATA,
                                              "the vendored libraries a build used, by key: FLAGS"),
-    "ParserBase.pending_doc_comments": Scanned("compiler/parser/parser_base.cryo", "string", DATA,
-                                               "pending doc-comment TEXTS"),
     "PhaseArtifacts.object_files": Scanned("compiler/artifacts.cryo", "string", DATA,
                                            "object FILE PATHS kept for the link"),
     "QualifiedName.parts":        Scanned("compiler/resolver/qualified_name.cryo", "SymbolStr", DATA,
@@ -679,6 +708,20 @@ SCANNED_ARRAYS = {
                                            "the registry's trait-impl heads by target type and trait identity"),
     "ModuleGraph.modules":        Scanned("compiler/module_graph.cryo", "ModuleInfo", TABLE,
                                           "the graph's modules by namespace"),
+    "DeclarationIndex.module_global_keys": Scanned("compiler/decl_index.cryo", "SymbolStr", TABLE,
+                                                   "the index's module-level globals by their leaf's id"),
+    "DeclarationIndex.module_global_modules": Scanned("compiler/decl_index.cryo", "SymbolStr", TABLE,
+                                                      "the index's module-level globals by their declaring module's id"),
+    "DeclarationIndex.module_global_namespaces": Scanned("compiler/decl_index.cryo", "SymbolStr", TABLE,
+                                                         "the index's module-level globals by their namespace's id"),
+    "DeclarationIndex.overload_func_owner": Scanned("compiler/decl_index.cryo", "SymbolStr", TABLE,
+                                                    "the index's overload entries by their owner's id"),
+    "DeclarationIndex.overload_func_mangled": Scanned("compiler/decl_index.cryo", "SymbolStr", TABLE,
+                                                      "the index's overload entries by their link symbol's id"),
+    "DeclarationIndex.prelude_ns": Scanned("compiler/decl_index.cryo", "SymbolStr", TABLE,
+                                           "the prelude's modules by namespace id"),
+    "ResolutionContext.assoc_bindings": Scanned("compiler/types/resolver.cryo", "Pair", TABLE,
+                                                "the impl's `This::Member` bindings by the member's leaf, inside its own door"),
     # -- texts, flags, file paths and triples: no declaration --
     "Diagnostic.labels":          Scanned("compiler/diag/diagnostic.cryo", "SpanLabel", DATA,
                                           "a diagnostic's labels: message TEXTS and span FILE PATHS"),
@@ -881,6 +924,7 @@ def strip_comment(line):
 STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 METHOD_HEAD_RE = re.compile(r"^    (static\s+)?([a-z_][a-z_0-9]*)\s*(?:<[^>]*>)?\s*\(")
 TYPE_HEAD_RE = re.compile(r"^type\s+(?:struct|class|union|enum)\s+([A-Za-z_][A-Za-z_0-9]*)")
+CLASS_BASE_RE = re.compile(r"^type\s+class\s+([A-Za-z_][A-Za-z_0-9]*)\s*(?:<[^>]*>)?\s*:\s*([A-Za-z_][A-Za-z_0-9]*)")
 # `implement<T> struct Foo<T> {` / `implement Foo {` / `implement trait Tr for Foo {`:
 # `this` inside the block is the type after `for` if there is one, else the
 # target.  A trait impl's methods belong to the target too, but a trait
@@ -927,262 +971,215 @@ RECORD_ARRAY_RE = re.compile(
 # signature test, the half of rule 2's that says "the caller hands a name in".
 KEY_PARAM_RE = re.compile(r":\s*&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*(?:%s)\b(?!\s*\[)"
                           % "|".join(KEY_TYPES))
-RETURN_RE = re.compile(r"\)\s*->\s*&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*([A-Za-z_][A-Za-z_0-9]*)")
 # Rule 1c's receiver: segments joined by `.`, each an identifier optionally
 # followed by `()` (a zero-argument accessor, placed by its declared return
 # type) or `[...]` (an index, placed by the element type).
-SEGMENT = r"[A-Za-z_][A-Za-z_0-9]*(?:\(\)|\[[^\[\]]*\])?"
-RECEIVER = r"(%s(?:\.%s)*)" % (SEGMENT, SEGMENT)
-
-
-# Rule 1c's element read: `<recv>.<field>[<index>]`, the receiver a placeable
-# one, not preceded by a segment of its own (so `a.b[i].c[j]` is read once at
-# `c`, with `a.b[i]` its receiver, and once at `b`).
-ELEM_RE = re.compile(r"(?<![A-Za-z_0-9.])%s\.([a-z_][a-z_0-9]*)\[([^\[\]]*)\]" % RECEIVER)
-# A local table's element read: a bare local or parameter indexed,
-# `fields[i]`, `slots[ki]` - placed by the local's annotation.
-LOCAL_ELEM_RE = re.compile(r"(?<![A-Za-z_0-9.])([a-z_][a-z_0-9]*)\[([^\[\]]*)\]")
-# The owner a local table is placed under.
+# The owner a scanned array is placed under when it is held in a local or a
+# parameter: `local.<Element>`.
 LOCAL = "local"
-# A local bound to a whole expression: `const m: MethodNode* = <expr>;`,
-# `mut f: &FieldInfo = &<expr>;`.  The alias holds for the block it is bound
-# in; a binding to a PART of an element (`.value`) is not an alias.
-BIND_RE = re.compile(r"^\s*(?:const|mut|let)\s+([a-z_][a-z_0-9]*)\s*:\s*[^=]+=\s*&?\s*(.+?)\s*;\s*$")
-IDENT = r"[a-z_][a-z_0-9]*"
-# What ends an operand of `==` / `!=` read outward from the operator.
-OPERAND_END_RE = re.compile(r"\)|&&|\|\||;|\{|\?|:")
+
+# The facts' renderings a scan is read from (`sema/call_facts.cryo`'s header).
+FACTS_LOCAL_AT = re.compile(r"^local:(?:mut )?[A-Za-z_0-9]+(?:@(\d+))?=")
+FACTS_ELEMENT = re.compile(r"^element(?:@(\d+))?:")
+# A key type's own comparison, and an identity's, as the facts render the callee.
+FACTS_KEY_EQUALS = re.compile(
+    r"^(compiler::resolver::symbol_str::SymbolStr|string|compiler::module_graph::ModulePath)"
+    r"\.(equals|eq)\(")
+FACTS_IDENTITY_EQUALS = re.compile(
+    r"^compiler::(?:types::type_ref::(TypeRef)|resolver::res::(DefId))\.(?:equals|eq)\(")
 
 
-def argument_text(line, start):
-    """The text between the `(` at `start` and its matching `)`, one line."""
+def bare_type(t):
+    """`compiler::ast::declaration::MethodNode*` -> `MethodNode`."""
+    t = t.strip().lstrip("&").replace("mut ", "").strip().rstrip("*").strip()
     depth = 0
-    for i in range(start, len(line)):
-        ch = line[i]
-        if ch == "(":
+    out = []
+    for ch in t:
+        if ch == "<":
             depth += 1
-        elif ch == ")":
+        elif ch == ">":
             depth -= 1
-            if depth == 0:
-                return line[start + 1:i].strip()
-    return line[start + 1:].strip() + " ..."
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out).rsplit("::", 1)[-1]
 
 
-def operand_before(line, end):
-    """The operand ending at `end`, read backwards to the nearest `(`,
-    `&&`, `||`, `=`, `;` or `{` (one line)."""
-    i = end
-    depth = 0
-    while i > 0:
-        ch = line[i - 1]
-        two = line[i - 2:i]
-        if ch == ")":
-            depth += 1
-        elif ch == "(":
-            if depth == 0:
-                break
-            depth -= 1
-        elif depth == 0 and (ch in "=;{!" or two in ("&&", "||")):
-            break
-        i -= 1
-    return line[i:end].strip()
+def scanned_element(prov, depth, compared):
+    """(owner, array, element type) of the array element the value in `prov` is
+    read off, when the INNERMOST loop around the record reads it - the
+    element indexed by that loop's counter, or bound to a local declared at
+    its depth; None otherwise: no element, a value that passed through a
+    call first, or an element the innermost loop does not read (the source
+    of the key being searched for, not the array being searched).
+
+    The owner is the type of the value the array is a member of, as the
+    compiler reports it (the receiver's static type), or `local` with the
+    element type as the array for an array held in a local or parameter or
+    returned by a call (the owner out of view).  The element type is the type the compared member
+    is read off, or `compared` when the element is itself the key.
+
+    A record outside every loop (depth 0) searches nothing: `argv[1] ==
+    "--help"` reads one element by position."""
+    if depth == 0:
+        return None
+    segs = prov.split("<-")
+    cur = depth
+    prev = None
+    for seg in segs:
+        src = seg
+        m = FACTS_LOCAL_AT.match(src)
+        if m:
+            if m.group(1) is not None:
+                cur = int(m.group(1))
+            src = src[m.end():]
+        if src.startswith("call:"):
+            return None
+        m = FACTS_ELEMENT.match(src)
+        if m is None:
+            prev = src
+            continue
+        if m.group(1) is not None:
+            cur = int(m.group(1))
+        if cur != depth:
+            return None
+        if prev is not None and prev.startswith("field:"):
+            elem = bare_type(prev[len("field:"):].rsplit(".", 1)[0])
+        else:
+            elem = bare_type(compared)
+        inner = src[m.end():]
+        m2 = FACTS_LOCAL_AT.match(inner)
+        if m2:
+            inner = inner[m2.end():]
+        if inner.startswith("field:"):
+            owner, field = inner[len("field:"):].split("<-", 1)[0].rsplit(".", 1)
+            return (bare_type(owner), field, elem)
+        return (LOCAL, elem, elem)
+    return None
 
 
-def operand_after(line, start):
-    """The operand starting at `start`, read forward to the nearest
-    operand end (one line)."""
-    depth = 0
-    i = start
-    while i < len(line):
-        ch = line[i]
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            if depth == 0:
-                break
-            depth -= 1
-        elif depth == 0 and OPERAND_END_RE.match(line, i):
-            break
-        i += 1
-    return line[start:i].strip()
+def require_facts(facts):
+    if not os.path.isfile(facts):
+        raise SystemExit("lane-gate: no facts at %s; run `make facts`" % facts)
 
 
-def key_chain(tree, elem, chain, key_types=KEY_TYPES):
-    """Whether `.a.b.c` walked from `elem` through the tree's declared fields
-    ends on a KEY-typed field.  A hop the tree does not declare (a field
-    inherited from a base class, an accessor) is unknown, and unknown is not
-    a key.  An empty chain is the element itself: an array of NAMES
-    (`captured_names[i].equals(n)`) is a table whose record is its key."""
-    ty = elem
-    segs = [s for s in chain.split(".") if s]
-    if not segs:
-        return elem in key_types
-    for n, s in enumerate(segs):
-        # `.name.id`: the interned id IS the symbol, compared as a number.
-        if s == "id" and ty == "SymbolStr" and "SymbolStr" in key_types and n == len(segs) - 1:
-            return True
-        f = tree.fields.get(ty, {}).get(s)
-        if f is None:
-            return False
-        if n == len(segs) - 1:
-            return f in key_types
-        ty = f
-    return False
+def element_chain(prov):
+    """The provenance from the nearest array element on - which element a
+    value is read off - or None when there is none."""
+    segs = prov.split("<-")
+    for i, seg in enumerate(segs):
+        m = FACTS_LOCAL_AT.match(seg)
+        src = seg[m.end():] if m else seg
+        if src.startswith("call:"):
+            return None
+        if FACTS_ELEMENT.match(src):
+            return "<-".join([src] + segs[i + 1:])
+    return None
 
 
-def inline_scans(tree, key_types=KEY_TYPES):
-    """Rule 1c's reads: [(rel, lineno, owner, field, elem, chain, key text)]
-    for every comparison of a typed array element's key-typed field, read
-    directly (`st.methods[i].name.equals(n)`) or through a local bound to
-    the element in the enclosing block (`const m: MethodNode* =
-    d.methods[i]; .. m.func.name.equals(n)`), against `.equals(`'s
-    argument or receiver, or the other operand of `==` / `!=`.  One row per
-    comparison: a compare with elements on both sides (`a[i].name.equals(b[j].name)`)
-    is the left element's read, keyed by the right.
+def facts_scans(tree, facts):
+    """Rule 1c's reads, from the compiler's facts: ([(rel, line, label,
+    elem, key)] compared by a KEY, [(rel, line, label, elem, "-")] compared
+    by an IDENTITY), `key` the other operand's provenance.  A comparison
+    whose two operands are both elements the innermost loop reads (a join)
+    is a read of each.  A key comparison is a `cmp` record or the `arg` record of a
+    key type's `equals`/`eq`, either operand read off an element (two
+    members of one element compared are one read); an identity comparison
+    is the `call` record of `TypeRef`/`DefId` `equals`/`eq`, whose record
+    carries the receiver's provenance and not the argument's.
 
-    A LOCAL TABLE - a local or parameter annotated as an array of records
-    (`mut fields: &FieldInfo[] = &st.fields;`, `slots: MethodInfo[]`) and
-    indexed - is the same scan with the owner out of view; it is placed
-    by its element under the owner `local` (`local.FieldInfo`).
+    A label is `Owner.array`, the owner the class that DECLARES the array
+    (a field read through a derived class's value is its base's), or
+    `local.Elem`."""
+    require_facts(facts)
+    by_lower = {rel.lower(): rel for rel in tree.rels}
+    names, identities = [], []
 
-    `key_types` is what a compared field must be to count: the name types
-    for rule 1c's placement, IDENTITY_TYPES for an IDENTITY entry's check."""
-    elem_of = {}
-    for owner, arrays in tree.typed_arrays.items():
-        for _rel, field, elem in arrays:
-            elem_of[(owner, field)] = elem
-    # Rule 1b's arrays of bare names (`string[]` is lowercase and not a
-    # typed array above): the element is the key itself.
-    for owner, arrays in tree.array_owners.items():
-        for _rel, field, elem in arrays:
-            if elem in key_types:
-                elem_of[(owner, field)] = elem
-    # A record is any declared type with a key-typed field; a key type is
-    # its own record.
-    records = {ty for ty, fs in tree.fields.items() if any(t in key_types for t in fs.values())}
-    records |= set(key_types)
-    rows = []
-    for rel in tree.rels:
-        depth = 0
-        aliases = {}
-        for lineno, raw in enumerate(tree.files[rel], 1):
-            code = STRING_RE.sub('""', strip_comment(raw))
-            for k in [k for k, v in aliases.items() if depth < v[3]]:
-                del aliases[k]
-            exprs = []
-            for m in ELEM_RE.finditer(code):
-                owner = tree.receiver_type(rel, lineno, m.group(1))
-                if owner is None:
-                    continue
-                elem = elem_of.get((owner, m.group(2)))
-                if elem is None:
-                    continue
-                exprs.append((m.group(0), owner, m.group(2), elem))
-            for m in LOCAL_ELEM_RE.finditer(code):
-                if m.group(1) == "this":
-                    continue
-                elem = tree.local_array_elem(rel, lineno, m.group(1))
-                if elem is None or elem not in records:
-                    continue
-                exprs.append((m.group(0), LOCAL, elem, elem))
-            b = BIND_RE.match(code)
-            if b is not None:
-                for text, owner, field, elem in exprs:
-                    if b.group(2) == text:
-                        aliases[b.group(1)] = (owner, field, elem, depth)
-            cands = [(re.escape(t), o, f, e) for t, o, f, e in exprs]
-            cands += [(r"\b" + re.escape(k), v[0], v[1], v[2]) for k, v in aliases.items()]
-            seen_at = set()
-            found = []
-            chain = r"((?:\.%s)*)" % IDENT
-            for pat, owner, field, elem in cands:
-                # `elem.key.equals(X)` / `.eq(X)`: keyed by X.
-                for cm in re.finditer(pat + chain + r"\.(?:equals|eq)\s*\(", code):
-                    if key_chain(tree, elem, cm.group(1), key_types):
-                        found.append((cm.end() - 1, 0, owner, field, elem, cm.group(1),
-                                      argument_text(code, cm.end() - 1)))
-                # `X.equals(elem.key)`: keyed by X, the receiver.
-                for cm in re.finditer(r"\.(?:equals|eq)\s*\(\s*" + pat + chain + r"\s*\)", code):
-                    if key_chain(tree, elem, cm.group(1), key_types):
-                        found.append((code.index("(", cm.start()), 1, owner, field, elem, cm.group(1),
-                                      operand_before(code, cm.start())))
-                # `elem.key == X` / `!= X`: keyed by X.
-                for cm in re.finditer(pat + chain + r"\s*(==|!=)\s*", code):
-                    if key_chain(tree, elem, cm.group(1), key_types):
-                        found.append((cm.start(2), 0, owner, field, elem, cm.group(1),
-                                      operand_after(code, cm.end())))
-                # `X == elem.key`: keyed by X.
-                for cm in re.finditer(r"(?<![=!<>])(==|!=)\s*" + pat + chain, code):
-                    if key_chain(tree, elem, cm.group(2), key_types):
-                        found.append((cm.start(1), 1, owner, field, elem, cm.group(2),
-                                      operand_before(code, cm.start(1))))
-            # One row per comparison, keyed at the operator's position: the
-            # element on the LEFT is the read where one stands on both sides.
-            for pos, _side, owner, field, elem, ch, key in sorted(found, key=lambda f: (f[0], f[1])):
-                if pos in seen_at:
-                    continue
-                seen_at.add(pos)
-                rows.append((rel, lineno, owner, field, elem, ch, key))
-            for ch in code:
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-    return rows
+    def label(hit):
+        owner, field, elem = hit
+        if owner != LOCAL:
+            owner = tree.declaring_type(owner, field)
+        return ("%s.%s" % (owner, field), elem)
+    with open(facts, encoding="utf-8") as fh:
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            if len(f) != 15:
+                raise SystemExit("lane-gate: %s: a record with %d fields, not 15; the facts "
+                                 "format has changed and this reader has not" % (facts, len(f)))
+            p = f[1][4:] if f[1].startswith("src/") else None
+            rel = by_lower.get(p.lower()) if p is not None else None
+            if rel is None:
+                continue
+            kind, lineno, depth = f[0], int(f[2]), int(f[14])
+            if kind == "cmp" or (kind == "arg" and FACTS_KEY_EQUALS.match(f[12])):
+                ops = [f[6], f[7]]
+                found = [scanned_element(op, depth, f[5]) for op in ops]
+                if found[0] is not None and element_chain(ops[0]) == element_chain(ops[1]):
+                    found = [None, found[1]]
+                for side, hit in enumerate(found):
+                    if hit is not None:
+                        names.append((rel, lineno) + label(hit) + (ops[1 - side],))
+            elif kind == "call" and FACTS_IDENTITY_EQUALS.match(f[12]):
+                m = FACTS_IDENTITY_EQUALS.match(f[12])
+                hit = scanned_element(f[7], depth, m.group(1) or m.group(2))
+                if hit is not None:
+                    identities.append((rel, lineno) + label(hit) + ("-",))
+    return names, identities
 
 
-def place_inline_scans(tree):
-    """Rule 1c: every (owner, array) the tree scans inline is in
-    SCANNED_ARRAYS, as a TABLE or as DATA with its reason, declared in the
-    file and with the element the entry names; every entry is still scanned
-    somewhere.  Refuses with every problem listed.  Returns the scans."""
-    scans = inline_scans(tree)
+def place_inline_scans(tree, facts):
+    """Rule 1c: every array the compiler reports a scan of (`facts_scans`)
+    is in SCANNED_ARRAYS, as a TABLE or as DATA with its reason, with the
+    element the facts give, and - unless it is held in a local - its owner
+    declared in the file the entry names and declaring the array; every
+    entry is still scanned somewhere.  An IDENTITY entry's array is scanned
+    by an identity and never by a name.  Refuses with every problem listed.
+    Returns the name scans."""
+    scans, by_identity = facts_scans(tree, facts)
     problems = []
     seen = {}
-    for rel, lineno, owner, field, elem, chain, key in scans:
-        seen.setdefault((owner, field), []).append((rel, lineno, elem, chain))
-    for (owner, field), sites in sorted(seen.items()):
-        label = "%s.%s" % (owner, field)
+    for rel, lineno, label, elem, _key in scans:
+        seen.setdefault(label, []).append((rel, lineno, elem))
+    for label, sites in sorted(seen.items()):
         entry = SCANNED_ARRAYS.get(label)
-        rel, lineno, elem, chain = sites[0]
+        rel, lineno, _elem = sites[0]
         if entry is None:
             problems.append(
-                "  `%s` (%s: %s[]) is scanned inline by its element's key (%s:%d `%s`, %d site%s) and is not in\n"
+                "  `%s` (%s[]) is scanned inline by a key (%s:%d, %d site%s) and is not in\n"
                 "      SCANNED_ARRAYS: a loop comparing a record's name is the same read as the owner's\n"
                 "      door; say which - a TABLE of declarations by leaf, or DATA with the reason the\n"
                 "      field compared names no declaration"
-                % (label, owner, elem, rel, lineno, chain, len(sites), "" if len(sites) == 1 else "s"))
+                % (label, sites[0][2], rel, lineno, len(sites), "" if len(sites) == 1 else "s"))
             continue
-        if entry.elem != elem:
-            problems.append("  `%s` is listed in SCANNED_ARRAYS with element `%s` but the tree declares `%s[]`"
-                            % (label, entry.elem, elem))
+        elems = sorted({e for _r, _l, e in sites})
+        if elems != [entry.elem]:
+            problems.append("  `%s` is listed in SCANNED_ARRAYS with element `%s` but the compiler reports `%s[]`"
+                            % (label, entry.elem, "[]`, `".join(elems)))
+        owner, field = label.split(".", 1)
         if owner == LOCAL:
             continue
-        declared = sorted({r for r, f, _e in tree.typed_arrays.get(owner, []) + tree.array_owners.get(owner, [])
-                           if f == field})
-        if entry.defn not in declared:
-            problems.append("  `%s` is listed in SCANNED_ARRAYS at %s but declared in %s"
-                            % (label, entry.defn, ", ".join(declared) or "no file"))
-    # An IDENTITY entry: its array is scanned by an identity-typed field, and
-    # never by a name.
-    by_identity = {}
-    for rel, lineno, owner, field, elem, chain, key in inline_scans(tree, IDENTITY_TYPES):
-        by_identity.setdefault((owner, field), []).append((rel, lineno, elem, chain))
+        declared = sorted(tree.declared_in.get(owner, ()))
+        if entry.defn not in declared or field not in tree.fields.get(owner, {}):
+            problems.append("  `%s` is listed in SCANNED_ARRAYS at %s but `%s` is declared in %s%s"
+                            % (label, entry.defn, owner, ", ".join(declared) or "no file",
+                               "" if field in tree.fields.get(owner, {}) else " without a field `%s`" % field))
+    identity = {}
+    for rel, lineno, label, _elem, _key in by_identity:
+        identity.setdefault(label, []).append((rel, lineno))
     for label, entry in sorted(SCANNED_ARRAYS.items()):
-        owner, field = label.split(".", 1)
         if entry.kind == IDENTITY:
-            if (owner, field) in seen:
-                rel, lineno, _elem, chain = seen[(owner, field)][0]
+            if label in seen:
+                rel, lineno, _elem = seen[label][0]
                 problems.append(
                     "  `%s` is listed in SCANNED_ARRAYS as keyed by identity (%s) but is scanned by a name\n"
-                    "      (%s:%d `%s`, %d site%s): compare the row's identity, or change the entry's kind\n"
+                    "      (%s:%d, %d site%s): compare the row's identity, or change the entry's kind\n"
                     "      and say why its key went back to a spelling"
-                    % (label, " / ".join(IDENTITY_TYPES), rel, lineno, chain, len(seen[(owner, field)]),
-                       "" if len(seen[(owner, field)]) == 1 else "s"))
-            if (owner, field) not in by_identity:
+                    % (label, " / ".join(IDENTITY_TYPES), rel, lineno, len(seen[label]),
+                       "" if len(seen[label]) == 1 else "s"))
+            if label not in identity:
                 problems.append("  `%s` is listed in SCANNED_ARRAYS as keyed by identity but nothing in the tree scans it"
                                 " by an identity (%s): a stale entry" % (label, " / ".join(IDENTITY_TYPES)))
             continue
-        if (owner, field) not in seen:
+        if label not in seen:
             problems.append("  `%s` is listed in SCANNED_ARRAYS but nothing in the tree scans it inline: a stale entry"
                             % label)
     if problems:
@@ -1192,16 +1189,16 @@ def place_inline_scans(tree):
 
 
 class Tree(object):
-    """Every .cryo file under `src`, read once, with the two maps rule 3
-    needs: each declared type's fields by name, and each file's top-level
-    block heads (which type `this` is on a given line)."""
+    """Every .cryo file under `src`, read once, with what placement needs
+    from declarations: each declared type's fields by name, the files it is declared
+    in, and each class's base."""
 
     def __init__(self, src):
         self.src = src
         self.files = {}
         self.fields = {}
-        self.returns = {}
-        self.blocks = {}
+        # {type_name: {relpath}}: the files a `type` block of the name is in.
+        self.declared_in = {}
         # {type_name: [(relpath, field, key_type)]}: every map-owning type
         # block, with the file it was found in.  A type declared in two files
         # keeps both, and rule 1 refuses it.
@@ -1213,6 +1210,9 @@ class Tree(object):
         # an array of some declared type; `record_owners` keeps the ones
         # whose element carries a key-typed field, once the tree is read.
         self.typed_arrays = {}
+        # {class_name: base_name}: a class's base, so a field the compiler
+        # reports on the receiver's type is named by the class declaring it.
+        self.bases = {}
         for dirpath, _dirs, names in os.walk(src):
             for fname in sorted(names):
                 if not fname.endswith(".cryo"):
@@ -1222,14 +1222,14 @@ class Tree(object):
                 with open(full, "r", encoding="utf-8", errors="replace") as fh:
                     lines = fh.read().split("\n")
                 self.files[rel] = lines
-                self.blocks[rel] = self.scan_blocks(lines, rel)
+                self.scan_blocks(lines, rel)
         self.rels = sorted(self.files)
 
     def scan_blocks(self, lines, rel):
         """[(first_line_index, type_name)] for every top-level type or impl
-        block, in order; fills `fields` for `type` blocks, `map_owners` for
-        the `type` blocks with a map field, and `returns` for every method
-        head at depth 1 of either."""
+        block, in order; fills `fields` and `declared_in` for `type` blocks,
+        `bases` for a class with a base, and `map_owners` for the `type`
+        blocks with a map field."""
         heads = []
         current = None
         depth = 0
@@ -1242,20 +1242,14 @@ class Tree(object):
                 current = m.group(1)
                 heads.append((i, current))
                 self.fields.setdefault(current, {})
-                self.returns.setdefault(current, {})
                 is_type = TYPE_HEAD_RE.match(code) is not None
+                if is_type:
+                    self.declared_in.setdefault(current, set()).add(rel)
+                mb = CLASS_BASE_RE.match(code)
+                if mb is not None:
+                    self.bases[mb.group(1)] = mb.group(2)
             elif current is not None and depth == 1:
-                mh = METHOD_HEAD_RE.match(code)
-                if mh is not None:
-                    head = code
-                    j = i
-                    while "{" not in head and j + 1 < len(lines):
-                        j += 1
-                        head += " " + STRING_RE.sub('""', strip_comment(lines[j])).strip()
-                    r = RETURN_RE.search(head[:head.index("{")] if "{" in head else head)
-                    if r is not None:
-                        self.returns[current][mh.group(2)] = r.group(1)
-                elif is_type:
+                if METHOD_HEAD_RE.match(code) is None and is_type:
                     f = FIELD_RE.match(code)
                     if f is not None:
                         self.fields[current][f.group(1)] = f.group(2)
@@ -1278,6 +1272,17 @@ class Tree(object):
                     depth -= 1
         return heads
 
+    def declaring_type(self, owner, field):
+        """The class along `owner`'s bases that declares `field`; `owner`
+        when none does (a type this tree does not declare)."""
+        t, seen = owner, set()
+        while t is not None and t not in seen:
+            if field in self.fields.get(t, {}):
+                return t
+            seen.add(t)
+            t = self.bases.get(t)
+        return owner
+
     def record_owners(self):
         """{type_name: [(relpath, field, element)]}: the typed arrays whose
         element is a type this tree declares with a field of a key type -
@@ -1289,80 +1294,6 @@ class Tree(object):
                 if any(ty in KEY_TYPES for ty in self.fields.get(elem, {}).values()):
                     out.setdefault(owner, []).append((rel, field, elem))
         return out
-
-    def enclosing_type(self, rel, lineno):
-        """The type `this` names at 1-based `lineno` in `rel`, or None."""
-        found = None
-        for start, name in self.blocks[rel]:
-            if start < lineno:
-                found = name
-            else:
-                break
-        return found
-
-    def local_type(self, rel, lineno, name):
-        """What `name` was last declared as before `lineno`: a parameter, a
-        `const`/`mut` binding or a field of the enclosing type, whichever
-        annotation is nearest above.  A struct-literal initializer
-        (`arena: arena,`) yields a lowercase token that names no type and is
-        skipped for the next match up.  None when nothing declares it."""
-        pat = re.compile(r"\b%s\s*:\s*&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*([A-Za-z_][A-Za-z_0-9]*)"
-                         % re.escape(name))
-        lines = self.files[rel]
-        i = lineno - 1
-        while i >= 0:
-            code = STRING_RE.sub('""', strip_comment(lines[i]))
-            for m in pat.finditer(code):
-                ty = m.group(1)
-                if ty[0].isupper() or ty in self.fields:
-                    return ty
-            i -= 1
-        return None
-
-    def local_array_elem(self, rel, lineno, name):
-        """The element type `name` was last annotated as an ARRAY of before
-        `lineno` - `slots: MethodInfo[]`, `fields: &FieldInfo[]`,
-        `params: GenericParamNode*[]` - or None when its nearest annotation
-        is not an array (`local_type` answers that one)."""
-        pat = re.compile(r"\b%s\s*:\s*(&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*([A-Za-z_][A-Za-z_0-9]*)\s*\*?\s*(\[\])?)"
-                         % re.escape(name))
-        lines = self.files[rel]
-        i = lineno - 1
-        while i >= 0:
-            code = STRING_RE.sub('""', strip_comment(lines[i]))
-            for m in pat.finditer(code):
-                ty = m.group(2)
-                if ty[0].isupper() or ty in self.fields:
-                    return ty if m.group(3) else None
-            i -= 1
-        return None
-
-    def receiver_type(self, rel, lineno, receiver):
-        """The declared type of a dotted receiver, walked segment by
-        segment: a field by its declaration, `x()` by the method's declared
-        return type, `x[...]` by the element type (the declaration regexes
-        drop `[]`, so an array field already names its element).  None where
-        any hop is unknown."""
-        segs = re.findall(SEGMENT, receiver)
-        ty = None
-        for n, seg in enumerate(segs):
-            call = seg.endswith(")")
-            name = re.match(r"[A-Za-z_][A-Za-z_0-9]*", seg).group(0)
-            if n == 0:
-                if name == "this":
-                    ty = self.enclosing_type(rel, lineno)
-                    if call:
-                        return None
-                elif call:
-                    return None
-                else:
-                    ty = self.local_type(rel, lineno, name)
-            else:
-                if ty is None:
-                    return None
-                table = self.returns if call else self.fields
-                ty = table.get(ty, {}).get(name)
-        return ty
 
 
 def block_methods(lines, start):
@@ -1644,8 +1575,7 @@ def count_facts(tree, facts):
     others = []
     unpinned = []
     seen_store = set()
-    if not os.path.isfile(facts):
-        raise SystemExit("lane-gate: no facts at %s; run `make facts`" % facts)
+    require_facts(facts)
     with open(facts, encoding="utf-8") as fh:
         for line in fh:
             f = line.rstrip("\n").split("\t")
@@ -1721,7 +1651,7 @@ def scan(src, facts):
     tree = Tree(src)
     place_map_owners(tree)
     place_array_owners(tree)
-    scans = place_inline_scans(tree)
+    scans = place_inline_scans(tree, facts)
     check_sealed_types(tree)
     found, unplaced, sets = count_facts(tree, facts)
     return found, unplaced, sets, (tree.map_owners, array_candidates(tree), scans)
@@ -1913,8 +1843,8 @@ def main():
             print("  %-20s %s" % (label, side))
             print("      %s; takes a name in: %s" % (", ".join(fields), ", ".join(methods)))
         by_array = {}
-        for rel, lineno, owner, field, _elem, _chain, _key in scans:
-            by_array.setdefault("%s.%s" % (owner, field), []).append("%s:%d" % (rel, lineno))
+        for rel, lineno, label, _elem, _key in scans:
+            by_array.setdefault(label, []).append("%s:%d" % (rel, lineno))
         print("scanned arrays (%d): rule 1c's population - an element's key compared inline - each placed"
               % len(by_array))
         for label in sorted(by_array):

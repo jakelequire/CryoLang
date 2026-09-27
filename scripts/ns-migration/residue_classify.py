@@ -178,8 +178,6 @@ CLASS_OF_METHOD = {
         ("J", "member: an arena type's methods held in a local, by leaf"),
     "local::FieldInfo[]":
         ("J", "member: a struct's or class's fields held by reference in a local, by leaf"),
-    "local::FieldDeclNode[]":
-        ("J", "member: a declaration's written fields held in a local, by leaf (the duplicate-field check)"),
     # RULED (Jake, 2026-09-22): this site stays in the population, read as a
     # rule 1c scan.  The review board read it as a text boundary outside D32;
     # outside the population does not mean clean, it means UNWATCHED - a J row

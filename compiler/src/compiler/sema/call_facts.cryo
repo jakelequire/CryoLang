@@ -62,6 +62,7 @@ import compiler::ast::expression::{
     ArrayAccessNode, BinaryExprNode, CallExprNode, CalleePin, CastExprNode, ExpressionNode,
     IdentifierNode, LiteralNode, MemberAccessNode, ScopeResolutionNode, UnaryExprNode
 };
+import compiler::ast::statement::{ BlockStmtNode, ExprStmtNode, StatementNode };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::decl_index::{ OverloadId };
@@ -91,6 +92,14 @@ type struct FactsScope {
     arena: TypeArena*;
     func:  FunctionDeclNode*;
     state: SemaState*;
+}
+
+/// A local a loop's condition claimed as its counter, and the depth it had
+/// before, so the loop hands the depth back when its body is done.
+type struct LoopCounter {
+    key:   u64;
+    had:   boolean;
+    depth: u64;
 }
 
 /// The entry sema bound a call to, and which of its answers named it.
@@ -494,6 +503,122 @@ type struct CallFacts {
             _ => { }
         }
         return "";
+    }
+
+    /// Claim for a loop at `depth` its counters, recording each one's
+    /// previous depth in `out`: a local the condition compares directly
+    /// (`i < n`, `i != end`, through `&&`, `||` and `!`) that the loop also
+    /// steps (`stepped`).  A counter declared before a `while` drives that
+    /// loop, as a `for` header's does the loop it heads: an element it
+    /// indexes in the body is read by that loop, not by the one the counter
+    /// was declared in.  A local the condition only reads is a bound (`j <
+    /// i` inside a loop over `i`) and keeps its depth; so does a member read
+    /// (`it.pos < n`), whose value may be an element bound outside the loop.
+    static claim_counters(state: SemaState*, cond: ExpressionNode*, depth: u64, stepped: &u64[],
+                          out: mut &LoopCounter[]) -> void {
+        if (cond == null) { return; }
+        const n: ASTNode* = cond as ASTNode*;
+        if (n.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = cond as UnaryExprNode*;
+            if (u.op.lexeme == "!") { CallFacts::claim_counters(state, u.operand, depth, stepped, out); }
+            return;
+        }
+        if (n.kind != NodeKind::BinaryExpression) { return; }
+        const bin: BinaryExprNode* = cond as BinaryExprNode*;
+        const op: string = bin.op.lexeme;
+        if (op == "&&" || op == "||") {
+            CallFacts::claim_counters(state, bin.left, depth, stepped, out);
+            CallFacts::claim_counters(state, bin.right, depth, stepped, out);
+            return;
+        }
+        if (op == "<" || op == "<=" || op == ">" || op == ">=" || op == "==" || op == "!=") {
+            CallFacts::claim_counter(state, bin.left, depth, stepped, out);
+            CallFacts::claim_counter(state, bin.right, depth, stepped, out);
+        }
+    }
+
+    /// The locals a loop steps - `i++`, `--i`, `i += 1`, `i = next` - in its
+    /// `for` update and in the statements directly in its body.  A step
+    /// nested deeper (inside an `if`) is not seen, and its counter keeps
+    /// the depth it was declared at.
+    static stepped_locals(update: ExpressionNode*, body: StatementNode*) -> u64[] {
+        mut out: u64[] = [];
+        CallFacts::add_stepped(update, &out);
+        if (body != null && (body as ASTNode*).kind == NodeKind::BlockStatement) {
+            const blk: BlockStmtNode* = body as BlockStmtNode*;
+            for (mut i: i64 = 0; i < blk.statements.length; i++) {
+                const s: StatementNode* = blk.statements[i];
+                if (s != null && (s as ASTNode*).kind == NodeKind::ExpressionStatement) {
+                    CallFacts::add_stepped((s as ExprStmtNode*).expression, &out);
+                }
+            }
+        }
+        return out;
+    }
+
+    static add_stepped(e: ExpressionNode*, out: mut &u64[]) -> void {
+        if (e == null) { return; }
+        const n: ASTNode* = e as ASTNode*;
+        mut target: ExpressionNode* = null;
+        if (n.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = e as UnaryExprNode*;
+            if (u.op.lexeme == "++" || u.op.lexeme == "--") { target = u.operand; }
+        }
+        if (n.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = e as BinaryExprNode*;
+            if (b.op.kind.is_assignment_op()) { target = b.left; }
+        }
+        if (target == null || (target as ASTNode*).kind != NodeKind::Identifier) { return; }
+        match ((target as IdentifierNode*).res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Local(sym) => { out.push(sym.key()); }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+    }
+
+    static claim_counter(state: SemaState*, e: ExpressionNode*, depth: u64, stepped: &u64[],
+                         out: mut &LoopCounter[]) -> void {
+        if (e == null || (e as ASTNode*).kind != NodeKind::Identifier) { return; }
+        match ((e as IdentifierNode*).res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Local(sym) => {
+                        const key: u64 = sym.key();
+                        mut steps: boolean = false;
+                        for (mut i: i64 = 0; i < stepped.length; i++) {
+                            if (stepped[i] == key) { steps = true; }
+                        }
+                        if (!steps) { return; }
+                        match (state.facts_depths.get(&key)) {
+                            Option::Some(d) => {
+                                if (d >= depth) { return; }
+                                out.push(LoopCounter { key: key, had: true, depth: d });
+                            }
+                            Option::None => { out.push(LoopCounter { key: key, had: false, depth: 0 }); }
+                        }
+                        state.facts_depths.insert(key, depth);
+                    }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+    }
+
+    /// Hand back the depths `claim_counters` took, latest first.
+    static release_counters(state: SemaState*, claimed: &LoopCounter[]) -> void {
+        for (mut i: i64 = claimed.length - 1; i >= 0; i--) {
+            const c: LoopCounter = claimed[i];
+            if (c.had) {
+                state.facts_depths.insert(c.key, c.depth);
+            } else {
+                state.facts_depths.remove(&c.key);
+            }
+        }
     }
 
     /// A local's provenance: a parameter of the enclosing function by its

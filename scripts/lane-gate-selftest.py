@@ -210,10 +210,11 @@ for _name, _ex in sorted(GATE_MOD.EXCLUDED_ARRAYS.items()):
         FILES[_ex.defn] = _existing + ARRAY_STUB % _name
 
 # One stub per SCANNED array (rule 1c): the element type with a `name`
-# key, the owner with the array, and a scan of it in the owner's own file
-# (so the residue, which shares this fixture, sees no site).  Rule 1c
-# refuses an entry nothing scans, so the fixture cannot accept the gate's
-# table without carrying every one.
+# key and the owner with the array, declared where the gate's table says;
+# the scan itself is a facts record (SCAN_FACTS), in the owner's own file so
+# the residue, which shares this fixture, sees no site.  Rule 1c refuses an
+# entry nothing scans, so the fixture cannot accept the gate's table without
+# carrying every one.
 SCAN_ELEMS_FILE = "compiler/scan_elems.cryo"
 
 
@@ -234,41 +235,60 @@ def _insert_field(text, head, line):
     return text.replace(head, head + line, 1)
 
 
-def _scan_block(owner, field, elem):
-    """A scan of `o.<field>` (or, for a LOCAL table, of a local `<field>[]`
-    of `elem`) by the element's key: `.name` of a record, the element
-    itself when the array is one of names."""
-    key = "" if elem in GATE_MOD.KEY_TYPES else ".name"
+SYM = "compiler::resolver::symbol_str::SymbolStr"
+TREF = "compiler::types::type_ref::TypeRef"
+KEY_EQ = SYM + ".equals(&this, " + SYM + ") -> boolean"
+TREF_EQ = TREF + ".equals(&this, " + TREF + ") -> boolean"
+KEY_TYPE_TEXT = {"SymbolStr": SYM, "string": "string"}
+
+
+def elem_prov(owner, field, elem, member="name", at="element@1:", base="param:o"):
+    """Where a compared value comes from when it is read off an element of
+    `owner.field` (a local array when `owner` is LOCAL): `.member` of a
+    record element, the element itself when `member` is None."""
     if owner == GATE_MOD.LOCAL:
-        return ("type struct Scan_local_%s {\n"
-                "    scan(&this, name: SymbolStr) -> void {\n"
-                "        mut xs: %s[] = [];\n"
-                "        for (mut i: i64 = 0; i < xs.length; i++) {\n"
-                "            if (xs[i]%s.equals(name)) { return; }\n"
-                "        }\n"
-                "    }\n"
-                "}\n" % (elem, elem, key))
-    return ("type struct Scan_%s_%s {\n"
-            "    scan(&this, name: SymbolStr, o: %s*) -> void {\n"
-            "        for (mut i: i64 = 0; i < o.%s.length; i++) {\n"
-            "            if (o.%s[i]%s.equals(name)) { return; }\n"
-            "        }\n"
-            "    }\n"
-            "}\n" % (owner, field, owner, field, field, key))
+        src = at + "local:mut xs@0=expr:ArrayLiteral"
+    else:
+        src = "%sfield:fixture::%s*.%s<-%s" % (at, owner, field, base)
+    if member is None:
+        return src
+    return "field:fixture::%s*.%s<-%s" % (elem, member, src)
 
 
-def _id_scan_block(owner, field):
-    """A scan of `o.<field>` by the element's identity-typed `key`."""
-    return ("type struct IdScan_%s_%s {\n"
-            "    scan(&this, t: TypeRef, o: %s*) -> void {\n"
-            "        for (mut i: i64 = 0; i < o.%s.length; i++) {\n"
-            "            if (o.%s[i].key.equals(t)) { return; }\n"
-            "        }\n"
-            "    }\n"
-            "}\n" % (owner, field, owner, field, field))
+def cmp_rec(rel, line, left, right="param:name", depth=1, ktype=SYM):
+    """A `cmp` record: `left == right` at loop depth `depth`."""
+    return "\t".join(["cmp", "src/" + rel, str(line), "9", "==", ktype, right, left,
+                      "-", "-", "-", "-", "-", "-", str(depth)])
 
 
-SCAN_LOCALS_FILE = "compiler/scan_locals.cryo"
+def eq_rec(rel, line, recv, arg="param:name", depth=1):
+    """The `arg` record of `recv.equals(arg)` on a SymbolStr."""
+    return "\t".join(["arg", "src/" + rel, str(line), "9", "0", SYM, arg, recv,
+                      "C$fixture$SymbolStr-equals", "call", "-", "-", KEY_EQ, "-", str(depth)])
+
+
+def id_rec(rel, line, recv, depth=1):
+    """The `call` record of `recv.equals(t)` on a TypeRef."""
+    return "\t".join(["call", "src/" + rel, str(line), "9", "1", "-", "-", recv,
+                      "C$fixture$TypeRef-equals", "call", "-", "-", TREF_EQ, "-", str(depth)])
+
+
+def scan_rec(label, line):
+    """The facts record of a scan of the entry `label` by its element's key,
+    in the owner's own file (a local table's in sema's)."""
+    sc = GATE_MOD.SCANNED_ARRAYS[label]
+    owner, field = label.split(".", 1)
+    rel = SEMA_FILE if owner == GATE_MOD.LOCAL else sc.defn
+    if sc.kind == GATE_MOD.IDENTITY:
+        return id_rec(rel, line, elem_prov(owner, field, sc.elem, "key"))
+    if sc.elem in GATE_MOD.KEY_TYPES:
+        return cmp_rec(rel, line, elem_prov(owner, sc.elem if owner == GATE_MOD.LOCAL else field, sc.elem, None),
+                       ktype=KEY_TYPE_TEXT[sc.elem])
+    return cmp_rec(rel, line, elem_prov(owner, field, sc.elem))
+
+
+SEMA_FILE = "compiler/sema/sema.cryo"
+SCAN_FACTS = []
 for _label, _sc in sorted(GATE_MOD.SCANNED_ARRAYS.items()):
     _owner, _field = _label.split(".", 1)
     if _sc.elem not in GATE_MOD.KEY_TYPES:
@@ -281,19 +301,20 @@ for _label, _sc in sorted(GATE_MOD.SCANNED_ARRAYS.items()):
     if _sc.kind == GATE_MOD.IDENTITY:
         _where = [r for r, t in FILES.items() if "type struct %s {\n" % _sc.elem in t]
         FILES[_where[0]] = _insert_field(FILES[_where[0]], "type struct %s {\n" % _sc.elem, "    key: TypeRef;\n")
+    SCAN_FACTS.append(scan_rec(_label, 900 + len(SCAN_FACTS)))
     if _owner == GATE_MOD.LOCAL:
-        FILES[SCAN_LOCALS_FILE] = FILES.get(SCAN_LOCALS_FILE, "") + _scan_block(_owner, _field, _sc.elem)
         continue
     _ohead = "type struct %s {\n" % _owner
     _existing = FILES.get(_sc.defn, "")
+    # A map owner's key arrays hold interned ids (`u32[]`), compared with a
+    # key's `.id`, as the tree's do; declared as the key type they would
+    # make the owner a record carrying a name.
+    _decl = "u32" if _sc.elem in GATE_MOD.KEY_TYPES and (
+        _owner in GATE_MOD.EXCLUDED or _owner in GATE_MOD.STORES) else _sc.elem
     if _ohead in _existing:
-        FILES[_sc.defn] = _insert_field(_existing, _ohead, "    %s: %s[];\n" % (_field, _sc.elem))
+        FILES[_sc.defn] = _insert_field(_existing, _ohead, "    %s: %s[];\n" % (_field, _decl))
     else:
-        FILES[_sc.defn] = _existing + _ohead + "    %s: %s[];\n}\n" % (_field, _sc.elem)
-    if _sc.kind == GATE_MOD.IDENTITY:
-        FILES[_sc.defn] += _id_scan_block(_owner, _field)
-    else:
-        FILES[_sc.defn] += _scan_block(_owner, _field, _sc.elem)
+        FILES[_sc.defn] = _existing + _ohead + "    %s: %s[];\n}\n" % (_field, _decl)
 
 # One stub per SEALED type, private field and all, in the file the gate's
 # table names; the first one is the sealed-type mutations' subject.
@@ -314,13 +335,20 @@ for _name, (_defn, _reason) in sorted(GATE_MOD.SEALED_TYPES.items()):
 FIRST_SEALED = sorted(GATE_MOD.SEALED_TYPES)[0]
 _SEALED_DEFN = GATE_MOD.SEALED_TYPES[FIRST_SEALED][0]
 
-# The first scanned array in the gate's table, for the stale-entry mutation.
-FIRST_SCANNED = sorted(l for l, sc in GATE_MOD.SCANNED_ARRAYS.items() if sc.kind != GATE_MOD.IDENTITY)[0]
-# The first array keyed by identity, for the two identity mutations: a scan
-# of it by name, and the identity scan gone.
+# The first scanned array in the gate's table held by a declared owner whose
+# element is a record, for the stale-entry, element, file and derived-class
+# cases.
+FIRST_SCANNED = sorted(l for l, sc in GATE_MOD.SCANNED_ARRAYS.items()
+                       if sc.kind == GATE_MOD.DATA and not l.startswith(GATE_MOD.LOCAL + ".")
+                       and sc.elem not in GATE_MOD.KEY_TYPES
+                       and not any(l.split(".")[0] in t for t in (GATE_MOD.STORES, GATE_MOD.EXCLUDED,
+                                                                    GATE_MOD.EXCLUDED_ARRAYS)))[0]
+_SC_OWNER, _SC_FIELD = FIRST_SCANNED.split(".", 1)
+_SC = GATE_MOD.SCANNED_ARRAYS[FIRST_SCANNED]
+# The first array keyed by identity, for the two identity cases: a scan of
+# it by name, and the identity scan gone.
 FIRST_IDENTITY = sorted(l for l, sc in GATE_MOD.SCANNED_ARRAYS.items() if sc.kind == GATE_MOD.IDENTITY)[0]
 _ID_OWNER, _ID_FIELD = FIRST_IDENTITY.split(".", 1)
-_ID_DEFN = GATE_MOD.SCANNED_ARRAYS[FIRST_IDENTITY].defn
 _ID_ELEM = GATE_MOD.SCANNED_ARRAYS[FIRST_IDENTITY].elem
 
 # LOOKUP is 2: the caller's one, and the funnel's call INTO the index in
@@ -355,9 +383,7 @@ def sema_with(extra_lines):
 # as `cryo build --emit=facts` writes it - the declaration each call was
 # bound to, as its linker symbol and its rendered text.  The counting rules
 # read only these; the tree above feeds the rules that read declarations.
-SYM = "compiler::resolver::symbol_str::SymbolStr"
-TREF = "compiler::types::type_ref::TypeRef"
-INDEX = "compiler::decl_index::DeclarationIndex"
+INDEX ="compiler::decl_index::DeclarationIndex"
 FUNNEL = "compiler::sema::type_utils::TypeUtils"
 ARENA = "compiler::types::arena::TypeArena"
 REGISTRY = "compiler::types::generic_registry::GenericRegistry"
@@ -366,7 +392,6 @@ CONSTS = "compiler::const_table::ConstantTable"
 RESOLVER = "compiler::resolver::resolver::Resolver"
 CONTEXT = "compiler::compilation_context::CompilationContext"
 SCOPES = "compiler::sema::scope_manager::ScopeManager"
-SEMA_FILE = "compiler/sema/sema.cryo"
 
 
 def _mangled(path):
@@ -412,7 +437,12 @@ BASE_FACTS = [
     call("compiler/module_graph.cryo", 6, GRAPH, "find_module_index", "read", [SYM], "i64"),
     call("compiler/const_table.cryo", 6, CONSTS, "register", "write",
          [SYM, "compiler::ast::expression::ExpressionNode*"]),
-]
+] + SCAN_FACTS
+
+
+def facts_without(record):
+    assert record in BASE_FACTS
+    return [r for r in BASE_FACTS if r != record]
 
 
 def facts_with(extra):
@@ -506,6 +536,94 @@ COUNT_CASES = [
      facts_with(["call\tsrc/compiler/sema/sema.cryo\t20\t9"]),
      1, "a record with 4 fields, not 15"),
 ]
+
+def scan_fact_of(label):
+    """The base facts' scan record of the entry `label`."""
+    owner, field = label.split(".", 1)
+    needle = "field:fixture::%s*.%s<-" % (owner, field)
+    hits = [r for r in SCAN_FACTS if needle in r]
+    assert len(hits) == 1, (label, hits)
+    return hits[0]
+
+
+# A record array in neither table, for the rule 1c cases.
+SLOT_TREE = {"compiler/types/field_table.cryo":
+             "type struct SlotDecl {\n"
+             "    name: SymbolStr;\n"
+             "}\n"
+             "\n"
+             "type struct SlotTable {\n"
+             "    rows: SlotDecl[];\n"
+             "}\n"}
+SLOT_ROW = "field:fixture::SlotDecl*.name<-%sfield:fixture::SlotTable*.rows<-param:st"
+SLOT_REFUSED = "`SlotTable.rows` (SlotDecl[]) is scanned inline by a key (compiler/sema/sema.cryo:%d, 1 site) and is not in"
+_SC_HEAD = "type struct %s {\n" % _SC_OWNER
+_SC_LINE = "    %s: %s[];\n" % (_SC_FIELD, _SC.elem)
+assert _SC_HEAD + _SC_LINE in FILES[_SC.defn], (FIRST_SCANNED, FILES[_SC.defn])
+
+# Rule 1c: the door's loop written at the caller, read from the compiler's
+# report of each comparison.  Eleven such loops stood in the compiler under
+# rules 1-1b reading OK, because a scan is no method call and the array's
+# owner had no name-taking method to make it a candidate.  (name, tree
+# edits, facts, expected exit, must-appear-in-output); each rule has a case
+# that fails when the rule is removed from the gate.
+RULE_1C_CASES = [
+    ("a record array scanned by its element's name at the innermost loop, in neither table, is refused",
+     SLOT_TREE, facts_with([cmp_rec(SEMA_FILE, 15, SLOT_ROW % "element@1:")]),
+     1, SLOT_REFUSED % 15),
+    ("the same scan written `row.name.equals(name)` through a local bound to the element, refused",
+     SLOT_TREE, facts_with([eq_rec(SEMA_FILE, 16, SLOT_ROW.replace("<-%s", "<-local:row@1=%s") % "element@1:")]),
+     1, SLOT_REFUSED % 16),
+    ("a local table whose key is read through two locals (`w = ws[i]; d = w.decl; d.name`) is placed by "
+     "the element's type, and refused when placed nowhere",
+     {}, facts_with([cmp_rec(SEMA_FILE, 25, "field:fixture::SlotDecl*.name<-local:d@1=field:fixture::SlotWrap*.decl"
+                                            "<-local:w@1=element@1:param:ws")]),
+     1, "`local.SlotWrap` (SlotWrap[]) is scanned inline by a key (compiler/sema/sema.cryo:25, 1 site) and is not in"),
+    ("an element bound outside the innermost loop is the key searched for, not the array searched: accepted",
+     SLOT_TREE, facts_with([cmp_rec(SEMA_FILE, 17, SLOT_ROW.replace("<-%s", "<-local:row@1=%s") % "element@1:",
+                                    depth=2)]),
+     0, "lane-gate: OK"),
+    ("an element indexed by an outer loop's counter is the key searched for: accepted",
+     SLOT_TREE, facts_with([cmp_rec(SEMA_FILE, 18, SLOT_ROW % "element@1:", depth=2)]),
+     0, "lane-gate: OK"),
+    ("an element read outside every loop is read by position, not searched: accepted",
+     SLOT_TREE, facts_with([cmp_rec(SEMA_FILE, 19, SLOT_ROW % "element:", depth=0)]),
+     0, "lane-gate: OK"),
+    ("a value that passed through a call is the call's, not the element's: accepted",
+     SLOT_TREE, facts_with([cmp_rec(SEMA_FILE, 20, "call:fixture::f(string) -> string of " + SLOT_ROW % "element@1:")]),
+     0, "lane-gate: OK"),
+    ("a join - both operands elements the innermost loop reads - is a read of each: the unplaced side is refused",
+     SLOT_TREE, facts_with([cmp_rec(SEMA_FILE, 21, SLOT_ROW % "element@1:",
+                                    right=elem_prov(_SC_OWNER, _SC_FIELD, _SC.elem))]),
+     1, SLOT_REFUSED % 21),
+    ("an array read through a derived class's value is the declaring base's: accepted where the base is placed",
+     {"compiler/types/field_table.cryo": "type class DerivedOwner : %s {\n}\n" % _SC_OWNER},
+     facts_with([cmp_rec(SEMA_FILE, 22, elem_prov("DerivedOwner", _SC_FIELD, _SC.elem))]),
+     0, "lane-gate: OK"),
+    ("an entry whose element the compiler reports differently is refused",
+     {}, facts_with([cmp_rec(SEMA_FILE, 23, elem_prov(_SC_OWNER, _SC_FIELD, "OtherElem"))]),
+     1, "`%s` is listed in SCANNED_ARRAYS with element `%s` but the compiler reports" % (FIRST_SCANNED, _SC.elem)),
+    ("an entry whose owner is declared in another file than the table says is refused",
+     {_SC.defn: FILES[_SC.defn].replace(_SC_HEAD, "type struct %sMoved {\n" % _SC_OWNER, 1),
+      "compiler/types/field_table.cryo": _SC_HEAD + _SC_LINE + "}\n"},
+     None, 1, "`%s` is listed in SCANNED_ARRAYS at %s but `%s` is declared in "
+              % (FIRST_SCANNED, _SC.defn, _SC_OWNER)),
+    ("an entry whose owner no longer declares the array is refused",
+     {_SC.defn: FILES[_SC.defn].replace(_SC_HEAD + _SC_LINE, _SC_HEAD, 1)},
+     None, 1, "without a field `%s`" % _SC_FIELD),
+    ("a scanned-array entry nothing scans any more is a stale entry, refused",
+     {}, facts_without(scan_fact_of(FIRST_SCANNED)),
+     1, "`%s` is listed in SCANNED_ARRAYS but nothing in the tree scans it inline: a stale entry" % FIRST_SCANNED),
+    ("an array keyed by identity, scanned by a name, is refused though it is listed",
+     {}, facts_with([cmp_rec(SEMA_FILE, 24, elem_prov(_ID_OWNER, _ID_FIELD, _ID_ELEM))]),
+     1, "`%s` is listed in SCANNED_ARRAYS as keyed by identity (DefId / TypeRef) but is scanned by a name"
+        % FIRST_IDENTITY),
+    ("an array keyed by identity that nothing scans by identity any more is a stale entry, refused",
+     {}, facts_without(scan_fact_of(FIRST_IDENTITY)),
+     1, "`%s` is listed in SCANNED_ARRAYS as keyed by identity but nothing in the tree scans it by an identity"
+        % FIRST_IDENTITY),
+]
+
 
 # (name, {relpath: content or None to delete}, expected exit, must-appear-in-output)
 MUTATIONS = [
@@ -657,73 +775,6 @@ MUTATIONS = [
               "type struct %s {\n    names: SymbolStr[];\n    by_id: HashMap<u32, i64>;\n" % FIRST_ARRAY_EXCLUDED, 1)},
      1, "`%s` (%s) owns a map (by_id: HashMap<u32>) and is in neither STORES nor EXCLUDED"
         % (FIRST_ARRAY_EXCLUDED, GATE_MOD.EXCLUDED_ARRAYS[FIRST_ARRAY_EXCLUDED].defn)),
-    # Rule 1c: the door's loop written at the caller.  Eleven such loops
-    # stood in the compiler under rules 1-1b reading OK, because a scan is
-    # no method call and the array's owner had no name-taking method to
-    # make it a candidate.
-    ("the audit's grep: a caller that scans a record array by its element's name inline, "
-     "over an array in neither table, is refused",
-     {"compiler/types/field_table.cryo":
-          "type struct SlotDecl {\n"
-          "    name: SymbolStr;\n"
-          "    ty:   TypeRef;\n"
-          "}\n"
-          "\n"
-          "type struct SlotTable {\n"
-          "    rows: SlotDecl[];\n"
-          "}\n",
-      "compiler/sema/sema.cryo": sema_with(["const st: SlotTable* = null;",
-                                            "for (mut i: i64 = 0; i < st.rows.length; i++) {",
-                                            "    if (st.rows[i].name.equals(name)) { return; }",
-                                            "}"])},
-     1, "`SlotTable.rows` (SlotTable: SlotDecl[]) is scanned inline by its element's key "
-        "(compiler/sema/sema.cryo:15 `.name`, 1 site) and is not in"),
-    ("the same scan through a local bound to the element is the same read, refused",
-     {"compiler/types/field_table.cryo":
-          "type struct SlotDecl {\n"
-          "    name: SymbolStr;\n"
-          "    ty:   TypeRef;\n"
-          "}\n"
-          "\n"
-          "type struct SlotTable {\n"
-          "    rows: SlotDecl[];\n"
-          "}\n",
-      "compiler/sema/sema.cryo": sema_with(["const st: SlotTable* = null;",
-                                            "for (mut i: i64 = 0; i < st.rows.length; i++) {",
-                                            "    const row: SlotDecl* = st.rows[i];",
-                                            "    if (name.equals(row.name)) { return; }",
-                                            "}"])},
-     1, "`SlotTable.rows` (SlotTable: SlotDecl[]) is scanned inline by its element's key "
-        "(compiler/sema/sema.cryo:16 `.name`, 1 site) and is not in"),
-    ("a scan comparing a field that is no key (the element's type) is data: accepted",
-     {"compiler/types/field_table.cryo":
-          "type struct SlotDecl {\n"
-          "    name: SymbolStr;\n"
-          "    ty:   TypeRef;\n"
-          "}\n"
-          "\n"
-          "type struct SlotTable {\n"
-          "    rows: SlotDecl[];\n"
-          "}\n",
-      "compiler/sema/sema.cryo": sema_with(["const st: SlotTable* = null;",
-                                            "for (mut i: i64 = 0; i < st.rows.length; i++) {",
-                                            "    if (st.rows[i].ty == t) { return; }",
-                                            "}"])},
-     0, "lane-gate: OK"),
-    ("a scanned-array entry nothing scans any more is a stale entry, refused",
-     {GATE_MOD.SCANNED_ARRAYS[FIRST_SCANNED].defn:
-          FILES[GATE_MOD.SCANNED_ARRAYS[FIRST_SCANNED].defn].replace(
-              _scan_block(*(FIRST_SCANNED.split(".", 1) + [GATE_MOD.SCANNED_ARRAYS[FIRST_SCANNED].elem])), "", 1)},
-     1, "`%s` is listed in SCANNED_ARRAYS but nothing in the tree scans it inline: a stale entry"
-        % FIRST_SCANNED),
-    ("an array keyed by identity, scanned by a name, is refused though it is listed",
-     {_ID_DEFN: FILES[_ID_DEFN] + _scan_block(_ID_OWNER, _ID_FIELD, _ID_ELEM)},
-     1, "`%s` is listed in SCANNED_ARRAYS as keyed by identity (DefId / TypeRef) but is scanned by a name"
-        % FIRST_IDENTITY),
-    ("an array keyed by identity that nothing scans by identity any more is a stale entry, refused",
-     {_ID_DEFN: FILES[_ID_DEFN].replace(_id_scan_block(_ID_OWNER, _ID_FIELD), "", 1)},
-     1, "`%s` is listed in SCANNED_ARRAYS as keyed by identity but nothing in the tree scans it by an identity"
-        % FIRST_IDENTITY),
     ("a sealed identity type whose private label is dropped - every field public - is refused",
      {_SEALED_DEFN: FILES[_SEALED_DEFN].replace(
          _sealed_block(FIRST_SEALED), _sealed_block(FIRST_SEALED).replace("private:\n", ""), 1)},
@@ -828,7 +879,7 @@ def main():
         if code != 1 or "no bucket named NO_SUCH_ROW" not in out:
             failures.append("--row of an unknown bucket must be refused:\n%s" % out)
 
-        cases = [(n, e, None, c, t) for n, e, c, t in MUTATIONS] + COUNT_CASES
+        cases = [(n, e, None, c, t) for n, e, c, t in MUTATIONS] + COUNT_CASES + RULE_1C_CASES
         for i, (name, edits, records, want_code, want_text) in enumerate(cases):
             tree = os.path.join(work, "m%d" % i)
             shutil.copytree(base, tree)
@@ -861,8 +912,9 @@ def main():
         for f in failures:
             sys.stderr.write(f + "\n\n")
         return 1
-    print("lane-gate-selftest: OK -- baseline accepted, %d tree mutations and %d facts cases behaved, "
-          "a stale golden section refused" % (len(MUTATIONS), len(COUNT_CASES)))
+    print("lane-gate-selftest: OK -- baseline accepted, %d tree mutations, %d counting cases and %d "
+          "scan cases behaved, a stale golden section refused"
+          % (len(MUTATIONS), len(COUNT_CASES), len(RULE_1C_CASES)))
     return 0
 
 
