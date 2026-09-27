@@ -251,8 +251,6 @@ CLASS_OF_METHOD = {
         ("N", "the module a source FILE declares, by its FILE PATH"),
     "ModuleGraph::find_module_by_path":
         ("N", "a module by its FILE PATH"),
-    "ModuleGraph::ns_sym_of_file":
-        ("N", "a namespace by its FILE PATH"),
     "Resolver::find_module_scope":
         ("J", "module: a module's scope by its namespace path, to stand in it while a template is instantiated"),
     # -- the arena and the constant table --

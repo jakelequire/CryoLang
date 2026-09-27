@@ -127,7 +127,11 @@ public:
     di_builder:        void*;
     di_cu:             void*;
     di_file:           void*;
-    namespace_str:     SymbolStr;        // interned current namespace (e.g., "Math::Vec2")
+    /// The module the unit being compiled declares: set when the
+    /// orchestrator switches to a module, and, while sema walks a
+    /// specialization placed from another module, that template's module.
+    /// None for a unit declaring no namespace.
+    unit_module:       ModulePath;
 
     // -- Phase outputs (heap-allocated to keep CompilationContext small) --
     artifacts: PhaseArtifacts*;
@@ -324,7 +328,7 @@ public:
             di_builder:        null,
             di_cu:             null,
             di_file:           null,
-            namespace_str:     SymbolStr::empty(),
+            unit_module:       ModulePath::none(),
 
             artifacts:     _box_artifacts.leak(),
             diagnostics:   diag_ptr,
@@ -447,64 +451,15 @@ public:
 
     // Namespace helpers
 
-    /// Whether a namespace has been set for this compilation unit.
+    /// Whether the unit being compiled declares a module.
     has_namespace(&this) -> boolean {
-        return !this.namespace_str.is_empty();
+        return this.unit_module.is_valid();
     }
 
-    /// Set the namespace for this compilation unit from a dotted/scoped string.
-    set_namespace(mut &this, ns: string) -> void {
-        this.namespace_str = this.intern_table.intern(ns);
-    }
-
-    /// The namespace as a display string (for APIs that need strings).
+    /// The unit's module path as text, for display and for keys spelled
+    /// with it.
     namespace_display(&this) -> string {
-        return this.intern_table.resolve(this.namespace_str);
-    }
-
-    /// The namespace of the module that owns `file`, as its interned name, or
-    /// the empty symbol when no module in the graph declares it.
-    ///
-    /// This is the AMBIENT-CURSOR-FREE counterpart to `namespace_display()`.
-    /// `namespace_display()` answers "which module is the compiler standing in
-    /// right now", which is only the right question while a pass walks
-    /// declarations in order; it is the wrong one the moment an annotation is
-    /// re-resolved from somewhere else.  This answers "which module owns this
-    /// specific piece of syntax", which is what a bare leaf in that syntax
-    /// actually means.
-    ///
-    /// Exact, not a heuristic: a .cryo file declares exactly one namespace (the
-    /// parser records the first non-directive `ModuleDeclaration` as the file's
-    /// `namespace_name` and stops), so file -> module is a total function.
-    ///
-    /// Callers pass a node's own `span.file`, so the answer travels with the
-    /// syntax rather than with the walk.
-    ///
-    /// The empty symbol means "the graph cannot say", and it is NOT
-    /// distinguishable from a module whose namespace is the empty string: the
-    /// intern table seeds "" at id 0, so `intern("")` and `SymbolStr::empty()`
-    /// are the same handle.  Nothing declares an empty namespace, so the two
-    /// cases do not both arise - but a caller must not lean on telling them
-    /// apart.  Test `is_valid()` and fall back explicitly: reading a missing
-    /// answer as a namespace that compares unequal to every real one turns "I
-    /// don't know where this was written" into "this was written somewhere
-    /// else", the false-positive direction that reverted the visibility gate.
-    ///
-    /// Delegates to `ModuleGraph::ns_sym_of_file`, which is where this mapping
-    /// lives so that mono can share it (it cannot import this module - see the
-    /// note on that function).  One implementation, two layers.
-    module_ns_sym_of_file(&this, file: string) -> SymbolStr {
-        if (this.module_graph == null) { return SymbolStr::empty(); }
-        return this.module_graph.ns_sym_of_file(file);
-    }
-
-    /// The use-site module identity (a namespace SymbolStr) for import-scoped
-    /// name resolution: the declared namespace when set (the multi-module
-    /// norm), else the source file interned (single-file mode).  This is the
-    /// identity space shared by qualified type names and ModuleInfo dependencies.
-    current_module_ns(&this) -> SymbolStr {
-        if (this.has_namespace()) { return this.namespace_str; }
-        return this.intern_table.intern(this.source_file);
+        return this.intern_table.resolve(this.unit_module.as_sym());
     }
 
     /// Which modules a spelling names, as one file can see them.
@@ -516,7 +471,7 @@ public:
     /// and two copies of a reachability rule are two rules as soon as either
     /// is edited.
     modules_written_as(&this, spelling: string,
-                       use_ns: SymbolStr) -> ModuleSpellingMatch {
+                       use_module: ModulePath) -> ModuleSpellingMatch {
         mut r: ModuleSpellingMatch = ModuleSpellingMatch {
             found:   ModulePath::none(),
             found_def: DefId::invalid(),
@@ -526,7 +481,6 @@ public:
             matched: 0,
         };
         if (this.module_graph == null || this.decl_index == null) { return r; }
-        const use_module: ModulePath = this.module_graph.module_named(use_ns);
         const count: i64 = this.module_graph.module_count() as i64;
         for (mut i: i64 = 0; i < count; i++) {
             const cand: ModuleInfo* = this.module_graph.get_module(i);
@@ -546,7 +500,7 @@ public:
             // the whole one - an abbreviation like `core::option` is a proper
             // suffix, its first segment is an interior segment binding nothing,
             // and it stays unreachable here.
-            const reachable: boolean = cand_ns.id == use_ns.id
+            const reachable: boolean = cand.path().equals(use_module)
                 || cand_str.eq(spelling)
                 || this.decl_index.is_prelude_ns(cand.path())
                 || this.decl_index.ns_imports(use_module, cand.path());
@@ -558,11 +512,11 @@ public:
         return r;
     }
 
-    /// Temporarily override the active namespace (e.g., for scope switching in sema).
-    /// Returns the previous value so it can be restored.
-    swap_namespace(mut &this, new_ns: SymbolStr) -> SymbolStr {
-        const old: SymbolStr = this.namespace_str;
-        this.namespace_str = new_ns;
+    /// Stand in module `m` (sema, walking a specialization placed from
+    /// another module).  Returns the module replaced, to restore.
+    swap_unit_module(mut &this, m: ModulePath) -> ModulePath {
+        const old: ModulePath = this.unit_module;
+        this.unit_module = m;
         return old;
     }
 
@@ -584,10 +538,10 @@ public:
         if (QualifiedName::segment_count(this.intern_table.resolve(sym)) > 1) {
             return sym;
         }
-        if (this.namespace_str.is_empty()) {
+        if (!this.unit_module.is_valid()) {
             return sym;
         }
-        const ns: string = this.intern_table.resolve(this.namespace_str);
+        const ns: string = this.intern_table.resolve(this.unit_module.as_sym());
         const bare: string = this.intern_table.resolve(sym);
         return this.intern_table.intern(ns + "::" + bare);
     }
@@ -615,9 +569,9 @@ public:
         if (QualifiedName::segment_count(this.intern_table.resolve(sym)) > 1) {
             return sym;
         }
-        const home: SymbolStr = this.module_ns_sym_of_file(span_file);
+        const home: ModulePath = this.module_of_file(span_file);
         if (!home.is_valid()) { return this.qualify_symbol_sym(sym); }
-        const ns: string   = this.intern_table.resolve(home);
+        const ns: string   = this.intern_table.resolve(home.as_sym());
         const bare: string = this.intern_table.resolve(sym);
         return this.intern_table.intern(ns + "::" + bare);
     }
@@ -647,21 +601,20 @@ public:
     /// the emitted definition's symbol and every reader that walks a root for
     /// a declaration derive the key here, so they cannot disagree.
     /// Register a declaration the compiler synthesizes - an async future, a
-    /// closure's struct, the body an `async main` is renamed to - under the
-    /// module `ns` names (invalid parent when `ns` is empty).  The
-    /// synthesizer creates the declaration, so this is its one registration,
-    /// and every reference it builds copies the id.  Its origin is recorded
-    /// as generated, so its path cannot be one the program wrote.
-    register_in_module(mut &this, ns: SymbolStr, leaf: SymbolStr, kind: DefKind,
+    /// closure's struct, the body an `async main` is renamed to - under
+    /// module `m` (invalid parent for no module).  The synthesizer creates
+    /// the declaration, so this is its one registration, and every
+    /// reference it builds copies the id.  Its origin is recorded as
+    /// generated, so its path cannot be one the program wrote.
+    register_in_module(mut &this, m: ModulePath, leaf: SymbolStr, kind: DefKind,
                        span: SourceSpan) -> DefId {
-        return this.defs.register_generated(this.module_def_of(ns), leaf, kind, span);
+        return this.defs.register_generated(this.module_def_of(m), leaf, kind, span);
     }
 
-    /// The definition of the module the namespace `ns` names; invalid for
-    /// no namespace, and for one the module graph holds no module under.
-    module_def_of(&this, ns: SymbolStr) -> DefId {
-        if (!ns.is_valid() || this.module_graph == null) { return DefId::invalid(); }
-        return this.module_graph.module_def(this.module_graph.module_named(ns));
+    /// The definition of module `m`; invalid for no module.
+    module_def_of(&this, m: ModulePath) -> DefId {
+        if (!m.is_valid() || this.module_graph == null) { return DefId::invalid(); }
+        return this.module_graph.module_def(m);
     }
 
     /// The module the source file `file` declares; none for a file the
@@ -699,12 +652,12 @@ public:
         if (QualifiedName::segment_count(text) > 1) {
             const qn: QualifiedName = QualifiedName::parse(this.intern_table, text);
             *out_leaf = qn.leaf();
-            return this.module_family(this.intern_table.intern(qn.display_parent(this.intern_table)));
+            return this.minted_parent_family(qn);
         }
         *out_leaf = name;
         const home: ModulePath = this.module_of_file(span_file);
-        if (home.is_valid()) { return FamilyOwner::Def(this.module_graph.module_def(home)); }
-        return this.module_family(this.namespace_str);
+        if (home.is_valid()) { return this.module_family(home); }
+        return this.module_family(this.unit_module);
     }
 
     /// The family a name the compiler MINTED stands for, as the minting
@@ -717,16 +670,31 @@ public:
         if (QualifiedName::segment_count(text) > 1) {
             const qn: QualifiedName = QualifiedName::parse(this.intern_table, text);
             *out_leaf = qn.leaf();
-            return this.module_family(this.intern_table.intern(qn.display_parent(this.intern_table)));
+            return this.minted_parent_family(qn);
         }
         *out_leaf = name;
         return FamilyOwner::Def(DefId::invalid());
     }
 
-    /// The family owner the module namespace `ns` names: the module's
-    /// definition, and the root for no namespace.
-    module_family(&this, ns: SymbolStr) -> FamilyOwner {
-        return FamilyOwner::Def(this.module_def_of(ns));
+    /// The family owner module `m` is: the module's definition, and the
+    /// root for no module.
+    module_family(&this, m: ModulePath) -> FamilyOwner {
+        return FamilyOwner::Def(this.module_def_of(m));
+    }
+
+    /// The family owner the namespace `ns` names, for a namespace that
+    /// reaches here as text: the parent of a name the compiler minted
+    /// qualified, the namespace a C import writes on its declarations, the
+    /// allocator module codegen calls into.  The root for no namespace, and
+    /// for one the module graph holds no module under.
+    module_family_named(&this, ns: SymbolStr) -> FamilyOwner {
+        if (!ns.is_valid() || this.module_graph == null) { return FamilyOwner::Def(DefId::invalid()); }
+        return this.module_family(this.module_graph.module_named(ns));
+    }
+
+    /// The family of the parent of a name the compiler minted qualified.
+    minted_parent_family(mut &this, qn: QualifiedName) -> FamilyOwner {
+        return this.module_family_named(this.intern_table.intern(qn.display_parent(this.intern_table)));
     }
 
     /// The `(key, namespace)` a GLOBAL is registered under in the declaration
@@ -749,8 +717,8 @@ public:
             *out_ns = binding_namespace;
             return name;
         }
-        const home: SymbolStr = this.module_ns_sym_of_file(span_file);
-        *out_ns = if (home.is_valid()) { home } else { this.namespace_str };
+        const home: ModulePath = this.module_of_file(span_file);
+        *out_ns = if (home.is_valid()) { home.as_sym() } else { this.unit_module.as_sym() };
         return name;
     }
 
@@ -934,7 +902,7 @@ public:
         this.artifacts.reset_for_next_module();
         this.provisions.clear();
         this.source_file = next_source;
-        this.namespace_str = SymbolStr::empty();
+        this.unit_module = ModulePath::none();
 
         // Reset resolver cursor (preserves cross-module state)
         if (this.resolver != null) {
@@ -964,11 +932,7 @@ public:
 
         // Set namespace from module info
         const ns_str: string = this.intern_table.resolve(info.namespace_name);
-        if (ns_str.length() > 0) {
-            this.namespace_str = info.namespace_name;
-        } else {
-            this.namespace_str = SymbolStr::empty();
-        }
+        this.unit_module = if (info.namespace_name.is_valid()) { info.path() } else { ModulePath::none() };
 
         // NOTE: AST swap is handled by the orchestrator (compile_project) because
         // nested struct assignment (this.artifacts.ast = ...) through mut &this

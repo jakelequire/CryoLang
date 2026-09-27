@@ -191,23 +191,19 @@ type struct CallResolver {
     /// text contains the call, not the module the compiler happens to be
     /// standing in while it types the call.
     ///
-    /// Every scope and visibility rule in §3.3/§4 is relative to a use site, and
-    /// both classifiers below took theirs from `current_module_ns()` - the
-    /// ambient cursor.  Generic bodies are typed with the cursor parked on the
-    /// module that owns the *receiver* type, so calls that never leave their own
-    /// file are judged as cross-module: 204 of the 204 D-A "owner not in scope"
-    /// events on `examples/09-json-config` were `std::fmt::display::fmt_err`
-    /// called from `stdlib/fmt/display.cryo` itself, blamed on
-    /// `std::core::result`.  Reading that as real is what made the visibility
-    /// gate reject correct code and get reverted (spec §8.1e).
+    /// Every scope and visibility rule is relative to a use site.  The unit's
+    /// module is the wrong one while a generic body is typed: the cursor is
+    /// parked on the module that owns the receiver type, and a call that never
+    /// leaves its own file would be judged cross-module.
     ///
-    /// Falls back to the cursor - not to "no scope" - when the span names no
-    /// module in the graph (nodes synthesized without a file, single-file mode).
-    call_use_site_ns(&this, span: SourceSpan) -> SymbolStr {
-        if (this.ctx == null) { return SymbolStr::empty(); }
-        const syn: SymbolStr = this.ctx.module_ns_sym_of_file(span.file);
+    /// Falls back to the unit's module - not to "no scope" - when the span
+    /// names no module in the graph (a node synthesized without a file,
+    /// single-file mode).
+    call_use_site_module(&this, span: SourceSpan) -> ModulePath {
+        if (this.ctx == null) { return ModulePath::none(); }
+        const syn: ModulePath = this.ctx.module_of_file(span.file);
         if (syn.is_valid()) { return syn; }
-        return this.ctx.current_module_ns();
+        return this.ctx.unit_module;
     }
 
     /// The definition a bare callee names, whose family - its parent and its
@@ -2512,30 +2508,27 @@ type struct CallResolver {
     ///   - a symbolic/trial walk is in progress: those bind speculatively;
     ///   - the callee has no owning namespace - an `extern "C"` twin or an
     ///     intrinsic, which is not a module member to enforce against;
-    ///   - the use site is UNKNOWN.  `call_use_site_ns` returns an invalid
-    ///     symbol when nothing names the span's module, and an invalid symbol
-    ///     compares unequal to every real one - judging here would reject
-    ///     every call rather than none;
-    ///   - the use site IS the declaring module (spec §4).  This is the clause
-    ///     that misfired: it used to ask `current_module_ns()`, the ambient
-    ///     cursor, and rejected 204 `std::fmt::display::fmt_err` calls that
-    ///     never leave `display.cryo`.  It now asks where the syntax was
-    ///     written, which is the question §4 is actually about.
+    ///   - the use site is UNKNOWN.  `call_use_site_module` answers no module
+    ///     when nothing names the span's module, and no module is unequal to
+    ///     every real one - judging here would reject every call rather than
+    ///     none;
+    ///   - the use site IS the declaring module.  The use site is where the
+    ///     syntax was written, not the module the compiler stands in: a
+    ///     generic body is typed with the cursor on its receiver's module.
     ///
     /// This REPORTS; it does not change which symbol binds.  Removing a private
     /// candidate from overload selection would silently rebind the call to a
     /// different function, and a wrong bind is a miscompile that every gate in
     /// this repo stays green through (§4.1).  A hard error is the honest one.
-    enforce_callee_visibility(mut &this, callee: DefId, use_ns: SymbolStr,
+    enforce_callee_visibility(mut &this, callee: DefId, use_module: ModulePath,
                               span: SourceSpan) -> void {
         if (this.state.in_symbolic_check) { return; }
-        const use_module: DefId = this.ctx.module_graph.module_def(this.ctx.module_graph.module_named(use_ns));
-        if (!this.ctx.decl_index.hidden_from(callee, use_module)) { return; }
+        if (!this.ctx.decl_index.hidden_from(callee, this.ctx.module_def_of(use_module))) { return; }
         const callee_str: string = this.intern.resolve(this.ctx.defs.path_of(callee));
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
             fmt::format("`%s` is private and cannot be called from `%s`",
-                callee_str, this.intern.resolve(use_ns)));
+                callee_str, this.intern.resolve(use_module.as_sym())));
         d = d.at_with_label(span,
             fmt::format("`%s` is private to its declaring module", callee_str));
         d = d.with_note("declare it `public` to allow calls from other modules");
@@ -2550,7 +2543,7 @@ type struct CallResolver {
     /// it asks.  `def` is the stamp, the writer's own answer, which needs no
     /// resolution against any module.
     enforce_value_ref_visibility(mut &this, def: DefId, span: SourceSpan) -> void {
-        this.enforce_callee_visibility(def, this.call_use_site_ns(span), span);
+        this.enforce_callee_visibility(def, this.call_use_site_module(span), span);
     }
 
     /// The function a qualified path in VALUE position names, or an invalid
@@ -2565,7 +2558,7 @@ type struct CallResolver {
         if (!callee.is_valid()) { return TypeRef::invalid(); }
         const ft: TypeRef = this.ctx.decl_index.func_type_of_def(callee);
         if (!ft.is_valid()) { return TypeRef::invalid(); }
-        this.enforce_callee_visibility(callee, this.call_use_site_ns(scope.span),
+        this.enforce_callee_visibility(callee, this.call_use_site_module(scope.span),
             scope.span);
         // The pin is the qualified name, as the call form's is: a free
         // function's registry key is its qualified name.  A function TEMPLATE
@@ -5303,7 +5296,7 @@ type struct CallResolver {
         } else {
             if (scope != null) { scope.span } else { SourceSpan::none() }
         };
-        this.enforce_callee_visibility(callee, this.call_use_site_ns(q_span), q_span);
+        this.enforce_callee_visibility(callee, this.call_use_site_module(q_span), q_span);
 
         mut is_fn_template: boolean = false;
         mut tmpl: TemplateEntry* = null;

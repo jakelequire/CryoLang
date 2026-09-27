@@ -561,9 +561,9 @@ public:
     /// named is the entry that completed the pair.
     refuse_module_type_collisions(&this) -> void {
         if (this.ctx == null || this.ctx.module_graph == null) { return; }
-        const ns: SymbolStr = this.resolver.current_module_path().as_sym();
-        if (!ns.is_valid()) { return; }
-        const ns_str: string = this.resolver.intern_table.resolve(ns);
+        const unit: ModulePath = this.resolver.current_module_path();
+        if (!unit.is_valid()) { return; }
+        const ns_str: string = this.resolver.intern_table.resolve(unit.as_sym());
         const scope: Scope* = this.resolver.get_scope(this.resolver.current_scope);
         if (scope == null) { return; }
         for (mut i: i64 = 0; i < scope.symbols.length; i++) {
@@ -571,7 +571,7 @@ public:
             const s: Symbol = this.resolver.get_symbol(entry.sym);
             if (!this.symbol_names_type(&s)) { continue; }
             const name_str: string = this.resolver.intern_table.resolve(s.name);
-            const m: ModuleSpellingMatch = this.ctx.modules_written_as(name_str, ns);
+            const m: ModuleSpellingMatch = this.ctx.modules_written_as(name_str, unit);
             mut clash: ModulePath = if (m.visible >= 1) { m.found } else { ModulePath::none() };
             if (!clash.is_valid()) {
                 // `namespace A;` declaring `type N` beside a module `A::N`:
@@ -980,7 +980,7 @@ public:
             match (this.type_spelling_res(bare.name, bare.span)) {
                 ResSlot::Answered(r) => { bare.res.answer(r); }
                 _                    => {
-                    if (this.ctx.module_ns_sym_of_file(bare.span.file).is_valid()) {
+                    if (this.ctx.module_of_file(bare.span.file).is_valid()) {
                         undeclared.push(this.resolver.intern_table.resolve(bare.name));
                         bare.res.answer(Res::Err);
                     }
@@ -1445,14 +1445,14 @@ public:
     /// path, a leaf a facade offers twice - before returning here, so those
     /// never arrive.
     refuse_unbound_type(&this, name: SymbolStr, span: SourceSpan) -> boolean {
-        const use_ns: SymbolStr = this.ctx.module_ns_sym_of_file(span.file);
-        if (!use_ns.is_valid()) { return false; }
+        const use_module: ModulePath = this.ctx.module_of_file(span.file);
+        if (!use_module.is_valid()) { return false; }
         const written: string = this.resolver.intern_table.resolve(name);
         const intern: InternTable* = this.resolver.intern_table;
 
         if (this.resolver.contains_separator(written)) {
             const prefix: string = QualifiedName::parent_of(written);
-            const mods: ModuleSpellingMatch = this.ctx.modules_written_as(prefix, use_ns);
+            const mods: ModuleSpellingMatch = this.ctx.modules_written_as(prefix, use_module);
             if (mods.visible > 1) {
                 mut d: Diagnostic = Diagnostic::error(
                     ErrorCode::E0154_AMBIGUOUS_CALL,
@@ -1510,9 +1510,9 @@ public:
             const owner_path: ModulePath = owners[0];
             const owner_ns: SymbolStr = owner_path.as_sym();
             const owner: string = intern.resolve(owner_ns);
-            const reach: boolean = owner_ns.id == use_ns.id
+            const reach: boolean = owner_path.equals(use_module)
                 || this.ctx.decl_index.is_prelude_ns(owner_path)
-                || this.ctx.decl_index.ns_imports(this.ctx.module_graph.module_of_file(span.file), owner_path);
+                || this.ctx.decl_index.ns_imports(use_module, owner_path);
             const is_public: boolean = this.resolver.exports_named(owner_path, name).length > 0;
             if (!reach || !is_public) {
                 mut d: Diagnostic = Diagnostic::error(
@@ -1671,7 +1671,7 @@ public:
     /// binds in the writer's scope or spells a module path, never both, and
     /// which of the two it is has already been decided when this runs.
     walk_module_rooted_type(&this, written: string,
-                            use_ns: SymbolStr, span: SourceSpan) -> ResSlot {
+                            use_module: ModulePath, span: SourceSpan) -> ResSlot {
         const prefix: string = QualifiedName::parent_of(written);
         if (prefix.length() == 0) { return ResSlot::Pending; }
         const leaf: string = QualifiedName::leaf_of(written);
@@ -1699,7 +1699,7 @@ public:
 
         // A spelling two reachable modules share names neither of them, so the
         // walk stops rather than picking one.
-        const head: ModuleSpellingMatch = this.ctx.modules_written_as(prefix, use_ns);
+        const head: ModuleSpellingMatch = this.ctx.modules_written_as(prefix, use_module);
         if (head.visible != 1) { return ResSlot::Pending; }
 
         // The segment after the head resolves inside what the head named - the
@@ -1757,7 +1757,7 @@ public:
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0353_PRIVATE_ACCESS,
                 fmt::format("`%s::%s` is private and cannot be named from `%s`",
-                    owner, leaf, this.resolver.intern_table.resolve(use_ns)));
+                    owner, leaf, this.resolver.intern_table.resolve(use_module.as_sym())));
             d = d.at_with_label(span, "private declaration named by this path");
             this.ctx.emit_diagnostic(d);
         }
@@ -1801,9 +1801,9 @@ public:
         // referring to sets the `Res` itself; guessing a use site here would
         // compare an unknown writer unequal to every real module and reject
         // what it cannot place.
-        const use_ns: SymbolStr =
-            this.ctx.module_ns_sym_of_file(node.scope_span.file);
-        if (!use_ns.is_valid()) {
+        const use_module: ModulePath =
+            this.ctx.module_of_file(node.scope_span.file);
+        if (!use_module.is_valid()) {
             return;
         }
 
@@ -1841,7 +1841,7 @@ public:
             base = ResBase::PrimTy(node.scope_name);
             have_base = true;
         } else {
-            match (this.walk_module_rooted_type(written, use_ns, node.scope_span)) {
+            match (this.walk_module_rooted_type(written, use_module, node.scope_span)) {
                 ResSlot::Answered(Res::Def(d)) => {
                     base = ResBase::Def(d);
                     have_base = true;
@@ -1887,7 +1887,7 @@ public:
                 return;
             }
         }
-        const m: ModuleSpellingMatch = this.ctx.modules_written_as(written, use_ns);
+        const m: ModuleSpellingMatch = this.ctx.modules_written_as(written, use_module);
         const found:   ModulePath = m.found;
         const other:   ModulePath = m.other;
         const any:     ModulePath = m.any;
@@ -2245,7 +2245,7 @@ public:
                 // graph does not hold and the module lane below cannot see -
                 // so the path is module-rooted and the walk answers it.
                 if (this.alias_module_of(&hs).is_valid()) {
-                    return this.walk_module_rooted_type(written, SymbolStr::empty(), span);
+                    return this.walk_module_rooted_type(written, ModulePath::none(), span);
                 }
             }
             // The head names neither a type nor a generic parameter, so the
@@ -2259,11 +2259,11 @@ public:
             // annotation's OWN module rather than the cursor's, because a
             // qualified spelling means what the writing file's imports say it
             // means and the cursor is on whatever module the pass is walking.
-            const q_ns: SymbolStr = this.ctx.module_ns_sym_of_file(span.file);
-            if (q_ns.is_valid()) {
+            const q_module: ModulePath = this.ctx.module_of_file(span.file);
+            if (q_module.is_valid()) {
                 const q_prefix: string = QualifiedName::parent_of(written);
                 const q_mods: ModuleSpellingMatch =
-                    this.ctx.modules_written_as(q_prefix, q_ns);
+                    this.ctx.modules_written_as(q_prefix, q_module);
                 if (q_mods.matched > 0) {
                     // A module carries the written prefix, so the module lane
                     // owns this path: it answers, or the path is refused.  It
@@ -2273,7 +2273,7 @@ public:
                     // the writer cannot reach - recording a name the source may
                     // not legally spell as though it were fine.
                     const q_rooted: ResSlot =
-                        this.walk_module_rooted_type(written, q_ns, span);
+                        this.walk_module_rooted_type(written, q_module, span);
                     if (!q_rooted.is_pending()) { return q_rooted; }
                 } else {
                     // No module in the program spells the prefix, so the head
@@ -2288,7 +2288,7 @@ public:
                     // module's scope, and its canonical name is that
                     // spelling.  A leaf lookup finds nothing here by
                     // construction.
-                    const q_sid: u64 = this.resolver.find_module_scope(this.ctx.module_graph.module_named(q_ns));
+                    const q_sid: u64 = this.resolver.find_module_scope(q_module);
                     if (q_sid != 0) {
                         const alias_slot: ResSlot = this.leaf_in_module_scope(q_sid, name, span);
                         if (!alias_slot.is_pending()) { return alias_slot; }
@@ -2306,11 +2306,11 @@ public:
         // synthesized node, and a synthesizer that knows its referent sets the
         // `Res` itself; judging against an invalid namespace would compare
         // unequal to every real module and refuse everything.
-        const use_ns: SymbolStr = this.ctx.module_ns_sym_of_file(span.file);
-        if (!use_ns.is_valid()) {
+        const use_module: ModulePath = this.ctx.module_of_file(span.file);
+        if (!use_module.is_valid()) {
             return ResSlot::Pending;
         }
-        const home_sid: u64 = this.resolver.find_module_scope(this.ctx.module_graph.module_of_file(span.file));
+        const home_sid: u64 = this.resolver.find_module_scope(use_module);
         if (home_sid == 0) {
             return ResSlot::Pending;
         }
@@ -2894,7 +2894,7 @@ public:
     /// anything.
     record_const_value(&this, node: VarDeclNode*) -> void {
         this.record_const_value_in(
-            if (this.ctx != null && this.ctx.has_namespace()) { this.ctx.namespace_str } else { SymbolStr::empty() },
+            if (this.ctx != null) { this.ctx.unit_module.as_sym() } else { SymbolStr::empty() },
             node);
     }
 
@@ -2934,7 +2934,7 @@ public:
         if (!node.binding_namespace.is_empty()) {
             ns = node.binding_namespace;
         } else if (this.ctx.has_namespace()) {
-            ns = this.ctx.namespace_str;
+            ns = this.ctx.unit_module.as_sym();
         }
         const qualified: SymbolStr = if (ns.is_valid()) {
             ConstantTable::intern_qualified(intern, ns, node.name)
@@ -3299,7 +3299,7 @@ public:
                         ErrorCode::E0353_PRIVATE_ACCESS,
                         fmt::format("`%s::%s` is private and cannot be imported into `%s`",
                             resolved_module, name_str,
-                            this.resolver.intern_table.resolve(this.ctx.current_module_ns())));
+                            if (this.ctx.has_namespace()) { this.ctx.namespace_display() } else { this.ctx.source_file }));
                     d = d.at_with_label(node.span, "private declaration named by this import");
                     this.ctx.emit_diagnostic(d);
                     // The name is bound to nothing, HERE: a use of it is then
