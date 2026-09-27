@@ -583,13 +583,14 @@ type struct MangleContext {
         if (t == null) {
             return MangleContext::ice(fmt::format(
                 "encode_type_ref: arena lookup returned null for TypeRef id=%llu at %s",
-                ty.id, caller));
+                ty.key(), caller));
         }
-        return this.encode_type(t);
+        return this.encode_type(ty, t);
     }
 
-    /// Encode a Type* directly.  Compound types recurse via encode_type_ref.
-    encode_type(&this, ty: Type*) -> string {
+    /// Encode `ty`, the Type `ref` names.  Compound types recurse via
+    /// encode_type_ref.
+    encode_type(&this, ref: TypeRef, ty: Type*) -> string {
         if (ty == null) {
             return MangleContext::ice("encode_type: null Type* (internal compiler error, caller passed null)");
         }
@@ -694,10 +695,9 @@ type struct MangleContext {
             if (ty.kind == TypeKind::Struct
              || ty.kind == TypeKind::Class
              || ty.kind == TypeKind::Enum) {
-                const self_ref: TypeRef = TypeRef::new(ty.id, this.arena);
-                const inst_base: TypeRef = this.arena.inst_generic_base(self_ref);
+                const inst_base: TypeRef = this.arena.inst_generic_base(ref);
                 if (inst_base.is_valid()) {
-                    return this.encode_instantiation_of(inst_base, ty.id);
+                    return this.encode_instantiation_of(inst_base, ref);
                 }
             }
             const inner_n: string = MangleContext::encode_named_type_path(this.table, ty);
@@ -709,7 +709,7 @@ type struct MangleContext {
 
         if (ty.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = ty as InstantiatedType*;
-            return this.encode_instantiated(inst);
+            return this.encode_instantiated(ref, inst);
         }
 
         if (ty.kind == TypeKind::GenericParam) {
@@ -812,8 +812,8 @@ type struct MangleContext {
     /// Encode an InstantiatedType as a named generic instance:
     ///   Pair<int>       -> 4Pair$Li$G
     ///   Result<T, U>    -> 6Result$L<T>_<U>$G
-    encode_instantiated(&this, inst: InstantiatedType*) -> string {
-        return this.encode_instantiation_of(inst.generic_base, inst.id);
+    encode_instantiated(&this, ref: TypeRef, inst: InstantiatedType*) -> string {
+        return this.encode_instantiation_of(inst.generic_base, ref);
     }
 
     /// Encode an instantiation from its `(generic_base, type_args)` identity,
@@ -822,8 +822,7 @@ type struct MangleContext {
     /// guarantees a type mangles to a single symbol regardless of which
     /// representation the caller happens to hold; encoding them separately is
     /// what produced the defined-vs-referenced symbol split.
-    encode_instantiation_of(&this, base: TypeRef, owner_id: u64) -> string {
-        const owner: TypeRef = TypeRef::new(owner_id, this.arena);
+    encode_instantiation_of(&this, base: TypeRef, owner: TypeRef) -> string {
         const base_t: Type* = this.arena.lookup(base);
         mut buf: string = "N$L";
         if (base_t == null) {

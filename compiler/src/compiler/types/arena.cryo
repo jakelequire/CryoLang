@@ -43,7 +43,7 @@ import compiler::types::type_base::{
     BoolType, CharType, FloatType, IntType, NeverType, StringType, Type, UnitType,
     VaListType, VoidType
 };
-import compiler::types::type_ref::{ TypeRef };
+import compiler::types::type_ref::{ TypeRef, TypeRefs };
 import compiler::types::user_defined::{
     ClassType, EnumType, EnumVariantInfo, FieldInfo, FunctionTemplateType, StructType,
     TraitType, TypeAliasType
@@ -86,7 +86,6 @@ type struct TypeArena {
     defs: DefTable*;
     // -- Ownership --
     types:   Type*[];           // All types (indexed by allocation order)
-    next_id: u64;               // Monotonic counter (starts at 1; 0 = invalid)
     // True for the duration of a symbolic generic-body walk (sema sets it around
     // `symbolic_check_body`). While set, `create_instantiation` tags every new
     // InstantiatedType `is_symbolic`, so concrete instantiations that exist only
@@ -163,12 +162,20 @@ type struct TypeArena {
     // The one `This` placeholder (`this_placeholder`).
     this_param:            TypeRef;
 
+private:
+    /// The allocator of this arena's handles, and its only one: every
+    /// handle is made by `alloc_type`, so the handle at position `i` names
+    /// `types[i]`.
+    refs: TypeRefs;
+
+public:
+
     /// Create a new TypeArena and initialize all 20 primitive singletons.
     static new(intern_table: InternTable*) -> TypeArena {
         mut arena: TypeArena = TypeArena {
             defs: null,
             types:   [],
-            next_id: 1,
+            refs:    TypeRefs::new(),
             symbolic_no_demand_active: false,
             intern_table: intern_table,
 
@@ -216,37 +223,36 @@ type struct TypeArena {
     // Internal: primitive initialization
 
     init_primitives(mut &this) -> void {
-        this.void_type   = this.alloc_type(new VoidType(this.next_id));
-        this.unit_type   = this.alloc_type(new UnitType(this.next_id));
-        this.bool_type   = this.alloc_type(new BoolType(this.next_id));
-        this.char_type   = this.alloc_type(new CharType(this.next_id));
-        this.string_type = this.alloc_type(new StringType(this.next_id));
-        this.never_type  = this.alloc_type(new NeverType(this.next_id));
-        this.va_list_type = this.alloc_type(new VaListType(this.next_id));
+        this.void_type   = this.alloc_type(new VoidType(this.refs.upcoming()));
+        this.unit_type   = this.alloc_type(new UnitType(this.refs.upcoming()));
+        this.bool_type   = this.alloc_type(new BoolType(this.refs.upcoming()));
+        this.char_type   = this.alloc_type(new CharType(this.refs.upcoming()));
+        this.string_type = this.alloc_type(new StringType(this.refs.upcoming()));
+        this.never_type  = this.alloc_type(new NeverType(this.refs.upcoming()));
+        this.va_list_type = this.alloc_type(new VaListType(this.refs.upcoming()));
 
-        this.i8_type   = this.alloc_type(new IntType(this.next_id, IntegerKind::I8));
-        this.i16_type  = this.alloc_type(new IntType(this.next_id, IntegerKind::I16));
-        this.i32_type  = this.alloc_type(new IntType(this.next_id, IntegerKind::I32));
-        this.i64_type  = this.alloc_type(new IntType(this.next_id, IntegerKind::I64));
-        this.i128_type = this.alloc_type(new IntType(this.next_id, IntegerKind::I128));
-        this.u8_type   = this.alloc_type(new IntType(this.next_id, IntegerKind::U8));
-        this.u16_type  = this.alloc_type(new IntType(this.next_id, IntegerKind::U16));
-        this.u32_type  = this.alloc_type(new IntType(this.next_id, IntegerKind::U32));
-        this.u64_type  = this.alloc_type(new IntType(this.next_id, IntegerKind::U64));
-        this.u128_type = this.alloc_type(new IntType(this.next_id, IntegerKind::U128));
-        this.isize_type = this.alloc_type(new IntType(this.next_id, IntegerKind::Isize));
-        this.usize_type = this.alloc_type(new IntType(this.next_id, IntegerKind::Usize));
-        this.f32_type  = this.alloc_type(new FloatType(this.next_id, FloatKind::F32));
-        this.f64_type  = this.alloc_type(new FloatType(this.next_id, FloatKind::F64));
+        this.i8_type   = this.alloc_type(new IntType(this.refs.upcoming(), IntegerKind::I8));
+        this.i16_type  = this.alloc_type(new IntType(this.refs.upcoming(), IntegerKind::I16));
+        this.i32_type  = this.alloc_type(new IntType(this.refs.upcoming(), IntegerKind::I32));
+        this.i64_type  = this.alloc_type(new IntType(this.refs.upcoming(), IntegerKind::I64));
+        this.i128_type = this.alloc_type(new IntType(this.refs.upcoming(), IntegerKind::I128));
+        this.u8_type   = this.alloc_type(new IntType(this.refs.upcoming(), IntegerKind::U8));
+        this.u16_type  = this.alloc_type(new IntType(this.refs.upcoming(), IntegerKind::U16));
+        this.u32_type  = this.alloc_type(new IntType(this.refs.upcoming(), IntegerKind::U32));
+        this.u64_type  = this.alloc_type(new IntType(this.refs.upcoming(), IntegerKind::U64));
+        this.u128_type = this.alloc_type(new IntType(this.refs.upcoming(), IntegerKind::U128));
+        this.isize_type = this.alloc_type(new IntType(this.refs.upcoming(), IntegerKind::Isize));
+        this.usize_type = this.alloc_type(new IntType(this.refs.upcoming(), IntegerKind::Usize));
+        this.f32_type  = this.alloc_type(new FloatType(this.refs.upcoming(), FloatKind::F32));
+        this.f64_type  = this.alloc_type(new FloatType(this.refs.upcoming(), FloatKind::F64));
     }
 
     /// Allocate a type, assign it an ID, store it, and return a TypeRef.
     alloc_type(mut &this, ty: Type*) -> TypeRef {
-        mut id: u64 = this.next_id;
-        ty.id = id;
-        this.next_id += 1;
+        const ref: TypeRef = this.refs.next(this);
+        ty.id = ref.key();
         this.types.push(ty);
-        return TypeRef::new(id, this);
+        return ref;
     }
 
 
@@ -312,7 +318,7 @@ type struct TypeArena {
         h = this.hash_mix(h, aux0);
         h = this.hash_mix(h, aux1);
         for (mut i: i64 = 0; i < ops.length; i++) {
-            h = this.hash_mix(h, ops[i].id);
+            h = this.hash_mix(h, ops[i].key());
         }
         return this.hash_mix(h, ops.length as u64);
     }
@@ -335,7 +341,7 @@ type struct TypeArena {
         if (this.intern_entries[idx].ops_len != ops.length) { return false; }
         const base_off: i64 = this.intern_entries[idx].ops_start;
         for (mut i: i64 = 0; i < ops.length; i++) {
-            if (this.intern_ops[base_off + i].id != ops[i].id) { return false; }
+            if (!this.intern_ops[base_off + i].equals(ops[i])) { return false; }
         }
         return true;
     }
@@ -394,7 +400,7 @@ type struct TypeArena {
         mut violations: i64 = 0;
         for (mut i: i64 = 0; i < this.intern_entries.length; i++) {
             const found: TypeRef = this.intern_find_entry_key(i);
-            if (found.id != this.intern_entries[i].ty.id) { violations += 1; }
+            if (!found.equals(this.intern_entries[i].ty)) { violations += 1; }
         }
         return violations;
     }
@@ -447,7 +453,7 @@ type struct TypeArena {
         const hit: TypeRef = this.intern_find(TypeKind::Pointer, aux, 0, &ops);
         if (hit.is_valid()) { return hit; }
 
-        const ref: TypeRef = this.alloc_type(new PointerType(this.next_id, pointee, const_pointee));
+        const ref: TypeRef = this.alloc_type(new PointerType(this.refs.upcoming(), pointee, const_pointee));
         this.intern_record(TypeKind::Pointer, aux, 0, &ops, ref);
         return ref;
     }
@@ -461,7 +467,7 @@ type struct TypeArena {
         const hit: TypeRef = this.intern_find(TypeKind::Reference, aux, 0, &ops);
         if (hit.is_valid()) { return hit; }
 
-        const ref: TypeRef = this.alloc_type(new ReferenceType(this.next_id, referent, mutability));
+        const ref: TypeRef = this.alloc_type(new ReferenceType(this.refs.upcoming(), referent, mutability));
         this.intern_record(TypeKind::Reference, aux, 0, &ops, ref);
         return ref;
     }
@@ -477,7 +483,7 @@ type struct TypeArena {
         const hit: TypeRef = this.intern_find(TypeKind::Array, aux, 0, &ops);
         if (hit.is_valid()) { return hit; }
 
-        const ref: TypeRef = this.alloc_type(new ArrayType(this.next_id, element, size));
+        const ref: TypeRef = this.alloc_type(new ArrayType(this.refs.upcoming(), element, size));
         this.intern_record(TypeKind::Array, aux, 0, &ops, ref);
         return ref;
     }
@@ -489,7 +495,7 @@ type struct TypeArena {
         const hit: TypeRef = this.intern_find(TypeKind::Optional, 0, 0, &ops);
         if (hit.is_valid()) { return hit; }
 
-        const ref: TypeRef = this.alloc_type(new OptionalType(this.next_id, wrapped));
+        const ref: TypeRef = this.alloc_type(new OptionalType(this.refs.upcoming(), wrapped));
         this.intern_record(TypeKind::Optional, 0, 0, &ops, ref);
         return ref;
     }
@@ -500,7 +506,7 @@ type struct TypeArena {
     // MethodInfo or drop it).  On the cache-miss path the array is copied into
     // the owning FunctionType (TypeRef is Copy, so this is a cheap shallow copy).
     get_function(mut &this, ret: TypeRef, params: &TypeRef[], is_variadic: boolean) -> TypeRef {
-        LOG_DEBUG(LogComponent::TypeChecker, "[TypeArena] get_function() ret=%lu params=%lld", ret.id, params.length);
+        LOG_DEBUG(LogComponent::TypeChecker, "[TypeArena] get_function() ret=%lu params=%lld", ret.key(), params.length);
         // ops[0] = return type, ops[1..] = parameters.
         mut ops: TypeRef[] = [ret];
         for (mut i: i64 = 0; i < params.length; i++) {
@@ -516,7 +522,7 @@ type struct TypeArena {
         for (mut i: i64 = 0; i < params.length; i++) {
             params_owned.push(params[i]);
         }
-        const ref: TypeRef = this.alloc_type(new FunctionType(this.next_id, ret, params_owned, is_variadic));
+        const ref: TypeRef = this.alloc_type(new FunctionType(this.refs.upcoming(), ret, params_owned, is_variadic));
         this.intern_record(TypeKind::Function, aux, 0, &ops, ref);
         return ref;
     }
@@ -534,7 +540,7 @@ type struct TypeArena {
         const hit: TypeRef = this.intern_find(TypeKind::Tuple, 0, 0, &ops);
         if (hit.is_valid()) { return hit; }
 
-        const ref: TypeRef = this.alloc_type(new TupleType(this.next_id, elements));
+        const ref: TypeRef = this.alloc_type(new TupleType(this.refs.upcoming(), elements));
         this.intern_record(TypeKind::Tuple, 0, 0, &ops, ref);
         return ref;
     }
@@ -550,7 +556,7 @@ type struct TypeArena {
         const cached: Option<TypeRef> = this.struct_cache.get(&qualified_name.id);
         if (cached.is_some()) { return cached.unwrap(); }
 
-        mut ref: TypeRef = this.alloc_type(new StructType(this.next_id, qualified_name, declared_in, this.intern_table));
+        mut ref: TypeRef = this.alloc_type(new StructType(this.refs.upcoming(), qualified_name, declared_in, this.intern_table));
         this.struct_cache.insert(qualified_name.id, ref);
         return ref;
     }
@@ -576,7 +582,7 @@ type struct TypeArena {
         const cached: Option<TypeRef> = this.class_cache.get(&qualified_name.id);
         if (cached.is_some()) { return cached.unwrap(); }
 
-        mut ref: TypeRef = this.alloc_type(new ClassType(this.next_id, qualified_name, declared_in, this.intern_table));
+        mut ref: TypeRef = this.alloc_type(new ClassType(this.refs.upcoming(), qualified_name, declared_in, this.intern_table));
         this.class_cache.insert(qualified_name.id, ref);
         return ref;
     }
@@ -588,7 +594,7 @@ type struct TypeArena {
         const cached: Option<TypeRef> = this.enum_cache.get(&qualified_name.id);
         if (cached.is_some()) { return cached.unwrap(); }
 
-        mut ref: TypeRef = this.alloc_type(new EnumType(this.next_id, qualified_name, declared_in, this.intern_table));
+        mut ref: TypeRef = this.alloc_type(new EnumType(this.refs.upcoming(), qualified_name, declared_in, this.intern_table));
         this.enum_cache.insert(qualified_name.id, ref);
         return ref;
     }
@@ -599,7 +605,7 @@ type struct TypeArena {
         const cached: Option<TypeRef> = this.trait_cache.get(&qualified_name.id);
         if (cached.is_some()) { return cached.unwrap(); }
 
-        mut ref: TypeRef = this.alloc_type(new TraitType(this.next_id, qualified_name, declared_in, this.intern_table));
+        mut ref: TypeRef = this.alloc_type(new TraitType(this.refs.upcoming(), qualified_name, declared_in, this.intern_table));
         this.trait_cache.insert(qualified_name.id, ref);
         return ref;
     }
@@ -610,7 +616,7 @@ type struct TypeArena {
         const cached: Option<TypeRef> = this.alias_cache.get(&alias_name.id);
         if (cached.is_some()) { return cached.unwrap(); }
 
-        mut ref: TypeRef = this.alloc_type(new TypeAliasType(this.next_id, alias_name, this.intern_table, target));
+        mut ref: TypeRef = this.alloc_type(new TypeAliasType(this.refs.upcoming(), alias_name, this.intern_table, target));
         this.alias_cache.insert(alias_name.id, ref);
         return ref;
     }
@@ -624,7 +630,7 @@ type struct TypeArena {
         const cached: Option<TypeRef> = this.func_template_cache.get(&qualified_name.id);
         if (cached.is_some()) { return cached.unwrap(); }
 
-        mut ref: TypeRef = this.alloc_type(new FunctionTemplateType(this.next_id, qualified_name, this.intern_table));
+        mut ref: TypeRef = this.alloc_type(new FunctionTemplateType(this.refs.upcoming(), qualified_name, this.intern_table));
         this.func_template_cache.insert(qualified_name.id, ref);
         return ref;
     }
@@ -649,7 +655,7 @@ type struct TypeArena {
         const cached: Option<TypeRef> = this.generic_param_cache.get(&key);
         if (cached.is_some()) { return cached.unwrap(); }
 
-        mut ref: TypeRef = this.alloc_type(new GenericParamType(this.next_id, sym, name, index));
+        mut ref: TypeRef = this.alloc_type(new GenericParamType(this.refs.upcoming(), sym, name, index));
         this.generic_param_cache.insert(key, ref);
         return ref;
     }
@@ -660,7 +666,7 @@ type struct TypeArena {
     /// program.
     this_placeholder(mut &this, name: SymbolStr) -> TypeRef {
         if (this.this_param.is_valid()) { return this.this_param; }
-        this.this_param = this.alloc_type(new GenericParamType(this.next_id, SymbolID::invalid(), name, 0xFFFFFFFF as u64));
+        this.this_param = this.alloc_type(new GenericParamType(this.refs.upcoming(), SymbolID::invalid(), name, 0xFFFFFFFF as u64));
         return this.this_param;
     }
 
@@ -671,13 +677,13 @@ type struct TypeArena {
     create_assoc_projection(mut &this, base: TypeRef, member: SymbolStr, owning_trait: TypeRef) -> TypeRef {
         mut ops: TypeRef[] = [base];
         const aux0: u64 = member.id as u64;
-        const aux1: u64 = owning_trait.id;
+        const aux1: u64 = owning_trait.key();
 
         const hit: TypeRef = this.intern_find(TypeKind::AssocProjection, aux0, aux1, &ops);
         if (hit.is_valid()) { return hit; }
 
         const ref: TypeRef = this.alloc_type(
-            new AssocProjectionType(this.next_id, base, member, owning_trait));
+            new AssocProjectionType(this.refs.upcoming(), base, member, owning_trait));
         this.intern_record(TypeKind::AssocProjection, aux0, aux1, &ops, ref);
         return ref;
     }
@@ -712,7 +718,7 @@ type struct TypeArena {
         for (mut i: i64 = 0; i < args.length; i++) {
             args_owned.push(args[i]);
         }
-        mut inst_node: InstantiatedType* = new InstantiatedType(this.next_id, base, args_owned);
+        mut inst_node: InstantiatedType* = new InstantiatedType(this.refs.upcoming(), base, args_owned);
         // Tag instantiations minted during a symbolic walk so GenericValidation
         // skips them (they may be concrete instantiations living only inside a
         // never-instantiated template and are never monomorphized/codegen'd).
@@ -785,7 +791,7 @@ type struct TypeArena {
     /// read of the arena's storage: nothing outside this arena turns a
     /// number into a Type, so a handle is the only way in.
     lookup(&this, ty: TypeRef) -> Type* {
-        const id: u64 = ty.id;
+        const id: u64 = ty.key();
         if (id == 0) {
             return null;
         }
@@ -914,7 +920,7 @@ type struct TypeArena {
     swap_wrapper_to_concrete(mut &this, wrapper_ref: TypeRef, qualified_spec: SymbolStr,
                              declared_in: ModulePath, kind: TypeKind, is_union: boolean,
                              display: string) -> TypeRef {
-        const w_id: u64 = wrapper_ref.id;
+        const w_id: u64 = wrapper_ref.key();
         if (w_id == 0 || (w_id - 1) >= this.types.length) { return wrapper_ref; }
         const index: u64 = w_id - 1;
         const old: Type* = this.types[index];
@@ -1586,27 +1592,27 @@ type struct TypeArena {
         if (ty.kind == TypeKind::Pointer) {
             const p: PointerType* = ty as PointerType*;
             const inner: string = this.resolve_display_name(p.pointee);
-            return fmt::format("-> %s (#%lu)", inner, p.pointee.id);
+            return fmt::format("-> %s (#%lu)", inner, p.pointee.key());
         }
         if (ty.kind == TypeKind::Reference) {
             const r: ReferenceType* = ty as ReferenceType*;
             const inner: string = this.resolve_display_name(r.referent);
-            return fmt::format("-> %s (#%lu)", inner, r.referent.id);
+            return fmt::format("-> %s (#%lu)", inner, r.referent.key());
         }
         if (ty.kind == TypeKind::Array) {
             const a: ArrayType* = ty as ArrayType*;
             const elem: string = this.resolve_display_name(a.element);
-            return fmt::format("elem: %s (#%lu)", elem, a.element.id);
+            return fmt::format("elem: %s (#%lu)", elem, a.element.key());
         }
         if (ty.kind == TypeKind::Optional) {
             const o: OptionalType* = ty as OptionalType*;
             const inner: string = this.resolve_display_name(o.wrapped);
-            return fmt::format("-> %s (#%lu)", inner, o.wrapped.id);
+            return fmt::format("-> %s (#%lu)", inner, o.wrapped.key());
         }
         if (ty.kind == TypeKind::Function) {
             const f: FunctionType* = ty as FunctionType*;
             const ret: string = this.resolve_display_name(f.return_type);
-            return fmt::format("ret: %s (#%lu)", ret, f.return_type.id);
+            return fmt::format("ret: %s (#%lu)", ret, f.return_type.key());
         }
         if (ty.kind == TypeKind::Tuple) {
             const t: TupleType* = ty as TupleType*;
@@ -1616,7 +1622,7 @@ type struct TypeArena {
             const limit: i64 = if (t.elements.length < 4) { t.elements.length } else { 3 };
             for (mut i: i64 = 0; i < limit; i++) {
                 if (i > 0) { result += ", "; }
-                result += fmt::format("#%lu", t.elements[i].id);
+                result += fmt::format("#%lu", t.elements[i].key());
             }
             if (t.elements.length > 3) { result += ", ..."; }
             return result + ")";
@@ -1625,7 +1631,7 @@ type struct TypeArena {
             const al: TypeAliasType* = ty as TypeAliasType*;
             if (al.has_target()) {
                 const target: string = this.resolve_display_name(al.target);
-                return fmt::format("-> %s (#%lu)", target, al.target.id);
+                return fmt::format("-> %s (#%lu)", target, al.target.key());
             }
             return "-> ?";
         }
@@ -1634,7 +1640,7 @@ type struct TypeArena {
             const base: string = this.resolve_display_name(inst.generic_base);
             if (inst.resolved_type.is_valid()) {
                 const resolved: string = this.resolve_display_name(inst.resolved_type);
-                return fmt::format("base: %s => %s (#%lu)", base, resolved, inst.resolved_type.id);
+                return fmt::format("base: %s => %s (#%lu)", base, resolved, inst.resolved_type.key());
             }
             return fmt::format("base: %s => ?", base);
         }
@@ -1642,7 +1648,7 @@ type struct TypeArena {
             const cl: ClassType* = ty as ClassType*;
             if (cl.has_base) {
                 const base_name: string = this.resolve_display_name(cl.base_class);
-                return fmt::format("extends %s (#%lu)", base_name, cl.base_class.id);
+                return fmt::format("extends %s (#%lu)", base_name, cl.base_class.key());
             }
         }
         if (ty.kind == TypeKind::Error) {

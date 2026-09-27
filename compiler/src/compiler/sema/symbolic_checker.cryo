@@ -198,15 +198,15 @@ type struct SymbolicChecker {
         return TypeRef::invalid();
     }
 
-    /// Resolve a symbolic-walk receiver to its base struct/class `Type*`, peeling
-    /// references/pointers and - unlike `unwrap_to_base_type` - following the
+    /// Resolve a symbolic-walk receiver to its base struct/class type, peeling
+    /// references/pointers and - unlike `unwrap_to_base_ref` - following the
     /// owner's abstract self-instantiation to its `generic_base` template.
-    symbolic_recv_base(&this, recv_type: TypeRef) -> Type* {
-        const base: Type* = this.types.unwrap_to_base_type(recv_type);
-        if (base != null) { return base; }
+    symbolic_recv_base(&this, recv_type: TypeRef) -> TypeRef {
+        const base: TypeRef = this.types.unwrap_to_base_ref(recv_type);
+        if (base.is_valid()) { return base; }
         const gb: TypeRef = this.symbolic_inst_generic_base(recv_type);
-        if (gb.is_valid()) { return this.types.unwrap_to_base_type(gb); }
-        return null;
+        if (gb.is_valid()) { return this.types.unwrap_to_base_ref(gb); }
+        return TypeRef::invalid();
     }
 
     /// True (only in a generic-owner symbolic walk) when `ty` is the abstract
@@ -215,10 +215,10 @@ type struct SymbolicChecker {
     symbolic_is_generic_owner_receiver(&this, ty: TypeRef) -> boolean {
         if (!this.state.in_symbolic_check || !this.state.symbolic_owner_is_generic) { return false; }
         if (!ty.is_valid() || !this.state.current_owner_type.is_valid()) { return false; }
-        const recv_base:  Type* = this.symbolic_recv_base(ty);
-        const owner_base: Type* = this.types.unwrap_to_base_type(this.state.current_owner_type);
-        if (recv_base == null || owner_base == null) { return false; }
-        return recv_base.id == owner_base.id;
+        const recv_base:  TypeRef = this.symbolic_recv_base(ty);
+        const owner_base: TypeRef = this.types.unwrap_to_base_ref(this.state.current_owner_type);
+        if (!recv_base.is_valid() || !owner_base.is_valid()) { return false; }
+        return recv_base.equals(owner_base);
     }
 
     /// During a generic-owner symbolic walk, resolve `this.<field>` to the field's
@@ -233,10 +233,9 @@ type struct SymbolicChecker {
         *out_index = -1;
         if (!this.symbolic_is_generic_owner_receiver(recv_type)) { return TypeRef::invalid(); }
         if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
-        const base: Type* = this.symbolic_recv_base(recv_type);
-        if (base == null) { return TypeRef::invalid(); }
-        const tmpl: TemplateEntry* =
-            this.ctx.generic_registry.template_of_type(TypeRef::new(base.id, this.arena));
+        const base: TypeRef = this.symbolic_recv_base(recv_type);
+        if (!base.is_valid()) { return TypeRef::invalid(); }
+        const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(base);
         if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
         if (tmpl.node_kind == NodeKind::StructDeclaration) {
             const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
@@ -293,10 +292,9 @@ type struct SymbolicChecker {
                                method_name: SymbolStr) -> FunctionDeclNode* {
         if (!this.symbolic_is_generic_owner_receiver(recv_type)) { return null; }
         if (this.ctx.generic_registry == null) { return null; }
-        const base: Type* = this.symbolic_recv_base(recv_type);
-        if (base == null) { return null; }
-        const tmpl: TemplateEntry* =
-            this.ctx.generic_registry.template_of_type(TypeRef::new(base.id, this.arena));
+        const base: TypeRef = this.symbolic_recv_base(recv_type);
+        if (!base.is_valid()) { return null; }
+        const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(base);
         if (tmpl == null || tmpl.ast_node == null) { return null; }
         const empty_methods: MethodNode*[] = [];
         mut methods: &MethodNode*[] = &empty_methods;
@@ -377,7 +375,7 @@ type struct SymbolicChecker {
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return false; }
         if (t.kind == TypeKind::GenericParam) {
-            if (this.state.this_type.is_valid() && this.state.this_type.id == ty.id) { return true; }
+            if (this.state.this_type.is_valid() && this.state.this_type.equals(ty)) { return true; }
             return this.symbolic_param_in_scope((t as GenericParamType*).param_sym);
         }
         if (t.kind == TypeKind::AssocProjection) {

@@ -545,29 +545,37 @@ type struct TypeUtils {
     }
 
     /// Peel Pointer / Reference / resolved-InstantiatedType wrappers (bounded
-    /// depth) to the underlying base `Type*`, or null if an instantiation is
-    /// still unresolved.
-    unwrap_to_base_type(&this, ty: TypeRef) -> Type* {
-        mut t: Type* = this.arena.lookup(ty);
+    /// depth) to the underlying base type's handle, or invalid if an
+    /// instantiation is still unresolved.
+    unwrap_to_base_ref(&this, ty: TypeRef) -> TypeRef {
+        mut cur: TypeRef = ty;
+        mut t: Type* = this.arena.lookup(cur);
         mut depth: i32 = 0;
         while (t != null && depth < 5) {
             match (t.kind) {
                 TypeKind::Pointer => {
-                    t = this.arena.lookup((t as PointerType*).pointee);
+                    cur = (t as PointerType*).pointee;
                 }
                 TypeKind::Reference => {
-                    t = this.arena.lookup((t as ReferenceType*).referent);
+                    cur = (t as ReferenceType*).referent;
                 }
                 TypeKind::InstantiatedType => {
                     const it: InstantiatedType* = t as InstantiatedType*;
-                    if (!it.has_resolved_type()) { return null; }
-                    t = this.arena.lookup(it.resolved_type);
+                    if (!it.has_resolved_type()) { return TypeRef::invalid(); }
+                    cur = it.resolved_type;
                 }
-                _ => { return t; }
+                _ => { return cur; }
             }
+            t = this.arena.lookup(cur);
             depth += 1;
         }
-        return t;
+        if (t == null) { return TypeRef::invalid(); }
+        return cur;
+    }
+
+    /// The base `Type*` `unwrap_to_base_ref` peels to, or null.
+    unwrap_to_base_type(&this, ty: TypeRef) -> Type* {
+        return this.arena.lookup(this.unwrap_to_base_ref(ty));
     }
 
     /// The generic base of an instantiation, or invalid.
@@ -770,7 +778,7 @@ type struct TypeUtils {
     same_param_sig(&this, a: Slice<TypeRef>, b: Slice<TypeRef>) -> boolean {
         if (a.length != b.length) { return false; }
         for (mut i: i64 = 0; i < a.length as i64; i++) {
-            if (a.get(i as u64).unwrap().id != b.get(i as u64).unwrap().id) { return false; }
+            if (!a.get(i as u64).unwrap().equals(b.get(i as u64).unwrap())) { return false; }
         }
         return true;
     }
@@ -781,7 +789,7 @@ type struct TypeUtils {
     /// nominals are keyed by qualified name in the arena and compound types are
     /// interned structurally, so one semantic type has exactly one id.
     types_equivalent(&this, a: TypeRef, b: TypeRef) -> boolean {
-        return a.id == b.id;
+        return a.equals(b);
     }
 
     /// True when `t` is a pointer/reference whose pointee is the same type as `v`.

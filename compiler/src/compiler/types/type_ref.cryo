@@ -3,6 +3,11 @@
 ///! Lightweight handle to a Type in the TypeArena.
 ///! Lives in its own sub-module so that compiler::ast can import TypeRef
 ///! without pulling in the full compiler::types module.
+///!
+///! A handle is made only by `TypeRefs::next`, the allocator the arena holds,
+///! and its number is read only through `key`: nothing outside this module
+///! turns a number back into a handle, so a table keyed by `key` holds only
+///! numbers the arena handed out, and a handle names the type it was made for.
 
 namespace compiler::types::type_ref;
 
@@ -15,9 +20,20 @@ import compiler::types::arena::{ TypeArena };
 /// Equality is determined by comparing type IDs.
 /// ID 0 is reserved as the invalid/unresolved sentinel.
 type struct TypeRef {
+private:
+    /// Position in the arena's sequence, from 1; 0 for the invalid handle.
     id:    u64;
+    /// The arena that made this handle; null for the invalid handle.
     arena: TypeArena*;
 
+    static new(id: u64, arena: TypeArena*) -> TypeRef {
+        return TypeRef {
+            id:    id,
+            arena: arena,
+        };
+    }
+
+public:
     /// Create an invalid/unresolved type reference (id = 0).
     static invalid() -> TypeRef {
         return TypeRef {
@@ -26,12 +42,10 @@ type struct TypeRef {
         };
     }
 
-    /// Create a new type reference with the given ID and arena.
-    static new(id: u64, arena: TypeArena*) -> TypeRef {
-        return TypeRef {
-            id:    id,
-            arena: arena,
-        };
+    /// The number a pass keys its own table by, hashes, or prints.  A read,
+    /// one way: there is no way back from the number to a handle.
+    key(&this) -> u64 {
+        return this.id;
     }
 
     /// Whether this refers to a valid type (id != 0 and arena != null).
@@ -47,5 +61,31 @@ type struct TypeRef {
     /// Check equality by type ID.
     equals(&this, other: TypeRef) -> boolean {
         return this.id == other.id;
+    }
+}
+
+/// The one source of `TypeRef`s: each `next` answers a fresh handle, from 1
+/// upward (0 is the invalid handle).  The arena holds the only one a
+/// compilation uses, privately; a handle is never built from a number.
+type struct TypeRefs {
+private:
+    next_id: u64;
+
+public:
+    static new() -> TypeRefs {
+        return TypeRefs { next_id: 1 };
+    }
+
+    /// The number the next handle will carry.  A `Type` records its own
+    /// number when it is built, which is before the arena stores it and
+    /// takes its handle.
+    upcoming(&this) -> u64 {
+        return this.next_id;
+    }
+
+    next(mut &this, arena: TypeArena*) -> TypeRef {
+        const ref: TypeRef = TypeRef::new(this.next_id, arena);
+        this.next_id += 1;
+        return ref;
     }
 }
