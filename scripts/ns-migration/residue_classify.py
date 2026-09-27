@@ -32,6 +32,17 @@ Classes (one letter each; the residue Jake rules on is the J rows):
                  identity a C symbol has;
        hint    - a did-you-mean that asks which trait spells a method
                  leaf; the spelling IS the question.
+  L  CONSTANT KEY - every key argument is one string literal written in the
+     compiler's own source, as the compiler reports the argument (`literal:"..."`
+     in the facts).  No spelling from the program being compiled can reach
+     such a call: it asks the same question for every program, so it is a
+     label or a name the compiler itself fixes, never a program's name
+     looked up by text.  Decided from the facts by `CONSTANT_KEY`, before
+     either table, so a new call passing a literal is classified with no row
+     written for it, and a table row cannot reclass one.  A literal reaching
+     the key any other way - through a local, a call such as
+     `intern("Ready")`, beside a key that is not a literal - is not this
+     class: the step between is where a program's spelling could enter.
   N  NOT A KEY - the string parameter names no declaration: a diagnostic
      label beside a `DefId`, a file path, a literal's text, a constructor's
      source file, a write onto an AST node, or a funnel's own forwarding
@@ -294,7 +305,27 @@ SITE_OVERRIDES = {
         ("J", "member: the resolver's duplicate-binding check, a binding by its local's leaf inside the destructure being bound"),
 }
 
-CLASSES = "JNSBCFW"
+CLASSES = "JLNSBCFW"
+
+# One string literal as the compiler renders an argument's provenance: the
+# text quoted, a quote or backslash inside it escaped (`CallFacts::literal_text`),
+# so no literal's text can end the match early or run into the next argument.
+LITERAL = r'literal:"(?:[^"\\]|\\.)*"'
+# A site's key is its key arguments' provenances joined by ", " (residue.py);
+# the whole of it must be literals, one per key argument.
+CONSTANT_KEY = re.compile(r"%s(?:, %s)*" % (LITERAL, LITERAL))
+CONSTANT = ("L", "constant: every key argument is a string literal in the compiler's source, so no spelling from the program being compiled reaches this call")
+
+
+def is_constant_key(arg):
+    return CONSTANT_KEY.fullmatch(arg or "") is not None
+
+
+def override_conflicts(rows):
+    """Site overrides naming a site the literal rule already classifies:
+    the rule is decided from the facts and a table row does not outrank it."""
+    return sorted(k for k in SITE_OVERRIDES if is_constant_key(k[2]) and any(
+        r[0] == k[0] and r[2] + "::" + r[3] == k[1] and r[4] == k[2] for r in rows))
 
 
 def classify(rows):
@@ -303,7 +334,9 @@ def classify(rows):
     for rel, lineno, ty, name, arg in rows:
         key = ty + "::" + name
         ov = SITE_OVERRIDES.get((rel, key, arg))
-        if ov is not None:
+        if is_constant_key(arg):
+            cls, reason = CONSTANT
+        elif ov is not None:
             cls, reason = ov
         elif key in CLASS_OF_METHOD:
             cls, reason = CLASS_OF_METHOD[key]
@@ -320,8 +353,8 @@ def render(classified):
         if row[4] in counts:
             counts[row[4]] += 1
     lines = []
-    lines.append("Population **%d** - J %d · N %d · S %d · B %d · C %d · F %d · W %d"
-                 % (len(classified), counts["J"], counts["N"], counts["S"], counts["B"],
+    lines.append("Population **%d** - J %d · L %d · N %d · S %d · B %d · C %d · F %d · W %d"
+                 % (len(classified), counts["J"], counts["L"], counts["N"], counts["S"], counts["B"],
                     counts["C"], counts["F"], counts["W"]))
     lines.append("")
     lines.append("| site | read | key's provenance | class | reason |")
@@ -364,6 +397,11 @@ def main():
     if stale_sites:
         raise SystemExit("residue_classify: site overrides that match no call in the tree: "
                          + "; ".join("%s %s (%s)" % k for k in stale_sites))
+    conflicts = override_conflicts(rows)
+    if conflicts:
+        raise SystemExit("residue_classify: site overrides on a site whose key is a literal, which the "
+                         "literal rule classifies from the facts: "
+                         + "; ".join("%s %s (%s)" % k for k in conflicts))
     path = residue.DEFAULT_RESIDUE
     counts = write_list(path, classified)
     unread = sorted(declared - called)

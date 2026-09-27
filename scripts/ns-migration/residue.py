@@ -362,9 +362,14 @@ def check(rows, path, out=print):
     counts = {}
     for row in classified:
         counts[row[4]] = counts.get(row[4], 0) + 1
+    conflicts = rc.override_conflicts(rows)
+    if conflicts:
+        out("residue: site overrides on a site whose key is a literal, which the literal rule "
+            "classifies: %s" % "; ".join("%s %s (%s)" % k for k in conflicts))
+        return 1
     # The convertible remainder is every class that is neither justified
-    # (J) nor outside D32 (N); the migration is complete at 0.
-    convertible = sum(n for c, n in counts.items() if c not in ("J", "N"))
+    # (J) nor outside D32 (L, N); the migration is complete at 0.
+    convertible = sum(n for c, n in counts.items() if c not in ("J", "L", "N"))
     out("residue: OK -- %d sites, list, tree and classifier agree; %s; convertible %d"
         % (len(classified), ", ".join("%s %d" % (c, counts[c]) for c in sorted(counts)), convertible))
     return 0

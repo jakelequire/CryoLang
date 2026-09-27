@@ -22,6 +22,14 @@ classifier - and each mutation moves one of them while the other two stand:
     is no site; two members of one element compared are one site.
   * THE CLASSIFIER.  Its verdict is the one the list is held to, so the
     classifier is not mutated here; the list mutations are its controls.
+    Its one rule decided from the facts rather than from a table - a key
+    that is string literals and nothing else is class L - is driven through
+    RULE_CASES: keys it must take (one literal, several, one whose text
+    holds an escaped quote and a comma, a literal into a door the tables
+    class J, a literal into a door no table classes) and keys it must leave
+    to the tables (a literal beside a parameter, either order; a literal
+    through `intern`; a local initialised by one; a non-string literal; no
+    key), and a site override on a literal site refused.
 
 Which types hold declarations is placement, read from a source tree: the
 lane gate's own fixture (scripts/lane-gate-selftest.py's FILES, every store
@@ -187,7 +195,61 @@ FACTS_MUTATIONS = [
      [rec("cmp", "compiler/sema/sema.cryo", 42, idx="==",
           prov=TRAIT_METHOD.replace(".name<-", ".alias<-"), recv=TRAIT_METHOD, depth=1)],
      1, DRIFT_ONE),
+    ("a literal key into a read method no table classes is classified by the rule: drift, not refused",
+     [rec("arg", "compiler/sema/sema.cryo", 43, door("compiler::types::arena::TypeArena", "lookup_by_name"),
+          prov='literal:"std::ops::Drop"')],
+     1, 'TypeArena::lookup_by_name (literal:"std::ops::Drop"): tree 1, list 0'),
 ]
+
+INTERN_OF = ("call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> "
+             "compiler::resolver::symbol_str::SymbolStr of ")
+# (name, holder, method, key provenance, class the classifier must give).
+# The holder's method is one the tables class, so a key the rule leaves
+# alone reads that class, and one it takes reads L whatever the table says.
+RULE_CASES = [
+    ("one literal", "DeclarationIndex", "type_of_decl", 'literal:"codegen/declare struct type"', "L"),
+    ("the empty literal", "ResolutionContext", "new", 'literal:""', "L"),
+    ("two literals", "ConstantTable", "intern_qualified", 'literal:"std", literal:"MAX"', "L"),
+    ("a literal whose text holds an escaped quote and a comma is ONE literal",
+     "DeclarationIndex", "type_of_decl", r'literal:"a\", param:name"', "L"),
+    ("a literal into a door the tables class J", "ModuleGraph", "find_module_index", 'literal:"std::core"', "L"),
+    ("a literal beside a parameter", "ConstantTable", "intern_qualified", 'literal:"std", param:name',
+     rc.CLASS_OF_METHOD["ConstantTable::intern_qualified"][0]),
+    ("a parameter beside a literal", "ConstantTable", "intern_qualified", 'param:ns, literal:"MAX"',
+     rc.CLASS_OF_METHOD["ConstantTable::intern_qualified"][0]),
+    ("a literal through `intern`", "ModuleGraph", "find_module_index", INTERN_OF + 'literal:"std::core"',
+     rc.CLASS_OF_METHOD["ModuleGraph::find_module_index"][0]),
+    ("a local initialised by a literal", "ModuleGraph", "find_module_index", 'local:p@0=literal:"std::core"',
+     rc.CLASS_OF_METHOD["ModuleGraph::find_module_index"][0]),
+    ("a literal with text after its closing quote", "ModuleGraph", "find_module_index", 'literal:"a"x',
+     rc.CLASS_OF_METHOD["ModuleGraph::find_module_index"][0]),
+    ("a non-string literal", "ModuleGraph", "find_module_index", "literal:null",
+     rc.CLASS_OF_METHOD["ModuleGraph::find_module_index"][0]),
+    ("no key", "ModuleGraph", "find_module_index", "",
+     rc.CLASS_OF_METHOD["ModuleGraph::find_module_index"][0]),
+]
+
+
+def rule_failures():
+    failures = []
+    for name, holder, meth, arg, want in RULE_CASES:
+        classified, _unknown = rc.classify([("compiler/sema/sema.cryo", 1, holder, meth, arg)])
+        got = classified[0][4]
+        if got != want:
+            failures.append("rule case (%s): `%s` into %s::%s classed %s, want %s"
+                            % (name, arg, holder, meth, got, want))
+    # A site override may not reclass a site the rule classifies.
+    row = ("compiler/sema/sema.cryo", 1, "ModuleGraph", "find_module_index", 'literal:"std::core"')
+    key = (row[0], "ModuleGraph::find_module_index", row[4])
+    rc.SITE_OVERRIDES[key] = ("J", "fixture")
+    try:
+        if rc.override_conflicts([row]) != [key]:
+            failures.append("rule case (a site override on a literal site): not refused")
+        if rc.override_conflicts([row[:4] + ('param:name',)]):
+            failures.append("rule case (a site override on a literal site): refused a site it does not name")
+    finally:
+        del rc.SITE_OVERRIDES[key]
+    return failures
 
 # The J row the list mutations edit: the graph's module read.
 J_ROW_KEY = "| `compiler/sema/sema.cryo:9` | `ModuleGraph::find_module_index` | `param:name` | J |"
@@ -204,13 +266,13 @@ def list_mutations(text):
          text.replace(line + "\n", line + "\n" + line + "\n"), 1, "tree 1, list 2"),
         ("a row's class blanked to `?` is refused as not the classifier's",
          text.replace(line, line.replace("| J |", "| ? |")), 1,
-         "the list says `?`, which is no class (JNSBCFW); the classifier says J"),
+         "the list says `?`, which is no class (JLNSBCFW); the classifier says J"),
         ("a J row flipped to N by hand is refused, not summed",
          text.replace(line, line.replace("| J |", "| N |")), 1,
          "the list says N, the classifier says J"),
         ("a class letter the classifier does not define is refused",
          text.replace(line, line.replace("| J |", "| X |")), 1,
-         "the list says `X`, which is no class (JNSBCFW)"),
+         "the list says `X`, which is no class (JLNSBCFW)"),
     ]
 
 
@@ -271,14 +333,15 @@ def main():
                                 % (i, name, want_code, want_text, code, out))
     finally:
         shutil.rmtree(work, ignore_errors=True)
+    failures.extend(rule_failures())
 
     if failures:
         sys.stderr.write("residue-selftest: %d FAILURE(S)\n\n" % len(failures))
         for f in failures:
             sys.stderr.write(f + "\n\n")
         return 1
-    print("residue-selftest: OK -- baseline accepted, %d facts and %d list mutations behaved"
-          % (len(FACTS_MUTATIONS), len(list_mutations(text))))
+    print("residue-selftest: OK -- baseline accepted, %d facts and %d list mutations behaved, %d literal-rule cases"
+          % (len(FACTS_MUTATIONS), len(list_mutations(text)), len(RULE_CASES) + 1))
     return 0
 
 
