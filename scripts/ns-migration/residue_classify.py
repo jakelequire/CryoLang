@@ -157,10 +157,6 @@ CLASS_OF_METHOD = {
         ("J", "module: the graph's modules by namespace, scanned inline"),
     "ModuleInfo::reexports[]":
         ("J", "module: a module's re-exported namespaces, module identities by path, scanned inline"),
-    "ModuleInfo::imported_namespaces[]":
-        ("J", "module: a module's imported namespaces, module identities by path, scanned in the graph's own file only"),
-    "ModuleInfo::submodules[]":
-        ("J", "module: a module's submodules, module identities by path, scanned in the graph's own file only"),
     "EnumDeclNode::variants[]":
         ("J", "member: an enum declaration's variant by its leaf off the node in hand, scanned inline"),
     "StructLiteralNode::field_inits[]":

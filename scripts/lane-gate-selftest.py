@@ -239,7 +239,8 @@ SYM = "compiler::resolver::symbol_str::SymbolStr"
 TREF = "compiler::types::type_ref::TypeRef"
 KEY_EQ = SYM + ".equals(&this, " + SYM + ") -> boolean"
 TREF_EQ = TREF + ".equals(&this, " + TREF + ") -> boolean"
-KEY_TYPE_TEXT = {"SymbolStr": SYM, "string": "string"}
+KEY_TYPE_TEXT = {"SymbolStr": SYM, "string": "string",
+                 "ModulePath": "compiler::module_graph::ModulePath"}
 
 
 def elem_prov(owner, field, elem, member="name", at="element@1:", base="param:o"):

@@ -1344,6 +1344,7 @@ type struct CompilerInstance {
         cdebug("[Compiler] After discovery: module_count=%u, modules.length=%u\n",
             ctx.module_graph.module_count(), ctx.module_graph.modules.length);
         cdebug("[Compiler] name_index.length=%u\n", ctx.module_graph.name_index.length());
+        ctx.module_graph.resolve_edges();
 
         // Classify each discovered module's origin from its file_path so
         // codegen and the build manifest route object/IR output into the
@@ -1421,7 +1422,7 @@ type struct CompilerInstance {
         // EMPTY - the old constant registered 12 std namespaces as "prelude"
         // even when no prelude was loaded.
         const prelude_ns_sym: SymbolStr = ctx.intern_table.intern(LangModule::Prelude.path());
-        mut prelude_set: SymbolStr[] = [];
+        mut prelude_set: ModulePath[] = [];
         for (mut pmi: u32 = 0; pmi < ctx.module_graph.modules.length; pmi++) {
             const pm: ModuleInfo* = &ctx.module_graph.modules[pmi];
             if (pm.namespace_name.id != prelude_ns_sym.id) { continue; }
@@ -1448,7 +1449,7 @@ type struct CompilerInstance {
             // made `ns_imports` answer "not imported" for 68% of the
             // visibility questions it was asked - see docs/name-resolution.md
             // §8.1.
-            mut imi_visible: SymbolStr[] = [];
+            mut imi_visible: ModulePath[] = [];
             for (mut di: i64 = 0; di < imi_info.dependencies.length; di++) {
                 imi_visible.push(imi_info.dependencies[di]);
             }
@@ -1468,25 +1469,25 @@ type struct CompilerInstance {
             // first" is the directory-order defect this spec exists to remove.
             mut wi: i64 = 0;
             while (wi < imi_visible.length) {
-                const via: SymbolStr = imi_visible[wi];
+                const via: ModulePath = imi_visible[wi];
                 wi = wi + 1;
                 for (mut ri: i64 = 0; ri < reexporters.length; ri++) {
                     const src: ModuleInfo* =
                         &ctx.module_graph.modules[reexporters[ri]];
-                    if (src.name.id != via.id) { continue; }
+                    if (!src.path().equals(via)) { continue; }
                     for (mut si: i64 = 0; si < src.reexports.length; si++) {
-                        const re_ns: SymbolStr = src.reexports[si];
-                        if (re_ns.id == imi_info.namespace_name.id) { continue; }
+                        const re_ns: ModulePath = src.reexports[si];
+                        if (re_ns.equals(imi_info.path())) { continue; }
                         mut re_seen: boolean = false;
                         for (mut qi: i64 = 0; qi < imi_visible.length; qi++) {
-                            if (imi_visible[qi].id == re_ns.id) { re_seen = true; }
+                            if (imi_visible[qi].equals(re_ns)) { re_seen = true; }
                         }
                         if (!re_seen) { imi_visible.push(re_ns); }
                     }
                 }
             }
             ctx.decl_index.register_module_imports(
-                imi_info.namespace_name, &imi_visible);
+                imi_info.path(), &imi_visible);
         }
 
         // Experimental gate: consuming a C++ vendor library (binding_source

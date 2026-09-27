@@ -92,8 +92,9 @@ type struct ModuleInfo {
     name:           SymbolStr;
     file_path:      string;
     namespace_name: SymbolStr;
-    dependencies:   SymbolStr[];
-    /// Namespaces this module can SEE but does not depend on for build order:
+    /// The modules this module imports, which must be compiled first.
+    dependencies:   ModulePath[];
+    /// Modules this module can SEE but does not depend on for build order:
     /// the expansion of `import A::B::{ X, Y };` into `A::B::X`, `A::B::Y`.
     ///
     /// Deliberately NOT dependencies.  `compute_order()` walks `dependencies`,
@@ -101,10 +102,9 @@ type struct ModuleInfo {
     /// loader avoids for `public module` declarations.  Visibility and build
     /// order are different relations; only `register_module_imports` consumes
     /// this, to answer "does this module import that namespace?".
-    imported_namespaces: SymbolStr[];
+    imported_namespaces: ModulePath[];
 
-    /// Namespaces this module declares with `public module X;`, resolved to
-    /// the target's own namespace.
+    /// Modules this module declares with `public module X;`.
     ///
     /// Recorded so a `public module` set can be DERIVED rather than
     /// transcribed: `instance.cryo` reads `std::prelude`'s set from here and
@@ -118,11 +118,10 @@ type struct ModuleInfo {
     /// re-export) is the `public import` design question, and it should be
     /// decided and measured on its own terms - not acquired as a side effect
     /// of removing a hardcoded list.
-    submodules:     SymbolStr[];
+    submodules:     ModulePath[];
 
-    /// Namespaces this module RE-EXPORTS with `export X;`, resolved to the
-    /// target's own namespace.  An importer of this module sees these as if it
-    /// had imported them itself, transitively.
+    /// Modules this module RE-EXPORTS with `export X;`.  An importer of this
+    /// module sees these as if it had imported them itself, transitively.
     ///
     /// A VISIBILITY edge and never a build-order one, for the reason
     /// `imported_namespaces` is: a per-export dependency edge would make
@@ -130,7 +129,21 @@ type struct ModuleInfo {
     /// unsatisfiable cycle across the whole program.  The consequence the
     /// consumer must respect: the closure over this list can revisit a module,
     /// so it terminates on a seen-set, not on the graph being acyclic.
-    reexports:      SymbolStr[];
+    reexports:      ModulePath[];
+
+    /// The four edge lists above as the loader records them, by the
+    /// namespace each target declares.  An import inside a cycle names a
+    /// module still being loaded, which the graph does not hold yet, so an
+    /// edge cannot be a module when it is recorded.  `ModuleGraph::
+    /// resolve_edges` turns them into the lists above once discovery has
+    /// finished, and empties them.
+    written_dependencies: SymbolStr[];
+    written_imported:     SymbolStr[];
+    written_submodules:   SymbolStr[];
+    written_reexports:    SymbolStr[];
+    /// Recorded dependencies the graph holds no module for.  A dependency
+    /// closure that met one is incomplete (`compute_import_closure`).
+    unresolved_dependencies: u32;
     processed:      boolean;
 
     // Source origin, classified by the orchestrator after discovery from the
@@ -158,6 +171,11 @@ type struct ModuleInfo {
             imported_namespaces: [],
             submodules:          [],
             reexports:           [],
+            written_dependencies: [],
+            written_imported:     [],
+            written_submodules:   [],
+            written_reexports:    [],
+            unresolved_dependencies: 0,
             processed:           false,
             origin:             ModuleOrigin::Local,
             origin_name:        "",
@@ -175,6 +193,11 @@ type struct ModuleInfo {
             imported_namespaces: [],
             submodules:          [],
             reexports:           [],
+            written_dependencies: [],
+            written_imported:     [],
+            written_submodules:   [],
+            written_reexports:    [],
+            unresolved_dependencies: 0,
             processed:           false,
             origin:             ModuleOrigin::Local,
             origin_name:        "",
@@ -224,35 +247,35 @@ type struct ModuleInfo {
         // ordering information, and the brace items are recorded separately as
         // visibility edges.
         if (dep.id == this.name.id) { return; }
-        this.dependencies.push(dep);
+        this.written_dependencies.push(dep);
     }
 
     /// Record a namespace this module can see without depending on it.
     /// See `imported_namespaces` for why this is not `add_dependency`.
     add_imported_namespace(mut &this, ns: SymbolStr) -> void {
-        for (mut i: i64 = 0; i < this.imported_namespaces.length; i++) {
-            if (this.imported_namespaces[i].id == ns.id) { return; }
+        for (mut i: i64 = 0; i < this.written_imported.length; i++) {
+            if (this.written_imported[i].id == ns.id) { return; }
         }
-        this.imported_namespaces.push(ns);
+        this.written_imported.push(ns);
     }
 
     /// Record an `export X;` target by its resolved namespace.
     /// See `reexports` for why this is not `add_dependency`.
     add_reexport(mut &this, ns: SymbolStr) -> void {
         if (ns.id == this.name.id) { return; }
-        for (mut i: i64 = 0; i < this.reexports.length; i++) {
-            if (this.reexports[i].id == ns.id) { return; }
+        for (mut i: i64 = 0; i < this.written_reexports.length; i++) {
+            if (this.written_reexports[i].id == ns.id) { return; }
         }
-        this.reexports.push(ns);
+        this.written_reexports.push(ns);
     }
 
     /// Record a `public module X;` target by its resolved namespace.
     /// See `submodules` for why this grants nothing on its own.
     add_submodule(mut &this, ns: SymbolStr) -> void {
-        for (mut i: i64 = 0; i < this.submodules.length; i++) {
-            if (this.submodules[i].id == ns.id) { return; }
+        for (mut i: i64 = 0; i < this.written_submodules.length; i++) {
+            if (this.written_submodules[i].id == ns.id) { return; }
         }
-        this.submodules.push(ns);
+        this.written_submodules.push(ns);
     }
 
 
@@ -393,6 +416,42 @@ type struct ModuleGraph {
         return ModulePath::none();
     }
 
+    /// Turn every module's recorded edges into the modules they name, once,
+    /// when discovery has finished and the graph holds every module an edge
+    /// can name.  A recorded namespace the graph holds no module for names
+    /// nothing: a dependency's is counted, so a closure over it knows it is
+    /// incomplete; any other edge carries no module to see.
+    resolve_edges(mut &this) -> void {
+        for (mut i: i64 = 0; i < this.modules.length; i++) {
+            mut unresolved: u32 = 0;
+            this.modules[i].dependencies = this.modules_of(&this.modules[i].written_dependencies, &unresolved);
+            this.modules[i].unresolved_dependencies = unresolved;
+            mut ignored: u32 = 0;
+            this.modules[i].imported_namespaces = this.modules_of(&this.modules[i].written_imported, &ignored);
+            this.modules[i].submodules = this.modules_of(&this.modules[i].written_submodules, &ignored);
+            this.modules[i].reexports = this.modules_of(&this.modules[i].written_reexports, &ignored);
+            this.modules[i].written_dependencies = [];
+            this.modules[i].written_imported = [];
+            this.modules[i].written_submodules = [];
+            this.modules[i].written_reexports = [];
+        }
+    }
+
+    /// The modules a recorded list of namespaces names, in order; one the
+    /// graph holds no module for is left out and counted in `*out_unresolved`.
+    modules_of(&this, written: &SymbolStr[], out_unresolved: u32*) -> ModulePath[] {
+        mut out: ModulePath[] = [];
+        for (mut i: i64 = 0; i < written.length; i++) {
+            const m: ModulePath = this.module_named(written[i]);
+            if (m.is_valid()) {
+                out.push(m);
+            } else {
+                *out_unresolved = *out_unresolved + 1;
+            }
+        }
+        return out;
+    }
+
     /// The path of the module the source file `file` declares; none for a
     /// file the graph did not load, or one declaring no namespace.
     module_of_file(&this, file: string) -> ModulePath {
@@ -461,38 +520,31 @@ type struct ModuleGraph {
     /// It cannot terminate on the graph being acyclic, because mutual
     /// re-export is legal by design.
     reexport_closure(&this, ns: ModulePath) -> ModulePath[] {
-        mut modules: ModulePath[] = [];
-        mut out: SymbolStr[] = [];
+        mut out: ModulePath[] = [];
         const start: i64 = this.find_module_index(ns);
-        if (start < 0) { return modules; }
+        if (start < 0) { return out; }
         const root: ModuleInfo* = this.get_module(start);
         for (mut i: i64 = 0; i < root.reexports.length; i++) {
             out.push(root.reexports[i]);
         }
         mut wi: i64 = 0;
         while (wi < out.length) {
-            const via: SymbolStr = out[wi];
+            const via: ModulePath = out[wi];
             wi = wi + 1;
-            const vidx: i64 = this.find_module_index(ModulePath::of(via));
+            const vidx: i64 = this.find_module_index(via);
             if (vidx < 0) { continue; }
             const vinfo: ModuleInfo* = this.get_module(vidx);
             for (mut ri: i64 = 0; ri < vinfo.reexports.length; ri++) {
-                const nxt: SymbolStr = vinfo.reexports[ri];
-                if (nxt.id == ns.as_sym().id) { continue; }
+                const nxt: ModulePath = vinfo.reexports[ri];
+                if (nxt.equals(ns)) { continue; }
                 mut seen: boolean = false;
                 for (mut qi: i64 = 0; qi < out.length; qi++) {
-                    if (out[qi].id == nxt.id) { seen = true; }
+                    if (out[qi].equals(nxt)) { seen = true; }
                 }
                 if (!seen) { out.push(nxt); }
             }
         }
-        // The re-export lists are recorded as the namespaces their
-        // declarations spell; each one the graph holds is a module.
-        for (mut mi: i64 = 0; mi < out.length; mi++) {
-            const m: ModulePath = this.module_named(out[mi]);
-            if (m.is_valid()) { modules.push(m); }
-        }
-        return modules;
+        return out;
     }
 
     /// Map an owner key (a namespace name, or a source-file path for modules
@@ -580,10 +632,10 @@ type struct ModuleGraph {
                 // Check if all dependencies are already placed.  Borrow the
                 // deps in place; moving them into a local would alias the
                 // array stored in `this.modules[i]` and double-free.
-                const deps: &SymbolStr[] = &this.modules[i].dependencies;
+                const deps: &ModulePath[] = &this.modules[i].dependencies;
                 mut all_ready: boolean = true;
                 for (mut d: i64 = 0; d < deps.length; d++) {
-                    const dep_idx: i64 = this.find_module_index(ModulePath::of(deps[d]));
+                    const dep_idx: i64 = this.find_module_index(deps[d]);
                     if (dep_idx >= 0 && !ModuleGraph::topo_contains(order, dep_idx as u32)) {
                         all_ready = false;
                     }
@@ -611,7 +663,7 @@ type struct ModuleGraph {
                     // its owning arrays and double-free at scope exit.
                     for (mut cd: i64 = 0; cd < cinfo.dependencies.length; cd++) {
                         const cdep_idx: i64 =
-                            this.find_module_index(ModulePath::of(cinfo.dependencies[cd]));
+                            this.find_module_index(cinfo.dependencies[cd]);
                         if (cdep_idx >= 0 && !ModuleGraph::topo_contains(order, cdep_idx as u32)) {
                             cdebug("    -> blocked by [%lld] %s\n",
                                 cdep_idx, this.modules[cdep_idx].file_path);
@@ -659,8 +711,9 @@ type struct ModuleGraph {
             const cur: u32 = queue[head];
             head = head + 1;
             const info: ModuleInfo* = &this.modules[cur];
+            if (info.unresolved_dependencies > 0 && out_incomplete != null) { *out_incomplete = true; }
             for (mut d: i64 = 0; d < info.dependencies.length; d++) {
-                const didx: i64 = this.find_module_index(ModulePath::of(info.dependencies[d]));
+                const didx: i64 = this.find_module_index(info.dependencies[d]);
                 if (didx < 0 || didx >= n as i64) {
                     if (out_incomplete != null) { *out_incomplete = true; }
                     continue;

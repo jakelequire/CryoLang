@@ -238,26 +238,21 @@ type struct DeclarationIndex {
     extern_symbol_first: HashMap<u32, Pair<u32, u64>>;
 
     // --- Module reachability and declaration visibility --------------------
-    // Everything below is keyed on the NAMESPACE identity space (e.g.
-    // `std::alloc::rc`, `CryoTests::Tests::Lang::LeafDispatchA`), the one space
-    // shared by a type's qualified name (namespace = qualified minus leaf),
-    // `ModuleInfo.dependencies` (stored as namespace names), and the use site's
-    // `current_module_name()`.  It is deliberately stored as resolved SymbolStr
-    // ids rather than reached via a ModuleGraph/CompilationContext back-pointer:
-    // Cryo forbids circular imports (the module graph must be a DAG), and both
-    // module_graph.cryo and compilation_context.cryo already import DeclIndex,
-    // so a back-pointer here would be a compile-time module cycle.
+    // Everything below is keyed by module (`ModulePath`), handed in by the
+    // orchestrator rather than reached through a ModuleGraph back-pointer:
+    // module_graph.cryo already imports this module, so a back-pointer here
+    // would be a compile-time module cycle.
 
-    // Use-site namespace SymbolStr.id -> the namespace ids it imports (a copy of
-    // that module's `ModuleInfo.dependencies`).  Populated once per module by
-    // the orchestrator (instance.cryo) after module discovery.
+    // A module's path id -> the path ids of the modules it can see through its
+    // imports.  Populated once per module by the orchestrator (instance.cryo)
+    // after module discovery.
     module_imports:      HashMap<u32, u32[]>;
 
-    // Namespace SymbolStr.ids re-exported by `std::prelude` (the modules whose
-    // public types - Rc, Box, Option, Range, ... - are auto-in-scope in every
-    // module).  A LOCAL type whose leaf collides with one of these is a hard
-    // conflict (ambiguous), not a silent shadow.  Populated once.
-    prelude_ns:          u32[];
+    // The modules `std::prelude` re-exports (those whose public types - Rc,
+    // Box, Option, Range, ... - are auto-in-scope in every module).  A LOCAL
+    // type whose leaf collides with one of these is a hard conflict
+    // (ambiguous), not a silent shadow.  Populated once.
+    prelude_modules:     ModulePath[];
 
 
     /// The declarations whose SIGNATURE the name layer refused - a parameter
@@ -302,7 +297,7 @@ type struct DeclarationIndex {
             overload_index:     HashMap::<u64, u32[]>::new(),
             extern_symbol_first: HashMap::<u32, Pair<u32, u64>>::new(),
             module_imports:     HashMap::<u32, u32[]>::new(),
-            prelude_ns:         [],
+            prelude_modules:    [],
             refused_methods:    HashMap::<u64, boolean>::new(),
         };
     }
@@ -1087,15 +1082,15 @@ type struct DeclarationIndex {
 
     // --- Import-scoped resolution: population + query -----------------------
 
-    /// Record a module's import list (its `ModuleInfo.dependencies`, which are
-    /// namespace names) under its own namespace, for later use-site scoping.
-    /// Called once per module by the orchestrator after module discovery.
-    register_module_imports(mut &this, module_ns: SymbolStr, imports: &SymbolStr[]) -> void {
+    /// Record the modules module `m` can see through its imports, for later
+    /// use-site scoping.  Called once per module by the orchestrator after
+    /// module discovery.
+    register_module_imports(mut &this, m: ModulePath, imports: &ModulePath[]) -> void {
         mut ids: u32[] = [];
         for (mut i: i64 = 0; i < imports.length; i++) {
-            ids.push(imports[i].id);
+            ids.push(imports[i].as_sym().id);
         }
-        this.module_imports.insert(module_ns.id, ids);
+        this.module_imports.insert(m.as_sym().id, ids);
     }
 
     /// Record the namespaces re-exported by `std::prelude` (deduped).  A local
@@ -1111,14 +1106,13 @@ type struct DeclarationIndex {
     /// `register_module_imports` does: `module_graph.cryo` already imports this
     /// module, so reaching a `ModuleGraph*` back the other way is a cycle Cryo
     /// forbids.
-    register_prelude_namespaces(mut &this, prelude: SymbolStr[]) -> void {
+    register_prelude_namespaces(mut &this, prelude: ModulePath[]) -> void {
         for (mut i: i64 = 0; i < prelude.length; i++) {
-            const id: u32 = prelude[i].id;
             mut seen: boolean = false;
-            for (mut j: i64 = 0; j < this.prelude_ns.length; j++) {
-                if (this.prelude_ns[j] == id) { seen = true; }
+            for (mut j: i64 = 0; j < this.prelude_modules.length; j++) {
+                if (this.prelude_modules[j].equals(prelude[i])) { seen = true; }
             }
-            if (!seen) { this.prelude_ns.push(id); }
+            if (!seen) { this.prelude_modules.push(prelude[i]); }
         }
     }
 
@@ -1171,17 +1165,17 @@ type struct DeclarationIndex {
     /// set asked two ways, so both read this one registration; a prelude the
     /// one accepts and the other does not bind is the gap that sends a name to
     /// a leaf-index search instead of to its module.
-    prelude_namespaces(&this) -> SymbolStr[] {
-        mut out: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < this.prelude_ns.length; i++) {
-            out.push(SymbolStr::from_id(this.prelude_ns[i]));
+    prelude_namespaces(&this) -> ModulePath[] {
+        mut out: ModulePath[] = [];
+        for (mut i: i64 = 0; i < this.prelude_modules.length; i++) {
+            out.push(this.prelude_modules[i]);
         }
         return out;
     }
 
     is_prelude_ns(&this, ns: ModulePath) -> boolean {
-        for (mut i: i64 = 0; i < this.prelude_ns.length; i++) {
-            if (this.prelude_ns[i] == ns.as_sym().id) { return true; }
+        for (mut i: i64 = 0; i < this.prelude_modules.length; i++) {
+            if (this.prelude_modules[i].equals(ns)) { return true; }
         }
         return false;
     }
