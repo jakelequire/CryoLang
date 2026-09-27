@@ -83,6 +83,7 @@ import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
+import utils::text::{ Text };
 
 
 type enum MoveState {
@@ -314,9 +315,9 @@ type struct MoveChecker {
     require_identity(mut &this, sym: SymbolID, name: SymbolStr,
                      span: SourceSpan) -> boolean {
         if (sym.is_valid()) { return true; }
-        this.ctx.ice_at(fmt::format(
+        this.ctx.ice_at(Text::new(fmt::format(
             "binding '%s' reached the move checker with no identity",
-            this.intern.resolve(name)), span);
+            this.intern.resolve(name))), span);
         this.fired += 1;
         this.fatal += 1;
         return false;
@@ -509,14 +510,14 @@ type struct MoveChecker {
             "future '%s' is moved after it has been polled",
             this.intern.resolve(name));
         mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0459_MOVED_AFTER_POLL, headline);
-        diag = diag.at_with_label(move_span, "moved here");
+            ErrorCode::E0459_MOVED_AFTER_POLL, Text::new(headline));
+        diag = diag.at_with_label(move_span, Text::new("moved here"));
         const pspan: SourceSpan = this.polled_at_span(sym);
         if (pspan.has_location()) {
-            diag = diag.also_at(pspan, "polled here, fixing its address");
+            diag = diag.also_at(pspan, Text::new("polled here, fixing its address"));
         }
         diag = diag.help(
-            "a future may hold a pointer into its own storage once it has run, so it must stay put; hand it over before the first poll (`block_on(f)`, `spawn(f)`, `Futures::join(a, b)`) rather than after");
+            Text::new("a future may hold a pointer into its own storage once it has run, so it must stay put; hand it over before the first poll (`block_on(f)`, `spawn(f)`, `Futures::join(a, b)`) rather than after"));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -818,10 +819,10 @@ type struct MoveChecker {
     /// unsound binary is never emitted.
     emit_use_after_move(mut &this, code: ErrorCode, headline: string,
                         use_span: SourceSpan, move_span: SourceSpan) -> void {
-        mut diag: Diagnostic = Diagnostic::error(code, headline);
-        diag = diag.at_with_label(use_span, "value used here after move");
+        mut diag: Diagnostic = Diagnostic::error(code, Text::new(headline));
+        diag = diag.at_with_label(use_span, Text::new("value used here after move"));
         if (move_span.has_location()) {
-            diag = diag.also_at(move_span, "value moved here");
+            diag = diag.also_at(move_span, Text::new("value moved here"));
         }
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
@@ -841,11 +842,11 @@ type struct MoveChecker {
             "value '%s' moved inside a loop is used again on the next iteration",
             this.intern.resolve(name));
         mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0452_USE_AFTER_MOVE, headline);
+            ErrorCode::E0452_USE_AFTER_MOVE, Text::new(headline));
         diag = diag.at_with_label(use_span,
-            "moved here, then re-read on the next iteration (double free)");
+            Text::new("moved here, then re-read on the next iteration (double free)"));
         diag = diag.help(
-            "declare the value inside the loop, reassign it after the move, or move out of a per-iteration binding");
+            Text::new("declare the value inside the loop, reassign it after the move, or move out of a per-iteration binding"));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -899,7 +900,7 @@ type struct MoveChecker {
     walk_function(mut &this, func: FunctionDeclNode*) -> void {
         if (func == null || func.body == null) { return; }
         if (func.is_generic()) { return; }
-        cdebug("[MoveCheck] === func '%s' ===\n", this.intern.resolve(func.name));
+        cdebug(Text::new("[MoveCheck] === func '%s' ===\n"), this.intern.resolve(func.name));
         this.enter_function(func);
         this.walk_block(func.body);
     }
@@ -1651,11 +1652,11 @@ type struct MoveChecker {
         const headline: string = fmt::format(
             "field '%s' moved out of a value more than once", field);
         mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0452_USE_AFTER_MOVE, headline);
+            ErrorCode::E0452_USE_AFTER_MOVE, Text::new(headline));
         diag = diag.at_with_label(ma.span,
-            "this field was already moved out of the value (double free)");
+            Text::new("this field was already moved out of the value (double free)"));
         diag = diag.help(
-            "a value can be moved out of a given field only once");
+            Text::new("a value can be moved out of a given field only once"));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -1833,11 +1834,11 @@ type struct MoveChecker {
 
     emit_deref_move_out_error(mut &this, u: UnaryExprNode*) -> void {
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
-            "cannot move a value that owns a destructor out of a pointer");
+            Text::new("cannot move a value that owns a destructor out of a pointer"));
         diag = diag.at_with_label(u.span,
-            "reading the pointee by value copies its owning handle; the storage this points at is still dropped by its owner (double free)");
+            Text::new("reading the pointee by value copies its owning handle; the storage this points at is still dropped by its owner (double free)"));
         diag = diag.help(
-            "borrow it instead (`p.field`, `p.method()`), or clone it; if this really is a take - the storage is yours to empty, or you overwrite it straight after - say so with an `unsafe` block around the sequence that makes it sound");
+            Text::new("borrow it instead (`p.field`, `p.method()`), or clone it; if this really is a take - the storage is yours to empty, or you overwrite it straight after - say so with an `unsafe` block around the sequence that makes it sound"));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -1848,11 +1849,11 @@ type struct MoveChecker {
         const headline: string = fmt::format(
             "cannot move field '%s' out of a value that owns a destructor", field);
         mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0453_DOUBLE_FREE, headline);
+            ErrorCode::E0453_DOUBLE_FREE, Text::new(headline));
         diag = diag.at_with_label(ma.span,
-            "moving this field out leaves the source to drop it again at scope exit (double free)");
+            Text::new("moving this field out leaves the source to drop it again at scope exit (double free)"));
         diag = diag.help(
-            "swap the field out with `core::mem::swap`, leaving a valid value to be dropped in place; or use a `Copy` field type");
+            Text::new("swap the field out with `core::mem::swap`, leaving a valid value to be dropped in place; or use a `Copy` field type"));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -1887,11 +1888,11 @@ type struct MoveChecker {
     emit_array_move_out_error(mut &this, aa: ArrayAccessNode*) -> void {
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0453_DOUBLE_FREE,
-            "cannot move an element out of an array that owns a destructor");
+            Text::new("cannot move an element out of an array that owns a destructor"));
         diag = diag.at_with_label(aa.span,
-            "copying this element out leaves the array to drop it again at scope exit (double free)");
+            Text::new("copying this element out leaves the array to drop it again at scope exit (double free)"));
         diag = diag.help(
-            "borrow the element instead (`const x: &T = &arr[i];`); or clone it when an owned copy is required");
+            Text::new("borrow the element instead (`const x: &T = &arr[i];`); or clone it when an owned copy is required"));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -1919,11 +1920,11 @@ type struct MoveChecker {
         if (this.is_owned_value_place(ma.object)) { return; }
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0453_DOUBLE_FREE,
-            "cannot move an owning array out of a value that owns a destructor");
+            Text::new("cannot move an owning array out of a value that owns a destructor"));
         diag = diag.at_with_label(ma.span,
-            "copying this array field out aliases the buffer the source still owns (double free)");
+            Text::new("copying this array field out aliases the buffer the source still owns (double free)"));
         diag = diag.help(
-            "borrow it (`const x: &T[] = &place.field;`) or clone it when an owned copy is required");
+            Text::new("borrow it (`const x: &T[] = &place.field;`) or clone it when an owned copy is required"));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -1942,7 +1943,7 @@ type struct MoveChecker {
         if (!ty.is_valid()) { return; }
         const _is_copy: boolean = this.is_copy(ty);
         const _is_moved: boolean = this.is_moved(sym);
-        cdebug("[MoveCheck:ident] '%s' ty.id=%llu is_copy=%d is_moved=%d in_move=%d\n",
+        cdebug(Text::new("[MoveCheck:ident] '%s' ty.id=%llu is_copy=%d is_moved=%d in_move=%d\n"),
             this.intern.resolve(name), ty.key(), _is_copy as i32,
             _is_moved as i32, in_move_context as i32);
         if (_is_copy) { return; }
@@ -1956,11 +1957,11 @@ type struct MoveChecker {
                 const headline: string = fmt::format(
                     "use of partially-moved value '%s'", this.intern.resolve(name));
                 mut diag: Diagnostic = Diagnostic::error(
-                    ErrorCode::E0452_USE_AFTER_MOVE, headline);
+                    ErrorCode::E0452_USE_AFTER_MOVE, Text::new(headline));
                 diag = diag.at_with_label(ident.span,
-                    "value moved here after one of its fields was already moved out");
+                    Text::new("value moved here after one of its fields was already moved out"));
                 diag = diag.help(
-                    "a value with a moved-out field cannot be moved or consumed as a whole");
+                    Text::new("a value with a moved-out field cannot be moved or consumed as a whole"));
                 this.ctx.emit_diagnostic(diag);
                 this.fired += 1;
                 this.fatal += 1;
@@ -1999,7 +2000,7 @@ type struct MoveCheckPass {
         mut checker: MoveChecker = MoveChecker::new(ctx);
         checker.walk_program(root);
         if (ctx.debug_mode) {
-            cdebug("[MoveCheck] %lld diagnostics emitted (%lld fatal)\n",
+            cdebug(Text::new("[MoveCheck] %lld diagnostics emitted (%lld fatal)\n"),
                 checker.fired, checker.fatal);
         }
         // Both within-iteration use-after-move and loop-carried moves are

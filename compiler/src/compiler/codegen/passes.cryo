@@ -57,6 +57,7 @@ import compiler::types::arena::{ TypeArena };
 import compiler::types::type_base::{ Type };
 import compiler::types::user_defined::{ ClassType, FieldInfo, StructType };
 import std::fmt::interp::{ fmt_append_display, fmt_append_lit, fmt_new };
+import utils::text::{ Text };
 
 
 // Linker configuration per target
@@ -240,12 +241,12 @@ type struct CodegenPasses {
     /// The error for a toolchain command that failed: what ran, where its
     /// inputs are kept, and - as a note - what the tool itself reported,
     /// which is the reason.
-    static tool_failure(what: string, cmd: string, rsp_path: string,
+    static tool_failure(what: Text, cmd: string, rsp_path: string,
                         output: string) -> Diagnostic {
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-            fmt::format("%s: %s\n  object list retained at: %s", what, cmd, rsp_path));
+            Text::new(fmt::format("%s: %s\n  object list retained at: %s", what.as_string(), cmd, rsp_path)));
         if (output.length() > 0) {
-            d = d.with_note(fmt::format("the tool reported:\n%s", output));
+            d = d.with_note(Text::new(fmt::format("the tool reported:\n%s", output)));
         }
         return d;
     }
@@ -586,9 +587,9 @@ type struct CodegenPasses {
             CodegenPasses::shell_quote(profile_dir), CodegenPasses::shell_quote(ll_path));
         const ll_rc: i32 = Command::shell(ll_cmd);
         if (ll_rc == 0) {
-            cdebug("[Codegen] Linked IR dump: %s\n", ll_path);
+            cdebug(Text::new("[Codegen] Linked IR dump: %s\n"), ll_path);
         } else {
-            cdebug("[Codegen] Warning: llvm-link-20 failed for IR dump (rc=%d)\n", ll_rc);
+            cdebug(Text::new("[Codegen] Warning: llvm-link-20 failed for IR dump (rc=%d)\n"), ll_rc);
         }
     }
 
@@ -771,7 +772,7 @@ type struct CodegenPasses {
         // overall compile still fails (the pipeline's final gate is
         // `!diagnostics.has_errors()`), so no unsound binary is emitted.
         if (ctx.diagnostics.has_errors()) {
-            cdebug("[Codegen] Skipping IR generation: earlier passes reported errors\n");
+            cdebug(Text::new("[Codegen] Skipping IR generation: earlier passes reported errors\n"));
             return PassResult::ok();
         }
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
@@ -782,42 +783,42 @@ type struct CodegenPasses {
             module_name = ctx.namespace_display();
         }
 
-        cdebug("[Codegen] Step 1: IR generation for module: %s\n", module_name);
+        cdebug(Text::new("[Codegen] Step 1: IR generation for module: %s\n"), module_name);
 
         // Initialize LLVM targets (idempotent).
-        cdebug("[Codegen] Step 2: Initializing LLVM targets...\n");
+        cdebug(Text::new("[Codegen] Step 2: Initializing LLVM targets...\n"));
         LTargetMachine::init_native_target();
-        cdebug("[Codegen] Step 3: LLVM targets initialized\n");
+        cdebug(Text::new("[Codegen] Step 3: LLVM targets initialized\n"));
 
         // Create per-module codegen context on the heap to avoid stack overflow.
         // CompilationContext is already large on the stack, and CodegenContext
         // adds ~400+ bytes of arrays and maps per module.
-        cdebug("[Codegen] Step 4: Creating CodegenContext...\n");
+        cdebug(Text::new("[Codegen] Step 4: Creating CodegenContext...\n"));
         const _box_cg: Box<CodegenContext> = Box::<CodegenContext>::new(CodegenContext::new(ctx, module_name));
         const cg: CodegenContext* = _box_cg.leak();
         // Two-phase init step 2: wire back-pointers on sub-components now
         // that `cg` is at its stable heap address.  Wiring before the move
         // into the Box would leave back-pointers dangling at the source.
         cg.wire();
-        cdebug("[Codegen] Step 5: CodegenContext created\n");
+        cdebug(Text::new("[Codegen] Step 5: CodegenContext created\n"));
 
         // Set target triple and data layout.  Honor a project-level
         // override (cryoconfig `target = "..."` or CLI `--target=TRIPLE`)
         // when one is set; otherwise fall back to the host triple from
         // LLVM.  The resolved triple is also fed to the target machine
         // below so the data-layout string matches.
-        cdebug("[Codegen] Step 6: Setting target triple...\n");
+        cdebug(Text::new("[Codegen] Step 6: Setting target triple...\n"));
         const triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
         cg.llvm_module.set_target_triple(triple);
-        cdebug("[Codegen] Step 7: Target triple set: %s\n", triple);
+        cdebug(Text::new("[Codegen] Step 7: Target triple set: %s\n"), triple);
 
-        cdebug("[Codegen] Step 8: Creating target machine...\n");
+        cdebug(Text::new("[Codegen] Step 8: Creating target machine...\n"));
         mut tm: LTargetMachine = LTargetMachine::create_target_machine_for_triple(triple);
         if (tm.is_valid()) {
             const layout: string = tm.get_data_layout_string();
             cg.llvm_module.set_data_layout(layout);
         }
-        cdebug("[Codegen] Step 9: Target machine ready\n");
+        cdebug(Text::new("[Codegen] Step 9: Target machine ready\n"));
 
         // DWARF debug-info scaffolding (no-op unless `-g`/--debug-info).
         // Must run before function-body emission so each prologue can
@@ -837,7 +838,7 @@ type struct CodegenPasses {
         // Create the visitor and generate IR.  Heap-allocate via Box::leak
         // so sub-emitters can hold stable `state: VisitorState*` back-pointers
         // into `gen.state`; same two-phase pattern as `CodegenContext` above.
-        cdebug("[Codegen] Step 12: Creating IRGeneratorVisitor...\n");
+        cdebug(Text::new("[Codegen] Step 12: Creating IRGeneratorVisitor...\n"));
         const _box_gen: Box<IRGeneratorVisitor> = Box::<IRGeneratorVisitor>::new(IRGeneratorVisitor(cg));
         const gen: IRGeneratorVisitor* = _box_gen.leak();
         // Two-phase init step 2: wire back-pointers on sub-emitters now
@@ -845,18 +846,18 @@ type struct CodegenPasses {
         // visitor's sub-emitter set is empty; the call site is in place
         // for incremental extraction.
         gen.wire();
-        cdebug("[Codegen] Step 13: Getting program AST...\n");
+        cdebug(Text::new("[Codegen] Step 13: Getting program AST...\n"));
         const program: ProgramNode* = ctx.artifacts.ast.program();
-        cdebug("[Codegen] Step 14: Generating program IR (program=%p)...\n", program as void*);
+        cdebug(Text::new("[Codegen] Step 14: Generating program IR (program=%p)...\n"), program as void*);
         const success: boolean = gen.generate_program(program);
         mut step15_status: string = "failed";
         if (success) { step15_status = "succeeded"; }
-        cdebug("[Codegen] Step 15: Program IR generation %s\n", step15_status);
+        cdebug(Text::new("[Codegen] Step 15: Program IR generation %s\n"), step15_status);
         libc::fflush(null);
 
         if (!success) {
             if (ctx.debug_mode) {
-                cdebug("[Codegen] IR generation failed for module: %s\n", module_name);
+                cdebug(Text::new("[Codegen] IR generation failed for module: %s\n"), module_name);
             }
             cg.dispose_builder();
             tm.dispose();
@@ -897,14 +898,14 @@ type struct CodegenPasses {
                 const fn_ty: void* = llvm::LLVMGlobalGetValueType(fn_val);
                 if (fn_ty == null) {
                     const fn_name: string = llvm::LLVMGetValueName(fn_val) as string;
-                    cdebug("[Codegen] CORRUPT: function '%s' has null type in module %s\n",
+                    cdebug(Text::new("[Codegen] CORRUPT: function '%s' has null type in module %s\n"),
                            fn_name, module_name);
                     has_corrupt = true;
                 } else {
                     const ret_ty: void* = llvm::LLVMGetReturnType(fn_ty);
                     if (ret_ty == null) {
                         const fn_name: string = llvm::LLVMGetValueName(fn_val) as string;
-                        cdebug("[Codegen] CORRUPT: function '%s' has null return type in module %s\n",
+                        cdebug(Text::new("[Codegen] CORRUPT: function '%s' has null return type in module %s\n"),
                                fn_name, module_name);
                         has_corrupt = true;
                     }
@@ -916,7 +917,7 @@ type struct CodegenPasses {
                         for (mut pi: u32 = 0; pi < param_count; pi++) {
                             if (slots[pi] == null) {
                                 const fn_name: string = llvm::LLVMGetValueName(fn_val) as string;
-                                cdebug("[Codegen] CORRUPT: function '%s' param %u is null type in module %s\n",
+                                cdebug(Text::new("[Codegen] CORRUPT: function '%s' param %u is null type in module %s\n"),
                                        fn_name, pi, module_name);
                                 has_corrupt = true;
                             }
@@ -955,7 +956,7 @@ type struct CodegenPasses {
         }
 
         if (has_corrupt) {
-            cdebug("[Codegen] Skipping verification for %s due to corrupt function types\n", module_name);
+            cdebug(Text::new("[Codegen] Skipping verification for %s due to corrupt function types\n"), module_name);
         } else {
             // Verify the LLVM module.
             mut verify_err: i8* = null;
@@ -970,7 +971,7 @@ type struct CodegenPasses {
                 // builds with several verify failures.
                 mut diag: Diagnostic = Diagnostic::error(
                     ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    fmt::format("LLVM module verification failed for %s", module_name));
+                    Text::new(fmt::format("LLVM module verification failed for %s", module_name)));
                 if (verify_err != null) {
                     const max_len: u64 = 2048;
                     const err_len: u64 = (verify_err as string).length();
@@ -979,9 +980,9 @@ type struct CodegenPasses {
                         mut tr: String = String::from_str(Str::from_raw(verify_err as u8*, max_len));
                         note_body = tr.into_raw();
                     }
-                    diag = diag.with_note("LLVM reports: " + note_body);
+                    diag = diag.with_note(Text::new("LLVM reports: " + note_body));
                     if (err_len > max_len) {
-                        diag = diag.with_note("(LLVM error truncated)");
+                        diag = diag.with_note(Text::new("(LLVM error truncated)"));
                     }
                 }
                 ctx.diagnostics.emit(diag);
@@ -998,7 +999,7 @@ type struct CodegenPasses {
         }
 
         if (ctx.debug_mode) {
-            cdebug("[Codegen] Module verified: %s\n", module_name);
+            cdebug(Text::new("[Codegen] Module verified: %s\n"), module_name);
         }
 
         // Store the LLVM module in artifacts.  The module is now owned by
@@ -1022,7 +1023,7 @@ type struct CodegenPasses {
         }
 
         if (ctx.debug_mode) {
-            cdebug("[Codegen] Optimization for module: %s (O%u)\n",
+            cdebug(Text::new("[Codegen] Optimization for module: %s (O%u)\n"),
                 ctx.artifacts.ir.module_name, ctx.opt_level);
         }
 
@@ -1033,7 +1034,7 @@ type struct CodegenPasses {
         // still governs instruction selection / register allocation.
         if (ctx.opt_level == 0) {
             if (ctx.debug_mode) {
-                cdebug("[Codegen] O0: skipping IR optimization pipeline\n");
+                cdebug(Text::new("[Codegen] O0: skipping IR optimization pipeline\n"));
             }
             return PassResult::ok();
         }
@@ -1055,8 +1056,8 @@ type struct CodegenPasses {
         if (result != 0) {
             tm.dispose();
             ctx.emit_error(ErrorCode::E0605_OPTIMIZATION_FAILED,
-                fmt::format("LLVM optimization pipeline failed for module '%s' (error code %d)",
-                    ctx.artifacts.ir.module_name, result));
+                Text::new(fmt::format("LLVM optimization pipeline failed for module '%s' (error code %d)",
+                    ctx.artifacts.ir.module_name, result)));
             return PassResult::failure(1);
         }
 
@@ -1070,8 +1071,8 @@ type struct CodegenPasses {
         if (verify_rc != 0) {
             mut diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0605_OPTIMIZATION_FAILED,
-                fmt::format("LLVM module verification failed after optimization for '%s'",
-                    ctx.artifacts.ir.module_name));
+                Text::new(fmt::format("LLVM module verification failed after optimization for '%s'",
+                    ctx.artifacts.ir.module_name)));
             if (verify_err != null) {
                 const max_len: u64 = 2048;
                 const err_len: u64 = (verify_err as string).length();
@@ -1080,7 +1081,7 @@ type struct CodegenPasses {
                     mut tr: String = String::from_str(Str::from_raw(verify_err as u8*, max_len));
                     note_body = tr.into_raw();
                 }
-                diag = diag.with_note("LLVM reports: " + note_body);
+                diag = diag.with_note(Text::new("LLVM reports: " + note_body));
                 llvm::LLVMDisposeMessage(verify_err as void*);
             }
             ctx.diagnostics.emit(diag);
@@ -1362,7 +1363,7 @@ type struct CodegenPasses {
             obj_triple, ctx.opt_level as i32);
         if (!tm.is_valid()) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                "failed to create target machine for object emission");
+                Text::new("failed to create target machine for object emission"));
             return PassResult::failure(1);
         }
 
@@ -1372,7 +1373,7 @@ type struct CodegenPasses {
 
         if (!success) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("failed to emit object file: %s", target.emit_path));
+                Text::new(fmt::format("failed to emit object file: %s", target.emit_path)));
             return PassResult::failure(1);
         }
 
@@ -1393,7 +1394,7 @@ type struct CodegenPasses {
         }
 
         if (ctx.debug_mode) {
-            cdebug("[Codegen] Emitted: %s\n", target.emit_path);
+            cdebug(Text::new("[Codegen] Emitted: %s\n"), target.emit_path);
         }
 
         return PassResult::ok();
@@ -1450,14 +1451,14 @@ type struct CodegenPasses {
         if (rc != 0) {
             const note: string = if (err != null) { err as string } else { "(no detail)" };
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("failed to write IR text to %s: %s", path, note));
+                Text::new(fmt::format("failed to write IR text to %s: %s", path, note)));
             if (err != null) { llvm::LLVMDisposeMessage(err as void*); }
             return PassResult::failure(1);
         }
         if (err != null) { llvm::LLVMDisposeMessage(err as void*); }
         ctx.artifacts.linked = LinkedOutput { object_file_path: path };
         if (ctx.debug_mode) {
-            cdebug("[Codegen] Emitted IR text: %s\n", path);
+            cdebug(Text::new("[Codegen] Emitted IR text: %s\n"), path);
         }
         return PassResult::ok();
     }
@@ -1562,7 +1563,7 @@ type struct CodegenPasses {
         const link_rsp_path: string = fmt::format("%s.rsp", exe_path);
         if (!CodegenPasses::write_rsp_file(link_rsp_path, &ctx.artifacts.object_files)) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("could not open linker response file for writing: %s", link_rsp_path));
+                Text::new(fmt::format("could not open linker response file for writing: %s", link_rsp_path)));
             return PassResult::failure(1);
         }
 
@@ -1652,7 +1653,7 @@ type struct CodegenPasses {
             const llvm_static: string = CodegenPasses::static_llvm_link_flags(CodegenPasses::pick_llvm_config());
             if (llvm_static.length() == 0) {
                 ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    "could not obtain static LLVM link flags from llvm-config (is it installed? set CRYO_LLVM_CONFIG)");
+                    Text::new("could not obtain static LLVM link flags from llvm-config (is it installed? set CRYO_LLVM_CONFIG)"));
                 return PassResult::failure(1);
             }
             cmd = fmt::format("%s %s", cmd, llvm_static);
@@ -1702,9 +1703,9 @@ type struct CodegenPasses {
         }
 
         if (ctx.debug_mode) {
-            cdebug("[Codegen] Linking %lld objects -> %s\n",
+            cdebug(Text::new("[Codegen] Linking %lld objects -> %s\n"),
                 ctx.artifacts.object_files.length, exe_path);
-            cdebug("[Codegen] Link command: %s\n", cmd);
+            cdebug(Text::new("[Codegen] Link command: %s\n"), cmd);
         }
 
         mut link_out: string = "";
@@ -1715,7 +1716,7 @@ type struct CodegenPasses {
             // unreplayable - the linker just reports the missing file instead
             // of the original error.
             ctx.emit_diagnostic(CodegenPasses::tool_failure(
-                fmt::format("linker invocation failed (%s exited with %d)", link_cfg.driver, rc),
+                Text::new(fmt::format("linker invocation failed (%s exited with %d)", link_cfg.driver, rc)),
                 cmd, link_rsp_path, link_out));
             return PassResult::failure(1);
         }
@@ -1724,7 +1725,7 @@ type struct CodegenPasses {
         // harmless).
         dir::remove_file(Path::from(link_rsp_path));
 
-        cdebug("[Codegen] Linked executable: %s\n", exe_path);
+        cdebug(Text::new("[Codegen] Linked executable: %s\n"), exe_path);
 
         // Hoist the freshly-linked binary from the per-profile cache up to
         // the build root (`<output_dir>/<name>[.exe]`) so it can be run
@@ -1738,11 +1739,11 @@ type struct CodegenPasses {
         const hrc: i32 = CodegenPasses::hoist_binary(exe_path, hoisted_exe);
         if (hrc != 0) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("failed to hoist executable to %s (copy exited with %d)",
-                    hoisted_exe, hrc));
+                Text::new(fmt::format("failed to hoist executable to %s (copy exited with %d)",
+                    hoisted_exe, hrc)));
             return PassResult::failure(1);
         }
-        cdebug("[Codegen] Hoisted executable: %s\n", hoisted_exe);
+        cdebug(Text::new("[Codegen] Hoisted executable: %s\n"), hoisted_exe);
 
         // Single-file `-o PATH` (Exe): mirror the hoisted binary to the
         // user's explicit output path.  The path is taken verbatim - no
@@ -1755,11 +1756,11 @@ type struct CodegenPasses {
             const orc: i32 = CodegenPasses::hoist_binary(hoisted_exe, ctx.output_path_override);
             if (orc != 0) {
                 ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    fmt::format("failed to copy executable to %s (copy exited with %d)",
-                        ctx.output_path_override, orc));
+                    Text::new(fmt::format("failed to copy executable to %s (copy exited with %d)",
+                        ctx.output_path_override, orc)));
                 return PassResult::failure(1);
             }
-            cdebug("[Codegen] Mirrored executable to -o path: %s\n",
+            cdebug(Text::new("[Codegen] Mirrored executable to -o path: %s\n"),
                 ctx.output_path_override);
         }
 
@@ -1817,7 +1818,7 @@ type struct CodegenPasses {
         const link_rsp_path: string = fmt::format("%s.rsp", exe_path);
         if (!CodegenPasses::write_rsp_file(link_rsp_path, &ctx.artifacts.object_files)) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("could not open linker response file for writing: %s", link_rsp_path));
+                Text::new(fmt::format("could not open linker response file for writing: %s", link_rsp_path)));
             return PassResult::failure(1);
         }
 
@@ -1854,8 +1855,8 @@ type struct CodegenPasses {
         }
 
         if (ctx.debug_mode) {
-            cdebug("[Codegen] Single-file link -> %s\n", exe_path);
-            cdebug("[Codegen] Link command: %s\n", cmd);
+            cdebug(Text::new("[Codegen] Single-file link -> %s\n"), exe_path);
+            cdebug(Text::new("[Codegen] Link command: %s\n"), cmd);
         }
 
         mut link_out: string = "";
@@ -1864,7 +1865,7 @@ type struct CodegenPasses {
             // Retained on failure so the reported command can be re-run; see
             // the project link path for the reasoning.
             ctx.emit_diagnostic(CodegenPasses::tool_failure(
-                fmt::format("linker invocation failed (%s exited with %d)", link_cfg.driver, rc),
+                Text::new(fmt::format("linker invocation failed (%s exited with %d)", link_cfg.driver, rc)),
                 cmd, link_rsp_path, link_out));
             return PassResult::failure(1);
         }
@@ -1872,7 +1873,7 @@ type struct CodegenPasses {
         // (best-effort - a failed unlink is harmless).
         dir::remove_file(Path::from(link_rsp_path));
 
-        cdebug("[Codegen] Linked executable: %s\n", exe_path);
+        cdebug(Text::new("[Codegen] Linked executable: %s\n"), exe_path);
         ctx.artifacts.linked = LinkedOutput { object_file_path: exe_path };
         return PassResult::ok();
     }
@@ -1939,16 +1940,16 @@ type struct CodegenPasses {
         const rsp_path: string = fmt::format("%s.rsp", archive_path);
         if (!CodegenPasses::write_rsp_file(rsp_path, objs)) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("could not open archiver response file for writing: %s", rsp_path));
+                Text::new(fmt::format("could not open archiver response file for writing: %s", rsp_path)));
             return PassResult::failure(1);
         }
 
         const cmd: string = fmt::format("%s rcs \"%s\" @\"%s\"", ar, archive_path, rsp_path);
 
         if (ctx.debug_mode) {
-            cdebug("[Codegen] Bundling %lld objects -> %s (via %s)\n",
+            cdebug(Text::new("[Codegen] Bundling %lld objects -> %s (via %s)\n"),
                 objs.length, archive_path, rsp_path);
-            cdebug("[Codegen] Bundle command: %s\n", cmd);
+            cdebug(Text::new("[Codegen] Bundle command: %s\n"), cmd);
         }
 
         mut ar_out: string = "";
@@ -1957,13 +1958,13 @@ type struct CodegenPasses {
             // Retained on failure so the reported command can be re-run; see
             // the project link path for the reasoning.
             ctx.emit_diagnostic(CodegenPasses::tool_failure(
-                fmt::format("ar invocation failed (exited with %d)", rc), cmd, rsp_path, ar_out));
+                Text::new(fmt::format("ar invocation failed (exited with %d)", rc)), cmd, rsp_path, ar_out));
             return PassResult::failure(1);
         }
         // Drop the response file now the archiver has read it (best-effort).
         dir::remove_file(Path::from(rsp_path));
 
-        cdebug("[Codegen] Bundled archive: %s (%lld objects)\n",
+        cdebug(Text::new("[Codegen] Bundled archive: %s (%lld objects)\n"),
             archive_path, objs.length);
         return PassResult::ok();
     }
@@ -2104,8 +2105,8 @@ type struct CodegenPasses {
                             };
                             mut wdiag: Diagnostic = Diagnostic::warning(
                                 ErrorCode::E0633_FUNCTION_BODY_ERROR,
-                                fmt::format("codegen: function '%s' transitively stripped because it calls a previously-stripped sibling in this module; see preceding error",
-                                    fn_name_safe));
+                                Text::new(fmt::format("codegen: function '%s' transitively stripped because it calls a previously-stripped sibling in this module; see preceding error",
+                                    fn_name_safe)));
                             cg.diag.emit(wdiag);
                             const wrap: LValue = LValue { raw: fn_val };
                             cg.diag.strip_function_body(wrap);
@@ -2373,7 +2374,7 @@ type struct EmitTarget {
 // against reintroducing that whole class of bug.
 // ---------------------------------------------------------------------------
 function ctx_audit_type(ty: void*, mod_ctx: void*, seen: void*[]*,
-                        mod_name: string, whence: string) -> void {
+                        mod_name: string, whence: Text) -> void {
     if (ty == null) { return; }
     for (mut i: i64 = 0; i < (*seen).length as i64; i++) {
         if ((*seen)[i] == ty) { return; }
@@ -2402,26 +2403,26 @@ function ctx_audit_module(module_raw: void*, mod_name: string) -> void {
     mut seen: void*[] = [];
     mut g: void* = llvm::LLVMGetFirstGlobal(module_raw);
     while (g != null) {
-        ctx_audit_type(llvm::LLVMGlobalGetValueType(g), mod_ctx, &seen, mod_name, "global-valtype");
+        ctx_audit_type(llvm::LLVMGlobalGetValueType(g), mod_ctx, &seen, mod_name, Text::new("global-valtype"));
         const init: void* = llvm::LLVMGetInitializer(g);
         if (init != null) {
-            ctx_audit_type(llvm::LLVMTypeOf(init), mod_ctx, &seen, mod_name, "global-init");
+            ctx_audit_type(llvm::LLVMTypeOf(init), mod_ctx, &seen, mod_name, Text::new("global-init"));
         }
         g = llvm::LLVMGetNextGlobal(g);
     }
     mut f: void* = llvm::LLVMGetFirstFunction(module_raw);
     while (f != null) {
-        ctx_audit_type(llvm::LLVMGlobalGetValueType(f), mod_ctx, &seen, mod_name, "fn-type");
+        ctx_audit_type(llvm::LLVMGlobalGetValueType(f), mod_ctx, &seen, mod_name, Text::new("fn-type"));
         mut bb: void* = llvm::LLVMGetFirstBasicBlock(f);
         while (bb != null) {
             mut inst: void* = llvm::LLVMGetFirstInstruction(bb);
             while (inst != null) {
-                ctx_audit_type(llvm::LLVMTypeOf(inst), mod_ctx, &seen, mod_name, "inst-type");
+                ctx_audit_type(llvm::LLVMTypeOf(inst), mod_ctx, &seen, mod_name, Text::new("inst-type"));
                 const nops: i32 = llvm::LLVMGetNumOperands(inst);
                 for (mut k: i32 = 0; k < nops; k++) {
                     const op: void* = llvm::LLVMGetOperand(inst, k as u32);
                     if (op != null) {
-                        ctx_audit_type(llvm::LLVMTypeOf(op), mod_ctx, &seen, mod_name, "operand-type");
+                        ctx_audit_type(llvm::LLVMTypeOf(op), mod_ctx, &seen, mod_name, Text::new("operand-type"));
                     }
                 }
                 inst = llvm::LLVMGetNextInstruction(inst);

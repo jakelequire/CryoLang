@@ -27,6 +27,7 @@ import compiler::ast::statement::{ BlockStmtNode };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag::suggestion::{ Suggestion };
+import utils::text::{ Text };
 
 
 type class ParserBase {
@@ -274,13 +275,13 @@ public:
 
     /// Expect and consume a token of the given kind.
     /// Reports an error and enters panic mode if the token doesn't match.
-    consume(kind: TokenType, message: string) -> Token {
+    consume(kind: TokenType, message: Text) -> Token {
         if (this.check(kind)) {
             return this.advance();
         }
 
         LOG_DEBUG(LogComponent::Parser, "[Parser] consume() failed: expected '%s', found '%s' at line %d",
-            message, this.current().lexeme, this.current().line);
+            message.as_string(), this.current().lexeme, this.current().line);
         this.error_expected_with_insert(kind, message);
         return this.current();
     }
@@ -320,13 +321,13 @@ public:
     /// real token.  This turns "expected ';'" into a one-click fix for
     /// the missing-semicolon / missing-comma / missing-paren cases that
     /// dominate parser-error UX.
-    error_expected_with_insert(kind: TokenType, expected: string) -> void {
+    error_expected_with_insert(kind: TokenType, expected: Text) -> void {
         const tok: Token = this.current();
-        const message: string = fmt::format("expected %s, found '%s'", expected, tok.lexeme);
+        const message: string = fmt::format("expected %s, found '%s'", expected.as_string(), tok.lexeme);
         const literal: string = ParserBase::literal_for_token(kind);
         if (literal == "") {
             // No safe auto-insertion; fall back to the plain error.
-            this.report_error(ErrorCode::E0100_EXPECTED_TOKEN, message);
+            this.report_error(ErrorCode::E0100_EXPECTED_TOKEN, Text::new(message));
             return;
         }
 
@@ -354,22 +355,22 @@ public:
             break;
         }
         if (!found_prev) {
-            this.report_error(ErrorCode::E0100_EXPECTED_TOKEN, message);
+            this.report_error(ErrorCode::E0100_EXPECTED_TOKEN, Text::new(message));
             return;
         }
 
         this.panic_mode = true;
         this.error_count += 1;
         mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0100_EXPECTED_TOKEN, message);
+            ErrorCode::E0100_EXPECTED_TOKEN, Text::new(message));
         diag = diag.at(this.current_span());
         const insert_span: SourceSpan = SourceSpan::new(
             this.source_file,
             anchor_line, anchor_col,
             anchor_line, anchor_col);
         diag = diag.suggest(Suggestion::machine_applicable(
-            insert_span, literal,
-            fmt::format("insert `%s` here", literal)));
+            insert_span, Text::new(literal),
+            Text::new(fmt::format("insert `%s` here", literal))));
         this.ctx.emit_diagnostic(diag);
     }
 
@@ -587,16 +588,16 @@ public:
 
 
     /// Report an error at the current position.
-    report_error(code: ErrorCode, message: string) -> void {
+    report_error(code: ErrorCode, message: Text) -> void {
         LOG_DEBUG(LogComponent::Parser, "[Parser] Error %s: %s at line %d",
-            code.format(), message, this.current().line);
+            code.format(), message.as_string(), this.current().line);
         this.panic_mode = true;
         this.error_count += 1;
         this.ctx.emit_error_at(code, message, this.current_span());
     }
 
     /// Report an error at a specific span.
-    report_error_at(code: ErrorCode, message: string, span: SourceSpan) -> void {
+    report_error_at(code: ErrorCode, message: Text, span: SourceSpan) -> void {
         this.panic_mode = true;
         this.error_count += 1;
         this.ctx.emit_error_at(code, message, span);
@@ -607,29 +608,29 @@ public:
     /// Unlike `report_error*`, this leaves `panic_mode` clear: the token stream
     /// is still synchronized, and entering panic mode would abandon the rest of
     /// the construct mid-expression and bury the real shape of the declaration.
-    report_invalid_at(code: ErrorCode, message: string, span: SourceSpan) -> void {
+    report_invalid_at(code: ErrorCode, message: Text, span: SourceSpan) -> void {
         this.error_count += 1;
         this.ctx.emit_error_at(code, message, span);
     }
 
     /// Report "expected X, found Y" error.
-    error_expected(expected: string) -> void {
+    error_expected(expected: Text) -> void {
         const tok: Token = this.current();
-        const message: string = fmt::format("expected %s, found '%s'", expected, tok.lexeme);
-        this.report_error(ErrorCode::E0100_EXPECTED_TOKEN, message);
+        const message: string = fmt::format("expected %s, found '%s'", expected.as_string(), tok.lexeme);
+        this.report_error(ErrorCode::E0100_EXPECTED_TOKEN, Text::new(message));
     }
 
     /// Report "unexpected token X" error.
     error_unexpected() -> void {
         const tok: Token = this.current();
         const message: string = fmt::format("unexpected token '%s'", tok.lexeme);
-        this.report_error(ErrorCode::E0101_UNEXPECTED_TOKEN, message);
+        this.report_error(ErrorCode::E0101_UNEXPECTED_TOKEN, Text::new(message));
     }
 
     /// Report "unexpected EOF" error.
     error_eof(context: string) -> void {
         const message: string = fmt::format("unexpected end of file while parsing %s", context);
-        this.report_error(ErrorCode::E0112_UNEXPECTED_EOF, message);
+        this.report_error(ErrorCode::E0112_UNEXPECTED_EOF, Text::new(message));
     }
 
 
@@ -676,10 +677,10 @@ public:
     /// an assignment to the local: it compiled, and the local read whatever
     /// its slot held.  Keywords are not identifiers there, as in Rust.  A
     /// keyword that opens nothing (`default`, `string`) stays a legal name.
-    refuse_declaration_keyword_name(tok: Token, what: string) -> void {
+    refuse_declaration_keyword_name(tok: Token, what: Text) -> void {
         if (!ParserBase::opens_declaration(tok.kind)) { return; }
         this.report_invalid_at(ErrorCode::E0100_EXPECTED_TOKEN,
-            fmt::format("expected %s, found `%s`, which is a reserved word", what, tok.lexeme),
+            Text::new(fmt::format("expected %s, found `%s`, which is a reserved word", what.as_string(), tok.lexeme)),
             this.span_from_token(tok));
     }
 
@@ -869,7 +870,7 @@ public:
             this.pending_right_angle = true;
             return;
         }
-        this.error_expected("'>'");
+        this.error_expected(Text::new("'>'"));
     }
 
     /// Count the number of `'\n'` bytes in `s`.  Used to compute the

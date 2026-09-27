@@ -24,6 +24,7 @@ import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
     ClassType, FieldInfo, MethodInfo, StructType, TypeAliasType
 };
+import utils::text::{ Text };
 
 
 // TypeCompatibility: Result of comparing two types
@@ -98,11 +99,11 @@ type struct TypeCheckResult {
         };
     }
 
-    static fail(message: string) -> TypeCheckResult {
+    static fail(message: Text) -> TypeCheckResult {
         return TypeCheckResult {
             result_type:   TypeRef::invalid(),
             success:       false,
-            error_message: message,
+            error_message: message.as_string(),
         };
     }
 }
@@ -715,14 +716,14 @@ type struct TypeChecker {
     check_binary_op(&this, op: string, lhs: TypeRef, rhs: TypeRef) -> TypeCheckResult {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeChecker] check_binary_op() op='%s' lhs=%lu rhs=%lu", op, lhs.key(), rhs.key());
         if (lhs.is_invalid() || rhs.is_invalid()) {
-            return TypeCheckResult::fail("Cannot apply operator to invalid types");
+            return TypeCheckResult::fail(Text::new("Cannot apply operator to invalid types"));
         }
 
         mut lhs_type: Type* = this.arena.lookup(lhs);
         mut rhs_type: Type* = this.arena.lookup(rhs);
 
         if (lhs_type == null || rhs_type == null) {
-            return TypeCheckResult::fail("Type lookup failed");
+            return TypeCheckResult::fail(Text::new("Type lookup failed"));
         }
 
         // Generic parameters are opaque to the pre-monomorphization
@@ -795,8 +796,8 @@ type struct TypeChecker {
             if ((op == "+" || op == "-") && lhs_is_ptrlike && rhs_type.is_numeric()) {
                 return TypeCheckResult::ok(lhs);
             }
-            return TypeCheckResult::fail(fmt::format("Cannot apply '%s' to %s and %s",
-                op, lhs_type.kind.to_string(), rhs_type.kind.to_string()));
+            return TypeCheckResult::fail(Text::new(fmt::format("Cannot apply '%s' to %s and %s",
+                op, lhs_type.kind.to_string(), rhs_type.kind.to_string())));
         }
 
         // Comparison: == != < > <= >=
@@ -835,9 +836,9 @@ type struct TypeChecker {
                 const other: Type* = if (lhs_ref) { rhs_type } else { lhs_type };
                 if (other.kind != TypeKind::Class && other.kind != TypeKind::Function
                         && other.kind != TypeKind::Void) {
-                    return TypeCheckResult::fail(fmt::format(
+                    return TypeCheckResult::fail(Text::new(fmt::format(
                         "Cannot compare %s and %s; dereference the reference to compare the value it refers to (`*x`)",
-                        lhs_type.kind.to_string(), rhs_type.kind.to_string()));
+                        lhs_type.kind.to_string(), rhs_type.kind.to_string())));
                 }
             }
             // Class/reference null checks: obj == null, &ref == null
@@ -860,8 +861,8 @@ type struct TypeChecker {
             if (lhs_type.kind == TypeKind::Enum && rhs_type.kind == TypeKind::Enum) {
                 return TypeCheckResult::ok(this.arena.get_bool());
             }
-            return TypeCheckResult::fail(fmt::format("Cannot compare %s and %s",
-                lhs_type.kind.to_string(), rhs_type.kind.to_string()));
+            return TypeCheckResult::fail(Text::new(fmt::format("Cannot compare %s and %s",
+                lhs_type.kind.to_string(), rhs_type.kind.to_string())));
         }
 
         // Logical: && ||
@@ -869,7 +870,7 @@ type struct TypeChecker {
             if (lhs_type.kind == TypeKind::Bool && rhs_type.kind == TypeKind::Bool) {
                 return TypeCheckResult::ok(this.arena.get_bool());
             }
-            return TypeCheckResult::fail(fmt::format("Logical '%s' requires boolean operands", op));
+            return TypeCheckResult::fail(Text::new(fmt::format("Logical '%s' requires boolean operands", op)));
         }
 
         // Bitwise: & | ^ << >>
@@ -884,21 +885,21 @@ type struct TypeChecker {
             if (lhs_intlike && rhs_intlike) {
                 return TypeCheckResult::ok(this.get_common_numeric_type(lhs, rhs));
             }
-            return TypeCheckResult::fail(fmt::format("Bitwise '%s' requires integer operands", op));
+            return TypeCheckResult::fail(Text::new(fmt::format("Bitwise '%s' requires integer operands", op)));
         }
 
-        return TypeCheckResult::fail(fmt::format("Unknown binary operator '%s'", op));
+        return TypeCheckResult::fail(Text::new(fmt::format("Unknown binary operator '%s'", op)));
     }
 
     /// Check a unary operation and return the result type.
     check_unary_op(&this, op: string, operand: TypeRef) -> TypeCheckResult {
         if (operand.is_invalid()) {
-            return TypeCheckResult::fail("Cannot apply unary operator to invalid type");
+            return TypeCheckResult::fail(Text::new("Cannot apply unary operator to invalid type"));
         }
 
         mut op_type: Type* = this.arena.lookup(operand);
         if (op_type == null) {
-            return TypeCheckResult::fail("Type lookup failed");
+            return TypeCheckResult::fail(Text::new("Type lookup failed"));
         }
         // Unwrap InstantiatedType: a generic instantiation wraps the
         // resolved type, but unary operator selection (deref, neg, etc.)
@@ -918,7 +919,7 @@ type struct TypeChecker {
             if (op_type.is_numeric()) {
                 return TypeCheckResult::ok(operand);
             }
-            return TypeCheckResult::fail("Negation requires numeric operand");
+            return TypeCheckResult::fail(Text::new("Negation requires numeric operand"));
         }
 
         // Increment / decrement: produce the operand's type unchanged.
@@ -937,11 +938,11 @@ type struct TypeChecker {
             // reseatable cursor - advancing it is meaningless. Steer the
             // user to a raw pointer, which `++`/`--` walk element-wise.
             if (op_type.kind == TypeKind::Reference) {
-                return TypeCheckResult::fail(fmt::format(
-                    "operator '%s' cannot be applied to a reference '&T'; a reference is an alias, not a reseatable cursor. Use a raw pointer 'T*' to walk memory", op));
+                return TypeCheckResult::fail(Text::new(fmt::format(
+                    "operator '%s' cannot be applied to a reference '&T'; a reference is an alias, not a reseatable cursor. Use a raw pointer 'T*' to walk memory", op)));
             }
-            return TypeCheckResult::fail(fmt::format(
-                "operator '%s' requires a numeric, pointer, or string operand", op));
+            return TypeCheckResult::fail(Text::new(fmt::format(
+                "operator '%s' requires a numeric, pointer, or string operand", op)));
         }
 
         // Logical not: !
@@ -949,7 +950,7 @@ type struct TypeChecker {
             if (op_type.kind == TypeKind::Bool) {
                 return TypeCheckResult::ok(operand);
             }
-            return TypeCheckResult::fail("Logical NOT requires boolean operand");
+            return TypeCheckResult::fail(Text::new("Logical NOT requires boolean operand"));
         }
 
         // Bitwise not: ~
@@ -957,7 +958,7 @@ type struct TypeChecker {
             if (op_type.kind == TypeKind::Int) {
                 return TypeCheckResult::ok(operand);
             }
-            return TypeCheckResult::fail("Bitwise NOT requires integer operand");
+            return TypeCheckResult::fail(Text::new("Bitwise NOT requires integer operand"));
         }
 
         // Dereference: *
@@ -980,7 +981,7 @@ type struct TypeChecker {
                 // pointer load + ptrtoint, which reads 8 bytes instead of 1.
                 return TypeCheckResult::ok(this.arena.get_char());
             }
-            return TypeCheckResult::fail("Dereference requires pointer or reference operand");
+            return TypeCheckResult::fail(Text::new("Dereference requires pointer or reference operand"));
         }
 
         // Address-of: & produces an immutable reference (&T), not a raw pointer (T*)
@@ -989,7 +990,7 @@ type struct TypeChecker {
                 this.arena.get_reference_to(operand, RefMutability::Immutable));
         }
 
-        return TypeCheckResult::fail(fmt::format("Unknown unary operator '%s'", op));
+        return TypeCheckResult::fail(Text::new(fmt::format("Unknown unary operator '%s'", op)));
     }
 
     /// Check a function call with the given argument types.
@@ -997,26 +998,26 @@ type struct TypeChecker {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeChecker] check_function_call() func=%lu args=%lld", func.key(), args.length);
         mut func_type: Type* = this.arena.lookup(func);
         if (func_type == null || func_type.kind != TypeKind::Function) {
-            return TypeCheckResult::fail("Called expression is not a function type");
+            return TypeCheckResult::fail(Text::new("Called expression is not a function type"));
         }
 
         mut fn_type: FunctionType* = func_type as FunctionType*;
 
         // Check arity
         if (!fn_type.is_variadic && args.length != fn_type.param_types.length) {
-            return TypeCheckResult::fail(fmt::format("Expected %ld arguments, got %ld",
-                fn_type.param_types.length, args.length));
+            return TypeCheckResult::fail(Text::new(fmt::format("Expected %ld arguments, got %ld",
+                fn_type.param_types.length, args.length)));
         }
 
         if (fn_type.is_variadic && args.length < fn_type.param_types.length) {
-            return TypeCheckResult::fail(fmt::format("Expected at least %ld arguments, got %ld",
-                fn_type.param_types.length, args.length));
+            return TypeCheckResult::fail(Text::new(fmt::format("Expected at least %ld arguments, got %ld",
+                fn_type.param_types.length, args.length)));
         }
 
         // Check each argument type
         for (mut i: i64 = 0; i < fn_type.param_types.length; i++) {
             if (!this.can_assign(args[i], fn_type.param_types[i])) {
-                return TypeCheckResult::fail(fmt::format("Argument %ld type mismatch", i + 1));
+                return TypeCheckResult::fail(Text::new(fmt::format("Argument %ld type mismatch", i + 1)));
             }
         }
 
@@ -1037,7 +1038,7 @@ type struct TypeChecker {
         *out = FieldLookup::none();
         mut base_type: Type* = this.arena.lookup(base);
         if (base_type == null) {
-            return TypeCheckResult::fail("Type lookup failed for field access");
+            return TypeCheckResult::fail(Text::new("Type lookup failed for field access"));
         }
 
         // Auto-dereference pointer and reference types for member access.
@@ -1046,13 +1047,13 @@ type struct TypeChecker {
             const ptr: PointerType* = base_type as PointerType*;
             base_type = this.arena.lookup(ptr.pointee);
             if (base_type == null) {
-                return TypeCheckResult::fail("Type lookup failed for pointer dereference");
+                return TypeCheckResult::fail(Text::new("Type lookup failed for pointer dereference"));
             }
         } else if (base_type.kind == TypeKind::Reference) {
             const ref: ReferenceType* = base_type as ReferenceType*;
             base_type = this.arena.lookup(ref.referent);
             if (base_type == null) {
-                return TypeCheckResult::fail("Type lookup failed for reference dereference");
+                return TypeCheckResult::fail(Text::new("Type lookup failed for reference dereference"));
             }
         }
 
@@ -1063,7 +1064,7 @@ type struct TypeChecker {
             if (inst.has_resolved_type()) {
                 base_type = this.arena.lookup(inst.resolved_type);
                 if (base_type == null) {
-                    return TypeCheckResult::fail("Type lookup failed for resolved instantiated type");
+                    return TypeCheckResult::fail(Text::new("Type lookup failed for resolved instantiated type"));
                 }
             }
         }
@@ -1075,8 +1076,8 @@ type struct TypeChecker {
                 *out = FieldLookup { field: &st.fields[fi], owner: base_type, depth: 0, index: fi };
                 return TypeCheckResult::ok(st.fields[fi].field_type);
             }
-            return TypeCheckResult::fail(fmt::format("Struct '%s' has no field '%s'",
-                st.display_name(), st.intern_table.resolve(field_name)));
+            return TypeCheckResult::fail(Text::new(fmt::format("Struct '%s' has no field '%s'",
+                st.display_name(), st.intern_table.resolve(field_name))));
         }
 
         if (base_type.kind == TypeKind::Class) {
@@ -1104,13 +1105,13 @@ type struct TypeChecker {
                     current = null;
                 }
             }
-            return TypeCheckResult::fail(fmt::format("Class '%s' has no field '%s'",
-                ct.display_name(), ct.intern_table.resolve(field_name)));
+            return TypeCheckResult::fail(Text::new(fmt::format("Class '%s' has no field '%s'",
+                ct.display_name(), ct.intern_table.resolve(field_name))));
         }
 
         // Tuple index access (0, 1, 2, ...)
         if (base_type.kind == TypeKind::Tuple) {
-            return TypeCheckResult::fail("Tuple field access requires numeric index");
+            return TypeCheckResult::fail(Text::new("Tuple field access requires numeric index"));
         }
 
         // Native array `T[]` / `T[N]` exposes `length` as an implicit field.
@@ -1125,18 +1126,18 @@ type struct TypeChecker {
             if (field_str.eq("length")) {
                 return TypeCheckResult::ok(this.arena.get_i64());
             }
-            return TypeCheckResult::fail(fmt::format("Array has no field '%s'", field_str));
+            return TypeCheckResult::fail(Text::new(fmt::format("Array has no field '%s'", field_str)));
         }
 
-        return TypeCheckResult::fail(fmt::format("Cannot access field on type %s",
-            base_type.kind.to_string()));
+        return TypeCheckResult::fail(Text::new(fmt::format("Cannot access field on type %s",
+            base_type.kind.to_string())));
     }
 
     /// Check index access (array[index]).
     check_index_access(&this, base: TypeRef, index: TypeRef) -> TypeCheckResult {
         mut base_type: Type* = this.arena.lookup(base);
         if (base_type == null) {
-            return TypeCheckResult::fail("Type lookup failed for index access");
+            return TypeCheckResult::fail(Text::new("Type lookup failed for index access"));
         }
 
         // Dereference InstantiatedType to its concrete resolved type
@@ -1145,7 +1146,7 @@ type struct TypeChecker {
             if (inst.has_resolved_type()) {
                 base_type = this.arena.lookup(inst.resolved_type);
                 if (base_type == null) {
-                    return TypeCheckResult::fail("Type lookup failed for resolved instantiated type");
+                    return TypeCheckResult::fail(Text::new("Type lookup failed for resolved instantiated type"));
                 }
             }
         }
@@ -1157,7 +1158,7 @@ type struct TypeChecker {
             if (idx_type != null && idx_type.kind == TypeKind::Int) {
                 return TypeCheckResult::ok(arr.element);
             }
-            return TypeCheckResult::fail("Array index must be an integer");
+            return TypeCheckResult::fail(Text::new("Array index must be an integer"));
         }
 
         // Pointer indexing.  A raw pointer `T*` indexes as C pointer arithmetic
@@ -1190,8 +1191,8 @@ type struct TypeChecker {
             return this.check_index_access(rt.referent, index);
         }
 
-        return TypeCheckResult::fail(fmt::format("Cannot index into type %s",
-            base_type.kind.to_string()));
+        return TypeCheckResult::fail(Text::new(fmt::format("Cannot index into type %s",
+            base_type.kind.to_string())));
     }
 
 

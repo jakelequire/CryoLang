@@ -145,6 +145,7 @@ SELFTEST_CASES = [
     ("find(&this, path: ModulePath) -> DefId {", False),
     ("equals(&this, other: MangledName) -> boolean {", False),
     ("static strip_eol(line: &String) -> u64 {", False),
+    ("static emit(out: void*, message: Text) -> void {", False),
     ("        lookup(name);", False),
     ("// lookup(&this, name: SymbolStr) -> TypeRef {", False),
 ]

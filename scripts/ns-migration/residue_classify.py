@@ -184,10 +184,6 @@ CLASS_OF_METHOD = {
     "local::VTableSlot[]":
         ("J", "member: a class's vtable slots held in a local, by the method's leaf (the override walk)"),
     # -- the declaration index --
-    "DeclarationIndex::type_of_decl":
-        ("N", "keyed by the `DefId`; the string is the diagnostic label of the asking site"),
-    "DeclarationIndex::impl_owner":
-        ("N", "keyed by the impl node; the string is the diagnostic label of the asking site"),
     "DeclarationIndex::global_entry_in_module":
         ("J", "member: a global's leaf inside the module the qualifier's stamp names (a `DefId`)"),
     "DeclarationIndex::lookup_family_entries":

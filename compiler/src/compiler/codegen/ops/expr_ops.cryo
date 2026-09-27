@@ -73,6 +73,7 @@ import compiler::types::compound::{ ArrayType, PointerType, ReferenceType };
 import compiler::types::type_base::{ FloatType, IntType, Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ EnumType };
+import utils::text::{ Text };
 
 
 type struct ExprOps {
@@ -537,16 +538,16 @@ type struct ExprOps {
         if (!current_bb.is_valid()) {
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0607_VARIABLE_GENERATION_ERROR,
-                fmt::format("codegen: local variable '%s': builder has no insert block", var_name));
+                Text::new(fmt::format("codegen: local variable '%s': builder has no insert block", var_name)));
             d = d.at(site_span);
-            d = d.with_note("the codegen builder must have an insert block active when a local is declared; this usually means a statement was visited outside of any function body");
+            d = d.with_note(Text::new("the codegen builder must have an insert block active when a local is declared; this usually means a statement was visited outside of any function body"));
             this.diag.emit(d);
             return;
         }
         const current_fn: LValue = current_bb.get_parent();
         if (!current_fn.is_valid()) {
             this.diag.emit_error_at_span(ErrorCode::E0607_VARIABLE_GENERATION_ERROR,
-                fmt::format("codegen: local variable '%s': insert block has no parent function", var_name),
+                Text::new(fmt::format("codegen: local variable '%s': insert block has no parent function", var_name)),
                 site_span);
             return;
         }
@@ -1207,8 +1208,8 @@ type struct ExprOps {
     /// `emit_panic_diverge_cleanup`.  The shared body of every synthesized-check
     /// raise (div-by-zero, non-exhaustive match, `new[]` overflow).
     emit_check_raise(mut &this, visitor: ASTVisitor*, sched: ASTNode*[]*,
-                     span: SourceSpan, message: string) -> void {
-        const msg: LValue = this.builder.build_global_string_ptr(message, "check.msg");
+                     span: SourceSpan, message: Text) -> void {
+        const msg: LValue = this.builder.build_global_string_ptr(message.as_string(), "check.msg");
         mut filename: string = span.file;
         if (filename == null || filename.length() == 0) { filename = "<unknown>"; }
         const file: LValue = this.builder.build_global_string_ptr(filename, "check.file");
@@ -2120,7 +2121,7 @@ type struct ExprOps {
         // clean SIGABRT.  Byte-identical on the default path.
         this.builder.position_at_end(trap_bb);
         if (this.ctx.project_panic_unwind && !this.intrinsics.no_runtime) {
-            this.emit_check_raise(visitor, div_sched, div_span, "attempt to divide by zero");
+            this.emit_check_raise(visitor, div_sched, div_span, Text::new("attempt to divide by zero"));
         } else {
             mut dz_ops: LValue[] = [];
             this.intrinsics.emit_check_sink("__cryo_panic_div_zero", div_span, &dz_ops);
@@ -2166,7 +2167,7 @@ type struct ExprOps {
         // truncated allocation.  Byte-identical on the default path.
         this.builder.position_at_end(trap_bb);
         if (this.ctx.project_panic_unwind && !this.intrinsics.no_runtime) {
-            this.emit_check_raise(visitor, ovf_sched, ovf_span, "arithmetic overflow");
+            this.emit_check_raise(visitor, ovf_sched, ovf_span, Text::new("arithmetic overflow"));
         } else {
             // `op` 2 = multiply: this guard is the array-size product. The
             // handler formats "arithmetic overflow (op 2): <lhs>, <rhs>", so it
@@ -2322,7 +2323,7 @@ type struct ExprOps {
     /// `what` names the construct for diagnostics. Returns a null `LValue`
     /// (after emitting a diagnostic) when no allocator can be resolved.
     emit_raw_alloc(mut &this, is_ast_node: boolean, size_val: LValue, align: u64,
-                   label: string, span: SourceSpan, what: string) -> LValue {
+                   label: Text, span: SourceSpan, what: Text) -> LValue {
         const align_val: LValue = LType::const_int(LType::i64(), align, false);
 
         if (is_ast_node) {
@@ -2331,14 +2332,14 @@ type struct ExprOps {
                 this.intern_str("cryo_ast_arena_alloc"), -1);
             if (!arena_fn.is_valid()) {
                 this.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                    fmt::format("codegen: %s: AST arena allocator not declared", what), span);
+                    Text::new(fmt::format("codegen: %s: AST arena allocator not declared", what.as_string())), span);
                 return LValue::null();
             }
             const arena_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(arena_fn.raw) };
             mut arena_args: Pair<LValue, TypeRef>[] = [];
             arena_args.push(Pair::<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
             arena_args.push(Pair::<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
-            return this.codegen_call(arena_fn, arena_ty, arena_args, label);
+            return this.codegen_call(arena_fn, arena_ty, arena_args, label.as_string());
         }
 
         const raw_fn: LValue = this.lang_function(LangItem::Alloc);
@@ -2347,7 +2348,7 @@ type struct ExprOps {
             mut raw_args: Pair<LValue, TypeRef>[] = [];
             raw_args.push(Pair::<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
             raw_args.push(Pair::<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
-            return this.codegen_call(raw_fn, raw_ty, raw_args, label);
+            return this.codegen_call(raw_fn, raw_ty, raw_args, label.as_string());
         }
 
         // Freestanding: `-nostdlib` means there is no libc `malloc` to fall
@@ -2362,25 +2363,25 @@ type struct ExprOps {
                 mut rt_args: Pair<LValue, TypeRef>[] = [];
                 rt_args.push(Pair::<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
                 rt_args.push(Pair::<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
-                return this.codegen_call(rt_fn, rt_ty, rt_args, label);
+                return this.codegen_call(rt_fn, rt_ty, rt_args, label.as_string());
             }
         }
 
         const malloc_fn: LValue = this.lang_function(LangItem::Malloc);
         if (!malloc_fn.is_valid()) {
             this.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                fmt::format("codegen: %s: `intrinsics::malloc` not declared", what), span);
+                Text::new(fmt::format("codegen: %s: `intrinsics::malloc` not declared", what.as_string())), span);
             return LValue::null();
         }
         const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
         if (!malloc_ty.is_valid()) {
             this.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
-                fmt::format("codegen: %s: failed to retrieve malloc function type", what), span);
+                Text::new(fmt::format("codegen: %s: failed to retrieve malloc function type", what.as_string())), span);
             return LValue::null();
         }
         mut malloc_args: Pair<LValue, TypeRef>[] = [];
         malloc_args.push(Pair::<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
-        return this.codegen_call(malloc_fn, malloc_ty, malloc_args, label);
+        return this.codegen_call(malloc_fn, malloc_ty, malloc_args, label.as_string());
     }
 
     /// The dealloc counterpart to `emit_raw_alloc`, for `delete`. Bitcasts the
@@ -2424,7 +2425,7 @@ type struct ExprOps {
         const free_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(free_fn.raw) };
         if (!free_ty.is_valid()) {
             this.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
-                "codegen: 'delete' expression: failed to retrieve free function type",
+                Text::new("codegen: 'delete' expression: failed to retrieve free function type"),
                 span);
             return;
         }
@@ -2448,7 +2449,7 @@ type struct ExprOps {
         const size: u64 = et.computed_size;
         if (size == 0) {
             this.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                "codegen: enum computed_size is 0 reaching codegen (TypeLowering bug)",
+                Text::new("codegen: enum computed_size is 0 reaching codegen (TypeLowering bug)"),
                 span);
             return LValue::null();
         }
@@ -2457,13 +2458,13 @@ type struct ExprOps {
         // Box the enum through the shared allocation funnel, exactly like
         // `new T()` in new_delete_emitter, so a boxed `new T::V` shares the
         // per-target arena routing.
-        const raw_ptr: LValue = this.emit_raw_alloc(false, size_val, 16, "newenum", span, "new T::V");
+        const raw_ptr: LValue = this.emit_raw_alloc(false, size_val, 16, Text::new("newenum"), span, Text::new("new T::V"));
         if (!raw_ptr.is_valid()) { return LValue::null(); }
 
         const enum_llvm: LType = this.type_mapper.map_type(enum_ref);
         if (!enum_llvm.is_valid()) {
             this.diag.emit_error_at_span(ErrorCode::E0609_TYPE_MAPPING_ERROR,
-                "codegen: new T::V: failed to map enum type",
+                Text::new("codegen: new T::V: failed to map enum type"),
                 span);
             return LValue::null();
         }

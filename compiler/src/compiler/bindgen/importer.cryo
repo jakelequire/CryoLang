@@ -75,6 +75,7 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import utils::text::{ Text };
 
 /// Name stem of a constant-folding probe variable.  The macro's index in
 /// `probe_names` is appended, which is what maps a folded value back to the
@@ -120,20 +121,20 @@ type struct ImportReport {
     /// silent unless `--debug` is set, since it rides `cdebug`).  Used by the
     /// inline `#include` path, where the report is diagnostic noise during a
     /// normal compile; the `cryo vendor` path uses `summary_stdout` instead.
-    summary(&this, label: string) -> void {
+    summary(&this, label: Text) -> void {
         if (this.skipped.length == 0 && this.approximated.length == 0
             && this.ignored.length == 0) { return; }
-        cdebug("[Bindgen] '%s' translation report: %lld not bound, %lld approximated, %lld ignored\n",
-               label, this.skipped.length as i64, this.approximated.length as i64,
+        cdebug(Text::new("[Bindgen] '%s' translation report: %lld not bound, %lld approximated, %lld ignored\n"),
+               label.as_string(), this.skipped.length as i64, this.approximated.length as i64,
                this.ignored.length as i64);
         for (mut i: i64 = 0; i < this.skipped.length; i++) {
-            cdebug("  [skip]   %s\n", this.skipped[i]);
+            cdebug(Text::new("  [skip]   %s\n"), this.skipped[i]);
         }
         for (mut i: i64 = 0; i < this.approximated.length; i++) {
-            cdebug("  [approx] %s\n", this.approximated[i]);
+            cdebug(Text::new("  [approx] %s\n"), this.approximated[i]);
         }
         for (mut i: i64 = 0; i < this.ignored.length; i++) {
-            cdebug("  [ignore] %s\n", this.ignored[i]);
+            cdebug(Text::new("  [ignore] %s\n"), this.ignored[i]);
         }
     }
 
@@ -156,11 +157,11 @@ type struct ImportReport {
     /// time (the honesty channel: every unbindable or approximated construct
     /// is listed, never silently dropped).  No-op when
     /// everything bound faithfully.
-    summary_stdout(&this, label: string) -> void {
+    summary_stdout(&this, label: Text) -> void {
         if (this.skipped.length == 0 && this.approximated.length == 0
             && this.ignored.length == 0) { return; }
         fmt::printf("Translation report for '%s': %lld not bound, %lld approximated (+%lld ignored: header guards / markers / function-like macros).\n",
-               label, this.skipped.length as i64, this.approximated.length as i64,
+               label.as_string(), this.skipped.length as i64, this.approximated.length as i64,
                this.ignored.length as i64);
         // LOST API (the headline): list prominently.
         for (mut i: i64 = 0; i < this.skipped.length; i++) {
@@ -830,7 +831,7 @@ type struct Importer {
             // it a synthetic `struct (unnamed at ...)` spelling, so test anonymity
             // via clang_Cursor_isAnonymous, NOT an empty-spelling check).
             // Reported, not silently relied upon - references fall back to void*.
-            cdebug("[Bindgen] skipped anonymous record (use a typedef to name it)\n");
+            cdebug(Text::new("[Bindgen] skipped anonymous record (use a typedef to name it)\n"));
             return;
         }
 
@@ -1568,7 +1569,7 @@ type struct Importer {
             // unless it names something only the C compiler can evaluate (a
             // constant in a system header), which the probe decides.
             this.defer_probe(name_sym,
-                fmt::format("marker macro '%s' -> '%s'", name_str, s1), false);
+                Text::new(fmt::format("marker macro '%s' -> '%s'", name_str, s1)), false);
             return;
         }
 
@@ -1580,7 +1581,7 @@ type struct Importer {
 
         clang::clang_disposeTokens(this.tu, toks, ntok);
         this.defer_probe(name_sym,
-            fmt::format("compound macro '%s' (non-trivial replacement)", name_str), true);
+            Text::new(fmt::format("compound macro '%s' (non-trivial replacement)", name_str)), true);
     }
 
     /// Queue an object-like macro that neither token pass could bind for the
@@ -1588,9 +1589,9 @@ type struct Importer {
     /// fails too.  Held rather than reported because the probe frequently
     /// recovers exactly these, and a report line claiming a loss that did not
     /// happen is worse than no line at all.
-    defer_probe(mut &this, name_sym: SymbolStr, reason: string, lost: boolean) -> void {
+    defer_probe(mut &this, name_sym: SymbolStr, reason: Text, lost: boolean) -> void {
         this.probe_names.push(name_sym);
-        this.probe_reasons.push(reason);
+        this.probe_reasons.push(reason.as_string());
         this.probe_lost.push(lost);
     }
 
@@ -2240,7 +2241,7 @@ type struct Importer {
 
                 const resolved: string = Importer::resolve_include_path(source_dir, include_path);
                 if (resolved == "") {
-                    cdebug("[Bindgen] WARNING: header not found: '%s' (relative to '%s')\n",
+                    cdebug(Text::new("[Bindgen] WARNING: header not found: '%s' (relative to '%s')\n"),
                            include_path, source_dir);
                     continue;
                 }
@@ -2251,13 +2252,13 @@ type struct Importer {
 
             if (ctx.debug_mode) {
                 const alias_str: string = ctx.intern_table.resolve(extern_node.namespace_alias);
-                cdebug("[Bindgen] '%s': %d includes, %d functions\n",
+                cdebug(Text::new("[Bindgen] '%s': %d includes, %d functions\n"),
                        alias_str, extern_node.include_paths.length, extern_node.functions.length);
             }
         }
 
         if (ctx.debug_mode && total_imported > 0) {
-            cdebug("[Bindgen] Total: %d C functions imported\n", total_imported);
+            cdebug(Text::new("[Bindgen] Total: %d C functions imported\n"), total_imported);
         }
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
@@ -2269,7 +2270,7 @@ type struct Importer {
                                ctx: CompilationContext*) -> i32 {
         mut no_extra: u8*[] = [];
         return Importer::collect_from_tu(resolved_path as u8*, null, 0,
-                                         &no_extra, resolved_path, extern_node, ctx, null, null,
+                                         &no_extra, Text::new(resolved_path), extern_node, ctx, null, null,
                                          "c", "");
     }
 
@@ -2282,8 +2283,8 @@ type struct Importer {
         if (!Importer::is_safe_header_name(header)) {
             ctx.diagnostics.emit(Diagnostic::error(
                 ErrorCode::E0806_HEADER_PREPROC_FAILED,
-                fmt::format("invalid system header name '<%s>': only letters, digits, and '. _ / + -' are allowed",
-                    header)));
+                Text::new(fmt::format("invalid system header name '<%s>': only letters, digits, and '. _ / + -' are allowed",
+                    header))));
             return 0;
         }
         const content: string = fmt::format("#include <%s>\n", header);
@@ -2294,7 +2295,7 @@ type struct Importer {
         };
         mut no_extra: u8*[] = [];
         return Importer::collect_from_tu("cryo_syshdr.c" as u8*, &uf, 1,
-                                         &no_extra, header, extern_node, ctx, null, null,
+                                         &no_extra, Text::new(header), extern_node, ctx, null, null,
                                          "c", "");
     }
 
@@ -2336,7 +2337,7 @@ type struct Importer {
     /// for the generator's include-graph `.deps` sidecar; null on the inline
     /// path skips the inclusion walk entirely.
     static collect_from_tu(source_filename: u8*, unsaved: CXUnsavedFile*, num_unsaved: u32,
-                           extra_args: &u8*[], label: string, extern_node: ExternBlockNode*,
+                           extra_args: &u8*[], label: Text, extern_node: ExternBlockNode*,
                            ctx: CompilationContext*, out_report: ImportReport*,
                            out_inputs: string[]*, lang: string, cpp_std: string) -> i32 {
         const index: void* = clang::clang_createIndex(0, 0);
@@ -2388,7 +2389,7 @@ type struct Importer {
         if ((tu as void*) == null) {
             ctx.diagnostics.emit(Diagnostic::error(
                 ErrorCode::E0806_HEADER_PREPROC_FAILED,
-                fmt::format("libclang failed to parse C header '%s'", label)));
+                Text::new(fmt::format("libclang failed to parse C header '%s'", label.as_string()))));
             clang::clang_disposeIndex(index);
             return 0;
         }
