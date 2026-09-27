@@ -561,7 +561,7 @@ type struct TypeArena {
     /// divergent layout / LLVM lowering / drop behaviour.
     create_union(mut &this, qualified_name: SymbolStr, declared_in: ModulePath) -> TypeRef {
         const ref: TypeRef = this.create_struct(qualified_name, declared_in);
-        const t: Type* = this.lookup(ref.id);
+        const t: Type* = this.lookup(ref);
         if (t != null) {
             const st: StructType* = t as StructType*;
             st.set_union(true);
@@ -733,11 +733,11 @@ type struct TypeArena {
     /// "give me the signature" cannot silently receive a collapsed aggregate
     /// concrete - the exact confusion the shared `resolved_type` field invites.
     instantiation_signature(&this, inst_ref: TypeRef) -> TypeRef {
-        const t: Type* = this.lookup(inst_ref.id);
+        const t: Type* = this.lookup(inst_ref);
         if (t == null || t.kind != TypeKind::InstantiatedType) { return TypeRef::invalid(); }
         const inst: InstantiatedType* = t as InstantiatedType*;
         if (!inst.has_signature()) { return TypeRef::invalid(); }
-        const sig: Type* = this.lookup(inst.signature_of().id);
+        const sig: Type* = this.lookup(inst.signature_of());
         if (sig == null || sig.kind != TypeKind::Function) { return TypeRef::invalid(); }
         return inst.signature_of();
     }
@@ -755,34 +755,37 @@ type struct TypeArena {
     }
 
 
-    /// If `id` resolves to a Pointer Type in this arena, return its
+    /// If `ty` is a Pointer Type in this arena, return its
     /// pointee TypeRef; otherwise return TypeRef::invalid().  Convenience
     /// for callers in modules where `Type` / `PointerType` aren't already
     /// in scope (e.g. AST/substituter).
-    pointer_pointee_of(&this, id: u64) -> TypeRef {
-        const t: Type* = this.lookup(id);
+    pointer_pointee_of(&this, ty: TypeRef) -> TypeRef {
+        const t: Type* = this.lookup(ty);
         if (t == null) { return TypeRef::invalid(); }
         if (t.kind != TypeKind::Pointer) { return TypeRef::invalid(); }
         const pt: PointerType* = t as PointerType*;
         return pt.pointee;
     }
 
-    /// If the type at `id` is an Array, return its element TypeRef; otherwise
+    /// If `ty` is an Array, return its element TypeRef; otherwise
     /// return TypeRef::invalid().  Sibling of `pointer_pointee_of` for callers
     /// in modules where `Type` / `ArrayType` aren't in scope (AST/substituter):
     /// lets the array-element annotation carry a pre-resolved TypeRef so the
     /// resolver never has to re-parse a non-bare-name element display (e.g.
     /// `i32*`, or a user-defined type out of scope at the spec site).
-    array_element_of(&this, id: u64) -> TypeRef {
-        const t: Type* = this.lookup(id);
+    array_element_of(&this, ty: TypeRef) -> TypeRef {
+        const t: Type* = this.lookup(ty);
         if (t == null) { return TypeRef::invalid(); }
         if (t.kind != TypeKind::Array) { return TypeRef::invalid(); }
         const at: ArrayType* = t as ArrayType*;
         return at.element;
     }
 
-    /// Look up a Type by its ID.  Returns null if the ID is invalid.
-    lookup(&this, id: u64) -> Type* {
+    /// The Type `ty` names.  Returns null for the invalid handle.  The one
+    /// read of the arena's storage: nothing outside this arena turns a
+    /// number into a Type, so a handle is the only way in.
+    lookup(&this, ty: TypeRef) -> Type* {
+        const id: u64 = ty.id;
         if (id == 0) {
             return null;
         }
@@ -800,11 +803,11 @@ type struct TypeArena {
     /// so layout math on the raw wrapper collapses fields onto their
     /// predecessors.
     lookup_payload_type(&this, ty: TypeRef) -> Type* {
-        mut t: Type* = this.lookup(ty.id);
+        mut t: Type* = this.lookup(ty);
         if (t != null && t.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = t as InstantiatedType*;
             if (inst.has_resolved_type()) {
-                const resolved: Type* = this.lookup(inst.resolved_type.id);
+                const resolved: Type* = this.lookup(inst.resolved_type);
                 if (resolved != null) { t = resolved; }
             }
         }
@@ -861,7 +864,7 @@ type struct TypeArena {
     /// so that TypeResolver can find the type during body-local resolution
     /// (where the ASTTypeSubstituter produces bare names).
     add_name_alias(mut &this, alias: SymbolStr, ty: TypeRef) -> void {
-        const t: Type* = this.lookup(ty.id);
+        const t: Type* = this.lookup(ty);
         if (t == null) { return; }
         match (t.kind) {
             TypeKind::Struct => { this.struct_cache.insert(alias.id, ty); }
@@ -963,7 +966,7 @@ type struct TypeArena {
     /// `Type*` virtual dispatch) can call this directly.
     contains_generic_param(&this, ty: TypeRef) -> boolean {
         if (!ty.is_valid()) { return false; }
-        const t: Type* = this.lookup(ty.id);
+        const t: Type* = this.lookup(ty);
         if (t == null) { return false; }
         if (t.kind == TypeKind::GenericParam) { return true; }
         if (t.kind == TypeKind::AssocProjection) {
@@ -1040,7 +1043,7 @@ type struct TypeArena {
     ///   - `Foo<T>` for a different base than the owner
     is_self_growing_instantiation(&this, ty: TypeRef, owner: DefId) -> boolean {
         if (!ty.is_valid() || !owner.is_valid()) { return false; }
-        const t: Type* = this.lookup(ty.id);
+        const t: Type* = this.lookup(ty);
         if (t == null) { return false; }
         // Peel transparent wrappers so `&Option<T*>` / `Option<T*>[]` match.
         if (t.kind == TypeKind::Pointer) {
@@ -1074,7 +1077,7 @@ type struct TypeArena {
         // contains a generic param but is not the bare param itself.
         for (mut i: i64 = 0; i < inst.type_args.length; i++) {
             const arg: TypeRef = inst.type_args[i];
-            const at: Type* = this.lookup(arg.id);
+            const at: Type* = this.lookup(arg);
             if (at == null) { continue; }
             const bare_param: boolean = at.kind == TypeKind::GenericParam;
             if (!bare_param && this.contains_generic_param(arg)) {
@@ -1091,7 +1094,7 @@ type struct TypeArena {
         mut d: i64 = 0;
         while (walk != null && d < depth) {
             if (!walk.has_base || !walk.base_class.is_valid()) { return null; }
-            const base_t: Type* = this.lookup(walk.base_class.id);
+            const base_t: Type* = this.lookup(walk.base_class);
             if (base_t == null || base_t.kind != TypeKind::Class) { return null; }
             walk = base_t as ClassType*;
             d += 1;
@@ -1128,7 +1131,7 @@ type struct TypeArena {
     /// sidesteps a codegen miscompile of cast-pointer field access at
     /// call sites.
     get_qualified_name(&this, ty: TypeRef) -> SymbolStr {
-        const t: Type* = this.lookup(ty.id);
+        const t: Type* = this.lookup(ty);
         if (t == null) { return SymbolStr::empty(); }
         match (t.kind) {
             TypeKind::Struct => {
@@ -1167,12 +1170,12 @@ type struct TypeArena {
         return this.types.length;
     }
 
-    /// Resolve a TypeRef ID to a human-readable display name string.
+    /// Resolve a TypeRef to a human-readable display name string.
     /// Delegates to format_display() so that compound types (pointers,
     /// references, arrays, etc.) resolve their inner types recursively
     /// instead of printing raw TypeRef IDs.
-    resolve_display_name(&this, id: u64) -> string {
-        const t: Type* = this.lookup(id);
+    resolve_display_name(&this, ty: TypeRef) -> string {
+        const t: Type* = this.lookup(ty);
         if (t == null) { return "?"; }
         return this.format_display(t);
     }
@@ -1187,38 +1190,38 @@ type struct TypeArena {
         match (ty.kind) {
             TypeKind::Pointer => {
                 const p: PointerType* = ty as PointerType*;
-                return this.resolve_display_name(p.pointee.id) + "*";
+                return this.resolve_display_name(p.pointee) + "*";
             }
             TypeKind::Reference => {
                 const r: ReferenceType* = ty as ReferenceType*;
-                const inner_name: string = this.resolve_display_name(r.referent.id);
+                const inner_name: string = this.resolve_display_name(r.referent);
                 // Cryo spells a mutable reference `mut &T`, not `&mut T`.
                 if (r.is_mutable()) { return "mut &" + inner_name; }
                 return "&" + inner_name;
             }
             TypeKind::Array => {
                 const a: ArrayType* = ty as ArrayType*;
-                const elem_name: string = this.resolve_display_name(a.element.id);
+                const elem_name: string = this.resolve_display_name(a.element);
                 if (a.is_dynamic()) { return elem_name + "[]"; }
                 const size_str: string = fmt::format("%ld", a.size);
                 return elem_name + "[" + size_str + "]";
             }
             TypeKind::Optional => {
                 const o: OptionalType* = ty as OptionalType*;
-                return this.resolve_display_name(o.wrapped.id) + "?";
+                return this.resolve_display_name(o.wrapped) + "?";
             }
             TypeKind::Function => {
                 const f: FunctionType* = ty as FunctionType*;
                 mut result: string = "(";
                 for (mut i: i64 = 0; i < f.param_types.length; i++) {
                     if (i > 0) { result += ", "; }
-                    result += this.resolve_display_name(f.param_types[i].id);
+                    result += this.resolve_display_name(f.param_types[i]);
                 }
                 if (f.is_variadic) {
                     if (f.param_types.length > 0) { result += ", "; }
                     result += "...";
                 }
-                const ret_name: string = this.resolve_display_name(f.return_type.id);
+                const ret_name: string = this.resolve_display_name(f.return_type);
                 return result + ") -> " + ret_name;
             }
             TypeKind::Tuple => {
@@ -1226,16 +1229,16 @@ type struct TypeArena {
                 mut result: string = "(";
                 for (mut i: i64 = 0; i < t.elements.length; i++) {
                     if (i > 0) { result += ", "; }
-                    result += this.resolve_display_name(t.elements[i].id);
+                    result += this.resolve_display_name(t.elements[i]);
                 }
                 return result + ")";
             }
             TypeKind::InstantiatedType => {
                 const inst: InstantiatedType* = ty as InstantiatedType*;
-                mut result: string = this.resolve_display_name(inst.generic_base.id) + "<";
+                mut result: string = this.resolve_display_name(inst.generic_base) + "<";
                 for (mut i: i64 = 0; i < inst.type_args.length; i++) {
                     if (i > 0) { result += ", "; }
-                    result += this.resolve_display_name(inst.type_args[i].id);
+                    result += this.resolve_display_name(inst.type_args[i]);
                 }
                 return result + ">";
             }
@@ -1251,9 +1254,9 @@ type struct TypeArena {
                 // reachable.  A resolved projection shows the concrete type.
                 const proj: AssocProjectionType* = ty as AssocProjectionType*;
                 if (proj.resolved_type.is_valid()) {
-                    return this.resolve_display_name(proj.resolved_type.id);
+                    return this.resolve_display_name(proj.resolved_type);
                 }
-                return this.resolve_display_name(proj.base.id) + "::"
+                return this.resolve_display_name(proj.base) + "::"
                     + this.intern_table.resolve(proj.member);
             }
             _ => { }
@@ -1272,8 +1275,8 @@ type struct TypeArena {
     /// Composite kinds (pointer/reference/array/optional/function/
     /// tuple/instantiated) recurse through this method so every leaf
     /// is shortened.
-    resolve_display_name_short(&this, id: u64) -> string {
-        const t: Type* = this.lookup(id);
+    resolve_display_name_short(&this, ty: TypeRef) -> string {
+        const t: Type* = this.lookup(ty);
         if (t == null) { return "?"; }
         return this.format_display_short(t);
     }
@@ -1284,54 +1287,54 @@ type struct TypeArena {
         match (ty.kind) {
             TypeKind::Pointer => {
                 const p: PointerType* = ty as PointerType*;
-                return this.resolve_display_name_short(p.pointee.id) + "*";
+                return this.resolve_display_name_short(p.pointee) + "*";
             }
             TypeKind::Reference => {
                 const r: ReferenceType* = ty as ReferenceType*;
-                const inner: string = this.resolve_display_name_short(r.referent.id);
+                const inner: string = this.resolve_display_name_short(r.referent);
                 // Cryo spells a mutable reference `mut &T`, not `&mut T`.
                 if (r.is_mutable()) { return "mut &" + inner; }
                 return "&" + inner;
             }
             TypeKind::Array => {
                 const a: ArrayType* = ty as ArrayType*;
-                const elem: string = this.resolve_display_name_short(a.element.id);
+                const elem: string = this.resolve_display_name_short(a.element);
                 if (a.is_dynamic()) { return elem + "[]"; }
                 return elem + "[" + fmt::format("%ld", a.size) + "]";
             }
             TypeKind::Optional => {
                 const o: OptionalType* = ty as OptionalType*;
-                return this.resolve_display_name_short(o.wrapped.id) + "?";
+                return this.resolve_display_name_short(o.wrapped) + "?";
             }
             TypeKind::Function => {
                 const f: FunctionType* = ty as FunctionType*;
                 mut result: string = "(";
                 for (mut i: i64 = 0; i < f.param_types.length; i++) {
                     if (i > 0) { result += ", "; }
-                    result += this.resolve_display_name_short(f.param_types[i].id);
+                    result += this.resolve_display_name_short(f.param_types[i]);
                 }
                 if (f.is_variadic) {
                     if (f.param_types.length > 0) { result += ", "; }
                     result += "...";
                 }
                 return result + ") -> "
-                    + this.resolve_display_name_short(f.return_type.id);
+                    + this.resolve_display_name_short(f.return_type);
             }
             TypeKind::Tuple => {
                 const t: TupleType* = ty as TupleType*;
                 mut result: string = "(";
                 for (mut i: i64 = 0; i < t.elements.length; i++) {
                     if (i > 0) { result += ", "; }
-                    result += this.resolve_display_name_short(t.elements[i].id);
+                    result += this.resolve_display_name_short(t.elements[i]);
                 }
                 return result + ")";
             }
             TypeKind::InstantiatedType => {
                 const inst: InstantiatedType* = ty as InstantiatedType*;
-                mut result: string = this.resolve_display_name_short(inst.generic_base.id) + "<";
+                mut result: string = this.resolve_display_name_short(inst.generic_base) + "<";
                 for (mut i: i64 = 0; i < inst.type_args.length; i++) {
                     if (i > 0) { result += ", "; }
-                    result += this.resolve_display_name_short(inst.type_args[i].id);
+                    result += this.resolve_display_name_short(inst.type_args[i]);
                 }
                 return result + ">";
             }
@@ -1346,9 +1349,9 @@ type struct TypeArena {
                 // concrete base renders `Range<i32>::Item`, not the path.
                 const proj: AssocProjectionType* = ty as AssocProjectionType*;
                 if (proj.resolved_type.is_valid()) {
-                    return this.resolve_display_name_short(proj.resolved_type.id);
+                    return this.resolve_display_name_short(proj.resolved_type);
                 }
-                return this.resolve_display_name_short(proj.base.id) + "::"
+                return this.resolve_display_name_short(proj.base) + "::"
                     + this.intern_table.resolve(proj.member);
             }
             _ => { }
@@ -1545,7 +1548,7 @@ type struct TypeArena {
             if (inst.resolved_type.is_valid()) { return "resolved"; }
             // Check if any type arg is a generic param: template-internal ref
             for (mut j: i64 = 0; j < inst.type_args.length; j++) {
-                const arg_ty: Type* = this.lookup(inst.type_args[j].id);
+                const arg_ty: Type* = this.lookup(inst.type_args[j]);
                 if (arg_ty != null) {
                     if (arg_ty.kind == TypeKind::GenericParam) {
                         return "template-internal";
@@ -1553,7 +1556,7 @@ type struct TypeArena {
                 }
             }
             // Check if base is a function template
-            const base_ty: Type* = this.lookup(inst.generic_base.id);
+            const base_ty: Type* = this.lookup(inst.generic_base);
             if (base_ty != null && base_ty.kind == TypeKind::FunctionTemplate) {
                 return "fn-template";
             }
@@ -1582,27 +1585,27 @@ type struct TypeArena {
     get_type_refs(&this, ty: Type*) -> string {
         if (ty.kind == TypeKind::Pointer) {
             const p: PointerType* = ty as PointerType*;
-            const inner: string = this.resolve_display_name(p.pointee.id);
+            const inner: string = this.resolve_display_name(p.pointee);
             return fmt::format("-> %s (#%lu)", inner, p.pointee.id);
         }
         if (ty.kind == TypeKind::Reference) {
             const r: ReferenceType* = ty as ReferenceType*;
-            const inner: string = this.resolve_display_name(r.referent.id);
+            const inner: string = this.resolve_display_name(r.referent);
             return fmt::format("-> %s (#%lu)", inner, r.referent.id);
         }
         if (ty.kind == TypeKind::Array) {
             const a: ArrayType* = ty as ArrayType*;
-            const elem: string = this.resolve_display_name(a.element.id);
+            const elem: string = this.resolve_display_name(a.element);
             return fmt::format("elem: %s (#%lu)", elem, a.element.id);
         }
         if (ty.kind == TypeKind::Optional) {
             const o: OptionalType* = ty as OptionalType*;
-            const inner: string = this.resolve_display_name(o.wrapped.id);
+            const inner: string = this.resolve_display_name(o.wrapped);
             return fmt::format("-> %s (#%lu)", inner, o.wrapped.id);
         }
         if (ty.kind == TypeKind::Function) {
             const f: FunctionType* = ty as FunctionType*;
-            const ret: string = this.resolve_display_name(f.return_type.id);
+            const ret: string = this.resolve_display_name(f.return_type);
             return fmt::format("ret: %s (#%lu)", ret, f.return_type.id);
         }
         if (ty.kind == TypeKind::Tuple) {
@@ -1621,16 +1624,16 @@ type struct TypeArena {
         if (ty.kind == TypeKind::TypeAlias) {
             const al: TypeAliasType* = ty as TypeAliasType*;
             if (al.has_target()) {
-                const target: string = this.resolve_display_name(al.target.id);
+                const target: string = this.resolve_display_name(al.target);
                 return fmt::format("-> %s (#%lu)", target, al.target.id);
             }
             return "-> ?";
         }
         if (ty.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = ty as InstantiatedType*;
-            const base: string = this.resolve_display_name(inst.generic_base.id);
+            const base: string = this.resolve_display_name(inst.generic_base);
             if (inst.resolved_type.is_valid()) {
-                const resolved: string = this.resolve_display_name(inst.resolved_type.id);
+                const resolved: string = this.resolve_display_name(inst.resolved_type);
                 return fmt::format("base: %s => %s (#%lu)", base, resolved, inst.resolved_type.id);
             }
             return fmt::format("base: %s => ?", base);
@@ -1638,7 +1641,7 @@ type struct TypeArena {
         if (ty.kind == TypeKind::Class) {
             const cl: ClassType* = ty as ClassType*;
             if (cl.has_base) {
-                const base_name: string = this.resolve_display_name(cl.base_class.id);
+                const base_name: string = this.resolve_display_name(cl.base_class);
                 return fmt::format("extends %s (#%lu)", base_name, cl.base_class.id);
             }
         }
@@ -1659,9 +1662,9 @@ type struct TypeArena {
     /// wrong key.  A no-op for non-aggregate concretes (e.g. a specialized
     /// function type), which carry no generic identity.
     set_type_generic_origin(mut &this, concrete: TypeRef, wrapper: TypeRef) -> void {
-        const t: Type* = this.lookup(concrete.id);
+        const t: Type* = this.lookup(concrete);
         if (t == null) { return; }
-        const w: Type* = this.lookup(wrapper.id);
+        const w: Type* = this.lookup(wrapper);
         if (w == null || w.kind != TypeKind::InstantiatedType) { return; }
         const wi: InstantiatedType* = w as InstantiatedType*;
         if (!wi.generic_base.is_valid()) { return; }
@@ -1692,7 +1695,7 @@ type struct TypeArena {
     /// name otherwise.  Empty for a type no trait can be implemented for by
     /// name.  Never a leaf: two modules' same-leaf types are two keys.
     template_key_of(&this, ty: TypeRef, intern: InternTable*) -> SymbolStr {
-        const t: Type* = this.lookup(ty.id);
+        const t: Type* = this.lookup(ty);
         if (t == null) { return SymbolStr::empty(); }
         const k: TypeKind = t.kind;
         if (k == TypeKind::Int || k == TypeKind::Float || k == TypeKind::Bool ||
@@ -1714,7 +1717,7 @@ type struct TypeArena {
     /// reads its own node; a post-mono concrete reads its intrinsic identity.
     /// Does NOT peel Pointer / Reference - see `TypeUtils::view_generic_base`.
     inst_generic_base(&this, ty: TypeRef) -> TypeRef {
-        const t: Type* = this.lookup(ty.id);
+        const t: Type* = this.lookup(ty);
         if (t == null) { return TypeRef::invalid(); }
         if (t.kind == TypeKind::InstantiatedType) { return (t as InstantiatedType*).generic_base; }
         if (t.kind == TypeKind::Struct) { return (t as StructType*).generic_base; }
@@ -1725,7 +1728,7 @@ type struct TypeArena {
 
     /// Number of type arguments `ty` carries as an instantiation (0 if none).
     inst_type_arg_count(&this, ty: TypeRef) -> i64 {
-        const t: Type* = this.lookup(ty.id);
+        const t: Type* = this.lookup(ty);
         if (t == null) { return 0; }
         if (t.kind == TypeKind::InstantiatedType) { return (t as InstantiatedType*).type_args.length; }
         if (t.kind == TypeKind::Struct) { return (t as StructType*).type_args.length; }
@@ -1739,7 +1742,7 @@ type struct TypeArena {
     /// value would alias the type's owned buffer and free it twice.
     inst_type_arg_at(&this, ty: TypeRef, i: i64) -> TypeRef {
         if (i < 0) { return TypeRef::invalid(); }
-        const t: Type* = this.lookup(ty.id);
+        const t: Type* = this.lookup(ty);
         if (t == null) { return TypeRef::invalid(); }
         if (t.kind == TypeKind::InstantiatedType) {
             const wt: InstantiatedType* = t as InstantiatedType*;

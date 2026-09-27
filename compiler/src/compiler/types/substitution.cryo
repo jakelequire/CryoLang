@@ -23,25 +23,25 @@ import compiler::types::user_defined::{ TypeAliasType };
 
 // TypeSubstitution: Generic parameter to concrete type mapping
 
-/// Maps generic parameter TypeIDs to concrete TypeRef replacements.
-/// Parallel arrays: param_ids[i] corresponds to replacements[i].
+/// Maps generic parameter types to concrete TypeRef replacements.
+/// Parallel arrays: params[i] corresponds to replacements[i].
 type struct TypeSubstitution {
-    param_ids:    u64[];       // GenericParamType TypeIDs
+    params:       TypeRef[];   // GenericParamType handles
     replacements: TypeRef[];   // Parallel: the concrete replacements
 
 
-    /// Create a substitution from parallel arrays of param TypeIDs and concrete types.
-    /// Args are borrowed and copied into independently-owned arrays (u64 and
-    /// TypeRef are Copy), so the caller keeps ownership and the same
-    /// (param_ids, type_args) pair can seed more than one substitution without
+    /// Create a substitution from parallel arrays of param types and concrete types.
+    /// Args are borrowed and copied into independently-owned arrays (TypeRef
+    /// is Copy), so the caller keeps ownership and the same
+    /// (params, type_args) pair can seed more than one substitution without
     /// aliasing a single buffer.
-    static from_params(param_type_ids: &u64[], type_args: &TypeRef[]) -> TypeSubstitution {
-        mut ids_copy:  u64[]     = [];
-        mut args_copy: TypeRef[] = [];
-        for (mut i: i64 = 0; i < param_type_ids.length; i++) { ids_copy.push(param_type_ids[i]); }
-        for (mut i: i64 = 0; i < type_args.length; i++)      { args_copy.push(type_args[i]); }
+    static from_params(param_types: &TypeRef[], type_args: &TypeRef[]) -> TypeSubstitution {
+        mut params_copy: TypeRef[] = [];
+        mut args_copy:   TypeRef[] = [];
+        for (mut i: i64 = 0; i < param_types.length; i++) { params_copy.push(param_types[i]); }
+        for (mut i: i64 = 0; i < type_args.length; i++)   { args_copy.push(type_args[i]); }
         return TypeSubstitution {
-            param_ids:    ids_copy,
+            params:       params_copy,
             replacements: args_copy,
         };
     }
@@ -49,20 +49,20 @@ type struct TypeSubstitution {
     /// Create an empty substitution.
     static empty() -> TypeSubstitution {
         return TypeSubstitution {
-            param_ids:    [],
+            params:       [],
             replacements: [],
         };
     }
 
 
     /// Add a single param -> replacement mapping.
-    add(mut &this, param_id: u64, replacement: TypeRef) -> void {
-        this.param_ids.push(param_id);
+    add(mut &this, param: TypeRef, replacement: TypeRef) -> void {
+        this.params.push(param);
         this.replacements.push(replacement);
     }
 
 
-    /// Look up the replacement for a given param TypeID.
+    /// Look up the replacement for a given param type.
     /// Returns TypeRef::invalid() if not found - or if found TWICE with two
     /// different answers.
     ///
@@ -73,10 +73,10 @@ type struct TypeSubstitution {
     /// with whichever was added first would substitute silently, so the
     /// answer is invalid and the type it was asked for stays unresolved.  A
     /// parameter bound twice to the SAME type is one answer and is given.
-    get(&this, param_id: u64) -> TypeRef {
+    get(&this, param: TypeRef) -> TypeRef {
         mut found: TypeRef = TypeRef::invalid();
-        for (mut i: i64 = 0; i < this.param_ids.length; i++) {
-            if (this.param_ids[i] != param_id) { continue; }
+        for (mut i: i64 = 0; i < this.params.length; i++) {
+            if (!this.params[i].equals(param)) { continue; }
             if (!found.is_valid()) { found = this.replacements[i]; continue; }
             if (found.id != this.replacements[i].id) { return TypeRef::invalid(); }
         }
@@ -85,12 +85,12 @@ type struct TypeSubstitution {
 
     /// Whether this substitution has any mappings.
     is_empty(&this) -> boolean {
-        return this.param_ids.length == 0;
+        return this.params.length == 0;
     }
 
     /// Number of param -> replacement pairs.
     size(&this) -> i64 {
-        return this.param_ids.length;
+        return this.params.length;
     }
 
 
@@ -104,7 +104,7 @@ type struct TypeSubstitution {
             return ty;
         }
 
-        const t: Type* = arena.lookup(ty.id);
+        const t: Type* = arena.lookup(ty);
         if (t == null) {
             return ty;
         }
@@ -154,7 +154,7 @@ type struct TypeSubstitution {
     // Per-kind application helpers
 
     apply_generic_param(&this, ty: TypeRef, t: Type*, arena: TypeArena*) -> TypeRef {
-        const replacement: TypeRef = this.get(ty.id);
+        const replacement: TypeRef = this.get(ty);
         if (replacement.is_valid()) {
             return replacement;
         }

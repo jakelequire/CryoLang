@@ -607,8 +607,8 @@ type struct MonoCallSpecializer {
         // Seed bindings from sema's stash (the source of truth).  Apply the active
         // specialization `subst`: a stash on a template body holds the enclosing
         // template's params; this spec concretizes them (no-op on a concrete stash).
-        if (entry.param_type_ids.length == 0) { return; }
-        if (call.resolved_type_args.length != entry.param_type_ids.length) {
+        if (entry.param_types.length == 0) { return; }
+        if (call.resolved_type_args.length != entry.param_types.length) {
             // No (or partial) stash: outside sema's visibility; leave unspecialized.
             // (Candidate to HARDEN to an ICE; left as a soft return for now.)
             return;
@@ -672,7 +672,7 @@ type struct MonoCallSpecializer {
             seeded.push(tr);
         }
         seeded = this.type_resolver.expand_default_type_args(entry, seeded, res_ctx);
-        if (seeded.length != entry.param_type_ids.length) { return; }
+        if (seeded.length != entry.param_types.length) { return; }
 
         const base_sym: SymbolStr = entry.spec_base_name(this.intern_table);
         const base_qname: QualifiedName = QualifiedName::from_symbol(base_sym);
@@ -722,17 +722,17 @@ type struct MonoCallSpecializer {
         const base: TypeRef = this.derive_receiver_type(ma.object);
         if (!base.is_valid()) { return TypeRef::invalid(); }
         // Unwrap Pointer/Reference/resolved-InstantiatedType to the struct/class.
-        mut bt: Type* = this.arena.lookup(base.id);
+        mut bt: Type* = this.arena.lookup(base);
         mut depth: i32 = 0;
         while (bt != null && depth < 8) {
             if (bt.kind == TypeKind::Pointer) {
-                bt = this.arena.lookup((bt as PointerType*).pointee.id);
+                bt = this.arena.lookup((bt as PointerType*).pointee);
             } else if (bt.kind == TypeKind::Reference) {
-                bt = this.arena.lookup((bt as ReferenceType*).referent.id);
+                bt = this.arena.lookup((bt as ReferenceType*).referent);
             } else if (bt.kind == TypeKind::InstantiatedType) {
                 const inst: InstantiatedType* = bt as InstantiatedType*;
                 if (!inst.has_resolved_type()) { return TypeRef::invalid(); }
-                bt = this.arena.lookup(inst.resolved_type.id);
+                bt = this.arena.lookup(inst.resolved_type);
             } else {
                 break;
             }
@@ -797,20 +797,20 @@ type struct MonoCallSpecializer {
         // Unwrap Reference/Pointer/InstantiatedType to a concrete Struct/Class/Enum
         // (what spec_entries.specialized_type points at).  An unresolved adapter inst
         // is left as-is for the is_unresolved_inst path + fixpoint re-walk.
-        mut t: Type* = this.arena.lookup(recv_type.id);
+        mut t: Type* = this.arena.lookup(recv_type);
         mut depth: i32 = 0;
         while (t != null && depth < 8) {
             if (t.kind == TypeKind::Pointer) {
                 recv_type = (t as PointerType*).pointee;
-                t = this.arena.lookup(recv_type.id);
+                t = this.arena.lookup(recv_type);
             } else if (t.kind == TypeKind::Reference) {
                 recv_type = (t as ReferenceType*).referent;
-                t = this.arena.lookup(recv_type.id);
+                t = this.arena.lookup(recv_type);
             } else if (t.kind == TypeKind::InstantiatedType) {
                 const inst: InstantiatedType* = t as InstantiatedType*;
                 if (inst.has_resolved_type()) {
                     recv_type = inst.resolved_type;
-                    t = this.arena.lookup(recv_type.id);
+                    t = this.arena.lookup(recv_type);
                 } else {
                     // Genuinely still an unresolved pre-mono wrapper: its spec has
                     // not been materialized yet.  Leave it for the fixpoint re-walk,
@@ -838,7 +838,7 @@ type struct MonoCallSpecializer {
             const canon: TypeRef = this.canonicalize_default_template_recv(recv_type);
             if (canon.is_valid() && canon.id != recv_type.id) {
                 recv_type = canon;
-                t = this.arena.lookup(recv_type.id);
+                t = this.arena.lookup(recv_type);
                 if (t == null) { return; }
             }
         }
@@ -1084,7 +1084,7 @@ type struct MonoCallSpecializer {
             mut target_ast: ASTNode* = inherent_owner_ast;
             mut from_template: boolean = false;
             if (this.generic_registry != null) {
-                const recv_t: Type* = this.arena.lookup(recv_type.id);
+                const recv_t: Type* = this.arena.lookup(recv_type);
                 if (recv_t != null && recv_t.kind == TypeKind::InstantiatedType) {
                     const inst_recv: InstantiatedType* = recv_t as InstantiatedType*;
                     const tmpl_recv: TemplateEntry* =
@@ -1179,7 +1179,7 @@ type struct MonoCallSpecializer {
             // path use (see ~line 1400).
             for (mut mbi: i64 = 0; mbi < method_param_names.length && mbi < bindings.length; mbi++) {
                 const mpref: TypeRef = this.arena.create_generic_param(method_param_syms[mbi], method_param_names[mbi], mbi as u64);
-                owner_subst.add(mpref.id, bindings[mbi]);
+                owner_subst.add(mpref, bindings[mbi]);
             }
             if (owner_subst.is_empty()) {
                 this.walk_block(spec_method.func.body, &rw_ctx, null);
@@ -1209,7 +1209,7 @@ type struct MonoCallSpecializer {
         // qualified name, except for an inherent block, which registers under
         // its own stamped target (a primitive's bare spelling).
         mut pin_target: SymbolStr = this.arena.get_qualified_name(recv_type);
-        const lazy_recv: Type* = this.arena.lookup(recv_type.id);
+        const lazy_recv: Type* = this.arena.lookup(recv_type);
         const lazy_prim: boolean = lazy_recv != null
                 && (lazy_recv.kind == TypeKind::Int || lazy_recv.kind == TypeKind::Float
                     || lazy_recv.kind == TypeKind::Bool || lazy_recv.kind == TypeKind::Char
@@ -1303,7 +1303,7 @@ type struct MonoCallSpecializer {
         // --- Non-generic static method on a generic owner (existing path) ---
         if (matched_nongeneric != null) {
             // The owner's type args come from sema's stash (declaration order).
-            if (call.resolved_type_args.length != entry.param_type_ids.length) { return false; }
+            if (call.resolved_type_args.length != entry.param_types.length) { return false; }
             mut binds: TypeRef[] = [];
             for (mut i: i64 = 0; i < call.resolved_type_args.length; i++) {
                 const b: TypeRef = this.concretize_stashed_arg(call.resolved_type_args[i], subst);
@@ -1364,7 +1364,7 @@ type struct MonoCallSpecializer {
 
         // Owner binds: scope turbofish, else template defaults.
         mut owner_binds: TypeRef[] = this.compute_owner_default_binds(scope, entry, subst);
-        if (owner_binds.length != entry.param_type_ids.length) { return false; }
+        if (owner_binds.length != entry.param_types.length) { return false; }
 
         // Materialize the owner instantiation.
         const inst_ref: TypeRef = registry.instantiate(
@@ -1387,7 +1387,7 @@ type struct MonoCallSpecializer {
     /// `Wrap<i32>`).  Mirrors sema's `compute_generic_static_owner_binds`.
     compute_owner_default_binds(mut &this, scope: ScopeResolutionNode*,
                                 entry: TemplateEntry*, subst: TypeSubstitution*) -> TypeRef[] {
-        const want: i64 = entry.param_type_ids.length;
+        const want: i64 = entry.param_types.length;
         if (want == 0) { return []; }
         if (this.type_resolver == null) { return []; }
         mut rc: ResolutionContext = ResolutionContext::new("");
@@ -1595,7 +1595,7 @@ type struct MonoCallSpecializer {
             }
         }
         if (this.generic_registry == null) { return null; }
-        const recv_t: Type* = this.arena.lookup(target_type.id);
+        const recv_t: Type* = this.arena.lookup(target_type);
         if (recv_t == null || recv_t.kind != TypeKind::InstantiatedType) { return null; }
         this.state.enqueue_from_type_ref(target_type);
         const inst: InstantiatedType* = recv_t as InstantiatedType*;
@@ -1685,7 +1685,7 @@ type struct MonoCallSpecializer {
             const arg_i: TypeRef = this.arena.inst_type_arg_at(owner_src, i);
             if (this.arena.contains_generic_param(arg_i)) { continue; }
             const pref: TypeRef = this.arena.create_generic_param(gp.sym_id, gp.name, i as u64);
-            subst.add(pref.id, arg_i);
+            subst.add(pref, arg_i);
         }
     }
 
@@ -1922,7 +1922,7 @@ type struct MonoCallSpecializer {
 
         mut arg_displays: SymbolStr[] = [];
         for (mut i: i64 = 0; i < args.length; i++) {
-            const arg_t: Type* = this.arena.lookup(args[i].id);
+            const arg_t: Type* = this.arena.lookup(args[i]);
             mut display: string = "";
             if (arg_t != null) {
                 const qname: SymbolStr = this.arena.get_qualified_name(args[i]);
@@ -1937,10 +1937,10 @@ type struct MonoCallSpecializer {
             arg_displays.push(this.intern_table.intern(display));
         }
 
-        mut param_ids: u64[] = [];
+        mut param_ids: TypeRef[] = [];
         for (mut i: i64 = 0; i < param_names.length; i++) {
             const gp_ref: TypeRef = this.arena.create_generic_param(param_syms[i], param_names[i], i as u64);
-            param_ids.push(gp_ref.id);
+            param_ids.push(gp_ref);
         }
         mut subst_val: TypeSubstitution = TypeSubstitution::from_params(param_ids, args);
         // Also concretize the owner's generic params (`A` in `Box<A>::add<T>`) from
@@ -1960,7 +1960,7 @@ type struct MonoCallSpecializer {
                 if (!owner_impl.derived_param_types[di].is_valid()) { continue; }
                 const dp_ref: TypeRef = this.arena.create_generic_param(
                     owner_impl.derived_param_syms[di], owner_impl.derived_param_names[di], di as u64);
-                subst_val.add(dp_ref.id, owner_impl.derived_param_types[di]);
+                subst_val.add(dp_ref, owner_impl.derived_param_types[di]);
             }
             // The impl's target is written in the impl's OWN parameter names
             // (`implement<X> Iterator for Range<X>`), which need not be the
@@ -1978,7 +1978,7 @@ type struct MonoCallSpecializer {
                             // A concrete argument written in the head is no parameter.
                             if (!n.param_sym().is_valid()) { continue; }
                             const tp_ref: TypeRef = this.arena.create_generic_param(n.param_sym(), n.name, ti as u64);
-                            subst_val.add(tp_ref.id, arg_t);
+                            subst_val.add(tp_ref, arg_t);
                         }
                         _ => {}
                     }
@@ -2151,7 +2151,7 @@ type struct MonoCallSpecializer {
     type_has_unresolved(&this, ty: TypeRef, depth: i32) -> boolean {
         if (!ty.is_valid()) { return true; }
         if (depth > 16) { return false; }
-        const t: Type* = this.arena.lookup(ty.id);
+        const t: Type* = this.arena.lookup(ty);
         if (t == null) { return true; }
         if (t.kind == TypeKind::Function) {
             const f: FunctionType* = t as FunctionType*;
@@ -2204,7 +2204,7 @@ type struct MonoCallSpecializer {
     /// it cannot name is a missing registration, recorded by
     /// `register_methods`, never keyed around.
     receiver_unmaterialized(&this, recv_type: TypeRef) -> boolean {
-        const t: Type* = this.arena.lookup(recv_type.id);
+        const t: Type* = this.arena.lookup(recv_type);
         if (t == null || t.kind != TypeKind::InstantiatedType) { return false; }
         return !this.state.has_materialized_spec(recv_type);
     }
@@ -2461,7 +2461,7 @@ type struct MonoCallSpecializer {
                             trait_name: SymbolStr) -> void {
         const trait_str: string = this.intern_table.resolve(trait_name);
         const fn_str: string = this.intern_table.resolve(tmpl_func.name);
-        const concrete_t: Type* = this.arena.lookup(concrete.id);
+        const concrete_t: Type* = this.arena.lookup(concrete);
         const concrete_str: string = if (concrete_t != null) {
             this.arena.format_display(concrete_t)
         } else {

@@ -22,13 +22,13 @@ import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 
 
-/// Structural inference context: `param_ids` are the template's open generic
-/// params (arena ids); `bindings[i]` is the concrete type bound to
-/// `param_ids[i]` (invalid until solved). Parallel arrays mirror the
+/// Structural inference context: `params` are the template's open generic
+/// params; `bindings[i]` is the concrete type bound to
+/// `params[i]` (invalid until solved). Parallel arrays mirror the
 /// monomorphizer's prior scratch layout so the two share semantics exactly.
 type struct InferCtx {
     arena:     TypeArena*;
-    param_ids: u64[];
+    params:    TypeRef[];
     bindings:  TypeRef[];
     // When `unify` rejects an open generic param because it was already
     // bound to a structurally different actual, it records that (existing,
@@ -39,13 +39,13 @@ type struct InferCtx {
     conflict_to:   TypeRef;
 
     /// Empty context for a template: one unbound slot per open param.
-    static for_template(arena: TypeArena*, param_ids: u64[]) -> InferCtx {
+    static for_template(arena: TypeArena*, params: TypeRef[]) -> InferCtx {
         mut binds: TypeRef[] = [];
-        for (mut i: i64 = 0; i < param_ids.length; i++) {
+        for (mut i: i64 = 0; i < params.length; i++) {
             binds.push(TypeRef::invalid());
         }
         return InferCtx {
-            arena: arena, param_ids: param_ids, bindings: binds,
+            arena: arena, params: params, bindings: binds,
             conflict_from: TypeRef::invalid(), conflict_to: TypeRef::invalid(),
         };
     }
@@ -53,29 +53,29 @@ type struct InferCtx {
     /// Adopt a caller-owned side-table (param ids + in-progress bindings).
     /// Lets the monomorphizer keep its accumulating scratch across the
     /// per-(formal,actual) `unify` loop while routing the algorithm here.
-    static adopt(arena: TypeArena*, param_ids: &u64[], bindings: &TypeRef[]) -> InferCtx {
-        // Own independent copies of the side-tables.  `param_ids`/`bindings`
+    static adopt(arena: TypeArena*, params: &TypeRef[], bindings: &TypeRef[]) -> InferCtx {
+        // Own independent copies of the side-tables.  `params`/`bindings`
         // arrive as borrows of the caller's arrays; storing the borrowed
         // handles directly would make this context's drop free the caller's
         // buffers (double free / use-after-free on the caller's side-table).
         // Both element types are Copy, so an element-wise copy is a true clone;
         // `unify` mutates bindings in place (index-assign), and
         // `unify_for_inference` copies the solved slots back to the caller.
-        mut pid: u64[] = [];
-        for (mut i: i64 = 0; i < param_ids.length; i++) { pid.push(param_ids[i]); }
+        mut pid: TypeRef[] = [];
+        for (mut i: i64 = 0; i < params.length; i++) { pid.push(params[i]); }
         mut bnd: TypeRef[] = [];
         for (mut i: i64 = 0; i < bindings.length; i++) { bnd.push(bindings[i]); }
         return InferCtx {
-            arena: arena, param_ids: pid, bindings: bnd,
+            arena: arena, params: pid, bindings: bnd,
             conflict_from: TypeRef::invalid(), conflict_to: TypeRef::invalid(),
         };
     }
 
-    /// Index of `id` in the open-param list, or -1 if `id` is not a param
-    /// this context is solving for.
-    binding_index(&this, id: u64) -> i64 {
-        for (mut i: i64 = 0; i < this.param_ids.length; i++) {
-            if (this.param_ids[i] == id) { return i; }
+    /// Index of `param` in the open-param list, or -1 if `param` is not a
+    /// param this context is solving for.
+    binding_index(&this, param: TypeRef) -> i64 {
+        for (mut i: i64 = 0; i < this.params.length; i++) {
+            if (this.params[i].equals(param)) { return i; }
         }
         return -1;
     }
@@ -100,14 +100,14 @@ type struct InferCtx {
     /// matches.
     unify(mut &this, formal: TypeRef, actual: TypeRef) -> boolean {
         if (!formal.is_valid() || !actual.is_valid()) { return false; }
-        const ft: Type* = this.arena.lookup(formal.id);
-        const at: Type* = this.arena.lookup(actual.id);
+        const ft: Type* = this.arena.lookup(formal);
+        const at: Type* = this.arena.lookup(actual);
         if (ft == null || at == null) { return false; }
 
         // Generic param: bind it. Must be one of this template's open params;
         // a foreign generic we can't make sense of is rejected.
         if (ft.kind == TypeKind::GenericParam) {
-            const idx: i64 = this.binding_index(formal.id);
+            const idx: i64 = this.binding_index(formal);
             if (idx < 0) { return false; }
             const existing: TypeRef = this.bindings[idx];
             if (existing.is_valid()) {

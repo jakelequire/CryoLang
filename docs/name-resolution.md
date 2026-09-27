@@ -200,7 +200,7 @@ measurement that decided it on the row.
 | D43 | **The five lane-gate re-pins are RATIFIED as a batch**: GRAPH_READ 35 → 62, LOOKUP_OTHER 90 → 92, ARENA_READ 60 → 61, DEFID_PATH 51 → 52, LOOKUP_LOCAL 56 → 51 - the counts moved because the instrument gained eyes, not because lookups were added; they are no longer to be flagged (Jake, relayed in plain text 2026-09-27) | **TAKEN** - the counts stood in `tests/lane-baseline.txt`; each row carries its current count | `no check` — a ratification of past re-pins; the counts are checked on their own rows | §8.363, §8.365, §8.368, §8.371 |
 | D44 | **An import that binds nothing in the requested namespace keeps its old answer** (`resolve_path`), rather than being an error or walking on (Jake, relayed in plain text 2026-09-27) | **TAKEN (§8.367)** | `no check` — a rule inside the import binding, behaviour-preserving by construction | §8.367, §8.371 |
 | D45 | **`ModuleGraph::module_named(text)` is RULED AGAINST.** Every place that stores a namespace as text holds a module identity instead - the call sites and the stored fields (`StructType.module_name`, `TemplateEntry.module_name`, `Symbol.source_module`, the stored namespace strings); text becomes an identity once, at the edge where source text enters, never through a door callable from anywhere (Jake, relayed in plain text 2026-09-27) | **RULED; BUILT for types and templates (§8.372) for symbols and the resolver's current module (§8.373), for the export questions and the module sets the graph and the name layer hand out (§8.374), for the compilation context's module and every use site (§8.375), for the module graph's edge lists and the prelude list (§8.376), for a C import's declarations and the declaration index's global table (§8.378), and the monomorphizer's stores found to hold files or nothing (§8.379)** - a struct's, class's, enum's and trait's record and a template's entry hold their module as a `ModulePath` (`declared_in`), taken from the declaration's definition or the unit writing it; a symbol's `source_module` and the resolver's `current_module` are `ModulePath`s, an import turning its written path into the module once; never from text. The compilation context's module (the unit being compiled, and the use site of a qualified path or a call) is a `ModulePath` (§8.375). The module graph's edge lists - dependencies, imported namespaces, sub-modules, re-exports - and the prelude list are `ModulePath[]`, turned from the namespaces the loader records once discovery has finished (§8.376). A C import's module is registered by the importer where it composes the namespace, and every declaration it synthesizes carries that module; the global table is keyed by its declaring module (§8.378). The monomorphizer's "current module", the method-spec owner list and an impl block's `source_module` each held a source FILE, and are named for it; the specialization table's origin module and the registry's per-module demand list were written and never read, and are deleted (§8.379). The door stands at 13 calls; still text: the declaration index's overload owner column (a declaration's qualified name, not a module); nothing may add a caller | `grep -rho 'module_named(' compiler/src --include=*.cryo \| wc -l` → **14** (-1 in §8.378: the name layer's C-import door; a C import's declarations carry the module the importer registered; 15 before, 16 after §8.375; §8.376 -2 +1 - the re-export closure and the resolver's prelude list read identities, and the graph's `modules_of` turns the recorded edges once; 19 after §8.374; §8.375 -3 - the spelling match, a call's visibility check and a C-import scope segment read the use site's identity; 20 after §8.373; §8.374 -4 +3 - the re-export walks and `private_declarations` read identities, the prelude list, an `export` path and the graph's recorded re-export lists enter once each; 21 after §8.372, 25 before it: the definition and 24 calls; §8.373 -2 +1 - a symbol's module and an import's re-export walk read identities, a C import's declarations ask once in `c_import_module`) | §8.363, §8.371, §8.372, §8.373, §8.374, §8.375, §8.376 |
-| D46 | **`TypeRef` is sealed, as its OWN project** - at least 500 refusals when tried, and 500 is the compiler's own diagnostic cap, so the true figure is higher; never started inside another unit (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — not built | §8.371 |
+| D46 | **`TypeRef` is sealed, as its OWN project** - at least 500 refusals when tried, and 500 is the compiler's own diagnostic cap, so the true figure is higher; never started inside another unit (Jake, relayed in plain text 2026-09-27) | **RULED; IN PROGRESS (§8.382)** - uncapped, the seal refused 822 sites (816 reads of the number, 6 constructions); the arena's reads now take the handle and the generic-parameter lists hold handles, so it refuses 205 (200 reads, 5 constructions). Not yet sealed | `grep -c '(&this, id: u64)' compiler/src/compiler/types/arena.cryo` → **0** (the arena's reads by number; 5 before §8.382) | §8.371, §8.382 |
 | D47 | **Identities carry a generation tag validated at use** - a stale or forged identity is caught where it is read; this supersedes answering the pointer-cast forgery with a language change (Jake, relayed in plain text 2026-09-27) | **BUILT for definition and symbol identities (§8.380)** - a `DefId` carries the tag of the `DefTable` that made it and a `SymbolID` the tag of the `SymbolIds` that made it; every table a process makes has its own tag, and the table's read path refuses (an internal-error panic) an id another table made or one made before a rebuild, where before it answered whichever entry sat at that index; the resolver also refuses a symbol admitted at an arena slot its id does not name. Shown by `scripts/ns-migration/8.380/tag_harness.py` (6 modes: refused over this tree, answered wrongly and silently over the tree before). Not tagged: `OverloadId`, `TypeRef` and the other arena positions | `grep -c 'd.index as i64' compiler/src/compiler/resolver/res.cryo` → **1** (the table's one position read, `slot`, which checks the tag; 12 reads before §8.380); `grep -rho 'key() - 1' compiler/src --include=*.cryo \| wc -l` → **0** (the resolver's arena is read through `SymbolIds::slot_of`, which checks the tag; 4 before §8.380, one of them a pass indexing the arena directly) | §8.371, §8.380 |
 | D48 | **One allocator per identity kind, owned by its table**: nothing outside the table can construct a second `SymbolID` allocator or a second `DefTable`, which would hand out colliding identities - sealing stopped forging an identity from a raw number, not minting one from a fresh allocator (Jake, relayed in plain text 2026-09-27) | **RULED; BLOCKED on a decision (§8.377)** - measured: a second `SymbolIds` and a second `DefTable` - minting a `DefId` - both compile from an unrelated module; made private, each constructor refuses its one owner (E0353), because the owner is in another module (`Resolver`, `CompilationContext`) and Cryo's `private` reaches the declaring module only; moving either owner beside its table is an import cycle. The choice - a visibility that reaches one named module, the generation tags of D47 catching a foreign identity where it is read, or the allocator folded into a table type (which closes the second allocator but not a second table) - is not this ledger's. **The second is BUILT (§8.380)**: a second allocator or table still COMPILES, but no id it makes is answered by the first - it is refused where it is read. What that leaves of this ruling, construction itself, is the open part | `no check` — construction is not refused | §8.371, §8.377, §8.380 |
 | D49 | **Both a `deprecated` attribute and a deny-by-default lint with a reason-carrying allow**, for their separate jobs - the attribute marks an API on its way out, the lint refuses a construct unless the allow at the site says why (Jake, relayed in plain text 2026-09-27) | **RULED** - the design is not written | `no check` — not built | §8.371 |
@@ -47026,3 +47026,107 @@ error each, no cascade.
 
 One branch in `resolver/name_resolution.cryo` (+9/-5), one project test,
 one `started-passing` line, the roster golden.
+
+### 8.382 The type arena is read by the handle it handed out, never by a number, and the generic-parameter lists hold handles; a `TypeRef` seal now refuses 205 sites where it refused 822; 0 objects moved - 2026-09-27
+
+## Why
+
+`TypeRef` is to be sealed (D46): its number and constructor private to its
+module, so no code can build a handle from a raw number. Tried at the
+parent commit, with a compiler whose diagnostic cap was switched off
+(`max_errors: 0` in `compiler/diag/config.cryo`, a measuring build only; the
+shipped cap of 500 is what stopped the earlier count), the seal refuses
+**822** sites in 59 files: 816 reads of `.id` and 6 calls of `TypeRef::new`;
+no code outside the module reads `.arena`.
+
+Of the 816 reads, about 600 were one shape: the arena's read took the
+handle's number, so every caller unwrapped the handle it already held.
+
+```cryo
+// before
+lookup(&this, id: u64) -> Type* { ... }
+const t: Type* = this.arena.lookup(ty.id);
+
+// after
+lookup(&this, ty: TypeRef) -> Type* { ... }
+const t: Type* = this.arena.lookup(ty);
+```
+
+A read that takes a number accepts any number - a stored one, a computed
+one, one from another arena - and answers whichever type sits at that
+position. A read that takes the handle accepts only a handle.
+
+## What changed
+
+* The arena's five number-taking reads take the handle: `lookup`,
+  `pointer_pointee_of`, `array_element_of`, `resolve_display_name`,
+  `resolve_display_name_short`. Codegen's three forwarders
+  `lookup_type_by_id(id: u64)` are `arena_type(ty: TypeRef)` (not
+  `lookup_type`: the declaration index has a name-keyed `lookup_type`, and
+  sharing its name would count every forwarder call as a local lookup in
+  the lane gate).
+* The call sites were rewritten from the compiler's own refusals by
+  `scripts/ns-migration/8.382/strip_id_args.py` (recipe in its README):
+  every argument the check refused as `u64` where a `TypeRef` was wanted,
+  and which read `<expr>.id`, lost the `.id` - 608 in the compiler, 28 in
+  the editor; 90 forwarder calls renamed.
+* Two arguments were not a handle's `.id` but a STORED number, and each
+  was a real store, not a rewrite:
+  - the generic-parameter lists held the parameters' numbers:
+    `TemplateEntry.param_type_ids: u64[]`, `TypeSubstitution.param_ids:
+    u64[]`, `InferCtx.param_ids: u64[]`. They hold the handles now
+    (`param_types`, `params`, `params`: `TypeRef[]`), and
+    `TypeSubstitution::add/get` and `InferCtx::binding_index` take the
+    parameter's handle. This removed one of the six in-compiler forgeries
+    the seal found:
+
+    ```cryo
+    // before - a handle rebuilt from a stored number
+    owner_params.push(TypeRef::new(tmpl.param_type_ids[i], arena));
+    // after
+    owner_params.push(tmpl.param_types[i]);
+    ```
+  - the monomorphizer's scan for standalone dynamic arrays counted type
+    numbers from 1 and read each through the arena; it walks the arena's
+    type list, as the specialization pass and codegen's pass already do.
+    It never needed the array type's handle, only its element's.
+* 14 `u64[]` locals that feed those stores became `TypeRef[]`, and their
+  pushes dropped `.id`. **No check lists those**: an array push is not
+  argument-checked before code generation, so they were found by reading
+  every writer of each store.
+
+## Evidence
+
+* `make verify ARGS="--baseline HEAD --require-identical"` from a clean
+  build: census, examples, editor, other-OS, incremental all OK; tests
+  3,515 objects moved 0, examples 1,126 moved 0; 346 warnings.
+* Lane gate: every row unchanged, as predicted.
+* Residue: 302 sites before and after, J 178; 13 rows re-keyed, because a
+  row's provenance spells the chain its key came through
+  (`lookup(&this, u64) of field TypeRef.id<-param:tref` now reads
+  `lookup(&this, TypeRef) of param:tref`). With line numbers and that hop
+  normalised the two lists are identical; before normalising the same
+  comparison reports them different. Not predicted - the provenance was not
+  in view when the prediction was made.
+* Inversion, each mutation alone over a copy of this tree, with the
+  unmutated copy as control (control: 346 warnings, exit 0):
+  - the arena read handed a number (`arena.lookup(ty.id)` in
+    `substitution.cryo`), `cryo check`:
+    `error[E0214]: mismatched types --> src/compiler/types/substitution.cryo:107:39 ... expected `compiler::types::type_ref::TypeRef`, found `u64``.
+  - a number pushed into a converted store (`pids.push(pref.id)` in
+    `call_resolver.cryo`): `cryo check` ACCEPTS it (exit 0); a FULL build
+    refuses it: `error[E0636]: codegen: no method 'push' found on type
+    'compiler::types::type_ref::TypeRef[]' --> src/compiler/sema/call_resolver.cryo:4586:13`.
+    The unmutated copy builds (exit 0).
+* The seal, re-measured over this tree with the uncapped compiler:
+  **205** refusals in 29 files (200 `.id`, 5 `TypeRef::new`), down from
+  822. Largest: `call_resolver.cryo` 54, `call_specializer.cryo` 23,
+  `arena.cryo` 19, `generic_registry.cryo` 11.
+
+## Blast radius
+
+Compiler 55 files (+764/-761, almost all one-token call-site edits), the
+editor 3 files, the generator and its README, the residue list (13 rows
+re-keyed). Gate cycles: 1 clean build + facts + verify, 1 editor build
+round (2 builds), 7 uncapped checks, 2 mutation checks, 2 mutated full
+builds.

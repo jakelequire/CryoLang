@@ -221,7 +221,7 @@ type struct CallEmitter {
                 mut new_ref: TypeRef = TypeRef::invalid();
                 mut new_qn: SymbolStr = SymbolStr::empty();
                 if (node.has_resolved_type()) {
-                    const rt: Type* = arena.lookup(node.resolved_type.id);
+                    const rt: Type* = arena.lookup(node.resolved_type);
                     if (rt != null && (rt.kind == TypeKind::Class || rt.kind == TypeKind::Struct)) {
                         new_ref = node.resolved_type;
                         new_qn = arena.get_qualified_name(new_ref);
@@ -241,7 +241,7 @@ type struct CallEmitter {
                             const obj_alloca: LValue = this.cg.flow.create_entry_alloca(
                                 current_fn, "ctor.tmp", mapped);
                             // Vtable slot for classes with virtual methods.
-                            const t_for_vtbl: Type* = this.cg.lookup_type_by_id(type_ref.id);
+                            const t_for_vtbl: Type* = this.cg.arena_type(type_ref);
                             if (t_for_vtbl != null && t_for_vtbl.kind == TypeKind::Class) {
                                 const cls_vtbl: ClassType* = t_for_vtbl as ClassType*;
                                 if (cls_vtbl.has_virtual_methods) {
@@ -308,15 +308,15 @@ type struct CallEmitter {
                     // Build the LLVM function type from the Cryo FunctionType.
                     // Unwrap Pointer/Reference if the param type is &fn(...).
                     mut callee_type_ref: TypeRef = id.resolved_type;
-                    mut callee_t: Type* = this.cg.lookup_type_by_id(callee_type_ref.id);
+                    mut callee_t: Type* = this.cg.arena_type(callee_type_ref);
                     if (callee_t != null && callee_t.kind == TypeKind::Pointer) {
                         const pt: PointerType* = callee_t as PointerType*;
                         callee_type_ref = pt.pointee;
-                        callee_t = this.cg.lookup_type_by_id(callee_type_ref.id);
+                        callee_t = this.cg.arena_type(callee_type_ref);
                     } else if (callee_t != null && callee_t.kind == TypeKind::Reference) {
                         const rt: ReferenceType* = callee_t as ReferenceType*;
                         callee_type_ref = rt.referent;
-                        callee_t = this.cg.lookup_type_by_id(callee_type_ref.id);
+                        callee_t = this.cg.arena_type(callee_type_ref);
                     }
                     if (callee_t != null && callee_t.kind == TypeKind::Function) {
                         const ft: FunctionType* = callee_t as FunctionType*;
@@ -402,13 +402,13 @@ type struct CallEmitter {
             // the ordinal sema pinned on the path.
             if (!callee_val.is_valid()) {
                 mut real_ref: TypeRef = node.resolved_type;
-                mut real_t: Type* = this.cg.lookup_type_by_id(real_ref.id);
+                mut real_t: Type* = this.cg.arena_type(real_ref);
                 mut follow_count: i32 = 0;
                 while (real_t != null && real_t.kind == TypeKind::InstantiatedType && follow_count < 5) {
                     const inst: InstantiatedType* = real_t as InstantiatedType*;
                     if (inst.has_resolved_type()) {
                         real_ref = inst.resolved_type;
-                        real_t = this.cg.lookup_type_by_id(real_ref.id);
+                        real_t = this.cg.arena_type(real_ref);
                     } else {
                         break;
                     }
@@ -446,7 +446,7 @@ type struct CallEmitter {
             // call indirectly through the loaded pointer.  Without this,
             // codegen would chase method lookups and bottom out on
             // "no method found" for every callback-style stdlib field.
-            mut ma_callee_t: Type* = this.cg.lookup_type_by_id(ma.resolved_type.id);
+            mut ma_callee_t: Type* = this.cg.arena_type(ma.resolved_type);
             // Unwrap pointer/reference to match how function-typed fields
             // land; `fn(...) -> T` stores as a raw function-pointer so the
             // member may resolve to a Function type directly.
@@ -455,7 +455,7 @@ type struct CallEmitter {
                 ma_fn_type = ma_callee_t as FunctionType*;
             } else if (ma_callee_t != null && ma_callee_t.kind == TypeKind::Pointer) {
                 const ppt: PointerType* = ma_callee_t as PointerType*;
-                const pin: Type* = this.cg.lookup_type_by_id(ppt.pointee.id);
+                const pin: Type* = this.cg.arena_type(ppt.pointee);
                 if (pin != null && pin.kind == TypeKind::Function) {
                     ma_fn_type = pin as FunctionType*;
                 }
@@ -506,15 +506,15 @@ type struct CallEmitter {
 
             // Get the object's type, unwrapping pointer/reference.
             mut obj_ref: TypeRef = ma.object.resolved_type;
-            mut t: Type* = this.cg.lookup_type_by_id(obj_ref.id);
+            mut t: Type* = this.cg.arena_type(obj_ref);
             if (t != null && t.kind == TypeKind::Pointer) {
                 const ptr_t: PointerType* = t as PointerType*;
                 obj_ref = ptr_t.pointee;
-                t = this.cg.lookup_type_by_id(obj_ref.id);
+                t = this.cg.arena_type(obj_ref);
             } else if (t != null && t.kind == TypeKind::Reference) {
                 const ref_t: ReferenceType* = t as ReferenceType*;
                 obj_ref = ref_t.referent;
-                t = this.cg.lookup_type_by_id(obj_ref.id);
+                t = this.cg.arena_type(obj_ref);
             }
 
             // Follow InstantiatedType chain to get the concrete type's TypeRef.
@@ -523,7 +523,7 @@ type struct CallEmitter {
                 const inst: InstantiatedType* = t as InstantiatedType*;
                 if (inst.has_resolved_type()) {
                     obj_ref = inst.resolved_type;
-                    t = this.cg.lookup_type_by_id(obj_ref.id);
+                    t = this.cg.arena_type(obj_ref);
                 } else { break; }
                 inst_depth += 1;
             }
@@ -533,11 +533,11 @@ type struct CallEmitter {
             if (t != null && t.kind == TypeKind::Pointer) {
                 const ptr_t2: PointerType* = t as PointerType*;
                 obj_ref = ptr_t2.pointee;
-                t = this.cg.lookup_type_by_id(obj_ref.id);
+                t = this.cg.arena_type(obj_ref);
             } else if (t != null && t.kind == TypeKind::Reference) {
                 const ref_t2: ReferenceType* = t as ReferenceType*;
                 obj_ref = ref_t2.referent;
-                t = this.cg.lookup_type_by_id(obj_ref.id);
+                t = this.cg.arena_type(obj_ref);
             }
 
             // Check for virtual dispatch: if the STATIC receiver type is a
@@ -666,7 +666,7 @@ type struct CallEmitter {
                 mut type_str: string = "<unknown>";
                 const dbg_arena: TypeArena* = this.cg.get_arena();
                 if (dbg_arena != null && ma.object.resolved_type.is_valid()) {
-                    type_str = dbg_arena.resolve_display_name(ma.object.resolved_type.id);
+                    type_str = dbg_arena.resolve_display_name(ma.object.resolved_type);
                 }
                 const member_str: string = intern.resolve(ma.member);
                 diag = Diagnostic::error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
@@ -701,7 +701,7 @@ type struct CallEmitter {
             // the receiver value is itself the `this` pointer; load it
             // out of the local slot.  For value receivers (`runner: Runner`),
             // take the lvalue address as `this`.
-            const recv_t: Type* = this.cg.lookup_type_by_id(ma.object.resolved_type.id);
+            const recv_t: Type* = this.cg.arena_type(ma.object.resolved_type);
             mut obj: LValue = LValue::null();
             if (recv_t != null && (recv_t.kind == TypeKind::Pointer
                                 || recv_t.kind == TypeKind::Reference)) {
@@ -758,7 +758,7 @@ type struct CallEmitter {
                 arg = this.address_of_value(arg);
             }
             if (va_ft != null && i < va_ft.param_types.length && arg.is_valid()) {
-                const pt: Type* = this.cg.lookup_type_by_id(va_ft.param_types[i].id);
+                const pt: Type* = this.cg.arena_type(va_ft.param_types[i]);
                 if (pt != null && pt.kind == TypeKind::VaList) {
                     arg = this.cg.abi.forward_va_list(&this.cg.builder, arg);
                 }
@@ -789,7 +789,7 @@ type struct CallEmitter {
                 && (node.callee.kind == NodeKind::Identifier
                     || node.callee.kind == NodeKind::ScopeResolution)) {
             const pinned_ft: TypeRef = this.cg.resolver.pinned_signature(node.resolved_callee);
-            const pinned_t: Type* = if (pinned_ft.is_valid()) { this.cg.lookup_type_by_id(pinned_ft.id) } else { null };
+            const pinned_t: Type* = if (pinned_ft.is_valid()) { this.cg.arena_type(pinned_ft) } else { null };
             if (pinned_t != null && pinned_t.kind == TypeKind::Function) {
                 const pinned_lty: LType = this.cg.resolver.build_function_ltype(pinned_t as FunctionType*);
                 if (pinned_lty.is_valid()) { fn_ty = pinned_lty; }
@@ -855,7 +855,7 @@ type struct CallEmitter {
         // return-type kind to stay in lockstep with the definition side.
         mut ret_kind_is_void: boolean = false;
         if (node.resolved_type.is_valid()) {
-            const _rt: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+            const _rt: Type* = this.cg.arena_type(node.resolved_type);
             if (_rt != null && (_rt.kind == TypeKind::Unit
                                 || _rt.kind == TypeKind::Void
                                 || _rt.kind == TypeKind::Never)) {
@@ -996,7 +996,7 @@ type struct CallEmitter {
         // the body-validator strips the entire function.
         mut should_unreachable: boolean = false;
         if (node.resolved_type.is_valid()) {
-            const _ret_t: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
+            const _ret_t: Type* = this.cg.arena_type(node.resolved_type);
             if (_ret_t != null && _ret_t.kind == TypeKind::Never) {
                 should_unreachable = true;
             }
@@ -1375,7 +1375,7 @@ type struct CallEmitter {
         // and would hand another module's `write` its parameter list.
         const ft_ref: TypeRef = this.cg.resolver.pinned_signature(node.resolved_callee);
         if (!ft_ref.is_valid()) { return null; }
-        const ct: Type* = this.cg.lookup_type_by_id(ft_ref.id);
+        const ct: Type* = this.cg.arena_type(ft_ref);
         if (ct == null || ct.kind != TypeKind::Function) { return null; }
         return ct as FunctionType*;
     }
@@ -1392,13 +1392,13 @@ type struct CallEmitter {
 
         // Peel InstantiatedType wrappers to the concrete underlying type.
         mut cur: TypeRef = ty;
-        mut t: Type* = arena.lookup(cur.id);
+        mut t: Type* = arena.lookup(cur);
         mut guard: i32 = 0;
         while (t != null && t.kind == TypeKind::InstantiatedType && guard < 16) {
             const inst: InstantiatedType* = t as InstantiatedType*;
             if (!inst.has_resolved_type()) { break; }
             cur = inst.resolved_type;
-            t = arena.lookup(cur.id);
+            t = arena.lookup(cur);
             guard = guard + 1;
         }
         if (t == null) { return false; }

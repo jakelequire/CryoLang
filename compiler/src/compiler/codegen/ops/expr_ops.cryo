@@ -177,10 +177,10 @@ type struct ExprOps {
     // Small ctx-routed accessors (inlined so ExprOps doesn't have to
     // import the parent Context module).
 
-    lookup_type_by_id(&this, id: u64) -> Type* {
+    arena_type(&this, ty: TypeRef) -> Type* {
         const c: CompilationContext* = this.ctx;
         const a: TypeArena* = c.type_arena;
-        return a.lookup(id);
+        return a.lookup(ty);
     }
 
     /// Lowered byte size of the aggregate an argument feeds into
@@ -211,7 +211,7 @@ type struct ExprOps {
             return this.llvm_module.abi_size_of(mapped);
         }
         // Pointer / reference to the aggregate.
-        const t: Type* = this.lookup_type_by_id(arg_ty_ref.id);
+        const t: Type* = this.arena_type(arg_ty_ref);
         if (t == null) { return 0; }
         mut pointee: TypeRef = TypeRef::invalid();
         if (t.kind == TypeKind::Pointer) {
@@ -228,7 +228,7 @@ type struct ExprOps {
     }
 
     int_type_is_signed(&this, ty: TypeRef) -> boolean {
-        const t: Type* = this.lookup_type_by_id(ty.id);
+        const t: Type* = this.arena_type(ty);
         if (t == null) { return false; }
         if (t.kind != TypeKind::Int) { return false; }
         const it: IntType* = t as IntType*;
@@ -259,7 +259,7 @@ type struct ExprOps {
     // sizeof / alignof
 
     codegen_sizeof(mut &this, type_ref: TypeRef) -> LValue {
-        const t: Type* = this.lookup_type_by_id(type_ref.id);
+        const t: Type* = this.arena_type(type_ref);
         if (t != null) {
             const cryo_size: u64 = t.size_bytes();
             if (cryo_size > 0) {
@@ -282,7 +282,7 @@ type struct ExprOps {
     }
 
     codegen_alignof(mut &this, type_ref: TypeRef) -> LValue {
-        const t: Type* = this.lookup_type_by_id(type_ref.id);
+        const t: Type* = this.arena_type(type_ref);
         if (t != null) {
             const cryo_align: u64 = t.alignment();
             if (cryo_align > 0) {
@@ -310,8 +310,8 @@ type struct ExprOps {
 
     codegen_cast(mut &this, val: LValue,
                  from_type: TypeRef, to_type: TypeRef) -> LValue {
-        const src_type: Type* = this.lookup_type_by_id(from_type.id);
-        const dst_type: Type* = this.lookup_type_by_id(to_type.id);
+        const src_type: Type* = this.arena_type(from_type);
+        const dst_type: Type* = this.arena_type(to_type);
         if (src_type == null || dst_type == null) {
             return val;
         }
@@ -375,7 +375,7 @@ type struct ExprOps {
                 signed_src = true;
                 const fet: EnumType* = src_type as EnumType*;
                 if (fet.discriminant_type.is_valid()) {
-                    const fdt: Type* = this.lookup_type_by_id(fet.discriminant_type.id);
+                    const fdt: Type* = this.arena_type(fet.discriminant_type);
                     if (fdt != null && fdt.kind == TypeKind::Int) {
                         from_bits = (fdt as IntType*).int_kind.bit_width() as u32;
                         signed_src = (fdt as IntType*).int_kind.is_signed();
@@ -392,7 +392,7 @@ type struct ExprOps {
                 to_bits = 32;
                 const tet: EnumType* = dst_type as EnumType*;
                 if (tet.discriminant_type.is_valid()) {
-                    const tdt: Type* = this.lookup_type_by_id(tet.discriminant_type.id);
+                    const tdt: Type* = this.arena_type(tet.discriminant_type);
                     if (tdt != null && tdt.kind == TypeKind::Int) {
                         to_bits = (tdt as IntType*).int_kind.bit_width() as u32;
                     }
@@ -562,7 +562,7 @@ type struct ExprOps {
         // to be wrong, and silent corruption of the neighbouring slot on the
         // ones that happen to be survivable.  Only ever raised - LLVM's own
         // choice is the floor.
-        const decl_ty: Type* = this.lookup_type_by_id(ty.id);
+        const decl_ty: Type* = this.arena_type(ty);
         if (decl_ty != null) {
             const want_align: u64 = decl_ty.alignment();
             if (want_align > 0 && want_align > alloca.alignment() as u64) {
@@ -600,7 +600,7 @@ type struct ExprOps {
                     // would otherwise zext the i32 -1 into 0xFFFFFFFF (a
                     // huge positive i64) instead of -1.
                     mut signed_target: boolean = false;
-                    const ty_t: Type* = this.lookup_type_by_id(ty.id);
+                    const ty_t: Type* = this.arena_type(ty);
                     if (ty_t != null && ty_t.kind == TypeKind::Int) {
                         const ti: IntType* = ty_t as IntType*;
                         signed_target = ti.int_kind.is_signed();
@@ -997,7 +997,7 @@ type struct ExprOps {
                 const target: LType = LType { raw: expected_ty };
                 mut src_signed: boolean = false;
                 if (arg_ty_ref.is_valid()) {
-                    const at_t: Type* = this.lookup_type_by_id(arg_ty_ref.id);
+                    const at_t: Type* = this.arena_type(arg_ty_ref);
                     if (at_t != null && at_t.kind == TypeKind::Int) {
                         const it: IntType* = at_t as IntType*;
                         src_signed = it.int_kind.is_signed();
@@ -1509,12 +1509,12 @@ type struct ExprOps {
         }
         // Determine if this is integer, float, or pointer arithmetic.
         // Follow InstantiatedType chain to get the concrete type.
-        mut t: Type* = this.lookup_type_by_id(result_type.id);
+        mut t: Type* = this.arena_type(result_type);
         mut bd: i32 = 0;
         while (t != null && t.kind == TypeKind::InstantiatedType && bd < 5) {
             const binst: InstantiatedType* = t as InstantiatedType*;
             if (binst.has_resolved_type()) {
-                t = this.lookup_type_by_id(binst.resolved_type.id);
+                t = this.arena_type(binst.resolved_type);
             } else { break; }
             bd += 1;
         }
@@ -1718,12 +1718,12 @@ type struct ExprOps {
         // InstantiatedType chain exactly like `t` above so generic contexts
         // behave identically to concrete ones.
         mut rhs_is_signed: boolean = false;
-        mut rt: Type* = this.lookup_type_by_id(rhs_type.id);
+        mut rt: Type* = this.arena_type(rhs_type);
         mut rbd: i32 = 0;
         while (rt != null && rt.kind == TypeKind::InstantiatedType && rbd < 5) {
             const rinst: InstantiatedType* = rt as InstantiatedType*;
             if (rinst.has_resolved_type()) {
-                rt = this.lookup_type_by_id(rinst.resolved_type.id);
+                rt = this.arena_type(rinst.resolved_type);
             } else { break; }
             rbd += 1;
         }
@@ -2185,7 +2185,7 @@ type struct ExprOps {
     /// Generate IR for a unary expression.
     codegen_unary(mut &this, operand: LValue, op_kind: TokenType, operand_type: TypeRef) -> LValue {
         mut out_value: LValue = LValue::null();
-        const t: Type* = this.lookup_type_by_id(operand_type.id);
+        const t: Type* = this.arena_type(operand_type);
         mut t_kind: TypeKind = TypeKind::Error;
         if (t != null) { t_kind = t.kind; }
         const is_float: boolean = t_kind == TypeKind::Float;
@@ -2234,7 +2234,7 @@ type struct ExprOps {
     /// `{T*, i64, i64}` when stored into a dynamic-array field.
     coerce_fixed_array_to_fat_ptr(mut &this, val: LValue, field_type: TypeRef) -> LValue {
         if (!val.is_valid()) { return val; }
-        const ft: Type* = this.lookup_type_by_id(field_type.id);
+        const ft: Type* = this.arena_type(field_type);
         if (ft == null || ft.kind != TypeKind::Array) { return val; }
         const arr_t: ArrayType* = ft as ArrayType*;
         if (arr_t.is_fixed()) { return val; }
@@ -2245,7 +2245,7 @@ type struct ExprOps {
         const elem_count: u32 = llvm::LLVMGetArrayLength(got_ty);
         const elem_lty: LType = LType { raw: llvm::LLVMGetElementType(got_ty) };
 
-        const elem_t_raw: Type* = this.lookup_type_by_id(arr_t.element.id);
+        const elem_t_raw: Type* = this.arena_type(arr_t.element);
         mut elem_size: u64 = 1;
         if (elem_t_raw != null && elem_t_raw.size_bytes() > 0) {
             elem_size = elem_t_raw.size_bytes();
