@@ -503,18 +503,18 @@ public:
     /// set - the way every qualified path is - and ITS kind is the answer.
     /// The type index cannot serve this: it is not populated until a later
     /// pass.
-    /// The module an `extern module` alias binds - its canonical namespace,
-    /// `<mod>::alias`, which is the alias symbol's own qualified name - or
-    /// an empty symbol for any other binding.  An alias is the one
+    /// The module an `extern module` alias binds - the module the graph
+    /// registered for the alias symbol's definition, `<mod>::alias` - or no
+    /// module for any other binding.  An alias is the one
     /// `Namespace` symbol a module's scope declares; the global scope's
     /// `Namespace` symbols are module IDENTITIES, declared under their full
     /// names, and a path spelling one of those is the module lane's
     /// (`modules_written_as`), not this one's.
-    alias_module_of(&this, s: &Symbol) -> SymbolStr {
+    alias_module_of(&this, s: &Symbol) -> ModulePath {
         const alias: SymbolID = this.alias_of(s);
-        if (!alias.is_valid()) { return SymbolStr::empty(); }
+        if (!alias.is_valid()) { return ModulePath::none(); }
         const a: Symbol = this.resolver.get_symbol(alias);
-        return this.resolver.qualified_name_of(&a);
+        return this.ctx.module_graph.declaring_module(a.def);
     }
 
     /// The `extern module` alias symbol a binding names - itself, or what an
@@ -572,13 +572,13 @@ public:
             if (!this.symbol_names_type(&s)) { continue; }
             const name_str: string = this.resolver.intern_table.resolve(s.name);
             const m: ModuleSpellingMatch = this.ctx.modules_written_as(name_str, ns);
-            mut clash: SymbolStr = if (m.visible >= 1) { m.found } else { SymbolStr::empty() };
+            mut clash: ModulePath = if (m.visible >= 1) { m.found } else { ModulePath::none() };
             if (!clash.is_valid()) {
                 // `namespace A;` declaring `type N` beside a module `A::N`:
                 // the two canonical names are one name.
-                const canonical: SymbolStr =
-                    this.resolver.intern_table.intern(ns_str + "::" + name_str);
-                if (this.ctx.module_graph.find_module_index(this.ctx.module_graph.module_named(canonical)) >= 0) {
+                const canonical: ModulePath = this.ctx.module_graph.module_named(
+                    this.resolver.intern_table.intern(ns_str + "::" + name_str));
+                if (this.ctx.module_graph.find_module_index(canonical) >= 0) {
                     clash = canonical;
                 }
             }
@@ -586,7 +586,7 @@ public:
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0205_REDEFINED_SYMBOL,
                 fmt::format("the name `%s` is already declared in this scope: `%s` is a module",
-                    name_str, this.resolver.intern_table.resolve(clash)));
+                    name_str, this.resolver.intern_table.resolve(clash.as_sym())));
             d = d.at_with_label(s.declaring_span,
                 if (s.kind == SymbolKind::Import) { "a type imported under a module's name" }
                 else { "a type declared under a module's name" });
@@ -1407,10 +1407,10 @@ public:
             const cand: ModuleInfo* = graph.get_module(m);
             if (cand.reexports.length == 0) { continue; }
             if (cand.name.id == decl_ns.id) { continue; }
-            const via: SymbolStr[] = graph.reexport_closure(cand.path());
+            const via: ModulePath[] = graph.reexport_closure(cand.path());
             mut reaches: boolean = false;
             for (mut i: i64 = 0; i < via.length; i++) {
-                if (via[i].id == decl_ns.id) { reaches = true; }
+                if (via[i].as_sym().id == decl_ns.id) { reaches = true; }
             }
             if (!reaches) { continue; }
             const cand_str: string = this.resolver.intern_table.resolve(cand.name);
@@ -1459,7 +1459,7 @@ public:
                     fmt::format("`%s` names more than one module in scope", prefix));
                 d = d.at_with_label(span, "ambiguous module path");
                 d = d.with_note(fmt::format("it could be `%s` or `%s`",
-                    intern.resolve(mods.found), intern.resolve(mods.other)));
+                    intern.resolve(mods.found.as_sym()), intern.resolve(mods.other.as_sym())));
                 d = d.with_note("write the path out in full to say which one is meant");
                 this.ctx.emit_diagnostic(d);
                 return true;
@@ -1468,7 +1468,7 @@ public:
                 // A module carries the spelling and the writer cannot reach
                 // it: the name exists, so this is E0240's story and not "no
                 // such name", as the scope lane says of the same prefix.
-                const owner: string = intern.resolve(mods.any);
+                const owner: string = intern.resolve(mods.any.as_sym());
                 mut d: Diagnostic = Diagnostic::error(
                     ErrorCode::E0240_NAMESPACE_NOT_REACHABLE,
                     fmt::format("`%s` is not reachable from this module", prefix));
@@ -1513,7 +1513,7 @@ public:
             const reach: boolean = owner_ns.id == use_ns.id
                 || this.ctx.decl_index.is_prelude_ns(owner_path)
                 || this.ctx.decl_index.ns_imports(this.ctx.module_graph.module_of_file(span.file), owner_path);
-            const is_public: boolean = this.resolver.exports_named(owner_ns, name).length > 0;
+            const is_public: boolean = this.resolver.exports_named(owner_path, name).length > 0;
             if (!reach || !is_public) {
                 mut d: Diagnostic = Diagnostic::error(
                     ErrorCode::E0240_NAMESPACE_NOT_REACHABLE,
@@ -1687,7 +1687,7 @@ public:
                 this.resolver.intern_table.intern(prefix), this.resolver.current_scope);
             if (head_bound.is_valid()) {
                 const hb: Symbol = this.resolver.get_symbol(head_bound);
-                const alias_ns: SymbolStr = this.alias_module_of(&hb);
+                const alias_ns: ModulePath = this.alias_module_of(&hb);
                 if (alias_ns.is_valid()) {
                     const decl: SymbolID = this.resolver.export_in(
                         alias_ns, this.resolver.intern_table.intern(leaf), Namespace::Type);
@@ -1745,7 +1745,7 @@ public:
         const hidden: SymbolID = this.private_in(head.found, leaf_sym, Namespace::Type);
         if (!hidden.is_valid()) { return ResSlot::Pending; }
         const hs: Symbol = this.resolver.get_symbol(hidden);
-        const owner: string = this.resolver.intern_table.resolve(head.found);
+        const owner: string = this.resolver.intern_table.resolve(head.found.as_sym());
         if (hs.kind == SymbolKind::Type || hs.kind == SymbolKind::TypeAlias) {
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0503_PRIVATE_SYMBOL_ACCESS,
@@ -1882,15 +1882,15 @@ public:
                 const alias_sym: Symbol = this.resolver.get_symbol(alias);
                 node.set_scope_res(Res::Def(alias_sym.def));
                 const am: SymbolID = this.resolver.export_in(
-                    this.resolver.qualified_name_of(&alias_sym), node.member_name, Namespace::Value);
+                    this.ctx.module_graph.declaring_module(alias_sym.def), node.member_name, Namespace::Value);
                 if (am.is_valid()) { node.set_member_def(this.resolver.get_symbol(am).def); }
                 return;
             }
         }
         const m: ModuleSpellingMatch = this.ctx.modules_written_as(written, use_ns);
-        const found:   SymbolStr = m.found;
-        const other:   SymbolStr = m.other;
-        const any:     SymbolStr = m.any;
+        const found:   ModulePath = m.found;
+        const other:   ModulePath = m.other;
+        const any:     ModulePath = m.any;
         const visible: i64 = m.visible;
         const matched: i64 = m.matched;
 
@@ -1942,8 +1942,8 @@ public:
             // Two modules the writer can see, both spelled this way: the
             // spelling does not name one of them.  Never picked, because
             // picking is the defect.
-            const a: string = this.resolver.intern_table.resolve(found);
-            const b: string = this.resolver.intern_table.resolve(other);
+            const a: string = this.resolver.intern_table.resolve(found.as_sym());
+            const b: string = this.resolver.intern_table.resolve(other.as_sym());
             if (!binds_in_scope) {
                 mut d: Diagnostic = Diagnostic::error(
                     ErrorCode::E0154_AMBIGUOUS_CALL,
@@ -1966,7 +1966,7 @@ public:
             // A module carries this spelling and the writer cannot reach it.
             // The name exists, so this is E0240's story and not "no such name"
             // (E0203) nor "reachable but private" (E0353).
-            const owner: string = this.resolver.intern_table.resolve(any);
+            const owner: string = this.resolver.intern_table.resolve(any.as_sym());
             if (!binds_in_scope) {
                 mut d: Diagnostic = Diagnostic::error(
                     ErrorCode::E0240_NAMESPACE_NOT_REACHABLE,
@@ -2945,21 +2945,21 @@ public:
     }
 
     /// The module in `m`'s `export` closure that publicly exports `name`, or
-    /// an invalid SymbolStr when none does.
+    /// no module when none does.
     ///
     /// This is the second half of one question - what does `m` OFFER under
     /// this name - whose first half is `m`'s own export table.  It is not a
     /// second strategy for the same lookup: the offered set is defined as the
     /// union, because an `export` grants an importer what the same path would
     /// grant if it were imported there.
-    reexport_offering(&this, m: SymbolStr, name: SymbolStr) -> SymbolStr {
-        const via: SymbolStr[] = this.ctx.module_graph.reexport_closure(this.ctx.module_graph.module_named(m));
+    reexport_offering(&this, m: ModulePath, name: SymbolStr) -> ModulePath {
+        const via: ModulePath[] = this.ctx.module_graph.reexport_closure(m);
         for (mut i: i64 = 0; i < via.length; i++) {
             if (this.resolver.exports_named(via[i], name).length > 0) {
                 return via[i];
             }
         }
-        return SymbolStr::empty();
+        return ModulePath::none();
     }
 
     /// The declaration module `m` OFFERS under `name`, or invalid.
@@ -2981,7 +2981,7 @@ public:
     /// `hits` separates "no such name here" from "that name is ambiguous here",
     /// because those call for different diagnostics and a bare invalid cannot
     /// tell them apart.
-    module_offering(&this, m: SymbolStr, name: SymbolStr, ns: Namespace, hits: i64*) -> SymbolID {
+    module_offering(&this, m: ModulePath, name: SymbolStr, ns: Namespace, hits: i64*) -> SymbolID {
         const all: SymbolID[] = this.module_offerings(m, name, ns);
         *hits = all.length;
         if (all.length == 0) { return SymbolID::invalid(); }
@@ -2992,7 +2992,7 @@ public:
     /// each one its re-export closure reaches, a declaration reached by two
     /// routes counted once.  The plural form of `module_offering`, for the
     /// refusal that names the two a facade offers.
-    module_offerings(&this, m: SymbolStr, name: SymbolStr, ns: Namespace) -> SymbolID[] {
+    module_offerings(&this, m: ModulePath, name: SymbolStr, ns: Namespace) -> SymbolID[] {
         mut out: SymbolID[] = [];
         // A module that DECLARES the name offers that one.  A re-export cannot
         // displace a declaration, so this is not a first-of-several choice.
@@ -3001,7 +3001,7 @@ public:
             out.push(own);
             return out;
         }
-        const via: SymbolStr[] = this.ctx.module_graph.reexport_closure(this.ctx.module_graph.module_named(m));
+        const via: ModulePath[] = this.ctx.module_graph.reexport_closure(m);
         mut seen: SymbolStr[] = [];
         for (mut i: i64 = 0; i < via.length; i++) {
             const cand: SymbolID = this.resolver.export_in(via[i], name, ns);
@@ -3023,7 +3023,7 @@ public:
 
     /// The private declaration module `m` holds under `name` in the
     /// namespace `ns`, or an invalid id.
-    private_in(&this, m: SymbolStr, name: SymbolStr, ns: Namespace) -> SymbolID {
+    private_in(&this, m: ModulePath, name: SymbolStr, ns: Namespace) -> SymbolID {
         const all: SymbolID[] = this.resolver.private_declarations(m, name);
         for (mut i: i64 = 0; i < all.length; i++) {
             if (ns.accepts(this.resolver.get_symbol(all[i]).kind)) { return all[i]; }
@@ -3046,21 +3046,20 @@ public:
     /// in topological order and re-exports create no ordering edge to sort by.
     /// `instance.cryo` closes over `ModuleInfo.reexports` once discovery has
     /// the full graph, and `DeclarationIndex` answers from that.
-    /// Everything `module_sym` offers to a braced import, by leaf: its own
+    /// Everything module `m` offers to a braced import, by leaf: its own
     /// public exports, the public exports of its re-export closure, and its
     /// sub-modules.  The set an `import M::{ name }` entry is answered from,
     /// in the order the three rungs ask.
-    offered_leaves(&this, module_sym: SymbolStr, resolved_module: string) -> string[] {
+    offered_leaves(&this, m: ModulePath, resolved_module: string) -> string[] {
         mut out: string[] = [];
-        const own: SymbolID[] = this.resolver.get_exports(module_sym);
+        const own: SymbolID[] = this.resolver.get_exports(m);
         for (mut i: i64 = 0; i < own.length; i++) {
             const sym: Symbol = this.resolver.get_symbol(own[i]);
             if (sym.visibility.is_public()) {
                 out.push(this.resolver.intern_table.resolve(sym.name));
             }
         }
-        const rx_all: SymbolStr[] =
-            this.ctx.module_graph.reexport_closure(this.ctx.module_graph.module_named(module_sym));
+        const rx_all: ModulePath[] = this.ctx.module_graph.reexport_closure(m);
         for (mut rx: i64 = 0; rx < rx_all.length; rx++) {
             const rx_exports: SymbolID[] = this.resolver.get_exports(rx_all[rx]);
             for (mut re: i64 = 0; re < rx_exports.length; re++) {
@@ -3086,9 +3085,9 @@ public:
     /// not a declaration, not a re-export, not a sub-module.  The module's
     /// offering is named so the writer can see what to write instead; a
     /// close spelling is offered as the fix.
-    refuse_unoffered_import(&this, node: ImportDeclNode*, module_sym: SymbolStr,
+    refuse_unoffered_import(&this, node: ImportDeclNode*, m: ModulePath,
                             resolved_module: string, name_str: string) -> void {
-        const offered: string[] = this.offered_leaves(module_sym, resolved_module);
+        const offered: string[] = this.offered_leaves(m, resolved_module);
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0502_INVALID_IMPORT,
             fmt::format("`%s` does not offer `%s`", resolved_module, name_str));
@@ -3180,7 +3179,7 @@ public:
             return;
         }
 
-        const exports: SymbolID[] = this.resolver.get_exports(module_sym);
+        const exports: SymbolID[] = this.resolver.get_exports(imported);
 
         // The module's registered name, for diagnostics and for composing a
         // sub-module's path as an import writes one.
@@ -3219,7 +3218,7 @@ public:
             // Each name keeps the module that DECLARED it, not the one that
             // passed it along: the qualified name is an identity, and routing
             // it through the re-exporter would give the same declaration two.
-            const rx_all: SymbolStr[] =
+            const rx_all: ModulePath[] =
                 this.ctx.module_graph.reexport_closure(imported);
             for (mut rx: i64 = 0; rx < rx_all.length; rx++) {
                 const rx_exports: SymbolID[] = this.resolver.get_exports(rx_all[rx]);
@@ -3260,7 +3259,7 @@ public:
                 // declarations, and which one a later use means is decided by
                 // the namespace it is used in, not by which one the module
                 // declared first.
-                mut offered: SymbolID[] = this.resolver.exports_named(module_sym, name);
+                mut offered: SymbolID[] = this.resolver.exports_named(imported, name);
                 mut through_export: boolean = false;
                 if (offered.length == 0) {
                     // Reached through `module_path`'s `export` closure.  The
@@ -3268,7 +3267,7 @@ public:
                     // passed it along, exactly as the Wildcard branch does: the
                     // qualified name is an identity, and routing it through the
                     // re-exporter would give the same declaration two.
-                    const via: SymbolStr = this.reexport_offering(module_sym, name);
+                    const via: ModulePath = this.reexport_offering(imported, name);
                     if (via.is_valid()) {
                         offered = this.resolver.exports_named(via, name);
                         through_export = true;
@@ -3286,7 +3285,7 @@ public:
                         this.resolver.declare_import(import_sym, offered[k]);
                     }
                 } else if (!node.is_export
-                           && this.resolver.private_declarations(module_sym, name).length > 0) {
+                           && this.resolver.private_declarations(imported, name).length > 0) {
                     // The module declares the name and marks it `private`.
                     // Visibility is a gate at the point a candidate is
                     // proposed, and the import is where this one is: binding
@@ -3308,7 +3307,7 @@ public:
                     // saying the name does not exist.
                     this.resolver.declare_refused(name, node.span);
                 } else if (node.is_export
-                           && this.resolver.private_declarations(module_sym, name).length > 0) {
+                           && this.resolver.private_declarations(imported, name).length > 0) {
                     // An `export` naming a private declaration is E0241,
                     // reported by the export check once the graph is whole;
                     // it is not a name the module fails to offer.
@@ -3324,12 +3323,12 @@ public:
                         // use site - which may never exist - to say so.  The
                         // import is where the name is written, and what the
                         // module DOES offer is what a writer needs to fix it.
-                        this.refuse_unoffered_import(node, module_sym, resolved_module, name_str);
+                        this.refuse_unoffered_import(node, imported, resolved_module, name_str);
                         this.resolver.declare_refused(name, node.span);
                         continue;
                     }
                     // Import all public exports from the resolved sub-module.
-                    const sub_exports: SymbolID[] = this.resolver.get_exports(sub_sym);
+                    const sub_exports: SymbolID[] = this.resolver.get_exports(sub_module);
                     for (mut j: i64 = 0; j < sub_exports.length; j++) {
                         const sub_export_sym: Symbol = this.resolver.get_symbol(sub_exports[j]);
                         if (sub_export_sym.visibility.is_public()) {

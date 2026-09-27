@@ -81,7 +81,7 @@ type struct Resolver {
     /// list instead of a per-module duplication of every prelude export, and so
     /// it shadows correctly: it is consulted only after every real scope has
     /// been asked, which is what makes an inner declaration win.
-    prelude_modules:    SymbolStr[];
+    prelude_modules:    ModulePath[];
 
     // Index: interned module name id -> the id of that module's scope.  A
     // lookup would otherwise linear-scan every scope with a per-scope strcmp
@@ -566,8 +566,15 @@ type struct Resolver {
     /// Record the namespaces reachable without an import.  Derived from the
     /// prelude module's own `public module` list, so it is empty when no
     /// prelude was loaded rather than defaulting to a transcribed set.
+    /// The list arrives as the namespaces the prelude's declarations spell;
+    /// each is turned into the module once, here.
     set_prelude_modules(mut &this, mods: SymbolStr[]) -> void {
-        this.prelude_modules = mods;
+        mut paths: ModulePath[] = [];
+        for (mut i: i64 = 0; i < mods.length; i++) {
+            const m: ModulePath = this.graph.module_named(mods[i]);
+            if (m.is_valid()) { paths.push(m); }
+        }
+        this.prelude_modules = paths;
     }
 
     /// Look up a name in the current scope only.
@@ -618,8 +625,8 @@ type struct Resolver {
     }
 
     /// Get all exported symbols from a module.
-    get_exports(&this, module_name: SymbolStr) -> SymbolID[] {
-        const mod_key: u64 = module_name.id as u64;
+    get_exports(&this, m: ModulePath) -> SymbolID[] {
+        const mod_key: u64 = m.as_sym().id as u64;
         mut result: SymbolID[] = [];
         for (mut i: i64 = 0; i < this.exports.length; i++) {
             if (this.exports[i].second == mod_key) {
@@ -632,7 +639,7 @@ type struct Resolver {
     /// The public declaration module `m` exports under `name` in the
     /// namespace `ns`, or an invalid id: `M::f` in an expression names the
     /// function `f`, never a type `M` also declares as `f`.
-    export_in(&this, m: SymbolStr, name: SymbolStr, ns: Namespace) -> SymbolID {
+    export_in(&this, m: ModulePath, name: SymbolStr, ns: Namespace) -> SymbolID {
         const all: SymbolID[] = this.exports_named(m, name);
         for (mut i: i64 = 0; i < all.length; i++) {
             if (ns.accepts(this.get_symbol(all[i]).kind)) { return all[i]; }
@@ -640,12 +647,12 @@ type struct Resolver {
         return SymbolID::invalid();
     }
 
-    /// Every public declaration `module_name` exports under `name`, in
+    /// Every public declaration module `m` exports under `name`, in
     /// declaration order: a type and a function may share a leaf, and a
     /// reader that wants one of them chooses by kind.
-    exports_named(&this, module_name: SymbolStr, name: SymbolStr) -> SymbolID[] {
+    exports_named(&this, m: ModulePath, name: SymbolStr) -> SymbolID[] {
         mut out: SymbolID[] = [];
-        const mod_key: u64 = module_name.id as u64;
+        const mod_key: u64 = m.as_sym().id as u64;
         for (mut i: i64 = 0; i < this.exports.length; i++) {
             if (this.exports[i].second == mod_key) {
                 const sym: Symbol = this.get_symbol(this.exports[i].first);
@@ -667,9 +674,9 @@ type struct Resolver {
     ///
     /// Read off the module's own scope: the export list holds only what is
     /// public, so a private declaration is exactly what it does not carry.
-    private_declarations(&this, module_name: SymbolStr, name: SymbolStr) -> SymbolID[] {
+    private_declarations(&this, m: ModulePath, name: SymbolStr) -> SymbolID[] {
         mut out: SymbolID[] = [];
-        const sid: u64 = this.find_module_scope(this.graph.module_named(module_name));
+        const sid: u64 = this.find_module_scope(m);
         if (sid == 0) { return out; }
         const scope: Scope* = this.get_scope(ScopeID { id: sid });
         const all: SymbolID[] = scope.get_overloads(name);
