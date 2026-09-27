@@ -479,16 +479,40 @@ type struct ModuleGraph {
         };
     }
 
-    /// Record the module a C import declares: `def` is the binding the name
-    /// layer made for the import's alias, and `ns` the namespace its
-    /// declarations are declared in - a module registered here, as a
-    /// discovered one is in `add_module`.  Answers the module's path: the
-    /// identity its declarations are declared in.
-    bind_c_import_module(mut &this, ns: SymbolStr, def: DefId) -> ModulePath {
-        this.module_defs.insert(ns.id, def);
-        this.def_list.push(def);
-        this.def_paths.push(ns);
+    /// Register the module a C import declares, under the namespace the
+    /// import composes for its alias (`<mod>::cit`), and answer its path:
+    /// the identity every declaration the import brings in is declared in.
+    /// The importer calls this once per import, before the name layer has
+    /// bound the alias, so the module holds no definition until
+    /// `bind_c_import_module` gives it one.  Registering a namespace again
+    /// keeps the definition already bound to it.
+    register_c_import_module(mut &this, ns: SymbolStr) -> ModulePath {
+        if (!ns.is_valid()) { return ModulePath::none(); }
+        if (!this.module_defs.contains_key(&ns.id)) {
+            this.module_defs.insert(ns.id, DefId::invalid());
+        }
         return ModulePath::of(ns);
+    }
+
+    /// Bind the C import module `m` to `def`, the binding the name layer
+    /// made for the import's alias, as a discovered module is bound in
+    /// `add_module`.
+    bind_c_import_module(mut &this, m: ModulePath, def: DefId) -> void {
+        if (!m.is_valid()) { return; }
+        this.module_defs.insert(m.sym.id, def);
+        this.def_list.push(def);
+        this.def_paths.push(m.sym);
+    }
+
+    /// The module the definition `d` IS: its path when `d` is a module the
+    /// graph holds - discovered, or a C import's - and none for any other
+    /// definition.  Identity to identity: no spelling is read.
+    module_of_def(&this, d: DefId) -> ModulePath {
+        if (!d.is_valid()) { return ModulePath::none(); }
+        for (mut i: i64 = 0; i < this.def_list.length; i++) {
+            if (this.def_list[i].equals(d)) { return ModulePath::of(this.def_paths[i]); }
+        }
+        return ModulePath::none();
     }
 
     /// The module the definition `d` is declared in - the nearest module on

@@ -35,7 +35,7 @@ import std::fmt;
 import compiler::artifacts::{ PhaseArtifacts };
 import compiler::compile_mode::{ CompileMode };
 import compiler::const_table::{ ConstantTable };
-import compiler::decl_index::{ DeclarationIndex };
+import compiler::decl_index::{ DeclarationIndex, GlobalEntry };
 import compiler::diag::config::{ DiagConfig };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::renderer::{ DiagRenderer, RenderConfig };
@@ -188,7 +188,7 @@ public:
     // the name layer answers it with that declaration's id once declared
     // (`NameDeclarationPass::settle_c_refs`).  Parallel arrays.
     c_ref_anns:  u64[];
-    c_ref_alias: SymbolStr[];
+    c_ref_alias: ModulePath[];
     c_ref_tags:  SymbolStr[];
     c_ref_decls: u64[];
 
@@ -584,9 +584,9 @@ public:
     /// to its leaf.  A reader standing in some other module - a pass
     /// walking a root that holds injected clones - gets the same key the
     /// registration used, which the ambient cursor cannot give it.
-    decl_type_key(mut &this, name: SymbolStr, binding_namespace: SymbolStr,
+    decl_type_key(mut &this, name: SymbolStr, binding_namespace: ModulePath,
                   span_file: string) -> SymbolStr {
-        if (!binding_namespace.is_empty()) {
+        if (binding_namespace.is_valid()) {
             return this.qualify_binding_sym(name, binding_namespace);
         }
         return this.qualify_symbol_sym_home(name, span_file);
@@ -638,6 +638,24 @@ public:
         return this.module_graph.declaring_module(d);
     }
 
+    /// The module the definition `d` IS; none when `d` is not a module.
+    module_of_def(&this, d: DefId) -> ModulePath {
+        if (this.module_graph == null) { return ModulePath::none(); }
+        return this.module_graph.module_of_def(d);
+    }
+
+    /// The global the definition `d` is, from its registration slot, or an
+    /// entry that is not `valid` when `d` names none or is not a global.  The
+    /// slot is `(leaf, module)`: a global is declared directly in its module,
+    /// so the module is the one `d`'s parent IS - the root for a unit with no
+    /// namespace - and a definition nested in a type asks under no module a
+    /// global is registered in.
+    global_entry_of_def(&this, d: DefId) -> GlobalEntry {
+        if (!d.is_valid()) { return GlobalEntry::none(); }
+        return this.decl_index.global_entry_in_module(
+            this.defs.leaf_of(d), this.module_of_def(this.defs.parent_of(d)));
+    }
+
     decl_fn_key(mut &this, name: SymbolStr, span_file: string) -> SymbolStr {
         return this.qualify_symbol_sym_home(name, span_file);
     }
@@ -684,8 +702,7 @@ public:
 
     /// The family owner the namespace `ns` names, for a namespace that
     /// reaches here as text: the parent of a name the compiler minted
-    /// qualified, the namespace a C import writes on its declarations, the
-    /// allocator module codegen calls into.  The root for no namespace, and
+    /// qualified, the allocator module codegen calls into.  The root for no namespace, and
     /// for one the module graph holds no module under.
     module_family_named(&this, ns: SymbolStr) -> FamilyOwner {
         if (!ns.is_valid() || this.module_graph == null) { return FamilyOwner::Def(DefId::invalid()); }
@@ -711,14 +728,14 @@ public:
     /// Falls back to the cursor when the file names no module in the graph
     /// (single-file mode), as the type declaration key does and for the same
     /// reason: an invalid namespace compares unequal to every real one.
-    decl_global_key(mut &this, name: SymbolStr, binding_namespace: SymbolStr,
-                    span_file: string, out_ns: SymbolStr*) -> SymbolStr {
-        if (!binding_namespace.is_empty()) {
-            *out_ns = binding_namespace;
+    decl_global_key(mut &this, name: SymbolStr, binding_namespace: ModulePath,
+                    span_file: string, out_module: ModulePath*) -> SymbolStr {
+        if (binding_namespace.is_valid()) {
+            *out_module = binding_namespace;
             return name;
         }
         const home: ModulePath = this.module_of_file(span_file);
-        *out_ns = if (home.is_valid()) { home.as_sym() } else { this.unit_module.as_sym() };
+        *out_module = if (home.is_valid()) { home } else { this.unit_module };
         return name;
     }
 
@@ -730,8 +747,8 @@ public:
     /// register (`type_resolution.cryo` ExternBlock branch).  Every caller
     /// tests the namespace first; a declaration without one is keyed by
     /// `decl_type_key` / `decl_global_key`.
-    qualify_binding_sym(mut &this, sym: SymbolStr, binding_namespace: SymbolStr) -> SymbolStr {
-        const ns: string = this.intern_table.resolve(binding_namespace);
+    qualify_binding_sym(mut &this, sym: SymbolStr, binding_namespace: ModulePath) -> SymbolStr {
+        const ns: string = this.intern_table.resolve(binding_namespace.as_sym());
         const bare: string = this.intern_table.resolve(sym);
         return this.intern_table.intern(ns + "::" + bare);
     }

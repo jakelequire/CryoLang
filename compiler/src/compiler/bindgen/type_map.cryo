@@ -24,6 +24,7 @@ import compiler::bindgen::clang;
 import compiler::bindgen::clang::{ CXType, CXCursor, CXString };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
+import compiler::module_graph::{ ModulePath };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, Res, ResSlot };
@@ -66,12 +67,11 @@ function scalar_name(k: i32) -> string {
 /// import's alias namespace so neither has to be threaded through the recursion.
 type struct CTypeMapper {
     ctx:   CompilationContext*;
-    /// The import's extern-module alias, by its canonical namespace
-    /// (`<mod>::alias`; empty for the functions-only path, in which records
-    /// collapse to `void*`).
-    alias: SymbolStr;
+    /// The import's extern-module alias's module (`<mod>::alias`; none for
+    /// the functions-only path, in which records collapse to `void*`).
+    alias: ModulePath;
 
-    static new(ctx: CompilationContext*, alias: SymbolStr) -> CTypeMapper {
+    static new(ctx: CompilationContext*, alias: ModulePath) -> CTypeMapper {
         return CTypeMapper { ctx: ctx, alias: alias };
     }
 
@@ -177,10 +177,10 @@ type struct CTypeMapper {
     /// Qualify a record/enum tag name under the import's alias namespace.
     /// Empty alias => no qualification (bare name).
     qualify_under_alias(&this, tag: SymbolStr) -> SymbolStr {
-        if (this.alias.is_empty()) {
+        if (!this.alias.is_valid()) {
             return tag;
         }
-        const ns: string = this.ctx.intern_table.resolve(this.alias);
+        const ns: string = this.ctx.intern_table.resolve(this.alias.as_sym());
         const bare: string = this.ctx.intern_table.resolve(tag);
         return this.ctx.intern_table.intern(ns + "::" + bare);
     }
@@ -295,7 +295,7 @@ type struct CTypeMapper {
             }
             // Reference to an emitted record: name it, qualified under the alias.
             const tag: SymbolStr = this.tag_name(c);
-            if (!tag.is_empty() && !this.alias.is_empty()) {
+            if (!tag.is_empty() && this.alias.is_valid()) {
                 return this.named(tag);
             }
             return this.ptr(this.prim("void"), false);
@@ -303,7 +303,7 @@ type struct CTypeMapper {
 
         if (k == clang::TK_Enum) {
             const tag: SymbolStr = this.tag_name(c);
-            if (!tag.is_empty() && !this.alias.is_empty()) {
+            if (!tag.is_empty() && this.alias.is_valid()) {
                 return this.named(tag);
             }
             // Enums with no emittable name still round-trip as their integer width.

@@ -47,9 +47,10 @@ import compiler::intrinsic_kind::{ IntrinsicKind };
 
 
 /// One global's registration slot, read by value: the key the slot is
-/// under (its leaf and the namespace of the module that declared it), the
-/// global's type as that module declared it, the module, the linker symbol
-/// when another object owns the storage, and whether it is thread-local.
+/// under (its leaf and the module that declared it), the global's type as
+/// that module declared it, the source file that declared it, the linker
+/// symbol when another object owns the storage, and whether it is
+/// thread-local.
 /// A reader holding one asks it, and asks the index nothing further by
 /// name; `valid` is false for a slot that does not exist.
 type struct GlobalEntry {
@@ -59,16 +60,16 @@ type struct GlobalEntry {
     /// with `global_entry_at` and asks nothing by name.  -1 when not `valid`.
     slot:          i64;
     leaf:          SymbolStr;
-    namespace:     SymbolStr;
+    declared_in:   ModulePath;
     type_ref:      TypeRef;
-    module:        SymbolStr;
+    source_file:   SymbolStr;
     extern_symbol: SymbolStr;
     thread_local:  boolean;
 
     static none() -> GlobalEntry {
         return GlobalEntry {
-            valid: false, slot: -1, leaf: SymbolStr::empty(), namespace: SymbolStr::empty(),
-            type_ref: TypeRef::invalid(), module: SymbolStr::empty(),
+            valid: false, slot: -1, leaf: SymbolStr::empty(), declared_in: ModulePath::none(),
+            type_ref: TypeRef::invalid(), source_file: SymbolStr::empty(),
             extern_symbol: SymbolStr::empty(), thread_local: false,
         };
     }
@@ -130,13 +131,13 @@ type struct DeclarationIndex {
     type_reverse:   HashMap<u64, DefId>;
 
     module_global_keys:       u32[];  // SymbolStr.id of global variable
-    module_global_modules:    u32[];  // SymbolStr.id of defining module (source_file)
-    module_global_namespaces: u32[];  // SymbolStr.id of defining namespace (e.g.,
-                                      // "std::collections::hashmap"). Used by
-                                      // codegen to mangle definitions and cross-
-                                      // module references with a module-qualified
-                                      // path so two modules can each declare the
-                                      // same private `const NAME = ...` without
+    module_global_files:      u32[];  // SymbolStr.id of the defining source file
+    module_global_declared_in: ModulePath[];  // the defining module
+                                      // (`std::collections::hashmap`).  Codegen
+                                      // mangles definitions and cross-module
+                                      // references under its path, so two
+                                      // modules can each declare the same
+                                      // private `const NAME = ...` without
                                       // colliding at link time.
     module_global_types:      TypeRef[];  // parallel to module_global_keys: the
                                       // global's type AS DECLARED IN THAT module -
@@ -285,8 +286,8 @@ type struct DeclarationIndex {
             module_global_keys:       [],
             module_global_threadlocal: [],
             module_global_extern_syms: [],
-            module_global_modules:    [],
-            module_global_namespaces: [],
+            module_global_files:      [],
+            module_global_declared_in: [],
             module_global_types:      [],
             overload_func_types:   [],
             overload_func_mangled: [],
@@ -637,47 +638,44 @@ type struct DeclarationIndex {
         this.type_reverse.insert(ty.id, def);
     }
 
-    /// Register a global with its defining module so codegen can walk the
-    /// per-module list to emit cross-module externs.  The slot is
-    /// `(name, namespace)`: `namespace` is the namespace this module declares (e.g.
-    /// `std::collections::hashmap`); codegen mangles the global as
-    /// `C$<namespace>.<name>` so two modules with the same private
-    /// `const NAME = ...` don't collide.  Pass an empty SymbolStr when no
-    /// namespace is set (the global stays bare-mangled).
+    /// Register a global with its defining source file and module so codegen
+    /// can walk the per-module list to emit cross-module externs.  The slot
+    /// is `(name, declared_in)`; codegen mangles the global as
+    /// `C$<module path>.<name>` so two modules with the same private
+    /// `const NAME = ...` don't collide.  `declared_in` is none for a unit
+    /// declaring no namespace (the global stays bare-mangled).
     register_global_with_module(mut &this, name: SymbolStr, ty: TypeRef,
-                                 module_name: SymbolStr, ns_name: SymbolStr,
+                                 source_file: SymbolStr, declared_in: ModulePath,
                                  thread_local: boolean) -> void {
         // Dedup so re-processing doesn't grow the list unboundedly.
         for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
             if (this.module_global_keys[i] == name.id &&
-                this.module_global_modules[i] == module_name.id) {
+                this.module_global_files[i] == source_file.id) {
                 // Refresh recorded metadata in case the global was first
-                // registered before its namespace / thread-local flag was set.
-                this.module_global_namespaces[i] = ns_name.id;
+                // registered before its module / thread-local flag was set.
+                this.module_global_declared_in[i] = declared_in;
                 this.module_global_threadlocal[i] = thread_local;
                 this.module_global_types[i] = ty;
                 return;
             }
         }
         this.module_global_keys.push(name.id);
-        this.module_global_modules.push(module_name.id);
-        this.module_global_namespaces.push(ns_name.id);
+        this.module_global_files.push(source_file.id);
+        this.module_global_declared_in.push(declared_in);
         this.module_global_threadlocal.push(thread_local);
         this.module_global_extern_syms.push(0);
         this.module_global_types.push(ty);
     }
 
     /// The registration slot of the global `name` declared by the module
-    /// whose namespace IS `ns`, or -1.  Exact on both: the leaf alone cannot
-    /// answer, since two modules may each declare it (`libc::FIONBIO`,
-    /// `syscall::FIONBIO`), and the namespace is the canonical one a stamp
-    /// carries, so there is no suffix to match and no second module that
-    /// could answer.  An empty `ns` is the root namespace, which a module
-    /// with no `namespace` declaration registers its globals under.
-    global_slot(&this, name: SymbolStr, ns: SymbolStr) -> i64 {
+    /// `m`, or -1.  Exact on both: the leaf alone cannot answer, since two
+    /// modules may each declare it (`libc::FIONBIO`, `syscall::FIONBIO`).
+    /// No module is the root, which a unit with no `namespace` declaration
+    /// registers its globals under.
+    global_slot(&this, name: SymbolStr, m: ModulePath) -> i64 {
         for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
             if (this.module_global_keys[i] != name.id) { continue; }
-            if (this.module_global_namespaces[i] != ns.id) { continue; }
+            if (!this.module_global_declared_in[i].equals(m)) { continue; }
             return i;
         }
         return -1;
@@ -690,68 +688,37 @@ type struct DeclarationIndex {
             valid:         true,
             slot:          i,
             leaf:          SymbolStr::from_id(this.module_global_keys[i]),
-            namespace:     SymbolStr::from_id(this.module_global_namespaces[i]),
+            declared_in:   this.module_global_declared_in[i],
             type_ref:      this.module_global_types[i],
-            module:        SymbolStr::from_id(this.module_global_modules[i]),
+            source_file:   SymbolStr::from_id(this.module_global_files[i]),
             extern_symbol: SymbolStr::from_id(this.module_global_extern_syms[i]),
             thread_local:  this.module_global_threadlocal[i],
         };
     }
 
-    /// The global `name` declared by `module` - the module a qualified path's
-    /// stamp names, beside the member leaf the path wrote (`libc::FIONBIO`) -
-    /// or an entry that is not `valid`.  The module's namespace IS its
-    /// canonical name, and it is read off the id here, not by the reader:
-    /// a reader holding a stamp hands it over, as `global_entry_of_def`'s
-    /// do, so no caller projects a module's identity to a string to ask by.
-    global_entry_in_module(&this, name: SymbolStr, module_id: DefId) -> GlobalEntry {
-        if (!module_id.is_valid()) { return GlobalEntry::none(); }
-        return this.global_entry_at(this.global_slot(name, this.defs.path_of(module_id)));
+    /// The global `name` declared by the module `m` - the module a qualified
+    /// path's stamp names, beside the member leaf the path wrote
+    /// (`libc::FIONBIO`), or the module a global's definition is declared
+    /// in - or an entry that is not `valid`.
+    global_entry_in_module(&this, name: SymbolStr, m: ModulePath) -> GlobalEntry {
+        return this.global_entry_at(this.global_slot(name, m));
     }
 
-    /// The `(leaf, namespace)` pair a global's registration slot is keyed
-    /// by, from the canonical name a stamp carries: its last segment under
-    /// the rest (the root namespace when there is no rest).  The one place a
-    /// canonical name is split back into the slot's key, so sema and codegen
-    /// cannot split it differently.  A C-import alias's global is the alias
-    /// module's (`<mod>::cit::NAME`) and splits like any other.
-    static split_global_key(q: SymbolStr, intern: InternTable*,
-                            out_leaf: SymbolStr*, out_ns: SymbolStr*) -> void {
-        const q_str: string = intern.resolve(q);
-        const ns_str: string = QualifiedName::parent_of(q_str);
-        *out_ns = if (ns_str.length() > 0) { intern.intern(ns_str) } else { SymbolStr::empty() };
-        *out_leaf = intern.intern(QualifiedName::leaf_of(q_str));
-    }
-
-    /// The global the definition `d` is, from its registration slot, or an
-    /// entry that is not `valid` when `d` names none or the definition is
-    /// not a global.  The slot is keyed by `(leaf, namespace)`, so the
-    /// canonical name is split HERE and nowhere a reader stands: a reader
-    /// holding a `DefId` hands it over rather than turning it back into a
-    /// name to split.  Sibling of `type_of_def`.
-    global_entry_of_def(&this, d: DefId, intern: InternTable*) -> GlobalEntry {
-        if (!d.is_valid()) { return GlobalEntry::none(); }
-        mut leaf: SymbolStr = SymbolStr::empty();
-        mut ns: SymbolStr = SymbolStr::empty();
-        DeclarationIndex::split_global_key(this.defs.path_of(d), intern, &leaf, &ns);
-        return this.global_entry_at(this.global_slot(leaf, ns));
-    }
-
-    /// Record that the global `name` of namespace `ns` binds linker symbol
+    /// Record that the global `name` of module `m` binds linker symbol
     /// `sym`.  A global whose type never resolved has no slot; it was
     /// diagnosed at the declaration and nothing references it.
-    record_global_extern_symbol(mut &this, name: SymbolStr, ns: SymbolStr,
+    record_global_extern_symbol(mut &this, name: SymbolStr, m: ModulePath,
                                 sym: SymbolStr) -> void {
-        const i: i64 = this.global_slot(name, ns);
+        const i: i64 = this.global_slot(name, m);
         if (i >= 0) { this.module_global_extern_syms[i] = sym.id; }
     }
 
-    /// Mark the global `name` of namespace `ns` thread-local.  The
+    /// Mark the global `name` of module `m` thread-local.  The
     /// `![thread_local]` directive is applied AFTER TypeResolution registered
     /// the global with the flag false, so the registration is corrected
     /// rather than made.
-    mark_global_thread_local(mut &this, name: SymbolStr, ns: SymbolStr) -> void {
-        const i: i64 = this.global_slot(name, ns);
+    mark_global_thread_local(mut &this, name: SymbolStr, m: ModulePath) -> void {
+        const i: i64 = this.global_slot(name, m);
         if (i >= 0) { this.module_global_threadlocal[i] = true; }
     }
 

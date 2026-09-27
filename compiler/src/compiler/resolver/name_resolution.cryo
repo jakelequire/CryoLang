@@ -179,27 +179,15 @@ public:
         }
     }
 
-    /// The module a C import's declarations live in, from the namespace the
-    /// importer wrote on each of them.  The graph registered it when this
-    /// pass bound the import's extern block, which precedes them in the
-    /// program: the importer appends what it declares after the block.  The
-    /// namespace is text only because the importer runs before the graph
-    /// holds the module; it is turned into the module once, here.
-    c_import_module(&this, binding_ns: SymbolStr) -> ModulePath {
-        return this.ctx.module_graph.module_named(binding_ns);
-    }
-
     /// Declare a C-imported type under `alias::name`.
     ///
     /// One home for the four declaration kinds an extern block emits, because
     /// the rule is about where a C-imported declaration LIVES and not about
     /// which kind it is; four copies of it would drift the moment one kind
     /// gained a case.
-    declare_c_imported(&this, alias: SymbolStr, name: SymbolStr,
+    declare_c_imported(&this, c_module: ModulePath, name: SymbolStr,
                        span: SourceSpan) -> SymbolID {
-        if (alias.is_empty() || !name.is_valid()) { return SymbolID::invalid(); }
-        const c_module: ModulePath = this.c_import_module(alias);
-        if (!c_module.is_valid()) { return SymbolID::invalid(); }
+        if (!c_module.is_valid() || !name.is_valid()) { return SymbolID::invalid(); }
         const saved_module: ModulePath = this.resolver.current_module_path();
         const saved_scope: u64 = this.resolver.get_current_scope_id();
         this.resolver.set_module(c_module);
@@ -212,10 +200,8 @@ public:
     /// Declare a C-imported global in its alias's module, as the module's
     /// own constant or variable, exported: `cit::FLAG_A` is then the
     /// module lane's answer, as `cit::add3` and `cit::Vec2` are.
-    declare_c_imported_global(&this, alias: SymbolStr, node: VarDeclNode*) -> void {
-        if (alias.is_empty() || !node.name.is_valid()) { return; }
-        const c_module: ModulePath = this.c_import_module(alias);
-        if (!c_module.is_valid()) { return; }
+    declare_c_imported_global(&this, c_module: ModulePath, node: VarDeclNode*) -> void {
+        if (!c_module.is_valid() || !node.name.is_valid()) { return; }
         const saved_module: ModulePath = this.resolver.current_module_path();
         const saved_scope: u64 = this.resolver.get_current_scope_id();
         this.resolver.set_module(c_module);
@@ -226,7 +212,7 @@ public:
         };
         this.resolver.record_resolution(node.span, sym_id);
         this.resolver.export_symbol(sym_id);
-        if (!node.is_mutable) { this.record_const_value_in(alias, node); }
+        if (!node.is_mutable) { this.record_const_value_in(c_module.as_sym(), node); }
         this.resolver.restore_scope(saved_module, saved_scope);
     }
 
@@ -263,7 +249,7 @@ public:
                 // through its alias namespace (`cit::Vec2`, via the decl_index
                 // qualified key); declaring its bare name in the file scope here
                 // would shadow same-named types in other modules.
-                if (struct_node.binding_namespace.is_empty()) {
+                if (!struct_node.binding_namespace.is_valid()) {
                     // A `private` type is nameable only inside its own module,
                     // the same rule a `private` function gets above.  Declared
                     // public here it binds in every importer's scope, and the
@@ -284,7 +270,7 @@ public:
             NodeKind::UnionDeclaration => {
                 const union_node: UnionDeclNode* = node as UnionDeclNode*;
                 // Same binding_namespace rule as structs (see above).
-                if (union_node.binding_namespace.is_empty()) {
+                if (!union_node.binding_namespace.is_valid()) {
                     const sym_id: SymbolID = this.resolver.declare_type(
                         union_node.name, union_node.span, union_node.is_public);
                     union_node.def = this.type_def_of(sym_id);
@@ -299,7 +285,7 @@ public:
             NodeKind::EnumDeclaration => {
                 const enum_node: EnumDeclNode* = node as EnumDeclNode*;
                 this.record_enum_decl(enum_node);
-                if (enum_node.binding_namespace.is_empty()) {
+                if (!enum_node.binding_namespace.is_valid()) {
                     const sym_id: SymbolID = this.resolver.declare_type(
                         enum_node.name, enum_node.span, enum_node.is_public);
                     enum_node.def = this.type_def_of(sym_id);
@@ -330,7 +316,7 @@ public:
             }
             NodeKind::TypeAliasDeclaration => {
                 const alias_node: TypeAliasDeclNode* = node as TypeAliasDeclNode*;
-                if (alias_node.binding_namespace.is_empty()) {
+                if (!alias_node.binding_namespace.is_valid()) {
                     const sym_id: SymbolID = this.resolver.declare_type(
                         alias_node.alias_name, alias_node.span, true);
                     alias_node.def = this.type_def_of(sym_id);
@@ -346,7 +332,7 @@ public:
                 // declaration of its alias's module, reachable as
                 // `cit::NAME`; declared bare here it would shadow same-leaf
                 // globals in other modules.
-                if (var_node.is_global && var_node.binding_namespace.is_empty()) {
+                if (var_node.is_global && !var_node.binding_namespace.is_valid()) {
                     // An immutable global is a named constant
                     // (`SymbolKind::Constant`); a mutable global is a variable.
                     // The kind lets later passes treat a const named in a
@@ -419,15 +405,15 @@ public:
                     // members resolve through the doors a module's do.  The
                     // alias is declared in the module writing the import.
                     const alias: SymbolStr = extern_node.namespace_alias;
-                    const canon: SymbolStr = extern_node.binding_namespace;
                     const ns_id: SymbolID = this.resolver.alloc_symbol_id();
                     const ns_sym: Symbol = Symbol::namespace_sym(
                         ns_id, alias, this.resolver.current_scope,
                         extern_node.span, this.resolver.current_module);
                     this.resolver.declare(ns_sym);
                     this.resolver.export_symbol(ns_id);
-                    const c_module: ModulePath = this.ctx.module_graph.bind_c_import_module(
-                        canon, this.resolver.get_symbol(ns_id).def);
+                    const c_module: ModulePath = extern_node.binding_namespace;
+                    this.ctx.module_graph.bind_c_import_module(
+                        c_module, this.resolver.get_symbol(ns_id).def);
 
                     const saved_module: ModulePath = this.resolver.current_module_path();
                     const saved_scope: u64 = this.resolver.get_current_scope_id();
@@ -2931,8 +2917,8 @@ public:
         // a C-imported enum, this module's for any other, as the enum's
         // stamp names it.
         mut ns: SymbolStr = SymbolStr::empty();
-        if (!node.binding_namespace.is_empty()) {
-            ns = node.binding_namespace;
+        if (node.binding_namespace.is_valid()) {
+            ns = node.binding_namespace.as_sym();
         } else if (this.ctx.has_namespace()) {
             ns = this.ctx.unit_module.as_sym();
         }

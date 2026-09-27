@@ -20,7 +20,7 @@ import compiler::diag::{
 };
 import compiler::decl_index;
 import compiler::module_graph;
-import compiler::module_graph::{ ModuleGraph, ModuleInfo };
+import compiler::module_graph::{ ModuleGraph, ModuleInfo, ModulePath };
 import compiler::ast;
 import compiler::ast::{
     cloner, declaration, expression, GenericAnnotation, NamedAnnotation, node, NodeKind,
@@ -302,20 +302,20 @@ type struct TypeResolutionRunner {
     }
 
 
-    /// Record, on the registration `(key, ns)`, the linker symbol an IMPORTED
+    /// Record, on the registration `(key, m)`, the linker symbol an IMPORTED
     /// global binds - its `![symbol("...")]` override when it has one, else
     /// its declared name.  A no-op for a global Cryo defines, which is mangled
     /// under its namespace.  The directive pass runs after this and re-records
     /// the override on the same slot.
     static record_extern_symbol(ctx: CompilationContext*, node: VarDeclNode*,
-                                key: SymbolStr, ns: SymbolStr) -> void {
+                                key: SymbolStr, m: ModulePath) -> void {
         if (!node.is_extern_import) { return; }
         const sym: SymbolStr = if (node.link_name.length() > 0) {
             ctx.intern(node.link_name)
         } else {
             node.name
         };
-        ctx.decl_index.record_global_extern_symbol(key, ns, sym);
+        ctx.decl_index.record_global_extern_symbol(key, m, sym);
     }
 
     /// Report an annotation the type layer could not resolve, at a
@@ -2467,7 +2467,7 @@ type struct TypeResolutionPasses {
                             };
                             mut ext_leaf: SymbolStr = fn_node.name;
                             const ext_owner: FamilyOwner = if (node.is_c_import()) {
-                                ctx.module_family_named(node.binding_namespace)
+                                ctx.module_family(node.binding_namespace)
                             } else {
                                 ctx.decl_fn_family(fn_node.name, fn_node.span.file, &ext_leaf)
                             };
@@ -2584,9 +2584,9 @@ type struct TypeResolutionPasses {
                             ic_node.set_resolved_type(ic_type);
                             // Register as a global so sema's lookup_global_var finds it
                             const ic_mod_sym: SymbolStr = ctx.intern(ctx.source_file);
-                            mut ic_ns: SymbolStr = SymbolStr::empty();
+                            mut ic_ns: ModulePath = ModulePath::none();
                             const ic_key: SymbolStr = ctx.decl_global_key(
-                                ic_node.name, SymbolStr::empty(), ic_node.span.file, &ic_ns);
+                                ic_node.name, ModulePath::none(), ic_node.span.file, &ic_ns);
                             ctx.decl_index.register_global_with_module(
                                 ic_key, ic_type, ic_mod_sym, ic_ns, false);
                         }
@@ -2981,7 +2981,7 @@ type struct TypeResolutionPasses {
                         // key and codegen mangles the symbol under the alias).
                         // Any other is its leaf under the writing module's
                         // namespace.
-                        mut g_ns: SymbolStr = SymbolStr::empty();
+                        mut g_ns: ModulePath = ModulePath::none();
                         const g_key: SymbolStr = ctx.decl_global_key(
                             var_node.name, var_node.binding_namespace, var_node.span.file, &g_ns);
                         ctx.decl_index.register_global_with_module(

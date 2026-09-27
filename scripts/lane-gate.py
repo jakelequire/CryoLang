@@ -688,9 +688,9 @@ SCANNED_ARRAYS = {
     "Importer.type_decl_tags":    Scanned("compiler/bindgen/importer.cryo", "SymbolStr", DATA,
                                           "the C importer's own type declarations by the C TAG it emitted each for: "
                                           "the header's namespace, which libclang hands over as text and no Cryo lookup reaches"),
-    "CompilationContext.c_ref_alias": Scanned("compiler/compilation_context.cryo", "SymbolStr", DATA,
-                                          "which C import made each pending record reference: the import's alias, "
-                                          "compared by that import to find its own"),
+    "CompilationContext.c_ref_alias": Scanned("compiler/compilation_context.cryo", "ModulePath", DATA,
+                                          "which C import made each pending record reference: the import's alias "
+                                          "module, compared by that import to find its own"),
     "Lockfile.packages":          Scanned("compiler/deps/lockfile.cryo", "LockedDep", DATA,
                                           "the lockfile's packages by name: FILE-level records"),
     "Lockfile.vendor":            Scanned("compiler/deps/lockfile.cryo", "LockedVendor", DATA,
@@ -714,10 +714,10 @@ SCANNED_ARRAYS = {
                                           "the graph's modules by namespace"),
     "DeclarationIndex.module_global_keys": Scanned("compiler/decl_index.cryo", "SymbolStr", TABLE,
                                                    "the index's module-level globals by their leaf's id"),
-    "DeclarationIndex.module_global_modules": Scanned("compiler/decl_index.cryo", "SymbolStr", TABLE,
-                                                      "the index's module-level globals by their declaring module's id"),
-    "DeclarationIndex.module_global_namespaces": Scanned("compiler/decl_index.cryo", "SymbolStr", TABLE,
-                                                         "the index's module-level globals by their namespace's id"),
+    "DeclarationIndex.module_global_files": Scanned("compiler/decl_index.cryo", "SymbolStr", TABLE,
+                                                    "the index's module-level globals by their declaring source file's id"),
+    "DeclarationIndex.module_global_declared_in": Scanned("compiler/decl_index.cryo", "ModulePath", TABLE,
+                                                          "the index's module-level globals by their declaring module, by identity"),
     "DeclarationIndex.overload_func_owner": Scanned("compiler/decl_index.cryo", "SymbolStr", TABLE,
                                                     "the index's overload entries by their owner's id"),
     "DeclarationIndex.overload_func_mangled": Scanned("compiler/decl_index.cryo", "SymbolStr", TABLE,
