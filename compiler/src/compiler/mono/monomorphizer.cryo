@@ -113,8 +113,10 @@ type struct Monomorphizer {
     // -- Incremental injection tracking (for batch compilation) --
     injection_cursor:  i64;
 
-    // Current module being processed (set by pass before calling process_all)
-    current_module:    SymbolStr;
+    // Source file of the unit being processed (set by pass before calling
+    // process_all): the spec owner a method spec is recorded under when its
+    // impl block carries none.
+    current_source_file: SymbolStr;
 
 
     /// Construct the orchestrator with its environment.  Collaborators + state are
@@ -142,7 +144,7 @@ type struct Monomorphizer {
             call_specializer:      MonoCallSpecializer::null(),
             spec_index:            HashMap::<u64, i64>::new(),
             injection_cursor:      0,
-            current_module:        SymbolStr::empty(),
+            current_source_file:   SymbolStr::empty(),
         };
     }
 
@@ -166,10 +168,10 @@ type struct Monomorphizer {
 
     // Public per-pass API (called by passes/specialization.cryo)
 
-    /// Set the current module context for origin tracking.
-    set_current_module(mut &this, module_name: SymbolStr) -> void {
-        this.current_module = module_name;
-        this.call_specializer.set_current_module(module_name);
+    /// Set the source file of the unit being specialized.
+    set_current_source_file(mut &this, file: SymbolStr) -> void {
+        this.current_source_file = file;
+        this.call_specializer.set_current_source_file(file);
     }
 
     /// True if every queued specialization request has been drained.
@@ -195,20 +197,19 @@ type struct Monomorphizer {
         return this.state.spec_entries[i].owner_source;
     }
 
-    /// Number of recorded generic-METHOD spec owner modules (see
-    /// MonoState::spec_owner_modules).  Parallel to `spec_count` for the
+    /// Number of recorded generic-METHOD spec owner files (see
+    /// MonoState::spec_owner_files).  Parallel to `spec_count` for the
     /// `spec_entries` type/free-function specs.
-    spec_owner_module_count(&this) -> i64 {
-        return this.state.spec_owner_modules.length;
+    spec_owner_file_count(&this) -> i64 {
+        return this.state.spec_owner_files.length;
     }
 
-    /// The owner-module key (namespace or source path) of method-spec record `i`,
-    /// resolvable via `ModuleGraph::source_file_for_owner_key`.
-    spec_owner_module_at(&this, i: i64) -> SymbolStr {
-        if (i < 0 || i >= this.state.spec_owner_modules.length) {
+    /// The source file of the unit that emits method-spec record `i`.
+    spec_owner_file_at(&this, i: i64) -> SymbolStr {
+        if (i < 0 || i >= this.state.spec_owner_files.length) {
             return SymbolStr::empty();
         }
-        return this.state.spec_owner_modules[i];
+        return this.state.spec_owner_files[i];
     }
 
     /// Consume sema's `resolved_type_args` stash across a module's call sites,
@@ -684,13 +685,11 @@ type struct Monomorphizer {
         for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
             walk_impls.push(kept_impl_asts[ri]);
         }
-        const origin: SymbolStr = this.current_module;
         const spec_entry: SpecializationEntry = SpecializationEntry {
             specialized_type:  concrete_type,
             specialized_name:  spec_name_sym,
             ast_node:          result.specialized_ast,
             impl_nodes:        kept_impl_asts,
-            origin_module:     origin,
             template_module:   entry.declared_in,
             instantiated_type: request.generic_type,
             injected:          false,

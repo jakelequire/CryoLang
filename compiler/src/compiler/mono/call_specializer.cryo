@@ -92,7 +92,7 @@ type struct MonoCallSpecializer {
     state:            MonoState*;
     trait_spec:       MonoTraitSpecializer*;
     ast_resolver:     MonoAstResolver*;
-    current_module:   SymbolStr;
+    current_source_file: SymbolStr;
     // Transient owner context, set only while re-walking a generic static
     // method's specialized body (finish_generic_static_method_spec): an
     // owner-constructing struct literal (`Wrap { v: item }`) whose type the
@@ -115,7 +115,7 @@ type struct MonoCallSpecializer {
             state:            null,
             trait_spec:       null,
             ast_resolver:     null,
-            current_module:   SymbolStr::empty(),
+            current_source_file: SymbolStr::empty(),
             gsm_owner_leaf:   SymbolStr::empty(),
             gsm_owner_recv:   TypeRef::invalid(),
             gsm_owner_spec:   SymbolStr::empty(),
@@ -138,8 +138,8 @@ type struct MonoCallSpecializer {
         this.ast_resolver     = ast_resolver;
     }
 
-    set_current_module(mut &this, module_name: SymbolStr) -> void {
-        this.current_module = module_name;
+    set_current_source_file(mut &this, file: SymbolStr) -> void {
+        this.current_source_file = file;
     }
 
 
@@ -638,8 +638,8 @@ type struct MonoCallSpecializer {
         // A function specialization's minted identifier is program-unique:
         // its family is the root's.
         call.set_resolved_callee(CalleePin::Family(FamilyOwner::Def(DefId::invalid()), spec_sym));
-        const new_inst: TypeRef = this.generic_registry.instantiate_for_module(
-            entry.base_type, bindings, this.current_module);
+        const new_inst: TypeRef = this.generic_registry.instantiate(
+            entry.base_type, bindings);
         // Seed mono's pending worklist directly: the registry only tracks
         // cache_keys, and drain_pending_worklist iterates `pending`.
         this.state.enqueue_from_type_ref(new_inst);
@@ -680,8 +680,8 @@ type struct MonoCallSpecializer {
             this.intern_table, this.arena, base_qname, seeded);
         if (!spec_sym.is_valid()) { return; }
         ident.set_resolved_callee(CalleePin::Family(FamilyOwner::Def(DefId::invalid()), spec_sym));
-        const new_inst: TypeRef = this.generic_registry.instantiate_for_module(
-            entry.base_type, seeded, this.current_module);
+        const new_inst: TypeRef = this.generic_registry.instantiate(
+            entry.base_type, seeded);
         this.state.enqueue_from_type_ref(new_inst);
     }
 
@@ -1319,8 +1319,8 @@ type struct MonoCallSpecializer {
             if (!spec_name_sym.is_valid()) { return false; }
 
             // Instantiate the owner + enqueue (the drain materializes its methods).
-            const inst_ref: TypeRef = registry.instantiate_for_module(
-                entry.base_type, binds, this.current_module);
+            const inst_ref: TypeRef = registry.instantiate(
+                entry.base_type, binds);
             if (!inst_ref.is_valid()) { return false; }
             this.state.enqueue_from_type_ref(inst_ref);
             // The member's family is the instantiation's, whose definition is
@@ -1367,8 +1367,8 @@ type struct MonoCallSpecializer {
         if (owner_binds.length != entry.param_type_ids.length) { return false; }
 
         // Materialize the owner instantiation.
-        const inst_ref: TypeRef = registry.instantiate_for_module(
-            entry.base_type, owner_binds, this.current_module);
+        const inst_ref: TypeRef = registry.instantiate(
+            entry.base_type, owner_binds);
         if (!inst_ref.is_valid()) { return false; }
 
         // Find the owner spec entry.  On the first walk it does not exist yet:
@@ -2215,16 +2215,16 @@ type struct MonoCallSpecializer {
                                recv_type: TypeRef, impl_node: ImplBlockNode*) -> void {
         if (this.decl_index == null) { return; }
         if (spec_method == null || impl_node == null) { return; }
-        mut owning_module: SymbolStr = SymbolStr::empty();
-        if (impl_node.source_module != "") {
-            owning_module = this.intern_table.intern(impl_node.source_module);
+        mut owning_file: SymbolStr = SymbolStr::empty();
+        if (impl_node.source_file != "") {
+            owning_file = this.intern_table.intern(impl_node.source_file);
         } else {
-            owning_module = this.current_module;
+            owning_file = this.current_source_file;
         }
-        // The spec's definition is emitted into `owning_module`; flag it as a spec
-        // owner so the per-module incremental cache does not reuse a stale object
-        // (see MonoState::record_spec_owner_module).
-        this.state.record_spec_owner_module(owning_module);
+        // The spec's definition is emitted into the unit of `owning_file`; flag
+        // it as a spec owner so the per-module incremental cache does not reuse
+        // a stale object (see MonoState::record_spec_owner_file).
+        this.state.record_spec_owner_file(owning_file);
         if (this.receiver_unmaterialized(recv_type)) { return; }
         mut spec_methods: MethodNode*[] = [];
         spec_methods.push(spec_method);
@@ -2244,9 +2244,9 @@ type struct MonoCallSpecializer {
         if (spec_method == null || owner_ast == null) { return; }
         if (this.receiver_unmaterialized(recv_type)) { return; }
         // Flag the emitting module as a spec owner for the incremental cache
-        // (see MonoState::record_spec_owner_module): an owner not flagged is
+        // (see MonoState::record_spec_owner_file): an owner not flagged is
         // served from its cached object, which predates the spec.
-        this.state.record_spec_owner_module(this.intern_table.intern(owner_ast.span.file));
+        this.state.record_spec_owner_file(this.intern_table.intern(owner_ast.span.file));
         mut spec_methods: MethodNode*[] = [];
         spec_methods.push(spec_method);
         this.decl_index.register_methods(
