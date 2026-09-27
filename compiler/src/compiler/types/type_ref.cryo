@@ -8,49 +8,53 @@
 ///! and its number is read only through `key`: nothing outside this module
 ///! turns a number back into a handle, so a table keyed by `key` holds only
 ///! numbers the arena handed out, and a handle names the type it was made for.
+///!
+///! Each handle carries the tag of the allocator that made it, and the arena
+///! reads a slot only through `TypeRefs::slot_of`, which refuses a handle
+///! another allocator made: every arena holds the same primitives at the
+///! same positions, so a first user type sits at the same number in every
+///! arena, and a number alone names SOME type in any of them.
 
 namespace compiler::types::type_ref;
 
-import compiler::types::arena;
-import compiler::types::arena::{ TypeArena };
+import std::fmt;
+
+/// The tag the next `TypeRefs` is made with.  Starts above 0, the invalid
+/// handle's tag, so no allocator owns the invalid handle.
+mut g_type_ref_tags: u32 = 0;
 
 // TypeRef: Lightweight handle to a Type in the TypeArena
 
 /// A lightweight handle to a type in the TypeArena.
-/// Equality is determined by comparing type IDs.
+/// Equality compares the number and the tag of the allocator that made it.
 /// ID 0 is reserved as the invalid/unresolved sentinel.
 type struct TypeRef {
 private:
     /// Position in the arena's sequence, from 1; 0 for the invalid handle.
-    id:    u64;
-    /// The arena that made this handle; null for the invalid handle.
-    arena: TypeArena*;
+    id:  u32;
+    /// The tag of the allocator that made this handle; 0 for the invalid
+    /// handle.
+    tag: u32;
 
-    static new(id: u64, arena: TypeArena*) -> TypeRef {
-        return TypeRef {
-            id:    id,
-            arena: arena,
-        };
+    static new(id: u32, tag: u32) -> TypeRef {
+        return TypeRef { id: id, tag: tag };
     }
 
 public:
     /// Create an invalid/unresolved type reference (id = 0).
     static invalid() -> TypeRef {
-        return TypeRef {
-            id:    0,
-            arena: null,
-        };
+        return TypeRef { id: 0, tag: 0 };
     }
 
     /// The number a pass keys its own table by, hashes, or prints.  A read,
     /// one way: there is no way back from the number to a handle.
     key(&this) -> u64 {
-        return this.id;
+        return this.id as u64;
     }
 
-    /// Whether this refers to a valid type (id != 0 and arena != null).
+    /// Whether this refers to a valid type (id != 0).
     is_valid(&this) -> boolean {
-        return this.id != 0 && this.arena != null;
+        return this.id != 0;
     }
 
     /// Whether this is the invalid sentinel.
@@ -58,9 +62,9 @@ public:
         return this.id == 0;
     }
 
-    /// Check equality by type ID.
+    /// Check equality by type ID and by the allocator that made it.
     equals(&this, other: TypeRef) -> boolean {
-        return this.id == other.id;
+        return this.id == other.id && this.tag == other.tag;
     }
 }
 
@@ -69,23 +73,44 @@ public:
 /// compilation uses, privately; a handle is never built from a number.
 type struct TypeRefs {
 private:
-    next_id: u64;
+    next_id: u32;
+    /// This allocator's tag, distinct from every other allocator the
+    /// process made; stamped on each handle `next` makes.
+    tag:     u32;
 
 public:
     static new() -> TypeRefs {
-        return TypeRefs { next_id: 1 };
+        g_type_ref_tags = g_type_ref_tags + 1;
+        return TypeRefs { next_id: 1, tag: g_type_ref_tags };
     }
 
     /// The number the next handle will carry.  A `Type` records its own
     /// number when it is built, which is before the arena stores it and
     /// takes its handle.
     upcoming(&this) -> u64 {
-        return this.next_id;
+        return this.next_id as u64;
     }
 
-    next(mut &this, arena: TypeArena*) -> TypeRef {
-        const ref: TypeRef = TypeRef::new(this.next_id, arena);
+    next(mut &this) -> TypeRef {
+        const ref: TypeRef = TypeRef::new(this.next_id, this.tag);
         this.next_id += 1;
         return ref;
+    }
+
+    /// The storage index of `ty`, a handle this allocator made; -1 for the
+    /// invalid handle, which names no type.  One another allocator made is
+    /// refused here: its number names a slot in SOME arena, and answering
+    /// it would read whichever type sits there.
+    slot_of(&this, ty: TypeRef) -> i64 {
+        if (ty.id == 0) { return -1; }
+        if (ty.tag != this.tag) { TypeRefs::refuse(ty.id, ty.tag, this.tag); }
+        return (ty.id - 1) as i64;
+    }
+
+    /// The refusal `slot_of` raises, kept out of the read it guards.
+    static refuse(number: u32, made_by: u32, read_by: u32) -> void {
+        panic(fmt::format(
+            "internal compiler error: a type handle made by allocator %u (number %u) was read against allocator %u",
+            made_by, number, read_by), FILE, LINE);
     }
 }

@@ -76,32 +76,38 @@ type struct GlobalEntry {
 }
 
 
+/// The tag the next `DeclarationIndex` is made with.  Starts above 0, the
+/// invalid id's tag, so no index owns the invalid id.
+mut g_overload_index_tags: u32 = 0;
+
 /// A signature's position in the index's function registry: the identity of
 /// one registered declaration signature, which a call pins and codegen reads
 /// the symbol and signature off.  Minted only here, by `register_signature`,
 /// and read only here: the position is private to this module, so an id
 /// cannot be built from a number anywhere else - an in-range position would
-/// silently name whichever entry sits there.
+/// silently name whichever entry sits there.  It carries the tag of the
+/// index that made it, and the index reads its registry only through
+/// `slot_of`, which refuses an id another index made: a second index's
+/// positions start at 0 too, so a position alone names SOME entry in any
+/// index.
 type struct OverloadId {
 private:
     /// Position in the registry's parallel arrays; `0xFFFFFFFF` for none.
     pos: u32;
+    /// The tag of the index that made this id; 0 for the invalid id.
+    table: u32;
 
-    /// The id of the entry at registry position `pos`.  Registration's mint.
-    static at_position(pos: u32) -> OverloadId {
-        return OverloadId { pos: pos };
-    }
-
-    /// The registry position, for this index's own accessors.
-    position(&this) -> u32 {
-        return this.pos;
+    /// The id of the entry at registry position `pos` of the index tagged
+    /// `table`.  Registration's mint.
+    static at_position(pos: u32, table: u32) -> OverloadId {
+        return OverloadId { pos: pos, table: table };
     }
 
 public:
     /// The id naming no entry, for a slot that must hold one before an
     /// answer exists.
     static invalid() -> OverloadId {
-        return OverloadId { pos: 4294967295 };
+        return OverloadId { pos: 4294967295, table: 0 };
     }
 
     is_valid(&this) -> boolean {
@@ -109,7 +115,7 @@ public:
     }
 
     equals(&this, other: OverloadId) -> boolean {
-        return this.pos == other.pos;
+        return this.pos == other.pos && this.table == other.table;
     }
 }
 
@@ -272,8 +278,14 @@ type struct DeclarationIndex {
     // recorded on its definition (`DefTable::signature_refused`).
     refused_methods:     HashMap<u64, boolean>;
 
+private:
+    /// This index's tag, distinct from every other index the process made;
+    /// stamped on each `OverloadId` it mints and checked by `slot_of`.
+    overload_tag:        u32;
 
+public:
     static new() -> DeclarationIndex {
+        g_overload_index_tags = g_overload_index_tags + 1;
         return DeclarationIndex {
             defs: null,
             func_type_refs:      HashMap::<u64, TypeRef>::new(),
@@ -300,7 +312,23 @@ type struct DeclarationIndex {
             module_imports:     HashMap::<u32, u32[]>::new(),
             prelude_modules:    [],
             refused_methods:    HashMap::<u64, boolean>::new(),
+            overload_tag:       g_overload_index_tags,
         };
+    }
+
+    /// The registry position of `id`, a valid id this index made.  One
+    /// another index made is refused here: its position names an entry in
+    /// SOME registry, and answering it would read whichever entry sits there.
+    slot_of(&this, id: OverloadId) -> i64 {
+        if (id.table != this.overload_tag) { DeclarationIndex::refuse(id.pos, id.table, this.overload_tag); }
+        return id.pos as i64;
+    }
+
+    /// The refusal `slot_of` raises, kept out of the read it guards.
+    static refuse(pos: u32, made_by: u32, read_by: u32) -> void {
+        panic(fmt::format(
+            "internal compiler error: a signature id made by index %u (position %u) was read against index %u (the invalid id carries 0)",
+            made_by, pos, read_by), FILE, LINE);
     }
 
 
@@ -401,7 +429,7 @@ type struct DeclarationIndex {
                     if (this.overload_func_types[pos as i64].equals(func_type_ref)
                             && this.overload_func_owner[pos as i64] == alias_of.id
                             && this.overload_func_mangled[pos as i64] == symbol.id) {
-                        return OverloadId::at_position(pos);
+                        return OverloadId::at_position(pos, this.overload_tag);
                     }
                 }
             }
@@ -416,32 +444,32 @@ type struct DeclarationIndex {
         this.overload_func_intrinsic.push(IntrinsicKind::Call);
         const positions: u32[]* = this.overload_index.get_or_insert(slot, []);
         (*positions).push(new_pos);
-        return OverloadId::at_position(new_pos);
+        return OverloadId::at_position(new_pos, this.overload_tag);
     }
 
     /// The trait entry `id`'s declaration implements; empty for an inherent
     /// method, a free function, or an invalid id.
     entry_trait(&this, id: OverloadId) -> DefId {
         if (!id.is_valid()) { return DefId::invalid(); }
-        return this.overload_func_trait[id.position() as i64];
+        return this.overload_func_trait[this.slot_of(id)];
     }
 
     /// Where entry `id`'s declaration is written; `none()` for an invalid id.
     entry_span(&this, id: OverloadId) -> SourceSpan {
         if (!id.is_valid()) { return SourceSpan::none(); }
-        return this.overload_func_span[id.position() as i64];
+        return this.overload_func_span[this.slot_of(id)];
     }
 
     /// The linker symbol of entry `id`; empty for an invalid id.
     entry_symbol(&this, id: OverloadId) -> SymbolStr {
         if (!id.is_valid()) { return SymbolStr::empty(); }
-        return SymbolStr::from_id(this.overload_func_mangled[id.position() as i64]);
+        return SymbolStr::from_id(this.overload_func_mangled[this.slot_of(id)]);
     }
 
     /// The signature of entry `id`; invalid for an invalid id.
     entry_signature(&this, id: OverloadId) -> TypeRef {
         if (!id.is_valid()) { return TypeRef::invalid(); }
-        return this.overload_func_types[id.position() as i64];
+        return this.overload_func_types[this.slot_of(id)];
     }
 
     /// Every entry of the family `(owner, leaf)`, in registration order.
@@ -451,7 +479,7 @@ type struct DeclarationIndex {
         match (this.overload_index.get_ref(&slot)) {
             Option::Some(positions) => {
                 for (mut k: i64 = 0; k < (*positions).length; k++) {
-                    result.push(OverloadId::at_position((*positions)[k]));
+                    result.push(OverloadId::at_position((*positions)[k], this.overload_tag));
                 }
             }
             Option::None => { }
@@ -479,13 +507,13 @@ type struct DeclarationIndex {
     /// sharing an intrinsic's leaf is never taken for it.
     mark_intrinsic(mut &this, id: OverloadId, kind: IntrinsicKind) -> void {
         if (!id.is_valid()) { return; }
-        this.overload_func_intrinsic[id.position() as i64] = kind;
+        this.overload_func_intrinsic[this.slot_of(id)] = kind;
     }
 
     /// How a call pinned to entry `id` lowers; `Call` for an invalid id.
     entry_intrinsic_kind(&this, id: OverloadId) -> IntrinsicKind {
         if (!id.is_valid()) { return IntrinsicKind::Call; }
-        return this.overload_func_intrinsic[id.position() as i64];
+        return this.overload_func_intrinsic[this.slot_of(id)];
     }
 
     /// How a call pinned to the family `(owner, leaf)` lowers: the kind its

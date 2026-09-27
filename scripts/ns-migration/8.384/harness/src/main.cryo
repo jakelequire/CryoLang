@@ -1,0 +1,107 @@
+namespace tagharness;
+
+import std::fmt;
+import std::ffi::libc;
+import compiler::resolver::res;
+import compiler::resolver::intern_table;
+import compiler::diag::source_span;
+import compiler::types::arena;
+import compiler::types::type_ref;
+import compiler::decl_index;
+import tagharness::mint;
+
+// Drives the type arena and the declaration index directly, one mode per
+// run, so each outcome is observed alone.  A mode that must be refused ends
+// in a panic (exit 101); a mode that must be answered prints its answer.
+//   ty_own        - a type handle read against the arena that made it
+//   ty_foreign    - a handle a second arena made, read against the first
+//   ty_stale      - a handle made before its arena was rebuilt IN THE SAME
+//                   VARIABLE (the same address), read after
+//   ty_allocator  - a handle a second, free-standing allocator made
+//   ovl_own       - a signature id read against the index that made it
+//   ovl_foreign   - an id a second index made, read against the first
+//   ovl_stale     - an id made before its index was rebuilt, read after
+//
+// Every arena holds the same twenty primitives at the same positions, so a
+// first user type sits at the same position in every arena: a number alone
+// cannot tell one arena's handle from another's.
+function main(argc: int, argv: string*) -> int {
+    if (argc < 2) { fmt::printf("usage: tagharness <mode>\n"); return 2; }
+    const mode: string = argv[1];
+    const intern: intern_table::InternTable* =
+        libc::malloc(sizeof(intern_table::InternTable)) as intern_table::InternTable*;
+    *intern = intern_table::InternTable::new();
+    const none: res::DefId = res::DefId::invalid();
+    const at: source_span::SourceSpan = source_span::SourceSpan::none();
+
+    if (mode == "sizes") {
+        fmt::printf("sizes: TypeRef %d, OverloadId %d\n",
+            sizeof(type_ref::TypeRef) as i32, sizeof(decl_index::OverloadId) as i32);
+        return 0;
+    }
+    if (mode == "ty_own") {
+        mut a: arena::TypeArena = arena::TypeArena::new(intern);
+        const p: type_ref::TypeRef = a.get_pointer_to(a.get_i32());
+        fmt::printf("ty_own: '%s'\n", a.resolve_display_name(p));
+        return 0;
+    }
+    if (mode == "ty_foreign") {
+        mut a: arena::TypeArena = arena::TypeArena::new(intern);
+        mut b: arena::TypeArena = arena::TypeArena::new(intern);
+        a.get_pointer_to(a.get_u8());
+        const p_b: type_ref::TypeRef = b.get_pointer_to(b.get_i32());
+        fmt::printf("ty_foreign: '%s'\n", a.resolve_display_name(p_b));
+        return 0;
+    }
+    if (mode == "ty_stale") {
+        mut t: arena::TypeArena = arena::TypeArena::new(intern);
+        const old_p: type_ref::TypeRef = t.get_pointer_to(t.get_i32());
+        t = arena::TypeArena::new(intern);
+        t.get_pointer_to(t.get_u8());
+        fmt::printf("ty_stale: '%s'\n", t.resolve_display_name(old_p));
+        return 0;
+    }
+    if (mode == "ty_allocator") {
+        mut a: arena::TypeArena = arena::TypeArena::new(intern);
+        const h: type_ref::TypeRef = mint::second_allocator_handle();
+        fmt::printf("ty_allocator: '%s'\n", a.resolve_display_name(h));
+        return 0;
+    }
+
+    mut defs: res::DefTable = res::DefTable::new(intern);
+    const owner: res::DefId = defs.register(none, intern.intern("m"), res::DefKind::Module, at);
+    const fam: res::FamilyOwner = res::FamilyOwner::Def(owner);
+    const leaf = intern.intern("f");
+    const sig: type_ref::TypeRef = type_ref::TypeRef::invalid();
+    const empty = intern.intern("");
+
+    if (mode == "ovl_own") {
+        mut x: decl_index::DeclarationIndex = decl_index::DeclarationIndex::new();
+        x.defs = &defs;
+        const id: decl_index::OverloadId = x.register_signature(fam, leaf, sig, empty, intern.intern("sym_alpha"), none, at);
+        fmt::printf("ovl_own: '%s'\n", intern.resolve(x.entry_symbol(id)));
+        return 0;
+    }
+    if (mode == "ovl_foreign") {
+        mut x: decl_index::DeclarationIndex = decl_index::DeclarationIndex::new();
+        mut y: decl_index::DeclarationIndex = decl_index::DeclarationIndex::new();
+        x.defs = &defs;
+        y.defs = &defs;
+        x.register_signature(fam, leaf, sig, empty, intern.intern("sym_alpha"), none, at);
+        const id_y: decl_index::OverloadId = y.register_signature(fam, leaf, sig, empty, intern.intern("sym_beta"), none, at);
+        fmt::printf("ovl_foreign: '%s'\n", intern.resolve(x.entry_symbol(id_y)));
+        return 0;
+    }
+    if (mode == "ovl_stale") {
+        mut x: decl_index::DeclarationIndex = decl_index::DeclarationIndex::new();
+        x.defs = &defs;
+        const old_id: decl_index::OverloadId = x.register_signature(fam, leaf, sig, empty, intern.intern("sym_alpha"), none, at);
+        x = decl_index::DeclarationIndex::new();
+        x.defs = &defs;
+        x.register_signature(fam, leaf, sig, empty, intern.intern("sym_gamma"), none, at);
+        fmt::printf("ovl_stale: '%s'\n", intern.resolve(x.entry_symbol(old_id)));
+        return 0;
+    }
+    fmt::printf("unknown mode\n");
+    return 2;
+}
