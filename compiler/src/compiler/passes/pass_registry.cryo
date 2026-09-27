@@ -821,13 +821,6 @@ type struct PassRegistry {
             ctx.set_namespace(ns);
         }
 
-        // Determine the module name for qualified type names.
-        // Use the raw namespace string directly (ctx.namespace_display() relies on
-        // QualifiedName::display() which has a codegen issue with string.append()).
-        const ns_raw: string = ctx.artifacts.ast.namespace_name;
-        const module_name: string = if (ns_raw != "") { ns_raw } else { ctx.source_file };
-        const module_sym: SymbolStr = ctx.intern(module_name);
-
         // Reject two type declarations that share a qualified name within
         // this module (E0207). Qualified names carry the namespace, so the
         // same bare name in different modules does not collide. Runs as a
@@ -895,7 +888,6 @@ type struct PassRegistry {
                     const _dbg: string = _intern.resolve(node.name);
                     cdebug("[TypeDecl]   -> Struct '%s'\n", _dbg);
                     const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
-                    const struct_module_sym: SymbolStr = if (!node.binding_namespace.is_empty()) { node.binding_namespace } else { module_sym };
                     // The index learns the name here, with the arena: this
                     // stage's guarantee is that every type name is known
                     // before any signature resolves, and that has to hold for
@@ -904,7 +896,7 @@ type struct PassRegistry {
                     // the per-module type list is not idempotent and stays
                     // TypeResolution's to own.
                     const struct_ref: TypeRef =
-                        arena.create_struct(qualified_sym, struct_module_sym);
+                        arena.create_struct(qualified_sym, ctx.declaring_module(node.def));
                     ctx.decl_index.register_type(node.def, struct_ref, node.is_public);
                     // Whether this IS the language's `Array`, `Slice`, `Rc`, ...
                     // is decided by the identity, claimed where it is minted.
@@ -919,9 +911,8 @@ type struct PassRegistry {
                     const _dbgu: string = _internu.resolve(node.name);
                     cdebug("[TypeDecl]   -> Union '%s'\n", _dbgu);
                     const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
-                    const union_module_sym: SymbolStr = if (!node.binding_namespace.is_empty()) { node.binding_namespace } else { module_sym };
                     const union_ref: TypeRef =
-                        arena.create_union(qualified_sym, union_module_sym);
+                        arena.create_union(qualified_sym, ctx.declaring_module(node.def));
                     ctx.decl_index.register_type(node.def, union_ref, node.is_public);
                     type_count++;
                 }
@@ -931,9 +922,8 @@ type struct PassRegistry {
                     const _dbg2: string = _intern2.resolve(node.name);
                     cdebug("[TypeDecl]   -> Enum '%s'\n", _dbg2);
                     const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, node.binding_namespace, node.span.file);
-                    const enum_module_sym: SymbolStr = if (!node.binding_namespace.is_empty()) { node.binding_namespace } else { module_sym };
                     const enum_ref: TypeRef =
-                        arena.create_enum(qualified_sym, enum_module_sym);
+                        arena.create_enum(qualified_sym, ctx.declaring_module(node.def));
                     ctx.decl_index.register_type(node.def, enum_ref, node.is_public);
                     // Whether this IS the language's `Result`/`Option` - the enums
                     // `?` desugars through - is decided by the identity, claimed
@@ -947,7 +937,7 @@ type struct PassRegistry {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
                     const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
                     const class_ref: TypeRef =
-                        arena.create_class(qualified_sym, module_sym);
+                        arena.create_class(qualified_sym, ctx.declaring_module(node.def));
                     ctx.decl_index.register_type(node.def, class_ref, node.is_public);
                     if (ctx.generic_registry != null) {
                         ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
@@ -958,7 +948,7 @@ type struct PassRegistry {
                     const node: TraitDeclNode* = stmt as TraitDeclNode*;
                     const qualified_sym: SymbolStr = ctx.decl_type_key(node.name, SymbolStr::empty(), node.span.file);
                     const trait_ref: TypeRef =
-                        arena.create_trait(qualified_sym, module_sym);
+                        arena.create_trait(qualified_sym, ctx.declaring_module(node.def));
                     // A trait carries no visibility modifier: public.
                     ctx.decl_index.register_type(node.def, trait_ref, true);
                     // Whether this IS the language's `Drop`/`Copy`/`Add`/... is

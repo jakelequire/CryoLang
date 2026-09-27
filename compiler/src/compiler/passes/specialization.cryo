@@ -28,6 +28,7 @@ import compiler::passes::{ pass_id, type_resolution };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::module_graph;
+import compiler::module_graph::{ ModulePath };
 import compiler::types;
 import compiler::types::{
     arena, compound, generic, generic_registry, type_base, type_ref, TypeKind,
@@ -37,8 +38,6 @@ import compiler::mono::{ monomorphizer, state };
 import compiler::resolver::{ intern_table, res, symbol_str };
 import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
-import compiler::resolver::qualified_name;
-import compiler::resolver::qualified_name::{ QualifiedName };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, EnumDeclNode, FunctionDeclNode, GenericParamNode,
@@ -518,17 +517,11 @@ type struct SpecializationPasses {
         const qn: SymbolStr = arena.get_qualified_name(tref);
         if (!qn.is_valid()) { return SymbolStr::empty(); }
         const qs: string = ctx.intern_table.resolve(qn);
-        // Parse (splitting on `::`), not `from_symbol` (which keeps the whole
-        // qualified name as one segment) - we need the enclosing namespace to
-        // match against a module's `namespace_name`.
-        const qname: QualifiedName = QualifiedName::parse(ctx.intern_table, qs);
-        const parent_str: string = qname.display_parent(ctx.intern_table);
-        mut fallback: SymbolStr = SymbolStr::empty();
-        if (parent_str != "") {
-            fallback = ctx.module_graph.source_file_for_owner_key(
-                ctx.intern_table.intern(parent_str), ctx.intern_table);
-        }
-        // A source-declared type: its namespace IS the answer.
+        // The file of the module the type is declared in, as its record holds
+        // it - a monomorph's record holds its template's module.
+        const fallback: SymbolStr = ctx.module_graph.source_file_of(
+            arena.declared_in(t), ctx.intern_table);
+        // A source-declared type: its module IS the answer.
         if (!qs.contains("$")) { return fallback; }
 
         // A monomorph.  Its name only tells us where the TEMPLATE lives; look
@@ -601,7 +594,7 @@ type struct SpecializationPasses {
         if (arg_owner.is_valid()) {
             owner_module_sym = arg_owner;
         } else if (entry.template_module.is_valid() && ctx.module_graph != null) {
-            const owner_path: SymbolStr = ctx.module_graph.source_file_for_owner_key(
+            const owner_path: SymbolStr = ctx.module_graph.source_file_of(
                 entry.template_module, ctx.intern_table);
             if (owner_path.is_valid()) { owner_module_sym = owner_path; }
         }
@@ -816,14 +809,6 @@ type struct SpecializationPasses {
             return;
         }
         const qualified_sym: SymbolStr = ctx.defs.path_of(def);
-        // Use the namespace (not file path) as the module name so that
-        // the monomorphizer's ResolutionContext can qualify type lookups
-        // correctly (e.g., "std::core::option" not "./core/option.cryo").
-        const module_sym: SymbolStr = if (ctx.has_namespace()) {
-            ctx.namespace_str
-        } else {
-            ctx.intern(ctx.source_file)
-        };
         LOG_DEBUG(LogComponent::General, "[TemplateRegistration] Registering %s template '%s'",
             node_kind.to_string(), ctx.resolve_str(name));
 
@@ -850,8 +835,10 @@ type struct SpecializationPasses {
             base_type = ctx.decl_index.type_of_def(def);
         }
 
+        // The module whose scope the template's body resolves in: the unit
+        // writing it.
         const entry: TemplateEntry = TemplateEntry::new(
-            name, qualified_sym, module_sym,
+            name, qualified_sym, ctx.current_module(),
             param_names, param_syms, param_type_ids,
             ast_node, node_kind,
             base_type
@@ -884,11 +871,9 @@ type struct SpecializationPasses {
                                               ctx: CompilationContext*) -> void {
         if (methods.length == 0) { return; }
 
-        const module_sym: SymbolStr = if (ctx.has_namespace()) {
-            ctx.namespace_str
-        } else {
-            ctx.intern(ctx.source_file)
-        };
+        // The module the methods are written in, whose scope their bodies
+        // resolve in - an impl's, which need not be the owner type's.
+        const written_in: ModulePath = ctx.current_module();
 
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
@@ -914,7 +899,7 @@ type struct SpecializationPasses {
             const base_type: TypeRef = arena.create_function_template(qualified_sym);
 
             const entry: TemplateEntry = TemplateEntry::new(
-                m.func.name, qualified_sym, module_sym,
+                m.func.name, qualified_sym, written_in,
                 param_names, param_syms, param_type_ids,
                 m.func as ASTNode*, NodeKind::FunctionDeclaration,
                 base_type

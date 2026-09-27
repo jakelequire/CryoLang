@@ -160,11 +160,11 @@ public:
     const_table: ConstantTable*;
 
     // -- Injected specialization origin tracking --
-    // Maps ASTNode pointer (as u64) -> template module SymbolStr.id.
+    // Maps ASTNode pointer (as u64) -> the module its template is declared in.
     // Populated by GenericExpressionResolution when injecting specialized ASTs;
     // queried by sema to switch to the template's module scope.
     injected_ast_ptrs:    u64[];
-    injected_ast_modules: u32[];
+    injected_ast_modules: ModulePath[];
 
     // -- Language-item references the parser wrote --
     // A desugaring names a language item before any declaration is
@@ -428,20 +428,20 @@ public:
     }
 
     /// Record that an injected AST node came from a specific template module.
-    register_injected_origin(mut &this, node_ptr: u64, module_name: SymbolStr) -> void {
+    register_injected_origin(mut &this, node_ptr: u64, template_module: ModulePath) -> void {
         this.injected_ast_ptrs.push(node_ptr);
-        this.injected_ast_modules.push(module_name.id);
+        this.injected_ast_modules.push(template_module);
     }
 
     /// Look up the template module for an injected AST node.
-    /// Returns empty SymbolStr if the node wasn't injected.
-    lookup_injected_origin(&this, node_ptr: u64) -> SymbolStr {
+    /// Returns no module if the node wasn't injected.
+    lookup_injected_origin(&this, node_ptr: u64) -> ModulePath {
         for (mut i: i64 = 0; i < this.injected_ast_ptrs.length; i++) {
             if (this.injected_ast_ptrs[i] == node_ptr) {
-                return SymbolStr::from_id(this.injected_ast_modules[i]);
+                return this.injected_ast_modules[i];
             }
         }
-        return SymbolStr::empty();
+        return ModulePath::none();
     }
 
 
@@ -669,6 +669,20 @@ public:
     module_of_file(&this, file: string) -> ModulePath {
         if (this.module_graph == null) { return ModulePath::none(); }
         return this.module_graph.module_of_file(file);
+    }
+
+    /// The module this unit's source file declares: what a declaration the
+    /// unit registers - or a synthesizer mints while lowering it - is
+    /// declared in.  None for a unit the graph did not load.
+    current_module(&this) -> ModulePath {
+        return this.module_of_file(this.source_file);
+    }
+
+    /// The module the definition `d` is declared in; none for a definition
+    /// no module the graph holds encloses.
+    declaring_module(&this, d: DefId) -> ModulePath {
+        if (this.module_graph == null) { return ModulePath::none(); }
+        return this.module_graph.declaring_module(d);
     }
 
     decl_fn_key(mut &this, name: SymbolStr, span_file: string) -> SymbolStr {

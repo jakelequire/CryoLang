@@ -7069,7 +7069,6 @@ type struct AsyncLower {
         } else { declared_ref };
 
         const span: SourceSpan = node.span;
-        const module_sym: SymbolStr = this.intern.intern(this.ctx.source_file);
 
         // Absent from the PROGRAM, not merely from this module's imports: the
         // names below are canonical, so the only way they miss is that nothing
@@ -7175,7 +7174,8 @@ type struct AsyncLower {
         // `this.<field>` accesses) and by every caller's return type; its FIELDS
         // are set in `lower`, once the body build has discovered the sub-future
         // and promoted-local inventory.
-        const struct_ref: TypeRef = this.arena.create_struct(q_name, module_sym);
+        const struct_ref: TypeRef = this.arena.create_struct(
+            q_name, this.ctx.declaring_module(fut_def));
 
         mut struct_decl: StructDeclNode* = new StructDeclNode(q_name, span);
         struct_decl.repr_c = false;
@@ -7204,13 +7204,10 @@ type struct AsyncLower {
                 param_syms.push(fut_params[gi].sym_id);
                 param_type_ids.push(param_refs[gi].id);
             }
-            // The NAMESPACE, not the file path: the monomorphizer's resolution
-            // context qualifies type lookups against a template's module name.
-            const tmpl_module: SymbolStr = if (this.ctx.has_namespace()) {
-                this.ctx.namespace_str
-            } else { module_sym };
+            // The unit's module: the monomorphizer resolves the template's
+            // body in its scope.
             this.ctx.generic_registry.register_template(TemplateEntry::new(
-                bare, q_name, tmpl_module, param_names, param_syms, param_type_ids,
+                bare, q_name, this.ctx.current_module(), param_names, param_syms, param_type_ids,
                 struct_decl as ASTNode*, NodeKind::StructDeclaration, struct_ref));
             self_ty = this.ctx.generic_registry.instantiate(struct_ref, &param_refs);
         }
@@ -7346,7 +7343,7 @@ type struct AsyncLower {
         // Repoint callers at the future type.
         node.set_resolved_return_type(self_ty);
         if (owner.method != null) {
-            this.repoint_method(&owner, node, module_sym);
+            this.repoint_method(&owner, node);
             // A method's callers read the NODE, so the future type STAYS on it;
             // `begin_body_check` lends the declared type back for the body walk.
         } else {
@@ -7427,8 +7424,7 @@ type struct AsyncLower {
     /// instance (`ty`) is a type the index never saw.  The stale
     /// Output-return overload is dropped first, or it stays resolvable
     /// beside the new struct-return one.
-    repoint_method(mut &this, owner: AsyncOwner*, node: FunctionDeclNode*,
-                   module_sym: SymbolStr) -> void {
+    repoint_method(mut &this, owner: AsyncOwner*, node: FunctionDeclNode*) -> void {
         this.rebuild_method_info(owner.ty, owner.method, node);
 
         mut arr: MethodNode*[] = [owner.method];

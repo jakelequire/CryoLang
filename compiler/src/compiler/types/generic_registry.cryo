@@ -49,6 +49,8 @@ import compiler::types::arena::{ TypeArena };
 import compiler::types::type_ref::{ TypeRef };
 import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
+import compiler::module_graph;
+import compiler::module_graph::{ ModulePath };
 
 
 // TemplateEntry: Metadata for a single generic declaration
@@ -57,7 +59,9 @@ import std::collections::pair::{ Pair };
 type struct TemplateEntry {
     name:           SymbolStr;           // Unqualified: "Array"
     qualified_name: SymbolStr;             // interned "std::collections::Array"
-    module_name:    SymbolStr;
+    /// The module the template is declared in; none for a unit the module
+    /// graph did not load.
+    declared_in:    ModulePath;
     /// The parameters' spellings, index-aligned with `param_syms` and
     /// `param_type_ids`.  What the arena's parameter types and a display
     /// are minted from; never what a written annotation is matched by.
@@ -81,7 +85,7 @@ type struct TemplateEntry {
     module_disambig: boolean;
 
     /// Create a new template entry.
-    static new(name: SymbolStr, qualified_name: SymbolStr, module_name: SymbolStr,
+    static new(name: SymbolStr, qualified_name: SymbolStr, declared_in: ModulePath,
                param_names: SymbolStr[], param_syms: SymbolID[], param_type_ids: u64[],
                ast_node: ASTNode*, node_kind: NodeKind,
                base_type: TypeRef) -> TemplateEntry {
@@ -89,7 +93,7 @@ type struct TemplateEntry {
         return TemplateEntry {
             name:           name,
             qualified_name: qualified_name,
-            module_name:    module_name,
+            declared_in:    declared_in,
             param_names:    param_names,
             param_syms:     param_syms,
             param_type_ids: param_type_ids,
@@ -108,7 +112,7 @@ type struct TemplateEntry {
     /// owner's leaf into the bare name (`Owner_method`) so two methods with
     /// the same leaf in different owners don't collapse to a single spec
     /// symbol.  Detected by checking whether the qualified name has more
-    /// segments than `module_name + "::" + name` would account for.
+    /// segments than `declared_in + "::" + name` would account for.
     /// The name a specialization of THIS template is registered under: the
     /// template's own module prefix, then the specialization's identifier.
     ///
@@ -131,7 +135,7 @@ type struct TemplateEntry {
 
     spec_base_name(&this, table: InternTable*) -> SymbolStr {
         const qualified_str: string = table.resolve(this.qualified_name);
-        const module_str: string = table.resolve(this.module_name);
+        const module_str: string = table.resolve(this.declared_in.as_sym());
         const name_str: string = table.resolve(this.name);
         const qualified_len: i64 = qualified_str.length() as i64;
         const module_len: i64 = module_str.length() as i64;
@@ -422,7 +426,7 @@ type struct GenericRegistry {
                 if (!this.is_free_function(&this.entries[j], table)) { continue; }
                 if (!this.entries[i].name.equals(this.entries[j].name)) { continue; }
                 // Same leaf, different defining module: flag both.
-                if (!this.entries[i].module_name.equals(this.entries[j].module_name)) {
+                if (!this.entries[i].declared_in.equals(this.entries[j].declared_in)) {
                     this.entries[i].module_disambig = true;
                     this.entries[j].module_disambig = true;
                 }
@@ -435,7 +439,7 @@ type struct GenericRegistry {
     /// method whose qualified name is `module::Owner::name`.
     is_free_function(&this, entry: TemplateEntry*, table: InternTable*) -> boolean {
         const qualified_str: string = table.resolve(entry.qualified_name);
-        const module_str: string = table.resolve(entry.module_name);
+        const module_str: string = table.resolve(entry.declared_in.as_sym());
         const name_str: string = table.resolve(entry.name);
         const module_len: i64 = module_str.length() as i64;
         const name_len: i64 = name_str.length() as i64;
