@@ -589,10 +589,11 @@ endif
 # 5).  Privatization cannot stop a NEW public wrapper and deletion cannot
 # stop a reintroduced helper; only a ratchet catches growth.
 #
-# Needs no compiler, no stdlib and no link: it counts call sites in the
-# source, so it runs on a fresh clone in under a second and has no per-host
-# golden.
-lane-check:
+# Counts the calls the compiler reports (`.facts/compiler.facts`), so the
+# facts are refreshed first when stale: a compiler build and about 80 s, and
+# nothing when they are fresh.  The stores and tables it places are still read
+# from the source's declarations.
+lane-check: facts-fresh
 	@$(PYTHON) scripts/lane-gate.py $(ARGS)
 
 # The gate's own test: every rule driven through a throwaway source tree,

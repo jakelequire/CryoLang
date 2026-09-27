@@ -31,7 +31,8 @@ make verify              # build once; census, examples, lsp, cross, check-fast 
                          # tests/started-compiling (refused before, builds now); one that corrects
                          # a program the baseline built, in tests/started-passing
 make roster-check        # roster golden: 2113 unit + 46 projects + 179 negative
-make lane-check          # resolution-lane surface ratchet; needs NO build
+make lane-check          # resolution-lane surface ratchet; counts the compiler's facts,
+                         # rebuilt first when stale (a compiler build + ~80 s)
 make ns-status-check     # run every check docs/name-resolution.md §0 carries
 make check-fast          # lane + §0 + pin, ~1 min; builds the compiler's facts first when
                          # stale (§0's residue rows count from them). Run before committing.

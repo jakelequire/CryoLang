@@ -351,88 +351,164 @@ def sema_with(extra_lines):
     return src.replace(marker, marker + "".join("        %s\n" % l for l in extra_lines))
 
 
+# The compiler's report of the fixture's calls: one `call` record per call,
+# as `cryo build --emit=facts` writes it - the declaration each call was
+# bound to, as its linker symbol and its rendered text.  The counting rules
+# read only these; the tree above feeds the rules that read declarations.
+SYM = "compiler::resolver::symbol_str::SymbolStr"
+TREF = "compiler::types::type_ref::TypeRef"
+INDEX = "compiler::decl_index::DeclarationIndex"
+FUNNEL = "compiler::sema::type_utils::TypeUtils"
+ARENA = "compiler::types::arena::TypeArena"
+REGISTRY = "compiler::types::generic_registry::GenericRegistry"
+GRAPH = "compiler::module_graph::ModuleGraph"
+CONSTS = "compiler::const_table::ConstantTable"
+RESOLVER = "compiler::resolver::resolver::Resolver"
+CONTEXT = "compiler::compilation_context::CompilationContext"
+SCOPES = "compiler::sema::scope_manager::ScopeManager"
+SEMA_FILE = "compiler/sema/sema.cryo"
+
+
+def _mangled(path):
+    return ".".join("%d%s" % (len(seg), seg) for seg in path.split("::"))
+
+
+def call(rel, line, owner, meth, recv, params, ret="void", pin="call", col=9):
+    """A `call` record for a call to method `meth` of `owner` - `recv` is
+    `read` (`&this`), `write` (`mut &this`) or `static` - or, with `owner`
+    None, to the free function `meth` (a path)."""
+    receiver = {"read": ["&this"], "write": ["mut &this"]}.get(recv, [])
+    if owner is None:
+        text = "%s(%s) -> %s" % (meth, ", ".join(params), ret)
+        symbol = "C$%s$F%s$Rv" % (_mangled(meth), "_".join("N" for _ in params) or "v")
+    else:
+        sep = "::" if recv == "static" else "."
+        text = "%s%s%s(%s) -> %s" % (owner, sep, meth, ", ".join(receiver + params), ret)
+        marker = {"read": "$s", "write": "$m"}.get(recv, "")
+        symbol = "C$%s-%d%s$F%s$Rv" % (_mangled(owner.split("<")[0]), len(meth), meth, marker)
+    if pin == "none":
+        symbol, text = "?", "." + meth
+    return "\t".join(["call", "src/" + rel, str(line), str(col), str(len(params)), "-", "-", "-",
+                      symbol, pin, "-", "-", text, "-", "0"])
+
+
+BASE_FACTS = [
+    call(SEMA_FILE, 7, INDEX, "lookup_type", "read", [SYM], TREF),
+    call(SEMA_FILE, 8, FUNNEL, "lookup_type_exact", "read", [SYM], TREF),
+    call(SEMA_FILE, 9, SCOPES, "lookup_type", "read", [SYM], TREF),
+    call(SEMA_FILE, 10, ARENA, "lookup_by_name", "read", [SYM], TREF),
+    call(SEMA_FILE, 12, ARENA, "get_qualified_name", "read", [TREF], SYM),
+    # A store method whose signature names no key: not counted.
+    call(SEMA_FILE, 13, ARENA, "lookup", "read", ["u64"], "compiler::types::type_base::Type*"),
+    # The funnel's call INTO the index: counted, only a store's own file is not.
+    call("compiler/sema/type_utils.cryo", 5, INDEX, "lookup_type", "read", [SYM], TREF),
+    # The resolver's owners asking it: not re-entries.
+    call("compiler/resolver/name_resolution.cryo", 5, RESOLVER, "lookup", "read",
+         [SYM, "compiler::resolver::scope::ScopeID"], "compiler::resolver::symbol_id::SymbolID"),
+    call("compiler/resolver/name_resolution.cryo", 6, RESOLVER, "set_module", "write", [SYM]),
+    # A store's calls from its own file: not counted, but they reach it.
+    call("compiler/types/generic_registry.cryo", 6, REGISTRY, "get_template", "read", [SYM],
+         "compiler::types::generic_registry::TemplateEntry*"),
+    call("compiler/module_graph.cryo", 6, GRAPH, "find_module_index", "read", [SYM], "i64"),
+    call("compiler/const_table.cryo", 6, CONSTS, "register", "write",
+         [SYM, "compiler::ast::expression::ExpressionNode*"]),
+]
+
+
+def facts_with(extra):
+    return BASE_FACTS + extra
+
+
+# (name, {relpath: content}, facts records or None for BASE_FACTS, expected
+# exit, must-appear-in-output).  Each counting rule has a case that fails when
+# the rule is removed: the key found in a parameter, in a return, inside a
+# generic argument, and not in `String`; the member test; the receiver's kind
+# choosing the row; the three doors; the owner's own file; the same-named
+# method on another type; the unpinned call; the reach control; one call
+# recorded twice; a record from outside the tree; a generic owner.
+COUNT_CASES = [
+    ("a reader keyed by `string` is inside the rule", {},
+     facts_with([call(SEMA_FILE, 20, INDEX, "by_spelling", "read", ["string"], TREF)]),
+     1, "LOOKUP_OTHER TOTAL 0 -> 1"),
+    ("a reader keyed only by what it returns is inside the rule", {},
+     facts_with([call(SEMA_FILE, 20, GRAPH, "name_of", "read", ["u32"], SYM)]),
+     1, "GRAPH_READ TOTAL 0 -> 1"),
+    ("a key inside a generic argument is a key", {},
+     facts_with([call(SEMA_FILE, 20, REGISTRY, "templates_named", "read", ["u32"],
+                      "std::core::option::Option<%s>" % SYM)]),
+     1, "REGISTRY_READ TOTAL 0 -> 1"),
+    ("a `std::collections::string::String` is text, not the key type `string`: accepted", {},
+     facts_with([call(SEMA_FILE, 20, INDEX, "describe", "read", ["std::collections::string::String"])]),
+     0, "lane-gate: OK"),
+    ("a `mut &this` store method lands in the store's WRITE row", {},
+     facts_with([call(SEMA_FILE, 20, CONSTS, "register", "write",
+                      [SYM, "compiler::ast::expression::ExpressionNode*"])]),
+     1, "CONST_WRITE TOTAL 0 -> 1"),
+    ("a static taking a name lands in the store's READ row", {},
+     facts_with([call(SEMA_FILE, 20, INDEX, "parse_key", "static", ["string"], TREF)]),
+     1, "LOOKUP_OTHER TOTAL 0 -> 1"),
+    ("a free function whose path reads like a store's static is not a store call: accepted", {},
+     facts_with([call(SEMA_FILE, 20, None, GRAPH + "::find", "static", ["string"], "i64")]),
+     0, "lane-gate: OK"),
+    ("a per-kind lookup on the index is the LOOKUP row", {},
+     facts_with([call(SEMA_FILE, 20, INDEX, "lookup_func_type", "read", [SYM], TREF)]),
+     1, "LOOKUP TOTAL 2 -> 3"),
+    ("the resolver asked by name outside its owners is a re-entry", {},
+     facts_with([call(SEMA_FILE, 20, RESOLVER, "lookup", "read",
+                      [SYM, "compiler::resolver::scope::ScopeID"], "compiler::resolver::symbol_id::SymbolID")]),
+     1, "REENTRY TOTAL 0 -> 1"),
+    ("get_resolver() outside the driver is a re-entry", {},
+     facts_with([call(SEMA_FILE, 20, CONTEXT, "get_resolver", "read", [], RESOLVER + "*")]),
+     1, "REENTRY TOTAL 0 -> 1"),
+    ("get_resolver() inside the driver is not: accepted", {},
+     facts_with([call("compiler/compilation_context.cryo", 20, CONTEXT, "get_resolver", "read", [],
+                      RESOLVER + "*")]),
+     0, "lane-gate: OK"),
+    ("DefTable::path_of is the identity turned back into a name", {},
+     facts_with([call(SEMA_FILE, 20, "compiler::resolver::res::DefTable", "path_of", "read",
+                      ["compiler::resolver::res::DefId"], SYM)]),
+     1, "DEFID_PATH TOTAL 0 -> 1"),
+    ("a module handed to a resolution context is a home write", {},
+     facts_with([call(SEMA_FILE, 20, "compiler::types::resolver::ResolutionContext", "set_home_module",
+                      "write", [SYM])]),
+     1, "HOME_WRITE TOTAL 0 -> 1"),
+    ("a store's own calls are not the surface: accepted", {},
+     facts_with([call("compiler/decl_index.cryo", 20, INDEX, "lookup_type", "read", [SYM], TREF)]),
+     0, "lane-gate: OK"),
+    ("a same-named method on another type is LOOKUP_LOCAL", {},
+     facts_with([call(SEMA_FILE, 20, "compiler::sema::sema::Sema", "get_template", "read", [SYM])]),
+     1, "LOOKUP_LOCAL TOTAL 1 -> 2"),
+    ("a method on another type named like no store method is not counted: accepted", {},
+     facts_with([call(SEMA_FILE, 20, "compiler::sema::sema::Sema", "walk", "read", [SYM])]),
+     0, "lane-gate: OK"),
+    ("a decrease is refused too (the ceiling must be re-pinned deliberately)", {},
+     [r for r in BASE_FACTS if "\t7\t9\t" not in r],
+     1, "LOOKUP TOTAL 2 -> 1"),
+    ("a call the compiler left unpinned, spelled like a counted method, is refused", {},
+     facts_with([call(SEMA_FILE, 20, None, "lookup_type", "read", [SYM], pin="none")]),
+     1, "left unpinned"),
+    ("an unpinned call spelled like nothing counted is not a store call: accepted", {},
+     facts_with([call(SEMA_FILE, 20, None, "push", "read", ["T"], pin="none")]),
+     0, "lane-gate: OK"),
+    ("a store no call reaches is refused: the reader cannot place calls on it", {},
+     [r for r in BASE_FACTS if "const_table" not in r],
+     1, "reaches ConstantTable"),
+    ("one call recorded twice at one site is one call: accepted", {},
+     facts_with([BASE_FACTS[0]]),
+     0, "lane-gate: OK"),
+    ("a call from outside the tree is not counted: accepted", {},
+     facts_with([BASE_FACTS[0].replace("src/compiler/sema/sema.cryo", "<stdlib>/core/str.cryo")]),
+     0, "lane-gate: OK"),
+    ("a generic owner's rendered arguments do not hide the store", {},
+     facts_with([call(SEMA_FILE, 20, GRAPH + "<T>", "find_module_index", "read", [SYM], "i64")]),
+     1, "GRAPH_READ TOTAL 0 -> 1"),
+    ("a record of another shape is refused: the reader and the format disagree", {},
+     facts_with(["call\tsrc/compiler/sema/sema.cryo\t20\t9"]),
+     1, "a record with 4 fields, not 15"),
+]
+
 # (name, {relpath: content or None to delete}, expected exit, must-appear-in-output)
 MUTATIONS = [
-    ("cross-file implement block declares a reader; its call is counted",
-     {"compiler/types/registry_ext.cryo":
-          "implement struct GenericRegistry {\n"
-          "    probe(&this, name: SymbolStr) -> i64 { return 0; }\n"
-          "}\n",
-      "compiler/sema/sema.cryo": sema_with(["this.ctx.generic_registry.probe(name);"])},
-     1, "REGISTRY_READ TOTAL 0 -> 1"),
-    ("a reader keyed by `string` is inside the rule",
-     {"compiler/decl_index.cryo":
-          FILES["compiler/decl_index.cryo"].replace(
-              "    entry_at(",
-              "    by_spelling(&this, name: string) -> TypeRef { return this.entries[0]; }\n"
-              "    entry_at("),
-      "compiler/sema/sema.cryo": sema_with(['this.ctx.decl_index.by_spelling("x");'])},
-     1, "LOOKUP_OTHER TOTAL 0 -> 1"),
-    ("a reader on another store (the module graph) has a row",
-     {"compiler/sema/sema.cryo": sema_with(["this.ctx.module_graph.find_module_index(name);"])},
-     1, "GRAPH_READ TOTAL 0 -> 1"),
-    ("a name-keyed write on another store (the constant table) has a row",
-     {"compiler/sema/sema.cryo": sema_with(["this.ctx.const_table.register(name, null);"])},
-     1, "CONST_WRITE TOTAL 0 -> 1"),
-    ("a write declared in a cross-file implement block lands in the WRITE row",
-     {"compiler/graph_ext.cryo":
-          "implement ModuleGraph {\n"
-          "    note(mut &this, name: SymbolStr) -> void {}\n"
-          "}\n",
-      "compiler/sema/sema.cryo": sema_with(["this.ctx.module_graph.note(name);"])},
-     1, "GRAPH_WRITE TOTAL 0 -> 1"),
-    ("the resolver asked by name outside its owners is a re-entry",
-     {"compiler/sema/sema.cryo": sema_with(["this.ctx.resolver.lookup(name, ScopeID::root());"])},
-     1, "REENTRY TOTAL 0 -> 1"),
-    ("get_resolver() and an ask through the accessor's return type are two re-entries",
-     {"compiler/sema/sema.cryo": sema_with(["this.ctx.get_resolver().lookup(name, ScopeID::root());"])},
-     1, "REENTRY TOTAL 0 -> 2"),
-    ("a store reached through a local under a new spelling is placed by its annotation",
-     {"compiler/sema/sema.cryo": sema_with(["const idx: DeclarationIndex* = this.ctx.decl_index;",
-                                            "idx.lookup_func_type(name);"])},
-     1, "LOOKUP TOTAL 2 -> 3"),
-    ("a store reached through a zero-argument accessor is placed by its return type",
-     {"compiler/sema/sema.cryo": sema_with(["this.ctx.get_arena().get_qualified_name(t);"])},
-     1, "ARENA_READ TOTAL 2 -> 3"),
-    ("a store reached through an indexed field is placed by the element type",
-     {"compiler/sema/sema.cryo": sema_with(["this.ctx.module_graph.modules[0].graph.find_module_index(name);"]),
-      "compiler/module_info.cryo":
-          "type struct ModuleInfo {\n"
-          "    graph: ModuleGraph*;\n"
-          "}\n"},
-     1, "GRAPH_READ TOTAL 0 -> 1"),
-    ("a receiver whose type cannot be read is refused, not dropped",
-     {"compiler/sema/sema.cryo": sema_with(["const g = mystery();", "g.get_template(name);"])},
-     1, "could not be placed by receiver"),
-    ("a call on something other than a dotted receiver is refused",
-     {"compiler/sema/sema.cryo": sema_with(["(this.ctx.decl_index).lookup_func_type(name);"])},
-     1, "could not be placed by receiver"),
-    ("a cast receiver is placed by the type the cast names",
-     {"compiler/sema/sema.cryo": sema_with(["(this.ctx.something as DeclarationIndex*).lookup_func_type(name);"])},
-     1, "LOOKUP TOTAL 2 -> 3"),
-    ("a cast whose operand carries parentheses is refused, not guessed",
-     {"compiler/sema/sema.cryo": sema_with(["(this.ctx.get_arena() as DeclarationIndex*).lookup_func_type(name);"])},
-     1, "could not be placed by receiver"),
-    ("a decrease is refused too (the ceiling must be re-pinned deliberately)",
-     {"compiler/sema/sema.cryo": FILES["compiler/sema/sema.cryo"].replace(
-          "        this.ctx.decl_index.lookup_type(name);\n", "")},
-     1, "LOOKUP TOTAL 2 -> 1"),
-    ("a commented-out call is not counted (uncommenting it is)",
-     {"compiler/sema/sema.cryo": FILES["compiler/sema/sema.cryo"].replace(
-          "        // this.ctx.decl_index.lookup_func_type(name);\n",
-          "        this.ctx.decl_index.lookup_func_type(name);\n")},
-     1, "LOOKUP TOTAL 2 -> 3"),
-    ("a store's own calls are not the surface",
-     {"compiler/decl_index.cryo": FILES["compiler/decl_index.cryo"].replace(
-          "    entry_at(&this, i: i64) -> TypeRef { return this.entries[i]; }",
-          "    entry_at(&this, i: i64) -> TypeRef { return this.lookup_type(this.names[i]); }")},
-     0, "lane-gate: OK"),
-    ("a store with no name-keyed method is an unmeasured tree, refused",
-     {"compiler/module_graph.cryo":
-          FILES["compiler/module_graph.cryo"].replace(
-              "    find_module_index(&this, name: SymbolStr) -> i64 { return -1; }\n",
-              "    count(&this) -> i64 { return 0; }\n", 1)},
-     1, "declares no method whose signature mentions"),
     ("a missing store definition is refused",
      {"compiler/const_table.cryo": None},
      1, "no compiler/const_table.cryo"),
@@ -693,8 +769,15 @@ def write_tree(base, files):
             fh.write(content)
 
 
-def run_gate(src, golden, *extra):
-    p = subprocess.run([sys.executable, GATE, "--src", src, "--golden", golden] + list(extra),
+def write_facts(path, records):
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        for r in records:
+            fh.write(r + "\n")
+
+
+def run_gate(src, golden, facts, *extra):
+    p = subprocess.run([sys.executable, GATE, "--src", src, "--golden", golden, "--facts", facts]
+                       + list(extra),
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     return p.returncode, p.stdout
 
@@ -705,52 +788,59 @@ def main():
     try:
         base = os.path.join(work, "base")
         golden = os.path.join(work, "golden.txt")
+        facts = os.path.join(work, "base.facts")
         write_tree(base, FILES)
+        write_facts(facts, BASE_FACTS)
 
-        # The baseline: --update pins exactly the numbers the tree was
+        # The baseline: --update pins exactly the numbers the facts were
         # written to produce, and the gate then reads OK against them.
-        code, out = run_gate(base, golden, "--update")
+        code, out = run_gate(base, golden, facts, "--update")
         if code != 0:
             failures.append("baseline --update exited %d:\n%s" % (code, out))
         for kind, n in BASELINE.items():
             want = "%s = %d" % (kind, n)
             if want not in out:
                 failures.append("baseline: expected `%s` in --update output:\n%s" % (want, out))
-        code, out = run_gate(base, golden)
+        code, out = run_gate(base, golden, facts)
         if code != 0 or "lane-gate: OK" not in out:
             failures.append("baseline: gate did not read OK against its own golden:\n%s" % out)
-        code, out = run_gate(base, golden, "--names")
-        if "GenericRegistry (2):" not in out or "ModuleGraph (1):" not in out:
-            failures.append("--names did not list the stores' sets:\n%s" % out)
-        code, out = run_gate(base, os.path.join(work, "absent.txt"))
+        # --names lists each store's methods that calls reach, with the
+        # receiver's kind, so what the rule swept up can be read.
+        code, out = run_gate(base, golden, facts, "--names")
+        for want in ("GenericRegistry (1):", "ModuleGraph (1):", "write  register", "read   get_qualified_name"):
+            if want not in out:
+                failures.append("--names did not list `%s`:\n%s" % (want, out))
+        code, out = run_gate(base, os.path.join(work, "absent.txt"), facts)
         if code != 1 or "no golden" not in out:
             failures.append("a missing golden must be refused:\n%s" % out)
-        # `--row` and `--rows` read the tree, never the golden: they answer
+        code, out = run_gate(base, golden, os.path.join(work, "absent.facts"))
+        if code != 1 or "no facts at" not in out:
+            failures.append("missing facts must be refused:\n%s" % out)
+        # `--row` and `--rows` read the facts, never the golden: they answer
         # with no golden at all, and a bucket the gate does not count is refused.
-        code, out = run_gate(base, os.path.join(work, "absent.txt"), "--row", "LOOKUP")
+        code, out = run_gate(base, os.path.join(work, "absent.txt"), facts, "--row", "LOOKUP")
         if code != 0 or out.strip() != "2":
             failures.append("--row LOOKUP must print the live total 2 with no golden:\n%s" % out)
-        code, out = run_gate(base, os.path.join(work, "absent.txt"), "--rows")
+        code, out = run_gate(base, os.path.join(work, "absent.txt"), facts, "--rows")
         if code != 0 or out.strip() != str(len(BASELINE)):
             failures.append("--rows must print %d:\n%s" % (len(BASELINE), out))
-        code, out = run_gate(base, golden, "--row", "NO_SUCH_ROW")
+        code, out = run_gate(base, golden, facts, "--row", "NO_SUCH_ROW")
         if code != 1 or "no bucket named NO_SUCH_ROW" not in out:
             failures.append("--row of an unknown bucket must be refused:\n%s" % out)
 
-        for i, (name, edits, want_code, want_text) in enumerate(MUTATIONS):
+        cases = [(n, e, None, c, t) for n, e, c, t in MUTATIONS] + COUNT_CASES
+        for i, (name, edits, records, want_code, want_text) in enumerate(cases):
             tree = os.path.join(work, "m%d" % i)
             shutil.copytree(base, tree)
             write_tree(tree, edits)
-            code, out = run_gate(tree, golden)
+            case_facts = facts
+            if records is not None:
+                case_facts = os.path.join(work, "m%d.facts" % i)
+                write_facts(case_facts, records)
+            code, out = run_gate(tree, golden, case_facts)
             if code != want_code or want_text not in out:
-                failures.append("mutation %d (%s): expected exit %d with `%s`, got exit %d:\n%s"
+                failures.append("case %d (%s): expected exit %d with `%s`, got exit %d:\n%s"
                                 % (i, name, want_code, want_text, code, out))
-            elif i == 0:
-                # The cross-file reader must also be visible in --names, so
-                # what the rule swept up can be read rather than inferred.
-                _c, names = run_gate(tree, golden, "--names")
-                if "read   probe" not in names:
-                    failures.append("mutation 0: --names does not list the implement-block reader:\n%s" % names)
 
         # The golden's side: a section the gate does not count (a retired
         # bucket left behind) is refused, not read past.  The tree is the
@@ -760,7 +850,7 @@ def main():
             text = fh.read()
         with open(stale, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text + "\n[RETIRED_ROW]\nTOTAL 0\n\n")
-        code, out = run_gate(base, stale)
+        code, out = run_gate(base, stale, facts)
         if code != 1 or "RETIRED_ROW: golden carries a section this gate does not count" not in out:
             failures.append("a golden section the gate does not count must be refused:\n%s" % out)
     finally:
@@ -771,7 +861,8 @@ def main():
         for f in failures:
             sys.stderr.write(f + "\n\n")
         return 1
-    print("lane-gate-selftest: OK -- baseline accepted, %d mutations behaved, a stale golden section refused" % len(MUTATIONS))
+    print("lane-gate-selftest: OK -- baseline accepted, %d tree mutations and %d facts cases behaved, "
+          "a stale golden section refused" % (len(MUTATIONS), len(COUNT_CASES)))
     return 0
 
 
