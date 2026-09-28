@@ -51,14 +51,36 @@
 /// enclose the record: with a local's own depth it tells an element bound
 /// inside the innermost loop - the array the loop searches - from one bound
 /// outside it, the source of the key searched for.
+///
+/// The same file carries one record per DECLARATION a module makes, in the
+/// same fifteen columns, written by the same check after it has walked the
+/// module's bodies: what a type, a field or a signature is, as resolution
+/// decided it.
+///
+///     type   file line col  fields  -       visibility  kind  -       -    ...  path   -             0
+///     field  file line col  index   type    visibility  -     -       key  ...  owner  name          0
+///     fn     file line col  params  return  visibility  role  symbol  -    ...  owner  name          0
+///     param  file line col  index   type    visibility  role  symbol  key  ...  owner  fn:parameter  0
+///
+/// (`callee-decl` and `enclosing` are `-`.)  `kind` is `struct`, `union`,
+/// `class`, `enum` or `trait`; `role` is `free`, `method`, `static`,
+/// `constructor` or `destructor`; `params` and a parameter's `index` do not
+/// count a receiver, which has no record.  `path` and `owner` are
+/// definition paths - a function's owner is its type, or its module when it
+/// is free.  `key` is the key the declared type carries (`string`,
+/// `SymbolStr`, `QualifiedName`, `ModulePath`) by value, by reference or as
+/// an array, or `-`; `?` stands for what resolution left unanswered.
 
 namespace compiler::sema::call_facts;
 
 import compiler::ast;
 import compiler::ast::{ LiteralKind, NodeKind };
-import compiler::ast::node::{ ASTNode };
+import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::lex::{ TokenType };
-import compiler::ast::declaration::{ FunctionDeclNode, MethodNode, VarDeclNode };
+import compiler::ast::declaration::{
+    ClassDeclNode, EnumDeclNode, FieldDeclNode, FunctionDeclNode, ImplBlockNode, MethodNode,
+    StructDeclNode, TraitDeclNode, UnionDeclNode, VarDeclNode
+};
 import compiler::ast::expression::{
     ArrayAccessNode, BinaryExprNode, CallExprNode, CalleePin, CastExprNode, ExpressionNode,
     IdentifierNode, LiteralNode, MemberAccessNode, ScopeResolutionNode, UnaryExprNode
@@ -386,11 +408,18 @@ type struct CallFacts {
     /// rule of the language: in a program that declares none of them, only
     /// `string` qualifies.
     static carries_key(ctx: CompilationContext*, arena: TypeArena*, t: TypeRef) -> boolean {
+        return CallFacts::key_of(ctx, arena, t).length() > 0;
+    }
+
+    /// The key a value of type `t` carries, as a declaration record prints
+    /// it - `string`, `SymbolStr`, `QualifiedName` or `ModulePath` - or ""
+    /// when it carries none; `carries_key` is this test.
+    static key_of(ctx: CompilationContext*, arena: TypeArena*, t: TypeRef) -> string {
         mut cur: TypeRef = t;
         for (mut depth: i32 = 0; depth < 8; depth++) {
-            if (!cur.is_valid()) { return false; }
+            if (!cur.is_valid()) { return ""; }
             const ty: Type* = arena.lookup(cur);
-            if (ty == null) { return false; }
+            if (ty == null) { return ""; }
             if (ty.kind == TypeKind::Reference) {
                 cur = (ty as ReferenceType*).referent;
                 continue;
@@ -399,16 +428,180 @@ type struct CallFacts {
                 cur = (ty as ArrayType*).element;
                 continue;
             }
-            if (ty.kind == TypeKind::String) { return true; }
-            if (ty.kind != TypeKind::Struct) { return false; }
+            if (ty.kind == TypeKind::String) { return "string"; }
+            if (ty.kind != TypeKind::Struct) { return ""; }
             const d: DefId = ctx.decl_index.registered_def(cur);
-            if (!d.is_valid()) { return false; }
+            if (!d.is_valid()) { return ""; }
             const path: string = CallFacts::def_text(ctx, d);
-            return path == "compiler::resolver::symbol_str::SymbolStr"
-                || path == "compiler::resolver::qualified_name::QualifiedName"
-                || path == "compiler::module_graph::ModulePath";
+            if (path == "compiler::resolver::symbol_str::SymbolStr") { return "SymbolStr"; }
+            if (path == "compiler::resolver::qualified_name::QualifiedName") { return "QualifiedName"; }
+            if (path == "compiler::module_graph::ModulePath") { return "ModulePath"; }
+            return "";
         }
-        return false;
+        return "";
+    }
+
+    // Declarations.  One record per type, field, function and parameter a
+    // module declares, written by the same check as the call records, so a
+    // reader asks the compiler what a declaration IS - its path, each
+    // member's resolved type and visibility, each signature - instead of
+    // reading its source (the header lists the columns).
+
+    /// Record every declaration `root` makes.  The walk is the spelling
+    /// lint's: top-level functions, and the methods of structs, unions,
+    /// classes and `implement` blocks, plus each type's own record and
+    /// fields and a trait's required methods.
+    static record_declarations(ctx: CompilationContext*, arena: TypeArena*, root: ProgramNode*) -> void {
+        if (root == null) { return; }
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            if (stmt.kind == NodeKind::FunctionDeclaration) {
+                const fd: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                const vis: string = if (fd.is_public) { "public" } else { "private" };
+                mut module_path: string = "?";
+                if (fd.def.is_valid()) { module_path = CallFacts::decl_path(ctx, ctx.defs.parent_of(fd.def)); }
+                CallFacts::record_function(ctx, arena, fd, stmt.span, Text::new(module_path),
+                                           Text::new("free"), Text::new(vis));
+            } else if (stmt.kind == NodeKind::StructDeclaration) {
+                const sd: StructDeclNode* = stmt as StructDeclNode*;
+                CallFacts::record_type(ctx, arena, stmt, sd.def, Text::new("struct"), sd.is_public, &sd.fields);
+                CallFacts::record_methods(ctx, arena, &sd.methods, Text::new(CallFacts::decl_path(ctx, sd.def)));
+            } else if (stmt.kind == NodeKind::UnionDeclaration) {
+                const ud: UnionDeclNode* = stmt as UnionDeclNode*;
+                CallFacts::record_type(ctx, arena, stmt, ud.def, Text::new("union"), ud.is_public, &ud.fields);
+                CallFacts::record_methods(ctx, arena, &ud.methods, Text::new(CallFacts::decl_path(ctx, ud.def)));
+            } else if (stmt.kind == NodeKind::ClassDeclaration) {
+                const cd: ClassDeclNode* = stmt as ClassDeclNode*;
+                CallFacts::record_type(ctx, arena, stmt, cd.def, Text::new("class"), cd.is_public, &cd.fields);
+                CallFacts::record_methods(ctx, arena, &cd.methods, Text::new(CallFacts::decl_path(ctx, cd.def)));
+            } else if (stmt.kind == NodeKind::EnumDeclaration) {
+                const ed: EnumDeclNode* = stmt as EnumDeclNode*;
+                const none: FieldDeclNode*[] = [];
+                CallFacts::record_type(ctx, arena, stmt, ed.def, Text::new("enum"), ed.is_public, &none);
+            } else if (stmt.kind == NodeKind::TraitDeclaration) {
+                const td: TraitDeclNode* = stmt as TraitDeclNode*;
+                const none: FieldDeclNode*[] = [];
+                CallFacts::record_type(ctx, arena, stmt, td.def, Text::new("trait"), true, &none);
+                const trait_path: string = CallFacts::decl_path(ctx, td.def);
+                for (mut k: i64 = 0; k < td.methods.length; k++) {
+                    const tf: FunctionDeclNode* = td.methods[k];
+                    if (tf == null) { continue; }
+                    const role: string = if (tf.is_static) { "static" } else { "method" };
+                    CallFacts::record_function(ctx, arena, tf, (tf as ASTNode*).span, Text::new(trait_path),
+                                               Text::new(role), Text::new("public"));
+                }
+            } else if (stmt.kind == NodeKind::ImplementationBlock) {
+                const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+                CallFacts::record_methods(ctx, arena, &ib.methods, Text::new(CallFacts::impl_target_text(ctx, ib)));
+            }
+        }
+    }
+
+    /// A type's own record, then one per field in declaration order.
+    static record_type(ctx: CompilationContext*, arena: TypeArena*, node: ASTNode*, def: DefId,
+                       kind_text: Text, is_public: boolean, fields: &FieldDeclNode*[]) -> void {
+        const owner: string = CallFacts::decl_path(ctx, def);
+        const vis: string = if (is_public) { "public" } else { "private" };
+        ctx.facts.push("type\t" + CallFacts::site_of(ctx, node.span) + "\t"
+            + fmt::format("%lld", fields.length) + "\t-\t" + vis + "\t" + kind_text.as_string()
+            + "\t-\t-\t-\t-\t" + owner + "\t-\t0");
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            const f: FieldDeclNode* = fields[i];
+            if (f == null) { continue; }
+            ctx.facts.push("field\t" + CallFacts::site_of(ctx, (f as ASTNode*).span) + "\t"
+                + fmt::format("%lld", i) + "\t" + CallFacts::declared_type_text(arena, f.resolved_type)
+                + "\t" + f.visibility.label() + "\t-\t-\t"
+                + CallFacts::key_text(ctx, arena, f.resolved_type) + "\t-\t-\t" + owner + "\t"
+                + ctx.intern_table.resolve(f.name) + "\t0");
+        }
+    }
+
+    /// The type an `implement` block's head was resolved to: its definition's
+    /// path, a primitive's own name, `?` when the head is unanswered.
+    static impl_target_text(ctx: CompilationContext*, ib: ImplBlockNode*) -> string {
+        match (ib.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(d)     => { return CallFacts::decl_path(ctx, d); }
+                    Res::PrimTy(p)  => { return ctx.intern_table.resolve(p); }
+                    _               => { }
+                }
+            }
+            _ => { }
+        }
+        return "?";
+    }
+
+    /// Each method's record, under `owner_text`, the path of the type the
+    /// block declares them on; a method cloned from a trait's default body
+    /// is the trait's declaration, recorded there, and is skipped.
+    static record_methods(ctx: CompilationContext*, arena: TypeArena*, methods: &MethodNode*[],
+                          owner_text: Text) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null || m.func.is_synth_default) { continue; }
+            mut role: string = "method";
+            if (m.is_constructor) {
+                role = "constructor";
+            } else if (m.is_destructor) {
+                role = "destructor";
+            } else if (m.is_static || m.func.is_static) {
+                role = "static";
+            }
+            CallFacts::record_function(ctx, arena, m.func, (m as ASTNode*).span, owner_text,
+                                       Text::new(role), Text::new(m.visibility.label()));
+        }
+    }
+
+    /// A function's record - its parameter count (the receiver not counted),
+    /// return type, visibility, role and linker symbol - then one per
+    /// parameter other than the receiver.
+    static record_function(ctx: CompilationContext*, arena: TypeArena*, f: FunctionDeclNode*,
+                           span: SourceSpan, owner_text: Text, role_text: Text, vis_text: Text) -> void {
+        const owner: string = owner_text.as_string();
+        const role: string = role_text.as_string();
+        const vis: string = vis_text.as_string();
+        mut params: VarDeclNode*[] = [];
+        for (mut i: i64 = 0; i < f.parameters.length; i++) {
+            const p: VarDeclNode* = f.parameters[i];
+            if (p != null && !p.is_receiver()) { params.push(p); }
+        }
+        mut symbol: string = "?";
+        if (f.overload_entry.is_valid()) { symbol = CallFacts::symbol_text(ctx, f.overload_entry); }
+        const name: string = ctx.intern_table.resolve(f.name);
+        ctx.facts.push("fn\t" + CallFacts::site_of(ctx, span) + "\t"
+            + fmt::format("%lld", params.length) + "\t"
+            + CallFacts::declared_type_text(arena, f.resolved_return_type) + "\t" + vis + "\t" + role
+            + "\t" + symbol + "\t-\t-\t-\t" + owner + "\t" + name + "\t0");
+        for (mut i: i64 = 0; i < params.length; i++) {
+            const p: VarDeclNode* = params[i];
+            ctx.facts.push("param\t" + CallFacts::site_of(ctx, (p as ASTNode*).span) + "\t"
+                + fmt::format("%lld", i) + "\t" + CallFacts::declared_type_text(arena, p.resolved_type)
+                + "\t" + vis + "\t" + role + "\t" + symbol + "\t"
+                + CallFacts::key_text(ctx, arena, p.resolved_type) + "\t-\t-\t" + owner + "\t"
+                + name + ":" + ctx.intern_table.resolve(p.name) + "\t0");
+        }
+    }
+
+    /// A declaration's path, or `?` for one registered under no definition.
+    static decl_path(ctx: CompilationContext*, d: DefId) -> string {
+        if (!d.is_valid()) { return "?"; }
+        return CallFacts::def_text(ctx, d);
+    }
+
+    /// A declared type as a record prints it, `?` when resolution left none.
+    static declared_type_text(arena: TypeArena*, t: TypeRef) -> string {
+        if (!t.is_valid()) { return "?"; }
+        return CallFacts::type_text(arena, t);
+    }
+
+    /// The key column of a field or parameter record: the key its type
+    /// carries, `-` for none.
+    static key_text(ctx: CompilationContext*, arena: TypeArena*, t: TypeRef) -> string {
+        const k: string = CallFacts::key_of(ctx, arena, t);
+        if (k.length() == 0) { return "-"; }
+        return k;
     }
 
     /// Where `e`'s value comes from (the table in this module's header).

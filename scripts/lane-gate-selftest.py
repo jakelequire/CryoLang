@@ -317,24 +317,32 @@ for _label, _sc in sorted(GATE_MOD.SCANNED_ARRAYS.items()):
     else:
         FILES[_sc.defn] = _existing + _ohead + "    %s: %s[];\n}\n" % (_field, _decl)
 
-# One stub per SEALED type, private field and all, in the file the gate's
-# table names; the first one is the sealed-type mutations' subject.
-def _sealed_block(name):
-    return "type struct %s {\nprivate:\n    slot: u32;\n}\n" % name
+# The sealed-type check reads the compiler's declaration records, so each
+# SEALED type is declared in the base facts: its `type` record and one private
+# field.  The first one is the sealed-type cases' subject.
+SEALED_FILE = "src/compiler/sealed.cryo"
 
 
-for _name, (_defn, _reason) in sorted(GATE_MOD.SEALED_TYPES.items()):
-    _existing = FILES.get(_defn, "")
-    _head = "type struct %s {\n" % _name
-    if _head in _existing:
-        # A stub of that name is already there (a sealed type that is also an
-        # array exclusion, `DefTable`): it gains the private field rather than
-        # a twin, which the sealed check would read first.
-        FILES[_defn] = _existing.replace(_head, _head + "private:\n    slot: u32;\n", 1)
-    else:
-        FILES[_defn] = _existing + _sealed_block(_name)
+def type_rec(path, line):
+    return "\t".join(["type", SEALED_FILE, str(line), "1", "1", "-", "public", "struct",
+                      "-", "-", "-", "-", path, "-", "0"])
+
+
+def field_rec(path, line, vis="private"):
+    return "\t".join(["field", SEALED_FILE, str(line), "5", "0", "u32", vis, "-",
+                      "-", "-", "-", "-", path, "slot", "0"])
+
+
+def fn_rec(path, name, params, ret, vis="public", role="static", rel=SEALED_FILE, line=90):
+    return "\t".join(["fn", rel, str(line), "5", str(params), ret, vis, role,
+                      "C$sym", "-", "-", "-", path, name, "0"])
+
+
+SEALED_FACTS = []
+for _i, _path in enumerate(sorted(GATE_MOD.SEALED_TYPES)):
+    SEALED_FACTS += [type_rec(_path, 10 * _i + 1), field_rec(_path, 10 * _i + 3)]
 FIRST_SEALED = sorted(GATE_MOD.SEALED_TYPES)[0]
-_SEALED_DEFN = GATE_MOD.SEALED_TYPES[FIRST_SEALED][0]
+FIRST_STORE = sorted(GATE_MOD.SEALED_STORES)[0]
 
 # The first scanned array in the gate's table held by a declared owner whose
 # element is a record, for the stale-entry, element, file and derived-class
@@ -438,7 +446,7 @@ BASE_FACTS = [
     call("compiler/module_graph.cryo", 6, GRAPH, "find_module_index", "read", [SYM], "i64"),
     call("compiler/const_table.cryo", 6, CONSTS, "register", "write",
          [SYM, "compiler::ast::expression::ExpressionNode*"]),
-] + SCAN_FACTS
+] + SCAN_FACTS + SEALED_FACTS
 
 
 def facts_without(record):
@@ -776,36 +784,39 @@ MUTATIONS = [
               "type struct %s {\n    names: SymbolStr[];\n    by_id: HashMap<u32, i64>;\n" % FIRST_ARRAY_EXCLUDED, 1)},
      1, "`%s` (%s) owns a map (by_id: HashMap<u32>) and is in neither STORES nor EXCLUDED"
         % (FIRST_ARRAY_EXCLUDED, GATE_MOD.EXCLUDED_ARRAYS[FIRST_ARRAY_EXCLUDED].defn)),
-    ("a sealed identity type whose private label is dropped - every field public - is refused",
-     {_SEALED_DEFN: FILES[_SEALED_DEFN].replace(
-         _sealed_block(FIRST_SEALED), _sealed_block(FIRST_SEALED).replace("private:\n", ""), 1)},
-     1, "`%s` (%s) has no private field" % (FIRST_SEALED, _SEALED_DEFN)),
-    ("the same field made private inline instead of under a label is accepted",
-     {_SEALED_DEFN: FILES[_SEALED_DEFN].replace(
-         _sealed_block(FIRST_SEALED), "type struct %s {\n    private slot: u32;\n}\n" % FIRST_SEALED, 1)},
-     0, "lane-gate: OK"),
+]
+
+
+def _sealed_facts(drop=None, add=()):
+    return [r for r in BASE_FACTS if r != drop] + list(add)
+
+
+# The sealed-type check, over the compiler's declaration records.  Each case
+# is a record set; the tree is the base.  The implement-block case is the
+# shape the source-reading check could not see: it read only the type's own
+# block.
+SEALED_CASES = [
+    ("a sealed identity type whose field is public - no private field left - is refused",
+     {}, _sealed_facts(field_rec(FIRST_SEALED, 3), [field_rec(FIRST_SEALED, 3, vis="public")]),
+     1, "`%s` (%s:1) has no private field" % (FIRST_SEALED, SEALED_FILE)),
     ("a sealed identity type publishing a static that builds one from an argument is refused",
-     {_SEALED_DEFN: FILES[_SEALED_DEFN].replace(
-         _sealed_block(FIRST_SEALED), _sealed_block(FIRST_SEALED).replace(
-             "}\n", "public:\n    static make(slot: u32) -> %s {\n        return %s { slot: slot };\n    }\n}\n"
-             % (FIRST_SEALED, FIRST_SEALED), 1), 1)},
-     1, "`%s` (%s) has a public `static make(slot: u32)` returning it" % (FIRST_SEALED, _SEALED_DEFN)),
-    ("the same mint written over two lines is refused",
-     {_SEALED_DEFN: FILES[_SEALED_DEFN].replace(
-         _sealed_block(FIRST_SEALED), _sealed_block(FIRST_SEALED).replace(
-             "}\n", "public:\n    static make(\n        slot: u32) -> %s {\n        return %s { slot: slot };\n    }\n}\n"
-             % (FIRST_SEALED, FIRST_SEALED), 1), 1)},
-     1, "has a public `static make(slot: u32)` returning it"),
-    ("the same static left private, or a public one taking no argument, is accepted",
-     {_SEALED_DEFN: FILES[_SEALED_DEFN].replace(
-         _sealed_block(FIRST_SEALED), _sealed_block(FIRST_SEALED).replace(
-             "}\n", "    static make(slot: u32) -> %s {\n        return %s { slot: slot };\n    }\n"
-             "public:\n    static none() -> %s {\n        return %s { slot: 0 };\n    }\n}\n"
-             % (FIRST_SEALED, FIRST_SEALED, FIRST_SEALED, FIRST_SEALED), 1), 1)},
+     {}, _sealed_facts(add=[fn_rec(FIRST_SEALED, "make", 1, FIRST_SEALED)]),
+     1, "has a public static `make (%s:90)` taking an argument and returning it" % SEALED_FILE),
+    ("the same static declared in an `implement` block in another file is refused",
+     {}, _sealed_facts(add=[fn_rec(FIRST_SEALED, "make", 1, FIRST_SEALED, rel="src/compiler/elsewhere.cryo")]),
+     1, "has a public static `make (src/compiler/elsewhere.cryo:90)`"),
+    ("a private minting static, a public one taking no argument, one returning another type and a method are accepted",
+     {}, _sealed_facts(add=[fn_rec(FIRST_SEALED, "make", 1, FIRST_SEALED, vis="private"),
+                            fn_rec(FIRST_SEALED, "none", 0, FIRST_SEALED),
+                            fn_rec(FIRST_SEALED, "slot_of", 1, "u32"),
+                            fn_rec(FIRST_SEALED, "with_slot", 1, FIRST_SEALED, role="method")]),
      0, "lane-gate: OK"),
-    ("a sealed-type entry whose type is no longer declared is stale, refused",
-     {_SEALED_DEFN: FILES[_SEALED_DEFN].replace(_sealed_block(FIRST_SEALED), "", 1)},
-     1, "`%s` is listed in SEALED_TYPES but %s declares no such type" % (FIRST_SEALED, _SEALED_DEFN)),
+    ("a store's public constructor taking an argument is accepted",
+     {}, _sealed_facts(add=[fn_rec(FIRST_STORE, "new", 1, FIRST_STORE)]),
+     0, "lane-gate: OK"),
+    ("a sealed-type entry the compiler no longer declares is stale, refused",
+     {}, _sealed_facts(type_rec(FIRST_SEALED, 1)),
+     1, "`%s` is listed in SEALED_TYPES but the compiler declares no such type" % FIRST_SEALED),
 ]
 
 
@@ -880,7 +891,7 @@ def main():
         if code != 1 or "no bucket named NO_SUCH_ROW" not in out:
             failures.append("--row of an unknown bucket must be refused:\n%s" % out)
 
-        cases = [(n, e, None, c, t) for n, e, c, t in MUTATIONS] + COUNT_CASES + RULE_1C_CASES
+        cases = [(n, e, None, c, t) for n, e, c, t in MUTATIONS] + COUNT_CASES + RULE_1C_CASES + SEALED_CASES
         for i, (name, edits, records, want_code, want_text) in enumerate(cases):
             tree = os.path.join(work, "m%d" % i)
             shutil.copytree(base, tree)
@@ -913,9 +924,9 @@ def main():
         for f in failures:
             sys.stderr.write(f + "\n\n")
         return 1
-    print("lane-gate-selftest: OK -- baseline accepted, %d tree mutations, %d counting cases and %d "
-          "scan cases behaved, a stale golden section refused"
-          % (len(MUTATIONS), len(COUNT_CASES), len(RULE_1C_CASES)))
+    print("lane-gate-selftest: OK -- baseline accepted, %d tree mutations, %d counting cases, %d "
+          "scan cases and %d sealed-type cases behaved, a stale golden section refused"
+          % (len(MUTATIONS), len(COUNT_CASES), len(RULE_1C_CASES), len(SEALED_CASES)))
     return 0
 
 
