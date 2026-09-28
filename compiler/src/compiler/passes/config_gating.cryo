@@ -53,6 +53,7 @@ import compiler::ast::declaration::{
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ DirectiveArg, DirectiveArgKind, DirectiveNode };
 import compiler::ast::statement::{ BlockStmtNode, StatementNode };
+import utils::keyword::{ Keyword };
 import utils::text::{ Text };
 
 
@@ -84,17 +85,17 @@ implement enum HostOS {
     /// as inactive rather than crashing - the directive processor emits a
     /// warning for unknown vocabulary so the user still sees a real
     /// diagnostic.
-    matches(&this, atom: string) -> boolean {
-        if (atom.eq("windows")) {
+    matches(&this, atom: Keyword) -> boolean {
+        if (atom.as_string().eq("windows")) {
             return match (this) { HostOS::Windows => { true } _ => { false } };
         }
-        if (atom.eq("linux")) {
+        if (atom.as_string().eq("linux")) {
             return match (this) { HostOS::Linux => { true } _ => { false } };
         }
-        if (atom.eq("macos")) {
+        if (atom.as_string().eq("macos")) {
             return match (this) { HostOS::Macos => { true } _ => { false } };
         }
-        if (atom.eq("unix")) {
+        if (atom.as_string().eq("unix")) {
             return match (this) {
                 HostOS::Linux => { true }
                 HostOS::Macos => { true }
@@ -107,8 +108,8 @@ implement enum HostOS {
     /// True if `atom` is a recognized OS atom (one of windows/linux/macos/unix).
     /// Used to distinguish `config(testing)` (not a platform gate; left alone)
     /// from `config(windows)` (a platform gate; subject to evaluation).
-    static is_os_atom(atom: string) -> boolean {
-        return match (atom) {
+    static is_os_atom(atom: Keyword) -> boolean {
+        return match (atom.as_string()) {
             "windows" | "linux" | "macos" | "unix" => { true }
             _                                      => { false }
         };
@@ -162,17 +163,17 @@ type struct CfgEnv {
 
     /// True if `atom` names a known non-OS feature flag (parallels
     /// `HostOS::is_os_atom`).  Keep in sync with `feature_active`.
-    static is_feature_atom(atom: string) -> boolean {
-        return atom.eq("native_alloc") || atom.eq("no_runtime")
-            || atom.eq("panic_unwind");
+    static is_feature_atom(atom: Keyword) -> boolean {
+        return atom.as_string().eq("native_alloc") || atom.as_string().eq("no_runtime")
+            || atom.as_string().eq("panic_unwind");
     }
 
     /// Evaluate a known feature atom against this env's flags.  Precondition:
     /// `CfgEnv::is_feature_atom(atom)` is true.
-    feature_active(&this, atom: string) -> boolean {
-        if (atom.eq("native_alloc")) { return this.native_alloc; }
-        if (atom.eq("no_runtime")) { return this.no_runtime; }
-        if (atom.eq("panic_unwind")) { return this.panic_unwind; }
+    feature_active(&this, atom: Keyword) -> boolean {
+        if (atom.as_string().eq("native_alloc")) { return this.native_alloc; }
+        if (atom.as_string().eq("no_runtime")) { return this.no_runtime; }
+        if (atom.as_string().eq("panic_unwind")) { return this.panic_unwind; }
         return false;
     }
 }
@@ -209,15 +210,15 @@ type struct ConfigGatingPasses {
             return CfgEvalResult::NotAGate;
         }
         // `not(<os-atom>)`: active when the target OS does NOT match.
-        if (HostOS::is_os_atom(a.name)) {
-            if (env.os.matches(a.name)) {
+        if (HostOS::is_os_atom(Keyword::new(a.name))) {
+            if (env.os.matches(Keyword::new(a.name))) {
                 return CfgEvalResult::Inactive;
             }
             return CfgEvalResult::Active;
         }
         // `not(<feature-atom>)`: active when the feature flag is OFF.
-        if (CfgEnv::is_feature_atom(a.name)) {
-            if (env.feature_active(a.name)) {
+        if (CfgEnv::is_feature_atom(Keyword::new(a.name))) {
+            if (env.feature_active(Keyword::new(a.name))) {
                 return CfgEvalResult::Inactive;
             }
             return CfgEvalResult::Active;
@@ -238,14 +239,14 @@ type struct ConfigGatingPasses {
         // Bare-ident form: `config(windows)` (OS atom) or
         // `config(native_syscalls)` (feature atom).
         if (a.kind == DirectiveArgKind::Ident) {
-            if (HostOS::is_os_atom(a.name)) {
-                if (env.os.matches(a.name)) {
+            if (HostOS::is_os_atom(Keyword::new(a.name))) {
+                if (env.os.matches(Keyword::new(a.name))) {
                     return CfgEvalResult::Active;
                 }
                 return CfgEvalResult::Inactive;
             }
-            if (CfgEnv::is_feature_atom(a.name)) {
-                if (env.feature_active(a.name)) {
+            if (CfgEnv::is_feature_atom(Keyword::new(a.name))) {
+                if (env.feature_active(Keyword::new(a.name))) {
                     return CfgEvalResult::Active;
                 }
                 return CfgEvalResult::Inactive;
@@ -257,7 +258,7 @@ type struct ConfigGatingPasses {
         if (a.kind == DirectiveArgKind::Nested) {
             const inner: DirectiveNode* = a.nested;
             if (inner == null) { return CfgEvalResult::NotAGate; }
-            if (inner.directive_kind.eq("not")) {
+            if (inner.directive_kind.as_string().eq("not")) {
                 return ConfigGatingPasses::eval_not_call(inner, env);
             }
             // `any(...)` / `all(...)` deferred until vocabulary expansion.
@@ -283,13 +284,13 @@ type struct ConfigGatingPasses {
 
         // Bare negation: `![not(<atom>)]`.  Mirrors the nested `not(...)`
         // form inside `config(...)` for consistency.
-        if (d.directive_kind.eq("not")) {
+        if (d.directive_kind.as_string().eq("not")) {
             return ConfigGatingPasses::eval_not_call(d, env);
         }
 
         // Wrapped form: `![config(...)]` / `![target(...)]`.
-        if (d.directive_kind.eq("config")
-                || d.directive_kind.eq("target")) {
+        if (d.directive_kind.as_string().eq("config")
+                || d.directive_kind.as_string().eq("target")) {
             return ConfigGatingPasses::eval_config_args(d, env);
         }
 

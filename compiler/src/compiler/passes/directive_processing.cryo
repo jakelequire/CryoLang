@@ -79,6 +79,7 @@ import compiler::types::arena::{ TypeArena };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ ClassType, EnumType, StructType };
+import utils::keyword::{ Keyword };
 import utils::text::{ Text };
 
 /// The lint that refuses a declaration taking one of the compiler's spelling
@@ -91,7 +92,7 @@ const LOOKUP_BY_SPELLING: string = "lookup_by_spelling";
 
 type struct DirectiveRecord {
     /// Directive name (e.g. "inline", "cfg").
-    kind:       string;
+    kind:       Keyword;
     /// The DirectiveNode in the AST.
     node:       DirectiveNode*;
     /// Owning declaration (null => standalone module-level directive).
@@ -138,9 +139,9 @@ public:
     }
 
     /// True if any directive in the registry has the given kind.
-    has(&this, kind: string) -> boolean {
+    has(&this, kind: Keyword) -> boolean {
         for (mut i: i64 = 0; i < this.records.length; i++) {
-            if (this.records[i].kind.eq(kind)) {
+            if (this.records[i].kind.as_string().eq(kind.as_string())) {
                 return true;
             }
         }
@@ -231,8 +232,8 @@ type struct DirectiveProcessingPasses {
     /// True if `name` is a built-in directive recognised by the compiler.
     /// Unknown names are accepted by the pass but get no validation or
     /// side-effects; they're still registered so user tooling can read them.
-    static is_known_builtin(name: string) -> boolean {
-        return match (name) {
+    static is_known_builtin(name: Keyword) -> boolean {
+        return match (name.as_string()) {
             "inline" | "noinline" | "entry" | "test" | "ignore"
             | "should_panic" | "config" | "deprecated" | "align"
             | "repr" | "link" | "symbol" | "target" | "allow" | "warn" | "deny"
@@ -287,8 +288,8 @@ type struct DirectiveProcessingPasses {
     /// Local copy of the OS-atom predicate so the validator can extend
     /// `config(...)` arg-shape checking without cross-importing the
     /// ConfigGating pass.  Kept in sync with config_gating.cryo's atom set.
-    static is_cfg_os_atom(name: string) -> boolean {
-        return match (name) {
+    static is_cfg_os_atom(name: Keyword) -> boolean {
+        return match (name.as_string()) {
             "windows" | "linux" | "macos" | "unix" => { true }
             _                                      => { false }
         };
@@ -302,7 +303,7 @@ type struct DirectiveProcessingPasses {
     /// emitted diagnostics.
     static validate_builtin(ctx: CompilationContext*, dir: DirectiveNode*,
                               target: DirectiveTarget) -> void {
-        const name: string = dir.directive_kind;
+        const name: string = dir.directive_kind.as_string();
         const argc: i64 = dir.args.length;
 
         match (name) {
@@ -316,19 +317,19 @@ type struct DirectiveProcessingPasses {
             // method (whose body is a function too) is a valid target.
             "inline" | "noinline" => {
                 if (argc != 0) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
                 if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function or method", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("function or method"), target);
                 }
             }
 
             "entry" | "test" | "ignore" | "should_panic" => {
                 if (argc != 0) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
                 if (target != DirectiveTarget::Function) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("function"), target);
                 }
             }
 
@@ -338,10 +339,10 @@ type struct DirectiveProcessingPasses {
             // run_directive_processing where we already have the decl pointer.
             "sink" => {
                 if (argc != 0) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
                 if (target != DirectiveTarget::Method) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "method", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("method"), target);
                 }
             }
 
@@ -351,10 +352,10 @@ type struct DirectiveProcessingPasses {
             // engine, so no deeper shape check is needed here.
             "implicit" => {
                 if (argc != 0) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
                 if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function or method", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("function or method"), target);
                 }
             }
 
@@ -364,7 +365,7 @@ type struct DirectiveProcessingPasses {
             // `bench` flavor for benchmarks) plug in here.
             "config" => {
                 if (argc < 1) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
                     return;
                 }
                 const a: DirectiveArg = dir.args[0];
@@ -375,11 +376,11 @@ type struct DirectiveProcessingPasses {
                 // to any decl.  Single-arg form.
                 if (a.kind == DirectiveArgKind::Nested) {
                     if (argc != 1) {
-                        DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                        DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
                         return;
                     }
                     if (a.nested == null
-                            || !a.nested.directive_kind.eq("not")) {
+                            || !a.nested.directive_kind.as_string().eq("not")) {
                         const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
                         const msg: string =
                             "directive `![config(...)]`: nested calls must be `not(<atom>)`";
@@ -391,7 +392,7 @@ type struct DirectiveProcessingPasses {
                 }
 
                 if (a.kind != DirectiveArgKind::Ident) {
-                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, 0, Text::new("an identifier"));
                     return;
                 }
 
@@ -411,20 +412,20 @@ type struct DirectiveProcessingPasses {
                         return;
                     }
                     if (target != DirectiveTarget::Module) {
-                        DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "namespace", target);
+                        DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("namespace"), target);
                     }
                     return;
                 }
 
                 // Every remaining flavor is single-arg.
                 if (argc != 1) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
                     return;
                 }
 
                 // OS-atom flavor: `config(windows)` etc.  No placement
                 // restriction; these gate any declaration.
-                if (DirectiveProcessingPasses::is_cfg_os_atom(a.name)) {
+                if (DirectiveProcessingPasses::is_cfg_os_atom(Keyword::new(a.name))) {
                     return;
                 }
 
@@ -432,7 +433,7 @@ type struct DirectiveProcessingPasses {
                 // Misspelled flavors fall through to the catch-all error.
                 if (a.name.eq("testing")) {
                     if (target != DirectiveTarget::Module) {
-                        DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "namespace", target);
+                        DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("namespace"), target);
                     }
                     return;
                 }
@@ -479,7 +480,7 @@ type struct DirectiveProcessingPasses {
             // the ConfigGating pass.  Zero args, unrestricted placement.
             "windows" | "linux" | "macos" | "unix" => {
                 if (argc != 0) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
             }
 
@@ -487,15 +488,15 @@ type struct DirectiveProcessingPasses {
             // form recognised inside `config(...)`.
             "not" => {
                 if (argc != 1) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
                     return;
                 }
                 const a: DirectiveArg = dir.args[0];
                 if (a.kind != DirectiveArgKind::Ident) {
-                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, 0, Text::new("an identifier"));
                     return;
                 }
-                if (!DirectiveProcessingPasses::is_cfg_os_atom(a.name)) {
+                if (!DirectiveProcessingPasses::is_cfg_os_atom(Keyword::new(a.name))) {
                     const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
                     const msg: string = fmt::format(
                         "directive `![not]`: unknown atom `%s` (expected `windows`, `linux`, `macos`, or `unix`)",
@@ -509,24 +510,24 @@ type struct DirectiveProcessingPasses {
             "deprecated" => {
                 // Optional single string-literal message.
                 if (argc > 1) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
                 }
                 if (argc == 1) {
                     const a: DirectiveArg = dir.args[0];
                     if (a.kind != DirectiveArgKind::StringLit) {
-                        DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "a string literal");
+                        DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, 0, Text::new("a string literal"));
                     }
                 }
             }
 
             "align" => {
                 if (argc != 1) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
                     return;
                 }
                 const a: DirectiveArg = dir.args[0];
                 if (a.kind != DirectiveArgKind::IntLit) {
-                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "an integer literal");
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, 0, Text::new("an integer literal"));
                     return;
                 }
                 // Enforce power-of-two and a sane upper bound.  The bound
@@ -550,18 +551,18 @@ type struct DirectiveProcessingPasses {
                     && target != DirectiveTarget::Class
                     && target != DirectiveTarget::Enum
                     && target != DirectiveTarget::Variable) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "struct/union/class/enum/variable", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("struct/union/class/enum/variable"), target);
                 }
             }
 
             "repr" => {
                 if (argc != 1) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
                     return;
                 }
                 const a: DirectiveArg = dir.args[0];
                 if (a.kind != DirectiveArgKind::Ident) {
-                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, 0, Text::new("an identifier"));
                     return;
                 }
                 // Recognised repr kinds.  Anything else is rejected explicitly
@@ -586,7 +587,7 @@ type struct DirectiveProcessingPasses {
                     && target != DirectiveTarget::Union
                     && target != DirectiveTarget::Class
                     && target != DirectiveTarget::Enum) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "struct/union/class/enum", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("struct/union/class/enum"), target);
                     return;
                 }
                 // Per-flavor placement.  `repr(packed)` and `repr(transparent)`
@@ -619,12 +620,12 @@ type struct DirectiveProcessingPasses {
             // effects diverge in `apply_effects`.
             "link" | "symbol" => {
                 if (argc != 1) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
                     return;
                 }
                 const a: DirectiveArg = dir.args[0];
                 if (a.kind != DirectiveArgKind::StringLit) {
-                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "a string literal");
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, 0, Text::new("a string literal"));
                 }
             }
 
@@ -635,10 +636,10 @@ type struct DirectiveProcessingPasses {
             // is applied in `apply_effects`.
             "no_mangle" => {
                 if (argc != 0) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
                 if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function or method", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("function or method"), target);
                 }
             }
 
@@ -646,10 +647,10 @@ type struct DirectiveProcessingPasses {
             // on a definition; the effect is applied in `apply_effects`.
             "weak" => {
                 if (argc != 0) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
                 if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function or method", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("function or method"), target);
                 }
             }
 
@@ -657,10 +658,10 @@ type struct DirectiveProcessingPasses {
             // `apply_effects` onto the VarDeclNode.
             "thread_local" => {
                 if (argc != 0) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
                 if (target != DirectiveTarget::Variable) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "global variable", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("global variable"), target);
                 }
             }
 
@@ -669,10 +670,10 @@ type struct DirectiveProcessingPasses {
             // in `apply_effects` where the FunctionDeclNode body is in hand.
             "naked" => {
                 if (argc != 0) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
                 if (target != DirectiveTarget::Function) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("function"), target);
                 }
             }
 
@@ -680,16 +681,16 @@ type struct DirectiveProcessingPasses {
             // method-target.  Names the object-file section for the symbol.
             "section" => {
                 if (argc != 1) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
                     return;
                 }
                 const a: DirectiveArg = dir.args[0];
                 if (a.kind != DirectiveArgKind::StringLit) {
-                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "a string literal");
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, 0, Text::new("a string literal"));
                     return;
                 }
                 if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function or method", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("function or method"), target);
                 }
             }
 
@@ -699,13 +700,13 @@ type struct DirectiveProcessingPasses {
             // retired in favor of `config`.
             "target" => {
                 if (argc != 1) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
                     return;
                 }
                 const a: DirectiveArg = dir.args[0];
                 if (a.kind == DirectiveArgKind::Nested) {
                     if (a.nested == null
-                            || !a.nested.directive_kind.eq("not")) {
+                            || !a.nested.directive_kind.as_string().eq("not")) {
                         const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
                         const msg: string =
                             "directive `![target(...)]`: nested calls must be `not(<atom>)`";
@@ -716,10 +717,10 @@ type struct DirectiveProcessingPasses {
                     return;
                 }
                 if (a.kind != DirectiveArgKind::Ident) {
-                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "an identifier");
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, 0, Text::new("an identifier"));
                     return;
                 }
-                if (!DirectiveProcessingPasses::is_cfg_os_atom(a.name)) {
+                if (!DirectiveProcessingPasses::is_cfg_os_atom(Keyword::new(a.name))) {
                     const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
                     const msg: string = fmt::format(
                         "directive `![target]`: unknown atom `%s` (expected `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`)",
@@ -737,7 +738,7 @@ type struct DirectiveProcessingPasses {
             // written after it, which never had a reason of their own.
             "allow" | "warn" | "deny" => {
                 if (argc == 0) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
                     return;
                 }
                 mut names_spelling_lint: boolean = false;
@@ -768,8 +769,8 @@ type struct DirectiveProcessingPasses {
                             name, a.name)));
                     } else {
                         bad_args += 1;
-                        DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, i,
-                            "a lint name or `reason = \"...\"`");
+                        DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, i,
+                            Text::new("a lint name or `reason = \"...\"`"));
                     }
                 }
                 if (lint_names == 0) {
@@ -788,7 +789,7 @@ type struct DirectiveProcessingPasses {
                 }
                 if (!name.eq("allow")) { return; }
                 if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function or method", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("function or method"), target);
                 }
                 // A misspelt key is already refused; saying the reason is also
                 // missing would report one mistake twice.
@@ -803,28 +804,28 @@ type struct DirectiveProcessingPasses {
             // emission).  An error anywhere but an extern block.
             "functions_only" => {
                 if (argc != 0) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
                 if (target != DirectiveTarget::Extern) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "extern module", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("extern module"), target);
                 }
             }
 
             "derive" => {
                 if (argc == 0) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
                     return;
                 }
                 for (mut i: i64 = 0; i < argc; i++) {
                     const a: DirectiveArg = dir.args[i];
                     if (a.kind != DirectiveArgKind::Ident) {
-                        DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, i, "a trait name (identifier)");
+                        DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, i, Text::new("a trait name (identifier)"));
                     }
                 }
                 if (target != DirectiveTarget::Struct
                     && target != DirectiveTarget::Class
                     && target != DirectiveTarget::Enum) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "struct/class/enum", target);
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("struct/class/enum"), target);
                 }
             }
 
@@ -835,17 +836,17 @@ type struct DirectiveProcessingPasses {
             // codegen); the assembler rejects genuinely unknown arches.
             "arch" => {
                 if (argc != 2) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 2, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 2, argc);
                     return;
                 }
                 const a0: DirectiveArg = dir.args[0];
                 const a1: DirectiveArg = dir.args[1];
                 if (a0.kind != DirectiveArgKind::Ident) {
-                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "an architecture identifier");
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, 0, Text::new("an architecture identifier"));
                     return;
                 }
                 if (a1.kind != DirectiveArgKind::Ident) {
-                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 1, "a dialect identifier (`intel` or `att`)");
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, 1, Text::new("a dialect identifier (`intel` or `att`)"));
                     return;
                 }
                 if (!(a1.name == "intel" || a1.name == "att")) {
@@ -863,14 +864,14 @@ type struct DirectiveProcessingPasses {
             // the special tokens `flags` / `memory`.  Attached to an `asm` block.
             "clobber" => {
                 if (argc == 0) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
                     return;
                 }
                 for (mut i: i64 = 0; i < argc; i++) {
                     const a: DirectiveArg = dir.args[i];
                     if (a.kind != DirectiveArgKind::Ident) {
-                        DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, i,
-                            "a register name, `flags`, or `memory`");
+                        DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, dir.directive_kind, i,
+                            Text::new("a register name, `flags`, or `memory`"));
                     }
                 }
             }
@@ -937,7 +938,9 @@ type struct DirectiveProcessingPasses {
     // the user can tell which one to remove.
 
     static emit_layout_conflict(ctx: CompilationContext*, dir: DirectiveNode*,
-                                  this_name: string, other_name: string) -> void {
+                                  this_name_text: Text, other_name_text: Text) -> void {
+        const this_name: string = this_name_text.as_string();
+        const other_name: string = other_name_text.as_string();
         const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
         const msg: string = fmt::format(
             "directive `![%s]` conflicts with `![%s]` on the same declaration",
@@ -953,20 +956,20 @@ type struct DirectiveProcessingPasses {
     static apply_layout_effects_struct(ctx: CompilationContext*,
                                          dir: DirectiveNode*,
                                          sd: StructDeclNode*,
-                                         name: string) -> void {
-        match (name) {
+                                         name: Keyword) -> void {
+        match (name.as_string()) {
             "repr" => {
                 if (dir.args.length != 1) { return; }
                 // Reject a second `![repr]` on the same decl.
                 if (sd.repr_c || sd.repr_packed || sd.repr_transparent) {
-                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr", "repr");
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, Text::new("repr"), Text::new("repr"));
                     return;
                 }
                 match (dir.args[0].name) {
                     "C"           => { sd.repr_c = true; }
                     "packed"      => {
                         if (sd.min_alignment != 0) {
-                            DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr(packed)", "align");
+                            DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, Text::new("repr(packed)"), Text::new("align"));
                             return;
                         }
                         sd.repr_packed = true;
@@ -978,11 +981,11 @@ type struct DirectiveProcessingPasses {
             "align" => {
                 if (dir.args.length != 1) { return; }
                 if (sd.repr_packed) {
-                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "repr(packed)");
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, Text::new("align"), Text::new("repr(packed)"));
                     return;
                 }
                 if (sd.min_alignment != 0) {
-                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "align");
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, Text::new("align"), Text::new("align"));
                     return;
                 }
                 sd.min_alignment = dir.args[0].int_value as u64;
@@ -994,22 +997,22 @@ type struct DirectiveProcessingPasses {
     static apply_layout_effects_union(ctx: CompilationContext*,
                                         dir: DirectiveNode*,
                                         ud: UnionDeclNode*,
-                                        name: string) -> void {
+                                        name: Keyword) -> void {
         // Unions accept the same layout directives as structs: `repr(C)`,
         // `repr(packed)` (floors alignment to 1), `repr(transparent)`, and
         // `![align(N)]`.  Mirrors apply_layout_effects_struct exactly.
-        match (name) {
+        match (name.as_string()) {
             "repr" => {
                 if (dir.args.length != 1) { return; }
                 if (ud.repr_c || ud.repr_packed || ud.repr_transparent) {
-                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr", "repr");
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, Text::new("repr"), Text::new("repr"));
                     return;
                 }
                 match (dir.args[0].name) {
                     "C"           => { ud.repr_c = true; }
                     "packed"      => {
                         if (ud.min_alignment != 0) {
-                            DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr(packed)", "align");
+                            DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, Text::new("repr(packed)"), Text::new("align"));
                             return;
                         }
                         ud.repr_packed = true;
@@ -1021,11 +1024,11 @@ type struct DirectiveProcessingPasses {
             "align" => {
                 if (dir.args.length != 1) { return; }
                 if (ud.repr_packed) {
-                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "repr(packed)");
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, Text::new("align"), Text::new("repr(packed)"));
                     return;
                 }
                 if (ud.min_alignment != 0) {
-                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "align");
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, Text::new("align"), Text::new("align"));
                     return;
                 }
                 ud.min_alignment = dir.args[0].int_value as u64;
@@ -1037,19 +1040,19 @@ type struct DirectiveProcessingPasses {
     static apply_layout_effects_class(ctx: CompilationContext*,
                                         dir: DirectiveNode*,
                                         cd: ClassDeclNode*,
-                                        name: string) -> void {
-        match (name) {
+                                        name: Keyword) -> void {
+        match (name.as_string()) {
             "repr" => {
                 if (dir.args.length != 1) { return; }
                 if (cd.repr_c || cd.repr_packed || cd.repr_transparent) {
-                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr", "repr");
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, Text::new("repr"), Text::new("repr"));
                     return;
                 }
                 match (dir.args[0].name) {
                     "C"           => { cd.repr_c = true; }
                     "packed"      => {
                         if (cd.min_alignment != 0) {
-                            DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr(packed)", "align");
+                            DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, Text::new("repr(packed)"), Text::new("align"));
                             return;
                         }
                         cd.repr_packed = true;
@@ -1061,11 +1064,11 @@ type struct DirectiveProcessingPasses {
             "align" => {
                 if (dir.args.length != 1) { return; }
                 if (cd.repr_packed) {
-                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "repr(packed)");
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, Text::new("align"), Text::new("repr(packed)"));
                     return;
                 }
                 if (cd.min_alignment != 0) {
-                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "align");
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, Text::new("align"), Text::new("align"));
                     return;
                 }
                 cd.min_alignment = dir.args[0].int_value as u64;
@@ -1077,16 +1080,16 @@ type struct DirectiveProcessingPasses {
     static apply_layout_effects_enum(ctx: CompilationContext*,
                                        dir: DirectiveNode*,
                                        ed: EnumDeclNode*,
-                                       name: string) -> void {
+                                       name: Keyword) -> void {
         // Enums accept only `repr(C)` and `![align(N)]` today; the validator
         // has already rejected `repr(packed)` / `repr(transparent)` on
         // enums, and a non-`C` `repr` argument would have been rejected
         // before reaching this function.
-        match (name) {
+        match (name.as_string()) {
             "repr" => {
                 if (dir.args.length != 1) { return; }
                 if (ed.repr_c) {
-                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "repr", "repr");
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, Text::new("repr"), Text::new("repr"));
                     return;
                 }
                 if (dir.args[0].name == "C") {
@@ -1096,7 +1099,7 @@ type struct DirectiveProcessingPasses {
             "align" => {
                 if (dir.args.length != 1) { return; }
                 if (ed.min_alignment != 0) {
-                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, "align", "align");
+                    DirectiveProcessingPasses::emit_layout_conflict(ctx, dir, Text::new("align"), Text::new("align"));
                     return;
                 }
                 ed.min_alignment = dir.args[0].int_value as u64;
@@ -1118,7 +1121,7 @@ type struct DirectiveProcessingPasses {
     static apply_effects(ctx: CompilationContext*, dir: DirectiveNode*,
                            decl: DeclarationNode*) -> void {
         if (decl == null) { return; }
-        const name: string = dir.directive_kind;
+        const name: string = dir.directive_kind.as_string();
 
         if (decl.kind == NodeKind::FunctionDeclaration) {
             const fn: FunctionDeclNode* = decl as FunctionDeclNode*;
@@ -1248,22 +1251,22 @@ type struct DirectiveProcessingPasses {
         // is produced regardless of source order.
         if (decl.kind == NodeKind::StructDeclaration) {
             const sd: StructDeclNode* = decl as StructDeclNode*;
-            DirectiveProcessingPasses::apply_layout_effects_struct(ctx, dir, sd, name);
+            DirectiveProcessingPasses::apply_layout_effects_struct(ctx, dir, sd, dir.directive_kind);
             return;
         }
         if (decl.kind == NodeKind::UnionDeclaration) {
             const ud: UnionDeclNode* = decl as UnionDeclNode*;
-            DirectiveProcessingPasses::apply_layout_effects_union(ctx, dir, ud, name);
+            DirectiveProcessingPasses::apply_layout_effects_union(ctx, dir, ud, dir.directive_kind);
             return;
         }
         if (decl.kind == NodeKind::ClassDeclaration) {
             const cd: ClassDeclNode* = decl as ClassDeclNode*;
-            DirectiveProcessingPasses::apply_layout_effects_class(ctx, dir, cd, name);
+            DirectiveProcessingPasses::apply_layout_effects_class(ctx, dir, cd, dir.directive_kind);
             return;
         }
         if (decl.kind == NodeKind::EnumDeclaration) {
             const ed: EnumDeclNode* = decl as EnumDeclNode*;
-            DirectiveProcessingPasses::apply_layout_effects_enum(ctx, dir, ed, name);
+            DirectiveProcessingPasses::apply_layout_effects_enum(ctx, dir, ed, dir.directive_kind);
             return;
         }
 
@@ -1365,39 +1368,39 @@ type struct DirectiveProcessingPasses {
     // Diagnostic helpers
 
     static emit_arity_error(ctx: CompilationContext*, dir: DirectiveNode*,
-                              name: string, expected: i64, got: i64) -> void {
+                              name: Keyword, expected: i64, got: i64) -> void {
         const code: ErrorCode = ErrorCode::E0150_DIRECTIVE_BAD_ARITY;
         const msg: string = fmt::format(
             "directive `![%s]` expects %lld argument(s) but got %lld",
-            name, expected, got);
+            name.as_string(), expected, got);
         mut diag: Diagnostic = Diagnostic::error(code, Text::new(msg));
         diag = diag.at(dir.span);
         ctx.emit_diagnostic(diag);
     }
 
     static emit_arg_kind_error(ctx: CompilationContext*, dir: DirectiveNode*,
-                                 name: string, idx: i64, expected_kind: string) -> void {
+                                 name: Keyword, idx: i64, expected_kind: Text) -> void {
         const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
         const msg: string = fmt::format(
             "directive `![%s]`: argument %lld must be %s",
-            name, idx + 1, expected_kind);
+            name.as_string(), idx + 1, expected_kind.as_string());
         mut diag: Diagnostic = Diagnostic::error(code, Text::new(msg));
         diag = diag.at(dir.span);
         ctx.emit_diagnostic(diag);
     }
 
     static emit_placement_error(ctx: CompilationContext*, dir: DirectiveNode*,
-                                  name: string, expected_target: string,
+                                  name: Keyword, expected_target: Text,
                                   actual: DirectiveTarget) -> void {
         const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
         const msg: string = fmt::format(
             "directive `![%s]` only applies to %s, not %s",
-            name, expected_target, actual.label());
+            name.as_string(), expected_target.as_string(), actual.label());
         mut diag: Diagnostic = Diagnostic::error(code, Text::new(msg));
         diag = diag.at(dir.span);
         diag = diag.suggest(Suggestion::machine_applicable(
             dir.span, Text::new(""),
-            Text::new(fmt::format("remove the misplaced `![%s]` directive", name))));
+            Text::new(fmt::format("remove the misplaced `![%s]` directive", name.as_string()))));
         ctx.emit_diagnostic(diag);
     }
 
@@ -1444,7 +1447,7 @@ type struct DirectiveProcessingPasses {
         for (mut i: i64 = 0; i < dirs.length; i++) {
             const d: DirectiveNode* = dirs[i];
             if (d == null) { continue; }
-            if (!d.directive_kind.eq("allow") && !d.directive_kind.eq("warn")) { continue; }
+            if (!d.directive_kind.as_string().eq("allow") && !d.directive_kind.as_string().eq("warn")) { continue; }
             for (mut j: i64 = 0; j < d.args.length; j++) {
                 const a: DirectiveArg = d.args[j];
                 if (a.kind == DirectiveArgKind::Ident && a.name.eq(LOOKUP_BY_SPELLING)) {
@@ -1545,7 +1548,7 @@ type struct DirectiveProcessingPasses {
         mut has_config_testing: boolean = false;
         mut has_test_directive: boolean = false;
         mut first_test_dir_span: SourceSpan = SourceSpan::none();
-        mut first_test_dir_name: string = "";
+        mut first_test_dir_name: Keyword = Keyword::new("");
 
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
@@ -1566,7 +1569,7 @@ type struct DirectiveProcessingPasses {
                 count += 1;
                 if (ctx.debug_mode) {
                     cdebug(Text::new("[DirectiveProcessing] module-level '%s' (%lld args) at %s:%u:%u\n"),
-                        d.directive_kind, d.args.length,
+                        d.directive_kind.as_string(), d.args.length,
                         d.span.file, d.span.start_line, d.span.start_col);
                 }
                 continue;
@@ -1592,16 +1595,16 @@ type struct DirectiveProcessingPasses {
 
                 // Cross-cutting flags for the test-mode validation below.
                 if (t == DirectiveTarget::Module
-                        && d.directive_kind.eq("config")
+                        && d.directive_kind.as_string().eq("config")
                         && d.args.length == 1
                         && d.args[0].kind == DirectiveArgKind::Ident
                         && d.args[0].name.eq("testing")) {
                     has_config_testing = true;
                 }
                 if (t == DirectiveTarget::Function
-                        && (d.directive_kind.eq("test")
-                         || d.directive_kind.eq("ignore")
-                         || d.directive_kind.eq("should_panic"))) {
+                        && (d.directive_kind.as_string().eq("test")
+                         || d.directive_kind.as_string().eq("ignore")
+                         || d.directive_kind.as_string().eq("should_panic"))) {
                     if (!has_test_directive) {
                         first_test_dir_span = d.span;
                         first_test_dir_name = d.directive_kind;
@@ -1631,7 +1634,7 @@ type struct DirectiveProcessingPasses {
                     mut tag: string = "custom ";
                     if (DirectiveProcessingPasses::is_known_builtin(d.directive_kind)) { tag = "builtin"; }
                     cdebug(Text::new("[DirectiveProcessing] %s '%s' on %s (%lld args) at %s:%u:%u\n"),
-                        tag, d.directive_kind, t.label(), d.args.length,
+                        tag, d.directive_kind.as_string(), t.label(), d.args.length,
                         d.span.file, d.span.start_line, d.span.start_col);
                 }
             }
@@ -1682,7 +1685,7 @@ type struct DirectiveProcessingPasses {
                         mut mtag: string = "custom ";
                         if (DirectiveProcessingPasses::is_known_builtin(md.directive_kind)) { mtag = "builtin"; }
                         cdebug(Text::new("[DirectiveProcessing] %s '%s' on method (%lld args) at %s:%u:%u\n"),
-                            mtag, md.directive_kind, md.args.length,
+                            mtag, md.directive_kind.as_string(), md.args.length,
                             md.span.file, md.span.start_line, md.span.start_col);
                     }
                 }
@@ -1957,7 +1960,7 @@ type struct DirectiveProcessingPasses {
                                             has_config_testing: boolean,
                                             has_test_directive: boolean,
                                             first_test_dir_span: SourceSpan,
-                                            first_test_dir_name: string) -> void {
+                                            first_test_dir_name: Keyword) -> void {
         if (ctx.project_config == null) { return; }
         // `cryo check <file>` analyses a single file in isolation.  It
         // synthesizes a one-file project rooted at the file's own directory, so
@@ -2012,7 +2015,7 @@ type struct DirectiveProcessingPasses {
             const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
             const msg: string = fmt::format(
                 "directive `![%s]` is only allowed inside a namespace marked `![config(testing)]`",
-                first_test_dir_name);
+                first_test_dir_name.as_string());
             mut diag: Diagnostic = Diagnostic::error(code, Text::new(msg));
             diag = diag.at(first_test_dir_span);
             ctx.emit_diagnostic(diag);
