@@ -36,6 +36,7 @@ import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import std::ffi::libc;
 import utils::text::{ Text };
+import compiler::resolver::mangled_name::{ MangledName };
 
 
 type struct IntrinsicEmitter {
@@ -96,7 +97,7 @@ type struct IntrinsicEmitter {
 
     // Per-kind LLVM-intrinsic factories
 
-    get_or_decl_unary_intrinsic(mut &this, name: string, ty: LType) -> LValue {
+    get_or_decl_unary_intrinsic(mut &this, name: MangledName, ty: LType) -> LValue {
         mut fn: LValue = this.llvm_module.get_named_function(name);
         if (fn.is_valid()) { return fn; }
         const param_buf: void* = libc::malloc(8);
@@ -107,7 +108,7 @@ type struct IntrinsicEmitter {
         return this.llvm_module.add_function(name, fn_ty);
     }
 
-    get_or_decl_ctlz_cttz(mut &this, name: string, ty: LType) -> LValue {
+    get_or_decl_ctlz_cttz(mut &this, name: MangledName, ty: LType) -> LValue {
         mut fn: LValue = this.llvm_module.get_named_function(name);
         if (fn.is_valid()) { return fn; }
         const param_buf: void* = libc::malloc(16);
@@ -121,7 +122,7 @@ type struct IntrinsicEmitter {
 
     /// `declare T @name(T, T)` - homogeneous binary LLVM intrinsics
     /// (llvm.copysign.*).
-    get_or_decl_binary_intrinsic(mut &this, name: string, ty: LType) -> LValue {
+    get_or_decl_binary_intrinsic(mut &this, name: MangledName, ty: LType) -> LValue {
         mut fn: LValue = this.llvm_module.get_named_function(name);
         if (fn.is_valid()) { return fn; }
         const param_buf: void* = libc::malloc(16);
@@ -135,7 +136,7 @@ type struct IntrinsicEmitter {
 
     /// `declare T @name(T, T, T)` - homogeneous ternary LLVM intrinsics
     /// (llvm.fshl/fshr funnel shifts, llvm.fma.*).
-    get_or_decl_ternary_intrinsic(mut &this, name: string, ty: LType) -> LValue {
+    get_or_decl_ternary_intrinsic(mut &this, name: MangledName, ty: LType) -> LValue {
         mut fn: LValue = this.llvm_module.get_named_function(name);
         if (fn.is_valid()) { return fn; }
         const param_buf: void* = libc::malloc(24);
@@ -150,7 +151,7 @@ type struct IntrinsicEmitter {
 
     /// `declare void @name()` - zero-arg void intrinsics (llvm.trap /
     /// llvm.debugtrap).
-    get_or_decl_void_noarg(mut &this, name: string) -> LValue {
+    get_or_decl_void_noarg(mut &this, name: MangledName) -> LValue {
         mut fn: LValue = this.llvm_module.get_named_function(name);
         if (fn.is_valid()) { return fn; }
         const fn_ty: LType = LType::function_type(LType::void_type(), null, 0, false);
@@ -159,7 +160,7 @@ type struct IntrinsicEmitter {
 
     /// `declare ptr @name(i32)` - llvm.frameaddress.p0 / llvm.returnaddress.
     /// Emits the call; `level` (a0) is the constant frame index.
-    emit_addr_intrinsic(mut &this, name: string, level: LValue) -> LValue {
+    emit_addr_intrinsic(mut &this, name: MangledName, level: LValue) -> LValue {
         const ptr_ty: LType = LType::pointer_to(LType::i8());
         mut fn: LValue = this.llvm_module.get_named_function(name);
         if (!fn.is_valid()) {
@@ -180,7 +181,7 @@ type struct IntrinsicEmitter {
 
     // `declare i1 @llvm.is.fpclass.f64(double, i32)`.  The i32 test mask is
     // an immarg at the call site; the declared parameter type is plain i32.
-    get_or_decl_fpclass(mut &this, name: string, val_ty: LType, mask_ty: LType) -> LValue {
+    get_or_decl_fpclass(mut &this, name: MangledName, val_ty: LType, mask_ty: LType) -> LValue {
         mut fn: LValue = this.llvm_module.get_named_function(name);
         if (fn.is_valid()) { return fn; }
         const param_buf: void* = libc::malloc(16);
@@ -235,7 +236,7 @@ type struct IntrinsicEmitter {
         return this.builder.build_sub(ai, bi, Text::new("ptr.diff"));
     }
 
-    emit_unary_llvm(mut &this, iname: string, ty: LType, x: LValue, narrow_to_i32: boolean, label: Text) -> LValue {
+    emit_unary_llvm(mut &this, iname: MangledName, ty: LType, x: LValue, narrow_to_i32: boolean, label: Text) -> LValue {
         const fn: LValue = this.get_or_decl_unary_intrinsic(iname, ty);
         if (!fn.is_valid()) { return LValue::null(); }
         const param_buf: void* = libc::malloc(8);
@@ -250,7 +251,7 @@ type struct IntrinsicEmitter {
         return raw;
     }
 
-    emit_clz_or_ctz(mut &this, iname: string, ty: LType, x: LValue) -> LValue {
+    emit_clz_or_ctz(mut &this, iname: MangledName, ty: LType, x: LValue) -> LValue {
         const fn: LValue = this.get_or_decl_ctlz_cttz(iname, ty);
         if (!fn.is_valid()) { return LValue::null(); }
         const param_buf: void* = libc::malloc(16);
@@ -268,7 +269,7 @@ type struct IntrinsicEmitter {
         return raw;
     }
 
-    emit_rotate(mut &this, iname: string, ty: LType, x: LValue, n: LValue) -> LValue {
+    emit_rotate(mut &this, iname: MangledName, ty: LType, x: LValue, n: LValue) -> LValue {
         const fn: LValue = this.get_or_decl_ternary_intrinsic(iname, ty);
         if (!fn.is_valid()) { return LValue::null(); }
         const param_buf: void* = libc::malloc(24);
@@ -294,7 +295,7 @@ type struct IntrinsicEmitter {
 
     /// Emit `call T @iname(T x, T y)` for a homogeneous binary LLVM
     /// intrinsic (llvm.copysign.f64).
-    emit_binary_llvm(mut &this, iname: string, ty: LType, x: LValue, y: LValue, label: Text) -> LValue {
+    emit_binary_llvm(mut &this, iname: MangledName, ty: LType, x: LValue, y: LValue, label: Text) -> LValue {
         const fn: LValue = this.get_or_decl_binary_intrinsic(iname, ty);
         if (!fn.is_valid()) { return LValue::null(); }
         const param_buf: void* = libc::malloc(16);
@@ -308,7 +309,7 @@ type struct IntrinsicEmitter {
 
     /// Emit `call T @iname(T x, T y, T z)` for a homogeneous ternary LLVM
     /// intrinsic (llvm.fma.f64).
-    emit_ternary_llvm(mut &this, iname: string, ty: LType, x: LValue, y: LValue, z: LValue, label: Text) -> LValue {
+    emit_ternary_llvm(mut &this, iname: MangledName, ty: LType, x: LValue, y: LValue, z: LValue, label: Text) -> LValue {
         const fn: LValue = this.get_or_decl_ternary_intrinsic(iname, ty);
         if (!fn.is_valid()) { return LValue::null(); }
         const param_buf: void* = libc::malloc(24);
@@ -332,7 +333,7 @@ type struct IntrinsicEmitter {
     emit_fpclass(mut &this, x: LValue, mask_val: LValue) -> LValue {
         const val_ty:  LType = LType::f64();
         const mask_ty: LType = LType::i32();
-        const fn: LValue = this.get_or_decl_fpclass("llvm.is.fpclass.f64", val_ty, mask_ty);
+        const fn: LValue = this.get_or_decl_fpclass(MangledName::new("llvm.is.fpclass.f64"), val_ty, mask_ty);
         if (!fn.is_valid()) { return LValue::null(); }
         mut mask_bits: u64 = 0;
         if (mask_val.is_valid() && llvm::LLVMIsConstant(mask_val.raw) != 0) {
@@ -552,19 +553,19 @@ type struct IntrinsicEmitter {
             IntrinsicKind::PtrDiff => { this.emit_ptr_diff(args[0], args[1]) }
 
             // -- Bit operations --
-            IntrinsicKind::Bswap16    => { this.emit_unary_llvm("llvm.bswap.i16", LType::i16(), a0, false, Text::new("bswap")) }
-            IntrinsicKind::Bswap32    => { this.emit_unary_llvm("llvm.bswap.i32", LType::i32(), a0, false, Text::new("bswap")) }
-            IntrinsicKind::Bswap64    => { this.emit_unary_llvm("llvm.bswap.i64", LType::i64(), a0, false, Text::new("bswap")) }
-            IntrinsicKind::Popcount32 => { this.emit_unary_llvm("llvm.ctpop.i32", LType::i32(), a0, true, Text::new("ctpop")) }
-            IntrinsicKind::Popcount64 => { this.emit_unary_llvm("llvm.ctpop.i64", LType::i64(), a0, true, Text::new("ctpop")) }
-            IntrinsicKind::Clz32 => { this.emit_clz_or_ctz("llvm.ctlz.i32", LType::i32(), a0) }
-            IntrinsicKind::Clz64 => { this.emit_clz_or_ctz("llvm.ctlz.i64", LType::i64(), a0) }
-            IntrinsicKind::Ctz32 => { this.emit_clz_or_ctz("llvm.cttz.i32", LType::i32(), a0) }
-            IntrinsicKind::Ctz64 => { this.emit_clz_or_ctz("llvm.cttz.i64", LType::i64(), a0) }
-            IntrinsicKind::Rotl32 => { this.emit_rotate("llvm.fshl.i32", LType::i32(), a0, a1) }
-            IntrinsicKind::Rotl64 => { this.emit_rotate("llvm.fshl.i64", LType::i64(), a0, a1) }
-            IntrinsicKind::Rotr32 => { this.emit_rotate("llvm.fshr.i32", LType::i32(), a0, a1) }
-            IntrinsicKind::Rotr64 => { this.emit_rotate("llvm.fshr.i64", LType::i64(), a0, a1) }
+            IntrinsicKind::Bswap16    => { this.emit_unary_llvm(MangledName::new("llvm.bswap.i16"), LType::i16(), a0, false, Text::new("bswap")) }
+            IntrinsicKind::Bswap32    => { this.emit_unary_llvm(MangledName::new("llvm.bswap.i32"), LType::i32(), a0, false, Text::new("bswap")) }
+            IntrinsicKind::Bswap64    => { this.emit_unary_llvm(MangledName::new("llvm.bswap.i64"), LType::i64(), a0, false, Text::new("bswap")) }
+            IntrinsicKind::Popcount32 => { this.emit_unary_llvm(MangledName::new("llvm.ctpop.i32"), LType::i32(), a0, true, Text::new("ctpop")) }
+            IntrinsicKind::Popcount64 => { this.emit_unary_llvm(MangledName::new("llvm.ctpop.i64"), LType::i64(), a0, true, Text::new("ctpop")) }
+            IntrinsicKind::Clz32 => { this.emit_clz_or_ctz(MangledName::new("llvm.ctlz.i32"), LType::i32(), a0) }
+            IntrinsicKind::Clz64 => { this.emit_clz_or_ctz(MangledName::new("llvm.ctlz.i64"), LType::i64(), a0) }
+            IntrinsicKind::Ctz32 => { this.emit_clz_or_ctz(MangledName::new("llvm.cttz.i32"), LType::i32(), a0) }
+            IntrinsicKind::Ctz64 => { this.emit_clz_or_ctz(MangledName::new("llvm.cttz.i64"), LType::i64(), a0) }
+            IntrinsicKind::Rotl32 => { this.emit_rotate(MangledName::new("llvm.fshl.i32"), LType::i32(), a0, a1) }
+            IntrinsicKind::Rotl64 => { this.emit_rotate(MangledName::new("llvm.fshl.i64"), LType::i64(), a0, a1) }
+            IntrinsicKind::Rotr32 => { this.emit_rotate(MangledName::new("llvm.fshr.i32"), LType::i32(), a0, a1) }
+            IntrinsicKind::Rotr64 => { this.emit_rotate(MangledName::new("llvm.fshr.i64"), LType::i64(), a0, a1) }
 
             // -- atomic_fence(order): emit `fence <order>`.  The Ordering is
             //    part of the instruction (extracted as a constant, SeqCst
@@ -591,7 +592,7 @@ type struct IntrinsicEmitter {
             //    post-call divergent-name check (see Panic), so the
             //    `unreachable` is emitted here. --
             IntrinsicKind::Trap => {
-                const fn: LValue = this.get_or_decl_void_noarg("llvm.trap");
+                const fn: LValue = this.get_or_decl_void_noarg(MangledName::new("llvm.trap"));
                 if (fn.is_valid()) {
                     const fty: LType = LType::function_type(LType::void_type(), null, 0, false);
                     this.builder.build_call(fty, fn, null, 0, Text::new(""));
@@ -603,7 +604,7 @@ type struct IntrinsicEmitter {
             // -- debugtrap(): `call void @llvm.debugtrap()`.  A breakpoint that
             //    RETURNS, so no trailing `unreachable`. --
             IntrinsicKind::DebugTrap => {
-                const fn: LValue = this.get_or_decl_void_noarg("llvm.debugtrap");
+                const fn: LValue = this.get_or_decl_void_noarg(MangledName::new("llvm.debugtrap"));
                 if (fn.is_valid()) {
                     const fty: LType = LType::function_type(LType::void_type(), null, 0, false);
                     this.builder.build_call(fty, fn, null, 0, Text::new(""));
@@ -614,29 +615,29 @@ type struct IntrinsicEmitter {
             // -- frame_address(n) / return_address(n): `ptr @llvm.frameaddress.p0(i32)`
             //    / `ptr @llvm.returnaddress(i32)`.  `n` (a0) must be a constant
             //    (LLVM immarg); n=0 is the current frame.  For the backtrace. --
-            IntrinsicKind::FrameAddress  => { this.emit_addr_intrinsic("llvm.frameaddress.p0", a0) }
-            IntrinsicKind::ReturnAddress => { this.emit_addr_intrinsic("llvm.returnaddress", a0) }
+            IntrinsicKind::FrameAddress  => { this.emit_addr_intrinsic(MangledName::new("llvm.frameaddress.p0"), a0) }
+            IntrinsicKind::ReturnAddress => { this.emit_addr_intrinsic(MangledName::new("llvm.returnaddress"), a0) }
 
             // -- Cheap IEEE-754 math: each lowers to the matching LLVM float
             //    intrinsic.  a0 is auto-deref'd via src_type above; the extra
             //    value args of copysign64/fma64 are deref'd here since the
             //    shared a1 path only handles the rotate count. --
-            IntrinsicKind::Fabs64   => { this.emit_unary_llvm("llvm.fabs.f64",  LType::f64(), a0, false, Text::new("fabs")) }
-            IntrinsicKind::Fabs32   => { this.emit_unary_llvm("llvm.fabs.f32",  LType::f32(), a0, false, Text::new("fabs")) }
-            IntrinsicKind::Floor64  => { this.emit_unary_llvm("llvm.floor.f64", LType::f64(), a0, false, Text::new("floor")) }
-            IntrinsicKind::Ceil64   => { this.emit_unary_llvm("llvm.ceil.f64",  LType::f64(), a0, false, Text::new("ceil")) }
-            IntrinsicKind::FTrunc64 => { this.emit_unary_llvm("llvm.trunc.f64", LType::f64(), a0, false, Text::new("ftrunc")) }
-            IntrinsicKind::Round64  => { this.emit_unary_llvm("llvm.round.f64", LType::f64(), a0, false, Text::new("round")) }
-            IntrinsicKind::Sqrt64   => { this.emit_unary_llvm("llvm.sqrt.f64",  LType::f64(), a0, false, Text::new("sqrt")) }
-            IntrinsicKind::Sqrt32   => { this.emit_unary_llvm("llvm.sqrt.f32",  LType::f32(), a0, false, Text::new("sqrt")) }
+            IntrinsicKind::Fabs64   => { this.emit_unary_llvm(MangledName::new("llvm.fabs.f64"),  LType::f64(), a0, false, Text::new("fabs")) }
+            IntrinsicKind::Fabs32   => { this.emit_unary_llvm(MangledName::new("llvm.fabs.f32"),  LType::f32(), a0, false, Text::new("fabs")) }
+            IntrinsicKind::Floor64  => { this.emit_unary_llvm(MangledName::new("llvm.floor.f64"), LType::f64(), a0, false, Text::new("floor")) }
+            IntrinsicKind::Ceil64   => { this.emit_unary_llvm(MangledName::new("llvm.ceil.f64"),  LType::f64(), a0, false, Text::new("ceil")) }
+            IntrinsicKind::FTrunc64 => { this.emit_unary_llvm(MangledName::new("llvm.trunc.f64"), LType::f64(), a0, false, Text::new("ftrunc")) }
+            IntrinsicKind::Round64  => { this.emit_unary_llvm(MangledName::new("llvm.round.f64"), LType::f64(), a0, false, Text::new("round")) }
+            IntrinsicKind::Sqrt64   => { this.emit_unary_llvm(MangledName::new("llvm.sqrt.f64"),  LType::f64(), a0, false, Text::new("sqrt")) }
+            IntrinsicKind::Sqrt32   => { this.emit_unary_llvm(MangledName::new("llvm.sqrt.f32"),  LType::f32(), a0, false, Text::new("sqrt")) }
             IntrinsicKind::Copysign64 => {
                 const sign: LValue = this.auto_deref_to(a1, LType::f64());
-                this.emit_binary_llvm("llvm.copysign.f64", LType::f64(), a0, sign, Text::new("copysign"))
+                this.emit_binary_llvm(MangledName::new("llvm.copysign.f64"), LType::f64(), a0, sign, Text::new("copysign"))
             }
             IntrinsicKind::Fma64 => {
                 const y: LValue = this.auto_deref_to(a1, LType::f64());
                 const z: LValue = this.auto_deref_to(args[2], LType::f64());
-                this.emit_ternary_llvm("llvm.fma.f64", LType::f64(), a0, y, z, Text::new("fma"))
+                this.emit_ternary_llvm(MangledName::new("llvm.fma.f64"), LType::f64(), a0, y, z, Text::new("fma"))
             }
 
             // -- dirent_name(entry) -> entry == null ? "" : (entry + 19).
@@ -728,7 +729,7 @@ type struct IntrinsicEmitter {
     /// Signature `(ptr, ptr, i32) -> void`, matching the abort funnel's call
     /// shape; the caller emits `unreachable` after the call since it diverges.
     get_or_decl_cryo_panic(mut &this) -> LValue {
-        mut fn: LValue = this.llvm_module.get_named_function("__cryo_panic");
+        mut fn: LValue = this.llvm_module.get_named_function(MangledName::new("__cryo_panic"));
         if (fn.is_valid()) { return fn; }
         const ptr_ty: LType = LType::pointer_to(LType::i8());
         const param_buf: void* = libc::malloc(24);
@@ -738,7 +739,7 @@ type struct IntrinsicEmitter {
         param_slots[2] = LType::i32().raw;
         const fty: LType = LType::function_type(LType::void_type(), param_buf, 3, false);
         libc::free(param_buf);
-        return this.llvm_module.add_function("__cryo_panic", fty);
+        return this.llvm_module.add_function(MangledName::new("__cryo_panic"), fty);
     }
 
     /// Emit `call @panic(msg, file, line); unreachable`.  Ensures the
@@ -748,7 +749,7 @@ type struct IntrinsicEmitter {
         // diverges through `llvm.trap` (`ud2`/SIGILL) instead.  The message
         // is discarded - there is nothing to print to.
         if (this.no_runtime) {
-            const trap_fn: LValue = this.get_or_decl_void_noarg("llvm.trap");
+            const trap_fn: LValue = this.get_or_decl_void_noarg(MangledName::new("llvm.trap"));
             if (trap_fn.is_valid()) {
                 const trap_fty: LType = LType::function_type(LType::void_type(), null, 0, false);
                 this.builder.build_call(trap_fty, trap_fn, null, 0, Text::new(""));
@@ -989,7 +990,7 @@ type struct IntrinsicEmitter {
     }
 
     get_or_decl_va_start(mut &this) -> LValue {
-        mut fn: LValue = this.llvm_module.get_named_function("llvm.va_start.p0");
+        mut fn: LValue = this.llvm_module.get_named_function(MangledName::new("llvm.va_start.p0"));
         if (fn.is_valid()) { return fn; }
         const ptr_ty: LType = LType::pointer_to(LType::i8());
         const buf: void* = libc::malloc(8);
@@ -997,11 +998,11 @@ type struct IntrinsicEmitter {
         slots[0] = ptr_ty.raw;
         const fty: LType = LType::function_type(LType::void_type(), buf, 1, false);
         libc::free(buf);
-        return this.llvm_module.add_function("llvm.va_start.p0", fty);
+        return this.llvm_module.add_function(MangledName::new("llvm.va_start.p0"), fty);
     }
 
     get_or_decl_va_end(mut &this) -> LValue {
-        mut fn: LValue = this.llvm_module.get_named_function("llvm.va_end.p0");
+        mut fn: LValue = this.llvm_module.get_named_function(MangledName::new("llvm.va_end.p0"));
         if (fn.is_valid()) { return fn; }
         const ptr_ty: LType = LType::pointer_to(LType::i8());
         const buf: void* = libc::malloc(8);
@@ -1009,7 +1010,7 @@ type struct IntrinsicEmitter {
         slots[0] = ptr_ty.raw;
         const fty: LType = LType::function_type(LType::void_type(), buf, 1, false);
         libc::free(buf);
-        return this.llvm_module.add_function("llvm.va_end.p0", fty);
+        return this.llvm_module.add_function(MangledName::new("llvm.va_end.p0"), fty);
     }
 
     // -- Freestanding check handlers (`runtime/abi/lang_items.def`) -----------
@@ -1044,7 +1045,7 @@ type struct IntrinsicEmitter {
         const init: LValue = LType::const_struct(buf, 3, false);
         libc::free(buf);
 
-        mut g: LValue = this.llvm_module.add_global(init.type_of(), "srcloc");
+        mut g: LValue = this.llvm_module.add_global(init.type_of(), MangledName::new("srcloc"));
         g.set_initializer(init);
         g.set_global_constant(true);
         g.set_linkage(LLinkage::Private);
@@ -1054,7 +1055,7 @@ type struct IntrinsicEmitter {
     /// Get-or-declare one of the runtime's check handlers. Every one takes the
     /// `SourceLoc*` first and returns void (declared `-> never` on the runtime
     /// side; the caller emits the `unreachable`).
-    get_or_decl_check_handler(mut &this, name: string, extra: i64) -> LValue {
+    get_or_decl_check_handler(mut &this, name: MangledName, extra: i64) -> LValue {
         mut fn: LValue = this.llvm_module.get_named_function(name);
         if (fn.is_valid()) { return fn; }
         const count: i64 = 1 + extra;
@@ -1064,7 +1065,7 @@ type struct IntrinsicEmitter {
         // `op` is the only u32 operand and it is always the FIRST extra; the
         // rest are u64. Matches the `lang_items.def` signatures exactly.
         for (mut i: i64 = 1; i < count; i++) {
-            if (name == "__cryo_panic_overflow" && i == 1) {
+            if (name.as_string() == "__cryo_panic_overflow" && i == 1) {
                 slots[i] = LType::i32().raw;
             } else {
                 slots[i] = LType::i64().raw;
@@ -1080,7 +1081,7 @@ type struct IntrinsicEmitter {
     ///
     /// Returns false when there is no handler for this shape, so the caller can
     /// keep its previous behaviour rather than emit a call to nothing.
-    emit_check_handler_call(mut &this, name: string, span: SourceSpan,
+    emit_check_handler_call(mut &this, name: MangledName, span: SourceSpan,
                             operands: &LValue[]) -> boolean {
         const fn: LValue = this.get_or_decl_check_handler(name, operands.length);
         if (!fn.is_valid()) { return false; }
@@ -1104,7 +1105,7 @@ type struct IntrinsicEmitter {
     /// `no_runtime`, else the libc `abort` the hosted abort strategy has always
     /// used. `operands` are the handler's extra arguments, already widened to
     /// the declared types.
-    emit_check_sink(mut &this, name: string, span: SourceSpan,
+    emit_check_sink(mut &this, name: MangledName, span: SourceSpan,
                     operands: &LValue[]) -> void {
         if (this.no_runtime) {
             if (this.emit_check_handler_call(name, span, operands)) { return; }
@@ -1117,10 +1118,10 @@ type struct IntrinsicEmitter {
 
     /// Declare libc `abort` extern: `void abort(void) __attribute__((noreturn))`.
     get_or_decl_abort(mut &this) -> LValue {
-        mut fn: LValue = this.llvm_module.get_named_function("abort");
+        mut fn: LValue = this.llvm_module.get_named_function(MangledName::new("abort"));
         if (fn.is_valid()) { return fn; }
         const fty: LType = LType::function_type(LType::void_type(), null, 0, false);
-        return this.llvm_module.add_function("abort", fty);
+        return this.llvm_module.add_function(MangledName::new("abort"), fty);
     }
 
     /// Declare the allocator lang item `__cryo_alloc(u64 size, u64 align) ->
@@ -1131,7 +1132,7 @@ type struct IntrinsicEmitter {
     /// is the whole point of routing allocation through a named symbol instead
     /// of open-coding a `malloc` call.
     get_or_decl_cryo_alloc(mut &this) -> LValue {
-        mut fn: LValue = this.llvm_module.get_named_function("__cryo_alloc");
+        mut fn: LValue = this.llvm_module.get_named_function(MangledName::new("__cryo_alloc"));
         if (fn.is_valid()) { return fn; }
         const param_buf: void* = libc::malloc(16);
         const slots: void** = param_buf as void**;
@@ -1140,13 +1141,13 @@ type struct IntrinsicEmitter {
         const fty: LType = LType::function_type(
             LType::pointer_to(LType::i8()), param_buf, 2, false);
         libc::free(param_buf);
-        return this.llvm_module.add_function("__cryo_alloc", fty);
+        return this.llvm_module.add_function(MangledName::new("__cryo_alloc"), fty);
     }
 
     /// Declare the deallocator lang item
     /// `__cryo_dealloc(void* ptr, u64 size, u64 align)`.  Idempotent.
     get_or_decl_cryo_dealloc(mut &this) -> LValue {
-        mut fn: LValue = this.llvm_module.get_named_function("__cryo_dealloc");
+        mut fn: LValue = this.llvm_module.get_named_function(MangledName::new("__cryo_dealloc"));
         if (fn.is_valid()) { return fn; }
         const param_buf: void* = libc::malloc(24);
         const slots: void** = param_buf as void**;
@@ -1156,7 +1157,7 @@ type struct IntrinsicEmitter {
         const fty: LType = LType::function_type(LType::void_type(), param_buf,
                                                 3, false);
         libc::free(param_buf);
-        return this.llvm_module.add_function("__cryo_dealloc", fty);
+        return this.llvm_module.add_function(MangledName::new("__cryo_dealloc"), fty);
     }
 
 }

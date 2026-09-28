@@ -30,13 +30,29 @@ where a refusal points.
   python retype.py --drop-unused <build-log> <root>
       Delete each entry unwrap a W0001 names as an unused variable.
 
+`--as MangledName`, anywhere on the command line, makes every mode work with
+that type instead of `Text`: its import, its `::new`, its name in the
+refusals' notes.
+
 `relocate.py` re-points a list's line numbers at the working tree when
 earlier edits have moved the declarations.
 """
 import os, re, sys
 
-IMPORT = "import utils::text::{ Text };"
-TEXT_T = "utils::text::Text"
+# The marker type the parameters become; `--as <Type>` picks another.
+TYPES = {
+    "Text": ("import utils::text::{ Text };", "utils::text::Text"),
+    "MangledName": ("import compiler::resolver::mangled_name::{ MangledName };",
+                    "compiler::resolver::mangled_name::MangledName"),
+}
+T = "Text"
+IMPORT, TEXT_T = TYPES[T]
+
+
+def use_type(name):
+    global T, IMPORT, TEXT_T
+    T = name
+    IMPORT, TEXT_T = TYPES[name]
 
 
 def code(line):
@@ -106,7 +122,7 @@ def retype_params(listfile, root):
         for ln, pn in items:
             pat = re.compile(r"(\b%s\s*:\s*(?:const\s+)?(?:&\s*(?:mut\s+)?)?)string\b" % re.escape(pn))
             for k in range(ln - 1, min(ln + 12, len(lines))):
-                t, c = pat.subn(r"\1Text", lines[k], count=1)
+                t, c = pat.subn(r"\g<1>" + T, lines[k], count=1)
                 if c:
                     lines[k] = t
                     n += 1
@@ -145,7 +161,7 @@ def prologue(listfile, root):
             head = ln - 1
             while not is_decl(lines[head], fn):
                 head += 1
-            pat = re.compile(r"\b%s(\s*:\s*Text\b)" % re.escape(pn))
+            pat = re.compile(r"\b%s(\s*:\s*%s\b)" % (re.escape(pn), T))
             k = head
             while not pat.search(lines[k]):
                 k += 1
@@ -209,7 +225,7 @@ def collapse(listfile, root):
                 if started and depth <= 0:
                     break
                 i += 1
-            pat = re.compile(r"Text::new\(%s\)" % re.escape(pn))
+            pat = re.compile(r"%s::new\(%s\)" % (T, re.escape(pn)))
             for k in range(head, i + 1):
                 lines[k], c = pat.subn(pn + "_text", lines[k])
                 n += c
@@ -222,7 +238,7 @@ def round_trips(root):
     argument was already text.  `--refusals` writes the shape when a `Text`
     that had been unwrapped for a `string` parameter meets that parameter
     retyped.  The check refuses any rewrite that was not."""
-    pat = re.compile(r"Text::new\(([A-Za-z_][\w.]*)\.as_string\(\)\)")
+    pat = re.compile(r"%s::new\(([A-Za-z_][\w.]*)\.as_string\(\)\)" % T)
     n = 0
     for base, _, files in os.walk(root):
         if os.sep + "build" in base or "/build" in base:
@@ -354,7 +370,7 @@ def refusals(log, root, dry):
                 pad = tail[len(t):]
                 if kind == "wrap":
                     src[el] = t + ")" + pad + src[el][ec:]
-                    src[li] = src[li][:c] + "Text::new(" + src[li][c:]
+                    src[li] = src[li][:c] + T + "::new(" + src[li][c:]
                 else:
                     src[el] = t + ").as_string()" + pad + src[el][ec:]
                     src[li] = src[li][:c] + "(" + src[li][c:]
@@ -364,7 +380,7 @@ def refusals(log, root, dry):
             arg = seg.rstrip()
             pad = seg[len(arg):]
             if kind == "wrap":
-                new = "Text::new(" + arg + ")"
+                new = T + "::new(" + arg + ")"
             elif SIMPLE.match(arg):
                 new = arg + ".as_string()"
             else:
@@ -383,6 +399,10 @@ def refusals(log, root, dry):
 
 if __name__ == "__main__":
     a = sys.argv[1:]
+    if "--as" in a:
+        k = a.index("--as")
+        use_type(a[k + 1])
+        del a[k:k + 2]
     if a[:1] == ["--params"]:
         retype_params(a[1], a[2])
     elif a[:1] == ["--round-trips"]:

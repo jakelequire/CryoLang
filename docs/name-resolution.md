@@ -142,7 +142,7 @@ instrument condition one's list is drawn from; its J count is not a target.
 Checks:
 
 * `python3 scripts/ns-migration/done.py --outstanding | wc -l` → **0** (5 before §8.360: the five overload-family doors take a `FamilyOwner` - a definition or a type by identity - and the written leaf, and are member reads; 6 before §8.359: `signature_refused` is asked by identity - a function's refusal on its definition, a method's by its owner type and leaf; 8 before §8.358, whose visibility gate asks by the callee's definition: `is_candidate_public` and `namespace_of` are deleted; 14 before §8.357: the six generic-parameter scans - `TemplateEntry::param_names[]`, `local::TraitBound[]`, `FunctionDeclNode::trait_bounds[]`, `ImplBlockNode::where_bounds[]` and the two `SemaState` parameter lists - compare by declaration once the arena keys a parameter by it; 23 before §8.333-§8.335: the six owner doors asked by the self type's name and both `get_template` lines, B and C, are gone, and `lookup_type_exact` is called only inside the funnel's own file; 25 before §8.331 converted the self-growth check and the two written-name scans; condition one's list, one line per function or hand-written scan and class - `get_template` is on two lines, B and C; 30 before §8.330 converted the four trait lookups and one scan)
-* `python3 scripts/ns-migration/done.py --name-taking | wc -l` → **748** (-63 in §8.389: literal and source text scanned for its value or rendered - numeric, string and f-string lexemes, the syntax highlighter's line, the renderer's line utilities, config values, semver strings, doc comments - takes `Text`; 811 before, -92 in §8.388: every LLVM builder's value label, basic-block and call-result labels, and codegen's triples, data layout, inline-asm text and literal text take `Text`; 903 before, -119 in §8.387: functions whose every spelling-typed parameter is a file path, a command line, a URL or hash, a target triple or file contents handed to the file system, a tool or the backend take `Text`; 1,022 before, -72 and +1 in §8.386: 72 functions whose only spelling-typed parameters were message text - a diagnostic's or a log line's message, a failure report's site label, a suggestion's replacement - take `Text`, and `Text::new(s: string)`, the one place bytes become text, enters; 1,093 before, -2 in §8.379: the generic registry's `instantiate_for_module`, whose module argument fed a list nothing read, and the graph's `source_file_for_owner_key`, whose namespace branch no key could reach, are deleted; 1,095 before, -4 in §8.378: a C import's module is registered once by the importer and every declaration it brings in carries it, so the name layer's `c_import_module` is deleted, `declare_c_imported_global` and the type mapper's constructor take the module, the graph's `bind_c_import_module` takes the module in place of text and `register_c_import_module` - the one place the import's composed namespace becomes a module - is new, and the global table's canonical-name splitter `split_global_key` is deleted; 1,099 before, -2 in §8.376: the declaration index's `register_module_imports` and `register_prelude_namespaces` and the resolver's `set_prelude_modules` take modules, and the graph's `modules_of` - the one place the loader's recorded edges become modules - is new; 1,101 before, -7 in §8.375: nine stop taking text - the context's `set_namespace`, `swap_namespace`, `module_def_of`, `module_family` and `module_ns_sym_of_file`, the graph's `ns_sym_of_file`, both monomorphizer layers' never-read `set_current_ns`, and `enforce_callee_visibility`, whose use site is a module - and two take the text that still reaches a family owner, `module_family_named` and `minted_parent_family`; 1,108 before, -1 in §8.374: `Resolver::get_exports` asks by the module's identity; 1,109 before, -3 in §8.373: the resolver's `set_module`, `restore_scope`, `module_scope_of` and `declare_module_symbol` take the module as a `ModulePath`, and the name layer's `c_import_module` is new - the one place a C import's declarations turn the namespace the importer wrote on them into its module; 1,112 before, -2 in §8.372: `register_injected_origin` takes the template's module as a `ModulePath`, and async lowering's `repoint_method` loses a namespace-text parameter it never read; 1,114 before, unchanged in §8.367, two out and two in: `Resolver::lookup_in_module` and `NameResolution::export_in` deleted, `Resolver::export_in` - the latter moved - and `Resolver::import_target_in`, an import binding of a leaf by its target, new; +4 in §8.365: the facts writer's `write` (a file path), `sort_key` (a record), `normalized_path` (a source path) and `local_provenance` (a local's spelling, printed) - text written, never looked up; 1,110 before, -13 in §8.364: the eight editor finders and the five spelling matchers only they used - `leaf_segment_str`, `type_name_matches`, `match_methods_on_type`, `match_fields_on_type`, `decl_name_matches` - moved into `tools/CryoLSP`; 1,123 before, +4 in §8.363: the module graph's text-to-module door `module_named` (RULED AGAINST, D45: it is to be removed, not kept as the answer) and the file-to-module `module_of_file` - on the graph and the context's null-guarded copy - and `bind_c_import_module`, which now takes the C import's namespace and mints its path itself; `ModulePath::of` moved into the graph's file, one line for one; 1,119 before, +2 in §8.362: codegen's `run_tool`, which runs a toolchain command with its output captured, and `tool_failure`, the error that carries that output - a command line and a file path, text run and read, not names looked up; +2 in §8.361: `DefTable::register_generated`, the registration a synthesizer's declaration goes through, and the `append` both registrations share; 1,114 before §8.360: six no longer take a spelling (`resolve_function` and `lookup_sole_entry` take the definition; `reset_function_overloads`, `reset_method_overloads`, `pin_scope_callee_qsym`, `check_impl_qualified_args` are gone or take an owner) and seven new ones do - `family_slot`, `reset_family`, the three context helpers that name a declaring module's family (`decl_fn_family`, `minted_family`, `module_family`, and `module_def_of` behind them) and the E0900 text's `family_text`; condition two's population, all of it unplaced; 1,115 before §8.359: `mark_signature_refused`, `signature_refused` and `signature_refused_in_module` deleted, `mark_method_signature_refused` and `method_signature_refused` new, each a method's leaf on an owner type; 1,117 before §8.358: five no longer take a spelling (`namespace_of`, `is_candidate_public`, `set_decl_visibility`, `enforce_value_ref_visibility`, `resolve_module_qualified_symbol`) and three new ones do (`Resolver::exports_named`, `NameResolution::export_in` and `private_in`, each a module's member by its leaf in one namespace); 1,120 before §8.357: `symbolic_name_is_generic_param` is deleted, `AsyncLower::param_spelled` and both `lookup_subst_for_param` take a parameter type or a symbol (-4), `TypeArena::this_placeholder(name)` is new (+1); 1,114 before the test runner ran its compile-fail and project suites on a worker pool, which added six functions taking a shell command or a file path, none a spelling: `shell_in_dir` (once per target), `Executor::suite_jobs`, `job_tmp_path`, `project_command` and `project_outcome`; 1,095 before §8.353, whose matcher saw a spelling only by value: +10 taking one by reference, `Resolver::resolve_path(segments: &SymbolStr[], ..)` among them, and +9 taking a `QualifiedName`; 1,099 before §8.349, which deleted `register_name_mapping`, `resolve_qualified_scoped`, `lookup_qualified_alternatives` and `ScopeResolution::resolved_or`; 1,098 before §8.348, which added `register_methods_through`, taking a diagnostic `site` label as `register_methods` does; 1,099 before §8.339, where `claim_wellknown` stopped taking a name; 1,109 before §8.333-§8.335: eleven functions - the owner and scope-segment doors and their helpers - stopped taking a name or were deleted, and the parser's `refuse_declaration_keyword_name` takes a diagnostic label; 1,110 before §8.332, where `register_impl_block`, `refuse_elided_template_params` and `set_resolved_template` stopped taking a name and `template_in` / `member_template_key` take the member's leaf; 1,113 before §8.331; 1,136 before §8.330, whose trait carriers stopped taking a name in 23 functions)
+* `python3 scripts/ns-migration/done.py --name-taking | wc -l` → **722** (-27 and +1 in §8.392: every function whose spelling-typed parameter is a link symbol - the backend's symbol table read and written by symbol, a symbol's linkage and COMDAT, the set of stripped symbols, an LLVM intrinsic or runtime check handler declared by symbol - takes `MangledName`, which now carries the symbol's bytes, and `MangledName::new(s: string)`, the one place bytes become a link symbol, enters; 748 before, -63 in §8.389: literal and source text scanned for its value or rendered - numeric, string and f-string lexemes, the syntax highlighter's line, the renderer's line utilities, config values, semver strings, doc comments - takes `Text`; 811 before, -92 in §8.388: every LLVM builder's value label, basic-block and call-result labels, and codegen's triples, data layout, inline-asm text and literal text take `Text`; 903 before, -119 in §8.387: functions whose every spelling-typed parameter is a file path, a command line, a URL or hash, a target triple or file contents handed to the file system, a tool or the backend take `Text`; 1,022 before, -72 and +1 in §8.386: 72 functions whose only spelling-typed parameters were message text - a diagnostic's or a log line's message, a failure report's site label, a suggestion's replacement - take `Text`, and `Text::new(s: string)`, the one place bytes become text, enters; 1,093 before, -2 in §8.379: the generic registry's `instantiate_for_module`, whose module argument fed a list nothing read, and the graph's `source_file_for_owner_key`, whose namespace branch no key could reach, are deleted; 1,095 before, -4 in §8.378: a C import's module is registered once by the importer and every declaration it brings in carries it, so the name layer's `c_import_module` is deleted, `declare_c_imported_global` and the type mapper's constructor take the module, the graph's `bind_c_import_module` takes the module in place of text and `register_c_import_module` - the one place the import's composed namespace becomes a module - is new, and the global table's canonical-name splitter `split_global_key` is deleted; 1,099 before, -2 in §8.376: the declaration index's `register_module_imports` and `register_prelude_namespaces` and the resolver's `set_prelude_modules` take modules, and the graph's `modules_of` - the one place the loader's recorded edges become modules - is new; 1,101 before, -7 in §8.375: nine stop taking text - the context's `set_namespace`, `swap_namespace`, `module_def_of`, `module_family` and `module_ns_sym_of_file`, the graph's `ns_sym_of_file`, both monomorphizer layers' never-read `set_current_ns`, and `enforce_callee_visibility`, whose use site is a module - and two take the text that still reaches a family owner, `module_family_named` and `minted_parent_family`; 1,108 before, -1 in §8.374: `Resolver::get_exports` asks by the module's identity; 1,109 before, -3 in §8.373: the resolver's `set_module`, `restore_scope`, `module_scope_of` and `declare_module_symbol` take the module as a `ModulePath`, and the name layer's `c_import_module` is new - the one place a C import's declarations turn the namespace the importer wrote on them into its module; 1,112 before, -2 in §8.372: `register_injected_origin` takes the template's module as a `ModulePath`, and async lowering's `repoint_method` loses a namespace-text parameter it never read; 1,114 before, unchanged in §8.367, two out and two in: `Resolver::lookup_in_module` and `NameResolution::export_in` deleted, `Resolver::export_in` - the latter moved - and `Resolver::import_target_in`, an import binding of a leaf by its target, new; +4 in §8.365: the facts writer's `write` (a file path), `sort_key` (a record), `normalized_path` (a source path) and `local_provenance` (a local's spelling, printed) - text written, never looked up; 1,110 before, -13 in §8.364: the eight editor finders and the five spelling matchers only they used - `leaf_segment_str`, `type_name_matches`, `match_methods_on_type`, `match_fields_on_type`, `decl_name_matches` - moved into `tools/CryoLSP`; 1,123 before, +4 in §8.363: the module graph's text-to-module door `module_named` (RULED AGAINST, D45: it is to be removed, not kept as the answer) and the file-to-module `module_of_file` - on the graph and the context's null-guarded copy - and `bind_c_import_module`, which now takes the C import's namespace and mints its path itself; `ModulePath::of` moved into the graph's file, one line for one; 1,119 before, +2 in §8.362: codegen's `run_tool`, which runs a toolchain command with its output captured, and `tool_failure`, the error that carries that output - a command line and a file path, text run and read, not names looked up; +2 in §8.361: `DefTable::register_generated`, the registration a synthesizer's declaration goes through, and the `append` both registrations share; 1,114 before §8.360: six no longer take a spelling (`resolve_function` and `lookup_sole_entry` take the definition; `reset_function_overloads`, `reset_method_overloads`, `pin_scope_callee_qsym`, `check_impl_qualified_args` are gone or take an owner) and seven new ones do - `family_slot`, `reset_family`, the three context helpers that name a declaring module's family (`decl_fn_family`, `minted_family`, `module_family`, and `module_def_of` behind them) and the E0900 text's `family_text`; condition two's population, all of it unplaced; 1,115 before §8.359: `mark_signature_refused`, `signature_refused` and `signature_refused_in_module` deleted, `mark_method_signature_refused` and `method_signature_refused` new, each a method's leaf on an owner type; 1,117 before §8.358: five no longer take a spelling (`namespace_of`, `is_candidate_public`, `set_decl_visibility`, `enforce_value_ref_visibility`, `resolve_module_qualified_symbol`) and three new ones do (`Resolver::exports_named`, `NameResolution::export_in` and `private_in`, each a module's member by its leaf in one namespace); 1,120 before §8.357: `symbolic_name_is_generic_param` is deleted, `AsyncLower::param_spelled` and both `lookup_subst_for_param` take a parameter type or a symbol (-4), `TypeArena::this_placeholder(name)` is new (+1); 1,114 before the test runner ran its compile-fail and project suites on a worker pool, which added six functions taking a shell command or a file path, none a spelling: `shell_in_dir` (once per target), `Executor::suite_jobs`, `job_tmp_path`, `project_command` and `project_outcome`; 1,095 before §8.353, whose matcher saw a spelling only by value: +10 taking one by reference, `Resolver::resolve_path(segments: &SymbolStr[], ..)` among them, and +9 taking a `QualifiedName`; 1,099 before §8.349, which deleted `register_name_mapping`, `resolve_qualified_scoped`, `lookup_qualified_alternatives` and `ScopeResolution::resolved_or`; 1,098 before §8.348, which added `register_methods_through`, taking a diagnostic `site` label as `register_methods` does; 1,099 before §8.339, where `claim_wellknown` stopped taking a name; 1,109 before §8.333-§8.335: eleven functions - the owner and scope-segment doors and their helpers - stopped taking a name or were deleted, and the parser's `refuse_declaration_keyword_name` takes a diagnostic label; 1,110 before §8.332, where `register_impl_block`, `refuse_elided_template_params` and `set_resolved_template` stopped taking a name and `template_in` / `member_template_key` take the member's leaf; 1,113 before §8.331; 1,136 before §8.330, whose trait carriers stopped taking a name in 23 functions)
 * `python3 scripts/ns-migration/done.py --selftest | tail -1` → **15** (the matcher above over declarations it must list - a spelling by value, by reference, as an array, as a `QualifiedName`, wrapped over two lines - and ones it must not, a `Text` among them since §8.386 (14 cases before); its matcher before §8.353 got 10)
 * `python3 scripts/parse_cache.py --selftest | tail -1` → **8** (the parse the rows share within one `ns-status-check` run: every way it could answer from a stale parse - a changed, added or removed source file, a changed script, a failed computation - driven through a throwaway tree; a key that ignored file contents got 3, §8.354)
 
@@ -210,7 +210,7 @@ measurement that decided it on the row.
 | D53 | **The spelling lint fires on the DECLARATION, not on each call.** The existing literal-argument rule stays where it is, a separate call-site rule of the gate (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — not built | §8.391 |
 | D54 | **The lint's denial gets a new error code; the existing E0152 covers a missing or empty reason** (Jake, relayed in plain text 2026-09-27) | **RULED** - the new code's number and wording are not chosen | `no check` — not built | §8.391 |
 | D55 | **The lint's normative spec text follows later**, once the syntax has settled in practice - it need not land with the mechanism (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — a timing rule | §8.391 |
-| D56 | **Link symbols get a MangledName type**, not written reasons (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — not built | §8.391 |
+| D56 | **Link symbols get a MangledName type**, not written reasons (Jake, relayed in plain text 2026-09-27) | **TAKEN (§8.392)** - `MangledName` carries the symbol's bytes; the backend's symbol table, linkage, the stripped set and the intrinsic and check-handler declarations take it (27 functions). Link symbols already typed `SymbolStr` - the codegen function and global registries' keys, `declare_extern_function_as` - are not converted | `grep -c 'name: MangledName' compiler/src/compiler/codegen/llvm_types.cryo` → **6** | §8.391, §8.392 |
 | D57 | **Keyword spellings get a keyword type**, not written reasons (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — not built | §8.391 |
 | D58 | **The seven outstanding lane re-pins are RATIFIED as they stand**: LOOKUP_LOCAL 51 → 59 → 69 → 71, ARENA_READ 61 → 63, LOOKUP_OTHER 92 → 93, GRAPH_WRITE 1 → 2. **Whether the gate should stop counting calls that ask by identity alone is DELIBERATELY DEFERRED** - an open principle, not answered (Jake, relayed in plain text 2026-09-27) | **TAKEN** for the seven; the principle **OPEN**. ARENA_READ 63 → 64 in §8.391 is a later increase of exactly that kind and is NOT covered by this ratification | `no check` — the counts are checked on their own rows | §8.391 |
 | D59 | **A bare identifier in expression position may not name a type** - refused, as Rust does; source-breaking, and accepted as such (Jake, relayed in plain text 2026-09-27). The bare-call stamp is fixed after it | **RULED** | `no check` — not built | §8.390, §8.391 |
@@ -48101,3 +48101,135 @@ Compiler: 3 files, +66 / -20 (`pattern_resolver.cryo`, `sema.cryo`,
 Gate cycles: 1 probe build + 2 corpus sweeps (probe, fix), 3 full test runs
 (probe, fix, parent-vs-new pair), 2 mutation builds, 1 clean build, 1 facts,
 2 check-fast, 2 verify (the first refused, above).
+
+### 8.392 Link symbols take `MangledName`, which now carries the symbol's bytes: 27 functions leave the name-taking population by construction (748 -> 722); 0 objects moved - 2026-09-27
+
+## What a link symbol is here
+
+A symbol as the linker and the backend see it: a Cryo-mangled name
+(`C$8compiler.7codegen...`), a C function's own name (`abort`, `strcmp`), a
+runtime entry point (`__cryo_panic`), an LLVM intrinsic (`llvm.trap`). The
+backend's symbol table is looked up by these bytes; nothing else looks
+anything up by them. They reached the backend as `string`, the type a name's
+spelling also travels as, so 27 functions that only ever hand a symbol to
+LLVM counted as taking a spelling.
+
+Before and after, at the backend's symbol table and one of its callers:
+
+```cryo
+get_named_function(&this, name: string) -> LValue { ... }
+mut fn: LValue = this.llvm_module.get_named_function("abort");
+```
+
+```cryo
+get_named_function(&this, name: MangledName) -> LValue {
+    return LValue { raw: llvm::LLVMGetNamedFunction(this.raw, name.as_string()) };
+}
+mut fn: LValue = this.llvm_module.get_named_function(MangledName::new("abort"));
+```
+
+## The type
+
+`MangledName` already existed, in the mangler, and was already outside the
+population as "an opaque link symbol" - but it held an interned `SymbolStr`,
+and every factory's result was resolved back to a `string` on the next line
+(8 sites) before it reached the backend, which has no intern table (two of
+its entry points, `LType::named_struct` and `struct_by_name`, are static).
+Now it holds the bytes, privately, like `Text`: `MangledName::new(s)` marks
+bytes as a link symbol, `as_string()` hands them to a C function or a
+`string` store, and the factories build the bytes without interning them. The
+two stores that key by an interned symbol - the declaration index's
+signature and the specializer's pin for a generic method - intern the bytes
+where they store (`intern.intern(mangled.as_string())`, 3 sites). The design
+choice (bytes rather than an interned handle) is mine: the interned form
+would have made every backend call intern `"abort"`.
+
+## The slice
+
+27 parameters, one per function, listed with the reason class in
+`scripts/ns-migration/8.391/mk_slice.py` (the tree's own line numbers are
+read from `done.py --name-taking`; `slice-mangled.tsv` is the list):
+
+* the backend's symbol table, read and written by symbol: `LModule`'s
+  `get_named_function`, `get_named_global`, `add_function`, `add_global`,
+  `LType::named_struct`, `struct_by_name`, the type mapper's
+  `forward_declare_struct`, the test harness's `add_extern_test_function` (8)
+* a symbol's linkage and COMDAT: `apply_spec_linkage`,
+  `apply_directive_effects` (2)
+* the set of symbols stripped from a module: both `is_stripped` (2)
+* LLVM intrinsics and runtime check handlers declared by symbol: the
+  intrinsic emitter's `get_or_decl_*` (7), `emit_*_llvm` / `emit_clz_or_ctz`
+  / `emit_rotate` / `emit_addr_intrinsic` (5), the check handler's three (3)
+
+Not in it: link symbols already typed `SymbolStr` - the codegen function and
+global registries' keys, `declare_extern_function_as(.., symbol)`,
+`held_symbol` - which key interned stores; converting them means retyping
+the stores (see the handoff).
+
+## How
+
+`retype.py` (committed with the `Text` work) gains `--as MangledName`: the
+same modes with that type's import, `::new` and qualified name. Uncapped
+check (`.objcmp/s64/cryo-nocap.exe`, `max_errors: 0`) after `--params`: 112
+refusals - 99 arguments refused as `string` where a `MangledName` is wanted
+(wrapped by `--refusals`), and 13 that are not arguments, fixed by
+`fix_mangled_sites.py` (committed): 3 reads of the old interned `.value`, 8
+`.resolve(intern)` of a factory's result (now held as the `MangledName`
+itself), and 2 comparisons of the symbol with a `string`. Second check: 16,
+each an argument already wrapped `MangledName::new(x)` whose `x` had become a
+`MangledName`; unwrapped by `--refusals` and collapsed by `--round-trips`
+(14; the 2 others are `mangled.as_string()` handed to the diagnostic that
+names a struct). Third check: 0 errors.
+
+`uses.py` over the 27: every use is a checked call into another retyped
+function, except one `if (name == null)` in `CodegenPasses::is_stripped`.
+`cryo check` accepted comparing the struct with `null`; the full build for the
+other OS then refused it as a codegen defect - "E0633: codegen: function
+'...is_stripped' ... left 1 of 3 basic block(s) unterminated; body
+discarded" - so it reads `name.as_string() == null` now. That a struct value
+compared with `null` passes the check is a type-check hole, recorded, not
+fixed here.
+
+One ordering slip, caught and redone: the hand edits ran before
+`--refusals` and merged two lines in `declaration_emitter.cryo`, so the 4
+refusals below that point would have been applied one line off; the file was
+restored and redone with the refusals first (`filter_log.py`, committed, cuts
+a check log to one file).
+
+## Proof by inversion
+
+`CRYO=<this tree's compiler> bash scripts/ns-migration/8.391/invert.sh`,
+each mutation alone:
+
+* A - a raw string literal where a link symbol is expected
+  (`get_named_function("abort")`): E0214 at `intrinsic_emitter.cryo:1121:62`,
+  "expected `...MangledName`, found `string`"
+* B - a name where a link symbol is expected
+  (`get_named_function(symbol)`, `symbol: SymbolStr`): E0214 at
+  `symbol_resolver.cryo:132:66`, "expected `...MangledName`, found
+  `...SymbolStr`". A first B, using `SymbolStr::empty()` in a file that does
+  not import it, was refused for that reason instead (E0240) and was moved -
+  it showed nothing about the type.
+* C - the link symbol where the declaration index's interned symbol is
+  expected: E0214 at `decl_index.cryo:1075:88`, "expected `...SymbolStr`,
+  found `...MangledName`"
+* control, the restored tree: "No errors found."
+
+## Counts
+
+* Name-taking 748 -> **722**, as predicted (27 out; `MangledName::new(s:
+  string)` in, the one place bytes become a link symbol).
+* Warnings (clean build) 344, the same set. Editor: 476 warnings, builds.
+* Lane, residue: unchanged.
+* Objects: 0 of 3,515 test objects and 0 of 1,126 example objects moved
+  (`make verify ARGS="--baseline HEAD --require-identical"`, OK in 304 s):
+  the symbols' bytes are the same, and the intern table no longer holding
+  the codegen-only symbols moved nothing.
+
+## Blast radius
+
+Compiler: 18 files, +181 / -152. Scripts: `retype.py` +20 (`--as`),
+`8.391/` new (`mk_slice.py`, `slice-mangled.tsv`, `fix_mangled_sites.py`,
+`filter_log.py`, `invert.sh`). Gate cycles: 3 uncapped checks, 2 other-OS
+full builds, 1 editor build, 1 clean build, 1 facts, 1 check-fast, 4
+inversion checks, 1 verify.

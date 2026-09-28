@@ -196,19 +196,40 @@ function operator_kind_from_name(name: string) -> Option<OperatorKind> {
 }
 
 
-// MangledName: opaque LLVM-safe symbol handle
+// MangledName: a link symbol
 
+/// A symbol as the linker and the backend see it: a Cryo-mangled name, a C
+/// function's own name, a runtime entry point, an LLVM intrinsic.  The
+/// backend's symbol table is looked up by these bytes and nothing else looks
+/// anything up by them - a declaration is found by its identity, and a name
+/// in source is a `SymbolStr` - so a function taking a `MangledName` takes
+/// no spelling a program wrote.
+///
+/// The bytes are one NUL-terminated `string`, so wrapping and unwrapping
+/// cost nothing.  `as_string` is written where a C function or a
+/// `string`-typed store needs them.
 type struct MangledName {
-    /// The interned mangled string.  Treat as opaque; only resolve
-    /// through the InternTable when emitting to LLVM IR or diagnostics.
-    value: SymbolStr;
+private:
+    raw: string;
+
+public:
+    /// Mark `s` as a link symbol: a C or runtime symbol, an LLVM intrinsic,
+    /// or a symbol the mangler already produced.
+    static new(s: string) -> MangledName {
+        return MangledName { raw: s };
+    }
+
+    /// The raw NUL-terminated bytes.
+    as_string(&this) -> string {
+        return this.raw;
+    }
 
 
     // Empty / pass-through
 
     /// An empty / invalid mangled name.
     static empty() -> MangledName {
-        return MangledName { value: SymbolStr::empty() };
+        return MangledName { raw: "" };
     }
 
 
@@ -257,7 +278,7 @@ type struct MangledName {
         buf += ctx.encode_params(params, receiver, is_variadic);
         buf += "$R";
         buf += ctx.encode_type_ref(ret, "for_trait_impl.ret");
-        return MangledName { value: table.intern(buf) };
+        return MangledName { raw: buf };
     }
 
     /// Choose between inherent-method and trait-impl mangling based on
@@ -293,7 +314,7 @@ type struct MangledName {
     /// Vtable for a class: `C$vt$<path>`.
     static for_vtable(table: InternTable*, owner_qname: QualifiedName) -> MangledName {
         const path: string = MangleContext::encode_path(table, owner_qname, SymbolStr::empty(), false);
-        return MangledName { value: table.intern("C$vt$" + path) };
+        return MangledName { raw: "C$vt$" + path };
     }
 
 
@@ -321,7 +342,7 @@ type struct MangledName {
         }
         const qname: QualifiedName = QualifiedName::single(table, full);
         const path: string = MangleContext::encode_path(table, qname, SymbolStr::empty(), false);
-        return MangledName { value: table.intern("C$" + path) };
+        return MangledName { raw: "C$" + path };
     }
 
     /// LLVM struct type name for a Cryo type: `C$<path>`.
@@ -329,7 +350,7 @@ type struct MangledName {
     /// are distinct; the `C$` prefix unambiguously marks Cryo origin.
     static for_struct_type(table: InternTable*, qname: QualifiedName) -> MangledName {
         const path: string = MangleContext::encode_path(table, qname, SymbolStr::empty(), false);
-        return MangledName { value: table.intern("C$" + path) };
+        return MangledName { raw: "C$" + path };
     }
 
 
@@ -373,22 +394,21 @@ type struct MangledName {
     /// `func.spec_type_args` through this, so the two always agree.
     with_method_spec_args(&this, table: InternTable*, arena: TypeArena*,
                           args: &TypeRef[]) -> MangledName {
-        if (args.length == 0) { return MangledName { value: this.value }; }
+        if (args.length == 0) { return MangledName { raw: this.raw }; }
         mut ctx: MangleContext = MangleContext::new(table, arena);
-        mut buf_m: string = table.resolve(this.value);
+        mut buf_m: string = this.raw;
         buf_m += "$MG";
         for (mut i: i64 = 0; i < args.length; i++) {
             if (i > 0) { buf_m += "_"; }
             buf_m += ctx.encode_type_ref(args[i], "with_method_spec_args.arg");
         }
         buf_m += "$";
-        return MangledName { value: table.intern(buf_m) };
+        return MangledName { raw: buf_m };
     }
 
-    is_empty(&this) -> boolean { return this.value.is_empty(); }
-    is_valid(&this) -> boolean { return this.value.is_valid(); }
-    equals(&this, other: MangledName) -> boolean { return this.value.equals(other.value); }
-    resolve(&this, table: InternTable*) -> string { return table.resolve(this.value); }
+    is_empty(&this) -> boolean { return this.raw == null || this.raw == ""; }
+    is_valid(&this) -> boolean { return !this.is_empty(); }
+    equals(&this, other: MangledName) -> boolean { return this.raw == other.raw; }
 }
 
 
@@ -439,7 +459,7 @@ type struct MangleContext {
             buf += "$R";
             buf += this.encode_type_ref(ret, "mangle_with_path.ret");
         }
-        return MangledName { value: this.table.intern(buf) };
+        return MangledName { raw: buf };
     }
 
 

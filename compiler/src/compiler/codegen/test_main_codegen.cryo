@@ -60,6 +60,7 @@ import compiler::types::generic_registry::{ GenericRegistry };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import utils::text::{ Text };
+import compiler::resolver::mangled_name::{ MangledName };
 
 
 // TestEntry: one row collected from the registry
@@ -134,7 +135,7 @@ type struct TestMainCodegen {
         while (i < test_count) {
             const t: TestEntry = tests[i];
             const name_global: LValue = TestMainCodegen::add_private_name_global(test_mod, i, t);
-            const fn_decl:     LValue = TestMainCodegen::add_extern_test_function(test_mod, t.mangled_name);
+            const fn_decl:     LValue = TestMainCodegen::add_extern_test_function(test_mod, MangledName::new(t.mangled_name));
             const entry:       LValue = TestMainCodegen::build_descriptor_const(
                 desc_ty, name_global, t.display_len, fn_decl,
                 t.ignored, t.should_panic);
@@ -155,7 +156,7 @@ type struct TestMainCodegen {
         }
         if (entries_buf != null) { libc::free(entries_buf); }
 
-        const arr_global: LValue = test_mod.add_global(arr_ty, "__cryo_test_descriptors");
+        const arr_global: LValue = test_mod.add_global(arr_ty, MangledName::new("__cryo_test_descriptors"));
         llvm::LLVMSetInitializer(arr_global.raw, arr_init.raw);
         llvm::LLVMSetGlobalConstant(arr_global.raw, 1);
 
@@ -279,7 +280,7 @@ type struct TestMainCodegen {
         // works in length-typed `Str`, not C strings.
         const arr_ty: LType = LType::array_of(LType::i8(), len as u32);
         const sym: string = fmt::format("__cryo_test_name_%llu", idx);
-        const g: LValue = test_mod.add_global(arr_ty, sym);
+        const g: LValue = test_mod.add_global(arr_ty, MangledName::new(sym));
         const init: LValue = LValue {
             raw: llvm::LLVMConstString(entry.display_name, len as u32, 1),
         };
@@ -296,7 +297,7 @@ type struct TestMainCodegen {
     /// rules, only the call-site type matters, and the runner module emits
     /// the correctly-typed call.  We just need the symbol to participate in
     /// the link.
-    static add_extern_test_function(test_mod: LModule, mangled: string) -> LValue {
+    static add_extern_test_function(test_mod: LModule, mangled: MangledName) -> LValue {
         const fn_ty: LType = LType::function_type(LType::void_type(), null, 0, false);
         return test_mod.add_function(mangled, fn_ty);
     }
@@ -375,15 +376,15 @@ type struct TestMainCodegen {
         const run_all_ty:  LType = TestMainCodegen::make_function_type_4(i32_ty, i32_ty, ptr_ty, ptr_ty, i64_ty);
 
         // Declare the runner-side externs.
-        const set_args_fn: LValue = test_mod.add_function(set_args_name, set_args_ty);
-        const set_env_fn:  LValue = test_mod.add_function(set_env_name,  set_env_ty);
-        const run_all_fn:  LValue = test_mod.add_function(run_all_name,  run_all_ty);
+        const set_args_fn: LValue = test_mod.add_function(MangledName::new(set_args_name), set_args_ty);
+        const set_env_fn:  LValue = test_mod.add_function(MangledName::new(set_env_name),  set_env_ty);
+        const run_all_fn:  LValue = test_mod.add_function(MangledName::new(run_all_name),  run_all_ty);
 
         // Declare main(i32, ptr, ptr) -> i32.  The third `char** envp`
         // param mirrors the user-program main-widening so `env::vars()`
         // works under `cryo test`; the C runtime always passes it.
         const main_ty: LType = TestMainCodegen::make_function_type_3(i32_ty, i32_ty, ptr_ty, ptr_ty);
-        const main_fn: LValue = test_mod.add_function("main", main_ty);
+        const main_fn: LValue = test_mod.add_function(MangledName::new("main"), main_ty);
         const entry:   LBasicBlock = LBasicBlock::append(main_fn, Text::new("entry"));
         mut builder: LBuilder = LBuilder::create();
         builder.position_at_end(entry);
