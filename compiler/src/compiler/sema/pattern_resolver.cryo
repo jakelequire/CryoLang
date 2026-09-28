@@ -447,27 +447,32 @@ type struct PatternResolver {
         }
     }
 
-    /// Validate `lo..hi` range patterns against the subject: the bound kind must
-    /// fit the subject (char vs integer), and `lo <= hi`.
-    check_range_patterns(mut &this, arms: &MatchArmNode*[], subject_type: TypeRef) -> void {
-        const base: Type* = this.types.unwrap_to_enum(subject_type);
+    /// Validate literal and `lo..hi` range patterns against the subject, and
+    /// that a range has `lo <= hi`.
+    ///
+    /// Codegen tests such a pattern against the subject's own value - a string
+    /// by content, anything else as an integer compare - and looks through no
+    /// reference, pointer or alias to do it.  So the subject's own type must be
+    /// the pattern's kind: a string pattern needs a `string` subject, a char
+    /// pattern or range a `char` one, an integer pattern or range an integer or
+    /// `char` one, `true` / `false` a `boolean` one.  A pattern let past here
+    /// has nothing to compare against and would never match.
+    check_literal_patterns(mut &this, arms: &MatchArmNode*[], subject_type: TypeRef) -> void {
+        mut subject: Type* = null;
+        if (subject_type.is_valid()) { subject = this.arena.lookup(subject_type); }
         for (mut i: i64 = 0; i < arms.length; i++) {
             const arm: MatchArmNode* = arms[i];
             if (arm == null) { continue; }
             for (mut j: i64 = 0; j < arm.patterns.length; j++) {
                 const pat: PatternNode* = arm.patterns[j];
-                if (pat == null || pat.pattern_kind != PatternKind::Range) { continue; }
+                if (pat == null) { continue; }
+                if (pat.pattern_kind != PatternKind::Literal
+                        && pat.pattern_kind != PatternKind::Range) { continue; }
 
-                if (base != null) {
-                    if (pat.literal_kind == LiteralKind::Char && base.kind != TypeKind::Char) {
-                        this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
-                            Text::new("char range pattern requires a `char` subject"), pat.span);
-                    } else if (pat.literal_kind == LiteralKind::Integer
-                            && base.kind != TypeKind::Int && base.kind != TypeKind::Char) {
-                        this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
-                            Text::new("integer range pattern requires an integer subject"), pat.span);
-                    }
+                if (subject != null) {
+                    this.check_pattern_fits_subject(pat, subject, subject_type);
                 }
+                if (pat.pattern_kind != PatternKind::Range) { continue; }
 
                 const lo: i64 = sema_decode_range_bound(Text::new(this.intern.resolve(pat.value)), pat.literal_kind);
                 const hi: i64 = sema_decode_range_bound(Text::new(this.intern.resolve(pat.high_value)), pat.literal_kind);
@@ -478,6 +483,39 @@ type struct PatternResolver {
                 }
             }
         }
+    }
+
+    /// E0200 when a literal or range pattern's kind is not the subject's own
+    /// type (see `check_literal_patterns`).
+    check_pattern_fits_subject(mut &this, pat: PatternNode*, subject: Type*,
+                               subject_type: TypeRef) -> void {
+        const k: TypeKind = subject.kind;
+        const is_range: boolean = pat.pattern_kind == PatternKind::Range;
+        mut fits: boolean = true;
+        mut kind: string = "";
+        mut wants: string = "";
+        match (pat.literal_kind) {
+            LiteralKind::String  => {
+                fits = k == TypeKind::String; kind = "string"; wants = "a `string`";
+            }
+            LiteralKind::Char    => {
+                fits = k == TypeKind::Char; kind = "char"; wants = "a `char`";
+            }
+            LiteralKind::Integer => {
+                fits = k == TypeKind::Int || k == TypeKind::Char;
+                kind = "integer"; wants = "an integer";
+            }
+            LiteralKind::Boolean => {
+                fits = k == TypeKind::Bool; kind = "boolean"; wants = "a `boolean`";
+            }
+            _                    => { }
+        }
+        if (fits) { return; }
+        const shape: string = if (is_range) { "range pattern" } else { "pattern" };
+        this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
+            Text::new(fmt::format("%s %s requires %s subject, found `%s`", kind, shape, wants,
+                this.arena.resolve_display_name(subject_type))),
+            pat.span);
     }
 
     /// Check that an enum match covers every variant of the subject (or has an

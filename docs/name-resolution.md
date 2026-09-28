@@ -205,8 +205,25 @@ measurement that decided it on the row.
 | D48 | **One allocator per identity kind, owned by its table**: nothing outside the table can construct a second `SymbolID` allocator or a second `DefTable`, which would hand out colliding identities - sealing stopped forging an identity from a raw number, not minting one from a fresh allocator (Jake, relayed in plain text 2026-09-27) | **SUPERSEDED by D47 - CLOSED (§8.386)**: the generation tags are the answer, and the work stops there (Jake, relayed in plain text 2026-09-27, agreeing to take "the tags as the answer to this hole and stop, because they cover more ground for less cost"). A second allocator or table still COMPILES - construction stays open deliberately - but nothing it mints is answered: since §8.380 and §8.384 each table refuses, where it reads, a `DefId`, `SymbolID`, `TypeRef` or `OverloadId` another table made or one made before a rebuild. A visibility reaching one named module is NOT wanted for this; if it is ever built it is decided on its own merits as a language feature. Measured before the ruling (§8.377): made private, each constructor refuses its one owner (E0353), because the owner is in another module and Cryo's `private` reaches the declaring module only; moving either owner beside its table is an import cycle | `no check` — construction is deliberately not refused; the refusal at read is D47's | §8.371, §8.377, §8.380, §8.384 |
 | D49 | **Both a `deprecated` attribute and a deny-by-default lint with a reason-carrying allow**, for their separate jobs - the attribute marks an API on its way out, the lint refuses a construct unless the allow at the site says why (Jake, relayed in plain text 2026-09-27) | **RULED** - the design is not written | `no check` — not built | §8.371 |
 | D50 | **The two disagreeing records are RE-MEASURED rather than reconciled to either document** (Jake, relayed in plain text 2026-09-27). The two: the editor answer-harness figure - 22 wrong or missing of 29 in this ledger and the handoff, 17 of 20 in the editor plan document - and the primitive-keyword ruling, recorded in a handoff and never carried into this ledger (named in the sixtieth session's brief) | **TAKEN (§8.377)** - neither old query set survives, so neither figure can be reproduced; the harness is rebuilt in the tree from the plan document's fixture and reads **18 of 25** wrong or missing (18 of the 20 questions shaped like the plan's; the 5 added all answer right), twice, identically; the ruling is carried into D18 | `no check` — the harness needs the editor server `make lsp-check` links and about two minutes; its reading is pinned in §8.377 | §8.371, §8.377 |
+| D51 | **The match-on-struct defect is fixed next, ahead of the remaining property work** - a string pattern against a struct subject passed the check, built, and silently never matched (Jake, relayed in plain text 2026-09-27) | **TAKEN (§8.391)** - refused, not made to match: a literal or range pattern whose kind is not the subject's own type is E0200 at the pattern; 0 programs in the corpus refused | `grep -c 'check_pattern_fits_subject' compiler/src/compiler/sema/pattern_resolver.cryo` → **2** | §8.389, §8.391 |
+| D52 | **The compiler learns which types are spellings from a list hardcoded inside the compiler** - not from a marker attribute on the type, and not from a list passed on the command line (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — not built | §8.391 |
+| D53 | **The spelling lint fires on the DECLARATION, not on each call.** The existing literal-argument rule stays where it is, a separate call-site rule of the gate (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — not built | §8.391 |
+| D54 | **The lint's denial gets a new error code; the existing E0152 covers a missing or empty reason** (Jake, relayed in plain text 2026-09-27) | **RULED** - the new code's number and wording are not chosen | `no check` — not built | §8.391 |
+| D55 | **The lint's normative spec text follows later**, once the syntax has settled in practice - it need not land with the mechanism (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — a timing rule | §8.391 |
+| D56 | **Link symbols get a MangledName type**, not written reasons (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — not built | §8.391 |
+| D57 | **Keyword spellings get a keyword type**, not written reasons (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — not built | §8.391 |
+| D58 | **The seven outstanding lane re-pins are RATIFIED as they stand**: LOOKUP_LOCAL 51 → 59 → 69 → 71, ARENA_READ 61 → 63, LOOKUP_OTHER 92 → 93, GRAPH_WRITE 1 → 2. **Whether the gate should stop counting calls that ask by identity alone is DELIBERATELY DEFERRED** - an open principle, not answered (Jake, relayed in plain text 2026-09-27) | **TAKEN** for the seven; the principle **OPEN**. ARENA_READ 63 → 64 in §8.391 is a later increase of exactly that kind and is NOT covered by this ratification | `no check` — the counts are checked on their own rows | §8.391 |
+| D59 | **A bare identifier in expression position may not name a type** - refused, as Rust does; source-breaking, and accepted as such (Jake, relayed in plain text 2026-09-27). The bare-call stamp is fixed after it | **RULED** | `no check` — not built | §8.390, §8.391 |
+| D60 | **The raw subcommand becomes real**: it builds a module graph as check and build do (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — not built | §8.391 |
+| D61 | **Array method arguments are type-checked before code generation**, so the fast check becomes trustworthy for them (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — not built | §8.391 |
+| D62 | **The move checker's identity count gets a declaration-level instrument** rather than staying pattern-matched (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — not built | §8.391 |
+| D63 | **The editor's fallback for a file with no project is removed** (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — not built | §8.391 |
+| D64 | **The deprecated attribute is reconsidered once the lint exists** - not built before it; this sets the order of D49's attribute half (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — a sequencing rule | §8.371, §8.391 |
+| D65 | **Explicit receivers on everything non-static is scheduled now**, as its own project: 925 methods, 107 constructors, and anything else non-static (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — not started | §8.391 |
+| D66 | **The primitive-keyword work happens now**; at the parse fork D18's keyword half stopped on, Cryo refuses a cast followed by a comparison without parentheses and asks for them (Jake, relayed in plain text 2026-09-27) | **RULED** - answers the one question D18's keyword half was waiting on | `no check` — not built | §8.295, §8.391 |
+| D67 | **Condition four's three clean audit rounds come after everything else** (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — a sequencing rule | §0.0, §8.391 |
 
-**D18's keyword half is RULED and UNBUILT - built once and backed out at a parse fork the ruling did not cover (§8.295: `x as u32 < y`), and waiting on that one ruling - and D32 is the criterion it is built toward** (D5 was, until §8.206; D2 and D9 were,
+**D18's keyword half is RULED and UNBUILT - built once and backed out at a parse fork the ruling did not cover (§8.295: `x as u32 < y`); that one ruling is now given (D66: refused, parentheses asked for) - and D32 is the criterion it is built toward** (D5 was, until §8.206; D2 and D9 were,
 until §8.213; D24 was, until §8.233 - this line kept naming it for forty-six entries after its row said TAKEN, §8.280; Q2 was, until §8.259; D25 was, until §8.263; D30's refusal was, until §8.268; D28 was, until §8.270; D30's identity half was, until §8.272; D31 was, until §8.278). Each was decided by Jake - D18 and D2 then re-parked as open
 questions, D2 across ninety-five entries; §8.202 records the re-affirmation,
 §8.216 the three rulings of 2026-09-16 and §8.229 the three of 2026-09-17. They
@@ -320,7 +337,7 @@ three, and its row carries the count. Read each zero off its own row.
 | callee visibility gate (E0353) | LIVE, reached; **starved of violations**; since §8.173 its call door is the QUALIFIED path only (-52 on the pinned arm: the bare doors 2-4 are deleted, a bare callee is vetted by the name layer before it is stamped) plus the two value doors | 1,817 reached / **0** rejected, last counted before §8.203 | `grep -rho 'ErrorCode::E0353_' compiler/src --include=*.cryo \| wc -l` → **5** (the five emitters: the name layer's import gate and rooted walk, sema's callee gate, the member resolver's two; the bare `E0353` read 18 until §8.271, ten of them comments, and 21 until §8.203 deleted the counter's three mentions) | §8.1f, §8.2ag, §8.173, §8.203 |
 | method visibility gate (E0353) | LIVE, reached; **starved of violations** | 5,600 reached / **0** rejected, last counted before §8.203 | same code | §8.2af, §8.2ag |
 | E0240 reachability gate | LIVE **at the name layer** (§8.258) — `refuse_unbound_type` asks the module scopes for the one declaration under the leaf (`type_declarers_of_leaf`), reachability of its module (the prelude, or `ns_imports` of the writer's) and its visibility (`lookup_in_module`, the export set), and names the shortest re-exporting import (`reaching_import_for`); the same gate the identifier lane's scope segment has, and the qualified type spelling now takes it too (a prefix a graph module spells that the writer cannot reach is E0240, not "cannot find") | — | `grep -rho 'ErrorCode::E0240_' compiler/src --include=*.cryo \| wc -l` → **3**; `grep -rho 'sole_declarer' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'refuse_unbound_type' compiler/src --include=*.cryo \| wc -l` → **4** (the definition, the annotation site, the struct literal, and since §8.381 a path's scope segment) | §8.2ad, §8.2ae, §8.193, §8.258 |
-| the `TypeArena` as a name-keyed store (29 methods under the rule: `lookup_by_name`, the reverse maps `get_qualified_name`/`template_key_of`, the leaf index `sole_declarer`/`leaf_declarers`, the display formatters returning `string`, the creators `create_struct(qualified_name, module)`… and the spec-name writers `reserve_spec_names`/`swap_wrapper_to_concrete`/`add_name_alias`) | **PINNED** (§8.241) — 76 reads / 46 writes outside `arena.cryo` (75 at §8.241; +1 in §8.242, the registry's `trait_decl_of` naming a trait type - `get_qualified_name` had no `Trait` arm before it, so a trait's name could not be asked back at all: 0 callers ever asked, measured); the written-name READ, `lookup_by_name`, is deleted since §8.247 (2 callers at §8.241, the resolver's 2c fallback and TemplateRegistration's base type, both by a canonical key the index answers); the leaf index and its 3 reads are deleted since §8.258 (the name layer explains a name it declined from its own module scopes); 34 of the reads are display text (32 before §8.263's E0306 report rendered the impl-qualified head's owner twice); the writes are the declaration half - a type keyed at creation by the name its declaration minted (23 of them `create_generic_param`) | — | `python3 scripts/lane-gate.py --row ARENA_READ` → **63** (+2 in §8.372, NOT ratified: `TypeArena::declared_in`, a struct's, class's, enum's or trait's module read off its record, asked by the file-ownership walk and the field visibility check - each a read that returns a `ModulePath`, a key type, where a namespace's text used to be split from a qualified name or handed to the graph's text door; 61 before, +1 in §8.365: the facts recorder prints a type's display name as report text, through one helper; 60 before, 72 until §8.333-§8.334: the owner and trait-head keys stopped being read off the arena as names - `get_qualified_name` and `template_key_of` at the registry's readers, method binding's owner retry, the monomorphizer's `inherent_key_of`; 73 until §8.332: `trait_decl_of`, which named a trait type back to a `DefId` through the arena, is deleted for `get_trait_decl(def_of(..))`; 75 until §8.331: `is_self_growing_instantiation` takes the owner's `DefId`; 74 until §8.320: the `for` loop's refusal of a scrutinee that is not an `Iterator` names its type with the display formatter; 75 until §8.289: `method_binding`'s arena-name fallback for a generic base the index had no name for, measured to fire 0 times, deleted); `python3 scripts/lane-gate.py --row ARENA_WRITE` → **44** (46 before §8.327: the two deleted copies of the concrete-trait-argument reader each minted a generic parameter by name) | §8.192, §8.241 |
+| the `TypeArena` as a name-keyed store (29 methods under the rule: `lookup_by_name`, the reverse maps `get_qualified_name`/`template_key_of`, the leaf index `sole_declarer`/`leaf_declarers`, the display formatters returning `string`, the creators `create_struct(qualified_name, module)`… and the spec-name writers `reserve_spec_names`/`swap_wrapper_to_concrete`/`add_name_alias`) | **PINNED** (§8.241) — 76 reads / 46 writes outside `arena.cryo` (75 at §8.241; +1 in §8.242, the registry's `trait_decl_of` naming a trait type - `get_qualified_name` had no `Trait` arm before it, so a trait's name could not be asked back at all: 0 callers ever asked, measured); the written-name READ, `lookup_by_name`, is deleted since §8.247 (2 callers at §8.241, the resolver's 2c fallback and TemplateRegistration's base type, both by a canonical key the index answers); the leaf index and its 3 reads are deleted since §8.258 (the name layer explains a name it declined from its own module scopes); 34 of the reads are display text (32 before §8.263's E0306 report rendered the impl-qualified head's owner twice); the writes are the declaration half - a type keyed at creation by the name its declaration minted (23 of them `create_generic_param`) | — | `python3 scripts/lane-gate.py --row ARENA_READ` → **64** (+1 in §8.391, an increase NOT ratified: the literal-pattern check reads the match subject's own type by its handle, `TypeArena::lookup(TypeRef)` in `pattern_resolver.cryo`, where the range check it replaces read it through `TypeUtils::unwrap_to_enum`, which peels references and pointers and so let a reference subject through - a read by identity, the kind whether the gate should count at all is the open principle recorded with D58; 63 before, +2 in §8.372, RATIFIED (D58): `TypeArena::declared_in`, a struct's, class's, enum's or trait's module read off its record, asked by the file-ownership walk and the field visibility check - each a read that returns a `ModulePath`, a key type, where a namespace's text used to be split from a qualified name or handed to the graph's text door; 61 before, +1 in §8.365: the facts recorder prints a type's display name as report text, through one helper; 60 before, 72 until §8.333-§8.334: the owner and trait-head keys stopped being read off the arena as names - `get_qualified_name` and `template_key_of` at the registry's readers, method binding's owner retry, the monomorphizer's `inherent_key_of`; 73 until §8.332: `trait_decl_of`, which named a trait type back to a `DefId` through the arena, is deleted for `get_trait_decl(def_of(..))`; 75 until §8.331: `is_self_growing_instantiation` takes the owner's `DefId`; 74 until §8.320: the `for` loop's refusal of a scrutinee that is not an `Iterator` names its type with the display formatter; 75 until §8.289: `method_binding`'s arena-name fallback for a generic base the index had no name for, measured to fire 0 times, deleted); `python3 scripts/lane-gate.py --row ARENA_WRITE` → **44** (46 before §8.327: the two deleted copies of the concrete-trait-argument reader each minted a generic parameter by name) | §8.192, §8.241 |
 | the `GenericRegistry` as a name-keyed store (23 methods: templates by qualified name, inherent impl blocks and owners, trait declarations by identity, trait-impl heads by `(trait identity, target type)` (§8.333; inherent owners and impl blocks by the type too), the well-known claims, `find_trait_defining_method` by bare method name) | **PINNED** (§8.241) — 67 reads / 19 writes outside `generic_registry.cryo`, the store no row enumerated before (audit 12: 22 methods, 87 sites). Keys are canonical strings derived from stamps - a registered type's qualified name, a trait's identity, a target key - so the surface is bucket B, not spelling, at every site but one: `find_trait_defining_method(method_name)` scans every trait for the first declaring a method of that BARE name, async or not, and is a HINT with one reader, sema's "defined on trait Y" note. Its second reader - the async lowering's receiver-refresh decision - reads the trait off the projection's `owning_trait` since §8.242, by identity (`get_trait_decl(def_of(..))` since §8.332): the scan answered `Read` for `AtmRead::read` and `GfTick` for `GenTick::tick` in the unit binary (4 of 11 sites; examples 28 of 28 agreed), and the refresh was dropped there - unobservably, since a carried receiver's storage never moves between polls (§8.242's mutation: every generic-receiver refresh dropped, 142 async unit tests + 17 negative + 3 projects PASS) | — | `python3 scripts/lane-gate.py --row REGISTRY_READ` → **12** (21 until §8.333-§8.334: the owner doors `lookup_inherent_owner`, `inherent_impl_blocks` and `overlapping_head` take the type and no name (the `find_inherent_impl_*` doors and `inherent_impl_has_method` stay, keyed by the method's leaf), and `get_template(SymbolStr)` is deleted; 33 until §8.332: eighteen `get_template` reads by a name leave the row, and five `template_in` member reads and one `member_template_key` enter it; 87 until §8.330: the trait lookups take a `DefId`, and `wellknown` returns one - the gate counts a store method whose RETURN is a name as name-keyed, so its callers left the row with it; 72 until §8.322: fifteen readers that spelled a standard-library path - `Array` ×3, `Slice`, `Context`, `Executor`, the four types never `Send` (one read, a loop), the allocator (one helper), `set_args`/`set_env` ×2 each, `run_all`, and two `Copy` checks that compared a spelling - ask `wellknown(LangItem::...)`; 71 until §8.320: the `for` loop asks for the language's `Iterator` by `LangItem`; 66 until §8.270: type resolution's impl arm asks `overlapping_head` at registration, the coherence question a head is refused by; 67 until §8.245: sema's template question by `template_of`; 67 until §8.286: `enum_try_shape` asks `wellknown("Result")` and `wellknown("Option")` for the identity `?` judges its operand by, two reads that replaced four variant-spelling reads on the enum; 69 until §8.288: the async lowering asks `wellknown("Poll")` and `wellknown("Option")` for the identities its synthesized nodes carry, two reads that replaced two spelled path constants); `python3 scripts/lane-gate.py --row REGISTRY_WRITE` → **1** (-7 in §8.379: `instantiate_for_module` is deleted - its module argument was pushed onto a list nothing read - and its seven callers call `instantiate`; 8 before, 13 until §8.339: `claim_wellknown` takes the registration's `DefId`, so its five callers - four type declarations, one function - leave the row; 19 until §8.333: `register_inherent_owner`, `register_inherent_impl_block` and `register_trait_impl` take the target's type; 22 until §8.332: `register_impl_block` takes the head's `DefId` at its three callers; 23 until §8.330: `register_trait_decl` takes the declaration's `DefId`; 20 until §8.322: the struct, class and function registrations claim their language items as the trait and enum arms do; 19 until §8.286: the enum registration arm claims `Result`/`Option` as the trait arm claims the operator traits); `grep -rho 'find_trait_defining_method(' compiler/src --include=*.cryo \| wc -l` → **2** (the definition, the hint); `grep -c 'trait_decl_of(' compiler/src/compiler/sema/async_lower.cryo` → **0** (2 until §8.332 deleted `trait_decl_of`: the two reads ask `get_trait_decl(def_of(..))`, the index's one door from a type to its definition; +1 in §8.318: a trait method's future rebuilt as an annotation keeps the trait its arena projection carried); `grep -c 'TypeKind::Trait => ' compiler/src/compiler/types/arena.cryo` → **1** (`get_qualified_name` names a trait) | §8.233, §8.241, §8.242 |
 | the `ModuleGraph` as a name-keyed store (6 methods: a module by namespace `find_module_index`, by path `find_module_by_path`, `reexport_closure`, `source_file_for_owner_key`, `ns_sym_of_file`, a static path comparison) | **PINNED** (§8.241) — 31 reads / 0 writes outside `module_graph.cryo` (32 at §8.241; -1 in §8.250, sema's E0202 declarers note, which asked the graph by name for each function key's parent, deleted with the report's move; the name layer's note walks the graph's modules by index). A module IS named: an import path is a module name by the language's definition, and `find_module_index` (10) answers the loader, the resolver's import binding and one diagnostic; 12 are by filesystem path | — | `python3 scripts/lane-gate.py --row GRAPH_READ` → **46** (-2 in §8.385: the import validation's dead lookup, whose answer only a debug line printed, is deleted - `module_named` and `find_module_index` on one line; 48 before, -1 in §8.379: `source_file_for_owner_key`, the orchestrator's namespace-or-file lookup of a method spec's owner, whose every key is a source file, read by `find_module_by_path` directly; 49 before, -1 in §8.376: the resolver's prelude door call; 50 before, -8 in §8.375: three `module_named` calls go, and the graph's file-to-namespace-text lookup with its forwarder; 58 before, -1 in §8.373: `module_named` 21 -> 20, the same three sites; 59 before, -3 in §8.372: four `module_named` calls go - a type's module and a template's are stored as `ModulePath` - and the context's `declaring_module` forwards to the graph's, the module a definition is declared in, identity to identity; 62 before, +27 in §8.363, the re-pin RATIFIED (D43) - the door it counts is RULED AGAINST (D45), so these sites are to go, not to stay: `ModulePath::of(text)` is private to the graph, and every site that built one from a namespace's text now asks the graph's door for it - `module_named` (24) or `module_of_file` (3) - so a conversion from text to a module the gate could not see, a static on a type that was no store, is now one call it counts; `find_module_index(graph.module_named(x))` is two reads where `find_module_index(ModulePath::of(x))` was one, and the answer is the same by construction; 35 before, +1 in §8.358, accepted by Jake with its reason: the visibility gate turns the use site's file into its module - the namespace the file was declared under, asked of the graph for its definition - so two modules are compared by identity; 32 until §8.346, whose two are a declaration's parent module asked by its path when the declaration is registered - the name layer's `admit` and a lowering's `register_in_module`; 31 until §8.339: `module_def`, the module that declares a re-exported member asked for the id the graph made when it discovered the module, in place of a mint from the same path); `python3 scripts/lane-gate.py --row GRAPH_WRITE` → **2** (+1 in §8.378: `register_c_import_module`, the importer entering the C import's module in the graph when it composes the namespace, so the declarations it synthesizes can carry the module; 1 before, 0 until §8.346: `bind_c_import_module`, the module a C import declares, which no file holds, entered in the graph's module-by-path table) | §8.241 |
 | the `ConstantTable` as a name-keyed store (`register`/`register_enum` under a qualified name; two static key helpers) | **PINNED** (§8.241) — 2 writes, both from `name_resolution.cryo` at the declaration (the pass that just walked to it); 3 static reads; every value read goes by stamp through `ConstEval::stamped_index_of`. Audit 12 wrote `ConstTable 0`: a zero over the wrong population - the type is `ConstantTable` | — | `python3 scripts/lane-gate.py --row CONST_WRITE` → **2**; `python3 scripts/lane-gate.py --row CONST_READ` → **2** (3 before §8.389: a literal's digits handed to `ConstantTable::parse_int_literal` counted as a read of the constant table by name while they were typed `string`) | §8.241, §8.389 |
@@ -393,7 +410,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: facts-check lane-check lane-selftest facts-selftest' Makefile` → **1** (§8.371: stale facts are REFUSED first, never regenerated - the facts target is the deliberate refresh - and the refusal's self-test runs; `facts-fresh`, which regenerated them, before, §8.366)
 * `python3 scripts/facts-selftest.py | tail -1 | grep -o '[0-9]* cases' | cut -d' ' -f1` → **12** (§8.371: the freshness check over a throwaway tree - an edited source, an added source and a missing inputs record refused, fresh facts and a non-source edit accepted, each through `facts.py --check` and through `facts_path`, which the lane gate and the residue check call - and a dry run of the lane-check and check-fast targets building nothing; with the staleness comparison deleted it fails 4 cases, with `lane-check` depending on `facts` it fails 2)
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **88** (+1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **91** (+3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)* `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -47898,3 +47915,189 @@ then the types" is a fallback chain. Left open.
 `scripts/lane-gate.py` +3, `scripts/ns-migration/approved.py` +25,
 `approved-names.tsv` +1 entry. No compiler source. Gate cycles: 2 lane-gate
 pairs, 1 approved pair, 1 lane-selftest, 1 check-fast.
+
+### 8.391 A literal or range pattern whose kind is not the match subject's own type is refused at the pattern; a string pattern on a struct compiled to an arm that never matched; seventeen rulings recorded - 2026-09-27
+
+## The defect
+
+`cryo check` accepted this, the build produced a program, and the program
+returned 0 - the arm written for `"yes"` could never be tested against a
+struct, and nothing said so:
+
+```cryo
+type struct Word { text: string; }
+
+function classify(w: Word) -> i32 {
+    return match (w) {
+        "yes" => { 1 }      // never matches, no diagnostic
+        _     => { 0 }
+    };
+}
+```
+
+Now:
+
+```
+error[E0200]: string pattern requires a `string` subject, found `MatchStringPatternOnStruct::Main::Word`
+ --> src/main.cryo:13:9
+```
+
+Cause. Sema checked a RANGE pattern's kind against the subject
+(`check_range_patterns`) and never checked a single literal pattern at all.
+Codegen compares a literal pattern with the subject's own value - a string by
+content when the subject's type is `string`, anything else as an integer
+compare - and a string literal against anything else lowers to no value; the
+arm emitter then took its "pattern produced no comparison (a codegen gap);
+treat it as an unconditional miss" branch. The range check had a second hole
+of the same shape: it peeled the subject through references and pointers
+(`TypeUtils::unwrap_to_enum`) before comparing kinds, and codegen peels
+nothing, so `match (c: &char) { '0'..'9' => .. }` passed the check and died
+at LLVM module verification (E0900).
+
+Measured on the compiler at the parent commit, each shape in its own scratch
+program:
+
+| subject | pattern | parent compiler |
+|---|---|---|
+| a struct | `"yes"` | builds, returns 0: never matches |
+| `&string` | `"yes"` | builds, returns 0: never matches |
+| `u32*` / `&u32` / `string` | `0` / `7` / `5` | passes the check; the three built together (with the `&string` case) fail LLVM module verification, E0900 - not isolated one by one |
+| `&char` | `'0'..'9'` | passes the check, E0900 LLVM verification failure |
+
+## Refuse, not match
+
+A literal pattern "matches exactly that value" (`docs/cryo.md` §7.1); a
+string literal is never exactly a struct's value, and there is no field it
+could mean. Rust refuses the same program (mismatched types in a pattern).
+The reference case could be made to match by loading through the reference,
+but the program can say that itself (`match (*s)`), and the corpus holds no
+program wanting it; refusing is the safe default where the current behaviour
+is silently nothing.
+
+## What changed
+
+* `PatternResolver::check_range_patterns` becomes `check_literal_patterns`,
+  called from the same two places (the statement and expression forms of
+  `match`), and checks every literal AND range pattern through the new
+  `check_pattern_fits_subject` against the subject's OWN type, peeling
+  nothing: a string pattern needs a `string` subject, a char pattern or range
+  a `char` one, an integer pattern or range an integer or `char` one,
+  `true` / `false` a `boolean` one. E0200, the code the range check already
+  used; the two range messages keep their old text as a prefix and gain
+  "found `T`".
+* Codegen's silent miss becomes an internal error: E0900 "codegen: a match
+  pattern produced no comparison against its subject", at the pattern, still
+  branching to the miss so the block stays terminated. Measured to fire 0
+  times over the corpus below before the change.
+
+## Blast radius: 0 programs
+
+A probe compiler (the parent tree plus one line printed per literal pattern
+in sema - literal kind and subject type - and one per codegen silent miss;
+not committed) built every corpus in the tree: the standard library, the
+compiler, the editor, the 14 examples, and the whole test run (2,209 unit,
+227 compile-fail, 85 projects). Every literal pattern's kind agreed with its
+subject: string on `string` 700 distinct sites, char on `char` 142, integer
+on `u32` 83 / `u16` 52 / `u8` 6 / `i32` 6, boolean on `boolean` 12 (library
+and tools); the test suites added integer on `u32` / `u16` / `i64` / `i32` /
+`u8` / `u64`, string, char and boolean, all on their own types. The silent
+miss fired 0 times. The control that the probe can report the defect: the
+struct program above printed `lit src/main.cryo:9 String M1::Main::Word` and
+`miss src/main.cryo:9`. With the fix, the same corpora all build and the
+test run passes (2,209 unit, 227 compile-fail, 88 projects with the three new
+ones, in verify's census) - no program that was in the tree is refused.
+
+## Proof
+
+Three compile-fail projects, one per shape, each declared in
+`tests/started-passing` (the parent compiler built or mis-reported each):
+`match_string_pattern_on_struct`, `match_string_pattern_on_reference`,
+`match_char_range_on_reference`. Each asserts E0200, the pattern's
+`file:line:col` and the message, and excludes E0900 and a successful build.
+`make verify ARGS="--baseline HEAD --require-identical"` runs the census
+with the parent's compiler over this tree's tests and asserts it fails on
+exactly the declared projects:
+
+* parent: `census FAIL ... suite exited 1`, and per project `baseline exit
+  0, tree exit 1` (the struct and the `&string` program BUILT on the parent)
+  and `baseline exit 1, tree exit 1` for the `&char` range (E0900 on the
+  parent, not the E0200 the project asks for)
+* this tree: `census ok ... suite exited 0`; `verify: OK in 264 s`
+
+The first cut put the two reference shapes in single-file negatives, and
+verify refused it - "the baseline failed 0 unit and 2 compile-fail test(s);
+only declared projects may fail there": a new negative that fails on the
+parent cannot be declared. They are projects now; the programs and the
+assertions are the same.
+
+Each mutation built alone, reverted before the next, against the unmutated
+tree as control (all three cases pass there). Run while the reference cases
+were still single-file negatives with the same programs and messages:
+
+* A - a string pattern fits any subject: the `&string` case FAILS, the
+  `&char` range case passes, and the struct project's build stops at the
+  codegen line instead of producing a program: `error[E0900]: codegen: a
+  match pattern produced no comparison against its subject -->
+  src/main.cryo:13:9` - the second line of defence reports what sema let
+  through.
+* B - the subject peeled through references and pointers again: both
+  reference cases FAIL; the struct project still refuses (E0200 at 13:9).
+
+## Counts
+
+* Lane: ARENA_READ 63 -> **64**, NOT predicted, an increase, re-pinned and
+  flagged: `pattern_resolver.cryo` 1 -> 2, the new
+  `TypeArena::lookup(subject_type)` - the subject's own type by its handle.
+  The range check it replaces read it through `unwrap_to_enum`, which is the
+  peeling that let a reference through, and no `TypeUtils` helper returns
+  the unpeeled type; a forwarding wrapper would move the count, not remove
+  it. A read by identity: the kind D58 leaves open whether the gate should
+  count.
+* Warnings (clean build): 344, the same set.
+* Name-taking population unchanged (748): `check_pattern_fits_subject`
+  takes a node, a type and a handle.
+* Tests: +3 projects (88 -> 91 test markers), declared in
+  `tests/started-passing`; roster golden re-pinned with `--update` (+3
+  projects; the two negatives it had merged are gone again).
+* Objects: 0 of 3,515 test objects and 0 of 1,126 example objects moved
+  against the parent (the declared projects' 108 baseline objects left out,
+  as verify does).
+
+## Rulings recorded (Jake, relayed in plain text 2026-09-27)
+
+Seventeen, one decision row each, D51 to D67: the match defect first (D51,
+TAKEN here); the spelling lint's shape - types known from a list inside the
+compiler (D52), linted at the declaration with the literal-argument rule kept
+as a separate call-site rule (D53), a new code for the denial and E0152 for a
+missing or empty reason (D54), the spec text later (D55); `MangledName` for
+link symbols (D56) and a keyword type for keyword spellings (D57) instead of
+written reasons; the seven lane re-pins ratified with the identity-only
+counting question deferred as an open principle (D58); a bare identifier in
+expression position may not name a type (D59); the raw subcommand builds a
+module graph (D60); array method arguments checked before codegen (D61); a
+declaration-level instrument for the move checker's identity count (D62);
+the editor's no-project fallback removed (D63); the deprecated attribute
+reconsidered once the lint exists (D64); explicit receivers on everything
+non-static as its own project (D65); the primitive-keyword work now, refusing
+a cast followed by a comparison without parentheses (D66, the question D18's
+keyword half waited on); condition four's audit rounds last (D67).
+
+## Not done
+
+* The spec: `docs/cryo.md` §7.1 says a literal matches "exactly that value"
+  and does not state that its type must be the subject's. Not added - a
+  normative sentence is not this unit's to write.
+* A numeric pattern written with a fraction (`1.5 =>`) is parsed as an
+  INTEGER literal pattern (the parser maps every numeric constant to
+  `Integer`) and lowered through an integer parse of its text. Not measured
+  further; same family, a separate fix.
+* Literal payloads inside enum patterns (`Some(5)`) take a different path
+  (the payload element test) and were not examined.
+
+## Blast radius
+
+Compiler: 3 files, +66 / -20 (`pattern_resolver.cryo`, `sema.cryo`,
+`pattern_emitter.cryo`). Tests: 3 projects, roster +3, started-passing +3.
+Gate cycles: 1 probe build + 2 corpus sweeps (probe, fix), 3 full test runs
+(probe, fix, parent-vs-new pair), 2 mutation builds, 1 clean build, 1 facts,
+2 check-fast, 2 verify (the first refused, above).

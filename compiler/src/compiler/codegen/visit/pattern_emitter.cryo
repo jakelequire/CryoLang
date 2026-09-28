@@ -29,6 +29,8 @@ import compiler::resolver::{ intern_table };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::pattern::{ EnumPatternNode, MatchArmNode, PatternNode };
+import compiler::diag;
+import compiler::diag::{ ErrorCode };
 import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{
     LBasicBlock, LIntPredicate, LRealPredicate, LType, LTypeKind, LValue
@@ -496,9 +498,15 @@ type struct PatternEmitter {
             } else if (cmp.is_valid()) {
                 this.cg.builder.build_cond_br(cmp, arm_bb, miss_bb);
             } else {
-                // Pattern produced no comparison (a codegen gap); treat it
-                // as an unconditional miss so control still reaches the rest
-                // of the chain rather than leaving the block unterminated.
+                // The pattern produced no comparison.  Sema refuses a
+                // pattern whose kind is not the subject's type, so reaching
+                // here means it admitted one codegen cannot test; compiling
+                // it as a miss would be an arm that silently never matches.
+                // Reported, and branched to the miss so the block stays
+                // terminated for the rest of the chain.
+                this.cg.diag.emit_error_at_span(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                    Text::new("codegen: a match pattern produced no comparison against its subject"),
+                    pat.span);
                 const cur: LBasicBlock = this.cg.builder.get_insert_block();
                 if (cur.is_valid() && !cur.has_terminator()) {
                     this.cg.builder.build_br(miss_bb);
