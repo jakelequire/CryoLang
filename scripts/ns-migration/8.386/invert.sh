@@ -9,6 +9,8 @@
 #   D: a name (`SymbolStr`) handed where a file path is expected
 #   E: a raw string literal handed where a backend label (`Text`) is expected
 #   F: a name handed where a backend label is expected
+#   G: a raw lexeme (a token's `string`) handed where literal text is expected
+#   H: a name handed where literal text is expected
 set -u
 CRYO=${CRYO:-bin/cryo}
 DI=compiler/src/compiler/decl_index.cryo
@@ -28,10 +30,14 @@ EX=compiler/src/compiler/codegen/ops/expr_ops.cryo
 EX_ORIG='            return this.builder.build_load(sret_pointee, slot, name);'
 FILE[E]=$EX; ORIG[E]=$EX_ORIG; NEW[E]=${EX_ORIG/, name)/, \"sret.load\")}
 FILE[F]=$EX; ORIG[F]=$EX_ORIG; NEW[F]=${EX_ORIG/, name)/, SymbolStr::empty())}
+EP=compiler/src/compiler/parser/expr_parser.cryo
+EP_ORIG='if (ParserBase::is_float_lexeme(Text::new(num_tok.lexeme))) {'
+FILE[G]=$EP; ORIG[G]=$EP_ORIG; NEW[G]=${EP_ORIG/Text::new(num_tok.lexeme)/num_tok.lexeme}
+FILE[H]=$EP; ORIG[H]=$EP_ORIG; NEW[H]=${EP_ORIG/Text::new(num_tok.lexeme)/SymbolStr::empty()}
 run() {
     (cd compiler && "$CRYO" check src/main.cryo 2>&1) | grep -E -A6 '^error\[|No errors found|Check failed' | head -14
 }
-for m in A B C D E F; do
+for m in A B C D E F G H; do
     f=${FILE[$m]}
     cp "$f" "$f.orig"
     python -c "import sys; p,o,n=sys.argv[1:4]; s=open(p,encoding='utf-8',newline='').read(); assert s.count(o)==1, 'mutation site not unique'; open(p,'w',encoding='utf-8',newline='').write(s.replace(o,n))" "$f" "${ORIG[$m]}" "${NEW[$m]}"

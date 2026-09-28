@@ -396,8 +396,8 @@ type struct DiagRenderer {
     /// freed after the print; the original cached line is untouched.
     print_source_line(&this, out: void*, line_text_text: Text) -> void {
         const line_text: string = line_text_text.as_string();
-        const expanded: string = DiagRenderer::expand_tabs(line_text);
-        syntax_highlighter::print_line(out, expanded, this.config.colors);
+        const expanded: string = DiagRenderer::expand_tabs(line_text_text);
+        syntax_highlighter::print_line(out, Text::new(expanded), this.config.colors);
         if (expanded != line_text) {
             libc::free(expanded as void*);
         }
@@ -420,30 +420,30 @@ type struct DiagRenderer {
     /// Blank gutter (padded, no line number): `<lead><line_width spaces>
     /// <blue>|<reset><tail>`.  `tail` is `" "` before a caret/source line or
     /// `"\n"` for a bare margin.
-    emit_gutter_blank(&this, out: void*, line_width: u32, tail: string) -> void {
+    emit_gutter_blank(&this, out: void*, line_width: u32, tail_text: Text) -> void {
         DiagSink::emit_raw(out, Text::new(this.lead()));
         DiagSink::emit_pad(out, line_width as i32);
         DiagSink::emit_raw(out, Text::new(" "));
         DiagSink::emit_raw(out, Text::new(this.color_blue()));
         DiagSink::emit_raw(out, Text::new("|"));
         DiagSink::emit_raw(out, Text::new(this.color_reset()));
-        DiagSink::emit_raw(out, Text::new(tail));
+        DiagSink::emit_raw(out, tail_text);
     }
 
     /// Numbered gutter: `<lead><num_pre><ln right-justified in line_width>
     /// <reset> <blue>|<reset><tail>`.  `num_pre` is the ANSI prefix before the
     /// number - grey for a context line, or bold+severity for the error line.
-    emit_gutter_num(&this, out: void*, num_pre: string, line_width: u32,
-                    ln: u32, tail: string) -> void {
+    emit_gutter_num(&this, out: void*, num_pre_text: Text, line_width: u32,
+                    ln: u32, tail_text: Text) -> void {
         DiagSink::emit_raw(out, Text::new(this.lead()));
-        DiagSink::emit_raw(out, Text::new(num_pre));
+        DiagSink::emit_raw(out, num_pre_text);
         DiagSink::emit_uint(out, ln as u64, line_width as i32);
         DiagSink::emit_raw(out, Text::new(this.color_reset()));
         DiagSink::emit_raw(out, Text::new(" "));
         DiagSink::emit_raw(out, Text::new(this.color_blue()));
         DiagSink::emit_raw(out, Text::new("|"));
         DiagSink::emit_raw(out, Text::new(this.color_reset()));
-        DiagSink::emit_raw(out, Text::new(tail));
+        DiagSink::emit_raw(out, tail_text);
     }
 
 
@@ -711,7 +711,7 @@ type struct DiagRenderer {
             if (line_text == "" && ln > span.start_line + 1) {
                 break;  // Stop at empty lines past the first one
             }
-            this.emit_gutter_num(out, grey, line_width, ln, " ");
+            this.emit_gutter_num(out, Text::new(grey), line_width, ln, Text::new(" "));
             this.print_source_line(out, Text::new(line_text));
             DiagSink::emit_raw(out, Text::new("\n"));
         }
@@ -722,7 +722,7 @@ type struct DiagRenderer {
 
     /// Render a margin-only line:  "   |"
     render_margin(&this, line_width: u32) -> void {
-        this.emit_gutter_blank(this.out, line_width, "\n");
+        this.emit_gutter_blank(this.out, line_width, Text::new("\n"));
     }
 
     /// Render an ellipsis line that separates non-adjacent line groups
@@ -892,7 +892,7 @@ type struct DiagRenderer {
                 // group). If we've actually run off the file end, the
                 // caller already bounded us by max_line, so this is
                 // safe.
-                this.emit_gutter_num(out, grey, line_width, ln, "\n");
+                this.emit_gutter_num(out, Text::new(grey), line_width, ln, Text::new("\n"));
                 continue;
             }
 
@@ -908,7 +908,7 @@ type struct DiagRenderer {
                 DiagSink::emit_raw(out, Text::new(reset));
                 DiagSink::emit_raw(out, Text::new(" "));
             } else {
-                this.emit_gutter_num(out, grey, line_width, ln, " ");
+                this.emit_gutter_num(out, Text::new(grey), line_width, ln, Text::new(" "));
             }
             this.print_source_line(out, Text::new(line_text));
             DiagSink::emit_raw(out, Text::new("\n"));
@@ -989,18 +989,18 @@ type struct DiagRenderer {
 
         const line_text: string = this.get_line(file_text, line_num);
 
-        const left_vs: u32 = DiagRenderer::byte_col_to_visual(line_text, left.span.start_col);
+        const left_vs: u32 = DiagRenderer::byte_col_to_visual(Text::new(line_text), left.span.start_col);
         const left_ve: u32 = if (left.span.end_col > left.span.start_col) {
-            DiagRenderer::byte_col_to_visual(line_text, left.span.end_col)
+            DiagRenderer::byte_col_to_visual(Text::new(line_text), left.span.end_col)
         } else { left_vs + 1 };
-        const right_vs: u32 = DiagRenderer::byte_col_to_visual(line_text, right.span.start_col);
+        const right_vs: u32 = DiagRenderer::byte_col_to_visual(Text::new(line_text), right.span.start_col);
         const right_ve: u32 = if (right.span.end_col > right.span.start_col) {
-            DiagRenderer::byte_col_to_visual(line_text, right.span.end_col)
+            DiagRenderer::byte_col_to_visual(Text::new(line_text), right.span.end_col)
         } else { right_vs + 1 };
 
         // Underline row.  Walk cells 1..max(left_ve, right_ve) and pick
         // the glyph for each cell; primary wins inside an overlap zone.
-        this.emit_gutter_blank(out, line_width, " ");
+        this.emit_gutter_blank(out, line_width, Text::new(" "));
         mut max_cell: u32 = if (right_ve > left_ve) { right_ve } else { left_ve };
         for (mut cell: u32 = 1; cell < max_cell; cell++) {
             const in_left:  boolean = cell >= left_vs  && cell < left_ve;
@@ -1033,7 +1033,7 @@ type struct DiagRenderer {
         DiagSink::emit_raw(out, Text::new("\n"));
 
         // Connector row for the left label.
-        this.emit_gutter_blank(out, line_width, " ");
+        this.emit_gutter_blank(out, line_width, Text::new(" "));
         const left_color: string = if (left.is_primary) { sev_color } else { cyan };
         for (mut cell: u32 = 1; cell < left_vs; cell++) {
             DiagSink::emit_raw(out, Text::new(" "));
@@ -1046,7 +1046,7 @@ type struct DiagRenderer {
 
         // Caption row for the left label.
         if (left.message != "") {
-            this.emit_gutter_blank(out, line_width, " ");
+            this.emit_gutter_blank(out, line_width, Text::new(" "));
             for (mut cell: u32 = 1; cell < left_vs; cell++) {
                 DiagSink::emit_raw(out, Text::new(" "));
             }
@@ -1073,15 +1073,15 @@ type struct DiagRenderer {
         // multi-byte UTF-8 codepoint counts as 1.  Without this the
         // carets drift right of their target on tab-indented source.
         const line_text: string = this.get_line(Text::new(span.file), span.start_line);
-        const visual_start: u32 = DiagRenderer::byte_col_to_visual(line_text, span.start_col);
+        const visual_start: u32 = DiagRenderer::byte_col_to_visual(Text::new(line_text), span.start_col);
         mut ul_start: u32 = 0;
         if (visual_start > 0) { ul_start = visual_start - 1; }
         mut ul_len: u32 = 1;
         if (span.end_col > span.start_col) {
-            ul_len = DiagRenderer::byte_range_visual_width(line_text, span.start_col, span.end_col);
+            ul_len = DiagRenderer::byte_range_visual_width(Text::new(line_text), span.start_col, span.end_col);
         }
 
-        this.emit_gutter_blank(out, line_width, " ");
+        this.emit_gutter_blank(out, line_width, Text::new(" "));
         for (mut s: u32 = 0; s < ul_start; s++) {
             DiagSink::emit_raw(out, Text::new(" "));
         }
@@ -1120,7 +1120,7 @@ type struct DiagRenderer {
         // header comments at the top of this file for the byte-to-cell
         // conversion contract.
         const line_text: string = this.get_line(Text::new(span.file), span.start_line);
-        const visual_start: u32 = DiagRenderer::byte_col_to_visual(line_text, span.start_col);
+        const visual_start: u32 = DiagRenderer::byte_col_to_visual(Text::new(line_text), span.start_col);
         mut ul_start: u32 = 0;
         if (visual_start > 0) {
             ul_start = visual_start - 1;
@@ -1128,12 +1128,12 @@ type struct DiagRenderer {
 
         mut ul_len: u32 = 1;
         if (span.end_col > span.start_col) {
-            ul_len = DiagRenderer::byte_range_visual_width(line_text, span.start_col, span.end_col);
+            ul_len = DiagRenderer::byte_range_visual_width(Text::new(line_text), span.start_col, span.end_col);
         }
 
         // Build the underline string: spaces + ^ + ~~~
         // Leading spaces for margin + pipe + gap
-        this.emit_gutter_blank(out, line_width, " ");
+        this.emit_gutter_blank(out, line_width, Text::new(" "));
 
         // Spaces to reach the underline start
         for (mut s: u32 = 0; s < ul_start; s++) {
@@ -1187,23 +1187,23 @@ type struct DiagRenderer {
 
         // Render the source line
         const line_text: string = this.get_line(Text::new(label.span.file), label.span.start_line);
-        this.emit_gutter_num(out, grey, line_width, label.span.start_line, " ");
+        this.emit_gutter_num(out, Text::new(grey), line_width, label.span.start_line, Text::new(" "));
         this.print_source_line(out, Text::new(line_text));
         DiagSink::emit_raw(out, Text::new("\n"));
 
         // Cyan underline - visual cells, not bytes.
-        const visual_start: u32 = DiagRenderer::byte_col_to_visual(line_text, label.span.start_col);
+        const visual_start: u32 = DiagRenderer::byte_col_to_visual(Text::new(line_text), label.span.start_col);
         mut ul_start: u32 = 0;
         if (visual_start > 0) {
             ul_start = visual_start - 1;
         }
         mut ul_len: u32 = 1;
         if (label.span.end_col > label.span.start_col) {
-            ul_len = DiagRenderer::byte_range_visual_width(line_text,
+            ul_len = DiagRenderer::byte_range_visual_width(Text::new(line_text),
                 label.span.start_col, label.span.end_col);
         }
 
-        this.emit_gutter_blank(out, line_width, " ");
+        this.emit_gutter_blank(out, line_width, Text::new(" "));
         for (mut s: u32 = 0; s < ul_start; s++) {
             DiagSink::emit_raw(out, Text::new(" "));
         }
@@ -1366,7 +1366,7 @@ type struct DiagRenderer {
             }
         }
         if (first_nl >= 0) {
-            this.render_multiline_suggestion(part, orig_line, first_nl,
+            this.render_multiline_suggestion(part, Text::new(orig_line), first_nl,
                 repl_byte_count);
             return;
         }
@@ -1387,8 +1387,8 @@ type struct DiagRenderer {
         // source bytes.  The renderer's tab-expansion + visual-column
         // math then handles alignment for tab-indented files exactly
         // like it does for the primary snippet.
-        const patched: string = DiagRenderer::splice_replacement(orig_line,
-            part.span.start_col, part.span.end_col, part.replacement);
+        const patched: string = DiagRenderer::splice_replacement(Text::new(orig_line),
+            part.span.start_col, part.span.end_col, Text::new(part.replacement));
 
         // Line-number column width matches the patched line's natural
         // digit count (no artificial minimum, matching the primary snippet).
@@ -1422,17 +1422,17 @@ type struct DiagRenderer {
         } else {
             0
         };
-        const visual_start: u32 = DiagRenderer::byte_col_to_visual(patched, part.span.start_col);
+        const visual_start: u32 = DiagRenderer::byte_col_to_visual(Text::new(patched), part.span.start_col);
         mut ul_start: u32 = 0;
         if (visual_start > 0) { ul_start = visual_start - 1; }
 
         mut ul_len: u32 = 1;
         if (has_repl) {
-            ul_len = DiagRenderer::byte_range_visual_width(patched,
+            ul_len = DiagRenderer::byte_range_visual_width(Text::new(patched),
                 part.span.start_col, part.span.start_col + repl_byte_len);
         }
 
-        this.emit_gutter_blank(out, line_width, " ");
+        this.emit_gutter_blank(out, line_width, Text::new(" "));
         for (mut s: u32 = 0; s < ul_start; s++) {
             DiagSink::emit_raw(out, Text::new(" "));
         }
@@ -1467,7 +1467,7 @@ type struct DiagRenderer {
     /// the anchor line's leading whitespace so emission sites don't have
     /// to compute the indent themselves.
     render_multiline_suggestion(mut &this, part: SuggestionPart,
-                                 orig_line: string, first_nl: i64,
+                                 orig_line: Text, first_nl: i64,
                                  repl_byte_count: i64) -> void {
         const green: string = this.color_green();
         const grey:  string = this.color_grey();
@@ -1479,9 +1479,9 @@ type struct DiagRenderer {
         // the replacement) into the anchor line.  This is the line that
         // visually "changes": it now carries the appended punctuation
         // (`,`) or whatever leads off the multi-line edit.
-        const first_seg: string = DiagRenderer::substring_bytes(part.replacement, 0, first_nl);
+        const first_seg: string = DiagRenderer::substring_bytes(Text::new(part.replacement), 0, first_nl);
         const patched_first: string = DiagRenderer::splice_replacement(orig_line,
-            part.span.start_col, part.span.end_col, first_seg);
+            part.span.start_col, part.span.end_col, Text::new(first_seg));
 
         // Indent for inserted lines = anchor line's leading whitespace.
         const indent_n: i64 = DiagRenderer::leading_whitespace_count(orig_line);
@@ -1501,7 +1501,7 @@ type struct DiagRenderer {
             const prev_ln: u32 = part.span.start_line - 1;
             const prev_text: string = this.get_line(Text::new(part.span.file), prev_ln);
             if (prev_text != "") {
-                this.emit_gutter_num(out, grey, line_width, prev_ln, " ");
+                this.emit_gutter_num(out, Text::new(grey), line_width, prev_ln, Text::new(" "));
                 this.print_source_line(out, Text::new(prev_text));
                 DiagSink::emit_raw(out, Text::new("\n"));
             }
@@ -1525,13 +1525,13 @@ type struct DiagRenderer {
         // Underline the inserted slice on the anchor line.
         const first_seg_bytes: u32 = first_nl as u32;
         if (first_seg_bytes > 0) {
-            const visual_start: u32 = DiagRenderer::byte_col_to_visual(patched_first,
+            const visual_start: u32 = DiagRenderer::byte_col_to_visual(Text::new(patched_first),
                 part.span.start_col);
             mut ul_start: u32 = 0;
             if (visual_start > 0) { ul_start = visual_start - 1; }
-            const ul_len: u32 = DiagRenderer::byte_range_visual_width(patched_first,
+            const ul_len: u32 = DiagRenderer::byte_range_visual_width(Text::new(patched_first),
                 part.span.start_col, part.span.start_col + first_seg_bytes);
-            this.emit_gutter_blank(out, line_width, " ");
+            this.emit_gutter_blank(out, line_width, Text::new(" "));
             for (mut s: u32 = 0; s < ul_start; s++) {
                 DiagSink::emit_raw(out, Text::new(" "));
             }
@@ -1554,7 +1554,7 @@ type struct DiagRenderer {
                     && (part.replacement[seg_end] as u8) != (10 as u8)) {
                 seg_end = seg_end + 1;
             }
-            const seg: string = DiagRenderer::substring_bytes(part.replacement,
+            const seg: string = DiagRenderer::substring_bytes(Text::new(part.replacement),
                 seg_start, seg_end);
             const new_line: string = indent_str + seg;
 
@@ -1578,17 +1578,17 @@ type struct DiagRenderer {
             const new_line_bytes: i64 = new_line.length() as i64;
             const indent_byte_end: u32 = (indent_n + 1) as u32;
             const indent_visual: u32 = if (indent_n > 0) {
-                DiagRenderer::byte_range_visual_width(new_line, 1, indent_byte_end)
+                DiagRenderer::byte_range_visual_width(Text::new(new_line), 1, indent_byte_end)
             } else {
                 0
             };
             const seg_visual: u32 = if ((new_line_bytes as i64) > indent_n) {
-                DiagRenderer::byte_range_visual_width(new_line,
+                DiagRenderer::byte_range_visual_width(Text::new(new_line),
                     indent_byte_end, (new_line_bytes + 1) as u32)
             } else {
                 0
             };
-            this.emit_gutter_blank(out, line_width, " ");
+            this.emit_gutter_blank(out, line_width, Text::new(" "));
             for (mut sp: u32 = 0; sp < indent_visual; sp++) {
                 DiagSink::emit_raw(out, Text::new(" "));
             }
@@ -1611,7 +1611,7 @@ type struct DiagRenderer {
             const next_ln: u32 = part.span.end_line + ctx_i;
             const next_text: string = this.get_line(Text::new(part.span.file), next_ln);
             if (next_text == "") { break; }
-            this.emit_gutter_num(out, grey, line_width, next_ln, " ");
+            this.emit_gutter_num(out, Text::new(grey), line_width, next_ln, Text::new(" "));
             this.print_source_line(out, Text::new(next_text));
             DiagSink::emit_raw(out, Text::new("\n"));
         }
@@ -1668,7 +1668,8 @@ type struct DiagRenderer {
     /// in `byte_col_to_visual` cancels the multi-byte cost.  Returns a
     /// freshly allocated string the caller owns; the source-cache copy
     /// is left untouched.
-    static expand_tabs(line: string) -> string {
+    static expand_tabs(line_text: Text) -> string {
+        const line: string = line_text.as_string();
         if (line == "") { return ""; }
         const len: i64 = line.length() as i64;
 
@@ -1721,7 +1722,8 @@ type struct DiagRenderer {
     /// Convert a 1-indexed byte column on `line` into a 1-indexed cell
     /// column on its rendered (tab-expanded) form.  Result for a column
     /// of 0 is 0; column past EOL clamps to the line's final cell+1.
-    static byte_col_to_visual(line: string, byte_col: u32) -> u32 {
+    static byte_col_to_visual(line_text: Text, byte_col: u32) -> u32 {
+        const line: string = line_text.as_string();
         if (byte_col == 0)      { return 0; }
         if (line == "")         { return byte_col; }
         const len: i64 = line.length() as i64;
@@ -1754,8 +1756,10 @@ type struct DiagRenderer {
     /// allocated string the caller owns; if no change would be made the
     /// original line is returned unchanged (caller should test pointer
     /// identity before freeing).
-    static splice_replacement(line: string, start_col: u32, end_col: u32,
-                                replacement: string) -> string {
+    static splice_replacement(line_text: Text, start_col: u32, end_col: u32,
+                                replacement_text: Text) -> string {
+        const line: string = line_text.as_string();
+        const replacement: string = replacement_text.as_string();
         if (line == "")              { return line; }
         if (start_col == 0)          { return line; }
 
@@ -1803,7 +1807,8 @@ type struct DiagRenderer {
     /// ranges or on allocation failure.  Used by the multi-line suggestion
     /// renderer to split a replacement string on `\n` and to pull leading
     /// whitespace off the anchor line for auto-indenting inserted lines.
-    static substring_bytes(s: string, start: i64, end: i64) -> string {
+    static substring_bytes(s_text: Text, start: i64, end: i64) -> string {
+        const s: string = s_text.as_string();
         if (s == null as string || s == "") { return ""; }
         if (end <= start) { return ""; }
         const len: i64 = end - start;
@@ -1816,7 +1821,8 @@ type struct DiagRenderer {
     /// bytes off the anchor line, so a fix-it like `,\nbuz: <bool>` lands
     /// at the same column as the existing fields without the emission site
     /// having to compute indent itself.
-    static leading_whitespace_count(line: string) -> i64 {
+    static leading_whitespace_count(line_text: Text) -> i64 {
+        const line: string = line_text.as_string();
         if (line == null as string || line == "") { return 0; }
         const len: i64 = line.length() as i64;
         mut i: i64 = 0;
@@ -1832,7 +1838,7 @@ type struct DiagRenderer {
     /// (1-indexed, half-open).  Used to compute caret-span widths so a
     /// `^^^^` underline matches the visual extent of a tab- or multi-byte
     /// span.
-    static byte_range_visual_width(line: string, start_byte: u32, end_byte: u32) -> u32 {
+    static byte_range_visual_width(line: Text, start_byte: u32, end_byte: u32) -> u32 {
         if (end_byte <= start_byte) { return 1; }
         const v_start: u32 = DiagRenderer::byte_col_to_visual(line, start_byte);
         const v_end:   u32 = DiagRenderer::byte_col_to_visual(line, end_byte);

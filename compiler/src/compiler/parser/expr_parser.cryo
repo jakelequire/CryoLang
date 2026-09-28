@@ -928,13 +928,13 @@ public:
             if (c == '{') {
                 if (i + 1 < len && (*(raw + i + 1) as char) == '{') {
                     // `{{`: flush through the first brace, skip the second.
-                    acc = this.fstr_flush_range(acc, raw, chunk_start, i + 1);
+                    acc = this.fstr_flush_range(acc, Text::new(raw), chunk_start, i + 1);
                     chunk_start = i + 2;
                     i += 2;
                     continue;
                 }
                 // Hole: flush the literal run before it.
-                acc = this.fstr_flush_range(acc, raw, chunk_start, i);
+                acc = this.fstr_flush_range(acc, Text::new(raw), chunk_start, i);
 
                 // Scan to the matching '}', tracking brace depth and
                 // skipping string/char literals so braces inside them
@@ -945,7 +945,7 @@ public:
                 while (j < len) {
                     const cj: char = *(raw + j) as char;
                     if (cj == '"' || cj == '\'') {
-                        j = this.fstr_skip_quoted(raw, len, j, cj);
+                        j = this.fstr_skip_quoted(Text::new(raw), len, j, cj);
                         continue;
                     }
                     if (cj == '{') {
@@ -970,12 +970,12 @@ public:
                 // Debug; a grammar-valid suffix is a format spec; anything
                 // else (e.g. a ternary's ` : b`) is not a spec and the
                 // whole hole stays the expression.
-                const tl: i64 = this.fstr_rstrip_len(hole_src);
+                const tl: i64 = this.fstr_rstrip_len(Text::new(hole_src));
                 mut expr_src: string = hole_src;
                 mut spec_src:  string = "";
                 // Helper kind: 0 = Display, 1 = Debug, 2 = full spec.
                 mut helper_kind: i64 = 0;
-                const sep: i64 = this.fstr_find_spec_colon(hole_src, tl);
+                const sep: i64 = this.fstr_find_spec_colon(Text::new(hole_src), tl);
                 if (sep >= 0) {
                     const spec_len: i64 = tl - (sep + 1);
                     const suffix: string = hole_src.substr(sep + 1, spec_len);
@@ -985,7 +985,7 @@ public:
                     } else if (spec_len == 0) {
                         // `{x:}` - empty spec renders as plain Display.
                         expr_src = hole_src.substr(0, sep);
-                    } else if (this.fstr_spec_is_valid(suffix)) {
+                    } else if (this.fstr_spec_is_valid(Text::new(suffix))) {
                         helper_kind = 2;
                         spec_src = suffix;
                         expr_src = hole_src.substr(0, sep);
@@ -1009,7 +1009,7 @@ public:
                     sc += 1;
                 }
                 const inner: ExpressionNode* = this.fstr_parse_hole(
-                    expr_src, hole_line, hole_col);
+                    Text::new(expr_src), hole_line, hole_col);
                 chunk_start = j + 1; // literal run resumes past the closing '}'
                 i = j + 1;
                 if (inner == null) {
@@ -1037,7 +1037,7 @@ public:
             if (c == '}') {
                 if (i + 1 < len && (*(raw + i + 1) as char) == '}') {
                     // `}}`: flush through the first brace, skip the second.
-                    acc = this.fstr_flush_range(acc, raw, chunk_start, i + 1);
+                    acc = this.fstr_flush_range(acc, Text::new(raw), chunk_start, i + 1);
                     chunk_start = i + 2;
                     i += 2;
                     continue;
@@ -1051,18 +1051,19 @@ public:
         }
 
         // Flush the trailing literal run.
-        acc = this.fstr_flush_range(acc, raw, chunk_start, len);
+        acc = this.fstr_flush_range(acc, Text::new(raw), chunk_start, len);
         return acc;
     }
 
     /// Flush the literal run `raw[start, end)` into `acc` as a
     /// `fmt_append_lit(acc, "<escape-processed>")` call.  No-op when empty.
     /// Uses `this.fstr_span` for synthesized node spans.
-    fstr_flush_range(acc: ExpressionNode*, raw: string,
+    fstr_flush_range(acc: ExpressionNode*, raw_text: Text,
                      start: i64, end: i64) -> ExpressionNode* {
+        const raw: string = raw_text.as_string();
         if (end <= start) { return acc; }
         const text_raw: string = raw.substr(start, end - start);
-        const text: string = Lexer::process_escape_sequences(text_raw);
+        const text: string = Lexer::process_escape_sequences(Text::new(text_raw));
         const lit: LiteralNode* = new LiteralNode(text, LiteralKind::String, this.fstr_span);
         return this.fstr_call2("fmt_append_lit", acc, lit as ExpressionNode*);
     }
@@ -1095,15 +1096,16 @@ public:
     /// would sit at 1:1 and collide in the resolution map, so a local used only
     /// inside an f-string looks unreferenced (W0001 false positive) and LSP
     /// hover/def point nowhere.
-    fstr_parse_hole(src: string, base_line: int, base_col: int) -> ExpressionNode* {
-        mut lx: Lexer = Lexer::new(Text::new("<fstring>"), Text::new(src), this.ctx.diagnostics);
+    fstr_parse_hole(src_text: Text, base_line: int, base_col: int) -> ExpressionNode* {
+        mut lx: Lexer = Lexer::new(Text::new("<fstring>"), src_text, this.ctx.diagnostics);
         lx.seed_location(base_line, base_col);
         const hole_toks: Token[] = lx.lex();
         return this.parse_expr_from_tokens(hole_toks);
     }
 
     /// Length of `s` with trailing ASCII whitespace trimmed.
-    fstr_rstrip_len(s: string) -> i64 {
+    fstr_rstrip_len(s_text: Text) -> i64 {
+        const s: string = s_text.as_string();
         mut n: i64 = s.length() as i64;
         while (n > 0) {
             const ch: char = *(s + n - 1) as char;
@@ -1139,13 +1141,14 @@ public:
     /// mixing a bare ternary with a spec must parenthesise the ternary; an
     /// idiomatic `a ? b : c` (spaces around `:`) is caught by the caller's
     /// grammar check failing on the leading space, leaving the hole intact.
-    fstr_find_spec_colon(s: string, tl: i64) -> i64 {
+    fstr_find_spec_colon(s_text: Text, tl: i64) -> i64 {
+        const s: string = s_text.as_string();
         mut depth: i64 = 0;
         mut i: i64 = 0;
         while (i < tl) {
             const c: char = *(s + i) as char;
             if (c == '"' || c == '\'') {
-                i = this.fstr_skip_quoted(s, tl, i, c);
+                i = this.fstr_skip_quoted(s_text, tl, i, c);
                 continue;
             }
             if (c == '(' || c == '[' || c == '{') {
@@ -1169,7 +1172,8 @@ public:
     /// `< > ^` and `type` is `x X o b`.  Rejecting an ill-formed suffix is
     /// what lets a ternary's ` : b` fall back to being part of the
     /// expression rather than a (broken) spec.
-    fstr_spec_is_valid(s: string) -> boolean {
+    fstr_spec_is_valid(s_text: Text) -> boolean {
+        const s: string = s_text.as_string();
         const n: i64 = s.length() as i64;
         if (n == 0) { return false; }
         mut i: i64 = 0;
@@ -1214,7 +1218,8 @@ public:
     /// Advance past a string/char literal in a hole scan.  `j` indexes the
     /// opening quote `q`; returns the index just past the closing quote (or
     /// end-of-template if unterminated, leaving the outer scan to fail).
-    fstr_skip_quoted(src: string, len: i64, j: i64, q: char) -> i64 {
+    fstr_skip_quoted(src_text: Text, len: i64, j: i64, q: char) -> i64 {
+        const src: string = src_text.as_string();
         mut k: i64 = j + 1;
         while (k < len) {
             const ck: char = *(src + k) as char;
@@ -2393,9 +2398,9 @@ public:
                     if (this.match_tok(TokenType::Minus)) { sign = -1; }
                     const num_tok: Token = this.advance();
                     const ns: SourceSpan = this.span_from_token(num_tok);
-                    if (ParserBase::is_float_lexeme(num_tok.lexeme)) {
+                    if (ParserBase::is_float_lexeme(Text::new(num_tok.lexeme))) {
                         const fv: f64 = ParserBase::parse_numeric_lexeme_f64(
-                            num_tok.lexeme);
+                            Text::new(num_tok.lexeme));
                         const signed_fv: f64 = if (sign < 0) { 0.0 - fv } else { fv };
                         const pf: PatternLiteralFloat* = new PatternLiteralFloat {
                             value: signed_fv, span: ns,
@@ -2403,7 +2408,7 @@ public:
                         pat.add_element(PatternElement::LiteralFloat(pf));
                     } else {
                         const iv: i64 = ParserBase::parse_numeric_lexeme_i64(
-                            num_tok.lexeme);
+                            Text::new(num_tok.lexeme));
                         const pi: PatternLiteralInt* = new PatternLiteralInt {
                             value: sign * iv, span: ns,
                         };
@@ -2528,7 +2533,7 @@ public:
         }
 
         if (member_tok.kind == TokenType::NumericConstant) {
-            const dot_pos: i64 = ExprParser::lexeme_first_dot(member_tok.lexeme);
+            const dot_pos: i64 = ExprParser::lexeme_first_dot(Text::new(member_tok.lexeme));
             if (dot_pos >= 0) {
                 const lex_len: i64 = member_tok.lexeme.length() as i64;
                 const first_str: string = member_tok.lexeme.substr(0, dot_pos as i64);
@@ -3069,12 +3074,12 @@ public:
                         // A size that needs more than 64 bits would saturate to
                         // a meaningless value; reject it up front rather than
                         // build a garbage array type.
-                        if (ParserBase::numeric_lexeme_overflows_u64(size_tok.lexeme)) {
+                        if (ParserBase::numeric_lexeme_overflows_u64(Text::new(size_tok.lexeme))) {
                             this.report_error(ErrorCode::E0010_NUMBER_TOO_LARGE,
                                 Text::new(fmt::format("array size `%s` does not fit in 64 bits",
                                     size_tok.lexeme)));
                         }
-                        size = ParserBase::parse_numeric_lexeme_i64(size_tok.lexeme);
+                        size = ParserBase::parse_numeric_lexeme_i64(Text::new(size_tok.lexeme));
                         this.advance();
                     } else {
                         // Named constant or computed size: T[BTREE_MAX_KEYS],
@@ -3278,7 +3283,8 @@ public:
     // index, or -1 if none. Used by `parse_member_access_expr` to split a
     // float-shaped token back into a chain of tuple indices when the lexer
     // has eaten the dot.
-    static lexeme_first_dot(s: string) -> i64 {
+    static lexeme_first_dot(s_text: Text) -> i64 {
+        const s: string = s_text.as_string();
         if (s == null) { return -1; }
         const len: i64 = s.length() as i64;
         for (mut i: i64 = 0; i < len; i++) {

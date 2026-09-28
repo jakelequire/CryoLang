@@ -25,6 +25,8 @@ where a refusal points.
       unwrap it once where the body opens (`attribute.py` picks the list).
   python retype.py --collapse <list.tsv> <repo-root>
       After `--refusals`: inside those bodies `Text::new(p)` becomes `p_text`.
+  python retype.py --round-trips <dir>
+      `Text::new(x.as_string())` becomes `x`.
   python retype.py --drop-unused <build-log> <root>
       Delete each entry unwrap a W0001 names as an unused variable.
 
@@ -35,6 +37,15 @@ import os, re, sys
 
 IMPORT = "import utils::text::{ Text };"
 TEXT_T = "utils::text::Text"
+
+
+def code(line):
+    """The line with string and char literals emptied and a `//` comment cut:
+    a brace inside `"{"` or `'{'` must not move a body's depth, or the body
+    runs on to the end of the file."""
+    s = re.sub(r'"(?:\\.|[^"\\])*"', '""', line)
+    s = re.sub(r"'(?:\\.|[^'\\])'", "''", s)
+    return s.split("//")[0]
 
 
 def is_decl(line, fn):
@@ -147,7 +158,7 @@ def prologue(listfile, root):
             # body's `p` is the string now, so those become plain `p`
             depth, started, e = 0, False, b
             while e < len(lines):
-                for ch in lines[e]:
+                for ch in code(lines[e]):
                     if ch == "{":
                         depth += 1; started = True
                     elif ch == "}":
@@ -190,7 +201,7 @@ def collapse(listfile, root):
                 head += 1
             depth, started, i = 0, False, head
             while i < len(lines):
-                for ch in lines[i]:
+                for ch in code(lines[i]):
                     if ch == "{":
                         depth += 1; started = True
                     elif ch == "}":
@@ -204,6 +215,29 @@ def collapse(listfile, root):
                 n += c
         write(p, lines, nl)
     print("collapsed %d re-wrap(s)" % n)
+
+
+def round_trips(root):
+    """`Text::new(x.as_string())` is `x`: only `Text` has `as_string`, so the
+    argument was already text.  `--refusals` writes the shape when a `Text`
+    that had been unwrapped for a `string` parameter meets that parameter
+    retyped.  The check refuses any rewrite that was not."""
+    pat = re.compile(r"Text::new\(([A-Za-z_][\w.]*)\.as_string\(\)\)")
+    n = 0
+    for base, _, files in os.walk(root):
+        if os.sep + "build" in base or "/build" in base:
+            continue
+        for fn in files:
+            if not fn.endswith(".cryo"):
+                continue
+            p = os.path.join(base, fn)
+            src, nl = read(p)
+            out = [pat.sub(r"\1", l) for l in src]
+            k = sum(1 for a, b in zip(src, out) if a != b)
+            if k:
+                write(p, out, nl)
+                n += k
+    print("removed %d round trip(s)" % n)
 
 
 def drop_unused(log, root):
@@ -351,6 +385,8 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["--params"]:
         retype_params(a[1], a[2])
+    elif a[:1] == ["--round-trips"]:
+        round_trips(a[1])
     elif a[:1] == ["--drop-unused"]:
         drop_unused(a[1], a[2])
     elif a[:1] == ["--collapse"]:

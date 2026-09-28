@@ -9,6 +9,14 @@ in the list's format, for `retype.py --prologue`.  A refusal no listed
 function contains is reported on stderr.
 """
 import re, sys
+
+
+def code(line):
+    """Literals emptied, comment cut: see retype.py."""
+    s = re.sub(r'"(?:\\.|[^"\\])*"', '""', line)
+    s = re.sub(r"'(?:\\.|[^'\\])'", "''", s)
+    return s.split("//")[0]
+
 listfile, log, root = sys.argv[1:4]
 rows = [l.rstrip("\n").split("\t") for l in open(listfile, encoding="utf-8") if l.strip()]
 cache = {}
@@ -24,7 +32,7 @@ for r in rows:
         head += 1
     depth, started, i = 0, False, head
     while i < len(L):
-        for ch in L[i]:
+        for ch in code(L[i]):
             if ch == "{":
                 depth += 1; started = True
             elif ch == "}":

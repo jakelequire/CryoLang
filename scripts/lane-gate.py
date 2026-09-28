@@ -451,8 +451,6 @@ EXCLUDED_ARRAYS = {
                                    "the command line's FLAGS by the spelling typed"),
     "Parser":             Excluded("compiler/parser/parser.cryo",
                                    "the parser's pending `static_assert` items, TEXTS, beside the doc-comment texts `ParserBase` carries"),
-    "ParserBase":         Excluded("compiler/parser/parser_base.cryo",
-                                   "pending doc-comment TEXTS; the parser's name tables that decided `ident <` by module-local spelling are deleted (the turbofish)"),
     "ProgramNode":        Excluded("compiler/AST/node.cryo",
                                    "the program's own written namespace name and its `static_assert` messages, TEXTS"),
     "ProjectConfig":      Excluded("compiler/project_config.cryo",

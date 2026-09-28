@@ -246,8 +246,6 @@ CLASS_OF_METHOD = {
     # -- the arena and the constant table --
     "ConstantTable::intern_qualified":
         ("N", "a key MINTED at the constant's declaration (`ns::name`) for its registration; the write side"),
-    "ConstantTable::parse_int_literal":
-        ("N", "a literal's text parsed to a value"),
 }
 
 # The importer's check for a C function already declared by its link name,

@@ -60,5 +60,19 @@ backend) adds four steps, because most of its bodies work on the bytes:
 11. The editor: `cd tools/CryoLSP && $CRYO build --build-dir=<scratch>`,
     then `retype.py --refusals <log> tools/CryoLSP`.
 
-Array and pointer parameters (`&string[]`, `string*`) are not in either
+Array and pointer parameters (`&string[]`, `string*`) are not in any
 slice: retyping one means retyping the store that feeds it.
+
+Slices 3 (`slice3.tsv`, backend labels) and 4 (`slice4.tsv`, literal and
+source text) follow steps 2-11, plus:
+
+12. `--refusals` also unwraps a `Text` handed to a C function's `i8*`/`u8*`.
+13. `python retype.py --round-trips compiler/src` - `Text::new(x.as_string())`
+    is `x` (only `Text` has `as_string`).
+14. `python rewraps.py compiler/src --fix` - a re-wrap of a parameter an
+    EARLIER slice unwrapped at entry (`--collapse` only sees its own list).
+
+The brace counters in `attribute.py`, `retype.py` and `uses.py` empty string
+and char literals first: a body holding `'{'` otherwise runs to the end of
+the file, and uses.py's first version missed uses that way and on a
+one-line body's head line.

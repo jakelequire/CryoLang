@@ -1229,7 +1229,7 @@ type struct Executor {
         if (args.has_arg("codegen-threads")) {
             config.codegen_threads_override =
                 project_config::ProjectConfig::parse_codegen_threads(
-                    args.get_value("codegen-threads")) as i32;
+                    Text::new(args.get_value("codegen-threads"))) as i32;
         }
         // `-g` / `--debug-info`: emit DWARF source-line debug info.
         if (args.has_flag("g") || args.has_flag("debug-info")) {
@@ -1493,7 +1493,7 @@ type struct Executor {
             if (args.positional_count() > 0) { pattern = args.input_file(); }
             mut jobs_value: string = "";
             if (args.has_arg("jobs")) { jobs_value = args.get_value("jobs"); }
-            const jobs: u32 = Executor::suite_jobs(jobs_value);
+            const jobs: u32 = Executor::suite_jobs(Text::new(jobs_value));
             const neg_dir: string = fmt::format("%s/tests/negative", proj_root);
             const neg_res: NegSuiteResult =
                 Executor::run_negative_suite(self_exe, stdlib_abs, neg_dir,
@@ -1526,7 +1526,7 @@ type struct Executor {
         if (!args.has_flag("list")) {
             const overall_pass: boolean =
                 unit_ok && (neg_failures == 0) && (proj_failures == 0);
-            const overall_active: boolean = Executor::neg_color_active(col_choice);
+            const overall_active: boolean = Executor::neg_color_active(Text::new(col_choice));
             fmt::printf("\n%s\n", TEST_RULE_HEAVY);
             if (overall_active && overall_pass) {
                 fmt::printf("  OVERALL  %sPASS%s", NEG_ANSI_GREEN, NEG_ANSI_RESET);
@@ -1619,7 +1619,8 @@ type struct Executor {
 
     /// Read a base-10 unsigned integer from `s` starting at byte `start`,
     /// stopping at the first non-digit.  -1 if no digit is present.
-    static neg_parse_uint(s: string, start: u64) -> i64 {
+    static neg_parse_uint(s_text: Text, start: u64) -> i64 {
+        const s: string = s_text.as_string();
         const n: u64 = s.length();
         mut v: i64 = 0;
         mut k: u64 = start;
@@ -1637,7 +1638,9 @@ type struct Executor {
 
     /// True if the FIRST line of `view` (up to '\n') contains `needle`.  Used to
     /// bind a `-->` arrow to the test file without scanning the rest of output.
-    static neg_line_contains(view: string, needle: string) -> boolean {
+    static neg_line_contains(view_text: Text, needle_text: Text) -> boolean {
+        const needle: string = needle_text.as_string();
+        const view: string = view_text.as_string();
         const n: u64 = view.length();
         mut eol: u64 = 0;
         while (eol < n && *((view as i8*) + eol) != 10) { eol += 1; }
@@ -1659,7 +1662,8 @@ type struct Executor {
     /// LINE (the integer after the second-to-last colon of the arrow line).
     /// Parsing from the tail is Windows-safe: a drive-letter colon (`C:\...`)
     /// sits earlier and never becomes one of the final two.  -1 if unparseable.
-    static neg_arrow_line(view: string) -> i64 {
+    static neg_arrow_line(view_text: Text) -> i64 {
+        const view: string = view_text.as_string();
         const n: u64 = view.length();
         mut k: u64 = 0;
         mut last_colon: i64 = -1;
@@ -1674,7 +1678,7 @@ type struct Executor {
             k += 1;
         }
         if (prev_colon < 0) { return -1; }
-        return Executor::neg_parse_uint(view, (prev_colon as u64) + 1);
+        return Executor::neg_parse_uint(view_text, (prev_colon as u64) + 1);
     }
 
     /// Parse every `//~ [^...] <SEV>[<CODE>] <msg>` expectation out of a negative
@@ -1754,7 +1758,6 @@ type struct Executor {
     /// arrow line).  Scoping to the file keeps `//~` exhaustiveness from tripping
     /// on stdlib-internal diagnostics.
     static parse_diagnostics(out_text: Text, fname_text: Text) -> NegDiag[] {
-        const fname: string = fname_text.as_string();
         const out: string = out_text.as_string();
         mut diags: NegDiag[] = [];
         const n: u64 = out.length();
@@ -1813,8 +1816,8 @@ type struct Executor {
             mut lineno: i64 = -1;
             if (arel >= 0 && habs + (arel as u64) < next_habs) {
                 const aview: string = ((out as i8*) + habs + (arel as u64)) as string;
-                if (Executor::neg_line_contains(aview, fname)) {
-                    lineno = Executor::neg_arrow_line(aview);
+                if (Executor::neg_line_contains(Text::new(aview), fname_text)) {
+                    lineno = Executor::neg_arrow_line(Text::new(aview));
                 }
             }
             if (lineno >= 0) {
@@ -1873,7 +1876,8 @@ type struct Executor {
     /// on/off decision for ANSI color emission. Auto checks `NO_COLOR`
     /// (presence forces off, per https://no-color.org/) and `isatty(1)`.
     /// Mirrors `resolve_color_active` in `stdlib/test/runner.cryo`.
-    static neg_color_active(col_choice: string) -> boolean {
+    static neg_color_active(col_choice_text: Text) -> boolean {
+        const col_choice: string = col_choice_text.as_string();
         if (col_choice == "always") { return true;  }
         if (col_choice == "never")  { return false; }
         // "auto" or "" (default): NO_COLOR > isatty.
@@ -1914,7 +1918,8 @@ type struct Executor {
     /// the unit runner resolves its own: `--jobs=N` (`cli_value`, "" when the
     /// flag is absent), else `CRYO_TEST_JOBS`; 0, neither, or a value that is
     /// not a whole number means the CPU count.  `1` runs one child at a time.
-    static suite_jobs(cli_value: string) -> u32 {
+    static suite_jobs(cli_value_text: Text) -> u32 {
+        const cli_value: string = cli_value_text.as_string();
         mut n: u32 = 0;
         if (cli_value.length() > 0) {
             match (u32::try_from(str::Str::new(cli_value))) {
@@ -1996,7 +2001,7 @@ type struct Executor {
 
         const is_pretty:  boolean = fmt_choice == "pretty";
         const is_compact: boolean = fmt_choice == "compact";
-        const color_on:   boolean = Executor::neg_color_active(col_choice);
+        const color_on:   boolean = Executor::neg_color_active(Text::new(col_choice));
 
         fmt::printf("\n%s\n", TEST_RULE_HEAVY);
         fmt::printf("  CRYO TESTS  /  compile-fail\n");
@@ -2463,7 +2468,7 @@ type struct Executor {
 
         const is_pretty:  boolean = fmt_choice == "pretty";
         const is_compact: boolean = fmt_choice == "compact";
-        const color_on:   boolean = Executor::neg_color_active(col_choice);
+        const color_on:   boolean = Executor::neg_color_active(Text::new(col_choice));
 
         fmt::printf("\n%s\n", TEST_RULE_HEAVY);
         fmt::printf("  CRYO TESTS  /  projects\n");
@@ -3001,7 +3006,7 @@ type struct Executor {
         if (args.has_arg("codegen-threads")) {
             config.codegen_threads_override =
                 project_config::ProjectConfig::parse_codegen_threads(
-                    args.get_value("codegen-threads")) as i32;
+                    Text::new(args.get_value("codegen-threads"))) as i32;
         }
         // `-g` / `--debug-info`: emit DWARF source-line debug info.
         if (args.has_flag("g") || args.has_flag("debug-info")) {
@@ -3196,7 +3201,7 @@ type struct Executor {
             }
         };
 
-        const key: string = Executor::to_lower(Executor::path_basename(Text::new(abs)));
+        const key: string = Executor::to_lower(Text::new(Executor::path_basename(Text::new(abs))));
         const name: string = registry::VendorRegistry::jstr(&root, "name", Executor::derive_namespace(key));
 
         mut entry: registry::VendorEntry = registry::VendorEntry {
@@ -3645,7 +3650,8 @@ type struct Executor {
     }
 
     /// ASCII-lowercase a string into a fresh heap buffer.
-    static to_lower(s: string) -> string {
+    static to_lower(s_text: Text) -> string {
+        const s: string = s_text.as_string();
         const n: u64 = s.length();
         const buf: i8* = libc::malloc(n + 1) as i8*;
         for (mut i: u64 = 0; i < n; i++) {
