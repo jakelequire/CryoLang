@@ -62,6 +62,7 @@ import compiler::ast::expression::{
     LiteralNode, ScopeResolutionNode, SizeofExprNode, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode };
+import compiler::lex::{ TokenType };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
@@ -368,10 +369,10 @@ type struct ConstEval {
             const u: UnaryExprNode* = expr as UnaryExprNode*;
             mut a: i64 = 0;
             if (!this.fold(u.operand, &a)) { return false; }
-            if (u.op.lexeme == "-") { *out = 0 - a; return true; }
-            if (u.op.lexeme == "+") { *out = a;     return true; }
-            if (u.op.lexeme == "~") { *out = ~a;    return true; }
-            if (u.op.lexeme == "!") { *out = if (a == 0) { 1 } else { 0 }; return true; }
+            if (u.op.kind == TokenType::Minus) { *out = 0 - a; return true; }
+            if (u.op.kind == TokenType::Plus) { *out = a;     return true; }
+            if (u.op.kind == TokenType::Tilde) { *out = ~a;    return true; }
+            if (u.op.kind == TokenType::Exclaim) { *out = if (a == 0) { 1 } else { 0 }; return true; }
             return false;
         }
 
@@ -381,7 +382,7 @@ type struct ConstEval {
             mut y: i64 = 0;
             if (!this.fold(b.left,  &x)) { return false; }
             if (!this.fold(b.right, &y)) { return false; }
-            return ConstEval::apply_binary(b.op.lexeme, x, y, out);
+            return ConstEval::apply_binary(b.op.kind, x, y, out);
         }
 
         return false;
@@ -454,8 +455,8 @@ type struct ConstEval {
             const u: UnaryExprNode* = expr as UnaryExprNode*;
             mut a: f64 = 0.0;
             if (!this.fold_real(u.operand, &a)) { return false; }
-            if (u.op.lexeme == "-") { *out = 0.0 - a; return true; }
-            if (u.op.lexeme == "+") { *out = a;       return true; }
+            if (u.op.kind == TokenType::Minus) { *out = 0.0 - a; return true; }
+            if (u.op.kind == TokenType::Plus) { *out = a;       return true; }
             return false;
         }
 
@@ -465,14 +466,14 @@ type struct ConstEval {
             mut y: f64 = 0.0;
             if (!this.fold_real(b.left,  &x)) { return false; }
             if (!this.fold_real(b.right, &y)) { return false; }
-            const op: string = b.op.lexeme;
-            if (op == "+") { *out = x + y; return true; }
-            if (op == "-") { *out = x - y; return true; }
-            if (op == "*") { *out = x * y; return true; }
+            const op: TokenType = b.op.kind;
+            if (op == TokenType::Plus) { *out = x + y; return true; }
+            if (op == TokenType::Minus) { *out = x - y; return true; }
+            if (op == TokenType::Star) { *out = x * y; return true; }
             // Division by zero is NOT refused: IEEE gives it an answer, and it
             // is the same answer the emitted code would compute, so declining
             // would replace an infinity with the zero the fallback publishes.
-            if (op == "/") { *out = x / y; return true; }
+            if (op == TokenType::Slash) { *out = x / y; return true; }
             return false;
         }
 
@@ -754,21 +755,21 @@ type struct ConstEval {
 
     /// Evaluate `x <op> y` with overflow and divide-by-zero guarded; false
     /// means the result is not representable and the fold must bail.
-    static apply_binary(op: string, x: i64, y: i64, out: i64*) -> boolean {
+    static apply_binary(op: TokenType, x: i64, y: i64, out: i64*) -> boolean {
         const I64MAX: i64 = CONST_I64_MAX_MAG as i64;
         const I64MIN: i64 = (0 - I64MAX) - 1;
 
-        if (op == "+") {
+        if (op == TokenType::Plus) {
             if (y > 0 && x > I64MAX - y) { return false; }
             if (y < 0 && x < I64MIN - y) { return false; }
             *out = x + y; return true;
         }
-        if (op == "-") {
+        if (op == TokenType::Minus) {
             if (y < 0 && x > I64MAX + y) { return false; }
             if (y > 0 && x < I64MIN + y) { return false; }
             *out = x - y; return true;
         }
-        if (op == "*") {
+        if (op == TokenType::Star) {
             if (x == 0 || y == 0) { *out = 0; return true; }
             // I64MIN has no positive counterpart; the re-division check below
             // would itself trap on it.
@@ -777,34 +778,34 @@ type struct ConstEval {
             if (p / y != x) { return false; }
             *out = p; return true;
         }
-        if (op == "/" || op == "%") {
+        if (op == TokenType::Slash || op == TokenType::Percent) {
             if (y == 0) { return false; }
             if (x == I64MIN && y == 0 - 1) { return false; }
-            if (op == "/") { *out = x / y; } else { *out = x % y; }
+            if (op == TokenType::Slash) { *out = x / y; } else { *out = x % y; }
             return true;
         }
-        if (op == "<<") {
+        if (op == TokenType::LessLess) {
             if (y < 0 || y >= 64) { return false; }
             const s: i64 = x << y;
             if ((s >> y) != x) { return false; }
             *out = s; return true;
         }
-        if (op == ">>") {
+        if (op == TokenType::GreaterGreater) {
             if (y < 0 || y >= 64) { return false; }
             *out = x >> y; return true;
         }
-        if (op == "&") { *out = x & y; return true; }
-        if (op == "|") { *out = x | y; return true; }
-        if (op == "^") { *out = x ^ y; return true; }
+        if (op == TokenType::Amp) { *out = x & y; return true; }
+        if (op == TokenType::Pipe) { *out = x | y; return true; }
+        if (op == TokenType::Caret) { *out = x ^ y; return true; }
 
-        if (op == "==") { *out = if (x == y) { 1 } else { 0 }; return true; }
-        if (op == "!=") { *out = if (x != y) { 1 } else { 0 }; return true; }
-        if (op == "<")  { *out = if (x <  y) { 1 } else { 0 }; return true; }
-        if (op == "<=") { *out = if (x <= y) { 1 } else { 0 }; return true; }
-        if (op == ">")  { *out = if (x >  y) { 1 } else { 0 }; return true; }
-        if (op == ">=") { *out = if (x >= y) { 1 } else { 0 }; return true; }
-        if (op == "&&") { *out = if (x != 0 && y != 0) { 1 } else { 0 }; return true; }
-        if (op == "||") { *out = if (x != 0 || y != 0) { 1 } else { 0 }; return true; }
+        if (op == TokenType::EqualEqual) { *out = if (x == y) { 1 } else { 0 }; return true; }
+        if (op == TokenType::ExclaimEqual) { *out = if (x != y) { 1 } else { 0 }; return true; }
+        if (op == TokenType::LAngle)  { *out = if (x <  y) { 1 } else { 0 }; return true; }
+        if (op == TokenType::LessEqual) { *out = if (x <= y) { 1 } else { 0 }; return true; }
+        if (op == TokenType::RAngle)  { *out = if (x >  y) { 1 } else { 0 }; return true; }
+        if (op == TokenType::GreaterEqual) { *out = if (x >= y) { 1 } else { 0 }; return true; }
+        if (op == TokenType::AmpAmp) { *out = if (x != 0 && y != 0) { 1 } else { 0 }; return true; }
+        if (op == TokenType::PipePipe) { *out = if (x != 0 || y != 0) { 1 } else { 0 }; return true; }
         return false;
     }
 }

@@ -13,6 +13,7 @@ import compiler::types::{
 import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::fmt;
+import compiler::lex::{ TokenType };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{
@@ -713,8 +714,8 @@ type struct TypeChecker {
     // Operation type checking
 
     /// Check a binary operation and return the result type.
-    check_binary_op(&this, op: string, lhs: TypeRef, rhs: TypeRef) -> TypeCheckResult {
-        LOG_DEBUG(LogComponent::TypeChecker, "[TypeChecker] check_binary_op() op='%s' lhs=%lu rhs=%lu", op, lhs.key(), rhs.key());
+    check_binary_op(&this, op: TokenType, lhs: TypeRef, rhs: TypeRef) -> TypeCheckResult {
+        LOG_DEBUG(LogComponent::TypeChecker, "[TypeChecker] check_binary_op() op='%s' lhs=%lu rhs=%lu", op.to_string(), lhs.key(), rhs.key());
         if (lhs.is_invalid() || rhs.is_invalid()) {
             return TypeCheckResult::fail(Text::new("Cannot apply operator to invalid types"));
         }
@@ -737,15 +738,15 @@ type struct TypeChecker {
         if (lhs_generic || rhs_generic) {
             // Comparison ops produce bool; everything else passes the
             // generic side through so substitution can resolve it.
-            if (op == "==" || op == "!=" || op == "<" || op == ">"
-                || op == "<=" || op == ">=") {
+            if (op == TokenType::EqualEqual || op == TokenType::ExclaimEqual || op == TokenType::LAngle || op == TokenType::RAngle
+                || op == TokenType::LessEqual || op == TokenType::GreaterEqual) {
                 return TypeCheckResult::ok(this.arena.get_bool());
             }
             return TypeCheckResult::ok(if (lhs_generic) { lhs } else { rhs });
         }
 
         // Arithmetic: + - * / %
-        if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%") {
+        if (op == TokenType::Plus || op == TokenType::Minus || op == TokenType::Star || op == TokenType::Slash || op == TokenType::Percent) {
             if (lhs_type.is_numeric() && rhs_type.is_numeric()) {
                 return TypeCheckResult::ok(this.get_common_numeric_type(lhs, rhs));
             }
@@ -761,7 +762,7 @@ type struct TypeChecker {
                 if (rhs_type.kind == TypeKind::Char) { return TypeCheckResult::ok(lhs); }
             }
             // String concatenation
-            if (op == "+" && lhs_type.kind == TypeKind::String && rhs_type.kind == TypeKind::String) {
+            if (op == TokenType::Plus && lhs_type.kind == TypeKind::String && rhs_type.kind == TypeKind::String) {
                 return TypeCheckResult::ok(this.arena.get_string());
             }
             // String / pointer byte-arithmetic: `s + offset`, `s - offset`
@@ -778,7 +779,7 @@ type struct TypeChecker {
             // arm for a numeric base and would emit `add ptr, i64` (invalid
             // IR).  Advancing a cursor reads naturally cursor-first anyway;
             // write `s + n`, not `n + s`.
-            if ((op == "+" || op == "-") &&
+            if ((op == TokenType::Plus || op == TokenType::Minus) &&
                     lhs_type.kind == TypeKind::String && rhs_type.is_numeric()) {
                 return TypeCheckResult::ok(this.arena.get_string());
             }
@@ -793,15 +794,15 @@ type struct TypeChecker {
             // is rejected for the same broken-IR reason.
             const lhs_is_ptrlike: boolean = lhs_type.kind == TypeKind::Pointer
                                          || lhs_type.kind == TypeKind::Reference;
-            if ((op == "+" || op == "-") && lhs_is_ptrlike && rhs_type.is_numeric()) {
+            if ((op == TokenType::Plus || op == TokenType::Minus) && lhs_is_ptrlike && rhs_type.is_numeric()) {
                 return TypeCheckResult::ok(lhs);
             }
             return TypeCheckResult::fail(Text::new(fmt::format("Cannot apply '%s' to %s and %s",
-                op, lhs_type.kind.to_string(), rhs_type.kind.to_string())));
+                op.to_string(), lhs_type.kind.to_string(), rhs_type.kind.to_string())));
         }
 
         // Comparison: == != < > <= >=
-        if (op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=") {
+        if (op == TokenType::EqualEqual || op == TokenType::ExclaimEqual || op == TokenType::LAngle || op == TokenType::RAngle || op == TokenType::LessEqual || op == TokenType::GreaterEqual) {
             if (lhs_type.is_numeric() && rhs_type.is_numeric()) {
                 return TypeCheckResult::ok(this.arena.get_bool());
             }
@@ -866,18 +867,18 @@ type struct TypeChecker {
         }
 
         // Logical: && ||
-        if (op == "&&" || op == "||") {
+        if (op == TokenType::AmpAmp || op == TokenType::PipePipe) {
             if (lhs_type.kind == TypeKind::Bool && rhs_type.kind == TypeKind::Bool) {
                 return TypeCheckResult::ok(this.arena.get_bool());
             }
-            return TypeCheckResult::fail(Text::new(fmt::format("Logical '%s' requires boolean operands", op)));
+            return TypeCheckResult::fail(Text::new(fmt::format("Logical '%s' requires boolean operands", op.to_string())));
         }
 
         // Bitwise: & | ^ << >>
         // `char` is a 1-byte integer at the LLVM level, so allow it
         // alongside `Int` (the FNV hash and similar byte-folding code
         // does `hash ^ s[i]` where `s[i]` is char).
-        if (op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
+        if (op == TokenType::Amp || op == TokenType::Pipe || op == TokenType::Caret || op == TokenType::LessLess || op == TokenType::GreaterGreater) {
             const lhs_intlike: boolean = lhs_type.kind == TypeKind::Int
                                       || lhs_type.kind == TypeKind::Char;
             const rhs_intlike: boolean = rhs_type.kind == TypeKind::Int
@@ -885,14 +886,14 @@ type struct TypeChecker {
             if (lhs_intlike && rhs_intlike) {
                 return TypeCheckResult::ok(this.get_common_numeric_type(lhs, rhs));
             }
-            return TypeCheckResult::fail(Text::new(fmt::format("Bitwise '%s' requires integer operands", op)));
+            return TypeCheckResult::fail(Text::new(fmt::format("Bitwise '%s' requires integer operands", op.to_string())));
         }
 
-        return TypeCheckResult::fail(Text::new(fmt::format("Unknown binary operator '%s'", op)));
+        return TypeCheckResult::fail(Text::new(fmt::format("Unknown binary operator '%s'", op.to_string())));
     }
 
     /// Check a unary operation and return the result type.
-    check_unary_op(&this, op: string, operand: TypeRef) -> TypeCheckResult {
+    check_unary_op(&this, op: TokenType, operand: TypeRef) -> TypeCheckResult {
         if (operand.is_invalid()) {
             return TypeCheckResult::fail(Text::new("Cannot apply unary operator to invalid type"));
         }
@@ -915,7 +916,7 @@ type struct TypeChecker {
         }
 
         // Negation: -
-        if (op == "-") {
+        if (op == TokenType::Minus) {
             if (op_type.is_numeric()) {
                 return TypeCheckResult::ok(operand);
             }
@@ -927,7 +928,7 @@ type struct TypeChecker {
         // C-style buffer walking like `p++` / `cursor++`).  `string` is a
         // length-less `i8*` cursor, so `str++` steps one byte - the idiom
         // the lexer/parser use to walk source text.
-        if (op == "++" || op == "--") {
+        if (op == TokenType::PlusPlus || op == TokenType::MinusMinus) {
             if (op_type.is_numeric()
                 || op_type.kind == TypeKind::Pointer
                 || op_type.kind == TypeKind::Char
@@ -939,14 +940,14 @@ type struct TypeChecker {
             // user to a raw pointer, which `++`/`--` walk element-wise.
             if (op_type.kind == TypeKind::Reference) {
                 return TypeCheckResult::fail(Text::new(fmt::format(
-                    "operator '%s' cannot be applied to a reference '&T'; a reference is an alias, not a reseatable cursor. Use a raw pointer 'T*' to walk memory", op)));
+                    "operator '%s' cannot be applied to a reference '&T'; a reference is an alias, not a reseatable cursor. Use a raw pointer 'T*' to walk memory", op.to_string())));
             }
             return TypeCheckResult::fail(Text::new(fmt::format(
-                "operator '%s' requires a numeric, pointer, or string operand", op)));
+                "operator '%s' requires a numeric, pointer, or string operand", op.to_string())));
         }
 
         // Logical not: !
-        if (op == "!") {
+        if (op == TokenType::Exclaim) {
             if (op_type.kind == TypeKind::Bool) {
                 return TypeCheckResult::ok(operand);
             }
@@ -954,7 +955,7 @@ type struct TypeChecker {
         }
 
         // Bitwise not: ~
-        if (op == "~") {
+        if (op == TokenType::Tilde) {
             if (op_type.kind == TypeKind::Int) {
                 return TypeCheckResult::ok(operand);
             }
@@ -962,7 +963,7 @@ type struct TypeChecker {
         }
 
         // Dereference: *
-        if (op == "*") {
+        if (op == TokenType::Star) {
             if (op_type.kind == TypeKind::Pointer) {
                 mut ptr: PointerType* = op_type as PointerType*;
                 return TypeCheckResult::ok(ptr.pointee);
@@ -985,12 +986,12 @@ type struct TypeChecker {
         }
 
         // Address-of: & produces an immutable reference (&T), not a raw pointer (T*)
-        if (op == "&") {
+        if (op == TokenType::Amp) {
             return TypeCheckResult::ok(
                 this.arena.get_reference_to(operand, RefMutability::Immutable));
         }
 
-        return TypeCheckResult::fail(Text::new(fmt::format("Unknown unary operator '%s'", op)));
+        return TypeCheckResult::fail(Text::new(fmt::format("Unknown unary operator '%s'", op.to_string())));
     }
 
     /// Check a function call with the given argument types.
