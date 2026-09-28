@@ -411,7 +411,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: facts-check lane-check lane-selftest facts-selftest' Makefile` → **1** (§8.371: stale facts are REFUSED first, never regenerated - the facts target is the deliberate refresh - and the refusal's self-test runs; `facts-fresh`, which regenerated them, before, §8.366)
 * `python3 scripts/facts-selftest.py | tail -1 | grep -o '[0-9]* cases' | cut -d' ' -f1` → **12** (§8.371: the freshness check over a throwaway tree - an edited source, an added source and a missing inputs record refused, fresh facts and a non-source edit accepted, each through `facts.py --check` and through `facts_path`, which the lane gate and the residue check call - and a dry run of the lane-check and check-fast targets building nothing; with the staleness comparison deleted it fails 4 cases, with `lane-check` depending on `facts` it fails 2)
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **96** (+3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **97** (+1 in §8.396, `array_method_argument_mismatch`; +3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)* `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -48563,3 +48563,92 @@ lint); 527 generated lines in 65 files (61 compiler, 4 editor);
 6 builds (2 uncapped), 1 pin, 3 uncapped compiler checks and 2 editor
 builds for the report, 1 regeneration control, 4 inversion checks, 2 facts,
 3 check-fast, 3 verify.
+
+### 8.396 A dynamic array's method arguments are checked by the type check, so `cryo check` refuses what only code generation refused (D61) - 2026-09-28
+
+## The hole
+
+`cryo check` passed an argument of the wrong type to a method of a dynamic
+array; only a full build refused it, in code generation, with a message
+about the wrong thing:
+
+```cryo
+mut nums: i64[] = [];
+nums.push("not a number");
+// before: cryo check -> "No errors found."
+//         cryo build -> error[E0636]: codegen: no method 'push' found on type 'i64[]'
+//                       (then E0633, a block left unterminated, and E0900)
+// after:  cryo check -> error[E0214]: mismatched types, at the argument:
+//                       expected `i64`, found `string`
+```
+
+A struct's method was checked (E0214), an unknown array method was refused
+(E0358), and an array method's return was typed right: only the ARGUMENT
+check missed the array.
+
+## Cause, and why it is one arm
+
+`CallResolver::check_method_call_arg_types` peels pointers, references and
+instantiations to the type whose methods it checks against, and had no arm
+for a dynamic `T[]`, so it found no candidate and reported nothing. The
+binder beside it (`bind_method_on_receiver`) and `TypeUtils::method_owner_ref`
+both reach a `T[]`'s methods through the `Array<T>` specialization
+registered for its element (`decl_index.lookup_array_type`); the check now
+does the same.
+
+That map is filled by the specialization pass, after mono. Measured with a
+probe line at the new arm over the repro: sema runs twice under
+`cryo check`; the pass before mono found no specialization (1 time for
+`i64[]`, 8 for `string[]` inside the stdlib) and the pass after it found
+`Array<i64>` and reported E0214. So the pass before mono returns early, as
+the arm for an unresolved instantiation already did, and the check happens
+in the pass after it - still inside `cryo check`, before code generation.
+
+## The message
+
+Code generation does not look methods up: it calls the one the type check
+bound, and E0636 fires when there is none. Its member-call text claimed
+"neither the concrete type nor any base defines this method" - which it
+never checked, and which was false here. It now says what it knows: "the
+call to method 'push' on type 'i64[]' was never bound to a method", with a
+note that the type check accepted the call without binding it, which is a
+compiler defect. The array shape no longer reaches it. The wording is mine.
+
+## Proof
+
+`array_method_argument_mismatch` (declared in `tests/started-passing`):
+`push`, `insert`, `set` and a borrowed `contains` argument on an `i64[]`.
+
+* parent compiler: `cryo check` - "No errors found."; `cryo build` - four
+  E0636 "codegen: no method '...' found on type 'i64[]'", then E0633 and
+  E0900.
+* this tree: `cryo check` and `cryo build` - four E0214 at `9:15`,
+  `10:20`, `11:17`, `13:23`, "expected `i64`, found `string`" (and
+  "expected `&i64`, found `&string`" for `contains`), no E0636.
+
+## Not taken
+
+`cryo check` also accepts a struct compared with `null`, and the build then
+dies with an unterminated block. It is a separate rule, not this one:
+`TypeChecker::check_binary_op` (`compiler/src/compiler/types/checker.cryo:857`)
+accepts `==` / `!=` whenever either side is `void` - the type of the `null`
+literal - whatever the other side is. Recorded, left.
+
+## Counts
+
+* Warnings (clean build) 344, the same set. `cryo check` of the compiler
+  itself: no errors.
+* Lane: unchanged (predicted a possible +1 for `lookup_array_type`; the
+  gate does not count it). Name-taking 716.
+* Test projects 96 -> 97; roster merged (+1).
+* Objects: 0 of 3,570 test objects and 0 of 1,126 example objects moved
+  (`make verify ARGS="--baseline HEAD --require-identical"`, OK in 322 s):
+  the check, now reaching every array method call after mono, refused
+  nothing in the stdlib, the compiler, the editor or the corpus, and
+  converted no argument.
+
+## Blast radius
+
+`sema/call_resolver.cryo` +9, `codegen/visit/call_emitter.cryo` +8 / -2.
+Gate cycles: 2 builds (1 probe), 2 repro checks, 1 facts, 1 check-fast,
+1 verify.
