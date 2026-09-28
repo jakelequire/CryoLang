@@ -7,6 +7,12 @@ its `private` fields, its public statics returning it).
 NEW: the same three questions asked of the compiler's declaration records
 (`type`, `field`, `fn` in `.facts/compiler.facts`).
 
+The OLD side is the source reader the switch deleted, so this runs with the
+gate as it stood before the switch: check out `scripts/lane-gate.py` from
+the switch commit's parent (`git show 3fd3d464^:scripts/lane-gate.py`) over
+the working copy first, and restore it after.  `sealed_mutations.py`, which
+calls this, needs the same.
+
 For every SEALED_TYPES entry it prints what each side found - the private
 fields and the public statics that take an argument and return the type -
 and each side's verdict, then `AGREE` or `DIFFER` per entry.  Exit 0 only
