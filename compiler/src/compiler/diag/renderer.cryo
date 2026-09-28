@@ -188,8 +188,9 @@ type struct DiagRenderer {
 
     /// Load a source file into the cache.  Returns true if the file was
     /// loaded (or was already cached).
-    load_source(mut &this, filepath: string) -> boolean {
-        if (this.has_source(filepath)) {
+    load_source(mut &this, filepath_text: Text) -> boolean {
+        const filepath: string = filepath_text.as_string();
+        if (this.has_source(filepath_text)) {
             return true;
         }
 
@@ -212,12 +213,14 @@ type struct DiagRenderer {
     }
 
     /// Check whether a file is already in the source cache.
-    has_source(&this, filepath: string) -> boolean {
+    has_source(&this, filepath_text: Text) -> boolean {
+        const filepath: string = filepath_text.as_string();
         return this.file_index.contains_key(&filepath);
     }
 
     /// Get the content of a cached source file, or "" if not cached.
-    get_content(&this, filepath: string) -> string {
+    get_content(&this, filepath_text: Text) -> string {
+        const filepath: string = filepath_text.as_string();
         const opt: Option<i64> = this.file_index.get(&filepath);
         if (opt.is_some()) {
             return this.cached_contents[opt.unwrap()];
@@ -227,8 +230,8 @@ type struct DiagRenderer {
 
     /// Extract a single line (1-indexed) from a cached source file.
     /// Returns "" if the file is not cached or the line doesn't exist.
-    get_line(&this, filepath: string, line_num: u32) -> string {
-        const content: string = this.get_content(filepath);
+    get_line(&this, filepath_text: Text, line_num: u32) -> string {
+        const content: string = this.get_content(filepath_text);
         if (content == "") {
             return "";
         }
@@ -391,7 +394,8 @@ type struct DiagRenderer {
     /// counts cells, not bytes) lines up with what the terminal
     /// actually renders.  The expanded copy is heap-allocated and
     /// freed after the print; the original cached line is untouched.
-    print_source_line(&this, out: void*, line_text: string) -> void {
+    print_source_line(&this, out: void*, line_text_text: Text) -> void {
+        const line_text: string = line_text_text.as_string();
         const expanded: string = DiagRenderer::expand_tabs(line_text);
         syntax_highlighter::print_line(out, expanded, this.config.colors);
         if (expanded != line_text) {
@@ -493,7 +497,7 @@ type struct DiagRenderer {
         //    block, line groups separated by `...`).  Otherwise fall
         //    back to the single-span snippet.
         if (diag.span.has_location()) {
-            this.load_source(diag.span.file);
+            this.load_source(Text::new(diag.span.file));
             if (this.has_same_file_secondary(diag)) {
                 this.render_combined_snippet(diag);
             } else {
@@ -516,7 +520,7 @@ type struct DiagRenderer {
             if (label.span.file == diag.span.file && diag.span.has_location()) {
                 continue;  // already rendered in the combined block
             }
-            this.load_source(label.span.file);
+            this.load_source(Text::new(label.span.file));
             this.render_secondary_span(label);
         }
 
@@ -668,7 +672,7 @@ type struct DiagRenderer {
 
         // Render context lines before the error
         for (mut ln: u32 = first_line; ln < span.start_line; ln++) {
-            const line_text: string = this.get_line(span.file, ln);
+            const line_text: string = this.get_line(Text::new(span.file), ln);
             DiagSink::emit_raw(out, Text::new(this.lead()));
             DiagSink::emit_raw(out, Text::new(grey));
             DiagSink::emit_uint(out, ln as u64, line_width as i32);
@@ -678,12 +682,12 @@ type struct DiagRenderer {
             DiagSink::emit_raw(out, Text::new("|"));
             DiagSink::emit_raw(out, Text::new(reset));
             DiagSink::emit_raw(out, Text::new(" "));
-            this.print_source_line(out, line_text);
+            this.print_source_line(out, Text::new(line_text));
             DiagSink::emit_raw(out, Text::new("\n"));
         }
 
         // Render the error line
-        const error_line: string = this.get_line(span.file, span.start_line);
+        const error_line: string = this.get_line(Text::new(span.file), span.start_line);
         DiagSink::emit_raw(out, Text::new(this.lead()));
         DiagSink::emit_raw(out, Text::new(bold));
         DiagSink::emit_raw(out, Text::new(blue));
@@ -694,7 +698,7 @@ type struct DiagRenderer {
         DiagSink::emit_raw(out, Text::new("|"));
         DiagSink::emit_raw(out, Text::new(reset));
         DiagSink::emit_raw(out, Text::new(" "));
-        this.print_source_line(out, error_line);
+        this.print_source_line(out, Text::new(error_line));
         DiagSink::emit_raw(out, Text::new("\n"));
 
         // Render the caret underline
@@ -703,12 +707,12 @@ type struct DiagRenderer {
         // Context lines after
         const last_ctx: u32 = span.start_line + ctx;
         for (mut ln: u32 = span.start_line + 1; ln <= last_ctx; ln++) {
-            const line_text: string = this.get_line(span.file, ln);
+            const line_text: string = this.get_line(Text::new(span.file), ln);
             if (line_text == "" && ln > span.start_line + 1) {
                 break;  // Stop at empty lines past the first one
             }
             this.emit_gutter_num(out, grey, line_width, ln, " ");
-            this.print_source_line(out, line_text);
+            this.print_source_line(out, Text::new(line_text));
             DiagSink::emit_raw(out, Text::new("\n"));
         }
 
@@ -840,7 +844,7 @@ type struct DiagRenderer {
             } else if (want_start <= group_end + 1) {
                 if (want_end > group_end) { group_end = want_end; }
             } else {
-                this.render_line_group(diag.severity, primary_span.file,
+                this.render_line_group(diag.severity, Text::new(primary_span.file),
                                        group_start, group_end,
                                        labels.as_slice(), line_width);
                 this.render_ellipsis(line_width);
@@ -849,7 +853,7 @@ type struct DiagRenderer {
             }
         }
         if (have_group) {
-            this.render_line_group(diag.severity, primary_span.file,
+            this.render_line_group(diag.severity, Text::new(primary_span.file),
                                    group_start, group_end,
                                    labels.as_slice(), line_width);
         }
@@ -861,7 +865,7 @@ type struct DiagRenderer {
     /// For each line in [start_line..end_line]: print the line itself
     /// (bold blue line-number when it carries a label, grey otherwise),
     /// then one underline row per label that anchors on that line.
-    render_line_group(mut &this, severity: Severity, file: string,
+    render_line_group(mut &this, severity: Severity, file_text: Text,
                       start_line: u32, end_line: u32,
                       labels: Slice<SpanLabel>, line_width: u32) -> void {
         const blue: string  = this.color_blue();
@@ -871,7 +875,7 @@ type struct DiagRenderer {
         const out: void* = this.out;
 
         for (mut ln: u32 = start_line; ln <= end_line; ln++) {
-            const line_text: string = this.get_line(file, ln);
+            const line_text: string = this.get_line(file_text, ln);
             // get_line returns "" for both empty and out-of-bounds; if
             // we've passed the end of file there's nothing more to do.
             // Detect end-of-file by trying one line further than the
@@ -906,11 +910,11 @@ type struct DiagRenderer {
             } else {
                 this.emit_gutter_num(out, grey, line_width, ln, " ");
             }
-            this.print_source_line(out, line_text);
+            this.print_source_line(out, Text::new(line_text));
             DiagSink::emit_raw(out, Text::new("\n"));
 
             if (has_label) {
-                this.render_labels_for_line(labels, file, ln, severity, line_width);
+                this.render_labels_for_line(labels, file_text, ln, severity, line_width);
             }
         }
     }
@@ -920,7 +924,7 @@ type struct DiagRenderer {
     /// side carets with a connector + caption row) or as the legacy
     /// one-row-per-label rendering when there's only one or when the
     /// labels are too many to stack cleanly.
-    render_labels_for_line(mut &this, all_labels: Slice<SpanLabel>, file: string,
+    render_labels_for_line(mut &this, all_labels: Slice<SpanLabel>, file_text: Text,
                             line_num: u32, severity: Severity,
                             line_width: u32) -> void {
         mut on_line: SpanLabel[] = [];
@@ -955,7 +959,7 @@ type struct DiagRenderer {
         // connector layout problem here.
         if (on_line.length == 2) {
             this.render_stacked_two_labels(on_line[0], on_line[1],
-                file, line_num, severity, line_width);
+                file_text, line_num, severity, line_width);
             return;
         }
 
@@ -975,7 +979,7 @@ type struct DiagRenderer {
     /// labels' colors come from severity/primary-ness; primary wins
     /// when caret ranges overlap.
     render_stacked_two_labels(mut &this, left: SpanLabel, right: SpanLabel,
-                               file: string, line_num: u32,
+                               file_text: Text, line_num: u32,
                                severity: Severity, line_width: u32) -> void {
         const cyan:  string = this.color_cyan();
         const reset: string = this.color_reset();
@@ -983,7 +987,7 @@ type struct DiagRenderer {
         const sev_color: string = this.severity_color(severity);
         const out: void* = this.out;
 
-        const line_text: string = this.get_line(file, line_num);
+        const line_text: string = this.get_line(file_text, line_num);
 
         const left_vs: u32 = DiagRenderer::byte_col_to_visual(line_text, left.span.start_col);
         const left_ve: u32 = if (left.span.end_col > left.span.start_col) {
@@ -1068,7 +1072,7 @@ type struct DiagRenderer {
         // Visual cells, not bytes: a tab counts as up to 4 cells, a
         // multi-byte UTF-8 codepoint counts as 1.  Without this the
         // carets drift right of their target on tab-indented source.
-        const line_text: string = this.get_line(span.file, span.start_line);
+        const line_text: string = this.get_line(Text::new(span.file), span.start_line);
         const visual_start: u32 = DiagRenderer::byte_col_to_visual(line_text, span.start_col);
         mut ul_start: u32 = 0;
         if (visual_start > 0) { ul_start = visual_start - 1; }
@@ -1115,7 +1119,7 @@ type struct DiagRenderer {
         // Calculate underline position in *visual cells* - see the
         // header comments at the top of this file for the byte-to-cell
         // conversion contract.
-        const line_text: string = this.get_line(span.file, span.start_line);
+        const line_text: string = this.get_line(Text::new(span.file), span.start_line);
         const visual_start: u32 = DiagRenderer::byte_col_to_visual(line_text, span.start_col);
         mut ul_start: u32 = 0;
         if (visual_start > 0) {
@@ -1182,9 +1186,9 @@ type struct DiagRenderer {
         this.render_margin(line_width);
 
         // Render the source line
-        const line_text: string = this.get_line(label.span.file, label.span.start_line);
+        const line_text: string = this.get_line(Text::new(label.span.file), label.span.start_line);
         this.emit_gutter_num(out, grey, line_width, label.span.start_line, " ");
-        this.print_source_line(out, line_text);
+        this.print_source_line(out, Text::new(line_text));
         DiagSink::emit_raw(out, Text::new("\n"));
 
         // Cyan underline - visual cells, not bytes.
@@ -1238,7 +1242,7 @@ type struct DiagRenderer {
         DiagSink::emit_raw(out, Text::new("\n"));
 
         if (child.span.has_location()) {
-            this.load_source(child.span.file);
+            this.load_source(Text::new(child.span.file));
             this.render_snippet(child.span, child.severity, Text::new(child.message));
         }
     }
@@ -1319,8 +1323,8 @@ type struct DiagRenderer {
             return;
         }
 
-        this.load_source(part.span.file);
-        const orig_line: string = this.get_line(part.span.file, part.span.start_line);
+        this.load_source(Text::new(part.span.file));
+        const orig_line: string = this.get_line(Text::new(part.span.file), part.span.start_line);
         if (orig_line == "") {
             // Source not available; degrade to the bare replacement row.
             if (part.replacement != "") {
@@ -1404,7 +1408,7 @@ type struct DiagRenderer {
         DiagSink::emit_raw(out, Text::new("|"));
         DiagSink::emit_raw(out, Text::new(reset));
         DiagSink::emit_raw(out, Text::new(" "));
-        this.print_source_line(out, patched);
+        this.print_source_line(out, Text::new(patched));
         DiagSink::emit_raw(out, Text::new("\n"));
 
         // Underline row: green diff glyph under the affected portion of
@@ -1495,10 +1499,10 @@ type struct DiagRenderer {
         // opens the construct, e.g. `Foo {`).  Skipped on file-start.
         if (part.span.start_line > 1) {
             const prev_ln: u32 = part.span.start_line - 1;
-            const prev_text: string = this.get_line(part.span.file, prev_ln);
+            const prev_text: string = this.get_line(Text::new(part.span.file), prev_ln);
             if (prev_text != "") {
                 this.emit_gutter_num(out, grey, line_width, prev_ln, " ");
-                this.print_source_line(out, prev_text);
+                this.print_source_line(out, Text::new(prev_text));
                 DiagSink::emit_raw(out, Text::new("\n"));
             }
         }
@@ -1515,7 +1519,7 @@ type struct DiagRenderer {
         DiagSink::emit_raw(out, Text::new("~"));
         DiagSink::emit_raw(out, Text::new(reset));
         DiagSink::emit_raw(out, Text::new(" "));
-        this.print_source_line(out, patched_first);
+        this.print_source_line(out, Text::new(patched_first));
         DiagSink::emit_raw(out, Text::new("\n"));
 
         // Underline the inserted slice on the anchor line.
@@ -1563,7 +1567,7 @@ type struct DiagRenderer {
             DiagSink::emit_raw(out, Text::new("+"));
             DiagSink::emit_raw(out, Text::new(reset));
             DiagSink::emit_raw(out, Text::new(" "));
-            this.print_source_line(out, new_line);
+            this.print_source_line(out, Text::new(new_line));
             DiagSink::emit_raw(out, Text::new("\n"));
 
             // Underline the new line with `+` glyphs - positioned
@@ -1605,10 +1609,10 @@ type struct DiagRenderer {
         // first empty line past the anchor.
         for (mut ctx_i: u32 = 1; ctx_i <= 2; ctx_i++) {
             const next_ln: u32 = part.span.end_line + ctx_i;
-            const next_text: string = this.get_line(part.span.file, next_ln);
+            const next_text: string = this.get_line(Text::new(part.span.file), next_ln);
             if (next_text == "") { break; }
             this.emit_gutter_num(out, grey, line_width, next_ln, " ");
-            this.print_source_line(out, next_text);
+            this.print_source_line(out, Text::new(next_text));
             DiagSink::emit_raw(out, Text::new("\n"));
         }
 

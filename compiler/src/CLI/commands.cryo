@@ -153,7 +153,8 @@ type struct ProjOutcome {
 /// Rewrite a path's `/` to `\` so a `cmd`-executed command resolves it.
 /// Windows-host only; never referenced on the POSIX side.
 ![target(windows)]
-function exec_path(path: string) -> string {
+function exec_path(path_text: Text) -> string {
+    const path: string = path_text.as_string();
     const len: u64 = path.length();
     const buf: i8* = libc::malloc(len + 1) as i8*;
     const pb: i8* = path as i8*;
@@ -167,7 +168,8 @@ function exec_path(path: string) -> string {
 
 /// POSIX shells execute forward-slash paths fine; pass through unchanged.
 ![target(unix)]
-function exec_path(path: string) -> string {
+function exec_path(path_text: Text) -> string {
+    const path: string = path_text.as_string();
     return path;
 }
 
@@ -194,12 +196,16 @@ function host_os_name() -> string {
 // directory".  A suite job sets its directory inside its own shell because
 // the process working directory is one value shared by every thread here.
 ![target(windows)]
-function shell_in_dir(dir: string, cmd: string) -> string {
+function shell_in_dir(dir_text: Text, cmd_text: Text) -> string {
+    const cmd: string = cmd_text.as_string();
+    const dir: string = dir_text.as_string();
     return fmt::format("cd /d \"%s\" && %s", dir, cmd);
 }
 
 ![target(unix)]
-function shell_in_dir(dir: string, cmd: string) -> string {
+function shell_in_dir(dir_text: Text, cmd_text: Text) -> string {
+    const cmd: string = cmd_text.as_string();
+    const dir: string = dir_text.as_string();
     return fmt::format("cd \"%s\" && %s", dir, cmd);
 }
 
@@ -705,7 +711,7 @@ type struct Executor {
         const manifest: string = args.positional_at(0);
         const widx:  u32 = args.positional_at(1).parse_c_uint() as u32;
         const wcount: u32 = args.positional_at(2).parse_c_uint() as u32;
-        return passes::CodegenPasses::run_emit_worker(manifest, widx, wcount) as int;
+        return passes::CodegenPasses::run_emit_worker(Text::new(manifest), widx, wcount) as int;
     }
 
     /// Resolves a command name string to a CommandKind.
@@ -924,17 +930,17 @@ type struct Executor {
         // as the default project name; `cryo init hello` + Enter at every
         // prompt is the documented shortcut path.
         const name: string = if (has_positional) {
-            Executor::prompt_default(&input, "Project name", target_dir)
+            Executor::prompt_default(&input, Text::new("Project name"), Text::new(target_dir))
         } else {
-            Executor::prompt_required(&input, "Project name")
+            Executor::prompt_required(&input, Text::new("Project name"))
         };
         if (name == "") {
             fmt::eprintf("Error: project name is required\n");
             return 1;
         }
-        const src_dir: string  = Executor::prompt_default(&input, "Source directory", "src");
-        const out_dir: string  = Executor::prompt_default(&input, "Output directory", "build");
-        const ttype:   string  = Executor::prompt_default(&input, "Target type (executable/library/stdlib)", "executable");
+        const src_dir: string  = Executor::prompt_default(&input, Text::new("Source directory"), Text::new("src"));
+        const out_dir: string  = Executor::prompt_default(&input, Text::new("Output directory"), Text::new("build"));
+        const ttype:   string  = Executor::prompt_default(&input, Text::new("Target type (executable/library/stdlib)"), Text::new("executable"));
 
         // Validate target_type; silently accepting "exe" or typos would
         // produce a cryoconfig the parser can't load.
@@ -957,10 +963,10 @@ type struct Executor {
 
         const main_path: string = fmt::format("%s/main.cryo", src_path);
         const ns_name: string = Executor::derive_namespace(name);
-        if (!Executor::write_main_cryo(main_path, ns_name)) { return 1; }
+        if (!Executor::write_main_cryo(Text::new(main_path), ns_name)) { return 1; }
 
         const config_path: string = fmt::format("%s/cryoconfig", target_dir);
-        if (!Executor::write_cryoconfig(config_path, name, src_dir, out_dir, ttype)) { return 1; }
+        if (!Executor::write_cryoconfig(Text::new(config_path), name, Text::new(src_dir), Text::new(out_dir), ttype)) { return 1; }
 
         fmt::printf("\n  Created %s\n", config_path);
         fmt::printf("  Created %s\n", main_path);
@@ -974,21 +980,25 @@ type struct Executor {
 
     /// Read a line from `input`, returning `def` when the user
     /// presses Enter (empty input) or stdin closes.
-    static prompt_default(input: mut &stdio::Stdin, label: string, def: string) -> string {
+    static prompt_default(input: mut &stdio::Stdin, label_text: Text, def_text: Text) -> string {
+        const def: string = def_text.as_string();
+        const label: string = label_text.as_string();
         fmt::printf("%s [%s]: ", label, def);
         libc::fflush(null);
-        return Executor::read_line_or(input, def);
+        return Executor::read_line_or(input, def_text);
     }
 
     /// Like `prompt_default` but with no default: returns the empty
     /// string on EOF / blank input so the caller can reject it.
-    static prompt_required(input: mut &stdio::Stdin, label: string) -> string {
+    static prompt_required(input: mut &stdio::Stdin, label_text: Text) -> string {
+        const label: string = label_text.as_string();
         fmt::printf("%s: ", label);
         libc::fflush(null);
-        return Executor::read_line_or(input, "");
+        return Executor::read_line_or(input, Text::new(""));
     }
 
-    static read_line_or(input: mut &stdio::Stdin, def: string) -> string {
+    static read_line_or(input: mut &stdio::Stdin, def_text: Text) -> string {
+        const def: string = def_text.as_string();
         // Read one line into a local buffer.  Keeping it out of the `match`
         // binding lets it drop as an ordinary local on the `def` paths and
         // be consumed by `into_raw` on the success path.
@@ -1024,7 +1034,8 @@ type struct Executor {
         return n;
     }
 
-    static write_main_cryo(path: string, ns_name: string) -> boolean {
+    static write_main_cryo(path_text: Text, ns_name: string) -> boolean {
+        const path: string = path_text.as_string();
         const f: void* = libc::fopen(path, "w");
         if (f == null) {
             fmt::eprintf("Error: cannot open %s for writing\n", path);
@@ -1101,8 +1112,11 @@ type struct Executor {
         return buf as string;
     }
 
-    static write_cryoconfig(path: string, name: string, src_dir: string,
-                            out_dir: string, target_type: string) -> boolean {
+    static write_cryoconfig(path_text: Text, name: string, src_dir_text: Text,
+                            out_dir_text: Text, target_type: string) -> boolean {
+        const out_dir: string = out_dir_text.as_string();
+        const path: string = path_text.as_string();
+        const src_dir: string = src_dir_text.as_string();
         const f: void* = libc::fopen(path, "w");
         if (f == null) {
             fmt::eprintf("Error: cannot open %s for writing\n", path);
@@ -1154,7 +1168,7 @@ type struct Executor {
                 const ext_start: i64 = flen - 5;
                 const ext: string = file + ext_start;
                 if (ext == ".cryo") {
-                    return Executor::compile_file(file, args);
+                    return Executor::compile_file(Text::new(file), args);
                 }
             }
             // Positional arg is not a .cryo file; treat it as a directory.
@@ -1162,7 +1176,7 @@ type struct Executor {
 
         // Project build: find cryoconfig in the given dir (or ".").
         const dir: string = if (file.length() > 0) { file } else { "." };
-        const config_path: string = project_config::ProjectConfig::find_cryoconfig(dir);
+        const config_path: string = project_config::ProjectConfig::find_cryoconfig(Text::new(dir));
         if (config_path.length() == 0) {
             if (file.length() > 0) {
                 fmt::eprintf("Error: '%s' is not a .cryo file and no cryoconfig was found in that directory.\n", file);
@@ -1241,7 +1255,7 @@ type struct Executor {
 
         mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
         logger::cdebug(Text::new("[Build] Compiling project from config: %s\n"), config_path);
-        const result: instance::CompilationResult = compiler.compile_project(config_path);
+        const result: instance::CompilationResult = compiler.compile_project(Text::new(config_path));
 
         if (result.success) {
             if (result.output_path.length() > 0) {
@@ -1274,7 +1288,7 @@ type struct Executor {
         } else {
             "."
         };
-        const config_path: string = project_config::ProjectConfig::find_cryoconfig(dir);
+        const config_path: string = project_config::ProjectConfig::find_cryoconfig(Text::new(dir));
         if (config_path == "") {
             fmt::eprintf("Error: No cryoconfig found in '%s' or parent directories.\n", dir);
             fmt::eprintf("Usage: cryo run [flags]   (run from a directory containing a cryoconfig)\n");
@@ -1303,7 +1317,7 @@ type struct Executor {
         Executor::apply_profile_flags(&config, &args);
 
         mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
-        const result: instance::CompilationResult = compiler.compile_project(config_path);
+        const result: instance::CompilationResult = compiler.compile_project(Text::new(config_path));
 
         if (!result.success) {
             fmt::eprintf("Project compilation failed (%u errors, %u warnings)\n",
@@ -1329,7 +1343,7 @@ type struct Executor {
         // Windows.  The decoded exit code is surfaced so the caller's `$?`
         // matches what the inner binary returned; a negative value signals a
         // spawn failure.
-        const status: i32 = exec::shell(exec_path(result.output_path));
+        const status: i32 = exec::shell(exec_path(Text::new(result.output_path)));
         if (status < 0) {
             fmt::eprintf("Error: failed to spawn '%s'\n", result.output_path);
             return 1;
@@ -1352,7 +1366,7 @@ type struct Executor {
 
         logger::cdebug(Text::new("[Test] Building test binary.\n"));
 
-        const config_path: string = project_config::ProjectConfig::find_cryoconfig(".");
+        const config_path: string = project_config::ProjectConfig::find_cryoconfig(Text::new("."));
         if (config_path == "") {
             fmt::eprintf("Error: No cryoconfig found in '.' or parent directories.\n");
             fmt::eprintf("Usage: cryo test [pattern] [flags]   (run from a Cryo project)\n");
@@ -1376,7 +1390,7 @@ type struct Executor {
         config.test_mode = true;
 
         mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
-        const result: instance::CompilationResult = compiler.compile_project(config_path);
+        const result: instance::CompilationResult = compiler.compile_project(Text::new(config_path));
 
         if (!result.success) {
             fmt::eprintf("Test build failed (%u errors, %u warnings)\n",
@@ -1392,7 +1406,7 @@ type struct Executor {
         // pattern (first positional) and the runner-side flags.  The leading
         // binary path is host-normalized (`/`->`\` on Windows) so `cmd` can
         // execute it; the appended flags carry no path separators.
-        mut cmd: string = exec_path(result.output_path);
+        mut cmd: string = exec_path(Text::new(result.output_path));
         if (args.positional_count() > 0) {
             cmd = fmt::format("%s %s", cmd, args.input_file());
         }
@@ -1421,7 +1435,7 @@ type struct Executor {
             col_choice = args.get_value("color");
         }
         if (fmt_choice.length() == 0 || col_choice.length() == 0) {
-            const proj_cfg: project_config::ProjectConfig = project_config::ProjectConfig::parse(config_path);
+            const proj_cfg: project_config::ProjectConfig = project_config::ProjectConfig::parse(Text::new(config_path));
             if (fmt_choice.length() == 0 && proj_cfg.test_format.length() > 0) {
                 fmt_choice = proj_cfg.test_format;
             }
@@ -1474,7 +1488,7 @@ type struct Executor {
         mut proj_ran: i32 = 0;
         mut proj_failures: i32 = 0;
         if (!args.has_flag("list")) {
-            const proj_root: string = Executor::dir_of(config_path);
+            const proj_root: string = Executor::dir_of(Text::new(config_path));
             mut pattern: string = "";
             if (args.positional_count() > 0) { pattern = args.input_file(); }
             mut jobs_value: string = "";
@@ -1540,7 +1554,8 @@ type struct Executor {
     /// Directory portion of `path` (everything before the last `/`), or
     /// "." when there is no slash. Used to locate tests/negative relative
     /// to the resolved cryoconfig.
-    static dir_of(path: string) -> string {
+    static dir_of(path_text: Text) -> string {
+        const path: string = path_text.as_string();
         const n: u64 = path.length();
         if (n == 0) { return "."; }
         mut i: i64 = (n - 1) as i64;
@@ -1563,7 +1578,8 @@ type struct Executor {
     }
 
     /// Read a file's full contents, or "" if it can't be opened.
-    static read_file_or_empty(path: string) -> string {
+    static read_file_or_empty(path_text: Text) -> string {
+        const path: string = path_text.as_string();
         match (file::read_to_string(path::Path::from(path))) {
             Result::Ok(s)  => { return s.into_raw(); }
             Result::Err(_) => { return ""; }
@@ -1572,7 +1588,8 @@ type struct Executor {
 
     /// Pull the expected error code out of a `![config(negative, <code>)]`
     /// directive in `content`. Returns "" if absent.
-    static neg_code_from(content: string) -> string {
+    static neg_code_from(content_text: Text) -> string {
+        const content: string = content_text.as_string();
         const idx: i64 = content.find("config(negative");
         if (idx < 0) { return ""; }
         mut p: i8* = (content as i8*) + (idx as u64) + ("config(negative".length() as u64);
@@ -1664,7 +1681,8 @@ type struct Executor {
     /// test's source.  `SEV` is `ERROR` or `WARN`/`WARNING`; each `^` after `//~`
     /// backs the target line up one (`//~^` = previous line).  `<msg>` (the rest
     /// of the line, trimmed) is an optional message-substring assertion.
-    static parse_neg_expectations(content: string) -> NegExpect[] {
+    static parse_neg_expectations(content_text: Text) -> NegExpect[] {
+        const content: string = content_text.as_string();
         mut out: NegExpect[] = [];
         const clen: u64 = content.length();
         mut line_no: i64 = 1;
@@ -1735,7 +1753,9 @@ type struct Executor {
     /// anchored in the test file `fname` (its basename must appear in the `-->`
     /// arrow line).  Scoping to the file keeps `//~` exhaustiveness from tripping
     /// on stdlib-internal diagnostics.
-    static parse_diagnostics(out: string, fname: string) -> NegDiag[] {
+    static parse_diagnostics(out_text: Text, fname_text: Text) -> NegDiag[] {
+        const fname: string = fname_text.as_string();
+        const out: string = out_text.as_string();
         mut diags: NegDiag[] = [];
         const n: u64 = out.length();
         mut off: u64 = 0;
@@ -1811,8 +1831,8 @@ type struct Executor {
     /// (severity + code + line, and the message-substring when given), and every
     /// diagnostic anchored in the file must be annotated - so an unexpected
     /// cascade fails the test.  "" on success, else a one-line reason.
-    static check_annotations(anns: &NegExpect[], out: string, fname: string) -> string {
-        const diags: NegDiag[] = Executor::parse_diagnostics(out, fname);
+    static check_annotations(anns: &NegExpect[], out_text: Text, fname_text: Text) -> string {
+        const diags: NegDiag[] = Executor::parse_diagnostics(out_text, fname_text);
         for (mut a: i64 = 0; a < anns.length; a++) {
             const e: NegExpect* = &anns[a];
             mut matched: boolean = false;
@@ -1926,7 +1946,8 @@ type struct Executor {
 
     /// Each suite job's own capture file: jobs run at once, so one shared
     /// scratch path would be overwritten by whichever finished last.
-    static job_tmp_path(tmp: string, k: u64) -> string {
+    static job_tmp_path(tmp_text: Text, k: u64) -> string {
+        const tmp: string = tmp_text.as_string();
         return fmt::format("%s.%llu", tmp, k);
     }
 
@@ -2014,15 +2035,15 @@ type struct Executor {
             if (pattern != "" && !name.contains(pattern)) { continue; }
 
             const full: string = fmt::format("%s/%s", neg_dir, name);
-            const content: string = Executor::read_file_or_empty(full);
-            const expected: string = Executor::neg_code_from(content);
+            const content: string = Executor::read_file_or_empty(Text::new(full));
+            const expected: string = Executor::neg_code_from(Text::new(content));
             names.push(name);
             contents.push(content);
             expects.push(expected);
             if (expected.length() == 0) {
                 job_of.push(-1);
             } else {
-                const out_path: string = Executor::job_tmp_path(tmp, cmds.length as u64);
+                const out_path: string = Executor::job_tmp_path(Text::new(tmp), cmds.length as u64);
                 job_of.push(cmds.length as i64);
                 if (stdlib_abs.length() > 0) {
                     cmds.push(fmt::format("%s check %s --stdlib=%s > %s 2>&1",
@@ -2086,8 +2107,8 @@ type struct Executor {
 
                 const k: u64 = job_of[i] as u64;
                 Executor::wait_job(done.as_ptr(), k);
-                const out_path: string = Executor::job_tmp_path(tmp, k);
-                const out: string = Executor::read_file_or_empty(out_path);
+                const out_path: string = Executor::job_tmp_path(Text::new(tmp), k);
+                const out: string = Executor::read_file_or_empty(Text::new(out_path));
                 dir::remove_file(path::Path::from(out_path));
                 // Warning codes (`W....`) render as `warning[Wxxxx]`; everything else
                 // as `error[Exxxx]`.  A warning-only file still exits 0, but the suite
@@ -2104,9 +2125,9 @@ type struct Executor {
                 // no annotations keep the code-presence-only behavior.
                 mut detail: string = "";
                 if (passed) {
-                    const anns: NegExpect[] = Executor::parse_neg_expectations(content);
+                    const anns: NegExpect[] = Executor::parse_neg_expectations(Text::new(content));
                     if (anns.length > 0) {
-                        detail = Executor::check_annotations(&anns, out, name);
+                        detail = Executor::check_annotations(&anns, Text::new(out), Text::new(name));
                         if (detail.length() > 0) { passed = false; }
                     }
                 }
@@ -2222,7 +2243,7 @@ type struct Executor {
             const idx: i64 = reg.find_index(lib);
             if (idx < 0) { return false; }
             const f: string = reg.entries[idx].cache_file_for(
-                registry::VendorRegistry::normalize_triple(""));
+                Text::new(registry::VendorRegistry::normalize_triple(Text::new(""))));
             return f.length() > 0 && metadata::exists(path::Path::from(f));
         }
         if (req.starts_with("os:")) {
@@ -2252,7 +2273,8 @@ type struct Executor {
 
     /// Parse a project's `test.json` into a `ProjSpec`. Returns `None` if the
     /// file is malformed (the caller reports that as a failing project).
-    static parse_test_json(content: string) -> Option<ProjSpec> {
+    static parse_test_json(content_text: Text) -> Option<ProjSpec> {
+        const content: string = content_text.as_string();
         mut root: value::JsonValue = match (parser::parse(str::Str::from(content))) {
             Result::Ok(v)      => { v }
             Result::Err(mut e) => { e.drop(); return Option::None; }
@@ -2395,7 +2417,8 @@ type struct Executor {
 
     /// True if `<projects_dir>/<name>/test.json` exists and `name` is a real
     /// subdirectory entry (not `.`/`..`) passing the optional `pattern`.
-    static proj_marker_path(projects_dir: string, name: string) -> string {
+    static proj_marker_path(projects_dir_text: Text, name: string) -> string {
+        const projects_dir: string = projects_dir_text.as_string();
         return fmt::format("%s/%s/test.json", projects_dir, name);
     }
 
@@ -2423,7 +2446,7 @@ type struct Executor {
             const pn: string = intrinsics::dirent_name(pre_entry);
             if (pn != "." && pn != ".."
                 && (pattern == "" || pn.contains(pattern))) {
-                const tj: string = Executor::proj_marker_path(projects_dir, pn);
+                const tj: string = Executor::proj_marker_path(Text::new(projects_dir), pn);
                 if (metadata::exists(path::Path::from(tj))) { to_run += 1; }
             }
             pre_entry = libc::readdir(pre_dp);
@@ -2472,16 +2495,16 @@ type struct Executor {
             entry = libc::readdir(dp);
             if (name == "." || name == "..") { continue; }
             if (pattern != "" && !name.contains(pattern)) { continue; }
-            const tj: string = Executor::proj_marker_path(projects_dir, name);
+            const tj: string = Executor::proj_marker_path(Text::new(projects_dir), name);
             if (!metadata::exists(path::Path::from(tj))) { continue; }
 
-            const content: string = Executor::read_file_or_empty(tj);
+            const content: string = Executor::read_file_or_empty(Text::new(tj));
             mut spec: ProjSpec = ProjSpec {
                 outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: "",
                 output_contains: [], output_excludes: [], requires: []
             };
             mut parsed_ok: boolean = false;
-            match (Executor::parse_test_json(content)) {
+            match (Executor::parse_test_json(Text::new(content))) {
                 Option::Some(s) => { spec = s; parsed_ok = true; }
                 Option::None    => { parsed_ok = false; }
             }
@@ -2516,9 +2539,9 @@ type struct Executor {
             verdict_of.push(verdict);
             reason_of.push(reason);
             if (verdict == 0) {
-                const out_path: string = Executor::job_tmp_path(tmp, cmds.length as u64);
+                const out_path: string = Executor::job_tmp_path(Text::new(tmp), cmds.length as u64);
                 job_of.push(cmds.length as i64);
-                cmds.push(Executor::project_command(self_exe, stdlib_abs, proj_dir, &spec, out_path));
+                cmds.push(Executor::project_command(Text::new(self_exe), Text::new(stdlib_abs), Text::new(proj_dir), &spec, Text::new(out_path)));
             } else {
                 job_of.push(-1);
             }
@@ -2561,7 +2584,7 @@ type struct Executor {
                 const verdict: i32 = verdict_of[i];
                 if (verdict == 1) {
                     Executor::proj_report(is_pretty, is_compact, color_on, false,
-                        "malformed test.json");
+                        Text::new("malformed test.json"));
                     failures += 1; ran += 1; continue;
                 }
                 if (verdict == 2) {
@@ -2572,7 +2595,7 @@ type struct Executor {
                 }
                 if (verdict == 3) {
                     Executor::proj_report(is_pretty, is_compact, color_on, false,
-                        fmt::format("unknown requires token \"%s\"", reason_of[i]));
+                        Text::new(fmt::format("unknown requires token \"%s\"", reason_of[i])));
                     failures += 1; ran += 1; continue;
                 }
                 if (verdict == 4) {
@@ -2583,21 +2606,21 @@ type struct Executor {
                 }
                 if (verdict == 5) {
                     Executor::proj_report(is_pretty, is_compact, color_on, false,
-                        fmt::format("cannot chdir to %s", reason_of[i]));
+                        Text::new(fmt::format("cannot chdir to %s", reason_of[i])));
                     failures += 1; ran += 1; continue;
                 }
 
                 const k: u64 = job_of[i] as u64;
                 Executor::wait_job(done.as_ptr(), k);
-                const out_path: string = Executor::job_tmp_path(tmp, k);
-                const res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path);
-                Executor::proj_report(is_pretty, is_compact, color_on, res.passed, res.detail);
+                const out_path: string = Executor::job_tmp_path(Text::new(tmp), k);
+                const res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], Text::new(out_path));
+                Executor::proj_report(is_pretty, is_compact, color_on, res.passed, Text::new(res.detail));
                 if (!res.passed) {
                     failures += 1;
                     // Surface the captured subprocess output on failure so the
                     // reason is visible (kept quiet on success).
                     if (!is_compact) {
-                        const out: string = Executor::read_file_or_empty(out_path);
+                        const out: string = Executor::read_file_or_empty(Text::new(out_path));
                         if (out.length() > 0) { fmt::printf("%s\n", out); }
                     }
                 }
@@ -2634,7 +2657,8 @@ type struct Executor {
     /// Print one project's PASS/FAIL line in the active format. `detail` is
     /// shown after a FAIL (e.g. "expected E0200").
     static proj_report(is_pretty: boolean, is_compact: boolean,
-                       color_on: boolean, passed: boolean, detail: string) -> void {
+                       color_on: boolean, passed: boolean, detail_text: Text) -> void {
+        const detail: string = detail_text.as_string();
         if (passed) {
             if (is_compact)      { fmt::printf("."); }
             else if (is_pretty)  { Executor::neg_chip_pass(color_on); fmt::printf("\n"); }
@@ -2656,8 +2680,11 @@ type struct Executor {
     /// `chdir`, because projects run concurrently and the process working
     /// directory is shared.  All paths handed to the subprocess (`self_exe`,
     /// `stdlib_abs`, `tmp`) are absolute so the changed cwd doesn't break them.
-    static project_command(self_exe: string, stdlib_abs: string,
-                           proj_dir: string, spec: &ProjSpec, tmp: string) -> string {
+    static project_command(self_exe_text: Text, stdlib_abs_text: Text,
+                           proj_dir_text: Text, spec: &ProjSpec, tmp_text: Text) -> string {
+        const self_exe: string = self_exe_text.as_string();
+        const stdlib_abs: string = stdlib_abs_text.as_string();
+        const tmp: string = tmp_text.as_string();
         mut std_flag: string = "";
         if (stdlib_abs.length() > 0) { std_flag = fmt::format(" --stdlib=%s", stdlib_abs); }
         if (spec.outcome == 1 || spec.outcome == 2) {
@@ -2665,17 +2692,17 @@ type struct Executor {
             // combined stdout+stderr so the ASSERTIONS in `project_outcome`
             // can scan it.
             const verb: string = if (spec.outcome == 1) { "build" } else { "run" };
-            return shell_in_dir(proj_dir,
-                fmt::format("%s %s%s > %s 2>&1", self_exe, verb, std_flag, tmp));
+            return shell_in_dir(proj_dir_text,
+                Text::new(fmt::format("%s %s%s > %s 2>&1", self_exe, verb, std_flag, tmp)));
         }
         // collect: run the project's own `cryo test`.
-        return shell_in_dir(proj_dir,
-            fmt::format("%s test --format=plain%s > %s 2>&1", self_exe, std_flag, tmp));
+        return shell_in_dir(proj_dir_text,
+            Text::new(fmt::format("%s test --format=plain%s > %s 2>&1", self_exe, std_flag, tmp)));
     }
 
     /// Judge one project from its command's exit status `st` and the output
     /// captured in `tmp`.
-    static project_outcome(spec: &ProjSpec, st: i32, tmp: string) -> ProjOutcome {
+    static project_outcome(spec: &ProjSpec, st: i32, tmp_text: Text) -> ProjOutcome {
         mut passed: boolean = false;
         mut detail: string = "";
 
@@ -2685,7 +2712,7 @@ type struct Executor {
             // `output_contains` marker (both folded in at parse time).
             const verb: string = if (spec.outcome == 1) { "build" } else { "run" };
             const ec: i64 = st as i64;
-            const out: string = Executor::read_file_or_empty(tmp);
+            const out: string = Executor::read_file_or_empty(tmp_text);
 
             if (spec.fails) {
                 passed = ec != 0;
@@ -2756,7 +2783,7 @@ type struct Executor {
         }
 
         mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
-        const result: instance::CompilationResult = compiler.compile_for_check(file);
+        const result: instance::CompilationResult = compiler.compile_for_check(Text::new(file));
 
         if (result.success) {
             if (result.warning_count > 0) {
@@ -2795,7 +2822,7 @@ type struct Executor {
         }
 
         mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
-        const result: instance::CompilationResult = compiler.compile_raw(file);
+        const result: instance::CompilationResult = compiler.compile_raw(Text::new(file));
 
         if (result.success) {
             fmt::printf("Compilation succeeded.\n");
@@ -2819,7 +2846,7 @@ type struct Executor {
         // Positional form: demangle the single argument.
         if (args.positional_count() > 0) {
             const sym: string = args.input_file();
-            Executor::print_demangled(sym);
+            Executor::print_demangled(Text::new(sym));
             return 0;
         }
 
@@ -2837,7 +2864,7 @@ type struct Executor {
                     if (len == 0) { continue; }      // skip blank lines
                     line.truncate(len);
                     saw_input = true;
-                    Executor::print_demangled(line.as_cstr() as string);
+                    Executor::print_demangled(Text::new(line.as_cstr() as string));
                 }
                 Result::Err(_) => { break; }
             }
@@ -2857,7 +2884,8 @@ type struct Executor {
     /// Prints the demangled form of a single symbol, with a quoting hint
     /// when the input looks like a shell-expanded mangled name (starts
     /// with `C` but no `$` follows (typical when bash ate the `$` tokens).
-    static print_demangled(sym: string) -> void {
+    static print_demangled(sym_text: Text) -> void {
+        const sym: string = sym_text.as_string();
         const pretty: string = demangler::Demangler::demangle(sym);
         fmt::printf("\n%s\n", pretty);
         if (Executor::looks_shell_expanded(sym)) {
@@ -2897,7 +2925,8 @@ type struct Executor {
     /// payloads here, so the rejection reason rides alongside the kind.
     /// `is_rejected = true` means the extension is one we explicitly
     /// refuse (e.g. `.a` archive); the caller should print an error.
-    static infer_output_kind(path: string, mut rejected: boolean*) -> compilation_context::OutputKind {
+    static infer_output_kind(path_text: Text, mut rejected: boolean*) -> compilation_context::OutputKind {
+        const path: string = path_text.as_string();
         *rejected = false;
         const len: i64 = path.length() as i64;
         if (len == 0) { return compilation_context::OutputKind::Exe; }
@@ -2928,7 +2957,8 @@ type struct Executor {
 
     /// Compiles a single file directly from a path.
     /// Routes through CompilerInstance for proper phase management.
-    static compile_file(file_path: string, args: cli::ParsedArgs) -> int {
+    static compile_file(file_path_text: Text, args: cli::ParsedArgs) -> int {
+        const file_path: string = file_path_text.as_string();
         if (args.has_flag("debug")) {
             logger::Logger::enable_debug();
         }
@@ -3006,7 +3036,7 @@ type struct Executor {
         if (args.has_arg("output")) { out_path = args.get_value("output"); }
         if (out_path.length() > 0) {
             mut rejected: boolean = false;
-            const kind: compilation_context::OutputKind = Executor::infer_output_kind(out_path, &rejected);
+            const kind: compilation_context::OutputKind = Executor::infer_output_kind(Text::new(out_path), &rejected);
             if (rejected) {
                 fmt::eprintf("Error: unsupported output extension for '%s'\n", out_path);
                 fmt::printf("  supported: .o (object), .asm/.s (assembly), .ll (LLVM IR text), no-extension (executable)\n");
@@ -3017,7 +3047,7 @@ type struct Executor {
         }
 
         mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
-        const result: instance::CompilationResult = compiler.compile_file(file_path);
+        const result: instance::CompilationResult = compiler.compile_file(file_path_text);
 
         if (result.success) {
             if (result.output_path.length() > 0) {
@@ -3053,14 +3083,14 @@ type struct Executor {
             logger::Logger::enable_debug();
         }
 
-        const config_path: string = project_config::ProjectConfig::find_cryoconfig(".");
+        const config_path: string = project_config::ProjectConfig::find_cryoconfig(Text::new("."));
         if (config_path.length() == 0) {
             fmt::eprintf("Error: no cryoconfig found in this directory.\n");
             fmt::eprintf("       run `cryo init` first to scaffold a project.\n");
             return 1;
         }
 
-        mut config: project_config::ProjectConfig = project_config::ProjectConfig::parse(config_path);
+        mut config: project_config::ProjectConfig = project_config::ProjectConfig::parse(Text::new(config_path));
         if (config.error_count > 0) {
             fmt::eprintf("cryoconfig has %lld schema error(s); fix them before fetching.\n",
                 config.error_count);
@@ -3075,7 +3105,7 @@ type struct Executor {
         const lock_path: string = fmt::format("%s/cryoconfig.lock",
             config.project_root);
         const outcome: dep_resolver::ResolveOutcome = dep_resolver::DepResolver::resolve(
-            &config, mode, lock_path);
+            &config, mode, Text::new(lock_path));
         if (outcome.failed) {
             fmt::printf("Dependency resolution failed.\n");
             return 1;
@@ -3117,7 +3147,7 @@ type struct Executor {
             fmt::eprintf("Error: cryo vendor add needs a path to a C project.\n");
             return 1;
         }
-        return Executor::vendor_register(path, &args, false);
+        return Executor::vendor_register(Text::new(path), &args, false);
     }
 
     /// Register (or re-register) the C library rooted at `path`.  Reads a
@@ -3129,7 +3159,8 @@ type struct Executor {
     /// always regenerates; a bare `cryo vendor <path>` passes `false`, so an
     /// unchanged (headers + triple + libclang + generator) provenance is a
     /// cache hit and libclang is not re-run.
-    static vendor_register(path: string, args: &cli::ParsedArgs, force: boolean) -> int {
+    static vendor_register(path_text: Text, args: &cli::ParsedArgs, force: boolean) -> int {
+        const path: string = path_text.as_string();
         // Resolve to an absolute path (the registry stores absolute roots so
         // `import vendor::Name` works from any project directory).
         mut abs: string = "";
@@ -3165,7 +3196,7 @@ type struct Executor {
             }
         };
 
-        const key: string = Executor::to_lower(Executor::path_basename(abs));
+        const key: string = Executor::to_lower(Executor::path_basename(Text::new(abs)));
         const name: string = registry::VendorRegistry::jstr(&root, "name", Executor::derive_namespace(key));
 
         mut entry: registry::VendorEntry = registry::VendorEntry {
@@ -3187,7 +3218,7 @@ type struct Executor {
         }
 
         const triple: string = if (args.has_arg("target")) { args.get_value("target") } else { "" };
-        const norm_triple: string = registry::VendorRegistry::normalize_triple(triple);
+        const norm_triple: string = registry::VendorRegistry::normalize_triple(Text::new(triple));
         const bindings_file: string = registry::VendorRegistry::jstr(&root, "bindings_file", "");
         root.drop();
 
@@ -3235,7 +3266,7 @@ type struct Executor {
                 fmt::eprintf("Error: bindings_file '%s' not found at %s\n", bindings_file, src);
                 return 1;
             }
-            if (!Executor::copy_text_file(src, dest)) {
+            if (!Executor::copy_text_file(Text::new(src), Text::new(dest))) {
                 lock.release();
                 fmt::eprintf("Error: failed to copy bindings into the cache (%s -> %s).\n", src, dest);
                 return 1;
@@ -3253,8 +3284,8 @@ type struct Executor {
                 return 1;
             }
             const prov_key: string = generator::VendorGenerator::provenance_key(
-                abs, &entry.headers, &entry.include_dirs, &entry.defines,
-                norm_triple, prev_file, entry.lang_arg());
+                Text::new(abs), &entry.headers, &entry.include_dirs, &entry.defines,
+                Text::new(norm_triple), Text::new(prev_file), Text::new(entry.lang_arg()));
             const hit: boolean = !force
                 && prev_key != "" && prev_key == prov_key
                 && prev_file != "" && metadata::exists(path::Path::from(prev_file));
@@ -3288,14 +3319,14 @@ type struct Executor {
                 // Record the include graph next to the bindings so a later cache
                 // check folds every transitively-included header, not just the
                 // entry header (see VendorGenerator::provenance_key).
-                generator::VendorGenerator::write_depfile(dest, &inputs);
+                generator::VendorGenerator::write_depfile(Text::new(dest), &inputs);
                 // Store the key computed FROM the just-written depfile (not the
                 // pre-generation `prov_key`, which folded the previous graph), so
                 // the next unchanged check folds the same `dest.deps` and hits
                 // without a spurious one-time regeneration.
                 const store_key: string = generator::VendorGenerator::provenance_key(
-                    abs, &entry.headers, &entry.include_dirs, &entry.defines,
-                    norm_triple, dest, entry.lang_arg());
+                    Text::new(abs), &entry.headers, &entry.include_dirs, &entry.defines,
+                    Text::new(norm_triple), Text::new(dest), Text::new(entry.lang_arg()));
                 entry.set_cache(norm_triple, dest, store_key);
                 produced = true;
             }
@@ -3349,7 +3380,8 @@ type struct Executor {
 
     /// A `+- label ------+` rule opening one library's block.  Passing "" gives
     /// the plain rule that closes the last block.
-    static vendor_box_rule(label: string) -> void {
+    static vendor_box_rule(label_text: Text) -> void {
+        const label: string = label_text.as_string();
         if (label == "") {
             const plain: string = Executor::vendor_fill('-' as u8, VENDOR_BOX_WIDTH - 2);
             fmt::printf("+%s+\n", plain);
@@ -3374,7 +3406,9 @@ type struct Executor {
     /// on further rows under an empty label, broken after the last path
     /// separator that fits so each row still holds whole path segments; a
     /// single segment longer than the column breaks at the column edge.
-    static vendor_box_field(label: string, value: string) -> void {
+    static vendor_box_field(label_text: Text, value_text: Text) -> void {
+        const label: string = label_text.as_string();
+        const value: string = value_text.as_string();
         const text: str::Str = str::Str::new(value);
         const n: u64 = text.length();
         mut start: u64 = 0;
@@ -3460,7 +3494,7 @@ type struct Executor {
         const order: i64[] = Executor::vendor_key_order(&reg);
         fmt::printf("Registered vendor libraries (%lld)\n", reg.entries.length as i64);
         fmt::printf("Bindings cache: %s\n\n",
-            exec_path(registry::VendorRegistry::vendor_root()));
+            exec_path(Text::new(registry::VendorRegistry::vendor_root())));
         mut missing: i64 = 0;
         for (mut oi: i64 = 0; oi < order.length; oi++) {
             const i: i64 = order[oi];
@@ -3471,18 +3505,18 @@ type struct Executor {
                 missing++;
                 title = fmt::format("%s  (source missing)", reg.entries[i].key);
             }
-            Executor::vendor_box_rule(title);
-            Executor::vendor_box_field("import as",
-                fmt::format("vendor::%s", reg.entries[i].name));
-            Executor::vendor_box_field("bindings",
-                Executor::vendor_binding_kind(&reg.entries[i]));
-            Executor::vendor_box_field("targets",
-                Executor::vendor_cached_targets(&reg.entries[i]));
-            Executor::vendor_box_field("source",
-                exec_path(reg.entries[i].source_path));
+            Executor::vendor_box_rule(Text::new(title));
+            Executor::vendor_box_field(Text::new("import as"),
+                Text::new(fmt::format("vendor::%s", reg.entries[i].name)));
+            Executor::vendor_box_field(Text::new("bindings"),
+                Text::new(Executor::vendor_binding_kind(&reg.entries[i])));
+            Executor::vendor_box_field(Text::new("targets"),
+                Text::new(Executor::vendor_cached_targets(&reg.entries[i])));
+            Executor::vendor_box_field(Text::new("source"),
+                Text::new(exec_path(Text::new(reg.entries[i].source_path))));
             Executor::vendor_box_gap();
         }
-        Executor::vendor_box_rule("");
+        Executor::vendor_box_rule(Text::new(""));
         if (missing > 0) {
             fmt::printf("\n%lld of %lld libraries no longer have their source; unregister them\n",
                 missing, reg.entries.length as i64);
@@ -3538,7 +3572,7 @@ type struct Executor {
         // registry.
         for (mut d: i64 = doomed.length - 1; d >= 0; d--) {
             fmt::printf("  %s\n", doomed[d]);
-            fmt::printf("      was %s\n", exec_path(paths[d]));
+            fmt::printf("      was %s\n", exec_path(Text::new(paths[d])));
         }
         fmt::printf("%lld librar%s left registered.\n", reg.entries.length as i64,
             if (reg.entries.length == 1) { "y" } else { "ies" });
@@ -3592,7 +3626,7 @@ type struct Executor {
             }
             // Re-run registration with force=true so `rebuild` always
             // regenerates, bypassing the provenance cache-hit check.
-            if (Executor::vendor_register(src, &args, true) != 0) { failures += 1; }
+            if (Executor::vendor_register(Text::new(src), &args, true) != 0) { failures += 1; }
         }
         if (failures > 0) { return 1; }
         return 0;
@@ -3600,7 +3634,8 @@ type struct Executor {
 
     /// The final path component of `p` (handles both `/` and `\` separators).
     /// Returns a pointer into `p`.
-    static path_basename(p: string) -> string {
+    static path_basename(p_text: Text) -> string {
+        const p: string = p_text.as_string();
         const n: i64 = p.length() as i64;
         mut start: i64 = 0;
         for (mut i: i64 = 0; i < n; i++) {
@@ -3624,7 +3659,9 @@ type struct Executor {
 
     /// Copy a text file `src` -> `dest` (truncating dest).  Used to seed the
     /// vendor cache with hand-written bindings.
-    static copy_text_file(src: string, dest: string) -> boolean {
+    static copy_text_file(src_text: Text, dest_text: Text) -> boolean {
+        const dest: string = dest_text.as_string();
+        const src: string = src_text.as_string();
         mut text: string = "";
         match (file::read_to_string(path::Path::from(src))) {
             Result::Ok(s)  => { text = s.into_raw(); }

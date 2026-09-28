@@ -31,6 +31,7 @@ import compiler::deps::cache::{ Cache };
 import compiler::project_config;
 import compiler::project_config::{ GitRefKind };
 import std::fmt::interp::{ fmt_append_display, fmt_append_lit, fmt_new };
+import utils::text::{ Text };
 
 
 
@@ -43,8 +44,9 @@ type struct Git {
 
     /// Ensure the bare clone for `url` exists and (when `refresh` is true)
     /// has the latest remote refs. Idempotent.  Returns true on success.
-    static ensure_bare_clone(url: string, refresh: boolean) -> boolean {
-        const dir: string = Cache::git_dir_for(url);
+    static ensure_bare_clone(url_text: Text, refresh: boolean) -> boolean {
+        const url: string = url_text.as_string();
+        const dir: string = Cache::git_dir_for(url_text);
 
         if (!metadata::exists(Path::from(dir))) {
             // First-time clone.  `--bare` skips materialising a working
@@ -89,8 +91,10 @@ type struct Git {
     /// Branch refs have to be qualified; `git fetch` from a bare clone
     /// doesn't track local branches, so we look at the remote-tracking
     /// `refs/heads/<branch>` ref directly.
-    static resolve_ref_to_sha(url: string, ref_kind: GitRefKind, ref_val: string) -> string {
-        const dir: string = Cache::git_dir_for(url);
+    static resolve_ref_to_sha(url_text: Text, ref_kind: GitRefKind, ref_val_text: Text) -> string {
+        const ref_val: string = ref_val_text.as_string();
+        const url: string = url_text.as_string();
+        const dir: string = Cache::git_dir_for(url_text);
 
         // Build the candidate refspec list.  We try them in order; the
         // first one that resolves wins.  `git rev-parse` succeeds (exit 0)
@@ -139,8 +143,8 @@ type struct Git {
     /// List every tag in the bare clone for `url`, one per element.
     /// Used for semver-range resolution against `version = "..."`.
     /// Returns an empty list on failure (and prints a diagnostic).
-    static list_tags(url: string) -> string[] {
-        const dir: string = Cache::git_dir_for(url);
+    static list_tags(url_text: Text) -> string[] {
+        const dir: string = Cache::git_dir_for(url_text);
         mut tag_args: string[] = [fmt::format("--git-dir=%s", dir), "tag", "--list"];
         return Git::capture_git(&tag_args);
     }
@@ -150,15 +154,15 @@ type struct Git {
 
     /// Path to the working tree for (`url`, `sha`).  Does not check
     /// existence; callers use `is_checkout_present` for that.
-    static checkout_path(url: string, sha: string) -> string {
-        return Cache::checkout_dir_for(url, sha);
+    static checkout_path(url_text: Text, sha_text: Text) -> string {
+        return Cache::checkout_dir_for(url_text, sha_text);
     }
 
     /// True when the working tree at (`url`, `sha`) is fully materialised.
     /// We probe for `.git` rather than the directory itself because an
     /// interrupted clone may leave a half-populated dir behind.
-    static is_checkout_present(url: string, sha: string) -> boolean {
-        const dir: string = Cache::checkout_dir_for(url, sha);
+    static is_checkout_present(url_text: Text, sha_text: Text) -> boolean {
+        const dir: string = Cache::checkout_dir_for(url_text, sha_text);
         if (!metadata::exists(Path::from(dir))) { return false; }
         return metadata::exists(Path::from(fmt::format("%s/.git", dir)));
     }
@@ -167,11 +171,12 @@ type struct Git {
     /// then `checkout` the requested SHA.  `--local` uses hardlinks where
     /// the filesystem permits, so per-SHA storage cost is dominated by the
     /// working tree itself rather than the .git history.
-    static materialize_checkout(url: string, sha: string) -> boolean {
-        if (Git::is_checkout_present(url, sha)) { return true; }
+    static materialize_checkout(url_text: Text, sha_text: Text) -> boolean {
+        const sha: string = sha_text.as_string();
+        if (Git::is_checkout_present(url_text, sha_text)) { return true; }
 
-        const bare:    string = Cache::git_dir_for(url);
-        const wt:      string = Cache::checkout_dir_for(url, sha);
+        const bare:    string = Cache::git_dir_for(url_text);
+        const wt:      string = Cache::checkout_dir_for(url_text, sha_text);
         const wt_par:  string = wt.parent_dir();
 
         dir::create_dir_all(Path::from(wt_par));

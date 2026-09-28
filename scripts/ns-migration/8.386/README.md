@@ -36,3 +36,29 @@ and copied out):
 6. `CRYO=<compiler> bash invert.sh` - a name handed where text is expected,
    text handed where a name is expected, each alone, then the restored
    tree as the control.
+
+The second slice (`slice2.tsv`: file paths, command lines, URLs and hashes,
+target triples and file contents handed to the file system, a tool or the
+backend) adds four steps, because most of its bodies work on the bytes:
+
+7. After step 2's check, `python attribute.py slice2.tsv <log> <root> >
+   slice2-prologue.tsv` - every function whose body the check refuses
+   anywhere other than at a call site's argument.
+8. `python retype.py --prologue slice2-prologue.tsv <root>`: those
+   parameters are renamed `p_text` and unwrapped once at entry, so the body
+   is untouched. Then check, `--refusals`, and `--collapse` (a re-wrap of the
+   parameter's own bytes passes `p_text` instead).
+9. `uses.py` over the parameters left as `Text`; every one with a use the
+   compiler does not check (a C-variadic argument, a generic call such as
+   `JsonValue::from(p)` or `HashMap::get(&p)`, an array push) is unwrapped
+   at entry the same way (`slice2-prologue2.tsv`, `slice2-prologue3.tsv`,
+   re-pointed with `relocate.py <list> HEAD`). The other OS's build
+   (`--target`) is a FULL build, so it also catches array pushes (E0636).
+10. A clean build; `python retype.py --drop-unused <build-log> <root>`
+    removes the unwraps whose every use was collapsed (W0001), and the
+    warning set is back to the parent's.
+11. The editor: `cd tools/CryoLSP && $CRYO build --build-dir=<scratch>`,
+    then `retype.py --refusals <log> tools/CryoLSP`.
+
+Array and pointer parameters (`&string[]`, `string*`) are not in either
+slice: retyping one means retyping the store that feeds it.

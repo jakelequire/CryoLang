@@ -108,14 +108,14 @@ type struct ImportReport {
 
     /// Note a construct that yielded no binding at all but COULD be bound (lost
     /// API) - the headline "not bound" bucket.
-    skip(mut &this, line: string) -> void { this.skipped.push(line); }
+    skip(mut &this, line: Text) -> void { this.skipped.push(line.as_string()); }
 
     /// Note a binding emitted at reduced fidelity (layout-only, no field access).
-    approx(mut &this, line: string) -> void { this.approximated.push(line); }
+    approx(mut &this, line: Text) -> void { this.approximated.push(line.as_string()); }
 
     /// Note a construct that is inherently not bindable API (header guard, marker
     /// macro, function-like macro) - expected noise, kept out of the headline.
-    ignore(mut &this, line: string) -> void { this.ignored.push(line); }
+    ignore(mut &this, line: Text) -> void { this.ignored.push(line.as_string()); }
 
     /// Emit a per-translation-unit summary (no-op when nothing was lost, and
     /// silent unless `--debug` is set, since it rides `cdebug`).  Used by the
@@ -385,8 +385,8 @@ type struct Importer {
                 return clang::VISIT_CONTINUE;
             }
             if (k == clang::CURSOR_FUNCTION_TEMPLATE) {
-                imp.report.skip(fmt::format("function template `%s` (no instantiated symbol)",
-                                imp.spelling_of(cursor)));
+                imp.report.skip(Text::new(fmt::format("function template `%s` (no instantiated symbol)",
+                                imp.spelling_of(cursor))));
                 return clang::VISIT_CONTINUE;
             }
         }
@@ -595,11 +595,11 @@ type struct Importer {
             const mangled: SymbolStr = cursor.intern_mangling(this.ctx);
             if (!mangled.is_valid()) {
                 if (cursor.is_inlined()) {
-                    this.report.skip(fmt::format("inline function `%s` (no out-of-line symbol)",
-                        this.ctx.intern_table.resolve(name_sym)));
+                    this.report.skip(Text::new(fmt::format("inline function `%s` (no out-of-line symbol)",
+                        this.ctx.intern_table.resolve(name_sym))));
                 } else {
-                    this.report.skip(fmt::format("function `%s` (no mangled symbol)",
-                        this.ctx.intern_table.resolve(name_sym)));
+                    this.report.skip(Text::new(fmt::format("function `%s` (no mangled symbol)",
+                        this.ctx.intern_table.resolve(name_sym))));
                 }
                 return;
             }
@@ -685,9 +685,9 @@ type struct Importer {
         // methods) and report it, rather than emit a layout-wrong shell.
         for (mut vi: i64 = 0; vi < this.cxx_method_cursors.length; vi++) {
             if (this.cxx_method_cursors[vi].is_virtual_method()) {
-                this.report.skip(fmt::format(
+                this.report.skip(Text::new(fmt::format(
                     "class %s (polymorphic: a vtable pointer Strategy A can't reproduce - methods would read fields at the wrong offset; needs Phase-2 vtable/ctor support)",
-                    owner_str));
+                    owner_str)));
                 return;
             }
         }
@@ -736,16 +736,16 @@ type struct Importer {
         // Constructors / destructors are a lifecycle concern (allocate +
         // call the mangled ctor, call dtor before free) - report for now.
         if (k == clang::CURSOR_CONSTRUCTOR) {
-            this.report.skip(fmt::format("%s constructor (lifecycle binding is Phase 2)", owner_str));
+            this.report.skip(Text::new(fmt::format("%s constructor (lifecycle binding is Phase 2)", owner_str)));
             return false;
         }
         if (k == clang::CURSOR_DESTRUCTOR) {
-            this.report.skip(fmt::format("%s destructor (lifecycle binding is Phase 2)", owner_str));
+            this.report.skip(Text::new(fmt::format("%s destructor (lifecycle binding is Phase 2)", owner_str)));
             return false;
         }
         if (k == clang::CURSOR_FUNCTION_TEMPLATE) {
-            this.report.skip(fmt::format("%s::%s (member template, no instantiated symbol)",
-                owner_str, mname));
+            this.report.skip(Text::new(fmt::format("%s::%s (member template, no instantiated symbol)",
+                owner_str, mname)));
             return false;
         }
         // C++ operator overloads / conversion operators are spelled
@@ -755,26 +755,26 @@ type struct Importer {
         // even the class's ordinary methods become unusable).  Skip + report;
         // surfacing C++ operators through Cryo's operator traits is a later phase.
         if (Importer::is_operator_spelling(mname)) {
-            this.report.skip(fmt::format("%s::%s (C++ operator overload - not bindable as a plain method; needs operator-trait mapping)",
-                owner_str, mname));
+            this.report.skip(Text::new(fmt::format("%s::%s (C++ operator overload - not bindable as a plain method; needs operator-trait mapping)",
+                owner_str, mname)));
             return false;
         }
         if (!cursor.is_public_member()) {
-            this.report.skip(fmt::format("%s::%s (non-public member)", owner_str, mname));
+            this.report.skip(Text::new(fmt::format("%s::%s (non-public member)", owner_str, mname)));
             return false;
         }
         if (cursor.is_virtual_method()) {
-            this.report.skip(fmt::format("%s::%s (virtual - dispatched via vtable; use the shim path)",
-                owner_str, mname));
+            this.report.skip(Text::new(fmt::format("%s::%s (virtual - dispatched via vtable; use the shim path)",
+                owner_str, mname)));
             return false;
         }
         if (cursor.is_inlined()) {
-            this.report.skip(fmt::format("%s::%s (inline - no out-of-line symbol)", owner_str, mname));
+            this.report.skip(Text::new(fmt::format("%s::%s (inline - no out-of-line symbol)", owner_str, mname)));
             return false;
         }
         const mangled: SymbolStr = cursor.intern_mangling(this.ctx);
         if (!mangled.is_valid()) {
-            this.report.skip(fmt::format("%s::%s (no mangled symbol)", owner_str, mname));
+            this.report.skip(Text::new(fmt::format("%s::%s (no mangled symbol)", owner_str, mname)));
             return false;
         }
 
@@ -911,9 +911,9 @@ type struct Importer {
         this.struct_nodes.push(node);
         this.emit_top_level(node as ASTNode*);
         const kindword: string = if (is_union) { "union" } else { "struct" };
-        this.report.approx(fmt::format(
+        this.report.approx(Text::new(fmt::format(
             "incomplete tag `%s %s` (declared, never defined in this translation unit) -> zero-field opaque record: usable only through a pointer",
-            kindword, this.ctx.intern_table.resolve(name_sym)));
+            kindword, this.ctx.intern_table.resolve(name_sym))));
     }
 
     /// Build a struct's fields from its collected member cursors, faithfully
@@ -960,11 +960,11 @@ type struct Importer {
                 const kindword: string = if (k == clang::CURSOR_UNION_DECL) { "union" } else { "struct" };
                 const nacc: i32 = this.add_reinterpret_accessors(node, fname, cur);
                 if (nacc > 0) {
-                    this.report.approx(fmt::format("anonymous %s in struct '%s' -> field '_anon%d' (%lld-byte) + %d get/set accessors",
-                                              kindword, sname, anon_n, sz, nacc));
+                    this.report.approx(Text::new(fmt::format("anonymous %s in struct '%s' -> field '_anon%d' (%lld-byte) + %d get/set accessors",
+                                              kindword, sname, anon_n, sz, nacc)));
                 } else {
-                    this.report.approx(fmt::format("anonymous member in struct '%s' -> field '_anon%d': %lld-byte opaque blob (no field access)",
-                                              sname, anon_n, sz));
+                    this.report.approx(Text::new(fmt::format("anonymous member in struct '%s' -> field '_anon%d': %lld-byte opaque blob (no field access)",
+                                              sname, anon_n, sz)));
                 }
                 anon_n = anon_n + 1;
                 approximated = true;
@@ -1008,11 +1008,11 @@ type struct Importer {
                 // width - 1/2/4/8 bytes; signed bitfields stay opaque).
                 const nacc: i32 = this.emit_bitfield_accessors(node, fname, span, start_byte, i, j);
                 if (nacc > 0) {
-                    this.report.approx(fmt::format("bitfield run in struct '%s' -> field '_bitfield%d' (%lld-byte) + %d get/set accessors",
-                                              sname, bits_n, span, nacc));
+                    this.report.approx(Text::new(fmt::format("bitfield run in struct '%s' -> field '_bitfield%d' (%lld-byte) + %d get/set accessors",
+                                              sname, bits_n, span, nacc)));
                 } else {
-                    this.report.approx(fmt::format("bitfield run in struct '%s' -> field '_bitfield%d': %lld-byte opaque storage (no field access)",
-                                              sname, bits_n, span));
+                    this.report.approx(Text::new(fmt::format("bitfield run in struct '%s' -> field '_bitfield%d': %lld-byte opaque storage (no field access)",
+                                              sname, bits_n, span)));
                 }
                 bits_n = bits_n + 1;
                 approximated = true;
@@ -1030,8 +1030,8 @@ type struct Importer {
             fnode.type_annotation = this.types.map(ftype);
             node.add_field(fnode);
             if (ftype.is_anonymous_record()) {
-                this.report.approx(fmt::format("field '%s' of anonymous type in struct '%s' -> opaque blob (no field access)",
-                                          this.ctx.intern_table.resolve(fname), sname));
+                this.report.approx(Text::new(fmt::format("field '%s' of anonymous type in struct '%s' -> opaque blob (no field access)",
+                                          this.ctx.intern_table.resolve(fname), sname)));
                 approximated = true;
             }
             i = i + 1;
@@ -1067,8 +1067,8 @@ type struct Importer {
                 mut fnode: FieldDeclNode* = new FieldDeclNode(fname, SourceSpan::none());
                 fnode.type_annotation = this.types.aligned_blob(sz, al);
                 node.add_field(fnode);
-                this.report.approx(fmt::format("anonymous member in union '%s' -> field '_anon%d': %lld-byte opaque blob (no field access)",
-                                          uname, anon_n, sz));
+                this.report.approx(Text::new(fmt::format("anonymous member in union '%s' -> field '_anon%d': %lld-byte opaque blob (no field access)",
+                                          uname, anon_n, sz)));
                 anon_n = anon_n + 1;
                 continue;
             }
@@ -1080,8 +1080,8 @@ type struct Importer {
             fnode.type_annotation = this.types.map(ftype);
             node.add_field(fnode);
             if (ftype.is_anonymous_record()) {
-                this.report.approx(fmt::format("field '%s' of anonymous type in union '%s' -> opaque blob (no field access)",
-                                          this.ctx.intern_table.resolve(fname), uname));
+                this.report.approx(Text::new(fmt::format("field '%s' of anonymous type in union '%s' -> opaque blob (no field access)",
+                                          this.ctx.intern_table.resolve(fname), uname)));
             }
         }
     }
@@ -1239,11 +1239,11 @@ type struct Importer {
             this.ec_names.push(dname);
             this.ec_values.push(dval);
             this.ec_enum_tags.push(name_sym);
-            this.report.approx(fmt::format(
+            this.report.approx(Text::new(fmt::format(
                 "enum '%s': constant '%s' = %lld duplicates '%s' -> alias const (bare `%s`, not an enum variant)",
                 ename, this.ctx.intern_table.resolve(dname), dval,
                 this.ctx.intern_table.resolve(this.cur_enum_dup_firsts[i]),
-                this.ctx.intern_table.resolve(dname)));
+                this.ctx.intern_table.resolve(dname))));
         }
     }
 
@@ -1327,9 +1327,9 @@ type struct Importer {
                     && this.emit_evaluated_const(name_sym, cursor)) {
                 return;
             }
-            this.report.skip(fmt::format(
+            this.report.skip(Text::new(fmt::format(
                 "global `%s` (internal linkage: no symbol outside the translation unit that defines it, and no constant value to bind instead)",
-                name_str));
+                name_str)));
             return;
         }
 
@@ -1344,7 +1344,7 @@ type struct Importer {
         if (this.is_cpp) {
             const mangled: SymbolStr = cursor.intern_mangling(this.ctx);
             if (!mangled.is_valid()) {
-                this.report.skip(fmt::format("global `%s` (no mangled symbol)", name_str));
+                this.report.skip(Text::new(fmt::format("global `%s` (no mangled symbol)", name_str)));
                 return;
             }
             vnode.link_name = this.ctx.intern_table.resolve(mangled);
@@ -1526,7 +1526,7 @@ type struct Importer {
         if (this.name_seen(name_sym)) { return; } // already bound by the simple pass
 
         if (clang::clang_Cursor_isMacroFunctionLike(cursor) != 0) {
-            this.report.ignore(fmt::format("function-like macro '%s'", name_str));
+            this.report.ignore(Text::new(fmt::format("function-like macro '%s'", name_str)));
             return;
         }
 
@@ -1535,12 +1535,12 @@ type struct Importer {
         mut ntok: u32 = 0;
         clang::clang_tokenize(this.tu, range, &toks, &ntok);
         if (toks == null) {
-            this.report.ignore(fmt::format("macro '%s' (no tokens)", name_str));
+            this.report.ignore(Text::new(fmt::format("macro '%s' (no tokens)", name_str)));
             return;
         }
         if (ntok < 2) {
             clang::clang_disposeTokens(this.tu, toks, ntok);
-            this.report.ignore(fmt::format("valueless macro '%s' (header guard / marker)", name_str));
+            this.report.ignore(Text::new(fmt::format("valueless macro '%s' (header guard / marker)", name_str)));
             return;
         }
 
@@ -1559,8 +1559,8 @@ type struct Importer {
             if (k1 == clang::TOKEN_IDENTIFIER) {
                 if (this.try_emit_identifier_alias(name_sym, name_str, s1)) { return; }
                 if (this.is_bound_function(s1)) {
-                    this.report.skip(fmt::format("alias '%s' -> function '%s' (forwarding wrapper unsupported)",
-                                            name_str, s1));
+                    this.report.skip(Text::new(fmt::format("alias '%s' -> function '%s' (forwarding wrapper unsupported)",
+                                            name_str, s1)));
                     return;
                 }
             }
@@ -1636,7 +1636,7 @@ type struct Importer {
             src.push_byte(10 as u8);
         } else {
             src.push(Str::new(fmt::format("#include \"%s\"\n",
-                Importer::to_forward_slashes(source_filename as string))));
+                Importer::to_forward_slashes(Text::new(source_filename as string)))));
         }
         // The probe must accept whatever type the expression has, which each
         // language spells differently: `auto` is C++'s, `__auto_type` the C one.
@@ -1668,8 +1668,8 @@ type struct Importer {
         // Whatever the probe did not bind keeps the token passes' verdict.
         for (mut i: i64 = 0; i < this.probe_names.length; i++) {
             if (this.name_seen(this.probe_names[i])) { continue; }
-            if (this.probe_lost[i]) { this.report.skip(this.probe_reasons[i]); }
-            else                    { this.report.ignore(this.probe_reasons[i]); }
+            if (this.probe_lost[i]) { this.report.skip(Text::new(this.probe_reasons[i])); }
+            else                    { this.report.ignore(Text::new(this.probe_reasons[i])); }
         }
     }
 
@@ -2161,7 +2161,7 @@ type struct Importer {
     emit_text_macro(mut &this, name_sym: SymbolStr, name_str: string,
                     spell: string, neg: boolean) -> void {
         if (neg) {
-            this.report.skip(fmt::format("macro '%s' (malformed signed text literal)", name_str));
+            this.report.skip(Text::new(fmt::format("macro '%s' (malformed signed text literal)", name_str)));
             return;
         }
         // Find the opening quote - it may follow an encoding prefix (`u8`/`L`/
@@ -2177,7 +2177,7 @@ type struct Importer {
         mut close: i64 = slen - 1;
         while (close > open && spell[close] != q) { close = close - 1; }
         if (open < 0 || close <= open) {
-            this.report.skip(fmt::format("macro '%s' (unparseable text literal '%s')", name_str, spell));
+            this.report.skip(Text::new(fmt::format("macro '%s' (unparseable text literal '%s')", name_str, spell)));
             return;
         }
 
@@ -2224,7 +2224,7 @@ type struct Importer {
             extern_node.binding_namespace = ctx.module_graph.register_c_import_module(ctx.intern_table.intern(
                 mod_name + "::" + ctx.intern_table.resolve(extern_node.namespace_alias)));
 
-            const source_dir: string = Importer::get_directory(ctx.source_file);
+            const source_dir: string = Importer::get_directory(Text::new(ctx.source_file));
 
             for (mut j: int = 0; j < extern_node.include_paths.length; j++) {
                 const include_path: string = extern_node.include_paths[j];
@@ -2234,19 +2234,19 @@ type struct Importer {
 
                 if (is_system) {
                     const count: i32 =
-                        Importer::import_system_header(include_path, extern_node, ctx);
+                        Importer::import_system_header(Text::new(include_path), extern_node, ctx);
                     total_imported += count;
                     continue;
                 }
 
-                const resolved: string = Importer::resolve_include_path(source_dir, include_path);
+                const resolved: string = Importer::resolve_include_path(Text::new(source_dir), Text::new(include_path));
                 if (resolved == "") {
                     cdebug(Text::new("[Bindgen] WARNING: header not found: '%s' (relative to '%s')\n"),
                            include_path, source_dir);
                     continue;
                 }
 
-                const count: i32 = Importer::import_local_header(resolved, extern_node, ctx);
+                const count: i32 = Importer::import_local_header(Text::new(resolved), extern_node, ctx);
                 total_imported += count;
             }
 
@@ -2266,20 +2266,22 @@ type struct Importer {
 
     /// Parse a local quoted header (`#include "foo.h"`) from its resolved
     /// path and emit its function prototypes.  Returns the count.
-    static import_local_header(resolved_path: string, extern_node: ExternBlockNode*,
+    static import_local_header(resolved_path_text: Text, extern_node: ExternBlockNode*,
                                ctx: CompilationContext*) -> i32 {
+        const resolved_path: string = resolved_path_text.as_string();
         mut no_extra: u8*[] = [];
         return Importer::collect_from_tu(resolved_path as u8*, null, 0,
-                                         &no_extra, Text::new(resolved_path), extern_node, ctx, null, null,
-                                         "c", "");
+                                         &no_extra, resolved_path_text, extern_node, ctx, null, null,
+                                         Text::new("c"), Text::new(""));
     }
 
     /// Parse an angle-bracket system header (`#include <stdio.h>`) by feeding
     /// a one-line `#include <...>` to libclang as an in-memory unsaved file - 
     /// libclang resolves it against its own system search path.  The header
     /// name is validated to path-safe characters first.
-    static import_system_header(header: string, extern_node: ExternBlockNode*,
+    static import_system_header(header_text: Text, extern_node: ExternBlockNode*,
                                 ctx: CompilationContext*) -> i32 {
+        const header: string = header_text.as_string();
         if (!Importer::is_safe_header_name(header)) {
             ctx.diagnostics.emit(Diagnostic::error(
                 ErrorCode::E0806_HEADER_PREPROC_FAILED,
@@ -2295,8 +2297,8 @@ type struct Importer {
         };
         mut no_extra: u8*[] = [];
         return Importer::collect_from_tu("cryo_syshdr.c" as u8*, &uf, 1,
-                                         &no_extra, Text::new(header), extern_node, ctx, null, null,
-                                         "c", "");
+                                         &no_extra, header_text, extern_node, ctx, null, null,
+                                         Text::new("c"), Text::new(""));
     }
 
     /// `clang_getInclusions` trampoline: records each non-system file the TU
@@ -2339,7 +2341,9 @@ type struct Importer {
     static collect_from_tu(source_filename: u8*, unsaved: CXUnsavedFile*, num_unsaved: u32,
                            extra_args: &u8*[], label: Text, extern_node: ExternBlockNode*,
                            ctx: CompilationContext*, out_report: ImportReport*,
-                           out_inputs: string[]*, lang: string, cpp_std: string) -> i32 {
+                           out_inputs: string[]*, lang_text: Text, cpp_std_text: Text) -> i32 {
+        const cpp_std: string = cpp_std_text.as_string();
+        const lang: string = lang_text.as_string();
         const index: void* = clang::clang_createIndex(0, 0);
         // Force the source language.  C (`-x c`) is the default and reproduces the
         // old preprocess byte-for-byte; C++ (`-x c++ -std=<cpp_std>`) drives the
@@ -2444,7 +2448,8 @@ type struct Importer {
     /// Path with `\` rewritten to `/`.  A Windows path embedded in a generated
     /// `#include "..."` would otherwise put a backslash where C reads an escape;
     /// clang accepts forward slashes on every host.
-    static to_forward_slashes(p: string) -> string {
+    static to_forward_slashes(p_text: Text) -> string {
+        const p: string = p_text.as_string();
         const len: u64 = p.length();
         mut s: String = String::with_capacity(len + 1);
         for (mut i: u64 = 0; i < len; i++) {
@@ -2455,7 +2460,8 @@ type struct Importer {
     }
 
     /// Extract directory component from a file path.
-    static get_directory(path: string) -> string {
+    static get_directory(path_text: Text) -> string {
+        const path: string = path_text.as_string();
         const len: u64 = path.length();
         mut last_sep: i64 = -1;
         for (mut i: u64 = 0; i < len; i++) {
@@ -2472,7 +2478,9 @@ type struct Importer {
 
     /// Resolve an include path relative to a source directory.  Returns the
     /// resolved path if the file exists, empty string otherwise.
-    static resolve_include_path(source_dir: string, include_path: string) -> string {
+    static resolve_include_path(source_dir_text: Text, include_path_text: Text) -> string {
+        const include_path: string = include_path_text.as_string();
+        const source_dir: string = source_dir_text.as_string();
         const src_len: u64 = source_dir.length();
         const inc_len: u64 = include_path.length();
         const total: u64 = src_len + 1 + inc_len + 1;

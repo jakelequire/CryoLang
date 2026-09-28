@@ -110,7 +110,8 @@ type struct LinkerConfig {
     ///   - anything else (aarch64, riscv, windows-msvc, ...): unsupported;
     ///     `run_linking` falls back to the object-files-only bailout that
     ///     prints a manual-link hint.
-    static linker_config_for_triple(triple: string) -> LinkerConfig {
+    static linker_config_for_triple(triple_text: Text) -> LinkerConfig {
+        const triple: string = triple_text.as_string();
         // Host build: a null/empty triple, or one that matches the (coerced)
         // host triple, takes the per-host config below.  The split is
         // platform-gated because the host config diverges by OS - exe suffix
@@ -127,7 +128,7 @@ type struct LinkerConfig {
                 && triple.contains("gnu")
                 && triple.contains("x86_64")) {
             return LinkerConfig {
-                driver:             CodegenPasses::pick_link_driver("x86_64-w64-mingw32-gcc"),
+                driver:             CodegenPasses::pick_link_driver(Text::new("x86_64-w64-mingw32-gcc")),
                 // `-lws2_32` for std::net (Winsock) and `-lntdll` for the
                 // async reactor (its readiness backend polls `\Device\Afd`
                 // through the NT layer); mingw auto-links neither, the way it
@@ -172,7 +173,7 @@ type struct LinkerConfig {
     ![target(unix)]
     static host_linker_config() -> LinkerConfig {
         return LinkerConfig {
-            driver:             CodegenPasses::pick_link_driver("cc"),
+            driver:             CodegenPasses::pick_link_driver(Text::new("cc")),
             exe_suffix:         "",
             extra_system_libs:  "-lm -lstdc++",
             use_stdlib_archive: true,
@@ -183,7 +184,7 @@ type struct LinkerConfig {
     ![target(windows)]
     static host_linker_config() -> LinkerConfig {
         return LinkerConfig {
-            driver:             CodegenPasses::pick_link_driver("cc"),
+            driver:             CodegenPasses::pick_link_driver(Text::new("cc")),
             exe_suffix:         ".exe",
             extra_system_libs:  "-lm -lws2_32 -lntdll",
             use_stdlib_archive: true,
@@ -222,9 +223,11 @@ type struct CodegenPasses {
     /// puts it in that error; a command that succeeds has its output printed
     /// here, as it would have been (a linker's warnings).  The log is
     /// removed on success and kept on failure, beside the response file.
-    static run_tool(cmd: string, log_path: string, out: string*) -> i32 {
+    static run_tool(cmd_text: Text, log_path_text: Text, out: string*) -> i32 {
+        const cmd: string = cmd_text.as_string();
+        const log_path: string = log_path_text.as_string();
         const rc: i32 = Command::shell(fmt::format("%s > %s 2>&1", cmd,
-            CodegenPasses::link_quote(log_path)));
+            CodegenPasses::link_quote(log_path_text)));
         mut text: string = "";
         match (file::read_to_string(Path::from(log_path))) {
             Result::Ok(t)  => { text = t.into_raw(); }
@@ -241,8 +244,11 @@ type struct CodegenPasses {
     /// The error for a toolchain command that failed: what ran, where its
     /// inputs are kept, and - as a note - what the tool itself reported,
     /// which is the reason.
-    static tool_failure(what: Text, cmd: string, rsp_path: string,
-                        output: string) -> Diagnostic {
+    static tool_failure(what: Text, cmd_text: Text, rsp_path_text: Text,
+                        output_text: Text) -> Diagnostic {
+        const cmd: string = cmd_text.as_string();
+        const output: string = output_text.as_string();
+        const rsp_path: string = rsp_path_text.as_string();
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
             Text::new(fmt::format("%s: %s\n  object list retained at: %s", what.as_string(), cmd, rsp_path)));
         if (output.length() > 0) {
@@ -256,12 +262,13 @@ type struct CodegenPasses {
     /// wrap - `cmd` honours only double quotes, and build paths never contain
     /// an embedded `"` (same assumption the archiver's response-file paths make).
     ![target(unix)]
-    static link_quote(s: string) -> string {
-        return CodegenPasses::shell_quote(s);
+    static link_quote(s_text: Text) -> string {
+        return CodegenPasses::shell_quote(s_text);
     }
 
     ![target(windows)]
-    static link_quote(s: string) -> string {
+    static link_quote(s_text: Text) -> string {
+        const s: string = s_text.as_string();
         return fmt::format("\"%s\"", s);
     }
 
@@ -313,21 +320,23 @@ type struct CodegenPasses {
     /// that ships `libunwind.so.8` but no `libunwind.so` dev symlink, for no
     /// benefit (identical ABI).  An LLVM-libunwind / freestanding combination
     /// that needs an explicit unwinder is a follow-up (a `[link]`-config knob).
-    static append_hosted_runtime_libs(ctx: CompilationContext*, cmd: string,
-                                      triple: string) -> string {
-        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple, true);
+    static append_hosted_runtime_libs(ctx: CompilationContext*, cmd_text: Text,
+                                      triple_text: Text) -> string {
+        const cmd: string = cmd_text.as_string();
+        const triple: string = triple_text.as_string();
+        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple_text, true);
         if (lib_dir.length() == 0) {
             return cmd;
         }
         mut out: string = cmd;
         out = fmt::format("%s %s", out, CodegenPasses::link_quote(
-            fmt::format("%s/libcryort-core-hosted.a", lib_dir)));
+            Text::new(fmt::format("%s/libcryort-core-hosted.a", lib_dir))));
         const archive: string = match (ctx.project_panic_unwind) {
             true  => { "libcryort-panic-unwind-hosted.a" }
             false => { "libcryort-panic-abort-hosted.a" }
         };
         out = fmt::format("%s %s", out, CodegenPasses::link_quote(
-            fmt::format("%s/%s", lib_dir, archive)));
+            Text::new(fmt::format("%s/%s", lib_dir, archive))));
         // Windows resolves the `_Unwind_*` ABI through LLVM's libunwind rather
         // than libgcc_s, and the mingw clang driver links it SHARED whenever the
         // toolchain ships `libunwind.dll.a` - which makes every binary we emit
@@ -356,7 +365,7 @@ type struct CodegenPasses {
         // which is how the self-host chain selects llvm-mingw's clang.
         if (triple.contains("windows")) {
             const driver: string =
-                CodegenPasses::pick_link_driver("x86_64-w64-mingw32-gcc");
+                CodegenPasses::pick_link_driver(Text::new("x86_64-w64-mingw32-gcc"));
             if (driver.contains("clang")) {
                 out = fmt::format("%s --unwindlib=none -Wl,-Bstatic -lunwind -Wl,-Bdynamic", out);
             }
@@ -373,7 +382,8 @@ type struct CodegenPasses {
     /// link that settled for a freestanding-only directory would name an entry
     /// symbol nothing defines, and `-e` on a missing symbol is a linker WARNING
     /// — the binary still links, and starts at whatever address ld defaulted to.
-    static runtime_dir_has_core(dir: string, hosted: boolean) -> boolean {
+    static runtime_dir_has_core(dir_text: Text, hosted: boolean) -> boolean {
+        const dir: string = dir_text.as_string();
         const base: string = match (hosted) {
             true  => { "libcryort-core-hosted.a" }
             false => { "libcryort-core.a" }
@@ -384,12 +394,14 @@ type struct CodegenPasses {
     /// Prefer `<dir>/<triple>`, fall back to `<dir>`, else "".  Always returns a
     /// freshly allocated path: callers build candidates from borrowed env-var
     /// views that drop at the end of their match arm.
-    static runtime_dir_pick(dir: string, triple: string, hosted: boolean) -> string {
+    static runtime_dir_pick(dir_text: Text, triple_text: Text, hosted: boolean) -> string {
+        const dir: string = dir_text.as_string();
+        const triple: string = triple_text.as_string();
         const per_target: string = fmt::format("%s/%s", dir, triple);
-        if (CodegenPasses::runtime_dir_has_core(per_target, hosted)) {
+        if (CodegenPasses::runtime_dir_has_core(Text::new(per_target), hosted)) {
             return per_target;
         }
-        if (CodegenPasses::runtime_dir_has_core(dir, hosted)) {
+        if (CodegenPasses::runtime_dir_has_core(dir_text, hosted)) {
             return fmt::format("%s", dir);
         }
         return "";
@@ -407,7 +419,9 @@ type struct CodegenPasses {
     /// to "" when nothing is present: the result is handed to the linker
     /// either way, so naming the canonical location is what makes a missing
     /// archive report itself as the file it should have been.
-    static stdlib_archive_path(stdlib_root: string, triple: string) -> string {
+    static stdlib_archive_path(stdlib_root_text: Text, triple_text: Text) -> string {
+        const stdlib_root: string = stdlib_root_text.as_string();
+        const triple: string = triple_text.as_string();
         const per_target: string = fmt::format("%s/.bin/%s/libcryo.a",
                                           stdlib_root, triple);
         if (metadata::exists(Path::from(per_target))) {
@@ -432,14 +446,14 @@ type struct CodegenPasses {
     ///
     /// `hosted` selects WHICH tier set the caller needs; a directory that holds
     /// only the other kind is not a hit (see `runtime_dir_has_core`).
-    static resolve_runtime_lib_dir(ctx: CompilationContext*, triple: string,
+    static resolve_runtime_lib_dir(ctx: CompilationContext*, triple_text: Text,
                                    hosted: boolean) -> string {
         // 0. Explicit override, for a runtime built somewhere else entirely.
         match (env::var(Str::new("CRYO_RUNTIME"))) {
             Option::Some(v) => {
                 mut s: String = v;
                 const hit: string = CodegenPasses::runtime_dir_pick(
-                    s.as_cstr() as string, triple, hosted);
+                    Text::new(s.as_cstr() as string), triple_text, hosted);
                 if (hit.length() > 0) { return hit; }
             }
             Option::None => {}
@@ -451,10 +465,10 @@ type struct CodegenPasses {
                 mut s: String = v;
                 const home: string = s.as_cstr() as string;
                 const hit_lib: string = CodegenPasses::runtime_dir_pick(
-                    fmt::format("%s/lib/cryo", home), triple, hosted);
+                    Text::new(fmt::format("%s/lib/cryo", home)), triple_text, hosted);
                 if (hit_lib.length() > 0) { return hit_lib; }
                 const hit_rt: string = CodegenPasses::runtime_dir_pick(
-                    fmt::format("%s/runtime/.bin", home), triple, hosted);
+                    Text::new(fmt::format("%s/runtime/.bin", home)), triple_text, hosted);
                 if (hit_rt.length() > 0) { return hit_rt; }
             }
             Option::None => {}
@@ -484,13 +498,13 @@ type struct CodegenPasses {
                 exe_buf[dir_end] = 0;
                 const bindir: string = exe_buf as string;
                 const hit_inst: string = CodegenPasses::runtime_dir_pick(
-                    fmt::format("%s/../lib/cryo", bindir), triple, hosted);
+                    Text::new(fmt::format("%s/../lib/cryo", bindir)), triple_text, hosted);
                 if (hit_inst.length() > 0) { return hit_inst; }
                 const hit_dev: string = CodegenPasses::runtime_dir_pick(
-                    fmt::format("%s/../runtime/.bin", bindir), triple, hosted);
+                    Text::new(fmt::format("%s/../runtime/.bin", bindir)), triple_text, hosted);
                 if (hit_dev.length() > 0) { return hit_dev; }
                 const hit_dev2: string = CodegenPasses::runtime_dir_pick(
-                    fmt::format("%s/../../runtime/.bin", bindir), triple, hosted);
+                    Text::new(fmt::format("%s/../../runtime/.bin", bindir)), triple_text, hosted);
                 if (hit_dev2.length() > 0) { return hit_dev2; }
             }
         }
@@ -498,7 +512,7 @@ type struct CodegenPasses {
         //    together but places neither relative to the binary.
         if (ctx.stdlib_root.length() > 0) {
             const hit: string = CodegenPasses::runtime_dir_pick(
-                fmt::format("%s/../runtime/.bin", ctx.stdlib_root), triple, hosted);
+                Text::new(fmt::format("%s/../runtime/.bin", ctx.stdlib_root)), triple_text, hosted);
             if (hit.length() > 0) { return hit; }
         }
         return "";
@@ -519,25 +533,27 @@ type struct CodegenPasses {
     /// import `NtTerminateProcess`/`RtlVirtualUnwind` (ntdll) and
     /// `WriteFile`/`VirtualAlloc` (kernel32), so naming those first would leave
     /// the tiers' references unresolved.
-    static append_runtime_tier_libs(ctx: CompilationContext*, cmd: string,
-                                     triple: string) -> string {
-        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple, false);
+    static append_runtime_tier_libs(ctx: CompilationContext*, cmd_text: Text,
+                                     triple_text: Text) -> string {
+        const cmd: string = cmd_text.as_string();
+        const triple: string = triple_text.as_string();
+        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple_text, false);
         if (lib_dir.length() == 0) {
             return cmd;
         }
         mut out: string = cmd;
         out = fmt::format("%s %s", out, CodegenPasses::link_quote(
-            fmt::format("%s/libcryort-alloc.a", lib_dir)));
+            Text::new(fmt::format("%s/libcryort-alloc.a", lib_dir))));
         out = fmt::format("%s %s", out, CodegenPasses::link_quote(
-            fmt::format("%s/libcryort-backtrace.a", lib_dir)));
+            Text::new(fmt::format("%s/libcryort-backtrace.a", lib_dir))));
         out = fmt::format("%s %s", out, CodegenPasses::link_quote(
-            fmt::format("%s/libcryort-core.a", lib_dir)));
+            Text::new(fmt::format("%s/libcryort-core.a", lib_dir))));
         const panic_tier: string = match (ctx.project_panic_unwind) {
             true  => { "libcryort-panic-unwind.a" }
             false => { "libcryort-panic-abort.a" }
         };
         out = fmt::format("%s %s", out, CodegenPasses::link_quote(
-            fmt::format("%s/%s", lib_dir, panic_tier)));
+            Text::new(fmt::format("%s/%s", lib_dir, panic_tier))));
         if (triple.contains("windows")) {
             out = fmt::format("%s -lkernel32 -lntdll", out);
         }
@@ -548,7 +564,9 @@ type struct CodegenPasses {
     /// root.  Cross-platform via `fs::file::copy`, which creates/truncates the
     /// destination and mirrors the source's Unix mode bits (so the hoisted
     /// binary stays executable).  Returns 0 on success, 1 on failure.
-    static hoist_binary(src: string, dst: string) -> i32 {
+    static hoist_binary(src_text: Text, dst_text: Text) -> i32 {
+        const dst: string = dst_text.as_string();
+        const src: string = src_text.as_string();
         match (file::copy(Path::from(src), Path::from(dst))) {
             Result::Ok(_)  => { return 0; }
             Result::Err(_) => { return 1; }
@@ -559,7 +577,8 @@ type struct CodegenPasses {
     /// double-quoted path per line (parses identically under a POSIX `sh -c`
     /// driver or a Windows `cmd /c` one, so selfhost byte-identity is
     /// unaffected).  Returns false if the file could not be written.
-    static write_rsp_file(path: string, objects: &string[]) -> boolean {
+    static write_rsp_file(path_text: Text, objects: &string[]) -> boolean {
+        const path: string = path_text.as_string();
         mut text: String = String::new();
         for (mut i: i64 = 0; i < objects.length; i++) {
             text.push_byte(34 as u8);           // "
@@ -581,10 +600,11 @@ type struct CodegenPasses {
     /// Windows-hosted compiler this is a no-op - the dump is a Linux CI aid, not
     /// part of a normal build's output.
     ![target(unix)]
-    static emit_linked_ir_dump(profile_dir: string, ll_path: string) -> void {
+    static emit_linked_ir_dump(profile_dir_text: Text, ll_path_text: Text) -> void {
+        const ll_path: string = ll_path_text.as_string();
         const ll_cmd: string = fmt::format(
             "llvm-link-20 -S %s/*/ir/*.ll -o %s 2>/dev/null",
-            CodegenPasses::shell_quote(profile_dir), CodegenPasses::shell_quote(ll_path));
+            CodegenPasses::shell_quote(profile_dir_text), CodegenPasses::shell_quote(ll_path_text));
         const ll_rc: i32 = Command::shell(ll_cmd);
         if (ll_rc == 0) {
             cdebug(Text::new("[Codegen] Linked IR dump: %s\n"), ll_path);
@@ -594,7 +614,7 @@ type struct CodegenPasses {
     }
 
     ![target(windows)]
-    static emit_linked_ir_dump(profile_dir: string, ll_path: string) -> void {
+    static emit_linked_ir_dump(profile_dir_text: Text, ll_path_text: Text) -> void {
         // cmd has no glob / `2>/dev/null`; the IR dump is a POSIX selfhost-check
         // aid and is not produced on a native Windows build.
     }
@@ -945,9 +965,9 @@ type struct CodegenPasses {
             mut ll_dir: string = "build/target/release/local/ir";
             if (ctx.project_config != null) {
                 ll_dir = ctx.project_config.ir_dir_for(
-                    CodegenPasses::current_origin_subdir(ctx));
+                    Text::new(CodegenPasses::current_origin_subdir(ctx)));
             }
-            ProjectConfig::mkdir_p(ll_dir);
+            ProjectConfig::mkdir_p(Text::new(ll_dir));
             const ll_path: string = fmt::format("%s/%s.ll", ll_dir, mn_s.as_cstr() as string);
             mut ll_err: i8* = null;
             llvm::LLVMPrintModuleToFile(cg.llvm_module.raw, ll_path, &ll_err as void*);
@@ -1200,8 +1220,9 @@ type struct CodegenPasses {
     /// the manifest and emit the objects assigned to this worker (module line
     /// `k` belongs to worker `k % count`, round-robin so large modules spread
     /// across workers).  Returns 0 if every assigned object emitted.
-    static run_emit_worker(manifest_path: string, worker_idx: u32,
+    static run_emit_worker(manifest_path_text: Text, worker_idx: u32,
                            worker_count: u32) -> i32 {
+        const manifest_path: string = manifest_path_text.as_string();
         mut content: String = String::new();
         match (file::read_to_string(Path::from(manifest_path))) {
             Result::Ok(s)  => { content = s; }
@@ -1230,7 +1251,7 @@ type struct CodegenPasses {
                     const bc: string = CodegenPasses::substr(line, 0, tab as u64);
                     const ol: string = CodegenPasses::substr(
                         line, (tab + 1) as u64, line.length() - (tab as u64) - 1);
-                    if (!CodegenPasses::emit_object_from_bitcode(bc, ol, triple, opt)) {
+                    if (!CodegenPasses::emit_object_from_bitcode(Text::new(bc), Text::new(ol), Text::new(triple), opt)) {
                         fmt::eprintln(f"__emit-obj: failed to emit {ol}");
                         failures = failures + 1;
                     }
@@ -1247,9 +1268,12 @@ type struct CodegenPasses {
     /// PROCESS (own address space, own LLVM globals) - so there is no shared
     /// LLVM state to race, which is what makes this safe where in-process
     /// threading was not.  Returns true if every worker exited successfully.
-    static run_multiprocess_emit(bc: string[]*, obj: string[]*, triple: string,
-                                 opt: u32, worker_count: u32, self_exe: string,
-                                 manifest_path: string) -> boolean {
+    static run_multiprocess_emit(bc: string[]*, obj: string[]*, triple_text: Text,
+                                 opt: u32, worker_count: u32, self_exe_text: Text,
+                                 manifest_path_text: Text) -> boolean {
+        const manifest_path: string = manifest_path_text.as_string();
+        const self_exe: string = self_exe_text.as_string();
+        const triple: string = triple_text.as_string();
         // Manifest: triple, opt, then "<bc>\t<o>" per module in topo order.
         mut mf: String = String::new();
         mf.push(triple);            mf.push_byte(10);
@@ -1317,8 +1341,11 @@ type struct CodegenPasses {
     /// own process, so there is no shared LLVM global state to race - the whole
     /// point of going multi-process instead of multi-thread.  Returns true iff
     /// the object was emitted.
-    static emit_object_from_bitcode(bc_path: string, o_path: string,
-                                    triple: string, opt_level: u32) -> boolean {
+    static emit_object_from_bitcode(bc_path_text: Text, o_path_text: Text,
+                                    triple_text: Text, opt_level: u32) -> boolean {
+        const bc_path: string = bc_path_text.as_string();
+        const o_path: string = o_path_text.as_string();
+        const triple: string = triple_text.as_string();
         LTargetMachine::init_native_target();
         const eff: string = LTargetMachine::resolve_effective_triple(triple);
         const lctx: LContext = LContext::create();
@@ -1351,7 +1378,7 @@ type struct CodegenPasses {
         // IRText is the only kind that doesn't go through LLVM's target-machine
         // emit path; it's a pure text dump of the module IR.
         if (target.is_ir_text) {
-            return CodegenPasses::emit_ir_text(ctx, target.emit_path);
+            return CodegenPasses::emit_ir_text(ctx, Text::new(target.emit_path));
         }
 
         // Resolve the effective triple here too; the object format
@@ -1390,7 +1417,7 @@ type struct CodegenPasses {
         // `.push()` on a multi-deref field chain has historically landed
         // on a temp copy (push-through-pointer codegen limitation).
         if (target.should_register) {
-            ctx.artifacts.register_object_file(target.emit_path);
+            ctx.artifacts.register_object_file(Text::new(target.emit_path));
         }
 
         if (ctx.debug_mode) {
@@ -1420,7 +1447,7 @@ type struct CodegenPasses {
         mut output_dir: string = "build/target/release/local/deps";
         if (ctx.project_config != null) {
             output_dir = ctx.project_config.deps_dir_for(
-                CodegenPasses::current_origin_subdir(ctx));
+                Text::new(CodegenPasses::current_origin_subdir(ctx)));
         }
         // Object files mirror the module namespace as SUBDIRECTORIES under the
         // origin's `deps/` dir (`std::core::intrinsics` ->
@@ -1437,14 +1464,15 @@ type struct CodegenPasses {
         // `deps/` and any `--build-dir=...` prefix; a bare `mkdir` of the deep
         // path would fail and object emission would error "No such file or
         // directory".
-        ProjectConfig::mkdir_p(obj_path.parent_dir());
+        ProjectConfig::mkdir_p(Text::new(obj_path.parent_dir()));
         return obj_path;
     }
 
     /// Dump the LLVM module to a `.ll` text file at `path`.  Skips the
     /// target machine entirely; IR text is target-independent and the
     /// only failure mode is filesystem (permissions, missing parent).
-    static emit_ir_text(ctx: CompilationContext*, path: string) -> PassResult {
+    static emit_ir_text(ctx: CompilationContext*, path_text: Text) -> PassResult {
+        const path: string = path_text.as_string();
         const mod_ref: void* = ctx.artifacts.ir.llvm_module;
         mut err: i8* = null;
         const rc: i32 = llvm::LLVMPrintModuleToFile(mod_ref, path, &err as void*);
@@ -1517,7 +1545,7 @@ type struct CodegenPasses {
         // ...) `supported` is false and we keep the historic
         // object-files-only bailout below.
         const effective_triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
-        const link_cfg: LinkerConfig = LinkerConfig::linker_config_for_triple(effective_triple);
+        const link_cfg: LinkerConfig = LinkerConfig::linker_config_for_triple(Text::new(effective_triple));
 
         if (!link_cfg.supported) {
             const obj_only_dir: string = cfg.profile_dir();
@@ -1533,7 +1561,7 @@ type struct CodegenPasses {
         // for custom `--build-dir=...` paths that haven't been
         // pre-created.
         const profile_dir: string = cfg.profile_dir();
-        ProjectConfig::mkdir_p(profile_dir);
+        ProjectConfig::mkdir_p(Text::new(profile_dir));
         // Test-mode builds use a `-test` suffix so the test executable
         // coexists with a normal `cryo run` build of the same project.
         // The `.exe` suffix (Windows targets) goes on top of `-test` so
@@ -1561,14 +1589,14 @@ type struct CodegenPasses {
         // same order, same libs => a byte-identical executable on every
         // host, so selfhost byte-identity is unaffected.
         const link_rsp_path: string = fmt::format("%s.rsp", exe_path);
-        if (!CodegenPasses::write_rsp_file(link_rsp_path, &ctx.artifacts.object_files)) {
+        if (!CodegenPasses::write_rsp_file(Text::new(link_rsp_path), &ctx.artifacts.object_files)) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 Text::new(fmt::format("could not open linker response file for writing: %s", link_rsp_path)));
             return PassResult::failure(1);
         }
 
         mut cmd: string = fmt::format("%s -o %s @\"%s\"",
-            link_cfg.driver, CodegenPasses::link_quote(exe_path), link_rsp_path);
+            link_cfg.driver, CodegenPasses::link_quote(Text::new(exe_path)), link_rsp_path);
         // `no_runtime`: freestanding link.  `-nostartfiles` drops crt0 (the
         // runtime provides its own `_start`), `-nostdlib` drops the default
         // libc/libm and the compiler runtime.  The stdlib archive and
@@ -1597,13 +1625,13 @@ type struct CodegenPasses {
         // resolving `system` libs), `system` -> -l, `static` -> the archive
         // path passed to the linker verbatim.
         for (mut i: i64 = 0; i < cfg.link_search.length; i++) {
-            cmd = fmt::format("%s -L%s", cmd, CodegenPasses::link_quote(cfg.link_search[i]));
+            cmd = fmt::format("%s -L%s", cmd, CodegenPasses::link_quote(Text::new(cfg.link_search[i])));
         }
         for (mut i: i64 = 0; i < cfg.link_system.length; i++) {
-            cmd = fmt::format("%s -l%s", cmd, CodegenPasses::link_quote(cfg.link_system[i]));
+            cmd = fmt::format("%s -l%s", cmd, CodegenPasses::link_quote(Text::new(cfg.link_system[i])));
         }
         for (mut i: i64 = 0; i < cfg.link_static.length; i++) {
-            cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(cfg.link_static[i]));
+            cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(Text::new(cfg.link_static[i])));
         }
         // Per-OS overlay ([link.unix] / [link.windows]).  Appended after
         // the common set, so a project can carry platform-divergent libs
@@ -1616,13 +1644,13 @@ type struct CodegenPasses {
         // -> verbatim path.
         if (effective_triple.contains("windows")) {
             for (mut i: i64 = 0; i < cfg.link_search_windows.length; i++) {
-                cmd = fmt::format("%s -L%s", cmd, CodegenPasses::link_quote(cfg.link_search_windows[i]));
+                cmd = fmt::format("%s -L%s", cmd, CodegenPasses::link_quote(Text::new(cfg.link_search_windows[i])));
             }
             for (mut i: i64 = 0; i < cfg.link_system_windows.length; i++) {
-                cmd = fmt::format("%s -l%s", cmd, CodegenPasses::link_quote(cfg.link_system_windows[i]));
+                cmd = fmt::format("%s -l%s", cmd, CodegenPasses::link_quote(Text::new(cfg.link_system_windows[i])));
             }
             for (mut i: i64 = 0; i < cfg.link_static_windows.length; i++) {
-                cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(cfg.link_static_windows[i]));
+                cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(Text::new(cfg.link_static_windows[i])));
             }
         } else {
             // The `[link.unix]` overlay carries the host libLLVM (`-lLLVM-20`
@@ -1634,14 +1662,14 @@ type struct CodegenPasses {
             // to value-filtering "LLVM-20" rather than skipping the overlay.
             if (!ctx.release_static) {
                 for (mut i: i64 = 0; i < cfg.link_search_unix.length; i++) {
-                    cmd = fmt::format("%s -L%s", cmd, CodegenPasses::link_quote(cfg.link_search_unix[i]));
+                    cmd = fmt::format("%s -L%s", cmd, CodegenPasses::link_quote(Text::new(cfg.link_search_unix[i])));
                 }
                 for (mut i: i64 = 0; i < cfg.link_system_unix.length; i++) {
-                    cmd = fmt::format("%s -l%s", cmd, CodegenPasses::link_quote(cfg.link_system_unix[i]));
+                    cmd = fmt::format("%s -l%s", cmd, CodegenPasses::link_quote(Text::new(cfg.link_system_unix[i])));
                 }
             }
             for (mut i: i64 = 0; i < cfg.link_static_unix.length; i++) {
-                cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(cfg.link_static_unix[i]));
+                cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(Text::new(cfg.link_static_unix[i])));
             }
         }
         // `--release-static`: splice the static libLLVM component set
@@ -1650,7 +1678,7 @@ type struct CodegenPasses {
         // Placed before the stdlib archive + system libs so the single-pass
         // static link order is objects -> LLVM -> libcryo.a -> libm/libstdc++.
         if (ctx.release_static) {
-            const llvm_static: string = CodegenPasses::static_llvm_link_flags(CodegenPasses::pick_llvm_config());
+            const llvm_static: string = CodegenPasses::static_llvm_link_flags(Text::new(CodegenPasses::pick_llvm_config()));
             if (llvm_static.length() == 0) {
                 ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                     Text::new("could not obtain static LLVM link flags from llvm-config (is it installed? set CRYO_LLVM_CONFIG)"));
@@ -1668,8 +1696,8 @@ type struct CodegenPasses {
         if (link_cfg.use_stdlib_archive && !cfg.no_std && !cfg.no_runtime
                 && ctx.stdlib_root.length() > 0) {
             const stdlib_archive: string = CodegenPasses::stdlib_archive_path(
-                ctx.stdlib_root, effective_triple);
-            cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
+                Text::new(ctx.stdlib_root), Text::new(effective_triple));
+            cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(Text::new(stdlib_archive)));
         }
         // A freestanding link has no libc to satisfy the panic/alloc/backtrace
         // lang items, so the tier archives ARE the runtime and must all be on
@@ -1678,9 +1706,9 @@ type struct CodegenPasses {
         // so exactly one panic tier must be named or the link fails on an
         // undefined symbol) and the core tier, which owns the entry.
         if (cfg.no_runtime) {
-            cmd = CodegenPasses::append_runtime_tier_libs(ctx, cmd, effective_triple);
+            cmd = CodegenPasses::append_runtime_tier_libs(ctx, Text::new(cmd), Text::new(effective_triple));
         } else {
-            cmd = CodegenPasses::append_hosted_runtime_libs(ctx, cmd, effective_triple);
+            cmd = CodegenPasses::append_hosted_runtime_libs(ctx, Text::new(cmd), Text::new(effective_triple));
         }
         // Cryo runtime support is fully inline-lowered: every intrinsic
         // with a kind (ptr_diff, fpclass, atomic_*, dirent_*, ...) is
@@ -1709,7 +1737,7 @@ type struct CodegenPasses {
         }
 
         mut link_out: string = "";
-        const rc: i32 = CodegenPasses::run_tool(cmd, fmt::format("%s.log", link_rsp_path), &link_out);
+        const rc: i32 = CodegenPasses::run_tool(Text::new(cmd), Text::new(fmt::format("%s.log", link_rsp_path)), &link_out);
         if (rc != 0) {
             // Keep the response file on the failure path: the command in the
             // diagnostic names it with `@`, so deleting it makes that command
@@ -1717,7 +1745,7 @@ type struct CodegenPasses {
             // of the original error.
             ctx.emit_diagnostic(CodegenPasses::tool_failure(
                 Text::new(fmt::format("linker invocation failed (%s exited with %d)", link_cfg.driver, rc)),
-                cmd, link_rsp_path, link_out));
+                Text::new(cmd), Text::new(link_rsp_path), Text::new(link_out)));
             return PassResult::failure(1);
         }
         // The response file has served its purpose; remove it so it doesn't
@@ -1733,10 +1761,10 @@ type struct CodegenPasses {
         // it.  libc's system(3) runs `sh -c`, so both paths are
         // shell-quoted.
         const hoisted_exe: string = CodegenPasses::bin_artifact_path_for_target(cfg, ctx);
-        ProjectConfig::mkdir_p(output_dir);
+        ProjectConfig::mkdir_p(Text::new(output_dir));
         // `hoist_binary` is host-shell-aware: `cp -f` on a POSIX-hosted
         // compiler, `copy /Y` (backslash paths) on a native Windows one.
-        const hrc: i32 = CodegenPasses::hoist_binary(exe_path, hoisted_exe);
+        const hrc: i32 = CodegenPasses::hoist_binary(Text::new(exe_path), Text::new(hoisted_exe));
         if (hrc != 0) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 Text::new(fmt::format("failed to hoist executable to %s (copy exited with %d)",
@@ -1753,7 +1781,7 @@ type struct CodegenPasses {
             _               => { false }
         };
         if (exe_override && ctx.output_path_override.length() > 0) {
-            const orc: i32 = CodegenPasses::hoist_binary(hoisted_exe, ctx.output_path_override);
+            const orc: i32 = CodegenPasses::hoist_binary(Text::new(hoisted_exe), Text::new(ctx.output_path_override));
             if (orc != 0) {
                 ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                     Text::new(fmt::format("failed to copy executable to %s (copy exited with %d)",
@@ -1777,7 +1805,7 @@ type struct CodegenPasses {
         const ll_path: string = fmt::format("%s.ll", hoisted_exe);
         // POSIX-only (shell glob + `2>/dev/null`); a no-op on a native
         // Windows-hosted compiler, where `cmd` provides neither.
-        CodegenPasses::emit_linked_ir_dump(profile_dir, ll_path);
+        CodegenPasses::emit_linked_ir_dump(Text::new(profile_dir), Text::new(ll_path));
 
         return PassResult::ok();
     }
@@ -1801,7 +1829,7 @@ type struct CodegenPasses {
         }
 
         const effective_triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
-        const link_cfg: LinkerConfig = LinkerConfig::linker_config_for_triple(effective_triple);
+        const link_cfg: LinkerConfig = LinkerConfig::linker_config_for_triple(Text::new(effective_triple));
         if (!link_cfg.supported) {
             // Unknown triple - same fallback as the project path.
             fmt::println(f"Cross-compile: produced {ctx.artifacts.object_files.length} object file(s) for target '{ctx.target_triple}'");
@@ -1816,14 +1844,14 @@ type struct CodegenPasses {
         // spawned command short and byte-identical on every host.  `@"%s"`
         // (literal double quotes) parses the same under `sh -c` and `cmd /c`.
         const link_rsp_path: string = fmt::format("%s.rsp", exe_path);
-        if (!CodegenPasses::write_rsp_file(link_rsp_path, &ctx.artifacts.object_files)) {
+        if (!CodegenPasses::write_rsp_file(Text::new(link_rsp_path), &ctx.artifacts.object_files)) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 Text::new(fmt::format("could not open linker response file for writing: %s", link_rsp_path)));
             return PassResult::failure(1);
         }
 
         mut cmd: string = fmt::format("%s -o %s @\"%s\"",
-            link_cfg.driver, CodegenPasses::link_quote(exe_path), link_rsp_path);
+            link_cfg.driver, CodegenPasses::link_quote(Text::new(exe_path)), link_rsp_path);
         // `no_runtime`: freestanding link (see run_linking).  In raw mode
         // `ctx.project_no_runtime` carries the flag.  Same per-OS split as the
         // project path: a PE cannot be `-static` (ntdll is always a DLL) and
@@ -1844,13 +1872,13 @@ type struct CodegenPasses {
         if (link_cfg.use_stdlib_archive && !ctx.project_no_runtime
                 && ctx.stdlib_root.length() > 0) {
             const stdlib_archive: string = CodegenPasses::stdlib_archive_path(
-                ctx.stdlib_root, raw_triple);
-            cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
+                Text::new(ctx.stdlib_root), Text::new(raw_triple));
+            cmd = fmt::format("%s %s", cmd, CodegenPasses::link_quote(Text::new(stdlib_archive)));
         }
         if (ctx.project_no_runtime) {
-            cmd = CodegenPasses::append_runtime_tier_libs(ctx, cmd, raw_triple);
+            cmd = CodegenPasses::append_runtime_tier_libs(ctx, Text::new(cmd), Text::new(raw_triple));
         } else {
-            cmd = CodegenPasses::append_hosted_runtime_libs(ctx, cmd, raw_triple);
+            cmd = CodegenPasses::append_hosted_runtime_libs(ctx, Text::new(cmd), Text::new(raw_triple));
             cmd = fmt::format("%s %s", cmd, link_cfg.extra_system_libs);
         }
 
@@ -1860,13 +1888,13 @@ type struct CodegenPasses {
         }
 
         mut link_out: string = "";
-        const rc: i32 = CodegenPasses::run_tool(cmd, fmt::format("%s.log", link_rsp_path), &link_out);
+        const rc: i32 = CodegenPasses::run_tool(Text::new(cmd), Text::new(fmt::format("%s.log", link_rsp_path)), &link_out);
         if (rc != 0) {
             // Retained on failure so the reported command can be re-run; see
             // the project link path for the reasoning.
             ctx.emit_diagnostic(CodegenPasses::tool_failure(
                 Text::new(fmt::format("linker invocation failed (%s exited with %d)", link_cfg.driver, rc)),
-                cmd, link_rsp_path, link_out));
+                Text::new(cmd), Text::new(link_rsp_path), Text::new(link_out)));
             return PassResult::failure(1);
         }
         // Discard the response file once the link has consumed it
@@ -1895,9 +1923,9 @@ type struct CodegenPasses {
             _                  => { fmt::format("lib%s.a", cfg.project_name) }
         };
         // Archive lands at the build root (`<output_dir>/lib<name>.a`).
-        ProjectConfig::mkdir_p(cfg.output_dir);
-        const archive_path: string = cfg.lib_archive_path(archive_name);
-        return CodegenPasses::bundle_object_list(ctx, archive_path, &ctx.artifacts.object_files);
+        ProjectConfig::mkdir_p(Text::new(cfg.output_dir));
+        const archive_path: string = cfg.lib_archive_path(Text::new(archive_name));
+        return CodegenPasses::bundle_object_list(ctx, Text::new(archive_path), &ctx.artifacts.object_files);
     }
 
     /// Archive an explicit object list into `archive_path`.  The shared core of
@@ -1905,8 +1933,9 @@ type struct CodegenPasses {
     /// "link-twice" path, where a `[[bin]]` derives `lib<name>.a` from its own
     /// object set (minus the entry module) instead of a second full compile.
     static bundle_object_list(
-        ctx: CompilationContext*, archive_path: string, objs: &string[]
+        ctx: CompilationContext*, archive_path_text: Text, objs: &string[]
     ) -> PassResult {
+        const archive_path: string = archive_path_text.as_string();
         // Invoke `<ar> rcs <archive> @<response-file>`.  `r` replaces stale
         // members on re-bundle, `c` suppresses the empty-archive warning,
         // `s` writes the symbol index that `ld` consults to satisfy
@@ -1938,7 +1967,7 @@ type struct CodegenPasses {
         // trip cmd's outer-quote-stripping rule.
         const ar: string = CodegenPasses::pick_archiver();
         const rsp_path: string = fmt::format("%s.rsp", archive_path);
-        if (!CodegenPasses::write_rsp_file(rsp_path, objs)) {
+        if (!CodegenPasses::write_rsp_file(Text::new(rsp_path), objs)) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 Text::new(fmt::format("could not open archiver response file for writing: %s", rsp_path)));
             return PassResult::failure(1);
@@ -1953,12 +1982,12 @@ type struct CodegenPasses {
         }
 
         mut ar_out: string = "";
-        const rc: i32 = CodegenPasses::run_tool(cmd, fmt::format("%s.log", rsp_path), &ar_out);
+        const rc: i32 = CodegenPasses::run_tool(Text::new(cmd), Text::new(fmt::format("%s.log", rsp_path)), &ar_out);
         if (rc != 0) {
             // Retained on failure so the reported command can be re-run; see
             // the project link path for the reasoning.
             ctx.emit_diagnostic(CodegenPasses::tool_failure(
-                Text::new(fmt::format("ar invocation failed (exited with %d)", rc)), cmd, rsp_path, ar_out));
+                Text::new(fmt::format("ar invocation failed (exited with %d)", rc)), Text::new(cmd), Text::new(rsp_path), Text::new(ar_out)));
             return PassResult::failure(1);
         }
         // Drop the response file now the archiver has read it (best-effort).
@@ -1976,8 +2005,8 @@ type struct CodegenPasses {
     /// only the ENTRY module's artifact may honor the override.
     static is_entry_module_active(ctx: CompilationContext*) -> boolean {
         if (ctx.project_config == null) { return false; }
-        return CodegenPasses::paths_equal_loose(ctx.source_file,
-            ctx.project_config.discovery_root_path());
+        return CodegenPasses::paths_equal_loose(Text::new(ctx.source_file),
+            Text::new(ctx.project_config.discovery_root_path()));
     }
 
     /// Returns true if `name` is in the stripped-functions set.
@@ -2133,7 +2162,8 @@ type struct CodegenPasses {
     /// interpolated user-controlled path needs this treatment.  Without it,
     /// a working directory with a space breaks linking, and a path containing
     /// shell metacharacters is an arbitrary-command-execution hazard.
-    static shell_quote(s: string) -> string {
+    static shell_quote(s_text: Text) -> string {
+        const s: string = s_text.as_string();
         const len: u64 = s.length();
         // Worst case: every byte is a single quote, expanding to 4 bytes,
         // plus two outer quotes and a NUL terminator.
@@ -2162,7 +2192,8 @@ type struct CodegenPasses {
     /// it's usable.  Mirrors `pick_c_preprocessor`'s `cc_available` probe.  The
     /// probe runs after IR is emitted (link/archive time), so the tool chosen
     /// never affects the `.ll` the selfhost gate compares.
-    static tool_available(tool: string) -> boolean {
+    static tool_available(tool_text: Text) -> boolean {
+        const tool: string = tool_text.as_string();
         mut probe: Command = Command::new(Str::new(tool));
         probe.arg(Str::new("--version"));
         probe.stdout(Stdio::Null);
@@ -2191,9 +2222,9 @@ type struct CodegenPasses {
             }
             Option::None => {}
         }
-        if (CodegenPasses::tool_available("ar"))         { return "ar"; }
-        if (CodegenPasses::tool_available("llvm-ar"))    { return "llvm-ar"; }
-        if (CodegenPasses::tool_available("llvm-ar-20")) { return "llvm-ar-20"; }
+        if (CodegenPasses::tool_available(Text::new("ar")))         { return "ar"; }
+        if (CodegenPasses::tool_available(Text::new("llvm-ar")))    { return "llvm-ar"; }
+        if (CodegenPasses::tool_available(Text::new("llvm-ar-20"))) { return "llvm-ar-20"; }
         return "ar";
     }
 
@@ -2218,7 +2249,8 @@ type struct CodegenPasses {
     ///   3. A cross driver (`*-mingw32-*`) that's missing has no sane host
     ///      substitute, so we DON'T fall back for it - the original name is
     ///      kept so the link error names the absent cross toolchain.
-    static pick_link_driver(default_driver: string) -> string {
+    static pick_link_driver(default_driver_text: Text) -> string {
+        const default_driver: string = default_driver_text.as_string();
         match (env::var(Str::new("CRYO_CC"))) {
             Option::Some(v) => {
                 const env_val: string = v.into_raw();
@@ -2226,11 +2258,11 @@ type struct CodegenPasses {
             }
             Option::None => {}
         }
-        if (CodegenPasses::tool_available(default_driver)) { return default_driver; }
+        if (CodegenPasses::tool_available(default_driver_text)) { return default_driver; }
         if (!default_driver.contains("mingw")) {
-            if (CodegenPasses::tool_available("gcc"))   { return "gcc"; }
-            if (CodegenPasses::tool_available("clang")) { return "clang"; }
-            if (CodegenPasses::tool_available("cc"))    { return "cc"; }
+            if (CodegenPasses::tool_available(Text::new("gcc")))   { return "gcc"; }
+            if (CodegenPasses::tool_available(Text::new("clang"))) { return "clang"; }
+            if (CodegenPasses::tool_available(Text::new("cc")))    { return "cc"; }
         }
         return default_driver;
     }
@@ -2266,7 +2298,8 @@ type struct CodegenPasses {
     /// caller can fail the link with a clear diagnostic.  Captures the tool's
     /// stdout via `Command::output()`.  Runs at link time (after IR is emitted),
     /// so it never touches the `.ll` the selfhost gate compares.
-    static static_llvm_link_flags(llvm_config: string) -> string {
+    static static_llvm_link_flags(llvm_config_text: Text) -> string {
+        const llvm_config: string = llvm_config_text.as_string();
         mut probe: Command = Command::new(Str::new(llvm_config));
         probe.arg(Str::new("--ldflags"));
         probe.arg(Str::new("--libs"));
@@ -2300,7 +2333,9 @@ type struct CodegenPasses {
     /// separator.  `ctx.source_file` and `discovery_root_path()` are built
     /// by different code paths and can disagree on separator style on a
     /// native Windows host even when they name the same file.
-    static paths_equal_loose(a: string, b: string) -> boolean {
+    static paths_equal_loose(a_text: Text, b_text: Text) -> boolean {
+        const a: string = a_text.as_string();
+        const b: string = b_text.as_string();
         const la: i64 = a.length() as i64;
         const lb: i64 = b.length() as i64;
         if (la != lb) { return false; }
@@ -2325,7 +2360,7 @@ type struct CodegenPasses {
     static profile_bin_path_for_target(cfg: ProjectConfig*,
                                          ctx: CompilationContext*) -> string {
         const tri: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
-        const lc:  LinkerConfig = LinkerConfig::linker_config_for_triple(tri);
+        const lc:  LinkerConfig = LinkerConfig::linker_config_for_triple(Text::new(tri));
         return cfg.profile_bin_path(ctx.mode.skip_user_main()).with_exe_suffix(lc.exe_suffix);
     }
 
@@ -2336,7 +2371,7 @@ type struct CodegenPasses {
     static bin_artifact_path_for_target(cfg: ProjectConfig*,
                                           ctx: CompilationContext*) -> string {
         const tri: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
-        const lc:  LinkerConfig = LinkerConfig::linker_config_for_triple(tri);
+        const lc:  LinkerConfig = LinkerConfig::linker_config_for_triple(Text::new(tri));
         return cfg.bin_artifact_path(ctx.mode.skip_user_main()).with_exe_suffix(lc.exe_suffix);
     }
 }

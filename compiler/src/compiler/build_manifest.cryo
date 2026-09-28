@@ -64,6 +64,7 @@ import std::collections::str::{ Str };
 import std::core::hash::{ Fnv128Hasher };
 import std::fmt::interp::{ fmt_append_display, fmt_append_lit, fmt_new };
 import std::json::value::{ JsonObject, JsonValue };
+import utils::text::{ Text };
 
 /// A source module feeding the build, as the fingerprint + manifest see it.
 type struct ModuleEntry {
@@ -109,7 +110,8 @@ type struct ModuleKeyTable {
     /// with the same-arity `read`/`write` intrinsics and a reference-array static
     /// fails codegen resolution outright (E0636). The distinctly-named free
     /// function sidesteps both.
-    static read_module_keys(path: string) -> ModuleKeyTable {
+    static read_module_keys(path_text: Text) -> ModuleKeyTable {
+        const path: string = path_text.as_string();
         mut t: ModuleKeyTable = ModuleKeyTable::empty();
         if (!metadata::exists(Path::from(path))) { return t; }
         mut content: string = "";
@@ -183,7 +185,8 @@ type struct Manifest {
     stdlib_archive: string;
 
     static new(cfg: ProjectConfig*, opt_level: u32, debug_info: boolean,
-               stdlib_archive: string) -> Manifest {
+               stdlib_archive_text: Text) -> Manifest {
+        const stdlib_archive: string = stdlib_archive_text.as_string();
         return Manifest {
             cfg:            cfg,
             opt_level:      opt_level,
@@ -214,7 +217,7 @@ type struct Manifest {
         for (mut i: i64 = 0; i < this.cfg.link_static.length; i++) { h.fold(this.cfg.link_static[i]); }
         // Stdlib archive bytes (so a rebuilt stdlib invalidates dependents).
         if (this.stdlib_archive.length() > 0) {
-            Manifest::fold_file(&h, this.stdlib_archive);
+            Manifest::fold_file(&h, Text::new(this.stdlib_archive));
         }
         // Every source module, in topo order: namespace + origin (output
         // location) + full content.  Folding origin_subdir means moving a
@@ -223,7 +226,7 @@ type struct Manifest {
         for (mut i: i64 = 0; i < modules.length; i++) {
             h.fold(modules[i].namespace_name);
             h.fold(modules[i].origin_subdir);
-            Manifest::fold_file(&h, modules[i].source_path);
+            Manifest::fold_file(&h, Text::new(modules[i].source_path));
         }
         return h.finish128();
     }
@@ -231,8 +234,9 @@ type struct Manifest {
     /// True when the saved fingerprint matches `fp_hex` AND every artifact
     /// still exists on disk. A missing sidecar or any missing artifact forces
     /// a build.
-    is_up_to_date(&this, fp_hex: string, artifacts: &string[]) -> boolean {
-        const saved: string = Manifest::read_file_trimmed(this.cfg.fingerprint_path());
+    is_up_to_date(&this, fp_hex_text: Text, artifacts: &string[]) -> boolean {
+        const fp_hex: string = fp_hex_text.as_string();
+        const saved: string = Manifest::read_file_trimmed(Text::new(this.cfg.fingerprint_path()));
         if (saved.length() == 0) { return false; }
         if (!saved.eq(fp_hex)) { return false; }
         for (mut i: i64 = 0; i < artifacts.length; i++) {
@@ -243,8 +247,9 @@ type struct Manifest {
 
     /// Write the fingerprint sidecar (`incremental/inputs.fp`), creating the
     /// incremental dir first.
-    write_fingerprint(&this, fp_hex: string) -> void {
-        ProjectConfig::mkdir_p(this.cfg.incremental_dir());
+    write_fingerprint(&this, fp_hex_text: Text) -> void {
+        const fp_hex: string = fp_hex_text.as_string();
+        ProjectConfig::mkdir_p(Text::new(this.cfg.incremental_dir()));
         const path: string = this.cfg.fingerprint_path();
         mut text: String = String::new();
         text.push(Str::new(fp_hex));
@@ -260,9 +265,10 @@ type struct Manifest {
 
     /// Write the human/tooling-facing per-profile `build-manifest.json` at
     /// `<output_dir>/target/<profile>/build-manifest.json`.
-    write_manifest(&this, modules: &ModuleEntry[], fp_hex: string,
+    write_manifest(&this, modules: &ModuleEntry[], fp_hex_text: Text,
                    artifacts: &string[]) -> void {
-        ProjectConfig::mkdir_p(this.cfg.profile_dir());
+        const fp_hex: string = fp_hex_text.as_string();
+        ProjectConfig::mkdir_p(Text::new(this.cfg.profile_dir()));
         const path: string = this.cfg.manifest_path();
 
         const cfp: u128 = Manifest::compiler_fingerprint();
@@ -298,9 +304,9 @@ type struct Manifest {
         mut mods: Array<JsonValue> = Array::<JsonValue>::new();
         for (mut i: i64 = 0; i < modules.length; i++) {
             const obj: string = fmt::format("%s/%s.o",
-                this.cfg.deps_dir_for(modules[i].origin_subdir),
+                this.cfg.deps_dir_for(Text::new(modules[i].origin_subdir)),
                 Manifest::path_module(modules[i].namespace_name));
-            const obj_size: i64 = Manifest::file_size_bytes(obj);
+            const obj_size: i64 = Manifest::file_size_bytes(Text::new(obj));
             mut m: JsonObject = JsonObject::new();
             m.put("namespace",   JsonValue::from(modules[i].namespace_name));
             m.put("source",      JsonValue::from(modules[i].source_path));
@@ -343,7 +349,8 @@ type struct Manifest {
     /// perturbs the fingerprint. The byte count is mixed in last as a length
     /// guard. File reading is compiler-specific, so this lives here and drives
     /// the canonical `Hasher::fold` for the actual byte mixing.
-    static fold_file(h: Fnv128Hasher*, path: string) -> void {
+    static fold_file(h: Fnv128Hasher*, path_text: Text) -> void {
+        const path: string = path_text.as_string();
         if (!metadata::exists(Path::from(path))) {
             h.fold("<missing>");
             return;
@@ -384,7 +391,7 @@ type struct Manifest {
             h.fold("<unknown-compiler>");
             return h.finish128();
         }
-        Manifest::fold_file(&h, exe);
+        Manifest::fold_file(&h, Text::new(exe));
         return h.finish128();
     }
 
@@ -398,7 +405,7 @@ type struct Manifest {
         mut h: Fnv128Hasher = Fnv128Hasher::new();
         h.fold(namespace_name);
         h.fold(origin_subdir);
-        Manifest::fold_file(&h, source_path);
+        Manifest::fold_file(&h, Text::new(source_path));
         return h.finish128();
     }
 
@@ -429,7 +436,8 @@ type struct Manifest {
 
     /// Read a file's content with trailing whitespace/newlines stripped, or ""
     /// when the file is absent or unreadable.
-    static read_file_trimmed(path: string) -> string {
+    static read_file_trimmed(path_text: Text) -> string {
+        const path: string = path_text.as_string();
         mut raw: string = "";
         match (file::read_to_string(Path::from(path))) {
             Result::Ok(s)  => { raw = s.into_raw(); }
@@ -475,7 +483,8 @@ type struct Manifest {
 
     /// File size in bytes via `fs::metadata`, without reading the contents.
     /// Returns -1 when the file can't be stat'd.
-    static file_size_bytes(path: string) -> i64 {
+    static file_size_bytes(path_text: Text) -> i64 {
+        const path: string = path_text.as_string();
         match (metadata::metadata(Path::from(path))) {
             Result::Ok(m)  => { return m.len() as i64; }
             Result::Err(_) => { return -1 as i64; }

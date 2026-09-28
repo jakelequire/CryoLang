@@ -213,9 +213,9 @@ type struct BindingSerializer {
                         seen_sym.push(sym);
                         s.render_function_named(fnode, alias, sym);
                         if (report != null) {
-                            report.approx(fmt::format(
+                            report.approx(Text::new(fmt::format(
                                 "function `%s` renamed to `%s` (C++ overload or cross-namespace leaf collision; binds `%s`)",
-                                fnm, alias, sym));
+                                fnm, alias, sym)));
                         }
                     }
                     continue;
@@ -433,7 +433,7 @@ type struct BindingSerializer {
         const name: string = BindingSerializer::ident(raw);
         const sym: string = if (node.link_name.length() > 0) { node.link_name } else { raw };
         if (!sym.eq(name)) {
-            this.out.push(fmt::format("    ![symbol(\"%s\")]\n", BindingSerializer::escape(sym)));
+            this.out.push(fmt::format("    ![symbol(\"%s\")]\n", BindingSerializer::escape(Text::new(sym))));
         }
         const kw: string = if (node.is_mutable) { "mut" } else { "const" };
         this.out.push(fmt::format("    %s %s: %s;\n",
@@ -476,7 +476,7 @@ type struct BindingSerializer {
         const lit: LiteralNode* = init as LiteralNode*;
         mut val: string = "";
         if (lit.literal_kind == LiteralKind::String) {
-            val = fmt::format("\"%s\"", BindingSerializer::escape(lit.value));
+            val = fmt::format("\"%s\"", BindingSerializer::escape(Text::new(lit.value)));
         } else if (lit.literal_kind == LiteralKind::Float) {
             val = lit.value;
         } else {
@@ -495,7 +495,7 @@ type struct BindingSerializer {
     /// the same honesty channel as a construct the importer refused.
     skip_const(mut &this, name: string, why: Text) -> void {
         if (this.report == null) { return; }
-        this.report.skip(fmt::format("const '%s' (%s)", name, why.as_string()));
+        this.report.skip(Text::new(fmt::format("const '%s' (%s)", name, why.as_string())));
     }
 
     /// Render a struct-literal global const (`const NAME: Type = Type { ... };`).
@@ -708,7 +708,8 @@ type struct BindingSerializer {
     }
 
     /// Escape a decoded byte string for embedding in a Cryo `"..."` literal.
-    static escape(s: string) -> string {
+    static escape(s_text: Text) -> string {
+        const s: string = s_text.as_string();
         const n: u64 = s.length();
         mut out: String = String::new();
         for (mut i: u64 = 0; i < n; i++) {
@@ -760,7 +761,7 @@ type struct VendorGenerator {
         // Build the shared clang args: `-I<abs include dir>` and `-D<define>`.
         mut extra: u8*[] = [];
         for (mut i: i64 = 0; i < include_dirs.length; i++) {
-            const inc: string = VendorGenerator::join(source_path, include_dirs[i]);
+            const inc: string = VendorGenerator::join(Text::new(source_path), Text::new(include_dirs[i]));
             extra.push(fmt::format("-I%s", inc) as u8*);
         }
         for (mut i: i64 = 0; i < defines.length; i++) {
@@ -773,7 +774,7 @@ type struct VendorGenerator {
         mut parsed: i32 = 0;
         for (mut i: i64 = 0; i < headers.length; i++) {
             const hp: string = VendorGenerator::resolve_header(
-                source_path, include_dirs, headers[i]);
+                Text::new(source_path), include_dirs, Text::new(headers[i]));
             if (hp.length() == 0) {
                 fmt::eprintf("warning: vendor header '%s' not found under %s\n",
                     headers[i], source_path);
@@ -785,7 +786,7 @@ type struct VendorGenerator {
             if (out_inputs != null) { out_inputs.push(hp); }
             Importer::collect_from_tu(hp as u8*, null, 0, &extra, Text::new(hp),
                                       extern_node, &ctx, &report, out_inputs,
-                                      language, cpp_std);
+                                      Text::new(language), Text::new(cpp_std));
             parsed = parsed + 1;
         }
         if (parsed == 0) { return ""; }
@@ -830,9 +831,12 @@ type struct VendorGenerator {
     /// upgrading does not spuriously invalidate a cache whose `GENERATOR_VERSION`
     /// already matched (the version bump to 6 is what forces the one-time
     /// regeneration that installs the sidecar).
-    static provenance_key(source_path: string, headers: &string[],
+    static provenance_key(source_path_text: Text, headers: &string[],
                           include_dirs: &string[], defines: &string[],
-                          triple: string, cache_file: string, lang: string) -> string {
+                          triple_text: Text, cache_file_text: Text, lang_text: Text) -> string {
+        const cache_file: string = cache_file_text.as_string();
+        const lang: string = lang_text.as_string();
+        const triple: string = triple_text.as_string();
         mut h: Fnv128Hasher = Fnv128Hasher::new();
         const depfile: string = if (cache_file.length() > 0) {
             fmt::format("%s.deps", cache_file)
@@ -841,19 +845,19 @@ type struct VendorGenerator {
         };
         if (depfile.length() > 0
                 && metadata::exists(Path::from(depfile))) {
-            VendorGenerator::fold_depfile(&h, depfile);
+            VendorGenerator::fold_depfile(&h, Text::new(depfile));
         } else {
             // Fallback (fresh register / pre-sidecar cache): entry headers only.
             for (mut i: i64 = 0; i < headers.length; i++) {
                 const hp: string = VendorGenerator::resolve_header(
-                    source_path, include_dirs, headers[i]);
+                    source_path_text, include_dirs, Text::new(headers[i]));
                 if (hp.length() == 0) {
                     // A missing header still perturbs the key (distinct marker +
                     // the requested name) so it can't masquerade as unchanged.
                     h.fold("<missing-header>");
                     h.fold(headers[i]);
                 } else {
-                    Manifest::fold_file(&h, hp);
+                    Manifest::fold_file(&h, Text::new(hp));
                 }
             }
         }
@@ -901,7 +905,8 @@ type struct VendorGenerator {
     /// listed file that has since been deleted perturbs the key with a distinct
     /// marker (so it can't masquerade as unchanged -> forces a regeneration that
     /// rebuilds the graph).  Blank lines are skipped.
-    static fold_depfile(h: Fnv128Hasher*, depfile: string) -> void {
+    static fold_depfile(h: Fnv128Hasher*, depfile_text: Text) -> void {
+        const depfile: string = depfile_text.as_string();
         mut content: string = "";
         match (file::read_to_string(Path::from(depfile))) {
             Result::Ok(s)  => { content = s.into_raw(); }
@@ -918,7 +923,7 @@ type struct VendorGenerator {
             if (end > start) {
                 const path: string = content.substr(start, end - start);
                 if (metadata::exists(Path::from(path))) {
-                    Manifest::fold_file(h, path);
+                    Manifest::fold_file(h, Text::new(path));
                 } else {
                     h.fold("<missing-include>");
                     h.fold(path);
@@ -933,7 +938,8 @@ type struct VendorGenerator {
     /// per line, in the order `generate` accumulated them.  Best-effort - a
     /// write failure just means the next cache check falls back to the
     /// entry-header key (a possible spurious regeneration, never a stale cache).
-    static write_depfile(cryo_path: string, inputs: &string[]) -> void {
+    static write_depfile(cryo_path_text: Text, inputs: &string[]) -> void {
+        const cryo_path: string = cryo_path_text.as_string();
         const dpath: string = fmt::format("%s.deps", cryo_path);
         mut text: String = String::new();
         for (mut i: i64 = 0; i < inputs.length; i++) {
@@ -965,7 +971,9 @@ type struct VendorGenerator {
     }
 
     /// `<base>/<rel>` (or `rel` when already absolute-ish).
-    static join(base: string, rel: string) -> string {
+    static join(base_text: Text, rel_text: Text) -> string {
+        const base: string = base_text.as_string();
+        const rel: string = rel_text.as_string();
         if (rel.length() == 0) { return base; }
         if (rel[0] == '/' || rel[0] == '\\'
             || (rel.length() > 1 && rel[1] == ':')) {
@@ -976,8 +984,10 @@ type struct VendorGenerator {
 
     /// Resolve a manifest header name to an existing file: try each include dir
     /// under source_path, then source_path itself, then the name verbatim.
-    static resolve_header(source_path: string, include_dirs: &string[],
-                          header: string) -> string {
+    static resolve_header(source_path_text: Text, include_dirs: &string[],
+                          header_text: Text) -> string {
+        const header: string = header_text.as_string();
+        const source_path: string = source_path_text.as_string();
         for (mut i: i64 = 0; i < include_dirs.length; i++) {
             const cand: string = fmt::format("%s/%s/%s",
                 source_path, include_dirs[i], header);

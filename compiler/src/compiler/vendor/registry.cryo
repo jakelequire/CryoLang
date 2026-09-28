@@ -51,6 +51,7 @@ import std::core::option;
 import std::core::option::{ Option };
 import std::json::{ value, parser, serializer };
 import std::json::value::{ JsonObject, JsonValue };
+import utils::text::{ Text };
 
 const VENDOR_SCHEMA_VERSION: i64 = 1;
 
@@ -118,7 +119,8 @@ type struct VendorEntry {
     }
 
     /// The generated bindings path for `triple`, or "" if not yet cached.
-    cache_file_for(&this, triple: string) -> string {
+    cache_file_for(&this, triple_text: Text) -> string {
+        const triple: string = triple_text.as_string();
         for (mut i: i64 = 0; i < this.cache.length; i++) {
             if (this.cache[i].triple == triple) {
                 return this.cache[i].file;
@@ -178,14 +180,15 @@ type struct VendorRegistry {
     /// `<vendor_root>/<key>/<triple>`: per-(library, triple) cache dir.
     static cache_dir_for(key: string, triple: string) -> string {
         const d: string = fmt::format("%s/%s/%s", VendorRegistry::vendor_root(), key,
-                                  VendorRegistry::normalize_triple(triple));
+                                  VendorRegistry::normalize_triple(Text::new(triple)));
         dir::create_dir_all(Path::from(d));
         return d;
     }
 
     /// A host build carries an empty target triple; map it to "host" so it
     /// survives as a path component and matches on the resolve side.
-    static normalize_triple(triple: string) -> string {
+    static normalize_triple(triple_text: Text) -> string {
+        const triple: string = triple_text.as_string();
         if (triple.length() == 0) { return "host"; }
         return triple;
     }
@@ -311,7 +314,7 @@ type struct VendorRegistry {
             Result::Err(_) => { text.drop(); return false; }
         }
         text.drop();
-        if (!VendorRegistry::replace_file_atomic(tmp, path)) {
+        if (!VendorRegistry::replace_file_atomic(Text::new(tmp), Text::new(path))) {
             dir::remove_file(Path::from(tmp));   // leave no stray temp file on a failed swap
             return false;
         }
@@ -327,11 +330,15 @@ type struct VendorRegistry {
     /// `MoveFileExA` with `MOVEFILE_REPLACE_EXISTING` (0x1) is the atomic-replace
     /// equivalent.  Returns true on success.
     ![target(windows)]
-    static replace_file_atomic(tmp: string, path: string) -> boolean {
+    static replace_file_atomic(tmp_text: Text, path_text: Text) -> boolean {
+        const path: string = path_text.as_string();
+        const tmp: string = tmp_text.as_string();
         return syscall::MoveFileExA(tmp, path, 0x1) != 0;
     }
     ![target(unix)]
-    static replace_file_atomic(tmp: string, path: string) -> boolean {
+    static replace_file_atomic(tmp_text: Text, path_text: Text) -> boolean {
+        const path: string = path_text.as_string();
+        const tmp: string = tmp_text.as_string();
         match (dir::rename(Path::from(tmp), Path::from(path))) {
             Result::Ok(_)  => { return true; }
             Result::Err(_) => { return false; }

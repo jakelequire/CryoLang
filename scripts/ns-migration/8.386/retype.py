@@ -19,11 +19,29 @@ where a refusal points.
       appended (parenthesised when it is not a plain path).  Every other
       refusal is listed, not edited: a return, an assignment, an operator,
       a field initialiser each need reading.  Files edited gain the import.
+
+  python retype.py --prologue <list.tsv> <repo-root>
+      For a body that works on the bytes: rename `p: Text` to `p_text` and
+      unwrap it once where the body opens (`attribute.py` picks the list).
+  python retype.py --collapse <list.tsv> <repo-root>
+      After `--refusals`: inside those bodies `Text::new(p)` becomes `p_text`.
+  python retype.py --drop-unused <build-log> <root>
+      Delete each entry unwrap a W0001 names as an unused variable.
+
+`relocate.py` re-points a list's line numbers at the working tree when
+earlier edits have moved the declarations.
 """
 import os, re, sys
 
 IMPORT = "import utils::text::{ Text };"
 TEXT_T = "utils::text::Text"
+
+
+def is_decl(line, fn):
+    """Whether `line` is the head of a declaration of `fn` - not a call to
+    it, which a forward search from a stale line number can reach first."""
+    return re.match(r"\s*(?:public\s+|private\s+)?(?:static\s+|function\s+)?%s\s*(<[^()]*>)?\s*\("
+                    % re.escape(fn), line) is not None and not line.rstrip().endswith(";")
 
 
 def read(p):
@@ -92,6 +110,113 @@ def retype_params(listfile, root):
     print("retyped %d parameter(s) in %d file(s)" % (n, len(todo)))
     for m in miss:
         print("  NOT FOUND " + m)
+
+
+def prologue(listfile, root):
+    """For each listed (already retyped) parameter `p: Text`, rename it
+    `p_text` and unwrap it once where the body opens -
+    `const p: string = p_text.as_string();` - so a body that works on the
+    bytes (lengths, indexing, `+`) is left as it was.  The signature is what
+    the callers see, and it says text."""
+    todo = {}
+    for l in open(listfile, encoding="utf-8"):
+        c = l.rstrip("\n").split("\t")
+        if len(c) < 3:
+            continue
+        f, ln = c[0].rsplit(":", 1)
+        todo.setdefault(f, []).append((int(ln), c[1], c[2]))
+    n = 0
+    for f, items in sorted(todo.items()):
+        p = os.path.join(root, f)
+        lines, nl = read(p)
+        # bottom-up so inserted lines do not shift the ones still to do
+        for ln, fn, pn in sorted(items, reverse=True):
+            head = ln - 1
+            while not is_decl(lines[head], fn):
+                head += 1
+            pat = re.compile(r"\b%s(\s*:\s*Text\b)" % re.escape(pn))
+            k = head
+            while not pat.search(lines[k]):
+                k += 1
+            lines[k] = pat.sub(pn + r"_text\1", lines[k], count=1)
+            b = k
+            while "{" not in lines[b]:
+                b += 1
+            unwrap = "const %s: string = %s_text.as_string();" % (pn, pn)
+            brace = lines[b].index("{")
+            if lines[b][brace + 1:].strip() == "":
+                indent = re.match(r"\s*", lines[head]).group(0) + "    "
+                lines.insert(b + 1, indent + unwrap)
+            else:
+                # a body on the head's own line: unwrap inside it
+                lines[b] = lines[b][:brace + 1] + " " + unwrap + lines[b][brace + 1:]
+            n += 1
+        write(p, lines, nl)
+    print("unwrapped %d parameter(s) at entry" % n)
+
+
+def collapse(listfile, root):
+    """After `--refusals`: inside the body of each function `--prologue`
+    unwrapped, `Text::new(p)` re-wraps the parameter's own bytes; pass
+    `p_text`, the text the caller handed in, instead."""
+    todo = {}
+    for l in open(listfile, encoding="utf-8"):
+        c = l.rstrip("\n").split("\t")
+        if len(c) < 3:
+            continue
+        todo.setdefault(c[0].rsplit(":", 1)[0], []).append((int(c[0].rsplit(":", 1)[1]), c[1], c[2]))
+    n = 0
+    for f, items in sorted(todo.items()):
+        p = os.path.join(root, f)
+        lines, nl = read(p)
+        for ln, fn, pn in items:
+            head = ln - 1
+            while not is_decl(lines[head], fn):
+                head += 1
+            depth, started, i = 0, False, head
+            while i < len(lines):
+                for ch in lines[i]:
+                    if ch == "{":
+                        depth += 1; started = True
+                    elif ch == "}":
+                        depth -= 1
+                if started and depth <= 0:
+                    break
+                i += 1
+            pat = re.compile(r"Text::new\(%s\)" % re.escape(pn))
+            for k in range(head, i + 1):
+                lines[k], c = pat.subn(pn + "_text", lines[k])
+                n += c
+        write(p, lines, nl)
+    print("collapsed %d re-wrap(s)" % n)
+
+
+def drop_unused(log, root):
+    """After `--collapse`: an entry unwrap whose every use was collapsed back
+    to `p_text` is an unused local, W0001 in a build log.  Delete the unwrap
+    each such warning names; leave every other W0001 alone."""
+    lines = open(log, encoding="utf-8", errors="replace").read().splitlines()
+    hits = {}
+    for i, l in enumerate(lines):
+        m = re.match(r"warning\[W0001\]: unused variable `(\w+)`", l)
+        if not m:
+            continue
+        f, ln, _ = lines[i + 1].strip()[3:].strip().rsplit(":", 2)
+        hits.setdefault(f, []).append((int(ln), m.group(1)))
+    n = 0
+    for f, items in hits.items():
+        p = os.path.join(root, f)
+        src, nl = read(p)
+        for ln, v in sorted(items, reverse=True):
+            want = "const %s: string = %s_text.as_string();" % (v, v)
+            if src[ln - 1].strip() == want:
+                del src[ln - 1]
+                n += 1
+            elif want in src[ln - 1]:
+                src[ln - 1] = src[ln - 1].replace(" " + want, "")
+                n += 1
+        write(p, src, nl)
+    print("dropped %d unused unwrap(s)" % n)
 
 
 def arg_end(lines, li, c):
@@ -208,6 +333,12 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["--params"]:
         retype_params(a[1], a[2])
+    elif a[:1] == ["--drop-unused"]:
+        drop_unused(a[1], a[2])
+    elif a[:1] == ["--collapse"]:
+        collapse(a[1], a[2])
+    elif a[:1] == ["--prologue"]:
+        prologue(a[1], a[2])
     elif a[:1] == ["--refusals"]:
         refusals(a[1], a[2], "--dry" in a)
     else:

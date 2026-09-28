@@ -20,7 +20,12 @@ def body(lines, ln):
     while i < len(lines):
         l = lines[i]
         out.append((i + 1, l))
-        for ch in l:
+        # braces inside a string or char literal, or a comment, do not count:
+        # a body holding `"{"` otherwise ends early and its uses go unlisted
+        code = re.sub(r'"(?:\\.|[^"\\])*"', '""', l)
+        code = re.sub(r"'(?:\\.|[^'\\])'", "''", code)
+        code = code.split("//")[0]
+        for ch in code:
             if ch == "{":
                 depth += 1
                 started = True
@@ -40,7 +45,18 @@ for r in rows:
     if f not in cache:
         cache[f] = open(root + "/" + f, encoding="utf-8", errors="replace").read().split("\n")
     b = body(cache[f], int(ln))
-    pat = re.compile(r"(?<![\w.])%s\b(?!\s*:)(?!\.as_string\(\))" % re.escape(pn))
-    for n, l in b[1:]:
+    head = " ".join(l for _, l in b[:14]).split("{")[0]
+    if re.search(r"\b%s_text\s*:\s*Text\b" % re.escape(pn), head):
+        continue  # unwrapped at entry: the body's `pn` is the string
+    pat =re.compile(r"(?<![\w.])%s\b(?!\s*:)(?!\.as_string\(\))" % re.escape(pn))
+    # the body starts after the first `{` - on the head's own line for a
+    # one-line body, whose uses a scan from the next line would never see
+    opened = False
+    for n, l in b:
+        if not opened:
+            if "{" not in l:
+                continue
+            opened = True
+            l = l[l.index("{") + 1:]
         if pat.search(l):
             print("%s:%d\t%s\t%s" % (f, n, pn, l.strip()))

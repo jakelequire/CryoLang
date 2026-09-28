@@ -274,7 +274,8 @@ type struct CompilationResult {
     /// runtime's compile-fail helpers. Empty for `--no-std` builds.
     stdlib_root:   string;
 
-    static ok(output_path: string) -> CompilationResult {
+    static ok(output_path_text: Text) -> CompilationResult {
+        const output_path: string = output_path_text.as_string();
         return CompilationResult {
             success:       true,
             error_count:   0,
@@ -284,7 +285,8 @@ type struct CompilationResult {
         };
     }
 
-    static ok_with_warnings(output_path: string, warnings: u32) -> CompilationResult {
+    static ok_with_warnings(output_path_text: Text, warnings: u32) -> CompilationResult {
+        const output_path: string = output_path_text.as_string();
         return CompilationResult {
             success:       true,
             error_count:   0,
@@ -402,7 +404,8 @@ type struct CompilerInstance {
     /// Run a pipeline on a context, handling AST dump, diagnostics, and
     /// result construction.  All single-file compile_* methods delegate here.
     run_pipeline(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                 output_path: string) -> CompilationResult {
+                 output_path_text: Text) -> CompilationResult {
+        const output_path: string = output_path_text.as_string();
         pipeline.set_verbose(this.config.verbose_passes);
 
         if (!pipeline.validate()) {
@@ -471,7 +474,7 @@ type struct CompilerInstance {
 
         if (success && !ctx.diagnostics.has_errors()) {
             return CompilationResult::ok_with_warnings(
-                output_path, ctx.diagnostics.warning_count);
+                output_path_text, ctx.diagnostics.warning_count);
         }
         return CompilationResult::failed(
             ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
@@ -498,7 +501,8 @@ type struct CompilerInstance {
     /// mirror of the linked executable, lands at PATH (see
     /// `run_object_emission` / `run_linking`).  `--no-std` opts out of
     /// the stdlib entirely for freestanding single files.
-    compile_file(&this, source: string) -> CompilationResult {
+    compile_file(&this, source_text: Text) -> CompilationResult {
+        const source: string = source_text.as_string();
         LOG_DEBUG(LogComponent::General, "[Compiler] compile_file: %s", source);
         if (this.config.debug) {
             LOG_DEBUG(LogComponent::General, "[Compiler] Compiling: %s (mode: single-file)", source);
@@ -547,7 +551,8 @@ type struct CompilerInstance {
     }
 
     /// Compile a single source file in raw mode (no stdlib, no prelude).
-    compile_raw(&this, source: string) -> CompilationResult {
+    compile_raw(&this, source_text: Text) -> CompilationResult {
+        const source: string = source_text.as_string();
         if (this.config.debug) {
             LOG_DEBUG(LogComponent::General, "[Compiler] Compiling: %s (mode: raw)", source);
         }
@@ -571,7 +576,7 @@ type struct CompilerInstance {
         compiler::codegen::type_map::TypeMapperCache::reset_shared_type_cache();
         compiler::codegen::ast_arena::cryo_ast_arena_reset();
         mut pipeline: PassRegistry = PassRegistry::build_raw_pipeline();
-        return this.run_pipeline(&ctx, &pipeline, ctx.artifacts.linked.object_file_path);
+        return this.run_pipeline(&ctx, &pipeline, Text::new(ctx.artifacts.linked.object_file_path));
     }
 
     /// Compile for `cryo check`: frontend + semantic analysis, no codegen,
@@ -589,7 +594,8 @@ type struct CompilerInstance {
     /// stdlib type like `String`/`Str`/`Array` failed to resolve (a spurious
     /// E0203/E0233 that a real build did not report).  Loading the whole module
     /// graph the way a build does makes `check` agree with `build`.
-    compile_for_check(&this, source: string) -> CompilationResult {
+    compile_for_check(&this, source_text: Text) -> CompilationResult {
+        const source: string = source_text.as_string();
         if (!metadata::exists(Path::from(source))) {
             fmt::eprintln(f"error: file not found: {source}");
             return CompilationResult::failed(1, 0);
@@ -627,7 +633,8 @@ type struct CompilerInstance {
     }
 
     /// Compile for LSP: frontend + semantic analysis, no codegen.
-    compile_for_lsp(&this, source: string) -> CompilationResult {
+    compile_for_lsp(&this, source_text: Text) -> CompilationResult {
+        const source: string = source_text.as_string();
         if (!metadata::exists(Path::from(source))) {
             return CompilationResult::failed(1, 0);
         }
@@ -635,7 +642,7 @@ type struct CompilerInstance {
         mangled_name::set_lsp_safe(true);
         mut ctx: CompilationContext = CompilationContext::new(CompileMode::Lsp, source);
         mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
-        return this.run_pipeline(&ctx, &pipeline, "");
+        return this.run_pipeline(&ctx, &pipeline, Text::new(""));
     }
 
 
@@ -648,7 +655,7 @@ type struct CompilerInstance {
     /// daemon.  Used as a fallback when we can't find a cryoconfig.
     /// For real diagnostics, route through `compile_for_lsp_project_into`.
     compile_for_lsp_content_into(&this, ctx: CompilationContext*,
-                                 virtual_path: string, content: string) -> CompilationResult {
+                                 virtual_path_text: Text, content_text: Text) -> CompilationResult {
         mangled_name::set_lsp_safe(true);
         // Same risk as the multi-target build path: TypeArena.next_id
         // resets every compile, so without clearing the (TypeRef.id ->
@@ -663,9 +670,9 @@ type struct CompilerInstance {
         // keystroke as it did when this path reset but never activated routing)
         // and deactivates on return.  Resetting here would free the just-built,
         // session-owned `ctx` out from under this compile.
-        ctx.artifacts.tokens = TokenStream::new([], virtual_path, content);
+        ctx.artifacts.tokens = TokenStream::new([], virtual_path_text, content_text);
         mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
-        return this.run_pipeline(ctx, &pipeline, "");
+        return this.run_pipeline(ctx, &pipeline, Text::new(""));
     }
 
     /// Compile a whole project for the LSP, with one module's source
@@ -680,13 +687,15 @@ type struct CompilerInstance {
     /// completion.  Codegen is gated off via `CompileMode::Lsp` so
     /// no LLVM IR is emitted; everything stops cleanly at TypeLowering.
     compile_for_lsp_project_into(&this, ctx: CompilationContext*,
-                                 config_path: string,
-                                 override_path: string,
-                                 override_content: string) -> CompilationResult {
+                                 config_path_text: Text,
+                                 override_path_text: Text,
+                                 override_content_text: Text) -> CompilationResult {
+        const override_content: string = override_content_text.as_string();
+        const override_path: string = override_path_text.as_string();
         mangled_name::set_lsp_safe(true);
         ctx.lsp_override_path    = override_path;
         ctx.lsp_override_content = override_content;
-        mut config: ProjectConfig = ProjectConfig::parse(config_path);
+        mut config: ProjectConfig = ProjectConfig::parse(config_path_text);
         if (this.config.output_dir_override != ""
                 && this.config.output_dir_override.length() > 0) {
             config.output_dir = this.config.output_dir_override;
@@ -759,11 +768,12 @@ type struct CompilerInstance {
     /// Compile a multi-module project using whole-program multi-pass.
     /// Parses cryoconfig, discovers all modules, then runs each pipeline
     /// stage across ALL modules before advancing to the next stage.
-    compile_project(&this, config_path: string) -> CompilationResult {
+    compile_project(&this, config_path_text: Text) -> CompilationResult {
+        const config_path: string = config_path_text.as_string();
         LOG_DEBUG(LogComponent::General, "[Compiler] compile_project: %s", config_path);
 
         // Project configuration
-        mut config: ProjectConfig = ProjectConfig::parse(config_path);
+        mut config: ProjectConfig = ProjectConfig::parse(config_path_text);
         if (config.error_count > 0) {
             // ProjectConfig::parse already wrote diagnostics to stderr;
             // bail before any module discovery / codegen runs against
@@ -888,7 +898,7 @@ type struct CompilerInstance {
             if (r.output_path.length() > 0) { last_output = r.output_path; }
         }
 
-        return CompilationResult::ok(last_output);
+        return CompilationResult::ok(Text::new(last_output));
     }
 
     /// Union the import closure of the compiler-injected module `ns` into
@@ -1108,9 +1118,9 @@ type struct CompilerInstance {
         if (!config.no_std) {
             mut tried: string[] = [];
             stdlib_root = CompilerInstance::resolve_stdlib_root(
-                this.config.stdlib_path_override,
-                config.stdlib_root,
-                config.project_root,
+                Text::new(this.config.stdlib_path_override),
+                Text::new(config.stdlib_root),
+                Text::new(config.project_root),
                 &tried);
             if (stdlib_root.length() > 0) {
                 cdebug(Text::new("[Compiler] Stdlib root: %s\n"), stdlib_root);
@@ -1163,9 +1173,9 @@ type struct CompilerInstance {
         // to cryoconfig); we surface a hard error rather than dropping
         // dep roots and reporting confusing "namespace not found"
         // diagnostics later.
-        const lock_path: string = CompilerInstance::lock_path_for(config.project_root);
+        const lock_path: string = CompilerInstance::lock_path_for(Text::new(config.project_root));
         const dep_outcome: ResolveOutcome = DepResolver::resolve(
-            &config, ResolveMode::Build, lock_path);
+            &config, ResolveMode::Build, Text::new(lock_path));
         if (dep_outcome.failed) {
             return CompilationResult::failed(1, 0);
         }
@@ -1262,7 +1272,7 @@ type struct CompilerInstance {
         // system header or libclang upgrade silently changed the bound API).
         const used_locks: LockedVendor[] = loader.collect_vendor_locks();
         if (used_locks.length > 0) {
-            if (!CompilerInstance::sync_vendor_lock(lock_path, &used_locks, this.config.locked)) {
+            if (!CompilerInstance::sync_vendor_lock(Text::new(lock_path), &used_locks, this.config.locked)) {
                 // Only `--locked` returns false (a drift/missing-entry gate
                 // failure); the diagnostic was already printed.
                 return CompilationResult::failed(1, 0);
@@ -1372,7 +1382,7 @@ type struct CompilerInstance {
                 mci_info.origin_name = fpath.parent_dir().basename();
                 // Warnings pointing into a generated binding are not the
                 // consuming author's to act on; the sink drops them from here on.
-                ctx.diagnostics.mark_vendor_file(fpath);
+                ctx.diagnostics.mark_vendor_file(Text::new(fpath));
                 continue;
             }
             if (!config.no_std && stdlib_root.length() > 0
@@ -1624,8 +1634,8 @@ type struct CompilerInstance {
                 // freshness dependency names the archive that will actually
                 // be linked rather than a flat path another target may own.
                 manifest_stdlib_archive = CodegenPasses::stdlib_archive_path(
-                    stdlib_root,
-                    LTargetMachine::resolve_effective_triple(ctx.target_triple));
+                    Text::new(stdlib_root),
+                    Text::new(LTargetMachine::resolve_effective_triple(ctx.target_triple)));
             }
             // Final artifact path(s) this build will produce.  For
             // executables, require BOTH the hoisted build-root binary (index
@@ -1649,16 +1659,16 @@ type struct CompilerInstance {
                     TargetType::Stdlib => { "libcryo.a" }
                     _                  => { fmt::format("lib%s.a", config.project_name) }
                 };
-                manifest_artifacts.push(ctx.project_config.lib_archive_path(archive_name));
+                manifest_artifacts.push(ctx.project_config.lib_archive_path(Text::new(archive_name)));
             }
             const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
                 ctx.project_config, ctx.opt_level, ctx.emit_debug_info,
-                manifest_stdlib_archive);
+                Text::new(manifest_stdlib_archive));
             const build_fp: u128 = manifest.compute_fingerprint(&mod_entries);
             build_fp_hex = compiler::build_manifest::Manifest::hex128(build_fp);
 
             if (!this.config.emit_facts
-                    && manifest.is_up_to_date(build_fp_hex, &manifest_artifacts)) {
+                    && manifest.is_up_to_date(Text::new(build_fp_hex), &manifest_artifacts)) {
                 // Nothing changed and the artifact still exists: skip
                 // frontend, codegen, and linking entirely.
                 const up_to_date_out: string = if (config.requires_entry_point()) {
@@ -1667,7 +1677,7 @@ type struct CompilerInstance {
                     ""
                 };
                 fmt::println(f"{config.project_name} is up to date ({config.profile})");
-                mut utd_result: CompilationResult = CompilationResult::ok(up_to_date_out);
+                mut utd_result: CompilationResult = CompilationResult::ok(Text::new(up_to_date_out));
                 utd_result.stdlib_root = ctx.stdlib_root;
                 return utd_result;
             }
@@ -1757,7 +1767,7 @@ type struct CompilerInstance {
         if (this.config.emit_facts) {
             const facts_path: string = fmt::format("%s/%s.facts",
                 ctx.project_config.output_dir, ctx.project_config.project_name);
-            if (!CallFacts::write(ctx, facts_path)) {
+            if (!CallFacts::write(ctx, Text::new(facts_path))) {
                 fmt::eprintln(f"error: cannot write facts to {facts_path}");
                 return this.project_failure_release(ctx, ast_buf);
             }
@@ -1884,7 +1894,7 @@ type struct CompilerInstance {
             const pm_global: u128 = pm_global_h.finish128();
 
             const pm_prior: build_manifest::ModuleKeyTable =
-                compiler::build_manifest::ModuleKeyTable::read_module_keys(ctx.project_config.module_keys_path());
+                compiler::build_manifest::ModuleKeyTable::read_module_keys(Text::new(ctx.project_config.module_keys_path()));
 
             // Per-module key (indexed by module index, parallel arrays).
             // `pm_closure_ok` clears for any module whose import closure came
@@ -1962,7 +1972,7 @@ type struct CompilerInstance {
                     if (prior_k != pm_key_hex[m as i64]) { continue; }
                     const objp: string = fmt::format("%s/%s.o",
                         ctx.project_config.deps_dir_for(
-                            ModuleInfo::origin_subdir(mi.origin, mi.origin_name)),
+                            Text::new(ModuleInfo::origin_subdir(mi.origin, mi.origin_name))),
                         compiler::build_manifest::Manifest::path_module(ctx.intern_table.resolve(mi.name)));
                     if (metadata::exists(Path::from(objp))) {
                         pm_cached[m as i64] = true;
@@ -2246,7 +2256,7 @@ type struct CompilerInstance {
                 if (pm_active && pm_cached[order[i] as i64]) {
                     cg_obj[i as i64] = fmt::format("%s/%s.o",
                         ctx.project_config.deps_dir_for(
-                            ModuleInfo::origin_subdir(_mi.origin, _mi.origin_name)),
+                            Text::new(ModuleInfo::origin_subdir(_mi.origin, _mi.origin_name))),
                         compiler::build_manifest::Manifest::path_module(_mn));
                     cdebug(Text::new("[Compiler] Codegen: reused cached object %s\n"), cg_obj[i as i64]);
                     continue;
@@ -2318,8 +2328,8 @@ type struct CompilerInstance {
                     mut ir_dir: string = "build/target/release/local/ir";
                     if (ctx.project_config != null) {
                         ir_dir = ctx.project_config.ir_dir_for(
-                            ModuleInfo::origin_subdir(
-                                mod_info.origin, mod_info.origin_name));
+                            Text::new(ModuleInfo::origin_subdir(
+                                mod_info.origin, mod_info.origin_name)));
                     }
                     // IR (`.ll`) files mirror the module namespace as
                     // SUBDIRECTORIES under `ir/`, exactly like the object files
@@ -2329,7 +2339,7 @@ type struct CompilerInstance {
                     const ll_rel: string =
                         compiler::build_manifest::Manifest::path_module(mod_name);
                     const ll_path: string = fmt::format("%s/%s.ll", ir_dir, ll_rel);
-                    ProjectConfig::mkdir_p(ll_path.parent_dir());
+                    ProjectConfig::mkdir_p(Text::new(ll_path.parent_dir()));
                     mut ll_err: i8* = null;
                     const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
                         ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
@@ -2476,14 +2486,14 @@ type struct CompilerInstance {
             if (multiproc) {
                 mut mf_dir: string = "build";
                 if (ctx.project_config != null) {
-                    mf_dir = ctx.project_config.deps_dir_for("local");
+                    mf_dir = ctx.project_config.deps_dir_for(Text::new("local"));
                 }
-                ProjectConfig::mkdir_p(mf_dir);
+                ProjectConfig::mkdir_p(Text::new(mf_dir));
                 const manifest: string = fmt::format("%s/.cryo_emit_manifest.txt", mf_dir);
                 const mp_triple: string = CodegenPasses::effective_triple(ctx);
                 const emit_ok: boolean = CodegenPasses::run_multiprocess_emit(
-                    &mp_bc, &mp_obj, mp_triple, ctx.opt_level, cg_threads,
-                    self_exe, manifest);
+                    &mp_bc, &mp_obj, Text::new(mp_triple), ctx.opt_level, cg_threads,
+                    Text::new(self_exe), Text::new(manifest));
                 if (!emit_ok) { cg_failed = true; }
                 for (mut k: i64 = 0; k < mp_pos.length as i64; k++) {
                     if (metadata::exists(Path::from(mp_obj[k]))) {
@@ -2503,7 +2513,7 @@ type struct CompilerInstance {
             // regardless of the order objects finished emitting.
             for (mut i: u32 = 0; i < n; i++) {
                 if (cg_obj[i as i64].length() > 0) {
-                    ctx.artifacts.register_object_file(cg_obj[i as i64]);
+                    ctx.artifacts.register_object_file(Text::new(cg_obj[i as i64]));
                 }
             }
 
@@ -2581,10 +2591,10 @@ type struct CompilerInstance {
                     lib_objs.push(o);
                 }
                 const lib_archive: string = ctx.project_config.lib_archive_path(
-                    fmt::format("lib%s.a", config.bundle_lib_from_bin));
-                ProjectConfig::mkdir_p(ctx.project_config.output_dir);
+                    Text::new(fmt::format("lib%s.a", config.bundle_lib_from_bin)));
+                ProjectConfig::mkdir_p(Text::new(ctx.project_config.output_dir));
                 const bres: PassResult = CodegenPasses::bundle_object_list(
-                    ctx, lib_archive, &lib_objs);
+                    ctx, Text::new(lib_archive), &lib_objs);
                 if (!bres.success) {
                     fmt::eprintf("error: deriving %s from bin objects failed\n", lib_archive);
                 } else {
@@ -2701,9 +2711,9 @@ type struct CompilerInstance {
         if (do_incremental && ctx.project_config != null) {
             const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
                 ctx.project_config, ctx.opt_level, ctx.emit_debug_info,
-                manifest_stdlib_archive);
-            manifest.write_fingerprint(build_fp_hex);
-            manifest.write_manifest(&mod_entries, build_fp_hex, &manifest_artifacts);
+                Text::new(manifest_stdlib_archive));
+            manifest.write_fingerprint(Text::new(build_fp_hex));
+            manifest.write_manifest(&mod_entries, Text::new(build_fp_hex), &manifest_artifacts);
             // Per-module cache keys for the NEXT build to consult.  Written
             // whenever they were computed: every module not marked cached was
             // just recompiled, so its key now matches its on-disk .o.
@@ -2744,7 +2754,7 @@ type struct CompilerInstance {
             CompilerInstance::timing_fmt(Text::new("TOTAL"), total, total);
         }
 
-        mut ok_result: CompilationResult = CompilationResult::ok(exe_path);
+        mut ok_result: CompilationResult = CompilationResult::ok(Text::new(exe_path));
         ok_result.stdlib_root = ctx.stdlib_root;
         libc::free(ast_buf);
         return ok_result;
@@ -3316,10 +3326,13 @@ type struct CompilerInstance {
     }
 
 
-    static resolve_stdlib_root(cli_override: string,
-                                 cryoconfig_override: string,
-                                 project_root: string,
+    static resolve_stdlib_root(cli_override_text: Text,
+                                 cryoconfig_override_text: Text,
+                                 project_root_text: Text,
                                  tried_out: string[]*) -> string {
+        const cli_override: string = cli_override_text.as_string();
+        const cryoconfig_override: string = cryoconfig_override_text.as_string();
+        const project_root: string = project_root_text.as_string();
         // 0. CLI override.
         if (cli_override.length() > 0) {
             if (metadata::exists(Path::from(cli_override + "/lib.cryo"))) {
@@ -3457,7 +3470,8 @@ type struct CompilerInstance {
     }
 
     /// Path to the lockfile next to a given cryoconfig.
-    static lock_path_for(consumer_root: string) -> string {
+    static lock_path_for(consumer_root_text: Text) -> string {
+        const consumer_root: string = consumer_root_text.as_string();
         if (consumer_root.length() == 0 || consumer_root.eq(".")) {
             return "cryoconfig.lock";
         }
@@ -3473,8 +3487,9 @@ type struct CompilerInstance {
     ///     content hash drifted.  Returns true when every binding matches.
     /// The packages section is preserved because `read` loads it and `write`
     /// emits it back untouched.
-    static sync_vendor_lock(lock_path: string, used: &LockedVendor[], locked: boolean) -> boolean {
-        mut lock: Lockfile = Lockfile::read(lock_path);
+    static sync_vendor_lock(lock_path_text: Text, used: &LockedVendor[], locked: boolean) -> boolean {
+        const lock_path: string = lock_path_text.as_string();
+        mut lock: Lockfile = Lockfile::read(lock_path_text);
         mut changed: boolean = false;
         mut drift:   boolean = false;
         for (mut i: i64 = 0; i < used.length; i++) {
@@ -3517,7 +3532,7 @@ type struct CompilerInstance {
         if (locked) {
             return !drift;
         }
-        if (changed && !Lockfile::write(lock_path, &lock)) {
+        if (changed && !Lockfile::write(lock_path_text, &lock)) {
             fmt::eprintf("warning: could not write vendor pins to %s\n", lock_path);
         }
         return true;
