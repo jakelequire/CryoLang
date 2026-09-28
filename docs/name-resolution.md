@@ -410,7 +410,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: facts-check lane-check lane-selftest facts-selftest' Makefile` → **1** (§8.371: stale facts are REFUSED first, never regenerated - the facts target is the deliberate refresh - and the refusal's self-test runs; `facts-fresh`, which regenerated them, before, §8.366)
 * `python3 scripts/facts-selftest.py | tail -1 | grep -o '[0-9]* cases' | cut -d' ' -f1` → **12** (§8.371: the freshness check over a throwaway tree - an edited source, an added source and a missing inputs record refused, fresh facts and a non-source edit accepted, each through `facts.py --check` and through `facts_path`, which the lane gate and the residue check call - and a dry run of the lane-check and check-fast targets building nothing; with the staleness comparison deleted it fails 4 cases, with `lane-check` depending on `facts` it fails 2)
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **91** (+3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **93** (+2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)* `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -48344,3 +48344,74 @@ Scripts: `retype.py` +1 (`Keyword` in its table), `mk_slice.py` two slices,
 `invert.sh` modes D-F. Gate cycles: 4 checks (one wasted on the pre-fix
 compiler, above), 1 cross full build, 1 editor build, 1 clean build, 1
 facts, 1 check-fast, 4 inversion checks, 1 verify.
+
+### 8.394 A lint level takes a `reason`, and allowing `lookup_by_spelling` requires one; the lint itself follows a re-pin (D52-D55) - 2026-09-28
+
+## What changed
+
+`![allow(..)]`, `![warn(..)]` and `![deny(..)]` parsed a `key = value`
+argument already, and refused it: they took identifiers only. They now take
+lint names and at most one `reason = "..."`, a non-empty string literal.
+Allowing `lookup_by_spelling` - the lint condition two asks for, ruled
+D52-D55 - needs that reason and a function or method to sit on:
+
+```cryo
+![allow(lookup_by_spelling, reason = "the parser hands this a bare leaf; no identity exists yet")]
+function find_leaf(name: SymbolStr) -> Decl { ... }        // accepted
+
+![allow(lookup_by_spelling)]                               // E0152: needs a reason
+![allow(lookup_by_spelling, reason = "   ")]               // E0152 at the reason: empty
+![allow(lookup_by_spelling, reasn = "x")]                  // E0152: unknown key (once)
+![allow(lookup_by_spelling, reason = 42)]                  // E0152: not a string literal
+![warn(lookup_by_spelling)]                                // E0152: no warning level
+![allow(lookup_by_spelling, reason = "x")] type struct S   // E0151: function or method only
+```
+
+Every refusal is E0152 (or E0151 for the placement), as D54 rules; the
+wording is mine. A type- or module-wide allow is refused because it would
+cover declarations written after it, which never had a reason of their own;
+`warn` is refused because it lowers the level without one. Both are my
+choices, not rulings.
+
+## Why a commit of its own
+
+The lint refuses every declaration in the compiler that takes a spelling
+type, 527 of them, and landing it without writing 527 reasons means marking
+those declarations with an allow - in `reason = ...` form. The pinned
+compiler that builds the compiler is the previous one, which refuses that
+form (measured: `make cryo` over the marked tree, 488 errors, each
+"directive `![allow]`: argument 2 must be an identifier"). So this syntax
+lands first, the pins are refreshed from it, and the lint and the marks land
+after, as the turbofish did (`3ab83793`).
+
+## Proof
+
+Two projects, each failing on the parent compiler and passing on this one
+(declared in `tests/started-passing`):
+
+* `spelling_lint_empty_reason` - parent: "E0152: directive `![allow]`:
+  argument 2 must be an identifier" at 10:1, the right code for the wrong
+  cause, which the project's `output_excludes` refuses; now: "E0152:
+  directive `![allow]`: `reason` is empty; say why the lint does not apply
+  here" at `src/main.cryo:10:29`.
+* `spelling_lint_missing_reason` - parent: built, and returned 3; now:
+  "E0152: `![allow(lookup_by_spelling)]` needs a reason: write `reason =
+  "..."` saying why this takes a spelling rather than an identity" at
+  `src/main.cryo:9:1`.
+
+## Counts
+
+* Name-taking 716, unchanged, as predicted: the one new helper,
+  `emit_bad_arg`, takes its message as `Text`.
+* Warnings (clean build) 344, the same set.
+* Test projects 91 -> 93. Roster merged (+2).
+* Lane, residue: unchanged.
+* Objects: 0 of 3,515 test objects and 0 of 1,126 example objects moved
+  (`make verify ARGS="--baseline HEAD --require-identical"`, OK in 256 s;
+  the two projects: baseline exit 1 and 0, tree exit 1 - the census
+  checks the message).
+
+## Blast radius
+
+`compiler/src/compiler/passes/directive_processing.cryo` +72 / -3. Gate
+cycles: 1 clean build, 1 facts, 1 check-fast, 1 verify.

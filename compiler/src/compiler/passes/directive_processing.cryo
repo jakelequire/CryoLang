@@ -30,7 +30,10 @@
 ///                                 evaluated by ConfigGating; <atom> is
 ///                                 windows / linux / macos / unix or
 ///                                 `not(<atom>)`.
-///   ![allow(name)] / ![warn(name)] / ![deny(name)] : lint level
+///   ![allow(name)] / ![warn(name)] / ![deny(name)] : lint level; each
+///                                 takes an optional `reason = "..."`
+///   ![allow(lookup_by_spelling, reason = "...")] : function / method: a
+///                                 lowered lint level takes a reason
 ///   ![derive(Trait, ...)]     : struct/class/enum: traits to auto-derive
 ///
 /// Unknown directive names are accepted and recorded but otherwise inert.
@@ -75,6 +78,11 @@ import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ ClassType, EnumType, StructType };
 import utils::text::{ Text };
+
+/// The lint that refuses a declaration taking one of the compiler's spelling
+/// types unless an `![allow(lookup_by_spelling, reason = "...")]` on it says
+/// why.
+const LOOKUP_BY_SPELLING: string = "lookup_by_spelling";
 
 
 // DirectiveRecord: one observed directive
@@ -720,16 +728,71 @@ type struct DirectiveProcessingPasses {
                 }
             }
 
+            // `![allow(lint, ..., reason = "...")]`: lint names, and at most
+            // one `reason`, a non-empty string literal.  `lookup_by_spelling`
+            // is denied unless allowed, and allowing it takes a reason and a
+            // function or method: a wider allow would cover declarations
+            // written after it, which never had a reason of their own.
             "allow" | "warn" | "deny" => {
                 if (argc == 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
                     return;
                 }
+                mut names_spelling_lint: boolean = false;
+                mut lint_names: i64 = 0;
+                mut reasons: i64 = 0;
+                mut bad_args: i64 = 0;
                 for (mut i: i64 = 0; i < argc; i++) {
                     const a: DirectiveArg = dir.args[i];
-                    if (a.kind != DirectiveArgKind::Ident) {
-                        DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, i, "an identifier");
+                    if (a.kind == DirectiveArgKind::Ident) {
+                        lint_names += 1;
+                        if (a.name.eq(LOOKUP_BY_SPELLING)) {
+                            names_spelling_lint = true;
+                        }
+                    } else if (a.kind == DirectiveArgKind::KeyValue && a.name.eq("reason")) {
+                        reasons += 1;
+                        if (a.value_kind != DirectiveArgKind::StringLit) {
+                            DirectiveProcessingPasses::emit_bad_arg(ctx, a.span, Text::new(fmt::format(
+                                "directive `![%s]`: `reason` must be a string literal", name)));
+                        } else if (a.str_value.trim().length() == 0) {
+                            DirectiveProcessingPasses::emit_bad_arg(ctx, a.span, Text::new(fmt::format(
+                                "directive `![%s]`: `reason` is empty; say why the lint does not apply here",
+                                name)));
+                        }
+                    } else if (a.kind == DirectiveArgKind::KeyValue) {
+                        bad_args += 1;
+                        DirectiveProcessingPasses::emit_bad_arg(ctx, a.span, Text::new(fmt::format(
+                            "directive `![%s]`: unknown key `%s` (the only key is `reason`)",
+                            name, a.name)));
+                    } else {
+                        bad_args += 1;
+                        DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, i,
+                            "a lint name or `reason = \"...\"`");
                     }
+                }
+                if (lint_names == 0) {
+                    DirectiveProcessingPasses::emit_bad_arg(ctx, dir.span, Text::new(fmt::format(
+                        "directive `![%s]` names no lint", name)));
+                }
+                if (reasons > 1) {
+                    DirectiveProcessingPasses::emit_bad_arg(ctx, dir.span, Text::new(fmt::format(
+                        "directive `![%s]` carries %lld reasons; write one", name, reasons)));
+                }
+                if (!names_spelling_lint) { return; }
+                if (name.eq("warn")) {
+                    DirectiveProcessingPasses::emit_bad_arg(ctx, dir.span, Text::new(
+                        "`lookup_by_spelling` has no warning level: it is denied, or allowed with a reason"));
+                    return;
+                }
+                if (!name.eq("allow")) { return; }
+                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function or method", target);
+                }
+                // A misspelt key is already refused; saying the reason is also
+                // missing would report one mistake twice.
+                if (reasons == 0 && bad_args == 0) {
+                    DirectiveProcessingPasses::emit_bad_arg(ctx, dir.span, Text::new(
+                        "`![allow(lookup_by_spelling)]` needs a reason: write `reason = \"...\"` saying why this takes a spelling rather than an identity"));
                 }
             }
 
@@ -1333,6 +1396,12 @@ type struct DirectiveProcessingPasses {
         diag = diag.suggest(Suggestion::machine_applicable(
             dir.span, Text::new(""),
             Text::new(fmt::format("remove the misplaced `![%s]` directive", name))));
+        ctx.emit_diagnostic(diag);
+    }
+
+    static emit_bad_arg(ctx: CompilationContext*, span: SourceSpan, msg: Text) -> void {
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0152_DIRECTIVE_BAD_ARG, msg);
+        diag = diag.at(span);
         ctx.emit_diagnostic(diag);
     }
 
