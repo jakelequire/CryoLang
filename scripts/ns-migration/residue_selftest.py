@@ -31,9 +31,10 @@ classifier - and each mutation moves one of them while the other two stand:
     through `intern`; a local initialised by one; a non-string literal; no
     key), and a site override on a literal site refused.
 
-Which types hold declarations is placement, read from a source tree: the
-lane gate's own fixture (scripts/lane-gate-selftest.py's FILES, every store
-with its map, a stub per exclusion).  The facts are written here, in the
+Which types hold declarations is placement, read from the compiler's
+declaration records over a tree: the lane gate's own fixture
+(scripts/lane-gate-selftest.py's FILES and DECL_FACTS, every store with its
+map, a stub per exclusion).  The call facts are written here, in the
 compiler's record format, naming methods the real classifier classifies.
 
 Usage:
@@ -102,7 +103,7 @@ BASE = [
     rec("arg", "compiler/sema/sema.cryo", 10, door(REGISTRY, "find_trait_defining_method", ret=SYM)),
     rec("arg", "compiler/sema/type_utils.cryo", 40, door(INDEX, "lookup_type")),
     rec("arg", "compiler/sema/sema.cryo", 20, EQUALS, recv=LOCAL_METHOD, depth=1),
-]
+] + LANE.DECL_FACTS
 BASE_SITES = 6
 BASE_CLASSES = {"S": 2, "N": 1, "J": 2}
 BASE_CLASSES[rc.CLASS_OF_METHOD["local::MethodNode[]"][0]] = \

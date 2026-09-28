@@ -79,25 +79,17 @@ def load_gate():
 
 def read_methods(gate, tree, type_name, defn):
     """{name} of `type_name`'s methods that take a key type as a PARAMETER
-    and are reads (not `mut &this`), as the declarations state them."""
+    and are reads (not `mut &this`), as the compiler's declaration records
+    state them."""
     taking = gate.name_taking_methods(tree, type_name)
-    kinds = {}
-    head_re = re.compile(r"^type\s+(?:struct|class|union|enum)\s+%s\b" % re.escape(type_name))
-    for rel in tree.rels:
-        lines = tree.files[rel]
-        for i, line in enumerate(lines):
-            code = gate.strip_comment(line)
-            m = gate.INHERENT_IMPL_RE.match(code)
-            if head_re.match(code) is None and (m is None or m.group(1) != type_name):
-                continue
-            kinds.update(gate.block_methods(lines, i))
+    kinds = tree.method_kinds.get(type_name, {})
     return {n for n in taking if kinds.get(n) in ("read", "static")}
 
 
-def placement(gate, src):
+def placement(gate, src, facts):
     """The holders and their declaring files, each holder's read methods as
     declared, and the tree the placement read."""
-    tree = gate.Tree(src)
+    tree = gate.Tree(src, facts)
     gate.place_map_owners(tree)
     gate.place_array_owners(tree)
     holders = {name: st.defn for name, st in gate.STORES.items()}
@@ -149,7 +141,7 @@ def split_callee(text):
 
 def population(gate, src, facts):
     """The population from the facts at `facts`: (rows, sets)."""
-    tree, holders, sets = placement(gate, src)
+    tree, holders, sets = placement(gate, src, facts)
     by_lower = {rel.lower(): rel for rel in tree.rels}
 
     def tree_rel(path):

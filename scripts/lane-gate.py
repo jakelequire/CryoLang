@@ -19,10 +19,12 @@ Each count is broken down per file so a failure names what moved.
 
 THREE RULES, EACH DERIVED FROM A DEFINITION, NONE FROM A LIST OF NAMES.
 
-  1. WHICH TYPES ARE STORES.  A store is a type that OWNS A MAP: any `type`
-     block in the tree with a field of the tree's one map type, `HashMap<K,
-     V>` (or `HashSet<T>`, its set form; none today), read from the tree on
-     every run.  The key type is not consulted: no map in this tree is
+  1. WHICH TYPES ARE STORES.  A store is a type that OWNS A MAP: any type
+     the tree declares with a field of the tree's one map type, `HashMap<K,
+     V>` (or `HashSet<T>`, its set form; none today), as the compiler's
+     declaration records report each field's resolved type - so a qualified
+     spelling, an alias and a field declared past a brace inside a character
+     literal are the field they are.  The key type is not consulted: no map in this tree is
      declared `HashMap<SymbolStr, ...>` - a name keys a map by its interned
      id, `u32`, and a `u64` is two of them packed, a type id or a source
      position - so the key's spelling cannot tell a name-keyed table from a
@@ -184,12 +186,15 @@ WHAT THE COUNT READS
 The calls come from the compiler's facts for the compiler project, so the
 gate needs a built compiler and fresh facts (`make facts`; `check-fast`
 refreshes them when stale, and a missing or stale file is refused).  So do
-the inline scans rule 1c places.  What stays read from the tree's
-declarations is what is ABOUT declarations, which the facts - a record per
-call and per comparison - do not carry: which types own a map or an array
-of names (rules 1 and 1b), the file a scanned array's owner is declared in
-and the class that declares an inherited array (rule 1c's placement), and
-whether an identity type's construction is sealed.
+the inline scans rule 1c places, and what is ABOUT declarations: the same
+facts carry a record per type, field, function and parameter, from which
+the gate reads which types own a map or an array of names and which of
+their methods take a name (rules 1 and 1b), the file a scanned array's
+owner is declared in and the class that declares an inherited array (rule
+1c's placement), and whether an identity type's construction is sealed.
+The tree itself is read only for which files exist.  A declaration the
+host's configuration prunes (`![config(linux)]` on Windows) has no record,
+so the gate sees the host's half of the tree.
 
 The facts are what THIS HOST compiled: code gated to another operating
 system (`![target(...)]`) is not in them.  The golden has no per-host
@@ -269,7 +274,6 @@ LOOKUPS = (
 # whether a door taking one leaves D32's population is a ruling, not a
 # side effect of the rename.
 KEY_TYPES = ("SymbolStr", "string", "ModulePath")
-KEY_RE = re.compile(r"\b(?:%s)\b" % "|".join(KEY_TYPES))
 
 
 class Store(object):
@@ -845,68 +849,6 @@ KINDS = ("LOOKUP", "LOOKUP_OTHER", "REGISTER", "LOOKUP_ROUTED", "LOOKUP_LOCAL",
          "REENTRY", "HOME_WRITE", "DEFID_PATH")
 
 
-def strip_comment(line):
-    """Drop a `//` comment tail, so a declaration or a scan named only in
-    prose is not read.
-
-    Naive about `//` inside a string literal: the line is cut there, and
-    whatever follows it on the line is not read - silently.  That is how a
-    call after `"a//b"` went uncounted when calls were read from source.
-    """
-    cut = line.find("//")
-    return line if cut < 0 else line[:cut]
-
-
-STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
-METHOD_HEAD_RE = re.compile(r"^    (static\s+)?([a-z_][a-z_0-9]*)\s*(?:<[^>]*>)?\s*\(")
-TYPE_HEAD_RE = re.compile(r"^type\s+(?:struct|class|union|enum)\s+([A-Za-z_][A-Za-z_0-9]*)")
-CLASS_BASE_RE = re.compile(r"^type\s+class\s+([A-Za-z_][A-Za-z_0-9]*)\s*(?:<[^>]*>)?\s*:\s*([A-Za-z_][A-Za-z_0-9]*)")
-# `implement<T> struct Foo<T> {` / `implement Foo {` / `implement trait Tr for Foo {`:
-# `this` inside the block is the type after `for` if there is one, else the
-# target.  A trait impl's methods belong to the target too, but a trait
-# method's signature is the trait's and is not a store's own surface, so only
-# the inherent form contributes to a set (see store_methods).
-IMPL_HEAD_RE = re.compile(
-    r"^implement(?:\s*<[^>]*>)?\s+(?:trait\s+[^\s{]+\s+for\s+)?"
-    r"(?:(?:struct|class|union|enum)\s+)?([A-Za-z_][A-Za-z_0-9]*)")
-INHERENT_IMPL_RE = re.compile(
-    r"^implement(?:\s*<[^>]*>)?\s+(?:(?:struct|class|union|enum)\s+)?"
-    r"([A-Za-z_][A-Za-z_0-9]*)(?:\s*<[^>]*>)?\s*\{")
-FIELD_RE = re.compile(r"^    ([a-z_][a-z_0-9]*)\s*:\s*&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*([A-Za-z_][A-Za-z_0-9]*)")
-# A field whose type is the tree's map type (or its set form), qualified or
-# not: `name_index: HashMap<u32, i64>;`, `commands: hashmap::HashMap<string,
-# Command>;`.  Rule 1's candidate test.  The key is captured for `--names`
-# and for nothing else.
-MAP_FIELD_RE = re.compile(
-    r"^    (?:public\s+|private\s+)?([a-z_][a-z_0-9]*)\s*:\s*"
-    r"(?:[a-z_][a-z_0-9]*::)*(HashMap|HashSet)\s*<\s*([^,>]+)")
-# A field that is an ARRAY OF NAMES: `param_names: SymbolStr[];`, `parts:
-# string[];`, or an array of pairs headed by a name (`Pair<SymbolStr, TypeRef>[]`,
-# the shape a linear name-keyed table takes when it stores an answer beside
-# each name).  Rule 1b's candidate test: a name-keyed table needs no map - a
-# linear search over an array of names answers the same question - and a
-# type that owns one AND declares a method taking a name is where such a
-# table is asked.  Every such type is placed, as rule 1's map owners are.
-NAME_ARRAY_RE = re.compile(
-    r"^    (?:public\s+|private\s+)?([a-z_][a-z_0-9]*)\s*:\s*"
-    r"((?:[a-z_][a-z_0-9]*::)*(?:SymbolStr|string)|(?:[a-z_][a-z_0-9]*::)*Pair\s*<\s*(?:SymbolStr|string)\s*,[^;]*>)"
-    r"\s*\[\]\s*;")
-# A field that is an ARRAY OF RECORDS, `fields: FieldInfo[];`, `assoc_types:
-# AssocTypeDeclNode*[];`: a candidate when the record is a type declared in
-# the tree with a key-typed field of its own, because `if (rows[i].name.equals(n))`
-# over such an array is the same table as an array of names with the answer
-# stored beside each - the shape `StructType`, `ClassType` and `EnumType`
-# keep their members in, invisible to the name-array test above.  The
-# element is resolved against the tree after every file is read, so the
-# record may be declared anywhere.
-RECORD_ARRAY_RE = re.compile(
-    r"^    (?:public\s+|private\s+)?([a-z_][a-z_0-9]*)\s*:\s*"
-    r"(?:[a-z_][a-z_0-9]*::)*([A-Z][A-Za-z_0-9]*)\s*\*?\s*\[\]\s*;")
-# A key type in PARAMETER position: `name: SymbolStr`, `s: string`, `&SymbolStr`,
-# never `SymbolStr[]` (an array handed in is a table, not a key).  Rule 1b's
-# signature test, the half of rule 2's that says "the caller hands a name in".
-KEY_PARAM_RE = re.compile(r":\s*&?\s*(?:mut\s+)?(?:[a-z_][a-z_0-9]*::)*(?:%s)\b(?!\s*\[)"
-                          % "|".join(KEY_TYPES))
 # Rule 1c's receiver: segments joined by `.`, each an identifier optionally
 # followed by `()` (a zero-argument accessor, placed by its declared return
 # type) or `[...]` (an index, placed by the element type).
@@ -1124,89 +1066,169 @@ def place_inline_scans(tree, facts):
     return scans
 
 
-class Tree(object):
-    """Every .cryo file under `src`, read once, with what placement needs
-    from declarations: each declared type's fields by name, the files it is declared
-    in, and each class's base."""
+def short_type(text):
+    """The declared name a rendered type is spelled by - its path's last
+    segment, with any reference, pointer, array and generic arguments
+    stripped: `&compiler::ast::node::ASTNode*[]` is `ASTNode`,
+    `std::collections::hashmap::HashMap<u32, i64, ...>` is `HashMap`."""
+    head = text.lstrip("&").split("<", 1)[0]
+    return head.rstrip("*[] ").rsplit("::", 1)[-1]
 
-    def __init__(self, src):
+
+def written_type(text):
+    """A rendered type with every path shortened to its last segment and no
+    spaces, as a listing names it: `Pair<SymbolStr,TypeRef>`."""
+    return re.sub(r"(?:[A-Za-z_][A-Za-z_0-9]*::)+", "", text).replace(" ", "")
+
+
+def generic_args(text):
+    """The top-level generic arguments of a rendered type, or []."""
+    if "<" not in text:
+        return []
+    inner = text[text.index("<") + 1:text.rindex(">")]
+    args, depth, cur = [], 0, ""
+    for ch in inner:
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+        if ch == "," and depth == 0:
+            args.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    args.append(cur.strip())
+    return args
+
+
+def receiver_of(role, symbol):
+    """How a declared method takes its receiver: a STATIC by its role; a
+    method whose linker symbol opens its parameters with `$m` takes `mut
+    &this`, a WRITE (docs/cryo-mangling-spec.md); any other receiver is a
+    READ."""
+    if role == "static":
+        return "static"
+    params = symbol.split("$F", 1)[1] if "$F" in symbol else ""
+    return "write" if params.startswith("$m") else "read"
+
+
+class Tree(object):
+    """What placement needs from the tree's declarations, as the compiler
+    reports them: the `type`, `field`, `fn` and `param` records
+    `cryo build --emit=facts` writes for every declaration under `src`
+    (`sema/call_facts.cryo`'s header).  Each declared type's fields by name,
+    the files it is declared in, each class's base, and the populations
+    rules 1 and 1b place.  A type is named by its path's last segment, as
+    the tables name it.
+
+    The compiler answers what each field's and parameter's type IS - an
+    alias, a qualified spelling, a wrapped signature and a member added in
+    an `implement` block in another file are the one declaration they
+    resolve to - so no rule here reads a declaration's text."""
+
+    def __init__(self, src, facts):
         self.src = src
-        self.files = {}
+        self.files = set()
+        for dirpath, _dirs, names in os.walk(src):
+            for fname in names:
+                if fname.endswith(".cryo"):
+                    full = os.path.join(dirpath, fname)
+                    self.files.add(os.path.relpath(full, src).replace(os.sep, "/"))
+        self.rels = sorted(self.files)
+        by_lower = {rel.lower(): rel for rel in self.rels}
         self.fields = {}
-        # {type_name: {relpath}}: the files a `type` block of the name is in.
+        # {type_name: {field: key}}: the key each field's type carries, `-`
+        # for none, for the record test.
+        self.field_keys = {}
+        # {type_name: {relpath}}: the files the compiler declares a struct,
+        # class, union or enum of the name in.
         self.declared_in = {}
-        # {type_name: [(relpath, field, key_type)]}: every map-owning type
-        # block, with the file it was found in.  A type declared in two files
-        # keeps both, and rule 1 refuses it.
+        # {type_name: [(relpath, field, map kind, key type)]}: every type
+        # with a field of the tree's map type or its set form.  A type
+        # declared in two files keeps both, and rule 1 refuses it.
         self.map_owners = {}
-        # {type_name: [(relpath, field, element)]}: every type block owning
-        # an array of names, rule 1b's candidates before the signature test.
+        # {type_name: [(relpath, field, element)]}: every type with a field
+        # that is an array of names, rule 1b's candidates before the
+        # signature test.
         self.array_owners = {}
-        # {type_name: [(relpath, field, element)]}: every type block owning
-        # an array of some declared type; `record_owners` keeps the ones
-        # whose element carries a key-typed field, once the tree is read.
+        # {type_name: [(relpath, field, element)]}: every type with a field
+        # that is an array of some named type or of pointers to one;
+        # `record_owners` keeps the ones whose element carries a key.
         self.typed_arrays = {}
         # {class_name: base_name}: a class's base, so a field the compiler
         # reports on the receiver's type is named by the class declaring it.
         self.bases = {}
-        for dirpath, _dirs, names in os.walk(src):
-            for fname in sorted(names):
-                if not fname.endswith(".cryo"):
+        # {type_name: {method: [param (type, key)]}}: each method and static
+        # declared on the type - in its own block or an inherent `implement`
+        # block, never a trait's impl, whose signature is the trait's.
+        self.methods = {}
+        # {type_name: {method: "read" | "write" | "static"}}: how each method
+        # takes its receiver, as its linker symbol encodes it.
+        self.method_kinds = {}
+        require_facts(facts)
+        records = []
+        rel_of_type = {}
+        with open(facts, encoding="utf-8") as fh:
+            for line in fh:
+                f = line.rstrip("\n").split("\t")
+                if len(f) != 15 or f[0] not in ("type", "field", "fn", "param"):
                     continue
-                full = os.path.join(dirpath, fname)
-                rel = os.path.relpath(full, src).replace(os.sep, "/")
-                with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                    lines = fh.read().split("\n")
-                self.files[rel] = lines
-                self.scan_blocks(lines, rel)
-        self.rels = sorted(self.files)
+                if not f[1].startswith("src/"):
+                    continue
+                rel = by_lower.get(f[1][len("src/"):].lower())
+                if rel is None:
+                    raise SystemExit("lane-gate: the facts declare in %s, which is not under %s; "
+                                     "run `make facts`" % (f[1], src))
+                records.append((rel, f))
+                if f[0] == "type" and f[7] in ("struct", "class", "union", "enum"):
+                    name = short_type(f[12])
+                    rel_of_type[f[12]] = rel
+                    self.declared_in.setdefault(name, set()).add(rel)
+                    self.fields.setdefault(name, {})
+                    if f[5] not in ("-", "?"):
+                        self.bases[name] = short_type(f[5])
+        methods, roles = {}, {}
+        for rel, f in records:
+            owner = short_type(f[12])
+            if f[0] == "field":
+                if f[12] not in rel_of_type:
+                    continue
+                rel = rel_of_type[f[12]]
+                field, ty = f[13], f[5]
+                self.fields.setdefault(owner, {})[field] = short_type(ty)
+                self.field_keys.setdefault(owner, {})[field] = f[9]
+                if short_type(ty) in ("HashMap", "HashSet"):
+                    args = generic_args(ty)
+                    self.map_owners.setdefault(owner, []).append(
+                        (rel, field, short_type(ty), written_type(args[0]) if args else "?"))
+                if ty.endswith("[]"):
+                    elem = ty[:-2]
+                    if Tree.names_array(elem):
+                        self.array_owners.setdefault(owner, []).append((rel, field, written_type(elem)))
+                    elif "<" not in elem and short_type(elem)[:1].isupper() and not elem.endswith("**"):
+                        self.typed_arrays.setdefault(owner, []).append((rel, field, short_type(elem)))
+            elif f[0] == "fn" and f[7] in ("method", "static") and not f[8].startswith("C$tr$"):
+                methods.setdefault((f[12], f[13], f[8]), [])
+                roles[(f[12], f[13], f[8])] = f[7]
+            elif f[0] == "param" and f[7] in ("method", "static") and not f[8].startswith("C$tr$"):
+                methods.setdefault((f[12], f[13].split(":", 1)[0], f[8]), []).append((f[5], f[9]))
+        for (path, name, symbol), params in methods.items():
+            self.methods.setdefault(short_type(path), {}).setdefault(name, []).extend(params)
+            self.method_kinds.setdefault(short_type(path), {})[name] = receiver_of(
+                roles.get((path, name, symbol), "method"), symbol)
 
-    def scan_blocks(self, lines, rel):
-        """[(first_line_index, type_name)] for every top-level type or impl
-        block, in order; fills `fields` and `declared_in` for `type` blocks,
-        `bases` for a class with a base, and `map_owners` for the `type`
-        blocks with a map field."""
-        heads = []
-        current = None
-        depth = 0
-        for i, raw in enumerate(lines):
-            code = STRING_RE.sub('""', strip_comment(raw))
-            m = TYPE_HEAD_RE.match(code)
-            if m is None:
-                m = IMPL_HEAD_RE.match(code)
-            if m is not None and depth == 0:
-                current = m.group(1)
-                heads.append((i, current))
-                self.fields.setdefault(current, {})
-                is_type = TYPE_HEAD_RE.match(code) is not None
-                if is_type:
-                    self.declared_in.setdefault(current, set()).add(rel)
-                mb = CLASS_BASE_RE.match(code)
-                if mb is not None:
-                    self.bases[mb.group(1)] = mb.group(2)
-            elif current is not None and depth == 1:
-                if METHOD_HEAD_RE.match(code) is None and is_type:
-                    f = FIELD_RE.match(code)
-                    if f is not None:
-                        self.fields[current][f.group(1)] = f.group(2)
-                    mf = MAP_FIELD_RE.match(code)
-                    if mf is not None:
-                        self.map_owners.setdefault(current, []).append(
-                            (rel, mf.group(1), mf.group(2), mf.group(3).strip()))
-                    na = NAME_ARRAY_RE.match(code)
-                    if na is not None:
-                        self.array_owners.setdefault(current, []).append(
-                            (rel, na.group(1), re.sub(r"\s+", "", na.group(2))))
-                    ra = RECORD_ARRAY_RE.match(code)
-                    if ra is not None:
-                        self.typed_arrays.setdefault(current, []).append(
-                            (rel, ra.group(1), ra.group(2)))
-            for ch in code:
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-        return heads
+    @staticmethod
+    def names_array(elem):
+        """Whether an array's element is a name - a `string` or a
+        `SymbolStr` - or a pair headed by one, the shape a linear name-keyed
+        table takes when it stores an answer beside each name."""
+        if elem.endswith("*"):
+            return False
+        if elem == "string" or ("<" not in elem and short_type(elem) == "SymbolStr"):
+            return True
+        args = generic_args(elem)
+        return short_type(elem) == "Pair" and bool(args) and (
+            args[0] == "string" or short_type(args[0]) == "SymbolStr")
 
     def declaring_type(self, owner, field):
         """The class along `owner`'s bases that declares `field`; `owner`
@@ -1221,58 +1243,15 @@ class Tree(object):
 
     def record_owners(self):
         """{type_name: [(relpath, field, element)]}: the typed arrays whose
-        element is a type this tree declares with a field of a key type -
+        element is a type this tree declares with a field carrying a key -
         a record with a spelling in it, so an array of them is a table the
         owner can search by that spelling."""
         out = {}
         for owner, arrays in self.typed_arrays.items():
             for rel, field, elem in arrays:
-                if any(ty in KEY_TYPES for ty in self.fields.get(elem, {}).values()):
+                if any(k in KEY_TYPES for k in self.field_keys.get(elem, {}).values()):
                     out.setdefault(owner, []).append((rel, field, elem))
         return out
-
-
-def block_methods(lines, start):
-    """{name: "read" | "write" | "static"} for every method declared at depth
-    1 of the block opening at `start` whose head mentions a KEY TYPE.
-
-    The head is everything from the method's name to the `{` that opens its
-    body, joined across lines.  A method is a WRITE when its receiver is
-    `mut &this`, STATIC when it has none, and a READ otherwise.
-    """
-    found = {}
-    depth = 0
-    entered = False
-    i = start
-    while i < len(lines):
-        code = STRING_RE.sub('""', strip_comment(lines[i]))
-        m = METHOD_HEAD_RE.match(code)
-        if m and depth == 1:
-            head = code
-            j = i
-            while "{" not in head or head.count("(") > head.count(")"):
-                j += 1
-                if j == len(lines):
-                    raise SystemExit("lane-gate: unterminated method head at line %d" % (i + 1))
-                head += " " + STRING_RE.sub('""', strip_comment(lines[j])).strip()
-            head = head[:head.index("{")]
-            if KEY_RE.search(head):
-                if m.group(1):
-                    found[m.group(2)] = "static"
-                elif "mut &this" in head:
-                    found[m.group(2)] = "write"
-                else:
-                    found[m.group(2)] = "read"
-        for ch in code:
-            if ch == "{":
-                depth += 1
-                entered = True
-            elif ch == "}":
-                depth -= 1
-        if entered and depth == 0:
-            break
-        i += 1
-    return found
 
 
 def place_map_owners(tree):
@@ -1326,43 +1305,17 @@ def place_map_owners(tree):
 
 
 def name_taking_methods(tree, type_name):
-    """Rule 1b's signature test for one type: the names of the methods
-    declared at depth 1 of its `type` block(s) and of every inherent
-    `implement` block naming it, whose head takes a KEY TYPE as a parameter.
-    A trait impl's methods are the trait's signature, not the type's own
-    surface, and are not read (as `store_methods` has it)."""
+    """Rule 1b's signature test for one type: the names of its methods and
+    statics - declared in its own block or in an inherent `implement` block
+    in any file, as the compiler records them - with a parameter whose type
+    carries a KEY TYPE by value or by reference.  An array of keys handed in
+    is a table, not a key.  A constructor builds the table rather than
+    asking it, and a trait impl's method has the trait's signature, not the
+    type's own surface (as `store_methods` has it); neither is read."""
     found = set()
-    type_re = re.compile(r"^type\s+(?:struct|class|union|enum)\s+%s\b" % re.escape(type_name))
-    for rel in tree.rels:
-        lines = tree.files[rel]
-        for i, line in enumerate(lines):
-            code = strip_comment(line)
-            m = INHERENT_IMPL_RE.match(code)
-            if type_re.match(code) is None and (m is None or m.group(1) != type_name):
-                continue
-            depth = 0
-            j = i
-            while j < len(lines):
-                c = STRING_RE.sub('""', strip_comment(lines[j]))
-                if depth == 1:
-                    mh = METHOD_HEAD_RE.match(c)
-                    if mh is not None:
-                        head = c
-                        k = j
-                        while ")" not in head and k + 1 < len(lines):
-                            k += 1
-                            head += " " + STRING_RE.sub('""', strip_comment(lines[k])).strip()
-                        params = head[head.index("(") + 1:head.index(")")] if ")" in head else head
-                        if KEY_PARAM_RE.search(params):
-                            found.add(mh.group(2))
-                for ch in c:
-                    if ch == "{":
-                        depth += 1
-                    elif ch == "}":
-                        depth -= 1
-                if depth <= 0 and j > i:
-                    break
-                j += 1
+    for name, params in tree.methods.get(type_name, {}).items():
+        if any(key in KEY_TYPES and not ty.endswith("[]") for ty, key in params):
+            found.add(name)
     return found
 
 
@@ -1584,7 +1537,7 @@ def count_facts(tree, facts):
 def scan(src, facts):
     """Return ({kind: {relpath: count}}, unplaced, {store: set}) over `src`,
     counting from `facts`."""
-    tree = Tree(src)
+    tree = Tree(src, facts)
     place_map_owners(tree)
     place_array_owners(tree)
     scans = place_inline_scans(tree, facts)

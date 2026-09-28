@@ -57,7 +57,7 @@
 /// module's bodies: what a type, a field or a signature is, as resolution
 /// decided it.
 ///
-///     type   file line col  fields  -       visibility  kind  -       -    ...  path   -             0
+///     type   file line col  fields  base    visibility  kind  -       -    ...  path   -             0
 ///     field  file line col  index   type    visibility  -     -       key  ...  owner  name          0
 ///     fn     file line col  params  return  visibility  role  symbol  -    ...  owner  name          0
 ///     param  file line col  index   type    visibility  role  symbol  key  ...  owner  fn:parameter  0
@@ -65,7 +65,9 @@
 /// (`callee-decl` and `enclosing` are `-`.)  `kind` is `struct`, `union`,
 /// `class`, `enum` or `trait`; `role` is `free`, `method`, `static`,
 /// `constructor` or `destructor`; `params` and a parameter's `index` do not
-/// count a receiver, which has no record.  `path` and `owner` are
+/// count a receiver, which has no record.  `base` is the path of the class
+/// a class extends, `-` for any other type or a class extending none.
+/// `path` and `owner` are
 /// definition paths - a function's owner is its type, or its module when it
 /// is free.  `key` is the key the declared type carries (`string`,
 /// `SymbolStr`, `QualifiedName`, `ModulePath`) by value, by reference or as
@@ -465,24 +467,29 @@ type struct CallFacts {
                                            Text::new("free"), Text::new(vis));
             } else if (stmt.kind == NodeKind::StructDeclaration) {
                 const sd: StructDeclNode* = stmt as StructDeclNode*;
-                CallFacts::record_type(ctx, arena, stmt, sd.def, Text::new("struct"), sd.is_public, &sd.fields);
+                CallFacts::record_type(ctx, arena, stmt, sd.def, Text::new("struct"), sd.is_public, &sd.fields,
+                                       Text::new("-"));
                 CallFacts::record_methods(ctx, arena, &sd.methods, Text::new(CallFacts::decl_path(ctx, sd.def)));
             } else if (stmt.kind == NodeKind::UnionDeclaration) {
                 const ud: UnionDeclNode* = stmt as UnionDeclNode*;
-                CallFacts::record_type(ctx, arena, stmt, ud.def, Text::new("union"), ud.is_public, &ud.fields);
+                CallFacts::record_type(ctx, arena, stmt, ud.def, Text::new("union"), ud.is_public, &ud.fields,
+                                       Text::new("-"));
                 CallFacts::record_methods(ctx, arena, &ud.methods, Text::new(CallFacts::decl_path(ctx, ud.def)));
             } else if (stmt.kind == NodeKind::ClassDeclaration) {
                 const cd: ClassDeclNode* = stmt as ClassDeclNode*;
-                CallFacts::record_type(ctx, arena, stmt, cd.def, Text::new("class"), cd.is_public, &cd.fields);
+                CallFacts::record_type(ctx, arena, stmt, cd.def, Text::new("class"), cd.is_public, &cd.fields,
+                                       Text::new(CallFacts::base_text(ctx, cd)));
                 CallFacts::record_methods(ctx, arena, &cd.methods, Text::new(CallFacts::decl_path(ctx, cd.def)));
             } else if (stmt.kind == NodeKind::EnumDeclaration) {
                 const ed: EnumDeclNode* = stmt as EnumDeclNode*;
                 const none: FieldDeclNode*[] = [];
-                CallFacts::record_type(ctx, arena, stmt, ed.def, Text::new("enum"), ed.is_public, &none);
+                CallFacts::record_type(ctx, arena, stmt, ed.def, Text::new("enum"), ed.is_public, &none,
+                                       Text::new("-"));
             } else if (stmt.kind == NodeKind::TraitDeclaration) {
                 const td: TraitDeclNode* = stmt as TraitDeclNode*;
                 const none: FieldDeclNode*[] = [];
-                CallFacts::record_type(ctx, arena, stmt, td.def, Text::new("trait"), true, &none);
+                CallFacts::record_type(ctx, arena, stmt, td.def, Text::new("trait"), true, &none,
+                                       Text::new("-"));
                 const trait_path: string = CallFacts::decl_path(ctx, td.def);
                 for (mut k: i64 = 0; k < td.methods.length; k++) {
                     const tf: FunctionDeclNode* = td.methods[k];
@@ -498,13 +505,30 @@ type struct CallFacts {
         }
     }
 
+    /// The path of the class `cd` extends, `-` when it extends none, `?` when
+    /// its base was left unanswered.
+    static base_text(ctx: CompilationContext*, cd: ClassDeclNode*) -> string {
+        match (cd.base_res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(d) => { return CallFacts::decl_path(ctx, d); }
+                    _           => { }
+                }
+            }
+            _ => { }
+        }
+        if (cd.base_class.is_empty()) { return "-"; }
+        return "?";
+    }
+
     /// A type's own record, then one per field in declaration order.
     static record_type(ctx: CompilationContext*, arena: TypeArena*, node: ASTNode*, def: DefId,
-                       kind_text: Text, is_public: boolean, fields: &FieldDeclNode*[]) -> void {
+                       kind_text: Text, is_public: boolean, fields: &FieldDeclNode*[],
+                       base: Text) -> void {
         const owner: string = CallFacts::decl_path(ctx, def);
         const vis: string = if (is_public) { "public" } else { "private" };
         ctx.facts.push("type\t" + CallFacts::site_of(ctx, node.span) + "\t"
-            + fmt::format("%lld", fields.length) + "\t-\t" + vis + "\t" + kind_text.as_string()
+            + fmt::format("%lld", fields.length) + "\t" + base.as_string() + "\t" + vis + "\t" + kind_text.as_string()
             + "\t-\t-\t-\t-\t" + owner + "\t-\t0");
         for (mut i: i64 = 0; i < fields.length; i++) {
             const f: FieldDeclNode* = fields[i];
