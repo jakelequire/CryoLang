@@ -1,15 +1,32 @@
-"""Write the link-symbol slice: every `string` parameter that names a symbol
-in the backend's symbol table, as `file:line <TAB> function <TAB> parameter
-<TAB> string` - the input `retype.py --as MangledName --params` reads.
+"""Write a slice as `file:line <TAB> function <TAB> parameter <TAB> string`,
+the input `retype.py --as <Type> --params` reads:
+
+  mangled - every `string` parameter that names a symbol in the backend's
+            symbol table (`--as MangledName`)
+  keyword - every `string` parameter matched against a table the language
+            or its configuration format fixes (`--as Keyword`)
 
 The declarations are found by (file, function, parameter) in the listing
 `done.py --name-taking` prints, so the line numbers are the tree's own.
 
-usage: python mk_slice.py <name-taking listing> <repo-root> > slice.tsv
+usage: python mk_slice.py <mangled|keyword> <name-taking listing> <repo-root> > slice.tsv
 """
 import os, re, sys
 
-SLICE = [
+KEYWORD = [
+    # the lexer's keyword table and the numeric-literal suffix table
+    ("compiler/src/compiler/lex/_module.cryo", "from_keyword", "s"),
+    ("compiler/src/compiler/lex/lexer.cryo", "is_valid_numeric_suffix", "s"),
+    ("compiler/src/compiler/sema/helpers.cryo", "sema_numeric_suffix_type", "suffix"),
+    # the primitive numeric types' spellings
+    ("compiler/src/compiler/sema/helpers.cryo", "is_numeric_type_name", "name"),
+    # the syntax highlighter's keyword list
+    ("compiler/src/utils/syntax_highlighter.cryo", "lex_eq", "kw"),
+    # a project setting's fixed values
+    ("compiler/src/compiler/project_config.cryo", "from_string", "s"),
+]
+
+MANGLED = [
     # the backend's symbol table, read and written by symbol
     ("compiler/src/compiler/codegen/llvm_types.cryo", "get_named_function", "name"),
     ("compiler/src/compiler/codegen/llvm_types.cryo", "get_named_global", "name"),
@@ -43,7 +60,8 @@ SLICE = [
     ("compiler/src/compiler/codegen/ops/intrinsic_emitter.cryo", "emit_check_sink", "name"),
 ]
 
-listing, root = sys.argv[1], sys.argv[2]
+which, listing, root = sys.argv[1], sys.argv[2], sys.argv[3]
+SLICE = {"mangled": MANGLED, "keyword": KEYWORD}[which]
 rows = {}
 for l in open(listing, encoding="utf-8"):
     c = l.rstrip("\n").split("\t")
@@ -51,17 +69,20 @@ for l in open(listing, encoding="utf-8"):
         rows.setdefault((c[0].rsplit(":", 1)[0], c[1]), []).append(c[0])
 missing = 0
 for f, fn, pn in SLICE:
+    # a name declared more than once in a file (both config enums'
+    # `from_string`) contributes every declaration
     locs = rows.get((f, fn), [])
-    if len(locs) != 1:
-        sys.stderr.write("%s %s: %d rows in the listing\n" % (f, fn, len(locs)))
+    if not locs:
+        sys.stderr.write("%s %s: not in the listing\n" % (f, fn))
         missing += 1
         continue
-    ln = int(locs[0].rsplit(":", 1)[1])
     src = open(os.path.join(root, f), encoding="utf-8").read().splitlines()
-    head = " ".join(src[ln - 1:ln + 3])
-    if not re.search(r"\b%s\s*:\s*string\b" % re.escape(pn), head):
-        sys.stderr.write("%s %s: no `%s: string` at its head\n" % (f, fn, pn))
-        missing += 1
-        continue
-    print("%s\t%s\t%s\tstring" % (locs[0], fn, pn))
+    for loc in locs:
+        ln = int(loc.rsplit(":", 1)[1])
+        head = " ".join(src[ln - 1:ln + 3])
+        if not re.search(r"\b%s\s*:\s*string\b" % re.escape(pn), head):
+            sys.stderr.write("%s %s: no `%s: string` at its head\n" % (loc, fn, pn))
+            missing += 1
+            continue
+        print("%s\t%s\t%s\tstring" % (loc, fn, pn))
 sys.exit(1 if missing else 0)

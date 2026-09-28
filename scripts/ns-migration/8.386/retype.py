@@ -44,6 +44,7 @@ TYPES = {
     "Text": ("import utils::text::{ Text };", "utils::text::Text"),
     "MangledName": ("import compiler::resolver::mangled_name::{ MangledName };",
                     "compiler::resolver::mangled_name::MangledName"),
+    "Keyword": ("import utils::keyword::{ Keyword };", "utils::keyword::Keyword"),
 }
 T = "Text"
 IMPORT, TEXT_T = TYPES[T]
