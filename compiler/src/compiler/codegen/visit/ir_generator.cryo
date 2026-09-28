@@ -316,7 +316,9 @@ public:
 
     /// Comma-join two constraint fragments (skipping the leading comma when
     /// `a` is empty).  Used to assemble the inline-asm constraint string.
-    asm_join(a: string, b: string) -> string {
+    asm_join(a_text: Text, b_text: Text) -> string {
+        const a: string = a_text.as_string();
+        const b: string = b_text.as_string();
         if (a == "") { return b; }
         return a + "," + b;
     }
@@ -333,7 +335,7 @@ public:
         // when the required directive is missing, which sema has already
         // reported (codegen is skipped once diagnostics exist).
         if (node.arch != "") {
-            const _triple: string = LTargetMachine::resolve_effective_triple(this.cg.ctx.target_triple);
+            const _triple: string = LTargetMachine::resolve_effective_triple(Text::new(this.cg.ctx.target_triple));
             if (!_triple.contains(node.arch)) {
                 this.state.last_value = LValue::null();
                 this.state.last_is_lvalue = false;
@@ -389,7 +391,7 @@ public:
 
         // Module-level (naked / global) asm: no operands, emit as module asm.
         if (node.is_module_level) {
-            this.cg.llvm_module.append_inline_asm(tmpl);
+            this.cg.llvm_module.append_inline_asm(Text::new(tmpl));
             this.state.last_value = LValue::null();
             this.state.last_is_lvalue = false;
             return;
@@ -405,7 +407,7 @@ public:
             else if (op.constraint == AsmConstraintKind::Pinned) {
                 c = "={" + op.pinned_reg + "}";
             }
-            cons = this.asm_join(cons, c);
+            cons = this.asm_join(Text::new(cons), Text::new(c));
         }
         for (mut p: i64 = 0; p < in_idx.length; p++) {
             const op: AsmOperand* = node.operands[in_idx[p]];
@@ -415,7 +417,7 @@ public:
             else if (op.constraint == AsmConstraintKind::Pinned) {
                 c = "{" + op.pinned_reg + "}";
             }
-            cons = this.asm_join(cons, c);
+            cons = this.asm_join(Text::new(cons), Text::new(c));
         }
         for (mut p: i64 = 0; p < tied_idx.length; p++) {
             const oi: i64 = tied_idx[p];
@@ -423,12 +425,12 @@ public:
             for (mut q: i64 = 0; q < out_idx.length; q++) {
                 if (out_idx[q] == oi) { outpos = q; break; }
             }
-            cons = this.asm_join(cons, fmt::format("%d", outpos as i32));
+            cons = this.asm_join(Text::new(cons), Text::new(fmt::format("%d", outpos as i32)));
         }
         for (mut c: i64 = 0; c < node.clobbers.length; c++) {
             const name: string = node.clobbers[c];
             mut tok: string = "~{" + name + "}";
-            cons = this.asm_join(cons, tok);
+            cons = this.asm_join(Text::new(cons), Text::new(tok));
         }
 
         // Collect argument values in constraint order: memory outputs (as
@@ -503,9 +505,9 @@ public:
         // Build the inline-asm callee and issue the call.
         const fn_ty: LType = LType::function_type(ret_ty, ptype_buf, nargs as u32, false);
         const dialect_i: i32 = if (node.dialect == AsmDialect::Intel) { 1 } else { 0 };
-        const callee: LValue = LValue::inline_asm(fn_ty, tmpl, cons, true, false, dialect_i, false);
+        const callee: LValue = LValue::inline_asm(fn_ty, Text::new(tmpl), Text::new(cons), true, false, dialect_i, false);
         const rname: string = if (direct_out.length == 0) { "" } else { "asm" };
-        const result: LValue = this.cg.builder.build_call(fn_ty, callee, arg_buf, nargs as u32, rname);
+        const result: LValue = this.cg.builder.build_call(fn_ty, callee, arg_buf, nargs as u32, Text::new(rname));
 
         if (arg_buf != null) { libc::free(arg_buf); }
         if (ptype_buf != null) { libc::free(ptype_buf); }
@@ -536,7 +538,7 @@ public:
         } else if (direct_out.length >= 2) {
             for (mut i: i64 = 0; i < direct_out.length; i++) {
                 const op: AsmOperand* = node.operands[out_idx[direct_out[i]]];
-                const ev: LValue = this.cg.builder.build_extract_value(result, i as u32, "asmout");
+                const ev: LValue = this.cg.builder.build_extract_value(result, i as u32, Text::new("asmout"));
                 const addr: LValue = this.dispatch.codegen_lvalue(this, op.expr);
                 if (addr.is_valid() && ev.is_valid()) {
                     this.cg.builder.build_store(ev, addr);
@@ -707,10 +709,10 @@ public:
         mut arm_bbs: LBasicBlock[] = [];
         for (mut i: i64 = 0; i < num_arms; i++) {
             const name: string = fmt::format("match.arm%lld", i);
-            arm_bbs.push(LBasicBlock::append(current_fn, name));
+            arm_bbs.push(LBasicBlock::append(current_fn, Text::new(name)));
         }
-        const no_match_bb: LBasicBlock = LBasicBlock::append(current_fn, "match.no_match");
-        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "match.end");
+        const no_match_bb: LBasicBlock = LBasicBlock::append(current_fn, Text::new("match.no_match"));
+        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, Text::new("match.end"));
 
         // Generate the comparison chain.
         // For each arm, compare subject against the pattern(s).
@@ -724,7 +726,7 @@ public:
             // discriminants hit `unreachable` rather than the post-match join.
             mut next_bb: LBasicBlock = no_match_bb;
             if (i + 1 < num_arms) {
-                next_bb = LBasicBlock::append(current_fn, fmt::format("match.test%lld", i + 1));
+                next_bb = LBasicBlock::append(current_fn, Text::new(fmt::format("match.test%lld", i + 1)));
             }
 
             // Emit the OR-pattern comparison chain for this arm.  A hit on
@@ -733,13 +735,13 @@ public:
             // full miss falls through to next_bb.
             if (arm.guard != null) {
                 const guard_bb: LBasicBlock = LBasicBlock::append(current_fn,
-                    fmt::format("match.guard%lld", i));
+                    Text::new(fmt::format("match.guard%lld", i)));
                 this.patterns.emit_match_arm_comparison(arm, guard_bb, next_bb,
-                    minfo, is_string_subj, subject, current_fn, "match");
+                    minfo, is_string_subj, subject, current_fn, Text::new("match"));
                 this.emit_guard_block(arm, guard_bb, arm_bbs[i], next_bb, minfo);
             } else {
                 this.patterns.emit_match_arm_comparison(arm, arm_bbs[i], next_bb,
-                    minfo, is_string_subj, subject, current_fn, "match");
+                    minfo, is_string_subj, subject, current_fn, Text::new("match"));
             }
 
             // Position at next_bb for the next test (if not the last arm).
@@ -922,13 +924,13 @@ public:
             mut field_val: LValue = LValue::null();
             if (src_is_struct_value) {
                 field_val = this.cg.builder.build_extract_value(
-                    src_val, slot as u32, "destruct.field");
+                    src_val, slot as u32, Text::new("destruct.field"));
             } else {
                 const field_ptr: LValue = this.cg.builder.build_struct_gep(
-                    struct_lty, src_val, slot as u32, "destruct.fieldptr");
+                    struct_lty, src_val, slot as u32, Text::new("destruct.fieldptr"));
                 const field_lty: LType = this.cg.type_mapper.map_type(b.resolved_type);
                 if (!field_lty.is_valid()) { continue; }
-                field_val = this.cg.builder.build_load(field_lty, field_ptr, "destruct.fieldval");
+                field_val = this.cg.builder.build_load(field_lty, field_ptr, Text::new("destruct.fieldval"));
             }
 
             this.cg.expr_ops.codegen_local_var(b.local_name, b.resolved_type,
@@ -983,8 +985,8 @@ public:
                 // `const_int` path would truncate. Build the constant from the
                 // literal's digit string instead.
                 mut radix: u8 = 10;
-                const digits: string = CodegenUtil::int_literal_clean(node.value, &radix);
-                this.state.last_value = LType::const_int_of_string(ty, digits, radix);
+                const digits: string = CodegenUtil::int_literal_clean(Text::new(node.value), &radix);
+                this.state.last_value = LType::const_int_of_string(ty, Text::new(digits), radix);
             } else {
                 const val: u64 = node.value.parse_int::<u64>();
                 this.state.last_value = LType::const_int(ty, val, sign_extend);
@@ -994,7 +996,7 @@ public:
             // Strip `_` digit separators first: the lexer accepts them in float
             // literals but `strtod` stops at the first `_`, so `1_000.5` would
             // otherwise silently parse to `1.0`.
-            const fdigits: string = CodegenUtil::float_literal_clean(node.value);
+            const fdigits: string = CodegenUtil::float_literal_clean(Text::new(node.value));
             const val: f64 = float::parse_f64(fdigits).unwrap_or(0.0);
             this.state.last_value = LType::const_real(ty, val);
         } else if (kind == LiteralKind::String) {
@@ -1007,7 +1009,7 @@ public:
             // etc.  Without this, every character-literal escape in cryoc source
             // is wrong (e.g., `c == '\n'` in skip_whitespace never matches).
             this.state.last_value = LType::const_int(LType::i32(),
-                                               CodegenUtil::decode_char_lexeme(node.value), false);
+                                               CodegenUtil::decode_char_lexeme(Text::new(node.value)), false);
         } else if (kind == LiteralKind::Boolean) {
             const bval: u64 = if (node.value == "true") { 1 } else { 0 };
             this.state.last_value = LType::const_int(LType::i1(), bval, false);
@@ -1035,7 +1037,7 @@ public:
                         if (filename == null || filename.length() == 0) {
                             filename = "<unknown>";
                         }
-                        this.state.last_value = this.cg.builder.build_global_string_ptr(filename, "FILE.str");
+                        this.state.last_value = this.cg.builder.build_global_string_ptr(Text::new(filename), Text::new("FILE.str"));
                     }
                     SourceLoc::Line => {
                         const line: u64 = node.span.start_line as u64;
@@ -1120,7 +1122,7 @@ public:
             return;
         }
 
-        const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, "structlit", ty);
+        const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, Text::new("structlit"), ty);
 
         // Union literal `MyUnion { x: v }`: sema guarantees exactly one field is
         // initialized.  All members overlap at offset 0, so bitcast the alloca
@@ -1143,7 +1145,7 @@ public:
                         const uflty: LType = this.cg.type_mapper.map_type(uft);
                         if (uflty.is_valid()) {
                             const ucast: LValue = this.cg.builder.build_bitcast(
-                                alloca, LType::pointer_to(uflty), "unioninit");
+                                alloca, LType::pointer_to(uflty), Text::new("unioninit"));
                             this.cg.builder.build_store(field_values[0], ucast);
                         }
                     }
@@ -1206,7 +1208,7 @@ public:
             }
             if (vtbl_global.is_valid()) {
                 const vptr_slot: LValue = this.cg.builder.build_struct_gep(
-                    ty, alloca, 0, "vptr.slot");
+                    ty, alloca, 0, Text::new("vptr.slot"));
                 if (vptr_slot.is_valid()) {
                     this.cg.builder.build_store(vtbl_global, vptr_slot);
                 }
@@ -1238,7 +1240,7 @@ public:
                 continue;
             }
             const slot: u32 = pin_slot as u32;
-            const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, slot, "field");
+            const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, slot, Text::new("field"));
             mut val: LValue = field_values[i];
             if (val.is_valid()) {
                 val = this.cg.expr_ops.coerce_fixed_array_to_fat_ptr(val, pin_field.field_type);
@@ -1277,12 +1279,12 @@ public:
                             signed_target = ft_int.int_kind.is_signed();
                         }
                         if (signed_target) {
-                            val = this.cg.builder.build_sext(val, field_lty, "field.widen");
+                            val = this.cg.builder.build_sext(val, field_lty, Text::new("field.widen"));
                         } else {
-                            val = this.cg.builder.build_zext(val, field_lty, "field.widen");
+                            val = this.cg.builder.build_zext(val, field_lty, Text::new("field.widen"));
                         }
                     } else if (want_bits < got_bits) {
-                        val = this.cg.builder.build_trunc(val, field_lty, "field.trunc");
+                        val = this.cg.builder.build_trunc(val, field_lty, Text::new("field.trunc"));
                     }
                 }
             }
@@ -1323,10 +1325,10 @@ public:
             return;
         }
 
-        const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, "tuplit", ty);
+        const alloca: LValue = this.cg.flow.create_entry_alloca(current_fn, Text::new("tuplit"), ty);
 
         for (mut i: i64 = 0; i < element_values.length; i++) {
-            const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, i as u32, "elem");
+            const gep: LValue = this.cg.builder.build_struct_gep(ty, alloca, i as u32, Text::new("elem"));
             const val: LValue = element_values[i];
             if (val.is_valid()) {
                 this.cg.builder.build_store(val, gep);
@@ -1410,7 +1412,7 @@ public:
             const dst_lty: LType = this.cg.type_mapper.map_type(node.resolved_target);
             if (addr.is_valid() && dst_lty.is_valid()) {
                 this.state.last_value = this.cg.builder.build_pointer_cast(
-                    addr, dst_lty, "upcast");
+                    addr, dst_lty, Text::new("upcast"));
             } else {
                 this.state.last_value = addr;
             }
@@ -1431,17 +1433,17 @@ public:
                 const addr: LValue = this.dispatch.codegen_lvalue(this,node.expression);
                 if (addr.is_valid() && dst_lty.is_valid()) {
                     this.state.last_value = this.cg.builder.build_pointer_cast(
-                        addr, dst_lty, "arrcast");
+                        addr, dst_lty, Text::new("arrcast"));
                 } else {
                     this.state.last_value = addr;
                 }
             } else {
                 const val: LValue = this.dispatch.codegen_rvalue(this,node.expression);
                 const data_ptr: LValue = this.cg.builder.build_extract_value(
-                    val, 0, "arrdata");
+                    val, 0, Text::new("arrdata"));
                 if (data_ptr.is_valid() && dst_lty.is_valid()) {
                     this.state.last_value = this.cg.builder.build_pointer_cast(
-                        data_ptr, dst_lty, "arrcast");
+                        data_ptr, dst_lty, Text::new("arrcast"));
                 } else {
                     this.state.last_value = data_ptr;
                 }
@@ -1703,14 +1705,14 @@ public:
         // Create basic blocks: one per arm + a no_match trap + merge.
         mut arm_bbs: LBasicBlock[] = [];
         for (mut i: i64 = 0; i < num_arms; i++) {
-            arm_bbs.push(LBasicBlock::append(current_fn, fmt::format("mexpr.arm%lld", i)));
+            arm_bbs.push(LBasicBlock::append(current_fn, Text::new(fmt::format("mexpr.arm%lld", i))));
         }
         // no_match block traps when the discriminant matches no arm; same
         // rationale as visit_match_stmt: without the trap, control silently
         // slides into adjacent function code.  No phi predecessor is added
         // for this block since it doesn't reach merge_bb.
-        const default_bb: LBasicBlock = LBasicBlock::append(current_fn, "mexpr.no_match");
-        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "mexpr.end");
+        const default_bb: LBasicBlock = LBasicBlock::append(current_fn, Text::new("mexpr.no_match"));
+        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, Text::new("mexpr.end"));
 
         // Comparison chain, same as visit_match_stmt.
         for (mut i: i64 = 0; i < num_arms; i++) {
@@ -1719,7 +1721,7 @@ public:
 
             mut next_bb: LBasicBlock = default_bb;
             if (i + 1 < num_arms) {
-                next_bb = LBasicBlock::append(current_fn, fmt::format("mexpr.test%lld", i + 1));
+                next_bb = LBasicBlock::append(current_fn, Text::new(fmt::format("mexpr.test%lld", i + 1)));
             }
 
             // Emit the OR-pattern comparison chain for this arm (see
@@ -1727,13 +1729,13 @@ public:
             // Guarded arms route a pattern hit through a guard block first.
             if (arm.guard != null) {
                 const guard_bb: LBasicBlock = LBasicBlock::append(current_fn,
-                    fmt::format("mexpr.guard%lld", i));
+                    Text::new(fmt::format("mexpr.guard%lld", i)));
                 this.patterns.emit_match_arm_comparison(arm, guard_bb, next_bb,
-                    minfo, is_string_subj_e, subject, current_fn, "mexpr");
+                    minfo, is_string_subj_e, subject, current_fn, Text::new("mexpr"));
                 this.emit_guard_block(arm, guard_bb, arm_bbs[i], next_bb, minfo);
             } else {
                 this.patterns.emit_match_arm_comparison(arm, arm_bbs[i], next_bb,
-                    minfo, is_string_subj_e, subject, current_fn, "mexpr");
+                    minfo, is_string_subj_e, subject, current_fn, Text::new("mexpr"));
             }
 
             if (i + 1 < num_arms) {
@@ -1828,7 +1830,7 @@ public:
         this.cg.builder.position_at_end(merge_bb);
 
         if (phi_count > 0 && result_ty.is_valid()) {
-            const phi: LValue = this.cg.builder.build_phi(result_ty, "mexpr.val");
+            const phi: LValue = this.cg.builder.build_phi(result_ty, Text::new("mexpr.val"));
             phi.add_incoming(phi_vals, phi_blks, phi_count);
             this.state.last_value = phi;
         } else {
@@ -1843,9 +1845,9 @@ public:
     override visit(mut &this, node: TernaryExprNode*) -> void {
         const cond: LValue = this.dispatch.codegen_rvalue(this,node.condition);
         const current_fn: LValue = this.get_current_function();
-        const then_bb: LBasicBlock = LBasicBlock::append(current_fn, "ternary.then");
-        const else_bb: LBasicBlock = LBasicBlock::append(current_fn, "ternary.else");
-        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "ternary.merge");
+        const then_bb: LBasicBlock = LBasicBlock::append(current_fn, Text::new("ternary.then"));
+        const else_bb: LBasicBlock = LBasicBlock::append(current_fn, Text::new("ternary.else"));
+        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, Text::new("ternary.merge"));
         this.cg.builder.build_cond_br(cond, then_bb, else_bb);
 
         const ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
@@ -1904,7 +1906,7 @@ public:
 
         this.cg.builder.position_at_end(merge_bb);
         if (n > 0 && ty.is_valid()) {
-            const phi: LValue = this.cg.builder.build_phi(ty, "ternary");
+            const phi: LValue = this.cg.builder.build_phi(ty, Text::new("ternary"));
             phi.add_incoming(vals, blks, n);
             this.state.last_value = phi;
         } else {
@@ -2040,11 +2042,11 @@ public:
                 // feeding a wider signed phi must sext, or `-1` becomes a huge
                 // positive value.
                 if (cg.int_type_is_signed(result_ty)) {
-                    return cg.builder.build_sext(val, expected, "mexpr.widen");
+                    return cg.builder.build_sext(val, expected, Text::new("mexpr.widen"));
                 }
-                return cg.builder.build_zext(val, expected, "mexpr.widen");
+                return cg.builder.build_zext(val, expected, Text::new("mexpr.widen"));
             }
-            return cg.builder.build_trunc(val, expected, "mexpr.trunc");
+            return cg.builder.build_trunc(val, expected, Text::new("mexpr.trunc"));
         }
 
         // int -> ptr / ptr -> int: match the `coerce_return_value` conventions.

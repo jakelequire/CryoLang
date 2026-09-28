@@ -143,6 +143,21 @@ def prologue(listfile, root):
             while "{" not in lines[b]:
                 b += 1
             unwrap = "const %s: string = %s_text.as_string();" % (pn, pn)
+            # an earlier `--refusals` may have unwrapped `p` at a use; the
+            # body's `p` is the string now, so those become plain `p`
+            depth, started, e = 0, False, b
+            while e < len(lines):
+                for ch in lines[e]:
+                    if ch == "{":
+                        depth += 1; started = True
+                    elif ch == "}":
+                        depth -= 1
+                if started and depth <= 0:
+                    break
+                e += 1
+            back = re.compile(r"(?<![\w.])%s\.as_string\(\)" % re.escape(pn))
+            for q in range(b, e + 1):
+                lines[q] = back.sub(pn, lines[q])
             brace = lines[b].index("{")
             if lines[b][brace + 1:].strip() == "":
                 indent = re.match(r"\s*", lines[head]).group(0) + "    "
@@ -277,7 +292,10 @@ def refusals(log, root, dry):
         if l.startswith("error[E0214]"):
             if ("expected `%s`" % TEXT_T) in note and "found `string`" in note:
                 kind = "wrap"
-            elif "expected `string`" in note and ("found `%s`" % TEXT_T) in note:
+            elif (re.search(r"expected `(string|i8\*|u8\*)`", note)
+                  and ("found `%s`" % TEXT_T) in note):
+                # a `string` parameter, or a C function's `i8*` / `u8*`,
+                # which a `string` argument already satisfied
                 kind = "unwrap"
         f, ln, col = loc.rsplit(":", 2)
         if kind is None:

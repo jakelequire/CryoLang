@@ -7,6 +7,8 @@
 #   B: text (`site: Text`) handed where a name is expected
 #   C: a raw, unmarked `string` handed where a file path (`Text`) is expected
 #   D: a name (`SymbolStr`) handed where a file path is expected
+#   E: a raw string literal handed where a backend label (`Text`) is expected
+#   F: a name handed where a backend label is expected
 set -u
 CRYO=${CRYO:-bin/cryo}
 DI=compiler/src/compiler/decl_index.cryo
@@ -22,10 +24,14 @@ FILE[B]=$DI; ORIG[B]=$DI_ORIG
 NEW[B]='                    Res::PrimTy(n) => { this.lookup_type(site) }'
 FILE[C]=$IN; ORIG[C]=$IN_ORIG; NEW[C]=${IN_ORIG/parse(config_path_text)/parse(config_path)}
 FILE[D]=$IN; ORIG[D]=$IN_ORIG; NEW[D]=${IN_ORIG/parse(config_path_text)/parse(SymbolStr::empty())}
+EX=compiler/src/compiler/codegen/ops/expr_ops.cryo
+EX_ORIG='            return this.builder.build_load(sret_pointee, slot, name);'
+FILE[E]=$EX; ORIG[E]=$EX_ORIG; NEW[E]=${EX_ORIG/, name)/, \"sret.load\")}
+FILE[F]=$EX; ORIG[F]=$EX_ORIG; NEW[F]=${EX_ORIG/, name)/, SymbolStr::empty())}
 run() {
     (cd compiler && "$CRYO" check src/main.cryo 2>&1) | grep -E -A6 '^error\[|No errors found|Check failed' | head -14
 }
-for m in A B C D; do
+for m in A B C D E F; do
     f=${FILE[$m]}
     cp "$f" "$f.orig"
     python -c "import sys; p,o,n=sys.argv[1:4]; s=open(p,encoding='utf-8',newline='').read(); assert s.count(o)==1, 'mutation site not unique'; open(p,'w',encoding='utf-8',newline='').write(s.replace(o,n))" "$f" "${ORIG[$m]}" "${NEW[$m]}"

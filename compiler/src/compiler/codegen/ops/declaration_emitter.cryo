@@ -1393,8 +1393,8 @@ type struct DeclarationEmitter {
                     // 128-bit global: build from the digit string so a value
                     // above u64::MAX isn't truncated by the u64 const_int path.
                     mut radix: u8 = 10;
-                    const digits: string = CodegenUtil::int_literal_clean(lit.value, &radix);
-                    init = LType::const_int_of_string(ty, digits, radix);
+                    const digits: string = CodegenUtil::int_literal_clean(Text::new(lit.value), &radix);
+                    init = LType::const_int_of_string(ty, Text::new(digits), radix);
                 } else {
                     const ival: u64 = lit.value.parse_int::<u64>();
                     init = LType::const_int(ty, ival, true);
@@ -1610,7 +1610,7 @@ type struct DeclarationEmitter {
                 node.span);
             return LValue::null();
         }
-        const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
+        const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, Text::new("entry"));
         this.builder.position_at_end(entry_bb);
         return fn_val;
     }
@@ -1638,7 +1638,7 @@ type struct DeclarationEmitter {
             return LValue::null();
         }
 
-        const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
+        const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, Text::new("entry"));
         this.builder.position_at_end(entry_bb);
 
         // DWARF: attach a DISubprogram + set the entry debug location
@@ -1705,7 +1705,7 @@ type struct DeclarationEmitter {
             if (pplan.cls == ArgClass::DirectPair
                     && pplan.llvm_slots.length == 2) {
                 const alloca: LValue = this.flow.create_entry_alloca(
-                    fn_val, param_name, param_ty);
+                    fn_val, Text::new(param_name), param_ty);
                 const lo_arg: LValue = LValue {
                     raw: llvm::LLVMGetParam(fn_val.raw, llvm_idx),
                 };
@@ -1721,7 +1721,7 @@ type struct DeclarationEmitter {
                 const eight: LValue = LType::const_int(LType::i64(), 8, false);
                 idx_slots[0] = eight.raw;
                 const hi_ptr: LValue = this.builder.build_gep(
-                    i8_ty, alloca, idx_buf, 1, "param.hi.ptr");
+                    i8_ty, alloca, idx_buf, 1, Text::new("param.hi.ptr"));
                 libc::free(idx_buf);
                 this.builder.build_store(hi_arg, hi_ptr);
                 this.values.set(param.name, alloca);
@@ -1729,7 +1729,7 @@ type struct DeclarationEmitter {
                 continue;
             }
 
-            const alloca: LValue = this.flow.create_entry_alloca(fn_val, param_name, param_ty);
+            const alloca: LValue = this.flow.create_entry_alloca(fn_val, Text::new(param_name), param_ty);
             const arg: LValue = LValue {
                 raw: llvm::LLVMGetParam(fn_val.raw, llvm_idx),
             };
@@ -1788,7 +1788,7 @@ type struct DeclarationEmitter {
         args.push(Pair::<LValue, TypeRef>::new(argc, TypeRef::invalid()));
         args.push(Pair::<LValue, TypeRef>::new(argv, TypeRef::invalid()));
         mut result: LValue = LValue::null();
-        result = this.expr_ops.codegen_call(set_args_fn, set_args_ty, args, "");
+        result = this.expr_ops.codegen_call(set_args_fn, set_args_ty, args, Text::new(""));
     }
 
     /// Emit `std::env::set_env(envp)` at the entry of the program's main,
@@ -1813,7 +1813,7 @@ type struct DeclarationEmitter {
         mut args: Pair<LValue, TypeRef>[] = [];
         args.push(Pair::<LValue, TypeRef>::new(envp, TypeRef::invalid()));
         mut result: LValue = LValue::null();
-        result = this.expr_ops.codegen_call(set_env_fn, set_env_ty, args, "");
+        result = this.expr_ops.codegen_call(set_env_fn, set_env_ty, args, Text::new(""));
     }
 
     /// Get-or-declare the external root-catch reporter `__cryo_panic_finish()`
@@ -1854,9 +1854,9 @@ type struct DeclarationEmitter {
 
         const saved_bb: LBasicBlock = this.builder.get_insert_block();
 
-        const entry_bb: LBasicBlock = LBasicBlock::append(wrapper, "entry");
-        const cont_bb:  LBasicBlock = LBasicBlock::append(wrapper, "cont");
-        const lpad_bb:  LBasicBlock = LBasicBlock::append(wrapper, "lpad");
+        const entry_bb: LBasicBlock = LBasicBlock::append(wrapper, Text::new("entry"));
+        const cont_bb:  LBasicBlock = LBasicBlock::append(wrapper, Text::new("cont"));
+        const lpad_bb:  LBasicBlock = LBasicBlock::append(wrapper, Text::new("lpad"));
 
         this.builder.position_at_end(entry_bb);
 
@@ -1872,7 +1872,7 @@ type struct DeclarationEmitter {
             }
         }
         const r: LValue = this.builder.build_invoke(
-            fn_type, user_main, arg_buf, nparams, cont_bb, lpad_bb, "");
+            fn_type, user_main, arg_buf, nparams, cont_bb, lpad_bb, Text::new(""));
         if (arg_buf != null) { libc::free(arg_buf); }
 
         // Normal exit: return the user main's result (or void).
@@ -1887,11 +1887,11 @@ type struct DeclarationEmitter {
         // Uncaught panic reached the root: catch-all, report + exit 101.
         this.builder.position_at_end(lpad_bb);
         const lpad_ty: LType = this.expr_ops.landingpad_type();
-        const lp: LValue = this.builder.build_landing_pad(lpad_ty, 1, "eh");
+        const lp: LValue = this.builder.build_landing_pad(lpad_ty, 1, Text::new("eh"));
         lp.add_clause(LType::const_pointer_null(LType::pointer_to(LType::i8())));
         const finish_fn: LValue = this.get_or_decl_panic_finish();
         const finish_ty: LType = LType::function_type(LType::void_type(), null, 0, false);
-        this.builder.build_call(finish_ty, finish_fn, null, 0, "");
+        this.builder.build_call(finish_ty, finish_fn, null, 0, Text::new(""));
         this.builder.build_unreachable();
 
         if (saved_bb.is_valid()) { this.builder.position_at_end(saved_bb); }
@@ -2010,7 +2010,7 @@ type struct DeclarationEmitter {
             return LValue::null();
         }
 
-        const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
+        const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, Text::new("entry"));
         this.builder.position_at_end(entry_bb);
 
         this.values.push_scope();
@@ -2105,7 +2105,7 @@ type struct DeclarationEmitter {
                     if (recv_plan.cls == ArgClass::DirectPair
                             && recv_plan.llvm_slots.length == 2) {
                         const slot: LValue = this.flow.create_entry_alloca(
-                            fn_val, "this", target_mapped);
+                            fn_val, Text::new("this"), target_mapped);
                         const lo_arg: LValue = LValue {
                             raw: llvm::LLVMGetParam(fn_val.raw, sret_off) };
                         const hi_arg: LValue = LValue {
@@ -2117,14 +2117,14 @@ type struct DeclarationEmitter {
                         const eight: LValue = LType::const_int(LType::i64(), 8, false);
                         idx_slots[0] = eight.raw;
                         const hi_ptr: LValue = this.builder.build_gep(
-                            i8_ty, slot, idx_buf, 1, "this.hi.ptr");
+                            i8_ty, slot, idx_buf, 1, Text::new("this.hi.ptr"));
                         libc::free(idx_buf);
                         this.builder.build_store(hi_arg, hi_ptr);
                         this.values.set(this_sym, slot);
                         recv_slots = 2;
                     } else {
                         const slot: LValue = this.flow.create_entry_alloca(
-                            fn_val, "this", target_mapped);
+                            fn_val, Text::new("this"), target_mapped);
                         this.builder.build_store(arg0, slot);
                         this.values.set(this_sym, slot);
                         recv_slots = 1;
@@ -2187,7 +2187,7 @@ type struct DeclarationEmitter {
             if (pplan_m.cls == ArgClass::DirectPair
                     && pplan_m.llvm_slots.length == 2) {
                 const alloca: LValue = this.flow.create_entry_alloca(
-                    fn_val, param_name, param_ty);
+                    fn_val, Text::new(param_name), param_ty);
                 const lo_arg: LValue = LValue {
                     raw: llvm::LLVMGetParam(fn_val.raw, param_idx),
                 };
@@ -2201,7 +2201,7 @@ type struct DeclarationEmitter {
                 const eight: LValue = LType::const_int(LType::i64(), 8, false);
                 idx_slots[0] = eight.raw;
                 const hi_ptr: LValue = this.builder.build_gep(
-                    i8_ty, alloca, idx_buf, 1, "param.hi.ptr");
+                    i8_ty, alloca, idx_buf, 1, Text::new("param.hi.ptr"));
                 libc::free(idx_buf);
                 this.builder.build_store(hi_arg, hi_ptr);
                 this.values.set(param.name, alloca);
@@ -2210,7 +2210,7 @@ type struct DeclarationEmitter {
             }
 
             const arg: LValue = LValue { raw: llvm::LLVMGetParam(fn_val.raw, param_idx) };
-            const alloca: LValue = this.flow.create_entry_alloca(fn_val, param_name, param_ty);
+            const alloca: LValue = this.flow.create_entry_alloca(fn_val, Text::new(param_name), param_ty);
             this.builder.build_store(arg, alloca);
             this.values.set(param.name, alloca);
             param_idx += 1;
@@ -2242,7 +2242,7 @@ type struct DeclarationEmitter {
         const actual_ty: void* = llvm::LLVMTypeOf(val.raw);
         if (actual_ty == null) { return val; }
         if (LType::kind_of(actual_ty) == LTypeKind::Pointer) {
-            return this.builder.build_load(expected, val, "deref");
+            return this.builder.build_load(expected, val, Text::new("deref"));
         }
         return val;
     }

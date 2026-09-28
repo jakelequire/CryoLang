@@ -144,7 +144,7 @@ type struct PatternEmitter {
             if (is_ptr) {
                 const tag_ty: LType = this.cg.type_mapper.enum_tag_ltype(info.enum_type);
                 info.tag_val = this.cg.builder.build_load(
-                    tag_ty, subject, "enum.tag");
+                    tag_ty, subject, Text::new("enum.tag"));
             } else {
                 info.tag_val = subject;
             }
@@ -175,11 +175,11 @@ type struct PatternEmitter {
             // precedes every read of it within an iteration.
             if (current_fn.is_valid()) {
                 info.subject_ptr = this.cg.flow.create_entry_alloca(
-                    current_fn, "match.subj", info.enum_llvm);
+                    current_fn, Text::new("match.subj"), info.enum_llvm);
             } else {
                 // No enclosing function to hoist into — extremely unusual; a
                 // local alloca still lowers correctly, it just cannot be hoisted.
-                info.subject_ptr = this.cg.builder.build_alloca(info.enum_llvm, "match.subj");
+                info.subject_ptr = this.cg.builder.build_alloca(info.enum_llvm, Text::new("match.subj"));
             }
             if (info.subject_ptr.is_valid()) {
                 this.cg.builder.build_store(subject, info.subject_ptr);
@@ -188,10 +188,10 @@ type struct PatternEmitter {
 
         if (info.subject_ptr.is_valid()) {
             const tag_ptr: LValue = this.cg.builder.build_struct_gep(
-                info.enum_llvm, info.subject_ptr, 0, "enum.tag.ptr");
+                info.enum_llvm, info.subject_ptr, 0, Text::new("enum.tag.ptr"));
             if (tag_ptr.is_valid()) {
                 info.tag_val = this.cg.builder.build_load(
-                    LType::i32(), tag_ptr, "enum.tag");
+                    LType::i32(), tag_ptr, Text::new("enum.tag"));
             }
         }
 
@@ -242,7 +242,7 @@ type struct PatternEmitter {
     payload_field_ptr(mut &this, enum_llvm: LType, subject_ptr: LValue,
                       offsets: &u64[], pos: i64, field_llvm: LType) -> LValue {
         const payload_ptr: LValue = this.cg.builder.build_struct_gep(
-            enum_llvm, subject_ptr, 1, "enum.payload.ptr");
+            enum_llvm, subject_ptr, 1, Text::new("enum.payload.ptr"));
         if (!payload_ptr.is_valid()) { return LValue::null(); }
         mut field_ptr_raw: LValue = payload_ptr;
         if (offsets[pos] != 0) {
@@ -251,11 +251,11 @@ type struct PatternEmitter {
             const obuf_arr: void** = obuf as void**;
             obuf_arr[0] = byte_off.raw;
             field_ptr_raw = this.cg.builder.build_gep(
-                LType::i8(), payload_ptr, obuf, 1, "enum.field.ptr");
+                LType::i8(), payload_ptr, obuf, 1, Text::new("enum.field.ptr"));
             libc::free(obuf);
         }
         return this.cg.builder.build_bitcast(
-            field_ptr_raw, LType::pointer_to(field_llvm), "enum.field.cast");
+            field_ptr_raw, LType::pointer_to(field_llvm), Text::new("enum.field.cast"));
     }
 
     /// Unwrap a payload TypeRef to its concrete `EnumType*`, or null when it
@@ -351,7 +351,7 @@ type struct PatternEmitter {
                 // iteration and reclaim none of them.  One slot serves every
                 // iteration because the store below precedes every read of the
                 // binding within the arm that reads it.
-                slot = this.cg.flow.temp_slot(vty, "match.bind");
+                slot = this.cg.flow.temp_slot(vty, Text::new("match.bind"));
                 if (!slot.is_valid()) { continue; }
                 this.cg.builder.build_store(minfo.subject_ptr, slot);
             }
@@ -380,7 +380,8 @@ type struct PatternEmitter {
             arm_bb: LBasicBlock, next_bb: LBasicBlock,
             minfo: MatchSubjectInfo, is_string_subj: boolean,
             subject: LValue, current_fn: LValue,
-            name_prefix: string) -> void {
+            name_prefix_text: Text) -> void {
+        const name_prefix: string = name_prefix_text.as_string();
         const npat: i64 = arm.patterns.length;
         for (mut p: i64 = 0; p < npat; p++) {
             const pat: PatternNode* = arm.patterns[p];
@@ -394,7 +395,7 @@ type struct PatternEmitter {
             mut miss_bb: LBasicBlock = next_bb;
             if (!is_last) {
                 miss_bb = LBasicBlock::append(current_fn,
-                    fmt::format("%s.or", name_prefix));
+                    Text::new(fmt::format("%s.or", name_prefix)));
             }
 
             if (pat.pattern_kind == PatternKind::Wildcard
@@ -438,7 +439,7 @@ type struct PatternEmitter {
                                                  minfo.subject_ty);
                         cmp = this.cg.builder.build_icmp(LIntPredicate::EQ,
                             subject, pat_val_coerced,
-                            fmt::format("%s.cmp", name_prefix));
+                            Text::new(fmt::format("%s.cmp", name_prefix)));
                     }
                 }
             } else if (pat.pattern_kind == PatternKind::Identifier) {
@@ -452,14 +453,14 @@ type struct PatternEmitter {
                         this.cg.expr_ops.coerce_icmp_operands(subject, pat_val,
                                              minfo.subject_ty);
                     cmp = this.cg.builder.build_icmp(LIntPredicate::EQ,
-                        subject, coerced, fmt::format("%s.cmp", name_prefix));
+                        subject, coerced, Text::new(fmt::format("%s.cmp", name_prefix)));
                 }
             } else if (pat.pattern_kind == PatternKind::Range) {
                 // Inclusive `lo..hi` range: `lo <= subject && subject <= hi`.
                 // String subjects can't form a range (sema rejects them), so
                 // this always operates on the integer/char subject directly.
                 cmp = this.codegen_range_compare(pat, minfo.subject_ty,
-                                                 subject, name_prefix);
+                                                 subject, name_prefix_text);
             } else if (pat.pattern_kind == PatternKind::Enum) {
                 const epat: EnumPatternNode* = pat as EnumPatternNode*;
                 if (minfo.enum_type != null
@@ -470,7 +471,7 @@ type struct PatternEmitter {
                     // block by branching to arm_bb (full match) / miss_bb.
                     this.emit_enum_pattern_test(epat, minfo.enum_type,
                         minfo.enum_llvm, minfo.subject_ptr, arm_bb, miss_bb,
-                        current_fn, name_prefix);
+                        current_fn, name_prefix_text);
                     handled = true;
                 } else if (minfo.enum_type != null && minfo.tag_val.is_valid()) {
                     // Tag-only check (bindings/wildcards in payload need no test).
@@ -485,7 +486,7 @@ type struct PatternEmitter {
                             tag_ty, variant.tag_value, false);
                         cmp = this.cg.builder.build_icmp(LIntPredicate::EQ,
                             minfo.tag_val, pat_val,
-                            fmt::format("%s.cmp", name_prefix));
+                            Text::new(fmt::format("%s.cmp", name_prefix)));
                     }
                 }
             }
@@ -544,7 +545,8 @@ type struct PatternEmitter {
     emit_enum_pattern_test(mut &this, epat: EnumPatternNode*, enum_type: EnumType*,
                            enum_llvm: LType, subject_ptr: LValue,
                            match_bb: LBasicBlock, miss_bb: LBasicBlock,
-                           current_fn: LValue, name_prefix: string) -> void {
+                           current_fn: LValue, name_prefix_text: Text) -> void {
+        const name_prefix: string = name_prefix_text.as_string();
         const variant: EnumVariantInfo* = CodegenUtil::pinned_variant(enum_type, epat.resolved_member);
         if (variant == null || !subject_ptr.is_valid() || !enum_llvm.is_valid()) {
             this.cg.builder.build_br(miss_bb);
@@ -556,16 +558,16 @@ type struct PatternEmitter {
         const tag_ty: LType = this.cg.type_mapper.enum_tag_ltype(enum_type);
         mut tag: LValue = LValue::null();
         if (enum_type.is_simple_enum()) {
-            tag = this.cg.builder.build_load(tag_ty, subject_ptr, "enum.tag");
+            tag = this.cg.builder.build_load(tag_ty, subject_ptr, Text::new("enum.tag"));
         } else {
             const tag_ptr: LValue = this.cg.builder.build_struct_gep(
-                enum_llvm, subject_ptr, 0, "enum.tag.ptr");
+                enum_llvm, subject_ptr, 0, Text::new("enum.tag.ptr"));
             if (!tag_ptr.is_valid()) { this.cg.builder.build_br(miss_bb); return; }
-            tag = this.cg.builder.build_load(tag_ty, tag_ptr, "enum.tag");
+            tag = this.cg.builder.build_load(tag_ty, tag_ptr, Text::new("enum.tag"));
         }
         const tag_const: LValue = LType::const_int(tag_ty, variant.tag_value, false);
         const tagcmp: LValue = this.cg.builder.build_icmp(LIntPredicate::EQ,
-            tag, tag_const, fmt::format("%s.tag", name_prefix));
+            tag, tag_const, Text::new(fmt::format("%s.tag", name_prefix)));
 
         // Collect payload positions that need a check (literal value / sub).
         const num_payload: i64 = variant.payload_types.length;
@@ -588,7 +590,7 @@ type struct PatternEmitter {
 
         // Tag must match before inspecting the payload.
         const tagok: LBasicBlock = LBasicBlock::append(current_fn,
-            fmt::format("%s.tagok", name_prefix));
+            Text::new(fmt::format("%s.tagok", name_prefix)));
         this.cg.builder.build_cond_br(tagcmp, tagok, miss_bb);
         this.cg.builder.position_at_end(tagok);
 
@@ -599,7 +601,7 @@ type struct PatternEmitter {
             const success_bb: LBasicBlock = if (is_last) {
                 match_bb
             } else {
-                LBasicBlock::append(current_fn, fmt::format("%s.pchk", name_prefix))
+                LBasicBlock::append(current_fn, Text::new(fmt::format("%s.pchk", name_prefix)))
             };
 
             const field_ref: TypeRef = variant.payload_types[pos];
@@ -610,15 +612,15 @@ type struct PatternEmitter {
 
             match (epat.elements[pos]) {
                 PatternElement::LiteralInt(pli) => {
-                    const lv: LValue = this.cg.builder.build_load(field_llvm, field_ptr, "pat.fld");
+                    const lv: LValue = this.cg.builder.build_load(field_llvm, field_ptr, Text::new("pat.fld"));
                     const cst: LValue = LType::const_int(field_llvm, pli.value as u64, false);
-                    const c: LValue = this.cg.builder.build_icmp(LIntPredicate::EQ, lv, cst, "pat.eq");
+                    const c: LValue = this.cg.builder.build_icmp(LIntPredicate::EQ, lv, cst, Text::new("pat.eq"));
                     this.cg.builder.build_cond_br(c, success_bb, miss_bb);
                 }
                 PatternElement::LiteralFloat(plf) => {
-                    const lv: LValue = this.cg.builder.build_load(field_llvm, field_ptr, "pat.fld");
+                    const lv: LValue = this.cg.builder.build_load(field_llvm, field_ptr, Text::new("pat.fld"));
                     const cst: LValue = LType::const_real(field_llvm, plf.value);
-                    const c: LValue = this.cg.builder.build_fcmp(LRealPredicate::OEQ, lv, cst, "pat.feq");
+                    const c: LValue = this.cg.builder.build_fcmp(LRealPredicate::OEQ, lv, cst, Text::new("pat.feq"));
                     this.cg.builder.build_cond_br(c, success_bb, miss_bb);
                 }
                 PatternElement::Sub(ps) => {
@@ -630,7 +632,7 @@ type struct PatternEmitter {
                     if (nested_ty != null) {
                         this.emit_enum_pattern_test(sub as EnumPatternNode*,
                             nested_ty, field_llvm, field_ptr, success_bb, miss_bb,
-                            current_fn, name_prefix);
+                            current_fn, name_prefix_text);
                     } else {
                         this.cg.builder.build_br(success_bb);
                     }
@@ -678,7 +680,7 @@ type struct PatternEmitter {
             if (slot.is_valid()) {
                 mut ty: LType = this.cg.type_mapper.map_type(subj_ty);
                 if (!ty.is_valid()) { ty = LType::i32(); }
-                return this.cg.builder.build_load(ty, slot, "pat.const");
+                return this.cg.builder.build_load(ty, slot, Text::new("pat.const"));
             }
             return LValue::null();
         }
@@ -698,7 +700,7 @@ type struct PatternEmitter {
                          subj_ty: TypeRef) -> LValue {
         if (lit_kind == LiteralKind::Char) {
             return LType::const_int(LType::i32(),
-                                    CodegenUtil::decode_char_lexeme(text), false);
+                                    CodegenUtil::decode_char_lexeme(Text::new(text)), false);
         }
         if (lit_kind == LiteralKind::Boolean) {
             const bval: u64 = if (text == "true") { 1 } else { 0 };
@@ -733,7 +735,8 @@ type struct PatternEmitter {
     /// and stored as unsigned i32).  Returns null if either bound fails to
     /// lower, leaving the caller to treat the arm as a non-matching miss.
     codegen_range_compare(mut &this, pat: PatternNode*, subj_ty: TypeRef,
-                          subject: LValue, name_prefix: string) -> LValue {
+                          subject: LValue, name_prefix_text: Text) -> LValue {
+        const name_prefix: string = name_prefix_text.as_string();
         const intern: InternTable* = this.cg.get_intern();
         const lo_val: LValue = this.lower_scalar_literal(
             intern.resolve(pat.value), pat.literal_kind, subj_ty);
@@ -754,10 +757,10 @@ type struct PatternEmitter {
         }
 
         const ge_lo: LValue = this.cg.builder.build_icmp(ge_pred, subject, lo_c,
-            fmt::format("%s.ge", name_prefix));
+            Text::new(fmt::format("%s.ge", name_prefix)));
         const le_hi: LValue = this.cg.builder.build_icmp(le_pred, subject, hi_c,
-            fmt::format("%s.le", name_prefix));
+            Text::new(fmt::format("%s.le", name_prefix)));
         return this.cg.builder.build_and(ge_lo, le_hi,
-            fmt::format("%s.range", name_prefix));
+            Text::new(fmt::format("%s.range", name_prefix)));
     }
 }
