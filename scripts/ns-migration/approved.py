@@ -151,6 +151,24 @@ def check_no_composed_leaf(root, name):
     return None
 
 
+def check_callers(root, name, spec):
+    """The calls of NAME, counted per file, are exactly SPEC
+    (`file:count,file:count,...`): a caller in a file the entry does not name,
+    one more or one fewer in a file it does, is the reason going stale."""
+    want = {}
+    for part in spec.split(","):
+        rel, _, n = part.strip().rpartition(":")
+        want[rel] = int(n)
+    got = {}
+    for rel, _, _ in calls(root, name):
+        got[rel] = got.get(rel, 0) + 1
+    for rel in sorted(set(want) | set(got)):
+        if want.get(rel, 0) != got.get(rel, 0):
+            return "`%s` is called %d time(s) in %s, the entry says %d" % (
+                name, got.get(rel, 0), rel, want.get(rel, 0))
+    return None
+
+
 def run_assertions(argv, root):
     """Run one command's assertions; the problems found."""
     problems = []
@@ -166,6 +184,9 @@ def run_assertions(argv, root):
         elif a == "--no-composed-leaf" and i + 1 < len(argv):
             problems.append(check_no_composed_leaf(root, argv[i + 1]))
             i += 2
+        elif a == "--callers" and i + 2 < len(argv):
+            problems.append(check_callers(root, argv[i + 1], argv[i + 2]))
+            i += 3
         else:
             return ["unknown assertion `%s`" % a]
     return [p for p in problems if p]
@@ -270,6 +291,13 @@ def selftest():
              'const fam: SymbolStr = scope.member_name;\n'
              '        const e: X = di.lookup(owner, fam);',
              ["--no-composed-leaf", "lookup"], 0),
+            ("the callers are the listed ones", good_owner, good_call,
+             ["--callers", "lookup", "compiler/src/a.cryo:1"], 0),
+            ("a caller the entry does not list", good_owner,
+             good_call + "\n        const e2: X = di.lookup(owner, leaf);",
+             ["--callers", "lookup", "compiler/src/a.cryo:1"], 1),
+            ("a listed caller is gone", good_owner, "const e: X = other(owner, leaf);",
+             ["--callers", "lookup", "compiler/src/a.cryo:1"], 1),
         ]
         ok = 0
         for label, owner, call, argv, want in cases:

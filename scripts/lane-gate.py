@@ -754,6 +754,9 @@ SEALED_TYPES = {
     "ModulePath": ("compiler/module_graph.cryo",
                    "a module's identity: built from a spelling, it names a module the graph "
                    "may never have registered, and every lookup keyed by it answers for text"),
+    "TypeRef": ("compiler/types/type_ref.cryo",
+                "a type's handle in the arena: built from a number, it names whichever type "
+                "sits at that position in whichever arena reads it"),
 }
 
 # A private field keeps a type's LITERAL inside its module; it does not stop
