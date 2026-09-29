@@ -434,7 +434,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: facts-check lane-check lane-selftest facts-selftest' Makefile` → **1** (§8.371: stale facts are REFUSED first, never regenerated - the facts target is the deliberate refresh - and the refusal's self-test runs; `facts-fresh`, which regenerated them, before, §8.366)
 * `python3 scripts/facts-selftest.py | tail -1 | grep -o '[0-9]* cases' | cut -d' ' -f1` → **12** (§8.371: the freshness check over a throwaway tree - an edited source, an added source and a missing inputs record refused, fresh facts and a non-source edit accepted, each through `facts.py --check` and through `facts_path`, which the lane gate and the residue check call - and a dry run of the lane-check and check-fast targets building nothing; with the staleness comparison deleted it fails 4 cases, with `lane-check` depending on `facts` it fails 2)
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **111** (+1 in §8.417, `trait_default_this_calls_typed`; 110 before, +1 in §8.412, `class_inherited_function_field_call`; 109 before, +1 in §8.410, `overload_receiver_consumes_by_pin`; 108 before, +3 in §8.405, `generic_function_named_like_type`, `generic_receiver_alias`, `generic_receiver_alias_refused`; 105 before, +1 in §8.404, `compare_with_null_refused`; 104 before, +2 in §8.403, `class_constructor_arguments_refused`, `class_constructor_overloads_by_arity`; 102 before, +3 in §8.402, `generic_receiver_by_type`, `generic_receiver_other_instantiation_refused`, `generic_function_type_argument`; 99 before, +2 in §8.401, `bare_type_as_value_refused`, `class_constructed_by_name`; +1 in §8.396, `array_method_argument_mismatch`; +3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **112** (+1 in §8.418, `type_declaration_bound_types_calls`; 111 before, +1 in §8.417, `trait_default_this_calls_typed`; 110 before, +1 in §8.412, `class_inherited_function_field_call`; 109 before, +1 in §8.410, `overload_receiver_consumes_by_pin`; 108 before, +3 in §8.405, `generic_function_named_like_type`, `generic_receiver_alias`, `generic_receiver_alias_refused`; 105 before, +1 in §8.404, `compare_with_null_refused`; 104 before, +2 in §8.403, `class_constructor_arguments_refused`, `class_constructor_overloads_by_arity`; 102 before, +3 in §8.402, `generic_receiver_by_type`, `generic_receiver_other_instantiation_refused`, `generic_function_type_argument`; 99 before, +2 in §8.401, `bare_type_as_value_refused`, `class_constructed_by_name`; +1 in §8.396, `array_method_argument_mismatch`; +3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)* `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -51060,3 +51060,134 @@ re-run passed.
 
 The typing conversion (8.416's patch) is not re-applied here. The five
 other untyped rows above are separate causes and are not fixed.
+
+### 8.418 A bound written on a type's own declaration types calls in the type's methods; the calls on unbounded type parameters are counted - 2026-09-29
+
+## Why
+
+A call on a value of a type parameter is typed through the bounds in
+scope: the enclosing function's `where` clause, the enclosing impl's, and
+- in a trait's default method - the trait itself for `This`. A `where`
+clause written on the type's own declaration was not among them, so a
+call in one of the type's own methods typed as nothing and a wrong use of
+its result compiled:
+
+```cryo
+type trait Sized2 { size(&this) -> u64; }
+
+type struct Holder<T> where T: Sized2 {
+    item: T;
+    as_text(&this) -> u64 {
+        const s: string = this.item.size();   // built; `size` returns u64
+        return 0;
+    }
+}
+```
+
+## What the brief's figure was
+
+The previous session counted 13 untyped calls as this shape (allocator
+calls: `allocate`, `deallocate`, `reallocate`). They are not: `RawBuffer`,
+`Array`, `HashMap`, `Rc`, `Arc`, `Box`, `Mutex` and `RwLock` declare their
+methods inside the type's body and bound `A` nowhere those methods can see
+- `where A: Allocator` appears only on their trait impls (`Drop`, `Eq`,
+`Hash`, ..; `raw_buffer.cryo:33` and `:176-177`). They are calls on
+UNBOUNDED parameters, counted below. The in-tree population of this entry's
+shape is 0: the only two types with a type-level `where` (`MapIter`,
+`FilterIter`, `core/iter.cryo:272,292`) restate it on their impls, and
+their calls were already typed.
+
+## What changed
+
+`MethodBinding::lookup_method_through_param_bounds` also scans the bounds
+written on the declaration of the type whose methods are being walked
+(`owner_declared_bounds`: the walk's owner type, its template, and
+`TemplateEntry::declared_where_bounds`, one accessor for the four
+aggregate kinds). Which parameter a bound names is decided by the
+parameter's declaration, as for the other clauses. The parameter-types
+sibling (`param_types_through_param_bounds`, argument classification) is
+NOT changed: no test observes it; it is the same one-line addition.
+
+## Proved
+
+- New project `type_declaration_bound_types_calls`, declared in
+  `tests/started-passing`: the tip builds it; the change refuses line 21
+  only (`E0200 ... expected string, found u64` at `src/main.cryo:21:27`);
+  line 16, a correct use, passes.
+- Inversion: `owner_declared_bounds` made to answer null - the project
+  builds (`Compiled -> build/type_declaration_bound_types_calls.exe`).
+  Unmutated: refused at 21:27, `aborting due to 1 error`.
+
+## Calls on an unbounded type parameter, measured
+
+A probe (`scripts/ns-migration/8.418/unbounded-receiver-probe.patch`) at
+every method call whose receiver is a type parameter counted the bounds in
+scope naming it - function `where`, impl `where`, the owner declaration's
+`where`; `This` excluded - over the compiler, every test project, every
+example (`probe_run.sh`) and the unit suite (`cryo test` with a filter
+matching nothing: the suite's files are compiled; `cryo build` in `tests/`
+does not compile them). Tabulated by `unbounded_tab.py`. 140 distinct call
+sites in the projects' builds (123 stdlib, 12 test projects, 5 examples,
+all but the stdlib's bounded) plus the unit suite's.
+
+Written on an unbounded parameter, every one in the stdlib - **22 sites**:
+
+| type (parameter) | calls | sites |
+|---|---|---|
+| `RawBuffer` (`A`) | `allocate`, `deallocate`, `reallocate` | `collections/raw_buffer.cryo:122,155,161` |
+| `Array` (`A`) | `allocate`, `deallocate`, `reallocate` | `collections/array.cryo:535,571,577` |
+| `HashMap` (`A`) | `allocate`, `deallocate` | `collections/hashmap.cryo:538,563` |
+| `Mutex` (`A`) | `allocate`, `deallocate` | `sync/mutex.cryo:190,196` |
+| `RwLock` (`A`) | `allocate`, `deallocate` | `sync/rwlock.cryo:202,208` |
+| `Rc`, `Arc`, `Box` (`A`) | `allocate` in `try_new_in` | `alloc/rc.cryo:131`, `alloc/arc.cryo:146`, `alloc/box.cryo:87` |
+| `BufWriter` (`W`) | `write_some` | `io/buf.cryo:145` |
+| `BufReader` (`R`) | `read` | `io/buf.cryo:367` |
+| `BufStream` (`S`) | `drop` | `io/buf.cryo:641` |
+| free functions (`O`, `T`) | `drop` | `future/executor.cryo:208,591`, `thread/_module.cryo:224,280` |
+
+So 15 allocator calls on eight types, 2 I/O calls on two, and 5 `drop`
+calls on a parameter with no bound.
+
+Not counted as unbounded:
+- `core/iter.cryo:181,202` (`compare` in `Iterator::min`/`max`): bounded
+  through a projection (`This::Item: Ord`), which the probe does not count
+  as naming the parameter; in the impls' copies it reads as unbounded.
+  That is the separate projection-bounded shape.
+- The unit suite: 4 sites, none written unbounded. Three are async
+  functions WITH `where S: AtmRead` / `where D: AtmDrain`
+  (`tests/tests/lang/async_trait_method.cryo:94,101,213`) whose lowered
+  state machine's `poll` is walked without the function's bounds; one is
+  an inference artifact, `s.length()` on an `Option::Some(String)`
+  payload typed as the `T` of `Option<T>`
+  (`tests/tests/lang/enum_ctor_arg_inference.cryo:88`).
+- Tests' projects and examples: 0. The probe reaches them - 12 and 5
+  bounded sites - so the zero is a measurement, not an unreached corpus.
+
+Whether such a call is an error where it is written was not decided by
+this change. Jake ruled it since, in plain text (2026-09-29): it is an
+error, and the stdlib's calls get bounds; that is a separate change.
+
+## Predicted, then measured
+
+- Flow list 797, lane gate, residue, name-taking, pending allows: predicted
+  unchanged or up by the new calls into the bound scan; measured unchanged
+  (797, rule three 747, rule four 50).
+- Projects 111 -> 112.
+
+## Evidence
+
+Taken by the session that adopted this change (the one that wrote it died
+before verifying):
+
+- `make check-fast`: OK; spelling flow "797 outstanding, as listed"; 453
+  section-0 rows match the tree.
+- `make verify ARGS="--baseline HEAD --require-identical"`: OK in 153 s.
+  `type_declaration_bound_types_calls`: baseline exit 0, tree exit 1.
+  Objects: tests 4012 / 4012 moved 0, examples 1126 / 1126 moved 0. census,
+  examples (14), lsp, cross, incr, blind, flow, fast all ok.
+- Clean build (`rm -rf compiler/build; make cryo`) against the cached
+  baseline's clean build log: 266 compiler warnings each side, 265 distinct,
+  no (code, file, line) in either set only.
+- What this is worth: the case it fixes has no in-tree population, so it
+  moves no existing program; the value is the new test and the 22-site
+  count of calls on unbounded parameters above.

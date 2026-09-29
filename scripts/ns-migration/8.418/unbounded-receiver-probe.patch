@@ -1,0 +1,112 @@
+diff --git a/compiler/src/compiler/sema/call_resolver.cryo b/compiler/src/compiler/sema/call_resolver.cryo
+index e4dd8bb7..80a89758 100644
+--- a/compiler/src/compiler/sema/call_resolver.cryo
++++ b/compiler/src/compiler/sema/call_resolver.cryo
+@@ -3256,6 +3256,7 @@ type struct CallResolver {
+         if (!obj_type.is_valid()) {
+             return TypeRef::invalid();
+         }
++        this.binding.uprobe(obj_type, member);
+         if (this.symbolic.symbolic_is_generic_owner_receiver(obj_type)) {
+             // A nested generic-method call on the still-generic owner (`this.try_push(item)`
+             // inside `String<A>::push<T>`) must stash its method bindings now; the
+diff --git a/compiler/src/compiler/sema/method_binding.cryo b/compiler/src/compiler/sema/method_binding.cryo
+index 68347f6c..ef3fe361 100644
+--- a/compiler/src/compiler/sema/method_binding.cryo
++++ b/compiler/src/compiler/sema/method_binding.cryo
+@@ -330,9 +330,70 @@ type struct MethodBinding {
+                 &this.state.symbolic_impl_node.where_bounds, param, method_name, recv, TypeRef::invalid());
+             if (r.is_valid()) { return r; }
+         }
++        const owner_bounds: TraitBound[]* = this.owner_declared_bounds();
++        if (owner_bounds != null) {
++            return this.scan_param_bounds(owner_bounds, param, method_name, recv, TypeRef::invalid());
++        }
+         return TypeRef::invalid();
+     }
+ 
++    uprobe(mut &this, recv: TypeRef, member: MemberAccessNode*) -> void {
++        mut t: Type* = this.arena.lookup(recv);
++        mut d: i32 = 0;
++        while (t != null && d < 5 && (t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference)) {
++            t = if (t.kind == TypeKind::Pointer) { this.arena.lookup((t as PointerType*).pointee) } else { this.arena.lookup((t as ReferenceType*).referent) };
++            d += 1;
++        }
++        if (t == null || t.kind != TypeKind::GenericParam) { return; }
++        const param: GenericParamType* = t as GenericParamType*;
++        if (this.arena.is_this_placeholder(param as Type*)) { return; }
++        mut n_fn: i64 = 0;
++        mut n_impl: i64 = 0;
++        mut n_owner: i64 = 0;
++        if (this.state.symbolic_current_func != null) {
++            const bs: &TraitBound[] = &this.state.symbolic_current_func.trait_bounds;
++            for (mut i: i64 = 0; i < bs.length; i++) {
++                if (!bs[i].has_projection_subject() && param.declared_by(bs[i].subject_sym)) { n_fn += 1; }
++            }
++        }
++        if (this.state.symbolic_impl_node != null) {
++            const bs: &TraitBound[] = &this.state.symbolic_impl_node.where_bounds;
++            for (mut i: i64 = 0; i < bs.length; i++) {
++                if (!bs[i].has_projection_subject() && param.declared_by(bs[i].subject_sym)) { n_impl += 1; }
++            }
++        }
++        const ob: TraitBound[]* = this.owner_declared_bounds();
++        if (ob != null) {
++            for (mut i: i64 = 0; i < (*ob).length; i++) {
++                if (!(*ob)[i].has_projection_subject() && param.declared_by((*ob)[i].subject_sym)) { n_owner += 1; }
++            }
++        }
++        const tag: string = if (n_fn + n_impl + n_owner == 0) { "UNBOUNDED" } else { "bounded" };
++        const ot: Type* = this.arena.lookup(this.state.current_owner_type);
++        const owner_s: string = if (ot != null) { this.arena.format_display(ot) } else { "-" };
++        const fn_s: string = if (this.state.symbolic_current_func != null) { this.intern.resolve(this.state.symbolic_current_func.name) } else { "-" };
++        const sym: string = if (this.state.in_symbolic_check) { "sym" } else { "con" };
++        const pm: string = if (this.state.post_mono_verify) { "post" } else { "pre" };
++        fmt::eprintln(fmt::format("UPROBE %s fn=%lld impl=%lld owner=%lld param=%s type=%s func=%s leaf=%s walk=%s/%s at=%s:%u",
++            tag, n_fn, n_impl, n_owner, this.arena.format_display(param as Type*), owner_s, fn_s,
++            this.intern.resolve(member.member), sym, pm, member.span.file, member.span.start_line));
++    }
++
++    /// The `where` bounds written on the declaration of the type whose
++    /// methods are being walked: they constrain the type's own parameters in
++    /// every method the declaration holds, as the enclosing function's and
++    /// impl's clauses constrain theirs.  Which parameter a bound names is
++    /// decided by its declaration, so an impl's parameter of the same
++    /// spelling is not bound by it.  Null outside such a walk.
++    owner_declared_bounds(&this) -> TraitBound[]* {
++        if (this.ctx.generic_registry == null) { return null; }
++        const base: TypeRef = this.symbolic.symbolic_recv_base(this.state.current_owner_type);
++        if (!base.is_valid()) { return null; }
++        const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(base);
++        if (tmpl == null) { return null; }
++        return tmpl.declared_where_bounds();
++    }
++
+     /// Search `bounds` for a BARE-parameter bound on `param`; return the first
+     /// bound trait's method return with the bound's associated-type args
+     /// substituted and `This` rebased onto `recv`. The bare-subject sibling of
+diff --git a/compiler/src/compiler/types/generic_registry.cryo b/compiler/src/compiler/types/generic_registry.cryo
+index 325def2b..dd6eb093 100644
+--- a/compiler/src/compiler/types/generic_registry.cryo
++++ b/compiler/src/compiler/types/generic_registry.cryo
+@@ -113,6 +113,20 @@ type struct TemplateEntry {
+         };
+     }
+ 
++    /// The `where` bounds written on this template's own declaration - a
++    /// struct, union, class or enum; null for anything else, a function
++    /// template's bounds being its declaration's.
++    declared_where_bounds(&this) -> ast::TraitBound[]* {
++        if (this.ast_node == null) { return null; }
++        return match (this.node_kind) {
++            NodeKind::StructDeclaration => { &(this.ast_node as StructDeclNode*).where_bounds }
++            NodeKind::UnionDeclaration  => { &(this.ast_node as UnionDeclNode*).where_bounds }
++            NodeKind::ClassDeclaration  => { &(this.ast_node as ClassDeclNode*).where_bounds }
++            NodeKind::EnumDeclaration   => { &(this.ast_node as EnumDeclNode*).where_bounds }
++            _                           => { null }
++        };
++    }
++
+     /// Spec base name for this template, used by `MangledName::specialized_identifier`
+     /// keys against.  For free functions this is the bare name (`offset`); for
+     /// static method templates registered under `Owner::method` it folds the
