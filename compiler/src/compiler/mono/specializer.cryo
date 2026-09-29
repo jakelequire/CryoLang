@@ -35,6 +35,7 @@ import compiler::types::arena::{ TypeArena };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::type_ref::{ TypeRef };
+import compiler::types::resolver::{ ResolutionContext, TypeResolver };
 import utils::text::{ Text };
 
 
@@ -76,14 +77,19 @@ type struct SpecializationResult {
 }
 
 type struct ASTSpecializer {
-    arena:        TypeArena*;
-    intern_table: InternTable*;
+    arena:         TypeArena*;
+    intern_table:  InternTable*;
+    /// What a receiver's written type denotes: the filter below compares
+    /// types, never spellings.
+    type_resolver: TypeResolver*;
 
 
-    static new(arena: TypeArena*, intern_table: InternTable*) -> ASTSpecializer {
+    static new(arena: TypeArena*, intern_table: InternTable*,
+               type_resolver: TypeResolver*) -> ASTSpecializer {
         return ASTSpecializer {
-            arena:        arena,
-            intern_table: intern_table,
+            arena:         arena,
+            intern_table:  intern_table,
+            type_resolver: type_resolver,
         };
     }
 
@@ -103,7 +109,6 @@ type struct ASTSpecializer {
     /// carries its own answer.  `TypeRef::invalid()` is legal and means the
     /// caller has no id yet; see `ASTTypeSubstituter.spec_typeref`.
     specialize(&this, entry: TemplateEntry*, type_args: &TypeRef[],
-               type_arg_displays: &string[],
                spec_typeref: TypeRef) -> SpecializationResult {
         // Validate
         if (entry == null) {
@@ -148,27 +153,17 @@ type struct ASTSpecializer {
             return SpecializationResult::fail(Text::new("AST clone returned null"));
         }
 
-        // 4. Build SymbolStr arrays for the substituter.
-        //    entry.name and entry.param_names are already SymbolStr; no re-interning.
-        mut arg_syms: SymbolStr[] = [];
-        for (mut ai: i64 = 0; ai < type_arg_displays.length; ai++) {
-            arg_syms.push(this.intern_table.intern(type_arg_displays[ai]));
-        }
-
-        // Independent copies of the parameter and display lists (every
-        // element type is Copy): the substituter stores and owns its arrays,
-        // so handing it the template entry's own buffers would double-free
-        // them, and `arg_syms` is read again for each impl block below.
+        // 4. An independent copy of the parameter list (its element type is
+        //    Copy): the substituter stores and owns its array, so handing it
+        //    the template entry's own buffer would double-free it.
         mut ps_copy: SymbolID[] = [];
         for (mut pi: i64 = 0; pi < entry.param_syms.length; pi++) {
             ps_copy.push(entry.param_syms[pi]);
         }
-        mut disp_copy: SymbolStr[] = [];
-        for (mut ai: i64 = 0; ai < arg_syms.length; ai++) { disp_copy.push(arg_syms[ai]); }
         mut substituter: ASTTypeSubstituter* = new ASTTypeSubstituter(
             subst_ptr, this.arena, this.intern_table,
             entry.name, spec_sym,
-            ps_copy, disp_copy, spec_typeref
+            ps_copy, spec_typeref
         );
         cloned_ast.accept(substituter);
 
@@ -193,28 +188,35 @@ type struct ASTSpecializer {
             if (cloned_impl != null) {
                 const impl_node: ImplBlockNode* = cloned_impl as ImplBlockNode*;
                 mut impl_substituter: ASTTypeSubstituter* =
-                    this.impl_substituter(impl_node, entry, spec_sym, type_args, &arg_syms, spec_typeref);
-                // The parameter the head writes at each position of the
-                // owner, or none where it writes a type: what a receiver
-                // annotation in this block spells the owner's identity in.
-                mut head_syms: SymbolID[] = [];
-                for (mut hi: i64 = 0; hi < impl_node.target_args.length; hi++) {
-                    head_syms.push(GenericRegistry::head_param_of(impl_node.target_args[hi]));
+                    this.impl_substituter(impl_node, entry, spec_sym, type_args, spec_typeref);
+                // Each parameter the head writes, bound to the argument at
+                // its position: a receiver annotation in this block is
+                // written in the head's parameters, and resolved under these
+                // bindings it denotes a type of this specialization.
+                mut head_ctx: ResolutionContext = ResolutionContext::new("");
+                for (mut hi: i64 = 0; hi < impl_node.target_args.length && hi < type_args.length; hi++) {
+                    const head_arg: TypeAnnotation* = impl_node.target_args[hi];
+                    const head_sym: SymbolID = GenericRegistry::head_param_of(head_arg);
+                    if (!head_sym.is_valid()) { continue; }
+                    match (*head_arg) {
+                        TypeAnnotation::Named(hn) => { head_ctx.add_binding(head_sym, hn.name, type_args[hi]); }
+                        _ => {}
+                    }
                 }
 
                 // Filter out methods whose `this` parameter is a Generic
-                // instantiation of the outer template with modified args
+                // instantiation of the outer template with other arguments
                 // (e.g. `this: Result<T*, E>` on `implement Result<T, E>`).
                 // Such methods apply only to specific outer T; monomorphizing
                 // them for arbitrary T produces invalid code, since the body
-                // uses the modified shape (`*ptr` where ptr is actually T, not
+                // uses the other shape (`*ptr` where ptr is actually T, not
                 // T*).  Our pipeline monomorphizes eagerly, so we skip them
-                // at specialization time based on the structural self-match.
+                // at specialization time.
                 mut kept: MethodNode*[] = [];
                 for (mut mi: i64 = 0; mi < impl_node.methods.length; mi++) {
                     const mthd: MethodNode* = impl_node.methods[mi];
                     const is_modified: boolean = this.method_has_modified_self_type(
-                        mthd, entry, &head_syms, type_arg_displays);
+                        mthd, entry, type_args, &head_ctx);
                     if (is_modified) {
                         continue;
                     }
@@ -253,9 +255,8 @@ type struct ASTSpecializer {
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     impl_substituter(&this, impl_node: ImplBlockNode*, entry: TemplateEntry*,
                      spec_sym: SymbolStr, type_args: &TypeRef[],
-                     arg_syms: &SymbolStr[], spec_typeref: TypeRef) -> ASTTypeSubstituter* {
+                     spec_typeref: TypeRef) -> ASTTypeSubstituter* {
         mut syms: SymbolID[] = [];
-        mut displays: SymbolStr[] = [];
         mut arena_ids: TypeRef[] = [];
         mut replacements: TypeRef[] = [];
         const n: i64 = if (impl_node.target_args.length < type_args.length) {
@@ -276,7 +277,6 @@ type struct ASTSpecializer {
                     }
                     if (seen) { continue; }
                     syms.push(sym);
-                    displays.push(arg_syms[ti]);
                     arena_ids.push(this.arena.create_generic_param(sym, named.name, ti as u64));
                     replacements.push(type_args[ti]);
                 }
@@ -289,28 +289,21 @@ type struct ASTSpecializer {
         return new ASTTypeSubstituter(
             subst_ptr, this.arena, this.intern_table,
             entry.name, spec_sym,
-            syms, displays, spec_typeref);
+            syms, spec_typeref);
     }
 
 
-    /// Detect methods whose `this` parameter is a Generic(base, args) where
-    /// base matches the outer template name AND the args are NOT the identity
-    /// mapping of the head's params (`head_syms[i]`, the parameter the impl
-    /// head writes at position i), and ALSO not equal to the spec's concrete
-    /// args. Example on `implement Result<T, E>`:
-    ///   `this: Result<T*, E>` while spec'ing Result<i32, string>
-    ///     -> args=[T*, E], spec=[i32, string]: T* is neither bare T nor i32
-    ///     -> modified=true (drop the method)
-    ///   `this: Result<T, E>` while spec'ing Result<i32, string>
-    ///     -> args=[T, E], spec=[i32, string]: each arg matches the bare
-    ///       outer param -> modified=false (keep)
-    ///   `this: Result<T, E>` after DefaultExpansion rewrote bare `Result`
-    ///     to `Result<T, E>` (or `Result<X, Y>` post-substitution) while
-    ///     spec'ing Result<X, Y>: args=[X, Y] match the spec's display
-    ///     names -> modified=false (keep, this is not a real shape change)
+    /// Whether `method`'s receiver is typed as this template instantiated
+    /// with arguments other than the specialization's.  Example on
+    /// `implement Result<T, E>` specialized as `Result<i32, string>`:
+    ///   `this: Result<T*, E>` denotes `Result<i32*, string>` -> drop it;
+    ///   `this: Result<T, E>` denotes `Result<i32, string>`   -> keep it;
+    ///   `this: Result<i32, E>` denotes `Result<i32, string>` -> keep it.
+    /// `head_ctx` binds each parameter the impl's head writes to the
+    /// specialization's argument at its position.
     method_has_modified_self_type(&this, method: MethodNode*, entry: TemplateEntry*,
-                                   head_syms: &SymbolID[],
-                                   type_arg_displays: &string[]) -> boolean {
+                                   type_args: &TypeRef[],
+                                   head_ctx: ResolutionContext*) -> boolean {
         if (method == null || method.func == null) { return false; }
         const func: FunctionDeclNode* = method.func;
 
@@ -320,89 +313,38 @@ type struct ASTSpecializer {
             if (!param.is_receiver()) { continue; }
             if (param.type_annotation == null) { continue; }
             if (this.annotation_is_modified_outer(
-                param.type_annotation, entry, head_syms, type_arg_displays)) {
+                param.type_annotation, entry, type_args, head_ctx)) {
                 return true;
             }
         }
         return false;
     }
 
-    /// Recursively unwrap Reference/Pointer and return true if the inner
-    /// annotation is Generic(Named(entry.name), args) where any arg is
-    /// NEITHER the head's param in its position NOR equal to the
-    /// corresponding spec type-arg display (or its leaf).
+    /// Through references and pointers, whether `ann` is a use of the
+    /// template `entry` instantiated with arguments other than the
+    /// specialization's.  The written type is compared as the type it
+    /// denotes, resolved under `head_ctx`: one spelling can name two types
+    /// (`Point` from two modules), and two spellings one type (`T` and the
+    /// argument it is bound to; an alias and the template it names).
+    /// Only a written instantiation is asked: a bare name is the receiver
+    /// the parser gives a method that wrote none, and it names the owner.
     annotation_is_modified_outer(&this, ann: TypeAnnotation*, entry: TemplateEntry*,
-                                  head_syms: &SymbolID[],
-                                  type_arg_displays: &string[]) -> boolean {
+                                  type_args: &TypeRef[],
+                                  head_ctx: ResolutionContext*) -> boolean {
         if (ann == null) { return false; }
         match (*ann) {
             TypeAnnotation::Reference(ref) => {
-                return this.annotation_is_modified_outer(ref.inner, entry, head_syms, type_arg_displays);
+                return this.annotation_is_modified_outer(ref.inner, entry, type_args, head_ctx);
             }
             TypeAnnotation::Pointer(ptr) => {
-                return this.annotation_is_modified_outer(ptr.inner, entry, head_syms, type_arg_displays);
+                return this.annotation_is_modified_outer(ptr.inner, entry, type_args, head_ctx);
             }
-            TypeAnnotation::Generic(gen) => {
-                match (*gen.base) {
-                    TypeAnnotation::Named(named) => {
-                        const matches_bare: boolean = named.name.equals(entry.name);
-                        const matches_qual: boolean = named.name.equals(entry.qualified_name);
-                        if (!matches_bare && !matches_qual) { return false; }
-                        if (gen.args.length != entry.param_count) { return false; }
-                        for (mut i: i64 = 0; i < gen.args.length; i++) {
-                            mut spec_disp: string = "";
-                            if (i < type_arg_displays.length) {
-                                spec_disp = type_arg_displays[i];
-                            }
-                            const head_sym: SymbolID = if (i < head_syms.length) {
-                                head_syms[i]
-                            } else {
-                                SymbolID::invalid()
-                            };
-                            if (!this.annotation_matches_param_or_spec(
-                                gen.args[i], head_sym, spec_disp)) {
-                                return true;
-                            }
-                        }
-                        return false;
-                    }
-                    _ => { return false; }
-                }
-            }
-            _ => { return false; }
-        }
-    }
-
-    /// True if `ann` is `Named(N)` where N is the head's parameter `param_sym`
-    /// (template identity, read off the stamp) OR spells the spec's type-arg
-    /// display (whole string or its leaf segment after `::`). The
-    /// spec-display match handles the case where DefaultExpansion has
-    /// already rewritten bare `T` annotations into `Named(<concrete-default>)`
-    /// before the specializer runs.
-    annotation_matches_param_or_spec(&this, ann: TypeAnnotation*,
-                                      param_sym: SymbolID,
-                                      spec_disp: string) -> boolean {
-        if (ann == null) { return false; }
-        match (*ann) {
-            TypeAnnotation::Named(named) => {
-                if (param_sym.is_valid() && named.param_sym().equals(param_sym)) { return true; }
-                if (spec_disp.length() == 0) { return false; }
-                const named_str: string = this.intern_table.resolve(named.name);
-                if (named_str.eq(spec_disp)) { return true; }
-                // Match the leaf segment of a qualified spec name.
-                const sd_len: i64 = spec_disp.length() as i64;
-                mut last_sep: i64 = -1;
-                for (mut k: i64 = 0; k + 1 < sd_len; k++) {
-                    if (spec_disp[k] == ':' && spec_disp[k + 1] == ':') {
-                        last_sep = k + 2;
-                    }
-                }
-                if (last_sep > 0) {
-                    // The leaf is the NUL-terminated suffix of `spec_disp` from
-                    // `last_sep`; compare against it directly (was an O(n^2)
-                    // `format("%s%c", ...)` char-by-char rebuild just to `eq` it).
-                    const leaf: string = spec_disp + last_sep;
-                    if (named_str.eq(leaf)) { return true; }
+            TypeAnnotation::Generic(_) => {
+                const denoted: TypeRef = this.type_resolver.resolve(ann, head_ctx);
+                if (!this.arena.inst_generic_base(denoted).equals(entry.base_type)) { return false; }
+                if (this.arena.inst_type_arg_count(denoted) != type_args.length) { return false; }
+                for (mut i: i64 = 0; i < type_args.length; i++) {
+                    if (!this.arena.inst_type_arg_at(denoted, i).equals(type_args[i])) { return true; }
                 }
                 return false;
             }

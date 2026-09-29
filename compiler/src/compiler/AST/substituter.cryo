@@ -21,10 +21,11 @@ import compiler::ast::{
     visitor
 };
 import compiler::types;
-import compiler::types::{ arena, substitution };
+import compiler::types::{ arena, substitution, TypeKind };
+import std::fmt;
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, ResBase, ResSlot };
+import compiler::resolver::res::{ DefId, ResSlot };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::types::type_ref;
@@ -72,7 +73,6 @@ public:
     /// own `<U>` copied under an `implement<U>` keeps its `U` while the
     /// impl's is rewritten, which no comparison of spellings can do.
     param_syms:        SymbolID[];
-    type_arg_displays: SymbolStr[];       // ["i32"]
     /// The arena id the specialization will occupy, or invalid when the caller
     /// has none.  Attached as `pre_resolved` to every annotation rewritten to
     /// `spec_name`, so a synthesized mangled name never has to be re-derived
@@ -86,7 +86,6 @@ public:
                        intern_table: InternTable*,
                        base_name: SymbolStr, spec_name: SymbolStr,
                        param_syms: SymbolID[],
-                       type_arg_displays: SymbolStr[],
                        spec_typeref: TypeRef)
         : BaseASTVisitor() {
         this.subst             = subst;
@@ -95,8 +94,21 @@ public:
         this.base_name         = base_name;
         this.spec_name         = spec_name;
         this.param_syms        = param_syms;
-        this.type_arg_displays = type_arg_displays;
         this.spec_typeref      = spec_typeref;
+    }
+
+    /// The name a rewritten annotation carries beside its argument's
+    /// TypeRef: the declaration's qualified name, or the arena's display of
+    /// a type that has none.  A label for diagnostics and debug output -
+    /// every annotation carrying it carries the TypeRef too, and the
+    /// resolver answers with that first.
+    arg_label(&this, arg: TypeRef) -> SymbolStr {
+        if (this.arena.lookup(arg) == null) {
+            return this.intern_table.intern(fmt::format("unknown_%llu", arg.key()));
+        }
+        const qname: SymbolStr = this.arena.get_qualified_name(arg);
+        if (qname.is_valid()) { return qname; }
+        return this.intern_table.intern(this.arena.resolve_display_name(arg));
     }
 
     /// Drop a callee pin, which - unlike a member pin - cannot cross a
@@ -263,7 +275,7 @@ public:
                 const member_sym: SymbolStr = this.intern_table.intern(member_str);
                 const base_pre: TypeRef = this.resolved_arg_typeref(pi);
                 const base_named: NamedAnnotation* = new NamedAnnotation {
-                    name:         this.type_arg_displays[pi],
+                    name:         this.arg_label(base_pre),
                     span:         named.span,
                     pre_resolved: base_pre,
                     res: ResSlot::Pending,
@@ -286,61 +298,49 @@ public:
         // The parameter this annotation names, when it is one of ours.
         const i: i64 = this.param_slot(named.param_sym());
         if (i >= 0) {
-            // Instead of blindly setting named.name (which produces
-            // Named("i32"), Named("void*"), Named("Foo[]") that the
-            // resolver must parse), produce the correct annotation kind.
-            const display: string = this.intern_table.resolve(this.type_arg_displays[i]);
-            const display_len: i64 = display.length() as i64;
-
-            // Unit type `()` has no Named form; it must become an empty Tuple
-            // annotation so resolve_tuple produces a valid unit TypeRef.
-            if (display_len == 2 && display[0] == '(' && display[1] == ')') {
-                ASTTypeSubstituter::rewrite_to_unit(ann, named.span);
+            // The annotation's shape is the argument's KIND, read off the
+            // arena.  Its printed text cannot say it: a function type
+            // returning a pointer prints ending in `*` and one returning an
+            // array ending in `[]`, and neither is a pointer or an array.
+            const arg: TypeRef = this.resolved_arg_typeref(i);
+            match (this.arena.kind_of(arg)) {
+                // `()` has no Named form; the empty tuple is the unit.
+                TypeKind::Unit => {
+                    ASTTypeSubstituter::rewrite_to_unit(ann, named.span);
+                    return ann;
+                }
+                TypeKind::Void | TypeKind::Bool | TypeKind::Int | TypeKind::Float
+                | TypeKind::Char | TypeKind::String | TypeKind::Never => {
+                    ASTTypeSubstituter::rewrite_to_primitive(ann, this.arg_label(arg), named.span);
+                    return ann;
+                }
+                // The pointee carries its TypeRef: sizeof/alignof in a
+                // specialized body read it, and the label names nothing the
+                // specializing module can reach.
+                TypeKind::Pointer => {
+                    const pointee: TypeRef = this.unwrap_pointer_pointee(arg);
+                    ASTTypeSubstituter::rewrite_to_pointer(
+                        ann, this.intern_table.intern(this.arena.resolve_display_name(pointee)),
+                        pointee, named.span);
+                    return ann;
+                }
+                _ => {}
+            }
+            // A dynamic array's element carries its TypeRef, as a pointee
+            // does; without it an element that is not a type in scope at the
+            // specialization resolves to nothing and mangling fails.
+            const element: TypeRef = this.arena.dynamic_array_element_of(arg);
+            if (element.is_valid()) {
+                ASTTypeSubstituter::rewrite_to_array(
+                    ann, this.intern_table.intern(this.arena.resolve_display_name(element)),
+                    element, named.span);
                 return ann;
             }
-            // Primitive type? -> Primitive annotation
-            if (ResBase::is_primitive_spelling(display)) {
-                ASTTypeSubstituter::rewrite_to_primitive(ann, this.type_arg_displays[i], named.span);
-                return ann;
-            }
-            // Pointer suffix? -> Pointer(Named(inner))
-            if (display_len > 1 && display[display_len - 1] == '*') {
-                const inner_str: string = display.substr(0, display_len - 1);
-                const inner_sym: SymbolStr = this.intern_table.intern(inner_str);
-                // Unwrap one Pointer level off the substitution arg so
-                // the inner Named gets a pre_resolved TypeRef. Critical
-                // for sizeof/alignof in spec'd bodies; without it the
-                // resolver falls back to bare-name lookup and fails for
-                // any user-defined type not in scope at the spec site.
-                const inner_pre: TypeRef = this.unwrap_pointer_pointee(
-                    this.resolved_arg_typeref(i));
-                ASTTypeSubstituter::rewrite_to_pointer(ann, inner_sym, inner_pre, named.span);
-                return ann;
-            }
-            // Array suffix? -> Array(Named(inner), -1)
-            if (display_len > 2 && display[display_len - 2] == '[' && display[display_len - 1] == ']') {
-                const inner_str: string = display.substr(0, display_len - 2);
-                const inner_sym: SymbolStr = this.intern_table.intern(inner_str);
-                // Unwrap one Array level off the substitution arg so the
-                // inner Named gets a pre_resolved TypeRef (mirrors the
-                // Pointer branch above). Without it, a non-bare-name element
-                // (a pointer, or an out-of-scope user type) resolves to
-                // invalid and produces an Array<invalid> that ICEs mangling.
-                const inner_pre: TypeRef = this.arena.array_element_of(
-                    this.resolved_arg_typeref(i));
-                ASTTypeSubstituter::rewrite_to_array(ann, inner_sym, inner_pre, named.span);
-                return ann;
-            }
-            // User-defined type: keep as Named with new name, and attach
-            // the pre-resolved TypeRef so the resolver doesn't need to
-            // re-derive it from the (potentially very long) mangled spec
-            // name. The substituter owns the answer here: subst.replacements[i]
-            // is the concrete TypeRef the user gave for this generic param.
-            // If it's still wrapped in InstantiatedType, follow through to
-            // the resolved struct/enum/class so resolve_named's caller sees
-            // a usable type immediately.
-            named.name = this.type_arg_displays[i];
-            named.pre_resolved = this.resolved_arg_typeref(i);
+            // Anything else stays Named, answered by the argument itself:
+            // the substitution holds the TypeRef the user gave, and the
+            // resolver takes `pre_resolved` before it reads the name.
+            named.name = this.arg_label(arg);
+            named.pre_resolved = arg;
             return ann;
         }
 
@@ -738,8 +738,8 @@ public:
             const si: i64 = this.param_slot(node.scope_res.relative_param_sym());
             if (si >= 0) {
                 rewrote_owner = true;
-                node.scope_name = this.type_arg_displays[si];
                 const arg_ref: TypeRef = this.resolved_arg_typeref(si);
+                node.scope_name = this.arg_label(arg_ref);
                 if (arg_ref.is_valid()) { node.spec_owner = arg_ref; }
             }
         }

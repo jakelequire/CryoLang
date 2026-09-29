@@ -397,8 +397,6 @@ EXCLUDED = {
 # owner is.  A type that owns a map is rule 1's, whatever arrays it also
 # owns, and is not listed here.
 EXCLUDED_ARRAYS = {
-    "ASTTypeSubstituter": Excluded("compiler/AST/substituter.cryo",
-                                   "the type arguments' DISPLAYS, index-aligned with the symbols the substitution is keyed by; written into the clone, never searched"),
     "AsmBlockStmtNode":   Excluded("compiler/AST/statement.cryo",
                                    "the asm block's own written clobber names, TEXTS handed to the backend"),
     "AsyncLower":         Excluded("compiler/sema/async_lower.cryo",
