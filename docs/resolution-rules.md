@@ -74,3 +74,91 @@ family readers beside `lookup_family_entries`) and lookups outside every
 door. Those are conversions still to make: each becomes a door's body, a
 caller of a door, or an identity lookup. No member door is identified yet
 for an associated type.
+
+## Appendix: rulings
+
+Decisions Jake made in plain text on questions the rules above leave open.
+Each is stated as the behaviour it requires; whether the compiler has it
+yet is recorded with the change that builds it, not here.
+
+### 2026-09-29
+
+1. **A method call on a type parameter with no bound is an error.** Inside
+   a generic body a parameter has no methods except those a trait bound
+   gives it, as in Rust. The standard library's calls that relied on the
+   opposite get bounds.
+
+   ```cryo
+   type trait Write { write_some(&this, n: u64) -> u64; }
+
+   type struct Sink<W> {
+       w: W;
+       push(&this, n: u64) -> u64 { return this.w.write_some(n); }   // error: `W` has no bound
+   }
+
+   type struct Sink2<W> where W: Write {
+       w: W;
+       push(&this, n: u64) -> u64 { return this.w.write_some(n); }   // Write::write_some
+   }
+   ```
+
+2. **Calling a private function-typed field from another module is
+   refused**, as reading it already is.
+
+   ```cryo
+   namespace A;
+   type struct Hook { private run: (i32) -> i32; }
+
+   namespace B;
+   import A::{ Hook };
+   function fire(h: &Hook) -> i32 { return h.run(1); }   // error: `run` is private to `A`
+   ```
+
+3. **After an import collision is refused, a later qualified use binds to
+   the item its qualified path names.** The collision refuses the bare
+   name only.
+
+   ```cryo
+   import Json::{ parse };
+   import Toml::{ parse };              // error: `parse` imported twice
+   const a: i32 = parse("1");           // refused: the bare name is the collision
+   const b: i32 = Toml::parse("1");     // binds to Toml's `parse`
+   ```
+
+4. **When a generic and a non-generic method of the same name both apply
+   to a call, the call is ambiguous and is an error.** Neither wins by
+   being non-generic.
+
+   ```cryo
+   type struct Box2 { v: i32; }
+   implement Box2 {
+       put(&this, x: i32) -> i32 { return x; }
+       put<T>(&this, x: T) -> i32 { return 0; }
+   }
+   const n: i32 = b.put(1);   // error: both `put`s apply
+   ```
+
+5. **The command-line flag lookups are out of scope for the rules.** A
+   flag or subcommand string (`"--emit"`, `"build"`) is an option string,
+   not a name in a program, so matching it is not a lookup rule three
+   governs.
+
+6. **Rulings live in this appendix** once `docs/name-resolution.md` is
+   deleted.
+
+### 2026-09-28
+
+Relayed in plain text. Done means the five rules above; the definition and
+the language's features are frozen for this work. `ModuleGraph::module_named`
+becomes a door private to the name layer and the module loader. These were
+dropped, and are not to be started:
+
+- a type of its own for file paths used as lookup keys;
+- command-line flags taking `Keyword`;
+- a written exception list for functions that turn raw text into names;
+- a pointer to a name (`SymbolStr*`) counting as taking a name;
+- writing the reasons for the pending spelling-lint allows;
+- the lane gate no longer counting calls that pass only identities.
+
+The pending allows, the residue file and the approved-names file are
+retired after the flow conversions, and are left alone until then.

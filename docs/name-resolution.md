@@ -118,7 +118,7 @@ instrument condition one's list is drawn from; its J count is not a target.
    resolver itself among them): `python3 scripts/ns-migration/done.py
    --name-taking`. Outside it: `ModulePath` (a module's identity, as in
    condition one), `MangledName` (an opaque link symbol, carrying its bytes since §8.392), `Keyword` (a spelling matched against a table the language or its configuration format fixes, §8.393) and `String` /
-   `str::Str` (text read or written, never looked up) (§8.353), and the compiler's own `Text` - a message, a site label, a suggestion's replacement, a file path, a command line or a label handed to the backend: bytes it writes or hands on and never looks anything up by (§8.386, §8.387, §8.388). **NOT MET.** The gate exists since §8.395, as a lint in the compiler rather than as D41's file (D52-D55): a function or method declaring a parameter of type `SymbolStr` or `QualifiedName` - by value, by reference or as an array; never its receiver - is refused (E0157) unless an `![allow(lookup_by_spelling, reason = "...")]` on it gives a non-empty reason (E0152 when missing or empty). It does not reach `string`, which the compiler's list of spelling types does not name: 231 of the 692 the listing counted before §8.400 take a spelling only as a `string` (§8.397 groups them by what their bodies do with it: fewer than one in ten reads a store); the listing is the compiler's declaration records since §8.400, and counts the 38 class constructors taking a spelling, which its regular expression never saw. 527 declarations carry an allow whose reason says none is written yet - 488 in the compiler (the listing's 461 spelling-typed rows, less one `SymbolStr*` out-parameter, plus 28 class constructors the listing's matcher does not see) and 39 in the editor; those reasons are condition two's list, still to be written.
+   `str::Str` (text read or written, never looked up) (§8.353), and the compiler's own `Text` - a message, a site label, a suggestion's replacement, a file path, a command line or a label handed to the backend: bytes it writes or hands on and never looks anything up by (§8.386, §8.387, §8.388). **NOT MET.** The gate exists since §8.395, as a lint in the compiler rather than as D41's file (D52-D55): a function or method declaring a parameter of type `SymbolStr` or `QualifiedName` - by value, by reference or as an array; never its receiver - is refused (E0157) unless an `![allow(lookup_by_spelling, reason = "...")]` on it gives a non-empty reason (E0152 when missing or empty). It does not reach `string`, which the compiler's list of spelling types does not name: 231 of the 692 the listing counted before §8.400 take a spelling only as a `string` (§8.397 groups them by what their bodies do with it: fewer than one in ten reads a store); the listing is the compiler's declaration records since §8.400, and counts the 38 class constructors taking a spelling, which its regular expression never saw. 521 declarations carry an allow whose reason says none is written yet - 482 in the compiler and 39 in the editor (527 when the lint landed, 488 in the compiler: six carriers were deleted since, three in §8.410 and three in §8.412); 530 declarations carry an allow, so 9 have a written reason. Writing the pending reasons was dropped by Jake's ruling relayed in plain text on 2026-09-28; the allows retire after the flow conversions.
    Its form is ruled (D41): a file of its own in the repository, one entry
    per line - the function's signature, the written reason, and the
    command that checks the reason - and a gate that refuses a name-taking
@@ -237,14 +237,14 @@ measurement that decided it on the row.
 | D66 | **The primitive-keyword work happens now**; at the parse fork D18's keyword half stopped on, Cryo refuses a cast followed by a comparison without parentheses and asks for them (Jake, relayed in plain text 2026-09-27) | **RULED** - answers the one question D18's keyword half was waiting on | `no check` — not built | §8.295, §8.391 |
 | D67 | **Condition four's three clean audit rounds come after everything else** (Jake, relayed in plain text 2026-09-27) | **RULED** | `no check` — a sequencing rule | §0.0, §8.391 |
 | D68 | **A class declares its constructor in the value namespace too**, as a Rust tuple struct does: `Node(1)` names the constructor, a value, and the class stays in the type namespace (Jake, relayed in plain text 2026-09-28; answers §9 Q13) | **TAKEN (§8.401)** - a class declaring a constructor binds a `SymbolKind::Constructor` under its name beside the type, carrying the class's definition and visibility and exported with it | `grep -c 'SymbolKind::Constructor' compiler/src/compiler/resolver/namespace_kind.cryo` → **1** | §8.400, §8.401 |
-| D69 | **A pointer to a name counts as taking a name**: the 12 functions whose only spelling is behind a pointer re-enter condition two's population, and `out_trait: SymbolStr*` comes under the spelling lint (Jake, relayed in plain text 2026-09-28) | **RULED** - not built: `CallFacts::key_of` and the lint's `spelling_type_of` follow references and arrays, not pointers | `no check` — not built | §8.400 |
-| D70 | **The 28 functions that turn raw text into names get a written exception list** (Jake, relayed in plain text 2026-09-28) | **RULED** | `no check` — not built | §8.397 |
-| D71 | **File paths used as lookup keys (48 functions) get a type of their own** (Jake, relayed in plain text 2026-09-28) | **RULED** | `no check` — not built | §8.397 |
-| D72 | **The 31 command-line flag and command functions take `Keyword`** (Jake, relayed in plain text 2026-09-28) | **RULED** | `no check` — not built | §8.397 |
+| D69 | **A pointer to a name counts as taking a name**: the 12 functions whose only spelling is behind a pointer re-enter condition two's population, and `out_trait: SymbolStr*` comes under the spelling lint (Jake, relayed in plain text 2026-09-28) | **DROPPED** (Jake, relayed in plain text later the same day, when done became the five rules of the resolution-rules document: not to be started; recorded in its rulings appendix) - never built: `CallFacts::key_of` and the lint's `spelling_type_of` follow references and arrays, not pointers | `no check` — dropped | §8.400 |
+| D70 | **The 28 functions that turn raw text into names get a written exception list** (Jake, relayed in plain text 2026-09-28) | **DROPPED** (Jake, relayed in plain text later the same day; recorded in the resolution-rules document's rulings appendix) | `no check` — dropped | §8.397 |
+| D71 | **File paths used as lookup keys (48 functions) get a type of their own** (Jake, relayed in plain text 2026-09-28) | **DROPPED** (Jake, relayed in plain text later the same day; recorded in the resolution-rules document's rulings appendix) | `no check` — dropped | §8.397 |
+| D72 | **The 31 command-line flag and command functions take `Keyword`** (Jake, relayed in plain text 2026-09-28) | **DROPPED** (Jake, relayed in plain text later the same day; recorded in the resolution-rules document's rulings appendix; and 2026-09-29, in plain text: the flag lookups are option strings, out of scope for the rules) | `no check` — dropped | §8.397 |
 | D73 | **`new C(args)` has its arguments type-checked, before the merge** (Jake, relayed in plain text 2026-09-28) | **BUILT** (§8.403) - `new C(args)` and the by-value `C(args)` are checked against the constructor of their arity; a generic class's constructors are not (not registered on the template) | `grep -c 'check_constructor_args(' compiler/src/compiler/sema/sema.cryo` → **1** (0 before §8.403) | §8.398, §8.403 |
 | D74 | **The monomorphizer's text-based matching of generic type arguments is reworked onto type identities now** (`mono/specializer.cryo`, a type argument interned by its display text and an annotation matched by whole text or by last segment) (Jake, relayed in plain text 2026-09-28) | **BUILT** (§8.402) - a type argument's shape is its kind in the arena, and a receiver's written instantiation is compared as the type it denotes; the leaf match and the display parameters are deleted. The template recognised by its spelling (six `base_name` comparisons in the substituter) is measured with one wrong answer and not built | `grep -o 'type_arg_displays' compiler/src/compiler/mono/specializer.cryo \| wc -l` → **0** (11 before §8.402) | §8.398, §8.402 |
 | D75 | **Condition three is redefined around what the compiler can enforce** - neither a command-carrying list beside the lint nor an admission that reasons cannot be checked; the new wording is its own piece of work (Jake, relayed in plain text 2026-09-28) | **RULED** | `no check` — the wording is not yet written | §0.0 |
-| D76 | **The lane gate stops counting calls that pass only identities**: this answers D58's deferred principle, retires the unratified ARENA_READ 63 → 64, and stops later conversions raising the counts (Jake, relayed in plain text 2026-09-28) | **RULED** | `no check` — not built | §8.391 |
+| D76 | **The lane gate stops counting calls that pass only identities**: this answers D58's deferred principle, retires the unratified ARENA_READ 63 → 64, and stops later conversions raising the counts (Jake, relayed in plain text 2026-09-28) | **DROPPED** (Jake, relayed in plain text later the same day; recorded in the resolution-rules document's rulings appendix) | `no check` — dropped | §8.391 |
 | D77 | **The three remaining fast-check holes are fixed as a batch**: a struct compared with `null`, `printf`-style call arguments, and `Point(1, 2)` on a struct (Jake, relayed in plain text 2026-09-28) | **RULED** - the third is closed by D59's refusal (§8.401: E0231 at the name, where `cryo check` passed it); the first is BUILT (§8.404: the pointer rule, not the `void` one, admitted any value beside `null`); the second is not built | `no check` — one of three not built | §8.396, §8.401, §8.404 |
 
 **D18's keyword half is RULED and UNBUILT - built once and backed out at a parse fork the ruling did not cover (§8.295: `x as u32 < y`); that one ruling is now given (D66: refused, parentheses asked for) - and D32 is the criterion it is built toward** (D5 was, until §8.206; D2 and D9 were,
@@ -51191,3 +51191,38 @@ before verifying):
 - What this is worth: the case it fixes has no in-tree population, so it
   moves no existing program; the value is the new test and the 22-site
   count of calls on unbounded parameters above.
+
+### 8.419 The rulings get a home outside this ledger; the dropped decisions and the pending-allow count are corrected - 2026-09-29
+
+## Why
+
+This document is to be deleted before the merge, and the rulings that
+answer what the five rules leave open lived only here and in an untracked
+handoff. Jake ruled in plain text on 2026-09-29 that rulings live in an
+appendix to `docs/resolution-rules.md`.
+
+## What changed
+
+- `docs/resolution-rules.md` gains "Appendix: rulings": Jake's six plain-text
+  rulings of 2026-09-29 (a method call on an unbounded type parameter is an
+  error; calling a private function-typed field from another module is
+  refused; after a refused import collision a qualified use binds to what
+  its path names; a generic and a non-generic method that both apply are
+  ambiguous; command-line flag lookups are out of scope; rulings live in the
+  appendix), each with a Cryo example, and the drops relayed on 2026-09-28.
+  The five rules and the door table are untouched.
+- D69, D70, D71, D72 and D76 read RULED, not built; they were dropped by the
+  ruling relayed later on 2026-09-28, which until now was recorded only in
+  the handoff. They read DROPPED.
+- Section 0's prose said 527 pending allows; the tree has 521 (482 compiler,
+  39 editor; the count row already read 521). Measured:
+  `grep -rho 'reason = "pending: this took a spelling' compiler/src tools/CryoLSP/src --include=*.cryo | wc -l`
+  -> 521, per tree 482 and 39; control, every `allow(lookup_by_spelling` ->
+  530, and every other reason spelled out -> 9 with written reasons, so the
+  pattern is not missing a spacing variant.
+
+## Not built
+
+Rulings 1 to 5 are recorded here, not implemented. Ruling 4 reverses what
+the compiler does today (the non-generic method wins), so it changes what
+existing programs resolve to.
