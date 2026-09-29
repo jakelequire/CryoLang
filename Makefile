@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe facts facts-check facts-selftest selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe facts facts-check facts-selftest facts-blind-spots selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -196,6 +196,8 @@ help:
 	@echo "                         (installs nothing; the only gate that builds it)"
 	@echo "  make facts             The compiler's --emit=facts report for compiler, stdlib, editor (.facts/);"
 	@echo "                         the only way they are refreshed - every gate reading them refuses stale ones"
+	@echo "  make facts-blind-spots  Where those facts cannot see a spelling, as a list checked against"
+	@echo "                         the compiler under test (a verify gate: blind)"
 	@echo "  make vendor-check      Check every constant shape survives cryo vendor"
 	@echo "  make api-index         Regenerate docs/stdlib-api.txt (the stdlib API index)"
 	@echo "  make api-index-check   Fail if docs/stdlib-api.txt is stale"
@@ -624,6 +626,17 @@ incremental-instance-check: cryo
 else
 incremental-instance-check: cryo
 	@$(PYTHON) scripts/incremental-instance-check.py --cryo "$(STAGE2)"
+endif
+
+# Where --emit=facts cannot see a spelling: the list in the script, each entry
+# a probe line of tests/fixtures/facts-blind-spots built with the compiler
+# under test, SEEN or BLIND, refused when an entry stops holding either way.
+ifeq ($(HOST_OS),windows)
+facts-blind-spots: cryo
+	@$(PYTHON) scripts/facts-blind-spots.py --cryo "$(STAGE2_EXE)"
+else
+facts-blind-spots: cryo
+	@$(PYTHON) scripts/facts-blind-spots.py --cryo "$(STAGE2)"
 endif
 
 # The judges behind verify's tests/started-compiling declarations, driven

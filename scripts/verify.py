@@ -12,6 +12,9 @@ build:
     incr       scripts/incremental-instance-check.py
                                          an edit asking a cached module for a
                                          new generic instance still links
+    blind      scripts/facts-blind-spots.py
+                                         the list of where --emit=facts cannot
+                                         see a spelling still holds
     fast       make check-fast           lane surface, section 0, pin integrity
 
 They are independent: each writes its own build directory, and nothing here
@@ -100,6 +103,8 @@ GATES = {
     "cross":    ([PY, "scripts/cross-check.py", "--cryo", "{cryo}"], r"^cross-check: "),
     "incr":     ([PY, "scripts/incremental-instance-check.py", "--cryo", "{cryo}"],
                  r"^incremental-instance-check: "),
+    "blind":    ([PY, "scripts/facts-blind-spots.py", "--cryo", "{cryo}"],
+                 r"^facts-blind-spots: "),
     # `ARGS=` on the command line: `make verify ARGS=...` exports ARGS to
     # child makes, and check-fast's lane-check would receive verify's flags.
     "fast":     (["make", "--no-print-directory", "check-fast", "ARGS="], r"check-fast: "),

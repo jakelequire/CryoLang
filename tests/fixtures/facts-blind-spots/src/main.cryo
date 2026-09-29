@@ -1,0 +1,60 @@
+/// Probes for `scripts/facts-blind-spots.py`: each line marked `spot:` is
+/// one entry of that script's list, which says whether `--emit=facts`
+/// records a spelling there.  A line the list calls BLIND is a shape of
+/// code the facts cannot see; one it calls SEEN is a control, proving the
+/// instrument reports that shape.
+namespace FactsBlindSpots::Main;
+
+import std::collections::hashmap;
+import utils::text;
+import utils::keyword;
+import compiler::resolver::symbol_str;
+
+type struct Holder { key: u32; }
+
+function takes_string(s: string) -> i32 { return s.length() as i32; }
+function takes_text(t: text::Text) -> i32 { return t.as_string().length() as i32; }
+function takes_keyword(k: keyword::Keyword) -> i32 { return k.as_string().length() as i32; }
+function takes_number(n: u32) -> i32 { return n as i32; }
+function takes_any<T>(v: T) -> i32 { return 1; }
+
+![allow(lookup_by_spelling, reason = "a probe of the facts writer: it takes spellings on purpose")]
+function probes(name: symbol_str::SymbolStr, other: symbol_str::SymbolStr, s: string,
+                t: text::Text, kw: keyword::Keyword) -> i32 {
+    mut total: i32 = 0;
+    mut seen: hashmap::HashMap<u32, i32> = hashmap::HashMap::<u32, i32>::new();
+    seen.insert(name.id, 1);                                     // spot: number-to-generic-insert
+    if (seen.get(&name.id).is_some()) { total = total + 1; }     // spot: number-to-generic-get
+    total = total + takes_string(s);                             // spot: string-to-string
+    total = total + takes_text(t);                               // spot: text-to-text
+    total = total + takes_keyword(kw);                           // spot: keyword-to-keyword
+    total = total + takes_number(name.id);                       // spot: number-to-number
+    total = total + takes_any::<symbol_str::SymbolStr>(name);    // spot: name-to-generic, callee-generic
+    if (name.equals(other)) { total = total + 1; }               // spot: equals-method
+    if (s == "Option") { total = total + 1; }                    // spot: string-compare
+    if (name.id == other.id) { total = total + 1; }              // spot: number-compare
+    match (s) {                                                  // spot: match-string
+        "Option" => { total = total + 2; }
+        _        => { }
+    }
+    const k: u32 = name.id;
+    if (seen.get(&k).is_some()) { total = total + 1; }           // spot: number-via-local
+    const h: Holder = Holder { key: name.id };                   // spot: number-into-field
+    total = total + h.key as i32;
+    const f: (string) -> i32 = takes_string;
+    total = total + f(s);                                        // spot: string-through-pointer, callee-pointer
+    const g = (x: string) -> i32 { return takes_string(x); };    // spot: string-in-closure
+    total = total + g(s);                                        // spot: callee-closure
+    return total;
+}
+
+function generic_probe<T>(v: T, s: string) -> i32 {
+    return takes_string(s);                                      // spot: string-in-generic-body
+}
+
+function main() -> i32 {
+    const a: symbol_str::SymbolStr = symbol_str::SymbolStr { id: 3 };
+    const b: symbol_str::SymbolStr = symbol_str::SymbolStr { id: 4 };
+    return probes(a, b, "Option", text::Text::new("t"), keyword::Keyword::new("k"))
+        + generic_probe::<i32>(1, "x");
+}

@@ -1,5 +1,5 @@
-/// `--emit=facts`: what each call that passes a spelling bound, and each
-/// comparison of spellings, as sema decided it.
+/// `--emit=facts`: what each call that passes a spelling bound, each
+/// comparison of spellings, and each `match` over one, as sema decided it.
 ///
 /// A KEY is a value that names something by its text: `string`,
 /// `SymbolStr`, `QualifiedName` (a path of `SymbolStr` segments) and
@@ -17,14 +17,26 @@
 ///           callee-decl  enclosing  callee-text  enclosing-text  depth
 ///
 /// `kind` is `call` (one per call, whatever it passes; `index` is its
-/// argument count), `arg`, `cmp`, `noparams` (a call with arguments whose parameter
-/// types sema never had) or `unaligned` (a signature whose parameters could
-/// not be matched to the arguments); a call the instrument cannot see into
-/// is counted rather than dropped.  `index` is the argument's position, the
-/// receiver not counted, or a comparison's operator.  `type` is the key
-/// parameter's type, or the compared key's.  `provenance` is where the
-/// argument's value comes from, and `receiver` where the method's receiver
-/// does (a comparison's right and left operands):
+/// argument count), `arg`, `sarg`, `cmp`, `match`, `noparams` (a call with
+/// arguments whose parameter types sema never had) or `unaligned` (a
+/// signature whose parameters could not be matched to the arguments); a call
+/// the instrument cannot see into is counted rather than dropped.  `index` is
+/// the argument's position, the receiver not counted, or a comparison's
+/// operator.  `type` is the key parameter's type, or the compared key's.
+/// `provenance` is where the argument's value comes from, and `receiver`
+/// where the method's receiver does (a comparison's right and left operands).
+///
+/// An `arg` is decided by the PARAMETER's type.  A `sarg` is decided by the
+/// argument's own VALUE, for an argument no `arg` record covers - passed to a
+/// parameter whose type carries no key, to a generic or variadic parameter,
+/// or to a call whose parameter types sema never had: a key, a `Text` or a
+/// `Keyword`, or a number read out of one (`name.id`).  Its `type` is what
+/// the value is: the key's or wrapper's name, `<name>.<member>` for a
+/// number read out of one.  A `match` is one per `match` whose subject's
+/// value is a spelling by the same test: `index` is how many arms carry a
+/// literal pattern, `type` the subject's spelling, `provenance` where the
+/// subject comes from, and `receiver` the literal patterns, comma-separated,
+/// `-` for none; the callee columns are `-`:
 ///
 ///     literal:<text>         a literal as written, a string quoted
 ///     param:<name>           the enclosing function's own parameter
@@ -76,7 +88,7 @@
 namespace compiler::sema::call_facts;
 
 import compiler::ast;
-import compiler::ast::{ LiteralKind, NodeKind };
+import compiler::ast::{ LiteralKind, NodeKind, PatternKind };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::lex::{ TokenType };
 import compiler::ast::declaration::{
@@ -88,6 +100,7 @@ import compiler::ast::expression::{
     IdentifierNode, LiteralNode, MemberAccessNode, ScopeResolutionNode, UnaryExprNode
 };
 import compiler::ast::statement::{ BlockStmtNode, ExprStmtNode, StatementNode };
+import compiler::ast::pattern::{ MatchArmNode, PatternNode };
 import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::decl_index::{ OverloadId };
@@ -172,6 +185,10 @@ type struct CallFacts {
         ctx.facts.push("call\t" + site + "\t" + fmt::format("%lld", call.arguments.length)
             + "\t-\t-\t" + receiver + "\t" + tail);
         if (call.arguments.length == 0) { return; }
+        // Which arguments an `arg` record describes; every other argument
+        // whose value is a spelling gets a `sarg`, on every path out.
+        mut covered: boolean[] = [];
+        for (mut i: i64 = 0; i < call.arguments.length; i++) { covered.push(false); }
 
         // The parameter types: the pinned declaration's signature when sema
         // pinned one, the types sema classified the arguments against when
@@ -186,6 +203,7 @@ type struct CallFacts {
             const sig: Type* = arena.lookup(ctx.decl_index.entry_signature(entry));
             if (sig == null || sig.kind != TypeKind::Function) {
                 ctx.facts.push("noparams\t" + site + "\t-\t-\t-\t" + receiver + "\t" + tail);
+                CallFacts::record_spelled_args(fs, call, &covered, site, receiver, tail);
                 return;
             }
             const ft: FunctionType* = sig as FunctionType*;
@@ -196,11 +214,13 @@ type struct CallFacts {
             if (offset < 0 || offset > 1
                     || (types.length - offset < call.arguments.length && !ft.is_variadic)) {
                 ctx.facts.push("unaligned\t" + site + "\t-\t-\t-\t" + receiver + "\t" + tail);
+                CallFacts::record_spelled_args(fs, call, &covered, site, receiver, tail);
                 return;
             }
         } else {
             if (!known || params.length == 0) {
                 ctx.facts.push("noparams\t" + site + "\t-\t-\t-\t" + receiver + "\t" + tail);
+                CallFacts::record_spelled_args(fs, call, &covered, site, receiver, tail);
                 return;
             }
             for (mut k: i64 = 0; k < params.length; k++) { types.push(params[k]); }
@@ -209,10 +229,128 @@ type struct CallFacts {
             if (i + offset >= types.length) { break; }
             const pt: TypeRef = types[i + offset];
             if (!CallFacts::carries_key(ctx, arena, pt)) { continue; }
+            covered[i] = true;
             ctx.facts.push("arg\t" + site + "\t" + fmt::format("%lld", i) + "\t"
                 + CallFacts::type_text(arena, pt) + "\t"
                 + CallFacts::provenance(fs, call.arguments[i], 0) + "\t" + receiver + "\t" + tail);
         }
+        CallFacts::record_spelled_args(fs, call, &covered, site, receiver, tail);
+    }
+
+    /// A `sarg` for each argument of `call` whose value is a spelling and
+    /// which no `arg` record describes.
+    static record_spelled_args(fs: &FactsScope, call: CallExprNode*, covered: &boolean[],
+                               site: string, receiver: string, tail: string) -> void {
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            if (covered[i]) { continue; }
+            const spelled: string = CallFacts::spelling_of_value(fs, call.arguments[i], 0);
+            if (spelled.length() == 0) { continue; }
+            fs.ctx.facts.push("sarg\t" + site + "\t" + fmt::format("%lld", i) + "\t" + spelled + "\t"
+                + CallFacts::provenance(fs, call.arguments[i], 0) + "\t" + receiver + "\t" + tail);
+        }
+    }
+
+    /// Record a `match` whose subject's value is a spelling, with the
+    /// literal patterns its arms compare it with.
+    static record_match(fs: &FactsScope, subject: ExpressionNode*, arms: &MatchArmNode*[],
+                        span: SourceSpan) -> void {
+        const spelled: string = CallFacts::spelling_of_value(fs, subject, 0);
+        if (spelled.length() == 0) { return; }
+        const ctx: CompilationContext* = fs.ctx;
+        mut literal_arms: i64 = 0;
+        mut literals: string = "";
+        for (mut i: i64 = 0; i < arms.length; i++) {
+            const arm: MatchArmNode* = arms[i];
+            if (arm == null) { continue; }
+            mut has_literal: boolean = false;
+            for (mut j: i64 = 0; j < arm.patterns.length; j++) {
+                const pat: PatternNode* = arm.patterns[j];
+                if (pat == null || pat.pattern_kind != PatternKind::Literal) { continue; }
+                has_literal = true;
+                if (literals.length() > 0) { literals = literals + ","; }
+                literals = literals + CallFacts::escaped_literal(
+                    ctx.intern_table.resolve(pat.value), pat.literal_kind);
+            }
+            if (has_literal) { literal_arms = literal_arms + 1; }
+        }
+        if (literals.length() == 0) { literals = "-"; }
+        ctx.facts.push("match\t" + CallFacts::site_of(ctx, span) + "\t"
+            + fmt::format("%lld", literal_arms) + "\t" + spelled + "\t"
+            + CallFacts::provenance(fs, subject, 0) + "\t" + literals + "\t-\t-\t-\t"
+            + CallFacts::enclosing(fs) + "\t-\t" + CallFacts::enclosing_text(fs)
+            + "\t" + fmt::format("%d", fs.state.loop_depth));
+    }
+
+    /// The spelling `e`'s VALUE is, whatever it is passed to, as a `sarg` or
+    /// `match` record prints it - a key (`key_of`), `Text` or `Keyword`, or
+    /// `<that>.<member>` for a number read out of one (`name.id`) - or ""
+    /// for none.  Read through `&`, `*` and casts, the way `provenance` is.
+    static spelling_of_value(fs: &FactsScope, e: ExpressionNode*, depth: i32) -> string {
+        if (e == null || depth > 8) { return ""; }
+        if (e.resolved_type.is_valid()) {
+            const own: string = CallFacts::spelling_of(fs.ctx, fs.arena, e.resolved_type);
+            if (own.length() > 0) { return own; }
+        }
+        const n: ASTNode* = e as ASTNode*;
+        if (n.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = e as UnaryExprNode*;
+            if (u.op.kind == TokenType::Amp || u.op.kind == TokenType::Star) {
+                return CallFacts::spelling_of_value(fs, u.operand, depth + 1);
+            }
+            return "";
+        }
+        if (n.kind == NodeKind::CastExpression) {
+            return CallFacts::spelling_of_value(fs, (e as CastExprNode*).expression, depth + 1);
+        }
+        if (n.kind != NodeKind::MemberAccess || !e.resolved_type.is_valid()) { return ""; }
+        const t: Type* = fs.arena.lookup(e.resolved_type);
+        if (t == null || t.kind != TypeKind::Int) { return ""; }
+        const obj: ExpressionNode* = (e as MemberAccessNode*).object;
+        if (obj == null || !obj.resolved_type.is_valid()) { return ""; }
+        mut one: TypeRef = obj.resolved_type;
+        const ot: Type* = fs.arena.lookup(one);
+        if (ot != null && (ot.kind == TypeKind::Reference || ot.kind == TypeKind::Pointer)) {
+            one = if (ot.kind == TypeKind::Reference) { (ot as ReferenceType*).referent }
+                  else { fs.arena.pointer_pointee_of(one) };
+        }
+        const kt: Type* = fs.arena.lookup(one);
+        if (kt == null || kt.kind == TypeKind::Array) { return ""; }
+        const holder: string = CallFacts::spelling_of(fs.ctx, fs.arena, one);
+        if (holder.length() == 0) { return ""; }
+        return holder + "." + fs.ctx.intern_table.resolve((e as MemberAccessNode*).member);
+    }
+
+    /// The spelling a value of type `t` is: a key, as `key_of` names it, or
+    /// the compiler's two wrappers of a spelling that is not a name, `Text`
+    /// and `Keyword` - under any number of references and arrays - or "".
+    /// The wrappers are not keys: a declaration taking one takes no name.
+    /// They are named here because a value carried in one is still a
+    /// spelling, and a lookup keyed by one is still a lookup by spelling.
+    static spelling_of(ctx: CompilationContext*, arena: TypeArena*, t: TypeRef) -> string {
+        const k: string = CallFacts::key_of(ctx, arena, t);
+        if (k.length() > 0) { return k; }
+        mut cur: TypeRef = t;
+        for (mut depth: i32 = 0; depth < 8; depth++) {
+            if (!cur.is_valid()) { return ""; }
+            const ty: Type* = arena.lookup(cur);
+            if (ty == null) { return ""; }
+            if (ty.kind == TypeKind::Reference) {
+                cur = (ty as ReferenceType*).referent;
+                continue;
+            }
+            if (ty.kind == TypeKind::Array) {
+                cur = (ty as ArrayType*).element;
+                continue;
+            }
+            if (ty.kind != TypeKind::Struct) { return ""; }
+            const d: DefId = ctx.decl_index.registered_def(cur);
+            if (!d.is_valid()) { return ""; }
+            const path: string = CallFacts::def_text(ctx, d);
+            if (path == "utils::text::Text") { return "Text"; }
+            if (path == "utils::keyword::Keyword") { return "Keyword"; }
+            return "";
+        }
+        return "";
     }
 
     /// Record `bin` when it compares keys: an `==` or `!=` whose operand is
@@ -695,10 +833,16 @@ type struct CallFacts {
     /// quotes and backslashes escaped so a record stays one line of fields,
     /// and cut at 60 characters.
     static literal_text(lit: LiteralNode*) -> string {
-        mut v: string = lit.value;
+        return CallFacts::escaped_literal(lit.value, lit.literal_kind);
+    }
+
+    /// A literal's text, escaped and cut as `literal_text` says; a string
+    /// quoted.
+    static escaped_literal(value: string, kind: LiteralKind) -> string {
+        mut v: string = value;
         if (v.length() > 60) { v = v.substr(0, 60) + "..."; }
         v = v.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r");
-        if (lit.literal_kind == LiteralKind::String) {
+        if (kind == LiteralKind::String) {
             return "\"" + v.replace("\"", "\\\"") + "\"";
         }
         return v;
