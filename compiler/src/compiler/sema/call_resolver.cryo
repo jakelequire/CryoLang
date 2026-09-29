@@ -714,14 +714,39 @@ type struct CallResolver {
     /// AUTHOR wrote: DropInsertion's scope-exit drops and codegen's field glue
     /// are both synthesized later, so neither can trip this.
     warn_explicit_drop_call(mut &this, call: CallExprNode*) -> void {
-        if (call.arguments.length != 0) { return; }
-        if (call.callee == null || call.callee.kind != NodeKind::MemberAccess) { return; }
-        const ma: MemberAccessNode* = call.callee as MemberAccessNode*;
-        if (!ma.member.equals(this.intern.intern("drop"))) { return; }
+        if (!this.is_explicit_drop_call(call)) { return; }
         mut diag: Diagnostic = Diagnostic::warning(
             ErrorCode::W0015_EXPLICIT_DROP_CALL,
             Text::new("explicit destructor call; the value is released at scope exit, and an aggregate's fields are released after its own `drop` runs. To release EARLY, write `mem::drop(x)`, which also stops the value being used afterwards. This is a warning while the tree is being cleaned up and will become an error"));
         diag = diag.at(call.span);
+        this.ctx.emit_diagnostic(diag);
+    }
+
+    /// Whether `call` is the explicit destructor call `x.drop()`: the
+    /// language gives every type one - a user `Drop` impl, the drop glue, or
+    /// nothing for a `Copy` value - so it names no method a bound must give.
+    is_explicit_drop_call(mut &this, call: CallExprNode*) -> boolean {
+        if (call.arguments.length != 0) { return false; }
+        if (call.callee == null || call.callee.kind != NodeKind::MemberAccess) { return false; }
+        const ma: MemberAccessNode* = call.callee as MemberAccessNode*;
+        return ma.member.equals(this.intern.intern("drop"));
+    }
+
+    /// A method call whose receiver is a type parameter no bound in scope
+    /// names: inside the body declaring it the parameter has only the
+    /// methods its bounds give it, so the call names nothing.
+    report_unbounded_receiver_call(mut &this, member: MemberAccessNode*, param: GenericParamType*) -> void {
+        const method_name: string = this.intern.resolve(member.member);
+        const param_display: string = this.arena.format_display(param as Type*);
+        const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+            Text::new(fmt::format("no method named `%s` found on type `%s`", method_name, param_display)));
+        diag = diag.at(primary_span);
+        diag = diag.with_note(Text::new(fmt::format(
+            "`%s` is a type parameter with no bound, so it has no methods", param_display)));
+        diag = diag.help(Text::new(fmt::format(
+            "add a `where %s: Trait` bound naming a trait that declares `%s`", param_display, method_name)));
         this.ctx.emit_diagnostic(diag);
     }
 
@@ -3310,6 +3335,10 @@ type struct CallResolver {
             if (abs_ret.is_valid()) {
                 member.set_resolved_type(abs_ret);
                 return abs_ret;
+            }
+            if (!this.is_explicit_drop_call(call)) {
+                const unbounded: GenericParamType* = this.binding.unbounded_receiver_param(obj_type);
+                if (unbounded != null) { this.report_unbounded_receiver_call(member, unbounded); }
             }
             return TypeRef::invalid();
         }

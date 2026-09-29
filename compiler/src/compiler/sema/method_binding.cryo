@@ -351,6 +351,53 @@ type struct MethodBinding {
         return tmpl.declared_where_bounds();
     }
 
+    /// The type parameter a method call's receiver is, when no bound in scope
+    /// names it; null for any other receiver.  Inside the body that declares
+    /// it a parameter has no methods but those its bounds give it, so a call
+    /// on one no bound names has nothing it can mean.  The scopes are the
+    /// function's `where` clause, the impl's, and the owner declaration's;
+    /// `This` is bounded by its trait.  A body the user did not write where
+    /// it stands - an impl's copy of a trait default, an `async` lowering's
+    /// `poll` - is skipped: its source is walked, with its own bounds, where
+    /// it is written.
+    unbounded_receiver_param(&this, recv_type: TypeRef) -> GenericParamType* {
+        const func: FunctionDeclNode* = this.state.symbolic_current_func;
+        if (func == null || func.is_synth_default || func.is_synthesized_body) { return null; }
+        mut t: Type* = this.arena.lookup(recv_type);
+        mut depth: i32 = 0;
+        while (t != null && depth < 5) {
+            if (t.kind == TypeKind::Pointer) {
+                t = this.arena.lookup((t as PointerType*).pointee);
+            } else if (t.kind == TypeKind::Reference) {
+                t = this.arena.lookup((t as ReferenceType*).referent);
+            } else {
+                break;
+            }
+            depth += 1;
+        }
+        if (t == null || t.kind != TypeKind::GenericParam) { return null; }
+        const param: GenericParamType* = t as GenericParamType*;
+        if (this.arena.is_this_placeholder(param as Type*)) { return null; }
+        if (MethodBinding::bounds_name_param(&func.trait_bounds, param)) { return null; }
+        if (this.state.symbolic_impl_node != null
+            && MethodBinding::bounds_name_param(&this.state.symbolic_impl_node.where_bounds, param)) {
+            return null;
+        }
+        const owner_bounds: TraitBound[]* = this.owner_declared_bounds();
+        if (owner_bounds != null && MethodBinding::bounds_name_param(owner_bounds, param)) { return null; }
+        return param;
+    }
+
+    /// Whether one of `bounds` has `param` itself as its subject; a bound on a
+    /// projection of it (`T::Item: Ord`) constrains the projection, not `T`.
+    static bounds_name_param(bounds: &TraitBound[], param: GenericParamType*) -> boolean {
+        for (mut i: i64 = 0; i < bounds.length; i++) {
+            if (bounds[i].has_projection_subject()) { continue; }
+            if (param.declared_by(bounds[i].subject_sym)) { return true; }
+        }
+        return false;
+    }
+
     /// Search `bounds` for a BARE-parameter bound on `param`; return the first
     /// bound trait's method return with the bound's associated-type args
     /// substituted and `This` rebased onto `recv`. The bare-subject sibling of

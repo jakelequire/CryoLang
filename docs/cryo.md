@@ -1803,6 +1803,15 @@ type enum Slot<T> where T: Tagged {
 
 A type's bound is checked once per instantiation: `Holder<Plain>` with a `Plain` that does not implement `Tagged` is an error (E0306) at the annotation that wrote it, with the bound as declared beside it. An instantiation reached without an annotation — a literal, a static call — is refused the same way where it is specialised.
 
+Inside the body that declares it, a parameter has only the methods its bounds give it. A method call on a parameter that no bound in scope names — the function's `where` clause, the enclosing `implement` block's, or the type declaration's — is an error (E0358) where the call is written, whether or not anything instantiates the body.
+
+```cryo
+type struct Sink<W> {
+    w: W;
+    total(&this) -> u64 { return this.w.count(); }   // error[E0358]: no method named `count` found on type `W`
+}
+```
+
 ### 11.4 Standard Library Traits
 
 | Trait                                                                                                         | Purpose                                                                                                           |
