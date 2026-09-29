@@ -245,6 +245,17 @@ yet is recorded with the change that builds it, not here.
     compiler, as a lint or an internal check. The existing scripts stay as
     they are until they are removed after the merge.
 
+19. **An object that `make verify --require-identical` reports moved, whose
+    functions and bodies are identical but emitted in another order, is
+    accepted with a written explanation in the commit message.** The verify
+    script is not changed to ignore emission order.
+
+20. **verify does not see a change to the standard library alone, and that
+    is accepted**: both of its runs compile against the working tree's
+    standard library. A library change that alters behaviour is proven by a
+    test project of its own, the way a counting transport proves that a
+    `BufStream` releases what it wraps once. verify is not extended.
+
 ### 2026-09-28
 
 Relayed in plain text. Done means the five rules above; the definition and

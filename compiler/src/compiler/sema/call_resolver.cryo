@@ -753,10 +753,13 @@ type struct CallResolver {
         return ma.member.equals(this.intern.intern("drop"));
     }
 
-    /// A method call whose receiver is a type parameter no bound in scope
-    /// names: inside the body declaring it the parameter has only the
-    /// methods its bounds give it, so the call names nothing.
-    report_unbounded_receiver_call(mut &this, member: MemberAccessNode*, param: GenericParamType*) -> void {
+    /// A method call whose receiver is a type parameter its bounds did not
+    /// type: inside the body declaring it the parameter has only the
+    /// methods its bounds give it, so the call names nothing - whether no
+    /// bound names the parameter or none of those naming it declares the
+    /// method.
+    report_param_receiver_call(mut &this, member: MemberAccessNode*, param: GenericParamType*,
+                               bounded: boolean) -> void {
         const method_name: string = this.intern.resolve(member.member);
         const param_display: string = this.arena.format_display(param as Type*);
         const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
@@ -764,8 +767,10 @@ type struct CallResolver {
             ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
             Text::new(fmt::format("no method named `%s` found on type `%s`", method_name, param_display)));
         diag = diag.at(primary_span);
-        diag = diag.with_note(Text::new(fmt::format(
-            "`%s` is a type parameter with no bound, so it has no methods", param_display)));
+        if (!bounded) {
+            diag = diag.with_note(Text::new(fmt::format(
+                "`%s` is a type parameter with no bound, so it has no methods", param_display)));
+        }
         diag = diag.help(Text::new(fmt::format(
             "add a `where %s: Trait` bound naming a trait that declares `%s`", param_display, method_name)));
         this.ctx.emit_diagnostic(diag);
@@ -3612,8 +3617,10 @@ type struct CallResolver {
                 return abs_ret;
             }
             if (!this.is_explicit_drop_call(call)) {
-                const unbounded: GenericParamType* = this.binding.unbounded_receiver_param(obj_type);
-                if (unbounded != null) { this.report_unbounded_receiver_call(member, unbounded); }
+                const param: GenericParamType* = this.binding.receiver_type_param(obj_type);
+                if (param != null) {
+                    this.report_param_receiver_call(member, param, this.binding.param_is_bounded(param));
+                }
             }
             return TypeRef::invalid();
         }

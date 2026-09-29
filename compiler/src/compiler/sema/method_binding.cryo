@@ -351,16 +351,14 @@ type struct MethodBinding {
         return tmpl.declared_where_bounds();
     }
 
-    /// The type parameter a method call's receiver is, when no bound in scope
-    /// names it; null for any other receiver.  Inside the body that declares
-    /// it a parameter has no methods but those its bounds give it, so a call
-    /// on one no bound names has nothing it can mean.  The scopes are the
-    /// function's `where` clause, the impl's, and the owner declaration's;
-    /// `This` is bounded by its trait.  A body the user did not write where
-    /// it stands - an impl's copy of a trait default, an `async` lowering's
-    /// `poll` - is skipped: its source is walked, with its own bounds, where
-    /// it is written.
-    unbounded_receiver_param(&this, recv_type: TypeRef) -> GenericParamType* {
+    /// The type parameter a method call's receiver is, or null for any other
+    /// receiver.  Inside the body that declares it a parameter has no
+    /// methods but those its bounds give it, so a call the bounds did not
+    /// type has nothing it can mean.  `This` is bounded by its trait and is
+    /// not one.  A body the user did not write where it stands - an impl's
+    /// copy of a trait default, an `async` lowering's `poll` - is skipped:
+    /// its source is walked, with its own bounds, where it is written.
+    receiver_type_param(&this, recv_type: TypeRef) -> GenericParamType* {
         const func: FunctionDeclNode* = this.state.symbolic_current_func;
         if (func == null || func.is_synth_default || func.is_synthesized_body) { return null; }
         mut t: Type* = this.arena.lookup(recv_type);
@@ -378,14 +376,20 @@ type struct MethodBinding {
         if (t == null || t.kind != TypeKind::GenericParam) { return null; }
         const param: GenericParamType* = t as GenericParamType*;
         if (this.arena.is_this_placeholder(param as Type*)) { return null; }
-        if (MethodBinding::bounds_name_param(&func.trait_bounds, param)) { return null; }
+        return param;
+    }
+
+    /// Whether a bound in scope of the body being walked names `param`: the
+    /// function's `where` clause, the impl's, or the owner declaration's.
+    param_is_bounded(&this, param: GenericParamType*) -> boolean {
+        const func: FunctionDeclNode* = this.state.symbolic_current_func;
+        if (func != null && MethodBinding::bounds_name_param(&func.trait_bounds, param)) { return true; }
         if (this.state.symbolic_impl_node != null
             && MethodBinding::bounds_name_param(&this.state.symbolic_impl_node.where_bounds, param)) {
-            return null;
+            return true;
         }
         const owner_bounds: TraitBound[]* = this.owner_declared_bounds();
-        if (owner_bounds != null && MethodBinding::bounds_name_param(owner_bounds, param)) { return null; }
-        return param;
+        return owner_bounds != null && MethodBinding::bounds_name_param(owner_bounds, param);
     }
 
     /// Whether one of `bounds` has `param` itself as its subject; a bound on a
@@ -421,11 +425,23 @@ type struct MethodBinding {
                 // the leaf being unique program-wide. `subst_bound_assoc_args`
                 // keeps the leaf: it reaches `get_trait_decl`, which is keyed
                 // by bare leaf alone, and a qualified key there misses silently.
+                //
+                // A bound gives its subject its trait's methods, then each
+                // supertrait's, nearest first.  The bound's arguments are the
+                // named trait's, not a supertrait's, so a supertrait's return
+                // has only `This` rebased.
+                const bound_def: DefId = if (tr == null) {
+                    this.ctx.decl_index.def_of(implied, this.arena) } else { tr.definition() };
                 const owner: TypeRef = if (tr == null) { implied } else {
-                    this.ctx.decl_index.type_of_def(tr.definition()) };
-                const ret: TypeRef = this.types.lookup_method_return(owner, method_name);
-                if (ret.is_valid()) {
-                    if (tr == null) { return this.subst_this_in_trait_return(ret, recv); }
+                    this.ctx.decl_index.type_of_def(bound_def) };
+                const chain: DefId[] = this.trait_chain(bound_def);
+                const depth: i64 = if (chain.length > 1) { chain.length } else { 1 };
+                for (mut k: i64 = 0; k < depth; k++) {
+                    const asked: TypeRef = if (k == 0) { owner } else {
+                        this.ctx.decl_index.type_of_def(chain[k]) };
+                    const ret: TypeRef = this.types.lookup_method_return(asked, method_name);
+                    if (!ret.is_valid()) { continue; }
+                    if (tr == null || k > 0) { return this.subst_this_in_trait_return(ret, recv); }
                     const leaf: SymbolStr = tr.path[tr.path.length - 1];
                     const sub: TypeRef = this.subst_bound_assoc_args(ret, leaf, tr);
                     return this.subst_this_in_trait_return(sub, recv);
@@ -433,6 +449,13 @@ type struct MethodBinding {
             }
         }
         return TypeRef::invalid();
+    }
+
+    /// `trait_def` followed by its supertraits, transitively, by identity;
+    /// empty for an invalid id or outside a build that registered traits.
+    trait_chain(&this, trait_def: DefId) -> DefId[] {
+        if (this.ctx.generic_registry == null) { return []; }
+        return this.ctx.generic_registry.trait_and_supertraits(trait_def);
     }
 
     /// The PARAMETER types of `method_name` as the trait(s) a where-clause binds
@@ -479,21 +502,25 @@ type struct MethodBinding {
                 const tr: TraitRef* = &b.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
                 // Identity rather than the written leaf: the leaf reaches the
-                // arena's leaf index only while it is unique program-wide.
-                const tref: TypeRef = this.ctx.decl_index.type_of_def(tr.definition());
-                if (!tref.is_valid()) { continue; }
-                const t: Type* = this.arena.lookup(tref);
-                if (t == null || t.kind != TypeKind::Trait) { continue; }
-                const tt: TraitType* = t as TraitType*;
-                for (mut mi: i64 = 0; mi < tt.required_methods.length; mi++) {
-                    const m: MethodInfo* = &tt.required_methods[mi];
-                    if (!m.name.equals(method_name)) { continue; }
-                    if (m.param_types.length != arg_count) { continue; }
-                    mut out: TypeRef[] = [];
-                    for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
-                        out.push(m.param_types[pi]);
+                // arena's leaf index only while it is unique program-wide.  The
+                // bound's trait first, then its supertraits nearest first.
+                const chain: DefId[] = this.trait_chain(tr.definition());
+                for (mut k: i64 = 0; k < chain.length; k++) {
+                    const tref: TypeRef = this.ctx.decl_index.type_of_def(chain[k]);
+                    if (!tref.is_valid()) { continue; }
+                    const t: Type* = this.arena.lookup(tref);
+                    if (t == null || t.kind != TypeKind::Trait) { continue; }
+                    const tt: TraitType* = t as TraitType*;
+                    for (mut mi: i64 = 0; mi < tt.required_methods.length; mi++) {
+                        const m: MethodInfo* = &tt.required_methods[mi];
+                        if (!m.name.equals(method_name)) { continue; }
+                        if (m.param_types.length != arg_count) { continue; }
+                        mut out: TypeRef[] = [];
+                        for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
+                            out.push(m.param_types[pi]);
+                        }
+                        return out;
                     }
-                    return out;
                 }
             }
         }
@@ -516,10 +543,16 @@ type struct MethodBinding {
                 // Identity for the registry lookup, leaf for the assoc-arg
                 // substitution: `subst_bound_assoc_args` reaches
                 // `get_trait_decl`, which is keyed by bare leaf alone.
+                // The bound's trait first, then its supertraits nearest first.
                 const leaf: SymbolStr = tr.path[tr.path.length - 1];
-                const ret: TypeRef = this.types.lookup_method_return(
-                    this.ctx.decl_index.type_of_def(tr.definition()), method_name);
-                if (ret.is_valid()) {
+                const chain: DefId[] = this.trait_chain(tr.definition());
+                for (mut k: i64 = 0; k < chain.length; k++) {
+                    const ret: TypeRef = this.types.lookup_method_return(
+                        this.ctx.decl_index.type_of_def(chain[k]), method_name);
+                    if (!ret.is_valid()) { continue; }
+                    // A supertrait's return has only `This` rebased: the
+                    // bound's arguments are the named trait's.
+                    if (k > 0) { return this.subst_this_in_trait_return(ret, recv); }
                     // Bound-supplied assoc args first (`Future<i64>` -> Output);
                     // any `This` the bound left unbound then rebases onto the
                     // projection receiver rather than dangling.
