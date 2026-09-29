@@ -17,7 +17,7 @@
 ///           callee-decl  enclosing  callee-text  enclosing-text  depth
 ///
 /// `kind` is `call` (one per call, whatever it passes; `index` is its
-/// argument count), `arg`, `sarg`, `cmp`, `match`, `noparams` (a call with
+/// argument count), `arg`, `sarg`, `cmp`, `match`, `assign`, `noparams` (a call with
 /// arguments whose parameter types sema never had) or `unaligned` (a
 /// signature whose parameters could not be matched to the arguments); a call
 /// the instrument cannot see into is counted rather than dropped.  `index` is
@@ -36,7 +36,14 @@
 /// value is a spelling by the same test: `index` is how many arms carry a
 /// literal pattern, `type` the subject's spelling, `provenance` where the
 /// subject comes from, and `receiver` the literal patterns, comma-separated,
-/// `-` for none; the callee columns are `-`:
+/// `-` for none.  An `assign` is one per assignment of a spelling to a
+/// local or parameter by name: `index` is the operator, `type` the
+/// spelling, `provenance` where the assigned value comes from, `receiver`
+/// the target as `local:<name>` or `param:<name>`, and `callee` the line
+/// the local is declared on (`-` when it has no initializer).  A local's
+/// own provenance names only its initializer, so these are every other
+/// value it can hold.  Otherwise the callee columns of both are `-`.  A
+/// provenance is one of:
 ///
 ///     literal:<text>         a literal as written, a string quoted
 ///     param:<name>           the enclosing function's own parameter
@@ -367,6 +374,55 @@ type struct CallFacts {
             + bin.op.lexeme + "\t" + CallFacts::type_text(fs.arena, key) + "\t"
             + CallFacts::provenance(fs, bin.right, 0) + "\t"
             + CallFacts::provenance(fs, bin.left, 0) + "\t-\t-\t-\t"
+            + CallFacts::enclosing(fs) + "\t-\t" + CallFacts::enclosing_text(fs)
+            + "\t" + fmt::format("%d", fs.state.loop_depth));
+    }
+
+    /// Record `bin` when it assigns a spelling to a local or a parameter by
+    /// name (`=`, `+=`, ...): where the new value comes from.  A local's
+    /// provenance names its initializer and nothing else, so a reader
+    /// following a local through `local:` or `param:` reads these for every
+    /// other value it can hold; without them a value that reaches a lookup
+    /// only by a later assignment has no record describing its trip.
+    static record_assign(fs: &FactsScope, bin: BinaryExprNode*) -> void {
+        if (bin == null || bin.left == null || bin.right == null) { return; }
+        if (!bin.op.kind.is_assignment_op()) { return; }
+        if ((bin.left as ASTNode*).kind != NodeKind::Identifier) { return; }
+        const spelled: string = CallFacts::spelling_of_value(fs, bin.left, 0);
+        if (spelled.length() == 0) { return; }
+        const ctx: CompilationContext* = fs.ctx;
+        const ident: IdentifierNode* = bin.left as IdentifierNode*;
+        const written: string = ctx.intern_table.resolve(ident.name);
+        mut target: string = "";
+        mut declared: string = "-";
+        match (ident.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Local(sym) => {
+                        target = "local:" + written;
+                        if (fs.func != null) {
+                            for (mut i: i64 = 0; i < fs.func.parameters.length; i++) {
+                                const p: VarDeclNode* = fs.func.parameters[i];
+                                if (p != null && p.sym_id.equals(sym)) { target = "param:" + written; }
+                            }
+                        }
+                        match (fs.state.facts_inits.get(&sym.key())) {
+                            Option::Some(v) => {
+                                const decl: ASTNode* = v as ASTNode*;
+                                declared = fmt::format("%u", decl.span.start_line);
+                            }
+                            Option::None => { }
+                        }
+                    }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+        if (target.length() == 0) { return; }
+        ctx.facts.push("assign\t" + CallFacts::site_of(ctx, (bin as ASTNode*).span) + "\t"
+            + bin.op.lexeme + "\t" + spelled + "\t"
+            + CallFacts::provenance(fs, bin.right, 0) + "\t" + target + "\t" + declared + "\t-\t-\t"
             + CallFacts::enclosing(fs) + "\t-\t" + CallFacts::enclosing_text(fs)
             + "\t" + fmt::format("%d", fs.state.loop_depth));
     }

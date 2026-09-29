@@ -40,6 +40,13 @@ function-pointer or closure call (a parameter reached only through one has no
 recorded caller, reported as `chain-lost`), and the parts of a composed key
 (`expr:` origins; a formatted key's first argument only).
 
+A local's provenance names its initializer only.  Every later assignment of a
+spelling to a local or parameter by name has an `assign` record, and where
+the trace passes a local or a parameter it follows each assignment to it in
+the same function as well - joined by the function and the local's name, so
+two locals of one name in one function share their assignments (the join
+over-reports there, never under-reports).
+
 The outstanding list, `scripts/spelling-flow.outstanding.tsv`, is every
 violation as (rule, lookup kind, key class, lookup function, origin kind,
 origin function, origin text) with a count - no line numbers, so an edit
@@ -114,7 +121,9 @@ IDENTITY_TEXT = (
 # The tracing rules, each switchable so the self-test can show the case
 # written for it failing without it.
 RULES = ("doors", "chain", "same-spelling-field", "pass-through", "identity-text",
-         "map", "write", "scan", "match")
+         "reassign", "map", "write", "scan", "match")
+
+LOCAL_NAME = re.compile(r"^(local|param):(?:mut )?([A-Za-z_0-9]+)")
 
 
 def split_call(body):
@@ -195,9 +204,14 @@ class Facts:
             elif r[0] == "fn":
                 fn_at[(r[1].lower(), r[13])].append(r[8])
         self.callers = collections.defaultdict(list)
+        self.assigns = collections.defaultdict(list)
         for r in self.recs:
             if r[0] in ("arg", "sarg") and r[4].isdigit():
                 self.callers[(r[8], int(r[4]))].append(r)
+            elif r[0] == "assign":
+                m = LOCAL_NAME.match(r[7])
+                if m:
+                    self.assigns[(r[11], m.group(1), m.group(2))].append(r)
         self.doors = {}
         for leaf, relpath in door_fns:
             hits = fn_at.get((relpath.lower(), leaf), [])
@@ -213,31 +227,51 @@ class Facts:
         """(origin record, kind, text) for every way `prov`, the value of `rec`, arrives."""
         if not ignore_doors and "doors" in self.rules and rec[11] in self.doors:
             return [(rec, "door", self.doors[rec[11]])]
+        out = []
         while True:
+            assigned = self.assigned(rec, prov)
+            if assigned:
+                key, recs = assigned
+                if key not in seen:
+                    for a in recs:
+                        out += self.origins(a, a[6], seen | {key}, ignore_doors)
             s = step(prov, self.rules)
             if s[0] == "next":
                 prov = s[1]
                 continue
             if s[0] == "origin":
-                return [(rec, s[1], s[2])]
+                if s[1] == "local" and assigned:
+                    return out      # declared with no initializer: its assignments are its values
+                return out + [(rec, s[1], s[2])]
             name = s[1]
             if name == "this":
-                return [(rec, "receiver", "this")]
+                return out + [(rec, "receiver", "this")]
             if "chain" not in self.rules:
-                return [(rec, "param", name)]
+                return out + [(rec, "param", name)]
             idx = self.param_index.get((rec[11], name))
             if idx is None:
-                return [(rec, "chain-lost", "param %s has no record" % name)]
+                return out + [(rec, "chain-lost", "param %s has no record" % name)]
             key = (rec[11], idx)
             if key in seen:
-                return []
+                return out
             calls = self.callers.get(key, [])
             if not calls:
-                return [(rec, "chain-lost", "no recorded caller passes %s" % name)]
-            out = []
+                return out + [(rec, "chain-lost", "no recorded caller passes %s" % name)]
             for c in calls:
                 out += self.origins(c, c[6], seen | {key}, ignore_doors)
             return out
+
+    def assigned(self, rec, prov):
+        """(seen-key, the `assign` records) when `prov` is a local or parameter of `rec`'s
+        function that something is assigned to after its initializer, else None."""
+        if "reassign" not in self.rules:
+            return None
+        m = LOCAL_NAME.match(prov)
+        if not m:
+            return None
+        key = (rec[11], m.group(1), m.group(2))
+        recs = self.assigns.get(key)
+        return (("assign",) + key, recs) if recs else None
 
     def lookups(self):
         """(kind, record, the provenance of the spelling) for every lookup in scope."""
@@ -355,6 +389,7 @@ CASES = [
     ("not-a-lookup", "none", None),
     ("origin-literal", "origin", "chain"),
     ("origin-through-resolve", "origin", "pass-through"),
+    ("origin-reassigned", "origin", "reassign"),
     ("identity-into-door", "identity", "identity-text"),
     ("identity-into-lookup", "identity", "identity-text"),
 ]

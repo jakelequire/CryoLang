@@ -37,6 +37,9 @@ What an entry asks of its line:
               `DefTable.path_of`) - in its provenance.  What a check that
               identity text never becomes a lookup key has to read from each
               record, and where that trace stops
+    assigned  an `assign` record on the line - an assignment to a local -
+              traces the assigned value to `text_of`: what a reader
+              following the local past its initializer reads
 
 Usage:
     python scripts/facts-blind-spots.py --cryo compiler/build/cryo.exe
@@ -118,6 +121,12 @@ SPOTS = [
     ("identity-text-via-local", "origin", SEEN,
      "identity text held in a `string` local, then a key: the provenance follows the local's "
      "initializer"),
+    ("identity-text-reassigned", "assigned", SEEN,
+     "identity text assigned to a `mut` local after its initializer, then a key: "
+     "`mut moved: string = \"Option\"; if (..) { moved = name.text_of(); } "
+     "by_text.get(&moved)`.  The key's provenance names the initializer only "
+     "(`local:mut moved=literal:\"Option\"`); the assignment has its own `assign` record, "
+     "which a reader following the local joins by function and name"),
     ("identity-text-concatenated", "origin", BLIND,
      "identity text concatenated into a key, `get(&(\"std::\" + name.text_of()))`: the "
      "key's provenance is `expr:BinaryExpression` and stops there"),
@@ -177,6 +186,8 @@ def answer(question, records):
     if question == "origin":
         return any(r[0] in ("arg", "sarg") and r[12].split("(", 1)[0].endswith(".get")
                    and "text_of" in r[6] for r in records)
+    if question == "assigned":
+        return any(r[0] == "assign" and "text_of" in r[6] for r in records)
     if question == "spelling":
         return any(r[0] in SPELLING_KINDS for r in records)
     if question in SPELLING_KINDS:
