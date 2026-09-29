@@ -628,23 +628,21 @@ public:
         if (node.is_generic()) { return; }
         const this_name: SymbolStr = this.intern.intern("This");
         const this_placeholder: TypeRef = this.arena.this_placeholder(this_name);
+        const saved_trait: TypeRef = this.state.symbolic_trait;
+        this.state.symbolic_trait = this.ctx.decl_index.type_of_decl(node.def, Text::new("sema/visit:TraitDeclNode"));
         for (mut j: i64 = 0; j < node.methods.length; j++) {
             const func: FunctionDeclNode* = node.methods[j];
             if (func == null || func.body == null) { continue; }
-            // A GENERIC default method (its own `<T>`) may use `static match (T)`
-            // in its body; that has to be walked SYMBOLICALLY (in_symbolic_check),
-            // exactly like a struct/impl generic method (visit_methods), so the
-            // arms are deferred to monomorphization instead of tripping E0645
-            // ("static match outside a generic context").  Non-generic defaults
-            // keep the plain walk.
-            if (func.is_generic()) {
-                this.symbolic_check_body(func, this_placeholder, this_placeholder);
-                continue;
-            }
-            this.enter_function(func, this_placeholder);
-            this.visit(func.body);
-            this.state.body_count += 1;
+            // Every default method is walked SYMBOLICALLY: its receiver `This` is
+            // abstract whether or not the method has type parameters of its own,
+            // so `this.m()` is typed through the trait that bounds `This`.  A
+            // plain walk treats `This` as a concrete type with no methods and
+            // leaves every such call, and everything bound from it, untyped.
+            // A generic default also needs it for `static match (T)`, whose arms
+            // are deferred to monomorphization instead of tripping E0645.
+            this.symbolic_check_body(func, this_placeholder, this_placeholder);
         }
+        this.state.symbolic_trait = saved_trait;
     }
 
     override visit(mut &this, node: ImplBlockNode*) -> void {

@@ -1,0 +1,148 @@
+diff --git a/compiler/src/compiler/sema/call_resolver.cryo b/compiler/src/compiler/sema/call_resolver.cryo
+index e4dd8bb7..5123ccde 100644
+--- a/compiler/src/compiler/sema/call_resolver.cryo
++++ b/compiler/src/compiler/sema/call_resolver.cryo
+@@ -3307,6 +3307,29 @@ type struct CallResolver {
+             // type-symbol lookup), making them unreachable in a symbolic walk.
+             const abs_ret: TypeRef =
+                 this.binding.abstract_receiver_method_return(obj_type, member.member);
++            {
++                mut pw: TypeRef = obj_type;
++                mut pt: Type* = this.arena.lookup(pw);
++                mut pd: i32 = 0;
++                while (pt != null && pd < 5 && (pt.kind == TypeKind::Pointer || pt.kind == TypeKind::Reference)) {
++                    pw = if (pt.kind == TypeKind::Pointer) { (pt as PointerType*).pointee } else { (pt as ReferenceType*).referent };
++                    pt = this.arena.lookup(pw);
++                    pd += 1;
++                }
++                const rt: Type* = this.arena.lookup(abs_ret);
++                const outcome: string = if (!abs_ret.is_valid()) { "invalid" } else {
++                    if (rt != null && rt.kind == TypeKind::Void) { "void" } else { "ok" } };
++                const is_this: boolean = pw.is_valid() && pw.equals(this.arena.this_placeholder(this.intern.intern("This")));
++                fmt::eprintln(fmt::format("VPROBE %s shape=%s this=%d trait=%d impl=%d fn=%d post=%d sym=%d leaf=%s at=%s:%u",
++                    outcome, if (pt != null) { pt.kind.to_string() } else { "null" },
++                    if (is_this) { 1 } else { 0 },
++                    0,
++                    if (this.state.symbolic_impl_node != null) { 1 } else { 0 },
++                    if (this.state.symbolic_current_func != null) { 1 } else { 0 },
++                    if (this.state.post_mono_verify) { 1 } else { 0 },
++                    if (this.state.in_symbolic_check) { 1 } else { 0 },
++                    this.intern.resolve(member.member), member.span.file, member.span.start_line));
++            }
+             if (abs_ret.is_valid()) {
+                 member.set_resolved_type(abs_ret);
+                 return abs_ret;
+@@ -3347,6 +3370,15 @@ type struct CallResolver {
+             // reaching this point means those arms declined; re-asking the
+             // same sources with less information cannot turn that into an
+             // answer.
++            {
++                const nt: Type* = this.arena.lookup(lookup_ref);
++                fmt::eprintln(fmt::format("NPROBE shape=%s this=%d sym=%d post=%d leaf=%s at=%s:%u",
++                    if (nt != null) { nt.kind.to_string() } else { "null" },
++                    if (this.arena.is_this_placeholder(nt)) { 1 } else { 0 },
++                    if (this.state.in_symbolic_check) { 1 } else { 0 },
++                    if (this.state.post_mono_verify) { 1 } else { 0 },
++                    this.intern.resolve(member.member), member.span.file, member.span.start_line));
++            }
+             return TypeRef::invalid();
+         }
+ 
+diff --git a/compiler/src/compiler/sema/method_binding.cryo b/compiler/src/compiler/sema/method_binding.cryo
+index b576e372..5382d30e 100644
+--- a/compiler/src/compiler/sema/method_binding.cryo
++++ b/compiler/src/compiler/sema/method_binding.cryo
+@@ -313,6 +313,13 @@ type struct MethodBinding {
+     lookup_method_through_param_bounds(mut &this, param: GenericParamType*, recv: TypeRef,
+                                        method_name: SymbolStr) -> TypeRef {
+         if (param == null) { return TypeRef::invalid(); }
++        // `This` in a trait's default method is bounded by that trait alone.
++        if (this.arena.is_this_placeholder(param as Type*)) {
++            if (!this.state.symbolic_trait.is_valid()) { return TypeRef::invalid(); }
++            const ret: TypeRef = this.types.lookup_method_return(this.state.symbolic_trait, method_name);
++            if (!ret.is_valid()) { return TypeRef::invalid(); }
++            return this.subst_this_in_trait_return(ret, recv);
++        }
+         if (this.state.symbolic_current_func != null) {
+             const r: TypeRef = this.scan_param_bounds(
+                 &this.state.symbolic_current_func.trait_bounds, param, method_name, recv);
+diff --git a/compiler/src/compiler/sema/sema.cryo b/compiler/src/compiler/sema/sema.cryo
+index 8693a5be..13011adb 100644
+--- a/compiler/src/compiler/sema/sema.cryo
++++ b/compiler/src/compiler/sema/sema.cryo
+@@ -628,23 +628,21 @@ public:
+         if (node.is_generic()) { return; }
+         const this_name: SymbolStr = this.intern.intern("This");
+         const this_placeholder: TypeRef = this.arena.this_placeholder(this_name);
++        const saved_trait: TypeRef = this.state.symbolic_trait;
++        this.state.symbolic_trait = this.ctx.decl_index.type_of_decl(node.def, Text::new("sema/visit:TraitDeclNode"));
+         for (mut j: i64 = 0; j < node.methods.length; j++) {
+             const func: FunctionDeclNode* = node.methods[j];
+             if (func == null || func.body == null) { continue; }
+-            // A GENERIC default method (its own `<T>`) may use `static match (T)`
+-            // in its body; that has to be walked SYMBOLICALLY (in_symbolic_check),
+-            // exactly like a struct/impl generic method (visit_methods), so the
+-            // arms are deferred to monomorphization instead of tripping E0645
+-            // ("static match outside a generic context").  Non-generic defaults
+-            // keep the plain walk.
+-            if (func.is_generic()) {
+-                this.symbolic_check_body(func, this_placeholder, this_placeholder);
+-                continue;
+-            }
+-            this.enter_function(func, this_placeholder);
+-            this.visit(func.body);
+-            this.state.body_count += 1;
+-        }
++            // Every default method is walked SYMBOLICALLY: its receiver `This` is
++            // abstract whether or not the method has type parameters of its own,
++            // so `this.m()` is typed through the trait that bounds `This`.  A
++            // plain walk treats `This` as a concrete type with no methods and
++            // leaves every such call, and everything bound from it, untyped.
++            // A generic default also needs it for `static match (T)`, whose arms
++            // are deferred to monomorphization instead of tripping E0645.
++            this.symbolic_check_body(func, this_placeholder, this_placeholder);
++        }
++        this.state.symbolic_trait = saved_trait;
+     }
+ 
+     override visit(mut &this, node: ImplBlockNode*) -> void {
+diff --git a/compiler/src/compiler/sema/state.cryo b/compiler/src/compiler/sema/state.cryo
+index eaa157ca..9f7ba154 100644
+--- a/compiler/src/compiler/sema/state.cryo
++++ b/compiler/src/compiler/sema/state.cryo
+@@ -165,6 +165,11 @@ type struct SemaState {
+     // method/free-fn `where T: Display` clause lands in
+     // `FunctionDeclNode.trait_bounds`, recovered from here for abstract receivers.
+     symbolic_current_func: FunctionDeclNode*;
++    // The trait whose default methods are being walked.  `This` in such a body
++    // is any type implementing that trait, so the trait is `This`'s bound; no
++    // where-clause writes it, and one `This` placeholder serves every trait,
++    // so the placeholder itself cannot say which trait bounds it.
++    symbolic_trait: TypeRef;
+     // Telemetry (debug-only): generic bodies walked, and real errors emitted.
+     symbolic_bodies_walked:    i64;
+     symbolic_total_would_emit: i64;
+@@ -220,6 +225,7 @@ type struct SemaState {
+             symbolic_method_param_nodes: [],
+             symbolic_impl_node:    null,
+             symbolic_current_func: null,
++            symbolic_trait:        TypeRef::invalid(),
+             symbolic_bodies_walked:    0,
+             symbolic_total_would_emit: 0,
+             last_expr_type: TypeRef::invalid(),
+diff --git a/compiler/src/compiler/types/arena.cryo b/compiler/src/compiler/types/arena.cryo
+index 160f4478..1d70dcef 100644
+--- a/compiler/src/compiler/types/arena.cryo
++++ b/compiler/src/compiler/types/arena.cryo
+@@ -680,6 +680,11 @@ public:
+         return this.this_param;
+     }
+ 
++    /// Whether `t` is the `This` placeholder.
++    is_this_placeholder(&this, t: Type*) -> boolean {
++        return t != null && this.this_param.is_valid() && this.lookup(this.this_param) == t;
++    }
++
+     /// Get or create a symbolic associated-type projection `Base::Member`.
+     /// Deduplicated by (base.id, member.id, owning_trait.id) so the same
+     /// projection always shares one arena slot - important so the
