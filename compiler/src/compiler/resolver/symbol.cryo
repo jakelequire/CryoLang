@@ -47,6 +47,14 @@ type enum SymbolKind {
     /// name that does not exist.  Every namespace accepts it and no namespace
     /// answers through it.
     Refused;
+    /// A class's constructor, bound in the VALUE namespace under the class's
+    /// name beside the class itself in the type namespace - two bindings,
+    /// one declaration, as a Rust tuple struct's constructor is.  It is what
+    /// `Node(1)` calls: a bare identifier in expression position names a
+    /// value, and without this binding a class could not be built by value.
+    /// Its definition is the class's, which is how every later stage reads a
+    /// call of a class's name.
+    Constructor;
 }
 
 implement enum SymbolKind {
@@ -66,15 +74,19 @@ implement enum SymbolKind {
             SymbolKind::Import       => { "Import" }
             SymbolKind::Intrinsic    => { "Intrinsic" }
             SymbolKind::Refused      => { "Refused" }
+            SymbolKind::Constructor  => { "Constructor" }
         };
     }
 
-    /// Whether this symbol kind supports function-style overloading.
+    /// Whether this symbol kind supports function-style overloading.  A
+    /// constructor shares its name with the class it builds, so it joins the
+    /// name's binding set rather than being refused as a redeclaration.
     allows_overload(&this) -> boolean {
         return match (this) {
-            SymbolKind::Function => { true }
-            SymbolKind::Method   => { true }
-            _                    => { false }
+            SymbolKind::Function    => { true }
+            SymbolKind::Method      => { true }
+            SymbolKind::Constructor => { true }
+            _                       => { false }
         };
     }
 }
@@ -275,6 +287,26 @@ type struct Symbol {
             is_mutable:     false,
             is_generic:     false,
             def:            DefId::invalid(),
+        };
+    }
+
+    /// A class's constructor in the value namespace: `name` is the class's,
+    /// and `def` the class's definition, copied - the constructor is not a
+    /// definition of its own.
+    ![allow(lookup_by_spelling, reason = "a binding records the spelling it is bound under; nothing is looked up here")]
+    static constructor(id: SymbolID, name: SymbolStr, scope: ScopeID, span: SourceSpan,
+                       declared_in: ModulePath, is_public: boolean, def: DefId) -> Symbol {
+        return Symbol {
+            id:             id,
+            name:           name,
+            kind:           SymbolKind::Constructor,
+            visibility:     is_public ? SymbolVisibility::Public : SymbolVisibility::Private,
+            scope_id:       scope,
+            declaring_span: span,
+            source_module:  declared_in,
+            is_mutable:     false,
+            is_generic:     false,
+            def:            def,
         };
     }
 

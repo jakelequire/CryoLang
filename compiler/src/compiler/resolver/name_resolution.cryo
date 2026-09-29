@@ -234,6 +234,14 @@ public:
         return this.resolver.get_symbol(sym_id).def;
     }
 
+    /// Whether a class declares a constructor of its own.
+    static declares_constructor(cd: ClassDeclNode*) -> boolean {
+        for (mut i: i64 = 0; i < cd.methods.length; i++) {
+            if (cd.methods[i] != null && cd.methods[i].is_constructor) { return true; }
+        }
+        return false;
+    }
+
     forward_declare_node(node: ASTNode*) -> void {
         match (node.kind) {
             NodeKind::FunctionDeclaration => {
@@ -306,6 +314,15 @@ public:
                 class_node.def = this.type_def_of(sym_id);
                 if (class_node.is_public) {
                     this.resolver.export_symbol(sym_id);
+                }
+                // A class that declares a constructor is callable by its
+                // name, `Node(1)`: the constructor binds in the value
+                // namespace beside the class, and is exported with it.
+                if (NameResolver::declares_constructor(class_node)) {
+                    const ctor: SymbolID = this.resolver.declare_constructor(sym_id);
+                    if (class_node.is_public) {
+                        this.resolver.export_symbol(ctor);
+                    }
                 }
             }
             NodeKind::TraitDeclaration => {
@@ -1307,6 +1324,28 @@ public:
         node.set_res(Res::Err);
     }
 
+    /// Refuse a bare identifier in expression position that names a type and
+    /// no value: E0231 when a call names it, E0201 otherwise, stamped `Err`.
+    /// A class that declares a constructor never reaches here - the
+    /// constructor is its value.
+    refuse_type_as_value(&this, node: IdentifierNode*) -> void {
+        const name: string = this.resolver.intern_table.resolve(node.name);
+        const as_callee: boolean = this.callee_ident == node;
+        mut d: Diagnostic = if (as_callee) {
+            Diagnostic::error(ErrorCode::E0231_NON_CALLABLE_TYPE,
+                Text::new(fmt::format("`%s` is a type, not a function", name)))
+        } else {
+            Diagnostic::error(ErrorCode::E0201_UNDEFINED_VARIABLE,
+                Text::new(fmt::format("expected a value, found type `%s`", name)))
+        };
+        d = d.at_with_label(node.span, Text::new("a type, not a value"));
+        d = d.with_note(Text::new(fmt::format(
+            "a bare name in an expression names a value; a class that declares a constructor is called by its name, and any other type is built by a literal or one of its own functions, `%s::new(..)`",
+            name)));
+        this.ctx.emit_diagnostic(d);
+        node.set_res(Res::Err);
+    }
+
     /// The type declarations under the leaf `name` across every module, as
     /// canonical names - public or private, and never an import, since an
     /// import binds a name a declaration elsewhere owns.  What decides
@@ -1550,7 +1589,12 @@ public:
     }
 
     override visit(node: IdentifierNode*) -> void {
-        mut sym_id: SymbolID = this.resolver.lookup(
+        // A bare identifier in expression position names a VALUE, so it is
+        // asked in the value namespace alone: a type spelled the same is not
+        // an answer, and when a module holds both a type and a function under
+        // the leaf the function is what `Color(5)` names, whichever was
+        // declared first.
+        mut sym_id: SymbolID = this.resolver.lookup_value(
             node.name, this.resolver.current_scope);
         if (!sym_id.is_valid()) {
             // A source-location pseudo-constant is declared nowhere, so no
@@ -1564,6 +1608,13 @@ public:
                     return;
                 }
                 Option::None => { }
+            }
+            // A type is not a value.  Asking whether the name binds at all
+            // chooses the message only - the answer is a refusal either way.
+            if (this.resolver.lookup(node.name, this.resolver.current_scope).is_valid()) {
+                this.refuse_type_as_value(node);
+                this.stamp_annotation_list(&node.generic_args);
+                return;
             }
             // No rib binds the name, the prelude included, and nothing
             // later in the pipeline can: this scope is the one the name was
@@ -1608,8 +1659,10 @@ public:
         }
         // Stamped from the lookup already performed, never a second one: the
         // scope this walk stands in is the scope the name was written in, and
-        // that is the only place the answer is knowable.
-        match (this.bare_name_res(sym_id)) {
+        // that is the only place the answer is knowable.  An import is
+        // stamped with the declaration it binds in the value namespace, not
+        // with whichever declaration its module listed first.
+        match (this.bare_name_res(this.resolver.value_target(sym_id))) {
             ResSlot::Answered(r) => { node.set_res(r); }
             _                    => { }
         }

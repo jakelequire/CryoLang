@@ -434,6 +434,16 @@ type struct Resolver {
         return this.declare(sym);
     }
 
+    /// Declare the constructor of the class `class_sym` just declared: a
+    /// value binding under the class's name, in the same scope, carrying the
+    /// class's definition and visibility.
+    declare_constructor(mut &this, class_sym: SymbolID) -> SymbolID {
+        const cls: Symbol = this.get_symbol(class_sym);
+        const id: SymbolID = this.alloc_symbol_id();
+        return this.declare(Symbol::constructor(id, cls.name, this.current_scope, cls.declaring_span,
+                                                this.current_module, cls.visibility.is_public(), cls.def));
+    }
+
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     declare_parameter(mut &this, name: SymbolStr, span: SourceSpan) -> SymbolID {
         const id: SymbolID = this.alloc_symbol_id();
@@ -547,6 +557,49 @@ type struct Resolver {
         }
         const any_ns: Option<Namespace> = Option::None;
         return this.lookup_prelude(name, any_ns);
+    }
+
+    /// The binding `name` has in the VALUE namespace, walking the rib chain
+    /// outward from `start`, or an invalid id.
+    ///
+    /// Each rib is asked for every binding it holds under the name - a type
+    /// and a function may share one - and answers with the first a value can
+    /// be: a declaration the value namespace accepts, a refused import (which
+    /// binds the name to nothing and stops the walk), or an import that binds
+    /// a value.  A binding that is only a type neither answers nor shadows:
+    /// the two namespaces are separate, so an inner type spelled like an
+    /// outer function leaves the function reachable.  The prelude is asked
+    /// last, in the value namespace.  The binding is returned as the rib
+    /// holds it - an import, not its target - because an import's own
+    /// record is what says whether it was ambiguous.
+    ![allow(lookup_by_spelling, reason = "a bare identifier is written as a spelling, and the ribs it is answered in bind names by their spelling; this is where the spelling becomes a binding")]
+    lookup_value(&this, name: SymbolStr, start: ScopeID) -> SymbolID {
+        mut scope_id: ScopeID = start;
+        while (scope_id.is_valid()) {
+            const scope: Scope* = this.get_scope(scope_id);
+            const all: SymbolID[] = scope.get_overloads(name);
+            for (mut i: i64 = 0; i < all.length; i++) {
+                const sym: Symbol = this.get_symbol(all[i]);
+                if (sym.kind == SymbolKind::Import) {
+                    if (this.import_target(&sym, Namespace::Value).is_valid()) { return all[i]; }
+                    continue;
+                }
+                if (Namespace::Value.accepts(sym.kind)) { return all[i]; }
+            }
+            scope_id = scope.parent_id;
+        }
+        return this.lookup_prelude(name, Option::Some(Namespace::Value));
+    }
+
+    /// The declaration a value binding names: an import's target in the
+    /// value namespace, any other binding itself.
+    value_target(&this, id: SymbolID) -> SymbolID {
+        if (!id.is_valid()) { return id; }
+        const sym: Symbol = this.get_symbol(id);
+        if (sym.kind != SymbolKind::Import) { return id; }
+        const target: SymbolID = this.import_target(&sym, Namespace::Value);
+        if (target.is_valid()) { return target; }
+        return id;
     }
 
     /// The outermost tier of the rib chain: names reachable without an import.
