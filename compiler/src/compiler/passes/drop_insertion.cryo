@@ -4142,22 +4142,18 @@ type struct DropInserter {
         if (c.callee != null && c.callee.kind == NodeKind::MemberAccess) {
             const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
             // Does this method consume its receiver (`![sink]` or by-value
-            // `this`)?  Prefer the pinned `resolved_method`; fall back to a
-            // receiver-type + method-name lookup when sema left it null (the
-            // monomorphized-generic-method case - e.g. `opt.unwrap()`).  The
-            // fallback is essential now that drop glue makes the receiver
-            // droppable: without it, an `![sink]` combinator that copies a
-            // payload out would not mark the receiver moved, and glue would
-            // double-free that payload at scope exit.
+            // `this`)?  The method the call was pinned to answers, and nothing
+            // else: a lookup of the member's name on the receiver type finds
+            // every overload of that name, so a borrowing overload beside a
+            // consuming one read as consuming and the receiver was never
+            // dropped.  An emitted body's method calls are pinned by sema or
+            // by the monomorphizer; a call left unpinned is one in a generic
+            // owner's template body, which is never emitted.  `MoveCheck`
+            // asks the same pin, so the two passes agree by construction.
             mut consumes: boolean = false;
             if (c.resolved_method != null) {
                 const m: MethodNode* = c.resolved_method as MethodNode*;
                 consumes = OwnershipQuery::method_consumes_receiver(this.arena, this.intern, m);
-            }
-            if (!consumes && ma.object != null) {
-                consumes = OwnershipQuery::type_method_consumes(
-                    this.arena, this.registry, this.intern,
-                    ma.object.resolved_type, ma.member);
             }
             if (consumes && ma.object != null) {
                 this.walk_expr_move(ma.object);

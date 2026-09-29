@@ -735,7 +735,7 @@ type struct CallEmitter {
                     if (this.cg.ctx.project_panic_unwind
                         && (ma.object.kind == NodeKind::CallExpression
                             || ma.object.kind == NodeKind::StructLiteral)
-                        && this.call_consumes_receiver(node, ma)
+                        && this.call_consumes_receiver(node)
                         && OwnershipQuery::needs_drop(this.cg.get_arena(),
                                this.cg.ctx.generic_registry, this.cg.get_intern(),
                                ma.object.resolved_type)) {
@@ -1076,22 +1076,18 @@ type struct CallEmitter {
     }
 
     /// Does the method invoked by `node` consume its receiver by value (an
-    /// explicit by-value `this` or an `![sink]`)?  Mirrors DropInsertion's check
-    /// exactly (resolved method first, then a receiver-type + name fallback for
-    /// monomorphized generics) so the two passes agree on which receivers are
-    /// moved into the call - the invariant that keeps a consumed anonymous
-    /// receiver from being both dropped here and left for some other pass.
-    call_consumes_receiver(&this, node: CallExprNode*, ma: MemberAccessNode*) -> boolean {
+    /// explicit by-value `this` or an `![sink]`)?  Asks the method the call was
+    /// pinned to, exactly as DropInsertion does, so the two passes agree on
+    /// which receivers are moved into the call - the invariant that keeps a
+    /// consumed anonymous receiver from being both dropped here and left for
+    /// some other pass.  A call with no pinned method has no receiver to
+    /// consume.
+    call_consumes_receiver(&this, node: CallExprNode*) -> boolean {
+        if (node.resolved_method == null) { return false; }
         const arena: TypeArena* = this.cg.get_arena();
         if (arena == null) { return false; }
-        const intern: InternTable* = this.cg.get_intern();
-        if (node.resolved_method != null) {
-            const m: MethodNode* = node.resolved_method as MethodNode*;
-            if (OwnershipQuery::method_consumes_receiver(arena, intern, m)) { return true; }
-        }
-        if (ma.object == null) { return false; }
-        return OwnershipQuery::type_method_consumes(arena, this.cg.ctx.generic_registry,
-                                                    intern, ma.object.resolved_type, ma.member);
+        const m: MethodNode* = node.resolved_method as MethodNode*;
+        return OwnershipQuery::method_consumes_receiver(arena, this.cg.get_intern(), m);
     }
 
     /// Emit the cleanup landing pad for an `invoke` under `--panic=unwind`.

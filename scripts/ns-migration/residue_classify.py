@@ -139,16 +139,10 @@ CLASS_OF_METHOD = {
         ("J", "member: the impl's own generic parameter by its leaf off the impl node in hand, scanned inline"),
     "StructDeclNode::fields[]":
         ("J", "member: a struct declaration's field by its leaf off the node in hand, scanned inline"),
-    "StructDeclNode::methods[]":
-        ("J", "member: a struct declaration's method by its leaf off the node in hand, scanned inline"),
     "UnionDeclNode::fields[]":
         ("J", "member: a union declaration's field by its leaf off the node in hand, scanned inline"),
-    "UnionDeclNode::methods[]":
-        ("J", "member: a union declaration's method by its leaf off the node in hand, scanned inline"),
     "ClassDeclNode::fields[]":
         ("J", "member: a class declaration's field by its leaf off the node in hand, scanned inline"),
-    "ClassDeclNode::methods[]":
-        ("J", "member: a class declaration's method by its leaf off the node in hand, scanned inline"),
     "ExternBlockNode::functions[]":
         ("J", "member: an extern block's function by its leaf off the block in hand, scanned inline"),
     "GenericRegistry::entries[]":

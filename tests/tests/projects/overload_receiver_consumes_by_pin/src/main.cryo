@@ -1,0 +1,59 @@
+/// Two overloads share the name `take`: one takes its receiver by value and
+/// consumes it, the other borrows it.  A call pinned to the borrowing overload
+/// leaves the caller owning the receiver, so the caller drops it at scope
+/// exit; a call pinned to the consuming one hands it to the callee, which
+/// drops it.  Each token is dropped exactly once.  Asking the receiver type
+/// for "a method named `take` that consumes" instead of asking the pinned
+/// overload read the borrowing call as a move, and `borrowed` was never
+/// dropped.  The exit code says which count was wrong; 0 means both held.
+namespace OverloadReceiverConsumesByPin::Main;
+
+import std::core::drop::{ Drop };
+import std::ffi::libc;
+
+mut g_drops: i32 = 0;
+
+type struct Token<T> {
+    id: T;
+}
+
+implement<T> struct Token<T> {
+    static new(id: T) -> Token<T> {
+        return Token::<T> { id: id };
+    }
+
+    /// Consumes the token.
+    take(this) -> i32 {
+        return 0;
+    }
+
+    /// Borrows it: same name, one more parameter.
+    take(&this, bump: i32) -> i32 {
+        return bump;
+    }
+}
+
+implement<T> trait Drop for struct Token<T> {
+    drop(mut &this) -> void {
+        g_drops = g_drops + 1;
+    }
+}
+
+function borrow_then_leave() -> i32 {
+    const borrowed: Token<i32> = Token::<i32>::new(7);
+    return borrowed.take(1);
+}
+
+function consume() -> i32 {
+    const consumed: Token<i32> = Token::<i32>::new(8);
+    return consumed.take();
+}
+
+function main() -> int {
+    if (borrow_then_leave() != 1) { return 1; }
+    if (g_drops != 1) { return 2; }
+    if (consume() != 0) { return 3; }
+    if (g_drops != 2) { return 4; }
+    libc::printf("overload-receiver ok\n");
+    return 0;
+}
