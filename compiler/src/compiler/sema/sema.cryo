@@ -114,7 +114,7 @@ import compiler::sema::helpers::{
 };
 import compiler::sema::lambda_synth::{ LambdaSynth };
 import compiler::sema::literal_resolver::{ LiteralResolver };
-import compiler::sema::member_resolver::{ MemberResolver };
+import compiler::sema::member_resolver::{ FieldAnswer, MemberResolver };
 import compiler::sema::method_binding::{ MethodBinding };
 import compiler::sema::pattern_resolver::{ PatternResolver };
 import compiler::sema::scope_manager::{ ScopeManager };
@@ -122,7 +122,7 @@ import compiler::sema::state::{ SemaState };
 import compiler::sema::symbolic_checker::{ SymbolicChecker };
 import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
-import compiler::types::checker::{ FieldLookup, TypeChecker, TypeCheckResult, TypeCompatibility };
+import compiler::types::checker::{ TypeChecker, TypeCheckResult, TypeCompatibility };
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType, TupleType };
 import compiler::types::generic::{ InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
@@ -3094,42 +3094,30 @@ public:
             const field_init: FieldInit = lit.field_inits[i];
             const value_expr: ExpressionNode* = field_init.value;
             mut field_type: TypeRef = TypeRef::invalid();
-            // The field this initializer names, by its coordinates in the
-            // literal's type - a class's base fields included, walked
-            // derived-first as `check_field_access` walks them - recorded
-            // on the initializer so codegen stores at those coordinates.
-            // A struct literal names a field directly, so it obeys the same
-            // module-scoped visibility as a `.field` access (E0353), asked of
-            // the entry this one walk found.
-            mut f_depth: i64 = -1;
-            mut f_index: i64 = -1;
+            // The field this initializer names, found by the member door as a
+            // `.field` access finds it - a class's base fields included,
+            // derived-first - and recorded on the initializer by its
+            // coordinates so codegen stores there.  A struct literal names a
+            // field directly, so it obeys the same module-scoped visibility
+            // as a `.field` access (E0353), asked of the entry the door found.
+            // Asked of a struct or class, and of the generic OWNER inside its
+            // own body (`String { buffer: RawBuffer::new(), .. }` in
+            // `String<A>::new`), whose field types give the values an expected
+            // type to bind the owner's arguments from; without one a
+            // generic-owner static call in the field position stashes nothing
+            // and is never pinned.
             if (struct_t != null
-                && (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class)) {
-                mut fl: FieldLookup = FieldLookup::none();
-                const found: TypeCheckResult = this.checker.check_field_access(
-                    struct_ref, field_init.field_name, &fl);
-                if (found.success && found.result_type.is_valid()) { field_type = found.result_type; }
-                if (fl.found()) {
-                    f_depth = fl.depth;
-                    f_index = fl.index;
-                    this.member.enforce_field_visibility(fl.field, fl.owner, field_init.field_name, field_init.span);
+                && (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class
+                    || this.symbolic.symbolic_is_generic_owner_receiver(struct_ref))) {
+                const fa: FieldAnswer = this.member.field_of(struct_ref, field_init.field_name);
+                field_type = fa.ty;
+                if (fa.index >= 0) {
+                    lit.field_inits[i].pin = MemberPin::Field(fa.depth, fa.index);
+                    lit.field_inits[i].pin_carried = false;
                 }
-            }
-            // A literal of the generic OWNER inside its own body (`String {
-            // buffer: RawBuffer::new(), .. }` in `String<A>::new`): the arena
-            // type of a template holds no fields, so the field's abstract type
-            // is read off the template's AST, as `this.<field>` reads it.  The
-            // value then has an expected type to bind its own owner arguments
-            // from; without one a generic-owner static call in the field
-            // position stashes nothing and is never pinned.
-            if (!field_type.is_valid()) {
-                mut o_index: i64 = -1;
-                field_type = this.symbolic.symbolic_resolve_owner_field(struct_ref, field_init.field_name, &o_index);
-                if (field_type.is_valid()) { f_depth = 0; f_index = o_index; }
-            }
-            if (f_index >= 0) {
-                lit.field_inits[i].pin = MemberPin::Field(f_depth, f_index);
-                lit.field_inits[i].pin_carried = false;
+                if (fa.entry != null) {
+                    this.member.enforce_field_visibility(fa.entry, fa.owner, field_init.field_name, field_init.span);
+                }
             }
             if (value_expr == null) { field_type = TypeRef::invalid(); }
             if (field_type.is_valid()) { this.state.expected_type = field_type; }

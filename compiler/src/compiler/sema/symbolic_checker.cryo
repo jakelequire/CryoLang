@@ -45,7 +45,7 @@ import compiler::compilation_context;
 import compiler::compilation_context::{ CompilationContext };
 import compiler::sema::{ state, type_utils };
 import compiler::ast::declaration::{
-    ClassDeclNode, FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
+    ClassDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
     StructDeclNode, UnionDeclNode
 };
 import compiler::sema::state::{ SemaState };
@@ -220,54 +220,6 @@ type struct SymbolicChecker {
         const owner_base: TypeRef = this.types.unwrap_to_base_ref(this.state.current_owner_type);
         if (!recv_base.is_valid() || !owner_base.is_valid()) { return false; }
         return recv_base.equals(owner_base);
-    }
-
-    /// During a generic-owner symbolic walk, resolve `this.<field>` to the field's
-    /// declared type off the owner template's AST (the arena StructType has no
-    /// fields for a generic template), read through the receiver's arguments:
-    /// inside `implement struct Conn<U>` over `Conn<S>` a field declared `S` is
-    /// `U`, the parameter the body's bounds are written on.  Invalid when not in such a walk,
-    /// the receiver isn't the owner, or `field` names no field (so a real typo
-    /// still falls through to E0204).
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    symbolic_resolve_owner_field(mut &this, recv_type: TypeRef,
-                                 field: SymbolStr, out_index: i64*) -> TypeRef {
-        *out_index = -1;
-        if (!this.symbolic_is_generic_owner_receiver(recv_type)) { return TypeRef::invalid(); }
-        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
-        const base: TypeRef = this.symbolic_recv_base(recv_type);
-        if (!base.is_valid()) { return TypeRef::invalid(); }
-        const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(base);
-        if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
-        if (tmpl.node_kind == NodeKind::StructDeclaration) {
-            const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
-            for (mut i: i64 = 0; i < sn.fields.length; i++) {
-                const f: FieldDeclNode* = sn.fields[i];
-                if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
-                    *out_index = i;
-                    return this.types.subst_owner_params_from_receiver(recv_type, f.resolved_type);
-                }
-            }
-        } else if (tmpl.node_kind == NodeKind::UnionDeclaration) {
-            const un: UnionDeclNode* = tmpl.ast_node as UnionDeclNode*;
-            for (mut i: i64 = 0; i < un.fields.length; i++) {
-                const f: FieldDeclNode* = un.fields[i];
-                if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
-                    *out_index = i;
-                    return this.types.subst_owner_params_from_receiver(recv_type, f.resolved_type);
-                }
-            }
-        } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
-            const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
-            for (mut i: i64 = 0; i < cn.fields.length; i++) {
-                const f: FieldDeclNode* = cn.fields[i];
-                if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
-                    *out_index = i;
-                    return this.types.subst_owner_params_from_receiver(recv_type, f.resolved_type);
-                }
-            }
-        }
-        return TypeRef::invalid();
     }
 
     /// During a generic-owner symbolic walk, resolve `this.<method>()`'s declared

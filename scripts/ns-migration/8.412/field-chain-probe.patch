@@ -1,0 +1,132 @@
+diff --git a/compiler/src/compiler/sema/member_resolver.cryo b/compiler/src/compiler/sema/member_resolver.cryo
+index 5734afcf..ebd37251 100644
+--- a/compiler/src/compiler/sema/member_resolver.cryo
++++ b/compiler/src/compiler/sema/member_resolver.cryo
+@@ -102,6 +102,51 @@ type struct MemberResolver {
+     }
+ 
+ 
++    ![allow(lookup_by_spelling, reason = "probe")]
++    fprobe(mut &this, site: string, loc: SourceSpan, recv: TypeRef, leaf: SymbolStr,
++           win: string, win_ty: TypeRef, win_idx: i64) -> void {
++        mut s_st: string = "na";
++        if (this.symbolic.symbolic_is_generic_owner_receiver(recv)) {
++            mut si: i64 = -1;
++            const sr: TypeRef = this.symbolic.symbolic_resolve_owner_field(recv, leaf, &si);
++            if (sr.is_valid()) { s_st = fmt::format("%lld/%lu", si, sr.key()); } else { s_st = "miss"; }
++        }
++        mut fl: FieldLookup = FieldLookup::none();
++        const cr: TypeCheckResult = this.checker.check_field_access(recv, leaf, &fl);
++        mut c_st: string = "miss";
++        if (cr.success) {
++            const cs: TypeRef = this.types.subst_owner_params_from_receiver(recv, cr.result_type);
++            if (fl.found()) { c_st = fmt::format("%lld:%lld/%lu", fl.depth, fl.index, cs.key()); } else { c_st = fmt::format("nofl/%lu", cs.key()); }
++        }
++        mut ti: i64 = -1;
++        const tr: TypeRef = this.resolve_field_via_template(recv, leaf, &ti);
++        mut t_st: string = "miss";
++        if (tr.is_valid()) { t_st = fmt::format("%lld/%lu", ti, tr.key()); }
++        // Shape of the peeled receiver.
++        mut shape: string = "";
++        mut pt: Type* = this.arena.lookup(recv);
++        mut dd: i32 = 0;
++        while (pt != null && dd < 6) {
++            if (pt.kind == TypeKind::Pointer) { shape = shape + "P"; pt = this.arena.lookup((pt as PointerType*).pointee); }
++            else if (pt.kind == TypeKind::Reference) { shape = shape + "R"; pt = this.arena.lookup((pt as ReferenceType*).referent); }
++            else if (pt.kind == TypeKind::InstantiatedType) {
++                const it: InstantiatedType* = pt as InstantiatedType*;
++                if (!it.has_resolved_type()) { shape = shape + "Iu"; pt = null; }
++                else { shape = shape + "Ir"; pt = this.arena.lookup(it.resolved_type); }
++            } else { break; }
++            dd += 1;
++        }
++        if (pt != null) {
++            if (pt.kind == TypeKind::Struct) { shape = shape + fmt::format("S%lld", (pt as StructType*).fields.length); }
++            else if (pt.kind == TypeKind::Class) { shape = shape + fmt::format("C%lld", (pt as ClassType*).fields.length); }
++            else { shape = shape + pt.kind.to_string(); }
++        }
++        const lf: string = this.intern.resolve(leaf);
++        const sym: string = if (this.state.in_symbolic_check) { "sym" } else { "con" };
++        const pm: string = if (this.state.post_mono_verify) { "post" } else { "pre" };
++        fmt::eprintln(f"FPROBE site={site} win={win} wi={win_idx} wt={win_ty.key()} S={s_st} C={c_st} T={t_st} shape={shape} walk={sym}/{pm} leaf={lf} at={loc.file}:{loc.start_line}");
++    }
++
+     // -- Member access (`obj.field` / `obj.0` / `obj.method`) --
+ 
+     resolve_member_access(mut &this, visitor: ASTVisitor*, member: MemberAccessNode*) -> TypeRef {
+@@ -116,13 +161,14 @@ type struct MemberResolver {
+             const owner_field: TypeRef =
+                 this.symbolic.symbolic_resolve_owner_field(obj_type, member.member, &owner_idx);
+             if (owner_field.is_valid()) {
++                this.fprobe("rma", member.span, obj_type, member.member, "S", owner_field, owner_idx);
+                 member.set_resolved_type(owner_field);
+                 member.set_resolved_member(MemberPin::Field(0, owner_idx));
+                 return owner_field;
+             }
+         }
+         // Symbolic walk: a `void`/abstract receiver is unresolved, not fieldless.
+-        if (this.symbolic.symbolic_type_unresolved(obj_type)) { return TypeRef::invalid(); }
++        if (this.symbolic.symbolic_type_unresolved(obj_type)) { this.fprobe("rma", member.span, obj_type, member.member, "bail", TypeRef::invalid(), -1); return TypeRef::invalid(); }
+ 
+         // Tuple positional access (`t.0`); walks past pointer/reference/inst wrappers.
+         mut walk_ty: TypeRef = obj_type;
+@@ -182,6 +228,7 @@ type struct MemberResolver {
+             } else {
+                 member.span
+             };
++            this.fprobe("rma", member.span, obj_type, member.member, "C", result.result_type, fl.index);
+             if (fl.found()) {
+                 member.set_resolved_member(MemberPin::Field(fl.depth, fl.index));
+                 this.enforce_field_visibility(fl.field, fl.owner, member.member, acc_span);
+@@ -196,9 +243,11 @@ type struct MemberResolver {
+         mut t_index: i64 = -1;
+         const field_ret: TypeRef = this.resolve_field_via_template(obj_type, member.member, &t_index);
+         if (field_ret.is_valid()) {
++            this.fprobe("rma", member.span, obj_type, member.member, "T", field_ret, t_index);
+             member.set_resolved_member(MemberPin::Field(0, t_index));
+             return field_ret;
+         }
++        this.fprobe("rma", member.span, obj_type, member.member, "none", TypeRef::invalid(), -1);
+ 
+         // Symbolic walk: an unwrapped `void`/abstract receiver - defer.
+         if (this.symbolic.symbolic_type_unresolved(walk_ty)) { return TypeRef::invalid(); }
+@@ -328,6 +377,7 @@ type struct MemberResolver {
+         const result: TypeCheckResult =
+             this.checker.check_field_access(obj_type, member.member, &fl);
+         if (result.success) {
++            this.fprobe("mto", member.span, obj_type, member.member, "C", result.result_type, fl.index);
+             if (fl.found()) {
+                 member.set_resolved_member(MemberPin::Field(fl.depth, fl.index));
+                 this.enforce_field_visibility(fl.field, fl.owner, member.member, acc_span);
+@@ -338,9 +388,11 @@ type struct MemberResolver {
+         mut t_index: i64 = -1;
+         const field_ret: TypeRef = this.resolve_field_via_template(obj_type, member.member, &t_index);
+         if (field_ret.is_valid()) {
++            this.fprobe("mto", member.span, obj_type, member.member, "T", field_ret, t_index);
+             member.set_resolved_member(MemberPin::Field(0, t_index));
+             return field_ret;
+         }
++        this.fprobe("mto", member.span, obj_type, member.member, "none", TypeRef::invalid(), -1);
+         // Method (from the dereferenced receiver symbol).
+         mut walk_ty: TypeRef = obj_type;
+         mut walk_t: Type* = this.arena.lookup(walk_ty);
+@@ -453,6 +505,7 @@ type struct MemberResolver {
+             f_index = ct.field_index(field_name);
+             if (f_index >= 0) { f_type = ct.fields[f_index].field_type; }
+         }
++        if (member != null) { this.fprobe("tffc", member.span, obj_type, field_name, if (f_index < 0) { "miss" } else { "F" }, f_type, f_index); }
+         if (f_index < 0) { return TypeRef::invalid(); }
+         const ft: Type* = this.arena.lookup(f_type);
+         if (ft == null || ft.kind != TypeKind::Function) { return TypeRef::invalid(); }
+diff --git a/compiler/src/compiler/sema/sema.cryo b/compiler/src/compiler/sema/sema.cryo
+index ec0136e5..c401f851 100644
+--- a/compiler/src/compiler/sema/sema.cryo
++++ b/compiler/src/compiler/sema/sema.cryo
+@@ -3127,6 +3127,7 @@ public:
+                 field_type = this.symbolic.symbolic_resolve_owner_field(struct_ref, field_init.field_name, &o_index);
+                 if (field_type.is_valid()) { f_depth = 0; f_index = o_index; }
+             }
++            this.member.fprobe("lit", field_init.span, struct_ref, field_init.field_name, if (f_index >= 0) { "hit" } else { "miss" }, field_type, f_index);
+             if (f_index >= 0) {
+                 lit.field_inits[i].pin = MemberPin::Field(f_depth, f_index);
+                 lit.field_inits[i].pin_carried = false;

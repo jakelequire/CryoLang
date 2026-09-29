@@ -1,0 +1,618 @@
+diff --git a/compiler/src/compiler/sema/call_resolver.cryo b/compiler/src/compiler/sema/call_resolver.cryo
+index 4e72d639..53f65645 100644
+--- a/compiler/src/compiler/sema/call_resolver.cryo
++++ b/compiler/src/compiler/sema/call_resolver.cryo
+@@ -3348,7 +3348,7 @@ type struct CallResolver {
+             return fin_inherited;
+         }
+ 
+-        const field_ret: TypeRef = this.member.try_field_function_call(lookup_ref, member.member, member);
++        const field_ret: TypeRef = this.member.try_field_function_call(lookup_ref, member);
+         if (field_ret.is_valid()) {
+             return field_ret;
+         }
+diff --git a/compiler/src/compiler/sema/member_resolver.cryo b/compiler/src/compiler/sema/member_resolver.cryo
+index 5734afcf..5b4af3da 100644
+--- a/compiler/src/compiler/sema/member_resolver.cryo
++++ b/compiler/src/compiler/sema/member_resolver.cryo
+@@ -30,7 +30,7 @@ import compiler::sema::{
+ };
+ import std::fmt;
+ import compiler::types::generic_registry;
+-import compiler::types::generic_registry::{ TemplateEntry };
++import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+ import compiler::resolver::lang_item;
+ import compiler::resolver::lang_item::{ LangItem };
+ import compiler::ast::declaration::{
+@@ -66,6 +66,27 @@ import compiler::types::user_defined::{
+ };
+ import utils::text::{ Text };
+ 
++/// A field as the member door found it: its type as seen through the
++/// receiver, and its coordinates - `index` into the field list of the type
++/// `depth` steps up a class's base chain - for the access to be pinned to.
++/// `entry` and `owner` are the arena entry and the type declaring it, for
++/// the visibility check; both are null for a field read off a generic
++/// template's declaration.  `index` is -1 for an array's `length`, which has
++/// a type and no slot.
++type struct FieldAnswer {
++    ty:    TypeRef;
++    entry: FieldInfo*;
++    owner: Type*;
++    depth: i64;
++    index: i64;
++
++    static none() -> FieldAnswer {
++        return FieldAnswer { ty: TypeRef::invalid(), entry: null, owner: null, depth: -1, index: -1 };
++    }
++
++    found(&this) -> boolean { return this.ty.is_valid(); }
++}
++
+ type struct MemberResolver {
+     arena:    TypeArena*;
+     intern:   InternTable*;
+@@ -108,21 +129,13 @@ type struct MemberResolver {
+         const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
+         if (!obj_type.is_valid()) { return TypeRef::invalid(); }
+ 
+-        // Access rooted at the abstract generic owner (`this.value` in a `Box<T>`
+-        // method): resolve the field off the owner template's AST.  Checked BEFORE
+-        // the unresolved bail (the owner self-instantiation carries abstract params).
+-        if (this.symbolic.symbolic_is_generic_owner_receiver(obj_type)) {
+-            mut owner_idx: i64 = -1;
+-            const owner_field: TypeRef =
+-                this.symbolic.symbolic_resolve_owner_field(obj_type, member.member, &owner_idx);
+-            if (owner_field.is_valid()) {
+-                member.set_resolved_type(owner_field);
+-                member.set_resolved_member(MemberPin::Field(0, owner_idx));
+-                return owner_field;
+-            }
++        // Symbolic walk: a `void`/abstract receiver is unresolved, not
++        // fieldless - except the abstract generic owner itself (`this.value`
++        // in a `Box<T>` method), whose fields its template declares.
++        const unresolved: boolean = this.symbolic.symbolic_type_unresolved(obj_type);
++        if (unresolved && !this.symbolic.symbolic_is_generic_owner_receiver(obj_type)) {
++            return TypeRef::invalid();
+         }
+-        // Symbolic walk: a `void`/abstract receiver is unresolved, not fieldless.
+-        if (this.symbolic.symbolic_type_unresolved(obj_type)) { return TypeRef::invalid(); }
+ 
+         // Tuple positional access (`t.0`); walks past pointer/reference/inst wrappers.
+         mut walk_ty: TypeRef = obj_type;
+@@ -172,36 +185,20 @@ type struct MemberResolver {
+             return tup.elements[idx];
+         }
+ 
+-        // Struct/class field access via TypeChecker.
+-        mut fl: FieldLookup = FieldLookup::none();
+-        const result: TypeCheckResult =
+-            this.checker.check_field_access(obj_type, member.member, &fl);
+-        if (result.success) {
+-            const acc_span: SourceSpan = if (member.member_span.has_location()) {
+-                member.member_span
+-            } else {
+-                member.span
+-            };
+-            if (fl.found()) {
+-                member.set_resolved_member(MemberPin::Field(fl.depth, fl.index));
+-                this.enforce_field_visibility(fl.field, fl.owner, member.member, acc_span);
+-            }
+-            // Mono-after-sema: substitute the receiver's type_args so a template
+-            // field types concretely (`.second -> i64`).
+-            return this.types.subst_owner_params_from_receiver(obj_type, result.result_type);
+-        }
+-
+-        // Mono-after-sema: read the field off the generic BASE template's AST and
+-        // substitute the receiver's type_args (`Pair<u32,i64>` pre-mono).
+-        mut t_index: i64 = -1;
+-        const field_ret: TypeRef = this.resolve_field_via_template(obj_type, member.member, &t_index);
+-        if (field_ret.is_valid()) {
+-            member.set_resolved_member(MemberPin::Field(0, t_index));
+-            return field_ret;
++        const acc_span: SourceSpan = if (member.member_span.has_location()) {
++            member.member_span
++        } else {
++            member.span
++        };
++        const fa: FieldAnswer = this.field_of(obj_type, member.member);
++        this.dprobe("rma", member.span, obj_type, member.member, &fa, false);
++        if (fa.found()) {
++            this.pin_field(member, &fa, acc_span);
++            return fa.ty;
+         }
+ 
+         // Symbolic walk: an unwrapped `void`/abstract receiver - defer.
+-        if (this.symbolic.symbolic_type_unresolved(walk_ty)) { return TypeRef::invalid(); }
++        if (unresolved || this.symbolic.symbolic_type_unresolved(walk_ty)) { return TypeRef::invalid(); }
+ 
+         // Method lookup with inheritance, from the *dereferenced* receiver symbol.
+         const type_sym: SymbolStr = this.types.lookup_type_sym(walk_ty);
+@@ -209,11 +206,6 @@ type struct MemberResolver {
+             const method_ret: TypeRef =
+                 this.binding.lookup_method_with_inheritance(walk_ty, member.member);
+             if (method_ret.is_valid()) {
+-                const acc_span: SourceSpan = if (member.member_span.has_location()) {
+-                    member.member_span
+-                } else {
+-                    member.span
+-                };
+                 this.enforce_method_visibility(obj_type, member.member, acc_span);
+                 return method_ret;
+             }
+@@ -323,23 +315,11 @@ type struct MemberResolver {
+         } else {
+             member.span
+         };
+-        // Field.
+-        mut fl: FieldLookup = FieldLookup::none();
+-        const result: TypeCheckResult =
+-            this.checker.check_field_access(obj_type, member.member, &fl);
+-        if (result.success) {
+-            if (fl.found()) {
+-                member.set_resolved_member(MemberPin::Field(fl.depth, fl.index));
+-                this.enforce_field_visibility(fl.field, fl.owner, member.member, acc_span);
+-            }
+-            return this.types.subst_owner_params_from_receiver(obj_type, result.result_type);
+-        }
+-        // Generic base-template field.
+-        mut t_index: i64 = -1;
+-        const field_ret: TypeRef = this.resolve_field_via_template(obj_type, member.member, &t_index);
+-        if (field_ret.is_valid()) {
+-            member.set_resolved_member(MemberPin::Field(0, t_index));
+-            return field_ret;
++        const fa: FieldAnswer = this.field_of(obj_type, member.member);
++        this.dprobe("mto", member.span, obj_type, member.member, &fa, false);
++        if (fa.found()) {
++            this.pin_field(member, &fa, acc_span);
++            return fa.ty;
+         }
+         // Method (from the dereferenced receiver symbol).
+         mut walk_ty: TypeRef = obj_type;
+@@ -377,89 +357,202 @@ type struct MemberResolver {
+         return TypeRef::invalid();
+     }
+ 
+-    /// Mono-after-sema: resolve a FIELD off the generic BASE template's AST when
+-    /// the receiver is an unresolved generic instantiation, substituting type_args.
+-    /// `*out_index` is the field's position in the template's field list, which
+-    /// is its position in every instantiation's (the specialized declaration is
+-    /// a clone of the template's, field for field).
+-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
+-    resolve_field_via_template(mut &this, recv_type: TypeRef, field: SymbolStr,
+-                               out_index: i64*) -> TypeRef {
+-        *out_index = -1;
+-        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+-        const inst: InstantiatedType* = this.types.peel_to_instantiation(recv_type);
+-        if (inst == null) { return TypeRef::invalid(); }
+-        const tmpl: TemplateEntry* =
+-            this.ctx.generic_registry.template_of_type(inst.generic_base);
++    ![allow(lookup_by_spelling, reason = "probe")]
++    old_ast_field(&this, tmpl_ref: TypeRef, recv: TypeRef, leaf: SymbolStr, out_i: i64*) -> TypeRef {
++        *out_i = -1;
++        const reg: GenericRegistry* = this.ctx.get_generic_registry();
++        if (reg == null || !tmpl_ref.is_valid()) { return TypeRef::invalid(); }
++        const tmpl: TemplateEntry* = reg.template_of_type(tmpl_ref);
+         if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
+-        mut abstract_field: TypeRef = TypeRef::invalid();
++        mut i: i64 = -1;
++        mut d: TypeRef = TypeRef::invalid();
+         if (tmpl.node_kind == NodeKind::StructDeclaration) {
+             const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
+-            for (mut i: i64 = 0; i < sn.fields.length; i++) {
+-                const f: FieldDeclNode* = sn.fields[i];
+-                if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
+-                    abstract_field = f.resolved_type;
+-                    *out_index = i;
+-                    break;
+-                }
+-            }
++            i = MemberResolver::declared_field_position(&sn.fields, leaf);
++            if (i >= 0) { d = sn.fields[i].resolved_type; }
+         } else if (tmpl.node_kind == NodeKind::UnionDeclaration) {
+             const un: UnionDeclNode* = tmpl.ast_node as UnionDeclNode*;
+-            for (mut i: i64 = 0; i < un.fields.length; i++) {
+-                const f: FieldDeclNode* = un.fields[i];
+-                if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
+-                    abstract_field = f.resolved_type;
+-                    *out_index = i;
+-                    break;
+-                }
+-            }
++            i = MemberResolver::declared_field_position(&un.fields, leaf);
++            if (i >= 0) { d = un.fields[i].resolved_type; }
+         } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+             const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
+-            for (mut i: i64 = 0; i < cn.fields.length; i++) {
+-                const f: FieldDeclNode* = cn.fields[i];
+-                if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
+-                    abstract_field = f.resolved_type;
+-                    *out_index = i;
+-                    break;
+-                }
++            i = MemberResolver::declared_field_position(&cn.fields, leaf);
++            if (i >= 0) { d = cn.fields[i].resolved_type; }
++        }
++        if (i < 0) { return TypeRef::invalid(); }
++        *out_i = i;
++        return this.types.subst_owner_params_from_receiver(recv, d);
++    }
++
++    ![allow(lookup_by_spelling, reason = "probe")]
++    dprobe(&this, site: string, loc: SourceSpan, recv: TypeRef, leaf: SymbolStr, fa: &FieldAnswer, lit_kind: boolean) -> void {
++        // The old chain's answer, recomputed.
++        const owner: boolean = this.symbolic.symbolic_is_generic_owner_receiver(recv);
++        mut s_i: i64 = -1;
++        mut s_t: TypeRef = TypeRef::invalid();
++        if (owner) { s_t = this.old_ast_field(this.symbolic.symbolic_recv_base(recv), recv, leaf, &s_i); }
++        mut fl: FieldLookup = FieldLookup::none();
++        const cr: TypeCheckResult = this.checker.check_field_access(recv, leaf, &fl);
++        mut t_i: i64 = -1;
++        mut t_t: TypeRef = TypeRef::invalid();
++        const inst: InstantiatedType* = this.types.peel_to_instantiation(recv);
++        if (inst != null) { t_t = this.old_ast_field(inst.generic_base, recv, leaf, &t_i); }
++        mut o_d: i64 = -1;
++        mut o_i: i64 = -1;
++        mut o_t: TypeRef = TypeRef::invalid();
++        mut o_w: string = "none";
++        if (site.eq("rma")) {
++            if (owner && s_t.is_valid()) { o_w = "S"; o_d = 0; o_i = s_i; o_t = s_t; }
++            else if (this.symbolic.symbolic_type_unresolved(recv)) { o_w = "bail"; }
++            else if (cr.success) { o_w = "C"; o_d = fl.depth; o_i = fl.index; o_t = this.types.subst_owner_params_from_receiver(recv, cr.result_type); }
++            else if (t_t.is_valid()) { o_w = "T"; o_d = 0; o_i = t_i; o_t = t_t; }
++        } else if (site.eq("mto")) {
++            if (cr.success) { o_w = "C"; o_d = fl.depth; o_i = fl.index; o_t = this.types.subst_owner_params_from_receiver(recv, cr.result_type); }
++            else if (t_t.is_valid()) { o_w = "T"; o_d = 0; o_i = t_i; o_t = t_t; }
++        } else if (site.eq("lit")) {
++            if (lit_kind && cr.success && cr.result_type.is_valid()) { o_w = "C"; o_d = fl.depth; o_i = fl.index; o_t = cr.result_type; }
++            else if (owner && s_t.is_valid()) { o_w = "S"; o_d = 0; o_i = s_i; o_t = s_t; }
++            if (lit_kind && cr.success && !fl.found()) { o_i = -1; }
++        } else if (site.eq("tffc")) {
++            mut ct: Type* = this.arena.lookup(recv);
++            if (ct != null && ct.kind == TypeKind::Reference) { ct = this.arena.lookup((ct as ReferenceType*).referent); }
++            if (ct != null && ct.kind == TypeKind::Struct) {
++                const st: StructType* = ct as StructType*;
++                o_i = st.field_index(leaf);
++                if (o_i >= 0) { o_w = "F"; o_d = 0; o_t = st.fields[o_i].field_type; }
++            } else if (ct != null && ct.kind == TypeKind::Class) {
++                const cl: ClassType* = ct as ClassType*;
++                o_i = cl.field_index(leaf);
++                if (o_i >= 0) { o_w = "F"; o_d = 0; o_t = cl.fields[o_i].field_type; }
+             }
+-        } else {
+-            return TypeRef::invalid();
+         }
+-        if (!abstract_field.is_valid()) { return TypeRef::invalid(); }
+-        return this.types.subst_owner_params_from_receiver(recv_type, abstract_field);
++        if (o_w.eq("bail")) { o_i = -1; }
++        const n_t: TypeRef = fa.ty;
++        mut same: boolean = o_t.equals(n_t) && o_i == fa.index;
++        if (same && o_i >= 0 && o_d != fa.depth) { same = false; }
++        if (!o_t.is_valid() && !n_t.is_valid()) { same = true; }
++        const tag: string = if (same) { "same" } else { "DIFF" };
++        const lf: string = this.intern.resolve(leaf);
++        fmt::eprintln(fmt::format("DPROBE %s site=%s old=%s:%lld:%lld/%lu new=%lld:%lld/%lu leaf=%s at=%s:%u",
++            tag, site, o_w, o_d, o_i, o_t.key(), fa.depth, fa.index, n_t.key(), lf, loc.file, loc.start_line));
+     }
+ 
+-    /// If `field_name` on `obj_type` is a Function-typed field, tag the member with
+-    /// that type (so codegen emits an indirect call) and return its return type.
+-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
+-    try_field_function_call(&this, obj_type: TypeRef, field_name: SymbolStr,
+-                            member: MemberAccessNode*) -> TypeRef {
+-        const t: Type* = this.arena.lookup(obj_type);
+-        if (t == null) { return TypeRef::invalid(); }
+-        mut check_t: Type* = t;
+-        if (check_t.kind == TypeKind::Reference) {
+-            check_t = this.arena.lookup((check_t as ReferenceType*).referent);
+-            if (check_t == null) { return TypeRef::invalid(); }
++    /// Door `member-field`.  `a.f` names a field of the type `a` has, and
++    /// that type is known only once `a` is checked, so the field is found
++    /// here by the receiver's type and the written leaf, and its coordinates
++    /// are handed back for every later stage to read.
++    ///
++    /// One source per receiver shape, never a second try.  Auto-deref is one
++    /// pointer or reference layer.  An instantiation with no resolved type,
++    /// and a generic template itself, is read off the template's declaration:
++    /// the arena type of a template holds no fields.  Everything else - a
++    /// struct, union or class, a resolved instantiation, an array's `length` -
++    /// is read off its arena type, a class's base chain derived-first.  The
++    /// field's type is seen through the receiver: the owner's parameters are
++    /// replaced by the receiver's arguments (`Pair<u32, i64>.second` is `i64`).
++    ![allow(lookup_by_spelling, reason = "a field is written as a spelling on a receiver whose type exists only once the receiver is checked; this is where the spelling becomes a field")]
++    field_of(&this, recv: TypeRef, leaf: SymbolStr) -> FieldAnswer {
++        mut owner: TypeRef = recv;
++        mut t: Type* = this.arena.lookup(owner);
++        if (t == null) { return FieldAnswer::none(); }
++        if (t.kind == TypeKind::Pointer) {
++            owner = (t as PointerType*).pointee;
++            t = this.arena.lookup(owner);
++        } else if (t.kind == TypeKind::Reference) {
++            owner = (t as ReferenceType*).referent;
++            t = this.arena.lookup(owner);
+         }
+-        mut f_type: TypeRef = TypeRef::invalid();
+-        mut f_index: i64 = -1;
+-        if (check_t.kind == TypeKind::Struct) {
+-            const st: StructType* = check_t as StructType*;
+-            f_index = st.field_index(field_name);
+-            if (f_index >= 0) { f_type = st.fields[f_index].field_type; }
+-        } else if (check_t.kind == TypeKind::Class) {
+-            const ct: ClassType* = check_t as ClassType*;
+-            f_index = ct.field_index(field_name);
+-            if (f_index >= 0) { f_type = ct.fields[f_index].field_type; }
++        if (t == null) { return FieldAnswer::none(); }
++        if (t.kind == TypeKind::InstantiatedType) {
++            const inst: InstantiatedType* = t as InstantiatedType*;
++            if (!inst.has_resolved_type()) {
++                return this.template_field(inst.generic_base, recv, leaf);
++            }
++            owner = inst.resolved_type;
++            t = this.arena.lookup(owner);
++            if (t == null) { return FieldAnswer::none(); }
+         }
+-        if (f_index < 0) { return TypeRef::invalid(); }
+-        const ft: Type* = this.arena.lookup(f_type);
+-        if (ft == null || ft.kind != TypeKind::Function) { return TypeRef::invalid(); }
+-        if (member != null) {
+-            member.set_resolved_type(f_type);
+-            member.set_resolved_member(MemberPin::Field(0, f_index));
++        const reg: GenericRegistry* = this.ctx.get_generic_registry();
++        if ((t.kind == TypeKind::Struct || t.kind == TypeKind::Class)
++                && reg != null && reg.is_template(owner.key())) {
++            return this.template_field(owner, recv, leaf);
+         }
++        mut fl: FieldLookup = FieldLookup::none();
++        const r: TypeCheckResult = this.checker.check_field_access(owner, leaf, &fl);
++        if (!r.success) { return FieldAnswer::none(); }
++        return FieldAnswer {
++            ty:    this.types.subst_owner_params_from_receiver(recv, r.result_type),
++            entry: fl.field,
++            owner: fl.owner,
++            depth: fl.depth,
++            index: fl.index,
++        };
++    }
++
++    /// The field `leaf` of the generic template `tmpl_ref`, read off its
++    /// declaration; its position there is its position in every
++    /// specialization, which is a clone of the template field for field.
++    ![allow(lookup_by_spelling, reason = "the member door's template half: a template's fields exist only as its declaration's, which carry their spelling")]
++    template_field(&this, tmpl_ref: TypeRef, recv: TypeRef, leaf: SymbolStr) -> FieldAnswer {
++        const reg: GenericRegistry* = this.ctx.get_generic_registry();
++        if (reg == null) { return FieldAnswer::none(); }
++        const tmpl: TemplateEntry* = reg.template_of_type(tmpl_ref);
++        if (tmpl == null || tmpl.ast_node == null) { return FieldAnswer::none(); }
++        mut i: i64 = -1;
++        mut declared: TypeRef = TypeRef::invalid();
++        if (tmpl.node_kind == NodeKind::StructDeclaration) {
++            const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
++            i = MemberResolver::declared_field_position(&sn.fields, leaf);
++            if (i >= 0) { declared = sn.fields[i].resolved_type; }
++        } else if (tmpl.node_kind == NodeKind::UnionDeclaration) {
++            const un: UnionDeclNode* = tmpl.ast_node as UnionDeclNode*;
++            i = MemberResolver::declared_field_position(&un.fields, leaf);
++            if (i >= 0) { declared = un.fields[i].resolved_type; }
++        } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
++            const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
++            i = MemberResolver::declared_field_position(&cn.fields, leaf);
++            if (i >= 0) { declared = cn.fields[i].resolved_type; }
++        }
++        if (i < 0) { return FieldAnswer::none(); }
++        return FieldAnswer {
++            ty:    this.types.subst_owner_params_from_receiver(recv, declared),
++            entry: null,
++            owner: null,
++            depth: 0,
++            index: i,
++        };
++    }
++
++    /// Position of the declared field `leaf` whose type is resolved, or -1.
++    ![allow(lookup_by_spelling, reason = "the member door's template half: a template's fields exist only as its declaration's, which carry their spelling")]
++    static declared_field_position(fields: &FieldDeclNode*[], leaf: SymbolStr) -> i64 {
++        for (mut i: i64 = 0; i < fields.length; i++) {
++            const f: FieldDeclNode* = fields[i];
++            if (f != null && f.name.equals(leaf) && f.resolved_type.is_valid()) { return i; }
++        }
++        return -1;
++    }
++
++    /// Record the field the door found on the access, and ask its
++    /// visibility of the entry the door found.  A template's field has no
++    /// entry; an array's `length` has no slot.
++    pin_field(mut &this, member: MemberAccessNode*, fa: &FieldAnswer, acc_span: SourceSpan) -> void {
++        if (fa.index >= 0) { member.set_resolved_member(MemberPin::Field(fa.depth, fa.index)); }
++        if (fa.entry != null) {
++            this.enforce_field_visibility(fa.entry, fa.owner, member.member, acc_span);
++        }
++    }
++
++    /// `obj.f(args)` where `f` is a function-typed field: tag the member with
++    /// that type (so codegen emits an indirect call) and return its return type.
++    try_field_function_call(&this, obj_type: TypeRef, member: MemberAccessNode*) -> TypeRef {
++        const fa: FieldAnswer = this.field_of(obj_type, member.member);
++        this.dprobe("tffc", member.span, obj_type, member.member, &fa, false);
++        if (!fa.found() || fa.index < 0) { return TypeRef::invalid(); }
++        const ft: Type* = this.arena.lookup(fa.ty);
++        if (ft == null || ft.kind != TypeKind::Function) { return TypeRef::invalid(); }
++        member.set_resolved_type(fa.ty);
++        member.set_resolved_member(MemberPin::Field(fa.depth, fa.index));
+         return (ft as FunctionType*).return_type;
+     }
+ 
+diff --git a/compiler/src/compiler/sema/sema.cryo b/compiler/src/compiler/sema/sema.cryo
+index ec0136e5..d834f95d 100644
+--- a/compiler/src/compiler/sema/sema.cryo
++++ b/compiler/src/compiler/sema/sema.cryo
+@@ -114,7 +114,7 @@ import compiler::sema::helpers::{
+ };
+ import compiler::sema::lambda_synth::{ LambdaSynth };
+ import compiler::sema::literal_resolver::{ LiteralResolver };
+-import compiler::sema::member_resolver::{ MemberResolver };
++import compiler::sema::member_resolver::{ FieldAnswer, MemberResolver };
+ import compiler::sema::method_binding::{ MethodBinding };
+ import compiler::sema::pattern_resolver::{ PatternResolver };
+ import compiler::sema::scope_manager::{ ScopeManager };
+@@ -122,7 +122,7 @@ import compiler::sema::state::{ SemaState };
+ import compiler::sema::symbolic_checker::{ SymbolicChecker };
+ import compiler::sema::type_utils::{ TypeUtils };
+ import compiler::types::arena::{ TypeArena };
+-import compiler::types::checker::{ FieldLookup, TypeChecker, TypeCheckResult, TypeCompatibility };
++import compiler::types::checker::{ TypeChecker, TypeCheckResult, TypeCompatibility };
+ import compiler::types::compound::{ ArrayType, PointerType, ReferenceType, TupleType };
+ import compiler::types::generic::{ InstantiatedType };
+ import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
+@@ -3094,42 +3094,32 @@ public:
+             const field_init: FieldInit = lit.field_inits[i];
+             const value_expr: ExpressionNode* = field_init.value;
+             mut field_type: TypeRef = TypeRef::invalid();
+-            // The field this initializer names, by its coordinates in the
+-            // literal's type - a class's base fields included, walked
+-            // derived-first as `check_field_access` walks them - recorded
+-            // on the initializer so codegen stores at those coordinates.
+-            // A struct literal names a field directly, so it obeys the same
+-            // module-scoped visibility as a `.field` access (E0353), asked of
+-            // the entry this one walk found.
+-            mut f_depth: i64 = -1;
+-            mut f_index: i64 = -1;
++            // The field this initializer names, found by the member door as a
++            // `.field` access finds it - a class's base fields included,
++            // derived-first - and recorded on the initializer by its
++            // coordinates so codegen stores there.  A struct literal names a
++            // field directly, so it obeys the same module-scoped visibility
++            // as a `.field` access (E0353), asked of the entry the door found.
++            // Asked of a struct or class, and of the generic OWNER inside its
++            // own body (`String { buffer: RawBuffer::new(), .. }` in
++            // `String<A>::new`), whose field types give the values an expected
++            // type to bind the owner's arguments from; without one a
++            // generic-owner static call in the field position stashes nothing
++            // and is never pinned.
+             if (struct_t != null
+-                && (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class)) {
+-                mut fl: FieldLookup = FieldLookup::none();
+-                const found: TypeCheckResult = this.checker.check_field_access(
+-                    struct_ref, field_init.field_name, &fl);
+-                if (found.success && found.result_type.is_valid()) { field_type = found.result_type; }
+-                if (fl.found()) {
+-                    f_depth = fl.depth;
+-                    f_index = fl.index;
+-                    this.member.enforce_field_visibility(fl.field, fl.owner, field_init.field_name, field_init.span);
++                && (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class
++                    || this.symbolic.symbolic_is_generic_owner_receiver(struct_ref))) {
++                const fa: FieldAnswer = this.member.field_of(struct_ref, field_init.field_name);
++                this.member.dprobe("lit", field_init.span, struct_ref, field_init.field_name, &fa,
++                    struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class);
++                field_type = fa.ty;
++                if (fa.index >= 0) {
++                    lit.field_inits[i].pin = MemberPin::Field(fa.depth, fa.index);
++                    lit.field_inits[i].pin_carried = false;
++                }
++                if (fa.entry != null) {
++                    this.member.enforce_field_visibility(fa.entry, fa.owner, field_init.field_name, field_init.span);
+                 }
+-            }
+-            // A literal of the generic OWNER inside its own body (`String {
+-            // buffer: RawBuffer::new(), .. }` in `String<A>::new`): the arena
+-            // type of a template holds no fields, so the field's abstract type
+-            // is read off the template's AST, as `this.<field>` reads it.  The
+-            // value then has an expected type to bind its own owner arguments
+-            // from; without one a generic-owner static call in the field
+-            // position stashes nothing and is never pinned.
+-            if (!field_type.is_valid()) {
+-                mut o_index: i64 = -1;
+-                field_type = this.symbolic.symbolic_resolve_owner_field(struct_ref, field_init.field_name, &o_index);
+-                if (field_type.is_valid()) { f_depth = 0; f_index = o_index; }
+-            }
+-            if (f_index >= 0) {
+-                lit.field_inits[i].pin = MemberPin::Field(f_depth, f_index);
+-                lit.field_inits[i].pin_carried = false;
+             }
+             if (value_expr == null) { field_type = TypeRef::invalid(); }
+             if (field_type.is_valid()) { this.state.expected_type = field_type; }
+diff --git a/compiler/src/compiler/sema/symbolic_checker.cryo b/compiler/src/compiler/sema/symbolic_checker.cryo
+index 493eb416..35e139f1 100644
+--- a/compiler/src/compiler/sema/symbolic_checker.cryo
++++ b/compiler/src/compiler/sema/symbolic_checker.cryo
+@@ -45,7 +45,7 @@ import compiler::compilation_context;
+ import compiler::compilation_context::{ CompilationContext };
+ import compiler::sema::{ state, type_utils };
+ import compiler::ast::declaration::{
+-    ClassDeclNode, FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
++    ClassDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
+     StructDeclNode, UnionDeclNode
+ };
+ import compiler::sema::state::{ SemaState };
+@@ -222,54 +222,6 @@ type struct SymbolicChecker {
+         return recv_base.equals(owner_base);
+     }
+ 
+-    /// During a generic-owner symbolic walk, resolve `this.<field>` to the field's
+-    /// declared type off the owner template's AST (the arena StructType has no
+-    /// fields for a generic template), read through the receiver's arguments:
+-    /// inside `implement struct Conn<U>` over `Conn<S>` a field declared `S` is
+-    /// `U`, the parameter the body's bounds are written on.  Invalid when not in such a walk,
+-    /// the receiver isn't the owner, or `field` names no field (so a real typo
+-    /// still falls through to E0204).
+-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
+-    symbolic_resolve_owner_field(mut &this, recv_type: TypeRef,
+-                                 field: SymbolStr, out_index: i64*) -> TypeRef {
+-        *out_index = -1;
+-        if (!this.symbolic_is_generic_owner_receiver(recv_type)) { return TypeRef::invalid(); }
+-        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+-        const base: TypeRef = this.symbolic_recv_base(recv_type);
+-        if (!base.is_valid()) { return TypeRef::invalid(); }
+-        const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(base);
+-        if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
+-        if (tmpl.node_kind == NodeKind::StructDeclaration) {
+-            const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
+-            for (mut i: i64 = 0; i < sn.fields.length; i++) {
+-                const f: FieldDeclNode* = sn.fields[i];
+-                if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
+-                    *out_index = i;
+-                    return this.types.subst_owner_params_from_receiver(recv_type, f.resolved_type);
+-                }
+-            }
+-        } else if (tmpl.node_kind == NodeKind::UnionDeclaration) {
+-            const un: UnionDeclNode* = tmpl.ast_node as UnionDeclNode*;
+-            for (mut i: i64 = 0; i < un.fields.length; i++) {
+-                const f: FieldDeclNode* = un.fields[i];
+-                if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
+-                    *out_index = i;
+-                    return this.types.subst_owner_params_from_receiver(recv_type, f.resolved_type);
+-                }
+-            }
+-        } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+-            const cn: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
+-            for (mut i: i64 = 0; i < cn.fields.length; i++) {
+-                const f: FieldDeclNode* = cn.fields[i];
+-                if (f != null && f.name.equals(field) && f.resolved_type.is_valid()) {
+-                    *out_index = i;
+-                    return this.types.subst_owner_params_from_receiver(recv_type, f.resolved_type);
+-                }
+-            }
+-        }
+-        return TypeRef::invalid();
+-    }
+-
+     /// During a generic-owner symbolic walk, resolve `this.<method>()`'s declared
+     /// return type off the owner template's AST, read through the receiver's
+     /// arguments as a field's type is.  Returns it only when
+diff --git a/compiler/src/compiler/types/checker.cryo b/compiler/src/compiler/types/checker.cryo
+index ef09f8f2..48744967 100644
+--- a/compiler/src/compiler/types/checker.cryo
++++ b/compiler/src/compiler/types/checker.cryo
+@@ -1038,10 +1038,9 @@ type struct TypeChecker {
+         return TypeCheckResult::ok(fn_type.return_type);
+     }
+ 
+-    /// Door `member-field`.  `a.f` names a field of the type `a` has, and
+-    /// that type is known only once `a` is checked, so the field is found
+-    /// here by the owner's type and the written leaf, and its coordinates
+-    /// are handed back for every later stage to read.
++    /// The arena half of the member door (`MemberResolver::field_of`), which
++    /// is its only caller: a field of a concrete type, read off its arena
++    /// entry.
+     ///
+     /// Check field access on a type.  On success `*out` is the field this
+     /// walk found - its entry, the type declaring it, and its coordinates
