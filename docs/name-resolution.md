@@ -50828,3 +50828,81 @@ by_text.get(&moved);                         // key traced to "Option" only
   call's first ARGUMENT, the start index, not the receiver, so
   `section = trimmed.substr(2, n)` reads as origin `literal 2`
   (`project_config.cryo:652`). The place is right; the text is not.
+
+### 8.415 Method selection binds a generic method's own type parameters, so a call on a concrete receiver to a generic method is pinned - 2026-09-29
+
+## Why
+
+The method door's design: the overload selection
+(`bind_method_on_receiver`) is the one place a method call's leaf becomes
+a method, and the call's typing reads its pin. That needs the selection
+to answer every call on a receiver it covers. Measured before building,
+with a probe recording why the selection declined each call it left
+unpinned, over the compiler's own build (60,891 method typings): on a
+concrete receiver (struct, class, enum, primitive, array) it declined
+about 690 typings, and every one but 19 was a call to a GENERIC method.
+Across all pinned typings only 68 were generic methods, each pinned by
+monomorphization, never by the selection: `args_bind_to_params` compares
+each argument with its parameter, and a method's own type parameter
+(`value: T` in `fold<T>`) equals no argument at any tier. Those calls
+were typed by the name-keyed finder alone.
+
+```cryo
+implement struct Fnv128Hasher {
+    fold<T>(mut &this, value: T) -> void { ... }
+}
+h.fold(Manifest::compiler_fingerprint());   // unpinned: `u128` binds no `T`
+```
+
+## What changed
+
+- `method_args_bind` binds a generic candidate: each argument first
+  unifies with its parameter through `InferCtx`, the one structural
+  unifier, over the method's own parameters
+  (`SymbolicChecker::symbolic_param_ref`, as the scope-call inference
+  builds them), so `T` binds once and consistently across the call; an
+  argument that does not unify binds by the tier's rule. A method with
+  no type parameters binds exactly as before.
+- Generic candidates are a SECOND selection: `bind_method_on_receiver`
+  runs the whole selection (trait-stamped first, then any) over the
+  non-generic candidates, and only when nothing binds, again over the
+  generic ones (`select_method`, `pick_own_method`, `bind_on_impl_block`
+  take `generic`). A call some non-generic overload takes is never taken
+  by a generic one. The language spec does not rank a generic method
+  against a same-named non-generic one; this order was chosen because it
+  leaves every existing pin as it was, not as a ruling.
+- The typing is untouched: `resolve_method_call` still asks the finder.
+  1 file, +66 / -19.
+
+## Proved
+
+- Probe over the compiler's build, before and after (outside
+  `call_resolver.cryo`, whose own lines this change moves): every site's
+  typing count identical; non-generic pins 51,680 both; generic pins
+  68 -> 737; unpinned 6,232 -> 5,563. No existing pin changed.
+- `make verify ARGS="--baseline HEAD --require-identical"` from a clean
+  build: 4012 test and 1126 example objects, 0 moved; every gate OK.
+  Monomorphization does not short-circuit a generic `resolved_method` -
+  it specializes the call and re-pins the specialization - which is why
+  the object code does not move.
+- Compiler warnings, clean build: 344, the same set as HEAD's.
+- The first build added an arena write to `call_resolver.cryo` (lane gate:
+  ARENA_WRITE 44 -> 45, refused); routed through `symbolic_param_ref`,
+  44.
+- A consuming generic method (`take<T>(this, tag: T)`) called twice on
+  one value is refused E0452 by the compiler before this change too; the
+  move check does not depend on this pin.
+
+## Predicted, then measured
+
+- Predicted: generic pins up by about 700, unpinned down by the same, no
+  pinned call changing; objects unmoved if monomorphization re-pins;
+  flow list possibly moving (callee identities appear in the facts).
+  Measured: +669 / -669, none changed, 0 objects moved; flow list 797
+  unchanged, lane gate unchanged.
+- What still reaches the finder unpinned on a concrete receiver: 19
+  typings, each with an argument whose type is invalid - a method call
+  on a dynamic array whose `Array<T>` is not yet registered types
+  silently invalid (1,373 typings) and its result is an argument here.
+  Plus the unresolved-instantiation, generic-owner and bounded-parameter
+  receivers, which the selection does not cover at all.
