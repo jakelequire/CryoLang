@@ -44,7 +44,8 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
-import compiler::resolver::res::{ DefId };
+import compiler::resolver::res::{ DefId, FamilyOwner };
+import compiler::decl_index::{ OverloadId };
 import compiler::module_graph;
 import compiler::module_graph::{ ModulePath };
 import compiler::sema::diagnostics::{ Diagnostics };
@@ -203,7 +204,7 @@ type struct MemberResolver {
         const type_sym: SymbolStr = this.types.lookup_type_sym(walk_ty);
         if (type_sym.is_valid()) {
             const method_ret: TypeRef =
-                this.binding.lookup_method_with_inheritance(walk_ty, member.member);
+                this.method_return_through_door(walk_ty, member);
             if (method_ret.is_valid()) {
                 this.enforce_method_visibility(obj_type, member.member, acc_span);
                 return method_ret;
@@ -346,13 +347,49 @@ type struct MemberResolver {
         const type_sym: SymbolStr = this.types.lookup_type_sym(walk_ty);
         if (type_sym.is_valid()) {
             const method_ret: TypeRef =
-                this.binding.lookup_method_with_inheritance(walk_ty, member.member);
+                this.method_return_through_door(walk_ty, member);
             if (method_ret.is_valid()) {
                 this.enforce_method_visibility(obj_type, member.member, acc_span);
                 return method_ret;
             }
         }
         return TypeRef::invalid();
+    }
+
+    /// The return of the method `member` names on `ty`, or on the nearest
+    /// base class declaring it, read off the member-function door's entries
+    /// for that owner and leaf.  Invalid when no owner in the chain has the
+    /// family, or when its overloads return different types: only the
+    /// call's selection can choose between those.
+    method_return_through_door(&this, ty: TypeRef, member: MemberAccessNode*) -> TypeRef {
+        mut owner: TypeRef = this.types.method_owner_ref(ty);
+        mut depth: i32 = 0;
+        while (owner.is_valid() && depth < 16) {
+            const entries: OverloadId[] = this.ctx.decl_index.lookup_family_entries(
+                FamilyOwner::Type(owner), member.member);
+            if (entries.length > 0) { return this.shared_entry_return(&entries); }
+            const t: Type* = this.arena.lookup(owner);
+            if (t == null || t.kind != TypeKind::Class) { break; }
+            const cls: ClassType* = t as ClassType*;
+            if (!cls.has_base || !cls.base_class.is_valid()) { break; }
+            owner = cls.base_class;
+            depth += 1;
+        }
+        return TypeRef::invalid();
+    }
+
+    /// The return type every entry of `entries` declares, canonicalized;
+    /// invalid when they differ or none carries a signature.
+    shared_entry_return(&this, entries: &OverloadId[]) -> TypeRef {
+        mut ret: TypeRef = TypeRef::invalid();
+        for (mut k: i64 = 0; k < entries.length; k++) {
+            const sig: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entries[k]));
+            if (sig == null || sig.kind != TypeKind::Function) { return TypeRef::invalid(); }
+            const r: TypeRef = this.types.canonicalize_method_return((sig as FunctionType*).return_type);
+            if (ret.is_valid() && !ret.equals(r)) { return TypeRef::invalid(); }
+            ret = r;
+        }
+        return ret;
     }
 
     /// Door `member-field`.  `a.f` names a field of the type `a` has, and
