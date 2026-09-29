@@ -146,6 +146,105 @@ yet is recorded with the change that builds it, not here.
 6. **Rulings live in this appendix** once `docs/name-resolution.md` is
    deleted.
 
+7. **Dropping a generic value in place goes through a compiler intrinsic**,
+   like Rust's `ptr::drop_in_place`, which emits each type's drop code
+   after monomorphization: a user `drop`, the drop glue, or nothing for a
+   `Copy` value. It is how the standard library releases a value of an
+   unbounded type parameter behind a pointer, instead of calling `.drop()`
+   on it.
+
+   ```cryo
+   function release<T>(p: T*) -> void {
+       (*p).drop();                      // a method call on an unbounded `T`
+   }
+   function release<T>(p: T*) -> void {
+       drop_in_place::<T>(p);            // the intrinsic; `T` needs no bound
+   }
+   ```
+
+   The intrinsic's name and module are not ruled; `drop_in_place` above is
+   illustrative.
+
+8. **The old finish-line decisions are superseded by the five rules**: the
+   count finish line, and the four conditions with the decisions that serve
+   them.
+
+9. **The 2026-09-28 freeze defers the language-feature work it moved off
+   this branch; it does not kill it.** Explicit receivers, primitive
+   keywords, the raw subcommand, the editor's no-project fallback, the
+   deprecated attribute and reference mutability each become a branch of
+   their own after the merge.
+
+10. **The ledger (`docs/name-resolution.md`), its status rows and its commit
+    hook stay until name resolution is complete.** The paperwork is removed
+    after that, not before.
+
+11. **Method selection takes its candidates through the member-function
+    door** (`member-function` in the table above). It gets no finder of its
+    own.
+
+12. **The generic template registry is re-keyed by identity (`DefId`)**, as
+    a unit of its own. Today a generic type and a generic function of the
+    same name collide in it.
+
+13. **An inherent method wins over a trait method**, as `docs/cryo.md`
+    ("Which Method a Call Names") says - whether either is generic. Today a
+    non-generic trait method beats a generic inherent one; that changes,
+    measured before it does.
+
+    ```cryo
+    type trait Show { show(&this, x: i32) -> i32; }
+    type struct P { v: i32; }
+    implement P { show<T>(&this, x: T) -> i32 { return 1; } }
+    implement trait Show for P { show(&this, x: i32) -> i32 { return 2; } }
+    const n: i32 = p.show(5);   // the inherent `show`: 1
+    ```
+
+14. **The drop-in-place intrinsic is `drop_in_place<T>(p: T*)` in a new
+    module `std::core::ptr`**, mirroring Rust's path. It does not go in
+    `std::core::intrinsics`. This names the intrinsic ruling 7 left
+    unnamed.
+
+    ```cryo
+    import std::core::ptr;
+    function release<T>(p: T*) -> void {
+        ptr::drop_in_place::<T>(p);
+    }
+    ```
+
+15. **`BufStream::drop`'s explicit `this.inner.drop()` is deleted**; the
+    field glue releases `inner` after the body. Explicit drop calls already
+    warn, and they become an error at the v1.0 freeze.
+
+    ```cryo
+    implement<S> Drop for BufStream<S> {
+        drop(mut &this) -> void {
+            this.inner.drop();   // deleted: `inner` is released by field glue
+        }
+    }
+    ```
+
+16. **A method call on a bounded type parameter whose bounds do not declare
+    the method is an error (E0358)**, as it is for an unbounded one.
+
+    ```cryo
+    type trait Counter { count(&this) -> u64; }
+    function f<T>(x: &T) -> void where T: Counter {
+        x.count();     // Counter::count
+        x.missing();   // error: no bound of `T` declares `missing`
+    }
+    ```
+
+17. **The E0358 note and help wording for a call on an unbounded parameter,
+    and the lane gate's ARENA_READ count moving from 64 to 65, are
+    approved.**
+
+18. **No new permanent Python instruments.** Workers build no new gates,
+    self-tests or tracking files; throwaway probes for measuring and
+    running the existing scripts are fine. New enforcement goes into the
+    compiler, as a lint or an internal check. The existing scripts stay as
+    they are until they are removed after the merge.
+
 ### 2026-09-28
 
 Relayed in plain text. Done means the five rules above; the definition and

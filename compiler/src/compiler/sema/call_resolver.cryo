@@ -73,6 +73,7 @@ import compiler::lex::{ TokenType };
 import compiler::ast::visitor::{ ASTVisitor };
 import compiler::ast::node_locator::{ NodeLocator };
 import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag::suggestion::{ Applicability, Suggestion };
 import compiler::resolver::intern_table::{ InternTable };
@@ -100,9 +101,9 @@ import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::checker::{ TypeChecker, TypeCompatibility };
 import compiler::types::compound::{
-    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType
+    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
 };
-import compiler::types::generic::{ GenericParamType, InstantiatedType };
+import compiler::types::generic::{ AssocProjectionType, GenericParamType, InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
@@ -131,6 +132,26 @@ const PF_FLOAT:   i64 = 2;   // %f %e %g %a (and their capitals)
 const PF_STRING:  i64 = 3;   // %s  (a C `string`)
 const PF_POINTER: i64 = 4;   // %p
 const PF_STRUCT:  i64 = 5;   // an aggregate argument - never valid for C printf
+
+/// One method selection.  `owner_inst` is the receiver when it is an
+/// instantiation not yet minted, whose template's methods are the
+/// candidates, and invalid otherwise.  `chosen` is the method selected and
+/// `ret` its return type as the receiver sees it.
+type struct Selection {
+    owner_inst: TypeRef;
+    chosen:     MethodNode*;
+    ret:        TypeRef;
+
+    static none() -> Selection {
+        return Selection { owner_inst: TypeRef::invalid(), chosen: null, ret: TypeRef::invalid() };
+    }
+
+    /// A call already bound: its pin, and the pin's declared return.
+    static of(mn: MethodNode*) -> Selection {
+        const r: TypeRef = if (mn != null && mn.func != null) { mn.func.resolved_return_type } else { TypeRef::invalid() };
+        return Selection { owner_inst: TypeRef::invalid(), chosen: mn, ret: r };
+    }
+}
 
 type struct CallResolver {
     arena:    TypeArena*;
@@ -1012,11 +1033,14 @@ type struct CallResolver {
             return this.resolve_direct_call(ident);
         }
         if (callee_node.kind == NodeKind::MemberAccess) {
+            const arg_snap: DiagnosticSnapshot = this.ctx.diagnostics.snapshot();
             this.lambda.reject_closure_struct_args_in_non_free_call(call,
                 Text::new("passing a capturing closure as a method-call argument"));
-            this.resolve_method_overload(visitor, call, callee as MemberAccessNode*);
+            const selected: Selection = this.resolve_method_overload(visitor, call, callee as MemberAccessNode*);
             this.check_method_call_arg_types(visitor, call, callee as MemberAccessNode*);
-            const mret: TypeRef = this.resolve_method_call(visitor, callee as MemberAccessNode*, call);
+            const args_refused: boolean = this.ctx.diagnostics.errors_since(arg_snap) > 0;
+            const mret: TypeRef = this.resolve_method_call(visitor, callee as MemberAccessNode*, call,
+                                                           selected, args_refused);
             // A pinned non-generic method's return type overrides `mret` for a
             // genuine overload, but NOT when `mret` is a generic method's per-call
             // canonical (scalar or unit) return: there the pin can be a SIBLING
@@ -2824,11 +2848,12 @@ type struct CallResolver {
     /// base chain), then the inherent blocks of a primitive, then its trait
     /// impls; each set is tried at every binding tier before the next set is
     /// consulted.  Leaves both unset on no match.
+    /// Returns what `bind_method_on_receiver` returns.
     resolve_method_overload(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
-                            member: MemberAccessNode*) -> void {
+                            member: MemberAccessNode*) -> Selection {
         const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
-        if (!obj_type.is_valid()) { return; }
-        this.bind_method_on_receiver(visitor, call, member, obj_type);
+        if (!obj_type.is_valid()) { return Selection::none(); }
+        return this.bind_method_on_receiver(visitor, call, member, obj_type);
     }
 
     /// Overload selection against a receiver whose type is already in hand.
@@ -2836,19 +2861,28 @@ type struct CallResolver {
     /// `.field.drop()`) carries its receiver's type on the node but sits in
     /// no scope the identifier could be re-resolved from, so it enters here
     /// and is bound exactly as a written call is.
+    ///
+    /// Returns the selection: the method the call names - the pin, or, for a
+    /// receiver that is an instantiation not yet minted, its template's
+    /// method, selected but not pinned.  Such a receiver has no method set of its own until
+    /// monomorphization mints it; the template's methods, seen through the
+    /// receiver's arguments, are what the call can name before then.  The
+    /// pin is left to the pass that sees the minted type: a template method
+    /// pinned here reads to mono as a call needing no specialization.
     bind_method_on_receiver(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
-                            member: MemberAccessNode*, obj_type: TypeRef) -> void {
+                            member: MemberAccessNode*, obj_type: TypeRef) -> Selection {
         // A call that is already bound stays bound.  Mono binds a generic
         // method call to the specialization it minted - a clone with no
         // generic parameters left, under the `$MG` symbol - and selecting
         // again here can only find the TEMPLATE, which a parameterless method
         // (`v.as<Str>()`) matches exactly; that would displace the
-        // specialization as `resolved_method` while the pin stays, and the
-        // call's return type would fall to the name-keyed lookup, which
-        // answers with whichever sibling specialization registered last.
-        if (call.resolved_callee.is_some() && call.resolved_method != null) { return; }
+        // specialization as `resolved_method` while the pin stays.
+        if (call.resolved_callee.is_some() && call.resolved_method != null) {
+            return Selection::of(call.resolved_method as MethodNode*);
+        }
         mut base_ref: TypeRef = obj_type;
         mut base_t: Type* = this.arena.lookup(obj_type);
+        mut owner_inst: TypeRef = TypeRef::invalid();
         mut unwrap_depth: i32 = 0;
         while (base_t != null && unwrap_depth < 5) {
             if (base_t.kind == TypeKind::Pointer) {
@@ -2859,7 +2893,12 @@ type struct CallResolver {
                 base_t = this.arena.lookup(base_ref);
             } else if (base_t.kind == TypeKind::InstantiatedType) {
                 const inst: InstantiatedType* = base_t as InstantiatedType*;
-                if (!inst.has_resolved_type()) { break; }
+                if (!inst.has_resolved_type()) {
+                    owner_inst = base_ref;
+                    base_ref = inst.generic_base;
+                    base_t = this.arena.lookup(base_ref);
+                    break;
+                }
                 base_ref = inst.resolved_type;
                 base_t = this.arena.lookup(base_ref);
             } else if (base_t.kind == TypeKind::Array
@@ -2879,6 +2918,7 @@ type struct CallResolver {
             unwrap_depth += 1;
         }
 
+        if (base_t == null) { return Selection::none(); }
         mut methods_ref: Slice<MethodInfo> = Slice::<MethodInfo>::from_raw(null, 0);
         mut start_cls: ClassType* = null;
         mut owner_str: string = "";
@@ -2902,15 +2942,15 @@ type struct CallResolver {
                 // whole identity, and the key its impl blocks register under.
                 owner_str = base_t.display_name();
             }
-            _ => { return; }
+            _ => { return Selection::none(); }
         }
-        if (owner_str.length() == 0) { return; }
+        if (owner_str.length() == 0) { return Selection::none(); }
 
         mut arg_types: TypeRef[] = [];
         for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
             const arg_expr: ExpressionNode* = call.arguments[ai];
-            if (arg_expr == null) { return; }
-            if (!arg_expr.resolved_type.is_valid()) { return; }
+            if (arg_expr == null) { return Selection::none(); }
+            if (!arg_expr.resolved_type.is_valid()) { return Selection::none(); }
             arg_types.push(arg_expr.resolved_type);
         }
 
@@ -2931,14 +2971,98 @@ type struct CallResolver {
         // when no non-generic candidate in any set binds, so a call some
         // non-generic overload takes is never taken by a generic one.
         const want_trait: DefId = member.resolved_trait;
+        mut sel: Selection = Selection::none();
+        sel.owner_inst = owner_inst;
+        if (owner_inst.is_valid()) {
+            // The template's arena type carries no methods; its declaration
+            // and the impl blocks attached to it do.
+            const tmpl: TemplateEntry* = if (this.ctx.generic_registry != null) {
+                this.ctx.generic_registry.template_of_type(base_ref)
+            } else { null };
+            if (tmpl == null) { return Selection::none(); }
+            for (mut pass: i32 = 0; pass < 2; pass++) {
+                const generic: boolean = pass == 1;
+                if (want_trait.is_valid()) {
+                    if (this.select_on_template(visitor, call, member, tmpl, owner_str, &arg_types,
+                            want_trait, generic, &sel)) { return sel; }
+                }
+                if (this.select_on_template(visitor, call, member, tmpl, owner_str, &arg_types,
+                        DefId::invalid(), generic, &sel)) { return sel; }
+            }
+            return Selection::none();
+        }
         for (mut pass: i32 = 0; pass < 2; pass++) {
             const generic: boolean = pass == 1;
             if (want_trait.is_valid()) {
                 if (this.select_method(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
-                        owner_str, &arg_types, want_trait, generic)) { return; }
+                        owner_str, &arg_types, want_trait, generic, &sel)) { return sel; }
             }
             if (this.select_method(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
-                    owner_str, &arg_types, DefId::invalid(), generic)) { return; }
+                    owner_str, &arg_types, DefId::invalid(), generic, &sel)) { return sel; }
+        }
+        return Selection::none();
+    }
+
+    /// Record the method a selection chose, its return seen through `view`
+    /// (null: as declared).  A receiver that is a minted type pins it on the
+    /// call; an instantiation not yet minted (`sel.owner_inst`) does not -
+    /// see `bind_method_on_receiver`.
+    choose_method(mut &this, call: CallExprNode*, mn: MethodNode*, owner_str: string,
+                  sel: Selection*, view: TypeSubstitution*) -> void {
+        sel.chosen = mn;
+        sel.ret = if (view != null) {
+            this.seen_through(view, mn.func.resolved_return_type)
+        } else { mn.func.resolved_return_type };
+        if (sel.owner_inst.is_valid()) { return; }
+        call.set_resolved_method(mn as ASTNode*);
+        this.pin_method_callee_from_qname(call, owner_str, mn, mn.is_static);
+    }
+
+    /// `ty` as a receiver sees it through `view`: its parameters substituted,
+    /// and each projection whose base that makes concrete replaced by the
+    /// type it reduces to (`FilterIter<I>::Item`, for a `FilterIter<
+    /// TakeIter<Range<i32>>>`, is `i32`) before anything enclosing it is
+    /// built - an `Option<..::Item>` built first would be an instantiation
+    /// no code demands and monomorphization never mints.
+    seen_through(mut &this, view: TypeSubstitution*, ty: TypeRef) -> TypeRef {
+        mut full: TypeSubstitution = TypeSubstitution::from_params(&view.params, &view.replacements);
+        this.bind_projections(ty, &full);
+        return full.apply(ty, this.arena);
+    }
+
+    /// Add to `subst` every projection in `ty` whose base `subst` makes
+    /// concrete, bound to the member type that base's impl gives it;
+    /// innermost first, so an outer projection's base is built from the
+    /// reduced inner one.
+    bind_projections(mut &this, ty: TypeRef, subst: TypeSubstitution*) -> void {
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return; }
+        match (t.kind) {
+            TypeKind::AssocProjection => {
+                const proj: AssocProjectionType* = t as AssocProjectionType*;
+                this.bind_projections(proj.base, subst);
+                const applied: TypeRef = subst.apply(ty, this.arena);
+                if (applied.equals(ty) || this.types.contains_generic_param(applied)) { return; }
+                const reduced: TypeRef = this.binding.reduce_assoc_projections(applied);
+                const rt: Type* = this.arena.lookup(reduced);
+                if (rt != null && rt.kind != TypeKind::AssocProjection) { subst.add(ty, reduced); }
+            }
+            TypeKind::Pointer   => { this.bind_projections((t as PointerType*).pointee, subst); }
+            TypeKind::Reference => { this.bind_projections((t as ReferenceType*).referent, subst); }
+            TypeKind::Function  => {
+                const f: FunctionType* = t as FunctionType*;
+                for (mut i: i64 = 0; i < f.param_types.length; i++) { this.bind_projections(f.param_types[i], subst); }
+                this.bind_projections(f.return_type, subst);
+            }
+            TypeKind::Tuple => {
+                const tup: TupleType* = t as TupleType*;
+                for (mut i: i64 = 0; i < tup.elements.length; i++) { this.bind_projections(tup.elements[i], subst); }
+            }
+            TypeKind::InstantiatedType => {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                for (mut i: i64 = 0; i < inst.type_args.length; i++) { this.bind_projections(inst.type_args[i], subst); }
+            }
+            _ => { }
         }
     }
 
@@ -2949,10 +3073,13 @@ type struct CallResolver {
     /// blocks, then the trait impls in registration order.  With
     /// `only_trait`, only that trait's methods are candidates; `generic`
     /// selects the generic methods, the others otherwise.  Returns true
-    /// when the call was bound.
+    /// when the call was bound.  For an instantiation not yet minted,
+    /// `base_ref` is its template, and its trait impls are the ones
+    /// selected for the instantiation.
     select_method(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
                   base_ref: TypeRef, base_t: Type*, start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
-                  owner_str: string, arg_types: &TypeRef[], only_trait: DefId, generic: boolean) -> boolean {
+                  owner_str: string, arg_types: &TypeRef[], only_trait: DefId, generic: boolean,
+                  sel: Selection*) -> boolean {
         // The receiver's own list holds its inherent methods and the methods
         // its trait impls deliver, in declaration order.  They are two sets,
         // the inherent one first: the order two `implement` blocks were
@@ -2972,8 +3099,7 @@ type struct CallResolver {
             if (own_tier == 3) {
                 this.apply_overload_converter_args(visitor, call, own.param_types.as_slice());
             }
-            call.set_resolved_method(own.ast_node as ASTNode*);
-            this.pin_method_callee_from_qname(call, own_owner, own.ast_node as MethodNode*, own.is_static);
+            this.choose_method(call, own.ast_node as MethodNode*, own_owner, sel, null);
             return true;
         }
 
@@ -2986,19 +3112,20 @@ type struct CallResolver {
                 && base_t.kind != TypeKind::Struct && base_t.kind != TypeKind::Enum) {
             const blocks: ImplBlockNode*[] = this.ctx.generic_registry.inherent_impl_blocks(base_ref);
             for (mut bi: i64 = 0; bi < blocks.length; bi++) {
-                if (this.bind_on_impl_block(visitor, call, member, blocks[bi], owner_str, arg_types, generic)) { return true; }
+                if (this.bind_on_impl_block(visitor, call, member, blocks[bi], owner_str, arg_types, generic, sel)) { return true; }
             }
         }
 
         // The trait impls selected for the receiver, in registration order: a
         // placed clone when it is a specialization, else the written heads
         // that unify with it and whose bounds hold.
-        const blocks: ImplBlockNode*[] = this.trait_checker().impls_of(base_ref);
+        const impl_subject: TypeRef = if (sel.owner_inst.is_valid()) { sel.owner_inst } else { base_ref };
+        const blocks: ImplBlockNode*[] = this.trait_checker().impls_of(impl_subject);
         for (mut ti: i64 = 0; ti < blocks.length; ti++) {
             const block: ImplBlockNode* = blocks[ti];
             // WHICH trait the block provides is the head's stamped identity.
             if (only_trait.is_valid() && !block.trait_def.equals(only_trait)) { continue; }
-            if (this.bind_on_impl_block(visitor, call, member, block, owner_str, arg_types, generic)) { return true; }
+            if (this.bind_on_impl_block(visitor, call, member, block, owner_str, arg_types, generic, sel)) { return true; }
         }
         return false;
     }
@@ -3029,7 +3156,7 @@ type struct CallResolver {
                     const mfn: FunctionDeclNode* = if (m.ast_node != null) { (m.ast_node as MethodNode*).func } else { null };
                     if ((mfn != null && mfn.generic_params.length > 0) != generic) { continue; }
                     if (!this.method_args_bind(call, arg_types, m.param_types.as_slice(),
-                            this.method_type_is_variadic(m.function_type), tier, mfn)) { continue; }
+                            this.method_type_is_variadic(m.function_type), tier, mfn, null)) { continue; }
                     *out_owner = cur_owner;
                     *out_tier = tier;
                     return m;
@@ -3055,19 +3182,139 @@ type struct CallResolver {
         return mn.func.origin_trait.equals(trait_id);
     }
 
-    /// Select among one impl block's methods, every tier in turn; `generic`
-    /// takes its generic methods, the others otherwise.  Returns true when
-    /// the call was bound.
+    /// `select_method` for an instantiation not yet minted (`sel.owner_inst`):
+    /// the candidates are its template's, in the same order - the methods
+    /// written in the declaration and in its inherent impl blocks, then the
+    /// trait impls selected for the instantiation.
+    select_on_template(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+                       tmpl: TemplateEntry*, owner_str: string, arg_types: &TypeRef[],
+                       only_trait: DefId, generic: boolean, sel: Selection*) -> boolean {
+        if (!only_trait.is_valid()) {
+            // The declaration's methods are written in the template's own
+            // parameters.
+            mut args: TypeRef[] = [];
+            for (mut ai: i64 = 0; ai < this.arena.inst_type_arg_count(sel.owner_inst); ai++) {
+                args.push(this.arena.inst_type_arg_at(sel.owner_inst, ai));
+            }
+            mut view: TypeSubstitution = TypeSubstitution::from_params(&tmpl.param_types, &args);
+            const decl: ASTNode* = tmpl.ast_node;
+            if (decl != null && decl.kind == NodeKind::StructDeclaration) {
+                if (this.bind_on_methods(visitor, call, member, &(decl as StructDeclNode*).methods,
+                        owner_str, arg_types, generic, sel, &view)) { return true; }
+            } else if (decl != null && decl.kind == NodeKind::UnionDeclaration) {
+                if (this.bind_on_methods(visitor, call, member, &(decl as UnionDeclNode*).methods,
+                        owner_str, arg_types, generic, sel, &view)) { return true; }
+            } else if (decl != null && decl.kind == NodeKind::ClassDeclaration) {
+                if (this.bind_on_methods(visitor, call, member, &(decl as ClassDeclNode*).methods,
+                        owner_str, arg_types, generic, sel, &view)) { return true; }
+            }
+            for (mut bi: i64 = 0; bi < tmpl.impl_blocks.length; bi++) {
+                const block: ImplBlockNode* = tmpl.impl_blocks[bi];
+                if (block == null || block.is_trait_impl()) { continue; }
+                if (this.bind_on_impl_block(visitor, call, member, block, owner_str, arg_types, generic, sel)) { return true; }
+            }
+        }
+        // The trait impls whose heads unify with the instantiation.  Their
+        // where-clauses are not confirmed here: a parameter an impl binds
+        // only in its where-clause cannot be bound by the checker, so an
+        // instantiation not yet minted would fail every such head.  The pass
+        // that sees the minted type selects among confirmed impls.
+        if (this.ctx.generic_registry == null) { return false; }
+        const blocks: ImplBlockNode*[] = this.ctx.generic_registry.trait_impls_of(sel.owner_inst, this.intern);
+        for (mut ti: i64 = 0; ti < blocks.length; ti++) {
+            const block: ImplBlockNode* = blocks[ti];
+            if (only_trait.is_valid() && !block.trait_def.equals(only_trait)) { continue; }
+            if (this.bind_on_impl_block(visitor, call, member, block, owner_str, arg_types, generic, sel)) { return true; }
+        }
+        return false;
+    }
+
+    /// Select among one impl block's methods; see `bind_on_methods`.
     bind_on_impl_block(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
                        block: ImplBlockNode*, owner_str: string, arg_types: &TypeRef[],
-                       generic: boolean) -> boolean {
+                       generic: boolean, sel: Selection*) -> boolean {
         if (block == null) { return false; }
+        if (!sel.owner_inst.is_valid()) {
+            return this.bind_on_methods(visitor, call, member, &block.methods, owner_str, arg_types,
+                                        generic, sel, null);
+        }
+        // A block's methods are written in the block's own parameters, which
+        // its head relates to the instantiation (`T` in `implement enum
+        // Option<T>`, for `Option<u8>`, is `u8`).
+        mut args: TypeRef[] = [];
+        for (mut ai: i64 = 0; ai < this.arena.inst_type_arg_count(sel.owner_inst); ai++) {
+            args.push(this.arena.inst_type_arg_at(sel.owner_inst, ai));
+        }
+        mut view: TypeSubstitution = TypeSubstitution::empty();
+        this.trait_checker().add_head_param_bindings(block, &args, &view);
+        this.bind_where_only_params(block, &view);
+        return this.bind_on_methods(visitor, call, member, &block.methods, owner_str, arg_types,
+                                    generic, sel, &view);
+    }
+
+    /// Bind the parameters an impl introduces only in its where-clause from
+    /// the impls its bound subjects have: in `implement<I, A> Iterator<A>
+    /// for TakeIter<I> where I: Iterator<A>`, a `TakeIter<Range<i32>>` has
+    /// `I` bound by the head, and `A` is `i32` because that is what
+    /// `Range<i32>`'s `Iterator` impl writes.  Bounds are read in order, so
+    /// a bound may use a parameter an earlier one bound.
+    bind_where_only_params(mut &this, block: ImplBlockNode*, view: TypeSubstitution*) -> void {
+        if (this.ctx.type_resolver == null) { return; }
+        for (mut bi: i64 = 0; bi < block.where_bounds.length; bi++) {
+            const bound: &TraitBound = &block.where_bounds[bi];
+            const subject: TypeRef = this.trait_checker().lookup_subst_for_param(bound.subject_sym, view);
+            if (!subject.is_valid() || this.types.contains_generic_param(subject)) { continue; }
+            for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
+                const tr: &TraitRef = &bound.trait_refs[ti];
+                if (tr.type_args.length == 0) { continue; }
+                const slots: TypeRef[] = this.ctx.type_resolver.concrete_trait_slots(subject, tr.definition());
+                for (mut ai: i64 = 0; ai < tr.type_args.length && ai < slots.length; ai++) {
+                    this.bind_where_arg(block, tr.type_args[ai], slots[ai], view);
+                }
+            }
+        }
+    }
+
+    /// Bind a parameter of `block` a where-clause writes as a trait argument
+    /// (`A` in `Iterator<A>`, `T` in `Iterator<T*>`) to the concrete argument
+    /// in its place, unless it is bound already.
+    bind_where_arg(mut &this, block: ImplBlockNode*, ta: TypeAnnotation*, concrete: TypeRef,
+                   view: TypeSubstitution*) -> void {
+        if (ta == null || !concrete.is_valid()) { return; }
+        match (*ta) {
+            TypeAnnotation::Named(n) => {
+                if (!n.param_sym().is_valid()) { return; }
+                if (this.trait_checker().lookup_subst_for_param(n.param_sym(), view).is_valid()) { return; }
+                for (mut gi: i64 = 0; gi < block.generic_params.length; gi++) {
+                    const gp: GenericParamNode* = block.generic_params[gi];
+                    if (gp == null || !gp.sym_id.equals(n.param_sym())) { continue; }
+                    view.add(this.symbolic.symbolic_param_ref(gp, gi as u64), concrete);
+                    return;
+                }
+            }
+            TypeAnnotation::Pointer(p) => {
+                this.bind_where_arg(block, p.inner, this.types.proj_pointer_pointee(concrete), view);
+            }
+            TypeAnnotation::Reference(r) => {
+                this.bind_where_arg(block, r.inner, this.types.proj_reference_referent(concrete), view);
+            }
+            _ => {}
+        }
+    }
+
+    /// Select among one list of declared methods, every tier in turn;
+    /// `generic` takes its generic methods, the others otherwise.  `view`,
+    /// when not null, is how the receiver sees the parameters the list is
+    /// written in.  Returns true when the call was bound.
+    bind_on_methods(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+                    methods: &MethodNode*[], owner_str: string, arg_types: &TypeRef[],
+                    generic: boolean, sel: Selection*, view: TypeSubstitution*) -> boolean {
         // A self-returning default (an iterator adapter's `take`) is a
         // template the block carries until a concrete sibling is minted;
         // once one exists the template is not a candidate.
         mut has_concrete_sibling: boolean = false;
-        for (mut ci: i64 = 0; ci < block.methods.length; ci++) {
-            const cm: MethodNode* = block.methods[ci];
+        for (mut ci: i64 = 0; ci < methods.length; ci++) {
+            const cm: MethodNode* = methods[ci];
             if (cm != null && cm.func != null && cm.func.name.equals(member.member)
                     && !cm.func.is_self_returning_default) {
                 has_concrete_sibling = true;
@@ -3076,8 +3323,8 @@ type struct CallResolver {
         }
         for (mut tier: i32 = 0; tier <= 3; tier++) {
             if (tier == 3 && this.state.in_implicit_conversion) { break; }
-            for (mut mi: i64 = 0; mi < block.methods.length; mi++) {
-                const mn: MethodNode* = block.methods[mi];
+            for (mut mi: i64 = 0; mi < methods.length; mi++) {
+                const mn: MethodNode* = methods[mi];
                 if (mn == null || mn.func == null) { continue; }
                 const fn_node: FunctionDeclNode* = mn.func;
                 if (!fn_node.name.equals(member.member)) { continue; }
@@ -3090,12 +3337,12 @@ type struct CallResolver {
                     if (pp.is_receiver()) { continue; }
                     params.push(pp.resolved_type);
                 }
-                if (!this.method_args_bind(call, arg_types, params.as_slice(), fn_node.is_variadic, tier, fn_node)) { continue; }
-                if (tier == 3) {
+                if (!this.method_args_bind(call, arg_types, params.as_slice(), fn_node.is_variadic, tier, fn_node,
+                        view)) { continue; }
+                if (tier == 3 && !sel.owner_inst.is_valid()) {
                     this.apply_overload_converter_args(visitor, call, params.as_slice());
                 }
-                call.set_resolved_method(mn as ASTNode*);
-                this.pin_method_callee_from_qname(call, owner_str, mn, mn.is_static);
+                this.choose_method(call, mn, owner_str, sel, view);
                 return true;
             }
         }
@@ -3137,10 +3384,16 @@ type struct CallResolver {
     /// unifier, `InferCtx`), and an argument that does not unify binds by
     /// the tier's rule against the parameter with the bindings substituted
     /// (`&w` for a `C` the turbofish made `W*`).  A method with none binds
-    /// exactly as `args_bind_to_params`.
+    /// exactly as `args_bind_to_params`.  A `view` binds the parameters it
+    /// substitutes the same way, as slots already solved (`push(x: T)` on a
+    /// `Vec<i32>` takes an `i32`): unification compares through them
+    /// without building the substituted parameter, which a candidate that
+    /// is never chosen would otherwise leave behind as a type nothing
+    /// demands.
     method_args_bind(mut &this, call: CallExprNode*, arg_types: &TypeRef[], params: Slice<TypeRef>,
-                     variadic: boolean, tier: i32, func: FunctionDeclNode*) -> boolean {
-        if (func == null || func.generic_params.length == 0) {
+                     variadic: boolean, tier: i32, func: FunctionDeclNode*, view: TypeSubstitution*) -> boolean {
+        const n_own: i64 = if (func != null) { func.generic_params.length } else { 0 };
+        if (n_own == 0 && view == null) {
             return this.args_bind_to_params(call, arg_types, params, variadic, tier);
         }
         mut fixed: i64 = params.length as i64;
@@ -3151,28 +3404,47 @@ type struct CallResolver {
             return false;
         }
         mut pids: TypeRef[] = [];
-        for (mut i: i64 = 0; i < func.generic_params.length; i++) {
+        for (mut i: i64 = 0; i < n_own; i++) {
             const gp: GenericParamNode* = func.generic_params[i];
             if (gp == null) { return false; }
             pids.push(this.symbolic.symbolic_param_ref(gp, i as u64));
         }
-        mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
-        mut targs: &TypeAnnotation*[] = &call.generic_args;
-        const callee_node: ASTNode* = call.callee as ASTNode*;
-        if (targs.length == 0 && callee_node != null && callee_node.kind == NodeKind::MemberAccess) {
-            targs = &(call.callee as MemberAccessNode*).generic_args;
+        if (view != null) {
+            for (mut vi: i64 = 0; vi < view.params.length; vi++) { pids.push(view.params[vi]); }
         }
-        if (targs.length > 0) {
-            if (targs.length != func.generic_params.length) { return false; }
-            const explicit: TypeRef[] = this.resolve_turbofish(targs);
-            if (explicit.length != targs.length) { return false; }
-            for (mut i: i64 = 0; i < explicit.length; i++) { ictx.bind_slot(i, explicit[i]); }
+        mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+        if (view != null) {
+            for (mut vi: i64 = 0; vi < view.replacements.length; vi++) {
+                ictx.bind_slot(n_own + vi, view.replacements[vi]);
+            }
+        }
+        if (n_own > 0) {
+            mut targs: &TypeAnnotation*[] = &call.generic_args;
+            const callee_node: ASTNode* = call.callee as ASTNode*;
+            if (targs.length == 0 && callee_node != null && callee_node.kind == NodeKind::MemberAccess) {
+                targs = &(call.callee as MemberAccessNode*).generic_args;
+            }
+            if (targs.length > 0) {
+                if (targs.length != n_own) { return false; }
+                const explicit: TypeRef[] = this.resolve_turbofish(targs);
+                if (explicit.length != targs.length) { return false; }
+                for (mut i: i64 = 0; i < explicit.length; i++) { ictx.bind_slot(i, explicit[i]); }
+            }
         }
         for (mut pi: i64 = 0; pi < fixed; pi++) {
             const param: TypeRef = params.get(pi as u64).unwrap();
             if (ictx.unify(param, arg_types[pi])) { continue; }
             mut subst: TypeSubstitution = TypeSubstitution::from_params(ictx.params, ictx.bindings);
-            const bound: TypeRef = subst.apply(param, this.arena);
+            mut bound: TypeRef = TypeRef::invalid();
+            if (view != null) {
+                // A projection the view makes concrete (`TakeIter<Range<i32>>
+                // ::Item`) unifies only once reduced; what it stood in front
+                // of (`B` in `(Item) -> B`) binds then.
+                bound = this.seen_through(&subst, param);
+                if (!bound.equals(param) && ictx.unify(bound, arg_types[pi])) { continue; }
+            } else {
+                bound = subst.apply(param, this.arena);
+            }
             if (!this.arg_binds_to_param(call, pi, arg_types[pi], bound, tier)) { return false; }
         }
         return true;
@@ -3275,8 +3547,11 @@ type struct CallResolver {
             || ty.kind == TypeKind::Never;
     }
 
+    /// The type of a method call.  Which method it names was answered by
+    /// the selection (`bind_method_on_receiver`), whose answer is `selected`;
+    /// `args_refused` is whether the argument check reported this call.
     resolve_method_call(mut &this, visitor: ASTVisitor*, member: MemberAccessNode*,
-                        call: CallExprNode*) -> TypeRef {
+                        call: CallExprNode*, selected: Selection, args_refused: boolean) -> TypeRef {
         const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
         if (!obj_type.is_valid()) {
             return TypeRef::invalid();
@@ -3387,16 +3662,15 @@ type struct CallResolver {
         // symbolic receivers / symbolic Item types (undecidable -> allow).
         const proj_blocked: boolean =
             this.binding.projection_default_unavailable(obj_type, member.member);
-        // A method only trait impls provide, none of which selects for THIS
-        // instantiation (`Wrap<i32, Beta>` against `implement<T> trait Show
-        // for Wrap<T, Alpha>`), is no method of the receiver: the index holds
-        // every head's methods under the template's key, and only the
-        // selection can tell them apart.
-        const head_blocked: boolean =
-            this.binding.trait_method_unavailable(lookup_ref, member.member);
-
-        const ret: TypeRef = this.binding.lookup_method_with_inheritance(lookup_ref, member.member);
-        if (ret.is_valid() && !proj_blocked && !head_blocked) {
+        // The method the selection chose: the pin on a minted receiver, the
+        // template's method on an instantiation not yet minted.
+        const lookup_t: Type* = this.arena.lookup(lookup_ref);
+        const on_template: boolean = lookup_t != null && lookup_t.kind == TypeKind::InstantiatedType;
+        const named: MethodNode* = if (on_template) { selected.chosen } else { call.resolved_method as MethodNode* };
+        const ret: TypeRef = if (on_template) { selected.ret } else { if (named != null && named.func != null) {
+            named.func.resolved_return_type
+        } else { TypeRef::invalid() } };
+        if (ret.is_valid() && !proj_blocked) {
             const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
             this.member.enforce_method_visibility(lookup_ref, member.member, acc_span);
             const refined: TypeRef = if (member.generic_args.length > 0) {
@@ -3428,18 +3702,6 @@ type struct CallResolver {
             return final_ret;
         }
 
-        const inherited: TypeRef = this.binding.lookup_method_through_trait_impls(lookup_ref, member.member);
-        if (inherited.is_valid() && !proj_blocked) {
-            const subst_inherited: TypeRef = this.binding.subst_this_in_type(inherited, obj_type);
-            mut fin_inherited: TypeRef = subst_inherited;
-            if (fin_inherited.is_valid() && this.types.contains_generic_param(fin_inherited)) {
-                fin_inherited = this.binding.resolve_generic_method_return(obj_type, member, call, fin_inherited);
-            }
-            fin_inherited = this.binding.finalize_assoc_return(obj_type, member, fin_inherited);
-            member.set_resolved_type(fin_inherited);
-            return fin_inherited;
-        }
-
         const field_ret: TypeRef = this.member.try_field_function_call(lookup_ref, member);
         if (field_ret.is_valid()) {
             return field_ret;
@@ -3463,6 +3725,18 @@ type struct CallResolver {
             member.set_resolved_type(coerced);
             return coerced;
         }
+
+        // The selection binds only an argument list whose types are all
+        // known, so a call with an argument that failed to type named no
+        // method: that is the argument's failure, not a missing method.
+        for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
+            const arg: ExpressionNode* = call.arguments[ai];
+            if (arg == null || !arg.resolved_type.is_valid()) { return TypeRef::invalid(); }
+        }
+        // The arguments were refused against the method the leaf names, and
+        // that report is this call's error; no overload binding them is the
+        // same failure, not a second one.
+        if (args_refused) { return TypeRef::invalid(); }
 
         // Every remaining exit is a failure, diagnosed one of several ways.
         // Counted once here so the tally is over OUTCOMES, not diagnostics.
