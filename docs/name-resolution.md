@@ -50087,3 +50087,48 @@ A trait's required method's `param` records carry symbol `?`.
 `sema/call_facts.cryo`, `sema/sema.cryo`, a new script and fixture, the
 Makefile and `scripts/verify.py`. Gate cycles: 1 clean compiler build, 1
 type check, 1 facts run, 2 check-fast, 1 verify, 9 runs of the list.
+
+### 8.407 The facts blind-spot list asks whether a lookup's key can be traced to text an identity handed back; two ways it cannot - concatenation and formatting - are listed and tested - 2026-09-28
+
+## Why
+
+The rule that text an identity hands back never becomes a lookup key is
+checked by reading each key record's provenance back to its origin. The list
+in `scripts/facts-blind-spots.py` said where the facts record nothing; it
+did not say where they record a key whose origin they cannot trace.
+
+## What changed
+
+A fourth question, `origin`: the key record of a line's `.get` names
+`text_of` - the fixture's stand-in for `InternTable.resolve` or
+`DefTable.path_of` - in its provenance. Four probe lines:
+
+| entry | status | key provenance |
+|---|---|---|
+| `by_text.get(&name.text_of())` | SEEN | `call:...SymbolStr.text_of(&this) -> string` |
+| `const held = name.text_of(); by_text.get(&held)` | SEEN | `local:held@0=call:...text_of...` |
+| `get(&("std::" + name.text_of()))` | BLIND | `expr:BinaryExpression` - the trace stops |
+| `get(&fmt::format("%s::%s", "std", name.text_of()))` | BLIND | `call:std::fmt::format ... of literal:"%s::%s"` - first argument only; the identity text is a separate record on the format call |
+
+No compiler change. The previous writer (before §8.406) fails the two
+SEEN lines as well: a generic `.get` had no key record at all. The
+concatenated entry relisted SEEN is refused by name; restored, OK.
+
+## Where it bites
+
+Over `.facts/compiler.facts`, key-taking calls whose argument's provenance
+is a concatenation or a format call (the two untraceable shapes): 56
+`intern` calls - 36 formatted and 17 concatenated `InternTable.intern`, 3
+on `CompilationContext.intern`. Each mints a name from composed text whose
+parts the facts cannot trace; how many of those parts are identity text is
+not measured.
+
+## Where the list lives
+
+The list and every blind entry's reason live in the script, and the probes
+in `tests/fixtures/facts-blind-spots/` - not only here - so they survive
+this document's removal.
+
+## Measured
+
+`make facts-blind-spots`: `OK -- 23 entries hold: 16 seen, 7 blind`.

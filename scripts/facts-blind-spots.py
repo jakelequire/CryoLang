@@ -16,6 +16,11 @@ line it no longer sees is a regression.  The SEEN entries are the controls:
 each shows the instrument reporting a shape, so a BLIND line's zero is not
 the zero of an instrument that reports nothing.
 
+This file IS the list, and the reason for each blind entry is written
+beside it here, not in any design document: it is what a gate over the facts
+- that a spelling reaches a lookup only through a ruled door, that text an
+identity hands back never becomes a lookup key - has to be read against.
+
 What an entry asks of its line:
 
     arg, sarg, cmp, match
@@ -26,6 +31,12 @@ What an entry asks of its line:
               describes a spelling
     callee    the line's `call` record names the declaration it reached
               (its pin is not `none`)
+    origin    the key record of the line's lookup (an `arg` or `sarg` of
+              a `.get`) traces the key to `text_of` - the fixture's stand-in
+              for text an identity hands back (`InternTable.resolve`,
+              `DefTable.path_of`) - in its provenance.  What a check that
+              identity text never becomes a lookup key has to read from each
+              record, and where that trace stops
 
 Usage:
     python scripts/facts-blind-spots.py --cryo compiler/build/cryo.exe
@@ -95,6 +106,20 @@ SPOTS = [
      "a call through a function pointer records no callee identity"),
     ("callee-closure", "callee", BLIND,
      "a call to a closure records no callee identity"),
+    ("identity-text-direct", "origin", SEEN,
+     "identity text used as a key directly, `by_text.get(&name.text_of())`: the key's "
+     "provenance is the call"),
+    ("identity-text-via-local", "origin", SEEN,
+     "identity text held in a `string` local, then a key: the provenance follows the local's "
+     "initializer"),
+    ("identity-text-concatenated", "origin", BLIND,
+     "identity text concatenated into a key, `get(&(\"std::\" + name.text_of()))`: the "
+     "key's provenance is `expr:BinaryExpression` and stops there"),
+    ("identity-text-formatted", "origin", BLIND,
+     "identity text formatted into a key, `get(&fmt::format(\"%s::%s\", \"std\", "
+     "name.text_of()))`: the key's provenance names the format call and its FIRST argument "
+     "only; the identity text is recorded as the format call's own argument, a separate "
+     "record nothing links to the key"),
 ]
 
 
@@ -143,6 +168,9 @@ def read(facts):
 
 
 def answer(question, records):
+    if question == "origin":
+        return any(r[0] in ("arg", "sarg") and r[12].split("(", 1)[0].endswith(".get")
+                   and "text_of" in r[6] for r in records)
     if question == "spelling":
         return any(r[0] in SPELLING_KINDS for r in records)
     if question in SPELLING_KINDS:
