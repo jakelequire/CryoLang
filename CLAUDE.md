@@ -34,6 +34,8 @@ make roster-check        # roster golden: 2113 unit + 46 projects + 179 negative
 make lane-check          # resolution-lane surface ratchet; counts the compiler's facts,
                          # REFUSED when stale - never rebuilt by a gate
 make ns-status-check     # run every check docs/name-resolution.md §0 carries
+make doors-check         # the door list in docs/resolution-rules.md against the door
+                         # markers in compiler/src, both directions; text only, no build
 make check-fast          # lane + §0 + pin, ~1 min, builds nothing; refuses stale facts
                          # (§0's residue rows count from them). Run before committing.
 make facts               # cryo build --emit=facts over compiler, stdlib, editor -> .facts/;
@@ -215,6 +217,7 @@ done; grep -a "^verify\|^  [a-z]\|JOB_EXIT" .verify/run.out
 |---|---|
 | `docs/cryo.md` | the language |
 | `docs/name-resolution.md` | symbol resolution, modules, visibility, scope |
+| `docs/resolution-rules.md` | the five rules resolution is done by, and the doors - the only functions a spelling may be looked up through |
 | `docs/cryo-mangling-spec.md` | symbol mangling |
 | `docs/abi.md` | calling convention, layout |
 | `docs/grammar.md` | syntax |

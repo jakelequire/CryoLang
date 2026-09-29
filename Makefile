@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe facts facts-check facts-selftest facts-blind-spots selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe facts facts-check facts-selftest facts-blind-spots selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check doors-check incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -190,6 +190,7 @@ help:
 	@echo "  make lane-selftest     Drive lane-gate.py through a throwaway tree, every rule both ways"
 	@echo "  make residue-selftest  Drive residue.py --check through a throwaway tree and list, both ways"
 	@echo "  make ns-status-check   Run every check docs/name-resolution.md §0 carries"
+	@echo "  make doors-check       The doors in docs/resolution-rules.md against the door markers in compiler/src"
 	@echo "  make check-fast        refuse stale facts + lane-check + the self-tests + ns-status-check + verify-pin (~1 min; builds nothing)"
 	@echo "  make install-hooks     Point git at the tracked hooks (run once per checkout)"
 	@echo "  make lsp-check         Compile tools/CryoLSP against current source"
@@ -651,6 +652,13 @@ approved-check:
 	@$(PYTHON) scripts/ns-migration/approved.py --selftest
 	@$(PYTHON) scripts/ns-migration/approved.py --check
 
+# The doors docs/resolution-rules.md lists against the functions compiler/src
+# marks with a door doc comment; either one without the other refuses.  Reads
+# text only, so it needs no build and no facts.
+doors-check:
+	@$(PYTHON) scripts/resolution-doors.py --selftest
+	@$(PYTHON) scripts/resolution-doors.py
+
 # ---- name-resolution status gate ---------------------------------------
 # Run every check §0 of docs/name-resolution.md carries and fail on drift.
 #
@@ -681,8 +689,8 @@ guard-selftest:
 # build.  This target builds nothing, and runs in about a minute.  A
 # one-minute gate everybody runs is worth more than a twenty-minute one
 # nobody does.
-check-fast: facts-check lane-check lane-selftest facts-selftest residue-selftest verify-selftest approved-check ns-status-check verify-pin
-	@echo "check-fast: OK (fresh facts, lane surface and its self-test, the facts check's self-test, the residue check's self-test, verify's declared-program self-test, the approved names' checks and their self-test, section 0, pin integrity)"
+check-fast: facts-check lane-check lane-selftest facts-selftest residue-selftest verify-selftest approved-check doors-check ns-status-check verify-pin
+	@echo "check-fast: OK (fresh facts, lane surface and its self-test, the facts check's self-test, the residue check's self-test, verify's declared-program self-test, the approved names' checks and their self-test, the doors against their list and its self-test, section 0, pin integrity)"
 
 # ---- git hooks ---------------------------------------------------------
 # Point git at the tracked hook directory.  Hooks live in scripts/git-hooks so
