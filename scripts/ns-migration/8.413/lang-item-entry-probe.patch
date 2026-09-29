@@ -1,0 +1,213 @@
+diff --git a/compiler/src/compiler/codegen/test_main_codegen.cryo b/compiler/src/compiler/codegen/test_main_codegen.cryo
+index 213368ca..f6d9eb72 100644
+--- a/compiler/src/compiler/codegen/test_main_codegen.cryo
++++ b/compiler/src/compiler/codegen/test_main_codegen.cryo
+@@ -36,7 +36,9 @@ import compiler::compilation_context::{ CompilationContext };
+ import compiler::project_config;
+ import compiler::project_config::{ ProjectConfig };
+ import compiler::decl_index;
+-import compiler::decl_index::{ DeclarationIndex };
++import compiler::decl_index::{ DeclarationIndex, OverloadId };
++import compiler::resolver::res::{ DefId };
++import compiler::resolver::res;
+ import compiler::resolver::{ symbol_str, intern_table };
+ import compiler::codegen;
+ import compiler::codegen::{ llvm };
+@@ -347,9 +349,24 @@ type struct TestMainCodegen {
+         const di:     DeclarationIndex* = ctx.decl_index;
+ 
+         // Look up mangled names of the runtime entry points through the DI.
+-        const set_args_mangled:   SymbolStr = di.entry_symbol(di.lookup_sole_entry(ctx.generic_registry.wellknown(LangItem::SetArgs)));
+-        const set_env_mangled:    SymbolStr = di.entry_symbol(di.lookup_sole_entry(ctx.generic_registry.wellknown(LangItem::SetEnv)));
+-        const run_all_mangled:    SymbolStr = di.entry_symbol(di.lookup_sole_entry(ctx.generic_registry.wellknown(LangItem::RunAll)));
++        const set_args_mangled:   SymbolStr = di.entry_symbol(di.entry_of_def(ctx.generic_registry.wellknown(LangItem::SetArgs)));
++        const set_env_mangled:    SymbolStr = di.entry_symbol(di.entry_of_def(ctx.generic_registry.wellknown(LangItem::SetEnv)));
++        const run_all_mangled:    SymbolStr = di.entry_symbol(di.entry_of_def(ctx.generic_registry.wellknown(LangItem::RunAll)));
++        for (mut pi: i32 = 0; pi < 3; pi++) {
++            const it: LangItem = if (pi == 0) { LangItem::SetArgs } else { if (pi == 1) { LangItem::SetEnv } else { LangItem::RunAll } };
++            const pd: DefId = ctx.generic_registry.wellknown(it);
++            mut old_sym: string = "<none>";
++            if (pd.is_valid()) {
++                const fam: OverloadId[] = di.lookup_family_entries(
++                    compiler::resolver::res::FamilyOwner::Def(ctx.defs.parent_of(pd)), ctx.defs.leaf_of(pd));
++                if (fam.length == 1) { old_sym = intern.resolve(di.entry_symbol(fam[0])); }
++                else { old_sym = fmt::format("<family of %lld>", fam.length); }
++            }
++            const new_e: OverloadId = di.entry_of_def(pd);
++            const new_sym: string = if (new_e.is_valid()) { intern.resolve(di.entry_symbol(new_e)) } else { "<none>" };
++            const tag: string = if (old_sym.eq(new_sym)) { "same" } else { "DIFF" };
++            fmt::eprintln(fmt::format("LPROBE %s item=%d old=%s new=%s", tag, pi, old_sym, new_sym));
++        }
+         if (!set_args_mangled.is_valid() || !set_env_mangled.is_valid()
+                 || !run_all_mangled.is_valid()) {
+             // The stdlib's test/env modules weren't compiled into this build
+diff --git a/compiler/src/compiler/decl_index.cryo b/compiler/src/compiler/decl_index.cryo
+index 429c0bb1..e8ec7ad2 100644
+--- a/compiler/src/compiler/decl_index.cryo
++++ b/compiler/src/compiler/decl_index.cryo
+@@ -141,6 +141,10 @@ type struct DeclarationIndex {
+     // invalid for a slot no type registration reached.
+     def_types:      TypeRef[];
+ 
++    // The definition's slot in `defs` -> the entry its signature was
++    // registered as; invalid for a slot no function registration reached.
++    def_entries:    OverloadId[];
++
+     module_global_keys:       u32[];  // SymbolStr.id of global variable
+     module_global_files:      u32[];  // SymbolStr.id of the defining source file
+     module_global_declared_in: ModulePath[];  // the defining module
+@@ -298,6 +302,7 @@ public:
+             type_map:            HashMap::<u32, TypeRef>::new(),
+             type_reverse:        HashMap::<u64, DefId>::new(),
+             def_types:           [],
++            def_entries:         [],
+             array_elem_to_type:  HashMap::<u64, TypeRef>::new(),
+             implicit_converters: HashMap::<u64, u64>::new(),
+             generic_converter_methods: [],
+@@ -503,16 +508,15 @@ public:
+         return result;
+     }
+ 
+-    /// The one entry of the definition `d`'s family - its parent and its
+-    /// leaf - when it has exactly one; invalid when it has none or several.
+-    /// For a synthesizer naming a declaration it holds the identity of and
+-    /// knows to carry one signature.
+-    lookup_sole_entry(&this, d: DefId) -> OverloadId {
++    /// The entry the function definition `d`'s signature was registered as,
++    /// or invalid when `d` is invalid or no function registration reached it.
++    /// Asked by the definition, not by its parent and leaf: those name the
++    /// family, which holds every overload declared under the leaf.
++    entry_of_def(&this, d: DefId) -> OverloadId {
+         if (!d.is_valid()) { return OverloadId::invalid(); }
+-        const entries: OverloadId[] = this.lookup_family_entries(
+-            FamilyOwner::Def(this.defs.parent_of(d)), this.defs.leaf_of(d));
+-        if (entries.length != 1) { return OverloadId::invalid(); }
+-        return entries[0];
++        const slot: i64 = this.defs.slot(d);
++        if (slot >= this.def_entries.length) { return OverloadId::invalid(); }
++        return this.def_entries[slot];
+     }
+ 
+     /// Record the kind an `intrinsic function` declaration's entry `id`
+@@ -1074,12 +1078,15 @@ public:
+     /// under `symbol` when one is given (an `extern "C"` declaration's C
+     /// name, a `![symbol]` link name, an intrinsic's bare name) and under
+     /// the Cryo mangling of the signature otherwise.  Answers the entry,
+-    /// which the caller stamps on the node.
++    /// which the caller stamps on the node, and keeps it under `def`, the
++    /// definition the signature declares, for `entry_of_def`; `def` is
++    /// invalid for a clone or a synthesized function, which declares none of
++    /// its own.
+     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
+     register_function_signature(mut &this, owner: FamilyOwner, leaf: SymbolStr,
+                                 return_type: TypeRef, func_type_ref: TypeRef,
+                                 intern: InternTable*, arena: TypeArena*,
+-                                symbol: SymbolStr, span: SourceSpan) -> OverloadId {
++                                symbol: SymbolStr, span: SourceSpan, def: DefId) -> OverloadId {
+         // The qualified name the Cryo mangling encodes: the owner's path and
+         // the leaf, as the definition's own path is composed.
+         const owner_path: SymbolStr = this.family_owner_path(owner);
+@@ -1088,29 +1095,36 @@ public:
+         } else {
+             leaf
+         };
+-        if (symbol.is_valid()) {
+-            return this.register_signature(owner, leaf, func_type_ref, SymbolStr::empty(), symbol, DefId::invalid(), span);
++        mut link: SymbolStr = symbol;
++        if (!link.is_valid()) {
++            // Compute the mangled symbol name including the full signature.
++            const qname: QualifiedName = QualifiedName::from_symbol(name);
++            // Borrow the FunctionType's param list rather than aliasing it into an
++            // owning local: a `mut params: TypeRef[] = ...; params = fn_ty.param_types`
++            // local would free the FunctionType's buffer when it drops (the
++            // signature array is still owned by the arena type) - a use-after-free
++            // the mangler hit while reading the borrowed params.
++            const empty_params: TypeRef[] = [];
++            mut params: &TypeRef[] = &empty_params;
++            mut is_variadic: boolean = false;
++            const ft: Type* = arena.lookup(func_type_ref);
++            if (ft != null && ft.kind == TypeKind::Function) {
++                const fn_ty: FunctionType* = ft as FunctionType*;
++                params = &fn_ty.param_types;
++                is_variadic = fn_ty.is_variadic;
++            }
++            const mangled: MangledName = MangledName::for_free_function(
++                intern, arena, qname, params, return_type, is_variadic);
++            link = intern.intern(mangled.as_string());
+         }
+-
+-        // Compute the mangled symbol name including the full signature.
+-        const qname: QualifiedName = QualifiedName::from_symbol(name);
+-        // Borrow the FunctionType's param list rather than aliasing it into an
+-        // owning local: a `mut params: TypeRef[] = ...; params = fn_ty.param_types`
+-        // local would free the FunctionType's buffer when it drops (the
+-        // signature array is still owned by the arena type) - a use-after-free
+-        // the mangler hit while reading the borrowed params.
+-        const empty_params: TypeRef[] = [];
+-        mut params: &TypeRef[] = &empty_params;
+-        mut is_variadic: boolean = false;
+-        const ft: Type* = arena.lookup(func_type_ref);
+-        if (ft != null && ft.kind == TypeKind::Function) {
+-            const fn_ty: FunctionType* = ft as FunctionType*;
+-            params = &fn_ty.param_types;
+-            is_variadic = fn_ty.is_variadic;
++        const entry: OverloadId = this.register_signature(
++            owner, leaf, func_type_ref, SymbolStr::empty(), link, DefId::invalid(), span);
++        if (def.is_valid() && entry.is_valid()) {
++            const slot: i64 = this.defs.slot(def);
++            while (this.def_entries.length <= slot) { this.def_entries.push(OverloadId::invalid()); }
++            this.def_entries[slot] = entry;
+         }
+-        const mangled: MangledName = MangledName::for_free_function(
+-            intern, arena, qname, params, return_type, is_variadic);
+-        return this.register_signature(owner, leaf, func_type_ref, SymbolStr::empty(), intern.intern(mangled.as_string()), DefId::invalid(), span);
++        return entry;
+     }
+ 
+ 
+diff --git a/compiler/src/compiler/passes/type_resolution.cryo b/compiler/src/compiler/passes/type_resolution.cryo
+index 7e0172cf..657702ba 100644
+--- a/compiler/src/compiler/passes/type_resolution.cryo
++++ b/compiler/src/compiler/passes/type_resolution.cryo
+@@ -1033,7 +1033,8 @@ type struct TypeResolutionPasses {
+                     const owner: FamilyOwner = ctx.decl_fn_family(func.name, func.span.file, &leaf);
+                     const entry: OverloadId = ctx.decl_index.register_function_signature(
+                         owner, leaf, func.resolved_return_type, func_type_ref, ctx.intern_table, arena,
+-                        SymbolStr::empty(), if (func.has_name_span()) { func.name_span } else { func.span });
++                        SymbolStr::empty(), if (func.has_name_span()) { func.name_span } else { func.span },
++                        if (is_source_decl) { func.def } else { DefId::invalid() });
+                     func.set_overload_entry(entry);
+                     // Whether this IS a function generated code calls - the
+                     // allocator, the entry point's `set_args` - is decided by
+@@ -2508,7 +2509,8 @@ type struct TypeResolutionPasses {
+                             fn_node.set_overload_entry(ctx.decl_index.register_function_signature(
+                                 ext_owner, ext_leaf, fn_node.resolved_return_type, func_type_ref,
+                                 ctx.intern_table, arena, ext_link_sym,
+-                                if (fn_node.has_name_span()) { fn_node.name_span } else { fn_node.span }));
++                                if (fn_node.has_name_span()) { fn_node.name_span } else { fn_node.span },
++                                fn_node.def));
+                             ctx.decl_index.note_extern_symbol(ext_link_sym, ext_q_name, func_type_ref);
+                             // An imported function is a declaration of this
+                             // module and takes its written visibility, as a
+@@ -2565,7 +2567,7 @@ type struct TypeResolutionPasses {
+                         // bare function name, not the qualified/mangled form.
+                         const i_entry: OverloadId = ctx.decl_index.register_function_signature(
+                             i_owner, i_leaf, node.resolved_return_type, i_func_type_ref, ctx.intern_table, arena,
+-                            node.name, node.span);
++                            node.name, node.span, node.def);
+ 
+                         // The ENTRY carries the intrinsic's kind, read from
+                         // the declaration's own name here, the one place a
+diff --git a/compiler/src/compiler/sema/lambda_synth.cryo b/compiler/src/compiler/sema/lambda_synth.cryo
+index 2f738fdf..95767fd5 100644
+--- a/compiler/src/compiler/sema/lambda_synth.cryo
++++ b/compiler/src/compiler/sema/lambda_synth.cryo
+@@ -696,7 +696,7 @@ type struct LambdaSynth {
+             spec_func.resolved_return_type, spec_param_types, false);
+         const entry: OverloadId = this.ctx.decl_index.register_function_signature(
+             spec_owner, spec_leaf, spec_func.resolved_return_type, spec_ft,
+-            this.intern, this.arena, SymbolStr::empty(), spec_func.span);
++            this.intern, this.arena, SymbolStr::empty(), spec_func.span, DefId::invalid());
+         spec_func.set_overload_entry(entry);
+         call.set_resolved_callee(CalleePin::Decl(entry));
+         this.state.closure_spec_map.insert(key, entry);

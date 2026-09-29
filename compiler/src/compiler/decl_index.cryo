@@ -141,6 +141,10 @@ type struct DeclarationIndex {
     // invalid for a slot no type registration reached.
     def_types:      TypeRef[];
 
+    // The definition's slot in `defs` -> the entry its signature was
+    // registered as; invalid for a slot no function registration reached.
+    def_entries:    OverloadId[];
+
     module_global_keys:       u32[];  // SymbolStr.id of global variable
     module_global_files:      u32[];  // SymbolStr.id of the defining source file
     module_global_declared_in: ModulePath[];  // the defining module
@@ -298,6 +302,7 @@ public:
             type_map:            HashMap::<u32, TypeRef>::new(),
             type_reverse:        HashMap::<u64, DefId>::new(),
             def_types:           [],
+            def_entries:         [],
             array_elem_to_type:  HashMap::<u64, TypeRef>::new(),
             implicit_converters: HashMap::<u64, u64>::new(),
             generic_converter_methods: [],
@@ -503,16 +508,15 @@ public:
         return result;
     }
 
-    /// The one entry of the definition `d`'s family - its parent and its
-    /// leaf - when it has exactly one; invalid when it has none or several.
-    /// For a synthesizer naming a declaration it holds the identity of and
-    /// knows to carry one signature.
-    lookup_sole_entry(&this, d: DefId) -> OverloadId {
+    /// The entry the function definition `d`'s signature was registered as,
+    /// or invalid when `d` is invalid or no function registration reached it.
+    /// Asked by the definition, not by its parent and leaf: those name the
+    /// family, which holds every overload declared under the leaf.
+    entry_of_def(&this, d: DefId) -> OverloadId {
         if (!d.is_valid()) { return OverloadId::invalid(); }
-        const entries: OverloadId[] = this.lookup_family_entries(
-            FamilyOwner::Def(this.defs.parent_of(d)), this.defs.leaf_of(d));
-        if (entries.length != 1) { return OverloadId::invalid(); }
-        return entries[0];
+        const slot: i64 = this.defs.slot(d);
+        if (slot >= this.def_entries.length) { return OverloadId::invalid(); }
+        return this.def_entries[slot];
     }
 
     /// Record the kind an `intrinsic function` declaration's entry `id`
@@ -1074,12 +1078,15 @@ public:
     /// under `symbol` when one is given (an `extern "C"` declaration's C
     /// name, a `![symbol]` link name, an intrinsic's bare name) and under
     /// the Cryo mangling of the signature otherwise.  Answers the entry,
-    /// which the caller stamps on the node.
+    /// which the caller stamps on the node, and keeps it under `def`, the
+    /// definition the signature declares, for `entry_of_def`; `def` is
+    /// invalid for a clone or a synthesized function, which declares none of
+    /// its own.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     register_function_signature(mut &this, owner: FamilyOwner, leaf: SymbolStr,
                                 return_type: TypeRef, func_type_ref: TypeRef,
                                 intern: InternTable*, arena: TypeArena*,
-                                symbol: SymbolStr, span: SourceSpan) -> OverloadId {
+                                symbol: SymbolStr, span: SourceSpan, def: DefId) -> OverloadId {
         // The qualified name the Cryo mangling encodes: the owner's path and
         // the leaf, as the definition's own path is composed.
         const owner_path: SymbolStr = this.family_owner_path(owner);
@@ -1089,7 +1096,8 @@ public:
             leaf
         };
         if (symbol.is_valid()) {
-            return this.register_signature(owner, leaf, func_type_ref, SymbolStr::empty(), symbol, DefId::invalid(), span);
+            return this.keep_def_entry(def,
+                this.register_signature(owner, leaf, func_type_ref, SymbolStr::empty(), symbol, DefId::invalid(), span));
         }
 
         // Compute the mangled symbol name including the full signature.
@@ -1110,7 +1118,19 @@ public:
         }
         const mangled: MangledName = MangledName::for_free_function(
             intern, arena, qname, params, return_type, is_variadic);
-        return this.register_signature(owner, leaf, func_type_ref, SymbolStr::empty(), intern.intern(mangled.as_string()), DefId::invalid(), span);
+        return this.keep_def_entry(def,
+            this.register_signature(owner, leaf, func_type_ref, SymbolStr::empty(), intern.intern(mangled.as_string()), DefId::invalid(), span));
+    }
+
+    /// Keep `entry` under the definition `def` for `entry_of_def`, and
+    /// answer it; nothing is kept for an invalid `def` or entry.
+    keep_def_entry(mut &this, def: DefId, entry: OverloadId) -> OverloadId {
+        if (def.is_valid() && entry.is_valid()) {
+            const slot: i64 = this.defs.slot(def);
+            while (this.def_entries.length <= slot) { this.def_entries.push(OverloadId::invalid()); }
+            this.def_entries[slot] = entry;
+        }
+        return entry;
     }
 
 
