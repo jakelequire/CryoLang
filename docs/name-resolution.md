@@ -232,7 +232,7 @@ measurement that decided it on the row.
 | D74 | **The monomorphizer's text-based matching of generic type arguments is reworked onto type identities now** (`mono/specializer.cryo`, a type argument interned by its display text and an annotation matched by whole text or by last segment) (Jake, relayed in plain text 2026-09-28) | **BUILT** (§8.402) - a type argument's shape is its kind in the arena, and a receiver's written instantiation is compared as the type it denotes; the leaf match and the display parameters are deleted. The template recognised by its spelling (six `base_name` comparisons in the substituter) is measured with one wrong answer and not built | `grep -o 'type_arg_displays' compiler/src/compiler/mono/specializer.cryo \| wc -l` → **0** (11 before §8.402) | §8.398, §8.402 |
 | D75 | **Condition three is redefined around what the compiler can enforce** - neither a command-carrying list beside the lint nor an admission that reasons cannot be checked; the new wording is its own piece of work (Jake, relayed in plain text 2026-09-28) | **RULED** | `no check` — the wording is not yet written | §0.0 |
 | D76 | **The lane gate stops counting calls that pass only identities**: this answers D58's deferred principle, retires the unratified ARENA_READ 63 → 64, and stops later conversions raising the counts (Jake, relayed in plain text 2026-09-28) | **RULED** | `no check` — not built | §8.391 |
-| D77 | **The three remaining fast-check holes are fixed as a batch**: a struct compared with `null`, `printf`-style call arguments, and `Point(1, 2)` on a struct (Jake, relayed in plain text 2026-09-28) | **RULED** - the third is closed by D59's refusal (§8.401: E0231 at the name, where `cryo check` passed it); the first two are not built | `no check` — two of three not built | §8.396, §8.401 |
+| D77 | **The three remaining fast-check holes are fixed as a batch**: a struct compared with `null`, `printf`-style call arguments, and `Point(1, 2)` on a struct (Jake, relayed in plain text 2026-09-28) | **RULED** - the third is closed by D59's refusal (§8.401: E0231 at the name, where `cryo check` passed it); the first is BUILT (§8.404: the pointer rule, not the `void` one, admitted any value beside `null`); the second is not built | `no check` — one of three not built | §8.396, §8.401, §8.404 |
 
 **D18's keyword half is RULED and UNBUILT - built once and backed out at a parse fork the ruling did not cover (§8.295: `x as u32 < y`); that one ruling is now given (D66: refused, parentheses asked for) - and D32 is the criterion it is built toward** (D5 was, until §8.206; D2 and D9 were,
 until §8.213; D24 was, until §8.233 - this line kept naming it for forty-six entries after its row said TAKEN, §8.280; Q2 was, until §8.259; D25 was, until §8.263; D30's refusal was, until §8.268; D28 was, until §8.270; D30's identity half was, until §8.272; D31 was, until §8.278). Each was decided by Jake - D18 and D2 then re-parked as open
@@ -421,7 +421,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: facts-check lane-check lane-selftest facts-selftest' Makefile` → **1** (§8.371: stale facts are REFUSED first, never regenerated - the facts target is the deliberate refresh - and the refusal's self-test runs; `facts-fresh`, which regenerated them, before, §8.366)
 * `python3 scripts/facts-selftest.py | tail -1 | grep -o '[0-9]* cases' | cut -d' ' -f1` → **12** (§8.371: the freshness check over a throwaway tree - an edited source, an added source and a missing inputs record refused, fresh facts and a non-source edit accepted, each through `facts.py --check` and through `facts_path`, which the lane gate and the residue check call - and a dry run of the lane-check and check-fast targets building nothing; with the staleness comparison deleted it fails 4 cases, with `lane-check` depending on `facts` it fails 2)
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **104** (+2 in §8.403, `class_constructor_arguments_refused`, `class_constructor_overloads_by_arity`; 102 before, +3 in §8.402, `generic_receiver_by_type`, `generic_receiver_other_instantiation_refused`, `generic_function_type_argument`; 99 before, +2 in §8.401, `bare_type_as_value_refused`, `class_constructed_by_name`; +1 in §8.396, `array_method_argument_mismatch`; +3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **105** (+1 in §8.404, `compare_with_null_refused`; 104 before, +2 in §8.403, `class_constructor_arguments_refused`, `class_constructor_overloads_by_arity`; 102 before, +3 in §8.402, `generic_receiver_by_type`, `generic_receiver_other_instantiation_refused`, `generic_function_type_argument`; 99 before, +2 in §8.401, `bare_type_as_value_refused`, `class_constructed_by_name`; +1 in §8.396, `array_method_argument_mismatch`; +3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)* `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -49730,3 +49730,71 @@ a lookup by path wherever else it is asked; not audited.
 program in the tree was refused. Gate cycles: 5 clean compiler builds (two
 designs, the kind fix, the restores), 4 mutant builds, 3 type checks, 2
 facts runs, 3 check-fast, 2 verify (the first refused `Tone(4)`).
+
+### 8.404 A value compared with `null` or another pointer is refused by the type check unless it is a pointer, a function, a string or a reference; the rule that let it through was the pointer rule, not the one the ruling named; 0 objects moved - 2026-09-28
+
+## Why
+
+D77's first hole: a struct compared with `null` passes `cryo check` and dies
+in the build. The ruling located it at `types/checker.cryo`'s rule that
+accepts a comparison when either side is `void`. Measured, that is not the
+rule that fires: `null` is typed `void*` (`LiteralResolver::resolve_null_literal`),
+a pointer, and the comparison is accepted by the rule before it - "either
+side is a pointer" - whatever the other side is. So the hole was every
+non-pointer kind, not structs alone:
+
+| `x == null` with `x` a | `cryo check` before | build before | after |
+|---|---|---|---|
+| struct value | passes | `E0633: codegen: function 'main' ... left 1 of 3 basic block(s) unterminated` | E0229 (`S` does not implement `Eq`) |
+| class value | passes | E0633 | E0229 |
+| enum value | passes | `E0900: LLVM module verification failed` | E0229 |
+| `i32` | passes | builds; compares a number with an address | `E0229: Cannot compare Int and Pointer` |
+| `boolean` | passes | builds, the same | `E0229: Cannot compare Boolean and Pointer` |
+| `i32` against `&n` | passes | builds, the same | `E0229: Cannot compare Int and Pointer` |
+| class pointer, string (controls) | passes | runs | passes, runs |
+
+## What changed
+
+The pointer rule accepts a comparison only when the side that is not the
+pointer is a pointer, a function, a string (a `char*`), a reference, or
+`void`, and otherwise fails with the message every other unaccepted
+comparison already gets ("Cannot compare %s and %s"). It refuses rather than
+falling through, because the class rule after it accepts a class value
+beside anything. A struct, class or enum value then reaches the operator
+traits, whose existing refusal names `Eq` - the message is existing
+wording; a struct that does implement `Eq` was already refused at `null`
+(E0214 at the `equals` argument), before and after.
+
+## Before and after, `cryo check` itself
+
+The previous compiler over the six programs: "No errors found." each. This
+one: the six refusals above. The change is one rule, so the pair is the
+whole inversion: the same programs, the rule restored, pass the check.
+
+## Tests
+
+`compare_with_null_refused` (compile_fail, six refusals). Declared in
+`tests/started-passing`: the baseline refused it too, but in code
+generation (E0633), without the report the project expects. Roster golden
++1.
+
+## Found on the way, not fixed
+
+An `implement trait Eq for struct S` whose method is spelled `eq` instead of
+the trait's `equals` passes `cryo check`, and the build fails at `v == w`
+with `E0636: codegen: the call to method 'equals' on type 'S' was never
+...`. Another place the fast check does not see what the build does.
+
+## Measured
+
+* Predicted: no program in the tree refused, 0 objects moved. Both held:
+  the compiler's own source, the standard library, the editor and the
+  census all pass the narrowed rule.
+* `make verify ARGS="--baseline HEAD --require-identical"`: OK in 346 s; 0
+  of 3,790 test and 0 of 1,126 example objects moved.
+* Warnings 344 from a clean build, the same set as the previous commit's.
+
+## Blast radius
+
+`types/checker.cryo` +15 / -2. Gate cycles: 2 compiler builds, 1 type
+check, 1 facts run, 1 check-fast, 1 verify.
