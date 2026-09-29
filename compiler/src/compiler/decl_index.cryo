@@ -137,6 +137,10 @@ type struct DeclarationIndex {
     // registration; a type's name is read off the definition.
     type_reverse:   HashMap<u64, DefId>;
 
+    // The definition's slot in `defs` -> the type it was registered as;
+    // invalid for a slot no type registration reached.
+    def_types:      TypeRef[];
+
     module_global_keys:       u32[];  // SymbolStr.id of global variable
     module_global_files:      u32[];  // SymbolStr.id of the defining source file
     module_global_declared_in: ModulePath[];  // the defining module
@@ -293,6 +297,7 @@ public:
             method_returns:      HashMap::<u64, TypeRef>::new(),
             type_map:            HashMap::<u32, TypeRef>::new(),
             type_reverse:        HashMap::<u64, DefId>::new(),
+            def_types:           [],
             array_elem_to_type:  HashMap::<u64, TypeRef>::new(),
             implicit_converters: HashMap::<u64, u64>::new(),
             generic_converter_methods: [],
@@ -644,12 +649,16 @@ public:
     /// `def` is the id the declaration was given where it was declared - the
     /// name layer's binding, a synthesizer's registration - and this makes
     /// none of its own: a second id for one declaration would compare unequal
-    /// to the first.  The store stays keyed by the definition's path.
+    /// to the first.  The type is kept under the definition for
+    /// `type_of_def`, and under its path for readers still asking by path.
     register_type(mut &this, def: DefId, ty: TypeRef, is_public: boolean) -> void {
         const qualified_name: SymbolStr = this.defs.path_of(def);
         this.type_map.insert(qualified_name.id, ty);
         this.type_reverse.insert(ty.key(), def);
         this.defs.record_visibility(def, is_public);
+        const slot: i64 = this.defs.slot(def);
+        while (this.def_types.length <= slot) { this.def_types.push(TypeRef::invalid()); }
+        this.def_types[slot] = ty;
     }
 
     /// Register the concrete `Array<T>` specialization a dynamic `T[]`
@@ -1006,11 +1015,16 @@ public:
         if (!found.is_valid()) { compiler::resolver::res::record_unregistered_def(site); }
         return found;
     }
-    /// The type of the definition `d`, or invalid when `d` names none or the
-    /// definition is not a type.  Sibling of `func_type_of_def`.
+    /// The type the definition `d` was registered as, or invalid when `d`
+    /// names none or no type registration reached it.  Sibling of
+    /// `func_type_of_def`.  Asked by the definition, not by its path: a
+    /// function and a type may share a path, and a lookup by path hands the
+    /// function the type.
     type_of_def(&this, d: DefId) -> TypeRef {
         if (!d.is_valid()) { return TypeRef::invalid(); }
-        return this.lookup_type(this.defs.path_of(d));
+        const slot: i64 = this.defs.slot(d);
+        if (slot >= this.def_types.length) { return TypeRef::invalid(); }
+        return this.def_types[slot];
     }
 
     /// The return type of the method `method_sym` declared on the type

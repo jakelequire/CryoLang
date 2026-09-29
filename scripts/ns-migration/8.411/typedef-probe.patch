@@ -1,0 +1,56 @@
+diff --git a/compiler/src/compiler/decl_index.cryo b/compiler/src/compiler/decl_index.cryo
+index 495dfcbd..d9387f18 100644
+--- a/compiler/src/compiler/decl_index.cryo
++++ b/compiler/src/compiler/decl_index.cryo
+@@ -137,6 +137,10 @@ type struct DeclarationIndex {
+     // registration; a type's name is read off the definition.
+     type_reverse:   HashMap<u64, DefId>;
+ 
++    // The definition's slot in `defs` -> the type it was registered as;
++    // invalid for a slot no type registration reached.
++    def_types:      TypeRef[];
++
+     module_global_keys:       u32[];  // SymbolStr.id of global variable
+     module_global_files:      u32[];  // SymbolStr.id of the defining source file
+     module_global_declared_in: ModulePath[];  // the defining module
+@@ -293,6 +297,7 @@ public:
+             method_returns:      HashMap::<u64, TypeRef>::new(),
+             type_map:            HashMap::<u32, TypeRef>::new(),
+             type_reverse:        HashMap::<u64, DefId>::new(),
++            def_types:           [],
+             array_elem_to_type:  HashMap::<u64, TypeRef>::new(),
+             implicit_converters: HashMap::<u64, u64>::new(),
+             generic_converter_methods: [],
+@@ -650,6 +655,9 @@ public:
+         this.type_map.insert(qualified_name.id, ty);
+         this.type_reverse.insert(ty.key(), def);
+         this.defs.record_visibility(def, is_public);
++        const slot: i64 = this.defs.slot(def);
++        while (this.def_types.length <= slot) { this.def_types.push(TypeRef::invalid()); }
++        this.def_types[slot] = ty;
+     }
+ 
+     /// Register the concrete `Array<T>` specialization a dynamic `T[]`
+@@ -1010,7 +1018,21 @@ public:
+     /// definition is not a type.  Sibling of `func_type_of_def`.
+     type_of_def(&this, d: DefId) -> TypeRef {
+         if (!d.is_valid()) { return TypeRef::invalid(); }
+-        return this.lookup_type(this.defs.path_of(d));
++        const pr_path: TypeRef = this.lookup_type(this.defs.path_of(d));
++        const pr_slot: i64 = this.defs.slot(d);
++        mut pr_def: TypeRef = TypeRef::invalid();
++        if (pr_slot < this.def_types.length) { pr_def = this.def_types[pr_slot]; }
++        if (!pr_def.equals(pr_path)) {
++            const pr_k: i32 = match (this.defs.kind_of(d)) {
++                DefKind::Module => { 0 } DefKind::Type => { 1 } DefKind::Function => { 2 }
++                DefKind::Value => { 3 } DefKind::Primitive => { 4 } DefKind::Instance => { 5 }
++            };
++            const pr_pv: i32 = if (pr_path.is_valid()) { 1 } else { 0 };
++            const pr_dv: i32 = if (pr_def.is_valid()) { 1 } else { 0 };
++            const pr_name: u32 = this.defs.path_of(d).id;
++            fmt::eprintln(f"TYPEDEF_PROBE kind={pr_k} path_valid={pr_pv} def_valid={pr_dv} path={pr_name}");
++        }
++        return pr_path;
+     }
+ 
+     /// The return type of the method `method_sym` declared on the type
