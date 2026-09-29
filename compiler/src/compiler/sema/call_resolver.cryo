@@ -3106,10 +3106,13 @@ type struct CallResolver {
     }
 
     /// `args_bind_to_params` for a method candidate `func`.  A generic
-    /// method's own type parameters are unknowns: each argument first unifies
-    /// with its parameter, binding them consistently across the call (the
-    /// one structural unifier, `InferCtx`), and binds by the tier's rule
-    /// otherwise.  A method with none binds exactly as `args_bind_to_params`.
+    /// method's own type parameters are unknowns: an explicit turbofish
+    /// binds them first; then each argument unifies with its parameter,
+    /// binding the rest consistently across the call (the one structural
+    /// unifier, `InferCtx`), and an argument that does not unify binds by
+    /// the tier's rule against the parameter with the bindings substituted
+    /// (`&w` for a `C` the turbofish made `W*`).  A method with none binds
+    /// exactly as `args_bind_to_params`.
     method_args_bind(mut &this, call: CallExprNode*, arg_types: &TypeRef[], params: Slice<TypeRef>,
                      variadic: boolean, tier: i32, func: FunctionDeclNode*) -> boolean {
         if (func == null || func.generic_params.length == 0) {
@@ -3129,10 +3132,23 @@ type struct CallResolver {
             pids.push(this.symbolic.symbolic_param_ref(gp, i as u64));
         }
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+        mut targs: &TypeAnnotation*[] = &call.generic_args;
+        const callee_node: ASTNode* = call.callee as ASTNode*;
+        if (targs.length == 0 && callee_node != null && callee_node.kind == NodeKind::MemberAccess) {
+            targs = &(call.callee as MemberAccessNode*).generic_args;
+        }
+        if (targs.length > 0) {
+            if (targs.length != func.generic_params.length) { return false; }
+            const explicit: TypeRef[] = this.resolve_turbofish(targs);
+            if (explicit.length != targs.length) { return false; }
+            for (mut i: i64 = 0; i < explicit.length; i++) { ictx.bind_slot(i, explicit[i]); }
+        }
         for (mut pi: i64 = 0; pi < fixed; pi++) {
             const param: TypeRef = params.get(pi as u64).unwrap();
             if (ictx.unify(param, arg_types[pi])) { continue; }
-            if (!this.arg_binds_to_param(call, pi, arg_types[pi], param, tier)) { return false; }
+            mut subst: TypeSubstitution = TypeSubstitution::from_params(ictx.params, ictx.bindings);
+            const bound: TypeRef = subst.apply(param, this.arena);
+            if (!this.arg_binds_to_param(call, pi, arg_types[pi], bound, tier)) { return false; }
         }
         return true;
     }
@@ -4705,6 +4721,22 @@ type struct CallResolver {
     /// (`make<i32>(..)`) or, failing that, from the argument types - the method
     /// analogue of `infer_free_call_bindings`.  Returns a length-`generic_params`
     /// all-valid array, or `[]` when inference is incomplete.
+    /// A call's explicit type arguments, resolved as the caller wrote them,
+    /// with the enclosing body's generic parameters in scope; `[]` when any
+    /// fails to resolve.
+    resolve_turbofish(mut &this, targs: &TypeAnnotation*[]) -> TypeRef[] {
+        mut empty: TypeRef[] = [];
+        mut rc: ResolutionContext = ResolutionContext::new("");
+        this.symbolic.symbolic_bind_params(&rc);
+        mut binds: TypeRef[] = [];
+        for (mut i: i64 = 0; i < targs.length; i++) {
+            const tr: TypeRef = this.ctx.type_resolver.resolve(targs[i], &rc);
+            if (!tr.is_valid()) { return empty; }
+            binds.push(tr);
+        }
+        return binds;
+    }
+
     infer_generic_method_bindings(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
                                   func: FunctionDeclNode*) -> TypeRef[] {
         mut empty: TypeRef[] = [];
@@ -4722,15 +4754,7 @@ type struct CallResolver {
         if (targs.length == 0 && scope.generic_args.length > 0) { targs = &scope.generic_args; }
         if (targs.length > 0) {
             if (targs.length != n) { return empty; }
-            mut rc: ResolutionContext = ResolutionContext::new("");
-            this.symbolic.symbolic_bind_params(&rc);
-            mut binds: TypeRef[] = [];
-            for (mut i: i64 = 0; i < targs.length; i++) {
-                const tr: TypeRef = this.ctx.type_resolver.resolve(targs[i], &rc);
-                if (!tr.is_valid()) { return empty; }
-                binds.push(tr);
-            }
-            return binds;
+            return this.resolve_turbofish(targs);
         }
         // Inference from concrete argument types.
         if (func.parameters.length != call.arguments.length) { return empty; }

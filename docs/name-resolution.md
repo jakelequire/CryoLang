@@ -50906,3 +50906,67 @@ h.fold(Manifest::compiler_fingerprint());   // unpinned: `u128` binds no `T`
   silently invalid (1,373 typings) and its result is an argument here.
   Plus the unresolved-instantiation, generic-owner and bounded-parameter
   receivers, which the selection does not cover at all.
+
+### 8.416 A generic method call with a turbofish binds the turbofish first; converting the concrete receivers' typing to read the pin is blocked by a `void`-typed argument - 2026-09-29
+
+## Why
+
+The next step after 8.415 was the typing: for a receiver the selection
+covers, read the pinned method's return instead of asking the name-keyed
+finder, with an unpinned call naming no method. Built that way
+(`.objcmp/s74/slice2-attempt.patch`, not landed), the compiler's own
+build refused two calls the finder had been answering regardless of
+their arguments.
+
+The first was the selection's: a generic method with an explicit
+turbofish.
+
+```cryo
+// spawn<C>(mut &this, ctx: C, body: (C) -> void)
+s.spawn::<EmitWorkerCtx*>(&wcs[w], emit_worker_entry);
+```
+
+8.415 unified each argument with its parameter and ignored the turbofish:
+`C` bound to `&EmitWorkerCtx` from the first argument, the function
+argument then conflicted, and nothing bound - E0358 once the typing read
+the pin.
+
+## What changed
+
+`method_args_bind`: an explicit turbofish (on the call or on the member)
+binds the method's type parameters first, resolved as the scope-call
+inference resolves one; an argument that does not unify is then compared
+by the tier's rule against the parameter with the bindings substituted
+(`TypeSubstitution`), so `&wcs[w]` binds `C = EmitWorkerCtx*` by the
+reference-to-pointer rule. The turbofish is resolved by
+`resolve_turbofish`, the scope-call inference's own block moved into a
+helper both now call: resolving it inline added a
+`ResolutionContext::new("")` site and the residue check refused the tree
+(`call_resolver.cryo ResolutionContext::new (literal:""): tree 15, list
+14`); moved, the file keeps its 14. The typing is untouched.
+
+## Proved
+
+- The compiler's facts, 8.415's tree against this one: unpinned calls
+  5,270 -> 5,269, the one being `Instance.cryo:3735 .spawn` (the other
+  moved records are this change's own lines).
+- With the typing converted, the build no longer refuses `spawn`.
+- `make verify ARGS="--baseline HEAD --require-identical"` from a clean
+  build: every gate OK, 4012 test and 1126 example objects, 0 moved.
+  Compiler warnings 344, the same set as HEAD's. Residue 242, lane gate,
+  flow list 797: unchanged.
+
+## The second refusal: not fixed, and it blocks the typing conversion
+
+`remaining.subslice(n, remaining.length())` in the `Write` trait's default
+`write<T>` (`stdlib/io/traits.cryo:336`), in the check after
+monomorphization, walking the template symbolically: a probe at the
+failure printed `arg0 kind=Void`. `n`, bound by `Result::Ok(n)` from
+`this.write_some(remaining)` on the abstract `This`, is typed `void`. The
+selection is right to bind nothing to `start: u64` from a `void`; the
+name-keyed finder answered `subslice` without looking at the arguments,
+which is what hid the wrong type. The cause is in the abstract-receiver
+arm (a bounded parameter's method return), another receiver shape. Not
+routed around: excusing a `void` argument in the selection would be a
+second path for the same question. It was the only refusal in the
+compiler's own build; the test suite was not run with the conversion.
