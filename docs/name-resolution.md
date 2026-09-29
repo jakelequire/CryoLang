@@ -309,7 +309,7 @@ three, and its row carries the count. Read each zero off its own row.
 | `spelling_type` call-ident fallback (E0202 tail) and `new`'s `resolve_primitive` step | **DELETED** — shadow 0 over six halves; their three rows retired | — | `grep -c 'resolve_primitive' compiler/src/compiler/sema/sema.cryo` → **0** | §8.25, §8.98, §8.171 |
 | `new`'s spelling step (`lookup_type_exact(new_expr.type_name)`) | **DELETED** (§8.256) — its whole population was an ALIAS KEYWORD (`new int[100]`), which the name layer stamps `PrimTy("i32")` now, so `spelling_type(new_expr.res)` is the one answer; shadow over the six halves: 0 `new` expressions answered by the spelling and not the stamp (1,407 by the stamp, the control; at HEAD the same probe printed the two `new int[100]` lines). The impl head's spelling arm for the same four spellings went with it (§8.188's `target_key` arm and type resolution's `register_methods_by_key` dispatch) | — | `grep -c 'lookup_type_exact(new_expr' compiler/src/compiler/sema/sema.cryo` → **0**; `grep -rho 'is_alias_keyword' compiler/src --include=*.cryo \| wc -l` → **0** | §8.25, §8.98, §8.171, §8.188, §8.256 |
 | bound-directed trait filter by LEAF (`select_method`, mono's spec-impl and trait-registry method lookups) | **DELETED** — `MemberAccessNode.resolved_trait` is the trait's identity and every reader compares it to `origin_trait` / `qualified_trait_name`; shadow 440 → 0 (the async-lowered `Future` impl was the one unstamped head); `trait_leaf_dispatch` exits 12 where a leaf comparison exits 11. The check is paired treewide the way the leaf-scan rows are: a zero over the two files that select a method, and the treewide count naming the survivors, every non-locator one a reader of the trait registry's TRAIT half (the row below, D24's) | — | `grep -rho 'leaf_segment' compiler/src/compiler/sema/call_resolver.cryo compiler/src/compiler/mono/call_specializer.cryo \| wc -l` → **0**; `grep -rh 'leaf_segment' compiler/src --include=*.cryo \| grep -v '^\s*//' \| grep -o 'leaf_segment' \| wc -l` → **2** (-7 in §8.364: the node locator's `leaf_segment_str` and its six uses moved into the editor with the finders; 9 before; `types/ownership.cryo` 1, the definition; `sema/async_lower.cryo` 1; 18 before §8.233 deleted the trait registry's leaf keys, 11 before §8.285 replaced the operator paths' two bound-by-leaf compares in `sema/sema.cryo` and `sema/member_resolver.cryo` with the trait's identity) | §8.171, §8.205 |
-| method selection by REGISTRATION ORDER (sema's `select_method` over the type's folded method list, where an impl block's methods sit beside the inherent ones in declaration order; its generic-method finder over the template's impl blocks as one list, and the trait registry ahead of the inherent owner and the inherent-impl registry; mono's `find_spec_impl_method` and `find_generic_trait_method_under`, whose `first_m` arm bound whichever impl the walk met first) | **DELETED** — one precedence at every selector, `docs/cryo.md` §13.4: the trait the call is stamped with, else an INHERENT method from any store, else the sole trait providing the name, else nothing; two traits beside an inherent method are not an ambiguity. Sema's binder measured 518,079 selections over six halves, 0 differing; mono's ladder 80,903, 0; the ambiguity check 12,867, 0; the stash finder 35,849 with 14,478 differing - 14,242 stamped calls (10,775 `Debug` stamps the old walk answered with `Display`'s identical `fmt<W>` signature, 3,467 the placed clone's node under the same trait) and 236 unstamped, one trait, the clone's node. The corpus never held a receiver with both an inherent and a trait method of one name, so the population was built: `inherent_method_over_trait` writes the four shapes (plain or generic type, plain or generic method) in both block orders plus a bound-directed call; the pin binds the trait's body for four of the eight and refuses the ninth (an inherent `go` between two traits') as the two-trait tie (E0154 then; E0156 since §8.224) | — | `grep -rho -e 'find_spec_impl_method' -e 'first_m\b' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho -e 'find_spec_impl_inherent_method' -e 'find_spec_impl_trait_method' compiler/src --include=*.cryo \| wc -l` → **6** (two definitions, three callers, one mention in the registry finder's doc); `grep -c 'pick_own_method' compiler/src/compiler/sema/call_resolver.cryo` → **3**; `grep -c '^### 13.4' docs/cryo.md` → **1**; `ls -d tests/tests/projects/inherent_method_over_trait*/test.json \| wc -l` → **1** | §8.205 |
+| method selection by REGISTRATION ORDER (sema's `select_method` over the type's folded method list, where an impl block's methods sit beside the inherent ones in declaration order; its generic-method finder over the template's impl blocks as one list, and the trait registry ahead of the inherent owner and the inherent-impl registry; mono's `find_spec_impl_method` and `find_generic_trait_method_under`, whose `first_m` arm bound whichever impl the walk met first) | **DELETED** — one precedence at every selector, `docs/cryo.md` §13.4: the trait the call is stamped with, else an INHERENT method from any store, else the sole trait providing the name, else nothing; two traits beside an inherent method are not an ambiguity. Sema's binder measured 518,079 selections over six halves, 0 differing; mono's ladder 80,903, 0; the ambiguity check 12,867, 0; the stash finder 35,849 with 14,478 differing - 14,242 stamped calls (10,775 `Debug` stamps the old walk answered with `Display`'s identical `fmt<W>` signature, 3,467 the placed clone's node under the same trait) and 236 unstamped, one trait, the clone's node. The corpus never held a receiver with both an inherent and a trait method of one name, so the population was built: `inherent_method_over_trait` writes the four shapes (plain or generic type, plain or generic method) in both block orders plus a bound-directed call; the pin binds the trait's body for four of the eight and refuses the ninth (an inherent `go` between two traits') as the two-trait tie (E0154 then; E0156 since §8.224) | — | `grep -rho -e 'find_spec_impl_method' -e 'first_m\b' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho -e 'find_spec_impl_inherent_method' -e 'find_spec_impl_trait_method' compiler/src --include=*.cryo \| wc -l` → **6** (two definitions, three callers, one mention in the registry finder's doc); `grep -c 'pick_own_method' compiler/src/compiler/sema/call_resolver.cryo` → **2** (3 before §8.425: the inherent and the trait half of the receiver's own list were two calls in one pass, and are one call asked per set); `grep -c '^### 13.4' docs/cryo.md` → **1**; `ls -d tests/tests/projects/inherent_method_over_trait*/test.json \| wc -l` → **1** | §8.205 |
 | callee door ladder (`lookup_callee_function_type`'s identifier branch: a `lookup_local` by spelling ahead of the stamp, then STAMP → HOME → BARE) | **DELETED** - the identifier branch is the stamp: `Local` → the local's type when callable, `Def` → `func_type_of_res`, else no hint; shadow 5,327 → 16, every line a `Pending` stamp (intrinsics through BARE, unresolved match guards and `main$async` through HOME, an unimported `swap`); the 12 left are §8.93's allocator leaf and `visibility_gate`'s refused privates; the `CALLEE-DOOR` audit stream went with it | — | `grep -c 'lookup_func_type_exact(ident.name)' compiler/src/compiler/sema/call_resolver.cryo` → **0** | §8.172 |
 | free-call template search by leaf and arity (`find_fn_template_for_call`'s registry scan, its cursor-module tie-break, `Resolver::resolve_function_source_module`) | **DELETED** - `lookup_scope_template(ident.res)` plus the arity gate; a local is never a template, which is what fixes a local fn-pointer bound to a same-leaf generic global (returned 5 for 10); shadow 12 → 0 | — | `grep -rho 'resolve_function_source_module' compiler/src \| wc -l` → **0** | §8.172 |
 | bare-callee family (`check_call_arity`, `try_pin_overload_mangled_callee`'s HOME → BARE key with its import-scoped candidate tiers and E0154, `resolve_direct_call`'s leaf-keyed `check_fnbind_candidate`, the two spelling-keyed local checks) | **DELETED** - one key, `callee_family`: the stamp's canonical name (`Def`), the local's own type (`Local`), or nothing for a `Pending` leaf (the `intrinsic_owner_of` arm, §8.93's hold, went with D19 in §8.207); shadow 3,343 → 0 over six halves once `panic` (3,318, D6 landing) and the two refused privates (E0202 now, the §8.167 shape) are named; `FNVIS` 0: no `Def`-stamped bare callee is another module's private; E0353 doors 2-4 and the `FNBIND-VIOLATION` stream went with it | — | `grep -c 'bare_candidate_scope' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -c 'callee_def(&this' compiler/src/compiler/sema/call_resolver.cryo` → **1** (`callee_family`, which answered the definition's path, until §8.360; the family is the definition's parent and leaf) | §8.173 |
@@ -51635,3 +51635,69 @@ flow 791, unchanged.
   B<T>`) is typed with `This` rebased only; its own arguments are not mapped
   through the subtrait's. None exists in the corpus.
 * An `implement trait Step for X` is not checked for `X: Ord`.
+
+### 8.425 An inherent method wins over a trait method whether either is generic - 2026-09-29
+
+## Why
+
+Ruling 13, and `docs/cryo.md` ("Which Method a Call Names"): an inherent
+method wins over a trait method. Selection ran every candidate set's
+non-generic methods before any set's generic ones, so a plain trait method
+beat a generic inherent one:
+
+```cryo
+type trait Beta { go(&this, u: i32) -> i64; }
+type struct IgTn { v: i32; }
+implement trait Beta for IgTn { go(&this, u: i32) -> i64 { return 2; } }
+implement struct IgTn { go<U>(&this, u: U) -> i64 { return 1; } }
+ig.go(7);   // was 2, the trait's; now 1, the inherent method
+```
+
+## Measured before
+
+A throwaway probe (`.objcmp/s79/selprobe.patch`) after every unstamped
+selection listed each candidate that applies at any tier, as inherent or
+trait and generic or not, and reported a call when a trait method was chosen
+while an inherent one applied (ruling 13), or when the set the ruling would
+choose from held both a generic and a non-generic applicable method (ruling
+4). Control: the rulings' own examples (`k1.cryo`) report one of each.
+
+Over the corpus (`probe_run.sh`: compiler, tests, 116 projects, 14
+examples, unit suite; 132 builds): ruling 13, **0** calls. Ruling 4, 33
+sites at first, every one an artifact - a generic method beside the
+specialization minted from it (`String::push<T>` and its clone), which has
+no generic parameters left; counted as generic by `spec_type_args`, 2
+sites remained, both `Iterator::fold<Acc>` / `queue<T>` trait defaults
+beside a specialized clone of the same default (`is_synth_default`,
+`is_specialization`, no `spec_type_args`). Genuine pairs: **0**.
+
+## What changed
+
+`select_method` and `select_on_template` take the set they are asked for,
+inherent or trait. Order: the stamped trait's methods (non-generic, then
+generic), then the inherent set (non-generic, then generic), then the trait
+set (non-generic, then generic). The stamped trait's generic methods now
+come before unstamped non-generic ones; a stamp is the trait a bound named
+where the call is written.
+
+## Proof by inversion
+
+`inherent_method_over_trait` gains `IgTn` (plain type), `GIgTn<T>`
+(generic type) and a bound-directed call on `IgTn`. The previous compiler
+prints `ig_tn=2 gig_tn=1 bound_ig_tn=2`; this one `ig_tn=1 gig_tn=1
+bound_ig_tn=2`. Declared in `tests/started-passing`.
+
+`make verify ARGS="--baseline HEAD --require-identical"`: OK, objects 0
+moved of 4,064 tests (the declared project's 57 left out) and 1,126
+examples - the corpus-wide confirmation that no other call's pin moved,
+the stamped reorder included. Compiler warnings: the same set of 344 from a
+clean build. `pick_own_method` count 3 -> 2.
+
+## Left
+
+Ruling 4 (a generic and a non-generic method that both apply is an error)
+is not built: no existing diagnostic fits (E0156 is two traits, E0154
+module paths), and the code and wording are not decided. Measured
+population 0. A post-mono check would also need a specialization to name
+the generic method it was minted from; a trait default's clone does not
+(`spec_type_args` is empty on it).

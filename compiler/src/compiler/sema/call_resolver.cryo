@@ -2971,10 +2971,11 @@ type struct CallResolver {
         // head's `trait_def`.  Two traits can share a leaf, and
         // a leaf comparison binds whichever of them registered first.
         //
-        // A generic method's own type parameters bind by unification with
-        // the arguments.  Generic candidates are a second selection, run only
-        // when no non-generic candidate in any set binds, so a call some
-        // non-generic overload takes is never taken by a generic one.
+        // Unstamped, an inherent method wins over a trait method, whether
+        // either is generic: every inherent candidate is tried before any
+        // trait's.  Within each set a generic method's own type parameters
+        // bind by unification with the arguments, and the generic candidates
+        // are tried after the others.
         const want_trait: DefId = member.resolved_trait;
         mut sel: Selection = Selection::none();
         sel.owner_inst = owner_inst;
@@ -2985,25 +2986,31 @@ type struct CallResolver {
                 this.ctx.generic_registry.template_of_type(base_ref)
             } else { null };
             if (tmpl == null) { return Selection::none(); }
-            for (mut pass: i32 = 0; pass < 2; pass++) {
-                const generic: boolean = pass == 1;
-                if (want_trait.is_valid()) {
+            if (want_trait.is_valid()) {
+                for (mut pass: i32 = 0; pass < 2; pass++) {
                     if (this.select_on_template(visitor, call, member, tmpl, owner_str, &arg_types,
-                            want_trait, generic, &sel)) { return sel; }
+                            want_trait, true, pass == 1, &sel)) { return sel; }
                 }
-                if (this.select_on_template(visitor, call, member, tmpl, owner_str, &arg_types,
-                        DefId::invalid(), generic, &sel)) { return sel; }
+            }
+            for (mut phase: i32 = 0; phase < 2; phase++) {
+                for (mut pass: i32 = 0; pass < 2; pass++) {
+                    if (this.select_on_template(visitor, call, member, tmpl, owner_str, &arg_types,
+                            DefId::invalid(), phase == 1, pass == 1, &sel)) { return sel; }
+                }
             }
             return Selection::none();
         }
-        for (mut pass: i32 = 0; pass < 2; pass++) {
-            const generic: boolean = pass == 1;
-            if (want_trait.is_valid()) {
+        if (want_trait.is_valid()) {
+            for (mut pass: i32 = 0; pass < 2; pass++) {
                 if (this.select_method(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
-                        owner_str, &arg_types, want_trait, generic, &sel)) { return sel; }
+                        owner_str, &arg_types, want_trait, true, pass == 1, &sel)) { return sel; }
             }
-            if (this.select_method(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
-                    owner_str, &arg_types, DefId::invalid(), generic, &sel)) { return sel; }
+        }
+        for (mut phase: i32 = 0; phase < 2; phase++) {
+            for (mut pass: i32 = 0; pass < 2; pass++) {
+                if (this.select_method(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
+                        owner_str, &arg_types, DefId::invalid(), phase == 1, pass == 1, &sel)) { return sel; }
+            }
         }
         return Selection::none();
     }
@@ -3071,35 +3078,31 @@ type struct CallResolver {
         }
     }
 
-    /// One pass of selection over every candidate set, each tier before the
-    /// next set: the receiver's own methods (a class's base chain, leaf to
-    /// root, is one set - the most-derived declaration wins at a tier before
-    /// a base's is tried at the same tier), then a primitive's inherent
-    /// blocks, then the trait impls in registration order.  With
-    /// `only_trait`, only that trait's methods are candidates; `generic`
+    /// One pass of selection over one candidate set, each tier before the
+    /// next source.  The inherent set (`from_trait` false) is the
+    /// receiver's own inherent methods (a class's base chain, leaf to root -
+    /// the most-derived declaration wins at a tier before a base's is tried
+    /// at the same tier), then a primitive's inherent blocks; the trait set
+    /// is the methods the receiver's trait impls deliver, then the trait
+    /// impls in registration order.  With `only_trait`, only that trait's
+    /// methods are candidates and only the trait set is asked; `generic`
     /// selects the generic methods, the others otherwise.  Returns true
     /// when the call was bound.  For an instantiation not yet minted,
     /// `base_ref` is its template, and its trait impls are the ones
     /// selected for the instantiation.
     select_method(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
                   base_ref: TypeRef, base_t: Type*, start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
-                  owner_str: string, arg_types: &TypeRef[], only_trait: DefId, generic: boolean,
-                  sel: Selection*) -> boolean {
+                  owner_str: string, arg_types: &TypeRef[], only_trait: DefId, from_trait: boolean,
+                  generic: boolean, sel: Selection*) -> boolean {
+        if (only_trait.is_valid() && !from_trait) { return false; }
         // The receiver's own list holds its inherent methods and the methods
-        // its trait impls deliver, in declaration order.  They are two sets,
-        // the inherent one first: the order two `implement` blocks were
-        // written in does not decide which body a call runs.
+        // its trait impls deliver, in declaration order; `from_trait` says
+        // which of the two it is asked for, so the order two `implement`
+        // blocks were written in does not decide which body a call runs.
         mut own_owner: string = "";
         mut own_tier: i32 = 0;
-        mut own: MethodInfo* = null;
-        if (!only_trait.is_valid()) {
-            own = this.pick_own_method(call, member, start_cls, methods_ref, owner_str,
-                                       arg_types, only_trait, false, generic, &own_owner, &own_tier);
-        }
-        if (own == null) {
-            own = this.pick_own_method(call, member, start_cls, methods_ref, owner_str,
-                                       arg_types, only_trait, true, generic, &own_owner, &own_tier);
-        }
+        const own: MethodInfo* = this.pick_own_method(call, member, start_cls, methods_ref, owner_str,
+                                   arg_types, only_trait, from_trait, generic, &own_owner, &own_tier);
         if (own != null) {
             if (own_tier == 3) {
                 this.apply_overload_converter_args(visitor, call, own.param_types.as_slice());
@@ -3113,12 +3116,14 @@ type struct CallResolver {
         // A primitive's inherent methods: the `implement string { }` blocks the
         // registry indexes under its type.  A declared type's blocks were
         // folded into its method set above.
-        if (!only_trait.is_valid() && start_cls == null
-                && base_t.kind != TypeKind::Struct && base_t.kind != TypeKind::Enum) {
-            const blocks: ImplBlockNode*[] = this.ctx.generic_registry.inherent_impl_blocks(base_ref);
-            for (mut bi: i64 = 0; bi < blocks.length; bi++) {
-                if (this.bind_on_impl_block(visitor, call, member, blocks[bi], owner_str, arg_types, generic, sel)) { return true; }
+        if (!from_trait) {
+            if (start_cls == null && base_t.kind != TypeKind::Struct && base_t.kind != TypeKind::Enum) {
+                const blocks: ImplBlockNode*[] = this.ctx.generic_registry.inherent_impl_blocks(base_ref);
+                for (mut bi: i64 = 0; bi < blocks.length; bi++) {
+                    if (this.bind_on_impl_block(visitor, call, member, blocks[bi], owner_str, arg_types, generic, sel)) { return true; }
+                }
             }
+            return false;
         }
 
         // The trait impls selected for the receiver, in registration order: a
@@ -3188,13 +3193,16 @@ type struct CallResolver {
     }
 
     /// `select_method` for an instantiation not yet minted (`sel.owner_inst`):
-    /// the candidates are its template's, in the same order - the methods
-    /// written in the declaration and in its inherent impl blocks, then the
-    /// trait impls selected for the instantiation.
+    /// the candidates are its template's, in the same sets - the inherent
+    /// set is the methods written in the declaration and in its inherent
+    /// impl blocks, the trait set the trait impls selected for the
+    /// instantiation.
     select_on_template(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
                        tmpl: TemplateEntry*, owner_str: string, arg_types: &TypeRef[],
-                       only_trait: DefId, generic: boolean, sel: Selection*) -> boolean {
-        if (!only_trait.is_valid()) {
+                       only_trait: DefId, from_trait: boolean, generic: boolean,
+                       sel: Selection*) -> boolean {
+        if (only_trait.is_valid() && !from_trait) { return false; }
+        if (!from_trait) {
             // The declaration's methods are written in the template's own
             // parameters.
             mut args: TypeRef[] = [];
@@ -3218,6 +3226,7 @@ type struct CallResolver {
                 if (block == null || block.is_trait_impl()) { continue; }
                 if (this.bind_on_impl_block(visitor, call, member, block, owner_str, arg_types, generic, sel)) { return true; }
             }
+            return false;
         }
         // The trait impls whose heads unify with the instantiation.  Their
         // where-clauses are not confirmed here: a parameter an impl binds
