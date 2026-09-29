@@ -15,6 +15,7 @@ namespace compiler::mono::specializer;
 import compiler::diag;
 import compiler::ast;
 import compiler::ast::{ cloner, declaration, node, substituter, TypeAnnotation };
+import compiler::resolver::res::{ ResSlot };
 import compiler::types;
 import compiler::types::{ arena, type_ref, substitution, generic_registry };
 import compiler::resolver::{ intern_table, symbol_str, qualified_name, mangled_name };
@@ -162,7 +163,7 @@ type struct ASTSpecializer {
         }
         mut substituter: ASTTypeSubstituter* = new ASTTypeSubstituter(
             subst_ptr, this.arena, this.intern_table,
-            entry.name, spec_sym,
+            entry.def, spec_sym,
             ps_copy, spec_typeref
         );
         cloned_ast.accept(substituter);
@@ -288,7 +289,7 @@ type struct ASTSpecializer {
         *subst_ptr = TypeSubstitution::from_params(&arena_ids, &replacements);
         return new ASTTypeSubstituter(
             subst_ptr, this.arena, this.intern_table,
-            entry.name, spec_sym,
+            entry.def, spec_sym,
             syms, spec_typeref);
     }
 
@@ -326,8 +327,12 @@ type struct ASTSpecializer {
     /// denotes, resolved under `head_ctx`: one spelling can name two types
     /// (`Point` from two modules), and two spellings one type (`T` and the
     /// argument it is bound to; an alias and the template it names).
-    /// Only a written instantiation is asked: a bare name is the receiver
-    /// the parser gives a method that wrote none, and it names the owner.
+    /// A name whose stamp is the template itself is the owner, every
+    /// instantiation of it - the receiver the parser gives a method that
+    /// wrote none is one - and is not resolved: a bare template whose
+    /// parameters all default denotes the default instantiation alone.  Any
+    /// other name, an alias of one instantiation among them, is asked what
+    /// it denotes like a written instantiation.
     annotation_is_modified_outer(&this, ann: TypeAnnotation*, entry: TemplateEntry*,
                                   type_args: &TypeRef[],
                                   head_ctx: ResolutionContext*) -> boolean {
@@ -340,15 +345,31 @@ type struct ASTSpecializer {
                 return this.annotation_is_modified_outer(ptr.inner, entry, type_args, head_ctx);
             }
             TypeAnnotation::Generic(_) => {
-                const denoted: TypeRef = this.type_resolver.resolve(ann, head_ctx);
-                if (!this.arena.inst_generic_base(denoted).equals(entry.base_type)) { return false; }
-                if (this.arena.inst_type_arg_count(denoted) != type_args.length) { return false; }
-                for (mut i: i64 = 0; i < type_args.length; i++) {
-                    if (!this.arena.inst_type_arg_at(denoted, i).equals(type_args[i])) { return true; }
-                }
-                return false;
+                return this.denotes_other_instantiation(ann, entry, type_args, head_ctx);
+            }
+            TypeAnnotation::Named(named) => {
+                const is_owner: boolean = match (named.res) {
+                    ResSlot::Answered(r) => { r.def_id().equals(entry.def) }
+                    _                    => { false }
+                };
+                if (is_owner) { return false; }
+                return this.denotes_other_instantiation(ann, entry, type_args, head_ctx);
             }
             _ => { return false; }
         }
+    }
+
+    /// Whether `ann`, resolved under `head_ctx`, is the template `entry`
+    /// instantiated with arguments other than `type_args`.
+    denotes_other_instantiation(&this, ann: TypeAnnotation*, entry: TemplateEntry*,
+                                 type_args: &TypeRef[],
+                                 head_ctx: ResolutionContext*) -> boolean {
+        const denoted: TypeRef = this.type_resolver.resolve(ann, head_ctx);
+        if (!this.arena.inst_generic_base(denoted).equals(entry.base_type)) { return false; }
+        if (this.arena.inst_type_arg_count(denoted) != type_args.length) { return false; }
+        for (mut i: i64 = 0; i < type_args.length; i++) {
+            if (!this.arena.inst_type_arg_at(denoted, i).equals(type_args[i])) { return true; }
+        }
+        return false;
     }
 }

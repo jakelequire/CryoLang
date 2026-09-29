@@ -65,7 +65,14 @@ public:
     subst:             TypeSubstitution*;
     arena:             TypeArena*;
     intern_table:      InternTable*;
-    base_name:         SymbolStr;         // "Array"
+    /// The declaration being specialized, or an invalid id when the caller
+    /// specializes none of its own (a method signature re-substituted under
+    /// its owner's arguments, a trait default's bodies).  A written name
+    /// denotes the specialization being built exactly when its stamp names
+    /// this declaration.  Its spelling cannot say so: a generic function may
+    /// share its name with a type, and the function's own signature and body
+    /// then name the TYPE.
+    template:          DefId;
     spec_name:         SymbolStr;         // "Array_i32"
     /// The symbols the parameters were declared as.  A written `T` in the
     /// cloned body carries its declaration's symbol in its stamp, and it is
@@ -84,14 +91,14 @@ public:
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     ASTTypeSubstituter(subst: TypeSubstitution*, arena: TypeArena*,
                        intern_table: InternTable*,
-                       base_name: SymbolStr, spec_name: SymbolStr,
+                       template: DefId, spec_name: SymbolStr,
                        param_syms: SymbolID[],
                        spec_typeref: TypeRef)
         : BaseASTVisitor() {
         this.subst             = subst;
         this.arena             = arena;
         this.intern_table      = intern_table;
-        this.base_name         = base_name;
+        this.template          = template;
         this.spec_name         = spec_name;
         this.param_syms        = param_syms;
         this.spec_typeref      = spec_typeref;
@@ -130,6 +137,38 @@ public:
     /// The same drop for a path's callee - see the overload above.
     drop_stale_callee_pin(&this, node: ScopeResolutionNode*) -> void {
         node.set_resolved_callee(CalleePin::None);
+    }
+
+    /// Whether a written name's stamp answers with the declaration being
+    /// specialized.  An unanswered name names nothing, so it is never the
+    /// template.
+    names_template(&this, slot: ResSlot) -> boolean {
+        if (!this.template.is_valid()) { return false; }
+        return match (slot) {
+            ResSlot::Answered(r) => { r.def_id().equals(this.template) }
+            _                    => { false }
+        };
+    }
+
+    /// Whether a path's scope segment is the declaration being specialized:
+    /// the name layer stopped on it as a type, with only the member left.
+    scope_names_template(&this, slot: ResSlot) -> boolean {
+        if (!this.template.is_valid()) { return false; }
+        match (slot) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    res::Res::TypeRelative(b, trailing) => {
+                        if (trailing != 1) { return false; }
+                        return match (b) {
+                            res::ResBase::Def(d) => { d.equals(this.template) }
+                            _                    => { false }
+                        };
+                    }
+                    _ => { return false; }
+                }
+            }
+            _ => { return false; }
+        }
     }
 
     /// The slot of the parameter `sym`, or -1 when it is none of this
@@ -344,7 +383,7 @@ public:
             return ann;
         }
 
-        // Rewrite the base type name to the specialized name.
+        // A name whose stamp is the template denotes the specialization.
         // e.g. `&this` on `Pair<T>` has annotation Reference(Named("Pair"))
         // which must become Reference(Named("Pair_string")) after substitution.
         //
@@ -355,7 +394,7 @@ public:
         // the home of every WRITTEN annotation in the clone unmovable.  The id
         // is the same one `reserve_spec_names` will publish, so this cannot fork
         // type identity.
-        if (named.name.equals(this.base_name)) {
+        if (this.names_template(named.res)) {
             named.name = this.spec_name;
             if (this.spec_typeref.is_valid()) {
                 named.pre_resolved = this.spec_typeref;
@@ -385,7 +424,7 @@ public:
 
     substitute_generic_annotation(ann: TypeAnnotation*, gen: GenericAnnotation*) -> TypeAnnotation* {
         // A Generic is a self-reference to the outer type ONLY when its
-        // base name matches base_name AND its args (BEFORE substitution)
+        // base names the template AND its args (BEFORE substitution)
         // are exactly the outer type's generic param names in declaration
         // order. Without the args check, an inner generic-method's
         // signature like `cast<U> -> NonNull<U>` (declared on `NonNull<T>`)
@@ -444,12 +483,12 @@ public:
         return true;
     }
 
-    /// Helper: returns true if the annotation is Named(base_name).
+    /// Whether the annotation is a name whose stamp is the template.
     is_named_matching_base(ann: TypeAnnotation*) -> boolean {
         if (ann == null) { return false; }
         match (*ann) {
             TypeAnnotation::Named(named) => {
-                return named.name.equals(this.base_name);
+                return this.names_template(named.res);
             }
             _ => { return false; }
         }
@@ -532,9 +571,8 @@ public:
         // lazy `try_instantiate_self_returning_default`; the spec'd impl copy
         // here is only used as the clone source.  The base->spec rename would
         // otherwise rewrite the combinator's OWN constructor call
-        // (`TakeIter::new`) when the adapter is implemented for a type whose
-        // base name collides with the adapter's (chaining `TakeIter` over a
-        // `TakeIter`), pinning the constructor to the inner spec and breaking
+        // (`TakeIter::new`) when the adapter is implemented for the adapter
+        // itself (chaining `TakeIter` over a `TakeIter`), pinning the constructor to the inner spec and breaking
         // `r.take(a).take(b)`.  The signature above IS still substituted, so
         // method lookup and the per-receiver re-resolution both see the right
         // return type.
@@ -637,7 +675,7 @@ public:
     }
 
     override visit(node: NewExprNode*) -> void {
-        const is_self: boolean = node.type_name.equals(this.base_name)
+        const is_self: boolean = this.names_template(node.res)
             && (node.generic_args.length == 0
                 || this.args_are_outer_param_refs(node.generic_args));
         // A self-reference denotes the enclosing specialization, recorded as the
@@ -679,13 +717,13 @@ public:
         // names the DEFINITION and is copied verbatim by every clone.  The id
         // is the same carrier `pre_resolved` already is for annotations.
         //
-        // The collapse rule is unchanged: same base, and either no generic
+        // The collapse rule: the stamp names the template, and either no generic
         // args or args that echo the outer type's params in order.  An inner
         // generic-method literal like `NonNull<U> { ... }` inside a `cast<U>`
-        // on `NonNull<T>` shares the base name but is a different
+        // on `NonNull<T>` names the same template but is a different
         // instantiation, and freezing it at the outer spec's args binds every
         // later `cast<V>` to the wrong sibling.
-        const is_self: boolean = node.struct_type.equals(this.base_name)
+        const is_self: boolean = this.names_template(node.res)
             && (node.generic_args.length == 0
                 || this.args_are_outer_param_refs(node.generic_args));
         // A self-reference arriving with no reserved id has nothing left to
@@ -712,7 +750,7 @@ public:
         //   * scope_generic_args: args on the scope (`Pair<T>::method`)
         //   * generic_args:       args on the method (`Pair::method<U>`)
         // Only the scope args participate in the self-type collapse.
-        const is_self: boolean = node.scope_name.equals(this.base_name)
+        const is_self: boolean = this.scope_names_template(node.scope_res)
             && (node.scope_generic_args.length == 0
                 || this.args_are_outer_param_refs(node.scope_generic_args));
         // True when the else-branch below retargets the scope segment at a
@@ -1009,7 +1047,7 @@ public:
     }
 
     override visit(node: EnumPatternNode*) -> void {
-        if (node.enum_name.equals(this.base_name)) {
+        if (this.names_template(node.res)) {
             node.enum_name = this.spec_name;
         }
         // The enum is the same declaration under another instantiation, so the

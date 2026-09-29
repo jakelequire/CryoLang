@@ -421,7 +421,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: facts-check lane-check lane-selftest facts-selftest' Makefile` → **1** (§8.371: stale facts are REFUSED first, never regenerated - the facts target is the deliberate refresh - and the refusal's self-test runs; `facts-fresh`, which regenerated them, before, §8.366)
 * `python3 scripts/facts-selftest.py | tail -1 | grep -o '[0-9]* cases' | cut -d' ' -f1` → **12** (§8.371: the freshness check over a throwaway tree - an edited source, an added source and a missing inputs record refused, fresh facts and a non-source edit accepted, each through `facts.py --check` and through `facts_path`, which the lane gate and the residue check call - and a dry run of the lane-check and check-fast targets building nothing; with the staleness comparison deleted it fails 4 cases, with `lane-check` depending on `facts` it fails 2)
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **105** (+1 in §8.404, `compare_with_null_refused`; 104 before, +2 in §8.403, `class_constructor_arguments_refused`, `class_constructor_overloads_by_arity`; 102 before, +3 in §8.402, `generic_receiver_by_type`, `generic_receiver_other_instantiation_refused`, `generic_function_type_argument`; 99 before, +2 in §8.401, `bare_type_as_value_refused`, `class_constructed_by_name`; +1 in §8.396, `array_method_argument_mismatch`; +3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **108** (+3 in §8.405, `generic_function_named_like_type`, `generic_receiver_alias`, `generic_receiver_alias_refused`; 105 before, +1 in §8.404, `compare_with_null_refused`; 104 before, +2 in §8.403, `class_constructor_arguments_refused`, `class_constructor_overloads_by_arity`; 102 before, +3 in §8.402, `generic_receiver_by_type`, `generic_receiver_other_instantiation_refused`, `generic_function_type_argument`; 99 before, +2 in §8.401, `bare_type_as_value_refused`, `class_constructed_by_name`; +1 in §8.396, `array_method_argument_mismatch`; +3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)* `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -49798,3 +49798,153 @@ with `E0636: codegen: the call to method 'equals' on type 'S' was never
 
 `types/checker.cryo` +15 / -2. Gate cycles: 2 compiler builds, 1 type
 check, 1 facts run, 1 check-fast, 1 verify.
+
+### 8.405 The monomorphizer recognises the template being specialized by its declaration, not its spelling, in the substituter and in the receiver filter; a generic function named like a type and a receiver written through an alias both get the right answer; 1 object moved, predicted in kind - 2026-09-28
+
+## Why
+
+Two wrong answers found in §8.402 and left open, both in the monomorphizer.
+
+A generic function sharing a type's name was rewritten into itself. The
+substituter decided "this written name is the template being specialized"
+by comparing the name's spelling with the template's, at six sites (a named
+annotation, the base of a generic annotation, a struct literal, `new`, a
+path's scope segment, an enum pattern):
+
+```cryo
+type struct Tag { n: i32; }
+function Tag<T>(x: T) -> Tag { ... }
+const t: Tag = Tag(1);
+// error[E0200]: mismatched types - expected 'Tag', found 'Tag<i32>'
+```
+
+A method whose receiver is written through a non-generic alias of one
+instantiation was specialized for every instantiation. The receiver filter
+asked only a written instantiation (`Wrapper<i64>`) what it denotes, and
+took any bare name to be the owner:
+
+```cryo
+type WI = Wrapper<i64>;
+implement struct Wrapper<T> { only_i64(this: &WI) -> i64 { return this.val; } }
+const w: Wrapper<i32> = ...;
+w.only_i64();   // built, and read the four-byte value as eight
+```
+
+## One mechanism
+
+Both are the same question - does this written name denote the template
+being specialized? - answered without asking which declaration the name
+resolves to. The substituter answered it by spelling; the filter answered
+"yes" for every bare name. Both now compare the name's stamp with the
+template's declaration.
+
+§8.402 recorded a blocker: that the receiver the parser gives a method
+(`Parser::receiver_type_annotation`) is `Pending` and could only be matched
+by spelling. Measured, that is not so. The name layer stamps it like any
+parameter annotation (`stamp_annotation` over every parameter,
+`name_resolution.cryo`). A probe compiler printing, at each of the six
+sites, whether the spelling matched, whether the stamp named the template
+and the stamp's shape (`.objcmp/s70/probe.patch`), building the compiler
+itself: 97,122 spelling matches - 36,560 named annotations, 18,076 generic
+bases, 1,112 struct literals, 6,020 scope segments, 35,354 enum patterns,
+no `new` - every one stamped and every one naming the template; no stamp
+naming the template without the spelling; no unanswered stamp. The one
+disagreement anywhere was the repro above (`spell=1 ident=0`).
+
+## What changed
+
+* `TemplateEntry` carries `def`, the declaration it is, set by its three
+  registrars (generic declarations, generic static methods, async futures).
+* `ASTTypeSubstituter` takes that `DefId` instead of the template's name.
+  `names_template` answers for a stamp that resolved to the template;
+  `scope_names_template` for a scope segment the name layer stopped on as
+  the template with only the member left. The two substituters that
+  specialize no declaration of their own pass an invalid id, as they passed
+  an empty name.
+* The receiver filter (`method_has_modified_self_type`): a name whose stamp
+  is the template is the owner and is not resolved - a bare template whose
+  parameters all default would denote the default instantiation alone - and
+  any other name is resolved and compared like a written instantiation.
+
+## Proof by inversion
+
+One mutant compiler (`.objcmp/s70/mutant.py`) restores the old answer at
+exactly one site, chosen by an environment variable; each mutation ran
+alone, against the same compiler unmutated as the control. Probe programs
+in `.objcmp/s70/sites/`, one per shape:
+
+| mutation | probe | control (no mutation) | mutated |
+|---|---|---|---|
+| named annotation by spelling | return type `-> Tag` | exit 4 | E0200 at the call |
+| struct literal by spelling | `Tag { n: 6 }` in the body | exit 6 | E0638 "struct literal field 'n' has no slot" |
+| bare receiver name is the owner | `this: &WI` | E0358 "no method named `only_i64` found on type `P6::Main::Wrapper<i32>`" | builds, exit 2 |
+| generic base, `new`, scope, enum pattern (each alone) | all probes | right | right |
+
+The named-annotation mutation alone also breaks the `new` (E0200), variant
+path (E0200), parameter (E0403 "reaches the end of its body without
+returning") and pointer probes: their wrong answer on the previous compiler
+came through the annotations around them. Four of the six sites have no
+probe in which their spelling answer ALONE changes a result: the generic
+base collapses through the named site, so it goes wrong only with it; the
+`new`, scope and enum-pattern rewrites are overwritten by later pins in
+every probe tried. They are converted because the question is one question.
+
+## Tests
+
+* `generic_function_named_like_type` (run, exit 39): a generic function
+  named like a struct (return type, struct literal, `new`), an
+  enum (variant path, local, patterns; a parameter typed as the enum), and a
+  generic static method named like a generic struct (`static Bag<T>(x: T)
+  -> Bag<T>`). The previous compiler refused it: `E0200` at
+  `src/ret.cryo:12:20`. Declared in `tests/started-compiling`.
+* `generic_receiver_alias_refused` (compile_fail, E0358 at
+  `src/main.cryo:17:14`). The previous compiler built it and ran the method
+  on a `Wrapper<i32>`. Declared in `tests/started-passing`.
+* `generic_receiver_alias` (run, exit 19): the alias's method on its own
+  instantiation reads both halves of `2^32 + 7`, and the owner's `get`
+  stays on `Wrapper<i32>`. Passes before and after; it guards against the
+  filter dropping too much, which no mutation here demonstrated.
+
+Roster golden +3 (`--merge`).
+
+## Measured
+
+* Predicted: 0 objects move in the existing corpus, because the probe found
+  no site where the two answers differ and the tree writes no receiver
+  through a bare name other than the owner's. Held: 0 of 3,844 existing
+  test and 0 of 1,126 example objects moved.
+* Not predicted: the new `generic_receiver_alias` project's own object
+  moves. It is the fix in kind: the previous compiler emitted
+  `Wrapper<i32>::wide(&Wrapper<i64>)`, the alias's method specialized for
+  an instantiation it was not written for; this one does not (`llvm-nm`
+  over both builds, one symbol fewer, no other difference). So
+  `make verify ARGS="--baseline HEAD --require-identical"` reports FAIL on
+  that one object; every gate in it passed (census, examples, lsp, cross,
+  incremental, check-fast).
+* Warnings 344 from a clean build, the same set as the previous commit's.
+* Name-taking and pending allows unchanged: the substituter's constructor
+  still takes the specialization's name, and `TemplateEntry::new` its
+  spellings.
+
+## Found on the way, not fixed
+
+* **The template registry is keyed by path.** A generic type and a generic
+  function in one module sharing a name share a key, and one of them is
+  lost: `type struct Box<T>` beside `function Box<T>(x: T) -> i32` makes
+  `Box<i32>` "E0204: no field or method `v` on type `S2D::Main::Box`" with
+  no substitution involved. `GenericRegistry::template_of(def)` answers by
+  the definition's path, so a non-generic struct beside a generic function
+  of its name is taken to be the function's template: `implement struct
+  Tag` is "E0302: `Tag` is a template with 1 parameter, and this impl head
+  names 0 of them". The same shape as `type_of_def`.
+* **A module's own function hides an imported type of the same name**:
+  `import M::{ Bag }` beside `function Bag<T>` is "E0203: cannot find type
+  `Bag` in this scope" at the signature, and a path `Tag::make` to an
+  imported `Tag` beside a function `Tag` is E0233. Not checked against the
+  spec's rule for a local declaration beside an import.
+
+## Blast radius
+
+7 compiler files, +102 / -38. Gate cycles: 4 clean compiler builds (probe,
+fix, mutant, fix), 3 type checks, 1 facts run, 1 check-fast, 1 verify, 1
+roster merge.
