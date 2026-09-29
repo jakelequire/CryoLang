@@ -96,6 +96,12 @@ SPOTS = [
      "the number behind a spelling stored in a plain integer local, then used as a key: "
      "`const k: u32 = name.id; seen.get(&k)`.  A value is a spelling by its TYPE, and `u32` "
      "is not one; the local's initializer is in the provenance of a record that is never written"),
+    ("number-composed-key", "spelling", BLIND,
+     "a key composed arithmetically from the numbers behind spellings, "
+     "`wide.get(&(((name.id as u64) << 32) | (other.id as u64)))` - the shape of the "
+     "compiler's family slot, `(owner_path.id << 32) | leaf.id`: the result is a `u64`, not "
+     "a number read out of a spelling, so no record is written and the key's parts are "
+     "traced nowhere"),
     ("number-into-field", "spelling", BLIND,
      "the number behind a spelling stored into a struct literal's field, "
      "`Holder { key: name.id }`: a field initializer is not an argument"),

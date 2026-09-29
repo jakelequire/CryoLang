@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe facts facts-check facts-selftest facts-blind-spots selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check doors-check incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe facts facts-check facts-selftest facts-blind-spots selfhost-check test test-list test-census verify roster-check lane-check lane-selftest residue-selftest verify-selftest approved-check doors-check spelling-flow spelling-flow-selftest incremental-instance-check ns-status-check guard-selftest check-fast install-hooks lsp-check cross-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -191,6 +191,10 @@ help:
 	@echo "  make residue-selftest  Drive residue.py --check through a throwaway tree and list, both ways"
 	@echo "  make ns-status-check   Run every check docs/name-resolution.md §0 carries"
 	@echo "  make doors-check       The doors in docs/resolution-rules.md against the door markers in compiler/src"
+	@echo "  make spelling-flow     Every spelling reaching a lookup outside a door, from the facts, against"
+	@echo "                         scripts/spelling-flow.outstanding.tsv (both directions)"
+	@echo "  make spelling-flow-selftest  The flow check over its fixture, each tracing rule removed in turn"
+	@echo "                         (a verify gate: flow)"
 	@echo "  make check-fast        refuse stale facts + lane-check + the self-tests + ns-status-check + verify-pin (~1 min; builds nothing)"
 	@echo "  make install-hooks     Point git at the tracked hooks (run once per checkout)"
 	@echo "  make lsp-check         Compile tools/CryoLSP against current source"
@@ -659,6 +663,23 @@ doors-check:
 	@$(PYTHON) scripts/resolution-doors.py --selftest
 	@$(PYTHON) scripts/resolution-doors.py
 
+# Every place a spelling reaches a lookup outside a door, or identity text
+# reaches a lookup at all, traced through the facts across calls, against the
+# committed outstanding list: a new one or a stale entry refuses.  Reads
+# .facts/ (refused when stale), builds nothing.
+spelling-flow:
+	@$(PYTHON) scripts/spelling-flow.py --check
+
+# The flow check over tests/fixtures/spelling-flow, built with the compiler
+# under test, and again with each tracing rule removed (a verify gate: flow).
+ifeq ($(HOST_OS),windows)
+spelling-flow-selftest: cryo
+	@$(PYTHON) scripts/spelling-flow.py --selftest --cryo "$(STAGE2_EXE)"
+else
+spelling-flow-selftest: cryo
+	@$(PYTHON) scripts/spelling-flow.py --selftest --cryo "$(STAGE2)"
+endif
+
 # ---- name-resolution status gate ---------------------------------------
 # Run every check §0 of docs/name-resolution.md carries and fail on drift.
 #
@@ -689,8 +710,8 @@ guard-selftest:
 # build.  This target builds nothing, and runs in about a minute.  A
 # one-minute gate everybody runs is worth more than a twenty-minute one
 # nobody does.
-check-fast: facts-check lane-check lane-selftest facts-selftest residue-selftest verify-selftest approved-check doors-check ns-status-check verify-pin
-	@echo "check-fast: OK (fresh facts, lane surface and its self-test, the facts check's self-test, the residue check's self-test, verify's declared-program self-test, the approved names' checks and their self-test, the doors against their list and its self-test, section 0, pin integrity)"
+check-fast: facts-check lane-check lane-selftest facts-selftest residue-selftest verify-selftest approved-check doors-check spelling-flow ns-status-check verify-pin
+	@echo "check-fast: OK (fresh facts, lane surface and its self-test, the facts check's self-test, the residue check's self-test, verify's declared-program self-test, the approved names' checks and their self-test, the doors against their list and its self-test, the spelling flow against its outstanding list, section 0, pin integrity)"
 
 # ---- git hooks ---------------------------------------------------------
 # Point git at the tracked hook directory.  Hooks live in scripts/git-hooks so

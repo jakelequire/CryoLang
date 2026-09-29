@@ -1,0 +1,91 @@
+/// Probes for `scripts/spelling-flow.py --selftest`: each line marked
+/// `flow:` is one case of that script's list, which says what the flow check
+/// must report there - a lookup it allows, a lookup it refuses, the place a
+/// refused spelling started, or nothing.  The fixture's doors are `door_find`
+/// and `door_text`, named to the script on its command line.
+namespace SpellingFlow::Main;
+
+import std::collections::hashmap;
+import compiler::resolver::symbol_str;
+import compiler::resolver::intern_table;
+import compiler::resolver::res;
+
+type struct Store {
+    by_id:   hashmap::HashMap<u32, i32>;
+    by_text: hashmap::HashMap<string, i32>;
+    names:   symbol_str::SymbolStr[];
+}
+
+![allow(lookup_by_spelling, reason = "a probe of the flow check: the fixture's door")]
+function door_find(store: &Store, name: symbol_str::SymbolStr) -> i32 {
+    mut n: i32 = 0;
+    if (store.by_id.get(&name.id).is_some()) { n = n + 1; }             // flow: door-interior
+    return n + body_by_id(store, name);
+}
+
+![allow(lookup_by_spelling, reason = "a probe of the flow check: reached only from a door")]
+function body_by_id(store: &Store, name: symbol_str::SymbolStr) -> i32 {
+    if (store.by_id.get(&name.id).is_some()) { return 1; }             // flow: door-body-number
+    return 0;
+}
+
+function door_text(store: &Store, s: string) -> i32 {
+    return body_text(store, s);
+}
+
+function body_text(store: &Store, s: string) -> i32 {
+    if (store.by_text.get(&s).is_some()) { return 1; }                 // flow: door-body-chain
+    return 0;
+}
+
+function lookup_text(store: &Store, s: string) -> i32 {
+    if (store.by_text.get(&s).is_some()) { return 1; }                 // flow: map-outside
+    return 0;
+}
+
+![allow(lookup_by_spelling, reason = "a probe of the flow check: a lookup outside every door")]
+function lookup_resolved(store: &Store, t: &intern_table::InternTable,
+                         name: symbol_str::SymbolStr) -> i32 {
+    if (store.by_text.get(&t.resolve(name)).is_some()) { return 1; }   // flow: map-resolved
+    return 0;
+}
+
+![allow(lookup_by_spelling, reason = "a probe of the flow check: a hand-written search")]
+function scan_names(store: &Store, name: symbol_str::SymbolStr) -> i32 {
+    for (mut i: i64 = 0; i < store.names.length; i++) {
+        if (store.names[i].equals(name)) { return 1; }                 // flow: scan-outside
+    }
+    return 0;
+}
+
+function match_text(s: string) -> i32 {
+    match (s) {                                                        // flow: match-outside
+        "Option" => { return 1; }
+        _        => { return 0; }
+    }
+}
+
+function not_a_lookup(s: string) -> i32 {
+    return s.length() as i32;                                          // flow: not-a-lookup
+}
+
+function main() -> i32 {
+    mut store: Store = Store {
+        by_id:   hashmap::HashMap::<u32, i32>::new(),
+        by_text: hashmap::HashMap::<string, i32>::new(),
+        names:   [],
+    };
+    const t: intern_table::InternTable = intern_table::InternTable { n: 0 };
+    const defs: res::DefTable = res::DefTable { n: 0 };
+    const a: symbol_str::SymbolStr = symbol_str::SymbolStr { id: 3 };
+    store.by_text.insert("written", 1);                                // flow: write-outside
+    mut total: i32 = door_find(&store, a) + door_text(&store, "x");
+    total = total + lookup_text(&store, "literal");                    // flow: origin-literal
+    total = total + lookup_resolved(&store, &t, a);                    // flow: origin-through-resolve
+    total = total + scan_names(&store, a);
+    total = total + match_text("Option");
+    total = total + not_a_lookup("x");
+    total = total + door_find(&store, defs.path_of(7));                // flow: identity-into-door
+    total = total + lookup_text(&store, t.resolve(defs.path_of(8)));   // flow: identity-into-lookup
+    return total;
+}
