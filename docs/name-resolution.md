@@ -228,7 +228,7 @@ measurement that decided it on the row.
 | D70 | **The 28 functions that turn raw text into names get a written exception list** (Jake, relayed in plain text 2026-09-28) | **RULED** | `no check` — not built | §8.397 |
 | D71 | **File paths used as lookup keys (48 functions) get a type of their own** (Jake, relayed in plain text 2026-09-28) | **RULED** | `no check` — not built | §8.397 |
 | D72 | **The 31 command-line flag and command functions take `Keyword`** (Jake, relayed in plain text 2026-09-28) | **RULED** | `no check` — not built | §8.397 |
-| D73 | **`new C(args)` has its arguments type-checked, before the merge** (Jake, relayed in plain text 2026-09-28) | **RULED** | `no check` — not built | §8.398 |
+| D73 | **`new C(args)` has its arguments type-checked, before the merge** (Jake, relayed in plain text 2026-09-28) | **BUILT** (§8.403) - `new C(args)` and the by-value `C(args)` are checked against the constructor of their arity; a generic class's constructors are not (not registered on the template) | `grep -c 'check_constructor_args(' compiler/src/compiler/sema/sema.cryo` → **1** (0 before §8.403) | §8.398, §8.403 |
 | D74 | **The monomorphizer's text-based matching of generic type arguments is reworked onto type identities now** (`mono/specializer.cryo`, a type argument interned by its display text and an annotation matched by whole text or by last segment) (Jake, relayed in plain text 2026-09-28) | **BUILT** (§8.402) - a type argument's shape is its kind in the arena, and a receiver's written instantiation is compared as the type it denotes; the leaf match and the display parameters are deleted. The template recognised by its spelling (six `base_name` comparisons in the substituter) is measured with one wrong answer and not built | `grep -o 'type_arg_displays' compiler/src/compiler/mono/specializer.cryo \| wc -l` → **0** (11 before §8.402) | §8.398, §8.402 |
 | D75 | **Condition three is redefined around what the compiler can enforce** - neither a command-carrying list beside the lint nor an admission that reasons cannot be checked; the new wording is its own piece of work (Jake, relayed in plain text 2026-09-28) | **RULED** | `no check` — the wording is not yet written | §0.0 |
 | D76 | **The lane gate stops counting calls that pass only identities**: this answers D58's deferred principle, retires the unratified ARENA_READ 63 → 64, and stops later conversions raising the counts (Jake, relayed in plain text 2026-09-28) | **RULED** | `no check` — not built | §8.391 |
@@ -421,7 +421,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: facts-check lane-check lane-selftest facts-selftest' Makefile` → **1** (§8.371: stale facts are REFUSED first, never regenerated - the facts target is the deliberate refresh - and the refusal's self-test runs; `facts-fresh`, which regenerated them, before, §8.366)
 * `python3 scripts/facts-selftest.py | tail -1 | grep -o '[0-9]* cases' | cut -d' ' -f1` → **12** (§8.371: the freshness check over a throwaway tree - an edited source, an added source and a missing inputs record refused, fresh facts and a non-source edit accepted, each through `facts.py --check` and through `facts_path`, which the lane gate and the residue check call - and a dry run of the lane-check and check-fast targets building nothing; with the staleness comparison deleted it fails 4 cases, with `lane-check` depending on `facts` it fails 2)
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **102** (+3 in §8.402, `generic_receiver_by_type`, `generic_receiver_other_instantiation_refused`, `generic_function_type_argument`; 99 before, +2 in §8.401, `bare_type_as_value_refused`, `class_constructed_by_name`; +1 in §8.396, `array_method_argument_mismatch`; +3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **104** (+2 in §8.403, `class_constructor_arguments_refused`, `class_constructor_overloads_by_arity`; 102 before, +3 in §8.402, `generic_receiver_by_type`, `generic_receiver_other_instantiation_refused`, `generic_function_type_argument`; 99 before, +2 in §8.401, `bare_type_as_value_refused`, `class_constructed_by_name`; +1 in §8.396, `array_method_argument_mismatch`; +3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)* `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -49606,3 +49606,127 @@ Compiler 6 files (+144 / -217): `mono/specializer.cryo`,
 no program in the tree. Gate cycles: 3 clean compiler builds (two designs
 and the restore), 3 mutant builds, 2 type checks, 1 facts run, 4
 check-fast, 1 verify.
+
+### 8.403 A construction's arguments are checked against the constructor of their arity, by `new C(args)` and by value `C(args)`; one wrong-typed construction in the compiler's own source fixed; 0 objects moved - 2026-09-28
+
+## Why
+
+D73: `new C(args)` did not type-check its arguments at all (repro in
+§8.398). Measured before changing anything, the hole was wider than that:
+
+| program | `cryo check` | build | run |
+|---|---|---|---|
+| `new Holder("not a Wrap")`, `Holder(w: Wrap)` its constructor | passes | builds | runs, 3 |
+| `Holder("not a Wrap")` by value | passes | builds | runs, 3 |
+| `new Holder()` and `new Holder(w, 5)` | passes | builds | runs, 3 |
+| `take("not a Wrap")`, an ordinary function (control) | E0214 | - | - |
+
+`resolve_new_expr` resolved the arguments and asked nothing of them. The
+by-value call reached `check_call_arity`, which looks a callee's family up
+under its PARENT and leaf; a class's constructors are registered as the
+class's methods, under the class and its leaf (`register_methods`, the key
+code generation's `resolve_family(FamilyOwner::Type(..), .., arity)`
+uses), so the lookup found nothing and returned. Code generation picks the
+constructor by argument count alone and emits no call when none has it.
+
+## What changed
+
+* `family_signatures_of(def)`: the signatures of the family a definition
+  names - a function's under its parent and leaf, a type's constructors
+  under the type and its leaf. Which of the two is the definition's KIND
+  (`DefTable::kind_of`). The first version asked `type_of_def(def)` instead,
+  and the census refused `class_constructed_by_name`'s `Tone(4)` with
+  "constructor `Tone` takes 0 argument(s)": `type_of_def` looks a type up by
+  the definition's PATH, and the function `Shapes::Tone` shares its path with
+  the enum `Shapes::Tone`, so it answered the function's definition with the
+  enum. The kind answers by identity.
+* `check_constructor_args`: the constructor whose parameters, less the
+  storage being initialized, number the call's arguments is checked
+  argument by argument by the checker every call uses; no such constructor
+  is E0216/E0215 naming the one arity the type offers, or "no overload of
+  constructor `Two` takes 3 argument(s)" when it offers several; a type that
+  declares no constructor takes no arguments. A generic type's constructors
+  are registered on its instantiations, so an unregistered one is not
+  judged here.
+* `check_call_arity` asks `family_signatures_of` - its lookup moved there,
+  so the lane gate's count of name-crossing index reads is unchanged - and
+  a callee whose definition is a type goes to the constructor check.
+  `resolve_new_expr` does the same for `new`.
+* `check_args_against_params` and `try_apply_implicit_conversion` work on
+  an argument array rather than a call node, so a construction's arguments
+  get the same implicit conversions a call's do; `emit_method_arity_error`
+  takes the span it points at.
+
+## Found by the new check in the compiler's own source
+
+```cryo
+// async_lower.cryo, the async-main wrapper
+const exec_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Executor);
+mut ex_scope: ScopeResolutionNode* = new ScopeResolutionNode(
+    exec_id, this.intern.intern("new"), span);        // scope_name: SymbolStr
+```
+
+`E0214 ... expected 'SymbolStr', found 'DefId'`: an 8-byte tagged
+definition id was written into a 4-byte spelling slot since `4ff24ea3`, so
+the node's written scope name was whatever interned string the low bits
+indexed. It compiled and worked because `set_synthesized_ref` carries the
+real identity beside it. Now `this.ctx.defs.leaf_of(exec_id)`. No object
+moved: nothing reads that name in the programs' code.
+
+## Each mutation alone, against the unmutated compiler
+
+`cryo check` over the three probes (not a build):
+
+| compiler | `new Holder("not a Wrap")` | `Holder("not a Wrap")` | `new Holder()`, `new Holder(w, 5)` |
+|---|---|---|---|
+| before | no errors | no errors | no errors |
+| this change | E0214 | E0214 | E0216, E0215 |
+| `new` not checked | **no errors** | E0214 | **no errors** |
+| by-value call not checked | E0214 | **no errors** | E0216, E0215 |
+
+## New wording
+
+The arity messages are the existing ones with the kind word
+"constructor" (`constructor 'Holder' takes 1 argument(s) but 0 were
+supplied`, `no overload of constructor 'Two' takes 3 argument(s)`). No new
+error code. The word is this session's - flagged for review.
+
+## Not covered
+
+`new Box3<i32>("no")` on a generic class is not refused - its
+constructors are not registered on the template - and `new Box3<i32>(4)`
+itself fails with E0200 at the `new` before and after, a separate defect.
+`type_of_def` answering a function's definition with a same-path type is
+a lookup by path wherever else it is asked; not audited.
+
+## Tests
+
+* `class_constructor_arguments_refused` (compile_fail, six refusals: a
+  wrong type by `new` and by value, too few, too many, arguments to a
+  struct with no constructor, an arity none of two constructors takes).
+  Declared in `tests/started-passing`: the baseline built and ran it.
+* `class_constructor_overloads_by_arity` (run, 11): each arity by `new`
+  and by value - the control that the check picks the right constructor.
+* Roster golden +2.
+
+## Measured
+
+* Predicted: 0 objects moved (candidates were async-main programs, through
+  the fixed scope name, and any construction whose argument now passes a
+  converter); name-taking 719 unchanged; pending allows 527 unchanged. All
+  held. Not predicted: the lane gate refused the first version's second
+  family lookup (LOOKUP_OTHER 44 -> 45); the lookup was hoisted into one
+  helper both paths share instead of re-pinning, and the residue's row for
+  it moved provenance and kept its class (member).
+* `make verify ARGS="--baseline HEAD --require-identical"`: OK; 0 of 3,790
+  test and 0 of 1,126 example objects moved; census, examples, editor,
+  other-OS, incremental and check-fast OK.
+* Warnings 344 from a clean build, equal as sets but five W0015 in
+  `call_resolver.cryo` at lines shifted by 55.
+
+## Blast radius
+
+4 files in `compiler/sema/` (+95 / -28), one of them the fix above. No
+program in the tree was refused. Gate cycles: 5 clean compiler builds (two
+designs, the kind fix, the restores), 4 mutant builds, 3 type checks, 2
+facts runs, 3 check-fast, 2 verify (the first refused `Tone(4)`).
