@@ -170,6 +170,45 @@ yet is recorded with the change that builds it, not here.
 50. **Ruling 47's error is approved as E0243**, "`parse` is imported
     twice".
 
+51. **A method with a receiver, named by path, is a function value whose
+    type takes the receiver first**, as in Rust. Ruling 46's ambiguity
+    (E0156) applies to it when a trait implemented for the owner also
+    provides the method.
+
+    ```cryo
+    const f = IgTn::go;                // type `(&IgTn) -> i32`
+    ```
+
+52. **Cryo gets import aliasing**, on this branch, despite the 2026-09-28
+    freeze: an imported item may be bound under another name, in a brace
+    entry and in a single-item import. The alias names the same
+    definition. E0243's help then suggests it.
+
+    ```cryo
+    import Toml::{ parse as toml_parse };
+    import Toml::parse as toml_parse;
+    ```
+
+53. **After E0243, a bare use binds to the first import with no further
+    error**, as in Rust. This supersedes ruling 3's "the bare use is
+    refused".
+
+54. **A run project checks that a qualified path (`Toml::parse(...)`) calls
+    that module's function when a single bare import of another module's
+    `parse` exists.**
+
+55. **`ResBase::primitive_position` as a third row of the `primitive`
+    door is confirmed.**
+
+56. **Types and values are separate namespaces for import collisions.** A
+    type `Tag` from one module and a function `Tag` from another, both
+    imported, do not collide.
+
+    ```cryo
+    import Shapes::{ Tag };     // a type
+    import Labels::{ Tag };     // a function: no collision
+    ```
+
 ### 2026-09-29
 
 1. **A method call on a type parameter with no bound is an error.** Inside
@@ -205,7 +244,7 @@ yet is recorded with the change that builds it, not here.
 
 3. **After an import collision is refused, a later qualified use binds to
    the item its qualified path names.** The collision refuses the bare
-   name only.
+   name only. *The bare use's refusal is superseded by ruling 53.*
 
    ```cryo
    import Json::{ parse };

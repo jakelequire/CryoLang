@@ -434,7 +434,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: facts-check lane-check lane-selftest facts-selftest' Makefile` → **1** (§8.371: stale facts are REFUSED first, never regenerated - the facts target is the deliberate refresh - and the refusal's self-test runs; `facts-fresh`, which regenerated them, before, §8.366)
 * `python3 scripts/facts-selftest.py | tail -1 | grep -o '[0-9]* cases' | cut -d' ' -f1` → **12** (§8.371: the freshness check over a throwaway tree - an edited source, an added source and a missing inputs record refused, fresh facts and a non-source edit accepted, each through `facts.py --check` and through `facts_path`, which the lane gate and the residue check call - and a dry run of the lane-check and check-fast targets building nothing; with the staleness comparison deleted it fails 4 cases, with `lane-check` depending on `facts` it fails 2)
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **132** (+1 in §8.440, `import_twice_refused_at_import`; 131 before, +1 in §8.436, `trait_method_through_field_in_generic_body`; 130 before, +2 in §8.434, `impl_qualified_path_in_generic_method`, `trait_impl_same_name_call_ambiguous`; 128 before, +1 in §8.432, `bound_path_names_declaring_trait`; 127 before, +2 in §8.431, `bound_call_through_index_field_projection`, `async_carried_local_released_at_return`; 125 before, +3 in §8.430, `private_function_field_call_refused`, `import_collision_qualified_use`, `import_collision_bare_use_refused`; 122 before, +3 in §8.429, `path_call_generic_method`, `static_path_generic_owner_ambiguous`, `unknown_trait_bound_no_cascade`, and `static_path_prefers_inherent_method` renamed to `static_path_inherent_trait_ambiguous`; 119 before, +1 in §8.428, `unknown_trait_refused_where_written`; 118 before, +3 and -1 in §8.427, `inherent_trait_method_ambiguous`, `inherent_trait_method_explicit`, `bound_call_names_bound_method`, and `inherent_method_over_trait` renamed to the first; 116 before, +2 in §8.424, `bounded_param_method_refused`, `supertrait_methods_through_bound`; 114 before, +1 in §8.423, `bufstream_releases_transport_once`; 113 before, +1 in §8.420, `unbounded_param_method_refused`; 112 before, +1 in §8.418, `type_declaration_bound_types_calls`; 111 before, +1 in §8.417, `trait_default_this_calls_typed`; 110 before, +1 in §8.412, `class_inherited_function_field_call`; 109 before, +1 in §8.410, `overload_receiver_consumes_by_pin`; 108 before, +3 in §8.405, `generic_function_named_like_type`, `generic_receiver_alias`, `generic_receiver_alias_refused`; 105 before, +1 in §8.404, `compare_with_null_refused`; 104 before, +2 in §8.403, `class_constructor_arguments_refused`, `class_constructor_overloads_by_arity`; 102 before, +3 in §8.402, `generic_receiver_by_type`, `generic_receiver_other_instantiation_refused`, `generic_function_type_argument`; 99 before, +2 in §8.401, `bare_type_as_value_refused`, `class_constructed_by_name`; +1 in §8.396, `array_method_argument_mismatch`; +3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **133** (+1 in §8.441, `generic_body_calls_typed_before_mono`; 132 before, +1 in §8.440, `import_twice_refused_at_import`; 131 before, +1 in §8.436, `trait_method_through_field_in_generic_body`; 130 before, +2 in §8.434, `impl_qualified_path_in_generic_method`, `trait_impl_same_name_call_ambiguous`; 128 before, +1 in §8.432, `bound_path_names_declaring_trait`; 127 before, +2 in §8.431, `bound_call_through_index_field_projection`, `async_carried_local_released_at_return`; 125 before, +3 in §8.430, `private_function_field_call_refused`, `import_collision_qualified_use`, `import_collision_bare_use_refused`; 122 before, +3 in §8.429, `path_call_generic_method`, `static_path_generic_owner_ambiguous`, `unknown_trait_bound_no_cascade`, and `static_path_prefers_inherent_method` renamed to `static_path_inherent_trait_ambiguous`; 119 before, +1 in §8.428, `unknown_trait_refused_where_written`; 118 before, +3 and -1 in §8.427, `inherent_trait_method_ambiguous`, `inherent_trait_method_explicit`, `bound_call_names_bound_method`, and `inherent_method_over_trait` renamed to the first; 116 before, +2 in §8.424, `bounded_param_method_refused`, `supertrait_methods_through_bound`; 114 before, +1 in §8.423, `bufstream_releases_transport_once`; 113 before, +1 in §8.420, `unbounded_param_method_refused`; 112 before, +1 in §8.418, `type_declaration_bound_types_calls`; 111 before, +1 in §8.417, `trait_default_this_calls_typed`; 110 before, +1 in §8.412, `class_inherited_function_field_call`; 109 before, +1 in §8.410, `overload_receiver_consumes_by_pin`; 108 before, +3 in §8.405, `generic_function_named_like_type`, `generic_receiver_alias`, `generic_receiver_alias_refused`; 105 before, +1 in §8.404, `compare_with_null_refused`; 104 before, +2 in §8.403, `class_constructor_arguments_refused`, `class_constructor_overloads_by_arity`; 102 before, +3 in §8.402, `generic_receiver_by_type`, `generic_receiver_other_instantiation_refused`, `generic_function_type_argument`; 99 before, +2 in §8.401, `bare_type_as_value_refused`, `class_constructed_by_name`; +1 in §8.396, `array_method_argument_mismatch`; +3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)* `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -52991,3 +52991,84 @@ a value on its own.  Whether a method with a receiver is a value
 (`(&IgTn, i32) -> i64`, as Rust's `fn` item is) is a language question left
 for a decision; the ambiguity cannot be reported for a value the language
 does not yet say exists.
+
+### 8.441 Two call shapes in generic bodies are typed before monomorphization - 2026-09-30
+
+## Why
+
+Ruling 35: a call sema cannot type before monomorphization gets its typing
+completed, not looked up during monomorphization.  The monomorphizer plan's
+conversion needs every call in a template body to carry a first-pass
+answer (a pin, a selection on the template, or a bound's trait stamp).
+
+## Measured first
+
+A throwaway probe (`.objcmp/s86/probe.patch`, reverted) printed, for every
+method call sema's first pass visits, whether it left an answer and whether
+the walk was a template body's.  Corpus: the compiler, the tests tree,
+every project, example and tool, and the unit suite (`.objcmp/s86/corpus.sh`,
+151 builds; the compile-fail files are not in it - verify's census covers
+them).  Control: the probe marks `main`'s calls `sym=0` and the template's
+`sym=1` on a scratch project, and prints the answered and unanswered calls
+of both.
+
+Unanswered template-body calls at HEAD, by site (`c1/none-sym.txt`):
+
+* `x.cast::<F>().as_ptr()` - 9 sites (`future/executor.cryo:697, 707`,
+  `thread/_module.cryo:386, 393, 710`, `thread/local.cryo:127`,
+  `sync/mpsc.cryo:144, 208`).  A method called with the body's own
+  parameter as explicit argument returned no type: the explicit-argument
+  typing resolved `F` in a context that binds no parameter, and gave up.
+* `const { inner }: PathBuf<A> = this; inner.into_raw()` - 2 sites
+  (`collections/string.cryo:260`, `fs/path.cryo:373`).  A destructure whose
+  type names the body's parameter registered every binding as `void`.
+* Not this unit: `.drop()` on an unbounded parameter (5 sites, the
+  `drop_in_place` slice); function-pointer field calls (`iter.cryo:285`,
+  `thread/local.cryo:128`), which are not method calls; `this.tids.push`
+  on a `u64[]` field, a builtin array method that is unanswered in
+  non-generic code too; `value.compare(&best)` in `Iterator::min`/`max`'s
+  default copies, unanswered in some copies and stamped in others (below).
+* The plan's own example, `inner_ptr.strong.fetch_add(..)` in
+  `alloc/arc.cryo`, is already answered: the probe prints a selection on
+  the template (`ans=sel`) at `arc.cryo:164`, `181` and `290`.
+
+## What changed
+
+* `MethodBinding::resolve_method_return_with_explicit_args`: in a template
+  body, the explicit arguments and the return annotation are resolved with
+  the body's parameters bound (`symbolic_bind_params`, which also makes the
+  resolution demand-free), bound after the owner's so those win.  An
+  argument naming the body's parameter types the return abstractly
+  (`NonNull<F>`); an argument naming nothing still leaves the call untyped.
+* `Sema::visit(DestructureDeclNode)`: in a template body, each binding is
+  typed as its field seen through the destructured type, through the
+  member-field door (`MemberResolver::field_of`), where it was `void`.  The
+  shape checks (every field bound, none twice) stay with the
+  specialization, as before.
+* New run project `generic_body_calls_typed_before_mono` (both shapes).
+
+```cryo
+function via_explicit<F>(m: &Maker, f: F) -> F {
+    return m.wrap::<F>(f).unwrap_v();   // was untyped; now Wrap<F>, `unwrap_v` selected
+}
+via_destructure(mut this) -> T {
+    const { w, n }: Outer<T> = this;    // `w` was void; now Wrap<T>
+    return w.unwrap_v();
+}
+```
+
+## Evidence
+
+* The same corpus with the change (`c2`): exactly the 11 sites leave the
+  unanswered set, nothing else in it moves, and every build's exit code is
+  the one it had.  On the scratch projects the probe shows the pair: at
+  HEAD `unwrap_v` is `ans=none` at both shapes, with the change `ans=sel`.
+* `make verify ARGS="--baseline HEAD --require-identical"`
+  (`.verify/runs/20260930-134241`): 0 of 4445 test objects and 0 of 1126
+  examples moved; every gate OK.  Clean build 344 warnings.
+* §0: projects 132 -> 133.  Lane and spelling flow unchanged: the
+  destructure asks the member-field door, which is already a door.
+* What remains of the plan's slice 5: `Iterator::min`/`max`'s
+  `value.compare(&best)` in default copies whose `This::Item` bound does
+  not stamp (3,840 unanswered visits against 2,701 stamped, 2 sites), and
+  the `.drop()` sites, which the `drop_in_place` slice owns.

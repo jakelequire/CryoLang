@@ -925,19 +925,18 @@ type struct MethodBinding {
         if (this.ctx.type_resolver == null)    { return fallback; }
         if (member.generic_args.length == 0)   { return fallback; }
 
-        // Symbolic walk: an explicit arg referencing the enclosing body's abstract
-        // params can't select a concrete instantiation - detect in a FRESH context
-        // (no bindings) and defer the whole call.
+        // An explicit arg naming the enclosing body's own parameters
+        // (`raw.cast::<F>()` inside `f<F>`) types the return abstractly
+        // (`NonNull<F>`): the call after it is selected on that instantiation
+        // through its template, and is typed before monomorphization like
+        // every other call in the body.  An arg that names nothing leaves the
+        // call untyped rather than typed by the bare lookup's `fallback`.
         if (this.state.in_symbolic_check) {
             mut sym_ctx: ResolutionContext = ResolutionContext::new("");
-            // `x.method<Widget>()` - the explicit args are the CALLER's syntax
-            // (spec §8.2l), so they mean what the member access's module says.
+            this.symbolic.symbolic_bind_params(&sym_ctx);
             for (mut i: i64 = 0; i < member.generic_args.length; i++) {
                 const a: TypeRef = this.ctx.type_resolver.resolve(member.generic_args[i], &sym_ctx);
-                if (!a.is_valid()
-                        || this.arena.contains_generic_param(a)) {
-                    return TypeRef::invalid();
-                }
+                if (!a.is_valid()) { return TypeRef::invalid(); }
             }
         }
 
@@ -991,6 +990,7 @@ type struct MethodBinding {
             if (im != null && im.func != null
                     && im.func.return_type_annotation != null) {
                 mut imp_ctx: ResolutionContext = ResolutionContext::new("");
+                this.symbolic.symbolic_bind_params(&imp_ctx);
                 for (mut i: i64 = 0; i < im.func.generic_params.length; i++) {
                     const gp: GenericParamNode* = im.func.generic_params[i];
                     if (gp == null) { continue; }
@@ -1060,6 +1060,9 @@ type struct MethodBinding {
                 res_ctx.add_binding(gp.sym_id, gp.name, this.types.view_type_arg_at(owner_ref, i));
             }
         }
+        // The explicit args are the caller's spelling; in a generic body they
+        // may name its parameters, bound after the owner's so those win.
+        this.symbolic.symbolic_bind_params(&res_ctx);
         for (mut i: i64 = 0; i < found.func.generic_params.length; i++) {
             const gp: GenericParamNode* = found.func.generic_params[i];
             if (gp == null) { continue; }
