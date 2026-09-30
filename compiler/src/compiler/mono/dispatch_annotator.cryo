@@ -5,22 +5,17 @@
 /// Annotates method calls with a disambiguating trait so the monomorphizer's
 /// trait-impl method lookups pick the right impl when a type implements two
 /// traits that declare a same-named method (the canonical case: `Display::fmt`
-/// vs `Debug::fmt`).  The information that disambiguates them - a `where T: Debug`
-/// bound, or the enclosing trait-impl's trait - is only available
-/// PRE-monomorphization (once a generic is substituted to a concrete type the
-/// bound is gone), so this runs over EVERY decl (generic templates included)
-/// before mono clones anything; the cloner copies `resolved_trait` onto every
-/// spec.
+/// vs `Debug::fmt`).  The enclosing trait-impl's trait is only available
+/// PRE-monomorphization, so this runs over EVERY decl (generic templates
+/// included) before mono clones anything; the cloner copies `resolved_trait`
+/// onto every spec.
 ///
-/// Two rules:
-///   1. Trait-impl recursion: a call to the enclosing method's own name inside a
-///      trait-impl method -> the impl's trait.
-///   2. Static path: `T::m(..)` where `T` is a generic param bounded by exactly
-///      ONE trait -> that trait.
+/// One rule, trait-impl recursion: a call to the enclosing method's own name
+/// inside a trait-impl method -> the impl's trait.
 ///
-/// A method call on a receiver whose type is a bounded parameter is stamped
-/// by sema, where the bound answers it (`CallResolver::resolve_method_call`),
-/// with the trait whose declaration answered.
+/// A call on a bounded parameter - a method call on a receiver of that type,
+/// or a path through it (`T::make()`) - is stamped by sema, where the bound
+/// answers it, with the trait whose declaration answered.
 ///
 /// Plain `type struct` collaborator: back-pointers set by `wire()`, no recursion
 /// seam (it walks the AST directly).
@@ -29,8 +24,7 @@ namespace compiler::mono::dispatch_annotator;
 
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, node, NodeKind, pattern, statement, TraitBound, TraitRef,
-    TypeAnnotation
+    declaration, expression, node, NodeKind, pattern, statement
 };
 import compiler::types::{ arena, type_ref, generic };
 import compiler::resolver::{ symbol_str, intern_table };
@@ -40,7 +34,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayLiteralNode, BinaryExprNode, CallExprNode, CastExprNode,
-    ExpressionNode, MemberAccessNode, ScopeResolutionNode, StructLiteralNode, TryExprNode,
+    ExpressionNode, MemberAccessNode, StructLiteralNode, TryExprNode,
     UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -53,8 +47,6 @@ import compiler::ast::statement::{
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res::{ DefId };
-import compiler::resolver::symbol_id;
-import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
 
 
@@ -77,27 +69,25 @@ type struct MonoDispatchAnnotator {
 
     annotate_bound_dispatch_in_module(mut &this, root: ProgramNode*) -> void {
         if (root == null) { return; }
-        mut no_bounds: TraitBound[] = [];
         const no_trait: DefId = DefId::invalid();
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
             match (stmt.kind) {
                 NodeKind::FunctionDeclaration => {
-                    const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                    this.annotate_dispatch_in_func(f, f.trait_bounds, no_trait);
+                    this.annotate_dispatch_in_func(stmt as FunctionDeclNode*, no_trait);
                 }
                 NodeKind::StructDeclaration => {
                     const sn: StructDeclNode* = stmt as StructDeclNode*;
-                    this.annotate_dispatch_in_methods(sn.methods, no_bounds, no_trait);
+                    this.annotate_dispatch_in_methods(sn.methods, no_trait);
                 }
                 NodeKind::UnionDeclaration => {
                     const un: UnionDeclNode* = stmt as UnionDeclNode*;
-                    this.annotate_dispatch_in_methods(un.methods, no_bounds, no_trait);
+                    this.annotate_dispatch_in_methods(un.methods, no_trait);
                 }
                 NodeKind::ClassDeclaration => {
                     const cn: ClassDeclNode* = stmt as ClassDeclNode*;
-                    this.annotate_dispatch_in_methods(cn.methods, no_bounds, no_trait);
+                    this.annotate_dispatch_in_methods(cn.methods, no_trait);
                 }
                 NodeKind::ImplementationBlock => {
                     const ib: ImplBlockNode* = stmt as ImplBlockNode*;
@@ -107,105 +97,45 @@ type struct MonoDispatchAnnotator {
                     // canonical name.
                     mut trait_id: DefId = DefId::invalid();
                     if (ib.is_trait_impl()) { trait_id = ib.trait_def; }
-                    this.annotate_dispatch_in_methods(ib.methods, ib.where_bounds, trait_id);
+                    this.annotate_dispatch_in_methods(ib.methods, trait_id);
                 }
                 _ => {}
             }
         }
     }
 
-    annotate_dispatch_in_methods(mut &this, methods: &MethodNode*[],
-                                 impl_bounds: &TraitBound[],
-                                 trait_id: DefId) -> void {
+    annotate_dispatch_in_methods(mut &this, methods: &MethodNode*[], trait_id: DefId) -> void {
         for (mut k: i64 = 0; k < methods.length; k++) {
             const m: MethodNode* = methods[k];
             if (m == null || m.func == null) { continue; }
-            // Rule 2 needs the param's bound, which may be impl-level
-            // (`implement<T> ... where T: Debug`) or method-level; merge both.
-            mut bounds: TraitBound[] = [];
-            for (mut a: i64 = 0; a < impl_bounds.length; a++) {
-                bounds.push(impl_bounds[a].clone());
-            }
-            for (mut b: i64 = 0; b < m.func.trait_bounds.length; b++) {
-                bounds.push(m.func.trait_bounds[b].clone());
-            }
-            this.annotate_dispatch_in_func(m.func, bounds, trait_id);
+            this.annotate_dispatch_in_func(m.func, trait_id);
         }
     }
 
-    annotate_dispatch_in_func(mut &this, func: FunctionDeclNode*,
-                              bounds: &TraitBound[],
-                              enclosing_trait: DefId) -> void {
+    annotate_dispatch_in_func(mut &this, func: FunctionDeclNode*, enclosing_trait: DefId) -> void {
         if (func == null || func.body == null) { return; }
-        this.annotate_dispatch_stmt(func.body as StatementNode*, func, bounds,
-                                    enclosing_trait);
+        this.annotate_dispatch_stmt(func.body as StatementNode*, func, enclosing_trait);
     }
 
-    /// Apply rule 1 to a single method-call's MemberAccess.
+    /// Apply the rule to a single method-call's MemberAccess.
     annotate_dispatch_member(mut &this, ma: MemberAccessNode*,
                              func: FunctionDeclNode*, enclosing_trait: DefId) -> void {
         if (ma == null) { return; }
         if (ma.resolved_trait.is_valid()) { return; }
-        // Rule 1: recursive same-named call inside a trait-impl method.
+        // Recursive same-named call inside a trait-impl method.
         if (enclosing_trait.is_valid() && ma.member.equals(func.name)) {
             ma.set_resolved_trait(enclosing_trait);
         }
     }
 
-    /// Rule 2, the static path: `T::m(..)` where `T` is a generic parameter
-    /// of the enclosing function bounded by exactly ONE trait names that
-    /// trait's `m` - `T` has no inherent methods where the call is written,
-    /// and the bound is the only thing that says what `m` is, exactly as a
-    /// bounded receiver's bound does for a method call.  Once `T` is substituted
-    /// the bound is gone and the concrete type may implement two traits
-    /// providing `m`; the stamp is what keeps the written meaning.  A path
-    /// the writer qualified with a head (`(Beta for T)::m`) is already
-    /// directed and is left alone; a parameter with two bounds is left to
-    /// the tie the concrete instantiation reports.  The scope segment is a
-    /// parameter exactly when a bound names it - a where-clause bounds the
-    /// function's or the impl's parameters and nothing else - so the bound
-    /// list is the one question, as it is for rule 1's receiver.
-    annotate_dispatch_path(mut &this, sr: ScopeResolutionNode*, bounds: &TraitBound[]) -> void {
-        if (sr == null || sr.impl_trait != null || sr.resolved_trait.is_valid()) { return; }
-        const tr: DefId = this.single_bound_trait_for(
-            sr.scope_res.relative_param_sym(), bounds);
-        if (tr.is_valid()) { sr.set_resolved_trait(tr); }
-    }
-
-    /// Return the identity of the single trait bounding the parameter `param`,
-    /// or empty when the param has zero or more-than-one bound trait
-    /// (ambiguous - leave the dispatch to its default), or when `param` names
-    /// no parameter.  The bound's stamped identity, not its written leaf: two
-    /// traits may share a leaf, and the stamp on the call is compared against
-    /// a method's `origin_trait`.
-    single_bound_trait_for(&this, param: SymbolID,
-                           bounds: &TraitBound[]) -> DefId {
-        mut found: DefId = DefId::invalid();
-        mut count: i64 = 0;
-        if (!param.is_valid()) { return found; }
-        for (mut i: i64 = 0; i < bounds.length; i++) {
-            const b: TraitBound* = &bounds[i];
-            if (!b.subject_sym.equals(param)) { continue; }
-            for (mut j: i64 = 0; j < b.trait_refs.length; j++) {
-                const tr: TraitRef* = &b.trait_refs[j];
-                if (tr.path.length == 0) { continue; }
-                found = tr.definition();
-                count += 1;
-            }
-        }
-        if (count == 1) { return found; }
-        return DefId::invalid();
-    }
-
     annotate_dispatch_stmt(mut &this, stmt: StatementNode*,
-                           func: FunctionDeclNode*, bounds: &TraitBound[],
-                           enclosing_trait: DefId) -> void {
+                           func: FunctionDeclNode*, enclosing_trait: DefId) -> void {
         if (stmt == null) { return; }
         const node: ASTNode* = stmt as ASTNode*;
         match (node.kind) {
             NodeKind::ExpressionStatement => {
                 const es: ExprStmtNode* = stmt as ExprStmtNode*;
-                this.annotate_dispatch_expr(es.expression, func, bounds, enclosing_trait);
+                this.annotate_dispatch_expr(es.expression, func, enclosing_trait);
             }
             NodeKind::DeclarationStatement => {
                 const ds: DeclStmtNode* = stmt as DeclStmtNode*;
@@ -213,20 +143,20 @@ type struct MonoDispatchAnnotator {
                 if (inner != null && (inner as ASTNode*).kind == NodeKind::VariableDeclaration) {
                     const vd: VarDeclNode* = inner as VarDeclNode*;
                     if (vd.initializer != null) {
-                        this.annotate_dispatch_expr(vd.initializer, func, bounds, enclosing_trait);
+                        this.annotate_dispatch_expr(vd.initializer, func, enclosing_trait);
                     }
                 }
             }
             NodeKind::ReturnStatement => {
                 const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
                 if (rs.expression != null) {
-                    this.annotate_dispatch_expr(rs.expression, func, bounds, enclosing_trait);
+                    this.annotate_dispatch_expr(rs.expression, func, enclosing_trait);
                 }
             }
             NodeKind::BlockStatement => {
                 const bs: BlockStmtNode* = stmt as BlockStmtNode*;
                 for (mut i: i64 = 0; i < bs.statements.length; i++) {
-                    this.annotate_dispatch_stmt(bs.statements[i], func, bounds, enclosing_trait);
+                    this.annotate_dispatch_stmt(bs.statements[i], func, enclosing_trait);
                 }
             }
             NodeKind::UnsafeBlockStatement => {
@@ -236,52 +166,52 @@ type struct MonoDispatchAnnotator {
                 // reason and was missing it too.
                 const ub: BlockStmtNode* = (stmt as UnsafeBlockStmtNode*).block;
                 for (mut i: i64 = 0; i < ub.statements.length; i++) {
-                    this.annotate_dispatch_stmt(ub.statements[i], func, bounds, enclosing_trait);
+                    this.annotate_dispatch_stmt(ub.statements[i], func, enclosing_trait);
                 }
             }
             NodeKind::IfStatement => {
                 const ifs: IfStmtNode* = stmt as IfStmtNode*;
-                this.annotate_dispatch_expr(ifs.condition, func, bounds, enclosing_trait);
+                this.annotate_dispatch_expr(ifs.condition, func, enclosing_trait);
                 if (ifs.then_stmt != null) {
-                    this.annotate_dispatch_stmt(ifs.then_stmt, func, bounds, enclosing_trait);
+                    this.annotate_dispatch_stmt(ifs.then_stmt, func, enclosing_trait);
                 }
                 if (ifs.has_else() && ifs.else_stmt != null) {
-                    this.annotate_dispatch_stmt(ifs.else_stmt, func, bounds, enclosing_trait);
+                    this.annotate_dispatch_stmt(ifs.else_stmt, func, enclosing_trait);
                 }
             }
             NodeKind::WhileStatement => {
                 const ws: WhileStmtNode* = stmt as WhileStmtNode*;
-                this.annotate_dispatch_expr(ws.condition, func, bounds, enclosing_trait);
+                this.annotate_dispatch_expr(ws.condition, func, enclosing_trait);
                 if (ws.body != null) {
-                    this.annotate_dispatch_stmt(ws.body, func, bounds, enclosing_trait);
+                    this.annotate_dispatch_stmt(ws.body, func, enclosing_trait);
                 }
             }
             NodeKind::ForStatement => {
                 const fs: ForStmtNode* = stmt as ForStmtNode*;
                 if (fs.condition != null) {
-                    this.annotate_dispatch_expr(fs.condition, func, bounds, enclosing_trait);
+                    this.annotate_dispatch_expr(fs.condition, func, enclosing_trait);
                 }
                 if (fs.body != null) {
-                    this.annotate_dispatch_stmt(fs.body, func, bounds, enclosing_trait);
+                    this.annotate_dispatch_stmt(fs.body, func, enclosing_trait);
                 }
             }
             NodeKind::LoopStatement => {
                 const ls: LoopStmtNode* = stmt as LoopStmtNode*;
                 if (ls.body != null) {
-                    this.annotate_dispatch_stmt(ls.body, func, bounds, enclosing_trait);
+                    this.annotate_dispatch_stmt(ls.body, func, enclosing_trait);
                 }
             }
             NodeKind::MatchStatement => {
                 const ms: MatchStmtNode* = stmt as MatchStmtNode*;
-                this.annotate_dispatch_expr(ms.subject, func, bounds, enclosing_trait);
+                this.annotate_dispatch_expr(ms.subject, func, enclosing_trait);
                 for (mut i: i64 = 0; i < ms.arms.length; i++) {
                     const arm: MatchArmNode* = ms.arms[i];
                     if (arm == null) { continue; }
                     if (arm.guard != null) {
-                        this.annotate_dispatch_expr(arm.guard, func, bounds, enclosing_trait);
+                        this.annotate_dispatch_expr(arm.guard, func, enclosing_trait);
                     }
                     if (arm.body != null) {
-                        this.annotate_dispatch_stmt(arm.body, func, bounds, enclosing_trait);
+                        this.annotate_dispatch_stmt(arm.body, func, enclosing_trait);
                     }
                 }
             }
@@ -290,7 +220,7 @@ type struct MonoDispatchAnnotator {
                 for (mut i: i64 = 0; i < sm.arms.length; i++) {
                     const arm: StaticMatchArmNode* = sm.arms[i];
                     if (arm != null && arm.body != null) {
-                        this.annotate_dispatch_stmt(arm.body, func, bounds, enclosing_trait);
+                        this.annotate_dispatch_stmt(arm.body, func, enclosing_trait);
                     }
                 }
             }
@@ -299,8 +229,7 @@ type struct MonoDispatchAnnotator {
     }
 
     annotate_dispatch_expr(mut &this, expr: ExpressionNode*,
-                           func: FunctionDeclNode*, bounds: &TraitBound[],
-                           enclosing_trait: DefId) -> void {
+                           func: FunctionDeclNode*, enclosing_trait: DefId) -> void {
         if (expr == null) { return; }
         const node: ASTNode* = expr as ASTNode*;
         match (node.kind) {
@@ -312,53 +241,48 @@ type struct MonoDispatchAnnotator {
                         call.callee as MemberAccessNode*, func, enclosing_trait);
                 }
                 for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                    this.annotate_dispatch_expr(call.arguments[i], func, bounds, enclosing_trait);
+                    this.annotate_dispatch_expr(call.arguments[i], func, enclosing_trait);
                 }
                 if (call.callee != null) {
-                    this.annotate_dispatch_expr(call.callee, func, bounds, enclosing_trait);
+                    this.annotate_dispatch_expr(call.callee, func, enclosing_trait);
                 }
             }
             NodeKind::MemberAccess => {
                 const ma: MemberAccessNode* = expr as MemberAccessNode*;
-                this.annotate_dispatch_expr(ma.object, func, bounds, enclosing_trait);
-            }
-            // Rule 2, wherever the path stands: a call's callee, or the
-            // method taken as a value.
-            NodeKind::ScopeResolution => {
-                this.annotate_dispatch_path(expr as ScopeResolutionNode*, bounds);
+                this.annotate_dispatch_expr(ma.object, func, enclosing_trait);
             }
             NodeKind::BinaryExpression => {
                 const be: BinaryExprNode* = expr as BinaryExprNode*;
-                this.annotate_dispatch_expr(be.left, func, bounds, enclosing_trait);
-                this.annotate_dispatch_expr(be.right, func, bounds, enclosing_trait);
+                this.annotate_dispatch_expr(be.left, func, enclosing_trait);
+                this.annotate_dispatch_expr(be.right, func, enclosing_trait);
             }
             NodeKind::UnaryExpression => {
                 const ue: UnaryExprNode* = expr as UnaryExprNode*;
-                this.annotate_dispatch_expr(ue.operand, func, bounds, enclosing_trait);
+                this.annotate_dispatch_expr(ue.operand, func, enclosing_trait);
             }
             NodeKind::TryExpression => {
                 const te: TryExprNode* = expr as TryExprNode*;
-                this.annotate_dispatch_expr(te.operand, func, bounds, enclosing_trait);
+                this.annotate_dispatch_expr(te.operand, func, enclosing_trait);
             }
             NodeKind::ArrayAccess => {
                 const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
-                this.annotate_dispatch_expr(aa.array, func, bounds, enclosing_trait);
-                this.annotate_dispatch_expr(aa.index, func, bounds, enclosing_trait);
+                this.annotate_dispatch_expr(aa.array, func, enclosing_trait);
+                this.annotate_dispatch_expr(aa.index, func, enclosing_trait);
             }
             NodeKind::CastExpression => {
                 const ce: CastExprNode* = expr as CastExprNode*;
-                this.annotate_dispatch_expr(ce.expression, func, bounds, enclosing_trait);
+                this.annotate_dispatch_expr(ce.expression, func, enclosing_trait);
             }
             NodeKind::StructLiteral => {
                 const sl: StructLiteralNode* = expr as StructLiteralNode*;
                 for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
-                    this.annotate_dispatch_expr(sl.field_inits[i].value, func, bounds, enclosing_trait);
+                    this.annotate_dispatch_expr(sl.field_inits[i].value, func, enclosing_trait);
                 }
             }
             NodeKind::ArrayLiteral => {
                 const al: ArrayLiteralNode* = expr as ArrayLiteralNode*;
                 for (mut i: i64 = 0; i < al.elements.length; i++) {
-                    this.annotate_dispatch_expr(al.elements[i], func, bounds, enclosing_trait);
+                    this.annotate_dispatch_expr(al.elements[i], func, enclosing_trait);
                 }
             }
             _ => {}
