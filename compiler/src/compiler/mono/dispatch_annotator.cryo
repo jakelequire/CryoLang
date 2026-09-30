@@ -12,13 +12,15 @@
 /// before mono clones anything; the cloner copies `resolved_trait` onto every
 /// spec.
 ///
-/// Three rules:
-///   1. Param receiver: `recv.m()` where `recv` is a parameter whose annotation
-///      head is a generic param bounded by exactly ONE trait -> that trait.
-///   2. Trait-impl recursion: a call to the enclosing method's own name inside a
+/// Two rules:
+///   1. Trait-impl recursion: a call to the enclosing method's own name inside a
 ///      trait-impl method -> the impl's trait.
-///   3. Static path: `T::m(..)` where `T` is a generic param bounded by exactly
-///      ONE trait -> that trait (the same bound, read at the scope segment).
+///   2. Static path: `T::m(..)` where `T` is a generic param bounded by exactly
+///      ONE trait -> that trait.
+///
+/// A method call on a receiver whose type is a bounded parameter is stamped
+/// by sema, where the bound answers it (`CallResolver::resolve_method_call`),
+/// with the trait whose declaration answered.
 ///
 /// Plain `type struct` collaborator: back-pointers set by `wire()`, no recursion
 /// seam (it walks the AST directly).
@@ -38,7 +40,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     ArrayAccessNode, ArrayLiteralNode, BinaryExprNode, CallExprNode, CastExprNode,
-    ExpressionNode, IdentifierNode, MemberAccessNode, ScopeResolutionNode, StructLiteralNode, TryExprNode,
+    ExpressionNode, MemberAccessNode, ScopeResolutionNode, StructLiteralNode, TryExprNode,
     UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -118,7 +120,7 @@ type struct MonoDispatchAnnotator {
         for (mut k: i64 = 0; k < methods.length; k++) {
             const m: MethodNode* = methods[k];
             if (m == null || m.func == null) { continue; }
-            // Rule 1 needs the param's bound, which may be impl-level
+            // Rule 2 needs the param's bound, which may be impl-level
             // (`implement<T> ... where T: Debug`) or method-level; merge both.
             mut bounds: TraitBound[] = [];
             for (mut a: i64 = 0; a < impl_bounds.length; a++) {
@@ -139,42 +141,22 @@ type struct MonoDispatchAnnotator {
                                     enclosing_trait);
     }
 
-    /// Apply the two annotation rules to a single method-call's MemberAccess.
+    /// Apply rule 1 to a single method-call's MemberAccess.
     annotate_dispatch_member(mut &this, ma: MemberAccessNode*,
-                             func: FunctionDeclNode*, bounds: &TraitBound[],
-                             enclosing_trait: DefId) -> void {
+                             func: FunctionDeclNode*, enclosing_trait: DefId) -> void {
         if (ma == null) { return; }
         if (ma.resolved_trait.is_valid()) { return; }
-        // Rule 1: receiver is a parameter typed as a single-bounded generic.
-        const obj_node: ASTNode* = ma.object as ASTNode*;
-        if (obj_node != null && obj_node.kind == NodeKind::Identifier) {
-            const id: IdentifierNode* = ma.object as IdentifierNode*;
-            for (mut p: i64 = 0; p < func.parameters.length; p++) {
-                const param: VarDeclNode* = func.parameters[p];
-                if (param == null) { continue; }
-                if (!param.sym_id.is_valid() || !param.sym_id.equals(id.res.local_sym())) { continue; }
-                const head: SymbolID = this.param_head_of_ann(param.type_annotation);
-                if (head.is_valid()) {
-                    const tr: DefId = this.single_bound_trait_for(head, bounds);
-                    if (tr.is_valid()) {
-                        ma.set_resolved_trait(tr);
-                        return;
-                    }
-                }
-                break;
-            }
-        }
-        // Rule 2: recursive same-named call inside a trait-impl method.
+        // Rule 1: recursive same-named call inside a trait-impl method.
         if (enclosing_trait.is_valid() && ma.member.equals(func.name)) {
             ma.set_resolved_trait(enclosing_trait);
         }
     }
 
-    /// Rule 3, the static path: `T::m(..)` where `T` is a generic parameter
+    /// Rule 2, the static path: `T::m(..)` where `T` is a generic parameter
     /// of the enclosing function bounded by exactly ONE trait names that
     /// trait's `m` - `T` has no inherent methods where the call is written,
     /// and the bound is the only thing that says what `m` is, exactly as a
-    /// parameter receiver's bound does in rule 1.  Once `T` is substituted
+    /// bounded receiver's bound does for a method call.  Once `T` is substituted
     /// the bound is gone and the concrete type may implement two traits
     /// providing `m`; the stamp is what keeps the written meaning.  A path
     /// the writer qualified with a head (`(Beta for T)::m`) is already
@@ -327,7 +309,7 @@ type struct MonoDispatchAnnotator {
                 if (call.callee != null
                         && (call.callee as ASTNode*).kind == NodeKind::MemberAccess) {
                     this.annotate_dispatch_member(
-                        call.callee as MemberAccessNode*, func, bounds, enclosing_trait);
+                        call.callee as MemberAccessNode*, func, enclosing_trait);
                 }
                 for (mut i: i64 = 0; i < call.arguments.length; i++) {
                     this.annotate_dispatch_expr(call.arguments[i], func, bounds, enclosing_trait);
@@ -340,7 +322,7 @@ type struct MonoDispatchAnnotator {
                 const ma: MemberAccessNode* = expr as MemberAccessNode*;
                 this.annotate_dispatch_expr(ma.object, func, bounds, enclosing_trait);
             }
-            // Rule 3, wherever the path stands: a call's callee, or the
+            // Rule 2, wherever the path stands: a call's callee, or the
             // method taken as a value.
             NodeKind::ScopeResolution => {
                 this.annotate_dispatch_path(expr as ScopeResolutionNode*, bounds);
@@ -383,17 +365,4 @@ type struct MonoDispatchAnnotator {
         }
     }
 
-    /// Recursively unwrap a parameter's annotation to its `Named` head - the
-    /// generic parameter a `&T` / `T*` / `Box<T>` is written over - which is
-    /// the name a `where` bound is keyed by.
-    param_head_of_ann(&this, ann: TypeAnnotation*) -> SymbolID {
-        if (ann == null) { return SymbolID::invalid(); }
-        return match (*ann) {
-            TypeAnnotation::Named(na)     => { na.param_sym() }
-            TypeAnnotation::Generic(ga)   => { this.param_head_of_ann(ga.base) }
-            TypeAnnotation::Reference(ra) => { this.param_head_of_ann(ra.inner) }
-            TypeAnnotation::Pointer(pa)   => { this.param_head_of_ann(pa.inner) }
-            _                             => { SymbolID::invalid() }
-        };
-    }
 }

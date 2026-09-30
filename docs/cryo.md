@@ -2271,7 +2271,21 @@ After the block is loaded, `my_bool.to_i32()` resolves like any other method cal
 
 ### 13.4 Which Method a Call Names
 
-A method call `recv.m(...)` on a receiver with an **inherent** method `m` names the inherent one, whatever trait impls for the receiver also provide `m` and whatever order the `implement` blocks were written in. Only a receiver with no inherent `m` reaches its trait impls, and then exactly one of them must provide `m`: a name two traits provide is an error (E0156), whether the call is written `recv.m(...)`, `T::m(recv, ...)`, `T::m()` for a static method, or `T::m` as a value, and never a pick by declaration or import order. The error names each candidate where it is declared and the spelling that chooses. A call made through a bound (`x.m()` where `x: &T` and `where T: Tr`, or the path `T::m(...)` and the value `T::m` under the same bound) names `Tr::m`, since `T` has no inherent methods where the call is written — the concrete type it is later instantiated with does not change that, even when it implements a second trait providing `m`. A parameter bounded by two traits directs nothing, and the instantiation reports the tie. This is Rust's rule.
+A method call `recv.m(...)` names the one method `m` its arguments bind to, and no kind of method outranks another. A receiver with an **inherent** method `m` and a trait impl that also provides an `m` the arguments bind to makes the call ambiguous (E0156), whichever order the `implement` blocks were written in and whether the receiver or either method is generic: the caller writes the impl-qualified path `(Tr for T)::m(&recv, ...)` below, or renames one of them. A name two traits provide is an error as well (E0156), whether the call is written `recv.m(...)`, `T::m(recv, ...)`, `T::m()` for a static method, or `T::m` as a value, and never a pick by declaration or import order. The error names each candidate where it is declared and the spelling that chooses. A call made through a bound (`x.m()` where `x: &T` and `where T: Tr`, or the path `T::m(...)` and the value `T::m` under the same bound) names `Tr::m`, since `T` has no methods but its bounds' where the call is written — the concrete type it is later instantiated with does not change that, even when it has an inherent `m` or implements a second trait providing `m`. A parameter bounded by two traits that both provide `m` directs nothing, and the instantiation reports the tie. A call through a bound follows Rust's rule; on a concrete receiver Rust lets the inherent method win, and Cryo refuses the call instead.
+
+```cryo
+type trait Beta { go(&this, u: i32) -> i64; }
+type struct IgTn { v: i32; }
+implement trait Beta for IgTn { go(&this, u: i32) -> i64 { return 2; } }
+implement struct IgTn { go<U>(&this, u: U) -> i64 { return 1; } }
+
+function via<T>(x: &T) -> i64 where T: Beta { return x.go(0); }
+
+const ig: IgTn = IgTn { v: 5 };
+const a: i64 = ig.go(7);                     // error[E0156]: an inherent `go` and `Beta::go` both apply
+const b: i64 = (Beta for IgTn)::go(&ig, 7);  // 2
+const c: i64 = via::<IgTn>(&ig);             // 2: the bound names `Beta::go`
+```
 
 **The impl-qualified path.** `(Tr for T)::m` names the `m` that `Tr`'s implementation for `T` delivers, whatever other traits provide `m` for `T`. It is one rule for every shape the tie takes: a static method, `(Tr for T)::m()`, which no receiver could select; a method with a receiver, `(Tr for T)::m(&recv, ...)`, the receiver its first argument; a method taken as a value, `(Tr for T)::m`; and the form inside a generic body, `(Tr for U)::m()` with `U` a type parameter, which selects `Tr`'s implementation for whatever `U` is instantiated with. The head reuses `for` exactly as `implement trait Tr for T` writes it - a trait, then a type by name with generic arguments if any - and is followed by `::` and one member. A head whose type does not implement the trait is refused (E0306, the bound the head asserts), one whose implementation has no such member is refused at the member (E0233), and the call's arguments are checked against that implementation's signature. The trait-qualified call `Tr::m(&recv, ...)` also resolves, by the receiver's type, but only where there is a receiver; the impl-qualified path is the form E0156 proposes.
 

@@ -93,7 +93,7 @@ import compiler::sema::helpers::{
 import compiler::sema::lambda_synth::{ LambdaSynth };
 import compiler::sema::literal_resolver::{ LiteralResolver };
 import compiler::sema::member_resolver::{ MemberResolver };
-import compiler::sema::method_binding::{ MethodBinding };
+import compiler::sema::method_binding::{ BoundDirection, MethodBinding };
 import compiler::sema::scope_manager::{ ScopeManager };
 import compiler::sema::state::{ SemaState };
 import compiler::sema::symbolic_checker::{ SymbolicChecker };
@@ -136,20 +136,28 @@ const PF_STRUCT:  i64 = 5;   // an aggregate argument - never valid for C printf
 /// One method selection.  `owner_inst` is the receiver when it is an
 /// instantiation not yet minted, whose template's methods are the
 /// candidates, and invalid otherwise.  `chosen` is the method selected and
-/// `ret` its return type as the receiver sees it.
+/// `ret` its return type as the receiver sees it; `tier` is the binding
+/// tier its arguments bound at, and `info` the receiver's own method entry
+/// it was found as (null when it came from a declaration or an impl
+/// block).  Selecting writes nothing to the call: a candidate set can be
+/// asked whether it applies, and the call is bound once, by
+/// `commit_selection`.
 type struct Selection {
     owner_inst: TypeRef;
     chosen:     MethodNode*;
     ret:        TypeRef;
+    tier:       i32;
+    info:       MethodInfo*;
 
     static none() -> Selection {
-        return Selection { owner_inst: TypeRef::invalid(), chosen: null, ret: TypeRef::invalid() };
+        return Selection { owner_inst: TypeRef::invalid(), chosen: null, ret: TypeRef::invalid(),
+                           tier: 0, info: null };
     }
 
     /// A call already bound: its pin, and the pin's declared return.
     static of(mn: MethodNode*) -> Selection {
         const r: TypeRef = if (mn != null && mn.func != null) { mn.func.resolved_return_type } else { TypeRef::invalid() };
-        return Selection { owner_inst: TypeRef::invalid(), chosen: mn, ret: r };
+        return Selection { owner_inst: TypeRef::invalid(), chosen: mn, ret: r, tier: 0, info: null };
     }
 }
 
@@ -2424,8 +2432,10 @@ type struct CallResolver {
         // The receiver's inherent methods are the candidates when any of
         // them has the call's arity; the ones its trait impls deliver are
         // consulted only when none does.  Two traits providing the name is
-        // an ambiguity; an inherent method beside them is not, since it
-        // outranks both.
+        // an ambiguity reported here; an inherent method beside a trait
+        // method that also applies is one the selection reports
+        // (`report_inherent_trait_tie`), and the arguments are checked
+        // against the inherent method.
         for (mut pass: i32 = 1; pass <= 2; pass++) {
             if (pass == 2 && found) { break; }
             mut walk: ClassType* = start_cls;
@@ -2537,22 +2547,7 @@ type struct CallResolver {
         }
 
         if (trait_ambiguous && !member.resolved_trait.is_valid()) {
-            // The receiver is the trait-qualified call's first argument - by
-            // reference when the receiver is not one already, as the method
-            // form's auto-ref made it - and the call's own arguments follow.
-            mut args_text: string = this.source_text(member.object.span);
-            if (args_text.length() == 0) { args_text = "receiver"; }
-            const recv_t: Type* = this.arena.lookup(member.object.resolved_type);
-            if (recv_t == null || recv_t.kind != TypeKind::Reference) { args_text = "&" + args_text; }
-            if (call.arguments.length > 0) {
-                const first: ExpressionNode* = call.arguments[0];
-                const last: ExpressionNode* = call.arguments[call.arguments.length - 1];
-                const rest: string = this.source_text(SourceSpan::new(Text::new(first.span.file),
-                    first.span.start_line, first.span.start_col, last.span.end_line, last.span.end_col));
-                args_text = args_text + ", " + (if (rest.length() == 0) { "..." } else { rest });
-            }
-            this.report_trait_method_tie(member.span, member.member,
-                this.arena.resolve_display_name_short(base_ref), &tie_traits, &tie_spans, args_text, true);
+            this.report_method_call_tie(call, member, base_ref, &tie_traits, &tie_spans, null);
             return;
         }
         // Several arity-matching signatures is an overload SET, not a reason to
@@ -2836,10 +2831,8 @@ type struct CallResolver {
     /// specialization's `$MG` disambiguator, a trait impl's trait - so
     /// nothing is mangled here.  A method the index never registered (a
     /// deferred combinator template) is left unpinned.
-    pin_method_callee_from_qname(mut &this, call: CallExprNode*, owner_qname_str: string,
-                                 mn: MethodNode*, is_static: boolean) -> void {
+    pin_method_callee(mut &this, call: CallExprNode*, mn: MethodNode*, is_static: boolean) -> void {
         if (mn == null || mn.func == null) { return; }
-        if (owner_qname_str.length() == 0) { return; }
         const fn_node: FunctionDeclNode* = mn.func;
         if (!fn_node.resolved_return_type.is_valid()) { return; }
         // GATED (R2): never stomp mono's exact-spec pin with a generic template's entry.
@@ -2960,74 +2953,185 @@ type struct CallResolver {
         }
 
         // Bound-directed dispatch.  A node stamped with the trait its call
-        // names (`fst.fmt(f)` inside `Display for Pair`, or on a parameter
-        // bounded by one trait) selects that trait's method ahead of any
-        // other: `Display::fmt` and `Debug::fmt` share a name, a signature
-        // and a receiver, so nothing but the stamp can tell them apart.  It
-        // is a ranking, not a restriction - `x.drop()` inside `Drop::drop`
-        // is stamped `Drop` and binds an inherent `drop` when that is what
-        // the receiver has.  Compared by identity: the stamp is the trait's
-        // canonical name, and so is a method's `origin_trait` and an impl
-        // head's `trait_def`.  Two traits can share a leaf, and
+        // names (`fst.fmt(f)` inside `Display for Pair`, or a call a bound
+        // answered in a generic body) selects that trait's method ahead of
+        // any other: `Display::fmt` and `Debug::fmt` share a name, a
+        // signature and a receiver, so nothing but the stamp can tell them
+        // apart, and a type substituted for a bounded parameter may declare
+        // an inherent method of the name that the generic body never saw.
+        // It is a ranking, not a restriction - `x.drop()` inside
+        // `Drop::drop` is stamped `Drop` and binds an inherent `drop` when
+        // that is what the receiver has.  Compared by identity: the stamp is
+        // the trait's canonical name, and so is a method's `origin_trait`
+        // and an impl head's `trait_def`.  Two traits can share a leaf, and
         // a leaf comparison binds whichever of them registered first.
         //
-        // Unstamped, an inherent method wins over a trait method, whether
-        // either is generic: every inherent candidate is tried before any
-        // trait's.  Within each set a generic method's own type parameters
-        // bind by unification with the arguments, and the generic candidates
-        // are tried after the others.
+        // Unstamped, the inherent methods and the trait methods are two
+        // sets and neither outranks the other: when both have a method the
+        // arguments bind to, whether either is generic, the call is
+        // ambiguous (`report_inherent_trait_tie`).  Within each set a
+        // generic method's own type parameters bind by unification with the
+        // arguments, and the generic candidates are tried after the others.
         const want_trait: DefId = member.resolved_trait;
         mut sel: Selection = Selection::none();
         sel.owner_inst = owner_inst;
+        // The template's arena type carries no methods; its declaration and
+        // the impl blocks attached to it do.
+        mut tmpl: TemplateEntry* = null;
         if (owner_inst.is_valid()) {
-            // The template's arena type carries no methods; its declaration
-            // and the impl blocks attached to it do.
-            const tmpl: TemplateEntry* = if (this.ctx.generic_registry != null) {
-                this.ctx.generic_registry.template_of_type(base_ref)
-            } else { null };
+            if (this.ctx.generic_registry != null) {
+                tmpl = this.ctx.generic_registry.template_of_type(base_ref);
+            }
             if (tmpl == null) { return Selection::none(); }
-            if (want_trait.is_valid()) {
-                for (mut pass: i32 = 0; pass < 2; pass++) {
-                    if (this.select_on_template(visitor, call, member, tmpl, owner_str, &arg_types,
-                            want_trait, true, pass == 1, &sel)) { return sel; }
-                }
-            }
-            for (mut phase: i32 = 0; phase < 2; phase++) {
-                for (mut pass: i32 = 0; pass < 2; pass++) {
-                    if (this.select_on_template(visitor, call, member, tmpl, owner_str, &arg_types,
-                            DefId::invalid(), phase == 1, pass == 1, &sel)) { return sel; }
-                }
-            }
-            return Selection::none();
         }
-        if (want_trait.is_valid()) {
-            for (mut pass: i32 = 0; pass < 2; pass++) {
-                if (this.select_method(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
-                        owner_str, &arg_types, want_trait, true, pass == 1, &sel)) { return sel; }
-            }
+        if (want_trait.is_valid() && this.select_in_set(visitor, call, member, base_ref, base_t, start_cls,
+                methods_ref, &arg_types, tmpl, want_trait, true, &sel)) {
+            return this.commit_selection(visitor, call, sel);
         }
-        for (mut phase: i32 = 0; phase < 2; phase++) {
-            for (mut pass: i32 = 0; pass < 2; pass++) {
-                if (this.select_method(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
-                        owner_str, &arg_types, DefId::invalid(), phase == 1, pass == 1, &sel)) { return sel; }
+        if (this.select_in_set(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
+                &arg_types, tmpl, DefId::invalid(), false, &sel)) {
+            // An instantiation whose arguments are still a generic body's
+            // parameters is asked again where it is instantiated.
+            if (tmpl == null || !this.types.contains_generic_param(owner_inst)) {
+                this.report_inherent_trait_tie(visitor, call, member, base_ref, base_t, start_cls,
+                    methods_ref, &arg_types, tmpl, owner_inst, sel.chosen);
             }
+            return this.commit_selection(visitor, call, sel);
+        }
+        if (this.select_in_set(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
+                &arg_types, tmpl, DefId::invalid(), true, &sel)) {
+            return this.commit_selection(visitor, call, sel);
         }
         return Selection::none();
     }
 
-    /// Record the method a selection chose, its return seen through `view`
-    /// (null: as declared).  A receiver that is a minted type pins it on the
-    /// call; an instantiation not yet minted (`sel.owner_inst`) does not -
-    /// see `bind_method_on_receiver`.
-    choose_method(mut &this, call: CallExprNode*, mn: MethodNode*, owner_str: string,
+    /// Select in one candidate set - the inherent methods, or with
+    /// `from_trait` the trait methods, only `only_trait`'s when it is
+    /// valid - the non-generic methods before the generic ones.  `tmpl`,
+    /// when not null, is the template of the instantiation not yet minted
+    /// the receiver is (`sel.owner_inst`), whose candidates are read off it.
+    select_in_set(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+                  base_ref: TypeRef, base_t: Type*, start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
+                  arg_types: &TypeRef[], tmpl: TemplateEntry*, only_trait: DefId,
+                  from_trait: boolean, sel: Selection*) -> boolean {
+        for (mut pass: i32 = 0; pass < 2; pass++) {
+            if (tmpl != null) {
+                if (this.select_on_template(visitor, call, member, tmpl, arg_types,
+                        only_trait, from_trait, pass == 1, sel)) { return true; }
+            } else {
+                if (this.select_method(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
+                        arg_types, only_trait, from_trait, pass == 1, sel)) { return true; }
+            }
+        }
+        return false;
+    }
+
+    /// An inherent method the arguments bind to (`inherent`) and a trait
+    /// method of the same name they bind to are both candidates for an
+    /// unstamped call, and neither outranks the other: the call is
+    /// ambiguous, reported with every trait that offers the method.  The
+    /// caller names the trait's method through the impl-qualified path,
+    /// `(Trait for Owner)::member(args)`, or renames one of them.  Silent
+    /// when no trait method applies.  Reported in a generic body's walk too:
+    /// the receiver is a minted type, whose call is pinned here and not
+    /// selected again for an instantiation.
+    report_inherent_trait_tie(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+                              base_ref: TypeRef, base_t: Type*, start_cls: ClassType*,
+                              methods_ref: Slice<MethodInfo>, arg_types: &TypeRef[],
+                              tmpl: TemplateEntry*, owner_inst: TypeRef, inherent: MethodNode*) -> void {
+        if (inherent == null || inherent.func == null) { return; }
+        mut traits: DefId[] = [];
+        mut spans: SourceSpan[] = [];
+        // Every trait whose method applies, each asked alone: the trait set
+        // asked whole answers only its first.  Only the impls whose
+        // where-clauses hold for the receiver count, minted or not.
+        const subject: TypeRef = if (owner_inst.is_valid()) { owner_inst } else { base_ref };
+        const blocks: ImplBlockNode*[] = this.trait_checker().impls_of(subject);
+        for (mut ti: i64 = 0; ti < blocks.length; ti++) {
+            const tid: DefId = blocks[ti].trait_def;
+            if (!tid.is_valid()) { continue; }
+            mut seen: boolean = false;
+            for (mut k: i64 = 0; k < traits.length; k++) {
+                if (traits[k].equals(tid)) { seen = true; break; }
+            }
+            if (seen) { continue; }
+            mut one: Selection = Selection::none();
+            one.owner_inst = owner_inst;
+            if (!this.select_in_set(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
+                    arg_types, tmpl, tid, true, &one)) { continue; }
+            traits.push(tid);
+            const f: FunctionDeclNode* = one.chosen.func;
+            spans.push(if (f.has_name_span()) { f.name_span } else { f.span });
+        }
+        if (traits.length == 0) { return; }
+        this.report_method_call_tie(call, member, subject, &traits, &spans, inherent.func);
+    }
+
+    /// E0156 for a method call `recv.member(args)` on `owner`: the tie's
+    /// help quotes the call's receiver and arguments as the impl-qualified
+    /// form takes them.  See `report_trait_method_tie`.
+    report_method_call_tie(mut &this, call: CallExprNode*, member: MemberAccessNode*, owner: TypeRef,
+                           traits: &DefId[], decl_spans: &SourceSpan[], inherent: FunctionDeclNode*) -> void {
+        const args_text: string = this.receiver_call_args_text(call, member);
+        this.report_trait_method_tie(member.span, member.member, this.arena.resolve_display_name_short(owner),
+            traits, decl_spans, args_text, true, inherent);
+    }
+
+    /// A method call's arguments as the impl-qualified form writes them:
+    /// the receiver first - by reference when it is not one already, as
+    /// the method form's auto-ref made it - and the call's own arguments
+    /// after it, quoted from the source.
+    receiver_call_args_text(mut &this, call: CallExprNode*, member: MemberAccessNode*) -> string {
+        mut args_text: string = this.source_text(member.object.span);
+        if (args_text.length() == 0) { args_text = "receiver"; }
+        const recv_t: Type* = this.arena.lookup(member.object.resolved_type);
+        if (recv_t == null || recv_t.kind != TypeKind::Reference) { args_text = "&" + args_text; }
+        if (call.arguments.length > 0) {
+            const first: ExpressionNode* = call.arguments[0];
+            const last: ExpressionNode* = call.arguments[call.arguments.length - 1];
+            const rest: string = this.source_text(SourceSpan::new(Text::new(first.span.file),
+                first.span.start_line, first.span.start_col, last.span.end_line, last.span.end_col));
+            args_text = args_text + ", " + (if (rest.length() == 0) { "..." } else { rest });
+        }
+        return args_text;
+    }
+
+    /// Record the method a selection chose, the tier its arguments bound at
+    /// and its return seen through `view` (null: as declared).
+    choose_method(mut &this, mn: MethodNode*, tier: i32, info: MethodInfo*,
                   sel: Selection*, view: TypeSubstitution*) -> void {
         sel.chosen = mn;
+        sel.tier = tier;
+        sel.info = info;
         sel.ret = if (view != null) {
             this.seen_through(view, mn.func.resolved_return_type)
         } else { mn.func.resolved_return_type };
-        if (sel.owner_inst.is_valid()) { return; }
+    }
+
+    /// Bind the call to the method `sel` chose.  An argument that bound
+    /// only through an `![implicit]` converter is converted.  A receiver
+    /// that is a minted type pins the method on the call; an instantiation
+    /// not yet minted (`sel.owner_inst`) does not - see
+    /// `bind_method_on_receiver`.
+    commit_selection(mut &this, visitor: ASTVisitor*, call: CallExprNode*, sel: Selection) -> Selection {
+        const mn: MethodNode* = sel.chosen;
+        if (mn == null || sel.owner_inst.is_valid()) { return sel; }
+        if (sel.tier == 3) {
+            if (sel.info != null) {
+                this.apply_overload_converter_args(visitor, call, sel.info.param_types.as_slice());
+            } else {
+                mut params: TypeRef[] = [];
+                for (mut pi: i64 = 0; pi < mn.func.parameters.length; pi++) {
+                    const pp: VarDeclNode* = mn.func.parameters[pi];
+                    if (pp == null || pp.is_receiver()) { continue; }
+                    params.push(pp.resolved_type);
+                }
+                this.apply_overload_converter_args(visitor, call, params.as_slice());
+            }
+        }
         call.set_resolved_method(mn as ASTNode*);
-        this.pin_method_callee_from_qname(call, owner_str, mn, mn.is_static);
+        this.pin_method_callee(call, mn, mn.is_static);
+        return sel;
     }
 
     /// `ty` as a receiver sees it through `view`: its parameters substituted,
@@ -3092,22 +3196,18 @@ type struct CallResolver {
     /// selected for the instantiation.
     select_method(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
                   base_ref: TypeRef, base_t: Type*, start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
-                  owner_str: string, arg_types: &TypeRef[], only_trait: DefId, from_trait: boolean,
+                  arg_types: &TypeRef[], only_trait: DefId, from_trait: boolean,
                   generic: boolean, sel: Selection*) -> boolean {
         if (only_trait.is_valid() && !from_trait) { return false; }
         // The receiver's own list holds its inherent methods and the methods
         // its trait impls deliver, in declaration order; `from_trait` says
         // which of the two it is asked for, so the order two `implement`
         // blocks were written in does not decide which body a call runs.
-        mut own_owner: string = "";
         mut own_tier: i32 = 0;
-        const own: MethodInfo* = this.pick_own_method(call, member, start_cls, methods_ref, owner_str,
-                                   arg_types, only_trait, from_trait, generic, &own_owner, &own_tier);
+        const own: MethodInfo* = this.pick_own_method(call, member, start_cls, methods_ref,
+                                   arg_types, only_trait, from_trait, generic, &own_tier);
         if (own != null) {
-            if (own_tier == 3) {
-                this.apply_overload_converter_args(visitor, call, own.param_types.as_slice());
-            }
-            this.choose_method(call, own.ast_node as MethodNode*, own_owner, sel, null);
+            this.choose_method(own.ast_node as MethodNode*, own_tier, own, sel, null);
             return true;
         }
 
@@ -3120,7 +3220,7 @@ type struct CallResolver {
             if (start_cls == null && base_t.kind != TypeKind::Struct && base_t.kind != TypeKind::Enum) {
                 const blocks: ImplBlockNode*[] = this.ctx.generic_registry.inherent_impl_blocks(base_ref);
                 for (mut bi: i64 = 0; bi < blocks.length; bi++) {
-                    if (this.bind_on_impl_block(visitor, call, member, blocks[bi], owner_str, arg_types, generic, sel)) { return true; }
+                    if (this.bind_on_impl_block(visitor, call, member, blocks[bi], arg_types, generic, sel)) { return true; }
                 }
             }
             return false;
@@ -3135,7 +3235,7 @@ type struct CallResolver {
             const block: ImplBlockNode* = blocks[ti];
             // WHICH trait the block provides is the head's stamped identity.
             if (only_trait.is_valid() && !block.trait_def.equals(only_trait)) { continue; }
-            if (this.bind_on_impl_block(visitor, call, member, block, owner_str, arg_types, generic, sel)) { return true; }
+            if (this.bind_on_impl_block(visitor, call, member, block, arg_types, generic, sel)) { return true; }
         }
         return false;
     }
@@ -3145,18 +3245,16 @@ type struct CallResolver {
     /// each tier before the next.  `from_trait` selects the set: the methods
     /// a trait impl delivers, or the inherent ones.  With `only_trait`, only
     /// that trait's methods are candidates; `generic` takes the generic
-    /// methods, the others otherwise.  Writes the owner the method was found
-    /// on and the tier it bound at.
+    /// methods, the others otherwise.  Writes the tier it bound at.
     pick_own_method(mut &this, call: CallExprNode*, member: MemberAccessNode*,
-                    start_cls: ClassType*, methods_ref: Slice<MethodInfo>, owner_str: string,
+                    start_cls: ClassType*, methods_ref: Slice<MethodInfo>,
                     arg_types: &TypeRef[], only_trait: DefId, from_trait: boolean, generic: boolean,
-                    out_owner: string*, out_tier: i32*) -> MethodInfo* {
+                    out_tier: i32*) -> MethodInfo* {
         for (mut tier: i32 = 0; tier <= 3; tier++) {
             if (tier == 3 && this.state.in_implicit_conversion) { break; }
             mut walk: ClassType* = start_cls;
             mut depth: i32 = 0;
             mut cur_methods: Slice<MethodInfo> = methods_ref;
-            mut cur_owner: string = owner_str;
             while (depth < 16) {
                 for (mut mi: u64 = 0; mi < cur_methods.length; mi++) {
                     const m: MethodInfo* = cur_methods.get_ref(mi).unwrap();
@@ -3167,7 +3265,6 @@ type struct CallResolver {
                     if ((mfn != null && mfn.generic_params.length > 0) != generic) { continue; }
                     if (!this.method_args_bind(call, arg_types, m.param_types.as_slice(),
                             this.method_type_is_variadic(m.function_type), tier, mfn, null)) { continue; }
-                    *out_owner = cur_owner;
                     *out_tier = tier;
                     return m;
                 }
@@ -3177,7 +3274,6 @@ type struct CallResolver {
                 if (parent_t == null || parent_t.kind != TypeKind::Class) { break; }
                 walk = parent_t as ClassType*;
                 cur_methods = walk.methods.as_slice();
-                cur_owner = this.intern.resolve(walk.qualified_name);
                 depth += 1;
             }
         }
@@ -3198,7 +3294,7 @@ type struct CallResolver {
     /// impl blocks, the trait set the trait impls selected for the
     /// instantiation.
     select_on_template(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
-                       tmpl: TemplateEntry*, owner_str: string, arg_types: &TypeRef[],
+                       tmpl: TemplateEntry*, arg_types: &TypeRef[],
                        only_trait: DefId, from_trait: boolean, generic: boolean,
                        sel: Selection*) -> boolean {
         if (only_trait.is_valid() && !from_trait) { return false; }
@@ -3213,18 +3309,18 @@ type struct CallResolver {
             const decl: ASTNode* = tmpl.ast_node;
             if (decl != null && decl.kind == NodeKind::StructDeclaration) {
                 if (this.bind_on_methods(visitor, call, member, &(decl as StructDeclNode*).methods,
-                        owner_str, arg_types, generic, sel, &view)) { return true; }
+                        arg_types, generic, sel, &view)) { return true; }
             } else if (decl != null && decl.kind == NodeKind::UnionDeclaration) {
                 if (this.bind_on_methods(visitor, call, member, &(decl as UnionDeclNode*).methods,
-                        owner_str, arg_types, generic, sel, &view)) { return true; }
+                        arg_types, generic, sel, &view)) { return true; }
             } else if (decl != null && decl.kind == NodeKind::ClassDeclaration) {
                 if (this.bind_on_methods(visitor, call, member, &(decl as ClassDeclNode*).methods,
-                        owner_str, arg_types, generic, sel, &view)) { return true; }
+                        arg_types, generic, sel, &view)) { return true; }
             }
             for (mut bi: i64 = 0; bi < tmpl.impl_blocks.length; bi++) {
                 const block: ImplBlockNode* = tmpl.impl_blocks[bi];
                 if (block == null || block.is_trait_impl()) { continue; }
-                if (this.bind_on_impl_block(visitor, call, member, block, owner_str, arg_types, generic, sel)) { return true; }
+                if (this.bind_on_impl_block(visitor, call, member, block, arg_types, generic, sel)) { return true; }
             }
             return false;
         }
@@ -3238,18 +3334,18 @@ type struct CallResolver {
         for (mut ti: i64 = 0; ti < blocks.length; ti++) {
             const block: ImplBlockNode* = blocks[ti];
             if (only_trait.is_valid() && !block.trait_def.equals(only_trait)) { continue; }
-            if (this.bind_on_impl_block(visitor, call, member, block, owner_str, arg_types, generic, sel)) { return true; }
+            if (this.bind_on_impl_block(visitor, call, member, block, arg_types, generic, sel)) { return true; }
         }
         return false;
     }
 
     /// Select among one impl block's methods; see `bind_on_methods`.
     bind_on_impl_block(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
-                       block: ImplBlockNode*, owner_str: string, arg_types: &TypeRef[],
+                       block: ImplBlockNode*, arg_types: &TypeRef[],
                        generic: boolean, sel: Selection*) -> boolean {
         if (block == null) { return false; }
         if (!sel.owner_inst.is_valid()) {
-            return this.bind_on_methods(visitor, call, member, &block.methods, owner_str, arg_types,
+            return this.bind_on_methods(visitor, call, member, &block.methods, arg_types,
                                         generic, sel, null);
         }
         // A block's methods are written in the block's own parameters, which
@@ -3262,7 +3358,7 @@ type struct CallResolver {
         mut view: TypeSubstitution = TypeSubstitution::empty();
         this.trait_checker().add_head_param_bindings(block, &args, &view);
         this.bind_where_only_params(block, &view);
-        return this.bind_on_methods(visitor, call, member, &block.methods, owner_str, arg_types,
+        return this.bind_on_methods(visitor, call, member, &block.methods, arg_types,
                                     generic, sel, &view);
     }
 
@@ -3321,7 +3417,7 @@ type struct CallResolver {
     /// when not null, is how the receiver sees the parameters the list is
     /// written in.  Returns true when the call was bound.
     bind_on_methods(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
-                    methods: &MethodNode*[], owner_str: string, arg_types: &TypeRef[],
+                    methods: &MethodNode*[], arg_types: &TypeRef[],
                     generic: boolean, sel: Selection*, view: TypeSubstitution*) -> boolean {
         // A self-returning default (an iterator adapter's `take`) is a
         // template the block carries until a concrete sibling is minted;
@@ -3353,10 +3449,7 @@ type struct CallResolver {
                 }
                 if (!this.method_args_bind(call, arg_types, params.as_slice(), fn_node.is_variadic, tier, fn_node,
                         view)) { continue; }
-                if (tier == 3 && !sel.owner_inst.is_valid()) {
-                    this.apply_overload_converter_args(visitor, call, params.as_slice());
-                }
-                this.choose_method(call, mn, owner_str, sel, view);
+                this.choose_method(mn, tier, null, sel, view);
                 return true;
             }
         }
@@ -3619,9 +3712,18 @@ type struct CallResolver {
             // projection receiver is constrained enough to type the call exactly;
             // this early return sits before both rescues further down (past the
             // type-symbol lookup), making them unreachable in a symbolic walk.
+            //
+            // A call a bound answered names that trait's method, and the
+            // node keeps it: the receiver is substituted by monomorphization,
+            // and the type it becomes may declare a method of the same name
+            // the generic body could not see.
+            mut dir: BoundDirection = BoundDirection::none();
             const abs_ret: TypeRef =
-                this.binding.abstract_receiver_method_return(obj_type, member.member);
+                this.binding.abstract_receiver_method_return(obj_type, member.member, &dir);
             if (abs_ret.is_valid()) {
+                if (dir.named().is_valid() && !member.resolved_trait.is_valid()) {
+                    member.set_resolved_trait(dir.named());
+                }
                 member.set_resolved_type(abs_ret);
                 return abs_ret;
             }
@@ -4576,7 +4678,7 @@ type struct CallResolver {
                 first.span.start_line, first.span.start_col, last.span.end_line, last.span.end_col));
         }
         this.report_trait_method_tie(path.span, path.member_name, this.intern.resolve(path.scope_name),
-            &traits, &spans, args_text, call != null);
+            &traits, &spans, args_text, call != null, null);
     }
 
     /// The source text under a single-line `span`, or "" when it spans lines
@@ -4592,26 +4694,39 @@ type struct CallResolver {
     }
 
     /// E0156: `member` is provided for `owner` by every trait in `traits`, at
-    /// the signature the use selects, and no inherent method outranks them.
-    /// A tie is an error, never a pick by declaration or import order.  Each
-    /// candidate is named where it is declared (`decl_spans`), and the help
-    /// names the spelling that chooses: the impl-qualified path
+    /// the signature the use selects - and, when `inherent` is not null, by
+    /// that inherent method too, which outranks none of them.  A tie is an
+    /// error, never a pick by declaration or import order.  Each candidate
+    /// is named where it is declared (`decl_spans`), and the help names the
+    /// spelling that chooses a trait's: the impl-qualified path
     /// `(Trait for Owner)::member(args)`, one rule for a method with a
     /// receiver (the receiver its first argument, as `args_text` carries
-    /// it), a static method, and a method taken as a value.  Silent during
-    /// a symbolic generic-body walk: the concrete instantiation reports.
+    /// it), a static method, and a method taken as a value.  A tie of
+    /// traits alone is silent during a symbolic generic-body walk: the
+    /// concrete instantiation reports.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     report_trait_method_tie(mut &this, span: SourceSpan, member: SymbolStr, owner_display: string,
                             traits: &DefId[], decl_spans: &SourceSpan[],
-                            args_text: string, is_call: boolean) -> void {
-        if (this.state.in_symbolic_check) { return; }
+                            args_text: string, is_call: boolean, inherent: FunctionDeclNode*) -> void {
+        if (this.state.in_symbolic_check && inherent == null) { return; }
         const member_str: string = this.intern.resolve(member);
-        mut diag: Diagnostic = Diagnostic::error(
-            ErrorCode::E0156_AMBIGUOUS_TRAIT_METHOD,
-            Text::new(fmt::format("`%s` is provided by more than one trait implemented for `%s`",
-                member_str, owner_display)));
+        const primary: string = if (inherent != null) {
+            fmt::format("`%s` is both an inherent method of `%s` and provided by a trait implemented for it",
+                member_str, owner_display)
+        } else {
+            fmt::format("`%s` is provided by more than one trait implemented for `%s`", member_str, owner_display)
+        };
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0156_AMBIGUOUS_TRAIT_METHOD, Text::new(primary));
         diag = diag.at_with_label(span,
             Text::new(fmt::format("which `%s` is meant here is ambiguous", member_str)));
+        // The inherent candidate is named first; the traits' number after it.
+        mut first_trait: i32 = 1;
+        if (inherent != null) {
+            const inh_note: string = fmt::format("candidate #1: the inherent method `%s::%s`", owner_display, member_str);
+            const inh_span: SourceSpan = if (inherent.has_name_span()) { inherent.name_span } else { inherent.span };
+            diag = if (inh_span.has_location()) { diag.with_note_at(Text::new(inh_note), inh_span) } else { diag.with_note(Text::new(inh_note)) };
+            first_trait = 2;
+        }
         // Two candidates of one leaf (`Alpha::Render`, `Omega::Render`) are
         // told apart only by their full paths; otherwise the leaf reads as
         // the program writes it.
@@ -4626,13 +4741,16 @@ type struct CallResolver {
             const trait_str: string = this.intern.resolve(this.ctx.defs.path_of(traits[i]));
             const leaf: string = if (leaf_collides) { trait_str } else { QualifiedName::leaf_of(trait_str) };
             const note: string = fmt::format("candidate #%d: `%s::%s`, from `implement trait %s for %s`",
-                (i + 1) as i32, leaf, member_str, trait_str, owner_display);
+                (i as i32) + first_trait, leaf, member_str, trait_str, owner_display);
             diag = if (decl_spans[i].has_location()) { diag.with_note_at(Text::new(note), decl_spans[i]) } else { diag.with_note(Text::new(note)) };
             const form: string = if (is_call) { fmt::format("`(%s for %s)::%s(%s)`", leaf, owner_display, member_str, args_text) }
                                  else { fmt::format("`(%s for %s)::%s`", leaf, owner_display, member_str) };
             help = if (help.length() == 0) { form } else { help + " or " + form };
         }
-        diag = diag.help(Text::new(fmt::format("name the implementation the call is meant through: %s", help)));
+        const help_line: string = if (inherent != null) {
+            fmt::format("neither outranks the other: call the trait's method as %s, or rename one of them", help)
+        } else { fmt::format("name the implementation the call is meant through: %s", help) };
+        diag = diag.help(Text::new(help_line));
         this.ctx.emit_diagnostic(diag);
     }
 

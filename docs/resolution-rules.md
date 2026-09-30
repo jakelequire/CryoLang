@@ -187,10 +187,10 @@ yet is recorded with the change that builds it, not here.
     a unit of its own. Today a generic type and a generic function of the
     same name collide in it.
 
-13. **An inherent method wins over a trait method**, as `docs/cryo.md`
-    ("Which Method a Call Names") says - whether either is generic. Today a
-    non-generic trait method beats a generic inherent one; that changes,
-    measured before it does.
+13. *Superseded by ruling 22.* **An inherent method wins over a trait
+    method**, as `docs/cryo.md` ("Which Method a Call Names") said - whether
+    either is generic. Today a non-generic trait method beats a generic
+    inherent one; that changes, measured before it does.
 
     ```cryo
     type trait Show { show(&this, x: i32) -> i32; }
@@ -255,6 +255,49 @@ yet is recorded with the change that builds it, not here.
     standard library. A library change that alters behaviour is proven by a
     test project of its own, the way a counting transport proves that a
     `BufStream` releases what it wraps once. verify is not extended.
+
+21. *Superseded by ruling 22 the same day.* **A generic inherent method and
+    a non-generic trait method of the same name that both apply to a call
+    make the call ambiguous.**
+
+22. **Whenever an inherent method and a trait method of the same name both
+    apply to a call, the call is an ambiguity error**, in every combination
+    of generic and non-generic receiver and method. There is no precedence
+    rule. The caller writes `(Trait for Owner)::member(args)` or renames one
+    of them. This supersedes ruling 13.
+
+    ```cryo
+    type trait Beta { go(&this, u: i32) -> i64; }
+    type struct IgTn { v: i32; }
+    implement trait Beta for IgTn { go(&this, u: i32) -> i64 { return 2; } }
+    implement struct IgTn { go<U>(&this, u: U) -> i64 { return 1; } }
+
+    const n: i64 = ig.go(7);                     // error: both `go`s apply
+    const m: i64 = (Beta for IgTn)::go(&ig, 7);  // Beta's: 2
+    ```
+
+24. **Ruling 22's ambiguity is E0156**, the error for a name more than one
+    trait provides, whose help already writes
+    `(Trait for Owner)::member(args)`, with a primary line that names the
+    inherent method.
+
+    ```
+    error[E0156]: `go` is both an inherent method of `IgTn` and provided by a trait implemented for it
+     note: candidate #1: the inherent method `IgTn::go`
+     note: candidate #2: `Beta::go`, from `implement trait Beta for IgTn`
+     help: neither outranks the other: call the trait's method as `(Beta for IgTn)::go(&ig, 7)`, or rename one of them
+    ```
+
+25. **A call written on a bounded type parameter means the bound's method,
+    full stop**, as in Rust. Generic code sees only its bounds, so an
+    instantiation never makes such a call ambiguous or redirects it to an
+    inherent method the instantiated type also has.
+
+    ```cryo
+    function same<T>(x: &T, y: &T) -> boolean where T: Eq {
+        return x.equals(y);   // Eq::equals, even for a T with an inherent `equals`
+    }
+    ```
 
 ### 2026-09-28
 

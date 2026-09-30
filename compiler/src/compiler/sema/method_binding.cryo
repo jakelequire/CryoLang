@@ -72,6 +72,33 @@ import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ ClassType, MethodInfo, TraitType };
 import utils::text::{ Text };
 
+/// The trait a call on a bounded receiver names: every trait a bound
+/// answers the method through is noted, and the call names one only when
+/// they are all the same trait.  Two traits providing the name direct
+/// nothing; the instantiation reports the tie.
+type struct BoundDirection {
+    trait_def: DefId;
+    tied:      boolean;
+
+    static none() -> BoundDirection {
+        return BoundDirection { trait_def: DefId::invalid(), tied: false };
+    }
+
+    note(mut &this, d: DefId) -> void {
+        if (this.tied || !d.is_valid()) { return; }
+        if (!this.trait_def.is_valid()) { this.trait_def = d; return; }
+        if (!this.trait_def.equals(d)) {
+            this.tied = true;
+            this.trait_def = DefId::invalid();
+        }
+    }
+
+    /// The one trait noted, or invalid when none was or two were.
+    named(&this) -> DefId {
+        return this.trait_def;
+    }
+}
+
 type struct MethodBinding {
     arena:    TypeArena*;
     intern:   InternTable*;
@@ -224,25 +251,26 @@ type struct MethodBinding {
     /// projection (`where This::Item: Ord`), resolve `method_name` through the
     /// bound trait(s). The bound is matched to the receiver by the projected
     /// MEMBER name, which distinguishes e.g. `This::Item` from `This::Key`
-    /// inside one method's where-clause.
+    /// inside one method's where-clause.  `dir` notes every trait the
+    /// bounds answer through, as for a bare parameter.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     lookup_method_through_projection_bounds(mut &this, proj: AssocProjectionType*,
                                             recv: TypeRef,
-                                            method_name: SymbolStr) -> TypeRef {
+                                            method_name: SymbolStr, dir: BoundDirection*) -> TypeRef {
         if (proj == null) { return TypeRef::invalid(); }
         const member: SymbolStr = proj.member;
         if (!member.is_valid()) { return TypeRef::invalid(); }
+        mut out: TypeRef = TypeRef::invalid();
         if (this.state.symbolic_current_func != null) {
-            const r: TypeRef = this.scan_projection_bounds(
-                &this.state.symbolic_current_func.trait_bounds, member, method_name, recv);
-            if (r.is_valid()) { return r; }
+            out = this.scan_projection_bounds(&this.state.symbolic_current_func.trait_bounds, member,
+                method_name, recv, true, dir);
         }
         if (this.state.symbolic_impl_node != null) {
-            const r: TypeRef = this.scan_projection_bounds(
-                &this.state.symbolic_impl_node.where_bounds, member, method_name, recv);
-            if (r.is_valid()) { return r; }
+            const r: TypeRef = this.scan_projection_bounds(&this.state.symbolic_impl_node.where_bounds,
+                member, method_name, recv, !out.is_valid(), dir);
+            if (!out.is_valid()) { out = r; }
         }
-        return TypeRef::invalid();
+        return out;
     }
 
     /// Type a method call whose receiver is ABSTRACT, by resolving `method_name`
@@ -256,8 +284,12 @@ type struct MethodBinding {
     /// `resolve_method_call` can fire, and the use site reads `void`. The bounds
     /// determine the signature exactly, so the call can and must be typed here.
     /// Pointer/reference wrappers are peeled first; invalid for any other shape.
+    /// `dir` notes each trait a bound answered through: the one it names,
+    /// when it is one, is the method the call names wherever the receiver
+    /// is later substituted.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    abstract_receiver_method_return(mut &this, recv_type: TypeRef, method_name: SymbolStr) -> TypeRef {
+    abstract_receiver_method_return(mut &this, recv_type: TypeRef, method_name: SymbolStr,
+                                    dir: BoundDirection*) -> TypeRef {
         mut walk: TypeRef = recv_type;
         mut t: Type* = this.arena.lookup(walk);
         mut depth: i32 = 0;
@@ -275,11 +307,11 @@ type struct MethodBinding {
         if (t == null) { return TypeRef::invalid(); }
         if (t.kind == TypeKind::AssocProjection) {
             return this.lookup_method_through_projection_bounds(
-                t as AssocProjectionType*, walk, method_name);
+                t as AssocProjectionType*, walk, method_name, dir);
         }
         if (t.kind == TypeKind::GenericParam) {
             return this.lookup_method_through_param_bounds(
-                t as GenericParamType*, walk, method_name);
+                t as GenericParamType*, walk, method_name, dir);
         }
         // A generic owner instantiated at a still-abstract argument (`H<S>` built
         // inside a generic function) is "unresolved" only in its ARGUMENTS: the
@@ -302,31 +334,37 @@ type struct MethodBinding {
     /// its type, so they are read there. The bare-parameter sibling of
     /// `lookup_method_through_projection_bounds`.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
+    ///
+    /// The function's bounds answer first, then the impl's, then the owner
+    /// declaration's; `dir` notes every trait any of them answers through,
+    /// so two traits providing the name leave the call undirected.
     lookup_method_through_param_bounds(mut &this, param: GenericParamType*, recv: TypeRef,
-                                       method_name: SymbolStr) -> TypeRef {
+                                       method_name: SymbolStr, dir: BoundDirection*) -> TypeRef {
         if (param == null) { return TypeRef::invalid(); }
         // `This` in a trait's default method is bounded by that trait alone,
         // which no where-clause writes.
         if (this.arena.is_this_placeholder(param as Type*)) {
             if (!this.state.symbolic_trait.is_valid()) { return TypeRef::invalid(); }
             mut none: TraitBound[] = [];
-            return this.scan_param_bounds(&none, param, method_name, recv, this.state.symbolic_trait);
+            return this.scan_param_bounds(&none, param, method_name, recv, this.state.symbolic_trait, true, dir);
         }
+        mut out: TypeRef = TypeRef::invalid();
         if (this.state.symbolic_current_func != null) {
-            const r: TypeRef = this.scan_param_bounds(
-                &this.state.symbolic_current_func.trait_bounds, param, method_name, recv, TypeRef::invalid());
-            if (r.is_valid()) { return r; }
+            out = this.scan_param_bounds(&this.state.symbolic_current_func.trait_bounds, param, method_name,
+                recv, TypeRef::invalid(), true, dir);
         }
         if (this.state.symbolic_impl_node != null) {
-            const r: TypeRef = this.scan_param_bounds(
-                &this.state.symbolic_impl_node.where_bounds, param, method_name, recv, TypeRef::invalid());
-            if (r.is_valid()) { return r; }
+            const r: TypeRef = this.scan_param_bounds(&this.state.symbolic_impl_node.where_bounds, param,
+                method_name, recv, TypeRef::invalid(), !out.is_valid(), dir);
+            if (!out.is_valid()) { out = r; }
         }
         const owner_bounds: TraitBound[]* = this.owner_declared_bounds();
         if (owner_bounds != null) {
-            return this.scan_param_bounds(owner_bounds, param, method_name, recv, TypeRef::invalid());
+            const r: TypeRef = this.scan_param_bounds(owner_bounds, param, method_name, recv,
+                TypeRef::invalid(), !out.is_valid(), dir);
+            if (!out.is_valid()) { out = r; }
         }
-        return TypeRef::invalid();
+        return out;
     }
 
     /// The `where` bounds written on the declaration of the type whose
@@ -400,9 +438,14 @@ type struct MethodBinding {
     /// `scan_projection_bounds`.  `implied`, when valid, is a bound no
     /// where-clause writes - the trait bounding `This` in its own default
     /// methods - asked before `bounds`, with no associated-type arguments.
+    /// Every bound is asked, and each trait - the bound's, or the
+    /// supertrait's - whose declaration answers is noted in `dir`; the
+    /// return is the first answer's, computed only when `need_ret`.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     scan_param_bounds(mut &this, bounds: &TraitBound[], param: GenericParamType*,
-                      method_name: SymbolStr, recv: TypeRef, implied: TypeRef) -> TypeRef {
+                      method_name: SymbolStr, recv: TypeRef, implied: TypeRef,
+                      need_ret: boolean, dir: BoundDirection*) -> TypeRef {
+        mut out: TypeRef = TypeRef::invalid();
         const first: i64 = if (implied.is_valid()) { -1 } else { 0 };
         for (mut bi: i64 = first; bi < bounds.length; bi++) {
             const b: TraitBound* = if (bi < 0) { null } else { &bounds[bi] };
@@ -433,14 +476,21 @@ type struct MethodBinding {
                         this.ctx.decl_index.type_of_def(chain[k]) };
                     const ret: TypeRef = this.types.lookup_method_return(asked, method_name);
                     if (!ret.is_valid()) { continue; }
-                    if (tr == null || k > 0) { return this.subst_this_in_trait_return(ret, recv); }
-                    const leaf: SymbolStr = tr.path[tr.path.length - 1];
-                    const sub: TypeRef = this.subst_bound_assoc_args(ret, leaf, tr);
-                    return this.subst_this_in_trait_return(sub, recv);
+                    dir.note(if (k == 0) { bound_def } else { chain[k] });
+                    if (need_ret && !out.is_valid()) {
+                        if (tr == null || k > 0) {
+                            out = this.subst_this_in_trait_return(ret, recv);
+                        } else {
+                            const leaf: SymbolStr = tr.path[tr.path.length - 1];
+                            const sub: TypeRef = this.subst_bound_assoc_args(ret, leaf, tr);
+                            out = this.subst_this_in_trait_return(sub, recv);
+                        }
+                    }
+                    break;
                 }
             }
         }
-        return TypeRef::invalid();
+        return out;
     }
 
     /// `trait_def` followed by its supertraits, transitively, by identity;
@@ -524,7 +574,9 @@ type struct MethodBinding {
     /// `method_name`. Mirrors the trait-scan in `lookup_method_through_bounds`.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     scan_projection_bounds(mut &this, bounds: &TraitBound[], member: SymbolStr,
-                           method_name: SymbolStr, recv: TypeRef) -> TypeRef {
+                           method_name: SymbolStr, recv: TypeRef, need_ret: boolean,
+                           dir: BoundDirection*) -> TypeRef {
+        mut out: TypeRef = TypeRef::invalid();
         for (mut bi: i64 = 0; bi < bounds.length; bi++) {
             const b: TraitBound* = &bounds[bi];
             if (b.subject_type == null) { continue; }
@@ -542,18 +594,22 @@ type struct MethodBinding {
                     const ret: TypeRef = this.types.lookup_method_return(
                         this.ctx.decl_index.type_of_def(chain[k]), method_name);
                     if (!ret.is_valid()) { continue; }
-                    // A supertrait's return has only `This` rebased: the
-                    // bound's arguments are the named trait's.
-                    if (k > 0) { return this.subst_this_in_trait_return(ret, recv); }
-                    // Bound-supplied assoc args first (`Future<i64>` -> Output);
-                    // any `This` the bound left unbound then rebases onto the
-                    // projection receiver rather than dangling.
-                    const sub: TypeRef = this.subst_bound_assoc_args(ret, leaf, tr);
-                    return this.subst_this_in_trait_return(sub, recv);
+                    dir.note(chain[k]);
+                    if (need_ret && !out.is_valid()) {
+                        // A supertrait's return has only `This` rebased: the
+                        // bound's arguments are the named trait's.
+                        // Bound-supplied assoc args first (`Future<i64>` ->
+                        // Output); any `This` the bound left unbound then
+                        // rebases onto the projection receiver rather than
+                        // dangling.
+                        out = if (k > 0) { this.subst_this_in_trait_return(ret, recv) } else {
+                            this.subst_this_in_trait_return(this.subst_bound_assoc_args(ret, leaf, tr), recv) };
+                    }
+                    break;
                 }
             }
         }
-        return TypeRef::invalid();
+        return out;
     }
 
     /// Substitute a bound's associated-type arguments into a trait-method return
