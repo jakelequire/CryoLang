@@ -1469,8 +1469,20 @@ type struct MethodBinding {
     solve_method_bindings(mut &this, orig_func: FunctionDeclNode*,
                           owner_ctx: ResolutionContext*, member: MemberAccessNode*,
                           call: CallExprNode*) -> TypeRef[] {
+        if (member == null) { return []; }
+        return this.solve_method_bindings_at(orig_func, owner_ctx, &member.generic_args, call, 0);
+    }
+
+    /// `solve_method_bindings` for a call whose method arguments start at
+    /// `first_arg` - 0 for `recv.m(args)`, 1 for a path call
+    /// `Owner::m(recv, args)`, whose receiver is its first argument - with
+    /// the turbofish `generic_args` the call wrote for the method.
+    solve_method_bindings_at(mut &this, orig_func: FunctionDeclNode*,
+                             owner_ctx: ResolutionContext*, generic_args: &TypeAnnotation*[],
+                             call: CallExprNode*, first_arg: i64) -> TypeRef[] {
         if (this.ctx.type_resolver == null) { return []; }
-        if (orig_func == null || call == null || member == null) { return []; }
+        if (orig_func == null || call == null) { return []; }
+        if (call.arguments.length < first_arg) { return []; }
         const n_method_params: i64 = orig_func.generic_params.length;
         if (n_method_params == 0) { return []; }
 
@@ -1479,7 +1491,7 @@ type struct MethodBinding {
             method_bindings.push(TypeRef::invalid());
         }
 
-        if (member.generic_args.length == n_method_params && member.generic_args.length > 0) {
+        if (generic_args.length == n_method_params && generic_args.length > 0) {
             // Explicit turbofish is authoritative.  CRITICAL: resolve in the
             // CALLER's scope, NOT through `owner_ctx` (which would shadow an
             // enclosing param sharing the receiver's param name).  Inside a
@@ -1494,7 +1506,7 @@ type struct MethodBinding {
             for (mut i: i64 = 0; i < n_method_params; i++) {
                 const tf_ctx: ResolutionContext* =
                     if (use_symbolic) { &tf_ctx_buf } else { owner_ctx };
-                const tr: TypeRef = this.ctx.type_resolver.resolve(member.generic_args[i], tf_ctx);
+                const tr: TypeRef = this.ctx.type_resolver.resolve(generic_args[i], tf_ctx);
                 if (!tr.is_valid()) { return []; }
                 if (this.types.contains_generic_param(tr) && !this.state.in_symbolic_check) {
                     return [];
@@ -1521,13 +1533,14 @@ type struct MethodBinding {
                 if (p.is_receiver()) { continue; }
                 explicit_params.push(p);
             }
-            if (explicit_params.length != call.arguments.length) { return []; }
+            const n_args: i64 = call.arguments.length - first_arg;
+            if (explicit_params.length != n_args) { return []; }
 
             mut ictx: InferCtx = InferCtx::for_template(this.arena, method_param_ids);
             // Resolve each parameter's formal type once (in the fresh-param
             // context), so all three inference passes share it.
             mut formals: TypeRef[] = [];
-            for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            for (mut i: i64 = 0; i < n_args; i++) {
                 const param: VarDeclNode* = explicit_params[i];
                 if (param == null || param.type_annotation == null) { return []; }
                 mut formal: TypeRef = this.ctx.type_resolver.resolve(param.type_annotation, &infer_ctx);
@@ -1541,8 +1554,8 @@ type struct MethodBinding {
             // context/adoption bind them, exactly as the free-function inference
             // path does. A SUFFIXED literal (`100u64`) is not skipped: the suffix
             // is its type, so it binds `T` like any other typed argument.
-            for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                const arg: ExpressionNode* = call.arguments[i];
+            for (mut i: i64 = 0; i < n_args; i++) {
+                const arg: ExpressionNode* = call.arguments[first_arg + i];
                 if (arg == null) { return []; }
                 if (this.method_arg_is_polymorphic_literal(arg)) { continue; }
                 const actual: TypeRef = arg.resolved_type;
@@ -1571,8 +1584,8 @@ type struct MethodBinding {
             }
             // PASS C - a polymorphic literal adopts whatever its param now binds;
             // if still unbound, it falls back to the literal's own default type.
-            for (mut i: i64 = 0; i < call.arguments.length; i++) {
-                const arg: ExpressionNode* = call.arguments[i];
+            for (mut i: i64 = 0; i < n_args; i++) {
+                const arg: ExpressionNode* = call.arguments[first_arg + i];
                 if (arg == null) { return []; }
                 if (!this.method_arg_is_polymorphic_literal(arg)) { continue; }
                 const f_idx: i64 = ictx.binding_index(formals[i]);

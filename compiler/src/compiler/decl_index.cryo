@@ -15,7 +15,8 @@
 
 namespace compiler::decl_index;
 
-import compiler::ast::{ TypeAnnotation };
+import compiler::ast::{ NodeKind, TypeAnnotation };
+import compiler::ast::node::{ ASTNode };
 import compiler::ast::declaration;
 import compiler::ast::declaration::{ FunctionDeclNode, ImplBlockNode, MethodNode, VarDeclNode };
 import compiler::types;
@@ -221,6 +222,10 @@ type struct DeclarationIndex {
                                       // monomorphized clone under its identifier),
                                       // else 0.
     overload_func_span:    SourceSpan[]; // where the entry's declaration is written
+    overload_func_decl:    ASTNode*[];   // the declaration the entry was first
+                                      // registered for: a method's MethodNode,
+                                      // a function's FunctionDeclNode; null for
+                                      // an entry registered with no node
     overload_func_trait:   DefId[];     // SymbolStr.id of the trait a trait-impl
                                       // method implements, else 0: an inherent
                                       // method beside a trait's under one key
@@ -317,6 +322,7 @@ public:
             overload_func_owner:   [],
             overload_func_trait:   [],
             overload_func_span:    [],
+            overload_func_decl:    [],
             overload_func_intrinsic: [],
             overload_index:     HashMap::<u64, u32[]>::new(),
             extern_symbol_first: HashMap::<u32, Pair<u32, u64>>::new(),
@@ -428,11 +434,13 @@ public:
     /// again answers the existing entry; a different symbol under the same
     /// family and signature is a different definition and appends its own.
     /// The id is the declaration's identity for every later consumer: the
-    /// registrar stamps it on the node, and a call pins it.
+    /// registrar stamps it on the node, and a call pins it.  `decl` is that
+    /// node, answered by `entry_decl`; an entry answered again keeps the
+    /// node it was first registered for.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     register_signature(mut &this, owner: FamilyOwner, leaf: SymbolStr, func_type_ref: TypeRef,
                        alias_of: SymbolStr, symbol: SymbolStr, trait_sym: DefId,
-                       span: SourceSpan) -> OverloadId {
+                       span: SourceSpan, decl: ASTNode*) -> OverloadId {
         const slot: u64 = this.family_slot(owner, leaf);
         if (slot == 0) { return OverloadId::invalid(); }
         this.func_type_refs.insert(slot, func_type_ref);
@@ -455,6 +463,7 @@ public:
         this.overload_func_owner.push(alias_of.id);
         this.overload_func_trait.push(trait_sym);
         this.overload_func_span.push(span);
+        this.overload_func_decl.push(decl);
         this.overload_func_intrinsic.push(IntrinsicKind::Call);
         const positions: u32[]* = this.overload_index.get_or_insert(slot, []);
         (*positions).push(new_pos);
@@ -472,6 +481,22 @@ public:
     entry_span(&this, id: OverloadId) -> SourceSpan {
         if (!id.is_valid()) { return SourceSpan::none(); }
         return this.overload_func_span[this.slot_of(id)];
+    }
+
+    /// The declaration entry `id` was registered for - a method's
+    /// `MethodNode`, a function's `FunctionDeclNode` - or null for an
+    /// invalid id or an entry registered with no node.
+    entry_decl(&this, id: OverloadId) -> ASTNode* {
+        if (!id.is_valid()) { return null; }
+        return this.overload_func_decl[this.slot_of(id)];
+    }
+
+    /// The method entry `id` was registered for; null when it names a
+    /// function or no node.
+    entry_method(&this, id: OverloadId) -> MethodNode* {
+        const d: ASTNode* = this.entry_decl(id);
+        if (d == null || d.kind != NodeKind::MethodDeclaration) { return null; }
+        return d as MethodNode*;
     }
 
     /// The linker symbol of entry `id`; empty for an invalid id.
@@ -915,7 +940,7 @@ public:
             // symbol and signature registration wrote, and mangles nothing.
             func.set_overload_entry(this.register_signature(
                 FamilyOwner::Type(owner), func.name, func_type_ref, SymbolStr::empty(), eff_mangled, func.origin_trait,
-                if (func.has_name_span()) { func.name_span } else { func.span }));
+                if (func.has_name_span()) { func.name_span } else { func.span }, method as ASTNode*));
         }
     }
 
@@ -1086,7 +1111,8 @@ public:
     register_function_signature(mut &this, owner: FamilyOwner, leaf: SymbolStr,
                                 return_type: TypeRef, func_type_ref: TypeRef,
                                 intern: InternTable*, arena: TypeArena*,
-                                symbol: SymbolStr, span: SourceSpan, def: DefId) -> OverloadId {
+                                symbol: SymbolStr, span: SourceSpan, def: DefId,
+                                decl: ASTNode*) -> OverloadId {
         // The qualified name the Cryo mangling encodes: the owner's path and
         // the leaf, as the definition's own path is composed.
         const owner_path: SymbolStr = this.family_owner_path(owner);
@@ -1097,7 +1123,7 @@ public:
         };
         if (symbol.is_valid()) {
             return this.keep_def_entry(def,
-                this.register_signature(owner, leaf, func_type_ref, SymbolStr::empty(), symbol, DefId::invalid(), span));
+                this.register_signature(owner, leaf, func_type_ref, SymbolStr::empty(), symbol, DefId::invalid(), span, decl));
         }
 
         // Compute the mangled symbol name including the full signature.
@@ -1119,7 +1145,7 @@ public:
         const mangled: MangledName = MangledName::for_free_function(
             intern, arena, qname, params, return_type, is_variadic);
         return this.keep_def_entry(def,
-            this.register_signature(owner, leaf, func_type_ref, SymbolStr::empty(), intern.intern(mangled.as_string()), DefId::invalid(), span));
+            this.register_signature(owner, leaf, func_type_ref, SymbolStr::empty(), intern.intern(mangled.as_string()), DefId::invalid(), span, decl));
     }
 
     /// Keep `entry` under the definition `def` for `entry_of_def`, and

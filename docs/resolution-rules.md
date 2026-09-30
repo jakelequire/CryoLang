@@ -310,6 +310,47 @@ yet is recorded with the change that builds it, not here.
     }
     ```
 
+26. **Ruling 22 covers static paths too.** When a trait implemented for the
+    type also provides the member, `IgTn::go(&ig, 7)` is the E0156
+    ambiguity, as `ig.go(7)` is; so are `T::m()` for a static method and
+    `T::m` as a value. The explicit forms are `(Beta for IgTn)::go(...)` for
+    the trait's method, or renaming.
+
+    ```cryo
+    const n: i64 = IgTn::go(&ig, 7);              // error[E0156]: both `go`s apply
+    const m: i64 = (Beta for IgTn)::go(&ig, 7);   // Beta's: 2
+    ```
+
+27. **The E0156 wording for an inherent method beside a trait's is
+    approved**: the primary line "`go` is both an inherent method of `IgTn`
+    and provided by a trait implemented for it", the note "candidate #1: the
+    inherent method `IgTn::go`", and the help "call the trait's method as
+    `(Beta for IgTn)::go(&ig, 7)`, or rename one of them".
+
+28. **E0242 ("cannot find trait") is approved**, including an unknown trait
+    in `implement trait X for ...` moving from E0203 to E0242.
+
+29. **The explicit call of a generic trait method, `(BetaG for NgTf)::go(&g,
+    7)`, compiles and runs**, since E0156's help sends people to that form.
+
+    ```cryo
+    type trait BetaG { go<U>(&this, u: U) -> i64; }
+    type struct NgTf { v: i32; }
+    implement trait BetaG for NgTf { go<U>(&this, u: U) -> i64 { return 2; } }
+    implement struct NgTf { go<U>(&this, u: U) -> i64 { return 1; } }
+
+    const n: i64 = (BetaG for NgTf)::go(&g, 7);   // 2
+    ```
+
+30. **Under `where T: Nowhere`, a call does not add E0306 after the E0242**
+    the bound already reported. The E0306 is suppressed only when the
+    E0242 was actually reported.
+
+    ```cryo
+    function f<T>(x: &T) -> i32 where T: Nowhere { return 1; }  // error[E0242]
+    const r: i32 = f::<i32>(&a);                               // no second error
+    ```
+
 ### 2026-09-28
 
 Relayed in plain text. Done means the five rules above; the definition and

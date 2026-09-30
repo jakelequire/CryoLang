@@ -3073,7 +3073,7 @@ type struct CallResolver {
     report_method_call_tie(mut &this, call: CallExprNode*, member: MemberAccessNode*, owner: TypeRef,
                            traits: &DefId[], decl_spans: &SourceSpan[], inherent: FunctionDeclNode*) -> void {
         const args_text: string = this.receiver_call_args_text(call, member);
-        this.report_trait_method_tie(member.span, member.member, this.arena.resolve_display_name_short(owner),
+        this.report_trait_method_tie(member.span, member.member, owner,
             traits, decl_spans, args_text, true, inherent);
     }
 
@@ -4288,7 +4288,7 @@ type struct CallResolver {
         if (this.ctx.decl_index != null) {
             const entries: OverloadId[] = this.ctx.decl_index.lookup_family_entries(FamilyOwner::Type(owner), member_sym);
             if (entries.length == 1) {
-                call.set_resolved_callee(CalleePin::Decl(entries[0]));
+                this.pin_static_entry(call, scope, entries[0]);
             }
         }
     }
@@ -4398,12 +4398,12 @@ type struct CallResolver {
             if (arg == null || !arg.resolved_type.is_valid()) { return false; }
             arg_types.push(arg.resolved_type);
         }
-        mut fits: OverloadId[] = this.select_static_overload(entries, &arg_types, false);
-        if (fits.length == 0) { fits = this.select_static_overload(entries, &arg_types, true); }
+        mut fits: OverloadId[] = this.select_static_overload(entries, &arg_types, false, call, scope);
+        if (fits.length == 0) { fits = this.select_static_overload(entries, &arg_types, true, call, scope); }
         if (fits.length == 0) { this.report_shared_for_exclusive(call, scope, entries, &arg_types); }
         if (fits.length != 1) { return false; }
-        call.set_resolved_callee(CalleePin::Decl(fits[0]));
         this.type_from_delivered_entry(scope, fits[0]);
+        this.pin_static_entry(call, scope, fits[0]);
         return true;
     }
 
@@ -4635,41 +4635,50 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < entries.length; i++) {
             if (this.ctx.decl_index.entry_signature(entries[i]).equals(ft)) { fits.push(entries[i]); }
         }
-        return this.choose_entry(&fits, path, null);
+        return this.choose_entry(&fits, path, null, owner);
     }
 
     /// The one entry of `fits` the `Type::method` path `path` names.  One
-    /// fit is it.  Several fit when an inherent method and a trait's share
-    /// the key and the signature: the path names the inherent one, as Rust's
-    /// does - a trait's method is reached through the trait's own path.
-    /// Several trait methods under one key and signature with no inherent
-    /// one is a genuine tie: the path names nothing, and the tie is reported
-    /// here, where every candidate is in hand, rather than left for codegen
-    /// to refuse as a name it cannot bind.
-    choose_entry(mut &this, fits: &OverloadId[], path: ScopeResolutionNode*, call: CallExprNode*) -> OverloadId {
+    /// fit is it.  Several fit when methods share the key and the arguments
+    /// bind to each, and no candidate outranks another: an inherent method
+    /// beside one or more traits' is a tie as two traits' are, reported here
+    /// where every candidate is in hand.  The caller names a trait's method
+    /// through the impl-qualified path, `(Trait for Owner)::member(args)`,
+    /// or renames one.  An inherent method in a tie stays bound, so the tie
+    /// is the one error the call reports; a tie of traits alone binds
+    /// nothing.
+    choose_entry(mut &this, fits: &OverloadId[], path: ScopeResolutionNode*, call: CallExprNode*,
+                 owner: FamilyOwner) -> OverloadId {
         if (fits.length == 1) { return fits[0]; }
         mut inherent: OverloadId = OverloadId::invalid();
         mut n: i64 = 0;
         for (mut i: i64 = 0; i < fits.length; i++) {
             if (!this.ctx.decl_index.entry_trait(fits[i]).is_valid()) { inherent = fits[i]; n = n + 1; }
         }
-        if (n == 1) { return inherent; }
-        if (n == 0 && fits.length >= 2) { this.report_static_path_tie(fits, path, call); }
+        if (n == 1) {
+            this.report_static_path_tie(fits, path, call, inherent, owner);
+            return inherent;
+        }
+        if (n == 0 && fits.length >= 2) { this.report_static_path_tie(fits, path, call, OverloadId::invalid(), owner); }
         return OverloadId::invalid();
     }
 
-    /// `path` names a method every one of `fits` provides through a
-    /// different trait, and no inherent method settles it.  The candidates
-    /// are the entries, each carrying where its declaration is written; the
-    /// call form's arguments are the receiver the trait-qualified call keeps.
+    /// `path` names a method every trait entry of `fits` provides through a
+    /// different trait - and `inherent`, when valid, an inherent method too
+    /// - and none of them outranks another.  The candidates are the
+    /// entries, each carrying where its declaration is written; the call
+    /// form's arguments are the receiver the trait-qualified call keeps.
     report_static_path_tie(mut &this, fits: &OverloadId[], path: ScopeResolutionNode*,
-                           call: CallExprNode*) -> void {
+                           call: CallExprNode*, inherent: OverloadId, owner: FamilyOwner) -> void {
         mut traits: DefId[] = [];
         mut spans: SourceSpan[] = [];
         for (mut i: i64 = 0; i < fits.length; i++) {
+            if (fits[i].equals(inherent)) { continue; }
             traits.push(this.ctx.decl_index.entry_trait(fits[i]));
             spans.push(this.ctx.decl_index.entry_span(fits[i]));
         }
+        const inh: MethodNode* = this.ctx.decl_index.entry_method(inherent);
+        const inh_func: FunctionDeclNode* = if (inh != null) { inh.func } else { null };
         mut args_text: string = "";
         if (call != null && call.arguments.length > 0) {
             const first: ExpressionNode* = call.arguments[0];
@@ -4677,8 +4686,14 @@ type struct CallResolver {
             args_text = this.source_text(SourceSpan::new(Text::new(first.span.file),
                 first.span.start_line, first.span.start_col, last.span.end_line, last.span.end_col));
         }
-        this.report_trait_method_tie(path.span, path.member_name, this.intern.resolve(path.scope_name),
-            &traits, &spans, args_text, call != null, null);
+        // The owner whose family the candidates are - `GIgTn<i32>` for
+        // `GIgTn::<i32>::go` - which a trait's method is provided for.
+        const owner_t: TypeRef = match (owner) {
+            FamilyOwner::Type(t) => { t }
+            FamilyOwner::Def(_)  => { TypeRef::invalid() }
+        };
+        this.report_trait_method_tie(path.span, path.member_name, owner_t,
+            &traits, &spans, args_text, call != null, inh_func);
     }
 
     /// The source text under a single-line `span`, or "" when it spans lines
@@ -4705,10 +4720,13 @@ type struct CallResolver {
     /// traits alone is silent during a symbolic generic-body walk: the
     /// concrete instantiation reports.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    report_trait_method_tie(mut &this, span: SourceSpan, member: SymbolStr, owner_display: string,
+    report_trait_method_tie(mut &this, span: SourceSpan, member: SymbolStr, owner: TypeRef,
                             traits: &DefId[], decl_spans: &SourceSpan[],
                             args_text: string, is_call: boolean, inherent: FunctionDeclNode*) -> void {
         if (this.state.in_symbolic_check && inherent == null) { return; }
+        if (!owner.is_valid()) { return; }
+        // The owner as the impl-qualified form writes it: `GnTf<i32>`.
+        const owner_display: string = this.arena.resolve_display_name_short(owner);
         const member_str: string = this.intern.resolve(member);
         const primary: string = if (inherent != null) {
             fmt::format("`%s` is both an inherent method of `%s` and provided by a trait implemented for it",
@@ -4774,30 +4792,30 @@ type struct CallResolver {
             if (arg == null || !arg.resolved_type.is_valid()) { return false; }
             arg_types.push(arg.resolved_type);
         }
-        mut fits: OverloadId[] = this.select_static_overload(&entries, &arg_types, false);
-        if (fits.length == 0) { fits = this.select_static_overload(&entries, &arg_types, true); }
-        const chosen: OverloadId = this.choose_entry(&fits, scope, call);
+        mut fits: OverloadId[] = this.select_static_overload(&entries, &arg_types, false, call, scope);
+        if (fits.length == 0) { fits = this.select_static_overload(&entries, &arg_types, true, call, scope); }
+        const chosen: OverloadId = this.choose_entry(&fits, scope, call, owner);
         if (!chosen.is_valid()) { return false; }
-        call.set_resolved_callee(CalleePin::Decl(chosen));
+        this.pin_static_entry(call, scope, chosen);
         return true;
     }
 
-    /// Every entry of `entries` whose signature every argument fits.
-    /// `autoref` admits a value argument for a reference parameter to its
-    /// type.
-    select_static_overload(&this, entries: &OverloadId[], arg_types: &TypeRef[],
-                           autoref: boolean) -> OverloadId[] {
+    /// Every entry of `entries` whose parameters (`static_entry_params`)
+    /// every argument fits.  `autoref` admits a value argument for a
+    /// reference parameter to its type.
+    select_static_overload(mut &this, entries: &OverloadId[], arg_types: &TypeRef[],
+                           autoref: boolean, call: CallExprNode*,
+                           scope: ScopeResolutionNode*) -> OverloadId[] {
         mut fits: OverloadId[] = [];
         for (mut oi: i64 = 0; oi < entries.length; oi++) {
-            const ot: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entries[oi]));
-            if (ot == null || ot.kind != TypeKind::Function) { continue; }
-            const fn_ty: FunctionType* = ot as FunctionType*;
-            if (fn_ty.param_types.length != arg_types.length) { continue; }
+            const params: TypeRef[] = this.static_entry_params(entries[oi], call, scope);
+            if (params.length == 0 && arg_types.length > 0) { continue; }
+            if (params.length != arg_types.length) { continue; }
             mut all_match: boolean = true;
-            for (mut pi: i64 = 0; pi < fn_ty.param_types.length; pi++) {
-                mut ok: boolean = this.overload_param_matches_arg(fn_ty.param_types[pi], arg_types[pi]);
+            for (mut pi: i64 = 0; pi < params.length; pi++) {
+                mut ok: boolean = this.overload_param_matches_arg(params[pi], arg_types[pi]);
                 if (!ok && autoref) {
-                    const pt: Type* = this.arena.lookup(fn_ty.param_types[pi]);
+                    const pt: Type* = this.arena.lookup(params[pi]);
                     ok = pt != null && pt.kind == TypeKind::Reference
                         && (pt as ReferenceType*).referent.equals(arg_types[pi]);
                 }
@@ -4806,6 +4824,97 @@ type struct CallResolver {
             if (all_match) { fits.push(entries[oi]); }
         }
         return fits;
+    }
+
+    /// The parameters a path call `Owner::m(args)` passes to entry `e`: its
+    /// signature's.  A generic method's template takes its signature with
+    /// the method's own type parameters bound for this call
+    /// (`path_method_bindings`) - the receiver, the first argument, as
+    /// written - and none when they do not bind.  A method-level
+    /// specialization takes none: it is an instance minted from a template,
+    /// not a declaration a path names.  A generic static method is its own
+    /// function template and is not selected here.
+    static_entry_params(mut &this, e: OverloadId, call: CallExprNode*,
+                        scope: ScopeResolutionNode*) -> TypeRef[] {
+        mut params: TypeRef[] = [];
+        const ot: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(e));
+        if (ot == null || ot.kind != TypeKind::Function) { return params; }
+        const fn_ty: FunctionType* = ot as FunctionType*;
+        const m: MethodNode* = this.ctx.decl_index.entry_method(e);
+        if (m != null && m.func != null && m.func.spec_type_args.length > 0) { return params; }
+        if (m == null || m.func == null || m.func.generic_params.length == 0) {
+            for (mut pi: i64 = 0; pi < fn_ty.param_types.length; pi++) { params.push(fn_ty.param_types[pi]); }
+            return params;
+        }
+        if (m.is_static || call == null || fn_ty.param_types.length == 0) { return params; }
+        mut binds: TypeRef[] = [];
+        mut ctx: ResolutionContext = this.path_method_context(m, fn_ty.param_types[0], call, scope, &binds);
+        if (binds.length == 0) { return params; }
+        params.push(fn_ty.param_types[0]);
+        for (mut pi: i64 = 0; pi < m.func.parameters.length; pi++) {
+            const p: VarDeclNode* = m.func.parameters[pi];
+            if (p == null || p.is_receiver()) { continue; }
+            if (p.type_annotation == null) { return []; }
+            const f: TypeRef = this.binding.reduce_assoc_projections(this.ctx.type_resolver.resolve(p.type_annotation, &ctx));
+            if (!f.is_valid() || this.types.contains_generic_param(f)) { return []; }
+            params.push(f);
+        }
+        return params;
+    }
+
+    /// The context generic method `m`'s signature is read in for the path
+    /// call `call`: the owner its receiver parameter `recv_param` names, and
+    /// the method's own type parameters bound from the call's turbofish,
+    /// else from the arguments after the receiver, as `recv.m(args)` binds
+    /// them.  The bindings, in declaration order, go to `out_binds`, left
+    /// empty when any stays unbound.
+    path_method_context(mut &this, m: MethodNode*, recv_param: TypeRef, call: CallExprNode*,
+                        scope: ScopeResolutionNode*, out_binds: TypeRef[]*) -> ResolutionContext {
+        mut ctx: ResolutionContext = ResolutionContext::new("");
+        if (this.ctx.type_resolver == null) { return ctx; }
+        mut owner: TypeRef = recv_param;
+        const rt: Type* = this.arena.lookup(recv_param);
+        if (rt != null && rt.kind == TypeKind::Reference) { owner = (rt as ReferenceType*).referent; }
+        if (rt != null && rt.kind == TypeKind::Pointer) { owner = (rt as PointerType*).pointee; }
+        ctx.set_this_type(owner);
+        mut targs: &TypeAnnotation*[] = &call.generic_args;
+        if (targs.length == 0 && scope != null) { targs = &scope.generic_args; }
+        const binds: TypeRef[] = this.binding.solve_method_bindings_at(m.func, &ctx, targs, call, 1);
+        if (binds.length != m.func.generic_params.length) { return ctx; }
+        for (mut i: i64 = 0; i < binds.length; i++) {
+            const gp: GenericParamNode* = m.func.generic_params[i];
+            if (gp == null) { return ctx; }
+            ctx.add_binding(gp.sym_id, gp.name, binds[i]);
+        }
+        for (mut i: i64 = 0; i < binds.length; i++) { (*out_binds).push(binds[i]); }
+        return ctx;
+    }
+
+    /// Bind the path call `call` to entry `e`.  A generic method's template
+    /// is not a definition the call can run: its own type parameters are
+    /// bound here - stashed for monomorphization, which mints the
+    /// specialization and pins it as it does for `recv.m(args)` - and the
+    /// path is typed through them.  Any other entry is pinned.
+    pin_static_entry(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*, e: OverloadId) -> void {
+        const m: MethodNode* = this.ctx.decl_index.entry_method(e);
+        if (m == null || m.func == null || m.func.generic_params.length == 0 || m.is_static) {
+            call.set_resolved_callee(CalleePin::Decl(e));
+            return;
+        }
+        const ot: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(e));
+        if (ot == null || ot.kind != TypeKind::Function) { return; }
+        const fn_ty: FunctionType* = ot as FunctionType*;
+        if (fn_ty.param_types.length == 0) { return; }
+        mut binds: TypeRef[] = [];
+        mut ctx: ResolutionContext = this.path_method_context(m, fn_ty.param_types[0], call, scope, &binds);
+        if (binds.length == 0) { return; }
+        call.set_resolved_type_args(binds);
+        call.set_resolved_method(m as ASTNode*);
+        if (m.func.return_type_annotation != null) {
+            const ret: TypeRef = this.binding.reduce_assoc_projections(
+                this.ctx.type_resolver.resolve(m.func.return_type_annotation, &ctx));
+            if (ret.is_valid() && !this.types.contains_generic_param(ret)) { scope.set_resolved_type(ret); }
+        }
     }
 
     /// Pin a module-qualified call to the family of the function `callee`
@@ -4869,13 +4978,15 @@ type struct CallResolver {
             }
             scope.set_resolved_type(resolved);
             this.pin_scope_callee_combined(call, scope, owner_sym, owner_ref, scope.member_name);
-            // A call through a trait's own path (`Dup::dup(&r)`) has the
-            // selected implementation's return on EVERY walk of the body: the
-            // first walk's pin sets it, and a later walk finds the call already
-            // pinned and would otherwise keep the trait declaration's `This`.
-            const owner_t: Type* = this.arena.lookup(owner_ref);
+            // A pinned call has its entry's return on EVERY walk of the body:
+            // the first walk's pin sets it, and a later walk finds the call
+            // already pinned and would otherwise keep the family's last
+            // signature - the trait declaration's `This` for a call through
+            // a trait's own path (`Dup::dup(&r)`), or another specialization's
+            // return for a generic method's (`Q::id(&q, 2u64)` beside
+            // `Q::id(&q, 3)`).
             const pinned: OverloadId = call.resolved_callee.decl_entry();
-            if (owner_t != null && owner_t.kind == TypeKind::Trait && pinned.is_valid()) {
+            if (pinned.is_valid()) {
                 this.type_from_delivered_entry(scope, pinned);
             }
             return scope.resolved_type;
@@ -5052,7 +5163,8 @@ type struct CallResolver {
             if (this.types.contains_generic_param(concrete)) { continue; }
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
                 const tref: TraitRef* = &bound.trait_refs[ri];
-                if (tref.path.length == 0) { continue; }
+                // A bound refused where it is written is reported there.
+                if (tref.path.length == 0 || tref.refused) { continue; }
                 const trait_name: SymbolStr = tref.path[tref.path.length - 1];
                 if (!this.trait_checker().type_implements_trait(concrete, tref.definition(), 0)) {
                     this.emit_free_call_bound_failure(call, tmpl, tref, concrete, trait_name);

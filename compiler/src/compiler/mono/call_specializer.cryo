@@ -715,6 +715,45 @@ type struct MonoCallSpecializer {
     /// harmless because such a (generic-type-spec) receiver is gated out of the
     /// derived path by its caller.  Returns invalid when the shape isn't
     /// reconstructible (caller then bails).
+    /// Where the generic method `m` a path call names is declared, for the
+    /// receiver `recv_type`: the owner declaration holding it
+    /// (`out_owner`), else the inherent or trait impl block that does
+    /// (`out_impl`).  Found by the node's identity, among the stores the
+    /// receiver's method sets are read from; false when none holds it.
+    path_method_placement(&this, m: MethodNode*, recv_type: TypeRef,
+                          out_impl: ImplBlockNode**, out_owner: ASTNode**) -> boolean {
+        if (this.generic_registry == null) { return false; }
+        const owner_ast: ASTNode* = this.generic_registry.lookup_inherent_owner(recv_type);
+        if (owner_ast != null) {
+            const empty: MethodNode*[] = [];
+            mut own: &MethodNode*[] = &empty;
+            if (owner_ast.kind == NodeKind::StructDeclaration) { own = &(owner_ast as StructDeclNode*).methods; }
+            else if (owner_ast.kind == NodeKind::UnionDeclaration) { own = &(owner_ast as UnionDeclNode*).methods; }
+            else if (owner_ast.kind == NodeKind::ClassDeclaration) { own = &(owner_ast as ClassDeclNode*).methods; }
+            for (mut i: i64 = 0; i < own.length; i++) {
+                if (own[i] == m) { *out_owner = owner_ast; return true; }
+            }
+        }
+        const inherent: ImplBlockNode*[] = this.generic_registry.inherent_impl_blocks(recv_type);
+        for (mut bi: i64 = 0; bi < inherent.length; bi++) {
+            if (MonoCallSpecializer::block_holds(inherent[bi], m)) { *out_impl = inherent[bi]; return true; }
+        }
+        const traits: ImplBlockNode*[] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
+        for (mut bi: i64 = 0; bi < traits.length; bi++) {
+            if (MonoCallSpecializer::block_holds(traits[bi], m)) { *out_impl = traits[bi]; return true; }
+        }
+        return false;
+    }
+
+    /// Whether `m` is one of `block`'s methods, by identity.
+    static block_holds(block: ImplBlockNode*, m: MethodNode*) -> boolean {
+        if (block == null) { return false; }
+        for (mut i: i64 = 0; i < block.methods.length; i++) {
+            if (block.methods[i] == m) { return true; }
+        }
+        return false;
+    }
+
     derive_receiver_type(&this, expr: ExpressionNode*) -> TypeRef {
         if (expr == null) { return TypeRef::invalid(); }
         if (expr.resolved_type.is_valid()) { return expr.resolved_type; }
@@ -777,8 +816,24 @@ type struct MonoCallSpecializer {
         }
         if (call.callee == null) { return; }
         const callee_node: ASTNode* = call.callee as ASTNode*;
-        if (callee_node.kind != NodeKind::MemberAccess) { return; }
-        const ma: MemberAccessNode* = call.callee as MemberAccessNode*;
+        // The receiver.  `recv.m(args)` writes it before the member.  A path
+        // call `Owner::m(recv, args)` passes it first, and sema bound the
+        // path to the generic method's template (`path_method`): the method
+        // is that declaration, not one found again by name here.
+        mut ma: MemberAccessNode* = null;
+        mut recv_expr: ExpressionNode* = null;
+        mut path_method: MethodNode* = null;
+        if (callee_node.kind == NodeKind::MemberAccess) {
+            ma = call.callee as MemberAccessNode*;
+            recv_expr = ma.object;
+        } else if (callee_node.kind == NodeKind::ScopeResolution) {
+            path_method = call.resolved_method as MethodNode*;
+            if (path_method == null || path_method.func == null) { return; }
+            if (path_method.func.generic_params.length == 0 || call.arguments.length == 0) { return; }
+            recv_expr = call.arguments[0];
+        } else {
+            return;
+        }
 
         // RECEIVER from sema (invariant #1): sema typed every receiver.  Apply the
         // active spec subst (the call may be walked inside a still-generic spec body).
@@ -786,12 +841,12 @@ type struct MonoCallSpecializer {
         // `resolved_type`; for the member-access shape (`this.h.relay(w)`) the type
         // is reconstructed structurally from the (carried) object type + the named
         // field, which is spec-local and authoritative - no re-inference.
-        mut recv_type: TypeRef = ma.object.resolved_type;
+        mut recv_type: TypeRef = recv_expr.resolved_type;
         mut recv_derived: boolean = false;
         if (recv_type.is_valid()) {
             if (subst != null) { recv_type = subst.apply(recv_type, this.arena); }
         } else {
-            recv_type = this.derive_receiver_type(ma.object);
+            recv_type = this.derive_receiver_type(recv_expr);
             recv_derived = true;
         }
         if (!recv_type.is_valid()) { return; }
@@ -858,7 +913,7 @@ type struct MonoCallSpecializer {
 
         // Zero-own-generic self-returning combinator defaults (take/filter) are
         // instantiated lazily here; own-generic ones (map<B>) fall through.
-        if (this.try_instantiate_self_returning_default(call, ma, recv_type)) {
+        if (ma != null && this.try_instantiate_self_returning_default(call, ma, recv_type)) {
             return;
         }
 
@@ -883,7 +938,10 @@ type struct MonoCallSpecializer {
         mut impl_node: ImplBlockNode* = null;
         mut inherent_owner_ast: ASTNode* = null;
         mut orig_method: MethodNode* = null;
-        if (ma.resolved_trait.is_valid()) {
+        if (path_method != null) {
+            if (!this.path_method_placement(path_method, recv_type, &impl_node, &inherent_owner_ast)) { return; }
+            orig_method = path_method;
+        } else if (ma.resolved_trait.is_valid()) {
             orig_method = this.find_spec_impl_trait_method(
                 recv_type, ma.member, ma.resolved_trait, &impl_node);
             if (orig_method == null) {
@@ -2439,7 +2497,8 @@ type struct MonoCallSpecializer {
             if (this.arena.contains_generic_param(concrete)) { continue; }
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
                 const tref: TraitRef* = &bound.trait_refs[ri];
-                if (tref.path.length == 0) { continue; }
+                // A bound refused where it is written is reported there.
+                if (tref.path.length == 0 || tref.refused) { continue; }
                 // Identity for the check; the diagnostic keeps the spelling.
                 const trait_name: SymbolStr = tref.path[tref.path.length - 1];
                 if (!this.trait_spec.type_implements_trait(concrete, tref.definition(), 0)) {
