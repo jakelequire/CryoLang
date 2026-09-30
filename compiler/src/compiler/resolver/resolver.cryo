@@ -324,10 +324,11 @@ type struct Resolver {
     }
 
     /// Declare an import symbol with ambiguity detection.
-    /// If the name already exists from a DIFFERENT module, the name is
-    /// marked ambiguous and the resolver will emit an error when it's used
-    /// without qualification (e.g. "use Pair" when both BattleTest::Pair
-    /// and Collections::Pair::Pair are imported).
+    /// If the name already exists from a DIFFERENT module in the same
+    /// namespace, the name is marked ambiguous in that namespace and the
+    /// resolver will emit an error when it's used there without
+    /// qualification (e.g. "use Pair" when both BattleTest::Pair and
+    /// Collections::Pair::Pair are imported).
     ///
     /// The symbol carries the id of the declaration it binds, copied by the
     /// import that found it: an import is not a definition, so it is not
@@ -362,12 +363,15 @@ type struct Resolver {
             // and whether one of them already names `target`.
             const all: SymbolID[] = this.scopes[this.current_scope.id - 1].get_overloads(name);
             if (explicit) {
-                const first: SymbolID = this.explicit_binding_beside(&all, target);
+                const first: SymbolID = this.binding_beside(&all, target, true);
                 if (first.is_valid()) { return first; }
             }
+            // The import this one competes with is the one in its namespace;
+            // with none there, the name's first binding.
             const ex: Symbol = this.symbols[this.symbol_ids.slot_of(existing_id)];
-            const ex_mod_sym: SymbolStr = ex.source_module.as_sym();
-            existing_module_id = ex_mod_sym.id;
+            const rival: SymbolID = this.binding_beside(&all, target, false);
+            const peer: Symbol = if (rival.is_valid()) { this.symbols[this.symbol_ids.slot_of(rival)] } else { ex };
+            existing_module_id = peer.source_module.as_sym().id;
             if (ex.kind == SymbolKind::Import && existing_module_id == new_module_id) {
                 const bound: SymbolID = this.binding_to(&all, target);
                 if (!bound.is_valid()) {
@@ -378,10 +382,19 @@ type struct Resolver {
                 }
                 return SymbolID::invalid();
             }
+            // Another module's item of the leaf in the OTHER namespace - a
+            // function beside an imported type - is a second binding of the
+            // name, not a rival for it: a lookup chooses between them by
+            // namespace, as it does for one module's type and function.
+            if (ex.kind == SymbolKind::Import && !rival.is_valid()) {
+                this.scopes[this.current_scope.id - 1].add_overload(name, id);
+                if (explicit) { this.explicit_imports.insert(id.key(), true); }
+                return SymbolID::invalid();
+            }
         }
 
         this.scopes[this.current_scope.id - 1]
-            .insert_import(name, id, new_module_id, existing_module_id);
+            .insert_import(name, id, new_module_id, existing_module_id, this.namespace_of(target));
         if (explicit) { this.explicit_imports.insert(id.key(), true); }
         return SymbolID::invalid();
     }
@@ -396,16 +409,22 @@ type struct Resolver {
         return SymbolID::invalid();
     }
 
-    /// Among one name's `bindings`, one an explicit import entry made whose
-    /// target is in the namespace `target` is in, or an invalid id.
-    explicit_binding_beside(&this, bindings: &SymbolID[], target: SymbolID) -> SymbolID {
-        const ns: Namespace = if (Namespace::Type.accepts(this.symbols[this.symbol_ids.slot_of(target)].kind)) {
+    /// The namespace the declaration `target` is bound in.
+    namespace_of(&this, target: SymbolID) -> Namespace {
+        return if (Namespace::Type.accepts(this.symbols[this.symbol_ids.slot_of(target)].kind)) {
             Namespace::Type
         } else {
             Namespace::Value
         };
+    }
+
+    /// Among one name's `bindings`, an import binding whose target is in the
+    /// namespace `target` is in - one an explicit entry made, when
+    /// `explicit_only` - or an invalid id.
+    binding_beside(&this, bindings: &SymbolID[], target: SymbolID, explicit_only: boolean) -> SymbolID {
+        const ns: Namespace = this.namespace_of(target);
         for (mut i: i64 = 0; i < bindings.length; i++) {
-            if (!this.explicit_imports.get(&bindings[i].key()).is_some()) { continue; }
+            if (explicit_only && !this.explicit_imports.get(&bindings[i].key()).is_some()) { continue; }
             const t: Option<SymbolID> = this.import_targets.get(&bindings[i].key());
             if (t.is_some() && ns.accepts(this.symbols[this.symbol_ids.slot_of(t.unwrap())].kind)) {
                 return bindings[i];
@@ -550,10 +569,10 @@ type struct Resolver {
     /// NOTE: Accesses scopes via array index directly (not by-value copy)
     /// to ensure the ambiguity arrays added during import processing are visible.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    is_ambiguous(&this, name: SymbolStr) -> boolean {
+    is_ambiguous(&this, name: SymbolStr, ns: Namespace) -> boolean {
         mut scope_id: ScopeID = this.current_scope;
         while (scope_id.is_valid()) {
-            if (this.scopes[scope_id.id - 1].is_ambiguous(name)) {
+            if (this.scopes[scope_id.id - 1].is_ambiguous(name, ns)) {
                 return true;
             }
             scope_id = this.scopes[scope_id.id - 1].parent_id;
@@ -564,8 +583,8 @@ type struct Resolver {
     /// Get the conflicting module paths for an ambiguous name.
     /// Returns two interned SymbolStr values: [module_a, module_b].
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    get_ambiguous_modules(&this, name: SymbolStr) -> SymbolStr[] {
-        return this.ambiguous_modules_from(this.current_scope, name);
+    get_ambiguous_modules(&this, name: SymbolStr, ns: Namespace) -> SymbolStr[] {
+        return this.ambiguous_modules_from(this.current_scope, name, ns);
     }
 
     /// The two modules whose imports tie for `name`, walking outward from an
@@ -573,10 +592,10 @@ type struct Resolver {
     /// cursor, which a pass called from elsewhere may have left standing in
     /// another module.  Empty when no rib on the chain records a tie.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    ambiguous_modules_from(&this, start: ScopeID, name: SymbolStr) -> SymbolStr[] {
+    ambiguous_modules_from(&this, start: ScopeID, name: SymbolStr, ns: Namespace) -> SymbolStr[] {
         mut scope_id: ScopeID = start;
         while (scope_id.is_valid()) {
-            const ids: u32[] = this.scopes[scope_id.id - 1].get_ambiguous_module_ids(name);
+            const ids: u32[] = this.scopes[scope_id.id - 1].get_ambiguous_module_ids(name, ns);
             if (ids.length >= 2) {
                 return [SymbolStr::from_id(ids[0]), SymbolStr::from_id(ids[1])];
             }
@@ -951,7 +970,7 @@ type struct Resolver {
                     // first was never the answer.  The rib DID bind the
                     // head - to nothing - so the walk stops here rather than
                     // letting an outer tier answer a name this one holds.
-                    if (sym.kind == SymbolKind::Import && sc.is_ambiguous(head)) {
+                    if (sym.kind == SymbolKind::Import && sc.is_ambiguous(head, ns)) {
                         return Res::Err;
                     }
                     // An import names the declaration it binds in `ns`.  One

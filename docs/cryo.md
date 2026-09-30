@@ -2370,6 +2370,15 @@ const b: i32 = Toml::parse("1");      // Toml's `parse`
 
 A wildcard is not a brace entry: two wildcards offering one name make only the bare use of that name ambiguous (E0154).
 
+Types and values are separate namespaces, for imports as for declarations. A type `Tag` from one module and a function `Tag` from another, both imported, do not collide: `Tag` in a type position names the type and a call `Tag(..)` names the function. Two imports tie only in the namespace they share, so two wildcards offering a type `Tag` make the type uses ambiguous (E0154) and leave a function `Tag` imported from a third module callable:
+
+```cryo
+import Shapes::{ Tag };               // a type
+import Labels::{ Tag };               // a function: no collision
+const t: Tag = Tag { id: 3 };         // Shapes's type
+const n: i32 = Tag(4);                // Labels's function
+```
+
 ### 14.4 Visibility
 
 | Modifier            | Meaning                                                                                  |
