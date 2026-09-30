@@ -1250,7 +1250,7 @@ type struct Point {
 
 ### 8.2 Fields and Visibility
 
-Struct fields are **public by default** - readable and writable wherever the struct itself is visible. Restrict a field with `private`; a private field is then accessible only from the **module that declares the struct** (enforced as `E0353`). Which module code is in is the module whose file it is written in, not the type it belongs to: a free function beside the struct may read the field, and an `implement` block written in another module may not, however it names the type. Visibility blocks group fields that share an access level:
+Struct fields are **public by default** - readable and writable wherever the struct itself is visible. Restrict a field with `private`; a private field is then accessible only from the **module that declares the struct** (enforced as `E0353`). Calling a function-typed field, `h.run(1)`, reads it, so a private one is refused outside that module as reading it is. Which module code is in is the module whose file it is written in, not the type it belongs to: a free function beside the struct may read the field, and an `implement` block written in another module may not, however it names the type. Visibility blocks group fields that share an access level:
 
 ```cryo
 type struct Rect {

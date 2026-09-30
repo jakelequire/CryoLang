@@ -497,13 +497,16 @@ type struct MemberResolver {
 
     /// `obj.f(args)` where `f` is a function-typed field: tag the member with
     /// that type (so codegen emits an indirect call) and return its return type.
-    try_field_function_call(&this, obj_type: TypeRef, member: MemberAccessNode*) -> TypeRef {
+    /// Calling the field reads it, so it is gated as a read is: a private or
+    /// protected field is refused outside the module that may reach it.
+    try_field_function_call(mut &this, obj_type: TypeRef, member: MemberAccessNode*) -> TypeRef {
         const fa: FieldAnswer = this.field_of(obj_type, member.member);
         if (!fa.found() || fa.index < 0) { return TypeRef::invalid(); }
         const ft: Type* = this.arena.lookup(fa.ty);
         if (ft == null || ft.kind != TypeKind::Function) { return TypeRef::invalid(); }
         member.set_resolved_type(fa.ty);
-        member.set_resolved_member(MemberPin::Field(fa.depth, fa.index));
+        const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
+        this.pin_field(member, &fa, acc_span);
         return (ft as FunctionType*).return_type;
     }
 
