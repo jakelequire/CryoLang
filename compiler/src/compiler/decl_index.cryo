@@ -23,7 +23,7 @@ import compiler::types;
 import compiler::types::{ arena, compound, type_base, type_ref, TypeKind };
 import compiler::resolver::{ symbol_str, intern_table, mangled_name, qualified_name };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DeclVisibility, DefId, FamilyOwner, Res, ResSlot, DefTable };
+import compiler::resolver::res::{ DeclVisibility, DefId, DefKind, FamilyOwner, Res, ResSlot, DefTable };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import std::core::option;
@@ -146,7 +146,12 @@ type struct DeclarationIndex {
     // registered as; invalid for a slot no function registration reached.
     def_entries:    OverloadId[];
 
-    module_global_keys:       u32[];  // SymbolStr.id of global variable
+    // The definition's slot in `defs` -> the declaration the name layer
+    // registered it for: a method's `MethodNode`, or a trait's declared
+    // method's `FunctionDeclNode`; null for a slot that is no method.
+    method_decls:   ASTNode*[];
+
+    module_global_keys:      u32[];  // SymbolStr.id of global variable
     module_global_files:      u32[];  // SymbolStr.id of the defining source file
     module_global_declared_in: ModulePath[];  // the defining module
                                       // (`std::collections::hashmap`).  Codegen
@@ -308,6 +313,7 @@ public:
             type_reverse:        HashMap::<u64, DefId>::new(),
             def_types:           [],
             def_entries:         [],
+            method_decls:        [],
             array_elem_to_type:  HashMap::<u64, TypeRef>::new(),
             implicit_converters: HashMap::<u64, u64>::new(),
             generic_converter_methods: [],
@@ -533,8 +539,10 @@ public:
         return result;
     }
 
-    /// The entry the function definition `d`'s signature was registered as,
-    /// or invalid when `d` is invalid or no function registration reached it.
+    /// The entry the function or method definition `d`'s signature was
+    /// registered as, or invalid when `d` is invalid or no registration
+    /// reached it (a generic owner's method is registered per instance, and
+    /// an instance is no definition).
     /// Asked by the definition, not by its parent and leaf: those name the
     /// family, which holds every overload declared under the leaf.
     entry_of_def(&this, d: DefId) -> OverloadId {
@@ -542,6 +550,48 @@ public:
         const slot: i64 = this.defs.slot(d);
         if (slot >= this.def_entries.length) { return OverloadId::invalid(); }
         return this.def_entries[slot];
+    }
+
+    /// Keep `decl` as the declaration the method definition `d` was
+    /// registered for (`CompilationContext::define_method`).
+    keep_method_decl(mut &this, d: DefId, decl: ASTNode*) -> void {
+        const slot: i64 = this.defs.slot(d);
+        while (this.method_decls.length <= slot) { this.method_decls.push(null); }
+        this.method_decls[slot] = decl;
+    }
+
+    /// The declaration the method definition `d` was registered for, or
+    /// null when `d` is invalid or names no method.
+    method_decl_of(&this, d: DefId) -> ASTNode* {
+        if (!d.is_valid()) { return null; }
+        const slot: i64 = this.defs.slot(d);
+        if (slot >= this.method_decls.length) { return null; }
+        return this.method_decls[slot];
+    }
+
+    /// Refuse a method registered under the family `(owner, leaf)` whose
+    /// definition says otherwise: the name layer registered the definition
+    /// from the declaration where it is written, and this index files the
+    /// method under the type the implementation head or the type body
+    /// resolved to, so the two answer where a method lives independently.
+    /// The definition must be a method of `owner`, under the method's own
+    /// leaf, registered for this very node.  A method with no definition is
+    /// a copy (a trait default placed here, a monomorphized clone) and is
+    /// not checked.
+    check_method_def(&this, owner: TypeRef, method: MethodNode*, intern: InternTable*) -> void {
+        const d: DefId = method.func.def;
+        if (!d.is_valid()) { return; }
+        if (this.defs.kind_of(d) == DefKind::Method
+                && this.defs.parent_of(d).equals(this.registered_def(owner))
+                && this.defs.leaf_of(d).equals(method.func.name)
+                && this.method_decl_of(d) == method as ASTNode*) {
+            return;
+        }
+        panic(fmt::format(
+            "internal compiler error: method `%s` is registered on `%s`, and its definition says it is `%s` of `%s`",
+            intern.resolve(method.func.name), intern.resolve(this.family_owner_path(FamilyOwner::Type(owner))),
+            intern.resolve(this.defs.leaf_of(d)),
+            intern.resolve(this.family_owner_path(FamilyOwner::Def(this.defs.parent_of(d))))), FILE, LINE);
     }
 
     /// Record the kind an `intrinsic function` declaration's entry `id`
@@ -840,6 +890,7 @@ public:
         for (mut i: i64 = 0; i < methods.length; i++) {
             const method: MethodNode* = methods[i];
             if (method == null || method.func == null) { continue; }
+            this.check_method_def(owner, method, intern);
             // Self-returning trait defaults (combinators) are deferred
             // templates with unresolved signatures - they are instantiated
             // lazily at call sites and the concrete spec is registered there
@@ -938,9 +989,9 @@ public:
             // so every consumer holding the node - the definition emitter,
             // a call sema or mono binds to it, a vtable slot - reads the
             // symbol and signature registration wrote, and mangles nothing.
-            func.set_overload_entry(this.register_signature(
+            func.set_overload_entry(this.keep_def_entry(func.def, this.register_signature(
                 FamilyOwner::Type(owner), func.name, func_type_ref, SymbolStr::empty(), eff_mangled, func.origin_trait,
-                if (func.has_name_span()) { func.name_span } else { func.span }, method as ASTNode*));
+                if (func.has_name_span()) { func.name_span } else { func.span }, method as ASTNode*)));
         }
     }
 

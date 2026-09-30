@@ -235,6 +235,43 @@ public:
         return this.resolver.get_symbol(sym_id).def;
     }
 
+    /// Register the method `func` as a definition of `owner` - the type it
+    /// is declared on or the trait declaring it - and stamp it on the
+    /// declaration, `decl` being the node the method is (a `MethodNode`, or
+    /// a trait's own `FunctionDeclNode`).  An owner the head could not name
+    /// registers nothing: the head's own error has been reported.
+    define_method(&this, owner: DefId, func: FunctionDeclNode*, decl: ASTNode*) -> DefId {
+        if (!owner.is_valid()) { return DefId::invalid(); }
+        func.def = this.ctx.define_method(owner, func.name, func.span, decl);
+        return func.def;
+    }
+
+    /// Register every method written in a type's body as a definition of
+    /// the type `owner`.
+    define_body_methods(&this, owner: DefId, methods: &MethodNode*[]) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const method: MethodNode* = methods[i];
+            if (method == null || method.func == null) { continue; }
+            this.define_method(owner, method.func, method as ASTNode*);
+        }
+    }
+
+    /// The definition an impl head names as the type its methods belong to:
+    /// the declared type, or the primitive.  Invalid for a head that names
+    /// neither.
+    impl_owner_def(&this, node: ImplBlockNode*) -> DefId {
+        return match (node.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(d)    => { d }
+                    Res::PrimTy(p) => { this.ctx.defs.primitive(p) }
+                    _              => { DefId::invalid() }
+                }
+            }
+            _ => { DefId::invalid() }
+        };
+    }
+
     /// Whether a class declares a constructor of its own.
     static declares_constructor(cd: ClassDeclNode*) -> boolean {
         for (mut i: i64 = 0; i < cd.methods.length; i++) {
@@ -715,7 +752,9 @@ public:
             node.fields[i].accept(this);
         }
 
-        // Visit methods
+        // Every method is a definition of the type before any body is
+        // walked.
+        this.define_body_methods(node.def, &node.methods);
         for (mut i: int = 0; i < node.methods.length; i++) {
             node.methods[i].accept(this);
         }
@@ -748,7 +787,9 @@ public:
             node.fields[i].accept(this);
         }
 
-        // Visit methods
+        // Every method is a definition of the type before any body is
+        // walked.
+        this.define_body_methods(node.def, &node.methods);
         for (mut i: int = 0; i < node.methods.length; i++) {
             node.methods[i].accept(this);
         }
@@ -812,7 +853,9 @@ public:
             node.fields[i].accept(this);
         }
 
-        // Visit methods
+        // Every method is a definition of the type before any body is
+        // walked.
+        this.define_body_methods(node.def, &node.methods);
         for (mut i: int = 0; i < node.methods.length; i++) {
             node.methods[i].accept(this);
         }
@@ -878,7 +921,8 @@ public:
         // body may call a sibling method declared after it.
         for (mut i: int = 0; i < node.methods.length; i++) {
             const method: FunctionDeclNode* = node.methods[i];
-            this.resolver.declare_method(method.name, method.span, true);
+            this.resolver.declare_method(method.name, method.span, true,
+                this.define_method(this.this_trait, method, method as ASTNode*));
         }
 
         // A default body is source written in THIS file, and is the only place
@@ -947,14 +991,18 @@ public:
         this.stamp_annotation_list(&node.assoc_binding_annotations);
         this.stamp_trait_bounds(&node.where_bounds);
 
-        // Declare and visit methods
+        // Declare and visit methods, each a definition of the type the head
+        // names - a trait implementation's too: the trait's own method is
+        // the trait's definition, the implementation's is the type's.
+        const method_owner: DefId = this.impl_owner_def(node);
         for (mut i: int = 0; i < node.methods.length; i++) {
             const method: MethodNode* = node.methods[i];
             if (method.func != null) {
                 const is_public: boolean =
                     method.visibility == Visibility::Public;
                 this.resolver.declare_method(
-                    method.func.name, method.func.span, is_public);
+                    method.func.name, method.func.span, is_public,
+                    this.define_method(method_owner, method.func, method as ASTNode*));
             }
             method.accept(this);
         }

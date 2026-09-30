@@ -135,6 +135,12 @@ type enum DefKind {
     /// not a definition; it is registered here only until instantiations
     /// carry their own handle instead.
     Instance;
+    /// A method: its parent is the type it is declared on (in the type's
+    /// body, an inherent implementation or a trait implementation) or the
+    /// trait that declares it.  A copy - a trait default placed in an
+    /// implementation, a monomorphized clone - is not a definition and gets
+    /// none.
+    Method;
 }
 
 /// Where a definition's name came from, recorded by the registrar that
@@ -189,6 +195,9 @@ private:
     visibility: DeclVisibility[];
     refused:    boolean[];
     origins:    NameOrigin[];
+    /// Each primitive's definition by its position in the primitive table;
+    /// invalid until the primitive is first asked for.
+    prim_defs:   DefId[];
 
 public:
     static new(intern: InternTable*) -> DefTable {
@@ -204,7 +213,31 @@ public:
             visibility: [],
             refused:    [],
             origins:    [],
+            prim_defs:   [],
         };
+    }
+
+    /// The definition of the primitive spelled `leaf`, registered the first
+    /// time it is asked for: a primitive is declared nowhere, so whichever
+    /// stage first needs it registers it - the name layer, for a method
+    /// written in `implement i32 { .. }`, or the type declarations, for the
+    /// primitive's type.  One primitive, one id, whoever asks first.  `leaf`
+    /// is a primitive's spelling as the primitive table answered it
+    /// (`Res::PrimTy`), never a written name; anything else is refused.
+    ![allow(lookup_by_spelling, reason = "a primitive is declared nowhere, so the spelling the primitive table answered is its only identity")]
+    primitive(mut &this, leaf: SymbolStr) -> DefId {
+        const at: i64 = ResBase::primitive_position(this.intern.resolve(leaf));
+        if (at < 0) {
+            panic(fmt::format(
+                "internal compiler error: `%s` was registered as a primitive, and the primitive table does not hold it",
+                this.intern.resolve(leaf)), FILE, LINE);
+        }
+        while (this.prim_defs.length <= at) { this.prim_defs.push(DefId::invalid()); }
+        if (!this.prim_defs[at].is_valid()) {
+            this.prim_defs[at] = this.append(DefId::invalid(), leaf, DefKind::Primitive,
+                SourceSpan::none(), NameOrigin::Written);
+        }
+        return this.prim_defs[at];
     }
 
     /// Append a definition declared in `parent` (the module, type or impl it
@@ -415,27 +448,40 @@ implement enum ResBase {
         // declaration index registers `()` beside them.  It reaches here as an
         // impl head's target TEXT; a written `()` in annotation position parses
         // as the empty tuple and never asks this.
-        return name.eq("()")
-            || name.eq("void")
-            || name.eq("boolean")
-            || name.eq("char")
-            || name.eq("string")
-            || name.eq("i8")
-            || name.eq("i16")
-            || name.eq("i32")
-            || name.eq("i64")
-            || name.eq("i128")
-            || name.eq("u8")
-            || name.eq("u16")
-            || name.eq("u32")
-            || name.eq("u64")
-            || name.eq("u128")
-            || name.eq("isize")
-            || name.eq("usize")
-            || name.eq("f32")
-            || name.eq("f64")
-            || name.eq("never")
-            || name.eq("va_list");
+        return ResBase::primitive_position(name) >= 0;
+    }
+
+    /// Door `primitive`.  The same fixed table in its one ordered form: the
+    /// predicate above is this position being present.
+    ///
+    /// The position of `name` in the fixed primitive table, or -1 when it
+    /// spells no primitive; the index a primitive's definition is kept under
+    /// (`DefTable::primitive`).
+    static primitive_position(name: string) -> i64 {
+        return match (name) {
+            "()"      => { 0 }
+            "void"    => { 1 }
+            "boolean" => { 2 }
+            "char"    => { 3 }
+            "string"  => { 4 }
+            "i8"      => { 5 }
+            "i16"     => { 6 }
+            "i32"     => { 7 }
+            "i64"     => { 8 }
+            "i128"    => { 9 }
+            "u8"      => { 10 }
+            "u16"     => { 11 }
+            "u32"     => { 12 }
+            "u64"     => { 13 }
+            "u128"    => { 14 }
+            "isize"   => { 15 }
+            "usize"   => { 16 }
+            "f32"     => { 17 }
+            "f64"     => { 18 }
+            "never"   => { 19 }
+            "va_list" => { 20 }
+            _         => { -1 }
+        };
     }
 
     /// Door `primitive`.  The alias keywords are the same fixed table: each

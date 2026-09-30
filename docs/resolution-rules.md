@@ -62,6 +62,7 @@ function carries no marker.
 | `module-by-path` | `ModuleGraph::module_named` | `compiler/src/compiler/module_graph.cryo` | written module path to its module |
 | `primitive` | `ResBase::is_primitive_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table |
 | `primitive` | `ResBase::primitive_of_alias` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table: alias keywords |
+| `primitive` | `ResBase::primitive_position` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table: a primitive's position, which its definition is kept under |
 | `lang-item` | `GenericRegistry::claim_wellknown` | `compiler/src/compiler/types/generic_registry.cryo` | the fixed language-item table |
 | `intern` | `InternTable::intern` | `compiler/src/compiler/resolver/intern_table.cryo` | text to `SymbolStr` |
 | `suggestion` | `find_best_candidate` | `compiler/src/compiler/diag/edit_distance.cryo` | "did you mean": result flows only into message text |
@@ -154,6 +155,20 @@ yet is recorded with the change that builds it, not here.
     `(BetaG for GgTf<i32>)::go(&e, 7)`, is handled by the monomorphizer's
     conversion** (the plan's slices 6 and 7), not fixed separately. Until
     then it is E0636.
+
+49. **Methods get `DefId`s, registered by the name layer like other
+    items.** Code the compiler generates names the methods it calls through
+    **method language items** (for example `FuturePoll`, `OptionTake`), as
+    rustc does; it never builds a name to look up.
+
+    ```cryo
+    // what the async lowering writes at `x.await`, named by identity
+    fut.poll(cx)      // LangItem::FuturePoll, not the leaf `poll`
+    slot.take()       // LangItem::OptionTake, not the leaf `take`
+    ```
+
+50. **Ruling 47's error is approved as E0243**, "`parse` is imported
+    twice".
 
 ### 2026-09-29
 
