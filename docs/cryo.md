@@ -2360,6 +2360,16 @@ Each `import` declaration imports from a single path. To bring two items from th
 
 Wildcard imports are convenient but can cause name collisions; prefer the brace form or using the module name directly.
 
+A brace entry brings its name in once. A second brace entry bringing in a name an earlier one already brought into the file, in the same namespace - another module's item of that name, or the same item again - is refused at the second import (E0243, "`parse` is imported twice"), as Rust refuses a second `use`. The first import stays the name's, and a qualified path still names its own module's item:
+
+```cryo
+import Json::{ parse };
+import Toml::{ parse };               // error[E0243]: `parse` is imported twice
+const b: i32 = Toml::parse("1");      // Toml's `parse`
+```
+
+A wildcard is not a brace entry: two wildcards offering one name make only the bare use of that name ambiguous (E0154).
+
 ### 14.4 Visibility
 
 | Modifier            | Meaning                                                                                  |

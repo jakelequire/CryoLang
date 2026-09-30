@@ -114,6 +114,11 @@ type struct Resolver {
     /// bindings and each one's target is what a namespace chooses between.
     import_targets: HashMap<u64, SymbolID>;
 
+    /// The import bindings an explicit entry - `import M::{ name }` - made,
+    /// by binding.  A glob's bindings are not among them: a second explicit
+    /// import of a name is refused against an explicit one only.
+    explicit_imports: HashMap<u64, boolean>;
+
     /// Create a new Resolver with a global scope.
     /// The InternTable pointer must outlive the Resolver (owned by CompilationContext).
     static new(table: InternTable*) -> Resolver {
@@ -140,6 +145,7 @@ type struct Resolver {
             module_scopes:        HashMap::<u32, u64>::new(),
             param_bounds:         [],
             import_targets:       HashMap::<u64, SymbolID>::new(),
+            explicit_imports:     HashMap::<u64, boolean>::new(),
         };
     }
 
@@ -330,7 +336,14 @@ type struct Resolver {
     /// the leaf - a type beside a function - is a second binding of the
     /// name, held in the scope's overload set as the declaring module's own
     /// scope holds it.  The same declaration imported again binds nothing new.
-    declare_import(mut &this, sym: Symbol, target: SymbolID) -> SymbolID {
+    ///
+    /// `explicit` is an entry of `import M::{ name }`, as opposed to a glob.
+    /// An explicit entry whose name an earlier explicit entry already brought
+    /// into this scope, in the namespace `target` is in, binds nothing, and
+    /// the earlier binding is answered for the caller to refuse the import
+    /// (E0243); a type and a function of one leaf are two namespaces and do
+    /// not collide.  Otherwise the answer is invalid.
+    declare_import(mut &this, sym: Symbol, target: SymbolID, explicit: boolean) -> SymbolID {
         const id: SymbolID = sym.id;
         const name: SymbolStr = sym.name;
         // Intern the module path to get a heap-safe SymbolStr ID
@@ -344,30 +357,59 @@ type struct Resolver {
         mut existing_module_id: u32 = 0;
         const existing_id: SymbolID = this.scopes[this.current_scope.id - 1].find(name);
         if (existing_id.is_valid()) {
+            // Every binding the scope holds under the name answers both
+            // questions: whether an explicit entry already brought it in,
+            // and whether one of them already names `target`.
+            const all: SymbolID[] = this.scopes[this.current_scope.id - 1].get_overloads(name);
+            if (explicit) {
+                const first: SymbolID = this.explicit_binding_beside(&all, target);
+                if (first.is_valid()) { return first; }
+            }
             const ex: Symbol = this.symbols[this.symbol_ids.slot_of(existing_id)];
             const ex_mod_sym: SymbolStr = ex.source_module.as_sym();
             existing_module_id = ex_mod_sym.id;
             if (ex.kind == SymbolKind::Import && existing_module_id == new_module_id) {
-                if (!this.import_target_in(this.current_scope, name, target).is_valid()) {
+                const bound: SymbolID = this.binding_to(&all, target);
+                if (!bound.is_valid()) {
                     this.scopes[this.current_scope.id - 1].add_overload(name, id);
                 }
-                return id;
+                if (explicit) {
+                    this.explicit_imports.insert(if (bound.is_valid()) { bound.key() } else { id.key() }, true);
+                }
+                return SymbolID::invalid();
             }
         }
 
         this.scopes[this.current_scope.id - 1]
             .insert_import(name, id, new_module_id, existing_module_id);
-        return id;
+        if (explicit) { this.explicit_imports.insert(id.key(), true); }
+        return SymbolID::invalid();
     }
 
-    /// The import binding of `name` in `scope` whose target is `target`, or
-    /// an invalid id.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    import_target_in(&this, scope: ScopeID, name: SymbolStr, target: SymbolID) -> SymbolID {
-        const all: SymbolID[] = this.scopes[scope.id - 1].get_overloads(name);
-        for (mut i: i64 = 0; i < all.length; i++) {
-            const t: Option<SymbolID> = this.import_targets.get(&all[i].key());
-            if (t.is_some() && t.unwrap().equals(target)) { return all[i]; }
+    /// Among one name's `bindings`, the import binding whose target is
+    /// `target`, or an invalid id.
+    binding_to(&this, bindings: &SymbolID[], target: SymbolID) -> SymbolID {
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            const t: Option<SymbolID> = this.import_targets.get(&bindings[i].key());
+            if (t.is_some() && t.unwrap().equals(target)) { return bindings[i]; }
+        }
+        return SymbolID::invalid();
+    }
+
+    /// Among one name's `bindings`, one an explicit import entry made whose
+    /// target is in the namespace `target` is in, or an invalid id.
+    explicit_binding_beside(&this, bindings: &SymbolID[], target: SymbolID) -> SymbolID {
+        const ns: Namespace = if (Namespace::Type.accepts(this.symbols[this.symbol_ids.slot_of(target)].kind)) {
+            Namespace::Type
+        } else {
+            Namespace::Value
+        };
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            if (!this.explicit_imports.get(&bindings[i].key()).is_some()) { continue; }
+            const t: Option<SymbolID> = this.import_targets.get(&bindings[i].key());
+            if (t.is_some() && ns.accepts(this.symbols[this.symbol_ids.slot_of(t.unwrap())].kind)) {
+                return bindings[i];
+            }
         }
         return SymbolID::invalid();
     }

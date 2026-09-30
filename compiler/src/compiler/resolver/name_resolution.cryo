@@ -272,6 +272,19 @@ public:
         };
     }
 
+    /// E0243: the explicit import written at `at` brings in `name`, which the
+    /// explicit import binding `first` already brought into this scope.
+    /// Refused at the second import, where the collision is written.
+    ![allow(lookup_by_spelling, reason = "the leaf is printed in the message, not looked up")]
+    refuse_repeated_import(&this, name: SymbolStr, at: SourceSpan, first: SymbolID) -> void {
+        const shown: string = this.resolver.intern_table.resolve(name);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0243_NAME_IMPORTED_TWICE,
+            Text::new(fmt::format("`%s` is imported twice", shown)));
+        d = d.at_with_label(at, Text::new(fmt::format("`%s` is imported again here", shown)));
+        d = d.with_note_at(Text::new("first imported here"), this.resolver.get_symbol(first).declaring_span);
+        this.ctx.emit_diagnostic(d);
+    }
+
     /// Whether a class declares a constructor of its own.
     static declares_constructor(cd: ClassDeclNode*) -> boolean {
         for (mut i: i64 = 0; i < cd.methods.length; i++) {
@@ -3340,7 +3353,7 @@ public:
                     const import_sym: Symbol = Symbol::import_sym(
                         id, export_sym.name, this.resolver.current_scope,
                         node.span, imported, export_sym.def);
-                    this.resolver.declare_import(import_sym, exports[i]);
+                    this.resolver.declare_import(import_sym, exports[i], false);
                 }
             }
             // A re-exported namespace is part of what this module offers, so
@@ -3367,7 +3380,7 @@ public:
                     const rimp: Symbol = Symbol::import_sym(
                         rid, rx_sym.name, this.resolver.current_scope,
                         node.span, rx_sym.source_module, rx_sym.def);
-                    this.resolver.declare_import(rimp, rx_exports[re]);
+                    this.resolver.declare_import(rimp, rx_exports[re], false);
                 }
             }
         } else if (node.style == ImportStyle::Specific) {
@@ -3409,6 +3422,7 @@ public:
                     }
                 }
                 if (offered.length > 0) {
+                    mut refused_twice: boolean = false;
                     for (mut k: i64 = 0; k < offered.length; k++) {
                         const osym: Symbol = this.resolver.get_symbol(offered[k]);
                         const src: ModulePath =
@@ -3417,7 +3431,14 @@ public:
                         const import_sym: Symbol = Symbol::import_sym(
                             id, name, this.resolver.current_scope,
                             node.span, src, osym.def);
-                        this.resolver.declare_import(import_sym, offered[k]);
+                        // A name an earlier explicit import already brought in,
+                        // in this declaration's namespace, binds nothing and is
+                        // refused here: the first import stays the name's.
+                        const first: SymbolID = this.resolver.declare_import(import_sym, offered[k], true);
+                        if (first.is_valid() && !refused_twice) {
+                            this.refuse_repeated_import(name, node.span, first);
+                            refused_twice = true;
+                        }
                     }
                 } else if (!node.is_export
                            && this.resolver.private_declarations(imported, name).length > 0) {
@@ -3471,7 +3492,7 @@ public:
                             const import_sym: Symbol = Symbol::import_sym(
                                 id, sub_export_sym.name, this.resolver.current_scope,
                                 node.span, sub_module, sub_export_sym.def);
-                            this.resolver.declare_import(import_sym, sub_exports[j]);
+                            this.resolver.declare_import(import_sym, sub_exports[j], false);
                         }
                     }
                 }
