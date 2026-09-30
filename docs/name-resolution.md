@@ -434,7 +434,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: facts-check lane-check lane-selftest facts-selftest' Makefile` → **1** (§8.371: stale facts are REFUSED first, never regenerated - the facts target is the deliberate refresh - and the refusal's self-test runs; `facts-fresh`, which regenerated them, before, §8.366)
 * `python3 scripts/facts-selftest.py | tail -1 | grep -o '[0-9]* cases' | cut -d' ' -f1` → **12** (§8.371: the freshness check over a throwaway tree - an edited source, an added source and a missing inputs record refused, fresh facts and a non-source edit accepted, each through `facts.py --check` and through `facts_path`, which the lane gate and the residue check call - and a dry run of the lane-check and check-fast targets building nothing; with the staleness comparison deleted it fails 4 cases, with `lane-check` depending on `facts` it fails 2)
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **128** (+1 in §8.432, `bound_path_names_declaring_trait`; 127 before, +2 in §8.431, `bound_call_through_index_field_projection`, `async_carried_local_released_at_return`; 125 before, +3 in §8.430, `private_function_field_call_refused`, `import_collision_qualified_use`, `import_collision_bare_use_refused`; 122 before, +3 in §8.429, `path_call_generic_method`, `static_path_generic_owner_ambiguous`, `unknown_trait_bound_no_cascade`, and `static_path_prefers_inherent_method` renamed to `static_path_inherent_trait_ambiguous`; 119 before, +1 in §8.428, `unknown_trait_refused_where_written`; 118 before, +3 and -1 in §8.427, `inherent_trait_method_ambiguous`, `inherent_trait_method_explicit`, `bound_call_names_bound_method`, and `inherent_method_over_trait` renamed to the first; 116 before, +2 in §8.424, `bounded_param_method_refused`, `supertrait_methods_through_bound`; 114 before, +1 in §8.423, `bufstream_releases_transport_once`; 113 before, +1 in §8.420, `unbounded_param_method_refused`; 112 before, +1 in §8.418, `type_declaration_bound_types_calls`; 111 before, +1 in §8.417, `trait_default_this_calls_typed`; 110 before, +1 in §8.412, `class_inherited_function_field_call`; 109 before, +1 in §8.410, `overload_receiver_consumes_by_pin`; 108 before, +3 in §8.405, `generic_function_named_like_type`, `generic_receiver_alias`, `generic_receiver_alias_refused`; 105 before, +1 in §8.404, `compare_with_null_refused`; 104 before, +2 in §8.403, `class_constructor_arguments_refused`, `class_constructor_overloads_by_arity`; 102 before, +3 in §8.402, `generic_receiver_by_type`, `generic_receiver_other_instantiation_refused`, `generic_function_type_argument`; 99 before, +2 in §8.401, `bare_type_as_value_refused`, `class_constructed_by_name`; +1 in §8.396, `array_method_argument_mismatch`; +3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **130** (+2 in §8.434, `impl_qualified_path_in_generic_method`, `trait_impl_same_name_call_ambiguous`; 128 before, +1 in §8.432, `bound_path_names_declaring_trait`; 127 before, +2 in §8.431, `bound_call_through_index_field_projection`, `async_carried_local_released_at_return`; 125 before, +3 in §8.430, `private_function_field_call_refused`, `import_collision_qualified_use`, `import_collision_bare_use_refused`; 122 before, +3 in §8.429, `path_call_generic_method`, `static_path_generic_owner_ambiguous`, `unknown_trait_bound_no_cascade`, and `static_path_prefers_inherent_method` renamed to `static_path_inherent_trait_ambiguous`; 119 before, +1 in §8.428, `unknown_trait_refused_where_written`; 118 before, +3 and -1 in §8.427, `inherent_trait_method_ambiguous`, `inherent_trait_method_explicit`, `bound_call_names_bound_method`, and `inherent_method_over_trait` renamed to the first; 116 before, +2 in §8.424, `bounded_param_method_refused`, `supertrait_methods_through_bound`; 114 before, +1 in §8.423, `bufstream_releases_transport_once`; 113 before, +1 in §8.420, `unbounded_param_method_refused`; 112 before, +1 in §8.418, `type_declaration_bound_types_calls`; 111 before, +1 in §8.417, `trait_default_this_calls_typed`; 110 before, +1 in §8.412, `class_inherited_function_field_call`; 109 before, +1 in §8.410, `overload_receiver_consumes_by_pin`; 108 before, +3 in §8.405, `generic_function_named_like_type`, `generic_receiver_alias`, `generic_receiver_alias_refused`; 105 before, +1 in §8.404, `compare_with_null_refused`; 104 before, +2 in §8.403, `class_constructor_arguments_refused`, `class_constructor_overloads_by_arity`; 102 before, +3 in §8.402, `generic_receiver_by_type`, `generic_receiver_other_instantiation_refused`, `generic_function_type_argument`; 99 before, +2 in §8.401, `bare_type_as_value_refused`, `class_constructed_by_name`; +1 in §8.396, `array_method_argument_mismatch`; +3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)* `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -52342,3 +52342,101 @@ Ruling 32 says an inherent `drop` does not satisfy `where T: Drop`.  Today
   its payload through `std::core::ptr::drop_in_place<T>` with no `Drop`
   bound (ruling 14, the plan's slice 4), where an inherent destructor is
   the payload's drop code like any other.  So it lands with slice 4.
+
+### 8.434 A path naming a trait implementation's generic method runs inside a generic body, and the dispatch annotator is deleted - 2026-09-30
+
+## Why
+
+Ruling 31: a method two traits provide, called on a concrete receiver
+inside an implementation of one of them, is E0156 - the enclosing impl's
+trait does not choose.  The monomorphizer's dispatch annotator made it
+choose (its one remaining rule: a call named like the enclosing trait-impl
+method is stamped with that impl's trait), and `Debug for String`
+(`stdlib/fmt/display.cryo:507`, `view.fmt(f)` on a `Str`, which has both
+`Display::fmt` and `Debug::fmt`) relied on it.  The explicit form the
+ruling asks for, `(Debug for Str)::fmt(&view, f)`, was E0636 "cannot
+resolve 'Str::fmt'" inside a generic method.  Three causes, each measured
+with a probe (`.objcmp/s83/unit2-with-probes.patch`) on
+`.objcmp/s83/r31e`:
+
+1. Sema's symbolic walk of the template selected no entry: the
+   parameter types of a generic method's entry (`static_entry_params`)
+   were refused when they mentioned any type parameter, so `w: W` (the
+   caller's own parameter) matched nothing (`fits=0`).
+2. The substituter dropped `resolved_method` on every clone.
+3. Mono's path branch read the receiver's type off the first argument,
+   which a clone carries untyped.
+
+## What changed
+
+* `CallResolver::static_entry_params`: in a template's symbolic walk a
+  parameter bound to an enclosing parameter stays abstract, as a
+  turbofish's already did (`solve_method_bindings_at`).
+* `ASTTypeSubstituter::template_path_method_crosses`: a path call's
+  `resolved_method` crosses the substitution when it is a generic method's
+  template (own type parameters left) on an owner its receiver names
+  without a type parameter.  `resolved_type_args` is substituted as
+  before; the final pin is still dropped.  A sibling's specialization, or
+  a generic owner's method, is dropped as before.
+* `MonoCallSpecializer::specialize_method_call`: a path call's receiver
+  is the pinned method's own receiver parameter
+  (`receiver_param_type`); a generic owner's is not specialized there.
+* `display.cryo:507` is `(Debug for Str)::fmt(&view, f)`.
+* `mono/dispatch_annotator.cryo` (292 lines) and its per-module pass in
+  `CompilerInstance` are deleted.  With it goes a whole load of every
+  module before monomorphization.
+
+```cryo
+type trait Aa { go<W>(&this, w: W) -> i32; }
+type trait Bb { go<W>(&this, w: W) -> i32; }
+// S implements both.
+implement trait Bb for T2 {
+    go<W>(&this, w: W) -> i32 { return this.s.go(w); }             // was: Bb's, then LLVM "Incorrect number of arguments"; now E0156
+    go<W>(&this, w: W) -> i32 { return (Bb for S)::go(&this.s, w); } // was: E0636 "cannot resolve 'S::go'"; now runs Bb's
+}
+```
+
+## Evidence
+
+* verify, in two runs because the baseline compiler cannot build the
+  rewritten `display.cryo`:
+  - the compiler change alone, `display.cryo` and the annotator as at HEAD,
+    `--baseline HEAD --require-identical` (`.verify/runs/20260930-012203`):
+    0 of 4391 test and 0 of 1126 example objects moved;
+    `impl_qualified_path_in_generic_method` refused by HEAD and built;
+    every gate OK but `fast` (the §0 project row).
+  - everything, against a scratch commit holding the compiler change and
+    the rewrite with the annotator kept (`s83-scratch-baseline`,
+    `.verify/runs/20260930-010946`): 0 of 4447 test and 0 of 1126 example
+    objects moved, so deleting the annotator moved nothing; the baseline
+    census failed `trait_impl_same_name_call_ambiguous` only; the tree's
+    census failed `ProcessAsync::two_children_join_concurrently` only, the
+    known load flake, which passed in the other run's tree census and
+    alone (`cryo test two_children_join_concurrently`).
+* Clean build: 344 warnings, the same set as HEAD's compared by (code,
+  file, message).  check-fast OK.
+* The old form under the new compiler is ruling 31's E0156:
+  `error[E0156]: `fmt` is provided by more than one trait implemented for
+  `Str`` at `display.cryo:507:16`.
+* Inversion, each alone against an unmutated control that builds and exits
+  0 (`.objcmp/s83/mutate.py`): dropping the template pin in the
+  substituter, refusing enclosing parameters in `static_entry_params`, and
+  reading the receiver off the argument each bring back
+  `error[E0636]: codegen: cannot resolve 'Str::fmt'` on
+  `impl_qualified_path_in_generic_method`.
+* New projects: `impl_qualified_path_in_generic_method` (run; the path in
+  a trait impl's generic method, an inherent generic method and a generic
+  free function, two instantiations each, and `{:?}` of a `String`),
+  declared in `tests/started-compiling`; `trait_impl_same_name_call_ambiguous`
+  (E0156), declared in `tests/started-passing`.
+
+## Not done
+
+* The method form with ONE trait providing the name,
+  `this.s.go(w)` inside an impl's generic method, still calls the
+  unspecialized template (LLVM "Incorrect number of arguments";
+  `.objcmp/s82/r31b`).
+* The pin compiler (`bin/cryo`) cannot compile a program that formats a
+  `String` with `{:?}` against this standard library (E0636 at
+  `display.cryo:507`); neither the standard library archive nor the
+  compiler instantiates it, so nothing needs a re-pin yet.

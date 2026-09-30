@@ -745,6 +745,15 @@ type struct MonoCallSpecializer {
         return false;
     }
 
+    /// The type of `m`'s receiver parameter (`&this` of `S` is `&S`);
+    /// invalid for a method with none.
+    static receiver_param_type(m: MethodNode*) -> TypeRef {
+        if (m.func == null || m.func.parameters.length == 0) { return TypeRef::invalid(); }
+        const recv: VarDeclNode* = m.func.parameters[0];
+        if (recv == null || !recv.is_receiver()) { return TypeRef::invalid(); }
+        return recv.resolved_type;
+    }
+
     /// Whether `m` is one of `block`'s methods, by identity.
     static block_holds(block: ImplBlockNode*, m: MethodNode*) -> boolean {
         if (block == null) { return false; }
@@ -841,7 +850,17 @@ type struct MonoCallSpecializer {
         // `resolved_type`; for the member-access shape (`this.h.relay(w)`) the type
         // is reconstructed structurally from the (carried) object type + the named
         // field, which is spec-local and authoritative - no re-inference.
+        //
+        // A path call's receiver is the owner of the declaration the path
+        // names, read off that method's own receiver parameter: the argument
+        // is only what is passed to it, and a clone's argument carries no
+        // type.  An owner that still mentions a type parameter is a generic
+        // owner's template method, which no specialization here answers.
         mut recv_type: TypeRef = recv_expr.resolved_type;
+        if (path_method != null) {
+            recv_type = MonoCallSpecializer::receiver_param_type(path_method);
+            if (!recv_type.is_valid() || this.arena.contains_generic_param(recv_type)) { return; }
+        }
         mut recv_derived: boolean = false;
         if (recv_type.is_valid()) {
             if (subst != null) { recv_type = subst.apply(recv_type, this.arena); }
@@ -919,7 +938,7 @@ type struct MonoCallSpecializer {
 
         // Method lookup (LOOKUP, not inference), the same precedence sema's
         // `select_method` binds under.  A call stamped with a trait (made
-        // through a bound, or a recursion inside that trait's impl) names
+        // through a bound) names
         // that trait's method: the stores holding trait impls are asked for
         // it first.  Otherwise an INHERENT method of the receiver's name
         // answers ahead of any trait impl's, whichever store holds it and

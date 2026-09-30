@@ -16,7 +16,7 @@ import compiler::diag;
 import compiler::ast;
 import compiler::ast::{
     ArrayAnnotation, declaration, expression, FunctionAnnotation, GenericAnnotation,
-    MemberPin, NamedAnnotation, node, pattern, PatternElement, PatternKind, PointerAnnotation,
+    MemberPin, NamedAnnotation, node, NodeKind, pattern, PatternElement, PatternKind, PointerAnnotation,
     PrimitiveAnnotation, ProjectionAnnotation, statement, TupleAnnotation, TypeAnnotation,
     visitor
 };
@@ -56,6 +56,7 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
+import compiler::ast::node::{ ASTNode };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::ast::visitor::{ BaseASTVisitor };
 
@@ -132,6 +133,26 @@ public:
     /// leaves a clone through this door and no other.
     drop_stale_callee_pin(&this, node: CallExprNode*) -> void {
         node.set_resolved_callee(CalleePin::None);
+    }
+
+    /// Whether a path call's method node is the same in every instantiation
+    /// of the body it sits in: sema bound `(Debug for Str)::fmt(&view, f)`
+    /// to the generic method `fmt<W>` of `Str`, and no substitution makes
+    /// that path name another declaration - only the method's own type
+    /// arguments move, and `resolved_type_args` carries those.  Two things
+    /// would make it another declaration: an owner the substitution reaches
+    /// (a receiver that mentions a type parameter belongs to a generic
+    /// owner, whose specialization holds its own copy), and a node that is
+    /// already one specialization of the method (a method with no type
+    /// parameters of its own left), which is a sibling's answer.
+    template_path_method_crosses(&this, node: CallExprNode*) -> boolean {
+        if (node.callee == null || (node.callee as ASTNode*).kind != NodeKind::ScopeResolution) { return false; }
+        if (node.resolved_method == null) { return false; }
+        const m: MethodNode* = node.resolved_method as MethodNode*;
+        if (m.func == null || m.func.generic_params.length == 0 || m.func.parameters.length == 0) { return false; }
+        const recv: VarDeclNode* = m.func.parameters[0];
+        if (recv == null || !recv.is_receiver() || !recv.resolved_type.is_valid()) { return false; }
+        return !this.arena.contains_generic_param(recv.resolved_type);
     }
 
     /// The same drop for a path's callee - see the overload above.
@@ -643,8 +664,10 @@ public:
         // A callee pin does not cross a substitution - `drop_stale_callee_pin`
         // says why - and neither does the method node beside it, which is one
         // sibling specialization's declaration.  The monomorphizer's discovery
-        // re-infers both for this body.
-        node.resolved_method = null;
+        // re-infers both for this body.  A path's template method on an owner
+        // no substitution reaches is the exception: it names the declaration
+        // this body's call specializes, in every instantiation alike.
+        if (!this.template_path_method_crosses(node)) { node.resolved_method = null; }
         this.drop_stale_callee_pin(node);
         // `resolved_type_args` is sema's stash of this call's generic type-arg
         // bindings, expressed in the TEMPLATE's params (e.g. `H`/`W`).  Unlike
