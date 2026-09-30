@@ -91,9 +91,10 @@ public:
     /// barred from the did-you-mean, since rewriting the target to it would
     /// make the alias its own meaning.  Empty elsewhere.
     defining_type: SymbolStr;
-    /// What a refused type spelling is called in its report: "type", or
-    /// "trait" while an impl head's trait is stamped.
-    type_noun: string;
+    /// Whether the spelling being stamped stands where a trait must: an
+    /// impl head's trait, a supertrait, a bound.  A refused one is reported
+    /// as a trait (E0242), not a type.
+    naming_trait: boolean;
     /// The spelling of the receiver binding.
     this_sym: SymbolStr;
     /// The trait `This` stands for in the body being walked: a trait
@@ -108,7 +109,7 @@ public:
         this.pending_base_ctor = null;
         this.callee_ident      = null;
         this.defining_type     = SymbolStr::empty();
-        this.type_noun         = "type";
+        this.naming_trait      = false;
         this.this_sym          = resolver.intern_table.intern("this");
         this.this_trait        = DefId::invalid();
     }
@@ -927,9 +928,9 @@ public:
         // while that leaf is unique program-wide.
         // The head's own name is a trait; what it is applied to is not.
         const trait_head: TypeAnnotation* = TypeAnnotation::head_base(node.trait_annotation);
-        this.type_noun = "trait";
+        this.naming_trait = true;
         this.stamp_annotation(trait_head);
-        this.type_noun = "type";
+        this.naming_trait = false;
         this.stamp_annotation(node.trait_annotation);
         const outer_trait: DefId = this.this_trait;
         this.this_trait = TypeAnnotation::trait_def(node.trait_annotation);
@@ -1517,9 +1518,8 @@ public:
                 this.ctx.emit_diagnostic(d);
                 return true;
             }
-            mut d: Diagnostic = Diagnostic::error(
-                ErrorCode::E0203_UNDEFINED_TYPE,
-                Text::new(fmt::format("cannot find %s `%s` in this scope", this.type_noun, written)));
+            mut d: Diagnostic = Diagnostic::error(this.not_found_code(),
+                Text::new(fmt::format("cannot find %s `%s` in this scope", this.noun(), written)));
             d = d.at_with_label(span, Text::new("not found in this scope"));
             this.ctx.emit_diagnostic(d);
             return true;
@@ -1576,9 +1576,8 @@ public:
                 return true;
             }
         }
-        mut d: Diagnostic = Diagnostic::error(
-            ErrorCode::E0203_UNDEFINED_TYPE,
-            Text::new(fmt::format("cannot find %s `%s` in this scope", this.type_noun, written)));
+        mut d: Diagnostic = Diagnostic::error(this.not_found_code(),
+            Text::new(fmt::format("cannot find %s `%s` in this scope", this.noun(), written)));
         d = d.at_with_label(span, Text::new("not found in this scope"));
         // The name a type alias is DEFINING cannot be the fix for a name
         // inside its own definition: accepting it yields `type Foo = Foo;`,
@@ -1591,9 +1590,19 @@ public:
                     && visible[i].eq(intern.resolve(this.defining_type))) { continue; }
             cands.push(visible[i]);
         }
-        d = d.did_you_mean(written, cands, this.type_noun, span);
+        d = d.did_you_mean(written, cands, this.noun(), span);
         this.ctx.emit_diagnostic(d);
         return true;
+    }
+
+    /// What a refused spelling is called in its report.
+    noun(&this) -> string {
+        return if (this.naming_trait) { "trait" } else { "type" };
+    }
+
+    /// The code a spelling that names nothing is refused with.
+    not_found_code(&this) -> ErrorCode {
+        return if (this.naming_trait) { ErrorCode::E0242_UNDEFINED_TRAIT } else { ErrorCode::E0203_UNDEFINED_TYPE };
     }
 
     override visit(node: IdentifierNode*) -> void {
@@ -2117,9 +2126,10 @@ public:
     /// keyed by its spelling reaches no registered trait, so every method
     /// dispatched through it came back untyped.
     ///
-    /// Only a definition is an identity.  A type parameter or a spelling this
-    /// pass cannot place leaves the field empty, and `TraitRef::identity`
-    /// then falls back to the written leaf and says so on its audit row.
+    /// Only a definition is an identity.  A type parameter leaves the field
+    /// empty.  A spelling that names nothing is refused where it is written,
+    /// as a trait (E0242): a bound or a supertrait no trait answers would
+    /// otherwise compile until something asks it for a method.
     stamp_trait_ref_identity(&this, tref: TraitRef*) -> void {
         if (tref == null || tref.path.length == 0) { return; }
         if (tref.resolved.is_valid()) { return; }
@@ -2127,14 +2137,20 @@ public:
         for (mut i: i64 = 1; i < tref.path.length; i++) {
             written = written + "::" + this.resolver.intern_table.resolve(tref.path[i]);
         }
-        match (this.type_spelling_res(this.resolver.intern_table.intern(written), tref.span)) {
+        const spelled: SymbolStr = this.resolver.intern_table.intern(written);
+        match (this.type_spelling_res(spelled, tref.span)) {
             ResSlot::Answered(r) => {
                 match (r) {
                     Res::Def(q) => { tref.resolved = q; }
                     _           => { }
                 }
             }
-            _ => { }
+            _ => {
+                const outer: boolean = this.naming_trait;
+                this.naming_trait = true;
+                this.refuse_unbound_type(spelled, tref.span);
+                this.naming_trait = outer;
+            }
         }
     }
 

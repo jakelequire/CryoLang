@@ -276,6 +276,17 @@ yet is recorded with the change that builds it, not here.
     const m: i64 = (Beta for IgTn)::go(&ig, 7);  // Beta's: 2
     ```
 
+23. **An unknown supertrait, or an unknown trait in a `where` clause, is
+    refused where it is written**, with wording that says trait, in the
+    style of Rust's "cannot find trait `Foo` in this scope" - not E0203's
+    "cannot find type". The code is E0242, new for this; an impl head's
+    unknown trait, which already said "trait", takes it too.
+
+    ```cryo
+    type trait Sub : Missing { go(&this) -> i32; }             // error[E0242]: cannot find trait `Missing` in this scope
+    function f<T>(x: &T) -> i32 where T: Nowhere { return 1; } // error[E0242]: cannot find trait `Nowhere` in this scope
+    ```
+
 24. **Ruling 22's ambiguity is E0156**, the error for a name more than one
     trait provides, whose help already writes
     `(Trait for Owner)::member(args)`, with a primary line that names the

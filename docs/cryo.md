@@ -1801,6 +1801,13 @@ type enum Slot<T> where T: Tagged {
 }
 ```
 
+Every trait a bound or a supertrait names must be one in scope where it is written; a name that finds none is refused there (E0242, "cannot find trait `X` in this scope"), whether or not anything calls through the bound.
+
+```cryo
+type trait Sub : Missing { go(&this) -> i32; }                // error[E0242]: cannot find trait `Missing` in this scope
+function f<T>(x: &T) -> i32 where T: Nowhere { return 1; }    // error[E0242]: cannot find trait `Nowhere` in this scope
+```
+
 A type's bound is checked once per instantiation: `Holder<Plain>` with a `Plain` that does not implement `Tagged` is an error (E0306) at the annotation that wrote it, with the bound as declared beside it. An instantiation reached without an annotation — a literal, a static call — is refused the same way where it is specialised.
 
 Inside the body that declares it, a parameter has only the methods its bounds give it. A method call on a parameter that no bound in scope names — the function's `where` clause, the enclosing `implement` block's, or the type declaration's — is an error (E0358) where the call is written, whether or not anything instantiates the body.
