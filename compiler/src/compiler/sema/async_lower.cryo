@@ -1434,20 +1434,44 @@ type struct AsyncLower {
 
     /// `recv.name()` typed `ret_ty`. The member/call re-resolve by name during
     /// the post-mono body re-check; `ret_ty` is the pre-mono hint.
-    method_call0(&this, recv: ExpressionNode*, name: string, ret_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
-        mut m: MemberAccessNode* = new MemberAccessNode(recv, this.intern.intern(name), span, span);
+    /// `<recv>.<item>()`: a call of the method language item `item`, which
+    /// names its method by definition (`CallExprNode.named_method`) and is
+    /// bound to the receiver's own method by that identity.  The member is
+    /// the method's leaf, for printing the tree only.
+    method_call0(&this, recv: ExpressionNode*, item: LangItem, ret_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        const d: DefId = this.method_item(item, span);
+        mut m: MemberAccessNode* = new MemberAccessNode(recv, this.ctx.defs.leaf_of(d), span, span);
         mut c: CallExprNode* = new CallExprNode(m as ExpressionNode*, span);
+        c.named_method = d;
         c.set_resolved_type(ret_ty);
         return c as ExpressionNode*;
     }
 
-    method_call1(&this, recv: ExpressionNode*, name: string, arg: ExpressionNode*,
+    /// `<recv>.<item>(<arg>)`; see `method_call0`.
+    method_call1(&this, recv: ExpressionNode*, item: LangItem, arg: ExpressionNode*,
                  ret_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
-        mut m: MemberAccessNode* = new MemberAccessNode(recv, this.intern.intern(name), span, span);
+        const d: DefId = this.method_item(item, span);
+        mut m: MemberAccessNode* = new MemberAccessNode(recv, this.ctx.defs.leaf_of(d), span, span);
         mut c: CallExprNode* = new CallExprNode(m as ExpressionNode*, span);
+        c.named_method = d;
         c.add_argument(arg);
         c.set_resolved_type(ret_ty);
         return c as ExpressionNode*;
+    }
+
+    /// The method the language item `item` names.  An item no declaration
+    /// claimed is a standard library without it, which no lowered `await`
+    /// can be compiled against: reported where the lowering needs it.
+    method_item(&this, item: LangItem, span: SourceSpan) -> DefId {
+        const d: DefId = this.ctx.generic_registry.wellknown(item);
+        if (!d.is_valid()) {
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                Text::new(fmt::format("the async lowering calls `%s`, and no declaration in this program is that method",
+                    item.path())));
+            diag = diag.at_with_label(span, Text::new("lowered here"));
+            this.ctx.emit_diagnostic(diag);
+        }
+        return d;
     }
 
     /// `this.<field> = <rhs>;` as a statement.
@@ -1792,8 +1816,8 @@ type struct AsyncLower {
     subst_giveaway_target(mut &this, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
         mut fld: ExpressionNode* = this.carrier_field_expr(span);
         mut take_call: ExpressionNode* =
-            this.method_call0(fld, "take", this.subst_carrier_opt, span);
-        return this.method_call0(take_call, "unwrap", ty, span);
+            this.method_call0(fld, LangItem::OptionTake, this.subst_carrier_opt, span);
+        return this.method_call0(take_call, LangItem::OptionUnwrap, ty, span);
     }
 
     /// Whether the carried value currently lives in a hoisted local rather than
@@ -2988,7 +3012,7 @@ type struct AsyncLower {
         const fi_ptr: TypeRef = this.arena.get_pointer_to(fi);
         mut subp_call: ExpressionNode* = this.method_call0(
             this.member(this.this_ident(sm.struct_ref, span), fut_sym, fut_opt, span),
-            "unwrap_ptr", fi_ptr, span);
+            LangItem::OptionUnwrapPtr, fi_ptr, span);
         sm.blocks[resume].add_statement(
             this.var_decl_stmt_bound(subp_sym, subp_id, true, fi_ptr, subp_call, span));
 
@@ -3017,7 +3041,7 @@ type struct AsyncLower {
         const poll_sym: SymbolStr = this.intern.intern(fmt::format("__poll_%lld", k));
         const poll_id:  SymbolID  = this.resolver.alloc_synthetic_binding();
         mut poll_call: ExpressionNode* = this.method_call1(
-            this.ident_bound(subp_sym, subp_id, fi_ptr, span), "poll",
+            this.ident_bound(subp_sym, subp_id, fi_ptr, span), LangItem::FuturePoll,
             this.ident(sm.cx_sym, sm.ctx_ptr_ty, span), sub_poll_out, span);
         sm.blocks[resume].add_statement(
             this.var_decl_stmt_bound(poll_sym, poll_id, true, sub_poll_out, poll_call, span));
@@ -3030,7 +3054,7 @@ type struct AsyncLower {
         pend.add_statement(new ReturnStmtNode(this.poll_pending(sm.poll_out, span), span) as StatementNode*);
         sm.blocks[resume].add_statement(new IfStmtNode(
             this.method_call0(this.ident_bound(poll_sym, poll_id, sub_poll_out, span),
-                              "is_pending", this.arena.get_bool(), span),
+                              LangItem::PollIsPending, this.arena.get_bool(), span),
             pend as StatementNode*, null, span) as StatementNode*);
 
         // A completed sub-future is moved out of its field so its destructor runs
@@ -3041,14 +3065,14 @@ type struct AsyncLower {
         const done_sym: SymbolStr = this.intern.intern(fmt::format("__done_%lld", k));
         mut done_take: ExpressionNode* = this.method_call0(
             this.member(this.this_ident(sm.struct_ref, span), fut_sym, fut_opt, span),
-            "take", fut_opt, span);
+            LangItem::OptionTake, fut_opt, span);
         sm.blocks[resume].add_statement(this.var_decl_stmt(done_sym, true, fut_opt, done_take, span));
 
         const await_sym: SymbolStr = this.intern.intern(fmt::format("__await_%lld", k));
         const await_id:  SymbolID  = this.resolver.alloc_synthetic_binding();
         sm.blocks[resume].add_statement(this.var_decl_stmt_bound(await_sym, await_id, false, ao,
             this.method_call0(this.ident_bound(poll_sym, poll_id, sub_poll_out, span),
-                              "into_ready", ao, span), span));
+                              LangItem::PollIntoReady, ao, span), span));
 
         this.rewrite_carrier_await(stmt, this.ident_bound(await_sym, await_id, ao, span));
         this.rewrite_returns(stmt, sm.poll_out, span);
@@ -4521,8 +4545,8 @@ type struct AsyncLower {
                   opt_ty: TypeRef, struct_ref: TypeRef, mutable: boolean,
                   span: SourceSpan) -> StatementNode* {
         mut fld: ExpressionNode* = this.member(this.this_ident(struct_ref, span), field, opt_ty, span);
-        mut take_call: ExpressionNode* = this.method_call0(fld, "take", opt_ty, span);
-        mut unwrap_call: ExpressionNode* = this.method_call0(take_call, "unwrap", lty, span);
+        mut take_call: ExpressionNode* = this.method_call0(fld, LangItem::OptionTake, opt_ty, span);
+        mut unwrap_call: ExpressionNode* = this.method_call0(take_call, LangItem::OptionUnwrap, lty, span);
         return this.var_decl_stmt(name, mutable, lty, unwrap_call, span);
     }
 
@@ -4539,7 +4563,7 @@ type struct AsyncLower {
                       opt_ty: TypeRef, lty_ptr: TypeRef, span: SourceSpan) -> StatementNode* {
         mut fld: ExpressionNode* = this.member(
             this.this_ident(sm.struct_ref, span), field, opt_ty, span);
-        mut call: ExpressionNode* = this.method_call0(fld, "unwrap_ptr", lty_ptr, span);
+        mut call: ExpressionNode* = this.method_call0(fld, LangItem::OptionUnwrapPtr, lty_ptr, span);
         return this.var_decl_stmt(ptr_name, true, lty_ptr, call, span);
     }
 
@@ -4756,7 +4780,7 @@ type struct AsyncLower {
                      span: SourceSpan) -> StatementNode* {
         mut fld: ExpressionNode* = this.member(
             this.this_ident(sm.struct_ref, span), field, opt_ty, span);
-        mut take_call: ExpressionNode* = this.method_call0(fld, "take", opt_ty, span);
+        mut take_call: ExpressionNode* = this.method_call0(fld, LangItem::OptionTake, opt_ty, span);
         return new ExprStmtNode(take_call, span) as StatementNode*;
     }
 

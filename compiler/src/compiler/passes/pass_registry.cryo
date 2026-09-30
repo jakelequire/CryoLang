@@ -57,8 +57,8 @@ import compiler::types::user_defined::{ TypeAliasType };
 import std::fmt;
 import compiler::artifacts::{ ASTOutput, TokenStream };
 import compiler::ast::declaration::{
-    ClassDeclNode, EnumDeclNode, ImportDeclNode, StructDeclNode, TraitDeclNode,
-    TypeAliasDeclNode, UnionDeclNode
+    ClassDeclNode, EnumDeclNode, ImplBlockNode, ImportDeclNode, MethodNode, StructDeclNode,
+    TraitDeclNode, TypeAliasDeclNode, UnionDeclNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::compilation_context::{ CompilationContext };
@@ -892,6 +892,7 @@ type struct PassRegistry {
                     const struct_ref: TypeRef =
                         arena.create_struct(qualified_sym, ctx.declaring_module(node.def));
                     ctx.decl_index.register_type(node.def, struct_ref, node.is_public);
+                    PassRegistry::claim_method_items(ctx, &node.methods);
                     // Whether this IS the language's `Array`, `Slice`, `Rc`, ...
                     // is decided by the identity, claimed where it is minted.
                     if (ctx.generic_registry != null) {
@@ -908,6 +909,7 @@ type struct PassRegistry {
                     const union_ref: TypeRef =
                         arena.create_union(qualified_sym, ctx.declaring_module(node.def));
                     ctx.decl_index.register_type(node.def, union_ref, node.is_public);
+                    PassRegistry::claim_method_items(ctx, &node.methods);
                     type_count++;
                 }
                 NodeKind::EnumDeclaration => {
@@ -933,6 +935,7 @@ type struct PassRegistry {
                     const class_ref: TypeRef =
                         arena.create_class(qualified_sym, ctx.declaring_module(node.def));
                     ctx.decl_index.register_type(node.def, class_ref, node.is_public);
+                    PassRegistry::claim_method_items(ctx, &node.methods);
                     if (ctx.generic_registry != null) {
                         ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
                     }
@@ -951,6 +954,11 @@ type struct PassRegistry {
                     // before this trait's asks by the identity and must find it.
                     if (ctx.generic_registry != null) {
                         ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
+                        for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
+                            if (node.methods[mi] != null) {
+                                ctx.generic_registry.claim_wellknown(node.methods[mi].def, ctx.intern_table);
+                            }
+                        }
                     }
                     type_count++;
                 }
@@ -975,6 +983,9 @@ type struct PassRegistry {
                     // An alias carries no visibility modifier: public.
                     ctx.decl_index.register_type(node.def, alias_ref, true);
                     type_count++;
+                }
+                NodeKind::ImplementationBlock => {
+                    PassRegistry::claim_method_items(ctx, &(stmt as ImplBlockNode*).methods);
                 }
                 _ => {
                     // Functions, variables, imports, etc. don't create Type objects here
@@ -1037,6 +1048,22 @@ type struct PassRegistry {
 
     // DirectiveProcessing: see compiler/passes/directive_processing.cryo.
 
+
+    /// Claim each method `methods` holds that is a language item, as a
+    /// type is claimed where its identity is first known.  Only a method
+    /// written in the module that declares its owner is claimed: an
+    /// implementation in another module can give the owner a method of the
+    /// same path, and it must not become the method generated code calls.
+    static claim_method_items(ctx: CompilationContext*, methods: &MethodNode*[]) -> void {
+        if (ctx.generic_registry == null) { return; }
+        const here: DefId = ctx.module_def_of(ctx.unit_module);
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null || !m.func.def.is_valid()) { continue; }
+            if (!ctx.defs.module_of(m.func.def).equals(here)) { continue; }
+            ctx.generic_registry.claim_wellknown(m.func.def, ctx.intern_table);
+        }
+    }
 
     /// A primitive's definition: a root of the definition tree, its spelling
     /// the leaf, the same id the name layer registered it as when a method

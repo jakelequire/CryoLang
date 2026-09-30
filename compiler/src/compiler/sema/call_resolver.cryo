@@ -2878,10 +2878,6 @@ type struct CallResolver {
         if (call.resolved_callee.is_some() && call.resolved_method != null) {
             return Selection::of(call.resolved_method as MethodNode*);
         }
-        if (!member.resolved_trait.is_valid()) {
-            const copied: DefId = this.binding.default_copy_bound_direction(obj_type, member.member);
-            if (copied.is_valid()) { this.stamp_trait_item(member, copied); }
-        }
         mut base_ref: TypeRef = obj_type;
         mut base_t: Type* = this.arena.lookup(obj_type);
         mut owner_inst: TypeRef = TypeRef::invalid();
@@ -2918,6 +2914,16 @@ type struct CallResolver {
                 break;
             }
             unwrap_depth += 1;
+        }
+
+        // A call the compiler generated names its method by definition and
+        // is bound by that identity alone.
+        if (call.named_method.is_valid()) {
+            return this.bind_named_method(visitor, call, member, base_ref, owner_inst);
+        }
+        if (!member.resolved_trait.is_valid()) {
+            const copied: DefId = this.binding.default_copy_bound_direction(obj_type, member.member);
+            if (copied.is_valid()) { this.stamp_trait_item(member, copied); }
         }
 
         if (base_t == null) { return Selection::none(); }
@@ -3008,6 +3014,45 @@ type struct CallResolver {
             return this.commit_selection(visitor, call, sel);
         }
         return Selection::none();
+    }
+
+    /// Bind a call that names its method by definition - a method language
+    /// item a lowering wrote - to the receiver's own method for it: for a
+    /// trait's declared method, the method the receiver's implementation of
+    /// the trait provides at that method's position; for any other, the
+    /// receiver's entry for the definition, its own or its copy of it.
+    /// Nothing is selected by name, and a concrete receiver without the
+    /// method is an internal error rather than a cue to try the member's
+    /// name.  A receiver still written in a generic body's parameters has no
+    /// method set of its own: the call is bound in each copy of the body
+    /// that substitutes them, and left alone here.
+    bind_named_method(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+                      recv: TypeRef, owner_inst: TypeRef) -> Selection {
+        const d: DefId = call.named_method;
+        const subject: TypeRef = if (owner_inst.is_valid()) { owner_inst } else { recv };
+        if (this.types.contains_generic_param(subject) || this.types.contains_unresolved_projection(subject)) {
+            return Selection::none();
+        }
+        mut chosen: MethodNode* = null;
+        if (recv.is_valid() && !owner_inst.is_valid() && this.ctx.generic_registry != null) {
+            const slot: i64 = this.ctx.generic_registry.trait_item_position(d);
+            if (slot >= 0) {
+                const block: ImplBlockNode* = this.ctx.generic_registry.select_trait_impl(
+                    this.ctx.defs.parent_of(d), recv, this.intern);
+                chosen = this.ctx.generic_registry.trait_item_method(block, slot);
+            } else {
+                chosen = this.ctx.decl_index.entry_method(this.ctx.decl_index.method_entry_on(recv, d));
+            }
+        }
+        if (chosen == null) {
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                Text::new(fmt::format("code the compiler generated calls `%s` by its definition, and the receiver's type has no method for it",
+                    this.intern.resolve(this.ctx.defs.leaf_of(d)))));
+            diag = diag.at_with_label(member.span, Text::new("generated call"));
+            this.ctx.emit_diagnostic(diag);
+            return Selection::none();
+        }
+        return this.commit_selection(visitor, call, Selection::of(chosen));
     }
 
     /// Stamp the call `member` is the callee of with the trait a bound

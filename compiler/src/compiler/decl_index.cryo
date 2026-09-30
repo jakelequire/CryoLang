@@ -151,6 +151,11 @@ type struct DeclarationIndex {
     // method's `FunctionDeclNode`; null for a slot that is no method.
     method_decls:   ASTNode*[];
 
+    // (owner type << 32 | a method definition's slot in `defs`) -> the
+    // entry of the owner's copy of that method: an instance's clone of its
+    // template's method, a type's copy of a trait's default.
+    copy_entries:   HashMap<u64, OverloadId>;
+
     module_global_keys:      u32[];  // SymbolStr.id of global variable
     module_global_files:      u32[];  // SymbolStr.id of the defining source file
     module_global_declared_in: ModulePath[];  // the defining module
@@ -314,6 +319,7 @@ public:
             def_types:           [],
             def_entries:         [],
             method_decls:        [],
+            copy_entries:        HashMap::<u64, OverloadId>::new(),
             array_elem_to_type:  HashMap::<u64, TypeRef>::new(),
             implicit_converters: HashMap::<u64, u64>::new(),
             generic_converter_methods: [],
@@ -558,6 +564,25 @@ public:
         const slot: i64 = this.defs.slot(d);
         while (this.method_decls.length <= slot) { this.method_decls.push(null); }
         this.method_decls[slot] = decl;
+    }
+
+    /// The entry of `owner`'s method for the method definition `d`: `d`'s
+    /// own when `d` is declared on `owner`, else the owner's copy of it - an
+    /// instance's clone of its template's method, a type's copy of a trait's
+    /// default.  Invalid when `owner` has neither.  Asked by identity, so a
+    /// caller that holds a method's definition never names the method.
+    method_entry_on(&this, owner: TypeRef, d: DefId) -> OverloadId {
+        if (!d.is_valid()) { return OverloadId::invalid(); }
+        if (this.defs.parent_of(d).equals(this.registered_def(owner))) { return this.entry_of_def(d); }
+        return match (this.copy_entries.get(&DeclarationIndex::copy_key(owner, this.defs.slot(d)))) {
+            Option::Some(e) => { e }
+            Option::None    => { OverloadId::invalid() }
+        };
+    }
+
+    /// The key of `owner`'s copy of the definition at `def_slot`.
+    static copy_key(owner: TypeRef, def_slot: i64) -> u64 {
+        return (owner.key() << 32) | (def_slot as u64);
     }
 
     /// The declaration the method definition `d` was registered for, or
@@ -989,9 +1014,16 @@ public:
             // so every consumer holding the node - the definition emitter,
             // a call sema or mono binds to it, a vtable slot - reads the
             // symbol and signature registration wrote, and mangles nothing.
-            func.set_overload_entry(this.keep_def_entry(func.def, this.register_signature(
+            const entry: OverloadId = this.keep_def_entry(func.def, this.register_signature(
                 FamilyOwner::Type(owner), func.name, func_type_ref, SymbolStr::empty(), eff_mangled, func.origin_trait,
-                if (func.has_name_span()) { func.name_span } else { func.span }, method as ASTNode*)));
+                if (func.has_name_span()) { func.name_span } else { func.span }, method as ASTNode*));
+            func.set_overload_entry(entry);
+            // A copy is the owner's method for the definition it stands for.
+            // A specialization of a generic method is that definition AND
+            // its own type arguments, an instance this table does not hold.
+            if (func.copy_of.is_valid() && func.spec_type_args.length == 0 && entry.is_valid()) {
+                this.copy_entries.insert(DeclarationIndex::copy_key(owner, this.defs.slot(func.copy_of)), entry);
+            }
         }
     }
 
