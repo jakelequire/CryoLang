@@ -51,10 +51,13 @@ ImportEntry        ::= Ident ("as" Ident)?
 
 (*  `as` binds the declaration an entry names under another name; the
     alias names the same declaration, never a spelling looked up again.
-    `ModulePath "as" Ident` names a module when one is registered under
-    the whole path, and otherwise the item its last segment names in the
-    module the rest of the path names: `import Toml::parse as tp;` is
-    `import Toml::{ parse as tp };`.                                    *)
+    `ModulePath "as" Ident` with one segment names that module.  With two
+    or more it names the item its last segment names in the module the
+    rest of the path names (`import Toml::parse as tp;` binds what
+    `import Toml::{ parse as tp };` binds), or the module registered under
+    the whole path when the rest offers no such item; when it names both,
+    the import is an error (E0244).  A module alias names the module
+    itself: `N::f`, `N::T`, `N::T::make` and `N::E::V` resolve in it.    *)
 
 (*  Symbol re-export.  `ExportForm` is `ImportForm` minus the wildcard:
     a glob re-export is the one form under which an importer's in-scope
@@ -62,9 +65,14 @@ ImportEntry        ::= Ident ("as" Ident)?
     new name written down at neither end.  `ModulePath "::" "*"` stays
     legal as an Import, where its effect is confined to one file.       *)
 Export             ::= "export" ExportForm ";"
-ExportForm         ::= ModulePath "::" "{" Ident ("," Ident)* "}"
+ExportForm         ::= ModulePath "::" "{" ImportEntry ("," ImportEntry)* "}"
                      | ModulePath "as" Ident
                      | ModulePath
+
+(*  An export entry's `as` binds the declaration in the exporting module
+    under the alias, as an import's does, and offers it to the module's
+    importers under the alias: `export fmt::{ printf as print };`.
+    `export M as V;` offers the module `M` under `V`.                    *)
 
 ModulePath         ::= Ident ("::" Ident)*
 QualName           ::= Ident ("::" Ident)*

@@ -521,6 +521,34 @@ type struct ModuleLoader {
     /// Catches the common case mismatch (`utils` -> `Utils`) and small
     /// typos (`compiler::Reslover` -> `compiler::resolver`). Returns ""
     /// when nothing is close enough or the map is empty.
+    /// E0500 for the import at `scan.import_spans[at]`, which names no
+    /// module: `path` is the module it was read as.  The diagnostic is
+    /// anchored at the path and, when a near-match exists in the discovered
+    /// namespace map, suggests it.  The lockstep span carries no file
+    /// (`scan_tokens` has none), so it is rebuilt with this file's path.
+    module_not_found(&this, file_path: string, scan: &ModuleScanResult, at: i64, path: string) -> Diagnostic {
+        mut span: SourceSpan = SourceSpan::none();
+        if (at < scan.import_spans.length) {
+            const raw: SourceSpan = scan.import_spans[at];
+            span = SourceSpan::new(Text::new(file_path),
+                raw.start_line, raw.start_col,
+                raw.end_line, raw.end_col);
+        }
+        const suggestion: string = this.suggest_module(path);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0500_MODULE_NOT_FOUND,
+            Text::new(fmt::format("cannot find module `%s`", path)));
+        if (span.has_location()) {
+            diag = diag.at_with_label(span,
+                Text::new(fmt::format("no module named `%s` is in scope", path)));
+        }
+        if (suggestion.length() > 0) {
+            diag = diag.with_note(Text::new(fmt::format("did you mean `%s`?", suggestion)));
+        }
+        return diag.help(
+            Text::new("imports resolve against the project root, the entry-point directory, and the standard library; module paths are case-sensitive"));
+    }
+
     suggest_module(&this, import_path: string) -> string {
         mut candidates: string[] = [];
         const count: u64 = this.ns_map.bucket_count();
@@ -623,6 +651,11 @@ type struct ModuleLoader {
 
         // Process imports: discover dependencies recursively
         mut success: boolean = true;
+        // Per brace item: the import whose path could not be found and whose
+        // entry this item is, or -1.  The item loop, which asks whether the
+        // entry is a module, reports it when it is none.
+        mut entry_owner_missing: i64[] = [];
+        for (mut ii: i64 = 0; ii < scan.import_item_count; ii++) { entry_owner_missing.push(-1); }
         for (mut i: i64 = 0; i < scan.import_count; i++) {
             const import_path: string = scan.import_paths[i];
 
@@ -652,33 +685,14 @@ type struct ModuleLoader {
                         cdebug(Text::new("[ModuleLoader]   import '%s' -> '%s' (found in graph)\n"),
                             import_path, resolved);
                     }
+                } else if (scan.import_entry_items[i] >= 0) {
+                    // `import A::B as C;` whose `A` is no module: the path
+                    // can only name the module `A::B`, and the item loop
+                    // below is where that is asked.
+                    entry_owner_missing[scan.import_entry_items[i]] = i;
+                    continue;
                 } else {
-                    // Unresolved import. Anchor the diagnostic at the
-                    // offending path, and - when a near-match exists in the
-                    // discovered namespace map - suggest it. The lockstep
-                    // import_spans array carries no file (scan_tokens has
-                    // none), so rebuild the span with this file's path.
-                    mut span: SourceSpan = SourceSpan::none();
-                    if (i < scan.import_spans.length) {
-                        const raw: SourceSpan = scan.import_spans[i];
-                        span = SourceSpan::new(Text::new(file_path),
-                            raw.start_line, raw.start_col,
-                            raw.end_line, raw.end_col);
-                    }
-                    const suggestion: string = this.suggest_module(import_path);
-                    mut diag: Diagnostic = Diagnostic::error(
-                        ErrorCode::E0500_MODULE_NOT_FOUND,
-                        Text::new(fmt::format("cannot find module `%s`", import_path)));
-                    if (span.has_location()) {
-                        diag = diag.at_with_label(span,
-                            Text::new(fmt::format("no module named `%s` is in scope", import_path)));
-                    }
-                    if (suggestion.length() > 0) {
-                        diag = diag.with_note(Text::new(fmt::format("did you mean `%s`?", suggestion)));
-                    }
-                    diag = diag.help(
-                        Text::new("imports resolve against the project root, the entry-point directory, and the standard library; module paths are case-sensitive"));
-                    sink.emit(diag);
+                    sink.emit(this.module_not_found(file_path, &scan, i, import_path));
                     success = false;
                     continue;
                 }
@@ -778,10 +792,17 @@ type struct ModuleLoader {
             const item_idx: i64 = graph.find_module_index(graph.module_named(item_sym));
             if (item_idx >= 0) {
                 info.add_imported_namespace(graph.modules[item_idx].name);
+                continue;
             }
             // Otherwise the item names a TYPE rather than a submodule, which
             // resolves to nothing here.  Correct, and not an error: the type is
-            // reached through its parent module, already a dependency above.
+            // reached through its parent module, already a dependency above -
+            // unless there is no parent module: `import A::B as C;` with no
+            // module `A` names a module `A::B` or nothing.
+            if (entry_owner_missing[ii] >= 0) {
+                sink.emit(this.module_not_found(file_path, &scan, entry_owner_missing[ii], item_path));
+                success = false;
+            }
         }
 
         // `export` targets.  Discovered exactly like an import - the module
@@ -1019,6 +1040,7 @@ type struct ModuleLoader {
         mut ns: string = "";
         mut imports: string[] = [];
         mut import_spans: SourceSpan[] = [];
+        mut import_entry_items: i64[] = [];
         mut import_items: string[] = [];
         mut exports: string[] = [];
         mut export_spans: SourceSpan[] = [];
@@ -1085,6 +1107,7 @@ type struct ModuleLoader {
                     } else {
                         imports.push(path);
                         import_spans.push(path_span);
+                        import_entry_items.push(-1);
                     }
 
                     // Brace list: `import A::B::{ X, Y };`.  The qualified-name
@@ -1152,6 +1175,7 @@ type struct ModuleLoader {
                             const owner: string = QualifiedName::parent_of(path);
                             if (!is_exp && owner.length() > 0) {
                                 imports[imports.length - 1] = owner;
+                                import_entry_items[import_entry_items.length - 1] = import_items.length;
                                 import_items.push(path);
                             }
                         }
@@ -1220,6 +1244,7 @@ type struct ModuleLoader {
             namespace_name:    ns,
             import_paths:      imports,
             import_spans:      import_spans,
+            import_entry_items: import_entry_items,
             import_count:      import_count_val,
             import_items:      import_items,
             import_item_count: import_item_count_val,
@@ -1405,6 +1430,11 @@ type struct ModuleScanResult {
     namespace_name:  string;
     import_paths:    string[];    // real `import` statements (create dependency edges)
     import_spans:    SourceSpan[]; // span of each import path, parallel to import_paths (file unset; caller fills)
+    /// Parallel to `import_paths`: for `import A::B as C;`, whose import path
+    /// is `A`, the position in `import_items` of the entry `A::B`; -1 for
+    /// every other import.  The path names an item of `A` or the module
+    /// `A::B`, so `A` need not be a module when `A::B` is one.
+    import_entry_items: i64[];
     import_count:    i64;
     /// Brace-list items expanded to full paths: `import A::B::{ X, Y };`
     /// yields `A::B::X` and `A::B::Y`.

@@ -209,6 +209,44 @@ yet is recorded with the change that builds it, not here.
     import Labels::{ Tag };     // a function: no collision
     ```
 
+57. **`import A::B as C;` where `A` has an item `B` and a module `A::B`
+    exists is an ambiguity error**, neither the item nor the module
+    winning. The writer uses the braced form for the item or names the
+    module by its path. The code is **E0244**, primary line "`A::B` names
+    both an item of `A` and a module", a label on the import ("`B` is
+    declared in `A`, and `A::B` is a module") and the help "import the item
+    with `import A::{ B as C };`, or the module with `import A::B;`". The
+    code and wording were chosen by the worker recording this ruling, as
+    the ruling asked.
+
+    ```cryo
+    import Shapes::Json as J;        // error[E0244]
+    import Shapes::{ Json as J };    // the item
+    ```
+
+58. **Whole-module aliases work.** `import M as N;` binds `N` to the
+    module's identity, and `N::f()`, `N::Type` and the rest resolve in that
+    module.
+
+    ```cryo
+    import Json as J;
+    const n: i32 = J::twice(3);
+    ```
+
+59. **`export` accepts `as` on an entry**, as `import` does.
+
+    ```cryo
+    export std::fmt::{ printf as print };
+    ```
+
+60. **A qualified call to an overloaded module function,
+    `Json::conv(1 as i32)`, compiles and calls the overload its arguments
+    select**, where it was E0900. Fixed on this branch.
+
+61. **An integer literal argument defaults to `i32` in overload
+    selection**, one fixed rule like Rust's literal default: with
+    `conv(i32)` and `conv(i64)`, `conv(1)` calls `conv(i32)`.
+
 ### 2026-09-29
 
 1. **A method call on a type parameter with no bound is an error.** Inside

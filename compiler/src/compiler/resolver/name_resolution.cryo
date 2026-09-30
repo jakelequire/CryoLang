@@ -13,7 +13,7 @@ namespace compiler::resolver::name_resolution;
 import compiler::resolver;
 import compiler::resolver::{ symbol_id, symbol_str, symbol, scope, resolver, qualified_name, intern_table };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, Res, ResBase, ResSlot, SourceLoc };
+import compiler::resolver::res::{ DefId, DefKind, Res, ResBase, ResSlot, SourceLoc };
 import compiler::resolver::namespace_kind;
 import compiler::resolver::namespace_kind::{ Namespace };
 import compiler::const_table;
@@ -68,7 +68,7 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::scope::{ Scope, ScopeEntry, ScopeID, ScopeKind };
-import compiler::resolver::symbol::{ Symbol, SymbolKind };
+import compiler::resolver::symbol::{ Symbol, SymbolKind, SymbolVisibility };
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::module_graph::{ ModulePath };
@@ -593,6 +593,32 @@ public:
         return s.id;
     }
 
+    /// The module an import alias binds - `import Json as J;` binds `J` to
+    /// the module `Json` - as a match naming that one module; a match naming
+    /// none for any other binding, or for no binding.  The alias carries the
+    /// module's own definition, so the module is read off the binding and
+    /// never re-derived from the alias's spelling.
+    module_alias_match(&this, bound: SymbolID) -> ModuleSpellingMatch {
+        mut r: ModuleSpellingMatch = ModuleSpellingMatch {
+            found:     ModulePath::none(),
+            found_def: DefId::invalid(),
+            other:     ModulePath::none(),
+            any:       ModulePath::none(),
+            visible:   0,
+            matched:   0,
+        };
+        if (!bound.is_valid()) { return r; }
+        const s: Symbol = this.resolver.get_symbol(bound);
+        if (s.kind != SymbolKind::Import || !s.def.is_valid()) { return r; }
+        if (this.resolver.defs.kind_of(s.def) != DefKind::Module) { return r; }
+        r.found = s.source_module;
+        r.found_def = s.def;
+        r.any = s.source_module;
+        r.visible = 1;
+        r.matched = 1;
+        return r;
+    }
+
     symbol_names_type(&this, s: &Symbol) -> boolean {
         if (s.kind == SymbolKind::Type || s.kind == SymbolKind::TypeAlias) { return true; }
         const tgt: SymbolID = this.resolver.import_target(s, Namespace::Type);
@@ -626,16 +652,26 @@ public:
         for (mut i: i64 = 0; i < scope.symbols.length; i++) {
             const entry: ScopeEntry* = &scope.symbols[i];
             const s: Symbol = this.resolver.get_symbol(entry.sym);
-            if (!this.symbol_names_type(&s)) { continue; }
+            // An import alias of a module is a module's name in this scope,
+            // so a second module spelled the same way is the same collision;
+            // the module it aliases is not a second one.
+            const aliased: ModuleSpellingMatch = this.module_alias_match(entry.sym);
+            if (!this.symbol_names_type(&s) && aliased.visible != 1) { continue; }
             const name_str: string = this.resolver.intern_table.resolve(s.name);
             const m: ModuleSpellingMatch = this.ctx.modules_written_as(name_str, unit);
             mut clash: ModulePath = if (m.visible >= 1) { m.found } else { ModulePath::none() };
+            if (aliased.visible == 1 && m.visible >= 1 && m.found_def.equals(aliased.found_def)) {
+                clash = if (m.visible >= 2) { m.other } else { ModulePath::none() };
+            }
             if (!clash.is_valid()) {
                 // `namespace A;` declaring `type N` beside a module `A::N`:
                 // the two canonical names are one name.
                 const canonical: ModulePath = this.ctx.module_graph.module_named(
                     this.resolver.intern_table.intern(ns_str + "::" + name_str));
-                if (this.ctx.module_graph.find_module_index(canonical) >= 0) {
+                const canonical_idx: i64 = this.ctx.module_graph.find_module_index(canonical);
+                if (canonical_idx >= 0
+                        && !(aliased.visible == 1
+                             && this.ctx.module_graph.get_module(canonical_idx).def.equals(aliased.found_def))) {
                     clash = canonical;
                 }
             }
@@ -644,11 +680,17 @@ public:
                 ErrorCode::E0205_REDEFINED_SYMBOL,
                 Text::new(fmt::format("the name `%s` is already declared in this scope: `%s` is a module",
                     name_str, this.resolver.intern_table.resolve(clash.as_sym()))));
-            d = d.at_with_label(s.declaring_span,
-                Text::new(if (s.kind == SymbolKind::Import) { "a type imported under a module's name" }
-                else { "a type declared under a module's name" }));
-            d = d.with_note(
-                Text::new("modules and types share one namespace; rename one of them, or reach the type by its module's path instead of importing it"));
+            if (aliased.visible == 1) {
+                d = d.at_with_label(s.declaring_span, Text::new("a module imported under another module's name"));
+                d = d.with_note(
+                    Text::new("an alias names its module in this scope as the other module's own name does; rename the alias"));
+            } else {
+                d = d.at_with_label(s.declaring_span,
+                    Text::new(if (s.kind == SymbolKind::Import) { "a type imported under a module's name" }
+                    else { "a type declared under a module's name" }));
+                d = d.with_note(
+                    Text::new("modules and types share one namespace; rename one of them, or reach the type by its module's path instead of importing it"));
+            }
             this.ctx.emit_diagnostic(d);
         }
     }
@@ -1805,7 +1847,9 @@ public:
         // the resolver's own, not the graph's, bound in the writer's scope,
         // and its declarations are one segment deep - so the leaf is asked of
         // its export set and nothing else.  Asked of the current scope, which
-        // is the writing scope for every caller.
+        // is the writing scope for every caller.  A head bound to an import
+        // alias names the module the alias binds.
+        mut aliased: ModuleSpellingMatch = this.module_alias_match(SymbolID::invalid());
         if (!this.resolver.contains_separator(prefix)) {
             const head_bound: SymbolID = this.resolver.lookup(
                 this.resolver.intern_table.intern(prefix), this.resolver.current_scope);
@@ -1818,12 +1862,14 @@ public:
                     if (!decl.is_valid()) { return ResSlot::Pending; }
                     return ResSlot::Answered(Res::Def(this.resolver.get_symbol(decl).def));
                 }
+                aliased = this.module_alias_match(head_bound);
             }
         }
 
         // A spelling two reachable modules share names neither of them, so the
         // walk stops rather than picking one.
-        const head: ModuleSpellingMatch = this.ctx.modules_written_as(prefix, use_module);
+        const head: ModuleSpellingMatch =
+            if (aliased.visible == 1) { aliased } else { this.ctx.modules_written_as(prefix, use_module) };
         if (head.visible != 1) { return ResSlot::Pending; }
 
         // The segment after the head resolves inside what the head named - the
@@ -2011,7 +2057,11 @@ public:
                 return;
             }
         }
-        const m: ModuleSpellingMatch = this.ctx.modules_written_as(written, use_module);
+        // A segment bound to an import alias names the module the alias
+        // binds; any other segment is asked as a module's spelling.
+        const aliased: ModuleSpellingMatch = this.module_alias_match(scope_sym);
+        const m: ModuleSpellingMatch =
+            if (aliased.visible == 1) { aliased } else { this.ctx.modules_written_as(written, use_module) };
         const found:   ModulePath = m.found;
         const other:   ModulePath = m.other;
         const any:     ModulePath = m.any;
@@ -2352,6 +2402,10 @@ public:
         // else: no module is named `I`, so a refusal here would report a
         // failure the name layer has no standing to report.
         if (this.resolver.contains_separator(written)) {
+            // The annotation's OWN module rather than the cursor's, because a
+            // qualified spelling means what the writing file's imports say it
+            // means and the cursor is on whatever module the pass is walking.
+            const q_module: ModulePath = this.ctx.module_of_file(span.file);
             const head: string = QualifiedName::head_of(written);
             const head_sym: SymbolID = this.resolver.lookup(
                 this.resolver.intern_table.intern(head),
@@ -2390,6 +2444,11 @@ public:
                 if (this.alias_module_of(&hs).is_valid()) {
                     return this.walk_module_rooted_type(written, ModulePath::none(), span);
                 }
+                // The head names an import alias of a module: the path is
+                // rooted in that module.
+                if (this.module_alias_match(head_sym).visible == 1) {
+                    return this.walk_module_rooted_type(written, q_module, span);
+                }
             }
             // The head names neither a type nor a generic parameter, so the
             // whole path names ONE definition - no receiver type is left for a
@@ -2398,11 +2457,7 @@ public:
             //
             // Which lane owns the path turns on what the head names, not on
             // which lane would answer first: a namespace some module
-            // registered, or a scope the writing module owns.  Asked from the
-            // annotation's OWN module rather than the cursor's, because a
-            // qualified spelling means what the writing file's imports say it
-            // means and the cursor is on whatever module the pass is walking.
-            const q_module: ModulePath = this.ctx.module_of_file(span.file);
+            // registered, or a scope the writing module owns.
             if (q_module.is_valid()) {
                 const q_prefix: string = QualifiedName::parent_of(written);
                 const q_mods: ModuleSpellingMatch =
@@ -3290,6 +3345,34 @@ public:
         this.ctx.emit_diagnostic(d);
     }
 
+    /// E0244: `import A::B as C;` where `A` offers an item `B` and `A::B` is
+    /// a module too.  The path names both, and neither is chosen: the item
+    /// is written in braces, and the module is imported by its path.
+    refuse_item_or_module_import(&this, node: ImportDeclNode*, i: int) -> void {
+        const owner: string = node.module_path;
+        const leaf: string = this.resolver.intern_table.resolve(node.specific_imports[i]);
+        const alias_str: string = this.resolver.intern_table.resolve(node.specific_aliases[i]);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0244_IMPORT_ITEM_OR_MODULE,
+            Text::new(fmt::format("`%s::%s` names both an item of `%s` and a module", owner, leaf, owner)));
+        d = d.at_with_label(node.span,
+            Text::new(fmt::format("`%s` is declared in `%s`, and `%s::%s` is a module", leaf, owner, owner, leaf)));
+        d = d.help(Text::new(fmt::format(
+            "import the item with `import %s::{ %s as %s };`, or the module with `import %s::%s;`",
+            owner, leaf, alias_str, owner, leaf)));
+        this.ctx.emit_diagnostic(d);
+    }
+
+    /// The graph's index of the sub-module an import's `i`th entry names,
+    /// `<module_path>::<entry>`, or -1 when there is none.
+    sub_module_index(&this, node: ImportDeclNode*, i: int) -> i64 {
+        const sub_path: string = fmt::format("%s::%s",
+            node.module_path, this.resolver.intern_table.resolve(node.specific_imports[i]));
+        const sub_sym: SymbolStr = this.resolver.intern_table.intern(sub_path);
+        const sub_module: ModulePath = this.ctx.module_graph.module_named(sub_sym);
+        return this.ctx.module_graph.find_module_index(sub_module);
+    }
+
     process_import(node: ImportDeclNode*) -> void {
         const module_path: string = node.module_path;
         LOG_DEBUG(LogComponent::General, "[NameResolver] process_import() module='%s'", module_path);
@@ -3323,7 +3406,10 @@ public:
         // The one place the written path becomes the module: every binding
         // below carries this identity.
         const imported: ModulePath = this.ctx.module_graph.module_named(module_sym);
-        if (this.ctx.module_graph.find_module_index(imported) < 0) {
+        const imported_idx: i64 = this.ctx.module_graph.find_module_index(imported);
+        // `import A::B as C;` asks its prefix only for an item: the path
+        // names the module `A::B` whether or not `A` is a module.
+        if (imported_idx < 0 && !node.path_entry) {
             this.refuse_unknown_module_import(node, module_path);
             return;
         }
@@ -3353,8 +3439,8 @@ public:
                     const id: SymbolID = this.resolver.alloc_symbol_id();
                     const import_sym: Symbol = Symbol::import_sym(
                         id, export_sym.name, this.resolver.current_scope,
-                        node.span, imported, export_sym.def);
-                    this.resolver.declare_import(import_sym, exports[i], false, false);
+                        node.span, export_sym.source_module, export_sym.def);
+                    this.resolver.declare_import(import_sym, this.resolver.declaration_of(exports[i]), false, false);
                 }
             }
             // A re-exported namespace is part of what this module offers, so
@@ -3381,7 +3467,7 @@ public:
                     const rimp: Symbol = Symbol::import_sym(
                         rid, rx_sym.name, this.resolver.current_scope,
                         node.span, rx_sym.source_module, rx_sym.def);
-                    this.resolver.declare_import(rimp, rx_exports[re], false, false);
+                    this.resolver.declare_import(rimp, this.resolver.declaration_of(rx_exports[re]), false, false);
                 }
             }
         } else if (node.style == ImportStyle::Specific) {
@@ -3413,19 +3499,29 @@ public:
                 // declarations, and which one a later use means is decided by
                 // the namespace it is used in, not by which one the module
                 // declared first.
-                mut offered: SymbolID[] = this.resolver.exports_named(imported, name);
-                mut through_export: boolean = false;
-                if (offered.length == 0) {
-                    // Reached through `module_path`'s `export` closure.  The
-                    // name keeps the module that DECLARED it, not the one that
-                    // passed it along, exactly as the Wildcard branch does: the
-                    // qualified name is an identity, and routing it through the
-                    // re-exporter would give the same declaration two.
+                mut offered: SymbolID[] = [];
+                if (imported_idx >= 0) {
+                    offered = this.resolver.exports_named(imported, name);
+                }
+                if (offered.length == 0 && imported_idx >= 0) {
+                    // Reached through `module_path`'s `export` closure.
                     const via: ModulePath = this.reexport_offering(imported, name);
                     if (via.is_valid()) {
                         offered = this.resolver.exports_named(via, name);
-                        through_export = true;
                     }
+                }
+                // The sub-module `<resolved_module>::<name>`, when there is
+                // one: asked of an entry its module offers nothing under, and
+                // of a path entry, which names an item or a module and must
+                // not name both.
+                mut sub_idx: i64 = -1;
+                if (offered.length == 0 || node.path_entry) {
+                    sub_idx = this.sub_module_index(node, i);
+                }
+                if (node.path_entry && offered.length > 0 && sub_idx >= 0) {
+                    this.refuse_item_or_module_import(node, i);
+                    this.resolver.declare_refused(bind_as, node.span);
+                    continue;
                 }
                 if (offered.length > 0) {
                     mut refused_twice: boolean = false;
@@ -3440,17 +3536,28 @@ public:
                         const ns: Namespace = this.resolver.namespace_of(offered[k]);
                         const done: i32 = if (ns == Namespace::Type) { in_type } else { in_value };
                         if (done == 2) { continue; }
+                        // The binding keeps the module that DECLARED the
+                        // name, not the one that passed it along, exactly as
+                        // the Wildcard branch does: the qualified name is an
+                        // identity, and routing it through the re-exporter or
+                        // an `export` entry's alias would give the same
+                        // declaration two, and two routes to it a collision.
                         const osym: Symbol = this.resolver.get_symbol(offered[k]);
-                        const src: ModulePath =
-                            if (through_export) { osym.source_module } else { imported };
+                        const src: ModulePath = osym.source_module;
                         const id: SymbolID = this.resolver.alloc_symbol_id();
-                        const import_sym: Symbol = Symbol::import_sym(
+                        mut import_sym: Symbol = Symbol::import_sym(
                             id, bind_as, this.resolver.current_scope,
                             node.span, src, osym.def);
+                        // `export M::{ printf as print }` offers the binding
+                        // itself: importers are offered `print`, naming the
+                        // declaration `printf` names.
+                        const offers_alias: boolean = node.is_export && !alias.is_empty();
+                        if (offers_alias) { import_sym.visibility = SymbolVisibility::Public; }
                         // A name an earlier explicit import already brought in,
                         // in this declaration's namespace, binds nothing and is
                         // refused here: the first import stays the name's.
                         const first: SymbolID = this.resolver.declare_import(import_sym, offered[k], true, done == 0);
+                        if (offers_alias && !first.is_valid()) { this.resolver.export_symbol(id); }
                         mut now: i32 = 1;
                         if (first.is_valid()) {
                             now = 2;
@@ -3491,10 +3598,7 @@ public:
                 } else {
                     // (b) sub-module: "<resolved_module>::<name>"
                     const name_str: string = this.resolver.intern_table.resolve(name);
-                    const sub_path: string = fmt::format("%s::%s", resolved_module, name_str);
-                    const sub_sym: SymbolStr = this.resolver.intern_table.intern(sub_path);
-                    const sub_module: ModulePath = this.ctx.module_graph.module_named(sub_sym);
-                    if (this.ctx.module_graph.find_module_index(sub_module) < 0) {
+                    if (sub_idx < 0) {
                         // Neither offered nor a sub-module: the entry names
                         // nothing, and binding nothing in silence leaves a
                         // use site - which may never exist - to say so.  The
@@ -3508,11 +3612,15 @@ public:
                     // is that) naming a sub-module binds the module under the
                     // alias, as a whole-path alias does; without one the
                     // entry brings in the sub-module's exports.
+                    const sub_module: ModulePath = this.ctx.module_graph.get_module(sub_idx).path();
                     if (!alias.is_empty()) {
-                        const sub_alias: Symbol = Symbol::import_sym(
-                            this.resolver.alloc_symbol_id(), alias, this.resolver.current_scope,
-                            node.span, sub_module, DefId::invalid());
+                        const sub_alias_id: SymbolID = this.resolver.alloc_symbol_id();
+                        mut sub_alias: Symbol = Symbol::import_sym(
+                            sub_alias_id, alias, this.resolver.current_scope,
+                            node.span, sub_module, this.ctx.module_graph.get_module(sub_idx).def);
+                        if (node.is_export) { sub_alias.visibility = SymbolVisibility::Public; }
                         this.resolver.declare(sub_alias);
+                        if (node.is_export) { this.resolver.export_symbol(sub_alias_id); }
                         continue;
                     }
                     // Import all public exports from the resolved sub-module.
@@ -3523,8 +3631,8 @@ public:
                             const id: SymbolID = this.resolver.alloc_symbol_id();
                             const import_sym: Symbol = Symbol::import_sym(
                                 id, sub_export_sym.name, this.resolver.current_scope,
-                                node.span, sub_module, sub_export_sym.def);
-                            this.resolver.declare_import(import_sym, sub_exports[j], false, false);
+                                node.span, sub_export_sym.source_module, sub_export_sym.def);
+                            this.resolver.declare_import(import_sym, this.resolver.declaration_of(sub_exports[j]), false, false);
                         }
                     }
                 }
@@ -3534,14 +3642,19 @@ public:
         // Handle aliased imports
         if (node.has_alias()) {
             // The alias is a binding in the importing scope, as the module's
-            // own name would be.  It is DECLARED - a new name the importing
-            // module introduces - so it is admitted and stamped as a
-            // declaration is, not handed another declaration's id.
+            // own name would be, and it names the module by the module's own
+            // definition: a path rooted in the alias is rooted in that
+            // module (`module_alias_match`), with nothing looked up again by
+            // the alias's spelling.
             const alias_id: SymbolID = this.resolver.alloc_symbol_id();
-            const alias_sym: Symbol = Symbol::import_sym(
+            mut alias_sym: Symbol = Symbol::import_sym(
                 alias_id, node.alias, this.resolver.current_scope,
-                node.span, imported, DefId::invalid());
+                node.span, imported, this.ctx.module_graph.get_module(imported_idx).def);
+            // `export M as V;` offers the alias: an importer of this module
+            // is offered `V`, naming the module `M`.
+            if (node.is_export) { alias_sym.visibility = SymbolVisibility::Public; }
             this.resolver.declare(alias_sym);
+            if (node.is_export) { this.resolver.export_symbol(alias_id); }
         }
     }
 }

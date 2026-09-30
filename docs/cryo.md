@@ -2358,7 +2358,17 @@ import Math::Vector::{ Vec2 as P2 };  // an item under another name
 import Math::Vector::Vec3 as P3;      // the same, for one item
 ```
 
-An entry's `as` binds the declaration it names under another name, and only that name: `import Toml::{ parse as toml_parse };` makes `toml_parse` Toml's `parse`, and does not bring `parse` into scope. The alias is the declaration itself - its overloads, its generic parameters, a type's statics and methods - not a second spelling looked up later. `import A::B as C;` names the module `A::B` when there is one, and otherwise the item `B` of the module `A`. An `export` takes no `as` on an entry.
+An entry's `as` binds the declaration it names under another name, and only that name: `import Toml::{ parse as toml_parse };` makes `toml_parse` Toml's `parse`, and does not bring `parse` into scope. The alias is the declaration itself - its overloads, its generic parameters, a type's statics and methods - not a second spelling looked up later.
+
+A module alias names the module itself. `import Math::Vector as V;` makes `V::Vec2`, `V::Vec2::new(..)`, `V::length(..)`, `V::Axis::X` and the value `V::length` mean what the same paths through `Vector` mean; `Math` need not be a module. An alias is a module's name in its file, so an alias spelled like another module the file imports is refused (E0205). A path continues through an alias into the module's own names, not into its sub-modules: `V::Inner::f()` is refused, and `import Math::Vector::Inner as VI;` names that module.
+
+`import A::B as C;` names the item `B` of the module `A`, or the module `A::B`. When `A` declares an item `B` and `A::B` is also a module, the path names both, and neither is chosen: the import is an error (E0244), and the fix says which one is meant:
+
+```cryo
+import Shapes::Json as J;          // error[E0244]: `Shapes::Json` names both an item of `Shapes` and a module
+import Shapes::{ Json as J };      // the item
+import Shapes::Json;               // the module, as `Json::..`
+```
 
 Each `import` declaration imports from a single path. To bring two items from the same module into scope, use the selective brace form (`import M::{A, B};`) or write two separate `import` statements.
 
@@ -2430,7 +2440,10 @@ After this, `import std::future;` alone puts `Context`, `Waker`, and everything 
 export Math::Vector;                  // importers get the module, hence Vector::Vec2
 export Math::Vector::{ Vec2, Vec3 };  // importers get Vec2 and Vec3
 export Math::Vector as V;             // importers get the name V
+export Math::Vector::{ Vec2 as P2 };  // importers get P2, naming Vec2
 ```
+
+An export entry takes `as` as an import entry does: `export std::fmt::{ printf as print };` binds `print` in the exporting module and offers it to its importers, where `print`, `Facade::print` and a glob all name `printf` itself.
 
 There is deliberately **no `export M::*;`**. A glob re-export is the one form under which an importer's in-scope set changes because some *child* module gained a declaration, with the new name written down at neither end. `import M::*;` remains legal, where its effect is confined to the one file that wrote it.
 
