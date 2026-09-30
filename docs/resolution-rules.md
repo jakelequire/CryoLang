@@ -58,6 +58,7 @@ function carries no marker.
 | `member-function` | `DeclarationIndex::lookup_family_entries` | `compiler/src/compiler/decl_index.cryo` | member: a function or method family, by owner and leaf |
 | `member-field` | `MemberResolver::field_of` | `compiler/src/compiler/sema/member_resolver.cryo` | member: a field, by owner type and leaf |
 | `member-variant` | `EnumType::variant_index` | `compiler/src/compiler/types/user_defined.cryo` | member: an enum variant, by owner type and leaf |
+| `trait-method` | `GenericRegistry::trait_item_slot` | `compiler/src/compiler/types/generic_registry.cryo` | member: a trait's declared method, by trait identity and leaf, to its position in the trait |
 | `module-by-path` | `ModuleGraph::module_named` | `compiler/src/compiler/module_graph.cryo` | written module path to its module |
 | `primitive` | `ResBase::is_primitive_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table |
 | `primitive` | `ResBase::primitive_of_alias` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table: alias keywords |
@@ -80,6 +81,79 @@ for an associated type.
 Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
+
+### 2026-09-30
+
+40. **The explicit-path piece of the monomorphizer plan lands ahead of the
+    plan's order**: a pin on `(Trait for Concrete)::m` survives
+    substitution, as built before the plan's earlier slices.
+
+41. **A trait method called on a concrete receiver reached through a field
+    inside a generic body is specialized now**, not left for the
+    monomorphizer's conversion. The receiver's type is re-derived in the
+    clone, and only a receiver that is a generic type's specialization is
+    left to the placement machinery.
+
+    ```cryo
+    type trait Bb { go<W>(&this, w: W) -> i32; }
+    type struct S { v: i32; }
+    implement trait Bb for S { go<W>(&this, w: W) -> i32 { return 2; } }
+    type struct T2 { s: S; }
+    function run<W>(t: &T2, w: W) -> i32 { return t.s.go(w); }   // S's go<W>, specialized
+    ```
+
+42. **A trait-method door** (`trait-method` in the table above) takes a
+    trait's identity and a method's leaf and returns the method's position
+    among the trait's declared methods. It is the one place an
+    implementation's method is matched to a trait's method by name; the
+    implementation's position table is filled through it.
+
+43. **The internal E0900 wording for a disagreement between the slot table
+    and the selection by name is approved**: "`m` was selected by name as a
+    trait's method, and the method table of the implementation the trait and
+    the receiver select answers a different one" (or "no method").
+
+44. **Only `implement trait Drop for X` defines a destructor.** An inherent
+    `drop` is not a destructor. This completes ruling 32. Both land with the
+    `drop_in_place` intrinsic (ruling 14) and never before it: applied
+    alone, `Box` would stop releasing what it holds, silently.
+
+    ```cryo
+    type struct H { p: i32*; }
+    implement struct H { drop(mut &this) -> void { .. } }            // an ordinary method
+    implement trait Drop for H { drop(mut &this) -> void { .. } }    // the destructor
+    ```
+
+45. **Ruling 30's suppression stays broad**: any error caused only by an
+    unknown trait is suppressed once the unknown trait is reported,
+    including in type positions and after E0155 or E0240.
+
+46. **Ruling 26 covers method values.** `const f = IgTn::go;` is the E0156
+    ambiguity when a trait implemented for `IgTn` also provides `go`.
+
+    ```cryo
+    const f = IgTn::go;                // error[E0156]: both `go`s apply
+    const g = (Beta for IgTn)::go;     // Beta's
+    ```
+
+47. **A second import bringing in an already-imported name is refused at
+    the import line itself**, as in Rust, with an error of its own. The
+    code is **E0243**, primary line "`parse` is imported twice", a label
+    on the second import ("`parse` is imported again here") and a note on
+    the first ("first imported here"), with the help "remove one of the
+    imports, or import one under another name with `as`". The code and
+    wording were chosen by the worker recording this ruling, as the ruling
+    asked; ruling 3's qualified use is unchanged.
+
+    ```cryo
+    import Json::{ parse };
+    import Toml::{ parse };   // error[E0243]: `parse` is imported twice
+    ```
+
+48. **The explicit call of a generic trait method on a generic owner,
+    `(BetaG for GgTf<i32>)::go(&e, 7)`, is handled by the monomorphizer's
+    conversion** (the plan's slices 6 and 7), not fixed separately. Until
+    then it is E0636.
 
 ### 2026-09-29
 
