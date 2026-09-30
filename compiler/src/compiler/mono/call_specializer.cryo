@@ -577,12 +577,10 @@ type struct MonoCallSpecializer {
                         Res::TypeRelative(_, _) => { true }
                         _                       => { false }
                     };
-                if (!scope_names_type) {
-                    // Scope-qualified call to a non-type (module-alias) scope:
-                    // only accept a free-function template that lives in that module.
-                    entry = this.find_scoped_function_template(
-                        callee_name, callee_scope, callee_scope_slot);
-                } else {
+                // A module-qualified call names the template sema recorded
+                // (`resolved_template`, read above); one that recorded none
+                // names no template, and nothing here looks it up again.
+                if (scope_names_type) {
                     // Scope resolves to a TYPE: this may be a non-generic static
                     // method on a GENERIC owner (`Slice<T>::from_raw`,
                     // `String<GA>::from_string`).  Sema stashed the owner's type args;
@@ -2391,53 +2389,11 @@ type struct MonoCallSpecializer {
 
     // -- Template lookup helpers (LOOKUP, not inference) --
 
-    /// The template a scope-qualified call names: the one the scope segment's
-    /// stamp names, which carries that module's OWN namespace.  The written
-    /// qualifier cannot supply it - the source may write any whole-segment
-    /// suffix of the real name and several modules can share one suffix - so
-    /// a segment whose stamp names no module names no template.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    find_scoped_function_template(mut &this, name: SymbolStr,
-                                  scope: SymbolStr,
-                                  scope_slot: ResSlot*) -> TemplateEntry* {
-        if (this.generic_registry == null || !scope.is_valid()) { return null; }
-        return this.scoped_template_from_stamp(scope_slot, name);
-    }
-
-    /// The template the SCOPE SEGMENT's stamp names, or null when it names
-    /// none.
-    ///
-    /// One key and one lookup: the stamp carries the module's own namespace,
-    /// which `scope_name` cannot supply - the source may write any
-    /// whole-segment suffix of it, and several modules can share one suffix.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    scoped_template_from_stamp(mut &this, slot: ResSlot*,
-                               name: SymbolStr) -> TemplateEntry* {
-        // No pendingness test: `require` is the only way to reach an answer,
-        // and a slot that has none yields `Err`, which the match below declines
-        // exactly as a non-definition does.  Branching on absence first is the
-        // fallback `ResSlot` exists to make unwriteable.
-        if (slot == null) { return null; }
-        mut scope_def: DefId = DefId::invalid();
-        match (slot.require(Text::new("scoped_template_from_stamp"))) {
-            Res::Def(q) => { scope_def = q; }
-            _           => { return null; }
-        }
-        const registry: GenericRegistry* = this.generic_registry;
-        if (registry == null) { return null; }
-        const entry: TemplateEntry* = registry.template_in(ResBase::Def(scope_def), name);
-        if (entry != null && entry.node_kind == NodeKind::FunctionDeclaration) {
-            return entry;
-        }
-        return null;
-    }
-
     /// The generic OWNER template a scope segment's stamp names, or null when
     /// the segment names no type declaration (a module, a primitive, a type
     /// parameter) or the declaration is not a template.
     ///
-    /// Sibling of `scoped_template_from_stamp`, which reads the same slot for
-    /// the MODULE answer.  A segment already spelled as a specialization
+    /// A segment already spelled as a specialization
     /// carries its template's stamp, so it names the template here too; the
     /// registry holds no template under a specialization's name, which is
     /// the answer a lookup by that spelling gave.
