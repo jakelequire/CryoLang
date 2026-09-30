@@ -2880,7 +2880,7 @@ type struct CallResolver {
         }
         if (!member.resolved_trait.is_valid()) {
             const copied: DefId = this.binding.default_copy_bound_direction(obj_type, member.member);
-            if (copied.is_valid()) { member.set_resolved_trait(copied); }
+            if (copied.is_valid()) { this.stamp_trait_item(member, copied); }
         }
         mut base_ref: TypeRef = obj_type;
         mut base_t: Type* = this.arena.lookup(obj_type);
@@ -2990,6 +2990,7 @@ type struct CallResolver {
         }
         if (want_trait.is_valid() && this.select_in_set(visitor, call, member, base_ref, base_t, start_cls,
                 methods_ref, &arg_types, tmpl, want_trait, true, &sel)) {
+            if (tmpl == null) { this.check_trait_item_table(member, base_ref, sel.chosen); }
             return this.commit_selection(visitor, call, sel);
         }
         if (this.select_in_set(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
@@ -3007,6 +3008,46 @@ type struct CallResolver {
             return this.commit_selection(visitor, call, sel);
         }
         return Selection::none();
+    }
+
+    /// Stamp the call `member` is the callee of with the trait a bound
+    /// answered it through and the position of the method it names among
+    /// that trait's declared ones, found where the call is written.
+    stamp_trait_item(&this, member: MemberAccessNode*, trait_def: DefId) -> void {
+        const slot: i64 = if (this.ctx.generic_registry == null) { -1 } else {
+            this.ctx.generic_registry.trait_item_slot(trait_def, member.member) };
+        member.set_resolved_trait_item(trait_def, slot);
+    }
+
+    /// The method `recv`'s implementation of the call's trait provides for
+    /// the trait's method the call names, found without the member's name:
+    /// the implementation selected by (trait, type), then its method at the
+    /// position the call recorded.  Null when the call recorded none or no
+    /// implementation is selected.
+    trait_item_answer(&this, member: MemberAccessNode*, recv: TypeRef) -> MethodNode* {
+        if (this.ctx.generic_registry == null || member.resolved_trait_slot < 0) { return null; }
+        const block: ImplBlockNode* = this.ctx.generic_registry.select_trait_impl(
+            member.resolved_trait, recv, this.intern);
+        return this.ctx.generic_registry.trait_item_method(block, member.resolved_trait_slot);
+    }
+
+    /// A call a trait's method was selected for by name on a concrete
+    /// receiver must name the method the trait's implementation provides at
+    /// the call's recorded position - that method, or a specialization of it
+    /// the monomorphizer minted.  The two answers come from two
+    /// independent paths, the selection by the member's name among the
+    /// receiver's methods and the implementation's table by position; a
+    /// disagreement is a defect in one of them, reported as an internal
+    /// error rather than compiled.
+    check_trait_item_table(mut &this, member: MemberAccessNode*, recv: TypeRef, chosen: MethodNode*) -> void {
+        if (member.resolved_trait_slot < 0) { return; }
+        const m: MethodNode* = this.trait_item_answer(member, recv);
+        if (m != null && (m == chosen || (chosen != null && chosen.spec_of == m))) { return; }
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+            Text::new(fmt::format("`%s` was selected by name as a trait's method, and the method table of the implementation the trait and the receiver select answers %s",
+                this.intern.resolve(member.member), if (m == null) { "no method" } else { "a different one" })));
+        d = d.at_with_label(member.span, Text::new("the two ways of finding this call's method disagree"));
+        this.ctx.emit_diagnostic(d);
     }
 
     /// Select in one candidate set - the inherent methods, or with
@@ -3726,7 +3767,7 @@ type struct CallResolver {
                 this.binding.abstract_receiver_method_return(obj_type, member.member, &dir);
             if (abs_ret.is_valid()) {
                 if (dir.named().is_valid() && !member.resolved_trait.is_valid()) {
-                    member.set_resolved_trait(dir.named());
+                    this.stamp_trait_item(member, dir.named());
                 }
                 member.set_resolved_type(abs_ret);
                 return abs_ret;
