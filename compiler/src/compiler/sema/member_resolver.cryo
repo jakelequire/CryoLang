@@ -132,10 +132,18 @@ type struct MemberResolver {
 
         // Symbolic walk: a `void`/abstract receiver is unresolved, not
         // fieldless - except the abstract generic owner itself (`this.value`
-        // in a `Box<T>` method), whose fields its template declares.
+        // in a `Box<T>` method), whose fields its template declares, and an
+        // instantiation not yet minted (`node.key` on an `Entry<K, V>*`),
+        // whose field is its template's seen through the arguments.  A call
+        // on such a field (`node.key.equals(key)` under `where K: Eq`) is
+        // typed, and so directed by the bound, where it is written.
         const unresolved: boolean = this.symbolic.symbolic_type_unresolved(obj_type);
         if (unresolved && !this.symbolic.symbolic_is_generic_owner_receiver(obj_type)) {
-            return TypeRef::invalid();
+            const through: FieldAnswer = this.field_of(obj_type, member.member);
+            if (!through.found()) { return TypeRef::invalid(); }
+            this.pin_field(member, &through,
+                if (member.member_span.has_location()) { member.member_span } else { member.span });
+            return through.ty;
         }
 
         // Tuple positional access (`t.0`); walks past pointer/reference/inst wrappers.
@@ -530,7 +538,12 @@ type struct MemberResolver {
         const array_type: TypeRef = this.dispatch.resolve_expr(visitor, access.array);
         const index_type: TypeRef = this.dispatch.resolve_expr(visitor, access.index);
         if (!array_type.is_valid()) { return TypeRef::invalid(); }
-        if (this.symbolic.symbolic_type_unresolved(array_type)) { return TypeRef::invalid(); }
+        // Symbolic walk: the built-in rules - a pointer's pointee, an array's
+        // element, a tuple's position - answer whatever the parameters are
+        // (`this.ptr[i]` on a `T*` is a `T`), so a call on the element is
+        // typed, and directed by its bound, where it is written.  Only an
+        // `Index` overload depends on the instantiation.
+        const unresolved: boolean = this.symbolic.symbolic_type_unresolved(array_type);
 
         // Tuple bracket indexing (`t[0]`): compile-time bounds-checked integer.
         mut walk_ty: TypeRef = array_type;
@@ -573,6 +586,7 @@ type struct MemberResolver {
 
         const result: TypeCheckResult = this.checker.check_index_access(array_type, index_type);
         if (result.success) { return result.result_type; }
+        if (unresolved) { return TypeRef::invalid(); }
 
         // Index operator overloading: `check_index_access` rejected a base with
         // no primitive indexing rule.  A concrete user aggregate (or a generic

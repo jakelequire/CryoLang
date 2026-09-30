@@ -351,6 +351,55 @@ yet is recorded with the change that builds it, not here.
     const r: i32 = f::<i32>(&a);                               // no second error
     ```
 
+31. **A method two traits provide, called inside one of those traits' impls
+    on a concrete receiver, is E0156.** There is no "the impl's own trait
+    wins" rule; the call names the trait it means.
+
+    ```cryo
+    implement trait Debug for struct String<GlobalAlloc> {
+        fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError> where W: FmtWrite {
+            const view: Str = this.as_str();
+            return view.fmt(f);                    // error[E0156]: Display::fmt and Debug::fmt
+            return (Debug for Str)::fmt(&view, f); // the one meant
+        }
+    }
+    ```
+
+32. **An inherent `drop` does not satisfy `where T: Drop`.** A type
+    implements the trait with `implement trait Drop for ...`.
+
+33. **A call on a bounded type parameter records its bound where it is
+    written, from every `where` level (the owner's and the method's) and
+    from associated-type bounds, by identity**, however the receiver is
+    reached (an index, a field, a projection). Such a call is never
+    re-selected by name after monomorphization, so ruling 22's ambiguity
+    cannot meet it there.
+
+    ```cryo
+    type struct Q { v: i32; }
+    implement struct Q { equals(&this, o: &Q) -> boolean { return false; } }
+    implement trait Eq for struct Q { equals(&this, o: &Q) -> boolean { return this.v == o.v; } }
+    a.index_of(&Q { v: 2 })   // Eq::equals inside `index_of` (`where T: Eq`); was E0156
+    ```
+
+34. **The crash of a generic overload sharing a name is fixed by
+    construction in the monomorphizer's conversion**, not by patching the
+    finder that crashes.
+
+35. **A call sema cannot type before monomorphization gets its typing
+    completed**; it is not looked up during monomorphization instead.
+
+36. **The async lowering pins the calls it generates itself.**
+
+37. **A call's final pin stays `CalleePin::Decl`**, with an instance table
+    in the monomorphizer; there is no new instance pin kind.
+
+38. **A specialization's entry is registered without a name key**, so no
+    name can reach an instance.
+
+39. **The post-monomorphization check for an unpinned call (E0900) also
+    names the template call site it came from.**
+
 ### 2026-09-28
 
 Relayed in plain text. Done means the five rules above; the definition and

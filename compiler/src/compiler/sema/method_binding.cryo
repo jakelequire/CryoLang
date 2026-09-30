@@ -493,6 +493,66 @@ type struct MethodBinding {
         return out;
     }
 
+    /// The trait a call in an implement block's copy of a trait default
+    /// names through a bound the default writes on a projection of `This`
+    /// (`value.compare(&best)` under `where This::Item: Ord` in `min`).  The
+    /// copy is made before the trait's body is walked, so it carries none of
+    /// the stamps that walk writes; in the copy, `This` is the implementing
+    /// type and the projection is the type it denotes for it, and a receiver
+    /// of that type is the bounded receiver the default was written on.
+    /// Invalid outside such a copy, when no bound's subject is the
+    /// receiver's type, or when two traits answer.
+    ![allow(lookup_by_spelling, reason = "a method's leaf asked of the traits a bound names by identity, as every bound scan beside it asks")]
+    default_copy_bound_direction(mut &this, recv_type: TypeRef, method_name: SymbolStr) -> DefId {
+        const func: FunctionDeclNode* = this.state.current_func;
+        if (func == null || !func.is_synth_default || func.trait_bounds.length == 0) { return DefId::invalid(); }
+        if (this.ctx.type_resolver == null || !this.state.this_type.is_valid()) { return DefId::invalid(); }
+        mut recv: TypeRef = recv_type;
+        mut t: Type* = this.arena.lookup(recv);
+        mut depth: i32 = 0;
+        while (t != null && depth < 5) {
+            if (t.kind == TypeKind::Pointer) { recv = (t as PointerType*).pointee; }
+            else if (t.kind == TypeKind::Reference) { recv = (t as ReferenceType*).referent; }
+            else { break; }
+            t = this.arena.lookup(recv);
+            depth += 1;
+        }
+        mut dir: BoundDirection = BoundDirection::none();
+        mut ctx: ResolutionContext = ResolutionContext::new("");
+        ctx.set_this_type(this.state.this_type);
+        for (mut bi: i64 = 0; bi < func.trait_bounds.length; bi++) {
+            const b: TraitBound* = &func.trait_bounds[bi];
+            if (!b.has_projection_subject() || b.subject_type == null) { continue; }
+            const subject: TypeRef = this.reduce_assoc_projections(
+                this.ctx.type_resolver.resolve(b.subject_type, &ctx));
+            if (!subject.is_valid() || !subject.equals(recv)) { continue; }
+            for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+                const tr: TraitRef* = &b.trait_refs[ti];
+                if (tr.path.length == 0 || tr.refused) { continue; }
+                mut ret: TypeRef = TypeRef::invalid();
+                const answered: DefId = this.bound_trait_declaring(tr, method_name, &ret);
+                dir.note(answered);
+            }
+        }
+        return dir.named();
+    }
+
+    /// The trait that declares `method_name` for the bound `tr`: its own
+    /// trait, else the nearest supertrait that does; the declaration's
+    /// return goes to `out_ret`.  Invalid when none does.
+    ![allow(lookup_by_spelling, reason = "a method's leaf asked of the traits a bound names by identity, as every bound scan beside it asks")]
+    bound_trait_declaring(mut &this, tr: TraitRef*, method_name: SymbolStr, out_ret: TypeRef*) -> DefId {
+        const chain: DefId[] = this.trait_chain(tr.definition());
+        for (mut k: i64 = 0; k < chain.length; k++) {
+            const ret: TypeRef = this.types.lookup_method_return(
+                this.ctx.decl_index.type_of_def(chain[k]), method_name);
+            if (!ret.is_valid()) { continue; }
+            *out_ret = ret;
+            return chain[k];
+        }
+        return DefId::invalid();
+    }
+
     /// `trait_def` followed by its supertraits, transitively, by identity;
     /// empty for an invalid id or outside a build that registered traits.
     trait_chain(&this, trait_def: DefId) -> DefId[] {
@@ -589,23 +649,19 @@ type struct MethodBinding {
                 // `get_trait_decl`, which is keyed by bare leaf alone.
                 // The bound's trait first, then its supertraits nearest first.
                 const leaf: SymbolStr = tr.path[tr.path.length - 1];
-                const chain: DefId[] = this.trait_chain(tr.definition());
-                for (mut k: i64 = 0; k < chain.length; k++) {
-                    const ret: TypeRef = this.types.lookup_method_return(
-                        this.ctx.decl_index.type_of_def(chain[k]), method_name);
-                    if (!ret.is_valid()) { continue; }
-                    dir.note(chain[k]);
-                    if (need_ret && !out.is_valid()) {
-                        // A supertrait's return has only `This` rebased: the
-                        // bound's arguments are the named trait's.
-                        // Bound-supplied assoc args first (`Future<i64>` ->
-                        // Output); any `This` the bound left unbound then
-                        // rebases onto the projection receiver rather than
-                        // dangling.
-                        out = if (k > 0) { this.subst_this_in_trait_return(ret, recv) } else {
-                            this.subst_this_in_trait_return(this.subst_bound_assoc_args(ret, leaf, tr), recv) };
-                    }
-                    break;
+                mut ret: TypeRef = TypeRef::invalid();
+                const answered: DefId = this.bound_trait_declaring(tr, method_name, &ret);
+                if (!answered.is_valid()) { continue; }
+                dir.note(answered);
+                if (need_ret && !out.is_valid()) {
+                    // A supertrait's return has only `This` rebased: the
+                    // bound's arguments are the named trait's.
+                    // Bound-supplied assoc args first (`Future<i64>` ->
+                    // Output); any `This` the bound left unbound then
+                    // rebases onto the projection receiver rather than
+                    // dangling.
+                    out = if (!answered.equals(tr.definition())) { this.subst_this_in_trait_return(ret, recv) } else {
+                        this.subst_this_in_trait_return(this.subst_bound_assoc_args(ret, leaf, tr), recv) };
                 }
             }
         }
