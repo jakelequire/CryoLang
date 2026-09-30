@@ -2354,7 +2354,11 @@ import Math::Vector;                  // import the module
 import Math::Vector::*;               // wildcard: everything public
 import Math::Vector as V;             // aliased
 import Math::Vector::{ Vec2, Vec3 };  // selective import (brace list)
+import Math::Vector::{ Vec2 as P2 };  // an item under another name
+import Math::Vector::Vec3 as P3;      // the same, for one item
 ```
+
+An entry's `as` binds the declaration it names under another name, and only that name: `import Toml::{ parse as toml_parse };` makes `toml_parse` Toml's `parse`, and does not bring `parse` into scope. The alias is the declaration itself - its overloads, its generic parameters, a type's statics and methods - not a second spelling looked up later. `import A::B as C;` names the module `A::B` when there is one, and otherwise the item `B` of the module `A`. An `export` takes no `as` on an entry.
 
 Each `import` declaration imports from a single path. To bring two items from the same module into scope, use the selective brace form (`import M::{A, B};`) or write two separate `import` statements.
 
@@ -2367,6 +2371,8 @@ import Json::{ parse };
 import Toml::{ parse };               // error[E0243]: `parse` is imported twice
 const b: i32 = Toml::parse("1");      // Toml's `parse`
 ```
+
+The fix is to remove one of the imports, or to bind one under another name: `import Toml::{ parse as toml_parse };`. An alias is a name like any other, so two entries binding one alias are E0243 too. A module's overloads of one function are one entry, not a repetition.
 
 A wildcard is not a brace entry: two wildcards offering one name make only the bare use of that name ambiguous (E0154).
 

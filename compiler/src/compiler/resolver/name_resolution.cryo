@@ -282,6 +282,7 @@ public:
             Text::new(fmt::format("`%s` is imported twice", shown)));
         d = d.at_with_label(at, Text::new(fmt::format("`%s` is imported again here", shown)));
         d = d.with_note_at(Text::new("first imported here"), this.resolver.get_symbol(first).declaring_span);
+        d = d.help(Text::new("remove one of the imports, or import one under another name with `as`"));
         this.ctx.emit_diagnostic(d);
     }
 
@@ -3353,7 +3354,7 @@ public:
                     const import_sym: Symbol = Symbol::import_sym(
                         id, export_sym.name, this.resolver.current_scope,
                         node.span, imported, export_sym.def);
-                    this.resolver.declare_import(import_sym, exports[i], false);
+                    this.resolver.declare_import(import_sym, exports[i], false, false);
                 }
             }
             // A re-exported namespace is part of what this module offers, so
@@ -3380,7 +3381,7 @@ public:
                     const rimp: Symbol = Symbol::import_sym(
                         rid, rx_sym.name, this.resolver.current_scope,
                         node.span, rx_sym.source_module, rx_sym.def);
-                    this.resolver.declare_import(rimp, rx_exports[re], false);
+                    this.resolver.declare_import(rimp, rx_exports[re], false, false);
                 }
             }
         } else if (node.style == ImportStyle::Specific) {
@@ -3402,6 +3403,11 @@ public:
             // mode.
             for (mut i: int = 0; i < node.specific_imports.length; i++) {
                 const name: SymbolStr = node.specific_imports[i];
+                // `parse as toml_parse`: the declarations offered under `name`
+                // are bound under the alias - the declaration itself, by its
+                // identity, never a spelling looked up again.
+                const alias: SymbolStr = node.specific_aliases[i];
+                const bind_as: SymbolStr = if (alias.is_empty()) { name } else { alias };
                 // Every declaration offered under the name is bound, each by
                 // its own binding: a type and a same-leaf function are two
                 // declarations, and which one a later use means is decided by
@@ -3423,22 +3429,37 @@ public:
                 }
                 if (offered.length > 0) {
                     mut refused_twice: boolean = false;
+                    // Per namespace, what this entry has done there: 0 nothing
+                    // yet, 1 bound, 2 refused.  The first declaration it binds
+                    // in a namespace is checked against earlier imports; the
+                    // rest there (a function's overloads) join that binding,
+                    // and none is bound where the first was refused.
+                    mut in_type: i32 = 0;
+                    mut in_value: i32 = 0;
                     for (mut k: i64 = 0; k < offered.length; k++) {
+                        const ns: Namespace = this.resolver.namespace_of(offered[k]);
+                        const done: i32 = if (ns == Namespace::Type) { in_type } else { in_value };
+                        if (done == 2) { continue; }
                         const osym: Symbol = this.resolver.get_symbol(offered[k]);
                         const src: ModulePath =
                             if (through_export) { osym.source_module } else { imported };
                         const id: SymbolID = this.resolver.alloc_symbol_id();
                         const import_sym: Symbol = Symbol::import_sym(
-                            id, name, this.resolver.current_scope,
+                            id, bind_as, this.resolver.current_scope,
                             node.span, src, osym.def);
                         // A name an earlier explicit import already brought in,
                         // in this declaration's namespace, binds nothing and is
                         // refused here: the first import stays the name's.
-                        const first: SymbolID = this.resolver.declare_import(import_sym, offered[k], true);
-                        if (first.is_valid() && !refused_twice) {
-                            this.refuse_repeated_import(name, node.span, first);
-                            refused_twice = true;
+                        const first: SymbolID = this.resolver.declare_import(import_sym, offered[k], true, done == 0);
+                        mut now: i32 = 1;
+                        if (first.is_valid()) {
+                            now = 2;
+                            if (!refused_twice) {
+                                this.refuse_repeated_import(bind_as, node.span, first);
+                                refused_twice = true;
+                            }
                         }
+                        if (ns == Namespace::Type) { in_type = now; } else { in_value = now; }
                     }
                 } else if (!node.is_export
                            && this.resolver.private_declarations(imported, name).length > 0) {
@@ -3461,7 +3482,7 @@ public:
                     // The name is bound to nothing, HERE: a use of it is then
                     // `Err` with this as its report, not a second diagnostic
                     // saying the name does not exist.
-                    this.resolver.declare_refused(name, node.span);
+                    this.resolver.declare_refused(bind_as, node.span);
                 } else if (node.is_export
                            && this.resolver.private_declarations(imported, name).length > 0) {
                     // An `export` naming a private declaration is E0241,
@@ -3480,7 +3501,18 @@ public:
                         // import is where the name is written, and what the
                         // module DOES offer is what a writer needs to fix it.
                         this.refuse_unoffered_import(node, imported, resolved_module, name_str);
-                        this.resolver.declare_refused(name, node.span);
+                        this.resolver.declare_refused(bind_as, node.span);
+                        continue;
+                    }
+                    // `import A::{ B as C }` (and `import A::B as C;`, which
+                    // is that) naming a sub-module binds the module under the
+                    // alias, as a whole-path alias does; without one the
+                    // entry brings in the sub-module's exports.
+                    if (!alias.is_empty()) {
+                        const sub_alias: Symbol = Symbol::import_sym(
+                            this.resolver.alloc_symbol_id(), alias, this.resolver.current_scope,
+                            node.span, sub_module, DefId::invalid());
+                        this.resolver.declare(sub_alias);
                         continue;
                     }
                     // Import all public exports from the resolved sub-module.
@@ -3492,7 +3524,7 @@ public:
                             const import_sym: Symbol = Symbol::import_sym(
                                 id, sub_export_sym.name, this.resolver.current_scope,
                                 node.span, sub_module, sub_export_sym.def);
-                            this.resolver.declare_import(import_sym, sub_exports[j], false);
+                            this.resolver.declare_import(import_sym, sub_exports[j], false, false);
                         }
                     }
                 }

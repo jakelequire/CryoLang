@@ -1941,6 +1941,8 @@ public:
         }
         // Intern the first segment to get a heap-pinned copy
         mut path_sym: SymbolStr = this.ctx.intern(first_tok.lexeme);
+        // The path without its last segment, once it has two.
+        mut prefix_sym: SymbolStr = SymbolStr::empty();
 
         // Per-segment tracking for the LSP; each segment's name +
         // span gets stamped on the resulting `ImportDeclNode` so
@@ -1996,7 +1998,16 @@ public:
                 }
                 while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
                     const item_tok: Token = this.consume(TokenType::Identifier, Text::new("import name"));
-                    imp.add_specific_import(this.intern_lexeme(item_tok));
+                    // `parse as toml_parse`: the entry's declaration, bound under
+                    // another name.  An import only: an export names what the
+                    // module offers under the names it declared.
+                    mut item_alias: SymbolStr = SymbolStr::empty();
+                    if (!is_export && this.check(TokenType::KwAs)) {
+                        this.advance();
+                        const alias_tok: Token = this.consume(TokenType::Identifier, Text::new("alias name"));
+                        item_alias = this.intern_lexeme(alias_tok);
+                    }
+                    imp.add_specific_import(this.intern_lexeme(item_tok), item_alias);
                     if (!this.match_tok(TokenType::Comma)) { break; }
                 }
                 this.consume(TokenType::RBrace, Text::new("'}'"));
@@ -2006,10 +2017,30 @@ public:
             }
             // Append "::segment" and intern to pin on the heap
             const prev: string = this.ctx.resolve_str(path_sym);
+            prefix_sym = path_sym;
             path_sym = this.ctx.intern(fmt::format("%s::%s", prev, next.lexeme));
             seg_names.push(this.ctx.intern(next.lexeme));
             seg_spans.push(this.span_from_token(next));
             this.advance();
+        }
+
+        // `import A::B as C;` is `import A::{ B as C };`: its last segment is
+        // an entry of the module the rest names - an item of it, or a
+        // sub-module - and the one question an entry is asked answers which.
+        // A one-segment path has no module to hold it, and an `export`
+        // renames nothing, so both stay a whole-module alias below.
+        if (this.check(TokenType::KwAs) && !is_export && seg_names.length >= 2) {
+            this.advance();
+            const entry_alias: Token = this.consume(TokenType::Identifier, Text::new("alias name"));
+            mut ent: ImportDeclNode* = new ImportDeclNode(
+                this.ctx.resolve_str(prefix_sym), ImportStyle::Specific, this.span_from_token(start));
+            for (mut i: i64 = 0; i < seg_names.length - 1; i++) {
+                ent.add_path_segment(seg_names[i], seg_spans[i]);
+            }
+            ent.add_specific_import(seg_names[seg_names.length - 1], this.intern_lexeme(entry_alias));
+            this.consume(TokenType::Semicolon, Text::new("';'"));
+            ent.span = this.span_from(start);
+            return ent;
         }
 
         // `import A::B;` names the module and binds nothing from it.  A name

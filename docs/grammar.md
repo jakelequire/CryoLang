@@ -44,9 +44,17 @@ AsmConstraint      ::= StringLit | "m" | "i" | "r"
 ModuleDecl         ::= "public"? "module" ModulePath ";"
 Import             ::= "import" ImportForm ";"
 ImportForm         ::= ModulePath "::" "*"
-                     | ModulePath "::" "{" Ident ("," Ident)* "}"
+                     | ModulePath "::" "{" ImportEntry ("," ImportEntry)* "}"
                      | ModulePath "as" Ident
                      | ModulePath
+ImportEntry        ::= Ident ("as" Ident)?
+
+(*  `as` binds the declaration an entry names under another name; the
+    alias names the same declaration, never a spelling looked up again.
+    `ModulePath "as" Ident` names a module when one is registered under
+    the whole path, and otherwise the item its last segment names in the
+    module the rest of the path names: `import Toml::parse as tp;` is
+    `import Toml::{ parse as tp };`.                                    *)
 
 (*  Symbol re-export.  `ExportForm` is `ImportForm` minus the wildcard:
     a glob re-export is the one form under which an importer's in-scope
