@@ -414,7 +414,7 @@ EXCLUDED_ARRAYS = {
     "Command":            Excluded("CLI/_module.cryo",
                                    "one CLI command's declared arguments: FLAGS by the spelling typed"),
     "CompilationContext": Excluded("compiler/compilation_context.cryo",
-                                   "include paths, FILE PATHS; the stores the context carries by pointer are placed on their own"),
+                                   "the facts lines it records, TEXTS; the stores the context carries by pointer are placed on their own"),
     "DiagSink":           Excluded("compiler/codegen/state/diag_sink.cryo",
                                    "codegen's record of the functions whose bodies it stripped, by the LINKER SYMBOL it minted (utils/diag_sink.cryo declares an unrelated type of the same name with no array)"),
     "Diagnostic":         Excluded("compiler/diag/diagnostic.cryo",
@@ -662,9 +662,10 @@ SCANNED_ARRAYS = {
     "Importer.type_decl_tags":    Scanned("compiler/bindgen/importer.cryo", "SymbolStr", DATA,
                                           "the C importer's own type declarations by the C TAG it emitted each for: "
                                           "the header's namespace, which libclang hands over as text and no Cryo lookup reaches"),
-    "CompilationContext.c_ref_alias": Scanned("compiler/compilation_context.cryo", "ModulePath", DATA,
+    "CompilationContext.c_refs":  Scanned("compiler/compilation_context.cryo", "CRecordRef", DATA,
                                           "which C import made each pending record reference: the import's alias "
-                                          "module, compared by that import to find its own"),
+                                          "module, compared by that import to find its own, and the C tag it names, "
+                                          "compared against the tags that import emitted"),
     "Lockfile.packages":          Scanned("compiler/deps/lockfile.cryo", "LockedDep", DATA,
                                           "the lockfile's packages by name: FILE-level records"),
     "Lockfile.vendor":            Scanned("compiler/deps/lockfile.cryo", "LockedVendor", DATA,

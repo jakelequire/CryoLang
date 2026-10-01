@@ -19,6 +19,7 @@ import compiler::resolver::{ symbol_str, intern_table, qualified_name, resolver 
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, DefTable, DefKind, FamilyOwner };
 import compiler::ast::node::{ ASTNode };
+import compiler::ast::{ NamedAnnotation };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import utils::logger;
@@ -154,6 +155,29 @@ type struct SourceOverride {
     content: string;
 }
 
+/// An injected specialization and the module its template is declared in.
+type struct InjectedOrigin {
+    node:   ASTNode*;
+    module: ModulePath;
+}
+
+/// A node a desugaring wrote naming a language item (its slot holds
+/// `ResSlot::Lang`) before the item was claimed.
+type struct LangRef {
+    node: ASTNode*;
+    item: LangItem;
+}
+
+/// A reference a C import made to one of its own records: the import's
+/// alias module, the C tag named, and the declaration the importer emitted
+/// for that tag (null when it emitted none, or has not pinned it yet).
+type struct CRecordRef {
+    ann:   NamedAnnotation*;
+    alias: ModulePath;
+    tag:   SymbolStr;
+    decl:  ASTNode*;
+}
+
 /// What the build was asked for: CLI flags merged over cryoconfig, complete
 /// before the context is made and never written after.
 type struct BuildOptions {
@@ -276,34 +300,17 @@ public:
     /// array size may name a constant declared in an imported module.
     const_table: ConstantTable*;
 
-    // -- Injected specialization origin tracking --
-    // Maps ASTNode pointer (as u64) -> the module its template is declared in.
-    // Populated by GenericExpressionResolution when injecting specialized ASTs;
-    // queried by sema to switch to the template's module scope.
-    injected_ast_ptrs:    u64[];
-    injected_ast_modules: ModulePath[];
+    /// Injected specializations, with the module each one's template is
+    /// declared in; sema stands in that module to walk them.
+    injected_origins: InjectedOrigin[];
 
-    // -- Language-item references the parser wrote --
-    // A desugaring names a language item before any declaration is
-    // registered, so its slot holds the item (`ResSlot::Lang`) and the node
-    // is listed here, by pointer as u64, until the item is claimed; the
-    // type-declaration stage then answers it with the claimed id
-    // (`PassRegistry::settle_lang_refs`).  Parallel arrays.
-    lang_ref_nodes: u64[];
-    lang_ref_items: LangItem[];
+    /// Language-item references a desugaring wrote before the item was
+    /// claimed (`PassRegistry::settle_lang_refs` answers them).
+    lang_refs: LangRef[];
 
-    // -- References a C import makes to its own records --
-    // The importer builds a declaration's field and alias types before the
-    // name layer has declared anything, so each such reference is listed
-    // here with the import's alias and the C tag it names; the importer
-    // then pins each to the declaration it emitted for that tag
-    // (`c_ref_decls`, a node pointer as u64, 0 when it emitted none), and
-    // the name layer answers it with that declaration's id once declared
-    // (`NameDeclarationPass::settle_c_refs`).  Parallel arrays.
-    c_ref_anns:  u64[];
-    c_ref_alias: ModulePath[];
-    c_ref_tags:  SymbolStr[];
-    c_ref_decls: u64[];
+    /// References a C import made to its own records before the name layer
+    /// declared anything (`NameDeclarationPass::settle_c_refs` answers them).
+    c_refs: CRecordRef[];
 
     // -- Inactive-region tracking (LSP tooling) --
     // Source spans of top-level declarations, methods, and inline `![dir] { }`
@@ -374,14 +381,9 @@ public:
             defs:          defs_ptr,
             decl_index:    decl_ptr,
             const_table:   consts_ptr,
-            injected_ast_ptrs:    [],
-            injected_ast_modules: [],
-            lang_ref_nodes:       [],
-            lang_ref_items:       [],
-            c_ref_anns:           [],
-            c_ref_alias:          [],
-            c_ref_tags:           [],
-            c_ref_decls:          [],
+            injected_origins:     [],
+            lang_refs:            [],
+            c_refs:               [],
             inactive_spans:       [],
             type_arena:    null,
 
@@ -436,17 +438,20 @@ public:
     }
 
     /// Record that an injected AST node came from a specific template module.
-    register_injected_origin(mut &this, node_ptr: u64, template_module: ModulePath) -> void {
-        this.injected_ast_ptrs.push(node_ptr);
-        this.injected_ast_modules.push(template_module);
+    note_lang_ref(mut &this, node: ASTNode*, item: LangItem) -> void {
+        this.lang_refs.push(LangRef { node: node, item: item });
+    }
+
+    register_injected_origin(mut &this, node: ASTNode*, template_module: ModulePath) -> void {
+        this.injected_origins.push(InjectedOrigin { node: node, module: template_module });
     }
 
     /// Look up the template module for an injected AST node.
     /// Returns no module if the node wasn't injected.
-    lookup_injected_origin(&this, node_ptr: u64) -> ModulePath {
-        for (mut i: i64 = 0; i < this.injected_ast_ptrs.length; i++) {
-            if (this.injected_ast_ptrs[i] == node_ptr) {
-                return this.injected_ast_modules[i];
+    lookup_injected_origin(&this, node: ASTNode*) -> ModulePath {
+        for (mut i: i64 = 0; i < this.injected_origins.length; i++) {
+            if (this.injected_origins[i].node == node) {
+                return this.injected_origins[i].module;
             }
         }
         return ModulePath::none();
