@@ -86,6 +86,20 @@ import compiler::codegen::state::function_registry::{ FunctionRegistry };
 import utils::text::{ Text };
 
 
+/// A module's DWARF builder and file, both null unless `-g`.
+type struct DebugInfoState {
+    builder: void*;
+    file:    void*;
+
+    static off() -> DebugInfoState {
+        return DebugInfoState { builder: null, file: null };
+    }
+
+    is_on(&this) -> boolean {
+        return this.builder != null;
+    }
+}
+
 type struct DeclarationEmitter {
     llvm_module: LModule*;
     builder:     LBuilder*;
@@ -100,6 +114,7 @@ type struct DeclarationEmitter {
     expr_ops:    ExprOps*;
     intrinsics:  IntrinsicEmitter*;
     diag:        DiagSink*;
+    debug_info:  DebugInfoState*;
     ctx:         CompilationContext*;
 
     static null() -> DeclarationEmitter {
@@ -117,6 +132,7 @@ type struct DeclarationEmitter {
             expr_ops:    null,
             intrinsics:  null,
             diag:        null,
+            debug_info:  null,
             ctx:         null,
         };
     }
@@ -129,7 +145,8 @@ type struct DeclarationEmitter {
          str_cache: StringCache*,
          flow: IRFlowEmitter*, resolver: SymbolResolver*,
          expr_ops: ExprOps*, intrinsics: IntrinsicEmitter*,
-         diag: DiagSink*, ctx: CompilationContext*) -> void {
+         diag: DiagSink*, debug_info: DebugInfoState*,
+         ctx: CompilationContext*) -> void {
         this.llvm_module = llvm_module;
         this.builder     = builder;
         this.type_mapper = type_mapper;
@@ -143,6 +160,7 @@ type struct DeclarationEmitter {
         this.expr_ops    = expr_ops;
         this.intrinsics  = intrinsics;
         this.diag        = diag;
+        this.debug_info  = debug_info;
         this.ctx         = ctx;
     }
 
@@ -1523,17 +1541,16 @@ type struct DeclarationEmitter {
     /// current debug location to the function's declaration line, scoped
     /// to that subprogram. Called from the prologue once the builder is at
     /// the entry block; every instruction emitted afterward inherits the
-    /// location. No-op unless `-g` populated `ctx.di_builder`. The
-    /// subroutine type carries no parameter list (sufficient for
-    /// function-level file:line backtraces; per-argument types and
-    /// per-statement line granularity are follow-ups).
+    /// location. No-op unless `-g`. The subroutine type carries no
+    /// parameter list (sufficient for function-level file:line backtraces;
+    /// per-argument types and per-statement line granularity are follow-ups).
     emit_debug_subprogram(mut &this, fn_val: LValue, node: FunctionDeclNode*) -> void {
         const ctx_ptr: CompilationContext* = this.ctx;
-        if (!ctx_ptr.emit_debug_info || ctx_ptr.di_builder == null) { return; }
+        if (!this.debug_info.is_on()) { return; }
         if (!fn_val.is_valid()) { return; }
 
-        const dib:  void* = ctx_ptr.di_builder;
-        const file: void* = ctx_ptr.di_file;
+        const dib:  void* = this.debug_info.builder;
+        const file: void* = this.debug_info.file;
 
         mut line: u32 = node.span.start_line;
         if (line == 0) { line = 1; }

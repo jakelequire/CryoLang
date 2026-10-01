@@ -48,6 +48,7 @@ import utils::logger;
 import utils::logger::{ cdebug };
 import std::ffi::libc;
 import compiler::codegen::context::{ CodegenContext };
+import compiler::codegen::ops::declaration_emitter::{ DebugInfoState };
 import compiler::codegen::llvm_types::{
     LContext, LFileType, LModule, LTargetMachine, LType, LValue
 };
@@ -844,7 +845,7 @@ type struct CodegenPasses {
         // DWARF debug-info scaffolding (no-op unless `-g`/--debug-info).
         // Must run before function-body emission so each prologue can
         // attach a DISubprogram + source location to its function.
-        CodegenPasses::setup_debug_info(ctx, cg.llvm_module.raw);
+        CodegenPasses::setup_debug_info(ctx, cg);
 
         // Cross-module externs are declared lazily by `resolve_symbol` /
         // `resolve_family` / `resolve_global` on first reference
@@ -906,8 +907,8 @@ type struct CodegenPasses {
         // Finalize debug info: wires every DISubprogram into the compile
         // unit and resolves temporary metadata. Must run before
         // LLVMVerifyModule, which checks debug-info well-formedness.
-        if (ctx.di_builder != null) {
-            llvm::LLVMDIBuilderFinalize(ctx.di_builder);
+        if (cg.debug_info.is_on()) {
+            llvm::LLVMDIBuilderFinalize(cg.debug_info.builder);
         }
 
         // Pre-verify: scan all functions for corrupt types before calling
@@ -2054,25 +2055,26 @@ type struct CodegenPasses {
     /// set: a DIBuilder, a DIFile for the module's source path, a
     /// DICompileUnit, and the module-level `Debug Info Version` / `Dwarf
     /// Version` flags (without which the backend drops all debug metadata).
-    /// The handles are stashed on `ctx` for the function prologue to attach
+    /// The handles go on `cg.debug_info` for the function prologue to attach
     /// per-function DISubprograms; `LLVMDIBuilderFinalize` must be called
     /// before verification. No-op when debug info is off.
-    static setup_debug_info(ctx: CompilationContext*, module_raw: void*) -> void {
+    static setup_debug_info(ctx: CompilationContext*, cg: CodegenContext*) -> void {
         if (!ctx.emit_debug_info) { return; }
+        const module_raw: void* = cg.llvm_module.raw;
 
         const dib: void* = llvm::LLVMCreateDIBuilder(module_raw);
-        ctx.di_builder = dib;
 
         // DIFile: use the module's source path as the file name and "." as the
         // directory; debuggers join the two.
         const src: string = ctx.source_file;
         const file: void* = llvm::LLVMDIBuilderCreateFile(
             dib, src, src.length(), ".", 1);
-        ctx.di_file = file;
+        cg.debug_info = DebugInfoState { builder: dib, file: file };
 
         // DICompileUnit: Lang = C (1), EmissionKind = Full (1); other flags off.
+        // The builder keeps it; nothing here reads it back.
         const producer: string = "Cryo compiler";
-        const cu: void* = llvm::LLVMDIBuilderCreateCompileUnit(
+        llvm::LLVMDIBuilderCreateCompileUnit(
             dib, 1, file,
             producer, producer.length(),
             0,            // isOptimized
@@ -2085,7 +2087,6 @@ type struct CodegenPasses {
             0,            // DebugInfoForProfiling
             "", 0,        // SysRoot
             "", 0);       // SDK
-        ctx.di_cu = cu;
 
         // Module flags (behavior Warning = 1). "Debug Info Version" must be 3
         // (DEBUG_METADATA_VERSION) or LLVM silently strips the debug info.
