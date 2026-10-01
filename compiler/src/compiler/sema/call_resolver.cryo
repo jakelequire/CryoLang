@@ -3163,15 +3163,21 @@ type struct CallResolver {
     }
 
     /// Record on a call in a generic body the method selected for it, when
-    /// that is an inherent method of the generic type the receiver is an
-    /// unminted instantiation of: the template's definition, which every
-    /// copy of the body carries.  Monomorphization maps it to the
-    /// receiver's copy, and to that copy's instance when the method has type
-    /// parameters of its own.  Any other selection records nothing.
+    /// the receiver is an unminted instantiation of a generic type: an
+    /// inherent method of that type, by the template's definition, or a
+    /// trait's default copied into the type's implementation, by the
+    /// trait's definition the copy stands for.  Every copy of the body
+    /// carries it, and monomorphization maps it to the receiver's copy -
+    /// instantiated when the method has type parameters of its own or is a
+    /// default instantiated per call.  Any other selection records nothing.
     pin_template_method(&this, call: CallExprNode*, mn: MethodNode*, owner_inst: TypeRef) -> void {
-        if (mn.func == null || !mn.func.def.is_valid()) { return; }
+        if (mn.func == null) { return; }
         const base: TypeRef = this.arena.inst_generic_base(owner_inst);
         if (!base.is_valid()) { return; }
+        if (!mn.func.def.is_valid()) {
+            if (mn.func.copy_of.is_valid()) { call.template_method = mn.func.copy_of; }
+            return;
+        }
         if (!this.ctx.defs.parent_of(mn.func.def).equals(this.ctx.decl_index.registered_def(base))) { return; }
         call.template_method = mn.func.def;
     }
@@ -3492,20 +3498,23 @@ type struct CallResolver {
         }
         call.set_resolved_method(mn as ASTNode*);
         this.pin_method_callee(call, mn, mn.is_static);
-        this.pin_generic_method(call, mn);
+        this.pin_instantiated_method(call, mn);
         return sel;
     }
 
-    /// Record on a call the method with type parameters of its own that sema
-    /// selected for it on a minted receiver, by the method's definition: the
-    /// declaration itself, or the one a copy stands for.  Monomorphization
-    /// maps it to the receiver's entry for that definition and to that
-    /// entry's instance at the call's type arguments; nothing finds the
-    /// method again by its member's name.  The pass after monomorphization
-    /// records nothing: no copy is made after it.
-    pin_generic_method(&this, call: CallExprNode*, mn: MethodNode*) -> void {
-        if (this.state.post_mono_verify || mn.func == null || mn.func.generic_params.length == 0
-                || mn.func.is_self_returning_default || mn.func.is_lazy_self_growing) { return; }
+    /// Record on a call the method sema selected for it on a minted
+    /// receiver when monomorphization instantiates that method for the call:
+    /// one with type parameters of its own, or a default instantiated per
+    /// call (`take`, `map`).  Recorded by the method's definition - the
+    /// declaration itself, or the one a copy stands for; monomorphization
+    /// maps it to the receiver's method for that definition and to its
+    /// instance, and nothing finds the method again by its member's name.
+    /// The pass after monomorphization records nothing: no copy is made
+    /// after it.
+    pin_instantiated_method(&this, call: CallExprNode*, mn: MethodNode*) -> void {
+        if (this.state.post_mono_verify || mn.func == null) { return; }
+        if (mn.func.generic_params.length == 0 && !mn.func.is_self_returning_default
+                && !mn.func.is_lazy_self_growing) { return; }
         const d: DefId = if (mn.func.def.is_valid()) { mn.func.def } else { mn.func.copy_of };
         if (d.is_valid()) { call.template_method = d; }
     }

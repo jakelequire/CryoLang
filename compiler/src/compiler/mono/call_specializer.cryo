@@ -929,25 +929,25 @@ type struct MonoCallSpecializer {
         if (!is_user_kind && !is_primitive_kind && !is_unresolved_inst) { return; }
 
         // A call sema answered where it is written names that method by its
-        // definition in every copy of the body, and is bound to the
-        // receiver's entry for it.  For a method with no type parameters of
-        // its own the one thing left here is materializing that copy when
-        // the receiver's specialization defers it; a method with its own is
-        // instantiated at the call's type arguments.  Nothing is found by
+        // definition in every copy of the body; a call a bound answered
+        // names the trait's method by its position.  Either is bound to the
+        // receiver's method for it, found by identity.  Nothing is found by
         // the member's name.
         if (call.template_method.is_valid()) {
-            const pinned: FunctionDeclNode* = this.decl_index.method_func_of(call.template_method);
-            if (pinned == null || pinned.generic_params.length == 0) {
-                this.materialize_deferred_copy(call, call.template_method, recv_type);
-                return;
-            }
             mut id_impl: ImplBlockNode* = null;
             mut id_owner: ASTNode* = null;
             const id_m: MethodNode* = this.receiver_method_of(call.template_method, recv_type, &id_impl, &id_owner);
-            if (id_m == null) { return; }
-            this.instantiate_generic_method(call, id_m, id_impl, id_owner, recv_type, recv_derived,
-                is_primitive_kind, subst);
+            this.bind_receiver_method(call, id_m, id_impl, id_owner, recv_type, recv_derived, is_primitive_kind, subst);
             return;
+        }
+        if (ma != null && ma.resolved_trait.is_valid() && ma.resolved_trait_slot >= 0) {
+            mut item_impl: ImplBlockNode* = null;
+            const item_m: MethodNode* = this.trait_item_on(ma, recv_type, &item_impl);
+            if (item_m != null) {
+                this.bind_receiver_method(call, item_m, item_impl, null, recv_type, recv_derived,
+                    is_primitive_kind, subst);
+                return;
+            }
         }
 
         // Zero-own-generic self-returning combinator defaults (take/filter) are
@@ -1349,51 +1349,117 @@ type struct MonoCallSpecializer {
         return this.instantiate_deferred(call, orig, impl_node, recv_type, made);
     }
 
-    /// Materialize the receiver's copy of the method definition `d` when the
-    /// receiver's specialization holds it deferred - a method whose
-    /// signature grows its owner (`Option<T>::as_ref -> Option<T*>`) is
-    /// instantiated only for a call that names it - and bind `call` to that
-    /// copy.  The copy is the placed impl block's method that is a copy of
-    /// `d`, by identity; a copy already made for an earlier call is reused.
-    /// A copy the receiver's specialization made eagerly needs nothing here.
-    materialize_deferred_copy(mut &this, call: CallExprNode*, d: DefId, recv_type: TypeRef) -> void {
+    /// The receiver's method for the definition `d`, and where it is held:
+    /// the type declaration (`out_owner_ast`) or the impl block
+    /// (`out_impl`) its instances are added to.  A default the receiver
+    /// instantiates per call (`take`, `map`, `Option<T>::as_ref`) is held
+    /// deferred in an impl block and has no index entry until a call
+    /// instantiates it, so it is found where it is held, by the definition
+    /// it is a copy of; every other method is the receiver's index entry for
+    /// `d` - the declaration itself, or the receiver's copy of it - placed
+    /// by its identity.  Null when the receiver has neither.
+    receiver_method_of(&this, d: DefId, recv_type: TypeRef, out_impl: ImplBlockNode**,
+                       out_owner_ast: ASTNode**) -> MethodNode* {
+        const deferred: MethodNode* = this.deferred_copy_of(d, recv_type, out_impl);
+        if (deferred != null) { return deferred; }
+        const m: MethodNode* = this.decl_index.entry_method(this.decl_index.method_entry_on(recv_type, d));
+        if (m == null || !this.method_placement(m, recv_type, out_impl, out_owner_ast)) { return null; }
+        return m;
+    }
+
+    /// The deferred copy of the definition `d` among the impl blocks the
+    /// receiver's methods are read from - those placed under its
+    /// specialization, then the trait impls selected for it - and the block
+    /// holding it (`out_impl`); null when none holds one.
+    deferred_copy_of(&this, d: DefId, recv_type: TypeRef, out_impl: ImplBlockNode**) -> MethodNode* {
         for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
             const entry: SpecializationEntry* = &this.state.spec_entries[i];
             if (!entry.specialized_type.equals(recv_type)) { continue; }
             for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
-                const impl_node: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
-                if (impl_node == null) { continue; }
-                mut deferred: MethodNode* = null;
-                mut made: MethodNode* = null;
-                for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
-                    const m: MethodNode* = impl_node.methods[k];
-                    if (m == null || m.func == null || !m.func.copy_of.equals(d)) { continue; }
-                    if (m.func.is_self_returning_default || m.func.is_lazy_self_growing) {
-                        if (deferred == null) { deferred = m; }
-                    } else if (made == null) {
-                        made = m;
-                    }
-                }
-                if (deferred != null) {
-                    this.instantiate_deferred(call, deferred, impl_node, recv_type, made);
-                    return;
+                const block: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
+                const m: MethodNode* = MonoCallSpecializer::deferred_in(block, d);
+                if (m != null) { *out_impl = block; return m; }
+            }
+        }
+        if (this.generic_registry == null) { return null; }
+        const traits: ImplBlockNode*[] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
+        for (mut i: i64 = 0; i < traits.length; i++) {
+            const m: MethodNode* = MonoCallSpecializer::deferred_in(traits[i], d);
+            if (m != null) { *out_impl = traits[i]; return m; }
+        }
+        return null;
+    }
+
+    /// The method of `block` that is a deferred copy of the definition `d`.
+    static deferred_in(block: ImplBlockNode*, d: DefId) -> MethodNode* {
+        if (block == null) { return null; }
+        for (mut k: i64 = 0; k < block.methods.length; k++) {
+            const m: MethodNode* = block.methods[k];
+            if (m == null || m.func == null || !m.func.copy_of.equals(d)) { continue; }
+            if (m.func.is_self_returning_default || m.func.is_lazy_self_growing) { return m; }
+        }
+        return null;
+    }
+
+    /// The method a call a bound answered names on the receiver: the method
+    /// the receiver's implementation of the bound's trait provides at the
+    /// position the call recorded, with that implementation (`out_impl`).
+    /// Null when the receiver has no implementation of the trait, or
+    /// several - a trait implemented at several trait arguments, which only
+    /// the call's arguments tell apart.  A receiver that is a generic type's
+    /// specialization holds its implementations in the blocks placed under
+    /// it, where the instances its calls ask for are added and emitted;
+    /// any other receiver's are the registry's heads selected for it.
+    trait_item_on(&this, ma: MemberAccessNode*, recv_type: TypeRef, out_impl: ImplBlockNode**) -> MethodNode* {
+        if (this.generic_registry == null) { return null; }
+        mut heads: ImplBlockNode*[] = [];
+        mut specialized: boolean = false;
+        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
+            const entry: SpecializationEntry* = &this.state.spec_entries[i];
+            if (!entry.specialized_type.equals(recv_type)) { continue; }
+            specialized = true;
+            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
+                const block: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
+                if (block != null && block.is_trait_impl() && block.trait_def.equals(ma.resolved_trait)) {
+                    heads.push(block);
                 }
             }
         }
+        if (!specialized) {
+            heads = this.generic_registry.heads_for(ma.resolved_trait, recv_type, this.intern_table);
+        }
+        if (heads.length != 1) { return null; }
+        const m: MethodNode* = this.generic_registry.trait_item_method(heads[0], ma.resolved_trait_slot);
+        if (m != null) { *out_impl = heads[0]; }
+        return m;
     }
 
-    /// The receiver's method for the definition `d` - the declaration itself
-    /// when the receiver declares it, else the receiver's copy of it - and
-    /// where that method lives: the type declaration holding it
-    /// (`out_owner_ast`) or the impl block (`out_impl`), the place its
-    /// instances are added.  Both are found by the method's identity; null
-    /// when the receiver has no entry for `d`, or the entry is in none of
-    /// the receiver's method stores.
-    receiver_method_of(&this, d: DefId, recv_type: TypeRef, out_impl: ImplBlockNode**,
-                       out_owner_ast: ASTNode**) -> MethodNode* {
-        const m: MethodNode* = this.decl_index.entry_method(this.decl_index.method_entry_on(recv_type, d));
-        if (m == null || !this.method_placement(m, recv_type, out_impl, out_owner_ast)) { return null; }
-        return m;
+    /// Bind `call` to the receiver's method `m`, held by `impl_node` or
+    /// declared on `owner_ast`: a default instantiated per call is bound to
+    /// the instance an earlier call made of it, else one minted now; a
+    /// method with type parameters of its own, to its instance at the call's
+    /// type arguments.  A method bound as it is written needs nothing here:
+    /// the pass after monomorphization binds it.
+    bind_receiver_method(mut &this, call: CallExprNode*, m: MethodNode*, impl_node: ImplBlockNode*,
+                         owner_ast: ASTNode*, recv_type: TypeRef, recv_derived: boolean,
+                         is_primitive_kind: boolean, subst: TypeSubstitution*) -> void {
+        if (m == null || m.func == null) { return; }
+        if (m.func.generic_params.length > 0) {
+            this.instantiate_generic_method(call, m, impl_node, owner_ast, recv_type, recv_derived,
+                is_primitive_kind, subst);
+            return;
+        }
+        if ((!m.func.is_self_returning_default && !m.func.is_lazy_self_growing) || impl_node == null) { return; }
+        mut made: MethodNode* = null;
+        for (mut k: i64 = 0; k < impl_node.methods.length && made == null; k++) {
+            const c: MethodNode* = impl_node.methods[k];
+            if (c != null && c != m && c.func != null && c.func.copy_of.equals(m.func.copy_of)
+                    && !c.func.is_self_returning_default && !c.func.is_lazy_self_growing
+                    && c.func.generic_params.length == 0) {
+                made = c;
+            }
+        }
+        this.instantiate_deferred(call, m, impl_node, recv_type, made);
     }
 
     /// Bind `call` to the receiver's instance of the deferred method `orig`
