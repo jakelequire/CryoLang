@@ -1730,7 +1730,7 @@ type struct CallResolver {
 
         mut orig_func: FunctionDeclNode* = null;
         mut owner_ctx: ResolutionContext =
-            this.binding.find_generic_method_for_call(recv_type, member, &orig_func);
+            this.binding.find_generic_method_for_call(recv_type, member, null, &orig_func);
         if (orig_func == null) { return out; }
         const n_method_params: i64 = orig_func.generic_params.length;
         if (n_method_params == 0) { return out; }
@@ -3044,9 +3044,13 @@ type struct CallResolver {
             return this.bind_named_method(visitor, call, member, base_ref, owner_inst);
         }
         // A call a generic body's template pinned is bound by that identity
-        // in each copy of the body whose receiver is minted.
+        // in each copy of the body whose receiver is minted.  A method with
+        // type parameters of its own is bound to its instance by
+        // monomorphization; one it left unbound is selected below.
+        const pinned_fn: FunctionDeclNode* = this.ctx.decl_index.method_func_of(call.template_method);
         if (call.template_method.is_valid() && !owner_inst.is_valid()
-                && !this.types.contains_generic_param(base_ref)) {
+                && !this.types.contains_generic_param(base_ref)
+                && (pinned_fn == null || !pinned_fn.is_generic())) {
             return this.bind_template_method(visitor, call, base_ref);
         }
         if (!member.resolved_trait.is_valid()) {
@@ -3159,13 +3163,13 @@ type struct CallResolver {
     }
 
     /// Record on a call in a generic body the method selected for it, when
-    /// that is an inherent method, with no type parameters of its own, of
-    /// the generic type the receiver is an unminted instantiation of: the
-    /// template's definition, which every copy of the body carries and the
-    /// binding after monomorphization maps to the receiver's copy
-    /// (`bind_template_method`).  Any other selection records nothing.
+    /// that is an inherent method of the generic type the receiver is an
+    /// unminted instantiation of: the template's definition, which every
+    /// copy of the body carries.  Monomorphization maps it to the
+    /// receiver's copy, and to that copy's instance when the method has type
+    /// parameters of its own.  Any other selection records nothing.
     pin_template_method(&this, call: CallExprNode*, mn: MethodNode*, owner_inst: TypeRef) -> void {
-        if (mn.func == null || !mn.func.def.is_valid() || mn.func.generic_params.length > 0) { return; }
+        if (mn.func == null || !mn.func.def.is_valid()) { return; }
         const base: TypeRef = this.arena.inst_generic_base(owner_inst);
         if (!base.is_valid()) { return; }
         if (!this.ctx.defs.parent_of(mn.func.def).equals(this.ctx.decl_index.registered_def(base))) { return; }
@@ -3488,7 +3492,22 @@ type struct CallResolver {
         }
         call.set_resolved_method(mn as ASTNode*);
         this.pin_method_callee(call, mn, mn.is_static);
+        this.pin_generic_method(call, mn);
         return sel;
+    }
+
+    /// Record on a call the method with type parameters of its own that sema
+    /// selected for it on a minted receiver, by the method's definition: the
+    /// declaration itself, or the one a copy stands for.  Monomorphization
+    /// maps it to the receiver's entry for that definition and to that
+    /// entry's instance at the call's type arguments; nothing finds the
+    /// method again by its member's name.  The pass after monomorphization
+    /// records nothing: no copy is made after it.
+    pin_generic_method(&this, call: CallExprNode*, mn: MethodNode*) -> void {
+        if (this.state.post_mono_verify || mn.func == null || mn.func.generic_params.length == 0
+                || mn.func.is_self_returning_default || mn.func.is_lazy_self_growing) { return; }
+        const d: DefId = if (mn.func.def.is_valid()) { mn.func.def } else { mn.func.copy_of };
+        if (d.is_valid()) { call.template_method = d; }
     }
 
     /// `ty` as a receiver sees it through `view`: its parameters substituted,
@@ -4025,7 +4044,7 @@ type struct CallResolver {
             // inside `String<A>::push<T>`) must stash its method bindings now; the
             // substituter concretizes them when the enclosing method specializes, so
             // mono can specialize the nested call (else codegen E0636).
-            this.binding.stash_owner_generic_method_bindings(obj_type, member, call);
+            this.binding.stash_owner_generic_method_bindings(obj_type, member, call, selected.chosen);
             mut mret: TypeRef = this.symbolic.symbolic_resolve_owner_method_return(obj_type, member.member);
             if (!mret.is_valid()) {
                 // A method delivered by a trait impl ON the owner
@@ -4062,7 +4081,7 @@ type struct CallResolver {
             // reported E0636 "no method found".  The post-mono sema pass does stash
             // it, which is far too late to drive specialization.
             if (call.resolved_type_args.length == 0) {
-                this.binding.stash_method_call_bindings(obj_type, member, call);
+                this.binding.stash_method_call_bindings(obj_type, member, call, selected.chosen);
             }
             // The stash solves the method's own type args but yields no RETURN
             // type, so every use of the result reads `void`. A bounded-param or
@@ -4090,7 +4109,7 @@ type struct CallResolver {
             }
             return TypeRef::invalid();
         }
-        this.binding.stash_method_call_bindings(obj_type, member, call);
+        this.binding.stash_method_call_bindings(obj_type, member, call, selected.chosen);
 
         mut lookup_ref: TypeRef = obj_type;
         mut base_t: Type* = this.arena.lookup(obj_type);
@@ -4160,14 +4179,14 @@ type struct CallResolver {
             // returns keep `refined` (see `generic_canonical_return`).
             mut final_ret: TypeRef = refined;
             if (refined.is_valid() && this.types.contains_generic_param(refined)) {
-                final_ret = this.binding.resolve_generic_method_return(obj_type, member, call, refined);
+                final_ret = this.binding.resolve_generic_method_return(obj_type, member, call, selected.chosen, refined);
             } else if (this.generic_canonical_return(call, refined)) {
                 // Only when the by-name lookup already returned a concrete SCALAR
                 // for a generic method (a possible sibling-spec leak). Gating the
                 // genret CALL on a scalar `refined` matters: re-deriving a compound
                 // return (iterator adapters) has arena side effects that break mono.
                 const grt: TypeRef =
-                    this.binding.resolve_generic_method_return(obj_type, member, call, refined);
+                    this.binding.resolve_generic_method_return(obj_type, member, call, selected.chosen, refined);
                 if (this.generic_canonical_return(call, grt)) { final_ret = grt; }
             }
             final_ret = this.binding.finalize_assoc_return(obj_type, member, final_ret);
@@ -4194,7 +4213,7 @@ type struct CallResolver {
         // coerced receiver so mono/codegen bind the method on `Target`.
         const coerced: TypeRef = this.member.try_deref_coercion(visitor, member);
         if (coerced.is_valid()) {
-            this.binding.stash_method_call_bindings(member.object.resolved_type, member, call);
+            this.binding.stash_method_call_bindings(member.object.resolved_type, member, call, null);
             member.set_resolved_type(coerced);
             return coerced;
         }

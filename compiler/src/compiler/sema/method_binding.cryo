@@ -1297,12 +1297,17 @@ type struct MethodBinding {
     /// per-call path can then specialize the nested call.  No-op outside a symbolic
     /// walk or when the call already carries a stash.
     stash_owner_generic_method_bindings(mut &this, recv_type: TypeRef,
-                                        member: MemberAccessNode*, call: CallExprNode*) -> void {
+                                        member: MemberAccessNode*, call: CallExprNode*, chosen: MethodNode*) -> void {
         if (call == null || member == null) { return; }
         if (!this.state.in_symbolic_check) { return; }
         if (call.resolved_type_args.length > 0) { return; }
-        const orig_func: FunctionDeclNode* =
-            this.symbolic.symbolic_find_owner_method(recv_type, member.member);
+        // The template's method the selection chose names the method; the
+        // owner's methods are asked by name only for a call it did not bind.
+        const orig_func: FunctionDeclNode* = if (chosen != null && chosen.func != null) {
+            chosen.func
+        } else {
+            this.symbolic.symbolic_find_owner_method(recv_type, member.member)
+        };
         if (orig_func == null) { return; }
         const n_method_params: i64 = orig_func.generic_params.length;
         if (n_method_params == 0) { return; }
@@ -1321,12 +1326,57 @@ type struct MethodBinding {
         call.set_resolved_type_args(bindings);
     }
 
+    /// The declaration of the generic method `chosen` the selection made,
+    /// and the type or impl block it is written in (`out_site`), whose
+    /// parameters the receiver's arguments bind: `chosen` itself when the
+    /// receiver's template, its impl blocks or the receiver's own stores
+    /// hold it, else the template's declaration a specialization's copy
+    /// stands for.  Null when neither is held there - a trait's default,
+    /// declared in the trait.  Found by identity.
+    chosen_declaration(&this, chosen: MethodNode*, tmpl: TemplateEntry*, recv_type: TypeRef,
+                       out_site: ASTNode**) -> MethodNode* {
+        const own: ASTNode* = this.method_site(chosen, tmpl, recv_type);
+        if (own != null) { *out_site = own; return chosen; }
+        if (chosen.func.def.is_valid() || !chosen.func.copy_of.is_valid()) { return null; }
+        const decl: ASTNode* = this.ctx.decl_index.method_decl_of(chosen.func.copy_of);
+        if (decl == null || decl.kind != NodeKind::MethodDeclaration) { return null; }
+        const written: MethodNode* = decl as MethodNode*;
+        const site: ASTNode* = this.method_site(written, tmpl, recv_type);
+        if (site == null) { return null; }
+        *out_site = site;
+        return written;
+    }
+
+    /// The type declaration or impl block holding the method `m` among the
+    /// receiver's stores: the template's declaration and its impl blocks,
+    /// a non-generic owner's declaration, its inherent blocks, the trait
+    /// impls selected for it.  Null when none holds it.
+    method_site(&this, m: MethodNode*, tmpl: TemplateEntry*, recv_type: TypeRef) -> ASTNode* {
+        if (tmpl != null && tmpl.ast_node != null) {
+            if (MethodNode::is_method_of(m, tmpl.ast_node)) { return tmpl.ast_node; }
+            for (mut bi: i64 = 0; bi < tmpl.impl_blocks.length; bi++) {
+                if (MethodNode::is_method_of(m, tmpl.impl_blocks[bi] as ASTNode*)) { return tmpl.impl_blocks[bi] as ASTNode*; }
+            }
+        }
+        const owner_ast: ASTNode* = this.ctx.generic_registry.lookup_inherent_owner(recv_type);
+        if (MethodNode::is_method_of(m, owner_ast)) { return owner_ast; }
+        const inherent: ImplBlockNode*[] = this.ctx.generic_registry.inherent_impl_blocks(recv_type);
+        for (mut bi: i64 = 0; bi < inherent.length; bi++) {
+            if (MethodNode::is_method_of(m, inherent[bi] as ASTNode*)) { return inherent[bi] as ASTNode*; }
+        }
+        const traits: ImplBlockNode*[] = this.ctx.generic_registry.trait_impls_of(recv_type, this.intern);
+        for (mut bi: i64 = 0; bi < traits.length; bi++) {
+            if (MethodNode::is_method_of(m, traits[bi] as ASTNode*)) { return traits[bi] as ASTNode*; }
+        }
+        return null;
+    }
+
     /// Locate the generic method targeted by `member` on `recv_type` and build the
     /// owner-binding context (receiver type params -> concrete args, plus `This`).
     /// Writes the method's FunctionDeclNode through `out_func` (null when nothing
     /// to infer).  Shared by `resolve_generic_method_return` + `stash_method_call_bindings`.
     find_generic_method_for_call(mut &this, mut recv_type: TypeRef, member: MemberAccessNode*,
-                                 out_func: FunctionDeclNode**) -> ResolutionContext {
+                                 chosen: MethodNode*, out_func: FunctionDeclNode**) -> ResolutionContext {
         *out_func = null;
         mut owner_ctx: ResolutionContext = ResolutionContext::new("");
         if (this.ctx.generic_registry == null) { return owner_ctx; }
@@ -1384,6 +1434,38 @@ type struct MethodBinding {
         mut found: MethodNode* = null;
         const empty_params: GenericParamNode*[] = [];
         mut owner_params: &GenericParamNode*[] = &empty_params;
+        // Template key: an instantiation (`Array<i32>`) keys off its generic base; a
+        // BARE template struct used directly as a receiver (`this` in `implement
+        // FmtWrite for struct String`, where `this` is the un-parameterized `String`,
+        // not `String<GlobalAlloc>`) keys off its own type id.  Without the bare case
+        // the call's method-arg bindings are never stashed, so mono can't pin the
+        // generic call and codegen's name+arity fallback picks a wrong sibling spec.
+        const tmpl_base: TypeRef = if (recv_base.is_valid()) { recv_base } else { recv_type };
+        const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(tmpl_base);
+
+        // The method the selection chose, when it has type parameters of its
+        // own, is the one the call names: its declaration, and the type or
+        // block whose parameters it is written in, are found by identity, and
+        // no store below is asked for the member's name.
+        mut by_identity: boolean = false;
+        mut chosen_func: FunctionDeclNode* = null;
+        if (chosen != null && chosen.func != null && chosen.func.generic_params.length > 0) {
+            by_identity = true;
+            mut site: ASTNode* = null;
+            found = this.chosen_declaration(chosen, tmpl, recv_type, &site);
+            if (found == null) {
+                const d: DefId = if (chosen.func.def.is_valid()) { chosen.func.def } else { chosen.func.copy_of };
+                chosen_func = this.ctx.decl_index.method_func_of(d);
+            } else if (site.kind == NodeKind::ImplementationBlock) {
+                owner_params = &(site as ImplBlockNode*).generic_params;
+            } else if (site.kind == NodeKind::StructDeclaration) {
+                owner_params = &(site as StructDeclNode*).generic_params;
+            } else if (site.kind == NodeKind::UnionDeclaration) {
+                owner_params = &(site as UnionDeclNode*).generic_params;
+            } else if (site.kind == NodeKind::ClassDeclaration) {
+                owner_params = &(site as ClassDeclNode*).generic_params;
+            }
+        }
 
         // The precedence `select_method` binds under.  A call stamped with a
         // trait names that trait's method, so its impls are asked first.
@@ -1397,22 +1479,14 @@ type struct MethodBinding {
         // method list).  Trait: the trait impls for the receiver, then a
         // trait default.
         mut trait_impl_block: ImplBlockNode* = null;
-        if (member.resolved_trait.is_valid()) {
+        if (!by_identity && member.resolved_trait.is_valid()) {
             found = this.find_generic_method_in_trait_impls(
                 recv_type, member.member, member.resolved_trait, &trait_impl_block);
             if (found != null && trait_impl_block != null) {
                 owner_params = &trait_impl_block.generic_params;
             }
         }
-        // Template key: an instantiation (`Array<i32>`) keys off its generic base; a
-        // BARE template struct used directly as a receiver (`this` in `implement
-        // FmtWrite for struct String`, where `this` is the un-parameterized `String`,
-        // not `String<GlobalAlloc>`) keys off its own type id.  Without the bare case
-        // the call's method-arg bindings are never stashed, so mono can't pin the
-        // generic call and codegen's name+arity fallback picks a wrong sibling spec.
-        const tmpl_base: TypeRef = if (recv_base.is_valid()) { recv_base } else { recv_type };
-        const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(tmpl_base);
-        if (found == null && tmpl != null && tmpl.ast_node != null) {
+        if (!by_identity && found == null && tmpl != null && tmpl.ast_node != null) {
             if (tmpl.node_kind == NodeKind::StructDeclaration) {
                 const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;
                 found = this.find_generic_method_in(&sn.methods, member.member);
@@ -1439,7 +1513,7 @@ type struct MethodBinding {
                 }
             }
         }
-        if (found == null) {
+        if (!by_identity && found == null) {
             const owner_ast: ASTNode* = this.ctx.generic_registry.lookup_inherent_owner(recv_type);
             if (owner_ast != null) {
                 if (owner_ast.kind == NodeKind::StructDeclaration) {
@@ -1454,13 +1528,13 @@ type struct MethodBinding {
                 }
             }
         }
-        if (found == null) {
+        if (!by_identity && found == null) {
             mut impl_blk: ImplBlockNode* = null;
             found = this.ctx.generic_registry.find_inherent_impl_generic_method(
                 recv_type, member.member, &impl_blk);
             if (found != null && impl_blk != null) { owner_params = &impl_blk.generic_params; }
         }
-        if (found == null) {
+        if (!by_identity && found == null) {
             found = this.find_generic_method_in_trait_impls(
                 recv_type, member.member, DefId::invalid(), &trait_impl_block);
             if (found != null && trait_impl_block != null) {
@@ -1470,6 +1544,8 @@ type struct MethodBinding {
         mut orig_func: FunctionDeclNode* = null;
         if (found != null) {
             orig_func = found.func;
+        } else if (by_identity) {
+            orig_func = chosen_func;
         } else {
             orig_func = this.find_generic_trait_default(recv_type, member.member);
         }
@@ -1707,11 +1783,11 @@ type struct MethodBinding {
     /// `try_infer_method_call` reads them instead of re-inferring.  Called for
     /// every method call; no-op for non-generic methods / abstract bindings.
     stash_method_call_bindings(mut &this, recv_type: TypeRef,
-                               member: MemberAccessNode*, call: CallExprNode*) -> void {
+                               member: MemberAccessNode*, call: CallExprNode*, chosen: MethodNode*) -> void {
         if (call == null || member == null) { return; }
         mut orig_func: FunctionDeclNode* = null;
         mut owner_ctx: ResolutionContext =
-            this.find_generic_method_for_call(recv_type, member, &orig_func);
+            this.find_generic_method_for_call(recv_type, member, chosen, &orig_func);
         if (orig_func == null) { return; }
         const n_method_params: i64 = orig_func.generic_params.length;
         mut bindings: TypeRef[] = this.solve_method_bindings(orig_func, &owner_ctx, member, call);
@@ -1726,11 +1802,11 @@ type struct MethodBinding {
     /// Returns `fallback` (the caller's prior resolution) on any miss - these
     /// exits are the pre-mono re-derivation; deletable once sema is authoritative.
     resolve_generic_method_return(mut &this, recv_type: TypeRef, member: MemberAccessNode*,
-                                  call: CallExprNode*, fallback: TypeRef) -> TypeRef {
+                                  call: CallExprNode*, chosen: MethodNode*, fallback: TypeRef) -> TypeRef {
         if (call == null || member == null) { return fallback; }
         mut orig_func: FunctionDeclNode* = null;
         mut owner_ctx: ResolutionContext =
-            this.find_generic_method_for_call(recv_type, member, &orig_func);
+            this.find_generic_method_for_call(recv_type, member, chosen, &orig_func);
         if (orig_func == null) { return fallback; }
         const ret_ann: TypeAnnotation* = orig_func.return_type_annotation;
         if (ret_ann == null) { return fallback; }

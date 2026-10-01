@@ -95,6 +95,23 @@ type struct SpecializationEntry {
                                        // ownership and AST placement so they always agree.
 }
 
+/// One instance of a method with type parameters of its own: its type
+/// arguments, in the method's declaration order, and the entry the instance
+/// was registered under.
+type struct MethodInstance {
+    args:  TypeRef[];
+    entry: OverloadId;
+
+    /// Whether this instance is the one at `args`, compared by identity.
+    binds(&this, args: &TypeRef[]) -> boolean {
+        if (this.args.length != args.length) { return false; }
+        for (mut i: i64 = 0; i < args.length; i++) {
+            if (!this.args[i].equals(args[i])) { return false; }
+        }
+        return true;
+    }
+}
+
 
 // MonoState: worklist + discovery engine + spec table + error counter
 
@@ -120,17 +137,25 @@ type struct MonoState {
     // emit diagnostics both bump this; process_all returns error_count == 0).
     error_count:      i64;
 
-    // Generic-method specialization registry, keyed by the spec method's mangled
-    // symbol.  A generic method call is specialized once per (owner, method,
-    // bindings); the same logical spec can be requested again from multiple call
-    // sites - notably an in-source `arr.fmt(f)` AND a clone of that same call in a
-    // specialized body (whose `resolved_callee`/`resolved_method` the substituter
-    // clears, forcing re-resolution).  Without dedup the second request
-    // materializes a DUPLICATE spec method (double AST push + double DI entry),
-    // which corrupts the owner spec's method set.  This set persists across the
-    // batch (it is NOT cleared by `reset_worklist`): the spec, once emitted, is
-    // shared by every module.
+    // Specializations of generic STATIC methods on a generic owner
+    // (`finish_generic_static_method_spec`), keyed by the spec method's mangled
+    // symbol.  One is specialized once per (owner, method, bindings); the same
+    // spec can be requested again from several call sites, and without dedup
+    // the second request materializes a DUPLICATE spec method (double AST push
+    // + double DI entry), which corrupts the owner spec's method set.  This set
+    // persists across the batch (it is NOT cleared by `reset_worklist`): the
+    // spec, once emitted, is shared by every module.  Methods called on a
+    // receiver are kept in `method_instances` instead.
     method_specs:     HashMap<string, OverloadId>;
+
+    // The instances of methods with type parameters of their own: the
+    // receiver's method for a definition, at its own type arguments, minted
+    // once and shared by every call that asks for it, whichever body the
+    // call was copied into.  Keyed by identity - the receiver type and the
+    // definition - with the type arguments compared within a key's
+    // positions.  Persists across the batch, as `method_specs` does.
+    method_instances: MethodInstance[];
+    instance_keys:    HashMap<u64, i64[]>;
 
     // Arena ids of InstantiatedTypes that have a REGISTERED spec entry.
     //
@@ -174,6 +199,8 @@ type struct MonoState {
             nested_visited:   [],
             error_count:      0,
             method_specs:     HashMap::<string, OverloadId>::new(),
+            method_instances: [],
+            instance_keys:    HashMap::<u64, i64[]>::new(),
             materialized_insts: HashMap::<u64, boolean>::new(),
             spec_owner_files: [],
         };
@@ -216,6 +243,35 @@ type struct MonoState {
             Option::Some(e) => { e }
             Option::None    => { OverloadId::invalid() }
         };
+    }
+
+    /// The entry of `owner`'s instance of the method definition at
+    /// `def_slot` at the type arguments `args`; invalid when none was minted.
+    method_instance(&this, owner: TypeRef, def_slot: i64, args: &TypeRef[]) -> OverloadId {
+        const key: u64 = MonoState::instance_key(owner, def_slot);
+        match (this.instance_keys.get_ref(&key)) {
+            Option::Some(positions) => {
+                for (mut k: i64 = 0; k < (*positions).length; k++) {
+                    const inst: MethodInstance* = &this.method_instances[(*positions)[k]];
+                    if (inst.binds(args)) { return inst.entry; }
+                }
+            }
+            Option::None => { }
+        }
+        return OverloadId::invalid();
+    }
+
+    /// Record `entry` as `owner`'s instance of the method definition at
+    /// `def_slot` at the type arguments `args`.
+    add_method_instance(mut &this, owner: TypeRef, def_slot: i64, args: TypeRef[], entry: OverloadId) -> void {
+        const key: u64 = MonoState::instance_key(owner, def_slot);
+        const positions: i64[]* = this.instance_keys.get_or_insert(key, []);
+        positions.push(this.method_instances.length);
+        this.method_instances.push(MethodInstance { args: args, entry: entry });
+    }
+
+    static instance_key(owner: TypeRef, def_slot: i64) -> u64 {
+        return (owner.key() << 32) | (def_slot as u64);
     }
 
     /// True if a spec entry has been REGISTERED for this instantiation (see
