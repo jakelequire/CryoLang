@@ -3098,9 +3098,10 @@ type struct CallResolver {
         // signature and a receiver, so nothing but the stamp can tell them
         // apart, and a type substituted for a bounded parameter may declare
         // an inherent method of the name that the generic body never saw.
-        // It is a ranking, not a restriction - `x.drop()` inside
-        // `Drop::drop` is stamped `Drop` and binds an inherent `drop` when
-        // that is what the receiver has.  Compared by identity: the stamp is
+        // On a minted receiver the stamp's recorded position answers through
+        // the implementations' tables (`bind_trait_item`); the selection by
+        // name below serves an instantiation not yet minted and a method
+        // bound to its specialization.  Compared by identity: the stamp is
         // the trait's canonical name, and so is a method's `origin_trait`
         // and an impl head's `trait_def`.  Two traits can share a leaf, and
         // a leaf comparison binds whichever of them registered first.
@@ -3122,6 +3123,17 @@ type struct CallResolver {
                 tmpl = this.ctx.generic_registry.template_of_type(base_ref);
             }
             if (tmpl == null) { return Selection::none(); }
+        }
+        // On a minted receiver, a call that recorded its trait method's
+        // position names the method the receiver's implementation of that
+        // trait provides there.  A method with type parameters of its own,
+        // or a default instantiated per call, is bound to its specialization
+        // instead, and selected below.
+        if (want_trait.is_valid() && tmpl == null && member.resolved_trait_slot >= 0) {
+            const items: MethodNode*[] = this.trait_item_answers(member, base_ref);
+            if (CallResolver::all_plain_methods(&items)) {
+                return this.bind_trait_item(visitor, call, &items, &arg_types);
+            }
         }
         if (want_trait.is_valid() && this.select_in_set(visitor, call, member, base_ref, base_t, start_cls,
                 methods_ref, &arg_types, tmpl, want_trait, true, &sel)) {
@@ -3247,33 +3259,83 @@ type struct CallResolver {
         member.set_resolved_trait_item(trait_def, slot);
     }
 
-    /// The method `recv`'s implementation of the call's trait provides for
+    /// The methods `recv`'s implementations of the call's trait provide for
     /// the trait's method the call names, found without the member's name:
-    /// the implementation selected by (trait, type), then its method at the
-    /// position the call recorded.  Null when the call recorded none or no
-    /// implementation is selected.
-    trait_item_answer(&this, member: MemberAccessNode*, recv: TypeRef) -> MethodNode* {
-        if (this.ctx.generic_registry == null || member.resolved_trait_slot < 0) { return null; }
-        const block: ImplBlockNode* = this.ctx.generic_registry.select_trait_impl(
+    /// each implementation selected by (trait, type), in registration order,
+    /// then its method at the position the call recorded.  A trait
+    /// implemented at several arguments (`Mul<f32, V>` and `Mul<V, V>` for
+    /// `V`) has an implementation, and an answer, for each.  Empty when the
+    /// call recorded no position or no implementation is selected.
+    trait_item_answers(&this, member: MemberAccessNode*, recv: TypeRef) -> MethodNode*[] {
+        mut out: MethodNode*[] = [];
+        if (this.ctx.generic_registry == null || member.resolved_trait_slot < 0) { return out; }
+        const heads: ImplBlockNode*[] = this.ctx.generic_registry.heads_for(
             member.resolved_trait, recv, this.intern);
-        return this.ctx.generic_registry.trait_item_method(block, member.resolved_trait_slot);
+        for (mut i: i64 = 0; i < heads.length; i++) {
+            const m: MethodNode* = this.ctx.generic_registry.trait_item_method(heads[i], member.resolved_trait_slot);
+            if (m != null) { out.push(m); }
+        }
+        return out;
+    }
+
+    /// Whether every method in `items` is bound as it is written: none has
+    /// type parameters of its own, and none is a default the implementation
+    /// instantiates per call.  An empty set qualifies; it binds nothing.
+    static all_plain_methods(items: &MethodNode*[]) -> boolean {
+        for (mut i: i64 = 0; i < items.length; i++) {
+            const f: FunctionDeclNode* = items[i].func;
+            if (f == null || f.generic_params.length > 0
+                    || f.is_self_returning_default || f.is_lazy_self_growing) { return false; }
+        }
+        return true;
+    }
+
+    /// Bind a call a bound answered where it is written to one of `items`,
+    /// the methods the receiver's implementations of that trait provide at
+    /// the call's recorded position: the first the arguments bind to, at
+    /// the lowest tier any of them binds.  Several are candidates only when
+    /// the trait is implemented at several arguments, which the arguments
+    /// tell apart.  Nothing is selected by the member's name, and no method
+    /// outside the trait's implementations is a candidate: arguments that
+    /// bind to none of them leave the call unbound.
+    bind_trait_item(mut &this, visitor: ASTVisitor*, call: CallExprNode*, items: &MethodNode*[],
+                    arg_types: &TypeRef[]) -> Selection {
+        for (mut tier: i32 = 0; tier <= 3; tier++) {
+            if (tier == 3 && this.state.in_implicit_conversion) { break; }
+            for (mut i: i64 = 0; i < items.length; i++) {
+                const f: FunctionDeclNode* = items[i].func;
+                mut params: TypeRef[] = [];
+                for (mut pi: i64 = 0; pi < f.parameters.length; pi++) {
+                    const pp: VarDeclNode* = f.parameters[pi];
+                    if (pp == null || pp.is_receiver()) { continue; }
+                    params.push(pp.resolved_type);
+                }
+                if (!this.args_bind_to_params(call, arg_types, params.as_slice(), f.is_variadic, tier)) { continue; }
+                mut sel: Selection = Selection::of(items[i]);
+                sel.tier = tier;
+                return this.commit_selection(visitor, call, sel);
+            }
+        }
+        return Selection::none();
     }
 
     /// A call a trait's method was selected for by name on a concrete
-    /// receiver must name the method the trait's implementation provides at
-    /// the call's recorded position - that method, or a specialization of it
-    /// the monomorphizer minted.  The two answers come from two
-    /// independent paths, the selection by the member's name among the
-    /// receiver's methods and the implementation's table by position; a
-    /// disagreement is a defect in one of them, reported as an internal
-    /// error rather than compiled.
+    /// receiver must name a method one of the trait's implementations for
+    /// the receiver provides at the call's recorded position - that method,
+    /// or a specialization of it the monomorphizer minted.  The two answers
+    /// come from two independent paths, the selection by the member's name
+    /// among the receiver's methods and the implementations' tables by
+    /// position; a disagreement is a defect in one of them, reported as an
+    /// internal error rather than compiled.
     check_trait_item_table(mut &this, member: MemberAccessNode*, recv: TypeRef, chosen: MethodNode*) -> void {
         if (member.resolved_trait_slot < 0) { return; }
-        const m: MethodNode* = this.trait_item_answer(member, recv);
-        if (m != null && (m == chosen || (chosen != null && chosen.spec_of == m))) { return; }
+        const items: MethodNode*[] = this.trait_item_answers(member, recv);
+        for (mut i: i64 = 0; i < items.length; i++) {
+            if (items[i] == chosen || (chosen != null && chosen.spec_of == items[i])) { return; }
+        }
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
             Text::new(fmt::format("`%s` was selected by name as a trait's method, and the method table of the implementation the trait and the receiver select answers %s",
-                this.intern.resolve(member.member), if (m == null) { "no method" } else { "a different one" })));
+                this.intern.resolve(member.member), if (items.length == 0) { "no method" } else { "a different one" })));
         d = d.at_with_label(member.span, Text::new("the two ways of finding this call's method disagree"));
         this.ctx.emit_diagnostic(d);
     }
