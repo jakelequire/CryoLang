@@ -125,7 +125,13 @@ CIncludeLine       ::= "#include" ( "<" /* path */ ">"
 
 IntrinsicDecl      ::= "intrinsic" "function" Ident
                        "(" ParamList? ")" ("->" Type)? (Block | ";")
+                     | "intrinsic" "function" Ident Generics
+                       "(" ParamList? ")" ("->" Type)? ("where" WhereClause)? ";"
                      | "intrinsic" "const" Ident ":" Type ("=" Expr)? ";"
+
+(*  A generic intrinsic has no body: it is typed and specialized as a
+    generic function, and each call to a specialization is lowered by the
+    compiler (`drop_in_place<T>(p: T*)` releases `*p`).                     *)
 
 (*  Compile-time assertion: `cond` is folded after layout; a false or
     non-constant condition is a compile error (E0237).  `cond` may use

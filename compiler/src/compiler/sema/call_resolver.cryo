@@ -3180,6 +3180,25 @@ type struct CallResolver {
         return this.commit_selection(visitor, call, Selection::of(chosen));
     }
 
+    /// Bind `x.drop()` built to release `x` to the destructor of `x`'s
+    /// type, by identity: the implementation `Drop` and the type select,
+    /// then its method at `Drop::drop`'s position.  A type with no
+    /// implementation has no destructor to call, and the call is left
+    /// unpinned: codegen releases the value with its glue, or not at all
+    /// when it is `Copy`.  A method of the type that is merely named `drop`
+    /// is not its destructor and is never reached.
+    bind_destructor(mut &this, visitor: ASTVisitor*, call: CallExprNode*, recv: TypeRef) -> Selection {
+        if (this.ctx.generic_registry == null) { return Selection::none(); }
+        const d: DefId = this.ctx.generic_registry.wellknown(LangItem::DropDrop);
+        if (!d.is_valid()) { return Selection::none(); }
+        const block: ImplBlockNode* = this.ctx.generic_registry.select_trait_impl(
+            this.ctx.defs.parent_of(d), recv, this.intern);
+        const chosen: MethodNode* = this.ctx.generic_registry.trait_item_method(
+            block, this.ctx.generic_registry.trait_item_position(d));
+        if (chosen == null) { return Selection::none(); }
+        return this.commit_selection(visitor, call, Selection::of(chosen));
+    }
+
     /// Stamp the call `member` is the callee of with the trait a bound
     /// answered it through and the position of the method it names among
     /// that trait's declared ones, found where the call is written.

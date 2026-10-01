@@ -72,7 +72,8 @@ import compiler::types::generic::{ InstantiatedType };
 import compiler::types::user_defined;
 import compiler::types::user_defined::{ ClassType, FieldInfo, StructType };
 import compiler::types::compound;
-import compiler::types::compound::{ ArrayType };
+import compiler::types::compound::{ ArrayType, PointerType };
+import compiler::intrinsic_kind::{ IntrinsicKind };
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, DeclarationNode, DestructureBinding, DestructureDeclNode,
@@ -80,7 +81,7 @@ import compiler::ast::declaration::{
     UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
-    ArrayAccessNode, ArrayLiteralNode, BinaryExprNode, CallExprNode, CastExprNode,
+    ArrayAccessNode, ArrayLiteralNode, BinaryExprNode, CallExprNode, CalleePin, CastExprNode,
     ExpressionNode, IdentifierNode, IfExprNode, LambdaExprNode, LiteralNode, MatchExprNode,
     MemberAccessNode, NewExprNode, StaticMatchExprNode, StructLiteralNode, TernaryExprNode,
     TryExprNode, TupleLiteralNode, UnaryExprNode
@@ -3931,6 +3932,31 @@ type struct DropInserter {
         }
     }
 
+    /// Rewrite a call to the `drop_in_place` intrinsic, `drop_in_place::<T>(p)`
+    /// with `T` substituted, into the release of `*p`: `(*p).drop()`, bound
+    /// to `T`'s destructor by identity, or left for codegen's glue when `T`
+    /// has none.  The node is rewritten in place, so whatever holds it holds
+    /// the release.  Every other call is left alone.
+    lower_drop_in_place(mut &this, c: CallExprNode*) -> void {
+        if (c.resolved_callee.intrinsic_kind(this.ctx.decl_index) != IntrinsicKind::DropInPlace) { return; }
+        if (c.arguments.length != 1 || c.arguments[0] == null) { return; }
+        const p: ExpressionNode* = c.arguments[0];
+        const pt: Type* = this.arena.lookup(p.resolved_type);
+        if (pt == null || pt.kind != TypeKind::Pointer) { return; }
+        const deref_tok: Token = Token::new(TokenType::Star, "*",
+            c.span.start_line as int, c.span.start_col as int);
+        const target: UnaryExprNode* = new UnaryExprNode(deref_tok, p, c.span);
+        target.is_synthetic = true;
+        target.set_resolved_type((pt as PointerType*).pointee);
+        const member: MemberAccessNode* = new MemberAccessNode(
+            target as ExpressionNode*, this.drop_sym, c.span, c.span);
+        c.callee = member as ExpressionNode*;
+        c.arguments = [];
+        c.resolved_callee = CalleePin::None;
+        c.resolved_method = null;
+        this.sema.bind_destructor_call(c);
+    }
+
     /// Build `binding.drop();` as ExprStmt(Call(MemberAccess(Ident, "drop"))).
     /// The synthesized nodes must carry resolved types; codegen runs
     /// after this pass and won't re-run type resolution, so an
@@ -4098,6 +4124,7 @@ type struct DropInserter {
 
     read_call(mut &this, c: CallExprNode*) -> void {
         if (c == null) { return; }
+        this.lower_drop_in_place(c);
         // Recognise `<ident>.drop()` and treat it as a move: the user
         // is explicitly releasing the binding here, so auto-drop must
         // not emit a second `.drop()` at scope exit.  Without this, any

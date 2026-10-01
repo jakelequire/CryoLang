@@ -581,6 +581,11 @@ public:
                 if (ic != null && doc != "") { ic.set_documentation(doc_text); }
                 return ic;
             }
+            if (this.peek_at(1).kind == TokenType::KwFunction && this.peek_at(3).kind == TokenType::LAngle) {
+                const gi: FunctionDeclNode* = this.parse_generic_intrinsic_declaration();
+                if (gi != null && doc != "") { gi.set_documentation(doc_text); }
+                return gi;
+            }
             const intr: IntrinsicDeclNode* = this.parse_intrinsic_declaration();
             if (intr != null && doc != "") { intr.set_documentation(doc_text); }
             return intr;
@@ -2725,6 +2730,36 @@ public:
 
         node.span = this.span_from(start);
         return node;
+    }
+
+    /// Parse a generic intrinsic declaration:
+    ///   intrinsic function name<T, ..>(params) -> RetType where .. ;
+    /// It is a generic function with no body, and is typed and specialized
+    /// as one; its entries carry the kind its name lowers as.
+    parse_generic_intrinsic_declaration() -> FunctionDeclNode* {
+        const start: Token = this.advance(); // consume 'intrinsic'
+        this.advance(); // consume 'function'
+        const name_tok: Token = this.consume(TokenType::Identifier, Text::new("intrinsic name"));
+        mut func: FunctionDeclNode* = new FunctionDeclNode(this.intern_lexeme(name_tok), this.span_from_token(start));
+        func.set_name_span(this.span_from_token(name_tok));
+        func.set_intrinsic(true);
+        const gen_params: GenericParamNode*[] = this.parse_generic_params(true);
+        for (mut i: i64 = 0; i < gen_params.length; i++) {
+            func.add_generic_param(gen_params[i]);
+        }
+        this.parse_function_param_list_into(func);
+        if (this.match_tok(TokenType::Arrow)) {
+            func.set_return_type_annotation(this.parse_type_annotation());
+        }
+        if (this.check(TokenType::KwWhere)) {
+            const bounds: TraitBound[] = this.parse_trait_bounds();
+            for (mut i: i64 = 0; i < bounds.length; i++) {
+                func.add_trait_bound(bounds[i].clone());
+            }
+        }
+        this.consume(TokenType::Semicolon, Text::new("';'"));
+        func.span = this.span_from(start);
+        return func;
     }
 
     /// Parse an intrinsic const declaration: intrinsic const NAME: Type;

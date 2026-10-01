@@ -1,0 +1,69 @@
+/// `drop_in_place<T>(p: T*)` releases the value `p` points to the way a
+/// value leaving scope is released: its type's `Drop` implementation and then
+/// its fields' glue, the glue alone for a type with no implementation, and
+/// nothing for a `Copy` value.  The destructor is found by identity - the
+/// implementation `Drop` and the type select - so a method that is merely
+/// named `drop` is not called.  Each value is released through a generic
+/// function, so the intrinsic is lowered once per specialization.  The exit
+/// code says which count was wrong; 0 means every one held.
+namespace DropInPlaceReleasesByDestructor::Main;
+
+import std::core::drop::{ Drop };
+import std::alloc::box::{ Box };
+import std::ffi::libc;
+
+intrinsic function drop_in_place<T>(p: T*) -> void;
+
+mut g_drops: i32 = 0;
+mut g_outer: i32 = 0;
+mut g_inherent: i32 = 0;
+
+type struct Counted { v: i32; }
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { g_drops = g_drops + 1; }
+}
+
+// No destructor of its own: released by its field's glue.
+type struct Holder { c: Counted; n: i32; }
+
+// A destructor and a droppable field: the destructor, then the field.
+type struct Outer { c: Counted; }
+implement trait Drop for struct Outer {
+    drop(mut &this) -> void { g_outer = g_outer + 1; }
+}
+
+// A method that is merely named `drop`: not a destructor.
+type struct Inh { v: i32; }
+implement struct Inh {
+    drop(mut &this) -> void { g_inherent = g_inherent + 1; }
+}
+
+function release<T>(p: T*) -> void {
+    drop_in_place::<T>(p);
+}
+
+function main() -> int {
+    const a: Counted* = Box::new(Counted { v: 1 }).into_raw();
+    release::<Counted>(a);
+    if (g_drops != 1) { return 1; }
+
+    const h: Holder* = Box::new(Holder { c: Counted { v: 2 }, n: 3 }).into_raw();
+    release::<Holder>(h);
+    if (g_drops != 2) { return 2; }
+
+    const o: Outer* = Box::new(Outer { c: Counted { v: 4 } }).into_raw();
+    release::<Outer>(o);
+    if (g_outer != 1) { return 3; }
+    if (g_drops != 3) { return 4; }
+
+    mut x: i32 = 5;
+    release::<i32>(&x);
+    if (x != 5) { return 5; }
+
+    const i: Inh* = Box::new(Inh { v: 6 }).into_raw();
+    release::<Inh>(i);
+    if (g_inherent != 0) { return 6; }
+
+    libc::printf("drop-in-place ok\n");
+    return 0;
+}
