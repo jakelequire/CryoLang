@@ -592,7 +592,6 @@ type struct CallResolver {
     /// payload-type list.
     substitute_payload_types(&this, payload: &TypeRef[], template_ref: TypeRef,
                              type_args: &TypeRef[]) -> TypeRef[] {
-        if (this.ctx.generic_registry == null) { return sema_copy_type_refs(payload); }
         const entry: TemplateEntry* =
             this.ctx.generic_registry.template_of_type(template_ref);
         if (entry == null) { return sema_copy_type_refs(payload); }
@@ -647,7 +646,6 @@ type struct CallResolver {
         mut out: TypeRef[] = [];
         for (mut i: i64 = 0; i < param_types.length; i++) { out.push(TypeRef::invalid()); }
         if (out.length == 0) { return out; }
-        if (this.ctx.generic_registry == null) { return out; }
 
         mut any_abstract: boolean = false;
         for (mut i: i64 = 0; i < param_types.length; i++) {
@@ -679,7 +677,6 @@ type struct CallResolver {
         } else if (callee_node.kind == NodeKind::ScopeResolution) {
             const sr: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
             if (sr.scope_generic_args.length == 0) { return out; }
-            if (this.ctx.type_resolver == null) { return out; }
             tmpl = this.lookup_scope_template(
                 sr.require_scope_res(Text::new("scope-call owner template")));
             if (tmpl == null) { return out; }
@@ -1531,7 +1528,6 @@ type struct CallResolver {
     /// diagnostic fired.  `resolved_callee` is left unpinned (mono specializes).
 
     check_generic_free_call(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> TypeRef {
-        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return TypeRef::invalid(); }
         const entry: TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length);
         if (entry == null) { return TypeRef::invalid(); }
         const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
@@ -1655,7 +1651,6 @@ type struct CallResolver {
         mut out: TypeRef[] = sema_copy_type_refs(param_types);
         for (mut i: i64 = 0; i < out.length; i++) { forced.push(false); }
         if (out.length == 0) { return out; }
-        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return out; }
         const callee_node: ASTNode* = call.callee as ASTNode*;
         // A METHOD call carries its turbofish on the MemberAccess
         // (`b.queue<u8>(0x42)`), not on the call node, so the identifier path
@@ -1821,7 +1816,6 @@ type struct CallResolver {
     /// with `ictx.bindings`, exactly as that helper requires.
     project_where_bound_params(mut &this, tmpl: FunctionDeclNode*, entry: TemplateEntry*,
                                ictx: InferCtx*) -> void {
-        if (this.ctx.type_resolver == null) { return; }
         this.ctx.type_resolver.project_where_bound_params_into(
             &tmpl.trait_bounds, &entry.param_syms, ictx, this.ctx.source_file,
             this.state.in_symbolic_check);
@@ -1892,7 +1886,6 @@ type struct CallResolver {
                                          scope: ScopeResolutionNode*) -> void {
         if (call == null || scope == null) { return; }
         if (call.resolved_type_args.length > 0) { return; }
-        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return; }
         const entry: TemplateEntry* = this.find_static_method_template(scope);
         if (entry == null || entry.node_kind != NodeKind::FunctionDeclaration) { return; }
         if (entry.param_types.length == 0) { return; }
@@ -2551,7 +2544,7 @@ type struct CallResolver {
         // The trait impls are candidates only when no inherent method took
         // the call.
         if (!ambiguous && !trait_ambiguous && !(found && !found_trait.is_valid())
-                && this.ctx.generic_registry != null) {
+) {
             // The impls selected for the receiver: a placed clone when it is
             // a specialization, else the written heads that unify with it and
             // whose bounds hold.
@@ -2807,11 +2800,9 @@ type struct CallResolver {
         // is not pinned - the value names an instantiation the template's
         // name does not, and nothing yet selects one for a value.
         mut is_fn_template: boolean = false;
-        if (this.ctx.generic_registry != null) {
-            const tmpl: TemplateEntry* = this.ctx.generic_registry.template_in(
-                ResBase::Def(scope.require_scope_res(Text::new("scope value template")).def_id()), scope.member_name);
-            if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) { is_fn_template = true; }
-        }
+        const tmpl: TemplateEntry* = this.ctx.generic_registry.template_in(
+            ResBase::Def(scope.require_scope_res(Text::new("scope value template")).def_id()), scope.member_name);
+        if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) { is_fn_template = true; }
         if (!is_fn_template && !scope.resolved_callee.is_some()) {
             scope.set_resolved_callee(CalleePin::Family(
                 FamilyOwner::Def(this.ctx.defs.parent_of(callee)), this.ctx.defs.leaf_of(callee)));
@@ -3127,9 +3118,7 @@ type struct CallResolver {
         // the impl blocks attached to it do.
         mut tmpl: TemplateEntry* = null;
         if (owner_inst.is_valid()) {
-            if (this.ctx.generic_registry != null) {
-                tmpl = this.ctx.generic_registry.template_of_type(base_ref);
-            }
+            tmpl = this.ctx.generic_registry.template_of_type(base_ref);
             if (tmpl == null) { return Selection::none(); }
         }
         // On a minted receiver, a call that recorded its trait method's
@@ -3245,7 +3234,7 @@ type struct CallResolver {
             return Selection::none();
         }
         mut chosen: MethodNode* = null;
-        if (recv.is_valid() && !owner_inst.is_valid() && this.ctx.generic_registry != null) {
+        if (recv.is_valid() && !owner_inst.is_valid()) {
             const slot: i64 = this.ctx.generic_registry.trait_item_position(d);
             if (slot >= 0) {
                 const block: ImplBlockNode* = this.ctx.generic_registry.select_trait_impl(
@@ -3277,7 +3266,6 @@ type struct CallResolver {
     /// out as the `Array<T>` specialization registered for its element, and
     /// is released by that type's destructor.
     bind_destructor(mut &this, visitor: ASTVisitor*, call: CallExprNode*, recv: TypeRef) -> Selection {
-        if (this.ctx.generic_registry == null) { return Selection::none(); }
         const d: DefId = this.ctx.generic_registry.wellknown(LangItem::DropDrop);
         if (!d.is_valid()) { return Selection::none(); }
         mut subject: TypeRef = recv;
@@ -3298,8 +3286,7 @@ type struct CallResolver {
     /// answered it through and the position of the method it names among
     /// that trait's declared ones, found where the call is written.
     stamp_trait_item(&this, member: MemberAccessNode*, trait_def: DefId) -> void {
-        const slot: i64 = if (this.ctx.generic_registry == null) { -1 } else {
-            this.ctx.generic_registry.trait_item_slot(trait_def, member.member) };
+        const slot: i64 = this.ctx.generic_registry.trait_item_slot(trait_def, member.member);
         member.set_resolved_trait_item(trait_def, slot);
     }
 
@@ -3312,7 +3299,7 @@ type struct CallResolver {
     /// call recorded no position or no implementation is selected.
     trait_item_answers(&this, member: MemberAccessNode*, recv: TypeRef) -> MethodNode*[] {
         mut out: MethodNode*[] = [];
-        if (this.ctx.generic_registry == null || member.resolved_trait_slot < 0) { return out; }
+        if (member.resolved_trait_slot < 0) { return out; }
         const heads: ImplBlockNode*[] = this.ctx.generic_registry.heads_for(
             member.resolved_trait, recv, this.intern);
         for (mut i: i64 = 0; i < heads.length; i++) {
@@ -3612,7 +3599,6 @@ type struct CallResolver {
             return true;
         }
 
-        if (this.ctx.generic_registry == null) { return false; }
 
         // A primitive's inherent methods: the `implement string { }` blocks the
         // registry indexes under its type.  A declared type's blocks were
@@ -3730,7 +3716,6 @@ type struct CallResolver {
         // only in its where-clause cannot be bound by the checker, so an
         // instantiation not yet minted would fail every such head.  The pass
         // that sees the minted type selects among confirmed impls.
-        if (this.ctx.generic_registry == null) { return false; }
         const blocks: ImplBlockNode*[] = this.ctx.generic_registry.trait_impls_of(sel.owner_inst, this.intern);
         for (mut ti: i64 = 0; ti < blocks.length; ti++) {
             const block: ImplBlockNode* = blocks[ti];
@@ -3770,7 +3755,6 @@ type struct CallResolver {
     /// `Range<i32>`'s `Iterator` impl writes.  Bounds are read in order, so
     /// a bound may use a parameter an earlier one bound.
     bind_where_only_params(mut &this, block: ImplBlockNode*, view: TypeSubstitution*) -> void {
-        if (this.ctx.type_resolver == null) { return; }
         for (mut bi: i64 = 0; bi < block.where_bounds.length; bi++) {
             const bound: &TraitBound = &block.where_bounds[bi];
             const subject: TypeRef = this.trait_checker().lookup_subst_for_param(bound.subject_sym, view);
@@ -4263,22 +4247,20 @@ type struct CallResolver {
         const type_display: string = if (recv_t != null) { this.arena.format_display(recv_t) } else { this.intern.resolve(type_sym) };
         const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
 
-        if (this.ctx.generic_registry != null) {
-            const failed_trait: SymbolStr = this.trait_checker().diagnose_method_bounds_failure(lookup_ref, member.member);
-            if (failed_trait.is_valid()) {
-                // The identity, rendered by its leaf as the tie report does.
-                const trait_str: string = QualifiedName::leaf_of(this.intern.resolve(failed_trait));
-                mut diag: Diagnostic = Diagnostic::error(
-                    ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
-                    Text::new(fmt::format("the trait `%s` is not implemented for `%s`", trait_str, type_display)));
-                diag = diag.at(primary_span);
-                diag = diag.with_note(Text::new(fmt::format(
-                    "the impl of `%s` for this type has a where-clause that this specialization does not satisfy", trait_str)));
-                diag = diag.help(Text::new(fmt::format(
-                    "method `%s` belongs to trait `%s`; ensure the type arguments satisfy the impl's bounds", method_name, trait_str)));
-                this.ctx.emit_diagnostic(diag);
-                return TypeRef::invalid();
-            }
+        const failed_trait: SymbolStr = this.trait_checker().diagnose_method_bounds_failure(lookup_ref, member.member);
+        if (failed_trait.is_valid()) {
+            // The identity, rendered by its leaf as the tie report does.
+            const trait_str: string = QualifiedName::leaf_of(this.intern.resolve(failed_trait));
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+                Text::new(fmt::format("the trait `%s` is not implemented for `%s`", trait_str, type_display)));
+            diag = diag.at(primary_span);
+            diag = diag.with_note(Text::new(fmt::format(
+                "the impl of `%s` for this type has a where-clause that this specialization does not satisfy", trait_str)));
+            diag = diag.help(Text::new(fmt::format(
+                "method `%s` belongs to trait `%s`; ensure the type arguments satisfy the impl's bounds", method_name, trait_str)));
+            this.ctx.emit_diagnostic(diag);
+            return TypeRef::invalid();
         }
         if (this.try_diagnose_method_bound_failure(obj_type, member)) { return TypeRef::invalid(); }
         if (this.try_diagnose_forin_noncopy(obj_type, member, primary_span)) { return TypeRef::invalid(); }
@@ -4641,7 +4623,7 @@ type struct CallResolver {
     /// built.  Sema then leaves the callee unpinned for mono.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     scope_is_generic_template(&this, owner: TypeRef, member_sym: SymbolStr) -> boolean {
-        if (this.ctx.generic_registry == null || !owner.is_valid()) { return false; }
+        if (!owner.is_valid()) { return false; }
         if (this.ctx.generic_registry.template_of_type(owner) != null) { return true; }
         const owner_def: DefId = this.ctx.decl_index.def_of(owner, this.ctx.type_arena);
         if (owner_def.is_valid() && member_sym.is_valid()
@@ -5297,7 +5279,6 @@ type struct CallResolver {
     path_method_context(mut &this, m: MethodNode*, recv_param: TypeRef, call: CallExprNode*,
                         scope: ScopeResolutionNode*, out_binds: TypeRef[]*) -> ResolutionContext {
         mut ctx: ResolutionContext = ResolutionContext::new("");
-        if (this.ctx.type_resolver == null) { return ctx; }
         mut owner: TypeRef = recv_param;
         const rt: Type* = this.arena.lookup(recv_param);
         if (rt != null && rt.kind == TypeKind::Reference) { owner = (rt as ReferenceType*).referent; }
@@ -5467,7 +5448,6 @@ type struct CallResolver {
     /// owner's registered name).  The owner is the one the scope segment
     /// names; null when no such template is registered.
     find_static_method_template(&this, scope: ScopeResolutionNode*) -> TemplateEntry* {
-        if (this.ctx.generic_registry == null) { return null; }
         // A specialization owns no template of its own: its static methods
         // are specialized with it, so a segment spelled as one names none.
         mut entry: TemplateEntry* = null;
@@ -5496,9 +5476,6 @@ type struct CallResolver {
     try_resolve_static_method_template(mut &this, scope: ScopeResolutionNode*,
                                        call: CallExprNode*) -> TypeRef {
         if (call == null || scope == null) { return TypeRef::invalid(); }
-        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) {
-            return TypeRef::invalid();
-        }
         // Fire ONLY when the scope names a TYPE (a static method).  A GENERIC
         // FREE function called module-qualified (`future::block_on(fut)`) is ALSO
         // registered as a qualified-name FunctionDeclaration template, but it is
@@ -5615,9 +5592,6 @@ type struct CallResolver {
     try_resolve_generic_static_method(mut &this, scope: ScopeResolutionNode*,
                                       call: CallExprNode*) -> TypeRef {
         if (call == null || scope == null) { return TypeRef::invalid(); }
-        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) {
-            return TypeRef::invalid();
-        }
         mut tmpl: TemplateEntry* =
             this.resolve_scope_owner_template(scope);
         if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
@@ -5808,7 +5782,6 @@ type struct CallResolver {
                                     call: CallExprNode*) -> void {
         if (call == null || scope == null) { return; }
         if (call.resolved_type_args.length > 0) { return; }
-        if (this.ctx.generic_registry == null) { return; }
         mut tmpl: TemplateEntry* =
             this.resolve_scope_owner_template(scope);
         if (tmpl == null || tmpl.ast_node == null) { return; }
@@ -5837,7 +5810,6 @@ type struct CallResolver {
     /// pre-mono, substituting inferred / default / expected owner args.
     resolve_static_method_return_via_template(mut &this, scope: ScopeResolutionNode*,
                                               call: CallExprNode*) -> TypeRef {
-        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
         mut tmpl: TemplateEntry* =
             this.resolve_scope_owner_template(scope);
         if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
@@ -6049,7 +6021,7 @@ type struct CallResolver {
         // (LLVM-illegal `getelementptr(void,..)`) or a polymorphic-literal arg
         // tripping the literal-default diagnostic (a spurious E0307 on an
         // explicitly-typed `Atomic<u64>::new(0)`).
-        if (scope.scope_generic_args.length > 0 && this.ctx.type_resolver != null) {
+        if (scope.scope_generic_args.length > 0) {
             mut rc: ResolutionContext = ResolutionContext::new("");
             this.symbolic.symbolic_bind_params(&rc);
             mut sb: TypeRef[] = [];
@@ -6110,23 +6082,21 @@ type struct CallResolver {
         // args/return DO determine, then backfill the trailing defaulted params from
         // their declared defaults.  Runs AFTER step 2 so a non-default owner arg from
         // a base-matching expected type still wins.
-        if (this.ctx.type_resolver != null) {
-            const prefix: TypeRef[] = this.infer_static_owner_prefix(tmpl, method, call);
-            if (prefix.length > 0 && prefix.length < want) {
-                mut rc_d: ResolutionContext = ResolutionContext::new("");
-                this.symbolic.symbolic_bind_params(&rc_d);
-                // A DEFAULT type argument is syntax written in the template's own
-                // declaration, so a bare leaf in it means whatever that leaf means in
-                // the TEMPLATE's module -- not in the caller's, which is where the
-                // ambient cursor is parked here (§5.2, keystone shape B).
-                mut filled: TypeRef[] = this.ctx.type_resolver.expand_default_type_args(tmpl, prefix, &rc_d);
-                if (filled.length == want) {
-                    mut all_ok: boolean = true;
-                    for (mut i: i64 = 0; i < filled.length; i++) {
-                        if (!this.symbolic.symbolic_type_concretizable(filled[i])) { all_ok = false; break; }
-                    }
-                    if (all_ok) { return filled; }
+        const prefix: TypeRef[] = this.infer_static_owner_prefix(tmpl, method, call);
+        if (prefix.length > 0 && prefix.length < want) {
+            mut rc_d: ResolutionContext = ResolutionContext::new("");
+            this.symbolic.symbolic_bind_params(&rc_d);
+            // A DEFAULT type argument is syntax written in the template's own
+            // declaration, so a bare leaf in it means whatever that leaf means in
+            // the TEMPLATE's module -- not in the caller's, which is where the
+            // ambient cursor is parked here (§5.2, keystone shape B).
+            mut filled: TypeRef[] = this.ctx.type_resolver.expand_default_type_args(tmpl, prefix, &rc_d);
+            if (filled.length == want) {
+                mut all_ok: boolean = true;
+                for (mut i: i64 = 0; i < filled.length; i++) {
+                    if (!this.symbolic.symbolic_type_concretizable(filled[i])) { all_ok = false; break; }
                 }
+                if (all_ok) { return filled; }
             }
         }
 
@@ -6272,7 +6242,7 @@ type struct CallResolver {
     /// template bodies stay on the existing path).
     infer_variant_instantiation(mut &this, base_ref: TypeRef, scope: ScopeResolutionNode*,
                                 call: CallExprNode*) -> TypeRef {
-        if (call == null || this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+        if (call == null) { return TypeRef::invalid(); }
         const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(base_ref);
         if (tmpl == null || tmpl.param_count == 0) { return TypeRef::invalid(); }
         const base_t: Type* = this.arena.lookup(base_ref);
@@ -6435,10 +6405,8 @@ type struct CallResolver {
         // the member up again.
         mut is_fn_template: boolean = false;
         mut tmpl: TemplateEntry* = null;
-        if (this.ctx.generic_registry != null) {
-            tmpl = this.ctx.generic_registry.template_of(callee);
-            if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) { is_fn_template = true; }
-        }
+        tmpl = this.ctx.generic_registry.template_of(callee);
+        if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) { is_fn_template = true; }
         if (is_fn_template && call != null) {
             call.set_resolved_template(tmpl.base_type);
             // GATED (R1): prefer mono's pin; recompute the spec return as fallback.
@@ -6507,7 +6475,6 @@ type struct CallResolver {
     /// return (concrete return BEFORE mono creates the spec).  Stashes the args.
     subst_return_from_call_args(mut &this, call: CallExprNode*, tmpl: TemplateEntry*,
                                 generic_args: &TypeAnnotation*[], tmpl_ret: TypeRef) -> TypeRef {
-        if (this.ctx.type_resolver == null) { return TypeRef::invalid(); }
         if (generic_args.length != tmpl.param_types.length) { return TypeRef::invalid(); }
         mut rc: ResolutionContext = ResolutionContext::new("");
         // Explicit turbofish on the call: the CALLER's syntax, not the
@@ -6546,7 +6513,6 @@ type struct CallResolver {
     /// there is no node-kind branch, because the question does not depend on
     /// which kind asked.
     lookup_scope_template(&this, r: Res) -> TemplateEntry* {
-        if (this.ctx.generic_registry == null) { return null; }
         return match (r) {
             Res::TypeRelative(b, _) => {
                 match (b) {
@@ -6604,7 +6570,6 @@ type struct CallResolver {
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     resolve_generic_scope_name(&this, base_name: SymbolStr, generic_args: &TypeAnnotation*[],
                                use_span: SourceSpan, tmpl: TemplateEntry*) -> SymbolStr {
-        if (this.ctx.type_resolver == null) { return SymbolStr::empty(); }
         const base: SymbolStr = if (tmpl != null) { tmpl.spec_base_name(this.intern) } else { base_name };
         mut res_ctx: ResolutionContext = ResolutionContext::new("");
         this.symbolic.symbolic_bind_params(&res_ctx);
@@ -6651,9 +6616,6 @@ type struct CallResolver {
                                generic_args: &TypeAnnotation*[],
                                use_span: SourceSpan) -> TypeRef {
         if (!base.is_valid()) { return TypeRef::invalid(); }
-        if (this.ctx.type_resolver == null || this.ctx.generic_registry == null) {
-            return TypeRef::invalid();
-        }
         if (generic_args.length == 0) { return base; }
         const tmpl: TemplateEntry* =
             this.ctx.generic_registry.template_of_type(base);

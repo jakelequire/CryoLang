@@ -364,6 +364,17 @@ public:
 
         const diag_ptr: DiagnosticSink* = _box_diag.leak();
 
+        const _box_res: Box<Resolver> = Box::<Resolver>::new(Resolver::new(intern_ptr, defs_ptr, graph_ptr));
+        const resolver_ptr: Resolver* = _box_res.leak();
+        const _box_arena: Box<TypeArena> = Box::<TypeArena>::new(TypeArena::new(intern_ptr, defs_ptr));
+        const arena_ptr: TypeArena* = _box_arena.leak();
+        const _box_greg: Box<GenericRegistry> = Box::<GenericRegistry>::new(GenericRegistry::new(arena_ptr));
+        const greg_ptr: GenericRegistry* = _box_greg.leak();
+        const _box_tr: Box<TypeResolver> = Box::<TypeResolver>::new(TypeResolver::new(
+            arena_ptr, intern_ptr, greg_ptr, resolver_ptr, decl_ptr, consts_ptr, graph_ptr));
+        const type_resolver_ptr: TypeResolver* = _box_tr.leak();
+        type_resolver_ptr.set_diagnostics(diag_ptr);
+
         mut ctx: CompilationContext = CompilationContext {
             options:           options,
             source_file:       source_file,
@@ -382,15 +393,15 @@ public:
             lang_refs:            [],
             c_refs:               [],
             inactive_spans:       [],
-            type_arena:    null,
+            type_arena:    arena_ptr,
 
             project_config:      project_config,
             active_module_index: -1,
             facts:               [],
 
-            resolver:             null,
-            type_resolver:        null,
-            generic_registry:     null,
+            resolver:             resolver_ptr,
+            type_resolver:        type_resolver_ptr,
+            generic_registry:     greg_ptr,
             monomorphizer:        null,
             directive_registry:   null,
         };
@@ -421,24 +432,18 @@ public:
     }
 
     get_resolver(mut &this) -> Resolver* {
-        if (this.resolver == null) {
-            this.init_resolver();
-        }
         return this.resolver;
     }
 
-    /// Returns the GenericRegistry if initialized; otherwise null.
-    /// Does NOT initialize on demand; callers that need it in later passes
-    /// should rely on init_type_system() having already been called.
     get_generic_registry(&this) -> GenericRegistry* {
         return this.generic_registry;
     }
 
-    /// Record that an injected AST node came from a specific template module.
     note_lang_ref(mut &this, node: ASTNode*, item: LangItem) -> void {
         this.lang_refs.push(LangRef { node: node, item: item });
     }
 
+    /// Record that an injected AST node came from a specific template module.
     register_injected_origin(mut &this, node: ASTNode*, template_module: ModulePath) -> void {
         this.injected_origins.push(InjectedOrigin { node: node, module: template_module });
     }
@@ -786,67 +791,14 @@ public:
         return this.intern_table.intern(ns + "::" + bare);
     }
 
-    // Lazy component initialization
-    // TODO:
-    // Remove later when all components are fully typed and can be initialized in the constructor
-
-    /// Initialize the type system components (TypeArena, TypeChecker, TypeResolver).
-    /// Called by the TypeDeclaration pass.
-    init_type_system(mut &this) -> void {
-        LOG_DEBUG(LogComponent::General, "[CompilationContext] init_type_system()");
-        // Ensure resolver is initialized (symbols live there now)
-        this.init_resolver();
-
-        // Create the TypeArena if it doesn't exist yet
-        if (this.type_arena == null) {
-            const _box_arena: Box<TypeArena> = Box::<TypeArena>::new(TypeArena::new(this.intern_table, this.defs));
-            this.type_arena = _box_arena.leak();
-        }
-
-        // Create the GenericRegistry early so that the TypeResolver can route
-        // generic instantiations through the dedup cache from the very first
-        // pass that resolves type annotations (FunctionSignature).
-        if (this.generic_registry == null) {
-            const _box_greg: Box<GenericRegistry> = Box::<GenericRegistry>::new(GenericRegistry::new(this.type_arena));
-            this.generic_registry = _box_greg.leak();
-        }
-
-        // Create the TypeResolver with all required dependencies.
-        // The Resolver (name_resolver) is initialized by the NameResolution pass
-        // which runs before TypeDeclaration, so it should be available here.
-        if (this.type_resolver == null) {
-            const _box_tr: Box<TypeResolver> = Box::<TypeResolver>::new(TypeResolver::new(
-                this.type_arena,
-                this.intern_table,
-                this.generic_registry,
-                this.resolver,
-                this.decl_index,
-                this.const_table,
-                this.module_graph
-            ));
-            this.type_resolver = _box_tr.leak();
-            this.type_resolver.set_diagnostics(this.diagnostics);
-        }
-    }
-
-    /// Initialize the Resolver for name resolution.
-    /// Called by the NameResolution pass.
-    init_resolver(mut &this) -> void {
-        LOG_DEBUG(LogComponent::General, "[CompilationContext] init_resolver()");
-        if (this.resolver == null) {
-            const _box_res: Box<Resolver> = Box::<Resolver>::new(
-                Resolver::new(this.intern_table, this.defs, this.module_graph));
-            this.resolver = _box_res.leak();
-        }
-        // The scope walk's outermost tier, installed here because this runs
-        // after the prelude set is derived and before any pass resolves a name.
-        // Re-stated on every call rather than once: the resolver outlives a
-        // single pass, and a tier that is only correct when installation
-        // happened to precede the first lookup is a tier nobody can reason
-        // about.
-        if (this.decl_index != null) {
-            this.resolver.set_prelude_modules(this.decl_index.prelude_namespaces());
-        }
+    /// Install the scope walk's outermost tier, the prelude modules.  Called
+    /// by each name-resolving pass on entry, after discovery has derived the
+    /// prelude set.  Re-stated on every call rather than once: the resolver
+    /// outlives a single pass, and a tier that is only correct when
+    /// installation happened to precede the first lookup is a tier nobody
+    /// can reason about.
+    install_prelude_modules(mut &this) -> void {
+        this.resolver.set_prelude_modules(this.decl_index.prelude_namespaces());
     }
 
 
@@ -961,9 +913,7 @@ public:
         // calls set_active_ast() separately after switch_to_module().
 
         // Update resolver's active module (scope restore handled by orchestrator)
-        if (this.resolver != null) {
-            this.resolver.set_module(info.path());
-        }
+        this.resolver.set_module(info.path());
 
         if (this.options.verbose) {
             LOG_DEBUG(LogComponent::General,

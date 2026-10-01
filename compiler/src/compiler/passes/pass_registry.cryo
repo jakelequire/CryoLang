@@ -792,26 +792,19 @@ type struct PassRegistry {
 
     // Type Declaration Pass
 
-    /// Initializes the type system (TypeArena, TypeChecker, TypeResolver) and
-    /// walks top-level declarations to create Type objects in the arena.
+    /// Walks top-level declarations to create Type objects in the arena.
     /// This pass bridges the gap between name resolution and type resolution:
     /// after this pass, every declared struct/enum/class/trait has a TypeRef.
     static run_type_declaration_pass(ctx: CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
         if (ctx.options.verbose) {
-            cdebug(Text::new("[TypeDeclaration] Initializing type system and collecting declarations\n"));
+            cdebug(Text::new("[TypeDeclaration] Collecting declarations\n"));
         }
 
-        // Initialize the TypeArena and related components
-        ctx.init_type_system();
+        ctx.install_prelude_modules();
 
         const arena: TypeArena* = ctx.type_arena;
-        if (arena == null) {
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                Text::new("TypeDeclaration: TypeArena was not created by init_type_system()"));
-            return PassResult::failure(1);
-        }
 
         // Get the AST root
         const root: ProgramNode* = ctx.artifacts.ast.root;
@@ -902,9 +895,7 @@ type struct PassRegistry {
                     PassRegistry::claim_method_items(ctx, &node.methods);
                     // Whether this IS the language's `Array`, `Slice`, `Rc`, ...
                     // is decided by the identity, claimed where it is minted.
-                    if (ctx.generic_registry != null) {
-                        ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
-                    }
+                    ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
                     type_count++;
                 }
                 NodeKind::UnionDeclaration => {
@@ -931,9 +922,7 @@ type struct PassRegistry {
                     // Whether this IS the language's `Result`/`Option` - the enums
                     // `?` desugars through - is decided by the identity, claimed
                     // here where it is first minted, as a trait's is below.
-                    if (ctx.generic_registry != null) {
-                        ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
-                    }
+                    ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
                     type_count++;
                 }
                 NodeKind::ClassDeclaration => {
@@ -943,9 +932,7 @@ type struct PassRegistry {
                         arena.create_class(qualified_sym, ctx.declaring_module(node.def));
                     ctx.decl_index.register_type(node.def, class_ref, node.is_public);
                     PassRegistry::claim_method_items(ctx, &node.methods);
-                    if (ctx.generic_registry != null) {
-                        ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
-                    }
+                    ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
                     type_count++;
                 }
                 NodeKind::TraitDeclaration => {
@@ -959,12 +946,10 @@ type struct PassRegistry {
                     // decided by the identity, and claimed here, where the identity
                     // is first minted: an ownership query of a module resolved
                     // before this trait's asks by the identity and must find it.
-                    if (ctx.generic_registry != null) {
-                        ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
-                        for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
-                            if (node.methods[mi] != null) {
-                                ctx.generic_registry.claim_wellknown(node.methods[mi].def, ctx.intern_table);
-                            }
+                    ctx.generic_registry.claim_wellknown(node.def, ctx.intern_table);
+                    for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
+                        if (node.methods[mi] != null) {
+                            ctx.generic_registry.claim_wellknown(node.methods[mi].def, ctx.intern_table);
                         }
                     }
                     type_count++;
@@ -1062,7 +1047,6 @@ type struct PassRegistry {
     /// implementation in another module can give the owner a method of the
     /// same path, and it must not become the method generated code calls.
     static claim_method_items(ctx: CompilationContext*, methods: &MethodNode*[]) -> void {
-        if (ctx.generic_registry == null) { return; }
         const here: DefId = ctx.module_def_of(ctx.unit_module);
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
@@ -1086,7 +1070,6 @@ type struct PassRegistry {
     /// waits for a later module.  One claimed id answers every reference to
     /// the item; none is made here.
     static settle_lang_refs(ctx: CompilationContext*) -> void {
-        if (ctx.generic_registry == null) { return; }
         mut kept: i64 = 0;
         for (mut i: i64 = 0; i < ctx.lang_refs.length; i++) {
             const r: LangRef = ctx.lang_refs[i];
