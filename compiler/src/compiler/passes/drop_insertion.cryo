@@ -72,7 +72,7 @@ import compiler::types::generic::{ InstantiatedType };
 import compiler::types::user_defined;
 import compiler::types::user_defined::{ ClassType, FieldInfo, StructType };
 import compiler::types::compound;
-import compiler::types::compound::{ ArrayType, PointerType };
+import compiler::types::compound::{ ArrayType, PointerType, ReferenceType };
 import compiler::intrinsic_kind::{ IntrinsicKind };
 import std::fmt;
 import compiler::ast::declaration::{
@@ -3941,13 +3941,18 @@ type struct DropInserter {
         if (c.resolved_callee.intrinsic_kind(this.ctx.decl_index) != IntrinsicKind::DropInPlace) { return; }
         if (c.arguments.length != 1 || c.arguments[0] == null) { return; }
         const p: ExpressionNode* = c.arguments[0];
+        // `p` is the `T*` parameter's argument: a pointer, or `&place`.
         const pt: Type* = this.arena.lookup(p.resolved_type);
-        if (pt == null || pt.kind != TypeKind::Pointer) { return; }
+        if (pt == null) { return; }
+        mut target_ty: TypeRef = TypeRef::invalid();
+        if (pt.kind == TypeKind::Pointer) { target_ty = (pt as PointerType*).pointee; }
+        if (pt.kind == TypeKind::Reference) { target_ty = (pt as ReferenceType*).referent; }
+        if (!target_ty.is_valid()) { return; }
         const deref_tok: Token = Token::new(TokenType::Star, "*",
             c.span.start_line as int, c.span.start_col as int);
         const target: UnaryExprNode* = new UnaryExprNode(deref_tok, p, c.span);
         target.is_synthetic = true;
-        target.set_resolved_type((pt as PointerType*).pointee);
+        target.set_resolved_type(target_ty);
         const member: MemberAccessNode* = new MemberAccessNode(
             target as ExpressionNode*, this.drop_sym, c.span, c.span);
         c.callee = member as ExpressionNode*;
