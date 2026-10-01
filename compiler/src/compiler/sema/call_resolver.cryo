@@ -784,18 +784,76 @@ type struct CallResolver {
         this.ctx.emit_diagnostic(diag);
     }
 
+    /// The declaration a free-function call names - a bare call's stamp, or
+    /// the member a module-qualified path's stamp binds - or an invalid id
+    /// for any other callee.
+    family_callee(&this, callee: ExpressionNode*) -> DefId {
+        if (callee == null) { return DefId::invalid(); }
+        const n: ASTNode* = callee as ASTNode*;
+        if (n.kind == NodeKind::Identifier) { return this.callee_def(callee as IdentifierNode*); }
+        if (n.kind != NodeKind::ScopeResolution) { return DefId::invalid(); }
+        const sr: ScopeResolutionNode* = callee as ScopeResolutionNode*;
+        return match (sr.scope_res) {
+            ResSlot::Answered(Res::Def(_)) => { sr.member_def }
+            _                              => { DefId::invalid() }
+        };
+    }
+
+    /// The entries of `callee`'s function family, through the member-function
+    /// door, by the declaration's owner and leaf.
+    family_entries(&this, callee: DefId) -> OverloadId[] {
+        if (!callee.is_valid()) { return []; }
+        return this.ctx.decl_index.lookup_family_entries(
+            FamilyOwner::Def(this.ctx.defs.parent_of(callee)), this.ctx.defs.leaf_of(callee));
+    }
+
+    /// The parameter types a call of `argc` arguments to an overloaded
+    /// family hints its arguments with: at each position, the type every
+    /// signature of that arity agrees on, and none where they differ.  A
+    /// literal at such a position keeps its own default type - an integer
+    /// `i32` - and that is what selects among the signatures, never the
+    /// parameter type of whichever signature a lookup met first.  A method
+    /// call's arguments are hinted the same way.  Empty for a family with one
+    /// signature, or none of that arity, which hints as one declaration does.
+    family_param_hints(&this, callee: DefId, argc: i64) -> TypeRef[] {
+        const entries: OverloadId[] = this.family_entries(callee);
+        mut out: TypeRef[] = [];
+        if (entries.length < 2) { return out; }
+        mut have: boolean = false;
+        for (mut ei: i64 = 0; ei < entries.length; ei++) {
+            const t: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entries[ei]));
+            if (t == null || t.kind != TypeKind::Function) { continue; }
+            const ft: FunctionType* = t as FunctionType*;
+            if (ft.is_variadic || ft.param_types.length != argc) { continue; }
+            if (!have) {
+                for (mut p: i64 = 0; p < argc; p++) { out.push(ft.param_types[p]); }
+                have = true;
+                continue;
+            }
+            for (mut p: i64 = 0; p < argc; p++) {
+                if (!out[p].equals(ft.param_types[p])) { out[p] = TypeRef::invalid(); }
+            }
+        }
+        return out;
+    }
+
     resolve_call(mut &this, visitor: ASTVisitor*, call: CallExprNode*) -> TypeRef {
         // Closure-call rewrite: `f(args)` where `f` is a closure-struct value.
         this.lambda.maybe_rewrite_closure_call(call);
         this.warn_explicit_drop_call(call);
 
-        // Compute the callee's param types for expected-type propagation.
-        mut param_types: TypeRef[] = [];
-        const callee_fn_type: TypeRef = this.lookup_callee_function_type(call.callee);
-        if (callee_fn_type.is_valid()) {
-            const ft_raw: Type* = this.arena.lookup(callee_fn_type);
-            if (ft_raw != null && ft_raw.kind == TypeKind::Function) {
-                param_types = sema_copy_type_refs(&(ft_raw as FunctionType*).param_types);
+        // Compute the callee's param types for expected-type propagation: an
+        // overloaded family's agreed positions, or the one signature a
+        // callee has.
+        mut param_types: TypeRef[] = this.family_param_hints(
+            this.family_callee(call.callee), call.arguments.length);
+        if (param_types.length == 0) {
+            const callee_fn_type: TypeRef = this.lookup_callee_function_type(call.callee);
+            if (callee_fn_type.is_valid()) {
+                const ft_raw: Type* = this.arena.lookup(callee_fn_type);
+                if (ft_raw != null && ft_raw.kind == TypeKind::Function) {
+                    param_types = sema_copy_type_refs(&(ft_raw as FunctionType*).param_types);
+                }
             }
         }
         if (param_types.length == 0) {
@@ -2594,28 +2652,94 @@ type struct CallResolver {
         // unpinned so mono specializes.
         const gen_tmpl: TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length);
         if (gen_tmpl != null && gen_tmpl.param_types.length > 0) { return TypeRef::invalid(); }
+        return this.pin_family_signature(call, this.callee_def(ident));
+    }
 
+    /// Pin `call` to the signature of `callee`'s family its arguments select,
+    /// and answer that signature's return.  The family's entries come through
+    /// the member-function door, by the declaration's owner and leaf; which
+    /// entry is the selection (`select_family_overload`).  Invalid, pinning
+    /// nothing, when an argument is untyped or no signature accepts them.
+    /// Shared by a bare call and a module-qualified one: both name a
+    /// declaration, and which of its signatures a call means is one question.
+    pin_family_signature(mut &this, call: CallExprNode*, callee: DefId) -> TypeRef {
+        if (call == null || call.resolved_callee.is_some()) { return TypeRef::invalid(); }
         mut arg_types: TypeRef[] = [];
         for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
             const arg: ExpressionNode* = call.arguments[ai];
             if (arg == null || !arg.resolved_type.is_valid()) { return TypeRef::invalid(); }
             arg_types.push(arg.resolved_type);
         }
-        const callee: DefId = this.callee_def(ident);
-        if (!callee.is_valid()) { return TypeRef::invalid(); }
-        const entries: OverloadId[] = this.ctx.decl_index.lookup_family_entries(
-            FamilyOwner::Def(this.ctx.defs.parent_of(callee)), this.ctx.defs.leaf_of(callee));
+        const entries: OverloadId[] = this.family_entries(callee);
         if (entries.length == 0) { return TypeRef::invalid(); }
         mut overloads: TypeRef[] = [];
         for (mut ei: i64 = 0; ei < entries.length; ei++) {
             overloads.push(this.ctx.decl_index.entry_signature(entries[ei]));
         }
         const oi: i64 = this.select_family_overload(&overloads, &arg_types);
-        if (oi < 0) { return TypeRef::invalid(); }
+        if (oi < 0) {
+            this.refuse_unmatched_family_call(call, callee, &overloads, &arg_types);
+            return TypeRef::invalid();
+        }
         // The pin is the selected entry: the declaration and the one of its
         // signatures the arguments chose, carrying its own symbol.
         call.set_resolved_callee(CalleePin::Decl(entries[oi]));
+        // Among several signatures, the arguments were classified only
+        // where the signatures agree; the one selected decides the rest.
+        if (entries.length > 1) {
+            const sel_t: Type* = this.arena.lookup(overloads[oi]);
+            if (sel_t != null && sel_t.kind == TypeKind::Function) {
+                this.classify_args_from_params(call, sema_copy_type_refs(&(sel_t as FunctionType*).param_types));
+            }
+        }
         return this.overload_return_type(overloads[oi]);
+    }
+
+    /// E0214 for a call to an overloaded family that no signature of the
+    /// call's arity accepts, as for a method.  A family with no signature of
+    /// that arity is the arity check's to report.  An integer literal is
+    /// `i32` wherever the signatures differ in its type, so a literal only
+    /// another width accepts is refused here, with the help to write it.
+    refuse_unmatched_family_call(mut &this, call: CallExprNode*, callee: DefId,
+                                 overloads: &TypeRef[], arg_types: &TypeRef[]) -> void {
+        if (this.state.in_symbolic_check || overloads.length < 2) { return; }
+        const leaf: string = this.intern.resolve(this.ctx.defs.leaf_of(callee));
+        const argc: i64 = arg_types.length;
+        mut literal: boolean = false;
+        for (mut i: i64 = 0; i < argc; i++) {
+            if (!this.types.arg_type_is_concrete(arg_types[i])) { return; }
+            if (is_numeric_literal_expr(call.arguments[i]) || is_negative_numeric_literal_expr(call.arguments[i])) {
+                literal = true;
+            }
+        }
+        // The signatures of the call's arity, their parameters end to end.
+        mut cand_params: TypeRef[] = [];
+        mut count: i64 = 0;
+        for (mut oi: i64 = 0; oi < overloads.length; oi++) {
+            const t: Type* = this.arena.lookup(overloads[oi]);
+            if (t == null || t.kind != TypeKind::Function) { continue; }
+            const ft: FunctionType* = t as FunctionType*;
+            if (ft.param_types.length != argc) { continue; }
+            for (mut p: i64 = 0; p < argc; p++) { cand_params.push(ft.param_types[p]); }
+            count = count + 1;
+        }
+        if (count == 0) { return; }
+        mut cands: string = "candidates are ";
+        for (mut c: i64 = 0; c < count; c++) {
+            if (c > 0) { cands = cands + ", "; }
+            cands = cands + "`" + leaf + this.render_param_list(&cand_params, c * argc, argc) + "`";
+        }
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0214_ARGUMENT_MISMATCH,
+            Text::new(fmt::format("no overload of `%s` accepts these arguments", leaf)));
+        diag = diag.at_with_label(call.span, Text::new(fmt::format("no `%s` takes `%s`", leaf,
+            this.render_param_list(arg_types, 0, argc))));
+        diag = diag.with_note(Text::new(cands));
+        if (literal) {
+            diag = diag.help(Text::new(
+                "an integer literal is `i32` where the overloads differ in its type; write the type you mean with `as`"));
+        }
+        this.ctx.emit_diagnostic(diag);
     }
 
     /// Spec §3.3 - visibility is a GATE, not a tie-breaker.  Emits E0353 when
@@ -6180,7 +6304,14 @@ type struct CallResolver {
             }
             if (subst_ret.is_valid()) { return subst_ret; }
         }
-        if (!is_fn_template) { this.pin_scope_callee_def(call, this.resolve_module_qualified_def(scope)); }
+        if (!is_fn_template) {
+            // Which of the member's signatures the arguments select, as for
+            // a bare call; the first declaration the path names is not the
+            // answer when the member is overloaded.
+            const selected_ret: TypeRef = this.pin_family_signature(call, callee);
+            if (selected_ret.is_valid()) { return selected_ret; }
+            this.pin_scope_callee_def(call, callee);
+        }
         return ret;
     }
 
