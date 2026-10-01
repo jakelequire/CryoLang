@@ -2295,6 +2295,17 @@ const b: i64 = (Beta for IgTn)::go(&ig, 7);  // 2
 const c: i64 = via::<IgTn>(&ig);             // 2: the bound names `Beta::go`
 ```
 
+**A method as a value.** A method named by path without a call is a function value. A static method's value has the method's own signature; a method with a receiver takes the receiver first, as in Rust: for `step(&this, u: i32) -> i64`, `Pt::step` is a `(&Pt, i32) -> i64`, called `f(&p, 7)`; `mut &this` gives `mut &Pt` and `this` gives `Pt`. The value names one method, so an inherent `m` beside a trait's `m` is the same tie (E0156) and `(Tr for T)::m` chooses. A method generic in its own parameters, or a generic owner's, is not taken as a value this way.
+
+```cryo
+type struct Pt { v: i32; }
+implement struct Pt { step(&this, u: i32) -> i64 { return (this.v + u) as i64; } }
+
+const p: Pt = Pt { v: 5 };
+const f = Pt::step;                      // (&Pt, i32) -> i64
+const n: i64 = f(&p, 7);                 // 12
+```
+
 **The impl-qualified path.** `(Tr for T)::m` names the `m` that `Tr`'s implementation for `T` delivers, whatever other traits provide `m` for `T`. It is one rule for every shape the tie takes: a static method, `(Tr for T)::m()`, which no receiver could select; a method with a receiver, `(Tr for T)::m(&recv, ...)`, the receiver its first argument; a method taken as a value, `(Tr for T)::m`; and the form inside a generic body, `(Tr for U)::m()` with `U` a type parameter, which selects `Tr`'s implementation for whatever `U` is instantiated with. The head reuses `for` exactly as `implement trait Tr for T` writes it - a trait, then a type by name with generic arguments if any - and is followed by `::` and one member. A head whose type does not implement the trait is refused (E0306, the bound the head asserts), one whose implementation has no such member is refused at the member (E0233), and the call's arguments are checked against that implementation's signature. A generic method's own type parameters bind from the path's turbofish, `(Tr for T)::m::<u8>(&recv, x)`, or from the arguments after the receiver, as they do for `recv.m(x)`. The trait-qualified call `Tr::m(&recv, ...)` also resolves, by the receiver's type, but only where there is a receiver; the impl-qualified path is the form E0156 proposes.
 
 ```cryo

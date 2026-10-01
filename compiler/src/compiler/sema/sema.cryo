@@ -3302,22 +3302,51 @@ public:
         return true;
     }
 
+    /// The method `ty::member` names when `ty` is a struct or class and the
+    /// member one of its methods; null otherwise.
+    scope_method(mut &this, ty: TypeRef, scope: ScopeResolutionNode*) -> MethodInfo* {
+        if (!ty.is_valid()) { return null; }
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return null; }
+        if (t.kind == TypeKind::Struct) { return (t as StructType*).get_method(scope.member_name); }
+        if (t.kind == TypeKind::Class)  { return (t as ClassType*).get_method(scope.member_name); }
+        return null;
+    }
+
     /// The function type of a STATIC method named `ty::member`, or invalid when
     /// `ty` names no struct/class, the member is not one of its methods, or the
-    /// method takes a receiver - an instance method is not a value on its own.
-    /// The stored `function_type` already excludes the receiver and is interned
-    /// through the same `get_function` an annotation goes through, so it is the
-    /// SAME id a `(A) -> R` annotation resolves to.
+    /// method takes a receiver (`scope_receiver_method_type`).  The stored
+    /// `function_type` already excludes the receiver and is interned through
+    /// the same `get_function` an annotation goes through, so it is the SAME id
+    /// a `(A) -> R` annotation resolves to.
     scope_static_method_type(mut &this, ty: TypeRef, scope: ScopeResolutionNode*) -> TypeRef {
-        if (!ty.is_valid()) { return TypeRef::invalid(); }
-        const t: Type* = this.arena.lookup(ty);
-        if (t == null) { return TypeRef::invalid(); }
-        mut m: MethodInfo* = null;
-        if (t.kind == TypeKind::Struct)     { m = (t as StructType*).get_method(scope.member_name); }
-        else if (t.kind == TypeKind::Class) { m = (t as ClassType*).get_method(scope.member_name); }
-        else { return TypeRef::invalid(); }
+        const m: MethodInfo* = this.scope_method(ty, scope);
         if (m == null || !m.is_static) { return TypeRef::invalid(); }
         return m.function_type;
+    }
+
+    /// The function type of a method WITH a receiver named `ty::member` as a
+    /// value: its signature with the receiver's type first, as Rust's method
+    /// paths are - `IgTn::go` for `go(&this, u: i32) -> i64` is
+    /// `(&IgTn, i32) -> i64`.  Invalid for a static method, a member that is
+    /// no method, a declaration whose receiver is not typed, and a signature
+    /// still naming a generic parameter - a generic method's, or a generic
+    /// owner's - which a value cannot be taken of without its arguments.
+    scope_receiver_method_type(mut &this, m: MethodInfo*) -> TypeRef {
+        if (m == null || m.is_static || m.ast_node == null) { return TypeRef::invalid(); }
+        const node: MethodNode* = m.ast_node as MethodNode*;
+        if (node.func == null || node.func.parameters.length == 0) { return TypeRef::invalid(); }
+        const recv: VarDeclNode* = node.func.parameters[0];
+        if (recv == null || !recv.is_receiver() || !recv.resolved_type.is_valid()) { return TypeRef::invalid(); }
+        const sig: Type* = this.arena.lookup(m.function_type);
+        if (sig == null || sig.kind != TypeKind::Function) { return TypeRef::invalid(); }
+        const ft: FunctionType* = sig as FunctionType*;
+        if (node.func.generic_params.length > 0) { return TypeRef::invalid(); }
+        mut params: TypeRef[] = [recv.resolved_type];
+        for (mut i: i64 = 0; i < ft.param_types.length; i++) { params.push(ft.param_types[i]); }
+        const value_ft: TypeRef = this.arena.get_function(ft.return_type, &params, ft.is_variadic);
+        if (this.types.contains_generic_param(value_ft)) { return TypeRef::invalid(); }
+        return value_ft;
     }
 
     resolve_scope_resolution(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
@@ -3340,6 +3369,18 @@ public:
             // the refusal, and a value taken from it reports nothing more.
             if (this.calls.scope_callee_signature_refused(scope, false)) { return TypeRef::invalid(); }
             return this.calls.pin_scope_value_static_method(scope, found, static_ft);
+        }
+        // A method WITH a receiver, named by path, is a function value taking
+        // the receiver first.  It names its method's entry exactly as a
+        // static method's value does - a method's entry is registered under
+        // that receiver-first signature - so an inherent method beside a
+        // trait's of the same name is the same tie (E0156), and an
+        // impl-qualified path answers the type of the entry it delivers.
+        const recv_m: MethodInfo* = this.scope_method(found, scope);
+        const recv_ft: TypeRef = this.scope_receiver_method_type(recv_m);
+        if (recv_ft.is_valid()) {
+            if (this.calls.scope_callee_signature_refused(scope, false)) { return TypeRef::invalid(); }
+            return this.calls.pin_scope_value_static_method(scope, found, recv_ft);
         }
         if (found.is_valid() && this.scope_member_binds_type(found, scope)) {
             this.validate_enum_scope_member(found, scope);
