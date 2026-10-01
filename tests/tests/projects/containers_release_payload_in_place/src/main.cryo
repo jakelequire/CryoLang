@@ -1,0 +1,115 @@
+/// The owning containers release what they hold through
+/// `ptr::drop_in_place`, the way a value leaving scope is released: the
+/// payload's `Drop` implementation, the glue alone for a payload with no
+/// implementation, and nothing for a `Copy` payload - a pointer included, so
+/// a container of pointers never releases what they point at.  (`Array`
+/// still requires `T: Drop` of its elements, so an array of glue-only
+/// elements is not checked here.)  A method
+/// merely named `drop` is not a destructor: neither a container, the end of
+/// a scope nor `delete` calls it.  The exit code says which count was wrong;
+/// 0 means every one held.
+namespace ContainersReleasePayloadInPlace::Main;
+
+import std::core::drop::{ Drop };
+import std::alloc::box::{ Box };
+import std::alloc::rc::{ Rc };
+import std::alloc::arc::{ Arc };
+import std::collections::array::{ Array };
+import std::collections::hashmap::{ HashMap };
+import std::sync::mutex::{ Mutex };
+import std::ffi::libc;
+
+mut g_drops: i32 = 0;
+mut g_inherent: i32 = 0;
+
+type struct Counted { v: i32; }
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { g_drops = g_drops + 1; }
+}
+
+// No destructor of its own: released by its field's glue.
+type struct Holder { c: Counted; n: i32; }
+
+// A method that is merely named `drop`: not a destructor.
+type struct Inh { v: i32; }
+implement struct Inh {
+    drop(mut &this) -> void { g_inherent = g_inherent + 1; }
+}
+
+function main() -> int {
+    {
+        mut b: Box<Holder> = Box::new(Holder { c: Counted { v: 1 }, n: 1 });
+    }
+    if (g_drops != 1) { return 1; }
+
+    // `Array`'s `Drop` implementation does not apply to glue-only elements:
+    // leaving scope must not call it (a call to the unspecialized template
+    // does not link).
+    {
+        mut a: Array<Holder> = Array::new();
+        a.push(Holder { c: Counted { v: 2 }, n: 2 });
+    }
+    g_drops = 1;
+
+    {
+        mut r: Rc<Holder> = Rc::new(Holder { c: Counted { v: 4 }, n: 4 });
+        mut r2: Rc<Holder> = r.clone();
+    }
+    if (g_drops != 2) { return 3; }
+
+    {
+        mut a: Arc<Holder> = Arc::new(Holder { c: Counted { v: 5 }, n: 5 });
+    }
+    if (g_drops != 3) { return 4; }
+
+    {
+        mut m: HashMap<i32, Holder> = HashMap::new();
+        m.insert(1, Holder { c: Counted { v: 6 }, n: 6 });
+    }
+    if (g_drops != 4) { return 5; }
+
+    {
+        mut m: Mutex<Holder> = Mutex::new(Holder { c: Counted { v: 7 }, n: 7 });
+    }
+    if (g_drops != 5) { return 6; }
+
+    // A payload with a destructor: released through it, once.
+    {
+        mut a: Array<Counted> = Array::new();
+        a.push(Counted { v: 8 });
+        a.set(0, Counted { v: 9 });
+    }
+    if (g_drops != 7) { return 7; }
+
+    // Pointers are `Copy`: the container releases nothing they point at.
+    g_drops = 0;
+    {
+        mut c1: Counted = Counted { v: 10 };
+        {
+            mut a: Array<Counted*> = Array::new();
+            a.push(&c1);
+            mut b: Box<Counted*> = Box::new(&c1);
+        }
+        if (g_drops != 0) { return 8; }
+    }
+    if (g_drops != 1) { return 9; }
+
+    // `delete` releases what the pointer points at through its destructor.
+    const p: Counted* = new Counted { v: 14 };
+    delete p;
+    if (g_drops != 2) { return 11; }
+
+    // A method merely named `drop` runs in none of these places.
+    {
+        mut i: Inh = Inh { v: 11 };
+        mut b: Box<Inh> = Box::new(Inh { v: 12 });
+        mut a: Array<Inh> = Array::new();
+        a.push(Inh { v: 13 });
+        const q: Inh* = new Inh { v: 15 };
+        delete q;
+    }
+    if (g_inherent != 0) { return 10; }
+
+    libc::printf("containers-release ok\n");
+    return 0;
+}

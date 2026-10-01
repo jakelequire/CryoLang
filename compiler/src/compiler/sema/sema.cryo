@@ -306,32 +306,28 @@ public:
         return v;
     }
 
-    /// Bind a method call another pass built.  The receiver already carries
-    /// its type - the synthesizer put it there - so the walk starts at
-    /// overload selection and pins `resolved_method` / `resolved_callee` the
-    /// way it would for the same call written in source.  A receiver with no
-    /// method of that name is left unpinned, which is what the caller's
-    /// `.drop()` on a type without a user drop relies on.
-    bind_synthesized_method_call(mut &this, call: CallExprNode*) -> void {
-        if (call == null || call.callee == null) { return; }
-        if (call.callee.kind != NodeKind::MemberAccess) { return; }
-        const member: MemberAccessNode* = call.callee as MemberAccessNode*;
-        if (member.object == null) { return; }
-        const recv: TypeRef = member.object.resolved_type;
-        if (!recv.is_valid()) { return; }
-        this.calls.bind_method_on_receiver(this as ASTVisitor*, call, member, recv);
-    }
-
     /// Bind a destructor call another pass built - `x.drop()` standing for
     /// releasing `x` - to the destructor of the receiver's type by identity
     /// (`CallResolver::bind_destructor`); left unpinned when the type has
-    /// none.
+    /// none, for codegen to release with the type's glue or not at all.  A
+    /// method of the type merely named `drop` is never bound here, and a
+    /// pointer receiver is a `Copy` value with no destructor: it never
+    /// reaches its pointee's.
     bind_destructor_call(mut &this, call: CallExprNode*) -> void {
         if (call == null || call.callee == null) { return; }
         if (call.callee.kind != NodeKind::MemberAccess) { return; }
         const member: MemberAccessNode* = call.callee as MemberAccessNode*;
         if (member.object == null || !member.object.resolved_type.is_valid()) { return; }
         this.calls.bind_destructor(this as ASTVisitor*, call, member.object.resolved_type);
+    }
+
+    /// Bind `p.drop()` built to release what the pointer `p` points at -
+    /// `delete p`'s destructor call - to the destructor of `pointee`, the
+    /// type `p` points at, by identity.  The call keeps its pointer receiver,
+    /// which method dispatch dereferences.
+    bind_pointee_destructor_call(mut &this, call: CallExprNode*, pointee: TypeRef) -> void {
+        if (call == null || !pointee.is_valid()) { return; }
+        this.calls.bind_destructor(this as ASTVisitor*, call, pointee);
     }
 
     /// A fresh trait checker over the shared arena + registry (a 4-pointer view).

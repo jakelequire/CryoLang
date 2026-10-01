@@ -140,12 +140,8 @@ type struct TraitChecker {
             // Pointers/references are non-owning aliases.  Delegate
             // `T*: Drop` to `T: Drop` so primitive pointers auto-pass while
             // pointers to user types require the pointee to impl `Drop`.  This
-            // is checked BEFORE the `Copy` rule below: a pointer is itself
-            // `Copy`, but a `where T: Drop` container of `T*` must still drop
-            // its elements through the pointee's real `Drop` - answering
-            // "satisfied" off the pointer's own Copy-ness would wrongly
-            // instantiate a container drop whose body derefs to a non-Copy
-            // pointee that has no `drop` method.
+            // is checked BEFORE the `Copy` rule below, which a pointer would
+            // otherwise always satisfy.
             const t_ptr: Type* = this.arena.lookup(ty);
             if (t_ptr != null && t_ptr.kind == TypeKind::Pointer) {
                 const pt: PointerType* = t_ptr as PointerType*;
@@ -173,23 +169,9 @@ type struct TraitChecker {
         if (!this.template_key_of(subject).is_valid()) { return false; }
         // The candidates by identity, the first whose bounds hold.
         const impl_block: ImplBlockNode* = this.select_impl(trait_name, subject, depth);
-        if (impl_block != null) { return true; }
-        // No `implement trait Drop` for this type - but a non-Copy type whose
-        // destructor is written as an inherent `drop` method still satisfies
-        // Drop: drop-insertion and codegen both resolve `.drop()` to the
-        // inherent method (mirroring `is_copy`, which already treats an
-        // inherent `drop` as non-Copy).  Without this, a `where T: Drop`
-        // container (`Box<T>`, `Rc<T>`, `Array<T>`, ...) rejects any T whose
-        // destructor is inline rather than a trait impl, and `Box<T>::drop`
-        // is never instantiated -> E0636 at codegen.  Container types always
-        // carry a trait Drop impl, so a head that unified and was refused by
-        // its bounds keeps that answer.
-        if (drop_name.is_valid() && trait_name.equals(drop_name)
-                && this.generic_registry.heads_for(trait_name, subject, this.intern_table).length == 0) {
-            return OwnershipQuery::has_inherent_drop(this.arena,
-                this.generic_registry, this.intern_table, ty);
-        }
-        return false;
+        // A method merely named `drop` does not satisfy `Drop`: a type
+        // implements it with `implement trait Drop`, as any other trait.
+        return impl_block != null;
     }
 
     /// The impl of `trait_id` for `subject` that APPLIES: the first

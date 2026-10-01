@@ -446,11 +446,9 @@ type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
     /// Remove the entry with matching key. Returns the removed
     /// value, or `None` if the key wasn't present.
     ///
-    /// `K::drop()` is called on the stored key before the entry
-    /// node is freed; ownership of `V` is transferred to the
-    /// caller (who is responsible for dropping it when done).  The
-    /// `where K: Drop` bound makes the K-drop sound across owning
-    /// (`String`) and POD (`u32`, no-op) instantiations alike.
+    /// The stored key is released in place before the entry node is
+    /// freed; ownership of `V` is transferred to the caller (who is
+    /// responsible for dropping it when done).
     ///
     /// Implementation: indirect-pointer (cursor) traversal so both the
     /// head-removal and mid-chain-removal cases reduce to a single
@@ -459,7 +457,7 @@ type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
     /// unreliable in earlier codegen paths and documented in the
     /// drop_insertion pass as "bootstrap HashMap remove corruption".
     remove(mut &this, key: &K) -> Option<V>
-    where K: Hash + Eq + Drop {
+    where K: Hash + Eq {
         if (this.bucket_count == 0) {
             return Option::None;
         }
@@ -485,7 +483,7 @@ type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
                 // running the slot's destructor, so `removed` becomes the sole
                 // owner of what the slot held.
                 unsafe { removed = *slot; }
-                node.key.drop();
+                ptr::drop_in_place::<K>(&node.key);
                 free_entry(this, node);
                 this.length = this.length - 1;
                 return Option::Some(removed);
@@ -499,13 +497,9 @@ type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
     /// Drop every entry. Retains the bucket array so subsequent
     /// inserts don't re-pay the allocation.
     ///
-    /// Calls `K::drop()` and `V::drop()` on each discarded entry
-    /// before freeing the entry node.  The `where K: Drop, V: Drop`
-    /// bound is what makes this sound: every K and V used in a
-    /// HashMap must have a `Drop` impl (primitives' impls are
-    /// no-ops, so `HashMap<u32, u64>` etc. still work).
-    clear(mut &this) -> void
-    where K: Drop, V: Drop {
+    /// Releases each discarded entry's key and value in place before
+    /// freeing the entry node.
+    clear(mut &this) -> void {
         if (this.buckets == null) { return; }
         mut i: u64 = 0;
         while (i < this.bucket_count) {
@@ -513,8 +507,8 @@ type struct HashMap<K, V, A = GlobalAlloc> where A: Allocator {
             loop {
                 if (node == null) { break; }
                 const next: Entry<K, V>* = node.next;
-                node.key.drop();
-                node.value.drop();
+                ptr::drop_in_place::<K>(&node.key);
+                ptr::drop_in_place::<V>(&node.value);
                 free_entry(this, node);
                 node = next;
             }
@@ -844,13 +838,13 @@ where A: Allocator {
     map.alloc.deallocate(NonNull::new(entry as u8*), block);
 }
 
-/// Release every entry and the bucket array.  Calls `K::drop()` and
-/// `V::drop()` on every entry before reclaiming its node, so
+/// Release every entry and the bucket array.  Releases every entry's key
+/// and value in place before reclaiming its node, so
 /// `HashMap<String, String>` and similar owning shapes don't leak.
 /// Ownership obligation: every HashMap must have `drop` called before
 /// going out of scope.
 implement<K, V, A> trait Drop for struct HashMap<K, V, A>
-where K: Drop, V: Drop, A: Allocator {
+where A: Allocator {
     drop(mut &this) -> void {
         this.clear();
         if (this.buckets != null) {

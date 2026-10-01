@@ -153,9 +153,10 @@ type struct Box<T, A = GlobalAlloc> where A: Allocator {
 
 }
 
-/// Release the heap storage.  Calls `T::drop()` on the owned value first
-/// so that any resources held by `T` (heap buffers, file descriptors,
-/// etc.) are released before the allocation is returned via
+/// Release the heap storage.  Releases the owned value in place first
+/// (`ptr::drop_in_place`: its `Drop` implementation, its fields' glue, or
+/// nothing for a `Copy` value), so that any resources held by `T` (heap
+/// buffers, file descriptors, etc.) are released before the allocation is returned via
 /// `this.alloc.deallocate(...)`.  The allocator instance itself lives in
 /// the `Box` struct (caller's stack), not in the heap allocation we're
 /// freeing.
@@ -167,14 +168,14 @@ type struct Box<T, A = GlobalAlloc> where A: Allocator {
 /// the allocation to the caller, so T's drop is NOT called for those
 /// paths.
 implement<T, A> trait Drop for struct Box<T, A>
-where T: Drop, A: Allocator {
+where A: Allocator {
     drop(mut &this) -> void {
         // Idempotent: a second drop of the same Box is a no-op rather
         // than a double free (matches the rest of the stdlib, whose Drop
         // impls all null their pointer). `into_raw`/`leak` consume the
         // Box so this path doesn't run after them.
         if (this.ptr == null) { return; }
-        (*this.ptr).drop();
+        ptr::drop_in_place::<T>(this.ptr);
         const block: Layout = Layout::of::<T>();
         this.alloc.deallocate(NonNull::new(this.ptr as u8*), block);
         this.ptr = null;

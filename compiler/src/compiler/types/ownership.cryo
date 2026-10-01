@@ -124,21 +124,17 @@ type struct OwnershipQuery {
                                              tt.elements, depth + 1);
         }
 
-        // User-defined aggregates: Copy if (a) no user-written Drop
-        // (trait impl OR inherent `drop` method) AND (b) every field
-        // is Copy. Stdlib types use the inherent shape, user code may
-        // use either.
+        // User-defined aggregates: Copy if (a) no `Drop` implementation
+        // AND (b) every field is Copy.  A method merely named `drop` is not
+        // a destructor and does not make a type non-Copy.
         if (k == TypeKind::Struct) {
             const st: StructType* = t as StructType*;
             if (OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty)) {
                 return false;
             }
-            if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty)) {
-                return false;
-            }
             // A union is an untagged overlay: the active member is unknown, so
             // its fields are never auto-dropped.  It is therefore Copy/POD
-            // regardless of member types (unless it declares its own `drop`,
+            // regardless of member types (unless it implements `Drop`,
             // handled above) -- do NOT recurse into the fields.
             if (st.is_union) {
                 return true;
@@ -151,18 +147,12 @@ type struct OwnershipQuery {
             if (OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty)) {
                 return false;
             }
-            if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty)) {
-                return false;
-            }
             return OwnershipQuery::all_fields_copy(arena, registry, intern,
                                                     ct.fields, depth + 1);
         }
         if (k == TypeKind::Enum) {
             const et: EnumType* = t as EnumType*;
             if (OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty)) {
-                return false;
-            }
-            if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty)) {
                 return false;
             }
             return OwnershipQuery::all_variants_copy(arena, registry, intern,
@@ -177,16 +167,12 @@ type struct OwnershipQuery {
                                                      al.target, depth + 1);
         }
 
-        // InstantiatedType wrappers route Drop lookup through both
-        // the trait-impl registry (template's canonical base type id) and the
-        // inherent-method walk (which handles the cloned spec's
-        // own `drop` method). Either match marks the type non-Copy.
+        // InstantiatedType wrappers route Drop lookup through the trait-impl
+        // registry (template's canonical base type id); a match marks the
+        // type non-Copy.
         if (k == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = t as InstantiatedType*;
             if (OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty)) {
-                return false;
-            }
-            if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty)) {
                 return false;
             }
             if (inst.has_resolved_type()) {
@@ -586,10 +572,9 @@ type struct OwnershipQuery {
             return false;
         }
 
-        // A user-written drop (trait impl or inherent method) is
-        // authoritative and self-contained: stop here.
-        if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty) ||
-            OwnershipQuery::type_implements_drop(arena, registry, intern, ty)) {
+        // A `Drop` implementation is authoritative and self-contained: stop
+        // here.
+        if (OwnershipQuery::type_implements_drop(arena, registry, intern, ty)) {
             return true;
         }
 
@@ -768,104 +753,6 @@ type struct OwnershipQuery {
         if (arena == null || registry == null || intern == null) { return false; }
         const drop_id: DefId = registry.wellknown(LangItem::Drop);
         return registry.heads_for(drop_id, ty, intern).length > 0;
-    }
-
-    /// True when a Struct/Class type's AST declares an inherent `drop`
-    /// method. Cryo's stdlib expresses ownership-handoff via inherent
-    /// `drop` rather than `implement trait Drop`, so this is the predicate
-    /// that actually drives Copy/non-Copy classification for stdlib types
-    /// like `Box<T>`, `String`, `Array<T>`, `HashMap<K, V>`. The
-    /// type-arena's `StructType.methods` is currently empty for most
-    /// declarations (methods live only on the AST), so we go through
-    /// the template registry to recover the original `StructDeclNode`
-    /// or `ClassDeclNode` and walk its `methods[]` array.
-    static has_inherent_drop(arena: TypeArena*, registry: GenericRegistry*,
-                              intern: InternTable*, ty: TypeRef) -> boolean {
-        if (arena == null || registry == null || intern == null) { return false; }
-        const drop_sym: SymbolStr = intern.intern("drop");
-        if (!drop_sym.is_valid()) { return false; }
-
-        // For an instantiation - pre-mono wrapper OR post-mono concrete - route to
-        // the template's AST; `registry.get_template` is keyed on the template name.
-        const t: Type* = arena.lookup(ty);
-        if (t == null) { return false; }
-        const inst_base: TypeRef = OwnershipQuery::inst_base_of(arena, ty);
-        if (inst_base.is_valid()) {
-            return OwnershipQuery::has_inherent_drop(arena, registry, intern, inst_base);
-        }
-
-        const qname: SymbolStr = OwnershipQuery::qualified_name_of(arena, ty);
-        if (!qname.is_valid()) { return false; }
-
-        // Templated types (e.g. `Box<T>`) live in `entries`. Check
-        // both the inline methods and any `implement` blocks attached
-        // to the template; Box's `drop` is inline, but Enum decls
-        // route inherent methods through impl blocks.
-        const tmpl: TemplateEntry* = registry.template_of_type(ty);
-        if (tmpl != null) {
-            if (tmpl.ast_node != null &&
-                OwnershipQuery::ast_has_drop(tmpl.ast_node, tmpl.node_kind, drop_sym)) {
-                return true;
-            }
-            if (OwnershipQuery::impl_blocks_have_drop(tmpl, drop_sym)) {
-                return true;
-            }
-        }
-
-        // Non-generic types might be registered as inherent owners only.
-        const owner_ast: ASTNode* = registry.lookup_inherent_owner(ty);
-        if (owner_ast != null &&
-            OwnershipQuery::ast_has_drop(owner_ast, owner_ast.kind, drop_sym)) {
-            return true;
-        }
-        // The inherent `drop` may instead live in a separate
-        // `implement T { ... }` block.  For a non-generic `T` that block
-        // has no TemplateEntry (so the `tmpl` path above misses it) and is
-        // not on the type-decl node (so `lookup_inherent_owner` misses it);
-        // it is recorded in the inherent-impl-block index at registration.
-        if (registry.inherent_impl_has_method(ty, drop_sym)) {
-            return true;
-        }
-        return false;
-    }
-
-    /// Walk a declaration AST node's inline `methods[]` array for a
-    /// method named `drop`. Handles StructDeclNode and ClassDeclNode
-    /// EnumDeclNode methods live on a separate `implement enum Foo`
-    /// impl block, which the caller picks up via the TemplateEntry's
-    /// `impl_blocks` array (see `has_inherent_drop`).
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    static ast_has_drop(node: ASTNode*, kind: NodeKind,
-                         drop_sym: SymbolStr) -> boolean {
-        if (node == null) { return false; }
-        if (kind == NodeKind::StructDeclaration) {
-            const decl: StructDeclNode* = node as StructDeclNode*;
-            return NodeLocator::method_by_name(&decl.methods, drop_sym) != null;
-        }
-        if (kind == NodeKind::UnionDeclaration) {
-            const decl: UnionDeclNode* = node as UnionDeclNode*;
-            return NodeLocator::method_by_name(&decl.methods, drop_sym) != null;
-        }
-        if (kind == NodeKind::ClassDeclaration) {
-            const decl: ClassDeclNode* = node as ClassDeclNode*;
-            return NodeLocator::method_by_name(&decl.methods, drop_sym) != null;
-        }
-        return false;
-    }
-
-    /// Walk all impl_blocks attached to `tmpl`, scanning each for a
-    /// method named `drop`. Used for types whose inherent methods
-    /// live in `implement` blocks rather than inline.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    static impl_blocks_have_drop(tmpl: TemplateEntry*,
-                                  drop_sym: SymbolStr) -> boolean {
-        if (tmpl == null) { return false; }
-        for (mut i: i64 = 0; i < tmpl.impl_blocks.length; i++) {
-            const ib: ImplBlockNode* = tmpl.impl_blocks[i];
-            if (ib == null) { continue; }
-            if (NodeLocator::method_by_name(&ib.methods, drop_sym) != null) { return true; }
-        }
-        return false;
     }
 
     /// Get the qualified-name SymbolStr for a Type. Centralises the

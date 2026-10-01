@@ -207,19 +207,17 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     }
 
     /// Overwrite the element at `index`, taking ownership of `value`.
-    /// The previous occupant is dropped before the slot is reused: a
-    /// raw slot store (`this.ptr[index] = value`) does NOT drop the
-    /// destination, so for owning `T` (`String`, `Box<T>`, ...) the
-    /// old element's resources would otherwise leak. The `where T: Drop`
-    /// bound is satisfied by every type (POD types drop to no IR), so
-    /// this restricts nothing. Panics on out-of-range.
-    set(mut &this, index: u64, value: T) -> void
-    where T: Drop {
+    /// The previous occupant is released in place before the slot is
+    /// reused: a raw slot store (`this.ptr[index] = value`) does NOT drop
+    /// the destination, so for owning `T` (`String`, `Box<T>`, ...) the
+    /// old element's resources would otherwise leak. Panics on
+    /// out-of-range.
+    set(mut &this, index: u64, value: T) -> void {
         if (index >= this.length) {
             core::panic("Array::set: index out of range", FILE, LINE);
         }
         mut prev: T* = this.get_ref(index).unwrap();
-        prev.drop();
+        ptr::drop_in_place::<T>(prev);
         this.ptr[index] = value;
     }
 
@@ -354,31 +352,28 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
         return removed;
     }
 
-    /// Shorten to at most `new_length`, dropping the truncated elements
-    /// via `T::drop`. A no-op if `new_length >= length`. Keeps capacity.
-    truncate(mut &this, new_length: u64) -> void
-    where T: Drop {
+    /// Shorten to at most `new_length`, releasing the truncated elements
+    /// in place. A no-op if `new_length >= length`. Keeps capacity.
+    truncate(mut &this, new_length: u64) -> void {
         if (new_length >= this.length) { return; }
         mut i: u64 = new_length;
         while (i < this.length) {
-            this.ptr[i].drop();
+            ptr::drop_in_place::<T>(&this.ptr[i]);
             i++;
         }
         this.length = new_length;
     }
 
-    /// Drop every initialized element (the `[0, length)` prefix) via
-    /// `T::drop`, then reset the length to zero while keeping the backing
+    /// Release every initialized element (the `[0, length)` prefix) in
+    /// place, then reset the length to zero while keeping the backing
     /// capacity.  Mirrors `drop`'s element teardown so `Array<String>`,
     /// `Array<Box<...>>`, and similar owning shapes don't leak their
-    /// contents.  The `where T: Drop` bound makes the element drop sound
-    /// (primitives' impls are no-ops).  Follow with `shrink_to_fit` to
-    /// release the capacity, or `drop` when the array itself goes away.
-    clear(mut &this) -> void
-    where T: Drop {
+    /// contents.  Follow with `shrink_to_fit` to release the capacity, or
+    /// `drop` when the array itself goes away.
+    clear(mut &this) -> void {
         mut i: u64 = 0;
         while (i < this.length) {
-            this.ptr[i].drop();
+            ptr::drop_in_place::<T>(&this.ptr[i]);
             i++;
         }
         this.length = 0;
@@ -462,7 +457,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// Gated on `T: Copy` for the same reason as `append` - each new slot is a
     /// bitwise copy of `value`, so for an owning `T` every one of them would own
     /// the same heap buffer and they would all free it.
-    resize(mut &this, new_length: u64, value: T) -> void where T: Copy + Drop {
+    resize(mut &this, new_length: u64, value: T) -> void where T: Copy {
         match (this.try_resize(new_length, value)) {
             Result::Ok(_)  => { return; }
             Result::Err(_) => {
@@ -474,7 +469,7 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// Fallible `resize`. Reserves the whole growth up front, so the array is
     /// either resized or left exactly as it was - never partially grown.
     try_resize(mut &this, new_length: u64, value: T) -> Result<(), AllocError>
-    where T: Copy + Drop {
+    where T: Copy {
         if (new_length <= this.length) {
             this.truncate(new_length);
             return Result::Ok(());
@@ -585,18 +580,25 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
     }
 }
 
-/// Release the backing storage. Drops every initialized element (the
-/// `[0, length)` prefix) via `T::drop` before reclaiming the allocation,
-/// so `Array<String>`, `Array<Box<...>>`, and similar owning shapes don't
+/// Release the backing storage. Releases every initialized element (the
+/// `[0, length)` prefix) in place before reclaiming the allocation, so
+/// `Array<String>`, `Array<Box<...>>`, and similar owning shapes don't
 /// leak. Ownership obligation: every Array must have `drop` called
-/// before going out of scope. Primitive `T`s have no-op `Drop` impls,
-/// so `Array<u32>` etc. still compile to a single deallocation.
+/// before going out of scope.
+///
+/// Unlike the other containers this keeps a `T: Drop` bound, so an array
+/// of elements with no `Drop` implementation whose fields need releasing
+/// is not released at all.  Releasing such elements here makes the
+/// compiler, built against this library, lose methods while checking its
+/// own source (`no method named `require` found on type `ResSlot``): it
+/// still reads an element (`MethodInfo`, `TemplateEntry`, `Scope`, ...)
+/// after the array that held it is dropped.
 implement<T, A> trait Drop for struct Array<T, A>
 where T: Drop, A: Allocator {
     drop(mut &this) -> void {
         mut i: u64 = 0;
         while (i < this.length) {
-            this.ptr[i].drop();
+            ptr::drop_in_place::<T>(&this.ptr[i]);
             i++;
         }
         if (this.ptr != null) {

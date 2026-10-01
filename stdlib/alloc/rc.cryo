@@ -240,14 +240,14 @@ type struct Weak<T, A = GlobalAlloc> {
     }
 }
 
-/// Decrement the strong count.  When it reaches zero, run `T::drop()` on the
-/// shared value and release the strong group's shared weak unit; if that
+/// Decrement the strong count.  When it reaches zero, release the shared
+/// value in place (`ptr::drop_in_place`) and release the strong group's shared weak unit; if that
 /// takes the weak count to zero as well, free the header.
 ///
 /// Ownership obligation: every `Rc` handle must have `drop` called exactly
 /// once before it goes out of scope.
 implement<T, A> trait Drop for struct Rc<T, A>
-where T: Drop, A: Allocator {
+where A: Allocator {
     drop(mut &this) -> void {
         // Idempotent per handle: null `this.inner` after decrementing so a
         // second drop of the *same* handle is a no-op rather than an
@@ -260,7 +260,7 @@ where T: Drop, A: Allocator {
             // Last strong owner: drop the shared value, then release the
             // strong group's shared weak unit. If no `Weak` outlives us,
             // that unit was the last weak reference - free the header now.
-            inner_ptr.value.drop();
+            ptr::drop_in_place::<T>(&inner_ptr.value);
             inner_ptr.weak = inner_ptr.weak - 1;
             if (inner_ptr.weak == 0) {
                 free_rc_inner::<T, A>(inner_ptr);
@@ -274,7 +274,7 @@ where T: Drop, A: Allocator {
 /// group has already released its shared unit (i.e. the value is gone), so
 /// this is the point at which the last surviving `Weak` frees the header.
 implement<T, A> trait Drop for struct Weak<T, A>
-where T: Drop, A: Allocator {
+where A: Allocator {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const inner_ptr: RcInner<T, A>* = this.inner;

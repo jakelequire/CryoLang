@@ -444,10 +444,10 @@ type struct NewDeleteEmitter {
         //   2. Free the allocation.
         // The operand is evaluated exactly once (see below): the pointer
         // is spilled to a temp slot, the drop is synthesized as a
-        // `.drop()` on a synthetic local reading that slot - routed
-        // through the normal method-dispatch path so trait `Drop` impls,
-        // inherent `drop`, and virtual class destructors all reach the
-        // right symbol - and the same spilled pointer is freed.  This
+        // `.drop()` on a synthetic local reading that slot - bound to the
+        // pointee's `Drop` implementation by identity, and emitted through
+        // the normal method-dispatch path, so virtual class destructors
+        // reach the right symbol - and the same spilled pointer is freed.  This
         // makes side-effecting operands (`delete arr.pop()`) safe: the
         // side effects fire once and the destructor and `free` see the
         // identical pointer.
@@ -484,11 +484,8 @@ type struct NewDeleteEmitter {
         mut should_drop: boolean = false;
         if (pointee.is_valid() && arena_ptr != null && registry_ptr != null
                 && intern_ptr != null) {
-            should_drop =
-                OwnershipQuery::has_inherent_drop(arena_ptr, registry_ptr,
-                                                    intern_ptr, pointee)
-                || OwnershipQuery::type_implements_drop(arena_ptr, registry_ptr,
-                                                        intern_ptr, pointee);
+            should_drop = OwnershipQuery::type_implements_drop(arena_ptr, registry_ptr,
+                                                               intern_ptr, pointee);
         }
 
         // Evaluate the operand exactly once.  A side-effecting operand
@@ -529,7 +526,7 @@ type struct NewDeleteEmitter {
             member.set_resolved_type(TypeRef::invalid());
             mut call: CallExprNode* = new CallExprNode(
                 member as ExpressionNode*, node.span);
-            this.cg.bind_synthesized_method_call(call);
+            this.cg.bind_pointee_destructor_call(call, pointee);
             mut stmt: ExprStmtNode* = new ExprStmtNode(
                 call as ExpressionNode*, node.span);
             stmt.accept(visitor);

@@ -3179,18 +3179,27 @@ type struct CallResolver {
     }
 
     /// Bind `x.drop()` built to release `x` to the destructor of `x`'s
-    /// type, by identity: the implementation `Drop` and the type select,
-    /// then its method at `Drop::drop`'s position.  A type with no
-    /// implementation has no destructor to call, and the call is left
+    /// type, by identity: the implementation of `Drop` that applies to the
+    /// type (its head selects it and its where-clause holds), then its
+    /// method at `Drop::drop`'s position.  A type with no implementation
+    /// that applies has no destructor to call, and the call is left
     /// unpinned: codegen releases the value with its glue, or not at all
     /// when it is `Copy`.  A method of the type that is merely named `drop`
-    /// is not its destructor and is never reached.
+    /// is not its destructor and is never reached.  A dynamic `T[]` is laid
+    /// out as the `Array<T>` specialization registered for its element, and
+    /// is released by that type's destructor.
     bind_destructor(mut &this, visitor: ASTVisitor*, call: CallExprNode*, recv: TypeRef) -> Selection {
         if (this.ctx.generic_registry == null) { return Selection::none(); }
         const d: DefId = this.ctx.generic_registry.wellknown(LangItem::DropDrop);
         if (!d.is_valid()) { return Selection::none(); }
-        const block: ImplBlockNode* = this.ctx.generic_registry.select_trait_impl(
-            this.ctx.defs.parent_of(d), recv, this.intern);
+        mut subject: TypeRef = recv;
+        const rt: Type* = this.arena.lookup(recv);
+        if (rt != null && rt.kind == TypeKind::Array && (rt as ArrayType*).is_dynamic()) {
+            subject = this.ctx.decl_index.lookup_array_type((rt as ArrayType*).element);
+            if (!subject.is_valid()) { return Selection::none(); }
+        }
+        const block: ImplBlockNode* = this.trait_checker().select_impl(
+            this.ctx.defs.parent_of(d), subject, 0);
         const chosen: MethodNode* = this.ctx.generic_registry.trait_item_method(
             block, this.ctx.generic_registry.trait_item_position(d));
         if (chosen == null) { return Selection::none(); }

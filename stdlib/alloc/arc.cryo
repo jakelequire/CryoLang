@@ -252,7 +252,7 @@ type struct Arc<T, A = GlobalAlloc> where A: Allocator {
     /// through the handle `Drop`, so the release/acquire teardown ordering is
     /// identical.  Undefined if the reference was already balanced.
     static decrement_strong_count(p: ArcInner<T, A>*) -> void
-    where T: Drop, A: Allocator {
+    where A: Allocator {
         mut a: Arc<T, A> = Arc::from_raw(p);
         a.drop();
     }
@@ -311,8 +311,8 @@ type struct Weak<T, A = GlobalAlloc> {
     }
 }
 
-/// Decrement the strong count atomically.  When it reaches zero, run
-/// `T::drop()` on the shared value and release the strong group's shared
+/// Decrement the strong count atomically.  When it reaches zero, release
+/// the shared value in place (`ptr::drop_in_place`) and release the strong group's shared
 /// weak unit; freeing the header falls to whichever weak release is last.
 /// The `Release` on `fetch_sub` plus the `Acquire` fence on the
 /// last-strong path establishes the happens-before edge that synchronizes
@@ -322,7 +322,7 @@ type struct Weak<T, A = GlobalAlloc> {
 /// Ownership obligation: every `Arc` handle must have `drop` called exactly
 /// once before going out of scope.
 implement<T, A> trait Drop for struct Arc<T, A>
-where T: Drop, A: Allocator {
+where A: Allocator {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const inner_ptr: ArcInner<T, A>* = this.inner;
@@ -335,7 +335,7 @@ where T: Drop, A: Allocator {
             // then release the strong group's shared weak unit (which frees
             // the header if no `Weak` outlives us).
             atomic::fence(MemoryOrder::Acquire);
-            inner_ptr.value.drop();
+            ptr::drop_in_place::<T>(&inner_ptr.value);
             release_weak::<T, A>(inner_ptr);
         }
         this.inner = null;
@@ -347,7 +347,7 @@ where T: Drop, A: Allocator {
 /// released its shared unit, so the value is gone and only the header
 /// remains to reclaim.
 implement<T, A> trait Drop for struct Weak<T, A>
-where T: Drop, A: Allocator {
+where A: Allocator {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const inner_ptr: ArcInner<T, A>* = this.inner;

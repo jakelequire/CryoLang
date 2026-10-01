@@ -208,8 +208,6 @@ CLASS_OF_METHOD = {
     "TypeUtils::lookup_method_return":
         ("J", "member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name)"),
     # -- the generic registry --
-    "GenericRegistry::inherent_impl_has_method":
-        ("J", "member: a method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand"),
     "GenericRegistry::find_inherent_impl_method":
         ("J", "member: a method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand"),
     "GenericRegistry::find_inherent_impl_generic_method":
