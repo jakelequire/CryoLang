@@ -54508,3 +54508,92 @@ type struct String<A = GlobalAlloc> {
   emitted.  Whether the post-mono pass should walk template bodies at all
   is open (not in the design's slice 6, which covers specialization bodies).
 * Then: the deletion and the post-mono E0900; the small shapes.
+
+### 8.459 A template pin carries the receiver it was selected on, and after monomorphization a generic call in an emitted body is bound to mono's instance or to nothing - 2026-10-01
+
+## Why
+
+Slice 6, the calls whose receiver mono could not type.  41 visits of five
+call sites in emitted bodies (`this.inner.push(segment)` in
+`PathBuf<A>::push`, `stdlib/fs/path.cryo:322,332`;
+`this.queue::<T>(data)`, `stdlib/io/traits.cryo:657`;
+`key.push(got)` in an async body, `stdlib/net/ws/conn.cryo:159`;
+`this.length.hash(hasher)`, `stdlib/collections/array.cryo:849`) carried a
+template pin to a method with type parameters of its own, but mono
+rebuilt the receiver from the receiver expression, whose type a clone does
+not carry for a field access (`derive_receiver_type` fails on a field of
+`this` typed by the template's `PathBuf<A>`).  Mono recorded no instance,
+and sema's pass after monomorphization selected the call BY NAME, binding
+it only because another call had minted the same instance.  Ruling 72
+allowed that fallback until the receiver fix.
+
+## What changed
+
+* `CallExprNode.template_recv`: the receiver `template_method` was selected
+  on, as sema typed it where the call is written (the unminted
+  instantiation, `String<A>`, or the minted type), written by the three
+  pin writers beside `template_method` (`pin_template_method`,
+  `pin_minted_method`, `pin_instantiated_method`, the last fed by the new
+  `Selection.recv`).  The cloner copies it and the substituter applies the
+  clone's substitution to it, as it does `resolved_type_args`.
+* Mono's `specialize_method_call` reads the receiver of a template-pinned
+  call from `template_recv` instead of the receiver expression; nothing is
+  reconstructed for it.
+* Sema after monomorphization, in an emitted body (not a symbolic walk of
+  a template), binds a template-pinned call to a generic method to the
+  instance mono recorded on it, or leaves it unbound (code generation's
+  E0636).  The by-name selection that followed is gone for these calls.
+
+```cryo
+type struct PathBuf<A = GlobalAlloc> {
+    inner: String<A>;
+    push(mut &this, segment: Str) -> void {
+        this.inner.push(segment);   // template_recv String<A> -> String<GlobalAlloc>;
+    }                               // bound to String<GlobalAlloc>::push<Str>, mono's instance
+}
+```
+
+## Evidence
+
+* Agreement (probe `.objcmp/s93/state-probe-r-n.patch`, the S93R block at
+  the top of `bind_method_on_receiver`: identity vs the by-name pick on
+  every post-mono template-pinned generic call in an emitted body; driver
+  `.objcmp/s93/corpus4.sh`, 406 entries = compiler, tests, every project,
+  example and tool, the unit leg, each negative alone).  Real
+  (`.objcmp/s93/c2`): 0 with no instance; the 41 visits now `agree`.
+  Control, the same probe with mono NOT reading `template_recv`
+  (`.objcmp/s93/mut-noread.exe`, `.objcmp/s93/c3`): 41 with no instance,
+  at exactly those five sites.  Summed per (verdict, site, build) the two
+  runs differ in those 41 rows and nothing else; every build's exit status
+  is identical.  1,495 pre-existing DISAGREE rows on calls mono pinned
+  before this change are equal in both runs: the by-name pick there is a
+  sibling instance (`s.push(text)` with `text: string` picks another
+  `push` instance) or the uninstantiated template, never mono's pin.
+* A first control (the substituter not substituting `template_recv`)
+  changed nothing: mono's walk applies the walk's substitution to the
+  receiver as well.  The substituter's step keeps a clone's pin
+  self-describing, as `resolved_type_args` is.
+* The strict branch (`.objcmp/s93/c5`) against the probe run before it
+  (`c2`): every build's and negative's output identical apart from
+  line shifts in the compiler's own warnings, exit statuses identical.
+* verify against HEAD (`.verify/runs/20261001-142402`): census, examples
+  14, lsp, cross, incr, blind, flow OK; objects **0 moved** of 5,501 test
+  and 1,126 example objects, as predicted.  The `fast` gate died on a
+  fork failure (`CreateProcessW failed`) under a concurrent corpus run;
+  `make check-fast` passes alone on the same tree.
+* Warnings: 331, the same (code, file) multiset as HEAD
+  (`cryo check src/main.cryo` on a HEAD export and on the tree).
+* Lane, flow (785) and section 0 unchanged.
+
+## Remaining (slice 6)
+
+* Mono's by-name finders answer nothing over the corpus (probe S93M on
+  `find_generic_method_by_name` and `try_instantiate_self_returning_default`,
+  `.objcmp/s93/c5`: 0; control: a mutant ignoring the template pin makes
+  them answer 31 times on `examples/01-hello`).
+* Sema's pass after monomorphization still selects 5,134 method calls by
+  name in emitted code (`.objcmp/s93/c5`, probe S93N), nearly all
+  unstamped, minted, with no template pin; 3,744 rows on a dynamic-array
+  receiver (`parts.push(..)` on a `string[]`, dispatched through
+  `Array<string>`), many in non-generic code.  The deletion and the
+  internal check wait on them.

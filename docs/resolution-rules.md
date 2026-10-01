@@ -83,6 +83,41 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-01
+
+70. **The pass after monomorphization does not re-walk generic template
+    bodies that are never emitted**, once it is measured that no diagnostic
+    depends on that walk.
+
+71. **The internal check after monomorphization uses plain wording** that
+    names the method, the specialization and the template call site:
+    "internal: call to `push` in `String<GlobalAlloc>::from_str` reached
+    codegen with no resolved method (written at string.cryo:120)".
+
+72. **The temporary identity-first, by-name fallback for the calls whose
+    receiver monomorphization could not type is accepted until the receiver
+    fix**, which must remove it before the by-name finders are deleted.
+
+73. **E0358 on `(*p).drop()` gets a help of its own**: "use
+    `std::core::ptr::drop_in_place(p)`".
+
+74. **The spelling-flow entry for `IntrinsicKind::from_name` is accepted.**
+
+75. **`CalleePin::intrinsic_kind` may live in the AST file.**
+
+76. **`Array` keeps `where T: Drop` until the compiler's use-after-drop is
+    fixed.** That fix is queued.
+
+77. **Inside a generic template, a call keeps the method it was written
+    against** (rule 1). `Bx::<i32>{..}.run()` returning 1 is confirmed.
+
+78. **The closure synthesizer's inherent `drop` becomes a real `Drop`
+    implementation**, not deleted.
+
+79. **An explicit inherent `x.drop()` that runs field release is accepted
+    until the call pin's method node and codegen's `.drop()` name branch are
+    removed.**
+
 ### 2026-09-30
 
 40. **The explicit-path piece of the monomorphizer plan lands ahead of the
