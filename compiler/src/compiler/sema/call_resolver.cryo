@@ -3148,6 +3148,7 @@ type struct CallResolver {
                 this.report_inherent_trait_tie(visitor, call, member, base_ref, base_t, start_cls,
                     methods_ref, &arg_types, tmpl, owner_inst, sel.chosen);
             }
+            this.pin_minted_method(call, sel, base_ref);
             return this.commit_selection(visitor, call, sel);
         }
         if (this.select_in_set(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
@@ -3171,11 +3172,28 @@ type struct CallResolver {
         call.template_method = mn.func.def;
     }
 
-    /// Bind a call carrying a template pin to the receiver's copy of the
-    /// pinned method, by identity: the copy the receiver's specialization
-    /// holds of the template's definition.  Nothing is selected by the
-    /// member's name.  A receiver with no copy leaves the call unbound,
-    /// which code generation refuses.
+    /// Record on a call in a generic body the method selected for it on a
+    /// minted receiver, when that method has no type parameters of its own,
+    /// is instantiated with its owner, and is the receiver's own entry for
+    /// its definition: the receiver is the same type in every copy of the
+    /// body, which binds that method by its definition after
+    /// monomorphization (`bind_template_method`) instead of selecting again.
+    pin_minted_method(&this, call: CallExprNode*, sel: Selection, recv: TypeRef) -> void {
+        const mn: MethodNode* = sel.chosen;
+        if (!this.state.in_symbolic_check || sel.owner_inst.is_valid() || mn == null) { return; }
+        const f: FunctionDeclNode* = mn.func;
+        if (f == null || !f.def.is_valid() || f.generic_params.length > 0
+                || f.is_self_returning_default || f.is_lazy_self_growing) { return; }
+        if (this.types.contains_generic_param(recv)) { return; }
+        if (!this.ctx.decl_index.method_entry_on(recv, f.def).equals(f.overload_entry)) { return; }
+        call.template_method = f.def;
+    }
+
+    /// Bind a call carrying a template pin to the receiver's entry for the
+    /// pinned definition, by identity: the method itself when the receiver
+    /// declares it, else the copy the receiver's specialization holds of
+    /// it.  Nothing is selected by the member's name.  A receiver with
+    /// neither leaves the call unbound, which code generation refuses.
     bind_template_method(mut &this, visitor: ASTVisitor*, call: CallExprNode*, recv: TypeRef) -> Selection {
         const chosen: MethodNode* = this.ctx.decl_index.entry_method(
             this.ctx.decl_index.method_entry_on(recv, call.template_method));

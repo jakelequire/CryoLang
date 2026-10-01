@@ -54079,3 +54079,65 @@ function sh<T>(x: &T) -> i32 where T: Show { return x.s_req(); }
 * Warnings: 331, the same set (lines shift in `call_resolver.cryo`).
 * §0: projects 156 -> 157; braced-import files 675 -> 676 (the new
   project).
+
+### 8.455 A call in a generic body on a minted receiver keeps the plain method sema selected for it in every specialization - 2026-10-01
+
+## Why
+
+Slice 6, the 89th session's piece 1: a method call in a generic body whose
+receiver is already a minted type (`s.length()` on a `Str` inside `Box<T>`) is
+pinned by sema where it is written, and the substituter drops that pin in
+every clone, so sema's pass after monomorphization selected the method
+again by its member's name - on a receiver that is the same type in every
+copy.  The template pin of 8.452 now covers it.
+
+## What changed
+
+* `CallResolver::pin_minted_method`, at the unstamped non-generic selection
+  in `bind_method_on_receiver`: during a generic body's walk
+  (`in_symbolic_check`), a selection on a minted receiver that mentions no
+  type parameter records `template_method` when the method has no type
+  parameters of its own, is not a per-call default (self-returning or
+  lazily grown), and `method_entry_on(receiver, def)` is the method's own
+  entry.  After monomorphization `bind_template_method` binds that entry;
+  mono's `specialize_method_call` goes to `materialize_deferred_copy`,
+  which finds nothing to do for such a method.
+* Left by name: stamped calls (8.454 binds the plain ones), generic methods,
+  per-call defaults, and a method reached through another type (a base
+  class's method, where the receiver's entry for the definition is not the
+  method's own).
+* Doc comments of `template_method` and `bind_template_method` widened.
+
+```cryo
+type struct Bx<T> { v: T; s: Str; }
+implement<T> struct Bx<T> {
+    n(&this) -> u64 { return this.s.length(); }   // Str::length, by its definition in Bx<i32>, Bx<f64>, ...
+}
+```
+
+## Evidence
+
+* Agreement (probe `.objcmp/s90/probe4.patch`: in every binding through a
+  template pin, the by-name selection run first with the pin hidden, then
+  the identity binding; corpus `.objcmp/s90/corpus.sh`, 401 entries):
+  newly pinned shape (the definition is the receiver's own) 5,399 agree,
+  0 disagree; 8.452's shape (a copy) 74,163 agree, 0 disagree, 5 with no
+  copy, all in refused programs (`generic_receiver_alias_refused`,
+  `generic_receiver_other_instantiation_refused` x2, negatives
+  `E0358_hashmap_get_noncopy`, `E0358_push_slice_non_copy`), the same five
+  8.452 found.  Every build's exit status equals the previous run's except
+  `generic_body_call_keeps_written_answer`, which the probe's own by-name
+  re-selection refuses (E0156), as the compiler before 8.452 did.
+* Unit leg alone: 411 newly pinned, all agreeing.
+* `make verify ARGS="--baseline HEAD --require-identical"`
+  (`.verify/runs/20261001-032209`): census, examples, incr, blind, flow and
+  fast OK; 0 of 5,335 test objects and 0 of 1,126 examples moved.  lsp and
+  cross FAILED with the host out of memory (2.3 GB of 32 free):
+  `HashMap::insert: allocation failed` (exit 101) and `Allocation failed`
+  (0xC0000409), both compiling `compiler/src` beside the census.  Run alone
+  on the same tree, `make lsp-check` and `make cross-check` are OK.  Control:
+  the peak working set of `cryo check src/main.cryo` is 1,524 MB with
+  `6392538f`'s compiler and 1,530 MB with this one.  (A first run,
+  `20261001-030650`, failed census and cross the same way, and fast on facts
+  made stale by a comment edited while it ran.)
+* Warnings: 331, the same set.
