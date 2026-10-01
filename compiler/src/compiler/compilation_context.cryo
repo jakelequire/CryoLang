@@ -1,11 +1,7 @@
 ///! Compilation Context
 ///!
-///! Single shared state container for a compilation session.  Replaces both
-///! PassContext (11 raw pointers) and component ownership on CompilerInstance
-///! (17 unique_ptrs with implicit destruction ordering).
-///!
-///! Components are initialized lazily via init_*() methods called by passes
-///! at the appropriate pipeline stage, not all upfront in a constructor.
+///! The state one compilation shares between its stages: the build's options,
+///! the module the pipeline stands in, and the stores every stage reads.
 
 namespace compiler::compilation_context;
 
@@ -30,8 +26,6 @@ import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::env;
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
-import compiler::types::checker;
-import compiler::types::checker::{ TypeChecker };
 import std::fmt;
 import compiler::artifacts::{ PhaseArtifacts };
 import compiler::compile_mode::{ CompileMode };
@@ -105,10 +99,10 @@ type struct ModuleSpellingMatch {
 
 type struct CompilationContext {
 public:
-    // -- Configuration (set at creation, read-only thereafter) --
     mode:              CompileMode;
+    /// The file of the module the pipeline stands in; moved by
+    /// `switch_to_module`.
     source_file:       string;
-    include_paths:     string[];
     debug_mode:        boolean;
     /// LLVM optimization level for this compilation: 0 (none/debuggable)
     /// .. 3 (aggressive). Drives both the IR pass pipeline
@@ -135,33 +129,24 @@ public:
     /// None for a unit declaring no namespace.
     unit_module:       ModulePath;
 
-    // -- Phase outputs (heap-allocated to keep CompilationContext small) --
     artifacts: PhaseArtifacts*;
 
-    // -- Diagnostics (heap-allocated) --
     diagnostics:   DiagnosticSink*;
     diag_renderer: DiagRenderer*;
-    diag_config:   DiagConfig*;
 
-    // -- Pass tracking --
     provisions: ProvisionSet;
 
-    // -- Multi-module state (heap-allocated) --
     module_graph: ModuleGraph*;
 
-    // -- Interned strings (heap-allocated, lives for the entire compilation) --
     intern_table: InternTable*;
 
-    // -- Every definition of this compilation (heap-allocated) --
-    // The one place a `DefId` is made and its path composed; every store
-    // that needs a definition's path asks it here.
+    /// The one place a `DefId` is made and its path composed.
     defs: DefTable*;
 
-    // -- Declaration index (heap-allocated) --
     decl_index: DeclarationIndex*;
 
-    // -- Folded module-level integer constants (heap-allocated) --
-    // Shared across modules: a fixed array size may name a constant declared
+    /// Folded module-level integer constants, shared across modules: a fixed
+    /// array size may name a constant declared
     // in an imported module, and imports are name-resolved first.
     const_table: ConstantTable*;
 
@@ -285,24 +270,14 @@ public:
     monomorphizer:        Monomorphizer*;
     directive_registry:   void*;           // DirectiveRegistry*; typed-erased to break import cycle.
 
-private:
-    type_checker:         TypeChecker*;
-    module_loader:        void*;           // ModuleLoader*; typed-erased to break import cycle.
-    codegen:              void*;           // LLVM C-API handle; typed-erased pending @cImport.
-    linker:               void*;           // LLVM C-API handle; typed-erased pending @cImport.
-
-public:
     /// Create a new compilation context for the given mode and source file.
     static new(mode: CompileMode, source_file: string) -> CompilationContext {
-        // Heap-allocate large sub-components to keep CompilationContext small.
-        // Struct construction copies fields by value through the stack, so
-        // an inline-fielded CompilationContext would risk stack overflow.
+        // Boxed for a stable address: the components point at each other.
         const _box_renderer: Box<DiagRenderer> = Box::<DiagRenderer>::new(DiagRenderer::new(RenderConfig::default()));
         const renderer: DiagRenderer* = _box_renderer.leak();
 
         const _box_artifacts: Box<PhaseArtifacts> = Box::<PhaseArtifacts>::new(PhaseArtifacts::new());
         const _box_diag: Box<DiagnosticSink>      = Box::<DiagnosticSink>::new(DiagnosticSink::new());
-        const _box_diag_config: Box<DiagConfig>   = Box::<DiagConfig>::new(DiagConfig::default());
         const _box_module_graph: Box<ModuleGraph> = Box::<ModuleGraph>::new(ModuleGraph::new());
         const _box_intern: Box<InternTable>       = Box::<InternTable>::new(InternTable::new());
         const _box_decl: Box<DeclarationIndex>    = Box::<DeclarationIndex>::new(DeclarationIndex::new());
@@ -318,12 +293,10 @@ public:
         consts_ptr.defs = defs_ptr;
 
         const diag_ptr: DiagnosticSink* = _box_diag.leak();
-        const diag_config_ptr: DiagConfig* = _box_diag_config.leak();
 
         mut ctx: CompilationContext = CompilationContext {
             mode:              mode,
             source_file:       source_file,
-            include_paths:     [],
             debug_mode:        false,
             opt_level:         2,
             emit_debug_info:   false,
@@ -335,7 +308,6 @@ public:
             artifacts:     _box_artifacts.leak(),
             diagnostics:   diag_ptr,
             diag_renderer: renderer,
-            diag_config:   diag_config_ptr,
             provisions:    ProvisionSet::empty(),
             module_graph:  graph_ptr,
             intern_table:  intern_ptr,
@@ -372,30 +344,15 @@ public:
 
             resolver:             null,
             type_resolver:        null,
-            type_checker:         null,
             generic_registry:     null,
             monomorphizer:        null,
-            module_loader:        null,
-            codegen:              null,
-            linker:               null,
             directive_registry:   null,
         };
 
-        // Wire the renderer and config into the sink
         diag_ptr.set_renderer(renderer);
-        // The config box was leaked above, so nothing else will ever drop it;
-        // the sink's copy is the only owner.
-        unsafe { diag_ptr.set_config(*diag_config_ptr); }
+        diag_ptr.set_config(DiagConfig::default());
         return ctx;
     }
-
-    /// Create a debug context with verbose logging.
-    static debug(mode: CompileMode, source_file: string) -> CompilationContext {
-        mut ctx_val: CompilationContext = CompilationContext::new(mode, source_file);
-        ctx_val.debug_mode = true;
-        return ctx_val;
-    }
-
 
     // String interning convenience
 
@@ -413,9 +370,6 @@ public:
     }
 
     /// Get a pointer to the intern table.
-    /// Use this instead of ctx.intern_table when accessing through an
-    /// inherited pointer (e.g. this.ctx in parser subclasses), where field
-    /// access through class hierarchies doesn't resolve correctly.
     get_intern_table(mut &this) -> InternTable* {
         return this.intern_table;
     }
@@ -928,33 +882,6 @@ public:
     /// Whether any errors have been emitted.
     has_errors(&this) -> boolean {
         return this.diagnostics.has_errors();
-    }
-
-
-    // Provision tracking
-
-
-    // Module-level reset (stdlib batch mode)
-
-    /// Reset per-module state for the next module in a batch compilation.
-    /// Checks mode.preserve_asts() to decide whether to save the current AST.
-    reset_for_next_module(mut &this, next_source: string) -> void {
-        LOG_DEBUG(LogComponent::General, "[CompilationContext] reset_for_next_module() next='%s'", next_source);
-        // Preserve ASTs if the mode requires it (StdlibBatch)
-        if (this.mode.preserve_asts()) {
-            this.artifacts.preserve_current_ast();
-        }
-
-        // Reset per-module data
-        this.artifacts.reset_for_next_module();
-        this.provisions.clear();
-        this.source_file = next_source;
-        this.unit_module = ModulePath::none();
-
-        // Reset resolver cursor (preserves cross-module state)
-        if (this.resolver != null) {
-            this.resolver.reset_for_next_module();
-        }
     }
 
 
