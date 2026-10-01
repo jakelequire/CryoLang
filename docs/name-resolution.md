@@ -53458,3 +53458,106 @@ const h = IgTn::go;                    // error[E0156] when Beta also provides `
 * New projects: `method_value_takes_receiver_first` (run; declared in
   `tests/started-compiling`), `method_value_inherent_trait_ambiguous`
   (E0156; `tests/started-passing`).
+
+### 8.447 An implementation's copy of a trait default answers a call on its projection-bounded receiver before monomorphization - 2026-09-30
+
+## Why
+
+Ruling 35: a call sema cannot type before monomorphization gets its typing
+completed.  `Iterator::min` and `max` call `value.compare(&best)` under
+`where This::Item: Ord`.  In an implementation's copy of the default,
+`This::Item` is a type the implementation gives, and sema has to see the
+receiver as the bounded projection the default was written on.  In most
+copies it did not: the call carried no trait stamp and no return type, and
+the `.is_lt()` / `.is_ge()` after it was untyped with it.  After
+monomorphization the same question was asked again on the concrete copy and
+answered there, so programs compiled; the answer was missing only where the
+monomorphizer plan needs it, before monomorphization.
+
+## Measured first
+
+A throwaway probe (`.objcmp/s88/probe1.patch`, reverted) printed, for every
+first-pass method call, whether it left an answer, and for the copy's bound
+the receiver's and the subject's type kind.  On a scratch project with a
+generic iterator and a plain one (`.objcmp/s88/u1d`):
+
+* `implement<I, A> Iterator<A> for TakeIter<I> where I: Iterator<A>`: the
+  subject `This::Item` stayed an unreduced projection.  The function that
+  answers the copy's bound resolved it in a fresh context holding `This`
+  only; reducing `TakeIter<I>::Item` from there needs `A`, which only a
+  where-clause on a still-generic `I` determines.  The copy's signature and
+  locals were resolved in the implementation's context, which binds `Item`
+  to `A` directly; the bound's subject never was.
+* An implementation whose item is a pointer (`Iterator<T*>`): the receiver
+  `value: T*` was peeled to `T` before the comparison and the subject `T*`
+  was not.
+* Copies whose item is a target parameter (`implement<T> Iterator<T> for
+  Cnt<T>`) or a concrete type already matched.
+* Both failing shapes are stdlib-wide: every build compiles every
+  `Iterator` implementation's copy.
+
+Corpus (`.objcmp/s88/corpus.sh`: the compiler, the tests tree, every
+project, example and tool, the unit leg, and each of the 179 negative files
+checked alone; 396 builds), unanswered first-pass visits at HEAD
+(`.objcmp/s88/cb/none-sites.txt`): `compare` 9,159 at each of
+`core/iter.cryo:181` and `:202`, and the `is_lt` / `is_ge` after them
+4,749 each.
+
+## What changed
+
+* `Resolver::resolve_func_signature`: a `where` clause's projection subject
+  is resolved with the signature, in its context, and kept on the
+  projection annotation (`ProjectionAnnotation.resolved`, a field that was
+  read and never written) when it reduced.  In an implementation's copy of
+  a default that context binds the implementation's associated types.  The
+  annotation's clone already drops the field, so a specialization resolves
+  its own.
+* `Cloner`: a copied function owns its bounds (`TraitBound.clone()`), as it
+  owns its parameters.  It shared the source's bound list, so every copy of
+  `min` had the one subject annotation; with the cache, the first
+  implementation's answer became every other's (measured: unanswered
+  copies rose from 27 to 42 on the scratch project before this).
+* `MethodBinding::default_copy_bound_return` replaces
+  `default_copy_bound_direction`: the subject is peeled as the receiver is,
+  and the bound's trait method's return is returned as well as noted.  The
+  stamp in `bind_method_on_receiver` and the abstract-receiver typing
+  (`lookup_method_through_param_bounds`, for a receiver that is one of the
+  block's parameters) both ask it, so the stamp and the call's type come
+  from one question.
+
+```cryo
+implement<I, A> trait Iterator<A> for struct TakeIter<I> where I: Iterator<A> { .. }
+// TakeIter's copy of `min`, where This::Item: Ord:
+if (value.compare(&best).is_lt()) { .. }
+// before: `compare` unanswered and untyped, `is_lt` unanswered
+// after:  `compare` stamped Ord (position 0) and typed Ordering, `is_lt` selected
+```
+
+## Evidence
+
+* The same corpus with the change (`.objcmp/s88/cf/`): exactly those four
+  sites leave the unanswered set (9,159 / 9,159 / 4,749 / 4,749 -> 0);
+  every other site's set is unchanged, and every build's exit code is the
+  one it had.  The base run's compiler entry was refused by the probe
+  compiler (a missing lint allowance in the tree it built, since fixed);
+  rebuilt alone (`selfb.out`), it differs from the after-run's only in the
+  same four sites.
+* What is still unanswered in template bodies: the five `.drop()` calls on
+  an unbounded parameter (`future/executor.cryo:208, 591`,
+  `thread/_module.cryo:224, 280, 410`), which the `drop_in_place` slice
+  owns; function-pointer field calls (`core/iter.cryo:285`,
+  `thread/local.cryo:128`) and a builtin `u64[]` push
+  (`thread/_module.cryo:718`), which are not method selections; and
+  `T::try_from(v).unwrap_or(fallback)` in `examples/09-json-config` (a
+  static call on a bounded parameter, untyped before monomorphization;
+  pre-existing, not followed).
+* No program changes: the post-monomorphization pass already answered these
+  calls on the concrete copy.  A program whose item type has an inherent
+  `compare` beside `Ord`'s, through `take(3).min()`, returns the `Ord`
+  answer at HEAD and with the change (`.objcmp/s88/u1t`).
+* `make verify ARGS="--baseline HEAD --require-identical"`
+  (`.verify/runs/20260930-201112`): 0 of 5,004 test objects and 0 of 1,126
+  examples moved; every gate OK.
+* Gates: lane, residue and spelling flow unchanged; §0 unchanged (the
+  replaced function keeps the name-taking count at 712).  Warnings: 344,
+  the same set (`cryo check`, compared as sets).

@@ -247,6 +247,56 @@ yet is recorded with the change that builds it, not here.
     selection**, one fixed rule like Rust's literal default: with
     `conv(i32)` and `conv(i64)`, `conv(1)` calls `conv(i32)`.
 
+62. **Under E0244's item-and-module tie there is no way to alias the
+    module, and that is accepted**: the writer renames one of them.
+
+63. **A braced import `import A::{ B }` where `B` is both an item of `A`
+    and a module `A::B` is an error too**, consistent with E0244; neither
+    the item nor the module wins.
+
+    ```cryo
+    import Shapes::{ Json };   // error, as `import Shapes::Json as J;` is (E0244)
+    ```
+
+64. **Brace exports restrict**: `export A::{ a };` exposes `a` and nothing
+    else of `A`, as `docs/cryo.md` section 14.5 says. The compiler is
+    fixed to match, with the breakage measured first.
+
+65. **A local declaration and an import of the same name in the same
+    namespace is E0205.** Neither the local winning silently nor an alias
+    being dropped silently is allowed.
+
+    ```cryo
+    import M::{ Tag };
+    type struct Tag {}        // error[E0205]
+    import Json as Loc;
+    type struct Loc {}        // error[E0205]
+    ```
+
+66. **A path continues through a module alias into its sub-modules.**
+
+    ```cryo
+    import Json as J;
+    const n: i32 = J::Inner::deep();   // Json::Inner::deep
+    ```
+
+67. **The E0214 help line for a free-function overload no signature
+    accepts is approved**: "an integer literal is `i32` where the overloads
+    differ in its type; write the type you mean with `as`".
+
+68. **A generic function or method used as a value infers its type
+    arguments from its use**, as in Rust: `const h = idf;`, `G::pick`, and
+    a generic owner's `W::get`. Today `const h = idf;` fails LLVM
+    verification.
+
+    ```cryo
+    function idf<T>(x: T) -> T { return x; }
+    const h: (i32) -> i32 = idf;   // idf::<i32>
+    ```
+
+69. **A float literal argument defaults to `f64` in overload selection
+    where the overloads differ**, mirroring ruling 61.
+
 ### 2026-09-29
 
 1. **A method call on a type parameter with no bound is an error.** Inside

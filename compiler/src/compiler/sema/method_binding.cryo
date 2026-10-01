@@ -364,6 +364,10 @@ type struct MethodBinding {
                 TypeRef::invalid(), !out.is_valid(), dir);
             if (!out.is_valid()) { out = r; }
         }
+        // In an implement block's copy of a trait default, a parameter of the
+        // block is what a projection the default bounds denotes.
+        const r: TypeRef = this.default_copy_bound_return(recv, method_name, dir);
+        if (!out.is_valid()) { out = r; }
         return out;
     }
 
@@ -493,48 +497,66 @@ type struct MethodBinding {
         return out;
     }
 
-    /// The trait a call in an implement block's copy of a trait default
-    /// names through a bound the default writes on a projection of `This`
-    /// (`value.compare(&best)` under `where This::Item: Ord` in `min`).  The
-    /// copy is made before the trait's body is walked, so it carries none of
-    /// the stamps that walk writes; in the copy, `This` is the implementing
-    /// type and the projection is the type it denotes for it, and a receiver
-    /// of that type is the bounded receiver the default was written on.
-    /// Invalid outside such a copy, when no bound's subject is the
-    /// receiver's type, or when two traits answer.
+    /// The return of `method_name` called in an implement block's copy of a
+    /// trait default, through a bound the default writes on a projection of
+    /// `This` (`value.compare(&best)` under `where This::Item: Ord` in
+    /// `min`); every trait such a bound answers through is noted in `dir`,
+    /// which names the call's trait when exactly one does.
+    /// The copy is made before the trait's body is walked, so it carries
+    /// none of the stamps that walk writes; in the copy, `This` is the
+    /// implementing type and the projection is the type it denotes for it,
+    /// and a receiver of that type is the bounded receiver the default was
+    /// written on.  Invalid outside such a copy, and when no bound's subject
+    /// is the receiver's type.
     ![allow(lookup_by_spelling, reason = "a method's leaf asked of the traits a bound names by identity, as every bound scan beside it asks")]
-    default_copy_bound_direction(mut &this, recv_type: TypeRef, method_name: SymbolStr) -> DefId {
+    default_copy_bound_return(mut &this, recv_type: TypeRef, method_name: SymbolStr,
+                              dir: BoundDirection*) -> TypeRef {
         const func: FunctionDeclNode* = this.state.current_func;
-        if (func == null || !func.is_synth_default || func.trait_bounds.length == 0) { return DefId::invalid(); }
-        if (this.ctx.type_resolver == null || !this.state.this_type.is_valid()) { return DefId::invalid(); }
-        mut recv: TypeRef = recv_type;
-        mut t: Type* = this.arena.lookup(recv);
-        mut depth: i32 = 0;
-        while (t != null && depth < 5) {
-            if (t.kind == TypeKind::Pointer) { recv = (t as PointerType*).pointee; }
-            else if (t.kind == TypeKind::Reference) { recv = (t as ReferenceType*).referent; }
-            else { break; }
-            t = this.arena.lookup(recv);
-            depth += 1;
-        }
-        mut dir: BoundDirection = BoundDirection::none();
+        if (func == null || !func.is_synth_default || func.trait_bounds.length == 0) { return TypeRef::invalid(); }
+        if (this.ctx.type_resolver == null || !this.state.this_type.is_valid()) { return TypeRef::invalid(); }
+        const recv: TypeRef = this.peel_all_indirection(recv_type);
+        mut out: TypeRef = TypeRef::invalid();
         mut ctx: ResolutionContext = ResolutionContext::new("");
         ctx.set_this_type(this.state.this_type);
         for (mut bi: i64 = 0; bi < func.trait_bounds.length; bi++) {
             const b: TraitBound* = &func.trait_bounds[bi];
             if (!b.has_projection_subject() || b.subject_type == null) { continue; }
-            const subject: TypeRef = this.reduce_assoc_projections(
-                this.ctx.type_resolver.resolve(b.subject_type, &ctx));
+            // The default's receiver is the projection itself, which carries
+            // no indirection to peel; in the copy the projection is a type
+            // that may (`T*`), and the receiver's peeling went through it.
+            const subject: TypeRef = this.peel_all_indirection(this.reduce_assoc_projections(
+                this.ctx.type_resolver.resolve(b.subject_type, &ctx)));
             if (!subject.is_valid() || !subject.equals(recv)) { continue; }
             for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
                 const tr: TraitRef* = &b.trait_refs[ti];
                 if (tr.path.length == 0 || tr.refused) { continue; }
                 mut ret: TypeRef = TypeRef::invalid();
                 const answered: DefId = this.bound_trait_declaring(tr, method_name, &ret);
+                if (!answered.is_valid()) { continue; }
                 dir.note(answered);
+                if (out.is_valid()) { continue; }
+                // The bound's arguments are the named trait's, not a
+                // supertrait's, so a supertrait's return has only `This`
+                // rebased.
+                if (answered.equals(tr.definition())) {
+                    ret = this.subst_bound_assoc_args(ret, tr.path[tr.path.length - 1], tr);
+                }
+                out = this.subst_this_in_trait_return(ret, recv_type);
             }
         }
-        return dir.named();
+        return out;
+    }
+
+    /// `t` with every pointer and reference around it peeled, as a method
+    /// call's receiver is.
+    peel_all_indirection(&this, t: TypeRef) -> TypeRef {
+        mut out: TypeRef = t;
+        for (mut depth: i32 = 0; depth < 5; depth++) {
+            const inner: TypeRef = this.types.peel_indirection(out);
+            if (!inner.is_valid()) { break; }
+            out = inner;
+        }
+        return out;
     }
 
     /// The trait that declares `method_name` for the bound `tr`: its own
