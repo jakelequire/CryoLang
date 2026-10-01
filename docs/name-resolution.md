@@ -54659,3 +54659,68 @@ type struct Array<T, A = GlobalAlloc> where A: Allocator {
   `Stdout`/`Stderr`, 242).
   Outside copies, nearly all are dynamic-array receivers (`parts.push(..)`
   on a `string[]`), which sema could not type before monomorphization.
+
+### 8.461 A trait method selected on a concrete receiver in a generic body is pinned where it is written, as an inherent one already was - 2026-10-01
+
+## Why
+
+Slice 6, calls in copies selected by name after monomorphization.  A
+census of those selections (probe S93N, after the trait-item path of
+`bind_method_on_receiver`, run `.objcmp/s93/c6`) counted 1,318 visits in
+copied bodies.  Their leading shapes were trait methods on a concrete
+receiver inside a generic body: `alloc.allocate(..)`/`deallocate(..)` on a
+local `GlobalAlloc` in `spawn_on<F, O>` (567), `h.finish()` on a
+`DefaultHasher` in `digest<T>` (153), `Str`'s `equals`/`compare` in
+`String<A>`'s `Eq`/`Ord` impls (240), `this.write_some(..)` on
+`Stdout`/`Stderr` in `Write::write<T>`'s copies (242).  The template walk
+selected these in the trait-method pass of `bind_method_on_receiver`,
+which - unlike the inherent pass - never called `pin_minted_method`, so
+they carried no template pin and every copy selected them again by name.
+A probe on `pin_minted_method` (`.objcmp/s93/h_p.log`) showed the three
+`01-hello` sites committed without ever reaching it.
+
+## What changed
+
+* The trait-restricted pass and the trait-set pass of
+  `bind_method_on_receiver` call `pin_minted_method` before committing, as
+  the inherent pass does: a method with no type parameters of its own,
+  selected on a minted receiver in a template walk, is recorded by its
+  definition and bound by identity in each copy (`bind_template_method`).
+
+```cryo
+function digest<T>(value: &T) -> u64 where T: Hash {
+    mut h: DefaultHasher = DefaultHasher::new();
+    value.hash(&h);
+    return h.finish();   // Hasher::finish of DefaultHasher, pinned in the template;
+}                        // digest<i32>'s copy binds it by identity
+```
+
+## Evidence
+
+* Census over the corpus (406 entries, driver `.objcmp/s93/corpus4.sh`):
+  post-mono selections by name in copied bodies 1,318 -> **34**; in other
+  bodies 3,816 -> 3,808 (`.objcmp/s93/c6` -> `c7`).
+* Agreement (probe S93A in `.objcmp/s93/state-probe-an.patch`: at every
+  post-mono `bind_template_method`, the pinned definition's entry on the
+  receiver against the by-name pick with the pin cleared): **66,877 agree,
+  0 disagree**; 5 with no entry, all in programs refused anyway
+  (`generic_receiver_alias_refused`,
+  `generic_receiver_other_instantiation_refused`, two E0358 negatives).
+  The probe's own re-selection by name raised E0156 in
+  `generic_body_call_keeps_written_answer` - the ambiguity the pin avoids;
+  without the probe that project builds and prints `written-answer ok`.
+* verify against HEAD (`.verify/runs/20261001-154741`): all gates OK;
+  objects **0 moved** of 5,501 test and 1,126 example objects, as
+  predicted.
+* Warnings 331, the same (code, file) multiset as HEAD.  Facts: compiler
+  records 78,658 -> 78,660 (the two new calls).
+
+## Remaining (slice 6)
+
+* 34 visits in copies still selected by name, and 3,808 in other bodies,
+  nearly all dynamic-array receivers: `parts.push(..)` on a `string[]` is
+  never selected before monomorphization (probe S93D on
+  `.objcmp/s93/da`: the receiver unwraps to the array type, no
+  `Array<string>` is registered yet, and selection returns nothing), so
+  it is first selected, by name, after it.  Completing that typing before
+  monomorphization is the fix (ruling 35).
