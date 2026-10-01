@@ -3043,6 +3043,12 @@ type struct CallResolver {
         if (call.named_method.is_valid()) {
             return this.bind_named_method(visitor, call, member, base_ref, owner_inst);
         }
+        // A call a generic body's template pinned is bound by that identity
+        // in each copy of the body whose receiver is minted.
+        if (call.template_method.is_valid() && !owner_inst.is_valid()
+                && !this.types.contains_generic_param(base_ref)) {
+            return this.bind_template_method(visitor, call, base_ref);
+        }
         if (!member.resolved_trait.is_valid()) {
             mut copied: BoundDirection = BoundDirection::none();
             this.binding.default_copy_bound_return(obj_type, member.member, &copied);
@@ -3137,6 +3143,32 @@ type struct CallResolver {
             return this.commit_selection(visitor, call, sel);
         }
         return Selection::none();
+    }
+
+    /// Record on a call in a generic body the method selected for it, when
+    /// that is an inherent method, with no type parameters of its own, of
+    /// the generic type the receiver is an unminted instantiation of: the
+    /// template's definition, which every copy of the body carries and the
+    /// binding after monomorphization maps to the receiver's copy
+    /// (`bind_template_method`).  Any other selection records nothing.
+    pin_template_method(&this, call: CallExprNode*, mn: MethodNode*, owner_inst: TypeRef) -> void {
+        if (mn.func == null || !mn.func.def.is_valid() || mn.func.generic_params.length > 0) { return; }
+        const base: TypeRef = this.arena.inst_generic_base(owner_inst);
+        if (!base.is_valid()) { return; }
+        if (!this.ctx.defs.parent_of(mn.func.def).equals(this.ctx.decl_index.registered_def(base))) { return; }
+        call.template_method = mn.func.def;
+    }
+
+    /// Bind a call carrying a template pin to the receiver's copy of the
+    /// pinned method, by identity: the copy the receiver's specialization
+    /// holds of the template's definition.  Nothing is selected by the
+    /// member's name.  A receiver with no copy leaves the call unbound,
+    /// which code generation refuses.
+    bind_template_method(mut &this, visitor: ASTVisitor*, call: CallExprNode*, recv: TypeRef) -> Selection {
+        const chosen: MethodNode* = this.ctx.decl_index.entry_method(
+            this.ctx.decl_index.method_entry_on(recv, call.template_method));
+        if (chosen == null) { return Selection::none(); }
+        return this.commit_selection(visitor, call, Selection::of(chosen));
     }
 
     /// Bind a call that names its method by definition - a method language
@@ -3356,7 +3388,11 @@ type struct CallResolver {
     /// `bind_method_on_receiver`.
     commit_selection(mut &this, visitor: ASTVisitor*, call: CallExprNode*, sel: Selection) -> Selection {
         const mn: MethodNode* = sel.chosen;
-        if (mn == null || sel.owner_inst.is_valid()) { return sel; }
+        if (mn == null) { return sel; }
+        if (sel.owner_inst.is_valid()) {
+            this.pin_template_method(call, mn, sel.owner_inst);
+            return sel;
+        }
         if (sel.tier == 3) {
             if (sel.info != null) {
                 this.apply_overload_converter_args(visitor, call, sel.info.param_types.as_slice());

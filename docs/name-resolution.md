@@ -434,7 +434,7 @@ Checks for this section, one per line so each can be copied whole:
 * `grep -c '^lane-selftest:' Makefile` → **1**
 * `grep -c '^check-fast: facts-check lane-check lane-selftest facts-selftest' Makefile` → **1** (§8.371: stale facts are REFUSED first, never regenerated - the facts target is the deliberate refresh - and the refusal's self-test runs; `facts-fresh`, which regenerated them, before, §8.366)
 * `python3 scripts/facts-selftest.py | tail -1 | grep -o '[0-9]* cases' | cut -d' ' -f1` → **12** (§8.371: the freshness check over a throwaway tree - an edited source, an added source and a missing inputs record refused, fresh facts and a non-source edit accepted, each through `facts.py --check` and through `facts_path`, which the lane gate and the residue check call - and a dry run of the lane-check and check-fast targets building nothing; with the staleness comparison deleted it fails 4 cases, with `lane-check` depending on `facts` it fails 2)
-* `ls -d tests/tests/projects/*/test.json | wc -l` → **155** (+1 in §8.451, `containers_release_payload_in_place`; 154 before, +2 in §8.450, `thread_detached_result_released_once`, `drop_on_unbounded_param_refused`; 152 before, +1 in §8.449, `generic_intrinsic_from_another_module`; 151 before, +1 in §8.448, `drop_in_place_releases_by_destructor`; 150 before, +2 in §8.446, `method_value_takes_receiver_first`, `method_value_inherent_trait_ambiguous`; 148 before, +4 in §8.445, `overload_qualified_call_selects`, `overload_qualified_call_no_match`, `overload_integer_literal_is_i32`, `overload_integer_literal_no_match`; 144 before, +6 in §8.444, `import_module_alias_resolves`, `import_module_alias_named_like_module`, `import_path_item_or_module_refused`, `import_path_item_or_module_explicit`, `export_alias_offers_item`, `export_alias_exported_twice`; 138 before, +2 in §8.443, `import_alias_binds_same_item`, `import_alias_imported_twice`; 136 before, +3 in §8.442, `import_type_and_function_same_leaf`, `import_type_tie_beside_function_refused`, `qualified_path_beside_bare_import`; 133 before, +1 in §8.441, `generic_body_calls_typed_before_mono`; 132 before, +1 in §8.440, `import_twice_refused_at_import`; 131 before, +1 in §8.436, `trait_method_through_field_in_generic_body`; 130 before, +2 in §8.434, `impl_qualified_path_in_generic_method`, `trait_impl_same_name_call_ambiguous`; 128 before, +1 in §8.432, `bound_path_names_declaring_trait`; 127 before, +2 in §8.431, `bound_call_through_index_field_projection`, `async_carried_local_released_at_return`; 125 before, +3 in §8.430, `private_function_field_call_refused`, `import_collision_qualified_use`, `import_collision_bare_use_refused`; 122 before, +3 in §8.429, `path_call_generic_method`, `static_path_generic_owner_ambiguous`, `unknown_trait_bound_no_cascade`, and `static_path_prefers_inherent_method` renamed to `static_path_inherent_trait_ambiguous`; 119 before, +1 in §8.428, `unknown_trait_refused_where_written`; 118 before, +3 and -1 in §8.427, `inherent_trait_method_ambiguous`, `inherent_trait_method_explicit`, `bound_call_names_bound_method`, and `inherent_method_over_trait` renamed to the first; 116 before, +2 in §8.424, `bounded_param_method_refused`, `supertrait_methods_through_bound`; 114 before, +1 in §8.423, `bufstream_releases_transport_once`; 113 before, +1 in §8.420, `unbounded_param_method_refused`; 112 before, +1 in §8.418, `type_declaration_bound_types_calls`; 111 before, +1 in §8.417, `trait_default_this_calls_typed`; 110 before, +1 in §8.412, `class_inherited_function_field_call`; 109 before, +1 in §8.410, `overload_receiver_consumes_by_pin`; 108 before, +3 in §8.405, `generic_function_named_like_type`, `generic_receiver_alias`, `generic_receiver_alias_refused`; 105 before, +1 in §8.404, `compare_with_null_refused`; 104 before, +2 in §8.403, `class_constructor_arguments_refused`, `class_constructor_overloads_by_arity`; 102 before, +3 in §8.402, `generic_receiver_by_type`, `generic_receiver_other_instantiation_refused`, `generic_function_type_argument`; 99 before, +2 in §8.401, `bare_type_as_value_refused`, `class_constructed_by_name`; +1 in §8.396, `array_method_argument_mismatch`; +3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
+* `ls -d tests/tests/projects/*/test.json | wc -l` → **156** (+1 in §8.452, `generic_body_call_keeps_written_answer`; 155 before, +1 in §8.451, `containers_release_payload_in_place`; 154 before, +2 in §8.450, `thread_detached_result_released_once`, `drop_on_unbounded_param_refused`; 152 before, +1 in §8.449, `generic_intrinsic_from_another_module`; 151 before, +1 in §8.448, `drop_in_place_releases_by_destructor`; 150 before, +2 in §8.446, `method_value_takes_receiver_first`, `method_value_inherent_trait_ambiguous`; 148 before, +4 in §8.445, `overload_qualified_call_selects`, `overload_qualified_call_no_match`, `overload_integer_literal_is_i32`, `overload_integer_literal_no_match`; 144 before, +6 in §8.444, `import_module_alias_resolves`, `import_module_alias_named_like_module`, `import_path_item_or_module_refused`, `import_path_item_or_module_explicit`, `export_alias_offers_item`, `export_alias_exported_twice`; 138 before, +2 in §8.443, `import_alias_binds_same_item`, `import_alias_imported_twice`; 136 before, +3 in §8.442, `import_type_and_function_same_leaf`, `import_type_tie_beside_function_refused`, `qualified_path_beside_bare_import`; 133 before, +1 in §8.441, `generic_body_calls_typed_before_mono`; 132 before, +1 in §8.440, `import_twice_refused_at_import`; 131 before, +1 in §8.436, `trait_method_through_field_in_generic_body`; 130 before, +2 in §8.434, `impl_qualified_path_in_generic_method`, `trait_impl_same_name_call_ambiguous`; 128 before, +1 in §8.432, `bound_path_names_declaring_trait`; 127 before, +2 in §8.431, `bound_call_through_index_field_projection`, `async_carried_local_released_at_return`; 125 before, +3 in §8.430, `private_function_field_call_refused`, `import_collision_qualified_use`, `import_collision_bare_use_refused`; 122 before, +3 in §8.429, `path_call_generic_method`, `static_path_generic_owner_ambiguous`, `unknown_trait_bound_no_cascade`, and `static_path_prefers_inherent_method` renamed to `static_path_inherent_trait_ambiguous`; 119 before, +1 in §8.428, `unknown_trait_refused_where_written`; 118 before, +3 and -1 in §8.427, `inherent_trait_method_ambiguous`, `inherent_trait_method_explicit`, `bound_call_names_bound_method`, and `inherent_method_over_trait` renamed to the first; 116 before, +2 in §8.424, `bounded_param_method_refused`, `supertrait_methods_through_bound`; 114 before, +1 in §8.423, `bufstream_releases_transport_once`; 113 before, +1 in §8.420, `unbounded_param_method_refused`; 112 before, +1 in §8.418, `type_declaration_bound_types_calls`; 111 before, +1 in §8.417, `trait_default_this_calls_typed`; 110 before, +1 in §8.412, `class_inherited_function_field_call`; 109 before, +1 in §8.410, `overload_receiver_consumes_by_pin`; 108 before, +3 in §8.405, `generic_function_named_like_type`, `generic_receiver_alias`, `generic_receiver_alias_refused`; 105 before, +1 in §8.404, `compare_with_null_refused`; 104 before, +2 in §8.403, `class_constructor_arguments_refused`, `class_constructor_overloads_by_arity`; 102 before, +3 in §8.402, `generic_receiver_by_type`, `generic_receiver_other_instantiation_refused`, `generic_function_type_argument`; 99 before, +2 in §8.401, `bare_type_as_value_refused`, `class_constructed_by_name`; +1 in §8.396, `array_method_argument_mismatch`; +3 in §8.395, `spelling_lint_refuses_unallowed`, `spelling_lint_allows_with_reason`, `spelling_lint_directive_shapes`; +2 in §8.394, `spelling_lint_empty_reason`, `spelling_lint_missing_reason`; +3 in §8.391, `match_string_pattern_on_struct`, `match_string_pattern_on_reference`, `match_char_range_on_reference`; +1 in §8.381, `static_call_undeclared_type`; +1 in §8.367, `import_type_beside_function_meets_module`; +1 in §8.362, `link_failure_carries_linker_report`; +1 in §8.361, `closure_struct_name_is_generated`; +1 in §8.358, `visibility_function_beside_type`; +1 in §8.356, `impl_field_method_through_receiver`; +1 in §8.352, `generic_caller_receiver_args`; +3 in §8.348, `impl_static_return_through_head`, `impl_derived_param_through_head`, `impl_method_bound_through_head`; +1 in §8.347, `impl_param_bound_through_head`; +1 in §8.336, `visibility_module_private`)
 * `ls tests/tests/negative/*.cryo | wc -l` → **227** (-4 in §8.336, the single-file E0353 negatives moved into `projects/visibility_module_private`; +1 in §8.335; +1 in §8.328; +1 in §8.311, +3 in §8.312, +1 in §8.313, +1 in §8.318, +1 in §8.320 - and one renamed there, E0358 → E0306 - +2 in §8.321, +1 in §8.322)
 * `grep -c 'runs-on: ubuntu-latest' .github/workflows/ci.yml` → **4** (of 5 jobs)
 * `grep -c '^cross-check:' Makefile` → **2** (one per host branch)* `grep -c 'branches: \[main\]' .github/workflows/ci.yml` → **2** (both hooks, `main` only; `grep -c 'branches:' .github/workflows/ci.yml` → **2** says there are no others)
@@ -53866,3 +53866,82 @@ type struct Holder { c: Counted; }                        // glue only
   `std::collections` calling `ptr::drop_in_place`
   (`error[E0353]`); both pins were refreshed from `3b4121d7` in `3823d75c`
   first (246/246 compiler objects byte-identical old pin vs new).
+
+### 8.452 A call a generic body's template pins to an inherent method keeps that answer in every specialization, bound by identity - 2026-10-01
+
+## Why
+
+The first piece of the monomorphizer conversion (`.objcmp/mono-design/DESIGN.md`
+slice 6): a template pin survives substitution and is mapped to the
+specialization's method by identity, so the call is not selected again by
+its member's name after monomorphization (rule 1).  The shape taken first is
+the one with an identity map already in the tree: a call whose receiver is
+an unminted instantiation of a generic type and whose selection there is an
+inherent method of that type with no type parameters of its own
+(`this.len()` in `Array<T>`).  `DeclarationIndex::method_entry_on(owner,
+def)` answers the specialization's copy of the template's definition, as it
+does for the method language items (`bind_named_method`).
+
+## What changed
+
+* `CallExprNode.template_method: DefId`: written by `commit_selection` when
+  the selection is made on an unminted instantiation
+  (`CallResolver::pin_template_method`: the method's definition's parent is
+  the instantiation's template, and the method has no type parameters);
+  copied by the cloner; never cleared by the substituter.
+* `bind_method_on_receiver`: a call carrying the pin, on a receiver that is
+  minted and mentions no type parameter, is bound by
+  `bind_template_method` (`method_entry_on`) and nothing else; no copy
+  leaves it unbound for code generation to refuse.
+* Mono's method finder chain is NOT skipped for these calls: skipping
+  `specialize_method_call` for them (as for `named_method`) makes the unit
+  build fail - `error[E0900]: unresolved generic instantiation after
+  monomorphization: 'std::core::result::Result<?, ?>'` twice - although
+  the chain answers nothing for a non-generic method; something before the
+  chain's answer (`derive_receiver_type`,
+  `canonicalize_default_template_recv`, the self-returning-default check)
+  has a side effect a later stage needs.  Not diagnosed; deleting the chain
+  must keep it.
+* New run project `generic_body_call_keeps_written_answer` (declared in
+  `tests/started-compiling`): the baseline re-selected `this.m()` in
+  `Bx<i32>`'s copy of `run` by name and refused it.
+
+```cryo
+type trait Tr { m(&this) -> i32; }
+type struct Bx<T> { v: T; }
+implement<T> struct Bx<T> {
+    m(&this) -> i32 { return 1; }
+    run(&this) -> i32 { return this.m(); }   // inherent `m`, where written
+}
+implement trait Tr for struct Bx<i32> { m(&this) -> i32 { return 2; } }
+Bx::<i32> { v: 0 }.run()   // 1; was error[E0156]: `m` is both an inherent method of `Bx<i32>` and provided by a trait implemented for it
+b.m()                      // on a `Bx<i32>` directly: still E0156
+```
+
+## Evidence
+
+* Measured at `44490db3` before the change (probe `.objcmp/s89/probe6.py`,
+  corpus `.objcmp/s89/corpus6.sh`: the compiler, `tests/`, every project,
+  example and tool, the unit leg, each negative; 401 entries): the
+  substituter nulls 15,758 method pins (`resolved_method` + callee),
+  154,037 path callee pins and 40,326 bare-call pins; mono's finder chain
+  answers step 1: 31, 2: 231, 3: 4, 4: 142, 5: 2,434, 6: 13, 7: 85,
+  8: 689, path 14, self-returning default 71, and nothing 76,748 times
+  (every answer a generic method); in placed specializations' bodies sema's
+  post-mono pass keeps a pin 26,452 times and selects by name 156,302 times
+  (104,287 pinned, 52,015 left unbound).  The compiler build alone: keeps
+  1,808, selects 7,943 + 1,152.
+* Agreement (probe `.objcmp/s89/probe6b.py`, the by-name selection run
+  beside the identity answer, same corpus): 66,437 agree, 0 disagree;
+  5 with no copy, all in programs that are refused anyway (2 negatives,
+  3 compile-fail projects), whose diagnostics are unchanged.  The compiler
+  build alone: 6,937 agree.
+* Mutation: `bind_template_method` answering nothing makes `examples/01-hello`
+  fail (`error[E0358]: no method named `next` found on type
+  `std::core::slice::SliceIter<u8>``, 18 times): nothing behind the identity
+  path selects by name.
+* `make verify ARGS="--baseline HEAD --require-identical"`
+  (`.verify/runs/20261001-004526`): the baseline refuses only the declared
+  project; 0 of 5,227 test objects and 0 of 1,126 examples moved; every
+  gate OK.
+* Warnings: 331, the same set (`cryo check src/main.cryo`).
