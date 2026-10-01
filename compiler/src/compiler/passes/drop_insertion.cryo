@@ -1560,7 +1560,7 @@ type struct DropInserter {
         // (after the subject is consumed, so a moved subject-local is excluded)
         // for the guard's cleanup landing pad.  `cleanup_out` is the match
         // node's `unwind_cleanup` array (null only if the caller opts out).
-        if (this.ctx.project_panic_unwind && cleanup_out != null) {
+        if (this.ctx.options.unwinds() && cleanup_out != null) {
             this.snapshot_unwind_cleanup(cleanup_out);
         }
 
@@ -4009,7 +4009,7 @@ type struct DropInserter {
                 // call's landing pad AFTER read_call has recorded its own
                 // receiver/arg moves, so a local moved into the call is
                 // excluded (the callee owns it now).
-                if (this.ctx.project_panic_unwind) { this.populate_unwind_cleanup(c); }
+                if (this.ctx.options.unwinds()) { this.populate_unwind_cleanup(c); }
             }
             NodeKind::BinaryExpression   => { this.read_binary(expr as BinaryExprNode*);               }
             NodeKind::UnaryExpression    => { this.read_unary(expr as UnaryExprNode*);                 }
@@ -4159,7 +4159,7 @@ type struct DropInserter {
         // origin nested in a LATER argument drops them (the callee never ran).
         // The frame is closed when the call is fully walked, so the call's own
         // unwind_cleanup (snapshotted after) correctly excludes them.
-        if (this.ctx.project_panic_unwind) { this.open_pending_arg_frame(); }
+        if (this.ctx.options.unwinds()) { this.open_pending_arg_frame(); }
         // General consuming-method case: any method whose receiver is
         // by-value (`mut this` / `this`) or that carries
         // `![sink]` consumes the LHS at the call site.
@@ -4189,7 +4189,7 @@ type struct DropInserter {
                 // A consumed bare-identifier receiver is a pending arg too: on a
                 // panic in a later positional argument it was moved out but the
                 // callee never took it, so it must be dropped.
-                if (this.ctx.project_panic_unwind) { this.record_pending_arg(ma.object); }
+                if (this.ctx.options.unwinds()) { this.record_pending_arg(ma.object); }
                 receiver_moved = true;
             }
         }
@@ -4198,7 +4198,7 @@ type struct DropInserter {
         }
         for (mut i: i64 = 0; i < c.arguments.length; i++) {
             const transferred: boolean = this.walk_argument(c.arguments[i]);
-            if (transferred && this.ctx.project_panic_unwind) {
+            if (transferred && this.ctx.options.unwinds()) {
                 this.record_pending_arg(c.arguments[i]);
             }
         }
@@ -4207,7 +4207,7 @@ type struct DropInserter {
         // caller) must not drop them. Any panic origin walked while the frame was
         // open (a nested call/binary/etc. in a later argument) already captured
         // them in its own schedule.
-        if (this.ctx.project_panic_unwind) { this.close_pending_arg_frame(); }
+        if (this.ctx.options.unwinds()) { this.close_pending_arg_frame(); }
     }
 
     read_binary(mut &this, b: BinaryExprNode*) -> void {
@@ -4249,7 +4249,7 @@ type struct DropInserter {
         // cleanup landing pad runs them.  An operator-overloaded form
         // (desugared_call set) lowers instead to an ordinary call that carries
         // its own schedule.
-        if (this.ctx.project_panic_unwind && b.desugared_call == null
+        if (this.ctx.options.unwinds() && b.desugared_call == null
             && (b.op.kind == TokenType::Slash        || b.op.kind == TokenType::Percent
              || b.op.kind == TokenType::SlashEqual   || b.op.kind == TokenType::PercentEqual)) {
             this.snapshot_unwind_cleanup(&b.unwind_cleanup);
@@ -4275,7 +4275,7 @@ type struct DropInserter {
         // for its cleanup landing pad.  Operator-overloaded indexing
         // (desugared_call set) lowers to an ordinary call with its own schedule;
         // pointer/tuple indexing carry an unused (harmless) schedule.
-        if (this.ctx.project_panic_unwind && aa.desugared_call == null) {
+        if (this.ctx.options.unwinds() && aa.desugared_call == null) {
             this.snapshot_unwind_cleanup(&aa.unwind_cleanup);
         }
     }
@@ -4339,7 +4339,7 @@ type struct DropInserter {
         if (n.array_size != null)  { this.walk_expr_read(n.array_size); }
         // `--panic=unwind`: `new T[n]` emits a size-overflow guard that raises;
         // snapshot the frame's live-local drops for its cleanup landing pad.
-        if (this.ctx.project_panic_unwind && n.array_size != null) {
+        if (this.ctx.options.unwinds() && n.array_size != null) {
             this.snapshot_unwind_cleanup(&n.unwind_cleanup);
         }
     }
@@ -4366,7 +4366,7 @@ type struct DropInsertionPass {
         if (root == null) { return PassResult::ok(); }
         mut inserter: DropInserter = DropInserter::new(ctx);
         inserter.walk_program(root);
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug(Text::new("[DropInsertion] %lld drops inserted, %lld diagnostics emitted\n"),
                 inserter.inserted, inserter.fired);
         }

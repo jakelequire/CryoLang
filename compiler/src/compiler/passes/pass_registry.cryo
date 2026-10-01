@@ -571,18 +571,18 @@ type struct PassRegistry {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         const source_path: string = ctx.source_file;
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug(Text::new("[Lexing] Tokenizing: %s\n"), source_path);
         }
 
         // LSP in-memory mode.  Two sources of in-memory content:
         //
-        //   (a) Single-file LSP entry (`compile_for_lsp_content_into`)
+        //   (a) Single-file LSP entry (`compile_for_lsp_content`)
         //       pre-populates `ctx.artifacts.tokens.source_content` for the
         //       one file it knows about.  Used by tooling that drives the
         //       compiler against a single buffer with no project context.
         //
-        //   (b) Multi-module LSP entry (`compile_for_lsp_project_into`)
+        //   (b) Multi-module LSP entry (`compile_for_lsp_project`)
         //       sets `ctx.lsp_override_path` and `ctx.lsp_override_content`
         //       so the orchestrator can keep iterating every module from
         //       disk while the ONE module the user is editing reads from
@@ -596,10 +596,17 @@ type struct PassRegistry {
         // leaked as a NUL-terminated `string` (via `into_raw`) so token
         // lexemes pointing into it stay valid for the rest of compilation.
         mut inmem_content: string = "";
-        if (ctx.lsp_override_path.length() > 0
-                && ctx.lsp_override_path.eq(source_path)) {
-            inmem_content = ctx.lsp_override_content;
-        } else if (ctx.artifacts.tokens.source_content != "") {
+        mut overridden: boolean = false;
+        match (ctx.options.source_override) {
+            Option::Some(o) => {
+                if (o.path.length() > 0 && o.path.eq(source_path)) {
+                    inmem_content = o.content;
+                    overridden = true;
+                }
+            }
+            Option::None => { }
+        }
+        if (!overridden && ctx.artifacts.tokens.source_content != "") {
             inmem_content = ctx.artifacts.tokens.source_content;
         }
         const inmem_mode: boolean =
@@ -727,7 +734,7 @@ type struct PassRegistry {
     static run_parsing_pass(ctx: CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug(Text::new("[Parsing] Parsing: %s\n"), ctx.source_file);
         }
 
@@ -759,7 +766,7 @@ type struct PassRegistry {
         LOG_DEBUG(LogComponent::Parser, "[Parsing] readback: ctx.artifacts.ast.root=%p",
             ctx.artifacts.ast.root);
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug(Text::new("[Parsing] Produced AST with %d top-level statements\n"),
                 root.statements.length);
         }
@@ -792,7 +799,7 @@ type struct PassRegistry {
     static run_type_declaration_pass(ctx: CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug(Text::new("[TypeDeclaration] Initializing type system and collecting declarations\n"));
         }
 
@@ -809,7 +816,7 @@ type struct PassRegistry {
         // Get the AST root
         const root: ProgramNode* = ctx.artifacts.ast.root;
         if (root == null) {
-            if (ctx.debug_mode) {
+            if (ctx.options.verbose) {
                 cdebug(Text::new("[TypeDeclaration] No AST root available, skipping\n"));
             }
             return PassResult::ok();
@@ -1036,7 +1043,7 @@ type struct PassRegistry {
         // index is asked (`ResBase::primitive_of_alias`), so no key holds
         // a second spelling of one type.
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug(Text::new("[TypeDeclaration] Created %lld type declarations (%lld total types in arena)\n"),
                 type_count, arena.type_count());
         }
@@ -1114,10 +1121,10 @@ type struct PassRegistry {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
         // No auto-imports in modes that disable them (Raw, StdlibBatch)
-        if (!ctx.mode.auto_imports_enabled()) {
-            if (ctx.debug_mode) {
+        if (!ctx.options.mode.auto_imports_enabled()) {
+            if (ctx.options.verbose) {
                 cdebug(Text::new("[AutoImport] Skipped: auto-imports disabled for mode '%s'\n"),
-                    ctx.mode.label());
+                    ctx.options.mode.label());
             }
             return PassResult::ok();
         }
@@ -1129,8 +1136,8 @@ type struct PassRegistry {
 
         // Check no_std from project config (stored on context)
         // If no_std is true, skip prelude injection
-        if (ctx.project_no_std) {
-            if (ctx.debug_mode) {
+        if (ctx.options.no_std) {
+            if (ctx.options.verbose) {
                 cdebug(Text::new("[AutoImport] Skipped: no_std is set\n"));
             }
             return PassResult::ok();
@@ -1143,7 +1150,7 @@ type struct PassRegistry {
         // multi-module compilations of stdlib sources.
         const ns: string = root.namespace_name;
         if (ns.starts_with("std::")) {
-            if (ctx.debug_mode) {
+            if (ctx.options.verbose) {
                 cdebug(Text::new("[AutoImport] Skipped: stdlib module '%s'\n"), ns);
             }
             return PassResult::ok();
@@ -1167,7 +1174,7 @@ type struct PassRegistry {
                 with_interp.push(root.statements[fi]);
             }
             root.statements = with_interp;
-            if (ctx.debug_mode) {
+            if (ctx.options.verbose) {
                 cdebug(Text::new("[AutoImport] Injected 'import std::fmt::interp' (f-string used)\n"));
             }
         }
@@ -1186,7 +1193,7 @@ type struct PassRegistry {
                 const imp: ImportDeclNode* = stmt as ImportDeclNode*;
                 if (imp.module_path.eq(prelude_path)
                     && imp.style == ImportStyle::Wildcard) {
-                    if (ctx.debug_mode) {
+                    if (ctx.options.verbose) {
                         cdebug(Text::new("[AutoImport] Skipped: explicit 'import std::prelude' already present\n"));
                     }
                     return PassResult::ok();
@@ -1207,7 +1214,7 @@ type struct PassRegistry {
         }
         root.statements = new_stmts;
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug(Text::new("[AutoImport] Injected 'import std::prelude' (%lld statements total)\n"),
                 root.statements.length);
         }
@@ -1242,7 +1249,7 @@ type struct PassRegistry {
         const graph: ModuleGraph* = ctx.module_graph;
         const single_file_mode: boolean = graph.module_count() == 0;
         mut sf_loader: ModuleLoader = ModuleLoader::new(
-            "", ctx.source_file, ctx.stdlib_root, ctx.project_no_std, []);
+            "", ctx.source_file, ctx.options.stdlib_root, ctx.options.no_std, []);
 
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
@@ -1253,7 +1260,7 @@ type struct PassRegistry {
             const module_path: string = import_node.module_path;
             import_count += 1;
 
-            if (ctx.debug_mode) {
+            if (ctx.options.verbose) {
                 cdebug(Text::new("[ImportResolution] Validating import: '%s'\n"), module_path);
             }
 
@@ -1272,7 +1279,7 @@ type struct PassRegistry {
             }
         }
 
-        if (ctx.debug_mode) {
+        if (ctx.options.verbose) {
             cdebug(Text::new("[ImportResolution] Validated %lld imports (%lld errors)\n"),
                 import_count, error_count);
         }

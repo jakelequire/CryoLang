@@ -42,7 +42,6 @@ import std::collections::hashmap::{ HashMap };
 
 import std::alloc::arena;
 
-import compiler::compile_mode;
 import compiler::compilation_context;
 import compiler::instance;
 import compiler::codegen::ast_arena;
@@ -216,13 +215,10 @@ type struct CompilerSession {
         // (hover/completion strings) land in libc and are freed as usual.
         ast_arena::cryo_alloc_arena_set_active(true);
 
-        // Allocate a fresh CompilationContext on the heap with mode=Lsp.  With
-        // routing active this - and the whole context - lands in `this.arena`.
-        const ctx_box: Box<compilation_context::CompilationContext> =
-            Box::<compilation_context::CompilationContext>::new(
-                compilation_context::CompilationContext::new(compile_mode::CompileMode::Lsp, path_cstr));
-        this.ctx = ctx_box.leak();
-        // `ctx` now reflects `content`; clear the pending-edit flag.
+        // The compile makes its context with routing active, so it - and the
+        // whole context - lands in `this.arena`.
+        this.ctx = null;
+        // `ctx` will reflect `content`; clear the pending-edit flag.
         this.needs_recompile = false;
 
         if (this.config_buf.length() == 0) {
@@ -230,21 +226,23 @@ type struct CompilerSession {
             // user gets lex / parse / AST-validation / name-resolution
             // diagnostics; later passes can't run because cross-file
             // types are invalid.
-            mut r_sf: instance::CompilationResult = this.instance.compile_for_lsp_content_into(
-                this.ctx, Text::new(path_cstr), Text::new(content_cstr));
+            const b_sf: instance::ProjectBuild = this.instance.compile_for_lsp_content(
+                Text::new(path_cstr), Text::new(content_cstr));
+            this.ctx = b_sf.ctx;
             // Compile done: turn routing OFF so handler-side allocations between
             // now and the next recompile use libc (and are freed as usual),
             // leaving the arena holding only this compile's ctx for the handlers
             // to walk until the next recompile's reset reclaims it.
             ast_arena::cryo_alloc_arena_set_active(false);
-            return r_sf;
+            return b_sf.result;
         }
 
         const config_cstr: string = this.config_buf.as_ptr() as string;
-        mut r_proj: instance::CompilationResult = this.instance.compile_for_lsp_project_into(
-            this.ctx, Text::new(config_cstr), Text::new(path_cstr), Text::new(content_cstr));
+        const b_proj: instance::ProjectBuild = this.instance.compile_for_lsp_project(
+            Text::new(config_cstr), Text::new(path_cstr), Text::new(content_cstr));
+        this.ctx = b_proj.ctx;
         ast_arena::cryo_alloc_arena_set_active(false);
-        return r_proj;
+        return b_proj.result;
     }
 }
 

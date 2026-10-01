@@ -63,7 +63,10 @@ import compiler::codegen::passes::{
     codegen_emit_job, CodegenPasses, emit_worker_entry, EmitJob, EmitTarget, EmitWorkerCtx
 };
 import compiler::codegen::test_main_codegen::{ TestMainCodegen };
-import compiler::compilation_context::{ CompilationContext, OutputKind };
+import compiler::compilation_context::{
+    BuildOptions, CompilationContext, HeapBackend, OutputKind, OutputOverride, PanicMode,
+    Runtime, SourceOverride
+};
 import compiler::compile_mode::{ CompileMode };
 import compiler::diag::{ ErrorCode };
 import compiler::module_graph::{ ModuleInfo, ModuleOrigin };
@@ -142,7 +145,7 @@ type struct CompilerConfig {
     /// 0..3). `-1` means "unset" => fall back to cryoconfig `[compiler]
     /// optimize`. Takes priority over the cryoconfig value so a single
     /// project can be built optimized or debuggable without editing the
-    /// file. Read in `compile_project_with_ctx`.
+    /// file. Read in `run_project`.
     opt_level_override:  i32;
     /// `-g` / `--debug-info`: emit DWARF debug info (source file/line +
     /// per-function scopes) so gdb/lldb can show file:line backtraces.
@@ -305,6 +308,13 @@ type struct CompilationResult {
     }
 }
 
+/// A compile's result and the context it ran in, which the caller owns;
+/// `ctx` is null when the build failed before a context was made.
+type struct ProjectBuild {
+    result: CompilationResult;
+    ctx:    CompilationContext*;
+}
+
 
 // Stdlib root resolution
 //
@@ -446,7 +456,7 @@ type struct CompilerInstance {
         // to stderr would (a) try to read source from disk via the
         // diag span's `file:` URI path and (b) print colour codes that
         // confuse the editor's log capture.
-        const skip_flush: boolean = match (ctx.mode) {
+        const skip_flush: boolean = match (ctx.options.mode) {
             CompileMode::Lsp => { true }
             _                => { false }
         };
@@ -530,7 +540,7 @@ type struct CompilerInstance {
             config.output_dir = fmt::format("%s/build", config.project_root);
         }
         // CLI `--target=TRIPLE`; `--opt-level` / `-g` / profile flags
-        // flow through `this.config` inside compile_project_with_ctx,
+        // flow through `this.config` inside run_project,
         // exactly as they do for a cryoconfig build.
         if (this.config.target_triple_override.length() > 0) {
             config.target_triple = this.config.target_triple_override;
@@ -560,16 +570,17 @@ type struct CompilerInstance {
             return CompilationResult::failed(1, 0);
         }
 
-        mut ctx: CompilationContext = CompilationContext::new(CompileMode::Raw, source);
-        ctx.debug_mode = this.config.debug;
-        ctx.target_triple = this.config.target_triple_override;
-        ctx.output_path_override = this.config.output_path_override;
-        ctx.output_kind          = this.config.output_kind;
+        mut options: BuildOptions = BuildOptions::defaults(CompileMode::Raw);
+        options.verbose = this.config.debug;
+        options.target_triple = this.config.target_triple_override;
+        options.output = OutputOverride::from_cli(this.config.output_kind,
+                                                  Text::new(this.config.output_path_override));
+        mut ctx: CompilationContext = CompilationContext::new(options, source, null);
         // Raw mode runs full codegen (IRGen/ObjectEmission), so it shares the
         // process-wide (TypeRef.id -> LLVMTypeRef) cache. TypeArena.next_id
         // resets to 1 per compile, so a prior compile's entries would alias
         // unrelated types here. Every other codegen entry resets it
-        // (compile_project_with_ctx, compile_for_lsp_content_into); raw was the
+        // (run_project, compile_for_lsp_content); raw was the
         // one that didn't.
         compiler::codegen::type_map::TypeMapperCache::reset_shared_type_cache();
         compiler::codegen::ast_arena::cryo_ast_arena_reset();
@@ -585,7 +596,7 @@ type struct CompilerInstance {
     /// every warning including the unknown-directive warning.
     ///
     /// This routes through the SAME multi-module project driver as
-    /// `compile_file` / `cryo build` (via `compile_project_with_ctx`), differing
+    /// `compile_file` / `cryo build` (via `run_project`), differing
     /// only in `CompileMode::Check`, which gates codegen off after TypeLowering.
     /// The earlier single-file frontend pipeline (`build_frontend_pipeline` over
     /// one module) never loaded the imported stdlib modules, so a reference to a
@@ -619,11 +630,7 @@ type struct CompilerInstance {
             return CompilationResult::failed(1, 0);
         }
 
-        const _box_ctx: Box<CompilationContext> = Box::<CompilationContext>::new(
-            CompilationContext::new(CompileMode::Check, root_path));
-        mut ctx: CompilationContext* = _box_ctx.leak();
-        ctx.debug_mode = this.config.debug;
-        return this.compile_project_with_ctx(ctx, config);
+        return this.compile_project_to_context(config, CompileMode::Check, Option::None).result;
     }
 
     /// Compile for LSP: frontend + semantic analysis, no codegen.
@@ -634,39 +641,41 @@ type struct CompilerInstance {
         }
 
         mangled_name::set_lsp_safe(true);
-        mut ctx: CompilationContext = CompilationContext::new(CompileMode::Lsp, source);
+        mut ctx: CompilationContext = CompilationContext::new(
+            BuildOptions::defaults(CompileMode::Lsp), source, null);
         mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
         return this.run_pipeline(&ctx, &pipeline, Text::new(""));
     }
 
 
-    /// Compile for LSP into a caller-owned context.
+    /// Compile for LSP, returning the context to the caller.
     /// Single-file mode: parses + type-checks just the one file the
     /// editor is showing, with no project context.  Cross-file
     /// references resolve to invalid TypeRefs; in LSP-safe mode the
     /// mangler emits a poison sentinel instead of panicking, so this
     /// path can run post-NameResolution passes without crashing the
     /// daemon.  Used as a fallback when we can't find a cryoconfig.
-    /// For real diagnostics, route through `compile_for_lsp_project_into`.
-    compile_for_lsp_content_into(&this, ctx: CompilationContext*,
-                                 virtual_path_text: Text, content_text: Text) -> CompilationResult {
+    /// For real diagnostics, route through `compile_for_lsp_project`.
+    compile_for_lsp_content(&this, virtual_path_text: Text,
+                            content_text: Text) -> ProjectBuild {
         mangled_name::set_lsp_safe(true);
+        const _box_ctx: Box<CompilationContext> = Box::<CompilationContext>::new(
+            CompilationContext::new(BuildOptions::defaults(CompileMode::Lsp),
+                                    virtual_path_text.as_string(), null));
+        mut ctx: CompilationContext* = _box_ctx.leak();
         // Same risk as the multi-target build path: TypeArena.next_id
         // resets every compile, so without clearing the (TypeRef.id ->
         // LLVMTypeRef) cache between LSP recompiles every fresh TypeRef
         // would alias a stale entry from a prior keystroke's compile.
         compiler::codegen::type_map::TypeMapperCache::reset_shared_type_cache();
         // NB: the arena is NOT reset here.  The LSP session owns the arena
-        // lifecycle - it resets + activates routing before constructing `ctx`
-        // (so this single-file path's whole container heap - intern strings,
-        // resolver maps, type tables, decl index - is arena-backed and bulk
-        // reclaimed by the next recompile, instead of leaking to libc every
-        // keystroke as it did when this path reset but never activated routing)
-        // and deactivates on return.  Resetting here would free the just-built,
-        // session-owned `ctx` out from under this compile.
+        // lifecycle - it resets + activates routing before calling this, so
+        // `ctx` and its whole container heap are arena-backed and reclaimed by
+        // the next recompile.  Resetting here would free them mid-compile.
         ctx.artifacts.tokens = TokenStream::new([], virtual_path_text, content_text);
         mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
-        return this.run_pipeline(ctx, &pipeline, Text::new(""));
+        const result: CompilationResult = this.run_pipeline(ctx, &pipeline, Text::new(""));
+        return ProjectBuild { result: result, ctx: ctx };
     }
 
     /// Compile a whole project for the LSP, with one module's source
@@ -680,15 +689,12 @@ type struct CompilerInstance {
     /// The LSP uses this for diagnostics, hover, go-to-def, and
     /// completion.  Codegen is gated off via `CompileMode::Lsp` so
     /// no LLVM IR is emitted; everything stops cleanly at TypeLowering.
-    compile_for_lsp_project_into(&this, ctx: CompilationContext*,
-                                 config_path_text: Text,
-                                 override_path_text: Text,
-                                 override_content_text: Text) -> CompilationResult {
+    compile_for_lsp_project(&this, config_path_text: Text,
+                            override_path_text: Text,
+                            override_content_text: Text) -> ProjectBuild {
         const override_content: string = override_content_text.as_string();
         const override_path: string = override_path_text.as_string();
         mangled_name::set_lsp_safe(true);
-        ctx.lsp_override_path    = override_path;
-        ctx.lsp_override_content = override_content;
         mut config: ProjectConfig = ProjectConfig::parse(config_path_text);
         if (this.config.output_dir_override != ""
                 && this.config.output_dir_override.length() > 0) {
@@ -733,7 +739,8 @@ type struct CompilerInstance {
                 config = CompilerInstance::make_bin_view(config, sel);
             }
         }
-        return this.compile_project_with_ctx(ctx, config);
+        return this.compile_project_to_context(config, CompileMode::Lsp,
+            Option::Some(SourceOverride { path: override_path, content: override_content }));
     }
 
     /// Switch to a module AND load its AST from the local buffers.
@@ -844,7 +851,7 @@ type struct CompilerInstance {
         // compiler `[lib]`).  Rather than run a second full `[lib]` compile,
         // the FIRST bin derives `lib<lib.name>.a` from its own object set
         // (minus its entry module) after it links - see
-        // `bundle_lib_from_bin` and `compile_project_with_ctx`.  The bin's
+        // `bundle_lib_from_bin` and `run_project`.  The bin's
         // compile is unchanged, so the executable stays byte-identical; only
         // the redundant lib pass is dropped.  A `[lib]` with no `[[bin]]`
         // (library-only project) still gets its own full compile below.
@@ -964,20 +971,19 @@ type struct CompilerInstance {
                 _                   => { CompileMode::MultiModule }
             }
         };
-        const _box_ctx: Box<CompilationContext> = Box::<CompilationContext>::new(
-            CompilationContext::new(mode, root_path));
-        mut ctx: CompilationContext* = _box_ctx.leak();
-        mut result: CompilationResult = this.compile_project_with_ctx(ctx, config);
+        const build: ProjectBuild = this.compile_project_to_context(config, mode, Option::None);
+        mut result: CompilationResult = build.result;
         // Per-target teardown.  Copy the survivor strings out of any
         // context-owned (interned) storage FIRST, then reclaim this target's
         // heap so a multi-target (`[lib]` + `[[bin]]`) build does not stack
         // both contexts into peak RSS.  Ordering matters: the dup must run
         // while the interned bytes are still valid, before the teardown frees
-        // them.  The LSP entry (`compile_project_with_ctx`) bypasses this
-        // method and keeps its context alive.
+        // them.  The LSP keeps its context alive and never comes through here.
         result.output_path = CompilerInstance::dup_survivor(result.output_path);
         result.stdlib_root = CompilerInstance::dup_survivor(result.stdlib_root);
-        ctx.release_per_target();
+        if (build.ctx != null) {
+            build.ctx.release_per_target();
+        }
         // Release this target's arena chunks back to the OS (the bulk of the
         // per-target heap) so the next target builds from a low baseline
         // instead of climbing on top of the prior target's retained arena.
@@ -985,21 +991,90 @@ type struct CompilerInstance {
         return result;
     }
 
-    /// Drive the multi-module orchestration against a caller-provided
-    /// context.  Lets the language server compile the whole project
-    /// (every module, every phase) while keeping the resulting `ctx`
-    /// alive afterwards so hover / definition / completion handlers
-    /// can walk the populated AST + resolver + type arena.
-    ///
-    /// The caller is responsible for:
-    ///   - Allocating `ctx` (heap, via `Box::leak`) with the correct
-    ///     `CompileMode`: `Lsp` for the language server entry,
-    ///     whatever `compile_project_with_config` picks for CLI builds.
-    ///   - Setting `ctx.lsp_override_path` + `ctx.lsp_override_content`
-    ///     before this call when the editor buffer should win over
-    ///     the on-disk version of one of the discovered modules.
-    compile_project_with_ctx(&this, ctx: CompilationContext*,
-                             mut config: ProjectConfig) -> CompilationResult {
+    /// Resolve the build's options from the CLI and `config`, make the
+    /// context from them, and run the whole project in it.  The context is
+    /// returned so the language server can walk it after the compile; it is
+    /// null when the build failed before one was made.
+    compile_project_to_context(&this, mut config: ProjectConfig, mode: CompileMode,
+                               source_override: Option<SourceOverride>) -> ProjectBuild {
+        // Precedence: CLI `--release`/`--dev`/`--profile=NAME` > cryoconfig
+        // `[profile] default` > built-in `release`.  Set before the clone
+        // below, so the per-profile cache subtree is the same everywhere.
+        if (this.config.profile_override.length() > 0) {
+            config.profile = this.config.profile_override;
+        }
+
+        // Priority: CLI -> $CRYO_STDLIB -> $CRYO_HOME -> binary-relative ->
+        // cryoconfig stdlib_root -> legacy fallbacks.
+        mut stdlib_root: string = "";
+        if (!config.no_std) {
+            mut tried: string[] = [];
+            stdlib_root = CompilerInstance::resolve_stdlib_root(
+                Text::new(this.config.stdlib_path_override),
+                Text::new(config.stdlib_root),
+                Text::new(config.project_root),
+                &tried);
+            if (stdlib_root.length() > 0) {
+                cdebug(Text::new("[Compiler] Stdlib root: %s\n"), stdlib_root);
+            } else {
+                // No prelude available: hard-fail rather than silently
+                // compile a project that can't see `Result`, `String`,
+                // etc.  Pass `--no-std` (or set `no_std = true` in
+                // cryoconfig) for genuinely freestanding builds.
+                fmt::eprintf("error: cannot locate the Cryo standard library\n");
+                fmt::eprintf("  none of the candidate paths contained a 'lib.cryo':\n");
+                for (mut ti: i64 = 0; ti < tried.length; ti++) {
+                    fmt::eprintln(f"    {tried[ti]}");
+                }
+                fmt::eprintf("  fix one of:\n");
+                fmt::eprintf("    --stdlib=PATH                            (one-off override)\n");
+                fmt::eprintf("    export CRYO_STDLIB=/path/to/stdlib       (explicit env)\n");
+                fmt::eprintf("    export CRYO_HOME=/path/to/install        (install root; stdlib at $CRYO_HOME/stdlib)\n");
+                fmt::eprintf("    [project] stdlib_root = \"...\"            (in cryoconfig; relative to project_root)\n");
+                fmt::eprintf("    --no-std                                 (build without the standard library)\n");
+                return ProjectBuild { result: CompilationResult::failed(1, 0), ctx: null };
+            }
+        }
+
+        mut options: BuildOptions = BuildOptions::defaults(mode);
+        options.verbose = this.config.debug;
+        options.output = OutputOverride::from_cli(this.config.output_kind,
+                                                  Text::new(this.config.output_path_override));
+        // Base from the profile (debug => O0, release => O2); an explicit
+        // `[compiler] optimize` wins over it, and `--opt-level=N` over both.
+        options.opt_level = ProjectConfig::profile_base_opt_level(config.profile);
+        if (config.opt_level_explicit) {
+            options.opt_level = config.opt_level;
+        }
+        if (this.config.opt_level_override >= 0) {
+            mut lvl: i32 = this.config.opt_level_override;
+            if (lvl > 3) { lvl = 3; }
+            options.opt_level = lvl as u32;
+        }
+        options.debug_info = ProjectConfig::profile_base_debug_info(config.profile)
+            || this.config.emit_debug_info;
+        options.no_std = config.no_std;
+        options.runtime = if (config.no_runtime) { Runtime::Freestanding } else { Runtime::Hosted };
+        options.panic = if (config.resolve_panic_unwind()) { PanicMode::Unwind } else { PanicMode::Abort };
+        options.heap = if (config.native_alloc) { HeapBackend::Native } else { HeapBackend::Libc };
+        options.stdlib_root = stdlib_root;
+        options.target_triple = config.target_triple;
+        options.static_link = this.config.release_static;
+        options.emit_facts = this.config.emit_facts;
+        options.source_override = source_override;
+
+        // An independent clone, so the local `config` stays usable below.
+        const _box_config: Box<ProjectConfig> = Box::<ProjectConfig>::new(config.clone());
+        const _box_ctx: Box<CompilationContext> = Box::<CompilationContext>::new(
+            CompilationContext::new(options, config.discovery_root_path(), _box_config.leak()));
+        mut ctx: CompilationContext* = _box_ctx.leak();
+        const result: CompilationResult = this.run_project(ctx, config);
+        return ProjectBuild { result: result, ctx: ctx };
+    }
+
+    /// Drive the multi-module orchestration in `ctx`, made from `config`.
+    run_project(&this, ctx: CompilationContext*,
+                mut config: ProjectConfig) -> CompilationResult {
         // Drop any cached (TypeRef.id -> LLVMTypeRef) entries from a prior
         // compile in this process.  TypeArena.next_id resets to 1 every
         // compile, so without this every fresh TypeRef would alias a
@@ -1020,7 +1095,7 @@ type struct CompilerInstance {
         // would free that session-owned ctx mid-compile, and deactivating here
         // would push discovery/frontend allocations back to libc (the very leak
         // this arrangement fixes).  So both are gated to the non-LSP build path.
-        const lsp_owns_arena: boolean = match (ctx.mode) {
+        const lsp_owns_arena: boolean = match (ctx.options.mode) {
             CompileMode::Lsp => { true }
             _                => { false }
         };
@@ -1050,91 +1125,7 @@ type struct CompilerInstance {
         mut tm_link_end:       i64 = 0;
 
         const root_path: string = config.discovery_root_path();
-        ctx.debug_mode = this.config.debug;
-
-        // Single-file `-o PATH` redirect.  compile_file sets these on
-        // the CompilerConfig; cryoconfig project builds leave them
-        // empty.  ObjectEmission applies the override to the ENTRY
-        // module's artifact and Linking mirrors the executable to the
-        // override path (Exe) or skips the link entirely (Object /
-        // Asm / IRText).
-        ctx.output_path_override = this.config.output_path_override;
-        ctx.output_kind          = this.config.output_kind;
-
-        // Resolve the build profile. Precedence: CLI `--release`/`--dev`/
-        // `--profile=NAME` > cryoconfig `[profile] default` > built-in
-        // `release`. The selected name flows into `config.profile` BEFORE the
-        // clone below, so the per-profile cache subtree
-        // (`<output_dir>/target/<profile>/`) is consistent across codegen,
-        // linking, and the manifest.
-        if (this.config.profile_override.length() > 0) {
-            config.profile = this.config.profile_override;
-        }
-
-        // Optimization level. Base comes from the profile (debug => O0,
-        // release => O2); an explicit `[compiler] optimize` wins over the
-        // profile, and `--opt-level=N` wins over everything.
-        ctx.opt_level = ProjectConfig::profile_base_opt_level(config.profile);
-        if (config.opt_level_explicit) {
-            ctx.opt_level = config.opt_level;
-        }
-        if (this.config.opt_level_override >= 0) {
-            mut lvl: i32 = this.config.opt_level_override;
-            if (lvl > 3) { lvl = 3; }
-            ctx.opt_level = lvl as u32;
-        }
-        // Debug info: base from the profile (debug => on), forced on by
-        // `-g` / `--debug-info` regardless of profile.
-        ctx.emit_debug_info = ProjectConfig::profile_base_debug_info(config.profile)
-            || this.config.emit_debug_info;
-        ctx.project_no_std = config.no_std;
-        ctx.project_no_runtime = config.no_runtime;
-        ctx.project_panic_unwind = config.resolve_panic_unwind();
-        ctx.target_triple = config.target_triple;
-        // Distribution-only static link (see CompilerConfig.release_static).
-        // Consumed at link time; has no effect on emitted IR.
-        ctx.release_static = this.config.release_static;
-        ctx.emit_facts = this.config.emit_facts;
-
-        // Box an independent clone so the local `config` stays usable for the
-        // rest of this function (stdlib resolution, dep scan, loader setup);
-        // the leaked box owns the copy that lives for `ctx`'s lifetime.
-        const _box_config: Box<ProjectConfig> = Box::<ProjectConfig>::new(config.clone());
-        ctx.set_project_config(_box_config.leak());
-
-        // Resolve stdlib root.  See resolve_stdlib_root above for the
-        // full priority chain (CLI -> $CRYO_STDLIB -> $CRYO_HOME ->
-        // binary-relative -> cryoconfig stdlib_root -> legacy fallbacks).
-        mut stdlib_root: string = "";
-        if (!config.no_std) {
-            mut tried: string[] = [];
-            stdlib_root = CompilerInstance::resolve_stdlib_root(
-                Text::new(this.config.stdlib_path_override),
-                Text::new(config.stdlib_root),
-                Text::new(config.project_root),
-                &tried);
-            if (stdlib_root.length() > 0) {
-                cdebug(Text::new("[Compiler] Stdlib root: %s\n"), stdlib_root);
-            } else {
-                // No prelude available: hard-fail rather than silently
-                // compile a project that can't see `Result`, `String`,
-                // etc.  Pass `--no-std` (or set `no_std = true` in
-                // cryoconfig) for genuinely freestanding builds.
-                fmt::eprintf("error: cannot locate the Cryo standard library\n");
-                fmt::eprintf("  none of the candidate paths contained a 'lib.cryo':\n");
-                for (mut ti: i64 = 0; ti < tried.length; ti++) {
-                    fmt::eprintln(f"    {tried[ti]}");
-                }
-                fmt::eprintf("  fix one of:\n");
-                fmt::eprintf("    --stdlib=PATH                            (one-off override)\n");
-                fmt::eprintf("    export CRYO_STDLIB=/path/to/stdlib       (explicit env)\n");
-                fmt::eprintf("    export CRYO_HOME=/path/to/install        (install root; stdlib at $CRYO_HOME/stdlib)\n");
-                fmt::eprintf("    [project] stdlib_root = \"...\"            (in cryoconfig; relative to project_root)\n");
-                fmt::eprintf("    --no-std                                 (build without the standard library)\n");
-                return CompilationResult::failed(1, 0);
-            }
-        }
-        ctx.stdlib_root = stdlib_root;
+        const stdlib_root: string = ctx.options.stdlib_root;
 
         // NB (LSP): the language server owns the per-recompile arena lifecycle at
         // the SESSION level (`CompilerSession::recompile`): it resets the arena
@@ -1206,9 +1197,9 @@ type struct CompilerInstance {
         // *now*, not whatever's on disk.  Without this, a freshly
         // typed `import std::collections::str` is invisible to the
         // discovery walk and `Str::from` fails to resolve.
-        if (ctx.lsp_override_path.length() > 0) {
-            loader.set_lsp_override(
-                ctx.lsp_override_path, ctx.lsp_override_content);
+        match (ctx.options.source_override) {
+            Option::Some(o) => { loader.set_lsp_override(o.path, o.content); }
+            Option::None    => { }
         }
 
         const discovery_ok: boolean = loader.discover_project(
@@ -1226,7 +1217,7 @@ type struct CompilerInstance {
             // LSP mode owns stdout for JSON-RPC, so we skip rendering
             // there and let the LSP's diagnostic-publish path surface
             // the same diagnostics through `textDocument/publishDiagnostics`.
-            const skip_flush_disc: boolean = match (ctx.mode) {
+            const skip_flush_disc: boolean = match (ctx.options.mode) {
                 CompileMode::Lsp => { true }
                 _                => { false }
             };
@@ -1274,7 +1265,7 @@ type struct CompilerInstance {
         // auto-imports are enabled.  Module discovery runs before AutoImport
         // injects the synthetic `import std::prelude`, so prelude submodules
         // wouldn't otherwise be discovered.
-        if (ctx.mode.auto_imports_enabled() && !config.no_std && stdlib_root.length() > 0) {
+        if (ctx.options.mode.auto_imports_enabled() && !config.no_std && stdlib_root.length() > 0) {
             const prelude_path: string = stdlib_root + "/prelude.cryo";
             if (metadata::exists(Path::from(prelude_path))) {
                 loader.discover_module(
@@ -1291,7 +1282,7 @@ type struct CompilerInstance {
         // entry points (`std::env`, `std::test::runner`) so they reach the
         // DI; the synthesized test main names them by their index entry,
         // which does not exist otherwise.
-        if (ctx.mode.skip_user_main()) {
+        if (ctx.options.mode.skip_user_main()) {
             const tests_dir: string = fmt::format("%s/tests", config.project_root);
             if (metadata::exists(Path::from(tests_dir))) {
                 loader.scan_all_project_files(tests_dir, this.config.debug);
@@ -1332,7 +1323,7 @@ type struct CompilerInstance {
         // for symbol visibility; this (gated on the same usage) puts the
         // module in the graph so it links, since the injection happens after
         // discovery.
-        if (ctx.mode.auto_imports_enabled() && !config.no_std
+        if (ctx.options.mode.auto_imports_enabled() && !config.no_std
                 && stdlib_root.length() > 0
                 && ctx.module_graph.uses_fstring) {
             const interp_path: string = stdlib_root + "/fmt/interp.cryo";
@@ -1593,7 +1584,7 @@ type struct CompilerInstance {
         // could otherwise report "up to date" while the user's deleted
         // or stale `-o` output is never regenerated.
         const do_incremental: boolean =
-            this.config.incremental && ctx.mode.codegen_enabled()
+            this.config.incremental && ctx.options.mode.codegen_enabled()
             && this.config.output_path_override.length() == 0;
         mut mod_entries: build_manifest::ModuleEntry[] = [];
         mut manifest_artifacts: string[] = [];
@@ -1626,7 +1617,7 @@ type struct CompilerInstance {
                 // be linked rather than a flat path another target may own.
                 manifest_stdlib_archive = CodegenPasses::stdlib_archive_path(
                     Text::new(stdlib_root),
-                    Text::new(LTargetMachine::resolve_effective_triple(Text::new(ctx.target_triple))));
+                    Text::new(LTargetMachine::resolve_effective_triple(Text::new(ctx.options.target_triple))));
             }
             // Final artifact path(s) this build will produce.  For
             // executables, require BOTH the hoisted build-root binary (index
@@ -1653,7 +1644,7 @@ type struct CompilerInstance {
                 manifest_artifacts.push(ctx.project_config.lib_archive_path(Text::new(archive_name)));
             }
             const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
-                ctx.project_config, ctx.opt_level, ctx.emit_debug_info,
+                ctx.project_config, ctx.options.opt_level, ctx.options.debug_info,
                 Text::new(manifest_stdlib_archive));
             const build_fp: u128 = manifest.compute_fingerprint(&mod_entries);
             build_fp_hex = compiler::build_manifest::Manifest::hex128(build_fp);
@@ -1669,7 +1660,7 @@ type struct CompilerInstance {
                 };
                 fmt::println(f"{config.project_name} is up to date ({config.profile})");
                 mut utd_result: CompilationResult = CompilationResult::ok(Text::new(up_to_date_out));
-                utd_result.stdlib_root = ctx.stdlib_root;
+                utd_result.stdlib_root = ctx.options.stdlib_root;
                 return utd_result;
             }
         }
@@ -1682,7 +1673,7 @@ type struct CompilerInstance {
         // heap-leaked CompilationContext.  Placed AFTER the up-to-date
         // short-circuit and every pre-pass error return (those stay inactive)
         // and AFTER the cross-reset survivors are built (the ProjectConfig
-        // clone at ~844, ctx.stdlib_root at ~879).  Deactivated before result
+        // clone at ~844, ctx.options.stdlib_root at ~879).  Deactivated before result
         // construction below (success) and in `project_failure_release` (every
         // pass-failure path), so the active flag never leaks past a target.
         compiler::codegen::ast_arena::cryo_alloc_arena_set_active(true);
@@ -1704,7 +1695,7 @@ type struct CompilerInstance {
         // pages (RSS never drops), so an editing session climbs even though the
         // context is logically freed each compile.  Skipping the create avoids
         // that entirely; the null disposes downstream are no-ops.
-        match (ctx.mode) {
+        match (ctx.options.mode) {
             CompileMode::Lsp => { }
             _ => { compiler::codegen::llvm_types::set_codegen_context_new(); }
         }
@@ -1836,7 +1827,7 @@ type struct CompilerInstance {
             }
 
             const pm_tool_fp: u128 = compiler::build_manifest::Manifest::toolchain_fingerprint(
-                ctx.project_config, ctx.opt_level, ctx.emit_debug_info);
+                ctx.project_config, ctx.options.opt_level, ctx.options.debug_info);
 
             // Spec ownership.  A spec whose owner can't be attributed to a
             // module would let a stale .o win, so disable the cache (full
@@ -1912,7 +1903,7 @@ type struct CompilerInstance {
             mut pm_implicit: boolean[] = [];
             for (mut i: u32 = 0; i < n; i++) { pm_implicit.push(false); }
             mut pm_implicit_short: boolean = false;
-            if (ctx.mode.auto_imports_enabled() && !config.no_std) {
+            if (ctx.options.mode.auto_imports_enabled() && !config.no_std) {
                 this.mark_implicit_closure(ctx, LangModule::Prelude.path(), n,
                                            &pm_implicit, &pm_implicit_short);
                 if (ctx.module_graph.uses_fstring) {
@@ -2084,15 +2075,15 @@ type struct CompilerInstance {
         // Each module gets its own LLVM module. Cross-module references are
         // resolved through SymbolResolver.
         cdebug(Text::new("[Compiler] Codegen gate: phase6_failed=%d, codegen_enabled=%d, errors=%u\n"),
-            phase6_failed as int, ctx.mode.codegen_enabled() as int, ctx.diagnostics.error_count);
-        if (!phase6_failed && ctx.mode.codegen_enabled()) {
+            phase6_failed as int, ctx.options.mode.codegen_enabled() as int, ctx.diagnostics.error_count);
+        if (!phase6_failed && ctx.options.mode.codegen_enabled()) {
             cdebug(Text::new("[Compiler] Codegen: %u modules\n"), n);
 
             // Concise per-package build summary.  Codegen only runs on a real
             // (non-short-circuited) build and never under LSP, so this is safe
             // to print to stdout.  Test mode owns its own runner output, so
             // skip the summary there to keep `cryo test` output clean.
-            if (!ctx.mode.skip_user_main()) {
+            if (!ctx.options.mode.skip_user_main()) {
                 mut n_std: u32 = 0;
                 mut n_local: u32 = 0;
                 mut n_dep: u32 = 0;
@@ -2392,7 +2383,7 @@ type struct CompilerInstance {
                 // identical to a serial build.
                 const cg_tri: string = CodegenPasses::effective_triple(ctx);
                 mut cg_tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
-                    Text::new(cg_tri), ctx.opt_level as i32);
+                    Text::new(cg_tri), ctx.options.opt_level as i32);
                 cg_jobs.push(EmitJob {
                     llvm_module:     ctx.artifacts.ir.llvm_module,
                     llvm_context:    compiler::codegen::llvm_types::current_codegen_context(),
@@ -2400,7 +2391,7 @@ type struct CompilerInstance {
                     emit_path:       tgt.emit_path,
                     emit_type:       tgt.emit_type,
                     triple:          cg_tri,
-                    opt_level:       ctx.opt_level,
+                    opt_level:       ctx.options.opt_level,
                     should_register: tgt.should_register,
                     ok:              false,
                     err_msg:         null as string
@@ -2483,7 +2474,7 @@ type struct CompilerInstance {
                 const manifest: string = fmt::format("%s/.cryo_emit_manifest.txt", mf_dir);
                 const mp_triple: string = CodegenPasses::effective_triple(ctx);
                 const emit_ok: boolean = CodegenPasses::run_multiprocess_emit(
-                    &mp_bc, &mp_obj, Text::new(mp_triple), ctx.opt_level, cg_threads,
+                    &mp_bc, &mp_obj, Text::new(mp_triple), ctx.options.opt_level, cg_threads,
                     Text::new(self_exe), Text::new(manifest));
                 if (!emit_ok) { cg_failed = true; }
                 for (mut k: i64 = 0; k < mp_pos.length as i64; k++) {
@@ -2514,7 +2505,7 @@ type struct CompilerInstance {
             // Walks the directive registry for `![test]` records, builds
             // a fresh LLVM module containing the descriptor table + main,
             // emits it to disk, and registers it with the linker artifacts.
-            if (!ctx.diagnostics.has_errors() && ctx.mode.skip_user_main()) {
+            if (!ctx.diagnostics.has_errors() && ctx.options.mode.skip_user_main()) {
                 cdebug(Text::new("[Compiler] test-main synthesis: Synthesizing test main\n"));
                 const test_result: PassResult = TestMainCodegen::run_test_main_codegen(ctx);
                 if (!test_result.success) {
@@ -2645,7 +2636,7 @@ type struct CompilerInstance {
 
         CompilerInstance::report_unstamped_decls(ctx);
 
-        const skip_flush: boolean = match (ctx.mode) {
+        const skip_flush: boolean = match (ctx.options.mode) {
             CompileMode::Lsp => { true }
             _                => { false }
         };
@@ -2701,7 +2692,7 @@ type struct CompilerInstance {
         // before the frontend ran. Side files only; no effect on the IR.
         if (do_incremental && ctx.project_config != null) {
             const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
-                ctx.project_config, ctx.opt_level, ctx.emit_debug_info,
+                ctx.project_config, ctx.options.opt_level, ctx.options.debug_info,
                 Text::new(manifest_stdlib_archive));
             manifest.write_fingerprint(Text::new(build_fp_hex));
             manifest.write_manifest(&mod_entries, Text::new(build_fp_hex), &manifest_artifacts);
@@ -2746,7 +2737,7 @@ type struct CompilerInstance {
         }
 
         mut ok_result: CompilationResult = CompilationResult::ok(Text::new(exe_path));
-        ok_result.stdlib_root = ctx.stdlib_root;
+        ok_result.stdlib_root = ctx.options.stdlib_root;
         libc::free(ast_buf);
         return ok_result;
     }
@@ -2754,7 +2745,7 @@ type struct CompilerInstance {
     // ========================================================================
     // Multi-module stage drivers
     //
-    // `compile_project_with_ctx` runs the pipeline one STAGE at a time across
+    // `run_project` runs the pipeline one STAGE at a time across
     // ALL modules before advancing, rather than one module through all stages.
     // Cross-module invariants force this: e.g. every template must be
     // registered (register_templates) before any module's default-expansion
@@ -3238,9 +3229,9 @@ type struct CompilerInstance {
     }
 
     /// Release the per-module AST / scope buffers allocated by
-    /// `compile_project_with_ctx` and forward to `project_failure`.
+    /// `run_project` and forward to `project_failure`.
     /// Used at every failure return inside the orchestrator so the
-    /// LSP daemon (which calls back into `compile_project_with_ctx`
+    /// LSP daemon (which calls back into `run_project`
     /// once per project change) does not leak ~16 bytes per module
     /// per recompile.
     project_failure_release(&this, ctx: CompilationContext*,
@@ -3248,7 +3239,7 @@ type struct CompilerInstance {
             -> CompilationResult {
         // Per-target arena: DEACTIVATE (failure path).  This is the single
         // chokepoint for all 12 pass-failure returns in
-        // compile_project_with_ctx, so the active flag never leaks past a
+        // run_project, so the active flag never leaks past a
         // failed target into the next target's survivor construction.
         compiler::codegen::ast_arena::cryo_alloc_arena_set_active(false);
         // Dispose this target's LLVM context too (frees any modules/types
@@ -3280,12 +3271,12 @@ type struct CompilerInstance {
         }
     }
     project_failure(&this, ctx: CompilationContext*) -> CompilationResult {
-        // Same LSP-mode skip as the success path in compile_project_with_ctx:
+        // Same LSP-mode skip as the success path in run_project:
         // the renderer's stderr stream may be `NULL` when the compiler runs
         // as a library inside another process.  The diagnostic array stays
         // populated for the LSP to read and emit as JSON.
         CompilerInstance::report_unstamped_decls(ctx);
-        const skip_flush: boolean = match (ctx.mode) {
+        const skip_flush: boolean = match (ctx.options.mode) {
             CompileMode::Lsp => { true }
             _                => { false }
         };

@@ -78,6 +78,149 @@ implement enum OutputKind {
     }
 }
 
+/// A single-file `-o PATH`: the artifact kind comes with its path.
+type enum OutputOverride {
+    Default;
+    Object(string);
+    Asm(string);
+    IRText(string);
+    Exe(string);
+}
+
+implement enum OutputOverride {
+    static from_cli(kind: OutputKind, path_text: Text) -> OutputOverride {
+        const path: string = path_text.as_string();
+        return match (kind) {
+            OutputKind::None   => { OutputOverride::Default }
+            OutputKind::Object => { OutputOverride::Object(path) }
+            OutputKind::Asm    => { OutputOverride::Asm(path) }
+            OutputKind::IRText => { OutputOverride::IRText(path) }
+            OutputKind::Exe    => { OutputOverride::Exe(path) }
+        };
+    }
+
+    /// The path `-o` named; empty for `Default`.
+    path(&this) -> string {
+        return match (this) {
+            OutputOverride::Default   => { "" }
+            OutputOverride::Object(p) => { p }
+            OutputOverride::Asm(p)    => { p }
+            OutputOverride::IRText(p) => { p }
+            OutputOverride::Exe(p)    => { p }
+        };
+    }
+
+    is_exe(&this) -> boolean {
+        return match (this) {
+            OutputOverride::Exe(_) => { true }
+            _                      => { false }
+        };
+    }
+
+    /// An object, assembly or IR file written straight by emission, with
+    /// nothing to link.
+    is_unlinked_artifact(&this) -> boolean {
+        return match (this) {
+            OutputOverride::Object(_) => { true }
+            OutputOverride::Asm(_)    => { true }
+            OutputOverride::IRText(_) => { true }
+            _                         => { false }
+        };
+    }
+}
+
+/// How a panic leaves the function that raised it.
+type enum PanicMode {
+    Abort;
+    Unwind;
+}
+
+/// Whether the program runs on the Cryo runtime or stands alone.
+type enum Runtime {
+    Hosted;
+    Freestanding;
+}
+
+/// Where `GlobalAlloc` gets its memory.
+type enum HeapBackend {
+    Libc;
+    Native;
+}
+
+/// Editor-buffer contents that replace one module's file on disk.
+type struct SourceOverride {
+    path:    string;
+    content: string;
+}
+
+/// What the build was asked for: CLI flags merged over cryoconfig, complete
+/// before the context is made and never written after.
+type struct BuildOptions {
+public:
+    mode:          CompileMode;
+    /// `--debug`: the compiler's own trace logging.
+    verbose:       boolean;
+    /// 0 (none) .. 3 (aggressive): the IR pipeline and the backend level.
+    opt_level:     u32;
+    /// `-g`: DWARF debug info.
+    debug_info:    boolean;
+    runtime:       Runtime;
+    panic:         PanicMode;
+    heap:          HeapBackend;
+    no_std:        boolean;
+    /// Where `lib.cryo` lives; empty when no stdlib was resolved.
+    stdlib_root:   string;
+    /// Empty when building for the host.
+    target_triple: string;
+    /// `--release-static`: link libLLVM and the C++ runtime statically.
+    static_link:   boolean;
+    /// `--emit=facts`.
+    emit_facts:    boolean;
+    output:        OutputOverride;
+    /// The LSP's unsaved buffer for one module.
+    source_override: Option<SourceOverride>;
+
+    static defaults(mode: CompileMode) -> BuildOptions {
+        return BuildOptions {
+            mode:            mode,
+            verbose:         false,
+            opt_level:       2,
+            debug_info:      false,
+            runtime:         Runtime::Hosted,
+            panic:           PanicMode::Abort,
+            heap:            HeapBackend::Libc,
+            no_std:          false,
+            stdlib_root:     "",
+            target_triple:   "",
+            static_link:     false,
+            emit_facts:      false,
+            output:          OutputOverride::Default,
+            source_override: Option::None,
+        };
+    }
+
+    unwinds(&this) -> boolean {
+        return match (this.panic) {
+            PanicMode::Unwind => { true }
+            PanicMode::Abort  => { false }
+        };
+    }
+
+    freestanding(&this) -> boolean {
+        return match (this.runtime) {
+            Runtime::Freestanding => { true }
+            Runtime::Hosted       => { false }
+        };
+    }
+
+    native_heap(&this) -> boolean {
+        return match (this.heap) {
+            HeapBackend::Native => { true }
+            HeapBackend::Libc   => { false }
+        };
+    }
+}
+
 /// What one file can see under a module spelling.
 ///
 /// `visible` and `matched` are kept apart because they answer different
@@ -101,22 +244,10 @@ type struct ModuleSpellingMatch {
 
 type struct CompilationContext {
 public:
-    mode:              CompileMode;
+    options:           BuildOptions;
     /// The file of the module the pipeline stands in; moved by
     /// `switch_to_module`.
     source_file:       string;
-    debug_mode:        boolean;
-    /// LLVM optimization level for this compilation: 0 (none/debuggable)
-    /// .. 3 (aggressive). Drives both the IR pass pipeline
-    /// (`default<O{n}>`, skipped entirely at 0) and the TargetMachine's
-    /// backend codegen level. Defaults to 2; set from cryoconfig
-    /// `[compiler] optimize` (true=>2, false=>0) or a `--opt-level=N`
-    /// CLI override in `compile_project_with_ctx`.
-    opt_level:         u32;
-    /// Emit DWARF debug info (gated by `-g`/--debug-info). Off by default.
-    /// Read by codegen to create a DICompileUnit + per-function
-    /// DISubprograms and attach source locations.
-    emit_debug_info:   boolean;
     /// The module the unit being compiled declares: set when the
     /// orchestrator switches to a module, and, while sema walks a
     /// specialization placed from another module, that template's module.
@@ -140,8 +271,7 @@ public:
     decl_index: DeclarationIndex*;
 
     /// Folded module-level integer constants, shared across modules: a fixed
-    /// array size may name a constant declared
-    // in an imported module, and imports are name-resolved first.
+    /// array size may name a constant declared in an imported module.
     const_table: ConstantTable*;
 
     // -- Injected specialization origin tracking --
@@ -186,73 +316,13 @@ public:
     // -- Type system (initialized lazily by TypeDeclaration pass) --
     type_arena: TypeArena*;
 
-    // -- Project configuration (multi-module mode) --
+    /// The driver's view of cryoconfig; passes read `options`.  Null for a
+    /// compile with no project.
     project_config:      ProjectConfig*;
-    project_no_std:      boolean;
-    /// `[compiler] no_runtime` (cryoconfig): freestanding build.  Read by
-    /// codegen to suppress the `main`-widening / `set_args`/`set_env`
-    /// prologue and the `@panic` runtime, and by the linker pass to drop
-    /// crt0 / libc / `libcryo.a`.  Also queryable from `![config(no_runtime)]`
-    /// gates via ConfigGating.  Default false.
-    project_no_runtime:  boolean;
-    /// `[compiler] panic = "unwind"` / CLI `--panic=unwind`: select DWARF
-    /// unwinding.  Read by codegen to emit invoke/landingpad cleanup edges and
-    /// attach `__cryo_personality_v0`, and by the linker pass to link the
-    /// `panic/unwind` runtime tier + libunwind instead of `panic/abort`.
-    /// Default false = abort (emitted IR is byte-identical to before).
-    project_panic_unwind:  boolean;
-    /// `[low_level] native_alloc` (cryoconfig): route `GlobalAlloc` through
-    /// the native mmap-backed heap instead of libc malloc.  Read by
-    /// ConfigGating to evaluate `![config(native_alloc)]` gates.  Default
-    /// false => libc-backed (Low-Level Plan Stage 3).  A temporary
-    /// migration switch, deleted once the native heap is proven (the
-    /// `native_syscalls` switch already completed that lifecycle).
-    native_alloc:        boolean;
     active_module_index: i64;
-    /// Resolved stdlib root: where `lib.cryo` lives.  Set by Instance
-    /// after `resolve_stdlib_root` runs; the linker reads
-    /// `<stdlib_root>/.bin/libcryo.a` from here so installed and
-    /// in-repo cryo invocations both link against the right archive.
-    /// Empty string <=> no stdlib (e.g. no_std project, or unresolved).
-    stdlib_root:         string;
-    /// Resolved cross-compilation target triple, or empty string when
-    /// building for the host.  Set by Instance after merging CLI
-    /// `--target=...` over `[project] target = "..."`.  Codegen reads
-    /// this in `run_ir_generation` to call `LLVMSetTarget`; the linker
-    /// pass compares it to the host triple to decide whether to skip
-    /// the `cc` shellout (cross-compile object files cannot be linked
-    /// by the host linker without a target-aware toolchain).
-    target_triple:       string;
-    /// `--release-static`: link statically against libLLVM + a static C++
-    /// runtime so the produced compiler binary has no `libLLVM-20.so` runtime
-    /// dependency.  Distribution-only; default false keeps the dynamic dev
-    /// link.  Read in `CodegenPasses::run_linking`; does not affect IR.
-    release_static:      boolean;
-    /// `--emit=facts`: body checking records one line per argument a call
-    /// passes to a parameter that carries a spelling (`sema::call_facts`),
-    /// and the build writes them beside its artifacts.  Off, nothing is
-    /// recorded and `facts` stays empty.
-    emit_facts:          boolean;
+    /// One line per argument a call passes to a spelling-typed parameter,
+    /// recorded while `options.emit_facts` is on.
     facts:               string[];
-    /// Single-file `-o PATH` override.  Set by `compile_file` from
-    /// `CompilerConfig::output_path_override`.  Empty string => no
-    /// override (per-origin `target/<profile>/<origin>/deps/<module>.o`).  Read by
-    /// `run_object_emission` to redirect emission and by the
-    /// single-file Exe flow to drive `cc` for final linking.
-    output_path_override: string;
-    /// Single-file output kind selector.  Mirrors
-    /// `CompilerConfig::output_kind`.  `OutputKind::None` <=> no `-o`.
-    output_kind:         OutputKind;
-
-    /// LSP in-memory source override.  When the Lexing pass switches
-    /// to the module whose `source_file` equals `lsp_override_path`,
-    /// it reads from `lsp_override_content` instead of the file on
-    /// disk, letting the language server compile what's currently
-    /// in the editor buffer (which may diverge from what's saved)
-    /// while every OTHER module in the project loads from disk.
-    /// Empty `lsp_override_path` (the default) disables the override.
-    lsp_override_path:    string;
-    lsp_override_content: string;
 
     // Owned components (initialized lazily by passes that need them).
     // Public because passes across the compiler reach into the context
@@ -264,8 +334,8 @@ public:
     monomorphizer:        Monomorphizer*;
     directive_registry:   DirectiveRegistry*;
 
-    /// Create a new compilation context for the given mode and source file.
-    static new(mode: CompileMode, source_file: string) -> CompilationContext {
+    static new(options: BuildOptions, source_file: string,
+               project_config: ProjectConfig*) -> CompilationContext {
         // Boxed for a stable address: the components point at each other.
         const _box_renderer: Box<DiagRenderer> = Box::<DiagRenderer>::new(DiagRenderer::new(RenderConfig::default()));
         const renderer: DiagRenderer* = _box_renderer.leak();
@@ -289,11 +359,8 @@ public:
         const diag_ptr: DiagnosticSink* = _box_diag.leak();
 
         mut ctx: CompilationContext = CompilationContext {
-            mode:              mode,
+            options:           options,
             source_file:       source_file,
-            debug_mode:        false,
-            opt_level:         2,
-            emit_debug_info:   false,
             unit_module:       ModulePath::none(),
 
             artifacts:     _box_artifacts.leak(),
@@ -316,22 +383,9 @@ public:
             inactive_spans:       [],
             type_arena:    null,
 
-            project_config:      null,
-            project_no_std:      false,
-            project_no_runtime:  false,
-            project_panic_unwind: false,
-            native_alloc:        false,
+            project_config:      project_config,
             active_module_index: -1,
-            stdlib_root:         "",
-            target_triple:       "",
-            release_static:      false,
-            emit_facts:          false,
             facts:               [],
-            output_path_override: "",
-            output_kind:         OutputKind::None,
-
-            lsp_override_path:    "",
-            lsp_override_content: "",
 
             resolver:             null,
             type_resolver:        null,
@@ -909,21 +963,10 @@ public:
             this.resolver.set_module(info.path());
         }
 
-        if (this.debug_mode) {
+        if (this.options.verbose) {
             LOG_DEBUG(LogComponent::General,
                 "[CompilationContext] switch_to_module(%lld) -> '%s' ns='%s'",
                 index, info.file_path, ns_str);
-        }
-    }
-
-    /// Set up the project configuration for multi-module compilation.
-    set_project_config(mut &this, config: ProjectConfig*) -> void {
-        this.project_config = config;
-        if (config != null) {
-            this.project_no_std = config.no_std;
-            this.project_no_runtime = config.no_runtime;
-            this.project_panic_unwind = config.resolve_panic_unwind();
-            this.native_alloc = config.native_alloc;
         }
     }
 
@@ -943,9 +986,7 @@ public:
     /// the peak near a single target.
     ///
     /// NOT called on the LSP path: the language server keeps its context
-    /// alive across requests and reaches this struct directly via
-    /// `compile_project_with_ctx`, never through
-    /// `compile_project_with_config` where this teardown is invoked.
+    /// alive across requests.
     release_per_target(mut &this) -> void {
         if (this.intern_table != null) {
             this.intern_table.release_strings();

@@ -698,7 +698,7 @@ type struct CallEmitter {
         // drops the whole live frame; it is closed once the call is built (the
         // callee then owns them). Opened before the receiver so a consumed
         // receiver temp joins this frame.
-        if (this.cg.ctx.project_panic_unwind) { this.cg.expr_ops.open_arg_temp_frame(); }
+        if (this.cg.ctx.options.unwinds()) { this.cg.expr_ops.open_arg_temp_frame(); }
         mut args: Pair<LValue, TypeRef>[] = [];
         if (node.callee.kind == NodeKind::MemberAccess) {
             const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
@@ -730,7 +730,7 @@ type struct CallEmitter {
                     // took it). Record it like a positional owning temp. Gated on
                     // the same consume check DropInsertion uses, so a receiver it
                     // treats as borrowed (still owned elsewhere) is not recorded.
-                    if (this.cg.ctx.project_panic_unwind
+                    if (this.cg.ctx.options.unwinds()
                         && (ma.object.kind == NodeKind::CallExpression
                             || ma.object.kind == NodeKind::StructLiteral)
                         && this.call_consumes_receiver(node)
@@ -772,7 +772,7 @@ type struct CallEmitter {
             // binding) is invisible to DropInsertion's name-keyed pending-arg
             // machinery; record it so a later argument's panic drops it. Autoref
             // args are borrows (the callee never owns them), so they are skipped.
-            if (this.cg.ctx.project_panic_unwind && !node.arguments[i].autoref) {
+            if (this.cg.ctx.options.unwinds() && !node.arguments[i].autoref) {
                 this.maybe_record_arg_temp(node.arguments[i], arg);
             }
             args.push(Pair::<LValue, TypeRef>::new(arg, node.arguments[i].resolved_type));
@@ -780,7 +780,7 @@ type struct CallEmitter {
         // Close this call's arg-temp frame: its temporaries are now owned by the
         // callee, so the call's own cleanup schedule must not drop them. A panic
         // origin walked while the frame was open already captured them.
-        if (this.cg.ctx.project_panic_unwind) { this.cg.expr_ops.close_arg_temp_frame(); }
+        if (this.cg.ctx.options.unwinds()) { this.cg.expr_ops.close_arg_temp_frame(); }
 
         mut fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(callee_val.raw) };
         // A free or extern call is made at the signature the front end
@@ -881,7 +881,7 @@ type struct CallEmitter {
         // Live anonymous arg temps in an enclosing in-progress call also force an
         // invoke: if this call unwinds, its pad must drop them (the callee that
         // would own them never runs on the unwind path).
-        const needs_invoke: boolean = this.cg.ctx.project_panic_unwind
+        const needs_invoke: boolean = this.cg.ctx.options.unwinds()
             && (node.unwind_cleanup.length > 0
                 || this.cg.expr_ops.has_live_arg_temps());
         if (needs_invoke) {
@@ -1166,7 +1166,7 @@ type struct CallEmitter {
         // unwind build WITH live locals; every other case falls through to
         // the byte-identical `try_emit` plain-call path below.
         if (kind == IntrinsicKind::Panic
-            && this.cg.ctx.project_panic_unwind
+            && this.cg.ctx.options.unwinds()
             && !this.cg.intrinsics.no_runtime
             && (node.unwind_cleanup.length > 0
                 || this.cg.expr_ops.has_live_arg_temps())
@@ -1258,7 +1258,7 @@ type struct CallEmitter {
             return;
         }
 
-        if (!this.cg.ctx.project_panic_unwind) {
+        if (!this.cg.ctx.options.unwinds()) {
             this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
                 Text::new("`catch_unwind` requires the unwinding panic strategy; rebuild with `--panic=unwind` (or set `panic = \"unwind\"` in cryoconfig). Under the default `--panic=abort` a panic terminates the process, so there is nothing to catch."),
                 node.span);
