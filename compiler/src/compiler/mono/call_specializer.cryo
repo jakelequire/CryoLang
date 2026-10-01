@@ -933,6 +933,16 @@ type struct MonoCallSpecializer {
         const is_unresolved_inst: boolean = tk == TypeKind::InstantiatedType;
         if (!is_user_kind && !is_primitive_kind && !is_unresolved_inst) { return; }
 
+        // A call sema answered where it is written, with an inherent method
+        // of the receiver's generic type, names that method in every copy of
+        // the body, and is bound to the receiver's copy of it.  The one thing
+        // left here is materializing that copy when the receiver's
+        // specialization defers it.  Nothing is found by the member's name.
+        if (call.template_method.is_valid()) {
+            this.materialize_deferred_copy(call, call.template_method, recv_type);
+            return;
+        }
+
         // Zero-own-generic self-returning combinator defaults (take/filter) are
         // instantiated lazily here; own-generic ones (map<B>) fall through.
         if (ma != null && this.try_instantiate_self_returning_default(call, ma, recv_type)) {
@@ -1290,11 +1300,65 @@ type struct MonoCallSpecializer {
         if (orig == null || orig.func == null || impl_node == null) { return false; }
         if (orig.func.generic_params.length > 0) { return false; }
         // Reuse an already-instantiated sibling rather than minting a duplicate.
-        // The pin is the symbol codegen declares the instantiation under: the
-        // impl block's target and the instantiated signature, exactly as
-        // `declare_impl_block` mangles it.  The target is the receiver's
-        // qualified name, except for an inherent block, which registers under
-        // its own stamped target (a primitive's bare spelling).
+        mut made: MethodNode* = null;
+        for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+            const m: MethodNode* = impl_node.methods[k];
+            if (m == null || m.func == null) { continue; }
+            if (m == orig) { continue; }
+            if (m.func.name.equals(ma.member)
+                    && !m.func.is_self_returning_default
+                    && !m.func.is_lazy_self_growing
+                    && m.func.generic_params.length == 0) {
+                made = m;
+                break;
+            }
+        }
+        return this.instantiate_deferred(call, orig, impl_node, recv_type, made);
+    }
+
+    /// Materialize the receiver's copy of the method definition `d` when the
+    /// receiver's specialization holds it deferred - a method whose
+    /// signature grows its owner (`Option<T>::as_ref -> Option<T*>`) is
+    /// instantiated only for a call that names it - and bind `call` to that
+    /// copy.  The copy is the placed impl block's method that is a copy of
+    /// `d`, by identity; a copy already made for an earlier call is reused.
+    /// A copy the receiver's specialization made eagerly needs nothing here.
+    materialize_deferred_copy(mut &this, call: CallExprNode*, d: DefId, recv_type: TypeRef) -> void {
+        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
+            const entry: SpecializationEntry* = &this.state.spec_entries[i];
+            if (!entry.specialized_type.equals(recv_type)) { continue; }
+            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
+                const impl_node: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
+                if (impl_node == null) { continue; }
+                mut deferred: MethodNode* = null;
+                mut made: MethodNode* = null;
+                for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
+                    const m: MethodNode* = impl_node.methods[k];
+                    if (m == null || m.func == null || !m.func.copy_of.equals(d)) { continue; }
+                    if (m.func.is_self_returning_default || m.func.is_lazy_self_growing) {
+                        if (deferred == null) { deferred = m; }
+                    } else if (made == null) {
+                        made = m;
+                    }
+                }
+                if (deferred != null) {
+                    this.instantiate_deferred(call, deferred, impl_node, recv_type, made);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Bind `call` to the receiver's instance of the deferred method `orig`
+    /// of `impl_node`: `made` when an earlier call instantiated it, else an
+    /// instance minted now, registered, and walked for the calls its body
+    /// makes.  The pin is the symbol codegen declares the instantiation under: the
+    /// impl block's target and the instantiated signature, exactly as
+    /// `declare_impl_block` mangles it.  The target is the receiver's
+    /// qualified name, except for an inherent block, which registers under
+    /// its own stamped target (a primitive's bare spelling).
+    instantiate_deferred(mut &this, call: CallExprNode*, orig: MethodNode*, impl_node: ImplBlockNode*,
+                         recv_type: TypeRef, made: MethodNode*) -> boolean {
         mut pin_target: SymbolStr = this.arena.get_qualified_name(recv_type);
         const lazy_recv: Type* = this.arena.lookup(recv_type);
         const lazy_prim: boolean = lazy_recv != null
@@ -1305,18 +1369,10 @@ type struct MonoCallSpecializer {
         if (own.is_valid() && (!impl_node.is_trait_impl() || (!pin_target.is_valid() && lazy_prim))) {
             pin_target = own;
         }
-        for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
-            const m: MethodNode* = impl_node.methods[k];
-            if (m == null || m.func == null) { continue; }
-            if (m == orig) { continue; }
-            if (m.func.name.equals(ma.member)
-                    && !m.func.is_self_returning_default
-                    && !m.func.is_lazy_self_growing
-                    && m.func.generic_params.length == 0) {
-                call.set_resolved_method(m as ASTNode*);
-                this.pin_spec_entry(call, m.func.overload_entry, pin_target.is_valid());
-                return true;
-            }
+        if (made != null) {
+            call.set_resolved_method(made as ASTNode*);
+            this.pin_spec_entry(call, made.func.overload_entry, pin_target.is_valid());
+            return true;
         }
         mut empty_params: GenericParamNode*[] = [];
         mut empty_args: TypeRef[] = [];

@@ -53945,3 +53945,63 @@ b.m()                      // on a `Bx<i32>` directly: still E0156
   project; 0 of 5,227 test objects and 0 of 1,126 examples moved; every
   gate OK.
 * Warnings: 331, the same set (`cryo check src/main.cryo`).
+
+### 8.453 A call carrying a template pin no longer passes through mono's by-name method finders; its deferred copy is materialized by identity - 2026-10-01
+
+## Why
+
+8.452 left mono's finder chain running for template-pinned calls, because
+skipping it broke the unit build with `error[E0900]: unresolved generic
+instantiation after monomorphization: 'std::core::result::Result<?, ?>'`
+twice.  Diagnosed: the side effect is `try_instantiate_self_returning_default`.
+An inherent method whose signature grows its owner (`Option<T>::as_ref ->
+Option<T*>`, `Result<T, E>::as_ref -> Result<T*, E*>`) is deferred - placed
+in the receiver's specialization flagged `is_lazy_self_growing`, never
+instantiated eagerly - and is materialized only by a call that names it.
+That instantiation was found by the member's name (`find_self_returning_default`)
+and is what mints `Result<i32*, i32*>` (the `?` arguments are pointers, which
+have no qualified name).  Skipping it left the instantiation sema's typing
+creates unmonomorphized.
+
+## What changed
+
+* `specialize_method_call`: a call with `template_method` goes to
+  `materialize_deferred_copy` and nothing else - none of the finders, no
+  self-returning-default search by name.
+* `materialize_deferred_copy(call, d, recv)`: in the receiver's
+  specialization's placed impl blocks, the method whose `copy_of` is `d`
+  and which is still deferred; a copy already instantiated (same `copy_of`,
+  unflagged) is reused.  By identity throughout.  A method the
+  specialization made eagerly needs nothing.
+* `try_instantiate_self_returning_default` keeps its by-name finder (the
+  unpinned calls still use it) and hands the instantiation to
+  `instantiate_deferred`, shared with the identity path.
+
+```cryo
+mut opt: Option<i32> = Option::Some(10);
+opt.as_ref()        // template pin: Option<T>::as_ref; Option<i32>'s copy
+                    // is instantiated for this call, found by its copy_of
+```
+
+## Evidence
+
+* Probe over the corpus at `666e28ef` (`.objcmp/s90/probe1.patch`, driver
+  `.objcmp/s90/corpus.sh`, 401 entries: compiler, `tests/`, every project,
+  example and tool, the unit leg, each negative): template-pinned calls
+  entered `specialize_method_call` 78,774 times; the self-returning
+  default search answered 7 (all `as_ref`, unit leg:
+  `tests/stdlib/option.cryo:270,282,300,309`, `result.cryo:162,172,184`);
+  the finder chain answered 0, the default-template canonicalization moved
+  0.  Control for the chain's zero: `.objcmp/s90/ctl`, `Ov<T>` with
+  `put(i32)` and `put<U>(U, i32)`, `o.put(7)` in `main` - the chain answers
+  the generic `put<U>` by name (`S90 CHAIN n=1`), then drops it for want of
+  type arguments.
+* Agreement (`.objcmp/s90/probe2.patch`, same corpus, identity and by-name
+  answers side by side): 7 agree, 0 disagree, 73,764 neither; every build's
+  exit status equals the run at `666e28ef`.
+* Mutation: `materialize_deferred_copy` returning at once makes the unit
+  leg fail with the two `Result<?, ?>` E0900s (rc 1); unmutated it builds.
+* `make verify ARGS="--baseline HEAD --require-identical"`
+  (`.verify/runs/20261001-014509`): 0 of 5,281 test objects and 0 of 1,126
+  examples moved; every gate OK.
+* Warnings: 331, the same set.
