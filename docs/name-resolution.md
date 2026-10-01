@@ -54597,3 +54597,65 @@ type struct PathBuf<A = GlobalAlloc> {
   receiver (`parts.push(..)` on a `string[]`, dispatched through
   `Array<string>`), many in non-generic code.  The deletion and the
   internal check wait on them.
+
+### 8.460 The pass after monomorphization does not walk generic template bodies again - 2026-10-01
+
+## Why
+
+Ruling 70.  Sema's pass after monomorphization re-walked every generic
+template body symbolically - generic functions, methods of generic owners,
+trait defaults, self-returning defaults - although no template body is
+emitted and each copy of one is walked in its own right.  In those walks
+calls were selected by name (21,415 commits of generic methods alone,
+8.458; 1,873 visits of template-pinned generic calls per corpus run here).
+
+## What changed
+
+* `symbolic_check_body` returns at once after monomorphization.  The walk
+  before monomorphization is unchanged and stays unconditional: it is what
+  types a template body, what its copies carry, and what an `async` body's
+  state machine is built from.
+* The post-mono branch for template-pinned generic calls no longer needs
+  to tell a symbolic walk apart; it binds mono's instance or nothing.
+
+```cryo
+type struct Array<T, A = GlobalAlloc> where A: Allocator {
+    .. hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        this.length.hash(hasher);   // the template's body: walked before mono only;
+    }                               // Array<u8, GlobalAlloc>'s copy is walked after it
+}
+```
+
+## Evidence
+
+* Measured before building it, with a mutant that skipped the walk
+  (`.objcmp/s93/mut70.exe`) against the same compiler without it
+  (`.objcmp/s93/probe-r2.exe`), over 406 corpus entries (compiler, tests,
+  every project, example and tool, the unit leg, and each of the 227
+  negative files alone through `cryo check`; driver
+  `.objcmp/s93/corpus4.sh`, runs `c2` and `c4`): every output byte equal
+  (diagnostics, warnings, rendered snippets), every exit status equal.
+  The mutant did skip the walk: 1,873 template-walk probe lines -> 0.
+* Control on the instrument: a mutant skipping symbolic walks before
+  monomorphization too (`.objcmp/s93/mut70all.exe`, `.objcmp/s93/n6`)
+  changes 180 of the 227 negative outputs and 2 exit statuses - the diff
+  sees diagnostics that come from template walks.
+* verify against HEAD (`.verify/runs/20261001-144823`): all gates OK;
+  objects **0 moved** of 5,501 test and 1,126 example objects, as
+  predicted.
+* Warnings 331, the same (code, file) multiset as HEAD.  Lane, flow and
+  section 0 unchanged.
+
+## Remaining (slice 6)
+
+* Sema after monomorphization still selects method calls by name in
+  emitted code (census `.objcmp/s93/c6`, probe S93N after the trait-item
+  path): 5,134 visits, 3,816 in ordinary bodies and 1,318 in copies.  In
+  copies the leading shapes are trait methods on a concrete receiver in a
+  generic body (`alloc.allocate(..)`/`deallocate(..)` on a local
+  `GlobalAlloc` in `spawn_on<F, O>`, 567; `hasher.finish()` on a
+  `DefaultHasher`, 153; `Str`'s `equals`/`compare`, 240) and calls in
+  trait defaults placed in an implementation (`this.write_some(..)` on
+  `Stdout`/`Stderr`, 242).
+  Outside copies, nearly all are dynamic-array receivers (`parts.push(..)`
+  on a `string[]`), which sema could not type before monomorphization.
