@@ -111,21 +111,21 @@ type struct InternTable {
     count(&this) -> u32 {
         return this.strings.length as u32;
     }
+}
 
-    /// Free every heap-allocated interned string.  Every entry at index
-    /// >= 1 was `alloc`'d in `intern`; index 0 is the `""`
-    /// string literal (static storage) and must NOT be freed.  The
-    /// `lookup` map's keys alias these same pointers, so after this call
-    /// the table is left dangling: callers MUST treat the InternTable as
-    /// dead and never intern/resolve again.  Used to reclaim the per-target
-    /// intern heap when a compilation context is torn down between targets.
-    ///
-    /// Frees through `free` (not raw `intrinsics::free`): copies
-    /// made while the arena was active are arena-owned and `free`
-    /// no-ops them (the bulk `cryo_ast_arena_release()` reclaims them); copies
-    /// made before activation are libc-owned and freed here.  Routing an
-    /// arena pointer to `intrinsics::free` would corrupt the heap.
-    release_strings(mut &this) -> void {
+/// Frees every interned string.  Every entry at index >= 1 was `alloc`'d in
+/// `intern`; index 0 is the `""` literal (static storage) and must NOT be
+/// freed.  The `lookup` map's keys alias these same pointers and are not
+/// freed again.  Every `string` resolved from the table dangles afterwards,
+/// so a caller keeps what must outlive it by copying first.
+///
+/// Frees through `free` (not raw `intrinsics::free`): copies made while the
+/// arena was active are arena-owned and `free` no-ops them (the bulk
+/// `cryo_ast_arena_release()` reclaims them); copies made before activation
+/// are libc-owned and freed here.  The table must therefore drop while its
+/// arena is still published.
+implement trait Drop for struct InternTable {
+    drop(mut &this) -> void {
         for (mut i: i64 = 1; i < this.strings.length; i++) {
             allocator::free(this.strings[i] as void*, 1);
         }

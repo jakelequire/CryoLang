@@ -25,6 +25,7 @@ import compiler::resolver::lang_item::{ LangItem };
 import utils::logger;
 import utils::logger::{ LOG_DEBUG, LogComponent };
 import std::env;
+import std::core::mem;
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
 import std::fmt;
@@ -921,27 +922,40 @@ public:
                 index, info.file_path, ns_str);
         }
     }
+}
 
-
-    // Per-target teardown
-
-    /// Reclaim heap owned by this context once the build's survivor strings
-    /// (the returned `CompilationResult`) have been copied out to storage
-    /// independent of the context.  After this call the context is DEAD and
-    /// must never be used again.
-    ///
-    /// A `cryo build` compiles each target (`[lib]`, then each `[[bin]]`)
-    /// with its own context in a single process.  Without this teardown a
-    /// completed target's heap stays resident while the next target builds,
-    /// so a multi-target build's peak RSS stacks both targets instead of
-    /// peaking at the larger one.  Reclaiming the prior context here caps
-    /// the peak near a single target.
-    ///
-    /// NOT called on the LSP path: the language server keeps its context
-    /// alive across requests.
-    release_per_target(mut &this) -> void {
-        if (this.intern_table != null) {
-            this.intern_table.release_strings();
+/// Releases what a compilation owns, users before what they use.  Each
+/// component was made as a leaked `Box` (by `new`, or by the stage that first
+/// needed it) for the stable address the others point at, and the project
+/// config is handed to `new`; each is reclaimed here as one.
+///
+/// Every `string` resolved from the intern table dangles afterwards: a caller
+/// copies what must outlive the context first.  Allocations made while the
+/// per-target arena was active are freed as no-ops, so the context must drop
+/// while that arena is still published.  The language server never drops
+/// one: its contexts live in a session arena, released whole.
+implement trait Drop for struct CompilationContext {
+    drop(mut &this) -> void {
+        if (this.monomorphizer != null) {
+            mem::drop(Box::<Monomorphizer>::from_raw(this.monomorphizer));
         }
+        if (this.directive_registry != null) {
+            delete this.directive_registry;
+        }
+        mem::drop(Box::<TypeResolver>::from_raw(this.type_resolver));
+        mem::drop(Box::<GenericRegistry>::from_raw(this.generic_registry));
+        mem::drop(Box::<TypeArena>::from_raw(this.type_arena));
+        mem::drop(Box::<Resolver>::from_raw(this.resolver));
+        mem::drop(Box::<ConstantTable>::from_raw(this.const_table));
+        mem::drop(Box::<DeclarationIndex>::from_raw(this.decl_index));
+        mem::drop(Box::<ModuleGraph>::from_raw(this.module_graph));
+        mem::drop(Box::<DefTable>::from_raw(this.defs));
+        mem::drop(Box::<DiagnosticSink>::from_raw(this.diagnostics));
+        mem::drop(Box::<DiagRenderer>::from_raw(this.diag_renderer));
+        mem::drop(Box::<PhaseArtifacts>::from_raw(this.artifacts));
+        if (this.project_config != null) {
+            mem::drop(Box::<ProjectConfig>::from_raw(this.project_config));
+        }
+        mem::drop(Box::<InternTable>::from_raw(this.intern_table));
     }
 }
