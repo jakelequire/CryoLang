@@ -1151,8 +1151,9 @@ type struct MonoCallSpecializer {
             return;
         }
 
+        mut copy_subst: TypeSubstitution* = null;
         const spec_method: MethodNode* = this.specialize_method(
-            orig_method, &orig_func.generic_params, &bindings, recv_type, impl_node);
+            orig_method, &orig_func.generic_params, &bindings, recv_type, impl_node, &copy_subst);
         if (spec_method == null) { return; }
         // Whether this spec is resolved through a PINNED `resolved_callee` (the
         // precise mangled symbol) rather than the trait-impl/combinator DI path.
@@ -1287,35 +1288,16 @@ type struct MonoCallSpecializer {
                 spec_method.func.body, &prune_ctx);
         }
 
-        // Re-walk the spec'd body for its own generic calls.  specialize_method ran
-        // ASTTypeSubstituter over the clone, which rewrites nested resolved_type_args
-        // stashes but NOT identifier `resolved_type`s (substituter.cryo:552).  So a
-        // nested call's owner-typed receiver (`this.try_add(item)`, typed `Box<A>` by
-        // the template's symbolic walk) is still abstract.  Pass an owner-param subst
-        // (`A` -> the receiver's concrete arg) so the re-walk concretizes the receiver
-        // and the nested generic call specializes against the right spec.
+        // Re-walk the copy's body for its own generic calls.  The substituter
+        // rewrites the clone's type-argument stashes but NOT the `resolved_type`
+        // an identifier carries from the template (`this` typed `Box<A>`, a local
+        // typed `A*`), so the walk applies the substitution the body was copied
+        // under: the method's parameters (`W` in `fmt<W>`), the owner's (`A` in
+        // `Box<A>`), and the ones the impl block names in its head (`A` in
+        // `implement<A, B> .. for Pair<A, B>`), which are not the owner's.
         if (spec_method.func != null && spec_method.func.body != null) {
             mut rw_ctx: ResolutionContext = ResolutionContext::new("");
-            mut owner_subst: TypeSubstitution = TypeSubstitution::empty();
-            this.add_owner_param_bindings(&owner_subst, recv_type);
-            // Also bind THIS method's own generic params (`m<W>`) to their concrete
-            // args, so a nested call whose receiver is typed by a method generic
-            // (`s: W; s.put(bytes)`) concretizes during the re-walk instead of keeping
-            // an abstract method-level `T` (codegen then reports "Incorrect number of
-            // arguments" against the still-generic `m<T>` symbol).  Owner-param
-            // bindings alone miss these when the owner is NON-generic
-            // (`Emitter.write_to<W>`): `W` is a method param, not an owner param.
-            // Same 0-based method-position index the substituter + resolve_func_and_body
-            // path use (see ~line 1400).
-            for (mut mbi: i64 = 0; mbi < method_param_names.length && mbi < bindings.length; mbi++) {
-                const mpref: TypeRef = this.arena.create_generic_param(method_param_syms[mbi], method_param_names[mbi], mbi as u64);
-                owner_subst.add(mpref, bindings[mbi]);
-            }
-            if (owner_subst.is_empty()) {
-                this.walk_block(spec_method.func.body, &rw_ctx, null);
-            } else {
-                this.walk_block(spec_method.func.body, &rw_ctx, &owner_subst);
-            }
+            this.walk_block(spec_method.func.body, &rw_ctx, copy_subst);
         }
     }
 
@@ -1489,8 +1471,9 @@ type struct MonoCallSpecializer {
         }
         mut empty_params: GenericParamNode*[] = [];
         mut empty_args: TypeRef[] = [];
+        mut copy_subst: TypeSubstitution* = null;
         const spec_method: MethodNode* = this.specialize_method(
-            orig, &empty_params, &empty_args, recv_type, impl_node);
+            orig, &empty_params, &empty_args, recv_type, impl_node, &copy_subst);
         if (spec_method == null || spec_method.func == null) { return false; }
         impl_node.methods.push(spec_method);
         call.set_resolved_method(spec_method as ASTNode*);
@@ -1498,7 +1481,7 @@ type struct MonoCallSpecializer {
         this.pin_spec_entry(call, spec_method.func.overload_entry, pin_target.is_valid());
         if (spec_method.func.body != null) {
             mut rw_ctx: ResolutionContext = ResolutionContext::new("");
-            this.walk_block(spec_method.func.body, &rw_ctx, null);
+            this.walk_block(spec_method.func.body, &rw_ctx, copy_subst);
         }
         return true;
     }
@@ -1720,8 +1703,9 @@ type struct MonoCallSpecializer {
         }
         if (orig_method.func.generic_params.length != method_binds.length) { return false; }
 
+        mut copy_subst: TypeSubstitution* = null;
         const spec_method: MethodNode* = this.specialize_method(
-            orig_method, &orig_method.func.generic_params, method_binds, recv_type, null);
+            orig_method, &orig_method.func.generic_params, method_binds, recv_type, null, &copy_subst);
         if (spec_method == null || spec_method.func == null) { return false; }
 
         // A `-> Owner` (bare-template) return substitutes to the still-bare owner
@@ -1790,13 +1774,12 @@ type struct MonoCallSpecializer {
         this.state.set_method_spec_entry(spec_sym, spec_method.func.overload_entry);
         this.pin_spec_entry(call, spec_method.func.overload_entry, spec_sym.is_valid());
 
-        // Re-walk the body for its own generic calls with the owner param bound
-        // (`A` -> concrete) so nested owner-typed calls (`Wrap::base(item)`)
+        // Re-walk the body for its own generic calls under the substitution
+        // it was copied with (the owner's `A` -> concrete, and the method's
+        // own parameters) so nested owner-typed calls (`Wrap::base(item)`)
         // resolve against the owner spec.
         if (spec_method.func.body != null) {
             mut rw_ctx: ResolutionContext = ResolutionContext::new("");
-            mut owner_subst: TypeSubstitution = TypeSubstitution::empty();
-            this.add_owner_param_bindings(&owner_subst, recv_type);
             // Publish the owner context so walk_expr can stamp owner-constructing
             // struct literals whose type the symbolic walk left invalid.
             const saved_leaf: SymbolStr = this.gsm_owner_leaf;
@@ -1805,11 +1788,7 @@ type struct MonoCallSpecializer {
             this.gsm_owner_leaf = if (owner_entry != null) { owner_entry.name } else { SymbolStr::empty() };
             this.gsm_owner_recv = recv_type;
             this.gsm_owner_spec = this.arena.get_qualified_name(recv_type);
-            if (owner_subst.is_empty()) {
-                this.walk_block(spec_method.func.body, &rw_ctx, null);
-            } else {
-                this.walk_block(spec_method.func.body, &rw_ctx, &owner_subst);
-            }
+            this.walk_block(spec_method.func.body, &rw_ctx, copy_subst);
             this.gsm_owner_leaf = saved_leaf;
             this.gsm_owner_recv = saved_recv;
             this.gsm_owner_spec = saved_spec;
@@ -2171,9 +2150,13 @@ type struct MonoCallSpecializer {
     /// (`params`, the method's declared parameter nodes) with `args`, clear
     /// generic_params, and re-resolve the signature against the owner type.
     /// Returns the spec'd MethodNode, or null if the signature didn't fully resolve.
+    /// `out_subst` receives the substitution the body was copied under - the
+    /// method's parameters, the owner's, and the ones its impl names - which
+    /// is the one the copy's body is walked with.
     specialize_method(mut &this, original: MethodNode*,
                       params: &GenericParamNode*[], args: &TypeRef[],
-                      owner_type: TypeRef, owner_impl: ImplBlockNode*) -> MethodNode* {
+                      owner_type: TypeRef, owner_impl: ImplBlockNode*,
+                      out_subst: TypeSubstitution**) -> MethodNode* {
         if (original == null || original.func == null) { return null; }
         if (params.length != args.length) { return null; }
         mut param_names: SymbolStr[] = [];
@@ -2235,6 +2218,7 @@ type struct MonoCallSpecializer {
         const subst_ptr: TypeSubstitution* =
             allocator::alloc(sizeof(TypeSubstitution), 16) as TypeSubstitution*;
         *subst_ptr = subst_val;
+        *out_subst = subst_ptr;
 
         mut cloner: ASTCloner = ASTCloner();
         (original as ASTNode*).accept(cloner);

@@ -3045,13 +3045,17 @@ type struct CallResolver {
         }
         // A call a generic body's template pinned is bound by that identity
         // in each copy of the body whose receiver is minted.  A method with
-        // type parameters of its own is bound to its instance by
-        // monomorphization; one it left unbound is selected below.
+        // type parameters of its own is bound to the instance monomorphization
+        // made of it for the call; one it left unbound is selected below.
         const pinned_fn: FunctionDeclNode* = this.ctx.decl_index.method_func_of(call.template_method);
         if (call.template_method.is_valid() && !owner_inst.is_valid()
                 && !this.types.contains_generic_param(base_ref)
                 && (pinned_fn == null || !pinned_fn.is_generic())) {
             return this.bind_template_method(visitor, call, base_ref);
+        }
+        if (this.state.post_mono_verify && pinned_fn != null && pinned_fn.is_generic()) {
+            const made: MethodNode* = CallResolver::instance_of_pin(call);
+            if (made != null) { return this.commit_selection(visitor, call, Selection::of(made)); }
         }
         if (!member.resolved_trait.is_valid()) {
             mut copied: BoundDirection = BoundDirection::none();
@@ -3209,6 +3213,18 @@ type struct CallResolver {
             this.ctx.decl_index.method_entry_on(recv, call.template_method));
         if (chosen == null) { return Selection::none(); }
         return this.commit_selection(visitor, call, Selection::of(chosen));
+    }
+
+    /// The instance monomorphization made for a call whose template pins a
+    /// method with type parameters of its own: the method it recorded on
+    /// the call, when that is an instance - no type parameters left - copied
+    /// from the pinned definition.  Null when monomorphization recorded no
+    /// instance of it.
+    static instance_of_pin(call: CallExprNode*) -> MethodNode* {
+        const made: MethodNode* = call.resolved_method as MethodNode*;
+        if (made == null || made.func == null || made.func.generic_params.length > 0) { return null; }
+        if (!made.func.copy_of.equals(call.template_method)) { return null; }
+        return made;
     }
 
     /// Bind a call that names its method by definition - a method language
