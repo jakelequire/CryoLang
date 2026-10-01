@@ -221,7 +221,7 @@ function thread_body<C, T>(arg: u8*) -> void {
     // one will ever read the result, so we own teardown here.
     const prev: u8 = (*shared).state.swap(STATE_THREAD_DONE, MemoryOrder::AcqRel);
     if (prev == STATE_DETACHED) {
-        (*rptr).drop();
+        ptr::drop_in_place::<T>(rptr);
         alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<Shared<T>>());
     }
 }
@@ -277,7 +277,7 @@ function reap_detached<T>(tid: u64, shared: Shared<T>*) -> void {
     if (prev == STATE_THREAD_DONE) {
         // Thread already finished and left the result for us; drop it.
         const rptr: T* = &(*shared).result;
-        (*rptr).drop();
+        ptr::drop_in_place::<T>(rptr);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<Shared<T>>());
     }
@@ -404,10 +404,9 @@ where C: Send, T: Send {
     const rc: i32 = os_create_thread::<C, T>(&tbuf[0], p as u8*, stack_bytes);
     if (rc != 0) {
         // The thread never started, so we still own both boxes. The
-        // payload's `ctx` was moved in; reclaim it so owned state inside
-        // it is released rather than leaked, then free both boxes.
-        const cback: C = (*p).ctx;
-        cback.drop();
+        // payload's `ctx` was moved in; release it in place so owned state
+        // inside it is not leaked, then free both boxes.
+        ptr::drop_in_place::<C>(&(*p).ctx);
         alloc.deallocate(NonNull::new(p as u8*), Layout::of::<Payload<C, T>>());
         alloc.deallocate(NonNull::new(shared as u8*), Layout::of::<Shared<T>>());
         return Result::Err(SpawnError::from_errno(rc));
