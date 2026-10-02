@@ -3307,11 +3307,15 @@ type struct CallResolver {
         const mn: MethodNode* = sel.chosen;
         if (!this.state.in_symbolic_check || sel.owner_inst.is_valid() || mn == null) { return; }
         const f: FunctionDeclNode* = mn.func;
-        if (f == null || !f.def.is_valid() || f.generic_params.length > 0
+        if (f == null || f.generic_params.length > 0
                 || f.is_self_returning_default || f.is_lazy_self_growing) { return; }
+        // A trait's default copied into an implementation has no definition
+        // of its own; it is the receiver's entry for the default it copies.
+        const d: DefId = if (f.def.is_valid()) { f.def } else { f.copy_of };
+        if (!d.is_valid()) { return; }
         if (this.types.contains_generic_param(recv)) { return; }
-        if (!this.ctx.decl_index.method_entry_on(recv, f.def).equals(f.overload_entry)) { return; }
-        call.template_method = f.def;
+        if (!this.ctx.decl_index.method_entry_on(recv, d).equals(f.overload_entry)) { return; }
+        call.template_method = d;
         call.template_recv = recv;
     }
 
@@ -4357,6 +4361,9 @@ type struct CallResolver {
         // coerced receiver so mono/codegen bind the method on `Target`.
         const coerced: TypeRef = this.member.try_deref_coercion(visitor, member);
         if (coerced.is_valid()) {
+            // The call names the method on the coerced receiver, bound here
+            // where it is written.
+            this.bind_method_on_receiver(visitor, call, member, member.object.resolved_type);
             this.binding.stash_method_call_bindings(member.object.resolved_type, member, call, null);
             member.set_resolved_type(coerced);
             return coerced;

@@ -54884,3 +54884,73 @@ implement<I, O> trait Iterator<O> for struct MapIter<I, O> where I: Iterator {
   `copy_of`; `this.ptr[i].hash(hasher)` on `Array<i32>` (the trait item's
   answer, `i32`'s `hash<H>`, has type parameters of its own and needs mono's
   instance); an operator `index` and `unwrap_or` in two test bodies.
+
+### 8.464 A trait's default copied into an implementation is pinned in a generic body by the default it copies, and a call reached through deref coercion is bound where it is written - 2026-10-01
+
+## Why
+
+Slice 6.  After 8.463 the census (`.objcmp/s94/c5`) counted 26 post-mono
+selections by name.  A probe on the trait-item state of each (`S94T`,
+`.objcmp/s94/probe6.exe` over the unit leg) showed two causes with no
+stamp and no template pin:
+
+* `this.next_below(..)` in `RandomSource`'s generic defaults, copied into
+  `Rng`'s implementation (`random/source.cryo:70,103,109,165,186`), and
+  `this.write_uint(..)` in `Hasher`'s (`core/hash.cryo:89,95`):
+  `pin_minted_method` required the selected method's own definition, and a
+  default copied into an implementation has none - only `copy_of`, which
+  `pin_template_method` and `pin_instantiated_method` already read.
+* `b.total()` / `b.bump_x(99)` on a box implementing `Deref`
+  (`tests/lang/operator_overload.cryo:437,441,453,464`): the typer rewrote
+  the receiver to `*(b.deref())` and typed the call, but bound nothing, so
+  the pass after monomorphization selected it by name.
+
+## What changed
+
+* `pin_minted_method` records the definition a copied default stands for
+  (`copy_of`) when the method has none of its own; the receiver's entry for
+  it is the copy, so `bind_template_method` binds it by identity in each
+  copy of the body.
+* The deref-coercion arm of `resolve_method_call` binds the call on the
+  coerced receiver (`bind_method_on_receiver`) where it is written.
+
+```cryo
+next_range<T>(mut &this, lo: T, hi: T) -> T {        // RandomSource default, copied for Rng
+    return static match (T) {
+        u64 | i64 => { lo + (this.next_below((hi - lo) as u64) as T) }   // pinned to Rng's copy of next_below
+        ...
+    };
+}
+mut b: CoordBox = CoordBox { c: Coord { px: 5, py: 6 } };
+b.total();                                            // bound to Coord::total through Deref, here
+```
+
+## Evidence
+
+* Census (`.objcmp/s94/c5` -> `c7`): post-mono selections by name in
+  ordinary bodies 11 -> **7**, in copies 15 -> **4**.  The same probe
+  reported each of these sites in the run before, so the zeros are not the
+  probe's.
+* Outputs: all 406 corpus entries byte-identical to the run before except
+  the compiler and LSP builds, whose warnings differ in line numbers only.
+* verify against HEAD (`.verify/runs/20261001-202912`): all gates OK;
+  objects **0 moved**, as predicted: each call is bound to the method the
+  by-name selection found.  Clean build: 331 warnings, the same set.
+
+## Remaining (slice 6), 11 visits
+
+* `get_or_insert(key, [])` (compiler, 3 sites, 6 visits with the LSP): an
+  empty array literal argument has no type until the parameter gives it
+  one, so the selection, which binds only typed arguments, gives up.
+* `s.length()` on a match-payload binding of an inline
+  `Option::Some(String::from_string(..))` (`tests/lang/
+  enum_ctor_arg_inference.cryo:88`).
+* `T::try_from(v).unwrap_or(fallback)` in a generic body
+  (`examples/09-json-config/src/main.cryo:102`): the receiver is the result
+  of a static call through a bound - slice 7.
+* `c[i]` with `T: Index<u64, i32>` (`tests/lang/operator_overload.cryo:
+  132`): the index desugar's `index` call in a copy carries no trait-item
+  stamp.
+* `this.ptr[i].hash(hasher)` on `Array<i32>` (`collections/array.cryo:852`):
+  stamped, slot 0, one answer - `i32`'s `hash<H>`, which has type
+  parameters of its own and needs monomorphization's instance for the call.
