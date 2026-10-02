@@ -694,7 +694,7 @@ type struct MonoCallSpecializer {
     ///     (sema's stash).
     ///   * ADAPTER RECEIVERS: there is no synchronous `ensure_receiver_inst_resolved`
     ///     (it would need the orchestrator's spec cache).  Instead the unwrap loop leaves
-    ///     an unresolved adapter inst alone; `find_spec_inline_method` enqueues it, and
+    ///     an unresolved adapter inst alone, and
     ///     the run_monomorphization walk/drain FIXPOINT resolves the chained call on a
     ///     later iteration (sema pre-types adapter returns as concrete InstantiatedTypes).
     /// Reconstruct a method-call receiver's type in a specialized body when the
@@ -809,7 +809,8 @@ type struct MonoCallSpecializer {
         // user-iterator receiver (`it: UpTo; it.take(n)`) sema resolves and pins
         // the unspecialized default; short-circuiting here would leave it never
         // instantiated and codegen would find no emitted `take` (E0636). Let these
-        // fall through to `try_instantiate_self_returning_default` below. (Once
+        // fall through to the binding by identity below, which instantiates the
+        // deferred default (`instantiate_deferred`). (Once
         // instantiated, the spec carries `is_self_returning_default = false`, so the
         // fixpoint re-walk short-circuits correctly.)
         if (call.resolved_method != null) {
@@ -961,84 +962,17 @@ type struct MonoCallSpecializer {
             }
         }
 
-        // Zero-own-generic self-returning combinator defaults (take/filter) are
-        // instantiated lazily here; own-generic ones (map<B>) fall through.
-        if (ma != null && this.try_instantiate_self_returning_default(call, ma, recv_type)) {
-            return;
-        }
-
-        // Method lookup (LOOKUP, not inference), the same precedence sema's
-        // `select_method` binds under.  A call stamped with a trait (made
-        // through a bound) names
-        // that trait's method: the stores holding trait impls are asked for
-        // it first.  Otherwise an INHERENT method of the receiver's name
-        // answers ahead of any trait impl's, whichever store holds it and
-        // whatever order the blocks were written in, and only when no
-        // inherent one exists is a trait's asked for - the sole trait
-        // providing the name, else nothing (several traits with no stamp is
-        // the call sema refuses as ambiguous, so there is no binding to make
-        // here).  The inherent stores: the impl blocks placed under this
-        // specialization, a non-generic owner's own methods, the
-        // specialization's inline methods, the inherent-impl registry (an
-        // `implement string { parse_int<T> }` block on a primitive, or an
-        // `implement struct Driver { run<F,R> }` block, which is merged into
-        // no owner's method list).  The trait stores: the trait impls placed
-        // under this specialization, then the trait-impl registry (a
-        // primitive's impl, a synthesized default on a non-generic user type).
+        // A path call names the generic method's template, which is bound
+        // where it is placed for the receiver.  A member call that reached
+        // here carries neither a template pin nor a trait item and names
+        // nothing: it is left unbound, and the pass after monomorphization
+        // refuses it.  Nothing is found by the member's name.
+        if (path_method == null) { return; }
         mut impl_node: ImplBlockNode* = null;
         mut inherent_owner_ast: ASTNode* = null;
-        mut orig_method: MethodNode* = null;
-        if (path_method != null) {
-            if (!this.method_placement(path_method, recv_type, &impl_node, &inherent_owner_ast)) { return; }
-            orig_method = path_method;
-        } else {
-            orig_method = this.find_generic_method_by_name(ma, recv_type, &impl_node, &inherent_owner_ast);
-        }
-        if (orig_method == null) { return; }
-        this.instantiate_generic_method(call, orig_method, impl_node, inherent_owner_ast, recv_type, recv_derived,
+        if (!this.method_placement(path_method, recv_type, &impl_node, &inherent_owner_ast)) { return; }
+        this.instantiate_generic_method(call, path_method, impl_node, inherent_owner_ast, recv_type, recv_derived,
             is_primitive_kind, subst);
-    }
-
-    /// The method a call with no template pin names, found by its member's
-    /// name on the receiver, and where it lives (see `specialize_method_call`
-    /// for the order the stores are asked in).
-    find_generic_method_by_name(mut &this, ma: MemberAccessNode*, recv_type: TypeRef,
-                                out_impl: ImplBlockNode**, out_owner_ast: ASTNode**) -> MethodNode* {
-        mut impl_node: ImplBlockNode* = null;
-        mut inherent_owner_ast: ASTNode* = null;
-        mut orig_method: MethodNode* = null;
-        if (ma.resolved_trait.is_valid()) {
-            orig_method = this.find_spec_impl_trait_method(
-                recv_type, ma.member, ma.resolved_trait, &impl_node);
-            if (orig_method == null) {
-                orig_method = this.find_trait_impl_method_for_target(
-                    recv_type, ma.member, ma.resolved_trait, &impl_node);
-            }
-        }
-        if (orig_method == null) {
-            orig_method = this.find_spec_impl_inherent_method(recv_type, ma.member, &impl_node);
-        }
-        if (orig_method == null) {
-            orig_method = this.find_inherent_method(recv_type, ma.member, &inherent_owner_ast);
-        }
-        if (orig_method == null) {
-            orig_method = this.find_spec_inline_method(recv_type, ma.member, &inherent_owner_ast);
-        }
-        if (orig_method == null && this.generic_registry != null) {
-            orig_method = this.generic_registry.find_inherent_impl_generic_method(
-                recv_type, ma.member, &impl_node);
-        }
-        if (orig_method == null) {
-            orig_method = this.find_spec_impl_trait_method(
-                recv_type, ma.member, DefId::invalid(), &impl_node);
-        }
-        if (orig_method == null) {
-            orig_method = this.find_trait_impl_method_for_target(
-                recv_type, ma.member, DefId::invalid(), &impl_node);
-        }
-        *out_impl = impl_node;
-        *out_owner_ast = inherent_owner_ast;
-        return orig_method;
     }
 
     /// Bind `call` to the instance of `orig_method` - the receiver's method,
@@ -1235,7 +1169,7 @@ type struct MonoCallSpecializer {
                 }
             }
             if (from_template) {
-                // find_spec_inline_method fell back to the template AST; route to the
+                // The method is placed on the template AST; route to the
                 // receiver's spec entry instead so the sibling doesn't leak across
                 // every instantiation.
                 for (mut si: i64 = 0; si < this.state.spec_entries.length; si++) {
@@ -1310,36 +1244,6 @@ type struct MonoCallSpecializer {
             mut rw_ctx: ResolutionContext = ResolutionContext::new("");
             this.walk_block(spec_method.func.body, &rw_ctx, copy_subst);
         }
-    }
-
-    /// Lazily instantiate a zero-own-generic self-returning trait default
-    /// (take/filter) for the concrete receiver.  Own-generic defaults (map<B>)
-    /// return false and fall through to specialize_method_call's main path.
-    /// The receiver type is passed in (read from resolved_type by the caller);
-    /// the fixpoint re-walk resolves an adapter receiver on a later iteration.
-    try_instantiate_self_returning_default(mut &this, call: CallExprNode*,
-                                           ma: MemberAccessNode*,
-                                           recv_type: TypeRef) -> boolean {
-        mut impl_node: ImplBlockNode* = null;
-        const orig: MethodNode* = this.find_self_returning_default(
-            recv_type, ma.member, &impl_node);
-        if (orig == null || orig.func == null || impl_node == null) { return false; }
-        if (orig.func.generic_params.length > 0) { return false; }
-        // Reuse an already-instantiated sibling rather than minting a duplicate.
-        mut made: MethodNode* = null;
-        for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
-            const m: MethodNode* = impl_node.methods[k];
-            if (m == null || m.func == null) { continue; }
-            if (m == orig) { continue; }
-            if (m.func.name.equals(ma.member)
-                    && !m.func.is_self_returning_default
-                    && !m.func.is_lazy_self_growing
-                    && m.func.generic_params.length == 0) {
-                made = m;
-                break;
-            }
-        }
-        return this.instantiate_deferred(call, orig, impl_node, recv_type, made);
     }
 
     /// The receiver's method for the definition `d`, and where it is held:
@@ -1808,67 +1712,7 @@ type struct MonoCallSpecializer {
     }
 
 
-    // -- Method-lookup ladder (LOOKUP, not inference) --
-
-    /// Spec'd struct/class own `methods[]` lookup for an inline generic method
-    /// (e.g. `NonNull<u8>::cast<U>`).  Two-step fallback when no spec entry exists:
-    /// enqueue the receiver and return the TEMPLATE's method (caller detects this by
-    /// `*out_owner_ast == tmpl.ast_node` and routes the spec to the receiver's entry).
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    find_spec_inline_method(mut &this, target_type: TypeRef, method_name: SymbolStr,
-                            out_owner_ast: ASTNode**) -> MethodNode* {
-        const empty_methods: MethodNode*[] = [];
-        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
-            const entry: SpecializationEntry* = &this.state.spec_entries[i];
-            if (!entry.specialized_type.equals(target_type)) { continue; }
-            if (entry.ast_node == null) { continue; }
-            mut owner_methods: &MethodNode*[] = &empty_methods;
-            if (entry.ast_node.kind == NodeKind::StructDeclaration) {
-                owner_methods = &(entry.ast_node as StructDeclNode*).methods;
-            } else if (entry.ast_node.kind == NodeKind::UnionDeclaration) {
-                owner_methods = &(entry.ast_node as UnionDeclNode*).methods;
-            } else if (entry.ast_node.kind == NodeKind::ClassDeclaration) {
-                owner_methods = &(entry.ast_node as ClassDeclNode*).methods;
-            } else {
-                continue;
-            }
-            for (mut k: i64 = 0; k < owner_methods.length; k++) {
-                const m: MethodNode* = owner_methods[k];
-                if (m == null || m.func == null) { continue; }
-                if (!m.func.name.equals(method_name)) { continue; }
-                if (m.func.generic_params.length == 0) { continue; }
-                *out_owner_ast = entry.ast_node;
-                return m;
-            }
-        }
-        if (this.generic_registry == null) { return null; }
-        const recv_t: Type* = this.arena.lookup(target_type);
-        if (recv_t == null || recv_t.kind != TypeKind::InstantiatedType) { return null; }
-        this.state.enqueue_from_type_ref(target_type);
-        const inst: InstantiatedType* = recv_t as InstantiatedType*;
-        const tmpl: TemplateEntry* =
-            this.generic_registry.template_of_type(inst.generic_base);
-        if (tmpl == null || tmpl.ast_node == null) { return null; }
-        mut tmpl_methods: &MethodNode*[] = &empty_methods;
-        if (tmpl.ast_node.kind == NodeKind::StructDeclaration) {
-            tmpl_methods = &(tmpl.ast_node as StructDeclNode*).methods;
-        } else if (tmpl.ast_node.kind == NodeKind::UnionDeclaration) {
-            tmpl_methods = &(tmpl.ast_node as UnionDeclNode*).methods;
-        } else if (tmpl.ast_node.kind == NodeKind::ClassDeclaration) {
-            tmpl_methods = &(tmpl.ast_node as ClassDeclNode*).methods;
-        } else {
-            return null;
-        }
-        for (mut k: i64 = 0; k < tmpl_methods.length; k++) {
-            const m: MethodNode* = tmpl_methods[k];
-            if (m == null || m.func == null) { continue; }
-            if (!m.func.name.equals(method_name)) { continue; }
-            if (m.func.generic_params.length == 0) { continue; }
-            *out_owner_ast = tmpl.ast_node;
-            return m;
-        }
-        return null;
-    }
+    // -- A generic method's receiver --
 
     /// Add owner-param -> concrete-arg bindings to `subst` for a generic method
     /// specialized on a generic-struct receiver.  The AST substituter is built only
@@ -1972,186 +1816,6 @@ type struct MonoCallSpecializer {
         const default_inst: TypeRef = this.arena.create_instantiation(recv_type, &default_args);
         if (this.state.has_materialized_spec(default_inst)) { return default_inst; }
         return recv_type;
-    }
-
-    /// The generic method named `method_name` in an INHERENT impl block placed
-    /// under the specialization `target_type`.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    find_spec_impl_inherent_method(&this, target_type: TypeRef, method_name: SymbolStr,
-                                   out_impl: ImplBlockNode**) -> MethodNode* {
-        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
-            const entry: SpecializationEntry* = &this.state.spec_entries[i];
-            if (!entry.specialized_type.equals(target_type)) { continue; }
-            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
-                const impl_node: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
-                if (impl_node == null || impl_node.is_trait_impl()) { continue; }
-                const m: MethodNode* = this.generic_method_in_impl(impl_node, method_name);
-                if (m != null) {
-                    *out_impl = impl_node;
-                    return m;
-                }
-            }
-        }
-        return null;
-    }
-
-    /// The generic method named `method_name` in a TRAIT impl block placed
-    /// under the specialization `target_type`: with `only_trait`, the one in
-    /// that trait's impl; otherwise the one in the sole trait impl providing
-    /// the name, and null when several do.  Several unstamped candidates are
-    /// the ambiguity sema refuses; picking among them by the order the
-    /// blocks were placed would bind a body the source never chose.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    find_spec_impl_trait_method(&this, target_type: TypeRef, method_name: SymbolStr,
-                                only_trait: DefId,
-                                out_impl: ImplBlockNode**) -> MethodNode* {
-        mut sole_m: MethodNode* = null;
-        mut sole_impl: ImplBlockNode* = null;
-        mut candidates: i64 = 0;
-        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
-            const entry: SpecializationEntry* = &this.state.spec_entries[i];
-            if (!entry.specialized_type.equals(target_type)) { continue; }
-            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
-                const impl_node: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
-                if (impl_node == null || !impl_node.is_trait_impl()) { continue; }
-                if (only_trait.is_valid() && !this.impl_provides_trait(impl_node, only_trait)) { continue; }
-                const m: MethodNode* = this.generic_method_in_impl(impl_node, method_name);
-                if (m == null) { continue; }
-                candidates = candidates + 1;
-                sole_m = m;
-                sole_impl = impl_node;
-            }
-        }
-        if (candidates != 1) { return null; }
-        *out_impl = sole_impl;
-        return sole_m;
-    }
-
-    /// The method of `impl_node` named `method_name` that has type parameters
-    /// of its own, or null.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    generic_method_in_impl(&this, impl_node: ImplBlockNode*, method_name: SymbolStr) -> MethodNode* {
-        for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
-            const m: MethodNode* = impl_node.methods[k];
-            if (m == null || m.func == null) { continue; }
-            if (!m.func.name.equals(method_name)) { continue; }
-            if (m.func.generic_params.length == 0) { continue; }
-            return m;
-        }
-        return null;
-    }
-
-    /// Inline generic method on a NON-generic struct/class, via the registry's
-    /// inherent-owner index.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    find_inherent_method(&this, recv_type: TypeRef, method_name: SymbolStr,
-                         out_owner_ast: ASTNode**) -> MethodNode* {
-        if (!recv_type.is_valid()) { return null; }
-        const registry: GenericRegistry* = this.generic_registry;
-        if (registry == null) { return null; }
-        mut owner_ast: ASTNode* = null;
-        // By the receiver's own type, the one key the inherent-owner index
-        // holds.  A generic receiver's specialization is a type of its own,
-        // so it finds no owner here rather than a same-leaf non-generic type
-        // in another module.
-        owner_ast = registry.lookup_inherent_owner(recv_type);
-        if (owner_ast == null) { return null; }
-        const empty_methods: MethodNode*[] = [];
-        mut owner_methods: &MethodNode*[] = &empty_methods;
-        if (owner_ast.kind == NodeKind::StructDeclaration) {
-            owner_methods = &(owner_ast as StructDeclNode*).methods;
-        } else if (owner_ast.kind == NodeKind::UnionDeclaration) {
-            owner_methods = &(owner_ast as UnionDeclNode*).methods;
-        } else if (owner_ast.kind == NodeKind::ClassDeclaration) {
-            owner_methods = &(owner_ast as ClassDeclNode*).methods;
-        } else {
-            return null;
-        }
-        for (mut k: i64 = 0; k < owner_methods.length; k++) {
-            const m: MethodNode* = owner_methods[k];
-            if (m == null || m.func == null) { continue; }
-            if (!m.func.name.equals(method_name)) { continue; }
-            if (m.func.generic_params.length == 0) { continue; }
-            *out_owner_ast = owner_ast;
-            return m;
-        }
-        return null;
-    }
-
-    /// A generic method (own type parameters) named `method_name` in a trait
-    /// impl for `recv_type`, from the trait-impl registry: a primitive's impl,
-    /// or a synthesized default on a non-generic user type.  With
-    /// `only_trait`, the one in that trait's impl; otherwise the one in the
-    /// sole impl providing the name, and null when several do
-    /// (`find_spec_impl_trait_method`'s rule, over the registry's store).
-    ///
-    /// The impls are those the registry selects for the receiver: a clone
-    /// the monomorphizer placed under its own specialization, else the written
-    /// heads that unify with it - never by leaf: two modules' same-leaf types
-    /// are two keys, and the answer for one was the other's.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    find_trait_impl_method_for_target(&this, recv_type: TypeRef,
-                                      method_name: SymbolStr,
-                                      only_trait: DefId,
-                                      out_impl: ImplBlockNode**) -> MethodNode* {
-        if (this.generic_registry == null) { return null; }
-        mut sole_m: MethodNode* = null;
-        mut sole_impl: ImplBlockNode* = null;
-        mut candidates: i64 = 0;
-        const blocks: ImplBlockNode*[] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
-        for (mut i: i64 = 0; i < blocks.length; i++) {
-            const impl_node: ImplBlockNode* = blocks[i];
-            if (only_trait.is_valid() && !this.impl_provides_trait(impl_node, only_trait)) { continue; }
-            const m: MethodNode* = this.generic_method_in_impl(impl_node, method_name);
-            if (m == null) { continue; }
-            candidates = candidates + 1;
-            sole_m = m;
-            sole_impl = impl_node;
-        }
-        if (candidates != 1) { return null; }
-        *out_impl = sole_impl;
-        return sole_m;
-    }
-
-    /// Find a self-returning trait default (combinator) regardless of own-generic
-    /// count: the receiver's spec'd impls first, then the impls the registry
-    /// selects for it (a placed clone, else the written heads that unify).
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    find_self_returning_default(&this, recv_type: TypeRef, method_name: SymbolStr,
-                                out_impl: ImplBlockNode**) -> MethodNode* {
-        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
-            const entry: SpecializationEntry* = &this.state.spec_entries[i];
-            if (!entry.specialized_type.equals(recv_type)) { continue; }
-            for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
-                const impl_node: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
-                if (impl_node == null) { continue; }
-                const m: MethodNode* = this.find_self_ret_method_in_impl(impl_node, method_name);
-                if (m != null) { *out_impl = impl_node; return m; }
-            }
-        }
-        if (this.generic_registry == null) { return null; }
-        const blocks: ImplBlockNode*[] = this.generic_registry.trait_impls_of(recv_type, this.intern_table);
-        for (mut i: i64 = 0; i < blocks.length; i++) {
-            const m: MethodNode* = this.find_self_ret_method_in_impl(blocks[i], method_name);
-            if (m != null) { *out_impl = blocks[i]; return m; }
-        }
-        return null;
-    }
-
-    /// First method named `method_name` in `impl_node` that is an
-    /// un-instantiated self-returning / lazy-self-growing adapter default.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    find_self_ret_method_in_impl(&this, impl_node: ImplBlockNode*,
-                                 method_name: SymbolStr) -> MethodNode* {
-        for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
-            const m: MethodNode* = impl_node.methods[k];
-            if (m == null || m.func == null) { continue; }
-            if (!m.func.name.equals(method_name)) { continue; }
-            if (!m.func.is_self_returning_default
-                    && !m.func.is_lazy_self_growing) { continue; }
-            return m;
-        }
-        return null;
     }
 
 
