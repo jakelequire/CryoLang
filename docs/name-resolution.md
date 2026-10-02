@@ -54814,3 +54814,73 @@ nums.push("x");               // E0214 expected `i64`, found `string` (was E0358
   `(this.init)()` (`thread/local.cryo:128`), function-pointer fields; calls
   in `static match` arms (`write_uint`, `next_below`); `this.ptr[i].hash(..)`
   on `Array<i32>`; `unwrap_or` and an operator `index` in two test bodies.
+
+### 8.463 A call through a function-typed field never reaches method selection once the member is answered as a field, and a generic body answers it where it is written - 2026-10-01
+
+## Why
+
+Slice 6.  After 8.462 the census (`.objcmp/s94/c3`) still counted 59
+post-mono selections by name; 33 were calls through a function-typed
+field.  A probe flag on the member's pin (`fld`, run
+`.objcmp/s94/small4.txt`) split them:
+
+* in ordinary bodies (`route.handler(req)` in `net/http/router.cryo:471`,
+  `h.run(1)`, `t.func()`, a class's inherited `cb`) the member was already
+  `MemberPin::Field` from the pass before monomorphization, and the pass
+  after it selected a method by the member's name again before falling back
+  to the field;
+* in copies (`this.f(value)` in `MapIter`'s `next`, `core/iter.cryo:285`;
+  `(this.init)()` in `ThreadLocal<T>::get`, `thread/local.cryo:128`) there
+  was no pin at all: the template walk's generic-owner arm of
+  `resolve_method_call` looks for a method of the owner template and, with
+  none, returned nothing, so the field was found first in each copy, after a
+  selection by name.
+
+## What changed
+
+* `bind_method_on_receiver` selects nothing for a member pinned as a field.
+  The pin comes from where the call is written, or from the template the
+  copy was made from (the cloner carries `resolved_member`).
+* The generic-owner arm of `resolve_method_call`, finding no method of the
+  member's name, answers the call through the function-typed field (the
+  `member-field` door, `MemberResolver::field_of`), pinning it in the
+  template.  A method of the name still comes first, as it does on a
+  concrete receiver.
+
+```cryo
+implement<I, O> trait Iterator<O> for struct MapIter<I, O> where I: Iterator {
+    next(mut &this) -> Option<O> {
+        return match (this.inner.next()) {
+            Option::Some(value) => { Option::Some(this.f(value)) }   // field `f`, pinned in the template
+            Option::None        => { Option::None }
+        };
+    }
+}
+```
+
+## Evidence
+
+* Census (`.objcmp/s94/c3` -> `c5`): post-mono selections by name in
+  ordinary bodies 30 -> **11**, in copies 29 -> **15**; every
+  function-typed-field call is gone.  The flag that classified them read
+  `fld=1` on 19 ordinary visits and `fld=0` on 14 copy visits in the run
+  before (`small4.txt`), so the instrument reports them when they occur.
+* Outputs: all 406 corpus entries byte-identical to the run before except
+  the compiler and LSP builds, whose warnings differ in line numbers only.
+* verify against HEAD (`.verify/runs/20261001-200052`): all gates OK;
+  objects **0 moved**, as predicted - the field and its coordinates are the
+  ones the post-mono pass reached.  Clean build: 331 warnings, the same
+  (code, file) set.
+
+## Remaining (slice 6)
+
+* 11 ordinary visits: an empty `[]` argument (`get_or_insert(slot, [])`,
+  6), a receiver reached by deref coercion (`b.total()`, `b.bump_x(99)` on
+  a `Deref` box, 4), a match-payload binding (`s.length()`, 1).
+* 15 copy visits: a trait's default called from another default in the
+  impl's copy (`this.next_below(..)` in `RandomSource`'s defaults for `Rng`,
+  `this.write_uint(..)` in `Hasher`'s): `pin_minted_method` requires the
+  method's own definition, and a default copied into an impl has only
+  `copy_of`; `this.ptr[i].hash(hasher)` on `Array<i32>` (the trait item's
+  answer, `i32`'s `hash<H>`, has type parameters of its own and needs mono's
+  instance); an operator `index` and `unwrap_or` in two test bodies.

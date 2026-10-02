@@ -3082,6 +3082,14 @@ type struct CallResolver {
     /// pinned here reads to mono as a call needing no specialization.
     bind_method_on_receiver(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
                             member: MemberAccessNode*, obj_type: TypeRef) -> Selection {
+        // A member answered as a function-typed field where it was written
+        // - in this body, or in the template a copy was made from - is a
+        // call through that field's value; no method is selected for it.
+        const through_field: boolean = match (member.resolved_member) {
+            MemberPin::Field(_, _) => { true }
+            _                      => { false }
+        };
+        if (through_field) { return Selection::none(); }
         // A call that is already bound stays bound.  Mono binds a generic
         // method call to the specialization it minted - a clone with no
         // generic parameters left, under the `$MG` symbol - and selecting
@@ -4186,7 +4194,9 @@ type struct CallResolver {
                 mret = this.binding.resolve_method_return_via_template(obj_type, member.member);
             }
             if (mret.is_valid()) { member.set_resolved_type(mret); return mret; }
-            return TypeRef::invalid();
+            // No method of the name: a call through a function-typed field,
+            // pinned here so every copy of the body carries the field.
+            return this.member.try_field_function_call(obj_type, member);
         }
         if (this.symbolic.symbolic_type_unresolved(obj_type)) {
             this.binding.stash_abstract_receiver_method(obj_type, member, call);
