@@ -55509,3 +55509,65 @@ function main() -> i32 { mut h: Holder = ..; h.drop(); return 0; }
   template method (`pin_static_entry`) and of an instance monomorphization
   made unkeyed (`pin_spec_entry` with `keyed` false), and `dead_code` and
   the facts recorder read it there.
+
+### 8.472 Drop insertion, move checking and code generation ask a call's pin which method it calls - 2026-10-02
+
+## Why
+
+Slice 8's first reader conversion. After monomorphization a method call's
+final answer is its pin, `CalleePin::Decl(entry)`; `CallExprNode.resolved_method`
+is a second record of it. The passes after monomorphization read the second
+record: whether a call consumes its receiver (drop insertion, move checking,
+codegen) and the vtable slot (codegen).
+
+## What changed
+
+* `DropInsertion` (the receiver-consumption question), `MoveChecker` (the
+  same), `CallEmitter::call_consumes_receiver` and the vtable-dispatch check
+  read the pinned entry's method, `DeclarationIndex::entry_method(call.resolved_callee.decl_entry())`.
+  A call with no declaration pin has no method, as one with no
+  `resolved_method` had none.
+
+## Evidence
+
+A probe at every reader of `resolved_method` that can reach a declaration
+index (`.objcmp/s96/add_s8r.py`, S96R: the node against the pinned entry's
+method - agree, differ, node with no declaration pin, pin with no node,
+neither), over all 409 corpus entries (`.objcmp/s96/c8/tally.log`):
+
+| reader | agree | differ | node, no pin | pin, no node | neither |
+|---|---|---|---|---|---|
+| drop insertion | 194,977 | 0 | 0 | 0 | 60,857 |
+| move checking | 271,787 | 0 | 0 | 0 | 92,180 |
+| codegen vtable check | 597,496 | 0 | 0 | 0 | 290,468 |
+| codegen receiver consumption | 8,478 | 0 | 0 | 0 | 0 |
+| mono, concrete-method early return | 102,440 | 4 | 189 | 181,664 | 341,966 |
+| mono, path call's template method | 0 | 0 | 19 | 151,063 | 157,138 |
+| sema, re-resolution guard (after mono) | 106,524 | 0 | 488 | 0 | 105,753 |
+| sema, return of the selected method (before / after mono) | 192,041 / 212,759 | 0 | 14 / 0 | 0 | 59,394 / 38 |
+| dead-code marking | 71,307 | 2 | 3 | 48,170 | 61,614 |
+
+* The four readers converted see only "agree" and "neither", so reading the
+  pin answers every one of them as before.
+* verify against HEAD (`.verify/runs/20261002-121546`): all gates OK,
+  objects **0 moved** (tests 5609, examples 1126). Clean build: 331
+  warnings, the same (code, file) set as before (`.objcmp/s96/mk32.out`).
+* No gate count moved.
+
+## Remaining
+
+The other readers are where `resolved_method` still carries something the pin
+does not (`.objcmp/s96/c8-differ-nopin.txt` lists each site):
+
+* "node, no pin": a path call naming a generic method records its template
+  there and stashes the type arguments, with no pin until monomorphization
+  (`pin_static_entry`); an instance monomorphization makes unkeyed
+  (`pin_spec_entry` with `keyed` false - `string.push(source)` on the bare
+  `String`) has no pin at all.
+* "differ": `./tests/string.cryo:109:34` and
+  `./tests/lang/async_generic_function.cryo:271:62` - the node and the pin
+  name different methods at monomorphization's early return and in
+  dead-code marking.
+* "pin, no node": copies, whose method node the substituter clears.
+* The facts recorder (`CallFacts`) and `CallResolver::instance_of_pin` read
+  it too and were not probed (no declaration index in reach).
