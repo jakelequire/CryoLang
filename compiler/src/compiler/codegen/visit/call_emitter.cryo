@@ -73,6 +73,7 @@ import compiler::types::compound::{
 };
 import compiler::types::generic::{ InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry };
+import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
@@ -595,18 +596,19 @@ type struct CallEmitter {
         }
 
         if (!callee_val.is_valid()) {
-            // A `.drop()` on a `Copy` receiver is a no-op: a bitwise-duplicable
-            // value owns no resources, so there is nothing to release.  A Copy
-            // type has no `Drop` implementation (having one would make it
-            // non-Copy), so the call is left unpinned - emit nothing rather
-            // than erroring.  This is how `ptr::drop_in_place::<T>` lowers
-            // for a Copy `T`.  Gated on `Copy` so a failed drop resolution on
-            // a genuinely-owning type still surfaces.
-            if (node.callee.kind == NodeKind::MemberAccess) {
+            // A release another pass built (`named_method` is `Drop::drop`'s
+            // language item) whose receiver's type has no destructor.  On a
+            // `Copy` receiver it is a no-op: a bitwise-duplicable value owns
+            // no resources, and a Copy type has no `Drop` implementation
+            // (having one would make it non-Copy).  This is how
+            // `ptr::drop_in_place::<T>` lowers for a Copy `T`.  Gated on
+            // `Copy` so a failed release of a genuinely-owning type still
+            // surfaces.
+            const releases: boolean = node.named_method.is_valid()
+                && node.named_method.equals(this.cg.ctx.generic_registry.wellknown(LangItem::DropDrop));
+            if (releases && node.callee.kind == NodeKind::MemberAccess) {
                 const dma: MemberAccessNode* = node.callee as MemberAccessNode*;
-                const drop_sym: SymbolStr = intern.intern("drop");
-                if (dma.member.equals(drop_sym)
-                        && OwnershipQuery::is_copy(this.cg.get_arena(),
+                if (OwnershipQuery::is_copy(this.cg.get_arena(),
                                this.cg.ctx.generic_registry,
                                this.cg.get_intern(),
                                dma.object.resolved_type)) {
@@ -614,14 +616,13 @@ type struct CallEmitter {
                     this.state.last_is_lvalue = false;
                     return;
                 }
-                // Drop glue: a `.drop()` on a non-Copy aggregate that carries
-                // no user-written drop (so resolution failed) is expanded into
-                // in-place drops of its droppable parts.  Reuses the same
-                // `.drop()` lowering recursively (a field that itself lacks a
-                // user drop re-enters this path).  In-place + idempotent leaf
-                // drops mean re-dropping an already-released part is a no-op.
-                if (dma.member.equals(drop_sym)
-                        && OwnershipQuery::needs_drop(this.cg.get_arena(),
+                // Drop glue: the release of a non-Copy aggregate with no
+                // destructor is expanded into in-place releases of its
+                // droppable parts.  Reuses the same lowering recursively (a
+                // field that itself lacks a destructor re-enters this path).
+                // In-place + idempotent leaf drops mean re-dropping an
+                // already-released part is a no-op.
+                if (OwnershipQuery::needs_drop(this.cg.get_arena(),
                                this.cg.ctx.generic_registry,
                                this.cg.get_intern(),
                                dma.object.resolved_type)) {
@@ -981,10 +982,15 @@ type struct CallEmitter {
         // sound only because leaf drops are in-place and null what they free,
         // making the second release a no-op - an invariant this now depends on
         // rather than merely benefits from.
-        if (node.callee.kind == NodeKind::MemberAccess && node.arguments.length == 0) {
+        //
+        // A destructor is the method of an implementation of `Drop`, which the
+        // call's pin names; a method merely named `drop` is not one, and runs
+        // no glue after it.
+        if (node.callee.kind == NodeKind::MemberAccess && node.arguments.length == 0
+                && this.cg.get_decl_index().entry_trait(node.resolved_callee.decl_entry()).equals(
+                       this.cg.ctx.defs.parent_of(this.cg.ctx.generic_registry.wellknown(LangItem::DropDrop)))) {
             const gma: MemberAccessNode* = node.callee as MemberAccessNode*;
-            const gdrop_sym: SymbolStr = intern.intern("drop");
-            if (gma.member.equals(gdrop_sym) && gma.object != null
+            if (gma.object != null
                     && OwnershipQuery::needs_drop(this.cg.get_arena(),
                            this.cg.ctx.generic_registry,
                            this.cg.get_intern(),

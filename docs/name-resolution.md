@@ -55444,3 +55444,68 @@ parameter.
   objects **0 moved** (tests 5609, examples 1126). Clean build: 331
   warnings, the same (code, file) set as before (`.objcmp/s96/mk24.out`).
 * No gate count moved.
+
+### 8.471 Code generation knows a release by the destructor's identity, not by a method's name `drop` - 2026-10-02
+
+## Why
+
+Slice 8's codegen half. Code generation recognized a release in two places
+by the member's spelling, `drop`:
+
+* an UNPINNED `x.drop()` - a release another pass built for a type with no
+  destructor - was lowered as the type's drop glue, or as nothing for a
+  `Copy` type;
+* after a pinned `x.drop()` it emitted the receiver's field glue, so a
+  destructor's fields are released whatever its body does.
+
+The second also ran after a call to an ordinary method merely named `drop`,
+which is not a destructor (ruling 44); ruling 79 accepted that only until
+this branch is removed.
+
+```cryo
+type struct Holder { s: String; }
+implement struct Holder { drop(mut &this) -> void { } }   // not a destructor
+function main() -> i32 { mut h: Holder = ..; h.drop(); return 0; }
+// the field glue ran after `h.drop()`; now `h.s` is released at scope exit
+```
+
+## What changed
+
+* `CallResolver::bind_destructor`, which binds every release another pass
+  builds (drop insertion, `drop_in_place`'s lowering, codegen's own glue),
+  records `Drop::drop`'s language item in the call's `named_method`, whether
+  or not the type has a destructor to bind. The binding itself is unchanged.
+* The unpinned branch asks `named_method` for that language item.
+* The field-glue branch asks whether the call's pin names a method of an
+  implementation of `Drop` (`DeclarationIndex::entry_trait`).
+* Neither mentions the spelling `drop`.
+
+## Evidence
+
+* The unpinned branch (S96Y, `.objcmp/s96/add_s8x.py`, over all 409 corpus
+  entries, `.objcmp/s96/c6`): 290,468 calls reach it (289,622 glue, 846
+  `Copy`), every one marked by `bind_destructor`; a written one, 0. Control:
+  with the marking left out (`ctl-nomark.exe`), the 2,982 on
+  `examples/01-hello` all read unmarked. With the marking on, every build and
+  check exit code is unchanged.
+* The field-glue branch (S96G, `.objcmp/s96/add_s8g.py`, `.objcmp/s96/c7`):
+  421,286 calls reach it, every one pinned to a `Drop` implementation's
+  method (418,949 built by a pass, 2,337 written - `this.stream.drop()` in a
+  destructor's body); bound to a method merely named `drop`, 0. Control: the
+  program above (`.objcmp/s96/idrop`) reads `dropimpl=0` at `h.drop()`.
+* verify against HEAD (`.verify/runs/20261002-113818`): all gates OK,
+  objects **0 moved** (tests 5609, examples 1126). Clean build: 331
+  warnings, the same (code, file) set as before (`.objcmp/s96/mk30.out`).
+* No gate count moved.
+
+## Remaining
+
+* `CallExprNode.resolved_method` is not removed. On `examples/01-hello`
+  every reader after monomorphization (drop insertion, move checking,
+  codegen's vtable slot and receiver-consumption question) sees it agree
+  with the final pin's entry (S96R, `.objcmp/s96/add_s8.py`: 1,739 / 2,471 /
+  6,071 / 103 agree, 0 differ, 0 with no pin); the pass before
+  monomorphization still uses it as the only record of a path call's generic
+  template method (`pin_static_entry`) and of an instance monomorphization
+  made unkeyed (`pin_spec_entry` with `keyed` false), and `dead_code` and
+  the facts recorder read it there.
