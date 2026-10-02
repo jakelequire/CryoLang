@@ -67,6 +67,7 @@ import compiler::diag::sink::{ DiagnosticSink };
 import compiler::passes::type_resolution;
 import compiler::passes::type_resolution::{ TypeResolutionPasses, TypeResolutionRunner };
 import compiler::ast::cloner::{ ASTCloner };
+import compiler::ast::postmono_writes::{ PostmonoWrites, g_postmono_writes };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DestructureBinding, DestructureDeclNode,
     EnumDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
@@ -1601,6 +1602,15 @@ public:
     /// every build, a module reused from the incremental cache included,
     /// while the check after it skips a cached module.
     resolve_call_recorded(mut &this, call: CallExprNode*) -> TypeRef {
+        if (g_postmono_writes != null && this.state.post_mono_verify) {
+            const entry_pin: CalleePin = call.resolved_callee;
+            mut entry_args: ExpressionNode*[] = [];
+            for (mut i: i64 = 0; i < call.arguments.length; i++) { entry_args.push(call.arguments[i]); }
+            const entry_bindings: u64[] = PostmonoWrites::bindings_of(call);
+            const written: TypeRef = this.calls.resolve_call(this, call);
+            PostmonoWrites::record_call(call, &entry_pin, &entry_args, &entry_bindings);
+            return written;
+        }
         const t: TypeRef = this.calls.resolve_call(this, call);
         if (this.ctx.options.emit_facts && !this.state.post_mono_verify) {
             const known: boolean = this.state.facts_call == call;
@@ -1642,6 +1652,7 @@ public:
         if (expr.has_resolved_type() && !this.state.post_mono_verify) {
             return expr.resolved_type;
         }
+        const entry: TypeRef = expr.resolved_type;
         const n: ASTNode* = expr as ASTNode*;
         const result: TypeRef = match (n.kind) {
             NodeKind::Literal           => { this.literals.resolve_literal(expr as LiteralNode*) }
@@ -1693,6 +1704,9 @@ public:
             _ => { TypeRef::invalid() }
         };
         if (result.is_valid()) { expr.set_resolved_type(result); }
+        if (g_postmono_writes != null && this.state.post_mono_verify) {
+            PostmonoWrites::record_type(this.arena, expr, entry, result);
+        }
         return result;
     }
 

@@ -1,0 +1,483 @@
+/// `--emit=postmono-writes`: what the type check after monomorphization
+/// writes, reported in `<output_dir>/<name>.postmono`.
+///
+/// That pass walks every body that is not generic, including every copy
+/// monomorphization made of a generic one, and writes a type on each
+/// expression, a pin on each call and a binding on each argument.  Each
+/// write is compared with what it overwrites:
+///
+/// * an expression that is not a copy, with the type it had on entry;
+/// * an expression in a copy, with the type its template's expression had
+///   before monomorphization, the copy's substitution applied (`expected`),
+///   so a write that restates the first pass's answer counts as a no-op;
+/// * a call's pin, with the pin it entered with and, in a copy, with its
+///   template's;
+/// * an argument's binding, with the one it entered with and its
+///   template's.
+///
+/// A writer can be removed once every cell it writes reads no-ops.  Off
+/// unless the flag is given: `g_postmono_writes` is null and each hook is
+/// one test of it.  Rows are counted under integer codes; their text is
+/// written once, when a row is first counted.
+namespace compiler::ast::postmono_writes;
+
+import compiler::ast;
+import compiler::ast::{ ArgBinding, NodeKind };
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::expression::{ CalleePin, CallExprNode, ExpressionNode };
+import compiler::resolver::resolution_map::{ ResolutionMap };
+import compiler::types;
+import compiler::types::{ TypeKind };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::compound::{
+    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+};
+import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
+import std::alloc::allocator;
+import std::collections::hashmap::{ HashMap };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::fmt;
+import std::fs::dir;
+import std::fs::file;
+import std::fs::path::{ Path };
+import utils::text::{ Text };
+
+/// The recorder, while `--emit=postmono-writes` is on; null otherwise.
+mut g_postmono_writes: PostmonoWrites* = null;
+
+/// Where an expression in a copy came from: the template's expression, and
+/// the type it had there with the copy's substitution applied (invalid when
+/// the template's expression was untyped when it was copied).
+type struct CloneOrigin {
+    template: ExpressionNode*;
+    expected: TypeRef;
+}
+
+/// Counted rows, in the order they were first counted.
+type struct Tally {
+    index:  HashMap<u64, i64>;
+    labels: string[];
+    counts: i64[];
+}
+
+implement struct Tally {
+    static new() -> Tally {
+        return Tally { index: HashMap::<u64, i64>::new(), labels: [], counts: [] };
+    }
+
+    /// The row counted under `key`, or -1 before its first count.
+    row(&this, key: u64) -> i64 {
+        return match (this.index.get(&key)) {
+            Option::Some(i) => { i }
+            Option::None    => { -1 }
+        };
+    }
+
+    open(mut &this, key: u64, label: Text) -> i64 {
+        const i: i64 = this.labels.length;
+        this.labels.push(label.as_string());
+        this.counts.push(0);
+        this.index.insert(key, i);
+        return i;
+    }
+
+    /// Count one in row `i`; true for its first three, which are sampled.
+    bump(mut &this, i: i64) -> boolean {
+        this.counts[i] = this.counts[i] + 1;
+        return this.counts[i] <= 3;
+    }
+}
+
+// What a type write did.  Outside a copy: against the type on entry.
+const BODY_SAME: u64 = 0;
+const BODY_FILL: u64 = 1;
+const BODY_CHANGE: u64 = 2;
+const BODY_LOST: u64 = 3;
+const BODY_UNTYPED: u64 = 4;
+// In a copy: against the template's type, substituted.
+const COPY_SAME: u64 = 5;
+const COPY_PARAM_SURVIVES: u64 = 6;
+const COPY_PROJECTION_SURVIVES: u64 = 7;
+const COPY_CHANGE: u64 = 8;
+const COPY_LOST: u64 = 9;
+// In a copy whose template's expression was untyped: against the entry.
+const UNTYPED_SAME: u64 = 10;
+const UNTYPED_FILL: u64 = 11;
+const UNTYPED_CHANGE: u64 = 12;
+const UNTYPED_UNTYPED: u64 = 13;
+
+type struct PostmonoWrites {
+    origins: HashMap<u64, CloneOrigin>;
+    types:   Tally;
+    pins:    Tally;
+    args:    Tally;
+    /// Each site a type write that was not a no-op reached, by outcome.
+    sites:   Tally;
+    samples: string[];
+    walked:  i64;
+    cached:  i64;
+}
+
+implement struct PostmonoWrites {
+    static new() -> PostmonoWrites {
+        return PostmonoWrites {
+            origins: HashMap::<u64, CloneOrigin>::new(),
+            types:   Tally::new(),
+            pins:    Tally::new(),
+            args:    Tally::new(),
+            sites:   Tally::new(),
+            samples: [],
+            walked:  0,
+            cached:  0,
+        };
+    }
+
+    /// Turn the recorder on for this compilation, emptied: a build of
+    /// several targets compiles each from a fresh tree, and the origins of
+    /// the last one's copies point into a tree that is gone.
+    static start() -> void {
+        if (g_postmono_writes != null) {
+            *g_postmono_writes = PostmonoWrites::new();
+            return;
+        }
+        const p: PostmonoWrites* = allocator::alloc(sizeof(PostmonoWrites), 16) as PostmonoWrites*;
+        *p = PostmonoWrites::new();
+        g_postmono_writes = p;
+    }
+
+    static key_of(e: ExpressionNode*) -> u64 {
+        return (e as void*) as u64;
+    }
+
+    static origin_of(e: ExpressionNode*) -> Option<CloneOrigin> {
+        return g_postmono_writes.origins.get(&PostmonoWrites::key_of(e));
+    }
+
+    /// Record that `clone` was copied from `template`.  A template that is
+    /// itself a copy whose type was never written passes its own origin's
+    /// type on.
+    static record_clone(template: ExpressionNode*, clone: ExpressionNode*) -> void {
+        if (g_postmono_writes == null || template == null || clone == null || template == clone) { return; }
+        mut expected: TypeRef = template.resolved_type;
+        if (!expected.is_valid()) {
+            match (PostmonoWrites::origin_of(template)) {
+                Option::Some(o) => { expected = o.expected; }
+                Option::None    => { }
+            }
+        }
+        g_postmono_writes.origins.insert(PostmonoWrites::key_of(clone),
+            CloneOrigin { template: template, expected: expected });
+    }
+
+    /// Apply the substitution a copy is made under to the type its
+    /// expression `e` is expected to have.  Applied without demanding the
+    /// instantiations it builds: the instrument must not mint what the
+    /// program does not.
+    static record_substituted(e: ExpressionNode*, subst: TypeSubstitution*, arena: TypeArena*) -> void {
+        if (g_postmono_writes == null || e == null || subst == null) { return; }
+        match (g_postmono_writes.origins.get_ref(&PostmonoWrites::key_of(e))) {
+            Option::Some(o) => {
+                if (!(*o).expected.is_valid()) { return; }
+                const was: boolean = arena.symbolic_no_demand_active;
+                arena.set_symbolic_no_demand(true);
+                (*o).expected = subst.apply((*o).expected, arena);
+                arena.set_symbolic_no_demand(was);
+            }
+            Option::None => { }
+        }
+    }
+
+    /// Whether a type parameter occurs in `ty`, under projections too; an
+    /// unnormalised projection on a concrete base alone answers false.
+    static has_param(arena: TypeArena*, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = arena.lookup(ty);
+        if (t == null) { return false; }
+        return match (t.kind) {
+            TypeKind::GenericParam    => { true }
+            TypeKind::AssocProjection => { PostmonoWrites::has_param(arena, (t as AssocProjectionType*).base) }
+            TypeKind::Pointer         => { PostmonoWrites::has_param(arena, (t as PointerType*).pointee) }
+            TypeKind::Reference       => { PostmonoWrites::has_param(arena, (t as ReferenceType*).referent) }
+            TypeKind::Array           => { PostmonoWrites::has_param(arena, (t as ArrayType*).element) }
+            TypeKind::Optional        => { PostmonoWrites::has_param(arena, (t as OptionalType*).wrapped) }
+            TypeKind::Tuple           => { PostmonoWrites::any_param(arena, &(t as TupleType*).elements) }
+            TypeKind::Function        => {
+                const f: FunctionType* = t as FunctionType*;
+                PostmonoWrites::has_param(arena, f.return_type) || PostmonoWrites::any_param(arena, &f.param_types)
+            }
+            TypeKind::InstantiatedType => { PostmonoWrites::any_param(arena, &(t as InstantiatedType*).type_args) }
+            _ => { false }
+        };
+    }
+
+    static any_param(arena: TypeArena*, tys: &TypeRef[]) -> boolean {
+        for (mut i: i64 = 0; i < tys.length; i++) {
+            if (PostmonoWrites::has_param(arena, tys[i])) { return true; }
+        }
+        return false;
+    }
+
+    static display(arena: TypeArena*, t: TypeRef) -> string {
+        if (!t.is_valid()) { return "<none>"; }
+        if (arena.lookup(t) == null) { return "<bad>"; }
+        return arena.resolve_display_name(t);
+    }
+
+    static outcome_name(o: u64) -> string {
+        return match (o) {
+            0  => { "body\tsame" }
+            1  => { "body\tfill" }
+            2  => { "body\tchange" }
+            3  => { "body\tlost" }
+            4  => { "body\tuntyped" }
+            5  => { "copy\tsame" }
+            6  => { "copy\tparam-survives" }
+            7  => { "copy\tprojection-survives" }
+            8  => { "copy\tchange" }
+            9  => { "copy\tlost" }
+            10 => { "copy\ttemplate-untyped-same" }
+            11 => { "copy\ttemplate-untyped-fill" }
+            12 => { "copy\ttemplate-untyped-change" }
+            _  => { "copy\ttemplate-untyped-untyped" }
+        };
+    }
+
+    /// What writing `result` did to an expression: one that is not a copy
+    /// against `entry`, one in a copy against `expected`.
+    static outcome(arena: TypeArena*, copy: boolean, expected: TypeRef, entry: TypeRef, result: TypeRef) -> u64 {
+        if (!copy) {
+            if (!entry.is_valid() && !result.is_valid()) { return BODY_UNTYPED; }
+            if (!entry.is_valid()) { return BODY_FILL; }
+            if (!result.is_valid()) { return BODY_LOST; }
+            if (entry.equals(result)) { return BODY_SAME; }
+            return BODY_CHANGE;
+        }
+        if (!expected.is_valid()) {
+            if (!result.is_valid()) { return UNTYPED_UNTYPED; }
+            if (!entry.is_valid()) { return UNTYPED_FILL; }
+            if (entry.equals(result)) { return UNTYPED_SAME; }
+            return UNTYPED_CHANGE;
+        }
+        if (!result.is_valid()) { return COPY_LOST; }
+        if (expected.equals(result)) { return COPY_SAME; }
+        if (PostmonoWrites::has_param(arena, expected)) { return COPY_PARAM_SURVIVES; }
+        if (arena.contains_generic_param(expected)) { return COPY_PROJECTION_SURVIVES; }
+        return COPY_CHANGE;
+    }
+
+    /// The type check after monomorphization wrote `result` on `e`, which
+    /// held `entry`.
+    static record_type(arena: TypeArena*, e: ExpressionNode*, entry: TypeRef, result: TypeRef) -> void {
+        if (g_postmono_writes == null || e == null) { return; }
+        const n: ASTNode* = e as ASTNode*;
+        mut copy: boolean = false;
+        mut expected: TypeRef = TypeRef::invalid();
+        match (PostmonoWrites::origin_of(e)) {
+            Option::Some(o) => { copy = true; expected = o.expected; }
+            Option::None    => { }
+        }
+        const o: u64 = PostmonoWrites::outcome(arena, copy, expected, entry, result);
+        const key: u64 = o * 1024 + (n.kind as u64);
+        mut i: i64 = g_postmono_writes.types.row(key);
+        if (i < 0) {
+            i = g_postmono_writes.types.open(key, Text::new(PostmonoWrites::outcome_name(o) + "\t" + n.kind.to_string()));
+        }
+        const sampled: boolean = g_postmono_writes.types.bump(i);
+        if (o == BODY_SAME || o == COPY_SAME || o == UNTYPED_SAME) { return; }
+        // The site, under its outcome: an outcome is at most 13, and a
+        // column past 4095 shares its row with another outcome's.
+        const site: u64 = ResolutionMap::make_key(e.span) ^ (o << 60);
+        mut j: i64 = g_postmono_writes.sites.row(site);
+        if (j < 0) {
+            j = g_postmono_writes.sites.open(site, Text::new(fmt::format("%s\t%s:%u:%u", PostmonoWrites::outcome_name(o),
+                e.span.file, e.span.start_line, e.span.start_col)));
+        }
+        g_postmono_writes.sites.bump(j);
+        if (sampled) {
+            g_postmono_writes.samples.push(fmt::format("sample\ttype\t%s\t%s\t%s:%u:%u\tentry=%s\texpected=%s\tresult=%s",
+                PostmonoWrites::outcome_name(o), n.kind.to_string(), e.span.file, e.span.start_line, e.span.start_col,
+                PostmonoWrites::display(arena, entry), PostmonoWrites::display(arena, expected),
+                PostmonoWrites::display(arena, result)));
+        }
+    }
+
+    /// 0 none, 1 a declaration, 2 a family.
+    static pin_code(p: &CalleePin) -> u64 {
+        if (p.decl_entry().is_valid()) { return 1; }
+        if (p.is_family()) { return 2; }
+        return 0;
+    }
+
+    static pin_name(c: u64) -> string {
+        return match (c) {
+            0 => { "none" }
+            1 => { "decl" }
+            2 => { "family" }
+            _ => { "-" }
+        };
+    }
+
+    /// Two pins of one kind naming one declaration; two family pins are
+    /// compared by kind alone.
+    static same_pin(a: &CalleePin, b: &CalleePin) -> boolean {
+        if (PostmonoWrites::pin_code(a) != PostmonoWrites::pin_code(b)) { return false; }
+        return !a.decl_entry().is_valid() || a.decl_entry().equals(b.decl_entry());
+    }
+
+    /// 0 unclassified, 1 by value, 2 borrowed; +4 with an autoref.
+    static binding_code(a: ExpressionNode*) -> u64 {
+        const b: u64 = match (a.arg_binding) {
+            ArgBinding::Unclassified => { 0 }
+            ArgBinding::ByValue      => { 1 }
+            ArgBinding::Borrowed     => { 2 }
+        };
+        return if (a.autoref) { b + 4 } else { b };
+    }
+
+    static yes_no(b: boolean) -> string {
+        return if (b) { "yes" } else { "no" };
+    }
+
+    /// The bindings `call`'s arguments hold, in order, before it is
+    /// resolved again; 8 for a missing argument.
+    static bindings_of(call: CallExprNode*) -> u64[] {
+        mut out: u64[] = [];
+        if (g_postmono_writes == null) { return out; }
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const a: ExpressionNode* = call.arguments[i];
+            const code: u64 = if (a == null) { 8 } else { PostmonoWrites::binding_code(a) };
+            out.push(code);
+        }
+        return out;
+    }
+
+    /// The type check after monomorphization resolved `call` again: it
+    /// entered pinned `entry_pin`, with arguments `entry_args` bound
+    /// `entry_bindings`.
+    static record_call(call: CallExprNode*, entry_pin: &CalleePin, entry_args: &ExpressionNode*[],
+                       entry_bindings: &u64[]) -> void {
+        if (g_postmono_writes == null || call == null) { return; }
+        mut copy: boolean = false;
+        mut template: CallExprNode* = null;
+        match (PostmonoWrites::origin_of(call as ExpressionNode*)) {
+            Option::Some(o) => {
+                copy = true;
+                if (o.template != null && (o.template as ASTNode*).kind == NodeKind::CallExpression) {
+                    template = o.template as CallExprNode*;
+                }
+            }
+            Option::None => { }
+        }
+        // 0 a name, 1 a path, 2 a member, 3 anything else.
+        mut shape: u64 = 3;
+        if (call.callee != null) {
+            const ck: NodeKind = (call.callee as ASTNode*).kind;
+            if (ck == NodeKind::Identifier) { shape = 0; }
+            if (ck == NodeKind::ScopeResolution) { shape = 1; }
+            if (ck == NodeKind::MemberAccess) { shape = 2; }
+        }
+        const tk: u64 = if (template == null) { 3 } else { PostmonoWrites::pin_code(&template.resolved_callee) };
+        const ek: u64 = PostmonoWrites::pin_code(entry_pin);
+        const ak: u64 = PostmonoWrites::pin_code(&call.resolved_callee);
+        const changed: boolean = !PostmonoWrites::same_pin(entry_pin, &call.resolved_callee);
+        // 0 no template, 1 the template's pin, 2 another.
+        const as_t: u64 = if (template == null) { 0 } else {
+            if (PostmonoWrites::same_pin(&template.resolved_callee, &call.resolved_callee)) { 1 } else { 2 }
+        };
+        const copy_code: u64 = if (copy) { 1 } else { 0 };
+        const changed_code: u64 = if (changed) { 1 } else { 0 };
+        const key: u64 = (((((copy_code * 4 + shape) * 4 + tk) * 4 + ek) * 4 + ak) * 2 + changed_code) * 3 + as_t;
+        mut i: i64 = g_postmono_writes.pins.row(key);
+        if (i < 0) {
+            const shape_name: string = match (shape) {
+                0 => { "name" }
+                1 => { "path" }
+                2 => { "member" }
+                _ => { "other" }
+            };
+            const as_name: string = match (as_t) {
+                0 => { "-" }
+                1 => { "yes" }
+                _ => { "no" }
+            };
+            i = g_postmono_writes.pins.open(key, Text::new("body=" + (if (copy) { "copy" } else { "body" })
+                + "\tshape=" + shape_name + "\ttemplate=" + PostmonoWrites::pin_name(tk)
+                + "\tentry=" + PostmonoWrites::pin_name(ek) + "\tafter=" + PostmonoWrites::pin_name(ak)
+                + "\tchanged=" + PostmonoWrites::yes_no(changed) + "\tas-template=" + as_name));
+        }
+        if (g_postmono_writes.pins.bump(i) && changed) {
+            g_postmono_writes.samples.push(fmt::format("sample\tpin\t%s\t%s:%u:%u", g_postmono_writes.pins.labels[i],
+                call.span.file, call.span.start_line, call.span.start_col));
+        }
+        for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
+            const a: ExpressionNode* = call.arguments[ai];
+            if (a == null) { continue; }
+            const replaced: boolean = ai >= entry_args.length || entry_args[ai] != a;
+            const now: u64 = PostmonoWrites::binding_code(a);
+            const was: u64 = if (ai < entry_bindings.length) { entry_bindings[ai] } else { 8 };
+            // 0 no template, 1 the template's, 2 another, 3 the template's unclassified.
+            mut vs: u64 = 0;
+            if (template != null && ai < template.arguments.length && template.arguments[ai] != null) {
+                const tb: u64 = PostmonoWrites::binding_code(template.arguments[ai]);
+                vs = if (tb == now) { 1 } else { if (tb == 0) { 3 } else { 2 } };
+            }
+            const replaced_code: u64 = if (replaced) { 1 } else { 0 };
+            const moved_code: u64 = if (now != was) { 1 } else { 0 };
+            const akey: u64 = ((copy_code * 2 + replaced_code) * 2 + moved_code) * 4 + vs;
+            mut j: i64 = g_postmono_writes.args.row(akey);
+            if (j < 0) {
+                const vs_name: string = match (vs) {
+                    0 => { "-" }
+                    1 => { "same" }
+                    2 => { "differ" }
+                    _ => { "template-unclassified" }
+                };
+                j = g_postmono_writes.args.open(akey, Text::new("body=" + (if (copy) { "copy" } else { "body" })
+                    + "\treplaced=" + PostmonoWrites::yes_no(replaced)
+                    + "\tchanged=" + PostmonoWrites::yes_no(now != was) + "\ttemplate=" + vs_name));
+            }
+            if (g_postmono_writes.args.bump(j) && (replaced || now != was)) {
+                g_postmono_writes.samples.push(fmt::format("sample\targ\t%s\t%s:%u:%u", g_postmono_writes.args.labels[j],
+                    a.span.file, a.span.start_line, a.span.start_col));
+            }
+        }
+    }
+
+    /// One module walked by the type check after monomorphization, or
+    /// served from the incremental cache and so not walked.
+    static record_module(walked: boolean) -> void {
+        if (g_postmono_writes == null) { return; }
+        if (walked) { g_postmono_writes.walked += 1; } else { g_postmono_writes.cached += 1; }
+    }
+
+    static rows(out: mut &String, kind: Text, t: &Tally) -> void {
+        for (mut i: i64 = 0; i < t.labels.length; i++) {
+            out.push(fmt::format("%s\t%s\t%lld\n", kind.as_string(), t.labels[i], t.counts[i]));
+        }
+    }
+
+    /// Write the report to `path`; false when it cannot be written.
+    static write(path_text: Text) -> boolean {
+        if (g_postmono_writes == null) { return true; }
+        const path: string = path_text.as_string();
+        mut text: String = String::new();
+        text.push(fmt::format("modules\twalked=%lld\tcached=%lld\n", g_postmono_writes.walked, g_postmono_writes.cached));
+        PostmonoWrites::rows(&text, Text::new("type"), &g_postmono_writes.types);
+        PostmonoWrites::rows(&text, Text::new("pin"), &g_postmono_writes.pins);
+        PostmonoWrites::rows(&text, Text::new("arg"), &g_postmono_writes.args);
+        PostmonoWrites::rows(&text, Text::new("site"), &g_postmono_writes.sites);
+        for (mut i: i64 = 0; i < g_postmono_writes.samples.length; i++) {
+            text.push(g_postmono_writes.samples[i]);
+            text.push_byte(10 as u8);
+        }
+        dir::create_dir_all(Path::from(path.parent_dir()));
+        return match (file::write(Path::from(path), text.as_bytes())) {
+            Result::Ok(_)  => { true }
+            Result::Err(_) => { false }
+        };
+    }
+}
