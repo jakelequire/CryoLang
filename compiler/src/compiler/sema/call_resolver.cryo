@@ -61,7 +61,7 @@ import compiler::resolver::res::{ DefId, DefKind, FamilyOwner, Res, ResBase, Res
 import compiler::decl_index::{ OverloadId };
 import compiler::ast::declaration::{
     ClassDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
-    StructDeclNode, UnionDeclNode, VarDeclNode
+    StructDeclNode, TraitDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
     CalleePin,
@@ -2776,6 +2776,14 @@ type struct CallResolver {
         }
         const entries: OverloadId[] = this.family_entries(callee);
         if (entries.length == 0) { return TypeRef::invalid(); }
+        // After monomorphization a call names the declaration it was written
+        // against, carried into every copy of its body, or nothing; one that
+        // reaches the selection here was left unpinned, which is the
+        // compiler's defect.
+        if (this.state.post_mono_verify) {
+            this.report_unbound_after_mono(call, this.intern.resolve(this.ctx.defs.leaf_of(callee)), "function");
+            return TypeRef::invalid();
+        }
         mut overloads: TypeRef[] = [];
         for (mut ei: i64 = 0; ei < entries.length; ei++) {
             overloads.push(this.ctx.decl_index.entry_signature(entries[ei]));
@@ -3266,7 +3274,7 @@ type struct CallResolver {
         // that reaches selection here was left unrecorded, which is the
         // compiler's defect; it is never selected again by its name.
         if (this.state.post_mono_verify) {
-            this.report_unbound_after_mono(call, member);
+            this.report_unbound_after_mono(call, this.intern.resolve(member.member), "method");
             return Selection::none();
         }
         if (want_trait.is_valid() && this.select_in_set(visitor, call, member, base_ref, base_t, start_cls,
@@ -3294,11 +3302,12 @@ type struct CallResolver {
         return Selection::none();
     }
 
-    /// The internal error for a method call that reached selection after
-    /// monomorphization: it names the method, the function whose body holds
-    /// the call - in a specialization, the specialization - and the place
-    /// the call is written, which for a copied body is its template's.
-    report_unbound_after_mono(mut &this, call: CallExprNode*, member: MemberAccessNode*) -> void {
+    /// The internal error for a call that reached selection after
+    /// monomorphization: it names the callee `leaf` - a `what`, method or
+    /// function - the function whose body holds the call - in a
+    /// specialization, the specialization - and the place the call is
+    /// written, which for a copied body is its template's.
+    report_unbound_after_mono(mut &this, call: CallExprNode*, leaf: string, what: string) -> void {
         const func: FunctionDeclNode* = this.state.current_func;
         mut where_fn: string = "<no function>";
         if (func != null) {
@@ -3310,8 +3319,8 @@ type struct CallResolver {
         }
         const file: string = call.span.file;
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-            Text::new(fmt::format("internal: call to `%s` in `%s` reached codegen with no resolved method (written at %s:%u)",
-                this.intern.resolve(member.member), where_fn, file.basename(), call.span.start_line)));
+            Text::new(fmt::format("internal: call to `%s` in `%s` reached codegen with no resolved %s (written at %s:%u)",
+                leaf, where_fn, what, file.basename(), call.span.start_line)));
         d = d.at(call.span);
         this.ctx.emit_diagnostic(d);
     }
@@ -3459,6 +3468,28 @@ type struct CallResolver {
     stamp_trait_item(&this, member: MemberAccessNode*, trait_def: DefId) -> void {
         const slot: i64 = this.ctx.generic_registry.trait_item_slot(trait_def, member.member);
         member.set_resolved_trait_item(trait_def, slot);
+    }
+
+    /// The type of a call a bound answered, `ret` being its trait method's
+    /// return: a method with type parameters of its own returns in them
+    /// (`next<T>(mut &this) -> T`), and the call's type arguments say what
+    /// they are at this call, so `r.next::<f64>()` is an `f64` where it is
+    /// written.  The method is the trait's declared one at the position the
+    /// call recorded.  `ret` unchanged when the call carries no type
+    /// arguments for it.
+    bound_return_at_call_args(&this, member: MemberAccessNode*, call: CallExprNode*, ret: TypeRef) -> TypeRef {
+        if (call.resolved_type_args.length == 0 || member.resolved_trait_slot < 0) { return ret; }
+        const decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(member.resolved_trait);
+        if (decl == null || member.resolved_trait_slot >= decl.methods.length) { return ret; }
+        const f: FunctionDeclNode* = decl.methods[member.resolved_trait_slot];
+        if (f == null || f.generic_params.length != call.resolved_type_args.length) { return ret; }
+        mut view: TypeSubstitution = TypeSubstitution::empty();
+        for (mut i: i64 = 0; i < f.generic_params.length; i++) {
+            const gp: GenericParamNode* = f.generic_params[i];
+            if (gp == null) { return ret; }
+            view.add(this.ctx.type_resolver.create_param_type(gp, i as u64), call.resolved_type_args[i]);
+        }
+        return view.apply(ret, this.arena);
     }
 
     /// The methods `recv`'s implementations of the call's trait provide for
@@ -4288,8 +4319,9 @@ type struct CallResolver {
                 if (member.resolved_trait.is_valid() && member.resolved_trait_slot >= 0) {
                     call.template_recv = obj_type;
                 }
-                member.set_resolved_type(abs_ret);
-                return abs_ret;
+                const typed_ret: TypeRef = this.bound_return_at_call_args(member, call, abs_ret);
+                member.set_resolved_type(typed_ret);
+                return typed_ret;
             }
             const param: GenericParamType* = this.binding.receiver_type_param(obj_type);
             if (param != null) {

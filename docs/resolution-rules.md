@@ -83,6 +83,18 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-02
+
+80. **The internal check after monomorphization names the specialization's
+    owner by its short display name** (`SliceIter<u8>`), as in "internal:
+    call to `next` in `SliceIter<u8>::for_each` reached codegen with no
+    resolved method (written at iter.cryo:74)". The lane gate's ARENA_READ
+    count rising by one for that rendering is accepted.
+
+81. **An enum constructor over an unminted argument infers its
+    instantiation** under ruling 35: `const o = Option::Some(String::from_string("hi"));`
+    compiles with `o: Option<String>`. It was refused with E0200.
+
 ### 2026-10-01
 
 70. **The pass after monomorphization does not re-walk generic template
