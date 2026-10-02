@@ -673,31 +673,6 @@ type struct MonoCallSpecializer {
 
     // -- Method-call specialization (consumes call.resolved_type_args) --
 
-    /// Specialize a generic method call from sema's method-level binding stash.
-    ///   * RECEIVER: `ma.object.resolved_type` (sema-pinned).
-    ///   * BINDINGS: the method's own generics come from `call.resolved_type_args`
-    ///     (sema's stash).
-    ///   * ADAPTER RECEIVERS: there is no synchronous `ensure_receiver_inst_resolved`
-    ///     (it would need the orchestrator's spec cache).  Instead the unwrap loop leaves
-    ///     an unresolved adapter inst alone, and
-    ///     the run_monomorphization walk/drain FIXPOINT resolves the chained call on a
-    ///     later iteration (sema pre-types adapter returns as concrete InstantiatedTypes).
-    /// Reconstruct a method-call receiver's type in a specialized body when the
-    /// cloner has reset the receiver expression's `resolved_type`.  A pure
-    /// structural READ over sema-given types: any expression sema typed returns
-    /// that type as-is; a member access resolves its object's type, unwraps to the
-    /// underlying struct/class, and reads the DECLARED type of the field at the
-    /// coordinates sema pinned on the access - which the clone carries, because
-    /// a field's position is the same in the template and in every
-    /// instantiation of it.  An access with no pin is not reconstructible.  This is
-    /// not inference and it does NOT concretize via the substitution - applying
-    /// the subst would mint untracked arena instantiations as a side effect, even
-    /// on calls that later bail.  Concretization isn't needed for the cases this
-    /// serves (a non-generic-owner receiver like the field `this.h : Inner`, whose
-    /// declared field type is already concrete); a still-generic reconstruction is
-    /// harmless because such a (generic-type-spec) receiver is gated out of the
-    /// derived path by its caller.  Returns invalid when the shape isn't
-    /// reconstructible (caller then bails).
     /// Where the method `m` is held for the receiver `recv_type`: a
     /// declaration (`out_owner`) - the receiver's specialization's, or a
     /// non-generic owner's own - or an impl block (`out_impl`) - one placed
@@ -741,42 +716,15 @@ type struct MonoCallSpecializer {
         return recv.resolved_type;
     }
 
-    derive_receiver_type(&this, expr: ExpressionNode*) -> TypeRef {
-        if (expr == null) { return TypeRef::invalid(); }
-        if (expr.resolved_type.is_valid()) { return expr.resolved_type; }
-        const node: ASTNode* = expr as ASTNode*;
-        if (node.kind != NodeKind::MemberAccess) { return TypeRef::invalid(); }
-        const ma: MemberAccessNode* = expr as MemberAccessNode*;
-        const base: TypeRef = this.derive_receiver_type(ma.object);
-        if (!base.is_valid()) { return TypeRef::invalid(); }
-        // Unwrap Pointer/Reference/resolved-InstantiatedType to the struct/class.
-        mut bt: Type* = this.arena.lookup(base);
-        mut depth: i32 = 0;
-        while (bt != null && depth < 8) {
-            if (bt.kind == TypeKind::Pointer) {
-                bt = this.arena.lookup((bt as PointerType*).pointee);
-            } else if (bt.kind == TypeKind::Reference) {
-                bt = this.arena.lookup((bt as ReferenceType*).referent);
-            } else if (bt.kind == TypeKind::InstantiatedType) {
-                const inst: InstantiatedType* = bt as InstantiatedType*;
-                if (!inst.has_resolved_type()) { return TypeRef::invalid(); }
-                bt = this.arena.lookup(inst.resolved_type);
-            } else {
-                break;
-            }
-            depth += 1;
-        }
-        if (bt == null) { return TypeRef::invalid(); }
-        match (ma.resolved_member) {
-            MemberPin::Field(d, i) => {
-                const fi: FieldInfo* = this.arena.pinned_field(bt, d, i);
-                if (fi != null) { return fi.field_type; }
-            }
-            _ => { }
-        }
-        return TypeRef::invalid();
-    }
-
+    /// Specialize a generic method call from sema's method-level binding stash.
+    ///   * RECEIVER: `ma.object.resolved_type` (sema-pinned).
+    ///   * BINDINGS: the method's own generics come from `call.resolved_type_args`
+    ///     (sema's stash).
+    ///   * ADAPTER RECEIVERS: there is no synchronous `ensure_receiver_inst_resolved`
+    ///     (it would need the orchestrator's spec cache).  Instead the unwrap loop leaves
+    ///     an unresolved adapter inst alone, and
+    ///     the run_monomorphization walk/drain FIXPOINT resolves the chained call on a
+    ///     later iteration (sema pre-types adapter returns as concrete InstantiatedTypes).
     specialize_method_call(mut &this, call: CallExprNode*, subst: TypeSubstitution*) -> void {
         if (call == null) { return; }
         // A call naming its method by definition is bound by that identity
@@ -856,14 +804,8 @@ type struct MonoCallSpecializer {
                 && call.template_recv.is_valid()) {
             recv_type = call.template_recv;
         }
-        mut recv_derived: boolean = false;
-        if (recv_type.is_valid()) {
-            if (subst != null) { recv_type = subst.apply(recv_type, this.arena); }
-        } else {
-            recv_type = this.derive_receiver_type(recv_expr);
-            recv_derived = true;
-        }
         if (!recv_type.is_valid()) { return; }
+        if (subst != null) { recv_type = subst.apply(recv_type, this.arena); }
 
         // Unwrap Reference/Pointer/InstantiatedType to a concrete Struct/Class/Enum
         // (what spec_entries.specialized_type points at).  An unresolved adapter inst
@@ -934,15 +876,14 @@ type struct MonoCallSpecializer {
             mut id_impl: ImplBlockNode* = null;
             mut id_owner: ASTNode* = null;
             const id_m: MethodNode* = this.receiver_method_of(call.template_method, recv_type, &id_impl, &id_owner);
-            this.bind_receiver_method(call, id_m, id_impl, id_owner, recv_type, recv_derived, is_primitive_kind, subst);
+            this.bind_receiver_method(call, id_m, id_impl, id_owner, recv_type, is_primitive_kind, subst);
             return;
         }
         if (ma != null && ma.resolved_trait.is_valid() && ma.resolved_trait_slot >= 0) {
             mut item_impl: ImplBlockNode* = null;
             const item_m: MethodNode* = this.trait_item_on(ma, recv_type, &item_impl);
             if (item_m != null) {
-                this.bind_receiver_method(call, item_m, item_impl, null, recv_type, recv_derived,
-                    is_primitive_kind, subst);
+                this.bind_receiver_method(call, item_m, item_impl, null, recv_type, is_primitive_kind, subst);
                 return;
             }
         }
@@ -956,7 +897,7 @@ type struct MonoCallSpecializer {
         mut impl_node: ImplBlockNode* = null;
         mut inherent_owner_ast: ASTNode* = null;
         if (!this.method_placement(path_method, recv_type, &impl_node, &inherent_owner_ast)) { return; }
-        this.instantiate_generic_method(call, path_method, impl_node, inherent_owner_ast, recv_type, recv_derived,
+        this.instantiate_generic_method(call, path_method, impl_node, inherent_owner_ast, recv_type,
             is_primitive_kind, subst);
     }
 
@@ -967,39 +908,10 @@ type struct MonoCallSpecializer {
     /// are still a generic body's parameters, is left alone.
     instantiate_generic_method(mut &this, call: CallExprNode*, orig_method: MethodNode*,
                                impl_node: ImplBlockNode*, inherent_owner_ast: ASTNode*,
-                               recv_type: TypeRef, recv_derived: boolean, is_primitive_kind: boolean,
+                               recv_type: TypeRef, is_primitive_kind: boolean,
                                subst: TypeSubstitution*) -> void {
         if (impl_node == null && inherent_owner_ast == null) { return; }
 
-        // Two specialization regimes for a generic method `m<W>` on receiver `R`:
-        //   * R is a NON-generic owner (`Inner`): there is NO monomorphization of
-        //     R, so `m<W>` specs exist ONLY because a call site demands them.  A
-        //     spec'd-body call (whose receiver type we reconstructed above) is a
-        //     real, possibly sole, demand - it MUST be specialized here.  This is
-        //     the inherent path (`inherent_owner_ast != null`).
-        //   * R is a generic-type SPEC (`Array<i32>`): `m<W>` is materialized and
-        //     placed by the canonical in-source / struct-spec machinery, driven by
-        //     in-source demand.  Re-driving it from a reconstructed receiver in a
-        //     specialized body races that machinery's cross-module placement and
-        //     corrupts R's spec (a sibling static like `Array::try_with_capacity_in`
-        //     then fails to resolve).  Reconstruction therefore serves ONLY the
-        //     non-generic-owner regime; for a generic-type-spec receiver we leave
-        //     the call to the established path.
-        // An inherent (non-trait) impl on a NON-generic / primitive receiver
-        // (e.g. `string::parse_int<T>`) is the same non-generic-owner regime as
-        // `inherent_owner_ast`: reconstruction is safe and, crucially, this is
-        // the path that PINS `resolved_callee` to the return-distinct spec
-        // symbol.  Without allowing it, a reconstructed receiver (string-literal
-        // calls reset `resolved_type`) skips the pin and codegen collapses every
-        // instantiation onto the first via the unmangled `Type::method` fallback.
-        // A trait impl on a non-generic receiver (`this.s.go(w)` with `s: S`)
-        // is that regime too: only a receiver that IS a generic type's
-        // specialization is left to the placement machinery, or the call keeps
-        // the unspecialized template and passes it the wrong arguments.
-        const inherent_primitive_owner: boolean =
-            impl_node != null && !impl_node.is_trait_impl();
-        if (recv_derived && inherent_owner_ast == null && !inherent_primitive_owner
-            && this.arena.inst_generic_base(recv_type).is_valid()) { return; }
 
         const orig_func: FunctionDeclNode* = orig_method.func;
         if (orig_func == null) { return; }
@@ -1323,11 +1235,11 @@ type struct MonoCallSpecializer {
     /// type arguments.  A method bound as it is written needs nothing here:
     /// the pass after monomorphization binds it.
     bind_receiver_method(mut &this, call: CallExprNode*, m: MethodNode*, impl_node: ImplBlockNode*,
-                         owner_ast: ASTNode*, recv_type: TypeRef, recv_derived: boolean,
+                         owner_ast: ASTNode*, recv_type: TypeRef,
                          is_primitive_kind: boolean, subst: TypeSubstitution*) -> void {
         if (m == null || m.func == null) { return; }
         if (m.func.generic_params.length > 0) {
-            this.instantiate_generic_method(call, m, impl_node, owner_ast, recv_type, recv_derived,
+            this.instantiate_generic_method(call, m, impl_node, owner_ast, recv_type,
                 is_primitive_kind, subst);
             return;
         }

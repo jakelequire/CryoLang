@@ -55407,3 +55407,40 @@ the instantiation's family by that leaf.
   has none of.
 * `derive_receiver_type` and slice 8 (`resolved_method`, codegen's `.drop()`
   branch) next.
+
+### 8.470 Monomorphization no longer rebuilds a method call's receiver type from the expression - 2026-10-02
+
+## Why
+
+`MonoCallSpecializer::derive_receiver_type` rebuilt the type of a method
+call's receiver in a copied body from the receiver expression - a member
+access read off its pinned field - for a call that recorded no receiver of
+its own. Every call the binding after it can bind now records one: a call
+carrying a template pin carries `template_recv`, as does a call a bound
+answered, and a path call reads its receiver off the method's receiver
+parameter.
+
+## What changed
+
+* `derive_receiver_type` is deleted, and with it the `recv_derived` flag it
+  set and the guard in `instantiate_generic_method` that held a
+  reconstructed receiver back from a generic type's specialization. A call
+  whose receiver type is unknown is left alone, as one whose reconstruction
+  failed was.
+* `specialize_method_call`'s doc comment, which sat above `method_placement`
+  together with the deleted function's, is on `specialize_method_call`.
+
+## Evidence
+
+* A probe on the function (`.objcmp/s96/add_derive.py`: S96D at every call,
+  and at every binding that used its answer) read 0 over all 409 corpus
+  entries, the 227 negative files among them (`.objcmp/s96/c5`,
+  `probe5.exe`). Control: with a bound-answered call's recorded receiver
+  ignored (`mut-derive.exe`), 109 calls reach it on `examples/01-hello`;
+  unmutated, 0. (In the control it returns no type for any of them, so the
+  "used" half of the probe has no control of its own; it cannot be used
+  where it is never reached.)
+* verify against HEAD (`.verify/runs/20261002-103232`): all gates OK,
+  objects **0 moved** (tests 5609, examples 1126). Clean build: 331
+  warnings, the same (code, file) set as before (`.objcmp/s96/mk24.out`).
+* No gate count moved.
