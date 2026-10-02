@@ -151,17 +151,37 @@ type struct Selection {
     ret:        TypeRef;
     tier:       i32;
     info:       MethodInfo*;
+    /// Not null when the selection only records the candidates it tries,
+    /// for the argument check, and binds nothing.
+    collect:    ArgCandidates*;
 
     static none() -> Selection {
         return Selection { owner_inst: TypeRef::invalid(), recv: TypeRef::invalid(), chosen: null,
-                           ret: TypeRef::invalid(), tier: 0, info: null };
+                           ret: TypeRef::invalid(), tier: 0, info: null, collect: null };
     }
 
     /// A call already bound: its pin, and the pin's declared return.
     static of(mn: MethodNode*) -> Selection {
         const r: TypeRef = if (mn != null && mn.func != null) { mn.func.resolved_return_type } else { TypeRef::invalid() };
         return Selection { owner_inst: TypeRef::invalid(), recv: TypeRef::invalid(), chosen: mn, ret: r,
-                           tier: 0, info: null };
+                           tier: 0, info: null, collect: null };
+    }
+}
+
+/// The methods a call's arguments are checked against when the selection
+/// bound none: how many have the member's name, their arities, and the
+/// parameters of those with the call's arity, `argc` each, flat.
+type struct ArgCandidates {
+    argc:       i64;
+    name_seen:  i64;
+    uniq_arity: i64;
+    count:      i64;
+    variadic:   boolean;
+    params:     TypeRef[];
+
+    static new(argc: i64) -> ArgCandidates {
+        return ArgCandidates { argc: argc, name_seen: 0, uniq_arity: -1, count: 0,
+                               variadic: false, params: [] };
     }
 }
 
@@ -1107,7 +1127,7 @@ type struct CallResolver {
             this.lambda.reject_closure_struct_args_in_non_free_call(call,
                 Text::new("passing a capturing closure as a method-call argument"));
             const selected: Selection = this.resolve_method_overload(visitor, call, callee as MemberAccessNode*);
-            this.check_method_call_arg_types(visitor, call, callee as MemberAccessNode*);
+            this.check_method_call_arg_types(visitor, call, callee as MemberAccessNode*, selected.chosen);
             const args_refused: boolean = this.ctx.diagnostics.errors_since(arg_snap) > 0;
             const mret: TypeRef = this.resolve_method_call(visitor, callee as MemberAccessNode*, call,
                                                            selected, args_refused);
@@ -2416,9 +2436,10 @@ type struct CallResolver {
     /// Per-argument type checking for an instance method call.  Gathers same-named
     /// candidates from inherent methods + trait impls; checks against the single
     /// signature when one emerges, and against the binder's verdict when several
-    /// do; flags two-trait ambiguity / arity.
+    /// do; flags two-trait ambiguity / arity.  `chosen_method` is the method
+    /// the selection bound the call to, null when it bound none.
     check_method_call_arg_types(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
-                                member: MemberAccessNode*) -> void {
+                                member: MemberAccessNode*, chosen_method: MethodNode*) -> void {
         const obj_type: TypeRef = member.object.resolved_type;
         if (!obj_type.is_valid()) { return; }
         mut base_ref: TypeRef = obj_type;
@@ -2431,16 +2452,20 @@ type struct CallResolver {
                 base_ref = (base_t as ReferenceType*).referent;
             } else if (base_t.kind == TypeKind::InstantiatedType) {
                 const inst: InstantiatedType* = base_t as InstantiatedType*;
-                if (!inst.has_resolved_type()) { return; }
+                if (!inst.has_resolved_type()) {
+                    // Not minted yet: the selection tried its template's
+                    // methods; a call it bound is checked where it is minted.
+                    if (chosen_method == null && !this.types.contains_generic_param(base_ref)) {
+                        this.check_args_on_template(visitor, call, member, base_ref);
+                    }
+                    return;
+                }
                 base_ref = inst.resolved_type;
             } else if (base_t.kind == TypeKind::Array && (base_t as ArrayType*).is_dynamic()) {
-                // A dynamic `T[]` dispatches through the `Array<T>`
-                // specialization registered for its element, as the binder
-                // does, and those are the parameters its arguments meet.  The
-                // specialization exists once mono has run, so the pass after
-                // mono is the one that checks; before it there is nothing to
-                // check against.
-                base_ref = this.ctx.decl_index.lookup_array_type((base_t as ArrayType*).element);
+                // A dynamic `T[]` has the methods of `Array<T>`, as the
+                // selection sees it, and those are the parameters its
+                // arguments meet.
+                base_ref = this.ctx.type_resolver.dynamic_array_type((base_t as ArrayType*).element);
                 if (!base_ref.is_valid()) { return; }
             } else {
                 break;
@@ -2625,6 +2650,77 @@ type struct CallResolver {
         if (name_seen > 0) {
             this.diag.emit_method_arity_error(call.span, member.member, "method", uniq_arity, argc, false);
         }
+    }
+
+    /// `check_method_call_arg_types` for a call on an instantiation not yet
+    /// minted that the selection bound to nothing.  The candidates are the
+    /// ones `select_on_template` tried - the template's inherent methods,
+    /// then, when none has the member's name, the trait impls selected for
+    /// the instantiation - with their parameters seen through it (`push(x: T)`
+    /// on an `Array<i64>` takes an `i64`).  One candidate of the call's arity
+    /// checks the arguments against its parameters, as on a minted receiver;
+    /// several is an overload set none of which took them.
+    check_args_on_template(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
+                           member: MemberAccessNode*, owner_inst: TypeRef) -> void {
+        const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(
+            this.arena.inst_generic_base(owner_inst));
+        if (tmpl == null) { return; }
+        mut found: ArgCandidates = ArgCandidates::new(call.arguments.length);
+        mut sel: Selection = Selection::none();
+        sel.owner_inst = owner_inst;
+        sel.recv = owner_inst;
+        sel.collect = &found;
+        const no_args: TypeRef[] = [];
+        this.select_on_template(visitor, call, member, tmpl, &no_args, DefId::invalid(), false, false, &sel);
+        this.select_on_template(visitor, call, member, tmpl, &no_args, DefId::invalid(), false, true, &sel);
+        if (found.name_seen == 0) {
+            this.select_on_template(visitor, call, member, tmpl, &no_args, DefId::invalid(), true, false, &sel);
+            this.select_on_template(visitor, call, member, tmpl, &no_args, DefId::invalid(), true, true, &sel);
+        }
+        if (found.count == 1) {
+            this.check_args_against_params(visitor, &call.arguments, found.params.as_slice());
+        } else if (found.count > 1) {
+            this.emit_no_matching_overload(call, member, owner_inst, &found.params, found.argc);
+        } else if (!found.variadic && found.name_seen > 0) {
+            this.diag.emit_method_arity_error(call.span, member.member, "method", found.uniq_arity,
+                found.argc, false);
+        }
+    }
+
+    /// Record in `found` a candidate the selection tried, with its
+    /// parameters seen through `view` (null: as declared) when it has the
+    /// call's arity.
+    record_candidate(mut &this, fn_node: FunctionDeclNode*, params: &TypeRef[],
+                     view: TypeSubstitution*, found: ArgCandidates*) -> void {
+        if (fn_node.is_variadic) { found.variadic = true; return; }
+        found.name_seen += 1;
+        found.uniq_arity = this.diag.note_arity(found.uniq_arity, params.length);
+        if (params.length != found.argc) { return; }
+        found.count += 1;
+        for (mut ci: i64 = 0; ci < params.length; ci++) {
+            found.params.push(if (view != null) { this.seen_through(view, params[ci]) } else { params[ci] });
+        }
+    }
+
+    /// The type arguments of an instantiation, in order.
+    inst_args(&this, inst: TypeRef) -> TypeRef[] {
+        mut args: TypeRef[] = [];
+        for (mut ai: i64 = 0; ai < this.arena.inst_type_arg_count(inst); ai++) {
+            args.push(this.arena.inst_type_arg_at(inst, ai));
+        }
+        return args;
+    }
+
+    /// How the methods written in `block` see an instantiation not yet
+    /// minted: the block's own parameters bound by its head (`T` in
+    /// `implement enum Option<T>`, for `Option<u8>`, is `u8`) and by its
+    /// where-clause.
+    impl_view(mut &this, block: ImplBlockNode*, owner_inst: TypeRef) -> TypeSubstitution {
+        mut view: TypeSubstitution = TypeSubstitution::empty();
+        const args: TypeRef[] = this.inst_args(owner_inst);
+        this.trait_checker().add_head_param_bindings(block, &args, &view);
+        this.bind_where_only_params(block, &view);
+        return view;
     }
 
 
@@ -3019,10 +3115,11 @@ type struct CallResolver {
             } else if (base_t.kind == TypeKind::Array
                     && (base_t as ArrayType*).is_dynamic()) {
                 // A dynamic `T[]` has no method set of its own: it is laid
-                // out as, and dispatches through, the `Array<T>`
-                // specialization registered for its element.  A fixed
-                // `T[N]` owns nothing and has no methods.
-                const arr_owner: TypeRef = this.ctx.decl_index.lookup_array_type(
+                // out as, and dispatches through, `Array<T>` - before
+                // monomorphization the instantiation, selected through its
+                // template like any other, after it the specialization.  A
+                // fixed `T[N]` owns nothing and has no methods.
+                const arr_owner: TypeRef = this.ctx.type_resolver.dynamic_array_type(
                     (base_t as ArrayType*).element);
                 if (!arr_owner.is_valid()) { break; }
                 base_ref = arr_owner;
@@ -3710,10 +3807,7 @@ type struct CallResolver {
         if (!from_trait) {
             // The declaration's methods are written in the template's own
             // parameters.
-            mut args: TypeRef[] = [];
-            for (mut ai: i64 = 0; ai < this.arena.inst_type_arg_count(sel.owner_inst); ai++) {
-                args.push(this.arena.inst_type_arg_at(sel.owner_inst, ai));
-            }
+            const args: TypeRef[] = this.inst_args(sel.owner_inst);
             mut view: TypeSubstitution = TypeSubstitution::from_params(&tmpl.param_types, &args);
             const decl: ASTNode* = tmpl.ast_node;
             if (decl != null && decl.kind == NodeKind::StructDeclaration) {
@@ -3756,16 +3850,7 @@ type struct CallResolver {
             return this.bind_on_methods(visitor, call, member, &block.methods, arg_types,
                                         generic, sel, null);
         }
-        // A block's methods are written in the block's own parameters, which
-        // its head relates to the instantiation (`T` in `implement enum
-        // Option<T>`, for `Option<u8>`, is `u8`).
-        mut args: TypeRef[] = [];
-        for (mut ai: i64 = 0; ai < this.arena.inst_type_arg_count(sel.owner_inst); ai++) {
-            args.push(this.arena.inst_type_arg_at(sel.owner_inst, ai));
-        }
-        mut view: TypeSubstitution = TypeSubstitution::empty();
-        this.trait_checker().add_head_param_bindings(block, &args, &view);
-        this.bind_where_only_params(block, &view);
+        mut view: TypeSubstitution = this.impl_view(block, sel.owner_inst);
         return this.bind_on_methods(visitor, call, member, &block.methods, arg_types,
                                     generic, sel, &view);
     }
@@ -3854,11 +3939,18 @@ type struct CallResolver {
                     if (pp.is_receiver()) { continue; }
                     params.push(pp.resolved_type);
                 }
+                // Collecting for the argument check binds nothing: each
+                // candidate is recorded once.
+                if (sel.collect != null) {
+                    this.record_candidate(fn_node, &params, view, sel.collect);
+                    continue;
+                }
                 if (!this.method_args_bind(call, arg_types, params.as_slice(), fn_node.is_variadic, tier, fn_node,
                         view)) { continue; }
                 this.choose_method(mn, tier, null, sel, view);
                 return true;
             }
+            if (sel.collect != null) { return false; }
         }
         return false;
     }
@@ -4143,6 +4235,7 @@ type struct CallResolver {
         this.binding.stash_method_call_bindings(obj_type, member, call, selected.chosen);
 
         mut lookup_ref: TypeRef = obj_type;
+        mut shown_ref: TypeRef = TypeRef::invalid();
         mut base_t: Type* = this.arena.lookup(obj_type);
         mut unwrap_depth: i32 = 0;
         while (base_t != null && unwrap_depth < 5) {
@@ -4156,6 +4249,16 @@ type struct CallResolver {
                 const inst: InstantiatedType* = base_t as InstantiatedType*;
                 if (!inst.has_resolved_type()) { break; }
                 lookup_ref = inst.resolved_type;
+                base_t = this.arena.lookup(lookup_ref);
+            } else if (base_t.kind == TypeKind::Array && (base_t as ArrayType*).is_dynamic()) {
+                // The type a dynamic array's methods belong to, as the
+                // selection above saw it; the written `T[]` is what a
+                // diagnostic shows.
+                shown_ref = lookup_ref;
+                const arr_owner: TypeRef = this.ctx.type_resolver.dynamic_array_type(
+                    (base_t as ArrayType*).element);
+                if (!arr_owner.is_valid()) { break; }
+                lookup_ref = arr_owner;
                 base_t = this.arena.lookup(lookup_ref);
             } else {
                 break;
@@ -4265,7 +4368,7 @@ type struct CallResolver {
         // Counted once here so the tally is over OUTCOMES, not diagnostics.
 
         const method_name: string = this.intern.resolve(member.member);
-        const recv_t: Type* = this.arena.lookup(lookup_ref);
+        const recv_t: Type* = this.arena.lookup(if (shown_ref.is_valid()) { shown_ref } else { lookup_ref });
         const type_display: string = if (recv_t != null) { this.arena.format_display(recv_t) } else { this.intern.resolve(type_sym) };
         const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
 

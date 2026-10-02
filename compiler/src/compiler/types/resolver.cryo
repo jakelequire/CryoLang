@@ -24,6 +24,7 @@ import compiler::ast::{
     TraitBound, TraitRef, TupleAnnotation, TypeAnnotation
 };
 import compiler::resolver::{ symbol_str, intern_table, resolver };
+import compiler::resolver::lang_item::{ LangItem };
 import compiler::decl_index;
 import compiler::decl_index::{ DeclarationIndex };
 import compiler::const_table;
@@ -1396,6 +1397,26 @@ type struct TypeResolver {
         const filled: TypeRef[] = this.expand_default_type_args(entry, empty, &ctx);
         if (filled.length != entry.param_count) { return ty; }
         return this.arena.create_instantiation(ty, &filled);
+    }
+
+    /// The type a dynamic `element[]` is laid out as and whose methods it
+    /// has: `Array<element>` with the template's defaults filled
+    /// (`Array<string, GlobalAlloc>`).  Before monomorphization it is the
+    /// instantiation, whose template's methods a call selects; after, the
+    /// same id holds the specialization.  Arena-only, like the default
+    /// canonicalization above: monomorphization demands `Array<element>`
+    /// for every concrete dynamic array it finds.  Invalid when the build
+    /// has no `Array`.
+    dynamic_array_type(&this, element: TypeRef) -> TypeRef {
+        if (!element.is_valid()) { return TypeRef::invalid(); }
+        const entry: TemplateEntry* = this.generic_registry.template_of(
+            this.generic_registry.wellknown(LangItem::Array));
+        if (entry == null) { return TypeRef::invalid(); }
+        mut ctx: ResolutionContext = ResolutionContext::new("");
+        mut args: TypeRef[] = [element];
+        args = this.expand_default_type_args(entry, args, &ctx);
+        if (args.length != entry.param_count) { return TypeRef::invalid(); }
+        return this.arena.create_instantiation(entry.base_type, &args);
     }
 
 
