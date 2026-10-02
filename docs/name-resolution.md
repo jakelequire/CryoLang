@@ -55047,3 +55047,53 @@ implement<T, A> trait Hash for struct Array<T, A> where T: Hash, A: Allocator {
 * `T::try_from(v).unwrap_or(fallback)` (`examples/09-json-config/src/
   main.cryo:102`): the receiver is a static call through a bound, untyped
   before monomorphization (S95P `recv=INVALID`).
+
+### 8.466 A static call through a bounded type parameter is typed where it is written, so a call on its result is selected there - 2026-10-01
+
+## Why
+
+Slice 6.  After 8.465 the census (`.objcmp/s94/s95c1`) counted 2
+selections by name after monomorphization, both `T::try_from(v).unwrap_or
+(fallback)` in copies of `get_or<T>` (`examples/09-json-config/src/
+main.cryo:102`, `where T: TryFrom<&JsonValue>`).  S95P showed the receiver
+`T::try_from(v)` untyped in the template (`recv=INVALID`):
+`resolve_scope_call` directed the path through the bound
+(`direct_param_path` records the trait) and returned no type, so
+`unwrap_or` on its result had nothing to be selected on before
+monomorphization, and each copy selected it by name.
+
+## What changed
+
+* `direct_param_path` returns the return type the directing trait declares,
+  `This` being the parameter, as a method call on a bounded receiver
+  already is (`abstract_receiver_method_return`); invalid when no one trait
+  directs the path.  A second walk of the same path finds the trait it
+  recorded and returns the same type.
+
+```cryo
+function get_or<T>(parent: &JsonValue, key: Str, fallback: T) -> T where T: TryFrom<&JsonValue> {
+    ...
+    return T::try_from(value_ptr).unwrap_or(fallback);   // Result<T, ConversionError>; unwrap_or pinned in the template
+}
+```
+
+## Evidence
+
+* Census (`.objcmp/s94/s95c1` -> `s95c2`, `.objcmp/s95/probe5.exe`): 2 ->
+  **0** corpus-wide - compiler, tests, every project, example and tool,
+  the unit leg, and the 227 negative files one by one (`cryo check` reaches
+  the pass after monomorphization; control in 8.465).  The probe's census
+  string is in the binary (`grep -c 'S94N fld'` = 1), and the same probe
+  reported these two visits in `s95c1`.
+* Outputs: 406 entries byte-identical to `s95c1` except the compiler and
+  LSP builds, whose warnings are the same and whose quoted source lines
+  moved with this file's edit; the new entry is 8.465's project.
+* verify against HEAD (`.verify/runs/20261001-222115`): all gates OK,
+  objects **0 moved** (tests 5555, examples 1126).  Clean build: 331
+  warnings, the same (code, file) set.
+
+## Remaining (slice 6)
+
+* No call reaches selection by name after monomorphization in the corpus.
+  Next: delete monomorphization's finder chain and the by-name selection
+  after monomorphization, with the internal check in their place.

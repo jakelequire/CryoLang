@@ -4710,8 +4710,7 @@ type struct CallResolver {
         // not the spelling - a type sharing a template parameter's spelling
         // (`type struct A` beside `Holder<A>`) is not that parameter.
         if (this.symbolic.symbolic_scope_is_generic_param(scope)) {
-            this.direct_param_path(scope);
-            return TypeRef::invalid();
+            return this.direct_param_path(scope);
         }
 
         // A declaration whose signature was refused where it was written
@@ -4757,13 +4756,23 @@ type struct CallResolver {
     /// qualified (`(Beta for T)::go`) is already directed; two traits
     /// answering leave the path undirected, and the instantiation reports
     /// the tie.
-    direct_param_path(mut &this, scope: ScopeResolutionNode*) -> void {
-        if (scope.impl_trait != null || scope.resolved_trait.is_valid()) { return; }
+    ///
+    /// Returns the call's type as the directing trait declares it, `This`
+    /// being the parameter (`T::try_from(v)` under `where T: TryFrom<X>` is
+    /// a `Result<T, ConversionError>`), so a call on the result is typed,
+    /// and selected, where it is written.  Invalid when no one trait
+    /// directs the path.
+    direct_param_path(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
+        if (scope.impl_trait != null) { return TypeRef::invalid(); }
         const param_ty: TypeRef = this.symbolic.symbolic_scope_param_type(scope);
-        if (!param_ty.is_valid()) { return; }
+        if (!param_ty.is_valid()) { return TypeRef::invalid(); }
         mut dir: BoundDirection = BoundDirection::none();
-        this.binding.abstract_receiver_method_return(param_ty, scope.member_name, &dir);
-        if (dir.named().is_valid()) { scope.set_resolved_trait(dir.named()); }
+        const ret: TypeRef = this.binding.abstract_receiver_method_return(param_ty, scope.member_name, &dir);
+        if (!dir.named().is_valid()) { return TypeRef::invalid(); }
+        // A walk that directed the path already finds the same trait.
+        if (!scope.resolved_trait.is_valid()) { scope.set_resolved_trait(dir.named()); }
+        if (!scope.resolved_trait.equals(dir.named())) { return TypeRef::invalid(); }
+        return ret;
     }
 
     /// Whether the declaration a `Scope::member` call names has a signature
