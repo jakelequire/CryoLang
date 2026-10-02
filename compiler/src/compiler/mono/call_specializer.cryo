@@ -1413,33 +1413,23 @@ type struct MonoCallSpecializer {
                 && entry.node_kind != NodeKind::ClassDeclaration) { return false; }
         if (entry.param_count == 0 || entry.ast_node == null) { return false; }
 
-        // Locate the matching static method(s) on the owner (instance methods
-        // route through specialize_method_call instead).  A non-generic method is
-        // handled by the owner-only path below (its stash is the OWNER's type args,
-        // and the owner drain materializes its body).  A generic method
-        // (`Wrap<A>::make<T>`) needs its OWN `<T>` specialized within the owner
-        // spec - the stash is the METHOD's `<T>`; owner args come from the scope
-        // turbofish or template defaults.
-        const empty_methods: MethodNode*[] = [];
-        mut methods: &MethodNode*[] = &empty_methods;
-        if (entry.node_kind == NodeKind::StructDeclaration) { methods = &(entry.ast_node as StructDeclNode*).methods; }
-        else if (entry.node_kind == NodeKind::UnionDeclaration) { methods = &(entry.ast_node as UnionDeclNode*).methods; }
-        else if (entry.node_kind == NodeKind::ClassDeclaration) { methods = &(entry.ast_node as ClassDeclNode*).methods; }
-        else { return false; }
-        mut matched_nongeneric: MethodNode* = null;
-        mut matched_generic: MethodNode* = null;
-        for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
-            if (m == null || m.func == null || !m.is_static) { continue; }
-            if (!m.func.name.equals(scope.member_name)) { continue; }
-            if (m.func.generic_params.length == 0) {
-                if (matched_nongeneric == null) { matched_nongeneric = m; }
-            } else {
-                if (matched_generic == null) { matched_generic = m; }
-            }
-        }
+        // The static method is the one sema recorded where the call is
+        // written, a method the owner's declaration holds (instance methods
+        // route through specialize_method_call instead).  A non-generic one
+        // needs only its owner instantiated: its stash is the OWNER's type
+        // args, the owner drain materializes its body, and the pass after
+        // monomorphization binds the call to the owner's copy by identity.  A
+        // generic one (`Wrap<A>::make<T>`) needs its OWN `<T>` specialized
+        // within the owner spec - the stash is the METHOD's `<T>`; owner args
+        // come from the scope turbofish or template defaults.
+        const recorded: ASTNode* = this.decl_index.method_decl_of(call.template_method);
+        if (recorded == null || recorded.kind != NodeKind::MethodDeclaration) { return false; }
+        const m: MethodNode* = recorded as MethodNode*;
+        if (m.func == null || !m.is_static || !MethodNode::is_method_of(m, entry.ast_node)) { return false; }
+        const matched_nongeneric: MethodNode* = if (m.func.generic_params.length == 0) { m } else { null };
+        const matched_generic: MethodNode* = if (m.func.generic_params.length > 0) { m } else { null };
 
-        // --- Non-generic static method on a generic owner (existing path) ---
+        // --- Non-generic static method on a generic owner ---
         if (matched_nongeneric != null) {
             // The owner's type args come from sema's stash (declaration order).
             if (call.resolved_type_args.length != entry.param_types.length) { return false; }
@@ -1462,9 +1452,9 @@ type struct MonoCallSpecializer {
                 entry.base_type, binds);
             if (!inst_ref.is_valid()) { return false; }
             this.state.enqueue_from_type_ref(inst_ref);
-            // The member's family is the instantiation's, whose definition is
-            // registered when the drain materializes it.
-            call.set_resolved_callee(CalleePin::Family(FamilyOwner::Type(inst_ref), scope.member_name));
+            // The owner the recorded method is bound on: an owner whose
+            // arguments the call's arguments inferred is written bare.
+            call.template_recv = inst_ref;
             return true;
         }
 

@@ -1700,6 +1700,9 @@ type struct CallResolver {
         if (callee_node.kind == NodeKind::MemberAccess) {
             return this.substitute_explicit_method_param_types(call, &out, forced);
         }
+        if (callee_node.kind == NodeKind::ScopeResolution) {
+            return this.substitute_explicit_path_param_types(call, &out, forced);
+        }
         if (call.generic_args.length == 0) { return out; }
         if (callee_node.kind != NodeKind::Identifier) { return out; }
         const ident: IdentifierNode* = call.callee as IdentifierNode*;
@@ -1750,6 +1753,46 @@ type struct CallResolver {
     /// No-op unless the callee is a member access carrying a full-arity
     /// turbofish for a locatable generic method whose args all resolve
     /// concretely — every miss leaves the caller's types untouched.
+    /// The path form of the method rule above: `(BetaG for NgTf)::go::<u8>(&g, 7)`
+    /// names a generic method whose formal `u: U` is `u8` at this call, and
+    /// left abstract it pushes no expected type, so the literal keeps its
+    /// `i32` default and no signature accepts it where the call is written.
+    /// The formals are the owner's method's, with its own parameters bound
+    /// from the turbofish (`static_entry_params`), for the one generic method
+    /// of the family - an impl head's trait's, under one - that the
+    /// turbofish and the argument count admit.
+    ![allow(lookup_by_spelling, reason = "a path's member is resolved where it is written, through the member-function door")]
+    substitute_explicit_path_param_types(mut &this, call: CallExprNode*,
+                                         param_types: &TypeRef[],
+                                         forced: mut &boolean[]) -> TypeRef[] {
+        mut out: TypeRef[] = sema_copy_type_refs(param_types);
+        const scope: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
+        const n_targs: i64 = if (call.generic_args.length > 0) { call.generic_args.length } else { scope.generic_args.length };
+        if (n_targs == 0) { return out; }
+        mut owner: FamilyOwner = FamilyOwner::Def(DefId::invalid());
+        if (!this.scope_owner(scope, &owner)) { return out; }
+        const head_trait: DefId = if (scope.impl_trait != null) { this.impl_qualified_trait(scope) } else { DefId::invalid() };
+        const entries: OverloadId[] = this.member_entries(owner, scope.member_name);
+        mut chosen: OverloadId = OverloadId::invalid();
+        for (mut i: i64 = 0; i < entries.length; i++) {
+            if (head_trait.is_valid() && !this.ctx.decl_index.entry_trait(entries[i]).equals(head_trait)) { continue; }
+            const m: MethodNode* = this.ctx.decl_index.entry_method(entries[i]);
+            if (m == null || m.func == null || m.is_static || m.func.generic_params.length != n_targs) { continue; }
+            if (chosen.is_valid()) { return out; }
+            chosen = entries[i];
+        }
+        if (!chosen.is_valid()) { return out; }
+        const formals: TypeRef[] = this.static_entry_params(chosen, call, scope);
+        if (formals.length != out.length) { return out; }
+        for (mut i: i64 = 0; i < out.length; i++) {
+            if (!out[i].is_valid() || !this.types.contains_generic_param(out[i])) { continue; }
+            if (!formals[i].is_valid() || this.types.contains_generic_param(formals[i])) { continue; }
+            out[i] = formals[i];
+            if (i < forced.length) { forced[i] = true; }
+        }
+        return out;
+    }
+
     substitute_explicit_method_param_types(mut &this, call: CallExprNode*,
                                            param_types: &TypeRef[],
                                            forced: mut &boolean[]) -> TypeRef[] {
@@ -2779,8 +2822,9 @@ type struct CallResolver {
         // After monomorphization a call names the declaration it was written
         // against, carried into every copy of its body, or nothing; one that
         // reaches the selection here was left unpinned, which is the
-        // compiler's defect.
-        if (this.state.post_mono_verify) {
+        // compiler's defect.  A converter call that pass builds around an
+        // argument is written there, and selected there.
+        if (this.state.post_mono_verify && !this.state.in_implicit_conversion) {
             this.report_unbound_after_mono(call, this.intern.resolve(this.ctx.defs.leaf_of(callee)), "function");
             return TypeRef::invalid();
         }
@@ -3466,8 +3510,14 @@ type struct CallResolver {
     /// answered it through and the position of the method it names among
     /// that trait's declared ones, found where the call is written.
     stamp_trait_item(&this, member: MemberAccessNode*, trait_def: DefId) -> void {
-        const slot: i64 = this.ctx.generic_registry.trait_item_slot(trait_def, member.member);
-        member.set_resolved_trait_item(trait_def, slot);
+        member.set_resolved_trait_item(trait_def, this.trait_slot_of(trait_def, member.member));
+    }
+
+    /// The position of `trait_def`'s declared method `leaf` among the
+    /// trait's methods, through the trait-method door; -1 for none.
+    ![allow(lookup_by_spelling, reason = "a trait method's leaf becomes its position through the trait-method door, where the call naming it is written")]
+    trait_slot_of(&this, trait_def: DefId, leaf: SymbolStr) -> i64 {
+        return this.ctx.generic_registry.trait_item_slot(trait_def, leaf);
     }
 
     /// The type of a call a bound answered, `ret` being its trait method's
@@ -4773,7 +4823,19 @@ type struct CallResolver {
         // not the spelling - a type sharing a template parameter's spelling
         // (`type struct A` beside `Holder<A>`) is not that parameter.
         if (this.symbolic.symbolic_scope_is_generic_param(scope)) {
-            return this.direct_param_path(scope);
+            const param_ret: TypeRef = this.direct_param_path(scope);
+            // The member is the declared method of the trait an impl head or
+            // a bound directs the path through, which every copy of the body
+            // binds on the type the parameter becomes.
+            const directing: DefId = if (scope.impl_trait != null) {
+                this.impl_qualified_trait(scope)
+            } else {
+                scope.resolved_trait
+            };
+            if (directing.is_valid() && !call.template_method.is_valid()) {
+                call.template_method = this.trait_item_def(directing, scope);
+            }
+            return param_ret;
         }
 
         // A declaration whose signature was refused where it was written
@@ -4898,7 +4960,17 @@ type struct CallResolver {
         }
         if (call.resolved_callee.is_some()) { return; }
         if (!scope_sym.is_valid() || !member_sym.is_valid()) { return; }
-        if (this.scope_is_generic_template(owner, member_sym)) { return; }
+        // A converter call the pass after monomorphization builds around an
+        // argument (`String::from_str("node")`'s `"node"` into a `Str`) is
+        // written there, and is resolved where it is written like any other.
+        if (this.state.post_mono_verify && !this.state.in_implicit_conversion) {
+            this.bind_static_after_mono(call, scope, owner);
+            return;
+        }
+        if (this.scope_is_generic_template(owner, member_sym)) {
+            this.record_template_static(call, scope, owner);
+            return;
+        }
         const scope_str: string = this.intern.resolve(scope_sym);
         const member_str: string = this.intern.resolve(member_sym);
         if (scope_str.length() == 0 || member_str.length() == 0) { return; }
@@ -4927,6 +4999,95 @@ type struct CallResolver {
                 this.pin_static_entry(call, scope, entries[0]);
             }
         }
+    }
+
+    /// Record on a static call whose owner is a generic type - its template,
+    /// or an instantiation not built yet - the method it names, in the
+    /// template's terms, where it is written: through an impl head, that
+    /// trait's declared method; otherwise the method of the template's
+    /// family the arguments' count admits, a tie between an inherent method
+    /// and a trait's reported here as everywhere (`choose_entry`).  Every
+    /// copy of the body carries it, and the pass after monomorphization
+    /// binds it on the minted owner by identity (`bind_static_after_mono`).
+    /// Records nothing for an owner with no template: its generic static
+    /// method is a template of its own, which monomorphization specializes.
+    record_template_static(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*, owner: TypeRef) -> void {
+        if (call.template_method.is_valid()) { return; }
+        if (scope.impl_trait != null) {
+            const head_trait: DefId = this.impl_qualified_trait(scope);
+            if (head_trait.is_valid()) { call.template_method = this.trait_item_def(head_trait, scope); }
+            return;
+        }
+        mut base: TypeRef = this.arena.inst_generic_base(owner);
+        if (!base.is_valid()) { base = owner; }
+        if (this.ctx.generic_registry.template_of_type(base) == null) { return; }
+        const entries: OverloadId[] = this.member_entries(FamilyOwner::Type(base), scope.member_name);
+        mut fits: OverloadId[] = [];
+        for (mut i: i64 = 0; i < entries.length; i++) {
+            const et: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entries[i]));
+            if (et == null || et.kind != TypeKind::Function) { continue; }
+            if ((et as FunctionType*).param_types.length == call.arguments.length) { fits.push(entries[i]); }
+        }
+        if (fits.length == 0) { return; }
+        // A tie is reported against the owner as written (`GnTf<i32>`).
+        const chosen: OverloadId = this.choose_entry(&fits, scope, call, FamilyOwner::Type(this.scope_owner_type(scope)));
+        const m: MethodNode* = this.ctx.decl_index.entry_method(chosen);
+        if (m == null || m.func == null) { return; }
+        call.template_method = if (m.func.def.is_valid()) { m.func.def } else { m.func.copy_of };
+    }
+
+    /// The definition of `trait_def`'s declared method the path `scope`
+    /// names, found through the trait-method door; invalid when the trait
+    /// declares none.
+    trait_item_def(&this, trait_def: DefId, scope: ScopeResolutionNode*) -> DefId {
+        const slot: i64 = this.trait_slot_of(trait_def, scope.member_name);
+        const decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_def);
+        if (slot < 0 || decl == null || slot >= decl.methods.length || decl.methods[slot] == null) {
+            return DefId::invalid();
+        }
+        return decl.methods[slot].def;
+    }
+
+    /// Bind, after monomorphization, a static call its template left
+    /// unpinned - an owner that was a generic type, a parameter a bound
+    /// directs, an impl head over either - to the method the call recorded
+    /// where it is written, on the minted owner, by identity: a trait's
+    /// declared method answers through the owner's implementations of that
+    /// trait at its position, the arguments choosing among several; any
+    /// other definition is the owner's entry for it.  A call that recorded
+    /// nothing, or whose owner has no such method, is the compiler's defect,
+    /// refused with E0900 and never selected by its member's name.
+    bind_static_after_mono(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*, written_owner: TypeRef) -> void {
+        const d: DefId = call.template_method;
+        // The owner monomorphization instantiated for the call - one whose
+        // arguments the call's arguments inferred is written bare - else
+        // the one written; an instantiation answers as the specialization
+        // it was built into.
+        mut owner: TypeRef = if (call.template_recv.is_valid()) { call.template_recv } else { written_owner };
+        const ot: Type* = this.arena.lookup(owner);
+        if (ot != null && ot.kind == TypeKind::InstantiatedType && (ot as InstantiatedType*).has_resolved_type()) {
+            owner = (ot as InstantiatedType*).resolved_type;
+        }
+        if (d.is_valid()) {
+            const pos: i64 = this.ctx.generic_registry.trait_item_position(d);
+            if (pos >= 0) {
+                const blocks: ImplBlockNode*[] = this.ctx.generic_registry.heads_for(
+                    this.ctx.defs.parent_of(d), owner, this.intern);
+                mut items: OverloadId[] = [];
+                for (mut i: i64 = 0; i < blocks.length; i++) {
+                    const m: MethodNode* = this.ctx.generic_registry.trait_item_method(blocks[i], pos);
+                    if (m != null && m.func != null && m.func.overload_entry.is_valid()) { items.push(m.func.overload_entry); }
+                }
+                if (items.length > 0 && this.pin_trait_delivered_call(call, scope, &items)) { return; }
+            } else {
+                const e: OverloadId = this.ctx.decl_index.method_entry_on(owner, d);
+                if (e.is_valid()) {
+                    this.pin_static_entry(call, scope, e);
+                    return;
+                }
+            }
+        }
+        this.report_unbound_after_mono(call, this.intern.resolve(scope.member_name), "method");
     }
 
     /// A call written through a TRAIT's path, `Beta::go(&p, ...)`: the
@@ -5004,13 +5165,20 @@ type struct CallResolver {
         this.ctx.emit_diagnostic(d);
     }
 
+    /// The entries of `owner`'s family `member`, through the member-function
+    /// door: what a static path written against `owner` names.
+    ![allow(lookup_by_spelling, reason = "a path's member leaf reaches the member-function door here, by its owner's identity")]
+    member_entries(&this, owner: FamilyOwner, member_sym: SymbolStr) -> OverloadId[] {
+        return this.ctx.decl_index.lookup_family_entries(owner, member_sym);
+    }
+
     /// The entries of `owner`'s family `member` that `trait_sym`'s
     /// implementation delivers - the candidates a call naming the trait
     /// selects among, in registration order.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     trait_delivered_entries(&this, owner: FamilyOwner, trait_sym: DefId,
                             member_sym: SymbolStr) -> OverloadId[] {
-        const all: OverloadId[] = this.ctx.decl_index.lookup_family_entries(owner, member_sym);
+        const all: OverloadId[] = this.member_entries(owner, member_sym);
         mut entries: OverloadId[] = [];
         for (mut i: i64 = 0; i < all.length; i++) {
             if (this.ctx.decl_index.entry_trait(all[i]).equals(trait_sym)) { entries.push(all[i]); }
@@ -5896,7 +6064,9 @@ type struct CallResolver {
             if (inst.is_valid()) { ret = inst; }
         }
         scope.set_resolved_type(ret);
-        // Deliberately DO NOT pin resolved_callee: mono pins the `$MG` spec symbol.
+        // Deliberately DO NOT pin resolved_callee: mono pins the `$MG` spec
+        // symbol of the method recorded here, which it reads by identity.
+        if (!call.template_method.is_valid()) { call.template_method = matched.func.def; }
         return ret;
     }
 
