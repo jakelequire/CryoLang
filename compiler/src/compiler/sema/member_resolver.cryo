@@ -58,7 +58,7 @@ import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::checker::{ FieldLookup, TypeChecker, TypeCheckResult };
 import compiler::types::compound::{ FunctionType, PointerType, ReferenceType, TupleType };
-import compiler::types::generic::{ InstantiatedType };
+import compiler::types::generic::{ GenericParamType, InstantiatedType };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
@@ -585,7 +585,18 @@ type struct MemberResolver {
 
         const result: TypeCheckResult = this.checker.check_index_access(array_type, index_type);
         if (result.success) { return result.result_type; }
-        if (unresolved) { return TypeRef::invalid(); }
+        if (unresolved) {
+            // A type parameter a bound gives `Index` is indexed through that
+            // bound where it is written: the desugar's call is answered by
+            // the bound and records it, and every copy of the body carries
+            // that record.  Any other unresolved base waits for its copies.
+            const bounded: ExpressionNode* = this.try_bounded_index(visitor, access, array_type);
+            if (bounded != null) {
+                access.desugared_call = bounded;
+                return bounded.resolved_type;
+            }
+            return TypeRef::invalid();
+        }
 
         // Index operator overloading: `check_index_access` rejected a base with
         // no primitive indexing rule.  A concrete user aggregate (or a generic
@@ -648,9 +659,27 @@ type struct MemberResolver {
             return null;
         }
         if (this.trait_checker().select_impl(index_id, base_ty, 0) == null) { return null; }
+        return this.build_index_desugar(visitor, access);
+    }
 
-        // Build `*(a.index(i))`.  The index expression is passed BY VALUE - the
-        // trait is `index(&this, idx: Idx)`, not `&Idx` - so no synthetic `&`.
+    /// The index desugar for a base that is a type parameter of the body
+    /// being walked, when a bound in scope gives the parameter
+    /// `std::core::ops::Index` - itself or as a supertrait of the trait it
+    /// names.  Null for any other base.
+    try_bounded_index(mut &this, visitor: ASTVisitor*, access: ArrayAccessNode*,
+                      ty: TypeRef) -> ExpressionNode* {
+        const param: GenericParamType* = this.binding.receiver_type_param(ty);
+        if (param == null) { return null; }
+        const index_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Index);
+        if (!index_id.is_valid() || !this.binding.param_bounded_by(param, index_id)) { return null; }
+        return this.build_index_desugar(visitor, access);
+    }
+
+    /// Build and resolve `*(a.index(i))` for `access`; null when it does not
+    /// type.
+    build_index_desugar(mut &this, visitor: ASTVisitor*, access: ArrayAccessNode*) -> ExpressionNode* {
+        // The index expression is passed BY VALUE - the trait is
+        // `index(&this, idx: Idx)`, not `&Idx` - so no synthetic `&`.
         const index_method: SymbolStr = this.intern.intern("index");
         const member: MemberAccessNode* =
             new MemberAccessNode(access.array, index_method, access.span, access.span);

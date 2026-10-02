@@ -655,9 +655,9 @@ type struct CallResolver {
     /// those same types feed `classify_args_from_params`, which derives each
     /// argument's move/borrow classification from them, so substituting in place
     /// would flip classifications for every call on a generic owner in the
-    /// program.  Only a substitution landing on an adoptable numeric type is
-    /// recorded - the sole kind the propagation can consume - so no other
-    /// consumer of the call's typing can observe this.
+    /// program.  Only a substitution the propagation consumes is recorded - an
+    /// adoptable numeric type, or an array type an array-literal argument lands
+    /// on - so no other consumer of the call's typing can observe this.
     ///
     /// Owner parameters are matched by NAME against the template's declared
     /// list, never by `param_index`: a METHOD-level parameter carries an index
@@ -732,13 +732,26 @@ type struct CallResolver {
                 // Inside the owner's own template body the argument is still the
                 // symbolic parameter, which is not numeric - so the body's own
                 // literals keep defaulting, exactly as before.
-                if (is_adoptable_numeric_type(this.arena, owner_args[p])) {
+                if (is_adoptable_numeric_type(this.arena, owner_args[p])
+                        || this.array_literal_into_array(call, i, owner_args[p])) {
                     out[i] = owner_args[p];
                 }
                 break;
             }
         }
         return out;
+    }
+
+    /// Whether argument `i` of `call` is an array literal landing on an array
+    /// slot.  The literal reads its element type off the slot, and an empty
+    /// one has nothing else to read it from: `m.get_or_insert(k, [])` on a
+    /// `HashMap<K, u32[]>` is a `u32[]` only through the receiver's
+    /// argument, and an argument with no type leaves the call unselected.
+    array_literal_into_array(&this, call: CallExprNode*, i: i64, slot: TypeRef) -> boolean {
+        if (i >= call.arguments.length || call.arguments[i] == null) { return false; }
+        if ((call.arguments[i] as ASTNode*).kind != NodeKind::ArrayLiteral) { return false; }
+        const st: Type* = this.arena.lookup(slot);
+        return st != null && st.kind == TypeKind::Array;
     }
 
 
@@ -4237,6 +4250,13 @@ type struct CallResolver {
                 if (dir.named().is_valid() && !member.resolved_trait.is_valid()) {
                     this.stamp_trait_item(member, dir.named());
                 }
+                // The receiver the bound answered on, in the body's own
+                // parameters: each copy of the body substitutes it, which is
+                // what monomorphization selects the implementation for.  A
+                // copy's receiver expression carries no type of its own.
+                if (member.resolved_trait.is_valid() && member.resolved_trait_slot >= 0) {
+                    call.template_recv = obj_type;
+                }
                 member.set_resolved_type(abs_ret);
                 return abs_ret;
             }
@@ -6376,12 +6396,10 @@ type struct CallResolver {
     /// constructor's argument types (`Option::Some(<Holder>)` -> `Option<Holder>`)
     /// when no expected type promoted it.  Matches each of the variant's
     /// bare-param payload positions against the corresponding argument's resolved
-    /// type and binds the template params.  Returns an `InstantiatedType` ONLY
-    /// when (1) every template param is bound to a fully concrete argument type
-    /// and (2) some bound arg owns a destructor - i.e. the exact case the
-    /// pattern-binding move-check needs concretised; otherwise `TypeRef::invalid()`
-    /// so the caller keeps the generic base (Copy/plain payloads and generic
-    /// template bodies stay on the existing path).
+    /// type and binds the template params.  Returns an `InstantiatedType` only
+    /// when every template param is bound to an argument type naming one type;
+    /// otherwise `TypeRef::invalid()` so the caller keeps the generic base
+    /// (generic template bodies stay on that path).
     infer_variant_instantiation(mut &this, base_ref: TypeRef, scope: ScopeResolutionNode*,
                                 call: CallExprNode*) -> TypeRef {
         if (call == null) { return TypeRef::invalid(); }
@@ -6415,14 +6433,16 @@ type struct CallResolver {
             const arg: ExpressionNode* = call.arguments[i];
             if (arg == null || !arg.has_resolved_type()) { continue; }
             const arg_ty: TypeRef = arg.resolved_type;
-            // Only a fully concrete argument may bind. A generic param would
-            // instantiate the enum over a parameter rather than a type, and an
-            // instantiation that has not resolved its own shape yet would
-            // demand `Option<?>` - a specialization monomorphization cannot
-            // produce, which then fails the codegen module as an ICE rather
-            // than as a source error. Both stay on the generic-base path,
-            // where the enclosing template's specialization binds them later.
-            if (!this.types.arg_type_is_concrete(arg_ty)) { continue; }
+            // Only an argument naming one type may bind. A generic param would
+            // instantiate the enum over a parameter rather than a type, and so
+            // would an instantiation holding one - `Option<?>`, a
+            // specialization monomorphization cannot produce, which then
+            // fails the codegen module as an ICE rather than as a source
+            // error. Both stay on the generic-base path, where the enclosing
+            // template's specialization binds them later.  An instantiation
+            // not yet minted whose arguments are types names one type, and
+            // binds as its specialization will after monomorphization.
+            if (!this.types.arg_type_names_one_type(arg_ty)) { continue; }
             for (mut p: i64 = 0; p < tmpl.param_count; p++) {
                 if (gpt.declared_by(tmpl.param_syms[p])) { bindings[p] = arg_ty; break; }
             }

@@ -424,14 +424,48 @@ type struct MethodBinding {
         return owner_bounds != null && MethodBinding::bounds_name_param(owner_bounds, param);
     }
 
+    /// Whether a bound in scope of the body being walked - the function's
+    /// `where` clause, the impl's, or the owner declaration's - gives `param`
+    /// the trait `trait_def`: names it, or names a trait it is a supertrait
+    /// of.  Compared by identity.
+    param_bounded_by(&this, param: GenericParamType*, trait_def: DefId) -> boolean {
+        const func: FunctionDeclNode* = this.state.symbolic_current_func;
+        if (func != null && this.bounds_give(&func.trait_bounds, param, trait_def)) { return true; }
+        if (this.state.symbolic_impl_node != null
+            && this.bounds_give(&this.state.symbolic_impl_node.where_bounds, param, trait_def)) {
+            return true;
+        }
+        const owner_bounds: TraitBound[]* = this.owner_declared_bounds();
+        return owner_bounds != null && this.bounds_give(owner_bounds, param, trait_def);
+    }
+
+    /// Whether one of `bounds` on `param` itself names `trait_def` or a trait
+    /// `trait_def` is a supertrait of.
+    bounds_give(&this, bounds: &TraitBound[], param: GenericParamType*, trait_def: DefId) -> boolean {
+        for (mut i: i64 = 0; i < bounds.length; i++) {
+            if (!MethodBinding::bound_names_param(&bounds[i], param)) { continue; }
+            for (mut ti: i64 = 0; ti < bounds[i].trait_refs.length; ti++) {
+                const chain: DefId[] = this.trait_chain(bounds[i].trait_refs[ti].definition());
+                for (mut k: i64 = 0; k < chain.length; k++) {
+                    if (chain[k].equals(trait_def)) { return true; }
+                }
+            }
+        }
+        return false;
+    }
+
     /// Whether one of `bounds` has `param` itself as its subject; a bound on a
     /// projection of it (`T::Item: Ord`) constrains the projection, not `T`.
     static bounds_name_param(bounds: &TraitBound[], param: GenericParamType*) -> boolean {
         for (mut i: i64 = 0; i < bounds.length; i++) {
-            if (bounds[i].has_projection_subject()) { continue; }
-            if (param.declared_by(bounds[i].subject_sym)) { return true; }
+            if (MethodBinding::bound_names_param(&bounds[i], param)) { return true; }
         }
         return false;
+    }
+
+    /// Whether the bound `b` has `param` itself as its subject.
+    static bound_names_param(b: TraitBound*, param: GenericParamType*) -> boolean {
+        return !b.has_projection_subject() && param.declared_by(b.subject_sym);
     }
 
     /// Search `bounds` for a BARE-parameter bound on `param`; return the first
