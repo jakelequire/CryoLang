@@ -95,6 +95,56 @@ yet is recorded with the change that builds it, not here.
     instantiation** under ruling 35: `const o = Option::Some(String::from_string("hi"));`
     compiles with `o: Option<String>`. It was refused with E0200.
 
+82. **An operator the trait bounds do not license is refused on the
+    generic template**, before monomorphization, as rustc does; it is not
+    checked per instance. `a + b` under a bound on a user trait that is
+    merely named `Add` is an error in the generic body.
+
+    ```cryo
+    type trait Add<R, O> { add(&this, r: R) -> O; }
+    function sum<T>(a: T, b: T) -> T where T: Add<T, T> {
+        return a + b;   // error: the bound is a user trait, not the language's `+`
+    }
+    ```
+
+83. **`static match (T)` checks every arm before monomorphization.** A
+    single-type arm (`string =>`) narrows `T` to that type inside the arm;
+    a multi-type arm (`i32 | i64 =>`) must be valid for each listed type,
+    checked once per listed type; the wildcard arm `_` knows only `T`'s
+    declared bounds, like ordinary generic code. How many existing sites the
+    wildcard rule rejects is measured before it is switched on, and the
+    bounds they need are added in the same change.
+
+    ```cryo
+    function show<T>(x: T) -> i32 {
+        return static match (T) {
+            string    => { x.length() as i32 }   // `x: string` here
+            i32 | i64 => { x as i32 }            // checked as i32, then as i64
+            _         => { 0 }                    // only `T`'s bounds
+        };
+    }
+    ```
+
+84. **The post-monomorphization write probe is a committed compiler
+    instrument**, an `--emit=` mode or a debug mode, not a Python script.
+    It gates the slices that remove the pass after monomorphization.
+
+85. **Instantiations that come into existence only when monomorphization
+    substitutes types into a copy are demanded and emitted**, as in rustc: a
+    type appearing in a body counts as a use.
+
+86. **The internal check after monomorphization words a free function's
+    unbound call like a method's**: "internal: call to `panic` in ...
+    reached codegen with no resolved function (written at mem.cryo:74)" -
+    ruling 71's wording, with "function" for "method".
+
+87. **This ends ruling 79.** An ordinary method merely named `drop`, called
+    explicitly, gets no field release after it; its fields are released at
+    scope exit.
+
+88. **The count of functions that take a name going from 699 to 701**, for
+    the `member_entries` and `trait_slot_of` helpers, is accepted.
+
 ### 2026-10-01
 
 70. **The pass after monomorphization does not re-walk generic template
@@ -126,7 +176,7 @@ yet is recorded with the change that builds it, not here.
 78. **The closure synthesizer's inherent `drop` becomes a real `Drop`
     implementation**, not deleted.
 
-79. **An explicit inherent `x.drop()` that runs field release is accepted
+79. *Ended by ruling 87.* **An explicit inherent `x.drop()` that runs field release is accepted
     until the call pin's method node and codegen's `.drop()` name branch are
     removed.**
 

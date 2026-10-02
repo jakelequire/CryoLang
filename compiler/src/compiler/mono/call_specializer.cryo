@@ -732,24 +732,19 @@ type struct MonoCallSpecializer {
         // this specializes is a method's own type parameters, and no method
         // language item has any.
         if (call.named_method.is_valid()) { return; }
-        // An already-concrete (non-generic, or already-minted spec) resolved method
-        // needs no work; mono pins the spec back into resolved_method at the end, so
-        // a re-walk over the same call (fixpoint) lands here and short-circuits.
-        //
-        // EXCEPTION: a self-returning / lazy-self-growing adapter default
-        // (`take`/`filter`/`map`/...) is pinned by sema by NAME (it has 0 own
-        // generics) but is still an un-instantiated template. On a CONCRETE
-        // user-iterator receiver (`it: UpTo; it.take(n)`) sema resolves and pins
-        // the unspecialized default; short-circuiting here would leave it never
-        // instantiated and codegen would find no emitted `take` (E0636). Let these
-        // fall through to the binding by identity below, which instantiates the
-        // deferred default (`instantiate_deferred`). (Once
-        // instantiated, the spec carries `is_self_returning_default = false`, so the
-        // fixpoint re-walk short-circuits correctly.)
-        if (call.resolved_method != null) {
-            const rm: MethodNode* = call.resolved_method as MethodNode*;
-            if (rm == null || rm.func == null) { return; }
-            if (rm.func.generic_params.length == 0
+        // A call pinned to a method with nothing left to instantiate - one
+        // with no type parameters of its own, or an instance minted for an
+        // earlier walk of this call - needs no work, so a re-walk over the
+        // same call (fixpoint) lands here and short-circuits.  A default
+        // instantiated per call (`take`/`filter`/`map`/...) has no type
+        // parameters of its own and is still a template: it falls through to
+        // the binding by identity below, which instantiates it
+        // (`instantiate_deferred`).
+        const pinned: OverloadId = call.resolved_callee.decl_entry();
+        if (pinned.is_valid()) {
+            const rm: MethodNode* = this.decl_index.entry_method(pinned);
+            if (rm != null && rm.func != null
+                    && rm.func.generic_params.length == 0
                     && !rm.func.is_self_returning_default
                     && !rm.func.is_lazy_self_growing) {
                 return;
@@ -758,9 +753,9 @@ type struct MonoCallSpecializer {
         if (call.callee == null) { return; }
         const callee_node: ASTNode* = call.callee as ASTNode*;
         // The receiver.  `recv.m(args)` writes it before the member.  A path
-        // call `Owner::m(recv, args)` passes it first, and sema bound the
-        // path to the generic method's template (`path_method`): the method
-        // is that declaration, not one found again by name here.
+        // call `Owner::m(recv, args)` passes it first, and sema recorded the
+        // generic method's definition the path names (`path_method`): the
+        // method is that declaration, not one found again by name here.
         mut ma: MemberAccessNode* = null;
         mut recv_expr: ExpressionNode* = null;
         mut path_method: MethodNode* = null;
@@ -768,8 +763,10 @@ type struct MonoCallSpecializer {
             ma = call.callee as MemberAccessNode*;
             recv_expr = ma.object;
         } else if (callee_node.kind == NodeKind::ScopeResolution) {
-            path_method = call.resolved_method as MethodNode*;
-            if (path_method == null || path_method.func == null) { return; }
+            const recorded: ASTNode* = this.decl_index.method_decl_of(call.template_method);
+            if (recorded == null || recorded.kind != NodeKind::MethodDeclaration) { return; }
+            path_method = recorded as MethodNode*;
+            if (path_method.func == null) { return; }
             if (path_method.func.generic_params.length == 0 || call.arguments.length == 0) { return; }
             recv_expr = call.arguments[0];
         } else {
@@ -872,23 +869,23 @@ type struct MonoCallSpecializer {
         // names the trait's method by its position.  Either is bound to the
         // receiver's method for it, found by identity.  Nothing is found by
         // the member's name.
-        if (call.template_method.is_valid()) {
+        if (path_method == null && call.template_method.is_valid()) {
             mut id_impl: ImplBlockNode* = null;
             mut id_owner: ASTNode* = null;
             const id_m: MethodNode* = this.receiver_method_of(call.template_method, recv_type, &id_impl, &id_owner);
-            this.bind_receiver_method(call, id_m, id_impl, id_owner, recv_type, is_primitive_kind, subst);
+            this.bind_receiver_method(call, id_m, id_impl, id_owner, recv_type, subst);
             return;
         }
         if (ma != null && ma.resolved_trait.is_valid() && ma.resolved_trait_slot >= 0) {
             mut item_impl: ImplBlockNode* = null;
             const item_m: MethodNode* = this.trait_item_on(ma, recv_type, &item_impl);
             if (item_m != null) {
-                this.bind_receiver_method(call, item_m, item_impl, null, recv_type, is_primitive_kind, subst);
+                this.bind_receiver_method(call, item_m, item_impl, null, recv_type, subst);
                 return;
             }
         }
 
-        // A path call names the generic method's template, which is bound
+        // A path call names the generic method's definition, which is bound
         // where it is placed for the receiver.  A member call that reached
         // here carries neither a template pin nor a trait item and names
         // nothing: it is left unbound, and the pass after monomorphization
@@ -897,8 +894,7 @@ type struct MonoCallSpecializer {
         mut impl_node: ImplBlockNode* = null;
         mut inherent_owner_ast: ASTNode* = null;
         if (!this.method_placement(path_method, recv_type, &impl_node, &inherent_owner_ast)) { return; }
-        this.instantiate_generic_method(call, path_method, impl_node, inherent_owner_ast, recv_type,
-            is_primitive_kind, subst);
+        this.instantiate_generic_method(call, path_method, impl_node, inherent_owner_ast, recv_type, subst);
     }
 
     /// Bind `call` to the instance of `orig_method` - the receiver's method,
@@ -908,8 +904,7 @@ type struct MonoCallSpecializer {
     /// are still a generic body's parameters, is left alone.
     instantiate_generic_method(mut &this, call: CallExprNode*, orig_method: MethodNode*,
                                impl_node: ImplBlockNode*, inherent_owner_ast: ASTNode*,
-                               recv_type: TypeRef, is_primitive_kind: boolean,
-                               subst: TypeSubstitution*) -> void {
+                               recv_type: TypeRef, subst: TypeSubstitution*) -> void {
         if (impl_node == null && inherent_owner_ast == null) { return; }
 
 
@@ -955,26 +950,6 @@ type struct MonoCallSpecializer {
             }
         }
 
-        // The pin symbol must match the symbol the spec is REGISTERED + EMITTED
-        // under, or codegen's `resolve_symbol` misses it and the call binds
-        // nothing.  For an inherent (non-trait) impl the registration
-        // target is the block's own key (e.g. bare `string`), which can
-        // differ from `recv_qname` for a primitive receiver; use it.  A
-        // primitive receiver has no qualified name at all; its impl blocks
-        // are declared under the target the block itself carries (`i32`), so
-        // that is the symbol's owner.  Left empty, no symbol is pinned and
-        // codegen binds `i32::fmt` by name - to whichever of `Display::fmt` /
-        // `Debug::fmt` the index registered first.
-        const recv_qname: SymbolStr = this.arena.get_qualified_name(recv_type);
-        mut pin_target: SymbolStr = recv_qname;
-        if (impl_node != null) {
-            const own: SymbolStr = impl_node.target_key(this.arena);
-            if (own.is_valid()
-                    && (!impl_node.is_trait_impl() || (!pin_target.is_valid() && is_primitive_kind))) {
-                pin_target = own;
-            }
-        }
-
         // An instance is minted once per (receiver, method definition, type
         // arguments).  The same instance is asked for again by every copy
         // of a call in a body specialized more than once, and by the
@@ -988,8 +963,7 @@ type struct MonoCallSpecializer {
         const def_slot: i64 = this.decl_index.defs.slot(def_of);
         const made: OverloadId = this.state.method_instance(recv_type, def_slot, &bindings);
         if (made.is_valid()) {
-            call.set_resolved_method(this.decl_index.entry_method(made) as ASTNode*);
-            this.pin_spec_entry(call, made, pin_target.is_valid());
+            this.pin_spec_entry(call, made);
             return;
         }
 
@@ -1087,7 +1061,6 @@ type struct MonoCallSpecializer {
         } else {
             impl_node.methods.push(spec_method);
         }
-        call.set_resolved_method(spec_method as ASTNode*);
 
         // DI registration + symbol pin.  Inherent generic methods on a fixed
         // receiver get the precise mangle pinned (disambiguates Inner::relay<A> vs
@@ -1109,7 +1082,7 @@ type struct MonoCallSpecializer {
         mut inst_args: TypeRef[] = [];
         for (mut ai: i64 = 0; ai < bindings.length; ai++) { inst_args.push(bindings[ai]); }
         this.state.add_method_instance(recv_type, def_slot, inst_args, spec_method.func.overload_entry);
-        this.pin_spec_entry(call, spec_method.func.overload_entry, pin_target.is_valid());
+        this.pin_spec_entry(call, spec_method.func.overload_entry);
 
         // Compile-time `static match` arm pruning on the freshly-minted spec body.
         // A method-level `static match (T)` (e.g. `string::parse_int<T>`) was cloned
@@ -1236,11 +1209,10 @@ type struct MonoCallSpecializer {
     /// the pass after monomorphization binds it.
     bind_receiver_method(mut &this, call: CallExprNode*, m: MethodNode*, impl_node: ImplBlockNode*,
                          owner_ast: ASTNode*, recv_type: TypeRef,
-                         is_primitive_kind: boolean, subst: TypeSubstitution*) -> void {
+                         subst: TypeSubstitution*) -> void {
         if (m == null || m.func == null) { return; }
         if (m.func.generic_params.length > 0) {
-            this.instantiate_generic_method(call, m, impl_node, owner_ast, recv_type,
-                is_primitive_kind, subst);
+            this.instantiate_generic_method(call, m, impl_node, owner_ast, recv_type, subst);
             return;
         }
         if ((!m.func.is_self_returning_default && !m.func.is_lazy_self_growing) || impl_node == null) { return; }
@@ -1259,26 +1231,11 @@ type struct MonoCallSpecializer {
     /// Bind `call` to the receiver's instance of the deferred method `orig`
     /// of `impl_node`: `made` when an earlier call instantiated it, else an
     /// instance minted now, registered, and walked for the calls its body
-    /// makes.  The pin is the symbol codegen declares the instantiation under: the
-    /// impl block's target and the instantiated signature, exactly as
-    /// `declare_impl_block` mangles it.  The target is the receiver's
-    /// qualified name, except for an inherent block, which registers under
-    /// its own stamped target (a primitive's bare spelling).
+    /// makes.  The pin is the instance's registered entry.
     instantiate_deferred(mut &this, call: CallExprNode*, orig: MethodNode*, impl_node: ImplBlockNode*,
                          recv_type: TypeRef, made: MethodNode*) -> boolean {
-        mut pin_target: SymbolStr = this.arena.get_qualified_name(recv_type);
-        const lazy_recv: Type* = this.arena.lookup(recv_type);
-        const lazy_prim: boolean = lazy_recv != null
-                && (lazy_recv.kind == TypeKind::Int || lazy_recv.kind == TypeKind::Float
-                    || lazy_recv.kind == TypeKind::Bool || lazy_recv.kind == TypeKind::Char
-                    || lazy_recv.kind == TypeKind::String);
-        const own: SymbolStr = impl_node.target_key(this.arena);
-        if (own.is_valid() && (!impl_node.is_trait_impl() || (!pin_target.is_valid() && lazy_prim))) {
-            pin_target = own;
-        }
         if (made != null) {
-            call.set_resolved_method(made as ASTNode*);
-            this.pin_spec_entry(call, made.func.overload_entry, pin_target.is_valid());
+            this.pin_spec_entry(call, made.func.overload_entry);
             return true;
         }
         mut empty_params: GenericParamNode*[] = [];
@@ -1288,9 +1245,8 @@ type struct MonoCallSpecializer {
             orig, &empty_params, &empty_args, recv_type, impl_node, &copy_subst);
         if (spec_method == null || spec_method.func == null) { return false; }
         impl_node.methods.push(spec_method);
-        call.set_resolved_method(spec_method as ASTNode*);
         this.register_spec_method_in_di(spec_method, recv_type, impl_node);
-        this.pin_spec_entry(call, spec_method.func.overload_entry, pin_target.is_valid());
+        this.pin_spec_entry(call, spec_method.func.overload_entry);
         if (spec_method.func.body != null) {
             mut rw_ctx: ResolutionContext = ResolutionContext::new("");
             this.walk_block(spec_method.func.body, &rw_ctx, copy_subst);
@@ -1554,8 +1510,7 @@ type struct MonoCallSpecializer {
         const pin_target: SymbolStr = this.arena.get_qualified_name(recv_type);
         const spec_sym: SymbolStr = this.mangled_symbol_for_spec_method(spec_method, pin_target);
         if (this.state.method_spec_seen(spec_sym)) {
-            call.set_resolved_method(spec_method as ASTNode*);
-            this.pin_spec_entry(call, this.state.method_spec_entry(spec_sym), spec_sym.is_valid());
+            this.pin_spec_entry(call, this.state.method_spec_entry(spec_sym));
             return true;
         }
         this.state.mark_method_spec(spec_sym);
@@ -1571,10 +1526,9 @@ type struct MonoCallSpecializer {
         } else {
             return false;
         }
-        call.set_resolved_method(spec_method as ASTNode*);
         this.register_spec_method_in_di_inherent(spec_method, recv_type, owner_ast);
         this.state.set_method_spec_entry(spec_sym, spec_method.func.overload_entry);
-        this.pin_spec_entry(call, spec_method.func.overload_entry, spec_sym.is_valid());
+        this.pin_spec_entry(call, spec_method.func.overload_entry);
 
         // Re-walk the body for its own generic calls under the substitution
         // it was copied with (the owner's `A` -> concrete, and the method's
@@ -1990,9 +1944,9 @@ type struct MonoCallSpecializer {
 
     /// Whether a receiver is an instantiation the worklist has not
     /// materialized yet.  A generic method requested on one has nothing to
-    /// be registered under yet: the spec sits on the template's block and
-    /// the call binds through the method node once the owner exists
-    /// (`pin_spec_entry`'s unkeyed shape).  Every other receiver is a type
+    /// be registered under yet: the spec sits on the template's block, and
+    /// the call is pinned to the entry the spec carries, the one the owner
+    /// registers it under when it is materialized.  Every other receiver is a type
     /// the index holds - a declaration, a primitive, a specialization
     /// registered at its placement, flipped to its concrete or not - so one
     /// it cannot name is a missing registration, recorded by
@@ -2047,14 +2001,10 @@ type struct MonoCallSpecializer {
             recv_type, spec_methods, this.intern_table, this.arena, Text::new("mono/spec inherent method"));
     }
 
-    /// Pin `call` to the materialized spec's registered entry.  A spec on a
-    /// receiver with no registry key (`keyed` false: the instantiation is
-    /// not materialized when the call is specialized) is left unpinned:
-    /// its registration went under the template's own key, which names a
-    /// definition nothing emits, and the call binds through the method node
-    /// once the receiver exists.
-    pin_spec_entry(mut &this, call: CallExprNode*, entry: OverloadId, keyed: boolean) -> void {
-        if (!keyed || !entry.is_valid()) { return; }
+    /// Pin `call` to the spec's entry: the call's final answer, which every
+    /// pass after monomorphization reads.
+    pin_spec_entry(mut &this, call: CallExprNode*, entry: OverloadId) -> void {
+        if (!entry.is_valid()) { return; }
         call.set_resolved_callee(CalleePin::Decl(entry));
     }
 

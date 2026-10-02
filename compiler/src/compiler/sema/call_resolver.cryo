@@ -1149,9 +1149,10 @@ type struct CallResolver {
             // canonical (scalar or unit) return: there the pin can be a SIBLING
             // spec of a different instantiation, and `mret` is authoritative
             // (`generic_canonical_return`).
-            if (mret.is_valid() && call.resolved_method != null
+            const ovl_pin: OverloadId = call.resolved_callee.decl_entry();
+            if (mret.is_valid() && ovl_pin.is_valid()
                     && !this.generic_canonical_return(call, mret)) {
-                const ovl_rm: MethodNode* = call.resolved_method as MethodNode*;
+                const ovl_rm: MethodNode* = this.ctx.decl_index.entry_method(ovl_pin);
                 if (ovl_rm != null && ovl_rm.func != null
                         && ovl_rm.func.generic_params.length == 0
                         && ovl_rm.func.resolved_return_type.is_valid()
@@ -2693,7 +2694,7 @@ type struct CallResolver {
         // argument at THAT signature's parameter type - a reinterpretation with
         // no diagnostic, where a single candidate would have produced E0214.
         if (ambiguous) {
-            if (call.resolved_method == null) {
+            if (!call.resolved_callee.decl_entry().is_valid()) {
                 this.emit_no_matching_overload(call, member, base_ref, cand_params, argc);
             }
             return;
@@ -3101,7 +3102,7 @@ type struct CallResolver {
     }
 
 
-    // -- Method overload selection (pins resolved_method / resolved_callee) --
+    // -- Method overload selection (pins resolved_callee) --
 
     /// Pin a method call to the method's own registered entry.  The node is
     /// the declaration sema bound the call to; its entry carries the symbol
@@ -3119,11 +3120,11 @@ type struct CallResolver {
         call.set_resolved_callee(CalleePin::Decl(fn_node.overload_entry));
     }
 
-    /// Tag `call.resolved_method` + pin `resolved_callee` for an instance method
-    /// call.  Candidates are the receiver's own methods (walking a class's
-    /// base chain), then the inherent blocks of a primitive, then its trait
-    /// impls; each set is tried at every binding tier before the next set is
-    /// consulted.  Leaves both unset on no match.
+    /// Pin `resolved_callee` for an instance method call.  Candidates are
+    /// the receiver's own methods (walking a class's base chain), then the
+    /// inherent blocks of a primitive, then its trait impls; each set is
+    /// tried at every binding tier before the next set is consulted.  Leaves
+    /// it unset on no match.
     /// Returns what `bind_method_on_receiver` returns.
     resolve_method_overload(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
                             member: MemberAccessNode*) -> Selection {
@@ -3159,10 +3160,10 @@ type struct CallResolver {
         // method call to the specialization it minted - a clone with no
         // generic parameters left, under the `$MG` symbol - and selecting
         // again here can only find the TEMPLATE, which a parameterless method
-        // (`v.as<Str>()`) matches exactly; that would displace the
-        // specialization as `resolved_method` while the pin stays.
-        if (call.resolved_callee.is_some() && call.resolved_method != null) {
-            return Selection::of(call.resolved_method as MethodNode*);
+        // (`v.as<Str>()`) matches exactly.
+        const bound: OverloadId = call.resolved_callee.decl_entry();
+        if (bound.is_valid()) {
+            return Selection::of(this.ctx.decl_index.entry_method(bound));
         }
         mut base_ref: TypeRef = obj_type;
         mut base_t: Type* = this.arena.lookup(obj_type);
@@ -3212,20 +3213,17 @@ type struct CallResolver {
         // in each copy of the body whose receiver is minted: to the
         // receiver's entry for the pinned definition, or, for a method with
         // type parameters of its own, after monomorphization, to the instance
-        // monomorphization made of it for the call and recorded on it.  A
-        // copy with no instance recorded leaves the call unbound, which code
-        // generation refuses; nothing selects it again by its member's name.
+        // monomorphization made of it for the call and pinned, which the
+        // guard above answers.  A copy with no instance pinned leaves the
+        // call unbound, which code generation refuses; nothing selects it
+        // again by its member's name.
         const pinned_fn: FunctionDeclNode* = this.ctx.decl_index.method_func_of(call.template_method);
         if (call.template_method.is_valid() && !owner_inst.is_valid()
                 && !this.types.contains_generic_param(base_ref)) {
             if (pinned_fn == null || !pinned_fn.is_generic()) {
                 return this.bind_template_method(visitor, call, base_ref);
             }
-            if (this.state.post_mono_verify) {
-                const made: MethodNode* = CallResolver::instance_of_pin(call);
-                if (made == null) { return Selection::none(); }
-                return this.commit_selection(visitor, call, Selection::of(made));
-            }
+            if (this.state.post_mono_verify) { return Selection::none(); }
         }
         if (!member.resolved_trait.is_valid()) {
             mut copied: BoundDirection = BoundDirection::none();
@@ -3426,18 +3424,6 @@ type struct CallResolver {
             this.ctx.decl_index.method_entry_on(recv, call.template_method));
         if (chosen == null) { return Selection::none(); }
         return this.commit_selection(visitor, call, Selection::of(chosen));
-    }
-
-    /// The instance monomorphization made for a call whose template pins a
-    /// method with type parameters of its own: the method it recorded on
-    /// the call, when that is an instance - no type parameters left - copied
-    /// from the pinned definition.  Null when monomorphization recorded no
-    /// instance of it.
-    static instance_of_pin(call: CallExprNode*) -> MethodNode* {
-        const made: MethodNode* = call.resolved_method as MethodNode*;
-        if (made == null || made.func == null || made.func.generic_params.length > 0) { return null; }
-        if (!made.func.copy_of.equals(call.template_method)) { return null; }
-        return made;
     }
 
     /// Bind a call that names its method by definition - a method language
@@ -3755,7 +3741,6 @@ type struct CallResolver {
                 this.apply_overload_converter_args(visitor, call, params.as_slice());
             }
         }
-        call.set_resolved_method(mn as ASTNode*);
         this.pin_method_callee(call, mn, mn.is_static);
         this.pin_instantiated_method(call, mn, sel.recv);
         return sel;
@@ -4443,7 +4428,7 @@ type struct CallResolver {
         // template's method on an instantiation not yet minted.
         const lookup_t: Type* = this.arena.lookup(lookup_ref);
         const on_template: boolean = lookup_t != null && lookup_t.kind == TypeKind::InstantiatedType;
-        const named: MethodNode* = if (on_template) { selected.chosen } else { call.resolved_method as MethodNode* };
+        const named: MethodNode* = selected.chosen;
         const ret: TypeRef = if (on_template) { selected.ret } else { if (named != null && named.func != null) {
             named.func.resolved_return_type
         } else { TypeRef::invalid() } };
@@ -5704,10 +5689,11 @@ type struct CallResolver {
     }
 
     /// Bind the path call `call` to entry `e`.  A generic method's template
-    /// is not a definition the call can run: its own type parameters are
-    /// bound here - stashed for monomorphization, which mints the
-    /// specialization and pins it as it does for `recv.m(args)` - and the
-    /// path is typed through them.  Any other entry is pinned.
+    /// is not a definition the call can run: the call records its definition
+    /// (`template_method`) and its own type parameters, bound here - stashed
+    /// for monomorphization, which mints the specialization and pins it as it
+    /// does for `recv.m(args)` - and the path is typed through them.  Any
+    /// other entry is pinned.
     pin_static_entry(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*, e: OverloadId) -> void {
         const m: MethodNode* = this.ctx.decl_index.entry_method(e);
         if (m == null || m.func == null || m.func.generic_params.length == 0 || m.is_static) {
@@ -5722,7 +5708,9 @@ type struct CallResolver {
         mut ctx: ResolutionContext = this.path_method_context(m, fn_ty.param_types[0], call, scope, &binds);
         if (binds.length == 0) { return; }
         call.set_resolved_type_args(binds);
-        call.set_resolved_method(m as ASTNode*);
+        if (!call.template_method.is_valid()) {
+            call.template_method = if (m.func.def.is_valid()) { m.func.def } else { m.func.copy_of };
+        }
         if (m.func.return_type_annotation != null) {
             const ret: TypeRef = this.binding.reduce_assoc_projections(
                 this.ctx.type_resolver.resolve(m.func.return_type_annotation, &ctx));

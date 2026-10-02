@@ -22,16 +22,16 @@
 ///!     field out of an aggregate while deliberately discarding the rest.
 ///!
 ///!   * W0002 (unused function/method) - a PRIVATE, module-local function or
-///!     method that no call site targets.  Method usage is read from each call
-///!     site's sema/mono-resolved `resolved_method` (operator overloads
-///!     included, via their `desugared_call`); free-function usage from the
-///!     resolution map.  Entry points (`main`, `![entry]`), tests, trait-impl
-///!     methods, constructors/destructors, virtual/override methods, generic
-///!     templates, mono specializations, and `![symbol(...)]` link-named
-///!     functions are never flagged.  STATIC methods are also skipped for now:
-///!     they are called as `Type::m()`, whose usage pins `resolved_callee` (a
-///!     name) not `resolved_method`, so the harvest can't see it - precise
-///!     static-call tracking is a follow-up.
+///!     method that no call site targets.  Method usage is read from the
+///!     methods each call site names - its pin, and the definition a call in
+///!     a generic body records (operator overloads included, via their
+///!     `desugared_call`); free-function usage from the resolution map.  Entry
+///!     points (`main`, `![entry]`), tests, trait-impl methods,
+///!     constructors/destructors, virtual/override methods, generic templates,
+///!     mono specializations, and `![symbol(...)]` link-named functions are
+///!     never flagged.  STATIC methods are also skipped: a static call pinned
+///!     to a family (`CalleePin::Family`) names no one method, so the harvest
+///!     cannot tell which member of the family it uses.
 ///!
 ///! Scope: only the module currently being compiled is linted, and standard-
 ///! library modules (`std::*`) are skipped entirely - a dependency's internals
@@ -88,6 +88,7 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::resolution_map::{ ResolutionMap };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::decl_index::{ OverloadId };
 import utils::text::{ Text };
 import utils::keyword::{ Keyword };
 
@@ -103,10 +104,11 @@ type struct DeadCodeChecker {
     used: HashMap<u64, boolean>;
 
     /// Set of method/function declaration-span keys that are the target of a
-    /// resolved call.  Populated by `harvest_module` from every call site's
-    /// `resolved_method` (set by sema/mono), which is the only reliable signal
-    /// for METHOD calls (`obj.foo()` is type-directed and not recorded in the
-    /// resolution map).  Also covers operator overloads via `desugared_call`.
+    /// resolved call.  Populated by `harvest_module` from the methods every
+    /// call site names (`mark_named_methods`), which is the only reliable
+    /// signal for METHOD calls (`obj.foo()` is type-directed and not recorded
+    /// in the resolution map).  Also covers operator overloads via
+    /// `desugared_call`.
     method_used: HashMap<u64, boolean>;
 
     /// Whether the body currently being walked was name-resolved, so its local
@@ -405,6 +407,19 @@ type struct DeadCodeChecker {
         this.method_used.insert(key, true);
     }
 
+    /// Record every method a call names as used: the method its pin binds
+    /// it to, and the definition it was written against when it records
+    /// one - a generic body's call before its receiver is minted, or a
+    /// path naming a method with type parameters of its own, which the pin
+    /// answers only in a copy.
+    mark_named_methods(mut &this, c: CallExprNode*) -> void {
+        const entry: OverloadId = c.resolved_callee.decl_entry();
+        if (entry.is_valid()) {
+            this.mark_call_target(this.ctx.decl_index.entry_method(entry) as ASTNode*);
+        }
+        this.mark_call_target(this.ctx.decl_index.method_decl_of(c.template_method));
+    }
+
     /// Walk every function/method body harvesting call targets.  This is a
     /// COMPLETE traversal (unlike the lint-1 walk it does not early-exit on
     /// divergence): a method called only inside otherwise-unreachable code is
@@ -528,7 +543,7 @@ type struct DeadCodeChecker {
         match (e.kind) {
             NodeKind::CallExpression => {
                 const c: CallExprNode* = e as CallExprNode*;
-                this.mark_call_target(c.resolved_method);
+                this.mark_named_methods(c);
                 this.walk_expr(c.callee);
                 for (mut i: i64 = 0; i < c.arguments.length; i++) { this.walk_expr(c.arguments[i]); }
             }
@@ -684,10 +699,9 @@ type struct DeadCodeChecker {
         }
         if (f.is_generic()) { return; }                       // template - skip
         if (f.is_specialization) { return; }                  // mono-generated instance
-        // Static methods are called as `Type::m()` (scope-resolution), whose
-        // usage pins `resolved_callee` (a name), not `resolved_method` - our
-        // harvest can't see it, so flagging them would false-positive. Tracking
-        // static-call usage precisely is a follow-up; skip them for now.
+        // A static call pinned to a family names no one method, so the
+        // harvest cannot see which static it uses; flagging statics would
+        // false-positive.
         if (m.is_static) { return; }
         // Dispatch-only or implicitly-invoked methods are never called by name:
         if (m.is_constructor || m.is_destructor || m.is_virtual || m.is_override) { return; }
