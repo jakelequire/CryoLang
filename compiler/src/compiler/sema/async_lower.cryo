@@ -22,7 +22,8 @@
 namespace compiler::sema::async_lower;
 
 import compiler::types::{
-    type_ref, type_base, arena, compound, user_defined, ownership, generic_registry, TypeKind
+    type_ref, type_base, arena, compound, user_defined, ownership, generic_registry, TypeKind,
+    RefMutability
 };
 import compiler::resolver::{
     symbol_str, intern_table, qualified_name, mangled_name, resolver
@@ -78,6 +79,7 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::sema::pattern_resolver::{ PatternResolver };
+import compiler::sema::literal_resolver::{ LiteralResolver };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType };
 import compiler::types::generic_registry::{ TemplateEntry };
@@ -378,6 +380,9 @@ type struct AsyncLower {
     // neither of which is cached on the AST. Used only by the `match`-arm await
     // lowering; null for every other path.
     patterns: PatternResolver*;
+    // Borrowed sema peer: types the `null` and unit literals this lowering
+    // builds by the rule the type check types a written one by.
+    literals: LiteralResolver*;
     counter:  u64;
     // Every name `mint_local` hands out for the async body currently being
     // lowered — i.e. exactly the body's locals and `match`-arm bindings, which
@@ -457,7 +462,7 @@ type struct AsyncLower {
 
     static null() -> AsyncLower {
         return AsyncLower { arena: null, intern: null, ctx: null, resolver: null,
-                            patterns: null, counter: 0,
+                            patterns: null, literals: null, counter: 0,
                             frame_locals: [], frame_local_src: [], pending: [],
                             edge_from: [], edge_to: [],
                             this_sym: SymbolStr::empty(), this_amp_sym: SymbolStr::empty(),
@@ -534,11 +539,12 @@ type struct AsyncLower {
     }
 
     wire(mut &this, arena: TypeArena*, intern: InternTable*, ctx: CompilationContext*,
-         patterns: PatternResolver*) -> void {
+         patterns: PatternResolver*, literals: LiteralResolver*) -> void {
         this.arena    = arena;
         this.intern   = intern;
         this.ctx      = ctx;
         this.patterns = patterns;
+        this.literals = literals;
         // Held from here rather than asked for at each mint: this lowering
         // declares bindings, and a binding's identity comes from the one
         // allocator that hands them out.  One door, wired once.
@@ -870,10 +876,11 @@ type struct AsyncLower {
 
     /// The unit value `()`. Spelled the way the parser spells it, so the rest of
     /// the pipeline sees an ordinary unit literal rather than a shape unique to
-    /// the async lowering.
+    /// the async lowering.  Typed as the type check types that literal in the
+    /// unit payload slot it fills.
     unit_value(&this, span: SourceSpan) -> ExpressionNode* {
         mut lit: LiteralNode* = new LiteralNode("void", LiteralKind::Null, span);
-        lit.set_resolved_type(this.arena.get_unit());
+        lit.set_resolved_type(this.literals.null_literal_type(this.arena.get_unit()));
         return lit as ExpressionNode*;
     }
 
@@ -1408,13 +1415,18 @@ type struct AsyncLower {
         return u as ExpressionNode*;
     }
 
-    /// `&(<e>)` typed `ty`.
-    addr_of(&this, e: ExpressionNode*, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+    /// `&(<e>)`, typed as the type check types a written `&e` stored into a
+    /// pointer slot: an immutable reference to `e`'s type.  The slot being a
+    /// `T*` does not make the value one; an untyped `e` leaves it untyped, as
+    /// it would a written one.
+    addr_of(&this, e: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
         const amp: Token = Token::new(TokenType::Amp, "&",
                                       span.start_line as int, span.start_col as int);
         mut u: UnaryExprNode* = new UnaryExprNode(amp, e, span);
         u.is_synthetic = true;
-        u.set_resolved_type(ty);
+        if (e.resolved_type.is_valid()) {
+            u.set_resolved_type(this.arena.get_reference_to(e.resolved_type, RefMutability::Immutable));
+        }
         return u as ExpressionNode*;
     }
 
@@ -1475,16 +1487,21 @@ type struct AsyncLower {
         return d;
     }
 
+    /// `<lhs> = <rhs>;` as a statement.  The assignment is typed as the type
+    /// check types a written one: its target's type.
+    assign_stmt(&this, lhs: ExpressionNode*, rhs: ExpressionNode*, span: SourceSpan) -> StatementNode* {
+        const eq: Token = Token::new(TokenType::Equal, "=", span.start_line as int, span.start_col as int);
+        mut assign: BinaryExprNode* = new BinaryExprNode(eq, lhs, rhs, span);
+        assign.set_resolved_type(lhs.resolved_type);
+        mut es: ExprStmtNode* = new ExprStmtNode(assign as ExpressionNode*, span);
+        return es as StatementNode*;
+    }
+
     /// `this.<field> = <rhs>;` as a statement.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     assign_member_stmt(&this, struct_ref: TypeRef, field: SymbolStr, field_ty: TypeRef,
                        rhs: ExpressionNode*, span: SourceSpan) -> StatementNode* {
-        mut lhs: ExpressionNode* = this.member(this.this_ident(struct_ref, span), field, field_ty, span);
-        const eq: Token = Token::new(TokenType::Equal, "=", span.start_line as int, span.start_col as int);
-        mut assign: BinaryExprNode* = new BinaryExprNode(eq, lhs, rhs, span);
-        assign.set_resolved_type(this.arena.get_void());
-        mut es: ExprStmtNode* = new ExprStmtNode(assign as ExpressionNode*, span);
-        return es as StatementNode*;
+        return this.assign_stmt(this.member(this.this_ident(struct_ref, span), field, field_ty, span), rhs, span);
     }
 
     /// A `match` arm `<value> => { <body> }` with a bare integer-literal pattern.
@@ -2408,16 +2425,18 @@ type struct AsyncLower {
         const t: Type* = this.arena.lookup(field_ty);
         const k: TypeKind = if (t != null) { t.kind } else { TypeKind::Error };
         mut lit: LiteralNode* = null;
+        mut lit_ty: TypeRef = field_ty;
         if (k == TypeKind::Bool) {
             lit = new LiteralNode("false", LiteralKind::Boolean, span);
         } else if (k == TypeKind::Float) {
             lit = new LiteralNode("0.0", LiteralKind::Float, span);
         } else if (k == TypeKind::Pointer) {
             lit = new LiteralNode("null", LiteralKind::Null, span);
+            lit_ty = this.literals.null_literal_type(field_ty);
         } else {
             lit = new LiteralNode("0", LiteralKind::Integer, span);
         }
-        lit.set_resolved_type(field_ty);
+        lit.set_resolved_type(lit_ty);
         return lit as ExpressionNode*;
     }
 
@@ -2818,12 +2837,7 @@ type struct AsyncLower {
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     assign_field_of_stmt(&this, obj: ExpressionNode*, field: SymbolStr, field_ty: TypeRef,
                          rhs: ExpressionNode*, span: SourceSpan) -> StatementNode* {
-        mut lhs: ExpressionNode* = this.member(obj, field, field_ty, span);
-        const eq: Token = Token::new(TokenType::Equal, "=", span.start_line as int, span.start_col as int);
-        mut assign: BinaryExprNode* = new BinaryExprNode(eq, lhs, rhs, span);
-        assign.set_resolved_type(this.arena.get_void());
-        mut es: ExprStmtNode* = new ExprStmtNode(assign as ExpressionNode*, span);
-        return es as StatementNode*;
+        return this.assign_stmt(this.member(obj, field, field_ty, span), rhs, span);
     }
 
     /// Emit into state `resume` the receiver refreshes for every `async`-method
@@ -2887,7 +2901,7 @@ type struct AsyncLower {
             // with an invalid ref would only add noise on top of that.
             if (!recv_ptr_ty.is_valid()) { return false; }
             mut recv_val: ExpressionNode* = fresh;
-            if (!via_ptr) { recv_val = this.addr_of(fresh, recv_ptr_ty, span); }
+            if (!via_ptr) { recv_val = this.addr_of(fresh, span); }
             sm.blocks[resume].add_statement(this.assign_field_of_stmt(
                 base, this.recv_sym, recv_ptr_ty, recv_val, span));
             return true;
@@ -5539,13 +5553,7 @@ type struct AsyncLower {
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     assign_local_stmt(&this, name: SymbolStr, ty: TypeRef, rhs: ExpressionNode*,
                       span: SourceSpan) -> StatementNode* {
-        mut lhs: ExpressionNode* = this.ident(name, ty, span);
-        const eq: Token = Token::new(TokenType::Equal, "=",
-                                     span.start_line as int, span.start_col as int);
-        mut assign: BinaryExprNode* = new BinaryExprNode(eq, lhs, rhs, span);
-        assign.set_resolved_type(this.arena.get_void());
-        mut es: ExprStmtNode* = new ExprStmtNode(assign as ExpressionNode*, span);
-        return es as StatementNode*;
+        return this.assign_stmt(this.ident(name, ty, span), rhs, span);
     }
 
     /// `!(<e>)`. Marked synthetic for the same reason `deref`/`addr_of` are: the
@@ -7755,8 +7763,7 @@ type struct AsyncLower {
             mut pval: ExpressionNode* = if (this.is_receiver_param(p)) {
                 if (this.pending[pi].recv_ptr) {
                     this.addr_of(this.ident_bound(this.this_sym, p.sym_id,
-                                                  this.pending[pi].recv_ty, span),
-                                 slot_ty, span)
+                                                  this.pending[pi].recv_ty, span), span)
                 } else {
                     this.ident_bound(this.this_sym, p.sym_id, slot_ty, span)
                 }

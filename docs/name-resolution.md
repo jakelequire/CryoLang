@@ -56317,7 +56317,9 @@ min(mut &this) -> Option<This::Item> where This::Item: Ord { ... }
 * Pins: the type check after monomorphization changed **802 -> 22**
   (like-for-like); the probe of 8.482 over the same run: **142,006 agree,
   0 disagree**.
-* Demand (ruling 85, not built): with the substituter in demanding mode
+* **This bullet is wrong; 8.485 corrects it.** The run it reports had
+  `--emit=postmono-writes` on, and that instrument changes demand.
+  Demand (ruling 85, not built): with the substituter in demanding mode
   (`dm.exe`) the seven examples raise no GenericValidation error, and the
   standard library built alone raises 25 (`ClonedIter<RefIter<SocketAddr>>`
   and the like, `.objcmp/s100/dm-std.log`): instantiations only a copy's
@@ -56368,3 +56370,75 @@ Src::<Result<i64, i64>> { v: Result::Ok(3) }                     // `Result` fir
   Corpus build outcomes identical; census OVERALL PASS, 227 compile-fail,
   160 projects. The compiler checks its own source clean; clean build 331
   warnings, the same set.
+
+### 8.485 The async lowering types the nodes it builds as the type check types written ones - 2026-10-03
+
+## Why
+
+The async lowering runs after the first type check and builds the poll
+state machine's nodes with types of its own choosing, which the type check
+after monomorphization then re-typed in every lowered body and every copy
+of one - 4,282 changed writes in non-generic bodies and 4,175 in copies
+over the corpus. Four shapes, each the lowering disagreeing with the type
+check's rule for the same node written by hand:
+
+```cryo
+this.state = 3;          // lowered: typed `void`;        type check: `u32`, the target's type
+this.recv = &stream;     // lowered: typed `TcpStream*`;   type check: `&TcpStream`
+return Poll::Ready(());  // lowered: `()` typed `()`;     type check: `void*`
+Fut { slot: null, .. }   // lowered: `null` typed `u8*`;  type check: `void*`
+```
+
+## What changed
+
+* One assignment builder, `AsyncLower::assign_stmt`, typed by its target;
+  `assign_member_stmt`, `assign_field_of_stmt` and `assign_local_stmt` are it.
+* `addr_of` types `&e` as an immutable reference to `e`'s type, whatever
+  pointer slot it is stored in, and leaves it untyped when `e` is.
+* The unit value and a pointer field's zero value are typed by
+  `LiteralResolver::null_literal_type` - the rule the type check types a
+  written `null` or `()` by, split out of `resolve_null_literal` and handed
+  to the lowering at wiring. It types `()` as `void*`; that is the type
+  check's existing answer, carried over, not decided here.
+
+## Correction to 8.483
+
+8.483's demand bullet is wrong. Its run had `--emit=postmono-writes` on,
+and that instrument changes demand: `PostmonoWrites::record_substituted`
+applies each copy's substitution first, in no-demand mode, so the
+substituter's own apply finds the instantiation already made. With the
+instrument off and the substituter demanding (`.objcmp/s100/dm.exe`, run
+`.objcmp/s100/cdm2`) **all 181 builds of the corpus fail** - 150 logs carry
+GenericValidation's E0900, `01-hello` fifteen of them
+(`HashMapIter<String, String>`, `KeysIter<..>`, `ValuesIter<..>`) - where the
+same compiler with the instrument on builds 108 (`.objcmp/s100/cdm`). The
+instantiations named are types in the bodies of methods no program calls;
+ruling 85 has them demanded and emitted, which is not built. Demand is to be
+measured with the instrument off.
+
+## Evidence
+
+* Probe: the gauge's type write, printed per changed write with its operator
+  (`.objcmp/s101/probe.patch`, tallied by `classes.py`). Over the corpus
+  (compiler, standard library alone, tests, every project, example and tool,
+  the unit leg, each negative file alone; `corpus-pm.sh`), at the tip
+  (`.objcmp/s101/c1`) and with this change (`c2`), 150 reports each:
+  non-copy `change` **4,282 -> 84** (`BinaryExpression` 3,650 -> 0,
+  `UnaryExpression` 436 -> 2, `Literal` 193 -> 79); copy `copy-entry change`
+  **4,175 -> 16** (`BinaryExpression` 3,411 -> 0, `UnaryExpression` 750 -> 4,
+  `Literal` 10 -> 8). The tip's run is the control: the same instrument
+  reads the cells non-zero there.
+* `copy projection-survives` for `BinaryExpression` 508 -> 566: a lowered
+  generic body's assignment now carries its target's type, and that column
+  compares against the template's type substituted without reduction; the
+  write itself is a no-op (`copy-entry change` 0).
+* Left, none async-lowered: literal widths (39 integer arguments, most of
+  them `r.take(5)`, where the type check after monomorphization types the
+  `u64` argument `i32`; `unwrap_or(0)` on
+  `Option<u8>` 28), operands of `-` and `?:` in `future_combinator.cryo`,
+  `static match` arms, `math::abs`.
+* All 409 corpus build outcomes and every diagnostic line identical. verify
+  against HEAD (`.verify/runs/20261003-030910`): census, examples, lsp,
+  cross, incr, blind, flow, fast OK; objects **0 moved** (5,609 + 1,126).
+  The compiler checks its own source clean; clean build 331 warnings, the
+  same set.
