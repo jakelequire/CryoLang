@@ -83,6 +83,68 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-03
+
+95. **`math::abs<T>` and `math::clamp<T>` are bounded by the standard
+    library's existing ordering and negation traits**: `abs` takes
+    `where T: Ord + Neg<T>` and `clamp` takes `where T: Ord`
+    (`std::core::cmp::Ord`, `std::core::ops::Neg<Output>`). With the bounds
+    written, ruling 82 applies to their bodies.
+
+    ```cryo
+    function clamp<T>(value: T, lo: T, hi: T) -> T where T: Ord { .. }
+    ```
+
+96. **In a monomorphized copy, a trait-bound call passes its arguments the
+    way monomorphization bound the call**: `b` in `a.equals(b)` is
+    borrowed, not moved. The second pass's answer is the wrong one. The
+    change is `.objcmp/s100/args-a1.patch`, and the 105 objects it moves are
+    accepted with that explanation.
+
+97. **Ruling 85's demand comes after only reachable methods are emitted**,
+    as rustc's collector does: an instantiation that appears when
+    monomorphization substitutes types is demanded once emitting is driven
+    by reachability, so it does not emit methods nothing calls.
+
+98. **A generic type's bare name inside its own body infers its type
+    arguments from the call**, as in Rust. `This::...` names the enclosing
+    type.
+
+    ```cryo
+    implement struct Array<T, A> {
+        grow(&this) -> .. {
+            const a = Array::try_with_capacity_in(n, alloc);  // arguments inferred from the call
+            const b = This::try_with_capacity_in(n, alloc);   // the enclosing Array<T, A>
+        }
+    }
+    ```
+
+99. **When the second pass after monomorphization is deleted, the literal
+    widths it was wrongly deciding move** (about 50 objects: `r.take(5)`'s
+    argument becomes `u64`), and those movers are accepted with that
+    explanation.
+
+100. **Ruling 94's help on `append` reads**: "`String` owns resources, so it
+     isn't `Copy`, and `append` is only available when `T` is".
+
+101. **A never-instantiated generic function holding an ambiguous call on a
+     concrete receiver is an error**, as commit b6770551 made it.
+
+102. **A `for` loop's initializer that does not fit its declared type is
+     E0200**, as for any declaration.
+
+     ```cryo
+     for (mut j: i32 = s.length(); j > 0; j--) { }   // error[E0200]
+     ```
+
+103. **`()` becomes a real unit type**, as a task of its own after the
+     merge. Until then the type checker keeps typing it `void*`.
+
+104. **The lane gate's `LOOKUP_OTHER` count going from 45 to 46** for the
+     member-function door call that replaces the template registry's
+     composed key, **and the spelling-flow check counting a map method's key
+     passed as an `arg`** as it counts one passed as a `sarg`, are accepted.
+
 ### 2026-10-02
 
 80. **The internal check after monomorphization names the specialization's
