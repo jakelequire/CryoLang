@@ -55733,3 +55733,72 @@ site	copy	param-survives	C:/.../stdlib/core/option.cryo:48:17	31
 * A `same-display` outcome (two types printing alike) is not reported; it
   counts as `change`.
 * Two family pins are compared by kind alone.
+
+### 8.475 The type check after monomorphization does not walk a specialization's deferred copy of a method - 2026-10-02
+
+## Why
+
+The first slice of removing that pass (P1 in the assessment): writes where a
+type parameter survives substitution in a copy, 90,244 over the corpus
+(§8.474's instrument, `.objcmp/s97/pm2`). The assessment read them as two
+identities for one parameter. Measured by site and by parameter symbol,
+they are two different things:
+
+* 70,614 (78%) are `Option::as_ref` and `Result::as_ref`
+  (`core/option.cryo:48-50`, `core/result.cryo:46-48`). These methods grow
+  their owner (`as_ref -> Option<T*>`), so they are instantiated per call
+  (`is_lazy_self_growing`). Each specialization of `Option` carries a copy of
+  the method whose body the substituter deliberately leaves alone, and which
+  is only ever the source the per-call instance is cloned from: codegen never
+  emits it. The impl's substitution binds the very `T` the body carries
+  (symbol 3876 on `01-hello`). There is one `T`; the body is simply a
+  template. The pass after monomorphization typed it concretely anyway, a
+  write nothing reads.
+* The rest are the iterator adapters, below.
+
+```cryo
+implement enum Option<T> {
+    as_ref(&this) -> Option<T*> { .. }   // Option<u8>'s copy of this: never emitted, never substituted
+}
+```
+
+## What changed
+
+* `SemaVisitor::visit_methods` walks a method whose return grows its owner
+  as it walks a self-returning trait default: symbolically, which after
+  monomorphization does nothing (ruling 70). Before monomorphization nothing
+  changes: such a method exists only on a generic owner, whose methods were
+  already walked symbolically.
+
+## Evidence
+
+* Predicted: `param-survives` falls by the 70,614 `as_ref` writes, to
+  19,630, and nothing else moves. Instrument corpus (`.objcmp/s97/pm3`
+  against `pm2`): `param-survives` 90,244 -> **19,630**; every build's exit
+  code unchanged. Unpredicted, explained: body `same` +4 in each of the
+  compiler and LSP builds, the four nodes of this change's own expression
+  (`|| method.func.is_lazy_self_growing`); pins walked -14,475 and argument
+  bindings rewritten in copies, against a template that differs, -14,481 -
+  the deferred copies' own calls and arguments, no longer walked (pins that
+  changed: 118,993 before and after); 6 arguments in the unit leg move from
+  "template differs" to "template unclassified": their template is a
+  deferred copy, which the instrument reads when the instance is checked and
+  which is no longer bound by then.
+* Clean build: 331 warnings, the same (code, file) set.
+* verify against HEAD (`.verify/runs/20261002-171701`): all gates OK,
+  objects **0 moved** (tests 5609, examples 1126).
+
+## Remaining (P1)
+
+19,630 writes, all but 37 in the iterator adapters (`thread` spawn
+closures 33, `tests/lang/operator_overload.cryo` 4): `FilterIter::next`'s `this.pred`
+(`core/iter.cryo:306`) and the `Iterator` defaults copied into the adapters
+(`core/iter.cryo:49-204`), where `I::Item` keeps the struct declaration's
+`I` (symbol 4194 on `01-hello`) while the impl substituter binds the impl
+head's `I` (4199). Measured on `01-hello` (`.objcmp/s97/add_p9.py`,
+`add_p10.py`): the field type is seen through the receiver correctly when the
+receiver is `FilterIter<I>` over the head's `I`, but a second lookup of the
+same field runs with the receiver over the struct's own `I`, and that walk's
+answer is the one the template keeps (`resolve_expr` returns a node's type
+once it has one, before monomorphization). Which walk types the impl's
+bodies over the declaration's parameters is not found yet.
