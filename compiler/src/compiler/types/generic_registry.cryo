@@ -333,13 +333,14 @@ type struct GenericRegistry {
     coherence_records:  Pair<u64, ImplBlockNode*>[];
     coherence_index:    HashMap<u64, i64>;
 
-    // -- Trait-decl registry (Phase B.6) --
-    // Maps a bare trait name (SymbolStr.id) to its TraitDeclNode*. Used by
-    // default-method synthesis: when an impl block names a trait, we look
-    // up the trait's AST to clone any default-bodied methods the impl
-    // didn't override.  Populated during FunctionSignature for ALL traits
-    // (generic or not); non-generic traits aren't in `entries`.
-    trait_decl_index:   HashMap<u32, i64>;
+    // -- Trait declarations --
+    // Every trait's declaration (generic or not; a non-generic trait is no
+    // template), by the trait's definition: default-method synthesis clones
+    // the defaults an implementation does not override from it, and the
+    // trait-method door finds a method's position in it.  `trait_decl_slots`
+    // is the position in `trait_decl_nodes` by the definition's slot in the
+    // definition table, -1 for a definition that is no registered trait.
+    trait_decl_slots:   i64[];
     trait_decl_nodes:   TraitDeclNode*[];
     // The identity each node was registered under, positionally aligned with
     // `trait_decl_nodes`. A node's own `name` is its written leaf, so a scan
@@ -409,7 +410,7 @@ type struct GenericRegistry {
             trait_head_index:  HashMap::<u64, i64[]>::new(),
             coherence_records: [],
             coherence_index:   HashMap::<u64, i64>::new(),
-            trait_decl_index:  HashMap::<u32, i64>::new(),
+            trait_decl_slots:  [],
             trait_decl_nodes:  [],
             trait_decl_keys:   [],
             inherent_owner_index: HashMap::<u64, i64>::new(),
@@ -1226,37 +1227,39 @@ type struct GenericRegistry {
     }
 
 
-    /// Register a trait declaration's AST under its canonical identity, so
+    /// Register a trait declaration's AST under the trait's definition, so
     /// default-method synthesis can find it cross-module when an impl block
-    /// names the trait.
-    ///
-    /// `name` is the qualified identity, NOT the written leaf. Keyed by leaf
-    /// this table was last-write-wins over a search key, so two same-leaf
-    /// traits in different modules collapsed to one entry and which body a
-    /// program got depended on import order in an unrelated file.
+    /// names the trait.  Registering one definition again replaces its node.
     register_trait_decl(mut &this, name: DefId, node: TraitDeclNode*) -> void {
         if (node == null || !name.is_valid()) { return; }
-        const existing: Option<i64> = this.trait_decl_index.get(&this.arena.defs.path_of(name).id);
-        if (existing.is_some()) {
-            this.trait_decl_nodes[existing.unwrap()] = node;
+        const existing: i64 = this.trait_decl_position(name);
+        if (existing >= 0) {
+            this.trait_decl_nodes[existing] = node;
             return;
         }
-        const idx: i64 = this.trait_decl_nodes.length;
+        const slot: i64 = this.arena.defs.slot(name);
+        while (this.trait_decl_slots.length <= slot) { this.trait_decl_slots.push(-1); }
+        this.trait_decl_slots[slot] = this.trait_decl_nodes.length;
         this.trait_decl_nodes.push(node);
         this.trait_decl_keys.push(name);
-        this.trait_decl_index.insert(this.arena.defs.path_of(name).id, idx);
+    }
+
+    /// The position of the definition `name`'s declaration in
+    /// `trait_decl_nodes`, or -1 when no trait was registered under it.
+    trait_decl_position(&this, name: DefId) -> i64 {
+        if (!name.is_valid()) { return -1; }
+        const slot: i64 = this.arena.defs.slot(name);
+        if (slot < 0 || slot >= this.trait_decl_slots.length) { return -1; }
+        return this.trait_decl_slots[slot];
     }
 
     /// Look up a trait declaration's AST by the trait's definition. Returns
-    /// null when no such trait was registered.  Two same-leaf traits in
-    /// different modules are two definitions, so they stay distinct.
+    /// null when no such trait was registered.  Two traits written under one
+    /// path are two definitions, so they stay distinct.
     get_trait_decl(&this, name: DefId) -> TraitDeclNode* {
-        if (!name.is_valid()) { return null; }
-        const opt: Option<i64> = this.trait_decl_index.get(&this.arena.defs.path_of(name).id);
-        if (opt.is_some()) {
-            return this.trait_decl_nodes[opt.unwrap()];
-        }
-        return null;
+        const at: i64 = this.trait_decl_position(name);
+        if (at < 0) { return null; }
+        return this.trait_decl_nodes[at];
     }
 
     /// Door `trait-method`.  A trait's method is named by its leaf in two
