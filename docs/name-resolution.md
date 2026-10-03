@@ -56070,3 +56070,63 @@ n.wide();   // error[E0358]: no method named `wide` found on type `Wrapper<i32>`
   receivers and the owner. Methods written inline in a generic struct's
   declaration are asked by the first pass but not filtered by the
   monomorphizer, which filters impl blocks only.
+
+### 8.480 An argument against an instantiation not yet minted, and a trait tie on a concrete receiver in a generic body, are refused before monomorphization - 2026-10-02
+
+## Why
+
+The last two of the errors only the type check after monomorphization
+reported, other than ruling 82's template refusal (`E0229`):
+
+```cryo
+// beta_text.cryo: public function tag(s: String) -> i32
+const total: i32 = Text::tag(5);   // E0214 mismatched types, found `i32`
+
+type struct T2 { s: S; }   // S implements both Aa and Bb, each with `go`
+implement trait Bb for T2 {
+    go<W>(&this, w: W) -> i32 { return this.s.go(w); }   // E0156
+}
+```
+
+* `check_args_against_params` skipped any position whose parameter was not
+  "concrete" (`TypeUtils::arg_type_is_concrete`), and an instantiation not yet
+  minted is not: `String` is `String<GlobalAlloc>` before monomorphization.
+  Measured: the same call against `tag(s: string)` is refused in the first
+  pass (`.objcmp/s99/mst2`), against `String` only after it (`mst`).
+* `report_trait_method_tie` was silent for any tie of traits during the
+  symbolic walk of a generic body, so a tie on a concrete receiver was
+  reported only per instance - and never, for a generic function nothing
+  instantiates. Measured on a generic FREE function too (`.objcmp/s99/gb`):
+  the same call in a non-generic function is first pass, in `amb<W>` after
+  monomorphization.
+
+## What changed
+
+* `check_args_against_params` judges a position whose types each name one type
+  (`arg_type_names_one_type`: concrete, or an instantiation not yet minted
+  whose arguments each name one), and still skips a parameter.
+* A tie of traits alone is silent in a symbolic walk only when the owner holds
+  a type parameter, where which impls apply depends on the argument; on a
+  concrete owner it is the same tie in every instantiation and is reported.
+* Behaviour change, by design of this step: a generic function that nothing
+  instantiates and that holds an ambiguous call on a concrete receiver is now
+  refused; it compiled before. No program in the corpus is one (verify below).
+
+## Evidence
+
+* Which pass reports each error (`.objcmp/s99/p3t-u3`, probe `p4.py` over this
+  change; the control is `.objcmp/s99/p3t-u2`, the tip): 
+  `trait_impl_same_name_call_ambiguous` and `module_suffix_tie_rejects_mismatch`
+  move from after monomorphization to the first pass, same text; the scratch
+  generic free function too (`.objcmp/s99/gb/out3.log` vs `out.log`). Of the
+  assessment's eleven post-mono-only errors, `E0229_user_trait_spelled_add_bound`
+  alone is still reported after monomorphization (ruling 82, the template
+  refusal).
+* The widened argument check against the population that must pass: the census
+  (`.objcmp/s99/census-m1.out`, OVERALL PASS, 227 compile-fail, 160 projects)
+  and the new compiler checking its own source, `cryo check src/main.cryo`:
+  "No errors found" (`.objcmp/s99/selfcheck-m1.out`).
+* verify against HEAD (`.verify/runs/20261002-215245`): census OK, all gates
+  OK, objects **0 moved** (tests 5609, examples 1126). The first attempt's
+  baseline failed the known flake `blocking_pool_a_configured_ceiling_is_enforced`
+  and was re-run. Clean build 331 warnings, the same set.
