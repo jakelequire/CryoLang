@@ -131,9 +131,6 @@ type struct DeclarationIndex {
     // Packed(type_id, method_id) -> return type
     method_returns: HashMap<u64, TypeRef>;
 
-    // Type name -> TypeRef (for struct, class, enum, trait lookups)
-    type_map:       HashMap<u32, TypeRef>;
-
     // Reverse: TypeRef.id -> the definition it was registered as, made by the
     // registration; a type's name is read off the definition.
     type_reverse:   HashMap<u64, DefId>;
@@ -314,7 +311,6 @@ public:
             defs: defs,
             func_type_refs:      HashMap::<u64, TypeRef>::new(),
             method_returns:      HashMap::<u64, TypeRef>::new(),
-            type_map:            HashMap::<u32, TypeRef>::new(),
             type_reverse:        HashMap::<u64, DefId>::new(),
             def_types:           [],
             def_entries:         [],
@@ -764,11 +760,10 @@ public:
     /// `def` is the id the declaration was given where it was declared - the
     /// name layer's binding, a synthesizer's registration - and this makes
     /// none of its own: a second id for one declaration would compare unequal
-    /// to the first.  The type is kept under the definition for
-    /// `type_of_def`, and under its path for readers still asking by path.
+    /// to the first.  The type is kept under the definition, for
+    /// `type_of_def`, and nowhere else: a definition's path is display text,
+    /// and two definitions written under one path are two types.
     register_type(mut &this, def: DefId, ty: TypeRef, is_public: boolean) -> void {
-        const qualified_name: SymbolStr = this.defs.path_of(def);
-        this.type_map.insert(qualified_name.id, ty);
         this.type_reverse.insert(ty.key(), def);
         this.defs.record_visibility(def, is_public);
         const slot: i64 = this.defs.slot(def);
@@ -798,8 +793,8 @@ public:
         return this.lookup_type_name(this.lookup_array_type(element));
     }
 
-    /// Register a reverse-only mapping (TypeRef -> qualified name) without
-    /// touching the forward type_map.  Used to make additional TypeRefs
+    /// Register a reverse-only mapping (TypeRef -> definition) without
+    /// touching the definition's own type.  Used to make additional TypeRefs
     /// (e.g., InstantiatedType, ArrayType) resolvable to an already-
     /// registered concrete type's qualified name.
     register_type_reverse_only(mut &this, def: DefId, ty: TypeRef) -> void {
@@ -970,7 +965,7 @@ public:
                 if (param.resolved_type.is_valid()) {
                     param_types.push(param.resolved_type);
                 } else if (param.is_value_receiver()) {
-                    const recv_ref: TypeRef = this.lookup_type(type_sym);
+                    const recv_ref: TypeRef = this.type_of_def(this.registered_def(owner));
                     if (recv_ref.is_valid()) {
                         param_types.push(recv_ref);
                     }
@@ -1096,8 +1091,9 @@ public:
     /// key under another.  A `Def` is canonical, so the index holds it or the
     /// declaration never registered - recorded against `site`.  A written
     /// primitive is `PrimTy` and names no declaration, because a primitive
-    /// owns members without being declared anywhere; its spelling IS its
-    /// registration key.  An unanswered slot belongs to the cloner, which
+    /// owns members without being declared anywhere; the primitive table's
+    /// answer is its identity, and its definition (`DefTable::primitive`) is
+    /// what its type is registered under.  An unanswered slot belongs to the cloner, which
     /// leaves a specialization alone because a `Res` names a definition and
     /// a specialization is not one - there the monomorphizer's `spec_owner`,
     /// the instantiation's own arena id, is the carrier.  Every head a
@@ -1115,7 +1111,7 @@ public:
                         if (!found.is_valid()) { compiler::resolver::res::record_unregistered_def(site); }
                         found
                     }
-                    Res::PrimTy(n) => { this.lookup_type(n) }
+                    Res::PrimTy(n) => { this.type_of_def(this.defs.primitive(n)) }
                     _              => { TypeRef::invalid() }
                 }
             }
@@ -1179,15 +1175,6 @@ public:
         return match (this.implicit_converters.get(&key)) {
             Option::Some(v) => { v }
             Option::None    => { 0 }
-        };
-    }
-
-    /// Look up a named type by its SymbolStr.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    lookup_type(&this, name: SymbolStr) -> TypeRef {
-        return match (this.type_map.get(&name.id)) {
-            Option::Some(val) => { val }
-            Option::None      => { TypeRef::invalid() }
         };
     }
 

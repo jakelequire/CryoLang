@@ -55,6 +55,28 @@ sys.path.insert(0, HERE)
 import residue  # noqa: E402
 import residue_classify as rc  # noqa: E402
 
+# The fixture's two stamp-derived doors - an index read and the funnel's -
+# and the funnel's forwarding call into the index: the S rows and the N
+# override the baseline counts.  Classed here, by the fixture: no read in the
+# compiler is stamp-derived any more, and the real classifier holds a class
+# only for a method the tree declares.
+FIXTURE_CLASSES = {
+    "DeclarationIndex::lookup_type":
+        ("S", "fixture: a type by a canonical name derived from a stamp"),
+    "TypeUtils::lookup_type_exact":
+        ("S", "fixture: the funnel's door onto the same"),
+}
+FIXTURE_OVERRIDES = {
+    ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_type", "param:name"):
+        ("N", "fixture: the funnel's own forwarding body"),
+}
+for _k, _v in FIXTURE_CLASSES.items():
+    assert _k not in rc.CLASS_OF_METHOD, _k
+    rc.CLASS_OF_METHOD[_k] = _v
+for _k, _v in FIXTURE_OVERRIDES.items():
+    assert _k not in rc.SITE_OVERRIDES, _k
+    rc.SITE_OVERRIDES[_k] = _v
+
 
 def load(path, name):
     spec = importlib.util.spec_from_file_location(name, path)

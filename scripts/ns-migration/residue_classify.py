@@ -186,8 +186,6 @@ CLASS_OF_METHOD = {
         ("J", "member: an overload family's signatures, asked as `lookup_family_entries` is"),
     "DeclarationIndex::lookup_func_type":
         ("J", "member: the signature last registered in an overload family, asked as `lookup_family_entries` is"),
-    "DeclarationIndex::lookup_type":
-        ("S", "a type by a canonical name derived from a stamp"),
     "DeclarationIndex::lookup_method_return":
         ("J", "member: a method's return by its leaf off the owner `TypeRef` in hand; the store is keyed by the owner's arena id"),
     "DeclarationIndex::method_signature_refused":
@@ -201,12 +199,10 @@ CLASS_OF_METHOD = {
     "DeclarationIndex::extern_symbol_conflict":
         ("J", "extern: a C symbol by its link name, the only identity a C symbol has"),
     # -- the funnel --
-    "TypeUtils::lookup_type_exact":
-        ("S", "a type by a canonical name derived from a stamp (`scope_owner_key`, `trait_identity`, `tr.identity()`)"),
     "TypeUtils::lookup_func_type_exact":
         ("J", "member: the funnel's door onto `DeclarationIndex::lookup_func_type`, an overload family by its owner and leaf"),
     "TypeUtils::lookup_method_return":
-        ("J", "member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper; `lookup_type_exact` where the caller holds a stamp's name)"),
+        ("J", "member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper)"),
     # -- the generic registry --
     "GenericRegistry::find_inherent_impl_method":
         ("J", "member: a method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand"),
@@ -249,10 +245,6 @@ EXTERN_LINK_NAME = ("J", "extern: whether this extern block already declares the
 # where the compiler reports the key argument's value comes from
 # (`residue.py`, from `cryo build --emit=facts`).
 SITE_OVERRIDES = {
-    ("compiler/passes/type_resolution.cryo", "DeclarationIndex::lookup_type", "local:n"):
-        ("J", "prim: `Res::PrimTy(n)` - the primitive's identity is the spelling the stamp carries"),
-    ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_type", "param:name"):
-        ("N", "the funnel's own forwarding body (`lookup_type_exact`); its callers are the sites"),
     ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_func_type", "param:leaf"):
         ("N", "the funnel's own forwarding body (`lookup_func_type_exact`); its callers are the sites"),
     ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_method_return", "param:method_sym"):
