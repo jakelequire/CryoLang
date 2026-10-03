@@ -55887,3 +55887,57 @@ function deref_ptr<T, U>(x: &T) -> U* where T: Deref<U> {
   is not a type write.
 * `TypeUtils` and `TypeArena` each keep a `contains_generic_param` that answers
   a different question under the same name.
+
+### 8.477 A method call left unbound after monomorphization is the internal E0900 alone - 2026-10-02
+
+## Why
+
+Ruling 91: a call left with no instance after monomorphization is E0900,
+not the user-facing E0214. Measured with a mutation that makes each generic
+method's instance and leaves it unpinned (`.objcmp/s98/mut_noinst.py`):
+`01-hello` failed with two errors for one call, `value.hash(&h)` in
+`digest<string>` (`core/hash.cryo:230`): the selection's E0900, and then an
+E0214 "no overload of `hash` accepts these arguments", which the argument
+check found by scanning the receiver's methods by name for a call the
+selection had bound to nothing. A second path, a call pinned to a generic
+template method whose copy has no instance, returned unbound and reported
+nothing at all.
+
+## What changed
+
+* After monomorphization, a method call the selection leaves unbound is not
+  argument-checked (`CallResolver` at the member-call site).
+* The path for a template-pinned generic method with no instance reports
+  `report_unbound_after_mono`, as the path beside it does.
+
+## Evidence
+
+* Control pair, each run alone on `01-hello`: the tip with the mutation,
+  E0214 + E0900 (`.objcmp/s98/mni-hello.out`); this change with the mutation,
+  the E0900 alone, `aborting due to 1 error` (`mni2-hello.out`).
+* Which tests reach it: none. verify against HEAD
+  (`.verify/runs/20261002-194449`): every census verdict unchanged, all gates
+  OK, objects **0 moved** (tests 5609, examples 1126). Clean build: 331
+  warnings, the same (code, file) set.
+
+## Measured, not landed: P3's first-pass errors
+
+Which pass reports each error the assessment listed as post-mono only
+(probe `.objcmp/s98/p4.py`, driver `p3tests.sh`, `.objcmp/s98/p3t-base`):
+after monomorphization, `E0358_hashmap_get_noncopy`,
+`E0358_push_slice_non_copy`, `generic_receiver_alias_refused`,
+`generic_receiver_other_instantiation_refused` (2),
+`trait_impl_same_name_call_ambiguous`, `module_suffix_tie_rejects_mismatch`
+and `E0229_user_trait_spelled_add_bound`; `static_path_generic_owner_ambiguous`
+is reported before it already.
+
+The two `where`-clause cases move to the first pass when its selection on an
+instantiation not yet minted asks monomorphization's own predicate,
+`TraitChecker::method_bounds_satisfied`, of the same bindings
+(`.objcmp/s98/u2/full-u2.patch`, measured `.objcmp/s98/p3t-u2a`). Their report
+then becomes the one a minted receiver already gets: "the trait bound
+`String: Copy` is not satisfied", with "method `get` requires `V: Copy`",
+where it was "no method named `get` found on type `HashMap<i32, String>`".
+verify cannot take that change: a baseline that fails a compile-fail test is
+refused, and `tests/started-passing` declares projects only
+(`scripts/verify.py:404-411`).
