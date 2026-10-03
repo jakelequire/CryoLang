@@ -4058,6 +4058,12 @@ type struct CallResolver {
                 break;
             }
         }
+        // A method whose own `where` clause the receiver's arguments do not
+        // meet is not a method of that instantiation: monomorphization leaves
+        // it out (`TraitChecker::method_bounds_satisfied`, asked of the same
+        // bindings), so it is no candidate here either.  Asked only of
+        // concrete arguments; a generic body's are checked per instance.
+        const where_asked: boolean = view != null && !this.view_is_abstract(view);
         for (mut tier: i32 = 0; tier <= 3; tier++) {
             if (tier == 3 && this.state.in_implicit_conversion) { break; }
             for (mut mi: i64 = 0; mi < methods.length; mi++) {
@@ -4067,6 +4073,7 @@ type struct CallResolver {
                 if (!fn_node.name.equals(member.member)) { continue; }
                 if (fn_node.is_self_returning_default && has_concrete_sibling) { continue; }
                 if ((fn_node.generic_params.length > 0) != generic) { continue; }
+                if (where_asked && !this.trait_checker().method_bounds_satisfied(fn_node, view)) { continue; }
                 mut params: TypeRef[] = [];
                 for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
                     const pp: VarDeclNode* = fn_node.parameters[pi];
@@ -4086,6 +4093,14 @@ type struct CallResolver {
                 return true;
             }
             if (sel.collect != null) { return false; }
+        }
+        return false;
+    }
+
+    /// Whether any type `view` binds still holds a type parameter.
+    view_is_abstract(&this, view: TypeSubstitution*) -> boolean {
+        for (mut i: i64 = 0; i < view.replacements.length; i++) {
+            if (this.types.contains_generic_param(view.replacements[i])) { return true; }
         }
         return false;
     }
@@ -4627,8 +4642,8 @@ type struct CallResolver {
                 d = d.with_note(Text::new(fmt::format("method `%s` requires `%s: %s`", method_str, param_str, trait_str)));
                 if (tref.definition().equals(this.ctx.generic_registry.wellknown(LangItem::Copy))) {
                     d = d.help(Text::new(fmt::format(
-                        "`%s` owns resources, so it isn't `Copy`; borrow the element in place with `get_ref` instead of copying it out with `%s`",
-                        conc_str, method_str)));
+                        "`%s` owns resources, so it isn't `Copy`, and `%s` is only available when `%s` is",
+                        conc_str, method_str, param_str)));
                 }
                 this.ctx.emit_diagnostic(d);
                 return true;

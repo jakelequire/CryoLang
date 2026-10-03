@@ -161,6 +161,21 @@ yet is recorded with the change that builds it, not here.
     monomorphization; a test that reaches this E0900 marks a gap in that
     check, which is closed there.
 
+92. **A method whose `where` clause the receiver's arguments do not meet is
+    refused before monomorphization** with the wording a minted receiver
+    already gets: "the trait bound `String: Copy` is not satisfied", note
+    "method `get` requires `V: Copy`". It replaces "no method named `get`
+    found on type ...".
+
+93. **A deliberate wording change in a negative test's expected report is
+    accepted as a verify mismatch**, explained in the commit body and the
+    ledger entry, as with ruling 19; `scripts/verify.py` is not changed
+    (ruling 18). The test's expected output changes in the same commit.
+
+94. **The help on a `Copy`-gated method's bound error is correct for the
+    method it names.** "borrow the element in place with `get_ref` instead
+    of copying it out with `append`" is wrong advice for `append`.
+
 ### 2026-10-01
 
 70. **The pass after monomorphization does not re-walk generic template

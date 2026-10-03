@@ -55941,3 +55941,55 @@ where it was "no method named `get` found on type `HashMap<i32, String>`".
 verify cannot take that change: a baseline that fails a compile-fail test is
 refused, and `tests/started-passing` declares projects only
 (`scripts/verify.py:404-411`).
+
+### 8.478 A method whose `where` clause an instantiation does not meet is no candidate in the first pass - 2026-10-02
+
+## Why
+
+Rulings 92-94. `m.get(&k)` on a `HashMap<i32, String>`, where `get` is
+declared `where V: Copy`, and `dst.append(src.as_slice())` on an
+`Array<String>`, where `append` is `where T: Copy`, were refused only by the
+type check after monomorphization: the first pass, selecting on an
+instantiation not yet minted, took the gated method as a candidate, and only
+monomorphization dropped it (`TraitChecker::method_bounds_satisfied`,
+`mono/trait_specializer.cryo:430`), leaving the second pass to find no method.
+
+```cryo
+const m: HashMap<i32, String> = HashMap::new();
+m.get(&k);   // error[E0358]: the trait bound `String: Copy` is not satisfied
+```
+
+## What changed
+
+* `CallResolver::bind_on_methods` asks the same predicate, of the same
+  bindings (the receiver's view), before a method is a candidate, when every
+  type the view binds is concrete (`view_is_abstract`); a generic body's
+  arguments are still checked per instance.
+* The two errors now come from the first pass with the report a minted
+  receiver already got (ruling 92): "the trait bound `String: Copy` is not
+  satisfied", note "method `get` requires `V: Copy`", in place of "no method
+  named `get` found on type `HashMap<i32, String>`". The two negative tests'
+  expected text changes with it.
+* The help on a `Copy` bound said "borrow the element in place with `get_ref`
+  instead of copying it out with `append`", wrong for `append` (ruling 94). It
+  now states the bound without naming a sibling method: "`String` owns
+  resources, so it isn't `Copy`, and `append` is only available when `T` is".
+
+## Evidence
+
+* Which pass reports each error (probe `.objcmp/s98/p4.py` over this change,
+  driver `p3tests.sh`, `.objcmp/s99/p3t-u1`; the tip's run is
+  `.objcmp/s98/p3t-base`): `E0358_hashmap_get_noncopy` and
+  `E0358_push_slice_non_copy` move from the pass after monomorphization to the
+  first; every other test in that set reports from the same pass as before.
+* `--emit=postmono-writes` writes no report for a program that fails to
+  compile, on the tip or here (`.objcmp/s99/gauge.sh`), so it cannot
+  attribute these two; the probe above does.
+* Ruling 93's accepted mismatch: verify against HEAD with the new expected
+  text refuses at the baseline, whose census fails exactly these two
+  compile-fail tests (`.verify/runs/20261002-203055`, compile-fail 225 passed,
+  2 failed). Run with the old expected text restored for the object compare
+  (`.verify/runs/20261002-203523`): baseline census PASS; tree census fails
+  exactly the two (old text expected); every other gate OK; objects **0
+  moved** (tests 5609, examples 1126). `make test-census` with the new text:
+  OVERALL PASS, compile-fail 227 passed, projects 160 passed.
