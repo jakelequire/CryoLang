@@ -56180,3 +56180,79 @@ function first<T>(p: T*) -> boolean { return p != null; }   // bool, in the temp
   (`.objcmp/s99/census-p2.out`); the compiler checks its own source clean
   (`selfcheck-p2.out`). verify against HEAD (`.verify/runs/20261002-222222`):
   all gates OK, objects **0 moved**. Clean build 331 warnings, the same set.
+
+### 8.482 Monomorphization pins a call bound as written in each copy and in each body it walks - 2026-10-03
+
+## Why
+
+The pass after monomorphization wrote the pin of 117,251 calls the
+monomorphizer could already answer by identity (gauge `--emit=postmono-writes`
+over the corpus, `.objcmp/s99/pmp2`). Each call had recorded where it is
+written what it names - `template_method` and `template_recv`, the trait and
+position a bound answered, or a generated call's `named_method` - and the
+monomorphizer found that method on the receiver in `specialize_method_call`
+and then dropped it unless it had to instantiate it. Four families:
+
+```cryo
+implement<T> trait Clone for enum Option<T> where T: Clone {
+    clone(&this) -> Option<T> { ... Option::Some(value.clone()) ... }  // bound call on `T`
+}
+parts.push(this.substr(start, n));   // `Array<string>` not minted where written
+Pair::<A, B>::new(a, b)              // static method of a generic owner
+this.fut.take()                      // a call `await` lowering generates
+```
+
+A copy's body is walked once, when it is made, often before the
+instantiations it names are minted; that is why the binding was left to a
+later pass.
+
+## What changed
+
+* `bind_receiver_method` pins a method bound as written (no type parameters
+  of its own, not a per-call default) on a minted, concrete receiver
+  (`pin_plain`).
+* A call whose receiver or owner is an instantiation not minted yet is queued
+  (`queued_binds`) and bound by the same identity once the instantiation's
+  methods are registered: `bind_queued_calls`, run at the end of
+  `run_generic_expression_resolution`. Only a method bound as written is
+  pinned there; an instance minted there would never be registered.
+* A static call on a generic owner pins the owner's entry for the recorded
+  method once the owner is minted. A path whose owner the copy's
+  substitution wrote (`spec_owner`: the owner's own name inside its body, or
+  `T::f()`) is bound on that owner (`bind_on_substituted_owner`); a trait
+  item there needs the owner's single implementation.
+* A call the compiler generates records the receiver it was built on
+  (`template_recv`, `async_lower.cryo` `method_call0/1`); monomorphization
+  binds it as the pass after it did (`bind_named_call`, `named_method_on`),
+  reading the receiver's implementations the way bound calls do
+  (`trait_heads_on`, split out of `trait_item_on`).
+
+## Evidence
+
+* Gauge, like-for-like over the same 149 reports (`.objcmp/s100/c10-149`
+  against `.objcmp/s99/pmp2`): pins the pass after monomorphization changed
+  **117,251 -> 802**. Left: 780 calls on a receiver typed by an unnormalised
+  projection (`value.compare(&best)` with `This::Item: Ord`, `core/iter.cryo:181,202`;
+  generated calls on `Option<S::Fut>`), which wait for projection
+  normalisation; 4 `T::try_from(x)` whose `T` has several `TryFrom`
+  implementations (arguments choose); 14 static calls in non-generic bodies
+  that recorded no owner; 4 others. Type and argument cells unchanged.
+* Agreement: a probe build (`.objcmp/s100/probe_agree_lib.py`) has the pass
+  after monomorphization clear every pin this change wrote, bind the call
+  itself and compare: **140,172 agree, 0 disagree**, over the corpus plus the
+  standard library built alone (`.objcmp/s100/c10`). Control: the same probe
+  with mono pinning the template's method instead of the receiver's
+  (`mut1.py`, alone, unmutated control beside it) reports 2,153
+  disagreements on seven examples (`.objcmp/s100/mm1`); an earlier draft
+  that read a generated call's implementation from the registry instead of
+  the specialization's blocks drew 84, fixed by `trait_heads_on`.
+* Reducing a projection in the receiver (`trait_spec.reduce_projections`)
+  was tried and dropped: it fills the projection type's `resolved_type` in
+  place, and the standard library built alone then fails GenericValidation
+  with E0900 on `Option<?>` and `Poll<?>` (`.facts/stdlib.log`, first
+  `make facts` this session). The corpus driver does not build the
+  standard library alone; this session's copy (`.objcmp/s100/corpus-pm.sh`) does.
+* Corpus build outcomes identical to before (exit code and report per
+  entry). Census OVERALL PASS, 227 compile-fail, 160 projects; verify against
+  HEAD (`.verify/runs/20261003-001611`): all gates OK, objects **0 moved**.
+  The compiler checks its own source clean; clean build 331 warnings, the same set.

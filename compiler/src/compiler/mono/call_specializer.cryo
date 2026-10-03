@@ -104,6 +104,12 @@ type struct MonoCallSpecializer {
     gsm_owner_leaf:   SymbolStr;
     gsm_owner_recv:   TypeRef;
     gsm_owner_spec:   SymbolStr;
+    /// Calls bound by identity to a method of a receiver or owner whose
+    /// instantiation was not minted when the call was walked: a copy's body
+    /// is walked once, when it is made, often before the instantiations it
+    /// names are.  Each is bound once the instantiation is registered
+    /// (`bind_queued_calls`).
+    queued_binds:     CallExprNode*[];
 
     static null() -> MonoCallSpecializer {
         return MonoCallSpecializer {
@@ -120,6 +126,7 @@ type struct MonoCallSpecializer {
             gsm_owner_leaf:   SymbolStr::empty(),
             gsm_owner_recv:   TypeRef::invalid(),
             gsm_owner_spec:   SymbolStr::empty(),
+            queued_binds:     [],
         };
     }
 
@@ -540,6 +547,7 @@ type struct MonoCallSpecializer {
         if (callee_node.kind == NodeKind::ScopeResolution) {
             const sr: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
             callee_scope_slot = &sr.scope_res;
+            this.bind_on_substituted_owner(call, sr);
         } else if (callee_node.kind != NodeKind::Identifier) {
             return;
         }
@@ -731,7 +739,10 @@ type struct MonoCallSpecializer {
         // once its receiver is minted, to the receiver's own method.  What
         // this specializes is a method's own type parameters, and no method
         // language item has any.
-        if (call.named_method.is_valid()) { return; }
+        if (call.named_method.is_valid()) {
+            this.bind_named_call(call, subst);
+            return;
+        }
         // A call pinned to a method with nothing left to instantiate - one
         // with no type parameters of its own, or an instance minted for an
         // earlier walk of this call - needs no work, so a re-walk over the
@@ -803,38 +814,8 @@ type struct MonoCallSpecializer {
         }
         if (!recv_type.is_valid()) { return; }
         if (subst != null) { recv_type = subst.apply(recv_type, this.arena); }
-
-        // Unwrap Reference/Pointer/InstantiatedType to a concrete Struct/Class/Enum
-        // (what spec_entries.specialized_type points at).  An unresolved adapter inst
-        // is left as-is for the is_unresolved_inst path + fixpoint re-walk.
+        recv_type = this.receiver_owner(recv_type);
         mut t: Type* = this.arena.lookup(recv_type);
-        mut depth: i32 = 0;
-        while (t != null && depth < 8) {
-            if (t.kind == TypeKind::Pointer) {
-                recv_type = (t as PointerType*).pointee;
-                t = this.arena.lookup(recv_type);
-            } else if (t.kind == TypeKind::Reference) {
-                recv_type = (t as ReferenceType*).referent;
-                t = this.arena.lookup(recv_type);
-            } else if (t.kind == TypeKind::InstantiatedType) {
-                const inst: InstantiatedType* = t as InstantiatedType*;
-                if (inst.has_resolved_type()) {
-                    recv_type = inst.resolved_type;
-                    t = this.arena.lookup(recv_type);
-                } else {
-                    // Genuinely still an unresolved pre-mono wrapper: its spec has
-                    // not been materialized yet.  Leave it for the fixpoint re-walk,
-                    // which re-enters once the spec exists.  (There is nothing to
-                    // "recover" here - under single-id a materialized named spec
-                    // REUSES this wrapper's arena id, so any lookup keyed on that id
-                    // could only ever hand back the same id it was given.)
-                    break;
-                }
-            } else {
-                break;
-            }
-            depth += 1;
-        }
         if (t == null) { return; }
         // A bare generic-template struct used directly as a receiver (`this` in
         // `implement FmtWrite for struct String`, or `mut s: String` with all params
@@ -874,6 +855,7 @@ type struct MonoCallSpecializer {
             mut id_owner: ASTNode* = null;
             const id_m: MethodNode* = this.receiver_method_of(call.template_method, recv_type, &id_impl, &id_owner);
             this.bind_receiver_method(call, id_m, id_impl, id_owner, recv_type, subst);
+            if (is_unresolved_inst) { this.queue_bind(call); }
             return;
         }
         if (ma != null && ma.resolved_trait.is_valid() && ma.resolved_trait_slot >= 0) {
@@ -881,8 +863,9 @@ type struct MonoCallSpecializer {
             const item_m: MethodNode* = this.trait_item_on(ma, recv_type, &item_impl);
             if (item_m != null) {
                 this.bind_receiver_method(call, item_m, item_impl, null, recv_type, subst);
-                return;
             }
+            if (is_unresolved_inst && call.template_recv.is_valid()) { this.queue_bind(call); }
+            if (item_m != null) { return; }
         }
 
         // A path call names the generic method's definition, which is bound
@@ -1179,6 +1162,18 @@ type struct MonoCallSpecializer {
     /// any other receiver's are the registry's heads selected for it.
     trait_item_on(&this, ma: MemberAccessNode*, recv_type: TypeRef, out_impl: ImplBlockNode**) -> MethodNode* {
         if (this.generic_registry == null) { return null; }
+        const heads: ImplBlockNode*[] = this.trait_heads_on(ma.resolved_trait, recv_type);
+        if (heads.length != 1) { return null; }
+        const m: MethodNode* = this.generic_registry.trait_item_method(heads[0], ma.resolved_trait_slot);
+        if (m != null) { *out_impl = heads[0]; }
+        return m;
+    }
+
+    /// The receiver's implementations of the trait `trait_def`: for a
+    /// generic type's specialization, the blocks placed under it, where the
+    /// instances its calls ask for are added and emitted; for any other
+    /// receiver, the registry's heads selected for it.
+    trait_heads_on(&this, trait_def: DefId, recv_type: TypeRef) -> ImplBlockNode*[] {
         mut heads: ImplBlockNode*[] = [];
         mut specialized: boolean = false;
         for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
@@ -1187,26 +1182,26 @@ type struct MonoCallSpecializer {
             specialized = true;
             for (mut j: i64 = 0; j < entry.impl_nodes.length; j++) {
                 const block: ImplBlockNode* = entry.impl_nodes[j] as ImplBlockNode*;
-                if (block != null && block.is_trait_impl() && block.trait_def.equals(ma.resolved_trait)) {
+                if (block != null && block.is_trait_impl() && block.trait_def.equals(trait_def)) {
                     heads.push(block);
                 }
             }
         }
         if (!specialized) {
-            heads = this.generic_registry.heads_for(ma.resolved_trait, recv_type, this.intern_table);
+            heads = this.generic_registry.heads_for(trait_def, recv_type, this.intern_table);
         }
-        if (heads.length != 1) { return null; }
-        const m: MethodNode* = this.generic_registry.trait_item_method(heads[0], ma.resolved_trait_slot);
-        if (m != null) { *out_impl = heads[0]; }
-        return m;
+        return heads;
     }
 
     /// Bind `call` to the receiver's method `m`, held by `impl_node` or
     /// declared on `owner_ast`: a default instantiated per call is bound to
     /// the instance an earlier call made of it, else one minted now; a
     /// method with type parameters of its own, to its instance at the call's
-    /// type arguments.  A method bound as it is written needs nothing here:
-    /// the pass after monomorphization binds it.
+    /// type arguments; any other method, to itself.  A receiver whose
+    /// instantiation is not minted yet, or that is still written in a
+    /// generic body's parameters, has no method of its own to bind to: the
+    /// call is bound once it is minted (`bind_queued_calls`), or in each
+    /// copy that substitutes the parameters.
     bind_receiver_method(mut &this, call: CallExprNode*, m: MethodNode*, impl_node: ImplBlockNode*,
                          owner_ast: ASTNode*, recv_type: TypeRef,
                          subst: TypeSubstitution*) -> void {
@@ -1215,7 +1210,15 @@ type struct MonoCallSpecializer {
             this.instantiate_generic_method(call, m, impl_node, owner_ast, recv_type, subst);
             return;
         }
-        if ((!m.func.is_self_returning_default && !m.func.is_lazy_self_growing) || impl_node == null) { return; }
+        if (!m.func.is_self_returning_default && !m.func.is_lazy_self_growing) {
+            const rt: Type* = this.arena.lookup(recv_type);
+            if (rt != null && rt.kind != TypeKind::InstantiatedType
+                    && !this.arena.contains_generic_param(recv_type)) {
+                this.pin_plain(call, m);
+            }
+            return;
+        }
+        if (impl_node == null) { return; }
         mut made: MethodNode* = null;
         for (mut k: i64 = 0; k < impl_node.methods.length && made == null; k++) {
             const c: MethodNode* = impl_node.methods[k];
@@ -1226,6 +1229,140 @@ type struct MonoCallSpecializer {
             }
         }
         this.instantiate_deferred(call, m, impl_node, recv_type, made);
+    }
+
+    /// The type a receiver's methods are read from: `recv` behind any
+    /// pointer or reference, an instantiation as the specialization minted
+    /// for it.  An instantiation not minted yet is answered as itself.
+    receiver_owner(&this, recv: TypeRef) -> TypeRef {
+        mut out: TypeRef = recv;
+        mut t: Type* = this.arena.lookup(out);
+        mut depth: i32 = 0;
+        while (t != null && depth < 8) {
+            if (t.kind == TypeKind::Pointer) {
+                out = (t as PointerType*).pointee;
+            } else if (t.kind == TypeKind::Reference) {
+                out = (t as ReferenceType*).referent;
+            } else if (t.kind == TypeKind::InstantiatedType && (t as InstantiatedType*).has_resolved_type()) {
+                out = (t as InstantiatedType*).resolved_type;
+            } else {
+                break;
+            }
+            t = this.arena.lookup(out);
+            depth += 1;
+        }
+        return out;
+    }
+
+    queue_bind(mut &this, call: CallExprNode*) -> void {
+        if (!call.resolved_callee.is_some()) { this.queued_binds.push(call); }
+    }
+
+    /// Bind a call the compiler generated, which names its method by
+    /// definition, to the receiver's own method for it.  A receiver still
+    /// written in a generic body's parameters is bound in each copy that
+    /// substitutes them; one not minted yet, once it is.
+    bind_named_call(mut &this, call: CallExprNode*, subst: TypeSubstitution*) -> void {
+        if (call.resolved_callee.is_some() || !call.template_recv.is_valid()) { return; }
+        mut recv: TypeRef = call.template_recv;
+        if (subst != null) { recv = subst.apply(recv, this.arena); }
+        if (this.arena.contains_generic_param(recv)) { return; }
+        const owner: TypeRef = this.receiver_owner(recv);
+        const ot: Type* = this.arena.lookup(owner);
+        if (ot == null) { return; }
+        if (ot.kind == TypeKind::InstantiatedType) {
+            this.queue_bind(call);
+            return;
+        }
+        this.pin_plain(call, this.named_method_on(call.named_method, owner));
+    }
+
+    /// A static call through a path whose owner the copy's substitution
+    /// wrote (`scope.spec_owner`): the owner's own name inside its body, which
+    /// names the specialization being made, or a type parameter's
+    /// (`T::default()`), which names the type bound to it.  The call is
+    /// bound on that owner, by the method it recorded where it is written,
+    /// once the owner is minted.  A method with type parameters of its own,
+    /// or a call carrying the owner's arguments, is specialized as written.
+    bind_on_substituted_owner(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*) -> void {
+        if (!scope.spec_owner.is_valid() || !call.template_method.is_valid()
+                || call.template_recv.is_valid() || call.resolved_type_args.length > 0) { return; }
+        const f: FunctionDeclNode* = this.decl_index.method_func_of(call.template_method);
+        if (f == null || f.generic_params.length > 0) { return; }
+        call.template_recv = scope.spec_owner;
+        this.queue_bind(call);
+    }
+
+    /// The method of `owner` the static path call `call` recorded: a trait's
+    /// declared method, answered by `owner`'s one implementation of the
+    /// trait at that method's position, and null when it has several,
+    /// which only the call's arguments tell apart; any other, `owner`'s
+    /// entry for the definition.
+    path_method_on(&this, call: CallExprNode*, owner: TypeRef) -> MethodNode* {
+        const d: DefId = call.template_method;
+        const slot: i64 = this.generic_registry.trait_item_position(d);
+        if (slot >= 0) {
+            const heads: ImplBlockNode*[] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
+            if (heads.length != 1) { return null; }
+            return this.generic_registry.trait_item_method(heads[0], slot);
+        }
+        return this.decl_index.entry_method(this.decl_index.method_entry_on(owner, d));
+    }
+
+    /// The method of `owner` the method definition `d` names: a trait's
+    /// declared method at its position in `owner`'s first implementation of
+    /// that trait; any other, `owner`'s entry for `d`.
+    named_method_on(&this, d: DefId, owner: TypeRef) -> MethodNode* {
+        const slot: i64 = this.generic_registry.trait_item_position(d);
+        if (slot >= 0) {
+            const heads: ImplBlockNode*[] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
+            if (heads.length == 0) { return null; }
+            return this.generic_registry.trait_item_method(heads[0], slot);
+        }
+        return this.decl_index.entry_method(this.decl_index.method_entry_on(owner, d));
+    }
+
+    /// Pin `call` to `m` when `m` is bound as it is written: one with type
+    /// parameters of its own, or a default instantiated per call, is bound
+    /// to an instance instead.
+    pin_plain(mut &this, call: CallExprNode*, m: MethodNode*) -> void {
+        if (m == null || m.func == null || m.func.generic_params.length > 0
+                || m.func.is_self_returning_default || m.func.is_lazy_self_growing) { return; }
+        this.pin_spec_entry(call, m.func.overload_entry);
+    }
+
+    /// Bind each queued call whose receiver or owner is now minted, by the
+    /// identity it recorded: the method a generated call names, the method
+    /// `template_method` names on `template_recv`, or the trait's method at
+    /// the position the call's member recorded.  Bound only to a method
+    /// bound as written: an instance minted here would never be
+    /// registered.  A call whose receiver is still not minted stays queued.
+    bind_queued_calls(mut &this) -> void {
+        mut still: CallExprNode*[] = [];
+        for (mut i: i64 = 0; i < this.queued_binds.length; i++) {
+            const call: CallExprNode* = this.queued_binds[i];
+            if (call.resolved_callee.is_some()) { continue; }
+            const owner: TypeRef = this.receiver_owner(call.template_recv);
+            const ot: Type* = this.arena.lookup(owner);
+            if (ot == null) { continue; }
+            if (ot.kind == TypeKind::InstantiatedType) {
+                still.push(call);
+                continue;
+            }
+            if (call.named_method.is_valid()) {
+                this.pin_plain(call, this.named_method_on(call.named_method, owner));
+            } else if ((call.callee as ASTNode*).kind == NodeKind::ScopeResolution) {
+                this.pin_plain(call, this.path_method_on(call, owner));
+            } else if (call.template_method.is_valid()) {
+                mut id_impl: ImplBlockNode* = null;
+                mut id_owner: ASTNode* = null;
+                this.pin_plain(call, this.receiver_method_of(call.template_method, owner, &id_impl, &id_owner));
+            } else {
+                mut item_impl: ImplBlockNode* = null;
+                this.pin_plain(call, this.trait_item_on(call.callee as MemberAccessNode*, owner, &item_impl));
+            }
+        }
+        this.queued_binds = still;
     }
 
     /// Bind `call` to the receiver's instance of the deferred method `orig`
@@ -1285,8 +1422,8 @@ type struct MonoCallSpecializer {
         // written, a method the owner's declaration holds (instance methods
         // route through specialize_method_call instead).  A non-generic one
         // needs only its owner instantiated: its stash is the OWNER's type
-        // args, the owner drain materializes its body, and the pass after
-        // monomorphization binds the call to the owner's copy by identity.  A
+        // args, the owner drain materializes its body, and the call is bound
+        // to the owner's copy by identity once the owner is minted.  A
         // generic one (`Wrap<A>::make<T>`) needs its OWN `<T>` specialized
         // within the owner spec - the stash is the METHOD's `<T>`; owner args
         // come from the scope turbofish or template defaults.
@@ -1323,6 +1460,7 @@ type struct MonoCallSpecializer {
             // The owner the recorded method is bound on: an owner whose
             // arguments the call's arguments inferred is written bare.
             call.template_recv = inst_ref;
+            this.queue_bind(call);
             return true;
         }
 
