@@ -4,10 +4,12 @@
 ///! and singleton primitives.  All types are created through the arena's factory
 ///! methods, which return TypeRef handles.
 ///!
-///! Design note: User-defined type caches are keyed by qualified name only
-///! (not module_id::name) so cross-module references dedup against the
-///! same arena entry; keying on module-prefixed names produces phantom
-///! duplicate types at every import site.
+///! A user-defined type (struct, class, enum, trait, alias) is allocated
+///! once per definition, where the definition is declared, and kept under
+///! that definition by the declaration index (`type_of_def`); a reference
+///! reaches it through the definition its name resolved to.  The arena
+///! keeps no table of them by name: two definitions written under one name
+///! are two types.
 
 namespace compiler::types::arena;
 
@@ -140,20 +142,13 @@ type struct TypeArena {
     // per-lookup allocation and no string hashing on these hot paths.
     //
     // Deliberately NOT used for:
-    //   * nominal types (Struct/Class/Enum/Trait/Alias) - keyed by qualified
-    //     name; see the file header on why module-prefixed keys are wrong.
+    //   * nominal types (Struct/Class/Enum/Trait/Alias) - one per
+    //     definition, kept under it by the declaration index (file header).
     //   * GenericParam - keyed by NAME ONLY, dropping `index`.  That is a correctness fix, not an oversight: see
     //     `create_generic_param`.  Re-including them here would regress it.
     intern_entries: InternEntry[];
     intern_ops:     TypeRef[];          // flat operand pool, sliced by InternEntry
     intern_cache:   HashMap<u64, i64>;  // structural hash (probed) -> intern_entries index
-
-    // -- User-defined type caches (SymbolStr.id -> TypeRef) --
-    struct_cache: HashMap<u32, TypeRef>;
-    class_cache:  HashMap<u32, TypeRef>;
-    enum_cache:   HashMap<u32, TypeRef>;
-    trait_cache:  HashMap<u32, TypeRef>;
-    alias_cache:  HashMap<u32, TypeRef>;
 
     // -- Function template placeholder cache (SymbolStr.id -> TypeRef) --
     func_template_cache: HashMap<u32, TypeRef>;
@@ -206,11 +201,6 @@ public:
             intern_entries:      [],
             intern_ops:          [],
             intern_cache:        HashMap::<u64, i64>::new(),
-            struct_cache:        HashMap::<u32, TypeRef>::new(),
-            class_cache:         HashMap::<u32, TypeRef>::new(),
-            enum_cache:          HashMap::<u32, TypeRef>::new(),
-            trait_cache:         HashMap::<u32, TypeRef>::new(),
-            alias_cache:         HashMap::<u32, TypeRef>::new(),
             func_template_cache: HashMap::<u32, TypeRef>::new(),
             generic_param_cache: HashMap::<u64, TypeRef>::new(),
             this_param:          TypeRef::invalid(),
@@ -547,27 +537,24 @@ public:
     }
 
 
-    // User-defined type factories (deduplicated by qualified name)
+    // User-defined type factories: one new type per call.  A definition's
+    // type is created once, where it is declared, and found through the
+    // definition afterwards; `qualified_name` is the type's own name, for
+    // display and mangling, never a key.
 
-    /// Create or retrieve a struct type by qualified name.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
+    /// Create a struct type named `qualified_name`.
+    ![allow(lookup_by_spelling, reason = "the new type's own name, stored on it for display and mangling; looks nothing up")]
     create_struct(mut &this, qualified_name: SymbolStr, declared_in: ModulePath) -> TypeRef {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeArena] create_struct() name='%s'",
             this.intern_table.resolve(qualified_name));
-
-        const cached: Option<TypeRef> = this.struct_cache.get(&qualified_name.id);
-        if (cached.is_some()) { return cached.unwrap(); }
-
-        mut ref: TypeRef = this.alloc_type(new StructType(this.refs.upcoming(), qualified_name, declared_in, this.intern_table));
-        this.struct_cache.insert(qualified_name.id, ref);
-        return ref;
+        return this.alloc_type(new StructType(this.refs.upcoming(), qualified_name, declared_in, this.intern_table));
     }
 
-    /// Create or retrieve a union type by qualified name.  A union is a
+    /// Create a union type named `qualified_name`.  A union is a
     /// StructType with `is_union = true`; the struct machinery (field lookup,
     /// member resolution, generics) is shared, and the flag drives the
     /// divergent layout / LLVM lowering / drop behaviour.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
+    ![allow(lookup_by_spelling, reason = "the new type's own name, stored on it for display and mangling; looks nothing up")]
     create_union(mut &this, qualified_name: SymbolStr, declared_in: ModulePath) -> TypeRef {
         const ref: TypeRef = this.create_struct(qualified_name, declared_in);
         const t: Type* = this.lookup(ref);
@@ -578,54 +565,30 @@ public:
         return ref;
     }
 
-    /// Create or retrieve a class type by qualified name.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
+    /// Create a class type named `qualified_name`.
+    ![allow(lookup_by_spelling, reason = "the new type's own name, stored on it for display and mangling; looks nothing up")]
     create_class(mut &this, qualified_name: SymbolStr, declared_in: ModulePath) -> TypeRef {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeArena] create_class() name='%s'", this.intern_table.resolve(qualified_name));
-
-        const cached: Option<TypeRef> = this.class_cache.get(&qualified_name.id);
-        if (cached.is_some()) { return cached.unwrap(); }
-
-        mut ref: TypeRef = this.alloc_type(new ClassType(this.refs.upcoming(), qualified_name, declared_in, this.intern_table));
-        this.class_cache.insert(qualified_name.id, ref);
-        return ref;
+        return this.alloc_type(new ClassType(this.refs.upcoming(), qualified_name, declared_in, this.intern_table));
     }
 
-    /// Create or retrieve an enum type by qualified name.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
+    /// Create an enum type named `qualified_name`.
+    ![allow(lookup_by_spelling, reason = "the new type's own name, stored on it for display and mangling; looks nothing up")]
     create_enum(mut &this, qualified_name: SymbolStr, declared_in: ModulePath) -> TypeRef {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeArena] create_enum() name='%s'", this.intern_table.resolve(qualified_name));
-
-        const cached: Option<TypeRef> = this.enum_cache.get(&qualified_name.id);
-        if (cached.is_some()) { return cached.unwrap(); }
-
-        mut ref: TypeRef = this.alloc_type(new EnumType(this.refs.upcoming(), qualified_name, declared_in, this.intern_table));
-        this.enum_cache.insert(qualified_name.id, ref);
-        return ref;
+        return this.alloc_type(new EnumType(this.refs.upcoming(), qualified_name, declared_in, this.intern_table));
     }
 
-    /// Create or retrieve a trait type by qualified name.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
+    /// Create a trait type named `qualified_name`.
+    ![allow(lookup_by_spelling, reason = "the new type's own name, stored on it for display and mangling; looks nothing up")]
     create_trait(mut &this, qualified_name: SymbolStr, declared_in: ModulePath) -> TypeRef {
-
-        const cached: Option<TypeRef> = this.trait_cache.get(&qualified_name.id);
-        if (cached.is_some()) { return cached.unwrap(); }
-
-        mut ref: TypeRef = this.alloc_type(new TraitType(this.refs.upcoming(), qualified_name, declared_in, this.intern_table));
-        this.trait_cache.insert(qualified_name.id, ref);
-        return ref;
+        return this.alloc_type(new TraitType(this.refs.upcoming(), qualified_name, declared_in, this.intern_table));
     }
 
-    /// Create or retrieve a type alias.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
+    /// Create a type alias named `alias_name`.
+    ![allow(lookup_by_spelling, reason = "the new type's own name, stored on it for display and mangling; looks nothing up")]
     create_type_alias(mut &this, alias_name: SymbolStr, target: TypeRef) -> TypeRef {
-
-        const cached: Option<TypeRef> = this.alias_cache.get(&alias_name.id);
-        if (cached.is_some()) { return cached.unwrap(); }
-
-        mut ref: TypeRef = this.alloc_type(new TypeAliasType(this.refs.upcoming(), alias_name, this.intern_table, target));
-        this.alias_cache.insert(alias_name.id, ref);
-        return ref;
+        return this.alloc_type(new TypeAliasType(this.refs.upcoming(), alias_name, this.intern_table, target));
     }
 
 
@@ -890,49 +853,6 @@ public:
         }
         if (out_align != null) { out_align[0] = max_align; }
         return offsets;
-    }
-
-    /// Register an additional name alias for an existing type in the
-    /// appropriate cache.  Used by the Monomorphizer to register a bare
-    /// specialization name (e.g. "Triple_i32_string") alongside the
-    /// canonical qualified name ("Collections::Pair::Triple_i32_string")
-    /// so that TypeResolver can find the type during body-local resolution
-    /// (where the ASTTypeSubstituter produces bare names).
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    add_name_alias(mut &this, alias: SymbolStr, ty: TypeRef) -> void {
-        const t: Type* = this.lookup(ty);
-        if (t == null) { return; }
-        match (t.kind) {
-            TypeKind::Struct => { this.struct_cache.insert(alias.id, ty); }
-            TypeKind::Class  => { this.class_cache.insert(alias.id, ty); }
-            TypeKind::Enum   => { this.enum_cache.insert(alias.id, ty); }
-            _                => {}
-        }
-    }
-
-    /// Register the (future) concrete for a generic instantiation under its
-    /// specialized names, WHILE the slot at `wrapper_ref` is still the
-    /// `InstantiatedType` wrapper.  This is the early half of the swap-relocate
-    /// that gives a generic instantiation a SINGLE arena id: names must resolve
-    /// during `resolve_specialized_ast` (a spec body can reference itself by its
-    /// bare/qualified spec name), and they must resolve to the SAME id the
-    /// concrete will occupy after `swap_wrapper_to_concrete` flips the slot in
-    /// place - so a body's self-reference and its `this` share one id.  `kind` is
-    /// the concrete's eventual kind (Struct/Class/Enum); `is_union` selects the
-    /// struct cache with the union flag semantics (unions are Structs).
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    reserve_spec_names(mut &this, wrapper_ref: TypeRef, qualified_spec: SymbolStr,
-                       bare_spec: SymbolStr, kind: TypeKind) -> void {
-        if (kind == TypeKind::Enum) {
-            this.enum_cache.insert(qualified_spec.id, wrapper_ref);
-            if (!bare_spec.equals(qualified_spec)) { this.enum_cache.insert(bare_spec.id, wrapper_ref); }
-        } else if (kind == TypeKind::Class) {
-            this.class_cache.insert(qualified_spec.id, wrapper_ref);
-            if (!bare_spec.equals(qualified_spec)) { this.class_cache.insert(bare_spec.id, wrapper_ref); }
-        } else {
-            this.struct_cache.insert(qualified_spec.id, wrapper_ref);
-            if (!bare_spec.equals(qualified_spec)) { this.struct_cache.insert(bare_spec.id, wrapper_ref); }
-        }
     }
 
     /// Flip the `InstantiatedType` slot at `wrapper_ref` into the concrete
@@ -1480,10 +1400,6 @@ public:
         cdebug(Text::new("  Structural interner: %lld entries | canonical-identity violations: %lld\n"),
             this.intern_entries.length, this.verify_canonical_identity());
         cdebug(Text::new("  GenericParam: %lld\n"), this.generic_param_cache.length());
-        cdebug(Text::new("  Struct: %lld | Class: %lld | Enum: %lld | Trait: %lld | Alias: %lld\n"),
-            this.struct_cache.length(), this.class_cache.length(),
-            this.enum_cache.length(), this.trait_cache.length(),
-            this.alias_cache.length());
     }
 
 
