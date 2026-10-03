@@ -56130,3 +56130,53 @@ implement trait Bb for T2 {
   OK, objects **0 moved** (tests 5609, examples 1126). The first attempt's
   baseline failed the known flake `blocking_pool_a_configured_ceiling_is_enforced`
   and was re-run. Clean build 331 warnings, the same set.
+
+### 8.481 A pointer comparison or pointer arithmetic on `T*` is typed in the generic body - 2026-10-02
+
+## Why
+
+The symbolic walk of a generic body returned no type for any binary
+operation with a symbolic operand (`resolve_binary`), and a `T*` is symbolic,
+as is `null` (a void operand). So `this.ptr == null`, `this.ptr != null` and
+`ptr + count` in `Array<T>`, `HashMap<K, V>`, `RawBuffer<T>`, `mem.cryo:47` and
+`ptr.cryo:25` were left untyped in the template, and every copy was typed by
+the pass after monomorphization: the `copy template-untyped-fill` cell, 5,569
+writes, 5,523 of them `BinaryExpression`. The pointer rules in
+`TypeChecker::check_binary_op` read the operands' top-level kinds only
+(pointer against pointer, function, string, reference or `null` gives `bool`;
+pointer plus or minus a number gives the pointer), so `T` is never needed.
+
+```cryo
+function first<T>(p: T*) -> boolean { return p != null; }   // bool, in the template
+```
+
+## What changed
+
+* `resolve_binary` hands an operation to `check_binary_op` in the symbolic walk
+  when `pointer_rule_settles`: one operand is a pointer, and each operand is a
+  pointer, `null`, or a settled type. Any other symbolic operand still leaves
+  the node untyped.
+
+## Evidence
+
+* The gauge (`--emit=postmono-writes` over the corpus, `.objcmp/s99/pmp2` this
+  change; control `.objcmp/s99/pmu2`, built before it), compared over the same
+  149 reports (`.objcmp/s99/pmu2-149`): `copy template-untyped-fill`
+  **5,557 -> 71**, `copy same` +5,486, the same number; no other copy cell
+  moves. Left in the cell: two calls at `fs/path.cryo:322,332`, `static match`
+  arms in `random/source.cryo:100-103`, and `math::abs<T>` / `clamp<T>`
+  (`math/_module.cryo:190,252`), which apply `<` and `-` to a `T` with no bound -
+  the shape ruling 82 refuses on the template, so building ruling 82 refuses
+  those two stdlib functions as written.
+* The non-copy and argument cells that moved in the same comparison are
+  8.480's, not this change's (`pmu2` was built before 8.480): the argument
+  check now reaching `String` parameters inserts the `![implicit]` conversion
+  in the first pass, so `Text::tag("hello")` against `tag(s: String)`
+  (`module_suffix_tie_checks_arguments`) and 8 calls in the unit leg are no
+  longer argument replacements after monomorphization: corpus `arg
+  replaced=yes` **16 -> 1**, `body fill` 32 -> 17. The rest of those cells
+  move only in `compiler` and `tools/CryoLSP`, whose source changed.
+* Census with this compiler: OVERALL PASS, 227 compile-fail, 160 projects
+  (`.objcmp/s99/census-p2.out`); the compiler checks its own source clean
+  (`selfcheck-p2.out`). verify against HEAD (`.verify/runs/20261002-222222`):
+  all gates OK, objects **0 moved**. Clean build 331 warnings, the same set.
