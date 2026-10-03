@@ -1394,6 +1394,14 @@ type struct MonoCallSpecializer {
 
     // -- Static method on a GENERIC owner (Slice<T>::from_raw, String<GA>::from_string) --
 
+    /// Whether one of the template's impl blocks, inherent or trait, holds `m`.
+    template_holds(&this, entry: TemplateEntry*, m: MethodNode*) -> boolean {
+        for (mut i: i64 = 0; i < entry.impl_blocks.length; i++) {
+            if (MethodNode::is_method_of(m, entry.impl_blocks[i] as ASTNode*)) { return true; }
+        }
+        return false;
+    }
+
     /// Specialize a non-generic static method on a generic owner from sema's owner
     /// stash.  Sema stashes the
     /// owner's concrete type args on the call (resolve_static_method_return_via_template
@@ -1430,9 +1438,17 @@ type struct MonoCallSpecializer {
         const recorded: ASTNode* = this.decl_index.method_decl_of(call.template_method);
         if (recorded == null || recorded.kind != NodeKind::MethodDeclaration) { return false; }
         const m: MethodNode* = recorded as MethodNode*;
-        if (m.func == null || !m.is_static || !MethodNode::is_method_of(m, entry.ast_node)) { return false; }
-        const matched_nongeneric: MethodNode* = if (m.func.generic_params.length == 0) { m } else { null };
-        const matched_generic: MethodNode* = if (m.func.generic_params.length > 0) { m } else { null };
+        if (m.func == null || !m.is_static) { return false; }
+        // A non-generic method is bound on the minted owner by the identity
+        // recorded (`path_method_on`), wherever the owner's method is
+        // written: its declaration, an impl block of the template, or a
+        // trait's declaration (`HashSet::<i32>::default()`).  A generic one
+        // is specialized into the declaration that holds it.
+        const in_decl: boolean = MethodNode::is_method_of(m, entry.ast_node);
+        const matched_nongeneric: MethodNode* = if (m.func.generic_params.length == 0
+                && (in_decl || this.template_holds(entry, m)
+                    || this.generic_registry.trait_item_position(call.template_method) >= 0)) { m } else { null };
+        const matched_generic: MethodNode* = if (m.func.generic_params.length > 0 && in_decl) { m } else { null };
 
         // --- Non-generic static method on a generic owner ---
         if (matched_nongeneric != null) {

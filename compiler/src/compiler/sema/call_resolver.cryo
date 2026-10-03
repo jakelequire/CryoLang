@@ -368,124 +368,59 @@ type struct CallResolver {
         return TypeRef::invalid();
     }
 
+    /// The parameter types `candidates` agree on, position by position, for
+    /// an argument's expected type: a position two candidates of the call's
+    /// arity disagree on is invalid, and no such candidate is no answer.
+    agreed_candidate_params(&this, candidates: &ArgCandidates) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        if (candidates.count == 0) { return out; }
+        for (mut p: i64 = 0; p < candidates.argc; p++) {
+            const first: TypeRef = candidates.params[p];
+            mut agree: boolean = true;
+            for (mut c: i64 = 1; c < candidates.count; c++) {
+                if (!candidates.params[c * candidates.argc + p].equals(first)) { agree = false; break; }
+            }
+            out.push(if (agree) { first } else { TypeRef::invalid() });
+        }
+        return out;
+    }
+
     /// Arity-matching method overloads' non-receiver param types for `member`, as
     /// an expected-type hint (a position-wise merge where all overloads agree).
-    /// Declared parameter types of `method_name` on the GENERIC TEMPLATE whose
-    /// uninstantiated arena type is `base`, read from the template's own AST.
-    ///
-    /// A template's arena node holds no methods: TypeResolution skips generic
-    /// declarations, because their field and parameter types still mention
-    /// unbound parameters and baking those in would size the type wrongly. Only
-    /// the specializations get populated, and they do not exist while the
-    /// symbolic walk is still looking at the template. The declaration does.
-    ///
-    /// The types handed back may still mention the template's own parameters.
-    /// That is enough for what this feeds — `classify_args_from_params` asks
-    /// only whether a parameter is a reference or a pointer, and substituting
-    /// type arguments never changes that. A parameter whose type has not been
-    /// resolved at all comes back invalid, which that caller already skips, so
-    /// such a slot is left exactly as unclassified as it was before.
-    ///
-    /// Both places a template's instance methods can be declared are searched:
-    /// its own body, and any `implement` block registered against it.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    param_types_from_template_decl(mut &this, base: TypeRef, method_name: SymbolStr,
-                                   arg_count: i64) -> TypeRef[] {
-        const greg: GenericRegistry* = this.ctx.generic_registry;
-        if (greg == null || !base.is_valid()) { return []; }
-        const bt: Type* = this.arena.lookup(base);
-        if (bt == null) { return []; }
-        mut owner: SymbolStr = SymbolStr::empty();
-        if (bt.kind == TypeKind::Struct) {
-            owner = (bt as StructType*).qualified_name;
-        } else if (bt.kind == TypeKind::Class) {
-            owner = (bt as ClassType*).qualified_name;
-        } else {
-            return [];
-        }
-        const tmpl: TemplateEntry* = greg.template_of_type(base);
-        if (tmpl == null) { return []; }
-
-        if (tmpl.ast_node != null) {
-            if (tmpl.node_kind == NodeKind::StructDeclaration) {
-                const r: TypeRef[] = this.scan_decl_method_param_types(
-                    &(tmpl.ast_node as StructDeclNode*).methods, method_name, arg_count);
-                if (r.length > 0) { return r; }
-            } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
-                const r: TypeRef[] = this.scan_decl_method_param_types(
-                    &(tmpl.ast_node as ClassDeclNode*).methods, method_name, arg_count);
-                if (r.length > 0) { return r; }
-            }
-        }
-        for (mut i: i64 = 0; i < tmpl.impl_blocks.length; i++) {
-            const ib: ImplBlockNode* = tmpl.impl_blocks[i];
-            if (ib == null) { continue; }
-            const r: TypeRef[] = this.scan_decl_method_param_types(
-                &ib.methods, method_name, arg_count);
-            if (r.length > 0) { return r; }
-        }
-        return [];
-    }
-
-    /// The non-self parameter types of the first method in `methods` named
-    /// `method_name` and taking `arg_count` of them. The receiver is excluded,
-    /// because `MethodInfo.param_types` is by contract the non-self parameters
-    /// and this stands in for it.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    scan_decl_method_param_types(mut &this, methods: &MethodNode*[],
-                                 method_name: SymbolStr, arg_count: i64) -> TypeRef[] {
-        for (mut i: i64 = 0; i < methods.length; i++) {
-            const mnode: MethodNode* = methods[i];
-            if (mnode == null || mnode.func == null) { continue; }
-            const fn_node: FunctionDeclNode* = mnode.func;
-            if (!fn_node.name.equals(method_name)) { continue; }
-            mut ptypes: TypeRef[] = [];
-            for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
-                const pp: VarDeclNode* = fn_node.parameters[pi];
-                if (pp == null) { continue; }
-                if (pp.is_receiver()) { continue; }
-                ptypes.push(pp.resolved_type);
-            }
-            if (ptypes.length != arg_count) { continue; }
-            return ptypes;
-        }
-        return [];
-    }
-
-    lookup_method_param_types(mut &this, visitor: ASTVisitor*, member: MemberAccessNode*,
-                              arg_count: i64) -> TypeRef[] {
+    lookup_method_param_types(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
+                              member: MemberAccessNode*, arg_count: i64) -> TypeRef[] {
         const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
         if (!obj_type.is_valid()) { return []; }
+        mut base_ref: TypeRef = obj_type;
         mut base_t: Type* = this.arena.lookup(obj_type);
         mut depth: i32 = 0;
         while (base_t != null && depth < 5) {
             match (base_t.kind) {
-                TypeKind::Pointer => { base_t = this.arena.lookup((base_t as PointerType*).pointee); }
-                TypeKind::Reference => { base_t = this.arena.lookup((base_t as ReferenceType*).referent); }
+                TypeKind::Pointer => {
+                    base_ref = (base_t as PointerType*).pointee;
+                    base_t = this.arena.lookup(base_ref);
+                }
+                TypeKind::Reference => {
+                    base_ref = (base_t as ReferenceType*).referent;
+                    base_t = this.arena.lookup(base_ref);
+                }
                 TypeKind::InstantiatedType => {
                     const inst: InstantiatedType* = base_t as InstantiatedType*;
                     if (inst.has_resolved_type()) {
-                        base_t = this.arena.lookup(inst.resolved_type);
+                        base_ref = inst.resolved_type;
+                        base_t = this.arena.lookup(base_ref);
                     } else {
-                        // A SYMBOLIC instantiation - `Gen<S>` seen from inside
-                        // `Gen<S>`'s own body - has no resolved type: nothing has
-                        // monomorphized it yet, and its arena node carries no
-                        // methods either, because TypeResolution skips generic
-                        // declarations outright. Its DECLARATION is the only place
-                        // the signature exists yet, so read it from there.
-                        //
-                        // Left unhandled this returned NO parameter types, so every
-                        // argument of `this.m(x)` inside a generic owner's own body
-                        // stayed `Unclassified` - and the two consumers of that
-                        // default disagree by design: the async substitution reads
-                        // an unclassified by-value argument as a BORROW and emits a
-                        // pointer read, which the move passes then see as moving an
-                        // owning value out of a pointer (E0453). Same failure, same
-                        // cause and same fix as the `GenericParam` arm below, one
-                        // level out: there the receiver IS a generic parameter,
-                        // here it is an instantiation mentioning one.
-                        return this.param_types_from_template_decl(
-                            inst.generic_base, member.member, arg_count);
+                        // An instantiation not minted yet - `Option<u8>`, or
+                        // `Gen<S>` seen from inside `Gen<S>`'s own body - has no
+                        // method set of its own, so its parameters are the
+                        // candidates the selection tries on it, seen through it
+                        // (`unwrap_or(default_value: T)` on an `Option<u8>` takes
+                        // a `u8`).  Left without them, every argument of such a
+                        // call stays `Unclassified`, and a literal takes its
+                        // default width while the parameter states another.
+                        mut cands: ArgCandidates = ArgCandidates::new(arg_count);
+                        if (!this.collect_on_template(visitor, call, member, base_ref, &cands)) { return []; }
+                        return this.agreed_candidate_params(&cands);
                     }
                 }
                 _ => { break; }
@@ -892,7 +827,7 @@ type struct CallResolver {
             const callee_node: ASTNode* = call.callee as ASTNode*;
             if (callee_node.kind == NodeKind::MemberAccess) {
                 param_types = this.lookup_method_param_types(
-                    visitor, call.callee as MemberAccessNode*, call.arguments.length);
+                    visitor, call, call.callee as MemberAccessNode*, call.arguments.length);
             }
         }
         if (param_types.length == 0) {
@@ -2725,21 +2660,8 @@ type struct CallResolver {
     /// several is an overload set none of which took them.
     check_args_on_template(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
                            member: MemberAccessNode*, owner_inst: TypeRef) -> void {
-        const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(
-            this.arena.inst_generic_base(owner_inst));
-        if (tmpl == null) { return; }
         mut found: ArgCandidates = ArgCandidates::new(call.arguments.length);
-        mut sel: Selection = Selection::none();
-        sel.owner_inst = owner_inst;
-        sel.recv = owner_inst;
-        sel.collect = &found;
-        const no_args: TypeRef[] = [];
-        this.select_on_template(visitor, call, member, tmpl, &no_args, DefId::invalid(), false, false, &sel);
-        this.select_on_template(visitor, call, member, tmpl, &no_args, DefId::invalid(), false, true, &sel);
-        if (found.name_seen == 0) {
-            this.select_on_template(visitor, call, member, tmpl, &no_args, DefId::invalid(), true, false, &sel);
-            this.select_on_template(visitor, call, member, tmpl, &no_args, DefId::invalid(), true, true, &sel);
-        }
+        if (!this.collect_on_template(visitor, call, member, owner_inst, &found)) { return; }
         if (found.count == 1) {
             this.check_args_against_params(visitor, &call.arguments, found.params.as_slice());
         } else if (found.count > 1) {
@@ -2748,6 +2670,30 @@ type struct CallResolver {
             this.diag.emit_method_arity_error(call.span, member.member, "method", found.uniq_arity,
                 found.argc, false);
         }
+    }
+
+    /// Record in `found` the candidates the selection tries for `call` on
+    /// the instantiation `owner_inst`, not minted yet: the template's
+    /// inherent methods, then, when none has the member's name, the trait
+    /// impls selected for the instantiation, each with its parameters seen
+    /// through it.  False when `owner_inst` names no template.
+    collect_on_template(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
+                        member: MemberAccessNode*, owner_inst: TypeRef, found: ArgCandidates*) -> boolean {
+        const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(
+            this.arena.inst_generic_base(owner_inst));
+        if (tmpl == null) { return false; }
+        mut sel: Selection = Selection::none();
+        sel.owner_inst = owner_inst;
+        sel.recv = owner_inst;
+        sel.collect = found;
+        const no_args: TypeRef[] = [];
+        this.select_on_template(visitor, call, member, tmpl, &no_args, DefId::invalid(), false, false, &sel);
+        this.select_on_template(visitor, call, member, tmpl, &no_args, DefId::invalid(), false, true, &sel);
+        if (found.name_seen == 0) {
+            this.select_on_template(visitor, call, member, tmpl, &no_args, DefId::invalid(), true, false, &sel);
+            this.select_on_template(visitor, call, member, tmpl, &no_args, DefId::invalid(), true, true, &sel);
+        }
+        return true;
     }
 
     /// Record in `found` a candidate the selection tried, with its
@@ -6202,12 +6148,14 @@ type struct CallResolver {
         return sb;
     }
 
-    /// Stash a generic static-method call's owner type args for mono, locating the
-    /// owner template + the (single, non-generic) static method itself.  Mirrors
-    /// the lookup in `resolve_static_method_return_via_template` so the stash is
-    /// produced regardless of which return-type-resolution branch wins.  Safe to
-    /// call on any `Scope::member` call: it no-ops unless `scope` is a registered
-    /// generic owner with exactly one matching non-generic static method.
+    /// Stash a generic static-method call's owner type args for mono.  The
+    /// method is the one recorded where the call is written
+    /// (`record_template_static`), wherever the owner's method is declared -
+    /// in the declaration, an impl block, or a trait (`HashSet::<i32>::default()`);
+    /// a non-generic static one has the owner's arguments to stash.  Run on
+    /// every `Scope::member` call so the stash is produced whichever
+    /// return-type branch wins; it no-ops unless `scope` names a generic
+    /// struct, union or class.
     stash_static_owner_bindings_for(mut &this, scope: ScopeResolutionNode*,
                                     call: CallExprNode*) -> void {
         if (call == null || scope == null) { return; }
@@ -6216,23 +6164,13 @@ type struct CallResolver {
             this.resolve_scope_owner_template(scope);
         if (tmpl == null || tmpl.ast_node == null) { return; }
         if (tmpl.param_types.length == 0) { return; }
-        const empty_methods: MethodNode*[] = [];
-        mut methods: &MethodNode*[] = &empty_methods;
-        if (tmpl.node_kind == NodeKind::StructDeclaration) { methods = &(tmpl.ast_node as StructDeclNode*).methods; }
-        else if (tmpl.node_kind == NodeKind::UnionDeclaration) { methods = &(tmpl.ast_node as UnionDeclNode*).methods; }
-        else if (tmpl.node_kind == NodeKind::ClassDeclaration) { methods = &(tmpl.ast_node as ClassDeclNode*).methods; }
-        else { return; }
-        mut found_count: i64 = 0;
-        mut matched: MethodNode* = null;
-        for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
-            if (m == null || m.func == null || !m.is_static) { continue; }
-            if (!m.func.name.equals(scope.member_name)) { continue; }
-            if (m.func.generic_params.length > 0) { return; }
-            found_count += 1;
-            matched = m;
-        }
-        if (found_count != 1 || matched == null) { return; }
+        if (tmpl.node_kind != NodeKind::StructDeclaration && tmpl.node_kind != NodeKind::UnionDeclaration
+                && tmpl.node_kind != NodeKind::ClassDeclaration) { return; }
+        this.record_template_static(call, scope, this.scope_owner_type(scope));
+        const recorded: ASTNode* = this.ctx.decl_index.method_decl_of(call.template_method);
+        if (recorded == null || recorded.kind != NodeKind::MethodDeclaration) { return; }
+        const matched: MethodNode* = recorded as MethodNode*;
+        if (matched.func == null || !matched.is_static || matched.func.generic_params.length > 0) { return; }
         this.stash_static_owner_bindings(scope, call, tmpl, matched);
     }
 

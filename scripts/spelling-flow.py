@@ -280,9 +280,12 @@ class Facts:
             if not self.in_scope(r):
                 continue
             op = r[12].split("(")[0]
-            if r[0] == "sarg" and r[8] == "?" and op in MAP_READ:
+            # A map method's key reaches it as an `arg` when the call knew the
+            # key parameter's type (the receiver's arguments substituted in)
+            # and as a `sarg` when it did not; it is the same lookup either way.
+            if r[0] in ("sarg", "arg") and r[8] == "?" and op in MAP_READ:
                 kind, prov = "map", r[6]
-            elif r[0] == "sarg" and r[8] == "?" and op in MAP_WRITE:
+            elif r[0] in ("sarg", "arg") and r[8] == "?" and op in MAP_WRITE:
                 kind, prov = "write", r[6]
             elif r[0] == "match":
                 kind, prov = "match", r[6]
