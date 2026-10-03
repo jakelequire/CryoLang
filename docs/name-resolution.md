@@ -55802,3 +55802,88 @@ same field runs with the receiver over the struct's own `I`, and that walk's
 answer is the one the template keeps (`resolve_expr` returns a node's type
 once it has one, before monomorphization). Which walk types the impl's
 bodies over the declaration's parameters is not found yet.
+
+### 8.476 A type seen through its receiver or through a bound carries the body's own parameters - 2026-10-02
+
+## Why
+
+P1 of removing the type check after monomorphization: 19,630 writes over
+the corpus where a copy's type, after monomorphization's substitution,
+still holds a type parameter (`.objcmp/s97/pm3`). §8.475 left them
+attributed to a second walk over the struct's own `I`. Measured on
+`01-hello` (`.objcmp/s98/p1.py`-`p3.py`): there is no second walk. The
+impl's body is walked once, `this` is `FilterIter<I>` over the impl head's
+`I` (symbol 4199), and `this.pred` alone comes out over the struct's `I`
+(4194). §8.475's second lookup was the struct's own `new` reading its field.
+
+Two causes, both in the first pass, both a parameter of a declaration the
+body is not written in:
+
+* **19,626: `TypeUtils::contains_generic_param` did not look inside a
+  function type or a projection.** `subst_owner_params_from_receiver`
+  returns its type untouched when that answers false, so a field
+  `pred: (&I::Item) -> boolean` and a method return `Option<I::Item>` came
+  back in the struct's or the trait's parameters, which no substitution of
+  the impl's body replaces. `TypeArena::contains_generic_param` asks a
+  different question (an unresolved projection on a concrete base counts
+  as generic there) and was never the one called here.
+* **4 (+2): a call through a bound on a generic trait kept the trait's own
+  parameter.** `subst_bound_assoc_args` substituted the bound's
+  associated-type arguments only, so under `where T: Deref<U>`, `x.deref()`
+  was `Target*`, and under `I: MyIter<T*>`, `this.inner.mynext()` was
+  `Option<Item>` (`tests/lang/operator_overload.cryo:40,132`,
+  `fluent_default_method_combinator.cryo:68-69`).
+
+```cryo
+implement<I> trait Iterator<I::Item> for struct FilterIter<I> where I: Iterator {
+    next(mut &this) -> Option<I::Item> {
+        const pred: (&I::Item) -> boolean = this.pred;   // was the struct's `I`
+        ..
+    }
+}
+function deref_ptr<T, U>(x: &T) -> U* where T: Deref<U> {
+    return x.deref();   // was `Target*`, Deref's own parameter
+}
+```
+
+## What changed
+
+* `TypeUtils::contains_generic_param` sees a function type's parameters and
+  return and a projection's base.
+* `MethodBinding::subst_bound_trait_args` (renamed from
+  `subst_bound_assoc_args`) substitutes the bound's leading arguments for the
+  trait's own parameters before its associated types.
+
+## Evidence
+
+* Predicted on `01-hello`: `param-survives` 151 -> 0, its writes moving to
+  `projection-survives` (the `I::Item` they carry is now the impl's, and is
+  unnormalised after substitution, P2's cell), nothing else moving. Measured:
+  151 -> 0, `projection-survives` 103 -> 254, every other cell equal.
+* Control (`.objcmp/s98/mut_fn.py`, alone, against the unmutated fix): the
+  function-type arm removed, `01-hello` reads `param-survives` **3**, all at
+  `core/iter.cryo:306:45` (one per `FilterIter` specialization), as
+  predicted. The bound fix's control is the corpus without it
+  (`.objcmp/s98/pmf1`): the unit leg reads 4, at the two
+  `operator_overload.cryo` sites; with it, 0.
+* Instrument corpus, tip (`.objcmp/s97/pm3`) against this change
+  (`.objcmp/s98/pmf2`): `param-survives` 19,630 -> **0**;
+  `projection-survives` 8,141 -> 27,506; copy `change` 4,820 -> 5,034; copy
+  `same` 2,058,907 -> 2,058,958. Every build's exit code unchanged. The 216
+  new copy `change` writes (`core/iter.cryo:134-204`) display identically on
+  both sides (`&i32` against `&i32`): a projection whose base is now concrete,
+  reduced but still a projection node. That is P2's normalisation. Body
+  `same` +258, member pin fills +4 and argument rows +26 are the compiler and
+  LSP builds compiling this change's own code.
+* Clean build: 331 warnings, the same (code, file) set.
+* verify against HEAD (`.verify/runs/20261002-185426`): all gates OK,
+  objects **0 moved** (tests 5609, examples 1126).
+
+## Remaining
+
+* The parameter-type sibling, `scan_param_bound_param_types`, still returns
+  a bound trait's parameter types unsubstituted (`index(i: Idx)` under
+  `T: Index<u64, i32>`); no instrument cell reads it, since argument binding
+  is not a type write.
+* `TypeUtils` and `TypeArena` each keep a `contains_generic_param` that answers
+  a different question under the same name.

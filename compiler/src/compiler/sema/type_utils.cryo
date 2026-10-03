@@ -317,15 +317,29 @@ type struct TypeUtils {
     // -- Structural type probes --
 
     /// Any unsubstituted generic parameter (GenericParam) anywhere
-    /// in the type's structure.  Gates type-mismatch diagnostics that would fire
-    /// spuriously on a leftover template-form signature type inside a
-    /// monomorphized caller.
+    /// in the type's structure, including a function type's parameters and
+    /// return and a projection's base (`(&I::Item) -> boolean` mentions `I`).
+    /// A substitution gated on this answer leaves a type it misses holding
+    /// a parameter nothing will replace.  An unresolved projection on a
+    /// concrete base mentions no parameter; `contains_unresolved_projection`
+    /// asks about that.
     contains_generic_param(&this, tref: TypeRef) -> boolean {
         if (!tref.is_valid()) { return false; }
         const t: Type* = this.arena.lookup(tref);
         if (t == null) { return false; }
         if (t.kind == TypeKind::GenericParam) {
             return true;
+        }
+        if (t.kind == TypeKind::AssocProjection) {
+            return this.contains_generic_param((t as AssocProjectionType*).base);
+        }
+        if (t.kind == TypeKind::Function) {
+            const func: FunctionType* = t as FunctionType*;
+            if (this.contains_generic_param(func.return_type)) { return true; }
+            for (mut i: i64 = 0; i < func.param_types.length; i++) {
+                if (this.contains_generic_param(func.param_types[i])) { return true; }
+            }
+            return false;
         }
         if (t.kind == TypeKind::Pointer) {
             return this.contains_generic_param((t as PointerType*).pointee);

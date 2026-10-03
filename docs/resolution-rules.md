@@ -145,6 +145,22 @@ yet is recorded with the change that builds it, not here.
 88. **The count of functions that take a name going from 699 to 701**, for
     the `member_entries` and `trait_slot_of` helpers, is accepted.
 
+89. **The lane gate's ARENA_READ count going from 64 to 65** for the
+    `--emit=postmono-writes` report, which renders type names into its
+    text, is accepted.
+
+90. **The three spelling-flow rows the `--emit=postmono-writes` flag
+    adds** (772 to 775: the `--emit` flag's read and the
+    `"postmono-writes"` match) are accepted. They are the same shape as
+    the existing flag rows, and under ruling 18 the gate is not changed to
+    exempt command-line flags.
+
+91. **A call left with no instance after monomorphization is the internal
+    E0900**, not the user-facing E0214 ("no overload accepts these
+    arguments"). A user-facing error comes from the check before
+    monomorphization; a test that reaches this E0900 marks a gap in that
+    check, which is closed there.
+
 ### 2026-10-01
 
 70. **The pass after monomorphization does not re-walk generic template
