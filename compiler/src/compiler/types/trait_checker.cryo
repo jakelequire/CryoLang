@@ -28,7 +28,7 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
 import compiler::resolver::{ intern_table, symbol_str };
 import std::fmt;
-import compiler::ast::declaration::{ FunctionDeclNode, ImplBlockNode, MethodNode };
+import compiler::ast::declaration::{ FunctionDeclNode, ImplBlockNode, MethodNode, VarDeclNode };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
 import compiler::resolver::intern_table::{ InternTable };
@@ -36,7 +36,8 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res::{ DefId };
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
-import compiler::types::compound::{ PointerType };
+import compiler::types::compound::{ PointerType, ReferenceType };
+import compiler::types::user_defined::{ TypeAliasType };
 import compiler::types::generic::{ GenericParamType };
 import compiler::types::generic_registry::{ GenericRegistry };
 import compiler::resolver::lang_item;
@@ -441,6 +442,48 @@ type struct TraitChecker {
         if (func == null) { return true; }
         if (func.trait_bounds.length == 0) { return true; }
         return this.bounds_satisfied(func.trait_bounds, subst);
+    }
+
+    /// Whether `func`'s receiver is written as the template `base`
+    /// instantiated with arguments other than `args`, read under `subst`
+    /// (the template's parameters bound to `args`): on `implement
+    /// Result<T, E>` as `Result<i32, string>`, `this: Result<T*, E>` denotes
+    /// `Result<i32*, string>` and is not a method of it; `this: Result<T, E>`
+    /// is.  A receiver written as the bare owner names every instantiation.
+    method_receiver_excludes(&this, func: FunctionDeclNode*, subst: TypeSubstitution*,
+                             base: TypeRef, args: &TypeRef[]) -> boolean {
+        if (func == null) { return false; }
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            if (param == null || !param.is_receiver()) { continue; }
+            mut ty: TypeRef = param.resolved_type;
+            if (subst != null) { ty = subst.apply(ty, this.arena); }
+            ty = this.receiver_core(ty);
+            if (!this.arena.inst_generic_base(ty).equals(base)) { return false; }
+            if (this.arena.inst_type_arg_count(ty) != args.length) { return false; }
+            for (mut ai: i64 = 0; ai < args.length; ai++) {
+                if (!this.arena.inst_type_arg_at(ty, ai).equals(args[ai])) { return true; }
+            }
+            return false;
+        }
+        return false;
+    }
+
+    /// The type a receiver is a reference or pointer to, through aliases.
+    receiver_core(&this, ty: TypeRef) -> TypeRef {
+        mut cur: TypeRef = ty;
+        for (mut depth: i32 = 0; depth < 8; depth++) {
+            const t: Type* = this.arena.lookup(cur);
+            if (t == null) { return cur; }
+            if (t.kind == TypeKind::Reference) { cur = (t as ReferenceType*).referent; continue; }
+            if (t.kind == TypeKind::Pointer) { cur = (t as PointerType*).pointee; continue; }
+            if (t.kind == TypeKind::TypeAlias && (t as TypeAliasType*).has_target()) {
+                cur = (t as TypeAliasType*).target;
+                continue;
+            }
+            return cur;
+        }
+        return cur;
     }
 
     /// The replacement `subst` holds for the generic parameter whose
