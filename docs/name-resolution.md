@@ -56328,3 +56328,43 @@ min(mut &this) -> Option<This::Item> where This::Item: Ord { ... }
   flow OK, objects **0 moved**; check-fast failed there on the moved
   spelling-flow entry alone and passes with it moved. The compiler checks its
   own source clean; clean build 331 warnings, the same set.
+
+### 8.484 A struct literal of an instantiation not minted yet types its values from the template's fields - 2026-10-03
+
+## Why
+
+`resolve_struct_literal` gave a field's value its expected type only when the
+literal's type was a minted struct or class, or the generic owner inside its
+own body. A literal of any other instantiation not minted yet left every
+value without one, so a literal took the default `i32` and a bare generic
+constructor its bare base, and the type check after monomorphization
+re-typed them per copy:
+
+```cryo
+RefIter::<T> { ptr: this.ptr, index: 0, length: this.length }   // `0`: i32 first, u64 after
+Src::<Result<i64, i64>> { v: Result::Ok(3) }                     // `Result` first, `Result<i64, i64>` after
+```
+
+## What changed
+
+* The literal asks the member door for the field (`MemberResolver::field_of`)
+  for an unminted instantiation too; the door already reads such a field off
+  the template through the instantiation's arguments.
+
+## Evidence
+
+* Gauge like-for-like (`.objcmp/s100/c13-149` against `c12-149`): non-copy
+  `change` **4,922 -> 4,038** (`Literal` 1,057 -> 186, `CallExpression` 13 -> 0);
+  copy `copy-entry change` **4,680 -> 3,501** (`Literal` 1,119 -> 10,
+  `ScopeResolution` 70 -> 0). Left: async-lowered nodes (`BinaryExpression`
+  3,452 + 2,853, `UnaryExpression` 397 + 634) and 186 literals outside struct
+  literals.
+* verify against HEAD (`.verify/runs/20261003-020651`, twice): all gates OK,
+  **1 object moved**: the unit-test build's `std/core/result.o` loses the nine
+  methods of `Option<Result>` - `Result` with no arguments, an instantiation
+  only the bare-base typing of `Result::Ok(3)` in
+  `where_bound_nested_param_inference.cryo:147` built, never called (the
+  disassembly is otherwise identical, `.objcmp/s100/ra.dis`/`rb.dis`).
+  Corpus build outcomes identical; census OVERALL PASS, 227 compile-fail,
+  160 projects. The compiler checks its own source clean; clean build 331
+  warnings, the same set.
