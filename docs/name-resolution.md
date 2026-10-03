@@ -56256,3 +56256,75 @@ later pass.
   entry). Census OVERALL PASS, 227 compile-fail, 160 projects; verify against
   HEAD (`.verify/runs/20261003-001611`): all gates OK, objects **0 moved**.
   The compiler checks its own source clean; clean build 331 warnings, the same set.
+
+### 8.483 Monomorphization writes each copied expression's type, its projections reduced - 2026-10-03
+
+## Why
+
+A copy of a generic body was cloned untyped (only identifiers carried a
+type), so every expression type in every copy - 2,243,154 writes over the
+corpus - was computed by the type check after monomorphization, which is
+the pass being removed. 97% of those were the template's first-pass type
+under the copy's substitution; 26,894 more were that type with an
+associated-type projection reduced, which substitution alone does not do:
+
+```cryo
+min(mut &this) -> Option<This::Item> where This::Item: Ord { ... }
+// copied for SplitIter: Option<SplitIter::Item> substituted, Option<Str> reduced
+```
+
+## What changed
+
+* A clone made for monomorphization (`ASTCloner::for_monomorphization`, and
+  `for_specialization`, which builds on it) carries every expression's
+  template type. Other clones - a closure's specialized function, a trait
+  default copied before the type check - stay untyped, because the type
+  check walks them and passes over what is already typed.
+* The substituter writes each expression's type as the copy sees it
+  (`ASTTypeSubstituter::in_copy`): the substitution applied, then each
+  projection whose base that makes concrete reduced, without demanding the
+  instantiations that builds. The call's `template_recv` is reduced the same
+  way, so a bound call on a projection-typed receiver
+  (`value.compare(&best)` with `This::Item: Ord`) is now pinned by
+  monomorphization too.
+* One projection reducer, `TypeResolver::reduce_projections(ty, memo)`;
+  `MonoTraitSpecializer::reduce_projections` is it with `memo`. Without
+  `memo` it records nothing on the projection type: recording the answer
+  there makes every type holding the projection read as concrete, and the
+  standard library built alone then fails GenericValidation (8.482).
+* The spelling-flow entry for the trait's associated-type table moves with
+  the walker (`scripts/spelling-flow.outstanding.tsv`, same flow, new function).
+* Gauge: `--emit=postmono-writes` gains `copy-entry` rows, each type write in
+  a copy compared with the type the copy entered with: `same` is a write that
+  changes nothing.
+
+## Evidence
+
+* Gauge over the corpus plus the standard library alone (`.objcmp/s100/c12`),
+  like-for-like 149 reports (`c12-149-sum.txt`): copy writes **2,238,402 same,
+  4,680 change, 72 none** - 99.79% no-ops. Before (gauge only, types not
+  carried; `g0.exe` on seven examples, `.objcmp/s100/m-g0`): 58,491 same, 42,680
+  change, 85,510 none of 186,681; the same seven with this change: 185,655 /
+  1,012 / 14. Substitution without the reduction (`p5b.exe`, `m-p5b`): 2,293
+  change, the 1,281 more all projections.
+* Left (4,680), all first-pass answers the template got wrong, not
+  substitution: async-lowered nodes (`BinaryExpression` 2,853,
+  `UnaryExpression` 634 - `buf.cryo:541`, `void`/`T*` against `u32`/`&T`),
+  literal widths in a struct literal of an unminted instantiation (`Literal`
+  1,119 - `RefIter::<T> { index: 0 }`, `array.cryo:180`, `i32` against `u64`),
+  a bare generic base on a constructor (`ScopeResolution` 70,
+  `combinator.cryo:282`).
+* Pins: the type check after monomorphization changed **802 -> 22**
+  (like-for-like); the probe of 8.482 over the same run: **142,006 agree,
+  0 disagree**.
+* Demand (ruling 85, not built): with the substituter in demanding mode
+  (`dm.exe`) the seven examples raise no GenericValidation error, and the
+  standard library built alone raises 25 (`ClonedIter<RefIter<SocketAddr>>`
+  and the like, `.objcmp/s100/dm-std.log`): instantiations only a copy's
+  written types name. They are demanded when the pass after
+  monomorphization goes; until then they are built undemanded.
+* Corpus build outcomes identical. verify against HEAD
+  (`.verify/runs/20261003-010835`): census, examples, lsp, cross, incr, blind,
+  flow OK, objects **0 moved**; check-fast failed there on the moved
+  spelling-flow entry alone and passes with it moved. The compiler checks its
+  own source clean; clean build 331 warnings, the same set.

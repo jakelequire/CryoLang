@@ -58,6 +58,7 @@ import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::types::arena::{ TypeArena };
 import compiler::ast::node::{ ASTNode };
 import compiler::types::substitution::{ TypeSubstitution };
+import compiler::types::resolver::{ TypeResolver };
 import compiler::ast::visitor::{ BaseASTVisitor };
 import compiler::ast::postmono_writes::{ PostmonoWrites };
 
@@ -89,6 +90,9 @@ public:
     /// is this name written in" is not a question a name the substituter just
     /// minted has.  Invalid means the annotation keeps today's by-name route.
     spec_typeref:      TypeRef;
+    /// What reduces a projection in a copied expression's type to the type
+    /// the implementation binds; null where a copy's types are not written.
+    types:             TypeResolver*;
 
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     ASTTypeSubstituter(subst: TypeSubstitution*, arena: TypeArena*,
@@ -104,6 +108,7 @@ public:
         this.spec_name         = spec_name;
         this.param_syms        = param_syms;
         this.spec_typeref      = spec_typeref;
+        this.types             = null;
     }
 
     /// The name a rewritten annotation carries beside its argument's
@@ -146,6 +151,34 @@ public:
             return;
         }
         node.set_resolved_callee(CalleePin::None);
+    }
+
+    /// Write a copied expression's type: the type its template's expression
+    /// had, which the clone carries, as this copy sees it (`in_copy`).
+    substitute_type(&this, node: ExpressionNode*) -> void {
+        PostmonoWrites::record_substituted(node, this.subst, this.arena);
+        if (this.subst == null || !node.resolved_type.is_valid()) { return; }
+        node.set_resolved_type(this.in_copy(node.resolved_type));
+    }
+
+    /// `t`, written in the template, as this copy sees it: under the copy's
+    /// substitution, each projection that makes concrete reduced (`types`,
+    /// when given).  Nothing already built is changed, and the
+    /// instantiations this builds are not demanded here.
+    in_copy(&this, t: TypeRef) -> TypeRef {
+        const was: boolean = this.arena.symbolic_no_demand_active;
+        this.arena.set_symbolic_no_demand(true);
+        const out: TypeRef = this.reduced(this.subst.apply(t, this.arena));
+        this.arena.set_symbolic_no_demand(was);
+        return out;
+    }
+
+    /// `t` with each projection whose base is concrete reduced to the type
+    /// the implementation binds, when `types` is given; nothing already
+    /// built is changed.
+    reduced(&this, t: TypeRef) -> TypeRef {
+        if (this.types == null) { return t; }
+        return this.types.reduce_projections(t, false);
     }
 
     /// The same drop for a path's callee - see the overload above.
@@ -637,7 +670,7 @@ public:
     }
 
     override visit(node: CastExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         node.expression.accept(this);
         if (node.target_annotation != null) {
             node.target_annotation = this.substitute_annotation(node.target_annotation);
@@ -648,7 +681,7 @@ public:
     // Expression visitors: rewrite generic_args
 
     override visit(node: CallExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         node.callee.accept(this);
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
             node.arguments[i].accept(this);
@@ -678,7 +711,7 @@ public:
         // template's parameters too, and is this copy's receiver once they
         // are substituted.
         if (node.template_recv.is_valid() && this.subst != null) {
-            node.template_recv = this.subst.apply(node.template_recv, this.arena);
+            node.template_recv = this.reduced(this.subst.apply(node.template_recv, this.arena));
         }
     }
 
@@ -688,14 +721,14 @@ public:
     /// so the monomorphizer's discovery walk can resolve them and pin the
     /// specialized callee. Ordinary identifiers (no turbofish) are untouched.
     override visit(node: IdentifierNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
         }
     }
 
     override visit(node: NewExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         const is_self: boolean = this.names_template(node.res)
             && (node.generic_args.length == 0
                 || this.args_are_outer_param_refs(node.generic_args));
@@ -730,7 +763,7 @@ public:
     }
 
     override visit(node: StructLiteralNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         // A self-reference denotes the enclosing specialization, and it is
         // recorded as the arena id that specialization already has - not by
         // rewriting the spelling to the mangled spec name.  `struct_type`
@@ -768,7 +801,7 @@ public:
     }
 
     override visit(node: ScopeResolutionNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         // ScopeResolution carries TWO arg lists:
         //   * scope_generic_args: args on the scope (`Pair<T>::method`)
         //   * generic_args:       args on the method (`Pair::method<U>`)
@@ -832,7 +865,7 @@ public:
     }
 
     override visit(node: SizeofExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         // Substitute generic params inside the operand annotation
         // (e.g., `HashMapEntry<K, V>` -> `HashMapEntry<S, j>`).
         if (node.type_ann != null) {
@@ -846,7 +879,7 @@ public:
     }
 
     override visit(node: AlignofExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         if (node.type_ann != null) {
             this.substitute_annotation(node.type_ann);
             node.set_operand_type(TypeRef::invalid());
@@ -855,27 +888,27 @@ public:
 
 
     override visit(node: TypeofExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         if (node.operand != null) { node.operand.accept(this); }
     }
 
     override visit(node: DeleteExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         if (node.operand != null) { node.operand.accept(this); }
     }
 
     override visit(node: AwaitExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         if (node.operand != null) { node.operand.accept(this); }
     }
 
     override visit(node: YieldExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         if (node.operand != null) { node.operand.accept(this); }
     }
 
     override visit(node: TryExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         // Monomorphization runs before sema lowers `?`, so only `operand`
         // is populated here; recurse into `desugared` too if a post-sema
         // clone is ever substituted.
@@ -991,7 +1024,7 @@ public:
     // Remaining expression visitors: recurse into children
 
     override visit(node: BinaryExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         node.left.accept(this);
         node.right.accept(this);
         // Rewrite the operator-overload call's stashed type-args (T -> concrete)
@@ -1000,20 +1033,20 @@ public:
     }
 
     override visit(node: UnaryExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         node.operand.accept(this);
         if (node.desugared_call != null) { node.desugared_call.accept(this); }
     }
 
     override visit(node: TernaryExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         node.condition.accept(this);
         node.true_expr.accept(this);
         node.false_expr.accept(this);
     }
 
     override visit(node: IfExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         node.condition.accept(this);
         node.then_expr.accept(this);
         if (node.else_expr != null) {
@@ -1022,7 +1055,7 @@ public:
     }
 
     override visit(node: MatchExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         node.subject.accept(this);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
             this.visit(node.arms[i]);
@@ -1030,7 +1063,7 @@ public:
     }
 
     override visit(node: StaticMatchExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         node.scrutinee = this.substitute_annotation(node.scrutinee);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
             this.visit(node.arms[i]);
@@ -1038,7 +1071,7 @@ public:
     }
 
     override visit(node: ArrayLiteralNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             node.elements[i].accept(this);
         }
@@ -1048,14 +1081,14 @@ public:
     }
 
     override visit(node: TupleLiteralNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             node.elements[i].accept(this);
         }
     }
 
     override visit(node: LambdaExprNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             this.visit(node.parameters[i]);
         }
@@ -1065,7 +1098,7 @@ public:
     }
 
     override visit(node: ArrayAccessNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         node.array.accept(this);
         node.index.accept(this);
         // Rewrite the index-overload call's stashed type-args (T -> concrete)
@@ -1075,7 +1108,7 @@ public:
     }
 
     override visit(node: MemberAccessNode*) -> void {
-        PostmonoWrites::record_substituted(node as ExpressionNode*, this.subst, this.arena);
+        this.substitute_type(node as ExpressionNode*);
         node.object.accept(this);
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);

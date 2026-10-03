@@ -269,6 +269,29 @@ implement struct PostmonoWrites {
         return COPY_CHANGE;
     }
 
+    /// A write on an expression in a copy against the type monomorphization
+    /// wrote there (`entry`): `same` is a write that changes nothing, `none`
+    /// one that fills an expression monomorphization left untyped.
+    static record_copy_entry(arena: TypeArena*, e: ExpressionNode*, entry: TypeRef, result: TypeRef) -> void {
+        const code: u64 = if (!entry.is_valid()) { 2 } else { if (entry.equals(result)) { 0 } else { 1 } };
+        const name: string = match (code) {
+            0 => { "same" }
+            1 => { "change" }
+            _ => { "none" }
+        };
+        const n: ASTNode* = e as ASTNode*;
+        const key: u64 = (200 + code) * 1024 + (n.kind as u64);
+        mut i: i64 = g_postmono_writes.types.row(key);
+        if (i < 0) {
+            i = g_postmono_writes.types.open(key, Text::new("copy-entry\t" + name + "\t" + n.kind.to_string()));
+        }
+        if (g_postmono_writes.types.bump(i) && code == 1) {
+            g_postmono_writes.samples.push(fmt::format("sample\tcopy-entry\t%s\t%s:%u:%u\tentry=%s\tresult=%s",
+                n.kind.to_string(), e.span.file, e.span.start_line, e.span.start_col,
+                PostmonoWrites::display(arena, entry), PostmonoWrites::display(arena, result)));
+        }
+    }
+
     /// The type check after monomorphization wrote `result` on `e`, which
     /// held `entry`.
     static record_type(arena: TypeArena*, e: ExpressionNode*, entry: TypeRef, result: TypeRef) -> void {
@@ -287,6 +310,7 @@ implement struct PostmonoWrites {
             i = g_postmono_writes.types.open(key, Text::new(PostmonoWrites::outcome_name(o) + "\t" + n.kind.to_string()));
         }
         const sampled: boolean = g_postmono_writes.types.bump(i);
+        if (copy) { PostmonoWrites::record_copy_entry(arena, e, entry, result); }
         if (o == BODY_SAME || o == COPY_SAME || o == UNTYPED_SAME) { return; }
         // The site, under its outcome: an outcome is at most 13, and a
         // column past 4095 shares its row with another outcome's.

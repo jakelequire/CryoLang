@@ -65,17 +65,32 @@ public:
     /// a concrete specialization. Read-and-clear via `consume_skip_generics()`.
     skip_generics: boolean;
 
+    /// When true, every cloned expression carries its template's type, for
+    /// the substitution the copy is made under to rewrite.  Off for a clone
+    /// the type check walks again, which types what is untyped and passes
+    /// over what is typed.
+    carries_types: boolean;
+
     ASTCloner() : BaseASTVisitor() {
         this.result        = null;
         this.spec_name     = SymbolStr::empty();
         this.skip_generics = false;
+        this.carries_types = false;
+    }
+
+    /// A cloner for a copy monomorphization makes: its expressions carry
+    /// their template's types.
+    static for_monomorphization() -> ASTCloner {
+        mut c: ASTCloner = ASTCloner();
+        c.carries_types  = true;
+        return c;
     }
 
     /// Create a cloner configured for specialization. The first matching
     /// decl-level visit will apply `name` and drop generic_params.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     static for_specialization(name: SymbolStr) -> ASTCloner {
-        mut c: ASTCloner   = ASTCloner();
+        mut c: ASTCloner   = ASTCloner::for_monomorphization();
         c.spec_name        = name;
         c.skip_generics    = true;
         return c;
@@ -115,7 +130,11 @@ public:
         if (node == null) { return null; }
         node.accept(this);
         PostmonoWrites::record_clone(node, this.result as ExpressionNode*);
-        return this.result as ExpressionNode*;
+        const e: ExpressionNode* = this.result as ExpressionNode*;
+        if (this.carries_types && e != null && !e.resolved_type.is_valid()) {
+            e.set_resolved_type(node.resolved_type);
+        }
+        return e;
     }
 
     /// Clone a statement node (cast wrapper).

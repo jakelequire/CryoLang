@@ -40,7 +40,10 @@ import compiler::resolver::scope::{ ScopeID };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, Res, ResBase, ResSlot };
 import compiler::types::compound;
-import compiler::types::compound::{ PointerType, ReferenceType };
+import compiler::types::compound::{
+    ArrayType, FunctionType, OptionalType, PointerType, ReferenceType, TupleType
+};
+import compiler::types::generic::{ AssocProjectionType, InstantiatedType };
 import compiler::types::type_base;
 import compiler::types::type_base::{ Type };
 import compiler::types::user_defined;
@@ -471,6 +474,92 @@ type struct TypeResolver {
             this.decl_index.def_of(owning_trait, this.arena));
         mut rc: ResolutionContext = ResolutionContext::new("");
         return this.resolve_concrete_member(base_ty, member, owner, &rc);
+    }
+
+    /// `ty` with each associated-type projection whose base is concrete
+    /// replaced by the member type the base's implementation binds
+    /// (`Option<Range<i32>::Item>` is `Option<i32>`), innermost first, so an
+    /// outer projection's base is built from the reduced inner one.  With
+    /// `memo` the answer is also recorded on the projection type, which then
+    /// reads as concrete to every later question about any type holding it;
+    /// without it nothing already built is changed.
+    reduce_projections(&this, ty: TypeRef, memo: boolean) -> TypeRef {
+        if (!ty.is_valid()) { return ty; }
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return ty; }
+        match (t.kind) {
+            TypeKind::AssocProjection => {
+                const proj: AssocProjectionType* = t as AssocProjectionType*;
+                if (proj.resolved_type.is_valid()) { return proj.resolved_type; }
+                const base: TypeRef = this.reduce_projections(proj.base, memo);
+                const reduced: TypeRef = this.concrete_projection(base, proj.member, proj.owning_trait);
+                if (!reduced.is_valid()) { return ty; }
+                if (memo) { proj.set_resolved_type(reduced); }
+                return reduced;
+            }
+            TypeKind::Pointer => {
+                const p: PointerType* = t as PointerType*;
+                const inner: TypeRef = this.reduce_projections(p.pointee, memo);
+                if (inner.equals(p.pointee)) { return ty; }
+                return this.arena.get_pointer_to(inner);
+            }
+            TypeKind::Reference => {
+                const r: ReferenceType* = t as ReferenceType*;
+                const inner: TypeRef = this.reduce_projections(r.referent, memo);
+                if (inner.equals(r.referent)) { return ty; }
+                return this.arena.get_reference_to(inner, r.mutability);
+            }
+            TypeKind::Array => {
+                const a: ArrayType* = t as ArrayType*;
+                const inner: TypeRef = this.reduce_projections(a.element, memo);
+                if (inner.equals(a.element)) { return ty; }
+                return this.arena.get_array_of(inner, a.size);
+            }
+            TypeKind::Optional => {
+                const o: OptionalType* = t as OptionalType*;
+                const inner: TypeRef = this.reduce_projections(o.wrapped, memo);
+                if (inner.equals(o.wrapped)) { return ty; }
+                return this.arena.get_optional_of(inner);
+            }
+            TypeKind::Function => {
+                const f: FunctionType* = t as FunctionType*;
+                const new_ret: TypeRef = this.reduce_projections(f.return_type, memo);
+                mut changed: boolean = !new_ret.equals(f.return_type);
+                mut new_params: TypeRef[] = [];
+                for (mut i: i64 = 0; i < f.param_types.length; i++) {
+                    const np: TypeRef = this.reduce_projections(f.param_types[i], memo);
+                    new_params.push(np);
+                    if (!np.equals(f.param_types[i])) { changed = true; }
+                }
+                if (!changed) { return ty; }
+                return this.arena.get_function(new_ret, new_params, f.is_variadic);
+            }
+            TypeKind::Tuple => {
+                const tup: TupleType* = t as TupleType*;
+                mut changed_t: boolean = false;
+                mut new_elems: TypeRef[] = [];
+                for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                    const ne: TypeRef = this.reduce_projections(tup.elements[i], memo);
+                    new_elems.push(ne);
+                    if (!ne.equals(tup.elements[i])) { changed_t = true; }
+                }
+                if (!changed_t) { return ty; }
+                return this.arena.get_tuple(new_elems);
+            }
+            TypeKind::InstantiatedType => {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                mut changed_i: boolean = false;
+                mut new_args: TypeRef[] = [];
+                for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+                    const na: TypeRef = this.reduce_projections(inst.type_args[i], memo);
+                    new_args.push(na);
+                    if (!na.equals(inst.type_args[i])) { changed_i = true; }
+                }
+                if (!changed_i) { return ty; }
+                return this.arena.create_instantiation(inst.generic_base, new_args);
+            }
+            _ => { return ty; }
+        }
     }
 
     /// The identity a written annotation's head names, off its stamp: a
