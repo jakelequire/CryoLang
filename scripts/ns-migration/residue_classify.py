@@ -186,10 +186,8 @@ CLASS_OF_METHOD = {
         ("J", "member: an overload family's signatures, asked as `lookup_family_entries` is"),
     "DeclarationIndex::lookup_func_type":
         ("J", "member: the signature last registered in an overload family, asked as `lookup_family_entries` is"),
-    "DeclarationIndex::lookup_method_return":
-        ("J", "member: a method's return by its leaf off the owner `TypeRef` in hand; the store is keyed by the owner's arena id"),
     "DeclarationIndex::method_signature_refused":
-        ("J", "member: whether a method's written signature was refused, by its leaf off the owner `TypeRef` in hand; keyed as `lookup_method_return` is"),
+        ("J", "member: whether a method's written signature was refused, by its leaf off the owner `TypeRef` in hand; the store is keyed by the owner's arena id and the leaf"),
     "DeclarationIndex::is_prelude_ns":
         ("J", "module: a namespace asked whether it is the prelude's; a module's identity is its path"),
     "DeclarationIndex::ns_imports":
@@ -201,8 +199,6 @@ CLASS_OF_METHOD = {
     # -- the funnel --
     "TypeUtils::lookup_func_type_exact":
         ("J", "member: the funnel's door onto `DeclarationIndex::lookup_func_type`, an overload family by its owner and leaf"),
-    "TypeUtils::lookup_method_return":
-        ("J", "member: a method's return by its leaf off the owner `TypeRef` in hand (`method_owner_ref` for a wrapper)"),
     # -- the generic registry --
     "GenericRegistry::find_inherent_impl_method":
         ("J", "member: a method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand"),
@@ -247,9 +243,7 @@ EXTERN_LINK_NAME = ("J", "extern: whether this extern block already declares the
 SITE_OVERRIDES = {
     ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_func_type", "param:leaf"):
         ("N", "the funnel's own forwarding body (`lookup_func_type_exact`); its callers are the sites"),
-    ("compiler/sema/type_utils.cryo", "DeclarationIndex::lookup_method_return", "param:method_sym"):
-        ("N", "the funnel's own forwarding body (`lookup_method_return`); its callers are the sites"),
-    ("compiler/sema/sema.cryo", "TypeUtils::lookup_method_return", 'call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> compiler::resolver::symbol_str::SymbolStr of literal:"iter"'):
+    ("compiler/sema/sema.cryo", "DeclarationIndex::lookup_family_entries", 'call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> compiler::resolver::symbol_str::SymbolStr of literal:"iter"'):
         ("J", "member: the for-in protocol's `iter` off a collection that does not implement `Iterator`"),
     # The member tables asked with a leaf the LANGUAGE fixes rather than one
     # the program wrote: the protocols' own variant and method names.

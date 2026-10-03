@@ -85,7 +85,7 @@ yet is recorded with the change that builds it, not here.
 
 ### 2026-10-03
 
-95. **`math::abs<T>` and `math::clamp<T>` are bounded by the standard
+95. *Superseded by ruling 112.* **`math::abs<T>` and `math::clamp<T>` are bounded by the standard
     library's existing ordering and negation traits**: `abs` takes
     `where T: Ord + Neg<T>` and `clamp` takes `where T: Ord`
     (`std::core::cmp::Ord`, `std::core::ops::Neg<Output>`). With the bounds
@@ -144,6 +144,56 @@ yet is recorded with the change that builds it, not here.
      member-function door call that replaces the template registry's
      composed key, **and the spelling-flow check counting a map method's key
      passed as an `arg`** as it counts one passed as a `sarg`, are accepted.
+
+105. **The Python paperwork is removed before the merge**, replaced where
+     a guarantee must survive by a check inside the compiler. This amends
+     ruling 10, which kept the ledger until name resolution was complete,
+     and ruling 18, which kept the scripts until after the merge.
+
+106. **The ledger (`docs/name-resolution.md`) goes before the merge too**,
+     with its status check and its commit hook, as the last paperwork
+     slice.
+
+107. **"The Python" means the migration paperwork and the test plumbing.**
+     General tooling stays: the pin, the self-host check, the release
+     scripts and verify.
+
+108. **Rule three outlives the flow tracer by structure**: the methods of
+     a name-keyed store that take a spelling are private to the module of
+     the door that owns the store, so a spelling reaching the store from
+     anywhere else is a visibility error.
+
+109. **The spelling lint (E0157) becomes "only a door may take a
+     spelling".** The pending allows are deleted, and an allow on a
+     function that takes no spelling is refused.
+
+110. **`--emit=facts` and its readers are deleted.**
+
+111. **`make verify --require-identical` stays until the last
+     name-resolution slice has landed**, and then shrinks to a short make
+     target.
+
+112. **`abs`, `clamp` and `checked_abs` are per-primitive functions**, as
+     Rust's `i32::abs` is, not generic functions with trait bounds: no
+     trait says "a literal converts to `T`", which their bodies need. With
+     them, ruling 82 applies to the standard library. Replaces ruling 95.
+
+     ```cryo
+     const a: i32 = (-5 as i32).abs();
+     ```
+
+113. **Every braced import of a name that is both an item and a module is
+     an error**, aliased or not (`import A::{ B }`, `import A::{ B as C }`),
+     settling rulings 57 and 63 together. E0244's help suggests renaming
+     one of the two rather than the braced form.
+
+114. **The 148 command-line flag entries stay on the spelling-flow list**
+     until the list itself is deleted.
+
+115. **The residue self-test's fixture supplying its own classes is
+     accepted**, and so is the conversion of the method return-type table:
+     each reader reads the return of the method it selects, and a
+     trait-declared method's return comes through the `trait-method` door.
 
 ### 2026-10-02
 

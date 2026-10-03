@@ -165,11 +165,12 @@ type struct MethodBinding {
     /// Mono-after-sema: resolve a method's return type when the receiver is an
     /// unresolved generic instantiation (`Slice<u8>` pre-mono).  Walks the generic
     /// BASE template's method list for an unambiguous non-static non-method-generic
-    /// match (then the DI / trait-default fallback), substituting the receiver's
+    /// match, else reads the return of `chosen`, the method the call's selection
+    /// chose (an impl block's or an enum's), substituting the receiver's
     /// type_args + `This`.  Invalid on 0/ambiguous/own-generic/abstract results.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     resolve_method_return_via_template(mut &this, recv_type: TypeRef,
-                                       method_name: SymbolStr) -> TypeRef {
+                                       method_name: SymbolStr, chosen: MethodNode*) -> TypeRef {
         const inst: InstantiatedType* = this.types.peel_to_instantiation(recv_type);
         if (inst == null) { return TypeRef::invalid(); }
         const tmpl: TemplateEntry* =
@@ -195,16 +196,15 @@ type struct MethodBinding {
             abstract_ret = m.func.resolved_return_type;
         }
 
-        // Impl-block / enum methods: look the return up in the DI on the
-        // generic BASE (still-abstract; substituted concrete below).
-        if (found_count == 0) {
-            const base_ref: TypeRef = this.types.method_owner_ref(inst.generic_base);
-            if (base_ref.is_valid()) {
-                const di_ret: TypeRef = this.types.lookup_method_return(base_ref, method_name);
-                if (di_ret.is_valid()) {
-                    abstract_ret = di_ret;
-                    found_count = 1;
-                }
+        // An impl block's or an enum's method: the one the selection chose,
+        // its return in the owner's parameters (substituted concrete below).
+        // A call the selection chose nothing for has no return to read.
+        if (found_count == 0 && chosen != null && chosen.func != null) {
+            const ret: TypeRef = this.types.canonicalize_method_return(
+                this.ctx.decl_index.entry_owner_return(chosen.func.overload_entry));
+            if (ret.is_valid()) {
+                abstract_ret = ret;
+                found_count = 1;
             }
         }
 
@@ -288,7 +288,7 @@ type struct MethodBinding {
     /// is later substituted.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     abstract_receiver_method_return(mut &this, recv_type: TypeRef, method_name: SymbolStr,
-                                    dir: BoundDirection*) -> TypeRef {
+                                    chosen: MethodNode*, dir: BoundDirection*) -> TypeRef {
         mut walk: TypeRef = recv_type;
         mut t: Type* = this.arena.lookup(walk);
         mut depth: i32 = 0;
@@ -321,7 +321,7 @@ type struct MethodBinding {
         // path returns invalid and the call types as nothing, which an enclosing
         // `await` reports as an operand that does not implement `Future`.
         if (t.kind == TypeKind::InstantiatedType) {
-            return this.resolve_method_return_via_template(walk, method_name);
+            return this.resolve_method_return_via_template(walk, method_name, chosen);
         }
         return TypeRef::invalid();
     }
@@ -503,14 +503,11 @@ type struct MethodBinding {
                 // has only `This` rebased.
                 const bound_def: DefId = if (tr == null) {
                     this.ctx.decl_index.def_of(implied, this.arena) } else { tr.definition() };
-                const owner: TypeRef = if (tr == null) { implied } else {
-                    this.ctx.decl_index.type_of_def(bound_def) };
                 const chain: DefId[] = this.trait_chain(bound_def);
                 const depth: i64 = if (chain.length > 1) { chain.length } else { 1 };
                 for (mut k: i64 = 0; k < depth; k++) {
-                    const asked: TypeRef = if (k == 0) { owner } else {
-                        this.ctx.decl_index.type_of_def(chain[k]) };
-                    const ret: TypeRef = this.types.lookup_method_return(asked, method_name);
+                    const asked: DefId = if (k == 0) { bound_def } else { chain[k] };
+                    const ret: TypeRef = this.trait_declared_return(asked, method_name);
                     if (!ret.is_valid()) { continue; }
                     dir.note(if (k == 0) { bound_def } else { chain[k] });
                     if (need_ret && !out.is_valid()) {
@@ -598,13 +595,22 @@ type struct MethodBinding {
     bound_trait_declaring(mut &this, tr: TraitRef*, method_name: SymbolStr, out_ret: TypeRef*) -> DefId {
         const chain: DefId[] = this.trait_chain(tr.definition());
         for (mut k: i64 = 0; k < chain.length; k++) {
-            const ret: TypeRef = this.types.lookup_method_return(
-                this.ctx.decl_index.type_of_def(chain[k]), method_name);
+            const ret: TypeRef = this.trait_declared_return(chain[k], method_name);
             if (!ret.is_valid()) { continue; }
             *out_ret = ret;
             return chain[k];
         }
         return DefId::invalid();
+    }
+
+    /// The return the trait `trait_def` declares for its method
+    /// `method_name`, found through the `trait-method` door; invalid when it
+    /// declares none.
+    ![allow(lookup_by_spelling, reason = "a method's leaf asked of a trait by identity, through the trait-method door")]
+    trait_declared_return(&this, trait_def: DefId, method_name: SymbolStr) -> TypeRef {
+        const slot: i64 = this.ctx.generic_registry.trait_item_slot(trait_def, method_name);
+        return this.types.canonicalize_method_return(
+            this.ctx.generic_registry.trait_item_return(trait_def, slot));
     }
 
     /// `trait_def` followed by its supertraits, transitively, by identity;
