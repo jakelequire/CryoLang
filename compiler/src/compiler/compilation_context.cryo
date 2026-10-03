@@ -17,9 +17,11 @@ import compiler::mono::monomorphizer;
 import compiler::mono::monomorphizer::{ Monomorphizer };
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, resolver };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, DefTable, DefKind, FamilyOwner };
+import compiler::resolver::res::{ DefId, DefTable, DefKind, FamilyOwner, ResBase };
 import compiler::ast::node::{ ASTNode };
-import compiler::ast::{ NamedAnnotation };
+import compiler::ast::{ NamedAnnotation, NodeKind };
+import compiler::ast::declaration::{ FunctionDeclNode, MethodNode };
+import compiler::types::generic_registry::{ TemplateEntry };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import utils::logger;
@@ -32,7 +34,7 @@ import std::fmt;
 import compiler::artifacts::{ PhaseArtifacts };
 import compiler::compile_mode::{ CompileMode };
 import compiler::const_table::{ ConstantTable };
-import compiler::decl_index::{ DeclarationIndex, GlobalEntry };
+import compiler::decl_index::{ DeclarationIndex, GlobalEntry, OverloadId };
 import compiler::diag::config::{ DiagConfig };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::renderer::{ DiagRenderer, RenderConfig };
@@ -727,6 +729,38 @@ public:
         }
         *out_leaf = name;
         return FamilyOwner::Def(DefId::invalid());
+    }
+
+    /// The template the member `leaf` of `container` is - a generic static
+    /// method on a type, a generic function in a module - read off the
+    /// member-function door's family for that owner: the one entry whose
+    /// definition is a template.  Null when none is, or when several are,
+    /// which only a call's arguments tell apart.  A primitive or a type
+    /// parameter holds no template.
+    ![allow(lookup_by_spelling, reason = "a member's leaf, asked of the owner a path's segment resolved to through the member-function door")]
+    member_template(&this, container: ResBase, leaf: SymbolStr) -> TemplateEntry* {
+        const owner: DefId = match (container) {
+            ResBase::Def(d) => { d }
+            _               => { DefId::invalid() }
+        };
+        if (!owner.is_valid() || !leaf.is_valid()) { return null; }
+        const entries: OverloadId[] = this.decl_index.lookup_family_entries(FamilyOwner::Def(owner), leaf);
+        mut found: TemplateEntry* = null;
+        for (mut i: i64 = 0; i < entries.length; i++) {
+            const decl: ASTNode* = this.decl_index.entry_decl(entries[i]);
+            if (decl == null) { continue; }
+            mut def: DefId = DefId::invalid();
+            if (decl.kind == NodeKind::MethodDeclaration && (decl as MethodNode*).func != null) {
+                def = (decl as MethodNode*).func.def;
+            } else if (decl.kind == NodeKind::FunctionDeclaration) {
+                def = (decl as FunctionDeclNode*).def;
+            }
+            const t: TemplateEntry* = this.generic_registry.template_of(def);
+            if (t == null || t == found) { continue; }
+            if (found != null) { return null; }
+            found = t;
+        }
+        return found;
     }
 
     /// The family owner module `m` is: the module's definition, and the

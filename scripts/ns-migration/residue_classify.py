@@ -212,10 +212,8 @@ CLASS_OF_METHOD = {
         ("J", "member: a method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand"),
     "GenericRegistry::find_inherent_impl_generic_method":
         ("J", "member: a generic method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand"),
-    "GenericRegistry::template_in":
-        ("J", "member: a template declared inside its container - a module's generic function, a type's generic static method - by the leaf written after the path segment; the container is the segment's resolved identity (`ResBase`), never a spelling"),
     "GenericRegistry::member_template_key":
-        ("N", "a key MINTED at the member template's declaration (`Owner::method`) for its registration; the write side of `template_in`"),
+        ("N", "a name MINTED at the member template's declaration (`Owner::method`) for its registration: its display name and its placeholder type's, never a key it is found by"),
     "GenericRegistry::trait_item_slot":
         ("J", "member: a method's leaf inside the trait whose identity a bound stamped on the call, asked once where the call is written, for the position that maps it to an implementation's method with no name after that"),
     "GenericRegistry::find_trait_defining_method":

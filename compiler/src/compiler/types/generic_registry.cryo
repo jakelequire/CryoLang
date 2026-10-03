@@ -28,7 +28,7 @@ import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, DefTable };
-import compiler::resolver::res::{ Res, ResBase };
+import compiler::resolver::res::{ Res };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::ast::{ TypeAnnotation, GenericAnnotation };
@@ -280,7 +280,11 @@ type struct GenericRegistry {
     tmpl_type_indices: i64[];
 
     // -- HashMap indices for O(1) lookup --
-    name_index: HashMap<u32, i64>;      // qualified_name SymbolStr.id -> entry index
+    // The entry each definition's template is, by the definition's slot in
+    // the definition table; -1 for a definition that is no template.  A
+    // generic type and a generic function written under one path are two
+    // definitions and two entries.
+    def_entries: i64[];
     type_index: HashMap<u64, i64>;      // TypeID -> entry index
 
     // -- Instantiation cache --
@@ -395,7 +399,7 @@ type struct GenericRegistry {
             entries:           [],
             tmpl_type_ids:     [],
             tmpl_type_indices: [],
-            name_index:        HashMap::<u32, i64>::new(),
+            def_entries:       [],
             type_index:        HashMap::<u64, i64>::new(),
             cache_keys:        [],
             cache_refs:        [],
@@ -471,20 +475,18 @@ type struct GenericRegistry {
 
     //  Template registration & lookup
 
-    /// Register a template entry.  Deduplicates by qualified_name;
-    /// if an entry with the same name exists, it is overwritten.
+    /// Register a template entry under its definition; a definition
+    /// registered again has its entry overwritten.
     register_template(mut &this, entry: TemplateEntry) -> void {
         // Capture the Copy fields before `entry` is moved into the store.
-        const qname_id:  u32     = entry.qualified_name.id;
+        const def:       DefId   = entry.def;
         const base_type: TypeRef = entry.base_type;
-        const existing: Option<i64> = this.name_index.get(&qname_id);
+        const existing: i64 = this.entry_index_of(def);
 
-        if (existing.is_some()) {
-            // Overwrite existing
-            const i: i64 = existing.unwrap();
-            this.entries[i] = entry;
+        if (existing >= 0) {
+            this.entries[existing] = entry;
             if (base_type.is_valid()) {
-                this.update_type_index(base_type.key(), i);
+                this.update_type_index(base_type.key(), existing);
             }
             return;
         }
@@ -492,7 +494,11 @@ type struct GenericRegistry {
         // New entry
         const idx: i64 = this.entries.length;
         this.entries.push(entry);
-        this.name_index.insert(qname_id, idx);
+        if (def.is_valid()) {
+            const slot: i64 = this.arena.defs.slot(def);
+            while (this.def_entries.length <= slot) { this.def_entries.push(-1); }
+            this.def_entries[slot] = idx;
+        }
 
         if (base_type.is_valid()) {
             this.tmpl_type_ids.push(base_type.key());
@@ -516,16 +522,22 @@ type struct GenericRegistry {
     /// offer took is a fact of the entry, not of any name the caller could
     /// compute.
     register_impl_block(mut &this, target: DefId, block: ImplBlockNode*) -> void {
-        if (!target.is_valid()) { return; }
-        const opt: Option<i64> = this.name_index.get(&this.arena.defs.path_of(target).id);
-        if (opt.is_some()) {
-            const idx: i64 = opt.unwrap();
-            mut entry_ptr: TemplateEntry* = &this.entries[idx];
-            for (mut i: i64 = 0; i < entry_ptr.impl_blocks.length; i++) {
-                if (entry_ptr.impl_blocks[i] == block) { return; }
-            }
-            entry_ptr.impl_blocks.push(block);
+        const idx: i64 = this.entry_index_of(target);
+        if (idx < 0) { return; }
+        mut entry_ptr: TemplateEntry* = &this.entries[idx];
+        for (mut i: i64 = 0; i < entry_ptr.impl_blocks.length; i++) {
+            if (entry_ptr.impl_blocks[i] == block) { return; }
         }
+        entry_ptr.impl_blocks.push(block);
+    }
+
+    /// The position of the entry the definition `def`'s template is, or -1
+    /// when `def` is no template (or is invalid: a primitive, a clone).
+    entry_index_of(&this, def: DefId) -> i64 {
+        if (!def.is_valid()) { return -1; }
+        const slot: i64 = this.arena.defs.slot(def);
+        if (slot < 0 || slot >= this.def_entries.length) { return -1; }
+        return this.def_entries[slot];
     }
 
     /// Record an inherent (non-trait) impl block under its target's type so
@@ -1439,43 +1451,16 @@ type struct GenericRegistry {
     }
 
     /// The template a definition IS, or null when that definition is not a
-    /// template (or is invalid: a primitive, a clone).  The store is keyed by
-    /// the definition's canonical name, and the unwrap happens here, once.
+    /// template (or is invalid: a primitive, a clone).
     template_of(&this, def: DefId) -> TemplateEntry* {
-        if (!def.is_valid()) { return null; }
-        const opt: Option<i64> = this.name_index.get(&this.arena.defs.path_of(def).id);
-        if (opt.is_some()) {
-            return &this.entries[opt.unwrap()];
-        }
-        return null;
+        const idx: i64 = this.entry_index_of(def);
+        if (idx < 0) { return null; }
+        return &this.entries[idx];
     }
 
-    /// The template named `member` inside `container` - a generic free
-    /// function in a module, or a generic static method on a type - or null.
-    /// `container` is what a path's segment resolved to; the member is the
-    /// leaf written after it, read inside its owner as a field is.  A type
-    /// parameter contains no template.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    template_in(&this, container: ResBase, member: SymbolStr) -> TemplateEntry* {
-        if (!member.is_valid() || this.arena == null) { return null; }
-        const owner: SymbolStr = match (container) {
-            ResBase::Def(d)          => { this.arena.defs.path_of(d) }
-            ResBase::PrimTy(n)       => { n }
-            ResBase::GenericParam(_) => { SymbolStr::empty() }
-        };
-        if (!owner.is_valid()) { return null; }
-        const key: SymbolStr = GenericRegistry::member_template_key(
-            this.arena.intern_table, owner, member);
-        const opt: Option<i64> = this.name_index.get(&key.id);
-        if (opt.is_some()) {
-            return &this.entries[opt.unwrap()];
-        }
-        return null;
-    }
-
-    /// The key a template declared as a member of `owner` is registered
-    /// under, `<owner>::<member>`.  One home for the composition, shared by
-    /// the registration and `template_in`, so the two cannot drift.
+    /// The name a template declared as a member of `owner` is registered
+    /// under, `<owner>::<member>`: its display name and the name its
+    /// placeholder type is minted under, never a key it is found by.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     static member_template_key(table: InternTable*, owner: SymbolStr,
                                member: SymbolStr) -> SymbolStr {
