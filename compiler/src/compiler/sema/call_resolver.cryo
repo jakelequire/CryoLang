@@ -1038,12 +1038,19 @@ type struct CallResolver {
             }
             if (inferred_generic_ret.is_valid()) { return inferred_generic_ret; }
             if (call.generic_args.length > 0) {
+                const spec_tmpl: TemplateEntry* = this.spelling_template(ident.res);
                 const spec_sym: SymbolStr = this.resolve_generic_scope_name(
-                    ident.name, call.generic_args, call.span,
-                    this.spelling_template(ident.res));
+                    ident.name, call.generic_args, call.span, spec_tmpl);
                 if (spec_sym.is_valid()) {
-                    mut spec_leaf: SymbolStr = SymbolStr::empty();
-                    const spec_owner: FamilyOwner = this.ctx.minted_family(spec_sym, &spec_leaf);
+                    // A function specialization's family is its template's
+                    // definition; a type's is the module its name is placed in.
+                    mut spec_leaf: SymbolStr = spec_sym;
+                    const spec_owner: FamilyOwner =
+                        if (spec_tmpl != null && spec_tmpl.node_kind == NodeKind::FunctionDeclaration) {
+                            FamilyOwner::Def(spec_tmpl.def)
+                        } else {
+                            this.ctx.minted_family(spec_sym, &spec_leaf)
+                        };
                     call.set_resolved_callee(CalleePin::Family(spec_owner, spec_leaf));
                     const spec_ret: TypeRef = this.family_return_type(spec_owner, spec_leaf);
                     if (spec_ret.is_valid()) { return spec_ret; }
@@ -1384,20 +1391,37 @@ type struct CallResolver {
     /// between same-named generics by the ambient cursor's module and then by
     /// import visibility, both of which the stamp already accounts for.
     ///
-    /// The arity still gates the answer.  A template whose parameter count
-    /// differs from the call's is not this call's template: generic inference
-    /// would otherwise proceed on a mismatched count and return a type, and
-    /// the arity diagnostic that the non-generic path reports would never run.
+    /// The stamp names one definition of the callee's family, and an
+    /// overloaded name has several: the call's is the one its arity admits,
+    /// read off the family (the member-function door, by the definition's
+    /// owner and leaf).  A template whose parameter count differs from the
+    /// call's is not this call's template: generic inference would otherwise
+    /// proceed on a mismatched count and return a type, and the arity
+    /// diagnostic that the non-generic path reports would never run.  Two
+    /// declarations of the call's arity are for the overload selection to
+    /// tell apart, and name no template here.
     find_fn_template_for_call(&this, ident: IdentifierNode*, argc: i64) -> TemplateEntry* {
         // The name layer answers every bare callee - a binding, or `Err`
         // for one it refused - so a slot with no answer is a defect the door
         // records; measured at 0 over the corpus before the door went in.
-        const t: TemplateEntry* = this.lookup_scope_template(
-            ident.res.require(Text::new("call_resolver:free-call template")));
+        const r: Res = ident.res.require(Text::new("call_resolver:free-call template"));
+        const t: TemplateEntry* = this.lookup_scope_template(r);
         if (t == null || t.node_kind != NodeKind::FunctionDeclaration) { return null; }
-        const f: FunctionDeclNode* = t.ast_node as FunctionDeclNode*;
-        if (f == null || f.parameters.length != argc) { return null; }
-        return t;
+        const entries: OverloadId[] = this.family_entries(r.def_id());
+        mut fits: FunctionDeclNode* = null;
+        mut count: i64 = 0;
+        for (mut i: i64 = 0; i < entries.length; i++) {
+            const d: ASTNode* = this.ctx.decl_index.entry_decl(entries[i]);
+            if (d == null || d.kind != NodeKind::FunctionDeclaration) { continue; }
+            const f: FunctionDeclNode* = d as FunctionDeclNode*;
+            if (f.parameters.length != argc) { continue; }
+            fits = f;
+            count = count + 1;
+        }
+        if (count != 1) { return null; }
+        const chosen: TemplateEntry* = this.ctx.generic_registry.template_of(fits.def);
+        if (chosen == null || chosen.node_kind != NodeKind::FunctionDeclaration) { return null; }
+        return chosen;
     }
 
     /// A bare / negated / arithmetic-constant numeric literal is polymorphic for
@@ -6888,7 +6912,10 @@ type struct CallResolver {
                     spec_sym = this.resolve_generic_scope_name(base, call.generic_args, call.span, tmpl);
                 }
                 if (spec_sym.is_valid()) {
-                    spec_owner = this.ctx.minted_family(spec_sym, &spec_leaf);
+                    // A function specialization's family is its template's
+                    // definition, the one its clone registers in.
+                    spec_owner = FamilyOwner::Def(tmpl.def);
+                    spec_leaf = spec_sym;
                 }
             }
             if (spec_leaf.is_valid()) {
