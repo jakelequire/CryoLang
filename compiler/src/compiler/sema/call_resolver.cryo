@@ -7135,14 +7135,19 @@ type struct CallResolver {
     }
 
     /// Resolve a generic scope-call return (`Result::ok`) to the concrete
-    /// specialization, from explicit scope args or the expected type.
+    /// specialization, from explicit scope args or the expected type.  The
+    /// owner's written arguments are substituted into whatever the return
+    /// is - an instantiation (`Result<Arc<T, A>, E>`), a bare parameter
+    /// (`-> T`), a pointer to one (`-> T*`); the expected type answers only
+    /// an instantiation of the generic it names.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     try_resolve_generic_return(mut &this, ret: TypeRef, scope_name: SymbolStr,
                                member_name: SymbolStr, scope: ScopeResolutionNode*) -> TypeRef {
         const ret_t: Type* = this.arena.lookup(ret);
-        if (ret_t == null || ret_t.kind != TypeKind::InstantiatedType) { return ret; }
-        const ret_inst: InstantiatedType* = ret_t as InstantiatedType*;
-        if (ret_inst.is_resolved()) { return ret; }
+        if (ret_t == null) { return ret; }
+        const instantiated: boolean = ret_t.kind == TypeKind::InstantiatedType;
+        if (instantiated && (ret_t as InstantiatedType*).is_resolved()) { return ret; }
+        if (!instantiated && !this.types.contains_generic_param(ret)) { return ret; }
         // Turbofish owner args (`Arc<Thing, GlobalAlloc>::try_new`): map them to the
         // OWNER's generic params and substitute throughout the return type. This
         // handles BOTH a return that IS the owner (`-> Arc<T, A>`) and one where the
@@ -7177,7 +7182,8 @@ type struct CallResolver {
                 }
             }
         }
-        if (!this.state.expected_type.is_valid()) { return ret; }
+        if (!instantiated || !this.state.expected_type.is_valid()) { return ret; }
+        const ret_inst: InstantiatedType* = ret_t as InstantiatedType*;
         mut exp_ref: TypeRef = this.state.expected_type;
         mut exp_t: Type* = this.arena.lookup(exp_ref);
         if (exp_t != null && exp_t.kind == TypeKind::TypeAlias) {
