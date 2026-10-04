@@ -774,6 +774,35 @@ type struct CallResolver {
             FamilyOwner::Def(this.ctx.defs.parent_of(callee)), this.ctx.defs.leaf_of(callee));
     }
 
+    /// The entry of the bare callee's family that a call passing capturing
+    /// closures selects, by the one selection a call's arguments make
+    /// (`select_family_overload`), each closure argument standing for the
+    /// function type it is called as - what the function-typed parameter it
+    /// is passed to must be.  Invalid when the call is pinned already,
+    /// passes no closure, or no signature accepts it.
+    closure_call_entry(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> OverloadId {
+        if (call == null || call.resolved_callee.is_some()) { return OverloadId::invalid(); }
+        mut arg_types: TypeRef[] = [];
+        mut any_closure: boolean = false;
+        for (mut ai: i64 = 0; ai < call.arguments.length; ai++) {
+            const arg: ExpressionNode* = call.arguments[ai];
+            if (arg == null) { return OverloadId::invalid(); }
+            const called_as: TypeRef = this.lambda.closure_call_type(arg.resolved_type);
+            if (called_as.is_valid()) { any_closure = true; }
+            arg_types.push(if (called_as.is_valid()) { called_as } else { arg.resolved_type });
+        }
+        if (!any_closure) { return OverloadId::invalid(); }
+        const entries: OverloadId[] = this.family_entries(this.callee_def(ident));
+        if (entries.length == 0) { return OverloadId::invalid(); }
+        mut overloads: TypeRef[] = [];
+        for (mut ei: i64 = 0; ei < entries.length; ei++) {
+            overloads.push(this.ctx.decl_index.entry_signature(entries[ei]));
+        }
+        const oi: i64 = this.select_family_overload(&overloads, &arg_types);
+        if (oi < 0) { return OverloadId::invalid(); }
+        return entries[oi];
+    }
+
     /// The parameter types a call of `argc` arguments to an overloaded
     /// family hints its arguments with: at each position, the type every
     /// signature of that arity agrees on, and none where they differ.  A
@@ -992,7 +1021,7 @@ type struct CallResolver {
 
         if (callee_node.kind == NodeKind::Identifier) {
             const ident: IdentifierNode* = callee as IdentifierNode*;
-            this.lambda.try_specialize_for_closure_args(call, ident);
+            this.lambda.try_specialize_for_closure_args(call, ident, this.closure_call_entry(call, ident));
 
             const inferred_generic_ret: TypeRef = this.check_generic_free_call(call, ident);
 
