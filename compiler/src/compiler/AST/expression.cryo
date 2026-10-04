@@ -15,6 +15,9 @@ import compiler::ast::node;
 import compiler::ast::node::{ ASTNode };
 import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
+import compiler::types::{ TypeKind };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::type_base::{ Type };
 import compiler::resolver::symbol_str;
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res;
@@ -514,6 +517,46 @@ public:
 
     add_argument(arg: ExpressionNode*) -> void {
         this.arguments.push(arg);
+    }
+
+    /// Record how each argument binds to the parameter it lands on.
+    ///
+    /// Two separate answers come out of the same parameter type:
+    ///   - `arg_binding` is the OWNERSHIP answer the move passes need.  A `&T`
+    ///     or `T*` parameter only ever receives an address, so the callee takes
+    ///     no ownership of the pointee; a bare `T` parameter receives the value
+    ///     and drops its own copy.
+    ///   - `autoref` is the narrower CODEGEN directive: take the address of a
+    ///     by-value argument standing in a `&T` slot.  A `T*` parameter needs no
+    ///     such fixup (the argument is already an address), which is why it must
+    ///     not be used to answer the ownership question - doing so classified
+    ///     every pointer-parameter argument as a by-value transfer.
+    ///
+    /// Arguments past the declared parameters (a variadic tail) are left
+    /// unclassified, which the move passes read as a transfer.
+    bind_arguments(arena: TypeArena*, param_types: &TypeRef[]) -> void {
+        const lim: i64 = if (param_types.length < this.arguments.length) {
+            param_types.length
+        } else {
+            this.arguments.length
+        };
+        for (mut j: i64 = 0; j < lim; j++) {
+            const arg: ExpressionNode* = this.arguments[j];
+            if (arg == null) { continue; }
+            const pt: Type* = arena.lookup(param_types[j]);
+            if (pt == null) { continue; }
+            if (pt.kind != TypeKind::Reference && pt.kind != TypeKind::Pointer) {
+                arg.arg_binding = ArgBinding::ByValue;
+                continue;
+            }
+            arg.arg_binding = ArgBinding::Borrowed;
+            if (pt.kind == TypeKind::Reference) {
+                const at: Type* = arena.lookup(arg.resolved_type);
+                if (at == null || (at.kind != TypeKind::Reference && at.kind != TypeKind::Pointer)) {
+                    arg.autoref = true;
+                }
+            }
+        }
     }
 
     /// Replace the argument at `idx` in place.  Used by sema when it

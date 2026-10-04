@@ -18,7 +18,7 @@ namespace compiler::mono::call_specializer;
 
 import compiler::ast;
 import compiler::ast::{
-    declaration, expression, MemberPin, node, NodeKind, pattern, statement, TraitBound,
+    ArgBinding, declaration, expression, MemberPin, node, NodeKind, pattern, statement, TraitBound,
     TraitRef, TypeAnnotation
 };
 import compiler::types::{
@@ -398,6 +398,7 @@ type struct MonoCallSpecializer {
                 }
                 this.specialize_free_call(call, res_ctx, subst);
                 this.specialize_method_call(call, subst);
+                this.bind_call_arguments(call);
             }
             NodeKind::BinaryExpression => {
                 const be: BinaryExprNode* = expr as BinaryExprNode*;
@@ -1329,6 +1330,39 @@ type struct MonoCallSpecializer {
         if (m == null || m.func == null || m.func.generic_params.length > 0
                 || m.func.is_self_returning_default || m.func.is_lazy_self_growing) { return; }
         this.pin_spec_entry(call, m.func.overload_entry);
+        this.bind_call_arguments(call);
+    }
+
+    /// Bind the arguments of a call pinned to a declaration to that
+    /// declaration's parameters (`CallExprNode::bind_arguments`): a method's
+    /// own parameters after its receiver for a call written on a receiver,
+    /// every parameter for a call through a path or a name.  A call whose
+    /// arguments are bound already - where it is written, outside a copy -
+    /// is left as it is.
+    bind_call_arguments(&this, call: CallExprNode*) -> void {
+        const e: OverloadId = call.resolved_callee.decl_entry();
+        if (!e.is_valid() || call.arguments.length == 0) { return; }
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const a: ExpressionNode* = call.arguments[i];
+            if (a != null && a.arg_binding != ArgBinding::Unclassified) { return; }
+        }
+        const m: MethodNode* = this.decl_index.entry_method(e);
+        mut params: TypeRef[] = [];
+        if (m != null && m.func != null) {
+            const on_receiver: boolean = (call.callee as ASTNode*).kind == NodeKind::MemberAccess;
+            for (mut i: i64 = 0; i < m.func.parameters.length; i++) {
+                const p: VarDeclNode* = m.func.parameters[i];
+                if (p == null) { return; }
+                if (on_receiver && p.is_receiver()) { continue; }
+                params.push(p.resolved_type);
+            }
+        } else {
+            const ft: Type* = this.arena.lookup(this.decl_index.entry_signature(e));
+            if (ft == null || ft.kind != TypeKind::Function) { return; }
+            const fn_t: FunctionType* = ft as FunctionType*;
+            for (mut i: i64 = 0; i < fn_t.param_types.length; i++) { params.push(fn_t.param_types[i]); }
+        }
+        call.bind_arguments(this.arena, &params);
     }
 
     /// Bind each queued call whose receiver or owner is now minted, by the
