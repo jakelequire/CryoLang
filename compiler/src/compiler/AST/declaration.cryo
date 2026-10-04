@@ -466,12 +466,13 @@ public:
     /// that define a same-named method for the same type mangle identically
     /// and collide at link time.  See `MangledName::for_method_or_trait_impl`.
     origin_trait:           DefId;
-    /// The associated type an `async` TRAIT method's future is bound through
-    /// (`read` -> `ReadFut`), recorded by the desugar that minted it on the
-    /// trait's declaration - the one place the name is made.  Empty on every
-    /// other function.  A reader that needs it reads it here rather than
-    /// minting the name again from the method's leaf.
-    async_fut_assoc:        SymbolStr;
+    /// The position, among its trait's associated types, of the associated
+    /// type an `async` TRAIT method's future is bound through (`read` ->
+    /// `ReadFut`), recorded by the desugar that minted it on the trait's
+    /// declaration - the one place the name is made.  -1 on every other
+    /// function.  A reader that needs it reads it here rather than minting
+    /// the name again from the method's leaf.
+    async_fut_slot:         i64;
     /// Concrete type arguments of a generic-METHOD specialization (`m<T>` with
     /// `T = i64`), set by the monomorphizer's `specialize_method` on the cloned
     /// spec.  Empty on every template / non-spec function.  Folded into the
@@ -550,7 +551,7 @@ public:
         this.return_type_annotation = null;
         this.resolved_return_type   = TypeRef::invalid();
         this.origin_trait           = DefId::invalid();
-        this.async_fut_assoc        = SymbolStr::empty();
+        this.async_fut_slot         = -1;
         this.spec_type_args         = [];
         this.overload_entry         = OverloadId::invalid();
         this.is_specialization      = false;
@@ -592,8 +593,7 @@ public:
     set_return_type_annotation(a: TypeAnnotation*) -> void  { this.return_type_annotation = a; }
     set_resolved_return_type(t: TypeRef) -> void             { this.resolved_return_type = t; }
     set_origin_trait(t: DefId) -> void                       { this.origin_trait = t; }
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    set_async_fut_assoc(a: SymbolStr) -> void                { this.async_fut_assoc = a; }
+    set_async_fut_slot(s: i64) -> void                       { this.async_fut_slot = s; }
     set_spec_type_args(a: TypeRef[]) -> void                 { this.spec_type_args = a; }
     set_overload_entry(e: OverloadId) -> void                { this.overload_entry = e; }
 
@@ -1243,13 +1243,18 @@ public:
         this.assoc_types.push(decl);
     }
 
-    /// The position of the associated type named `n` among the trait's
-    /// associated types, or -1 if the trait declares none such.  The
-    /// position is what the sugar's positional trait arguments are indexed
-    /// by (the generic parameters first, then the associated types in
-    /// declaration order), so it is the answer every projection reader
-    /// needs before the node itself.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
+    /// Door `assoc-type`.  An associated type is named by its leaf where a
+    /// projection is written (`I::Item`, `This::Item`), where an
+    /// implementation binds it (`type Item = i32;`), and where a trait's
+    /// `async` method's future is minted; each meets the trait's declaration
+    /// only by that leaf, and this is where the leaf becomes the type's
+    /// position among the trait's associated types, which every later
+    /// reader asks by instead.
+    ///
+    /// The position is what the sugar's positional trait arguments are
+    /// indexed by after the generic parameters.  Answers the first declared
+    /// associated type of the name, or -1 when the trait declares none.
+    ![allow(lookup_by_spelling, reason = "an associated type's leaf becomes its position in the trait here, the one place a written projection or binding is matched to the trait's declaration")]
     assoc_type_index(&this, n: SymbolStr) -> i64 {
         for (mut i: i64 = 0; i < this.assoc_types.length; i++) {
             if (this.assoc_types[i] != null && this.assoc_types[i].name.equals(n)) { return i; }
@@ -1261,13 +1266,6 @@ public:
     /// its associated types.
     slot_count(&this) -> i64 {
         return this.generic_params.length + this.assoc_types.length;
-    }
-
-    /// The associated-type decl named `n`, or null if the trait has none such.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    lookup_assoc_type(&this, n: SymbolStr) -> AssocTypeDeclNode* {
-        const i: i64 = this.assoc_type_index(n);
-        return if (i < 0) { null } else { this.assoc_types[i] };
     }
 
     /// The trait's method named `n`, or null if it declares none such; the
@@ -1545,7 +1543,12 @@ public:
     ///     generic params and 1 associated type, `implement Iterator<A> for X`
     ///     binds `Item := A` (see the desugar in TypeResolution).
     /// `TypeAnnotation::Projection(This::Item)` resolves through these.
+    /// A binding is read by its position among the trait's associated types
+    /// (`assoc_binding_slots`): a written one is placed through the
+    /// `assoc-type` door the first time the block is asked, and a writer that
+    /// already holds the position records it with no name.  -1 is unplaced.
     assoc_binding_names:       SymbolStr[];
+    assoc_binding_slots:       i64[];
     assoc_binding_annotations: TypeAnnotation*[];
 
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
@@ -1566,6 +1569,7 @@ public:
         this.derived_param_syms    = [];
         this.derived_param_types   = [];
         this.assoc_binding_names       = [];
+        this.assoc_binding_slots       = [];
         this.assoc_binding_annotations = [];
     }
 
@@ -1715,16 +1719,32 @@ public:
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     add_assoc_binding(mut &this, name: SymbolStr, ann: TypeAnnotation*) -> void {
         this.assoc_binding_names.push(name);
+        this.assoc_binding_slots.push(-1);
         this.assoc_binding_annotations.push(ann);
     }
 
-    /// The annotation bound for associated type `name`, or null if unbound.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    lookup_assoc_binding(&this, name: SymbolStr) -> TypeAnnotation* {
-        for (mut i: i64 = 0; i < this.assoc_binding_names.length; i++) {
-            if (this.assoc_binding_names[i].equals(name)) {
-                return this.assoc_binding_annotations[i];
+    /// Record a binding for the trait's `slot`-th associated type, by a
+    /// writer that holds the position (the positional header, a lowering
+    /// that minted the type).
+    bind_assoc_slot(mut &this, slot: i64, ann: TypeAnnotation*) -> void {
+        this.assoc_binding_names.push(SymbolStr::empty());
+        this.assoc_binding_slots.push(slot);
+        this.assoc_binding_annotations.push(ann);
+    }
+
+    /// The annotation this block binds `tdecl`'s `slot`-th associated type
+    /// to, or null when it binds none.  `tdecl` is the block's trait; a
+    /// written binding is placed through the `assoc-type` door here, and one
+    /// naming no associated type of the trait stays unplaced - the trait may
+    /// still gain the type it names (an `async` method's future is declared
+    /// on the trait by a later desugar).
+    assoc_binding_at(mut &this, tdecl: TraitDeclNode*, slot: i64) -> TypeAnnotation* {
+        if (tdecl == null || slot < 0) { return null; }
+        for (mut i: i64 = 0; i < this.assoc_binding_slots.length; i++) {
+            if (this.assoc_binding_slots[i] < 0 && this.assoc_binding_names[i].is_valid()) {
+                this.assoc_binding_slots[i] = tdecl.assoc_type_index(this.assoc_binding_names[i]);
             }
+            if (this.assoc_binding_slots[i] == slot) { return this.assoc_binding_annotations[i]; }
         }
         return null;
     }
@@ -1738,7 +1758,7 @@ public:
     /// in either of the two places the language allows.  Reading the header
     /// alone left a body-bound impl with no answer, so an adapter over it
     /// (`TakeIter<Count>`) derived nothing and was never specialized.
-    trait_slot_annotation(&this, tdecl: TraitDeclNode*, slot: i64) -> TypeAnnotation* {
+    trait_slot_annotation(mut &this, tdecl: TraitDeclNode*, slot: i64) -> TypeAnnotation* {
         if (tdecl == null || slot < 0) { return null; }
         if (this.trait_annotation != null) {
             match (*this.trait_annotation) {
@@ -1750,9 +1770,8 @@ public:
         }
         const assoc_idx: i64 = slot - tdecl.generic_params.length;
         if (assoc_idx < 0 || assoc_idx >= tdecl.assoc_types.length) { return null; }
-        const adecl: AssocTypeDeclNode* = tdecl.assoc_types[assoc_idx];
-        if (adecl == null) { return null; }
-        return this.lookup_assoc_binding(adecl.name);
+        if (tdecl.assoc_types[assoc_idx] == null) { return null; }
+        return this.assoc_binding_at(tdecl, assoc_idx);
     }
 }
 

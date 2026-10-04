@@ -205,10 +205,10 @@ type struct TypeResolutionRunner {
             if (adecl != null) {
                 const arg_ty: TypeRef = this.resolver.resolve(gen.args[0], res_ctx);
                 if (arg_ty.is_valid()) {
-                    res_ctx.add_assoc_binding(adecl.name, arg_ty);
+                    res_ctx.add_assoc_binding(trait_id, 0, arg_ty);
                 }
-                if (impl_node.lookup_assoc_binding(adecl.name) == null) {
-                    impl_node.add_assoc_binding(adecl.name, gen.args[0]);
+                if (impl_node.assoc_binding_at(trait_decl, 0) == null) {
+                    impl_node.bind_assoc_slot(0, gen.args[0]);
                 }
             }
         }
@@ -283,13 +283,13 @@ type struct TypeResolutionRunner {
         for (mut i: i64 = 0; i < trait_decl.assoc_types.length; i++) {
             const adecl: AssocTypeDeclNode* = trait_decl.assoc_types[i];
             if (adecl == null) { continue; }
-            if (impl_node.lookup_assoc_binding(adecl.name) != null) { continue; }
+            if (impl_node.assoc_binding_at(trait_decl, i) != null) { continue; }
             // The implicit `<Method>Fut` of an `async` trait method is bound by
             // the impl's own `async` method, not written by the user — and that
             // binding is added by the sema-time lowering, which has not run yet.
             // Requiring it here would make every async trait impl an error.
             if (TypeResolutionPasses::impl_binds_assoc_via_async(
-                    impl_node, trait_decl, adecl.name, this.ctx)) { continue; }
+                    impl_node, trait_decl, i, this.ctx)) { continue; }
             const aname: string = intern.resolve(adecl.name);
             this.ctx.emit_error_at(
                 ErrorCode::E0309_ASSOC_TYPE_NOT_BOUND,
@@ -1632,8 +1632,9 @@ type struct TypeResolutionPasses {
     /// bound to: `read` -> `ReadFut`, `read_exact` -> `ReadExactFut`. Each
     /// `_`-separated word is capitalised and the separators dropped, so the name
     /// reads as an ordinary Cryo type and cannot collide with the method name.
-    /// Minted ONCE, by `desugar_async_trait_methods`, and recorded on the
-    /// method (`FunctionDeclNode.async_fut_assoc`) for every later reader.
+    /// Minted ONCE, by `desugar_async_trait_methods`, which records its
+    /// position on the method (`FunctionDeclNode.async_fut_slot`) for every
+    /// later reader.
     /// Case-mapped through explicit alphabet tables rather than char arithmetic:
     /// `CharType` is 4 bytes here while the stdlib treats a char as 1, so
     /// `c - 32` is not a portable way to upper-case in this codebase.
@@ -1659,23 +1660,22 @@ type struct TypeResolutionPasses {
         return ctx.intern(fmt::format("%sFut", out));
     }
 
-    /// Whether `assoc` is the implicit future type of an `async` trait method
-    /// that `impl_node` supplies — either with its own `async` method, or with a
-    /// default body inherited from the trait.
+    /// Whether the trait's `slot`-th associated type is the implicit future
+    /// type of an `async` trait method that `impl_node` supplies — either with
+    /// its own `async` method, or with a default body inherited from the trait.
     ///
     /// Such a binding is added by the sema-time async lowering (which mints the
     /// future struct), long after E0309 runs, so the check has to recognise it
     /// as satisfied here rather than demanding the user write it.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     static impl_binds_assoc_via_async(impl_node: ImplBlockNode*, trait_decl: TraitDeclNode*,
-                                      assoc: SymbolStr, ctx: CompilationContext*) -> boolean {
+                                      slot: i64, ctx: CompilationContext*) -> boolean {
         if (impl_node == null || trait_decl == null || ctx == null) { return false; }
         for (mut ti: i64 = 0; ti < trait_decl.methods.length; ti++) {
             const tfunc: FunctionDeclNode* = trait_decl.methods[ti];
             if (tfunc == null || !tfunc.is_async) { continue; }
             // The associated type the desugar recorded on the method; not
             // minted again from the leaf.
-            if (!tfunc.async_fut_assoc.equals(assoc)) { continue; }
+            if (tfunc.async_fut_slot != slot) { continue; }
             // The impl overrides it with its own `async` method...
             for (mut mi: i64 = 0; mi < impl_node.methods.length; mi++) {
                 const m: MethodNode* = impl_node.methods[mi];
@@ -1723,7 +1723,8 @@ type struct TypeResolutionPasses {
             // A trait may legitimately declare the associated type itself; only
             // synthesize the one that is missing, so an explicit `type ReadFut;`
             // keeps its declaration-site bounds.
-            if (node.lookup_assoc_type(assoc) == null) {
+            mut slot: i64 = node.assoc_type_index(assoc);
+            if (slot < 0) {
                 mut adecl: AssocTypeDeclNode* =
                     libc::malloc(sizeof(AssocTypeDeclNode)) as AssocTypeDeclNode*;
                 *adecl = AssocTypeDeclNode {
@@ -1732,12 +1733,13 @@ type struct TypeResolutionPasses {
                     span:   func.span,
                 };
                 node.add_assoc_type(adecl);
+                slot = node.assoc_types.length - 1;
             }
-            // The name is made here and nowhere else: the method carries it
-            // for every reader that would otherwise mint it again.
-            func.set_async_fut_assoc(assoc);
+            // The name is made here and nowhere else: the method carries its
+            // position for every reader that would otherwise mint it again.
+            func.set_async_fut_slot(slot);
             func.set_resolved_return_type(
-                arena.create_assoc_projection(this_ty, assoc, trait_ref));
+                arena.create_assoc_projection(this_ty, assoc, trait_ref, slot));
         }
     }
 

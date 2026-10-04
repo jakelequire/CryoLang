@@ -78,14 +78,10 @@ END = "<!-- residue-table:end -->"
 # holds must be here; a method here the tree no longer declares is refused.
 CLASS_OF_METHOD = {
     # -- member tables inside their owner (rule 1b's justified kind) --
-    "ImplBlockNode::lookup_assoc_binding":
-        ("J", "member: the impl's own `This::Member` binding by the member's leaf, asked from inside the block"),
     "ImplBlockNode::set_target_type":
         ("N", "a write: the specialized impl's target name stored on the node"),
     "TraitType::add_assoc_type":
         ("N", "a write: the trait's own associated-type name recorded on the trait type"),
-    "ResolutionContext::lookup_assoc_binding":
-        ("J", "member: the `This::Member` binding of the impl being resolved, by leaf"),
     "ResolutionContext::new":
         ("N", "a constructor: the string is the SOURCE FILE the context resolves in"),
     # -- the member tables of the user-defined types: an array of records
@@ -105,10 +101,8 @@ CLASS_OF_METHOD = {
         ("J", "member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen"),
     "EnumType::get_method":
         ("J", "member: an enum's method by its leaf off the `EnumType` in hand"),
-    "TraitDeclNode::lookup_assoc_type":
-        ("J", "member: the trait's own associated type by its leaf, asked from the trait node in hand"),
     "TraitDeclNode::assoc_type_index":
-        ("J", "member: the trait's own associated type's position by its leaf, asked from the trait node in hand - the index the positional trait arguments are read by"),
+        ("J", "member: the `assoc-type` door - the trait's own associated type's position by its leaf, asked from the trait node in hand where a projection or a binding is written; every later reader asks by the position"),
     "TraitDeclNode::lookup_method":
         ("J", "member: the trait's own method by its leaf, asked from the trait node in hand"),
     # -- the same tables scanned INLINE (rule 1c): the door's loop written at
@@ -157,8 +151,6 @@ CLASS_OF_METHOD = {
         ("J", "member: a struct literal's written initializer by the field's leaf, scanned inline"),
     "DestructureDeclNode::bindings[]":
         ("J", "member: a destructure's written binding by the source field's leaf (which binding takes a field), scanned inline"),
-    "ImplBlockNode::assoc_binding_names[]":
-        ("J", "member: the impl's own `This::Member` binding by the member's leaf (the door's body; own file only)"),
     "LambdaExprNode::captured_names[]":
         ("J", "member: the lambda's captured names, asked whether one is captured (own file only)"),
     # -- local tables: the owner out of view, the element says what it is --

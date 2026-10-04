@@ -249,24 +249,24 @@ type struct MethodBinding {
     /// (`This::Item`) and an enclosing where-bound constrains that same
     /// projection (`where This::Item: Ord`), resolve `method_name` through the
     /// bound trait(s). The bound is matched to the receiver by the projected
-    /// MEMBER name, which distinguishes e.g. `This::Item` from `This::Key`
-    /// inside one method's where-clause.  `dir` notes every trait the
-    /// bounds answer through, as for a bare parameter.
+    /// associated type - its trait and position there - which distinguishes
+    /// e.g. `This::Item` from `This::Key` inside one method's where-clause.
+    /// `dir` notes every trait the bounds answer through, as for a bare
+    /// parameter.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     lookup_method_through_projection_bounds(mut &this, proj: AssocProjectionType*,
                                             recv: TypeRef,
                                             method_name: SymbolStr, dir: BoundDirection*) -> TypeRef {
         if (proj == null) { return TypeRef::invalid(); }
-        const member: SymbolStr = proj.member;
-        if (!member.is_valid()) { return TypeRef::invalid(); }
+        if (!proj.member.is_valid()) { return TypeRef::invalid(); }
         mut out: TypeRef = TypeRef::invalid();
         if (this.state.symbolic_current_func != null) {
-            out = this.scan_projection_bounds(&this.state.symbolic_current_func.trait_bounds, member,
+            out = this.scan_projection_bounds(&this.state.symbolic_current_func.trait_bounds, proj,
                 method_name, recv, true, dir);
         }
         if (this.state.symbolic_impl_node != null) {
             const r: TypeRef = this.scan_projection_bounds(&this.state.symbolic_impl_node.where_bounds,
-                member, method_name, recv, !out.is_valid(), dir);
+                proj, method_name, recv, !out.is_valid(), dir);
             if (!out.is_valid()) { out = r; }
         }
         return out;
@@ -688,18 +688,19 @@ type struct MethodBinding {
         return [];
     }
 
-    /// Search `bounds` for a projection-subject bound whose projected member
-    /// equals `member`; return the first bound-trait method return for
-    /// `method_name`. Mirrors the trait-scan in `lookup_method_through_bounds`.
+    /// Search `bounds` for a projection-subject bound whose projected
+    /// associated type is `proj`'s; return the first bound-trait method
+    /// return for `method_name`. Mirrors the trait-scan in
+    /// `lookup_method_through_bounds`.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    scan_projection_bounds(mut &this, bounds: &TraitBound[], member: SymbolStr,
+    scan_projection_bounds(mut &this, bounds: &TraitBound[], proj: AssocProjectionType*,
                            method_name: SymbolStr, recv: TypeRef, need_ret: boolean,
                            dir: BoundDirection*) -> TypeRef {
         mut out: TypeRef = TypeRef::invalid();
         for (mut bi: i64 = 0; bi < bounds.length; bi++) {
             const b: TraitBound* = &bounds[bi];
             if (b.subject_type == null) { continue; }
-            if (!this.projection_ann_member(b.subject_type).equals(member)) { continue; }
+            if (!this.bound_subject_is(b.subject_type, proj)) { continue; }
             for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
                 const tr: TraitRef* = &b.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
@@ -768,6 +769,7 @@ type struct MethodBinding {
             const by_param: TypeSubstitution = TypeSubstitution::from_params(&params, &args);
             out = by_param.apply(out, this.arena);
         }
+        const trait_ty: TypeRef = this.ctx.decl_index.type_of_def(tr.definition());
         for (mut a: i64 = 0; a < tdecl.assoc_types.length; a++) {
             const decl: AssocTypeDeclNode* = tdecl.assoc_types[a];
             if (decl == null) { continue; }
@@ -775,64 +777,63 @@ type struct MethodBinding {
             if (idx < 0 || idx >= tr.type_args.length) { continue; }
             const arg: TypeRef = this.ctx.type_resolver.resolve(tr.type_args[idx], &rc);
             if (!arg.is_valid()) { continue; }
-            out = this.subst_assoc_by_member(out, decl.name, arg);
+            out = this.subst_assoc_slot(out, trait_ty, a, arg);
         }
         return out;
     }
 
-    /// Replace every associated-type projection named `member` inside `ty` with
-    /// `repl`, rebuilding the enclosing type structurally.  Mirrors
-    /// `reduce_assoc_projections`, but keyed on the projection's MEMBER instead
-    /// of on a concrete base.
+    /// Replace every projection of the `slot`-th associated type of the trait
+    /// `trait_ty` inside `ty` with `repl`, rebuilding the enclosing type
+    /// structurally.  Mirrors `reduce_assoc_projections`, but keyed on the
+    /// projected associated type instead of on a concrete base.
     ///
     /// It deliberately does NOT cache onto the `AssocProjectionType`: the
     /// projection is trait-relative (`This::Output` as written in the trait decl)
     /// and interned once, so it is shared by every bound over that trait -
     /// pinning one bound's answer would leak into all the others.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    subst_assoc_by_member(mut &this, ty: TypeRef, member: SymbolStr, repl: TypeRef) -> TypeRef {
+    subst_assoc_slot(mut &this, ty: TypeRef, trait_ty: TypeRef, slot: i64, repl: TypeRef) -> TypeRef {
         if (!ty.is_valid()) { return ty; }
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return ty; }
         match (t.kind) {
             TypeKind::AssocProjection => {
                 const proj: AssocProjectionType* = t as AssocProjectionType*;
-                if (proj.member.equals(member)) { return repl; }
-                const base: TypeRef = this.subst_assoc_by_member(proj.base, member, repl);
+                if (proj.slot == slot && proj.owning_trait.equals(trait_ty)) { return repl; }
+                const base: TypeRef = this.subst_assoc_slot(proj.base, trait_ty, slot, repl);
                 if (base.equals(proj.base)) { return ty; }
-                return this.arena.create_assoc_projection(base, proj.member, proj.owning_trait);
+                return this.arena.create_assoc_projection(base, proj.member, proj.owning_trait, proj.slot);
             }
             TypeKind::Pointer => {
                 const p: PointerType* = t as PointerType*;
-                const inner: TypeRef = this.subst_assoc_by_member(p.pointee, member, repl);
+                const inner: TypeRef = this.subst_assoc_slot(p.pointee, trait_ty, slot, repl);
                 if (inner.equals(p.pointee)) { return ty; }
                 return this.arena.get_pointer_to(inner);
             }
             TypeKind::Reference => {
                 const r: ReferenceType* = t as ReferenceType*;
-                const inner: TypeRef = this.subst_assoc_by_member(r.referent, member, repl);
+                const inner: TypeRef = this.subst_assoc_slot(r.referent, trait_ty, slot, repl);
                 if (inner.equals(r.referent)) { return ty; }
                 return this.arena.get_reference_to(inner, r.mutability);
             }
             TypeKind::Array => {
                 const a: ArrayType* = t as ArrayType*;
-                const inner: TypeRef = this.subst_assoc_by_member(a.element, member, repl);
+                const inner: TypeRef = this.subst_assoc_slot(a.element, trait_ty, slot, repl);
                 if (inner.equals(a.element)) { return ty; }
                 return this.arena.get_array_of(inner, a.size);
             }
             TypeKind::Optional => {
                 const o: OptionalType* = t as OptionalType*;
-                const inner: TypeRef = this.subst_assoc_by_member(o.wrapped, member, repl);
+                const inner: TypeRef = this.subst_assoc_slot(o.wrapped, trait_ty, slot, repl);
                 if (inner.equals(o.wrapped)) { return ty; }
                 return this.arena.get_optional_of(inner);
             }
             TypeKind::Function => {
                 const f: FunctionType* = t as FunctionType*;
-                const new_ret: TypeRef = this.subst_assoc_by_member(f.return_type, member, repl);
+                const new_ret: TypeRef = this.subst_assoc_slot(f.return_type, trait_ty, slot, repl);
                 mut changed: boolean = !new_ret.equals(f.return_type);
                 mut new_params: TypeRef[] = [];
                 for (mut i: i64 = 0; i < f.param_types.length; i++) {
-                    const np: TypeRef = this.subst_assoc_by_member(f.param_types[i], member, repl);
+                    const np: TypeRef = this.subst_assoc_slot(f.param_types[i], trait_ty, slot, repl);
                     new_params.push(np);
                     if (!np.equals(f.param_types[i])) { changed = true; }
                 }
@@ -844,7 +845,7 @@ type struct MethodBinding {
                 mut changed_t: boolean = false;
                 mut new_elems: TypeRef[] = [];
                 for (mut i: i64 = 0; i < tup.elements.length; i++) {
-                    const ne: TypeRef = this.subst_assoc_by_member(tup.elements[i], member, repl);
+                    const ne: TypeRef = this.subst_assoc_slot(tup.elements[i], trait_ty, slot, repl);
                     new_elems.push(ne);
                     if (!ne.equals(tup.elements[i])) { changed_t = true; }
                 }
@@ -856,7 +857,7 @@ type struct MethodBinding {
                 mut changed_i: boolean = false;
                 mut new_args: TypeRef[] = [];
                 for (mut i: i64 = 0; i < inst.type_args.length; i++) {
-                    const na: TypeRef = this.subst_assoc_by_member(inst.type_args[i], member, repl);
+                    const na: TypeRef = this.subst_assoc_slot(inst.type_args[i], trait_ty, slot, repl);
                     new_args.push(na);
                     if (!na.equals(inst.type_args[i])) { changed_i = true; }
                 }
@@ -874,6 +875,23 @@ type struct MethodBinding {
         match (*ann) {
             TypeAnnotation::Projection(pj) => { return pj.member; }
             _ => { return SymbolStr::empty(); }
+        }
+    }
+
+    /// Whether the written projection `ann` (a bound's subject, `This::Item`)
+    /// names the associated type `proj` is a projection of: the same trait,
+    /// and the same position there once the `assoc-type` door has placed the
+    /// written leaf.
+    bound_subject_is(&this, ann: TypeAnnotation*, proj: AssocProjectionType*) -> boolean {
+        if (ann == null || proj == null || proj.slot < 0) { return false; }
+        match (*ann) {
+            TypeAnnotation::Projection(pj) => {
+                const trait_ty: TypeRef = this.ctx.type_resolver.projection_trait(pj);
+                if (!trait_ty.equals(proj.owning_trait)) { return false; }
+                const tdecl: TraitDeclNode* = this.ctx.type_resolver.trait_decl_of(trait_ty);
+                return tdecl != null && tdecl.assoc_type_index(pj.member) == proj.slot;
+            }
+            _ => { return false; }
         }
     }
 
@@ -1944,7 +1962,7 @@ type struct MethodBinding {
                 const proj: AssocProjectionType* = t as AssocProjectionType*;
                 if (proj.resolved_type.is_valid()) { return proj.resolved_type; }
                 const base: TypeRef = this.reduce_assoc_projections(proj.base);
-                const reduced: TypeRef = this.ctx.type_resolver.concrete_projection(base, proj.member, proj.owning_trait);
+                const reduced: TypeRef = this.ctx.type_resolver.concrete_projection(base, proj.slot, proj.owning_trait);
                 if (reduced.is_valid()) {
                     proj.set_resolved_type(reduced);
                     return reduced;

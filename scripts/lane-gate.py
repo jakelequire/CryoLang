@@ -548,7 +548,7 @@ SCANNED_ARRAYS = {
     # -- the declarations' own member arrays, read by leaf from other files:
     #    the same table as the arena's, on the AST side --
     "TraitDeclNode.assoc_types":  Scanned("compiler/AST/declaration.cryo", "AssocTypeDeclNode", TABLE,
-                                          "a trait's associated types by leaf off the trait node in hand"),
+                                          "a trait's associated types by leaf off the trait node in hand (the `assoc-type` door's body)"),
     "TraitDeclNode.methods":      Scanned("compiler/AST/declaration.cryo", "FunctionDeclNode", TABLE,
                                           "a trait's methods by leaf off the trait node in hand"),
     "ImplBlockNode.methods":      Scanned("compiler/AST/declaration.cryo", "MethodNode", TABLE,
@@ -570,8 +570,6 @@ SCANNED_ARRAYS = {
     #    of a literal and a destructure --
     "EnumDeclNode.variants":      Scanned("compiler/AST/declaration.cryo", "EnumVariantNode", TABLE,
                                           "an enum declaration's variants by leaf off the node in hand"),
-    "ImplBlockNode.assoc_binding_names": Scanned("compiler/AST/declaration.cryo", "SymbolStr", TABLE,
-                                                 "the impl's own `This::Member` bindings by the member's leaf (the door `lookup_assoc_binding`'s body)"),
     "LambdaExprNode.captured_names": Scanned("compiler/AST/expression.cryo", "SymbolStr", TABLE,
                                              "the lambda's captured names, asked whether one is captured (its own accessor's body)"),
     "StructLiteralNode.field_inits": Scanned("compiler/AST/expression.cryo", "FieldInit", TABLE,
@@ -703,8 +701,6 @@ SCANNED_ARRAYS = {
                                                       "the index's overload entries by their link symbol's id"),
     "DeclarationIndex.prelude_modules": Scanned("compiler/decl_index.cryo", "ModulePath", TABLE,
                                                 "the prelude's modules, by identity"),
-    "ResolutionContext.assoc_bindings": Scanned("compiler/types/resolver.cryo", "Pair", TABLE,
-                                                "the impl's `This::Member` bindings by the member's leaf, inside its own door"),
     # -- texts, flags, file paths and triples: no declaration --
     "Diagnostic.labels":          Scanned("compiler/diag/diagnostic.cryo", "SpanLabel", DATA,
                                           "a diagnostic's labels: message TEXTS and span FILE PATHS"),

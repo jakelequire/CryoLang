@@ -59,6 +59,7 @@ function carries no marker.
 | `member-field` | `MemberResolver::field_of` | `compiler/src/compiler/sema/member_resolver.cryo` | member: a field, by owner type and leaf |
 | `member-variant` | `EnumType::variant_index` | `compiler/src/compiler/types/user_defined.cryo` | member: an enum variant, by owner type and leaf |
 | `trait-method` | `GenericRegistry::trait_item_slot` | `compiler/src/compiler/types/generic_registry.cryo` | member: a trait's declared method, by trait identity and leaf, to its position in the trait |
+| `assoc-type` | `TraitDeclNode::assoc_type_index` | `compiler/src/compiler/AST/declaration.cryo` | member: a trait's associated type, by the trait's declaration and leaf, to its position among the trait's associated types |
 | `module-by-path` | `ModuleGraph::module_named` | `compiler/src/compiler/module_graph.cryo` | written module path to its module |
 | `primitive` | `ResBase::is_primitive_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table |
 | `primitive` | `ResBase::primitive_of_alias` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table: alias keywords |
@@ -74,8 +75,7 @@ door (`EnumType::get_variant` beside `variant_index`, the rib walks
 `Resolver::lookup` and `lookup_prelude` beside `lookup_value`, the four
 family readers beside `lookup_family_entries`) and lookups outside every
 door. Those are conversions still to make: each becomes a door's body, a
-caller of a door, or an identity lookup. No member door is identified yet
-for an associated type.
+caller of a door, or an identity lookup.
 
 ## Appendix: rulings
 
