@@ -227,9 +227,6 @@ CLASS_OF_METHOD = {
         ("N", "a module by its FILE PATH"),
     "Resolver::find_module_scope":
         ("J", "module: a module's scope by its namespace path, to stand in it while a template is instantiated"),
-    # -- the arena and the constant table --
-    "ConstantTable::intern_qualified":
-        ("N", "a key MINTED at the constant's declaration (`ns::name`) for its registration; the write side"),
 }
 
 # The importer's check for a C function already declared by its link name,

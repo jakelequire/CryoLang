@@ -46,7 +46,7 @@ import compiler::ast;
 import compiler::ast::{ declaration, expression, LiteralKind, node, NodeKind, TypeAnnotation };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::resolver::res;
-import compiler::resolver::res::{ Res, ResBase, ResSlot, DefTable };
+import compiler::resolver::res::{ Res, ResBase, ResSlot, DefTable, DefId };
 import compiler::types::{ type_ref, arena };
 import compiler::types::type_base;
 import compiler::types::type_base::{ Type };
@@ -113,39 +113,40 @@ type struct ConstEntry {
 
 
 type struct ConstantTable {
-    /// The compilation's definitions, for a definition's path.  Borrowed;
+    /// The compilation's definitions, for a definition's slot.  Borrowed;
     /// set by `CompilationContext`, which owns it.
     defs: DefTable*;
     entries: ConstEntry[];
-    /// Qualified name id -> index into `entries`.
-    by_qualified: HashMap<u32, i64>;
+    /// The constant's definition's slot -> index into `entries`.
+    by_def: HashMap<i64, i64>;
 
     /// Module-level `type enum` declarations, so `Enum::Variant` folds to its
-    /// discriminant.  Keyed ONLY by canonical qualified name: the resolver
-    /// says which type a written scope names, so there is nothing here for a
-    /// spelling to be matched against.
+    /// discriminant.  Keyed by the enum's definition: the resolver says which
+    /// type a written scope names, so there is nothing here for a spelling to
+    /// be matched against.
     enums: EnumDeclNode*[];
-    enums_by_qualified: HashMap<u32, i64>;
+    enums_by_def: HashMap<i64, i64>;
 
     static new(defs: DefTable*) -> ConstantTable {
         return ConstantTable {
             defs: defs,
-            entries:            [],
-            by_qualified:       HashMap::<u32, i64>::new(),
-            enums:              [],
-            enums_by_qualified: HashMap::<u32, i64>::new(),
+            entries:      [],
+            by_def:       HashMap::<i64, i64>::new(),
+            enums:        [],
+            enums_by_def: HashMap::<i64, i64>::new(),
         };
     }
 
-    /// Record `qualified` as a constant initialized from `init`.
+    /// Record the constant `def` as initialized from `init`.
     ///
-    /// Re-registering the same qualified name replaces its initializer rather
+    /// Re-registering the same definition replaces its initializer rather
     /// than adding a second entry, which keeps repeated passes over a module
-    /// idempotent.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    register(mut &this, qualified: SymbolStr, init: ExpressionNode*,
+    /// idempotent.  A declaration with no definition records nothing.
+    register(mut &this, def: DefId, init: ExpressionNode*,
              int_typed: boolean) -> void {
-        match (this.by_qualified.get(&qualified.id)) {
+        if (!def.is_valid()) { return; }
+        const key: i64 = this.defs.slot(def);
+        match (this.by_def.get(&key)) {
             Option::Some(existing) => {
                 this.entries[existing].init       = init;
                 this.entries[existing].value      = 0;
@@ -167,22 +168,32 @@ type struct ConstantTable {
             real_state:     CONST_PENDING,
             int_typed:      int_typed,
         });
-        this.by_qualified.insert(qualified.id, idx);
+        this.by_def.insert(key, idx);
     }
 
-    /// Record a module-level enum declaration under its canonical qualified
-    /// name - the key `Res::TypeRelative`'s base carries.  Re-registering the
-    /// same name replaces the node.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    register_enum(mut &this, qualified: SymbolStr, node: EnumDeclNode*) -> void {
-        if (node == null) { return; }
-        match (this.enums_by_qualified.get(&qualified.id)) {
+    /// Record a module-level enum declaration under its definition - the
+    /// one `Res::TypeRelative`'s base carries.  Re-registering the same
+    /// definition replaces the node.
+    register_enum(mut &this, node: EnumDeclNode*) -> void {
+        if (node == null || !node.def.is_valid()) { return; }
+        const key: i64 = this.defs.slot(node.def);
+        match (this.enums_by_def.get(&key)) {
             Option::Some(existing) => { this.enums[existing] = node; return; }
             Option::None => { }
         }
         const idx: i64 = this.enums.length;
         this.enums.push(node);
-        this.enums_by_qualified.insert(qualified.id, idx);
+        this.enums_by_def.insert(key, idx);
+    }
+
+    /// The entry of the constant `d`, or -1 when `d` is no constant this
+    /// table holds.
+    index_of(&this, d: DefId) -> i64 {
+        if (!d.is_valid()) { return -1; }
+        return match (this.by_def.get(&this.defs.slot(d))) {
+            Option::Some(i) => { i }
+            Option::None    => { -1 }
+        };
     }
 
     /// Whether `ann` names an integer primitive, which is what decides how the
@@ -217,14 +228,6 @@ type struct ConstantTable {
         return if (canon.length() > 0) { canon } else { lexeme };
     }
 
-    /// Intern `<ns>::<leaf>`.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    static intern_qualified(intern: InternTable*, ns: SymbolStr,
-                            leaf: SymbolStr) -> SymbolStr {
-        if (intern == null) { return SymbolStr::empty(); }
-        const joined: string = fmt::format("%s::%s", intern.resolve(ns), intern.resolve(leaf));
-        return intern.intern(joined);
-    }
 
     /// Decode an integer literal lexeme, honouring `0x`/`0o`/`0b` prefixes and
     /// `_` separators.  False on overflow past u64 or on a stray character.
@@ -485,7 +488,7 @@ type struct ConstEval {
     }
 
     /// The entry a bare name's STAMP denotes, or -1.  A `Def` is the
-    /// constant's canonical name, the key the table is built under; every
+    /// constant's definition, the key the table is built under; every
     /// other answer - a local, a type parameter, a type, no answer - names
     /// no module-level constant.
     stamped_index_of(&this, id: IdentifierNode*) -> i64 {
@@ -493,12 +496,7 @@ type struct ConstEval {
         return match (id.res) {
             ResSlot::Answered(r) => {
                 match (r) {
-                    Res::Def(d) => {
-                        match (this.table.by_qualified.get(&this.table.defs.path_of(d).id)) {
-                            Option::Some(i) => { i }
-                            Option::None    => { -1 }
-                        }
-                    }
+                    Res::Def(d) => { this.table.index_of(d) }
                     _ => { -1 }
                 }
             }
@@ -523,13 +521,14 @@ type struct ConstEval {
     /// in hand, and this reads it.
     ///
     /// Two answers are meaningful here and they are different questions:
-    /// `Def` means the scope named a MODULE, so the member is a constant of
-    /// that module; `TypeRelative` means it named a TYPE, so the member is an
-    /// enum variant of it.  Anything else is not a compile-time integer.
+    /// `Def` means the scope named a MODULE, so the member is the constant
+    /// the name layer bound in that module (`member_def`); `TypeRelative`
+    /// means it named a TYPE, so the member is an enum variant of it.
+    /// Anything else is not a compile-time integer.
     fold_scoped(&this, sr: ScopeResolutionNode*, out: i64*) -> boolean {
         if (this.table == null || this.intern == null) { return false; }
         return this.fold_scoped_res(
-            sr.scope_res.require(Text::new("ConstEval::fold_scoped")), sr.member_name, out);
+            sr.scope_res.require(Text::new("ConstEval::fold_scoped")), sr, out);
     }
 
     /// `fold_scoped`, from an answer already read off the node.
@@ -538,19 +537,14 @@ type struct ConstEval {
     /// without requiring the slot a second time: `require` records a pending
     /// bug for an unstamped node, so asking twice would count one unstamped
     /// path as two.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    fold_scoped_res(&this, r: Res, member: SymbolStr, out: i64*) -> boolean {
+    fold_scoped_res(&this, r: Res, sr: ScopeResolutionNode*, out: i64*) -> boolean {
         if (this.table == null || this.intern == null) { return false; }
 
         return match (r) {
-            Res::Def(ns) => {
-                const key: SymbolStr = ConstantTable::intern_qualified(
-                    this.intern, this.table.defs.path_of(ns), member);
-                if (!key.is_valid()) { return false; }
-                return match (this.table.by_qualified.get(&key.id)) {
-                    Option::Some(i) => { this.fold_entry(i, out) }
-                    Option::None    => { false }
-                };
+            Res::Def(_) => {
+                const i: i64 = this.table.index_of(sr.member_def);
+                if (i < 0) { return false; }
+                return this.fold_entry(i, out);
             }
             Res::TypeRelative(base, trailing) => {
                 // `Enum::Variant` is one trailing segment past the type.  A
@@ -558,11 +552,10 @@ type struct ConstEval {
                 if (trailing != 1) { return false; }
                 return match (base) {
                     ResBase::Def(q) => {
-                        const qn: SymbolStr = this.table.defs.path_of(q);
-                        return match (this.table.enums_by_qualified.get(&qn.id)) {
+                        return match (this.table.enums_by_def.get(&this.table.defs.slot(q))) {
                             Option::Some(ei) => {
                                 ConstEval::variant_tag_of(
-                                    this.table.enums[ei], member, out)
+                                    this.table.enums[ei], sr.member_name, out)
                             }
                             Option::None => { false }
                         };
@@ -646,18 +639,14 @@ type struct ConstEval {
 
         const r: Res = sr.scope_res.require(Text::new("ConstEval::fold_scoped_real"));
         return match (r) {
-            Res::Def(ns) => {
-                const key: SymbolStr = ConstantTable::intern_qualified(
-                    this.intern, this.table.defs.path_of(ns), sr.member_name);
-                if (!key.is_valid()) { return false; }
-                return match (this.table.by_qualified.get(&key.id)) {
-                    Option::Some(i) => { this.fold_entry_real(i, out) }
-                    Option::None    => { false }
-                };
+            Res::Def(_) => {
+                const i: i64 = this.table.index_of(sr.member_def);
+                if (i < 0) { return false; }
+                return this.fold_entry_real(i, out);
             }
             _ => {
                 mut iv: i64 = 0;
-                if (!this.fold_scoped_res(r, sr.member_name, &iv)) { return false; }
+                if (!this.fold_scoped_res(r, sr, &iv)) { return false; }
                 *out = iv as f64;
                 return true;
             }

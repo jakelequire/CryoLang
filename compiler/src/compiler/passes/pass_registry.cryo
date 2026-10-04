@@ -815,56 +815,61 @@ type struct PassRegistry {
             return PassResult::ok();
         }
 
-        // Reject two type declarations that share a qualified name within
-        // this module (E0207). Qualified names carry the namespace, so the
-        // same bare name in different modules does not collide. Runs as a
+        // Reject two type declarations under one leaf in one namespace
+        // (E0207): two definitions whose parent - the module, or the alias
+        // module of a C import - is the same, written under the same name.
+        // The same leaf in different modules does not collide.  Runs as a
         // pre-pass with a module-local seen set.
-        mut seen_type_syms: u32[] = [];
+        mut seen_types: u64[] = [];
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
-            mut tsym: SymbolStr = SymbolStr::empty();
+            mut def: DefId = DefId::invalid();
+            mut leaf: SymbolStr = SymbolStr::empty();
             mut tspan: SourceSpan = SourceSpan::none();
-            mut is_type: boolean = false;
             match (stmt.kind) {
                 NodeKind::StructDeclaration => {
                     const n: StructDeclNode* = stmt as StructDeclNode*;
-                    tsym = ctx.decl_type_key(n.name, n.binding_namespace, n.span.file); tspan = n.span; is_type = true;
+                    def = n.def; leaf = n.name; tspan = n.span;
                 }
                 NodeKind::UnionDeclaration => {
                     const n: UnionDeclNode* = stmt as UnionDeclNode*;
-                    tsym = ctx.decl_type_key(n.name, n.binding_namespace, n.span.file); tspan = n.span; is_type = true;
+                    def = n.def; leaf = n.name; tspan = n.span;
                 }
                 NodeKind::EnumDeclaration => {
                     const n: EnumDeclNode* = stmt as EnumDeclNode*;
-                    tsym = ctx.decl_type_key(n.name, n.binding_namespace, n.span.file); tspan = n.span; is_type = true;
+                    def = n.def; leaf = n.name; tspan = n.span;
                 }
                 NodeKind::ClassDeclaration => {
                     const n: ClassDeclNode* = stmt as ClassDeclNode*;
-                    tsym = ctx.decl_type_key(n.name, ModulePath::none(), n.span.file); tspan = n.span; is_type = true;
+                    def = n.def; leaf = n.name; tspan = n.span;
                 }
                 NodeKind::TraitDeclaration => {
                     const n: TraitDeclNode* = stmt as TraitDeclNode*;
-                    tsym = ctx.decl_type_key(n.name, ModulePath::none(), n.span.file); tspan = n.span; is_type = true;
+                    def = n.def; leaf = n.name; tspan = n.span;
                 }
                 NodeKind::TypeAliasDeclaration => {
                     const n: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
-                    tsym = ctx.decl_type_key(n.alias_name, n.binding_namespace, n.span.file); tspan = n.span; is_type = true;
+                    def = n.def; leaf = n.alias_name; tspan = n.span;
                 }
                 _ => {}
             }
-            if (!is_type) { continue; }
+            if (!def.is_valid()) { continue; }
+            const parent: DefId = ctx.defs.parent_of(def);
+            const at: i64 = if (parent.is_valid()) { ctx.defs.slot(parent) + 1 } else { 0 };
+            const at_bits: u64 = at as u64;
+            const key: u64 = (at_bits << 32) | (leaf.id as u64);
             mut dup: boolean = false;
-            for (mut k: i64 = 0; k < seen_type_syms.length; k++) {
-                if (seen_type_syms[k] == tsym.id) { dup = true; break; }
+            for (mut k: i64 = 0; k < seen_types.length; k++) {
+                if (seen_types[k] == key) { dup = true; break; }
             }
             if (dup) {
                 ctx.emit_error_at(ErrorCode::E0207_REDEFINED_TYPE,
                     Text::new(fmt::format("type `%s` is defined multiple times",
-                        ctx.resolve_str(tsym))),
+                        ctx.resolve_str(ctx.defs.path_of(def)))),
                     tspan);
             } else {
-                seen_type_syms.push(tsym.id);
+                seen_types.push(key);
             }
         }
 

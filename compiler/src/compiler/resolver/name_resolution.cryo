@@ -215,7 +215,7 @@ public:
         };
         this.resolver.record_resolution(node.span, sym_id);
         this.resolver.export_symbol(sym_id);
-        if (!node.is_mutable) { this.record_const_value_in(c_module.as_sym(), node); }
+        if (!node.is_mutable) { this.record_const_value(this.resolver.get_symbol(sym_id).def, node); }
         this.resolver.restore_scope(saved_module, saved_scope);
     }
 
@@ -346,7 +346,6 @@ public:
             }
             NodeKind::EnumDeclaration => {
                 const enum_node: EnumDeclNode* = node as EnumDeclNode*;
-                this.record_enum_decl(enum_node);
                 if (!enum_node.binding_namespace.is_valid()) {
                     const sym_id: SymbolID = this.resolver.declare_type(
                         enum_node.name, enum_node.span, enum_node.is_public);
@@ -358,6 +357,7 @@ public:
                     enum_node.def = this.type_def_of(this.declare_c_imported(
                         enum_node.binding_namespace, enum_node.name, enum_node.span));
                 }
+                this.record_enum_decl(enum_node);
             }
             NodeKind::ClassDeclaration => {
                 const class_node: ClassDeclNode* = node as ClassDeclNode*;
@@ -423,7 +423,7 @@ public:
                     // bare leaf and take whichever module registered last.
                     this.resolver.export_symbol(sym_id);
                     if (!var_node.is_mutable) {
-                        this.record_const_value(var_node);
+                        this.record_const_value(this.resolver.get_symbol(sym_id).def, var_node);
                     }
                 } else if (var_node.is_global) {
                     this.declare_c_imported_global(var_node.binding_namespace, var_node);
@@ -3091,57 +3091,30 @@ public:
     /// only ever see what preceded it.  A non-integer initializer is recorded
     /// too and simply never folds - only a use that needs the value reports
     /// anything.
-    record_const_value(&this, node: VarDeclNode*) -> void {
-        this.record_const_value_in(
-            if (this.ctx != null) { this.ctx.unit_module.as_sym() } else { SymbolStr::empty() },
-            node);
-    }
-
-    /// `record_const_value` under an explicit namespace: a C-imported
-    /// constant is its alias module's, keyed there.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    record_const_value_in(&this, ns: SymbolStr, node: VarDeclNode*) -> void {
+    ///
+    /// Kept under `def`, the definition the constant was just declared as:
+    /// the one every use's stamp carries, a C-imported constant's in its
+    /// alias module as any other's in its own.
+    record_const_value(&this, def: DefId, node: VarDeclNode*) -> void {
         if (this.ctx == null || this.ctx.const_table == null) { return; }
         const intern: InternTable* = this.ctx.intern_table;
         if (intern == null) { return; }
         if (node.initializer == null) { return; }
-
-        const qualified: SymbolStr = if (ns.is_valid()) {
-            ConstantTable::intern_qualified(intern, ns, node.name)
-        } else {
-            node.name
-        };
         // The declared type travels with the initializer: it is what decides
         // whether `1 / 2` is this constant's 0 or its 0.5, and the folder
         // cannot recover it from the expression.
         this.ctx.const_table.register(
-            qualified, node.initializer,
+            def, node.initializer,
             ConstantTable::declares_integer(node.type_annotation, intern));
     }
 
     /// Record a module-level enum so `Enum::Variant` folds to its discriminant
-    /// wherever a compile-time integer is wanted.  Keyed the same two ways a
-    /// constant is, because a use site spells an enum the same ways.
+    /// wherever a compile-time integer is wanted.  Kept under the enum's
+    /// definition, which a use's stamp carries; called once the declaration
+    /// has one.
     record_enum_decl(&this, node: EnumDeclNode*) -> void {
         if (this.ctx == null || this.ctx.const_table == null) { return; }
-        const intern: InternTable* = this.ctx.intern_table;
-        if (intern == null) { return; }
-
-        // Keyed by its declaring module's namespace: the alias module's for
-        // a C-imported enum, this module's for any other, as the enum's
-        // stamp names it.
-        mut ns: SymbolStr = SymbolStr::empty();
-        if (node.binding_namespace.is_valid()) {
-            ns = node.binding_namespace.as_sym();
-        } else if (this.ctx.has_namespace()) {
-            ns = this.ctx.unit_module.as_sym();
-        }
-        const qualified: SymbolStr = if (ns.is_valid()) {
-            ConstantTable::intern_qualified(intern, ns, node.name)
-        } else {
-            node.name
-        };
-        this.ctx.const_table.register_enum(qualified, node);
+        this.ctx.const_table.register_enum(node);
     }
 
     /// The module in `m`'s `export` closure that publicly exports `name`, or
