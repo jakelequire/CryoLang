@@ -101,6 +101,13 @@ public:
     /// declaration's own, or the trait an `implement trait` block
     /// implements.  Invalid everywhere else, an inherent impl included.
     this_trait: DefId;
+    /// The type `This::` names in the body being walked when no trait
+    /// defines it - an inherent impl's target, or a type declaration's own
+    /// name - with the parameters it is declared with.  Empty elsewhere.
+    this_owner:      SymbolStr;
+    this_owner_decl: ASTNode*;
+    /// The keyword `This` as a path segment spells it.
+    this_type_spelling: SymbolStr;
 
     NameResolver(resolver: Resolver*, ctx: CompilationContext*)
         : BaseASTVisitor() {
@@ -112,6 +119,42 @@ public:
         this.naming_trait      = false;
         this.this_sym          = resolver.intern_table.intern("this");
         this.this_trait        = DefId::invalid();
+        this.this_owner        = SymbolStr::empty();
+        this.this_owner_decl   = null;
+        this.this_type_spelling = resolver.intern_table.intern("This");
+    }
+
+    /// The parameters `This` is written with in the body of `decl`: an
+    /// inherent impl's, or a struct declaration's own.
+    static this_owner_params_of(decl: ASTNode*) -> GenericParamNode*[] {
+        mut out: GenericParamNode*[] = [];
+        if (decl == null) { return out; }
+        if (decl.kind == NodeKind::ImplementationBlock) {
+            const ib: ImplBlockNode* = decl as ImplBlockNode*;
+            for (mut i: i64 = 0; i < ib.generic_params.length; i++) { out.push(ib.generic_params[i]); }
+        } else if (decl.kind == NodeKind::StructDeclaration) {
+            const sd: StructDeclNode* = decl as StructDeclNode*;
+            for (mut i: i64 = 0; i < sd.generic_params.length; i++) { out.push(sd.generic_params[i]); }
+        }
+        return out;
+    }
+
+    /// `This::member` written where `This` names a type with no trait
+    /// defining it is the enclosing type with its own parameters as its
+    /// arguments - `Pair::<T>::member` in `implement struct Pair<T>` - and
+    /// is resolved as that path is.
+    rewrite_this_scope(mut &this, node: ScopeResolutionNode*) -> void {
+        if (!node.scope_name.equals(this.this_type_spelling)) { return; }
+        if (!this.this_owner.is_valid() || this.this_trait.is_valid()) { return; }
+        if (node.scope_generic_args.length > 0) { return; }
+        node.scope_name = this.this_owner;
+        const params: GenericParamNode*[] = NameResolver::this_owner_params_of(this.this_owner_decl);
+        mut args: TypeAnnotation*[] = [];
+        for (mut i: i64 = 0; i < params.length; i++) {
+            const p: GenericParamNode* = params[i];
+            args.push(TypeAnnotation::named(p.name, node.span));
+        }
+        node.set_scope_generic_args(args);
     }
 
     /// Declare a declaration's generic parameters in the current scope, each
@@ -811,9 +854,15 @@ public:
         // Every method is a definition of the type before any body is
         // walked.
         this.define_body_methods(node.def, &node.methods);
+        const outer_owner: SymbolStr = this.this_owner;
+        const outer_owner_decl: ASTNode* = this.this_owner_decl;
+        this.this_owner = node.name;
+        this.this_owner_decl = node as ASTNode*;
         for (mut i: int = 0; i < node.methods.length; i++) {
             node.methods[i].accept(this);
         }
+        this.this_owner = outer_owner;
+        this.this_owner_decl = outer_owner_decl;
 
         this.resolver.exit_scope();
     }
@@ -1002,6 +1051,10 @@ public:
 
         // Declare generic params (e.g., implement enum Optional<T> { ... })
         this.declare_generics(node.generic_params);
+        const outer_owner: SymbolStr = this.this_owner;
+        const outer_owner_decl: ASTNode* = this.this_owner_decl;
+        this.this_owner = node.target_type;
+        this.this_owner_decl = node as ASTNode*;
 
         // Resolve the target type name
         const target_id: SymbolID = this.resolver.lookup(
@@ -1064,6 +1117,8 @@ public:
         }
 
         this.this_trait = outer_trait;
+        this.this_owner = outer_owner;
+        this.this_owner_decl = outer_owner_decl;
         this.resolver.exit_scope();
     }
 
@@ -1791,6 +1846,7 @@ public:
     }
 
     override visit(node: ScopeResolutionNode*) -> void {
+        this.rewrite_this_scope(node);
         // Look up the scope name (e.g., "Foo" in "Foo::Bar")
         const scope_sym: SymbolID = this.resolver.lookup(
             node.scope_name, this.resolver.current_scope);

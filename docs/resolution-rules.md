@@ -83,6 +83,51 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-04
+
+119. **`module_named` is private to `module_graph.cryo`.** Callers outside
+     the module graph reach a module through the graph, not through the
+     door, so ruling 108's privacy is expressed by ordinary visibility.
+
+120. **`math::min` and `math::max` take `where T: Ord`**, so their
+     comparisons are licensed by the bound under ruling 82.
+
+     ```cryo
+     function min<T>(a: T, b: T) -> T where T: Ord { .. }
+     ```
+
+121. **The tests that apply an operator to an unbounded type parameter get
+     the bound the operator needs**; they do not become negative tests of
+     ruling 82's refusal.
+
+122. **Ruling 82's refusal is E0229, with a message naming the type
+     parameter and its bounds**, reported on the generic body.
+
+     ```cryo
+     function add<T>(a: T, b: T) -> T { return a + b; }   // error[E0229], names `T` and its bounds
+     ```
+
+123. **The standard library's "frozen, no `checked_*`" overflow contract
+     exempts `checked_abs`**: it is the one checked operation ruling 112
+     names, and the contract says so.
+
+124. **After ruling 82, an unbounded type parameter passed where a concrete
+     type is expected is refused.** `math::sqrt` and `math::fabs` then take
+     a bound or become per-type functions.
+
+     ```cryo
+     function f<T>(x: T) -> f64 { return takes_f64(x); }   // refused: `T` is not `f64`
+     ```
+
+125. **A generic function's instances are filed under the template's
+     definition**, keyed by that definition plus the type arguments, as
+     rustc keys an instance.
+
+126. **Codegen's `GlobalRegistry`, keyed by linker symbol, stays as it is**;
+     it is outside rule two.
+
+127. **`LangItem::AstArenaAlloc` stays.**
+
 ### 2026-10-03
 
 95. *Superseded by ruling 112.* **`math::abs<T>` and `math::clamp<T>` are bounded by the standard
