@@ -11,18 +11,20 @@
 ///! `atan2`.
 ///!
 ///! Operations that are meaningful at more than one width are a single
-///! generic dispatched on `T` at compile time (`sqrt`, `fabs`, `min`, `max`,
-///! `clamp`, `abs`, `checked_abs`) rather than a family of type-suffixed
-///! names. f64 stays the default, so an unannotated float literal argument
-///! still picks the double-precision form; `sqrt<f32>(x)` or an f32-typed
-///! argument selects single precision. The remaining transcendentals are
-///! f64-only because libm is.
+///! generic dispatched on `T` at compile time (`sqrt`, `fabs`, `min`, `max`)
+///! rather than a family of type-suffixed names. f64 stays the default, so
+///! an unannotated float literal argument still picks the double-precision
+///! form; `sqrt<f32>(x)` or an f32-typed argument selects single precision.
+///! The remaining transcendentals are f64-only because libm is.
+///!
+///! `abs`, `checked_abs` and `clamp` are methods of each numeric primitive
+///! (`(-5 as i32).abs()`, `x.clamp(lo, hi)`, in `core::primitives`): their
+///! bodies compare with and negate from a literal `0`, which no trait bound
+///! on a `T` licenses.
 
 namespace std::math;
 
 import std::ffi::libc;
-import std::core::option;
-import std::core::option::{ Option };
 import std::core::intrinsics;
 import std::core::mem;
 
@@ -178,42 +180,13 @@ function signum(value: f64) -> f64 {
     return value;
 }
 
-/// Integer absolute value: cheap enough to be intrinsic-free.
-///
-/// WARNING: two's-complement has no positive counterpart for the most-negative
-/// value, so `abs(i64::MIN)` and `abs(i32::MIN)` overflow and return the SAME
-/// negative input (the standard C/Rust `abs` footgun). Feeding that result to
-/// a size/index computation silently corrupts it. When the input may be the
-/// minimum, use `checked_abs`, which returns `None` on overflow instead of a
-/// wrong (negative) value.
-function abs<T>(value: T) -> T {
-    if (value < 0) { return 0 - value; }
-    return value;
-}
-
-/// Non-overflowing absolute value: `None` for the most-negative value of `T`
-/// (whose magnitude is not representable), `Some(|value|)` otherwise. The
-/// overflow is detected without naming the MIN constant: only MIN negates to
-/// a still-negative value under two's complement.
-function checked_abs<T>(value: T) -> Option<T> {
-    if (value < 0) {
-        const neg: T = 0 - value;
-        if (neg < 0) { return Option::None; }
-        return Option::Some(neg);
-    }
-    return Option::Some(value);
-}
-
-// --- min / max / clamp -------------------------------------------------
+// --- min / max ---------------------------------------------------------
 //
 // One generic per operation, dispatched on `T` at compile time.
 //
 // Float `min`/`max` are NaN-transparent (IEEE minNum/maxNum: a NaN operand
 // is ignored and the other returned; both-NaN yields NaN). This differs
 // from `cmp::min`/`cmp::max`, which order NaN under the total bit-order.
-// `clamp` keeps plain comparisons for every type, so a NaN `value`
-// propagates (it is not silently pulled into range) - which is why it needs
-// no per-type dispatch at all.
 
 /// Smaller of `a` and `b`. NaN-transparent for the float types.
 function min<T>(a: T, b: T) -> T {
@@ -244,14 +217,6 @@ function max<T>(a: T, b: T) -> T {
         }
         _ => { if (a > b) { return a; } return b; }
     }
-}
-
-/// `value` confined to `[lo, hi]`. NaN-propagating for the float types: a NaN
-/// `value` compares false against both bounds and falls through unchanged.
-function clamp<T>(value: T, lo: T, hi: T) -> T {
-    if (value < lo) { return lo; }
-    if (value > hi) { return hi; }
-    return value;
 }
 
 // --- classification ----------------------------------------------------
