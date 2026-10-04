@@ -125,7 +125,7 @@ import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::checker::{ TypeChecker, TypeCheckResult, TypeCompatibility };
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType, TupleType };
-import compiler::types::generic::{ InstantiatedType };
+import compiler::types::generic::{ GenericParamType, InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
@@ -1172,29 +1172,15 @@ public:
                 Text::new("`static match` outside a generic context is not supported yet (its type could not be resolved to a single arm)"),
                 node.span);
         }
-        // First arm: the representative diagnostic walk, narrowed to its concrete
-        // type when the scrutinee is a generic param (symbolic-only, eligible).
-        const arm0: StaticMatchArmNode* = node.arms[0];
-        if (arm0 != null && arm0.body != null) {
-            const s0: i64 = this.narrow_static_match_arm(node.scrutinee, arm0);
-            this.dispatch_stmt(arm0.body);
-            this.scopes.restore_scope(s0);
+        // A concrete (already-pruned) static match has exactly one arm.
+        if (this.state.in_symbolic_check && ASTCloner::has_multi_type_arm(&node.arms)) {
+            node.arms = ASTCloner::split_multi_type_arms(&node.arms);
         }
-        // Remaining arms (symbolic only): stamp their bodies - narrowed to each
-        // arm's concrete type - for correct monomorphization and hover, with
-        // diagnostics suppressed so arms this instantiation may never select
-        // don't report concrete-check errors.
-        if (this.state.in_symbolic_check && node.arms.length > 1) {
-            const sink: DiagnosticSink* = this.ctx.diagnostics;
-            for (mut ai: i64 = 1; ai < node.arms.length; ai++) {
-                const arm: StaticMatchArmNode* = node.arms[ai];
-                if (arm == null || arm.body == null) { continue; }
-                const sv: i64 = this.narrow_static_match_arm(node.scrutinee, arm);
-                if (sink != null) { sink.begin_suppress(); }
-                this.dispatch_stmt(arm.body);
-                if (sink != null) { sink.end_suppress(); }
-                this.scopes.restore_scope(sv);
-            }
+        const n_arms: i64 = if (this.state.in_symbolic_check) { node.arms.length } else { 1 };
+        for (mut ai: i64 = 0; ai < n_arms; ai++) {
+            const arm: StaticMatchArmNode* = node.arms[ai];
+            if (arm == null || arm.body == null) { continue; }
+            this.walk_static_match_arm(node.scrutinee, arm, false, TypeRef::invalid());
         }
     }
 
@@ -2729,50 +2715,18 @@ public:
         }
         const outer_expected: TypeRef = this.state.expected_type;
         mut result_type: TypeRef = TypeRef::invalid();
-        // During the symbolic (generic-template) check, type-check EVERY arm body - 
-        // not just `arms[0]`.  Each concrete instantiation prunes the static match
-        // to whichever arm matches its type and clones that arm's body; an unchecked
-        // arm clones with an untyped receiver and un-stashed nested generic calls,
-        // so a spec landing on a non-first arm (`String<A>::try_push<u8>` -> the `u8`
-        // arm) can't resolve its inner call (codegen E0636 / wrong-spec miscompile).
-        // A concrete (already-pruned) static match has exactly one arm, so the
-        // non-symbolic path checks only `arms[0]` exactly as before.
+        // A generic template's walk checks EVERY arm: each instantiation keeps
+        // the arm its type selects and copies that arm's body, so an unwalked
+        // arm copies with untyped receivers and unbound inner calls.  A concrete
+        // (already-pruned) static match has exactly one arm.
+        if (this.state.in_symbolic_check && ASTCloner::has_multi_type_arm(&sm.arms)) {
+            sm.arms = ASTCloner::split_multi_type_arms(&sm.arms);
+        }
         const n_arms: i64 = if (this.state.in_symbolic_check) { sm.arms.length } else { 1 };
-        const sink: DiagnosticSink* = this.ctx.diagnostics;
         for (mut ai: i64 = 0; ai < n_arms; ai++) {
             const arm: StaticMatchArmNode* = sm.arms[ai];
             if (arm == null || arm.body == null) { continue; }
-            // Narrow this arm to its concrete type (symbolic-only, eligible arms)
-            // so `item`/method calls resolve concretely and hover sees the real
-            // type.  Arms after the first are still walked (stamping their bodies
-            // for correct monomorphization) but with diagnostics suppressed - the
-            // first arm is the representative one for reporting, and the concrete
-            // re-check of later arms would otherwise surface errors for arms this
-            // instantiation may never select.
-            const nsave: i64 = this.narrow_static_match_arm(sm.scrutinee, arm);
-            const suppress: boolean = ai > 0 && sink != null;
-            if (suppress) { sink.begin_suppress(); }
-            mut arm_result: TypeRef = TypeRef::invalid();
-            if ((arm.body as ASTNode*).kind == NodeKind::BlockStatement) {
-                const block: BlockStmtNode* = arm.body as BlockStmtNode*;
-                const last_idx: i64 = block.statements.length - 1;
-                for (mut j: i64 = 0; j < block.statements.length; j++) {
-                    if (j == last_idx && outer_expected.is_valid()) { this.state.expected_type = outer_expected; }
-                    this.dispatch_stmt(block.statements[j]);
-                    if (j == last_idx) { this.state.expected_type = outer_expected; }
-                }
-                if (block.statements.length > 0) {
-                    const last: StatementNode* = block.statements[block.statements.length - 1];
-                    if ((last as ASTNode*).kind == NodeKind::ExpressionStatement) {
-                        const es: ExprStmtNode* = last as ExprStmtNode*;
-                        if (es.expression != null && es.expression.has_resolved_type()) { arm_result = es.expression.resolved_type; }
-                    }
-                }
-            } else {
-                this.dispatch_stmt(arm.body);
-            }
-            if (suppress) { sink.end_suppress(); }
-            this.scopes.restore_scope(nsave);
+            const arm_result: TypeRef = this.walk_static_match_arm(sm.scrutinee, arm, true, outer_expected);
             // The static match's type is the first arm's (all arms must agree).
             if (ai == 0) { result_type = arm_result; }
         }
@@ -2781,22 +2735,59 @@ public:
         return result_type;
     }
 
+    /// Walk one arm of a `static match (T)`, reporting what is wrong in it
+    /// whichever instantiation selects it.  An arm listing a type is walked
+    /// with `T` narrowed to that type; the wildcard arm with `T` abstract,
+    /// knowing only `T`'s bounds.  An arm listing several types has been
+    /// split into one arm per type before this (`split_multi_type_arms`).
+    /// Returns the arm's value type when `as_value`.
+    walk_static_match_arm(mut &this, scrutinee: TypeAnnotation*, arm: StaticMatchArmNode*,
+                          as_value: boolean, outer_expected: TypeRef) -> TypeRef {
+        const pattern: TypeAnnotation* = if (arm.type_patterns.length == 1) { arm.type_patterns[0] } else { null };
+        const body: StatementNode* = arm.body;
+        const depth: u64 = this.state.symbolic_narrow_syms.length as u64;
+        const save: i64 = this.narrow_static_match_arm(scrutinee, pattern);
+        mut arm_result: TypeRef = TypeRef::invalid();
+        if (as_value && (body as ASTNode*).kind == NodeKind::BlockStatement) {
+            const block: BlockStmtNode* = body as BlockStmtNode*;
+            const last_idx: i64 = block.statements.length - 1;
+            for (mut j: i64 = 0; j < block.statements.length; j++) {
+                if (j == last_idx && outer_expected.is_valid()) { this.state.expected_type = outer_expected; }
+                this.dispatch_stmt(block.statements[j]);
+                if (j == last_idx) { this.state.expected_type = outer_expected; }
+            }
+            if (block.statements.length > 0) {
+                const last: StatementNode* = block.statements[block.statements.length - 1];
+                if ((last as ASTNode*).kind == NodeKind::ExpressionStatement) {
+                    const es: ExprStmtNode* = last as ExprStmtNode*;
+                    if (es.expression != null && es.expression.has_resolved_type()) { arm_result = es.expression.resolved_type; }
+                }
+            }
+        } else {
+            this.dispatch_stmt(body);
+        }
+        this.scopes.restore_scope(save);
+        this.state.symbolic_narrow_syms.truncate(depth);
+        this.state.symbolic_narrow_types.truncate(depth);
+        return arm_result;
+    }
+
     /// During the symbolic generic-body check, narrow a `static match (T)` arm to
-    /// its concrete type for the duration of that arm's body walk.  When the
-    /// scrutinee is a bare generic param (`T`) and the arm lists exactly one
-    /// concrete type pattern (`String => ...`), every in-scope local typed
-    /// exactly `T` is rebound to that concrete type, so member/method resolution
-    /// - and hover - sees the real type instead of an abstract param.  The
-    /// rebinding is logged on the scope undo log; the caller restores the
-    /// returned checkpoint after the body.  A no-op returning the checkpoint
-    /// unchanged when not eligible (non-symbolic walk, multi-type / wildcard arm,
-    /// non-generic scrutinee, or a still-generic arm pattern).
+    /// the concrete type `pattern` for the duration of one walk of its body.
+    /// When the scrutinee is a bare generic param (`T`), a type naming `T` is
+    /// the pattern's type inside the arm (`symbolic_bind_params` reads the
+    /// narrowing), and every in-scope local typed exactly `T` is rebound to it,
+    /// so member/method resolution - and hover - sees the real type instead of
+    /// an abstract param.  The rebinding is logged on the scope undo log; the
+    /// caller restores the returned checkpoint after the body and pops the
+    /// narrowing.  A no-op returning the checkpoint unchanged when not eligible
+    /// (non-symbolic walk, no pattern, non-generic scrutinee, or a
+    /// still-generic pattern).
     narrow_static_match_arm(mut &this, scrutinee: TypeAnnotation*,
-                            arm: StaticMatchArmNode*) -> i64 {
+                            pattern: TypeAnnotation*) -> i64 {
         const save: i64 = this.scopes.save_scope();
         if (!this.state.in_symbolic_check) { return save; }
-        if (scrutinee == null || arm == null) { return save; }
-        if (arm.type_patterns.length != 1) { return save; }
+        if (scrutinee == null || pattern == null) { return save; }
         if (this.arena == null) { return save; }
 
         mut rc: ResolutionContext = ResolutionContext::new("");
@@ -2809,8 +2800,10 @@ public:
         if (st == null) { return save; }
         if (st.kind != TypeKind::GenericParam) { return save; }
 
-        const arm_ref: TypeRef = this.ctx.type_resolver.resolve(arm.type_patterns[0], &rc);
+        const arm_ref: TypeRef = this.ctx.type_resolver.resolve(pattern, &rc);
         if (!arm_ref.is_valid() || this.arena.contains_generic_param(arm_ref)) { return save; }
+        this.state.symbolic_narrow_syms.push((st as GenericParamType*).param_sym);
+        this.state.symbolic_narrow_types.push(arm_ref);
 
         // Collect locals typed exactly as the scrutinee param first, then rebind:
         // register_local_with_mut mutates `state.locals`, so it must not run while
