@@ -2173,10 +2173,10 @@ type struct CallResolver {
     has_implicit_converter(&this, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
         if (!arg_ty.is_valid() || !param_ty.is_valid()) { return false; }
         if (arg_ty.equals(param_ty)) { return false; }
-        if (this.ctx.decl_index.lookup_implicit_converter(arg_ty.key(), param_ty.key()) != 0) { return true; }
+        if (this.ctx.decl_index.lookup_implicit_converter(arg_ty.key(), param_ty.key()).is_valid()) { return true; }
         const base: TypeRef = this.types.generic_base_of(param_ty);
         return base.is_valid()
-            && this.ctx.decl_index.lookup_implicit_converter(arg_ty.key(), base.key()) != 0;
+            && this.ctx.decl_index.lookup_implicit_converter(arg_ty.key(), base.key()).is_valid();
     }
 
     /// Synthesize + re-resolve an implicit-converter call around `expr` when one
@@ -2188,41 +2188,51 @@ type struct CallResolver {
         if (from_ty.equals(to_ty)) { return null; }
         if (this.state.in_implicit_conversion) { return null; }
 
-        mut packed: u64 = this.ctx.decl_index.lookup_implicit_converter(from_ty.key(), to_ty.key());
-        if (packed == 0) {
+        mut conv: DefId = this.ctx.decl_index.lookup_implicit_converter(from_ty.key(), to_ty.key());
+        if (!conv.is_valid()) {
             const base: TypeRef = this.types.generic_base_of(to_ty);
             if (base.is_valid()) {
-                packed = this.ctx.decl_index.lookup_implicit_converter(from_ty.key(), base.key());
+                conv = this.ctx.decl_index.lookup_implicit_converter(from_ty.key(), base.key());
             }
         }
-        if (packed == 0) { return null; }
-        const type_name_id:   u32 = (packed >> 32) as u32;
-        const method_name_id: u32 = (packed & 0xFFFFFFFF) as u32;
+        if (!conv.is_valid()) { return null; }
 
+        // The call names the converter by its definition: a function by the
+        // identifier's stamp, a method on the type that declares it, bound
+        // to its entry before it is resolved.  Neither the use site's scope
+        // nor another member of a family answers instead.  The spellings on
+        // the nodes are the definition's own.
         const sp: SourceSpan = expr.span;
         mut callee: ExpressionNode* = null;
-        if (type_name_id == 0) {
-            mut id: IdentifierNode* = new IdentifierNode(SymbolStr::from_id(method_name_id), sp);
+        mut conv_call: CallExprNode* = null;
+        if (this.ctx.defs.kind_of(conv) != DefKind::Method) {
+            mut id: IdentifierNode* = new IdentifierNode(this.ctx.defs.leaf_of(conv), sp);
+            id.set_res(Res::Def(conv));
             callee = id as ExpressionNode*;
+            conv_call = new CallExprNode(callee, sp);
         } else {
+            // The owner is the type declaring the converter; `to_ty` when the
+            // converter yields its own type, keeping the target's arguments.
+            const owner_def: DefId = this.ctx.defs.parent_of(conv);
+            const owner_ty: TypeRef = if (this.ctx.decl_index.def_of(to_ty, this.ctx.type_arena).equals(owner_def)) {
+                to_ty
+            } else {
+                this.ctx.decl_index.type_of_def(owner_def)
+            };
             mut sr: ScopeResolutionNode* = new ScopeResolutionNode(
-                SymbolStr::from_id(type_name_id), SymbolStr::from_id(method_name_id), sp);
-            // The converter yields `to_ty`, so that is what this reference
-            // names.  The scope segment holds the owner's BARE name - the
-            // converter registry stores it that way - so the `Res` is derived
-            // from the type rather than read off the spelling.
-            sr.set_synthesized_ref(to_ty, this.ctx.decl_index.def_of(to_ty, this.ctx.type_arena));
+                this.ctx.defs.leaf_of(owner_def), this.ctx.defs.leaf_of(conv), sp);
+            sr.set_synthesized_ref(owner_ty, owner_def);
             // Generic-identity view: a post-mono concrete target still needs its
             // type_args stamped onto the synthesized scope, or the converter call
             // resolves against the bare generic scope name.
-            const n_args: i64 = this.types.view_type_arg_count(to_ty);
+            const n_args: i64 = this.types.view_type_arg_count(owner_ty);
             if (n_args > 0) {
                 mut gargs: TypeAnnotation*[] = [];
                 for (mut gi: i64 = 0; gi < n_args; gi++) {
                     mut na: NamedAnnotation* = new NamedAnnotation {
                         name:         SymbolStr::empty(),
                         span:         sp,
-                        pre_resolved: this.types.view_type_arg_at(to_ty, gi),
+                        pre_resolved: this.types.view_type_arg_at(owner_ty, gi),
                         res: ResSlot::Pending,
                     };
                     gargs.push(new TypeAnnotation::Named(na));
@@ -2230,9 +2240,18 @@ type struct CallResolver {
                 sr.set_scope_generic_args(gargs);
             }
             callee = sr as ExpressionNode*;
+            conv_call = new CallExprNode(callee, sp);
+            // The owner's own method, or its copy on a built instance, is
+            // pinned.  An instance not built yet reads its methods off its
+            // generic template, whose method no call can run: the call is
+            // left as a written path on it is, for monomorphization, which
+            // demands the instance's method as it binds it.
+            const methods_of: TypeRef = this.types.method_owner_ref(owner_ty);
+            if (this.ctx.generic_registry.template_of_type(methods_of) == null) {
+                const e: OverloadId = this.ctx.decl_index.method_entry_on(methods_of, conv);
+                if (e.is_valid()) { conv_call.set_resolved_callee(CalleePin::Decl(e)); }
+            }
         }
-
-        mut conv_call: CallExprNode* = new CallExprNode(callee, sp);
         conv_call.add_argument(expr);
 
         this.state.in_implicit_conversion = true;

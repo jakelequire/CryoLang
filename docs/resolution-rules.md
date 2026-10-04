@@ -195,6 +195,32 @@ yet is recorded with the change that builds it, not here.
      each reader reads the return of the method it selects, and a
      trait-declared method's return comes through the `trait-method` door.
 
+116. **A static call that is refused has no type**: when the selection picks
+     no method (two methods tie, or no overload fits the arguments), the call
+     is not typed with the return of the method registered last.
+
+     ```cryo
+     const v: i32 = Both::go(&b);   // error[E0156], and no second error on `v`
+     ```
+
+117. **The function-template placeholders are converted before
+     `module_named` is made private**, the order the change converting
+     them took.
+
+118. **Two call-resolution defects are fixed on this branch**: a call to
+     overloaded generic free functions selects the overload its arguments
+     fit, and a generic owner's method returning a bare type parameter,
+     called through a path that writes the owner's arguments, has that
+     parameter substituted.
+
+     ```cryo
+     function pick<T>(a: T) -> T { return a; }
+     function pick<T>(a: T, b: T) -> T { return b; }
+     const y: i32 = pick(4, 5);             // the two-argument `pick`
+
+     const c: i32 = Box2::<i32>::get(&bx);  // `get` returns `T`, here `i32`
+     ```
+
 ### 2026-10-02
 
 80. **The internal check after monomorphization names the specialization's
