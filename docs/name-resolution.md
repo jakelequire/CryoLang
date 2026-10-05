@@ -58178,3 +58178,80 @@ and the `i32` result widens at the declaration (`sext`), as
   be declared to verify (`tests/started-passing` names projects), so the
   run reports FAIL on that one move; every gate ok.  Clean build: 330
   warnings, the same set.
+
+### 8.508 A copy of a generic body carries the types its template decided - 2026-10-04
+
+## Why
+
+The census's four build blockers (C1-C4, 8.505): with the pass after
+monomorphization off, 121 corpus entries failed, nearly all on these,
+because a copy reached codegen without types only that pass re-derived.
+The 107th's probe fixes, made real.
+
+```cryo
+function swap_in_copy<T>(a: T*, b: T*) -> void {
+    const temp: T = *a;      // C2: the copy's `temp` had no type
+    *a = *b;
+    *b = temp;
+}
+function size_in_copy<T>() -> u64 { return sizeof(T); }   // C1
+function spread<T>(p: CarriedPair<T>) -> T {
+    const { left, right }: CarriedPair<T> = p;            // C3
+    return right;
+}
+match (c) { CarriedChoice::One(v) => { .. } .. }          // C4, `c: CarriedChoice<T>`
+```
+
+## What changed
+
+* **C1** `sizeof`/`alignof`: the cloner carries the operand's type and the
+  substituter rewrites it for the copy (`operand_in_copy`), where it
+  cleared it.  Without a substitution it is still dropped.
+* **C2** a local declaration's type: carried by the statement clone and
+  substituted.  Not a parameter's - those go through `clone_var_decl`,
+  and the copy's signature is monomorphization's to build.
+* **C3** a destructure in a generic body: each binding's type is recorded
+  on the template (`register_destructure_locals_abstract`), and the clone
+  carries it and the destructured type; the substituter rewrites both.
+* **C4** an enum pattern's variant ordinal: the template walk records it
+  where the pattern names the subject's own enum
+  (`PatternResolver::pattern_is_subjects_enum`, the non-reporting half of
+  `pattern_names_enum`, split through `pattern_enum`).  The ordinal is the
+  same in every instantiation and the clone already carried it.
+* Four tests in `tests/lang/generics.cryo`, one per item, in user code.
+  Roster +4.
+
+## Evidence
+
+* Pass off, async/closure bodies still walked (the census's round-3 mode),
+  unit leg: HEAD's compiler with the switches fails to build it (16
+  errors: `sizeof` operand with no type x6, `*b = temp` in `mem::swap`
+  copies, ...); this one builds it and passes 2,218 of 2,218, 228
+  compile-fail, 171 of 175 projects (the four unpinned-call projects).
+* Agreement probe over the full corpus (8.506's driver), the pass on, each
+  carried answer against the one the pass derives itself: `sizeof`
+  operands 6,975 same / 0 differ; local declaration types 176,250 same /
+  0 (167,252 by annotation, 8,998 by initializer); destructure bindings
+  1,025 / 0; enum patterns 387,550 same, 6 set first by the pass, all in
+  async-lowered `poll` bodies (C5).  Controls, each disabled alone:
+  `sizeof` not substituted -> 6,760 differ; locals not substituted -> 870
+  differ, and 208 builds fail (E0200 x296); bindings not substituted ->
+  E0361 x260, E0200 x429; the template walk recording no pattern ->
+  337,238 set first by the pass.  A first version of the local probe
+  compared the carried type with itself (`check_var_decl` keeps a type it
+  is handed) and read 100% agreement under its own control; it now
+  resolves the annotation or reads the initializer afresh.
+* `make verify --baseline HEAD --require-identical`: 4 of 6,257 test
+  objects moved, 0 of 1,126 examples - not predicted, and explained:
+  (a) `AsyncDestructureLocals`: a destructure in a generic `async`
+  function is now split by the async lowering (`split_destructures`,
+  `const __ds = ..; const {a: a$D ..} = __ds; const a = a$D`) as one in a
+  concrete `async` function always was - the lowering skipped untyped
+  destructures, and the template's were untyped (C3); (b)
+  `AsyncGenericFunction`, `async_carried_local_released_at_return` and
+  `generic_caller_receiver_args`: two `Option<..>` instances are emitted
+  in the other order, so their string constants are numbered differently
+  (`@check.msg.130` <-> `.149`).  With C2's one carried line removed, that
+  project's IR is identical to HEAD's, so it is the carried local type.
+  Every other differing line is a local's numeric suffix.  Every gate ok.
+* Clean build: 330 warnings, the same set.

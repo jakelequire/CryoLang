@@ -183,9 +183,11 @@ type struct PatternResolver {
             return payload_types;
         }
         const variant: EnumVariantInfo* = &et.variants[vi];
-        // The ordinal codegen reads the tag and the payload layout by; the
-        // symbolic walk's answer is not recorded, for the reason above.
-        if (!this.state.in_symbolic_check) {
+        // The ordinal codegen reads the tag and the payload layout by, the
+        // same in the template and in every copy.  The symbolic walk records
+        // it only where the pattern names the subject's own enum, for the
+        // reason above.
+        if (!this.state.in_symbolic_check || this.pattern_is_subjects_enum(enum_pat, et)) {
             enum_pat.set_resolved_member(MemberPin::Variant(vi));
         }
         payload_types = sema_copy_type_refs(&variant.payload_types);
@@ -214,13 +216,8 @@ type struct PatternResolver {
         return payload_types;
     }
 
-    /// Whether the enum `enum_pat`'s stamp names is the definition `subject`
-    /// is an instance of; true as well when the stamp makes no enum claim
-    /// (a pattern the name layer could not answer is diagnosed there, and a
-    /// synthesized one without a stamp asserts nothing).  A pattern naming
-    /// another enum is refused: its variant leaf may be one the subject's
-    /// enum also declares, and reading the leaf off the subject would match.
-    pattern_names_enum(mut &this, enum_pat: EnumPatternNode*, subject: EnumType*) -> boolean {
+    /// The enum `enum_pat`'s stamp names, or null when it makes no enum claim.
+    pattern_enum(&this, enum_pat: EnumPatternNode*) -> Type* {
         mut named: TypeRef = TypeRef::invalid();
         match (enum_pat.res) {
             ResSlot::Answered(r) => {
@@ -231,12 +228,31 @@ type struct PatternResolver {
             }
             _ => { }
         }
-        if (!named.is_valid()) { return true; }
+        if (!named.is_valid()) { return null; }
         const named_t: Type* = this.types.unwrap_to_enum(named);
-        if (named_t == null || named_t.kind != TypeKind::Enum) { return true; }
-        const named_def: u64 = PatternResolver::enum_definition_id(named_t as EnumType*);
-        const subject_def: u64 = PatternResolver::enum_definition_id(subject);
-        if (named_def == subject_def) { return true; }
+        if (named_t == null || named_t.kind != TypeKind::Enum) { return null; }
+        return named_t;
+    }
+
+    /// Whether the pattern's stamp names `subject`'s own enum definition,
+    /// without reporting anything.
+    pattern_is_subjects_enum(&this, enum_pat: EnumPatternNode*, subject: EnumType*) -> boolean {
+        const named_t: Type* = this.pattern_enum(enum_pat);
+        return named_t != null && PatternResolver::enum_definition_id(named_t as EnumType*)
+            == PatternResolver::enum_definition_id(subject);
+    }
+
+    /// Whether the enum `enum_pat`'s stamp names is the definition `subject`
+    /// is an instance of; true as well when the stamp makes no enum claim
+    /// (a pattern the name layer could not answer is diagnosed there, and a
+    /// synthesized one without a stamp asserts nothing).  A pattern naming
+    /// another enum is refused: its variant leaf may be one the subject's
+    /// enum also declares, and reading the leaf off the subject would match.
+    pattern_names_enum(mut &this, enum_pat: EnumPatternNode*, subject: EnumType*) -> boolean {
+        const named_t: Type* = this.pattern_enum(enum_pat);
+        if (named_t == null) { return true; }
+        if (PatternResolver::enum_definition_id(named_t as EnumType*)
+                == PatternResolver::enum_definition_id(subject)) { return true; }
         const want: string = this.intern.resolve(subject.qualified_name);
         const got: string = this.intern.resolve((named_t as EnumType*).qualified_name);
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0200_TYPE_MISMATCH,

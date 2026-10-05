@@ -322,3 +322,77 @@ function generic_literal_arg_adapts_to_sibling_width() -> Result<(), TestError> 
     }
     return Result::Ok(());
 }
+
+// ============================================================================
+// Answers a generic body decides, carried into each copy
+// ============================================================================
+
+// `sizeof`/`alignof` of a parameter: each copy's operand is its own type.
+function size_in_copy<T>() -> u64 { return sizeof(T) + alignof(T); }
+
+![test]
+function sizeof_in_a_copy_is_the_copys_type() -> Result<(), TestError> {
+    match (expect_eq(size_in_copy::<u8>(), 2)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(size_in_copy::<i64>(), 16);
+}
+
+// A local declared with a parameter's type, assigned through a pointer.
+function swap_in_copy<T>(a: T*, b: T*) -> void {
+    const temp: T = *a;
+    *a = *b;
+    *b = temp;
+}
+
+![test]
+function local_of_parameter_type_in_a_copy() -> Result<(), TestError> {
+    mut x: i64 = 3;
+    mut y: i64 = 40000000000;
+    swap_in_copy::<i64>(&x, &y);
+    match (expect_eq(x, 40000000000)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(y, 3);
+}
+
+type struct CarriedPair<T> { left: T; right: T; }
+
+// A destructure whose type names the body's parameter.
+function spread_in_copy<T>(p: CarriedPair<T>, take_right: boolean) -> T {
+    const { left, right }: CarriedPair<T> = p;
+    if (take_right) { return right; }
+    return left;
+}
+
+![test]
+function destructure_of_parameter_type_in_a_copy() -> Result<(), TestError> {
+    match (expect_eq(spread_in_copy::<i64>(CarriedPair::<i64> { left: 1, right: 50000000000 }, true), 50000000000)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(spread_in_copy::<i64>(CarriedPair::<i64> { left: 1, right: 50000000000 }, false), 1);
+}
+
+type enum CarriedChoice<T> { Neither; One(T); }
+
+// A match on an enum of the parameter: each arm's variant in every copy.
+function choose_in_copy<T>(c: CarriedChoice<T>, fallback: T) -> T {
+    match (c) {
+        CarriedChoice::One(v)  => { return v; }
+        CarriedChoice::Neither => { return fallback; }
+    }
+}
+
+![test]
+function enum_pattern_of_parameter_type_in_a_copy() -> Result<(), TestError> {
+    const one: CarriedChoice<i64> = CarriedChoice::One(7);
+    const neither: CarriedChoice<i64> = CarriedChoice::Neither;
+    match (expect_eq(choose_in_copy::<i64>(one, 9), 7)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(choose_in_copy::<i64>(neither, 9), 9);
+}

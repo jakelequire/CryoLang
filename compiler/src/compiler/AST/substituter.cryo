@@ -639,6 +639,16 @@ public:
     }
 
     override visit(node: DestructureDeclNode*) -> void {
+        // The decided types - the destructured value's and each binding's -
+        // as this copy sees them.
+        if (this.subst != null) {
+            if (node.resolved_type.is_valid()) { node.resolved_type = this.in_copy(node.resolved_type); }
+            for (mut i: i64 = 0; i < node.bindings.length; i++) {
+                if (node.bindings[i].resolved_type.is_valid()) {
+                    node.bindings[i].resolved_type = this.in_copy(node.bindings[i].resolved_type);
+                }
+            }
+        }
         if (node.type_annotation != null) {
             node.type_annotation = this.substitute_annotation(node.type_annotation);
         }
@@ -878,11 +888,7 @@ public:
         // (e.g., `HashMapEntry<K, V>` -> `HashMapEntry<S, j>`).
         if (node.type_ann != null) {
             this.substitute_annotation(node.type_ann);
-            // The annotation now names a different type, so any resolution of
-            // the old one describes the template rather than this
-            // specialization. Dropped rather than kept: a stale size is a
-            // wrong answer, an absent one is re-derived from the annotation.
-            node.set_operand_type(TypeRef::invalid());
+            node.set_operand_type(this.operand_in_copy(node.operand_type));
         }
     }
 
@@ -890,8 +896,17 @@ public:
         this.substitute_type(node as ExpressionNode*);
         if (node.type_ann != null) {
             this.substitute_annotation(node.type_ann);
-            node.set_operand_type(TypeRef::invalid());
+            node.set_operand_type(this.operand_in_copy(node.operand_type));
         }
+    }
+
+    /// A `sizeof`/`alignof` operand's decided type as this copy sees it.
+    /// Without a substitution the annotation may now name a different type
+    /// than the one decided, so the answer is dropped: a stale size is a
+    /// wrong answer, and a missing one is an error codegen reports.
+    operand_in_copy(&this, t: TypeRef) -> TypeRef {
+        if (this.subst == null || !t.is_valid()) { return TypeRef::invalid(); }
+        return this.in_copy(t);
     }
 
 
@@ -1154,6 +1169,9 @@ public:
     }
 
     override visit(node: VarDeclNode*) -> void {
+        if (this.subst != null && node.resolved_type.is_valid()) {
+            node.resolved_type = this.in_copy(node.resolved_type);
+        }
         if (node.type_annotation != null) {
             node.type_annotation = this.substitute_annotation(node.type_annotation);
         }
