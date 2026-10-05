@@ -58128,3 +58128,53 @@ function read_deref<T, U>(b: T) -> U where T: Deref<U> {
 * A first version pinned the `None` itself with `EnumType::variant_index`
   on the node's leaf: `residue.py` counted a new spelling lookup.  Letting
   the walk answer it asks no new question.
+
+### 8.507 A where-bound decides its parameter before the expected type does - 2026-10-04
+
+## Why
+
+The fifth miscompile the census found behind the pass after
+monomorphization (C10).  `block_on<F, R>(fut: F) -> R where F: Future<R>`:
+
+```cryo
+const a: i64 = future::block_on(gf_identity(11));
+```
+
+The argument binds `F` to `gf_identity<i32>`'s future.  The free-call
+inference then filled the still-unbound `R` from the expected type (`i64`)
+before projecting it off `F`'s bound, so the call was `block_on<F, i64>`
+while `F` is a `Future<i32>`.  The pass after monomorphization re-typed the
+copy's `match` and sign-extended the `i32` payload; with it off, `poll`'s
+`i32` result was read as an `i64`.  Ruling 99 accepts objects that move
+for a literal's width once the pass is gone; this is not one of those - the
+instantiation itself was wrong.
+
+## What changed
+
+`CallResolver::check_generic_free_call` and `infer_free_call_bindings`
+project the where-bound parameters off what the arguments bound BEFORE
+consulting the expected type, and again after the literal pass as before.
+The bound is a requirement and the expected type a hint: `R` is `i32`,
+and the `i32` result widens at the declaration (`sext`), as
+`const b: i64 = block_on(gf_const_step::<u32>(3, 12))` already did.
+
+## Evidence
+
+* Pass off (probe over the tree): `s108/c10` (`block_on(gf_identity(11))`
+  and `(-3)` into `i64`) fails to build before (E0900, the `Poll<i64>`
+  match in `block_on<.., i64>` has no comparison) and runs (exit 0) after;
+  `AsyncGenericFunction::generic_async_infers_its_type_argument` fails
+  before (census round 3) and passes after.
+* Agreement probe over the full corpus (the 8.506 driver, pass on): at
+  every call where the early projection binds a parameter while an expected
+  type is in force, the binding is compared with what the expected type
+  would have bound.  390 sites: 233 the same, 156 where the expected type
+  binds nothing for that parameter, 1 different - this `block_on`, the
+  positive control.  Every build's status unchanged.
+* `make verify --baseline HEAD --require-identical`: 1 of 6,257 test
+  objects moved, `AsyncGenericFunction.o`; 0 of 1,126 example objects.  Its
+  IR differs in one function: the test calls `block_on<.., i32>` and
+  widens, where it called `block_on<.., i64>`.  A unit test's object cannot
+  be declared to verify (`tests/started-passing` names projects), so the
+  run reports FAIL on that one move; every gate ok.  Clean build: 330
+  warnings, the same set.
