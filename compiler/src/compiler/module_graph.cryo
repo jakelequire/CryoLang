@@ -411,17 +411,16 @@ type struct ModuleGraph {
         return &this.modules[index];
     }
 
+private:
     /// Door `module-by-path`.  A module is written as a path of text in an
     /// import, a qualified name or a manifest, and the graph is the only
-    /// thing that knows which modules exist.  Meant to be private to the
-    /// name layer and the module loader.
+    /// thing that knows which modules exist.  Private to the graph: a caller
+    /// elsewhere asks one of the methods below, each named for the one kind
+    /// of text it turns into a module.
     ///
     /// The path of the module the namespace `ns` names, when the graph holds
     /// one under it - discovered, or bound by a C import - and none
-    /// otherwise.  The one door that turns written text into a module: an
-    /// import's path, an export's item, a qualified path's module part, a
-    /// namespace some other store recorded.  It cannot answer a module that
-    /// does not exist.
+    /// otherwise.  It cannot answer a module that does not exist.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     module_named(&this, ns: SymbolStr) -> ModulePath {
         if (!ns.is_valid()) { return ModulePath::none(); }
@@ -429,6 +428,35 @@ type struct ModuleGraph {
             return ModulePath::of(ns);
         }
         return ModulePath::none();
+    }
+
+public:
+    /// The module an import or export path names as written in source -
+    /// `import a::b;`, a braced entry's `a::b::c`, `export a::b;` and an
+    /// export's entry - when the graph holds one under that path; none
+    /// otherwise.
+    ![allow(lookup_by_spelling, reason = "an import or export path is a module written as text in source, and nothing has bound it yet: this is where it becomes the module")]
+    module_of_written_path(&this, written: SymbolStr) -> ModulePath {
+        return this.module_named(written);
+    }
+
+    /// The module `<parent>::<leaf>` when a written module path and an item
+    /// name written beside it together also name a module - an imported
+    /// entry that is a sub-module, a type declared beside a module of its
+    /// own path; none otherwise.
+    ![allow(lookup_by_spelling, reason = "asks whether an item's written path is also a module's, so the two can be told apart or refused as a tie; the path is joined from source text no binding answers")]
+    module_beside_item(&this, parent: string, leaf: string, intern: InternTable*) -> ModulePath {
+        if (intern == null) { return ModulePath::none(); }
+        return this.module_named(intern.intern(parent + "::" + leaf));
+    }
+
+    /// The module the parent of a name the compiler minted qualified names
+    /// (`std::core::option` for a specialization minted as
+    /// `std::core::option::Option<i32>`); none when the graph holds no
+    /// module under it.
+    ![allow(lookup_by_spelling, reason = "a minted qualified name carries its module only as its parent's text; the minting is what has to change for this to take an identity")]
+    module_of_minted_parent(&this, ns: SymbolStr) -> ModulePath {
+        return this.module_named(ns);
     }
 
     /// The module the compiler imports on a program's behalf, `m`, when the

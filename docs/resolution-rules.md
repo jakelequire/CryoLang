@@ -40,8 +40,9 @@ declaration so the reason cannot be removed without touching the code.
 
 The ruled kinds of door: the bare-identifier scope lookup and its
 type-namespace twin; one door per member kind, each taking an owner identity
-plus a leaf name; module-by-path (private to the name layer and the module
-loader, its other callers converting or becoming its body); the fixed
+plus a leaf name; module-by-path (private to the module graph, which offers
+its callers methods each named for the one kind of text it turns into a
+module); the fixed
 primitive and language-item table; the interner; and diagnostic suggestions,
 whose result may flow only into message text.
 
