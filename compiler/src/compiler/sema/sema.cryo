@@ -130,6 +130,7 @@ import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::resolver::{ ResolutionContext };
+import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
@@ -2969,15 +2970,30 @@ public:
         this.state.symbolic_narrow_syms.push((st as GenericParamType*).param_sym);
         this.state.symbolic_narrow_types.push(arm_ref);
 
-        // Collect locals typed exactly as the scrutinee param first, then rebind:
-        // register_local_with_mut mutates `state.locals`, so it must not run while
-        // the entry iterator is live.
+        // Collect the locals whose type names the scrutinee param first - `T`
+        // itself, or `&T`, `T*`, `Array<T>` - then rebind each to its type
+        // with the arm's type in the param's place: register_local_with_mut
+        // mutates `state.locals`, so it must not run while the entry iterator
+        // is live.
+        mut params: TypeRef[] = [scrut_ref];
+        mut args: TypeRef[] = [arm_ref];
+        const narrowing: TypeSubstitution = TypeSubstitution::from_params(&params, &args);
         mut keys: u32[] = [];
+        mut narrowed: TypeRef[] = [];
         mut it: HashMapIter<u32, TypeRef> = this.state.locals.iter();
         loop {
             match (it.next()) {
                 Option::Some(pair) => {
-                    if (pair.second.equals(scrut_ref)) { keys.push(pair.first); }
+                    if (pair.second.equals(scrut_ref)) {
+                        keys.push(pair.first);
+                        narrowed.push(arm_ref);
+                    } else if (this.arena.contains_generic_param(pair.second)) {
+                        const nt: TypeRef = narrowing.apply(pair.second, this.arena);
+                        if (nt.is_valid() && !nt.equals(pair.second)) {
+                            keys.push(pair.first);
+                            narrowed.push(nt);
+                        }
+                    }
                 }
                 Option::None => { break; }
             }
@@ -2985,7 +3001,7 @@ public:
         for (mut i: i64 = 0; i < keys.length; i++) {
             const nm: SymbolStr = SymbolStr::from_id(keys[i]);
             const is_mut: boolean = this.scopes.local_is_mutable(nm);
-            this.scopes.register_local_with_mut(nm, arm_ref, is_mut);
+            this.scopes.register_local_with_mut(nm, narrowed[i], is_mut);
         }
         keys.drop();
         return save;
