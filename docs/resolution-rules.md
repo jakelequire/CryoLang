@@ -128,6 +128,22 @@ yet is recorded with the change that builds it, not here.
 
 127. **`LangItem::AstArenaAlloc` stays.**
 
+128. **`math::sqrt` and `math::fabs` become methods of each float type**, as
+     ruling 112 made `abs` one of each numeric primitive; the generic
+     functions are removed.
+
+     ```cryo
+     const r: f64 = (2.0).sqrt();
+     ```
+
+129. **`make verify`'s `tests/started-passing` may name a negative test
+     file whose report changes deliberately**, so a change to a refusal's
+     message is verified in one run rather than composed by hand from two.
+
+130. **`This::` stamps the owner's definition directly** (and the owner's
+     parameters as its arguments) instead of writing the owner's name into
+     the path and resolving it again.
+
 ### 2026-10-03
 
 95. *Superseded by ruling 112.* **`math::abs<T>` and `math::clamp<T>` are bounded by the standard

@@ -1992,6 +1992,34 @@ public:
         const trait_id: DefId = this.ctx.generic_registry.wellknown(map.lang);
         if (!trait_id.is_valid()) { return null; }
         if (this.trait_checker().select_impl(trait_id, base_ty, 0) == null) { return null; }
+        return this.operator_desugar(receiver, rhs, map, trait_id, op_tok, span);
+    }
+
+    /// `*b` on a type parameter whose bound gives it `Deref` (likewise `-x`
+    /// under `Neg`, `!x` under `Not`), in a generic body: the desugar the
+    /// bound licenses, built where the operator is written.  A reference to
+    /// the parameter is looked through, as the concrete path does once the
+    /// primitive operator refused it.  Null on any other operand.  A copy whose operand is not a user type applies the
+    /// primitive operator instead (`UnaryExprNode::desugar_by_bound`).
+    bound_unary_desugar(mut &this, unary: UnaryExprNode*, ty: TypeRef) -> ExpressionNode* {
+        if (!this.state.in_symbolic_check) { return null; }
+        // A pointer keeps the primitive operator, as it does on the concrete path.
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null || t.kind == TypeKind::Pointer) { return null; }
+        const map: OperatorTraitMap = OperatorTraitMap::for_unary(unary.op.kind);
+        if (!map.valid) { return null; }
+        const trait_id: DefId = this.ctx.generic_registry.wellknown(map.lang);
+        if (!trait_id.is_valid()) { return null; }
+        const param: GenericParamType* = this.binding.receiver_type_param(ty);
+        if (param == null || !this.binding.param_bounded_by(param, trait_id)) { return null; }
+        return this.operator_desugar(unary.operand, null, map, trait_id, unary.op, unary.span);
+    }
+
+    /// The operator's call on `trait_id`'s method, wrapped as `map` says,
+    /// and resolved.
+    operator_desugar(mut &this, receiver: ExpressionNode*, rhs: ExpressionNode*,
+                     map: OperatorTraitMap, trait_id: DefId, op_tok: Token,
+                     span: SourceSpan) -> ExpressionNode* {
         const method_sym: SymbolStr = this.intern.intern(map.method);
         mut desugared: ExpressionNode* =
             this.build_operator_call(receiver, method_sym, trait_id, rhs, op_tok, span);
@@ -2552,7 +2580,15 @@ public:
         const result: TypeCheckResult = this.checker.check_unary_op(unary.op.kind, operand_type);
         if (!result.success) {
             if (this.symbolic.symbolic_type_unresolved(operand_type)) {
-                this.refuse_unlicensed_param_operator(unary.op.kind, true, operand_type, TypeRef::invalid(), unary.span);
+                if (this.refuse_unlicensed_param_operator(unary.op.kind, true, operand_type, TypeRef::invalid(), unary.span)) {
+                    return operand_type;
+                }
+                const bde: ExpressionNode* = this.bound_unary_desugar(unary, operand_type);
+                if (bde != null) {
+                    unary.desugared_call = bde;
+                    unary.desugar_by_bound = true;
+                    return bde.resolved_type;
+                }
                 return operand_type;
             }
             // Operator overloading: `-x` on a user type (Phase 1) or a
@@ -3063,7 +3099,10 @@ public:
         } else {
             mut bare_err: ScopeResolutionNode* =
                 new ScopeResolutionNode(enum_name, err_variant, span);
-            bare_err.set_synthesized_ref(ret_ty, this.ctx.decl_index.def_of(ret_ty, this.ctx.type_arena));
+            // The `Res` alone: a node that carries its type is answered from
+            // it and never walked, and the walk is what pins the variant
+            // codegen builds.  It types the value by the return it is in.
+            bare_err.set_synthesized_res(this.ctx.decl_index.def_of(ret_ty, this.ctx.type_arena));
             ret_value = bare_err as ExpressionNode*;
         }
         // Inside the `poll` an `async fn` was lowered into, every `return`
@@ -3540,8 +3579,12 @@ public:
         // asked, so the miss is real rather than a lane sema does not model.
         if (this.state.in_symbolic_check) {
             // `T::make` taken as a value names the bound's member as the
-            // call `T::make()` does.
+            // call `T::make()` does, and records the trait's method for each
+            // copy to bind on the type the parameter becomes.
             this.calls.direct_param_path(scope);
+            if (scope.resolved_trait.is_valid() && !scope.template_method.is_valid()) {
+                scope.template_method = this.calls.trait_item_def(scope.resolved_trait, scope);
+            }
             return found;
         }
         // A module's function whose signature was refused where it was

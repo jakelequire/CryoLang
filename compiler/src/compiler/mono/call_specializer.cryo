@@ -412,8 +412,12 @@ type struct MonoCallSpecializer {
                 }
             }
             NodeKind::UnaryExpression => {
-                const ue: UnaryExprNode* = expr as UnaryExprNode*;
+                mut ue: UnaryExprNode* = expr as UnaryExprNode*;
                 this.walk_expr(ue.operand, res_ctx, subst);
+                if (ue.desugar_by_bound && ue.desugared_call != null
+                        && this.operand_takes_primitive_operator(ue.operand, subst)) {
+                    ue.desugared_call = null;
+                }
                 if (ue.desugared_call != null) {
                     this.walk_expr(ue.desugared_call, res_ctx, subst);
                 }
@@ -509,10 +513,27 @@ type struct MonoCallSpecializer {
                 // function-reference VALUE (`tramp<i32>` passed/cast/assigned).
                 this.specialize_fn_value_ref(expr as IdentifierNode*, res_ctx, subst);
             }
+            NodeKind::ScopeResolution => {
+                this.bind_path_value(expr as ScopeResolutionNode*);
+            }
             _ => {}
         }
     }
 
+
+    /// Whether an operand a bound gave an operator's trait is, in this copy,
+    /// a type the primitive operator applies to: anything but a user type,
+    /// once no type parameter is left in it.  A user type overloads through
+    /// its implementation of the trait, which the bound guarantees.
+    operand_takes_primitive_operator(&this, operand: ExpressionNode*, subst: TypeSubstitution*) -> boolean {
+        if (operand == null) { return false; }
+        mut ty: TypeRef = operand.resolved_type;
+        if (subst != null) { ty = subst.apply(ty, this.arena); }
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null || this.arena.contains_generic_param(ty)) { return false; }
+        return t.kind != TypeKind::Struct && t.kind != TypeKind::Class
+            && t.kind != TypeKind::Enum && t.kind != TypeKind::InstantiatedType;
+    }
 
     /// Concretize one stashed type-arg: apply the active specialization, then
     /// reduce any associated-type projection the substitution left standing.
@@ -1285,6 +1306,24 @@ type struct MonoCallSpecializer {
     /// bound on that owner, by the method it recorded where it is written,
     /// once the owner is minted.  A method with type parameters of its own,
     /// or a call carrying the owner's arguments, is specialized as written.
+    /// A bound-directed path taken as a VALUE in a copy (`const f = T::make;`
+    /// with `T` bound to `P`): the function is the method the path recorded
+    /// where it is written, on the owner the copy's substitution wrote, by
+    /// identity.  A method with type parameters of its own is not a value
+    /// bound as written, and an owner not yet minted has no entries; both
+    /// are left unpinned.
+    bind_path_value(mut &this, scope: ScopeResolutionNode*) -> void {
+        if (!scope.template_method.is_valid() || !scope.spec_owner.is_valid()
+                || scope.resolved_callee.is_some()) { return; }
+        const owner: TypeRef = this.receiver_owner(scope.spec_owner);
+        const ot: Type* = this.arena.lookup(owner);
+        if (ot == null || ot.kind == TypeKind::InstantiatedType) { return; }
+        const m: MethodNode* = this.recorded_method_on(scope.template_method, owner);
+        if (m == null || m.func == null || m.func.generic_params.length > 0
+                || !m.func.overload_entry.is_valid()) { return; }
+        scope.set_resolved_callee(CalleePin::Decl(m.func.overload_entry));
+    }
+
     bind_on_substituted_owner(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*) -> void {
         if (!scope.spec_owner.is_valid() || !call.template_method.is_valid()
                 || call.template_recv.is_valid() || call.resolved_type_args.length > 0) { return; }
@@ -1300,7 +1339,14 @@ type struct MonoCallSpecializer {
     /// which only the call's arguments tell apart; any other, `owner`'s
     /// entry for the definition.
     path_method_on(&this, call: CallExprNode*, owner: TypeRef) -> MethodNode* {
-        const d: DefId = call.template_method;
+        return this.recorded_method_on(call.template_method, owner);
+    }
+
+    /// The method of `owner` the definition `d` a path recorded names: a
+    /// trait's declared method at its position in `owner`'s one
+    /// implementation of the trait, null when it has several; any other,
+    /// `owner`'s entry for `d`.
+    recorded_method_on(&this, d: DefId, owner: TypeRef) -> MethodNode* {
         const slot: i64 = this.generic_registry.trait_item_position(d);
         if (slot >= 0) {
             const heads: ImplBlockNode*[] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
