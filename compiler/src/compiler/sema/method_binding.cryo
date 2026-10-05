@@ -370,6 +370,64 @@ type struct MethodBinding {
         return out;
     }
 
+    /// The parameter types, after its receiver, of `func` - the declared
+    /// method of the trait `trait_def` - with the arguments of the `where`
+    /// bound on the parameter `param_ty` naming that trait substituted in:
+    /// what a call the bound directs to `func` passes (`[&JsonValue]` for
+    /// `T::try_from(v)` under `where T: TryFrom<&JsonValue>`).  Empty when
+    /// the trait has no parameters of its own, or no bound on `param_ty`
+    /// itself names it.
+    bound_method_params(mut &this, param_ty: TypeRef, trait_def: DefId,
+                        func: FunctionDeclNode*) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        if (func == null) { return out; }
+        const pt: Type* = this.arena.lookup(param_ty);
+        if (pt == null || pt.kind != TypeKind::GenericParam) { return out; }
+        const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_def);
+        if (tdecl == null || tdecl.generic_params.length == 0) { return out; }
+        const tr: TraitRef* = this.param_bound_naming(pt as GenericParamType*, trait_def);
+        if (tr == null) { return out; }
+        const leaf: SymbolStr = tr.path[tr.path.length - 1];
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const p: VarDeclNode* = func.parameters[i];
+            if (p == null || !p.resolved_type.is_valid()) { return []; }
+            if (p.is_receiver()) { continue; }
+            out.push(this.subst_bound_trait_args(p.resolved_type, leaf, tr));
+        }
+        return out;
+    }
+
+    /// The trait of a `where` bound on `param` itself naming `trait_def`, by
+    /// identity: the enclosing function's bounds first, then the impl's,
+    /// then the owner declaration's, as `lookup_method_through_param_bounds`
+    /// asks them.  Null when none does.
+    param_bound_naming(&this, param: GenericParamType*, trait_def: DefId) -> TraitRef* {
+        if (this.state.symbolic_current_func != null) {
+            const r: TraitRef* = MethodBinding::bound_ref_in(&this.state.symbolic_current_func.trait_bounds, param, trait_def);
+            if (r != null) { return r; }
+        }
+        if (this.state.symbolic_impl_node != null) {
+            const r: TraitRef* = MethodBinding::bound_ref_in(&this.state.symbolic_impl_node.where_bounds, param, trait_def);
+            if (r != null) { return r; }
+        }
+        const owner_bounds: TraitBound[]* = this.owner_declared_bounds();
+        if (owner_bounds != null) { return MethodBinding::bound_ref_in(owner_bounds, param, trait_def); }
+        return null;
+    }
+
+    static bound_ref_in(bounds: &TraitBound[], param: GenericParamType*, trait_def: DefId) -> TraitRef* {
+        for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+            const b: TraitBound* = &bounds[bi];
+            if (!MethodBinding::bound_names_param(b, param)) { continue; }
+            for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+                const tr: TraitRef* = &b.trait_refs[ti];
+                if (tr.path.length == 0 || tr.refused) { continue; }
+                if (tr.definition().equals(trait_def)) { return tr; }
+            }
+        }
+        return null;
+    }
+
     /// The `where` bounds written on the declaration of the type whose
     /// methods are being walked: they constrain the type's own parameters in
     /// every method the declaration holds, as the enclosing function's and

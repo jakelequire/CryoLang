@@ -2017,6 +2017,27 @@ public:
         return this.operator_desugar(unary.operand, null, map, trait_id, unary.op, unary.span);
     }
 
+    /// `a + b` on a left operand that is itself a type parameter whose bound
+    /// gives it the operator's trait (`T: Add<T, T>`; `a == b` under `Eq`,
+    /// `a < b` under `Ord`), in a generic body: the desugar the bound
+    /// licenses, built where the operator is written, as the concrete path
+    /// builds it for a user type.  Null on any other left operand - a
+    /// reference to the parameter among them, whose comparison a copy
+    /// decides by its referent.  A copy whose operand is not a user type
+    /// applies the primitive operator instead (`BinaryExprNode::desugar_by_bound`).
+    bound_binary_desugar(mut &this, bin: BinaryExprNode*, lhs: TypeRef) -> ExpressionNode* {
+        if (!this.state.in_symbolic_check) { return null; }
+        const t: Type* = this.arena.lookup(lhs);
+        if (t == null || t.kind != TypeKind::GenericParam) { return null; }
+        const map: OperatorTraitMap = OperatorTraitMap::for_binary(bin.op.kind);
+        if (!map.valid) { return null; }
+        const trait_id: DefId = this.ctx.generic_registry.wellknown(map.lang);
+        if (!trait_id.is_valid()) { return null; }
+        const param: GenericParamType* = this.binding.receiver_type_param(lhs);
+        if (param == null || !this.binding.param_bounded_by(param, trait_id)) { return null; }
+        return this.operator_desugar(bin.left, bin.right, map, trait_id, bin.op, bin.span);
+    }
+
     /// The operator's call on `trait_id`'s method, wrapped as `map` says,
     /// and resolved.
     operator_desugar(mut &this, receiver: ExpressionNode*, rhs: ExpressionNode*,
@@ -2398,7 +2419,15 @@ public:
 
         if ((this.symbolic.symbolic_type_unresolved(lhs) || this.symbolic.symbolic_type_unresolved(rhs))
                 && !this.pointer_rule_settles(lhs, rhs)) {
-            this.refuse_unlicensed_param_operator(bin.op.kind, false, lhs, rhs, bin.span);
+            if (this.refuse_unlicensed_param_operator(bin.op.kind, false, lhs, rhs, bin.span)) {
+                return TypeRef::invalid();
+            }
+            const bde: ExpressionNode* = this.bound_binary_desugar(bin, lhs);
+            if (bde != null) {
+                bin.desugared_call = bde;
+                bin.desugar_by_bound = true;
+                return bde.resolved_type;
+            }
             return TypeRef::invalid();
         }
         if (lhs.is_valid() && rhs.is_valid()) {

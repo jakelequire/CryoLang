@@ -4854,6 +4854,11 @@ type struct CallResolver {
             };
             if (directing.is_valid() && !call.template_method.is_valid()) {
                 call.template_method = this.trait_item_def(directing, scope);
+                if (scope.impl_trait == null) {
+                    call.bound_params = this.binding.bound_method_params(
+                        this.symbolic.symbolic_scope_param_type(scope), directing,
+                        this.ctx.decl_index.method_func_of(call.template_method));
+                }
             }
             return param_ret;
         }
@@ -6280,14 +6285,16 @@ type struct CallResolver {
         return sb;
     }
 
-    /// Stash a generic static-method call's owner type args for mono.  The
-    /// method is the one recorded where the call is written
-    /// (`record_template_static`), wherever the owner's method is declared -
-    /// in the declaration, an impl block, or a trait (`HashSet::<i32>::default()`);
-    /// a non-generic static one has the owner's arguments to stash.  Run on
-    /// every `Scope::member` call so the stash is produced whichever
-    /// return-type branch wins; it no-ops unless `scope` names a generic
-    /// struct, union or class.
+    /// Stash a call's owner type args for mono, for a call through a path
+    /// whose owner is a generic type.  The method is the one recorded where
+    /// the call is written (`record_template_static`), wherever the owner's
+    /// method is declared - in the declaration, an impl block, or a trait
+    /// (`HashSet::<i32>::default()`, `(Beta for Wrap<i32>)::make()`); a
+    /// non-generic one has the owner's arguments to stash, whether it is
+    /// static or takes its receiver as the path's first argument
+    /// (`Box2::<i32>::get(&b)`).  Run on every `Scope::member` call so the
+    /// stash is produced whichever return-type branch wins; it no-ops unless
+    /// `scope` names a generic struct, union or class.
     stash_static_owner_bindings_for(mut &this, scope: ScopeResolutionNode*,
                                     call: CallExprNode*) -> void {
         if (call == null || scope == null) { return; }
@@ -6299,11 +6306,9 @@ type struct CallResolver {
         if (tmpl.node_kind != NodeKind::StructDeclaration && tmpl.node_kind != NodeKind::UnionDeclaration
                 && tmpl.node_kind != NodeKind::ClassDeclaration) { return; }
         this.record_template_static(call, scope, this.scope_owner_type(scope));
-        const recorded: ASTNode* = this.ctx.decl_index.method_decl_of(call.template_method);
-        if (recorded == null || recorded.kind != NodeKind::MethodDeclaration) { return; }
-        const matched: MethodNode* = recorded as MethodNode*;
-        if (matched.func == null || !matched.is_static || matched.func.generic_params.length > 0) { return; }
-        this.stash_static_owner_bindings(scope, call, tmpl, matched);
+        const func: FunctionDeclNode* = this.ctx.decl_index.method_func_of(call.template_method);
+        if (func == null || func.generic_params.length > 0) { return; }
+        this.stash_static_owner_bindings(scope, call, tmpl, func);
     }
 
     /// GATED (R1): resolve a static method's return off a generic owner TEMPLATE
@@ -6342,7 +6347,7 @@ type struct CallResolver {
         // static call, so this normally no-ops; it just guarantees the stash on any
         // path that reaches us without the pre-stash (absence of a stash means mono
         // cannot specialize this owner-generic static call).
-        this.stash_static_owner_bindings(scope, call, tmpl, matched);
+        this.stash_static_owner_bindings(scope, call, tmpl, matched.func);
         if (!this.types.contains_generic_param(abstract_ret)) { return abstract_ret; }
 
         // B2a: the return type is the abstract return with the SAME owner bindings the
@@ -6374,17 +6379,17 @@ type struct CallResolver {
     /// lives in `compute_static_owner_bindings` step 3, which calls this with `true`
     /// solely to detect the case, then emits E0307 (an unannotated literal is no
     /// longer accepted as the sole source for a generic owner's type argument).
-    infer_static_owner_bindings_from_args(mut &this, tmpl: TemplateEntry*, method: MethodNode*,
+    infer_static_owner_bindings_from_args(mut &this, tmpl: TemplateEntry*, func: FunctionDeclNode*,
                                           call: CallExprNode*, allow_literal_default: boolean) -> TypeRef[] {
-        if (method == null || method.func == null) { return []; }
+        if (func == null) { return []; }
         if (tmpl.param_types.length == 0) { return []; }
-        if (method.func.parameters.length != call.arguments.length) { return []; }
+        if (func.parameters.length != call.arguments.length) { return []; }
         mut pids: TypeRef[] = [];
         for (mut i: i64 = 0; i < tmpl.param_types.length; i++) { pids.push(tmpl.param_types[i]); }
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
         // Pass 1: bind from concrete (non-literal, non-null) argument types.
-        for (mut i: i64 = 0; i < method.func.parameters.length; i++) {
-            const p: VarDeclNode* = method.func.parameters[i];
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const p: VarDeclNode* = func.parameters[i];
             if (p == null || !p.resolved_type.is_valid()) { continue; }
             const arg: ExpressionNode* = call.arguments[i];
             if (arg == null) { continue; }
@@ -6404,8 +6409,8 @@ type struct CallResolver {
         // 3) then rejects that with E0307 - an unannotated literal is no longer an
         // accepted source for a generic owner's type argument.  No emission here.
         if (allow_literal_default) {
-            for (mut i: i64 = 0; i < method.func.parameters.length; i++) {
-                const p2: VarDeclNode* = method.func.parameters[i];
+            for (mut i: i64 = 0; i < func.parameters.length; i++) {
+                const p2: VarDeclNode* = func.parameters[i];
                 if (p2 == null || !p2.resolved_type.is_valid()) { continue; }
                 const arg2: ExpressionNode* = call.arguments[i];
                 if (arg2 == null || !this.sema_arg_is_polymorphic_literal(arg2)) { continue; }
@@ -6433,11 +6438,11 @@ type struct CallResolver {
     /// narrow base-equality expected-type source can't.  Returns a length-`want`
     /// all-bound binding set (declaration order) or `[]`.
     infer_static_owner_bindings_from_expected(mut &this, tmpl: TemplateEntry*,
-                                              method: MethodNode*) -> TypeRef[] {
-        if (method == null || method.func == null) { return []; }
+                                              func: FunctionDeclNode*) -> TypeRef[] {
+        if (func == null) { return []; }
         if (tmpl.param_types.length == 0) { return []; }
         if (!this.state.expected_type.is_valid()) { return []; }
-        const abstract_ret: TypeRef = method.func.resolved_return_type;
+        const abstract_ret: TypeRef = func.resolved_return_type;
         if (!abstract_ret.is_valid()) { return []; }
         // Nothing to recover if the return is already concrete.
         if (!this.types.contains_generic_param(abstract_ret)) { return []; }
@@ -6461,17 +6466,17 @@ type struct CallResolver {
     /// param be backfilled from its declared default when it appears in neither the
     /// params nor the return (`Arc<T, A = GlobalAlloc>::try_new`, whose `A` is
     /// hardcoded GlobalAlloc in the signature).  Empty when nothing binds.
-    infer_static_owner_prefix(mut &this, tmpl: TemplateEntry*, method: MethodNode*,
+    infer_static_owner_prefix(mut &this, tmpl: TemplateEntry*, func: FunctionDeclNode*,
                               call: CallExprNode*) -> TypeRef[] {
-        if (method == null || method.func == null) { return []; }
+        if (func == null) { return []; }
         if (tmpl.param_types.length == 0) { return []; }
         mut pids: TypeRef[] = [];
         for (mut i: i64 = 0; i < tmpl.param_types.length; i++) { pids.push(tmpl.param_types[i]); }
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
         // Source A: concrete (non-literal, non-null) argument types.
-        if (method.func.parameters.length == call.arguments.length) {
-            for (mut i: i64 = 0; i < method.func.parameters.length; i++) {
-                const p: VarDeclNode* = method.func.parameters[i];
+        if (func.parameters.length == call.arguments.length) {
+            for (mut i: i64 = 0; i < func.parameters.length; i++) {
+                const p: VarDeclNode* = func.parameters[i];
                 if (p == null || !p.resolved_type.is_valid()) { continue; }
                 const arg: ExpressionNode* = call.arguments[i];
                 if (arg == null) { continue; }
@@ -6485,7 +6490,7 @@ type struct CallResolver {
         // Source B: the abstract return unified against the expected type, which
         // recovers a param the args don't determine (incl. one nested in the return).
         if (this.state.expected_type.is_valid()) {
-            const abstract_ret: TypeRef = method.func.resolved_return_type;
+            const abstract_ret: TypeRef = func.resolved_return_type;
             if (abstract_ret.is_valid() && this.types.contains_generic_param(abstract_ret)) {
                 ictx.unify(abstract_ret, this.state.expected_type);
             }
@@ -6509,7 +6514,7 @@ type struct CallResolver {
     /// source builds and returns its OWN array (no owning-array reassignment/
     /// aliasing); `[]` when no source yields a complete set.
     compute_static_owner_bindings(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*,
-                                  tmpl: TemplateEntry*, method: MethodNode*) -> TypeRef[] {
+                                  tmpl: TemplateEntry*, func: FunctionDeclNode*) -> TypeRef[] {
         const want: i64 = tmpl.param_types.length;
         if (want == 0) { return []; }
 
@@ -6541,7 +6546,7 @@ type struct CallResolver {
 
         // 1. Inferred from CONCRETE argument types (no literal-default guess yet).
         // Returns a length-`want` all-bound set or `[]`.
-        const ib: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, method, call, false);
+        const ib: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, func, call, false);
         if (ib.length == want) { return ib; }
 
         // 1b. Unify the method's ABSTRACT return type against the expected type to
@@ -6551,7 +6556,7 @@ type struct CallResolver {
         // - its owner param `T` is in no parameter, only in the annotation
         // `Result<Array<u64,GlobalAlloc>, E>`, so structural unification of the
         // declared return against the expected type is the only source.
-        const eb_unify: TypeRef[] = this.infer_static_owner_bindings_from_expected(tmpl, method);
+        const eb_unify: TypeRef[] = this.infer_static_owner_bindings_from_expected(tmpl, func);
         if (eb_unify.length == want) { return eb_unify; }
 
         // 2. Expected-type derived (e.g. `const s: Slice<i32> = Slice::from_raw(..)`).
@@ -6582,7 +6587,7 @@ type struct CallResolver {
         // args/return DO determine, then backfill the trailing defaulted params from
         // their declared defaults.  Runs AFTER step 2 so a non-default owner arg from
         // a base-matching expected type still wins.
-        const prefix: TypeRef[] = this.infer_static_owner_prefix(tmpl, method, call);
+        const prefix: TypeRef[] = this.infer_static_owner_prefix(tmpl, func, call);
         if (prefix.length > 0 && prefix.length < want) {
             mut rc_d: ResolutionContext = ResolutionContext::new("");
             this.symbolic.symbolic_bind_params(&rc_d);
@@ -6611,7 +6616,7 @@ type struct CallResolver {
         // not cascade; the emitted error aborts the build.  Single-fire: `stash_*`
         // sets `resolved_type_args` from these bindings, so its idempotency guard
         // short-circuits every later `compute` for this call before it re-emits.
-        const lb: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, method, call, true);
+        const lb: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, func, call, true);
         if (lb.length == want) {
             // EXEMPTION: a range literal (`0..5` / `1..=4`) is lowered by the parser
             // into `Range::new` / `RangeInclusive::new` (see expr_parser.cryo), and its
@@ -6675,14 +6680,14 @@ type struct CallResolver {
     /// that names any OTHER template's parameter
     /// (`symbolic_type_concretizable`), so the next source answers instead.
     stash_static_owner_bindings(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*,
-                                tmpl: TemplateEntry*, method: MethodNode*) -> void {
+                                tmpl: TemplateEntry*, func: FunctionDeclNode*) -> void {
         if (call == null || scope == null || tmpl == null) { return; }
         if (call.resolved_type_args.length > 0) { return; }
         const want: i64 = tmpl.param_types.length;
         if (want == 0) { return; }
         // `binds` owns a fresh buffer; `set_resolved_type_args` takes it by value
         // (move), so there is no aliasing/double-free.
-        mut binds: TypeRef[] = this.compute_static_owner_bindings(scope, call, tmpl, method);
+        mut binds: TypeRef[] = this.compute_static_owner_bindings(scope, call, tmpl, func);
         if (binds.length != want) { return; }
         for (mut i: i64 = 0; i < binds.length; i++) {
             if (!binds[i].is_valid()) { return; }
@@ -7267,7 +7272,10 @@ type struct CallResolver {
                 if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
             }
             const owner_ty: TypeRef = this.scope_owner_type(scope);
-            if (this.scope_is_generic_template(owner_ty, scope.member_name)) { return; }
+            if (this.scope_is_generic_template(owner_ty, scope.member_name)) {
+                this.check_template_static_args(visitor, scope, call);
+                return;
+            }
             const scope_str:  string = this.intern.resolve(lookup_sym);
             const member_str: string = this.intern.resolve(scope.member_name);
             if (scope_str.length() == 0 || member_str.length() == 0) { return; }
@@ -7307,6 +7315,37 @@ type struct CallResolver {
         // inherent gather to defer to.
         if (names_module) { return; }
         this.check_static_scope_method_args(visitor, scope, call);
+    }
+
+    /// Argument check for a call through a path whose owner is a generic
+    /// type (`String::from_str("node")`): against the parameters of the
+    /// method the call recorded where it is written, with the owner's
+    /// arguments it stashed substituted in.  This is where an argument meets
+    /// its converter (`"node"` into a `Str`), so a call whose method is
+    /// bound only after monomorphization is converted here, in the body as
+    /// written, and every copy carries the converted argument.  A parameter
+    /// still naming a type parameter or an unreduced projection
+    /// (`(&FilterIter<I>::Item) -> boolean`) is not checked here (passed as invalid,
+    /// which `check_args_against_params` skips): its projections are reduced
+    /// only in the copies.  A method with type parameters of its own, or a
+    /// call with no complete stash, is checked where it is bound.
+    check_template_static_args(mut &this, visitor: ASTVisitor*, scope: ScopeResolutionNode*,
+                               call: CallExprNode*) -> void {
+        const func: FunctionDeclNode* = this.ctx.decl_index.method_func_of(call.template_method);
+        if (func == null || func.generic_params.length > 0) { return; }
+        const tmpl: TemplateEntry* = this.resolve_scope_owner_template(scope);
+        if (tmpl == null || tmpl.param_types.length == 0
+                || call.resolved_type_args.length != tmpl.param_types.length) { return; }
+        mut subst: TypeSubstitution = TypeSubstitution::from_params(tmpl.param_types, call.resolved_type_args);
+        mut params: TypeRef[] = [];
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const p: VarDeclNode* = func.parameters[i];
+            if (p == null || !p.resolved_type.is_valid()) { return; }
+            const pt: TypeRef = this.binding.reduce_assoc_projections(subst.apply(p.resolved_type, this.arena));
+            const open: boolean = this.types.contains_generic_param(pt) || this.types.contains_unresolved_projection(pt);
+            params.push(if (open) { TypeRef::invalid() } else { pt });
+        }
+        this.check_args_against_params(visitor, &call.arguments, params.as_slice());
     }
 
     /// Argument check for an impl-qualified call, `(Beta for P)::go(&p)`:

@@ -45,7 +45,7 @@ import compiler::ast::expression::{
     CalleePin,
     ArrayAccessNode, ArrayLiteralNode, BinaryExprNode, CallExprNode, CastExprNode,
     ExpressionNode, IdentifierNode, IfExprNode, MatchExprNode, MemberAccessNode,
-    ScopeResolutionNode, StaticMatchExprNode, StructLiteralNode, TryExprNode,
+    NewExprNode, ScopeResolutionNode, StaticMatchExprNode, StructLiteralNode, TryExprNode,
     UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -401,9 +401,13 @@ type struct MonoCallSpecializer {
                 this.bind_call_arguments(call);
             }
             NodeKind::BinaryExpression => {
-                const be: BinaryExprNode* = expr as BinaryExprNode*;
+                mut be: BinaryExprNode* = expr as BinaryExprNode*;
                 this.walk_expr(be.left, res_ctx, subst);
                 this.walk_expr(be.right, res_ctx, subst);
+                if (be.desugar_by_bound && be.desugared_call != null
+                        && this.operand_takes_primitive_operator(be.left, subst)) {
+                    be.desugared_call = null;
+                }
                 // An operator-overload desugar (`a.add(&b)`) is a method call
                 // that may need specialization (e.g. `Vec<i32>::add`); walk it
                 // so nested/generic instantiations are discovered.
@@ -515,6 +519,16 @@ type struct MonoCallSpecializer {
             }
             NodeKind::ScopeResolution => {
                 this.bind_path_value(expr as ScopeResolutionNode*);
+            }
+            NodeKind::NewExpression => {
+                const ne: NewExprNode* = expr as NewExprNode*;
+                for (mut i: i64 = 0; i < ne.arguments.length; i++) {
+                    this.walk_expr(ne.arguments[i], res_ctx, subst);
+                }
+                if (ne.array_size != null) { this.walk_expr(ne.array_size, res_ctx, subst); }
+                if (ne.struct_init != null) {
+                    this.walk_expr(ne.struct_init as ExpressionNode*, res_ctx, subst);
+                }
             }
             _ => {}
         }
@@ -1334,12 +1348,42 @@ type struct MonoCallSpecializer {
     }
 
     /// The method of `owner` the static path call `call` recorded: a trait's
-    /// declared method, answered by `owner`'s one implementation of the
-    /// trait at that method's position, and null when it has several,
-    /// which only the call's arguments tell apart; any other, `owner`'s
-    /// entry for the definition.
+    /// declared method, answered by `owner`'s implementation of the trait
+    /// at that method's position - its one implementation, or among several
+    /// the one the directing bound names (`bound_params`), null when that
+    /// leaves no single one; any other, `owner`'s entry for the definition.
     path_method_on(&this, call: CallExprNode*, owner: TypeRef) -> MethodNode* {
-        return this.recorded_method_on(call.template_method, owner);
+        const d: DefId = call.template_method;
+        const slot: i64 = this.generic_registry.trait_item_position(d);
+        if (slot < 0) { return this.recorded_method_on(d, owner); }
+        const heads: ImplBlockNode*[] = this.trait_heads_on(this.decl_index.defs.parent_of(d), owner);
+        if (heads.length == 1) { return this.generic_registry.trait_item_method(heads[0], slot); }
+        // Several implementations of one generic trait (`TryFrom<&JsonValue>`
+        // beside `TryFrom<i64>` for `u64`): the one the bound directing the
+        // call names, whose method takes the parameters the bound gives it.
+        mut found: MethodNode* = null;
+        for (mut h: i64 = 0; h < heads.length; h++) {
+            const m: MethodNode* = this.generic_registry.trait_item_method(heads[h], slot);
+            if (m == null || !this.takes_bound_params(m, call)) { continue; }
+            if (found != null) { return null; }
+            found = m;
+        }
+        return found;
+    }
+
+    /// Whether `m`'s parameters after its receiver are exactly the call's
+    /// `bound_params`, in order.  A call no bound directs takes nothing.
+    takes_bound_params(&this, m: MethodNode*, call: CallExprNode*) -> boolean {
+        if (m.func == null || call.bound_params.length == 0) { return false; }
+        mut k: i64 = 0;
+        for (mut i: i64 = 0; i < m.func.parameters.length; i++) {
+            const p: VarDeclNode* = m.func.parameters[i];
+            if (p == null) { return false; }
+            if (p.is_receiver()) { continue; }
+            if (k >= call.bound_params.length || !p.resolved_type.equals(call.bound_params[k])) { return false; }
+            k += 1;
+        }
+        return k == call.bound_params.length;
     }
 
     /// The method of `owner` the definition `d` a path recorded names: a
@@ -1482,8 +1526,9 @@ type struct MonoCallSpecializer {
         return false;
     }
 
-    /// Specialize a non-generic static method on a generic owner from sema's owner
-    /// stash.  Sema stashes the
+    /// Specialize a call through a path to a non-generic method of a generic
+    /// owner (static, or taking its receiver as the first argument) from
+    /// sema's owner stash.  Sema stashes the
     /// owner's concrete type args on the call (resolve_static_method_return_via_template
     /// -> stash_static_owner_bindings), so this just instantiates the owner, enqueues
     /// it (the worklist drain materializes + DI-registers its methods), and pins the
@@ -1506,32 +1551,30 @@ type struct MonoCallSpecializer {
                 && entry.node_kind != NodeKind::ClassDeclaration) { return false; }
         if (entry.param_count == 0 || entry.ast_node == null) { return false; }
 
-        // The static method is the one sema recorded where the call is
-        // written, a method the owner's declaration holds (instance methods
-        // route through specialize_method_call instead).  A non-generic one
-        // needs only its owner instantiated: its stash is the OWNER's type
-        // args, the owner drain materializes its body, and the call is bound
-        // to the owner's copy by identity once the owner is minted.  A
-        // generic one (`Wrap<A>::make<T>`) needs its OWN `<T>` specialized
-        // within the owner spec - the stash is the METHOD's `<T>`; owner args
-        // come from the scope turbofish or template defaults.
+        // The method is the one sema recorded where the call is written.  A
+        // non-generic one, static or taking its receiver as the path's first
+        // argument (`Box2::<i32>::get(&b)`), needs only its owner
+        // instantiated: its stash is the OWNER's type args, the owner drain
+        // materializes its body, and the call is bound to the owner's copy by
+        // identity once the owner is minted, wherever the owner's method is
+        // written - its declaration, an impl block of the template, or a
+        // trait's declaration (`HashSet::<i32>::default()`,
+        // `(Beta for Wrap<i32>)::make()`).  A generic static one
+        // (`Wrap<A>::make<T>`) needs its OWN `<T>` specialized within the
+        // owner spec - the stash is the METHOD's `<T>`; owner args come from
+        // the scope turbofish or template defaults.
+        const func: FunctionDeclNode* = this.decl_index.method_func_of(call.template_method);
+        if (func == null) { return false; }
         const recorded: ASTNode* = this.decl_index.method_decl_of(call.template_method);
-        if (recorded == null || recorded.kind != NodeKind::MethodDeclaration) { return false; }
-        const m: MethodNode* = recorded as MethodNode*;
-        if (m.func == null || !m.is_static) { return false; }
-        // A non-generic method is bound on the minted owner by the identity
-        // recorded (`path_method_on`), wherever the owner's method is
-        // written: its declaration, an impl block of the template, or a
-        // trait's declaration (`HashSet::<i32>::default()`).  A generic one
-        // is specialized into the declaration that holds it.
-        const in_decl: boolean = MethodNode::is_method_of(m, entry.ast_node);
-        const matched_nongeneric: MethodNode* = if (m.func.generic_params.length == 0
-                && (in_decl || this.template_holds(entry, m)
-                    || this.generic_registry.trait_item_position(call.template_method) >= 0)) { m } else { null };
-        const matched_generic: MethodNode* = if (m.func.generic_params.length > 0 && in_decl) { m } else { null };
+        const m: MethodNode* = if (recorded.kind == NodeKind::MethodDeclaration) { recorded as MethodNode* } else { null };
+        const trait_item: boolean = this.generic_registry.trait_item_position(call.template_method) >= 0;
+        const in_decl: boolean = m != null && MethodNode::is_method_of(m, entry.ast_node);
+        const nongeneric: boolean = func.generic_params.length == 0
+            && (trait_item || in_decl || (m != null && this.template_holds(entry, m)));
+        const matched_generic: MethodNode* = if (m != null && m.is_static && func.generic_params.length > 0 && in_decl) { m } else { null };
 
-        // --- Non-generic static method on a generic owner ---
-        if (matched_nongeneric != null) {
+        // --- Non-generic method on a generic owner ---
+        if (nongeneric) {
             // The owner's type args come from sema's stash (declaration order).
             if (call.resolved_type_args.length != entry.param_types.length) { return false; }
             mut binds: TypeRef[] = [];
