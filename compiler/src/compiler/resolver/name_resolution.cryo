@@ -103,9 +103,13 @@ public:
     this_trait: DefId;
     /// The type `This::` names in the body being walked when no trait
     /// defines it - an inherent impl's target, or a type declaration's own
-    /// name - with the parameters it is declared with.  Empty elsewhere.
-    this_owner:      SymbolStr;
+    /// definition - and the declaration whose parameters it is written
+    /// with.  `this_owner_decl` is null elsewhere.
+    this_owner:      ResBase;
     this_owner_decl: ASTNode*;
+    /// The owner's symbol, for the resolution map: the impl head's binding.
+    /// Invalid in a type declaration's own body, which holds none.
+    this_owner_sym:  SymbolID;
     /// The keyword `This` as a path segment spells it.
     this_type_spelling: SymbolStr;
 
@@ -119,8 +123,9 @@ public:
         this.naming_trait      = false;
         this.this_sym          = resolver.intern_table.intern("this");
         this.this_trait        = DefId::invalid();
-        this.this_owner        = SymbolStr::empty();
+        this.this_owner        = ResBase::Def(DefId::invalid());
         this.this_owner_decl   = null;
+        this.this_owner_sym    = SymbolID::invalid();
         this.this_type_spelling = resolver.intern_table.intern("This");
     }
 
@@ -141,20 +146,27 @@ public:
 
     /// `This::member` written where `This` names a type with no trait
     /// defining it is the enclosing type with its own parameters as its
-    /// arguments - `Pair::<T>::member` in `implement struct Pair<T>` - and
-    /// is resolved as that path is.
-    rewrite_this_scope(mut &this, node: ScopeResolutionNode*) -> void {
-        if (!node.scope_name.equals(this.this_type_spelling)) { return; }
-        if (!this.this_owner.is_valid() || this.this_trait.is_valid()) { return; }
-        if (node.scope_generic_args.length > 0) { return; }
-        node.scope_name = this.this_owner;
+    /// arguments - `Pair::<T>::member` in `implement struct Pair<T>`.  The
+    /// scope is stamped with the owner's definition and each argument with
+    /// the parameter it is, here, where `This` is written: the owner's name
+    /// is never written into the path to be looked up a second time.  True
+    /// when it stamped.
+    stamp_this_scope(mut &this, node: ScopeResolutionNode*) -> boolean {
+        if (!node.scope_name.equals(this.this_type_spelling)) { return false; }
+        if (this.this_owner_decl == null || this.this_trait.is_valid()) { return false; }
+        if (node.scope_generic_args.length > 0) { return false; }
         const params: GenericParamNode*[] = NameResolver::this_owner_params_of(this.this_owner_decl);
         mut args: TypeAnnotation*[] = [];
         for (mut i: i64 = 0; i < params.length; i++) {
             const p: GenericParamNode* = params[i];
-            args.push(TypeAnnotation::named(p.name, node.span));
+            args.push(TypeAnnotation::answered(p.name, Res::GenericParam(p.sym_id), node.span));
         }
         node.set_scope_generic_args(args);
+        node.set_scope_res(Res::TypeRelative(this.this_owner, 1));
+        if (this.this_owner_sym.is_valid()) {
+            this.resolver.record_resolution(node.span, this.this_owner_sym);
+        }
+        return true;
     }
 
     /// Declare a declaration's generic parameters in the current scope, each
@@ -854,15 +866,18 @@ public:
         // Every method is a definition of the type before any body is
         // walked.
         this.define_body_methods(node.def, &node.methods);
-        const outer_owner: SymbolStr = this.this_owner;
+        const outer_owner: ResBase = this.this_owner;
         const outer_owner_decl: ASTNode* = this.this_owner_decl;
-        this.this_owner = node.name;
-        this.this_owner_decl = node as ASTNode*;
+        const outer_owner_sym: SymbolID = this.this_owner_sym;
+        this.this_owner = ResBase::Def(node.def);
+        this.this_owner_decl = if (node.def.is_valid()) { node as ASTNode* } else { null };
+        this.this_owner_sym = SymbolID::invalid();
         for (mut i: int = 0; i < node.methods.length; i++) {
             node.methods[i].accept(this);
         }
         this.this_owner = outer_owner;
         this.this_owner_decl = outer_owner_decl;
+        this.this_owner_sym = outer_owner_sym;
 
         this.resolver.exit_scope();
     }
@@ -1051,10 +1066,6 @@ public:
 
         // Declare generic params (e.g., implement enum Optional<T> { ... })
         this.declare_generics(node.generic_params);
-        const outer_owner: SymbolStr = this.this_owner;
-        const outer_owner_decl: ASTNode* = this.this_owner_decl;
-        this.this_owner = node.target_type;
-        this.this_owner_decl = node as ASTNode*;
 
         // Resolve the target type name
         const target_id: SymbolID = this.resolver.lookup(
@@ -1070,6 +1081,23 @@ public:
                 node.set_res(r);
             }
             _                    => { }
+        }
+        // `This::` in the body names what the head was just answered with.
+        const outer_owner: ResBase = this.this_owner;
+        const outer_owner_decl: ASTNode* = this.this_owner_decl;
+        const outer_owner_sym: SymbolID = this.this_owner_sym;
+        this.this_owner_decl = null;
+        this.this_owner_sym = target_id;
+        match (node.res) {
+            ResSlot::Answered(Res::Def(d)) => {
+                this.this_owner = ResBase::Def(d);
+                this.this_owner_decl = node as ASTNode*;
+            }
+            ResSlot::Answered(Res::PrimTy(p)) => {
+                this.this_owner = ResBase::PrimTy(p);
+                this.this_owner_decl = node as ASTNode*;
+            }
+            _ => { }
         }
 
         // The trait an impl head names. After `declare_generics`, for the same
@@ -1119,6 +1147,7 @@ public:
         this.this_trait = outer_trait;
         this.this_owner = outer_owner;
         this.this_owner_decl = outer_owner_decl;
+        this.this_owner_sym = outer_owner_sym;
         this.resolver.exit_scope();
     }
 
@@ -1846,21 +1875,22 @@ public:
     }
 
     override visit(node: ScopeResolutionNode*) -> void {
-        this.rewrite_this_scope(node);
-        // Look up the scope name (e.g., "Foo" in "Foo::Bar")
-        const scope_sym: SymbolID = this.resolver.lookup(
-            node.scope_name, this.resolver.current_scope);
-        if (scope_sym.is_valid()) {
-            this.resolver.record_resolution(node.span, scope_sym);
+        if (!this.stamp_this_scope(node)) {
+            // Look up the scope name (e.g., "Foo" in "Foo::Bar")
+            const scope_sym: SymbolID = this.resolver.lookup(
+                node.scope_name, this.resolver.current_scope);
+            if (scope_sym.is_valid()) {
+                this.resolver.record_resolution(node.span, scope_sym);
+            }
+            // A segment that already binds in scope names a TYPE (or a value), and
+            // what its members are is sema's question, not this one.  Passing the
+            // SYMBOL through is what keeps the two refusals below from judging a
+            // type that merely shares its name with some module elsewhere in the
+            // program, and it is also the base a type-relative answer records - so
+            // the stamp is built from the lookup already performed rather than from
+            // a second one asking the same question.
+            this.stamp_module_scope(node, scope_sym);
         }
-        // A segment that already binds in scope names a TYPE (or a value), and
-        // what its members are is sema's question, not this one.  Passing the
-        // SYMBOL through is what keeps the two refusals below from judging a
-        // type that merely shares its name with some module elsewhere in the
-        // program, and it is also the base a type-relative answer records - so
-        // the stamp is built from the lookup already performed rather than from
-        // a second one asking the same question.
-        this.stamp_module_scope(node, scope_sym);
         // The scope segment's own arguments (`Pair<String, String>::new`) and
         // the member's (`Layout::of<Entry<K, V>>`) are written types in their
         // own right; what they name is settled here, where the writing scope
