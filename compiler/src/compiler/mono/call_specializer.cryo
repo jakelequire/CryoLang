@@ -405,7 +405,7 @@ type struct MonoCallSpecializer {
                 this.walk_expr(be.left, res_ctx, subst);
                 this.walk_expr(be.right, res_ctx, subst);
                 if (be.desugar_by_bound && be.desugared_call != null
-                        && this.operand_takes_primitive_operator(be.left, subst)) {
+                        && this.operand_takes_primitive_operator(be.left, subst, true)) {
                     be.desugared_call = null;
                 }
                 // An operator-overload desugar (`a.add(&b)`) is a method call
@@ -419,7 +419,7 @@ type struct MonoCallSpecializer {
                 mut ue: UnaryExprNode* = expr as UnaryExprNode*;
                 this.walk_expr(ue.operand, res_ctx, subst);
                 if (ue.desugar_by_bound && ue.desugared_call != null
-                        && this.operand_takes_primitive_operator(ue.operand, subst)) {
+                        && this.operand_takes_primitive_operator(ue.operand, subst, false)) {
                     ue.desugared_call = null;
                 }
                 if (ue.desugared_call != null) {
@@ -538,13 +538,23 @@ type struct MonoCallSpecializer {
     /// Whether an operand a bound gave an operator's trait is, in this copy,
     /// a type the primitive operator applies to: anything but a user type,
     /// once no type parameter is left in it.  A user type overloads through
-    /// its implementation of the trait, which the bound guarantees.
-    operand_takes_primitive_operator(&this, operand: ExpressionNode*, subst: TypeSubstitution*) -> boolean {
+    /// its implementation of the trait, which the bound guarantees.  With
+    /// `through_reference`, a reference is judged by its referent: a binary
+    /// operator on a reference to a user type compares or combines the
+    /// referents, while `&i64 == &i64` stays the primitive operator.
+    operand_takes_primitive_operator(&this, operand: ExpressionNode*, subst: TypeSubstitution*,
+                                     through_reference: boolean) -> boolean {
         if (operand == null) { return false; }
         mut ty: TypeRef = operand.resolved_type;
         if (subst != null) { ty = subst.apply(ty, this.arena); }
-        const t: Type* = this.arena.lookup(ty);
-        if (t == null || this.arena.contains_generic_param(ty)) { return false; }
+        if (this.arena.contains_generic_param(ty)) { return false; }
+        mut t: Type* = this.arena.lookup(ty);
+        mut depth: i32 = 0;
+        while (through_reference && t != null && t.kind == TypeKind::Reference && depth < 4) {
+            t = this.arena.lookup((t as ReferenceType*).referent);
+            depth += 1;
+        }
+        if (t == null) { return false; }
         return t.kind != TypeKind::Struct && t.kind != TypeKind::Class
             && t.kind != TypeKind::Enum && t.kind != TypeKind::InstantiatedType;
     }
