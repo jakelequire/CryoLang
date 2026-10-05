@@ -134,7 +134,7 @@ import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{
-    ClassType, EnumType, EnumVariantInfo, FieldInfo, MethodInfo, StructType, TraitType
+    ClassType, EnumType, EnumVariantInfo, FieldInfo, MethodInfo, StructType, TraitType, TypeAliasType
 };
 import std::core::mem::{ swap };
 import std::core::option::{ Option };
@@ -855,6 +855,8 @@ public:
         mut eff_this: TypeRef = this_type;
         if (this_type.is_valid() && owner_type.is_valid() && this_type.equals(owner_type)) {
             eff_this = this.symbolic.symbolic_owner_instance(owner_type);
+            const written: TypeRef = this.written_receiver_type(func);
+            if (written.is_valid()) { eff_this = written; }
         }
         this.enter_function(func, eff_this);
         this.visit(func.body);
@@ -866,6 +868,35 @@ public:
         this.state.symbolic_current_func = saved_cur_func;
         this.state.symbolic_bodies_walked += 1;
         this.state.symbolic_total_would_emit += sink.errors_since(snap) as i64;
+    }
+
+    /// The instantiation a method exists for when its receiver is written
+    /// with a type of its own (`only_i32(this: &Wrapper<i32>)`), seen through
+    /// the reference; invalid for a receiver written `this` or `&this`, which
+    /// is the owner with its own parameters.
+    written_receiver_type(&this, func: FunctionDeclNode*) -> TypeRef {
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            const p: VarDeclNode* = func.parameters[i];
+            if (p == null || !p.is_value_receiver() || p.type_annotation == null) { continue; }
+            if (!p.resolved_type.is_valid()) { return TypeRef::invalid(); }
+            mut written: TypeRef = p.resolved_type;
+            mut t: Type* = this.arena.lookup(written);
+            if (t != null && t.kind == TypeKind::Reference) {
+                written = (t as ReferenceType*).referent;
+                t = this.arena.lookup(written);
+            }
+            // An alias names its target (`this: &WideWrapper`).
+            mut depth: i32 = 0;
+            while (t != null && t.kind == TypeKind::TypeAlias && depth < 8) {
+                const al: TypeAliasType* = t as TypeAliasType*;
+                if (!al.has_target()) { return TypeRef::invalid(); }
+                written = al.target;
+                t = this.arena.lookup(written);
+                depth += 1;
+            }
+            return written;
+        }
+        return TypeRef::invalid();
     }
 
     /// Walk every method body of a GENERIC owner symbolically.  A method on a
@@ -2083,6 +2114,64 @@ public:
         return true;
     }
 
+    /// An operator applied in a generic body to an operand that is still one
+    /// of the body's type parameters is licensed by that parameter's bounds
+    /// alone: one of them must give it the operator's language trait, or a
+    /// trait that has it as a supertrait.  A parameter with no such bound -
+    /// unbounded, or bounded only by other traits, a user trait spelled like
+    /// the language's among them - is refused here, on the generic body,
+    /// whatever any instantiation would have supplied.  A pointer operand is
+    /// left to the pointer rules.  True when it reported.
+    refuse_unlicensed_param_operator(mut &this, op: TokenType, unary: boolean,
+                                     lhs: TypeRef, rhs: TypeRef, span: SourceSpan) -> boolean {
+        if (!this.state.in_symbolic_check) { return false; }
+        const map: OperatorTraitMap = if (unary) { OperatorTraitMap::for_unary(op) } else { OperatorTraitMap::for_binary(op) };
+        if (!map.valid) { return false; }
+        const lang_def: DefId = this.ctx.generic_registry.wellknown(map.lang);
+        if (!lang_def.is_valid()) { return false; }
+        if (this.refuse_unlicensed_operand(op, map, lang_def, lhs, span)) { return true; }
+        if (unary) { return false; }
+        return this.refuse_unlicensed_operand(op, map, lang_def, rhs, span);
+    }
+
+    refuse_unlicensed_operand(mut &this, op: TokenType, map: OperatorTraitMap, lang_def: DefId,
+                              ty: TypeRef, span: SourceSpan) -> boolean {
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null || t.kind == TypeKind::Pointer) { return false; }
+        const param: GenericParamType* = this.binding.receiver_type_param(ty);
+        if (param == null) { return false; }
+        if (this.binding.param_bounded_by(param, lang_def)) { return false; }
+        const shown: string = this.intern.resolve(param.param_name);
+        const op_text: string = op.to_string();
+        // The trait is spelled by its path: a bound of the program's own may
+        // share its name.
+        const trait_path: string = map.lang.path();
+        const bounds: DefId[] = this.binding.param_bound_traits(param);
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0229_INVALID_BINARY_OP,
+            Text::new(fmt::format("the `%s` operator cannot be applied to `%s`: its bounds do not give it `%s`",
+                op_text, shown, trait_path)));
+        diag = diag.at_with_label(span, Text::new(fmt::format("`%s` needs `%s: %s`", op_text, shown, trait_path)));
+        if (bounds.length == 0) {
+            diag = diag.with_note(Text::new(fmt::format(
+                "`%s` is a type parameter with no bound, so no operator applies to it", shown)));
+        } else if (bounds.length == 1) {
+            diag = diag.with_note(Text::new(fmt::format(
+                "`%s` is bounded by `%s`, which is not `%s` and does not have it as a supertrait",
+                shown, this.intern.resolve(this.ctx.defs.leaf_of(bounds[0])), trait_path)));
+        } else {
+            mut listed: string = "";
+            for (mut i: i64 = 0; i < bounds.length; i++) {
+                const name: string = this.intern.resolve(this.ctx.defs.leaf_of(bounds[i]));
+                listed = if (i == 0) { fmt::format("`%s`", name) } else { fmt::format("%s, `%s`", listed, name) };
+            }
+            diag = diag.with_note(Text::new(fmt::format(
+                "`%s` is bounded by %s; none of them is `%s` or has it as a supertrait", shown, listed, trait_path)));
+        }
+        diag = diag.help(Text::new(fmt::format("add the bound: `where %s: %s`", shown, trait_path)));
+        this.ctx.emit_diagnostic(diag);
+        return true;
+    }
+
     /// Warn when two DIFFERENT concrete numeric types meet in one operation.
     ///
     /// Only the widening direction can occur here - the common-type rule picks
@@ -2167,6 +2256,10 @@ public:
             // symbolically-unresolved operands so pre-monomorphization
             // generic bodies don't trip.
             const base_op: TokenType = bin.op.kind.compound_base();
+            if (base_op != TokenType::Unknown && lhs.is_valid() && rhs.is_valid()
+                && (this.symbolic.symbolic_type_unresolved(lhs) || this.symbolic.symbolic_type_unresolved(rhs))) {
+                this.refuse_unlicensed_param_operator(base_op, false, lhs, rhs, bin.span);
+            }
             if (base_op != TokenType::Unknown && lhs.is_valid() && rhs.is_valid()
                 && !this.symbolic.symbolic_type_unresolved(lhs)
                 && !this.symbolic.symbolic_type_unresolved(rhs)) {
@@ -2275,6 +2368,7 @@ public:
 
         if ((this.symbolic.symbolic_type_unresolved(lhs) || this.symbolic.symbolic_type_unresolved(rhs))
                 && !this.pointer_rule_settles(lhs, rhs)) {
+            this.refuse_unlicensed_param_operator(bin.op.kind, false, lhs, rhs, bin.span);
             return TypeRef::invalid();
         }
         if (lhs.is_valid() && rhs.is_valid()) {
@@ -2457,7 +2551,10 @@ public:
         }
         const result: TypeCheckResult = this.checker.check_unary_op(unary.op.kind, operand_type);
         if (!result.success) {
-            if (this.symbolic.symbolic_type_unresolved(operand_type)) { return operand_type; }
+            if (this.symbolic.symbolic_type_unresolved(operand_type)) {
+                this.refuse_unlicensed_param_operator(unary.op.kind, true, operand_type, TypeRef::invalid(), unary.span);
+                return operand_type;
+            }
             // Operator overloading: `-x` on a user type (Phase 1) or a
             // `Neg`-bounded generic param (Phase 2) rewrites to `x.neg()`.
             // A bounded param is non-numeric, so it reaches this failure path.
