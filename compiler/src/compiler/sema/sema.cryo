@@ -125,7 +125,7 @@ import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::checker::{ TypeChecker, TypeCheckResult, TypeCompatibility };
 import compiler::types::compound::{ ArrayType, PointerType, ReferenceType, TupleType };
-import compiler::types::generic::{ GenericParamType, InstantiatedType };
+import compiler::types::generic::{ AssocProjectionType, GenericParamType, InstantiatedType };
 import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
@@ -290,7 +290,7 @@ public:
                            &this.symbolic, &this.scopes);
         this.lambda.wire(this.arena, this.intern, this.ctx, &this.state, &this.symbolic,
                          &this.scopes, &this.dispatch);
-        this.async_lower.wire(this.arena, this.intern, this.ctx, &this.patterns, &this.literals);
+        this.async_lower.wire(this.arena, this.intern, this.ctx, &this.patterns, &this.literals, &this.member);
         this.member.wire(this.arena, this.intern, this.ctx, &this.checker, &this.state, &this.types,
                          &this.symbolic, &this.binding, &this.diag, &this.dispatch);
         this.calls.wire(this.arena, this.intern, this.ctx, &this.checker, &this.state, &this.types,
@@ -1763,6 +1763,8 @@ public:
         // the lookup genuinely does not implement `Future` and must still be
         // diagnosed below.
         if (this.state.in_symbolic_check && this.arena.contains_generic_param(fut_ty)) {
+            const declared: TypeRef = this.async_trait_method_output(fut_ty);
+            if (declared.is_valid()) { return declared; }
             const sym_out: TypeRef = this.ctx.type_resolver.project_member(fut_ty, out_sym, future_ty, &rc);
             if (sym_out.is_valid()) { return sym_out; }
         }
@@ -1776,6 +1778,35 @@ public:
         return out_ty;
     }
 
+
+    /// The Output of `fut_ty` when it is the implicit `<Method>Fut` of an
+    /// `async` trait method: that method's declared return, with `This` read
+    /// as the projection's base.  Each implementation binds the associated
+    /// type to the future its own `async` method lowers to, whose Output is
+    /// that method's return, so every implementation agrees on it and a
+    /// generic body knows it before any copy exists - which is what lets a `?`
+    /// on the awaited value be shaped there.  Invalid for any other type, and
+    /// for a method of a generic trait, whose return may name the trait's
+    /// parameters.
+    async_trait_method_output(mut &this, fut_ty: TypeRef) -> TypeRef {
+        const t: Type* = this.arena.lookup(fut_ty);
+        if (t == null || t.kind != TypeKind::AssocProjection) { return TypeRef::invalid(); }
+        const ap: AssocProjectionType* = t as AssocProjectionType*;
+        if (ap.slot < 0) { return TypeRef::invalid(); }
+        const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
+            this.ctx.decl_index.def_of(ap.owning_trait, this.ctx.type_arena));
+        if (tdecl == null || tdecl.generic_params.length > 0) { return TypeRef::invalid(); }
+        for (mut i: i64 = 0; i < tdecl.methods.length; i++) {
+            const f: FunctionDeclNode* = tdecl.methods[i];
+            if (f == null || !f.is_async || f.async_fut_slot != ap.slot) { continue; }
+            if (f.return_type_annotation == null) { return TypeRef::invalid(); }
+            mut rc: ResolutionContext = ResolutionContext::new("");
+            const declared: TypeRef = this.ctx.type_resolver.resolve(f.return_type_annotation, &rc);
+            if (!declared.is_valid()) { return TypeRef::invalid(); }
+            return this.binding.subst_this_in_type(declared, ap.base);
+        }
+        return TypeRef::invalid();
+    }
 
     // -- Expression resolvers kept on the main visitor --
 
@@ -3012,16 +3043,18 @@ public:
         return save;
     }
 
-    /// `Poll::Ready(value)`, typed as `poll_out`. Mirrors the wrapper the async
-    /// lowering puts on every `return` it moves into a `poll` body.
+    /// `Poll::Ready(value)` for a `return` of type `poll_out`. Mirrors the
+    /// wrapper the async lowering puts on every `return` it moves into a
+    /// `poll` body.  The `Res` alone and no type: a node that carries its type
+    /// is answered from it and never walked, and the walk of the `return` it
+    /// is built into is what pins the variant.
     make_poll_ready(&this, value: ExpressionNode*, poll_out: TypeRef,
                     span: SourceSpan) -> ExpressionNode* {
         mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
             this.async_lower.poll_identity(), this.intern.intern("Ready"), span);
-        scope.set_synthesized_ref(poll_out, this.ctx.decl_index.def_of(poll_out, this.ctx.type_arena));
+        scope.set_synthesized_res(this.ctx.decl_index.def_of(poll_out, this.ctx.type_arena));
         mut call: CallExprNode* = new CallExprNode(scope as ExpressionNode*, span);
         call.add_argument(value);
-        call.set_resolved_type(poll_out);
         return call as ExpressionNode*;
     }
 

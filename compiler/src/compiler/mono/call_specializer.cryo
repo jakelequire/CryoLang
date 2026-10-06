@@ -38,20 +38,20 @@ import compiler::ast::substituter;
 import compiler::ast::substituter::{ ASTTypeSubstituter };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
-    MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
+    ClassDeclNode, DeclarationNode, DestructureDeclNode, FunctionDeclNode, GenericParamNode,
+    ImplBlockNode, MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{
     CalleePin,
     ArrayAccessNode, ArrayLiteralNode, BinaryExprNode, CallExprNode, CastExprNode,
-    ExpressionNode, IdentifierNode, IfExprNode, MatchExprNode, MemberAccessNode,
-    NewExprNode, ScopeResolutionNode, StaticMatchExprNode, StructLiteralNode, TryExprNode,
-    UnaryExprNode
+    DeleteExprNode, ExpressionNode, IdentifierNode, IfExprNode, LambdaExprNode, MatchExprNode,
+    MemberAccessNode, NewExprNode, ScopeResolutionNode, StaticMatchExprNode, StructLiteralNode,
+    TernaryExprNode, TryExprNode, TupleLiteralNode, UnaryExprNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
 import compiler::ast::statement::{
-    BlockStmtNode, DeclStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode,
+    BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode, IfStmtNode, LoopStmtNode,
     MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode, UnsafeBlockStmtNode,
     WhileStmtNode
 };
@@ -292,6 +292,9 @@ type struct MonoCallSpecializer {
             NodeKind::DeclarationStatement => {
                 const ds: DeclStmtNode* = stmt as DeclStmtNode*;
                 const inner: DeclarationNode* = ds.declaration;
+                if (inner != null && (inner as ASTNode*).kind == NodeKind::DestructureDeclaration) {
+                    this.walk_expr((inner as DestructureDeclNode*).initializer, res_ctx, subst);
+                }
                 if (inner != null && (inner as ASTNode*).kind == NodeKind::VariableDeclaration) {
                     mut vd: VarDeclNode* = inner as VarDeclNode*;
                     // Inside a generic-static-method body re-walk: a local typed with
@@ -351,9 +354,23 @@ type struct MonoCallSpecializer {
                 this.walk_expr(ws.condition, res_ctx, subst);
                 if (ws.body != null) { this.walk_stmt(ws.body, res_ctx, subst); }
             }
+            NodeKind::DoWhileStatement => {
+                const dw: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+                if (dw.body != null) { this.walk_stmt(dw.body, res_ctx, subst); }
+                this.walk_expr(dw.condition, res_ctx, subst);
+            }
             NodeKind::ForStatement => {
                 const fs: ForStmtNode* = stmt as ForStmtNode*;
+                // The initializer is a declaration or an expression.
+                if (fs.init != null) {
+                    if ((fs.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                        this.walk_expr((fs.init as VarDeclNode*).initializer, res_ctx, subst);
+                    } else {
+                        this.walk_expr(fs.init as ExpressionNode*, res_ctx, subst);
+                    }
+                }
                 if (fs.condition != null) { this.walk_expr(fs.condition, res_ctx, subst); }
+                if (fs.update != null) { this.walk_expr(fs.update, res_ctx, subst); }
                 if (fs.body != null) { this.walk_stmt(fs.body, res_ctx, subst); }
             }
             NodeKind::LoopStatement => {
@@ -528,6 +545,31 @@ type struct MonoCallSpecializer {
                 if (ne.array_size != null) { this.walk_expr(ne.array_size, res_ctx, subst); }
                 if (ne.struct_init != null) {
                     this.walk_expr(ne.struct_init as ExpressionNode*, res_ctx, subst);
+                }
+            }
+            NodeKind::TernaryExpression => {
+                const te: TernaryExprNode* = expr as TernaryExprNode*;
+                this.walk_expr(te.condition, res_ctx, subst);
+                this.walk_expr(te.true_expr, res_ctx, subst);
+                this.walk_expr(te.false_expr, res_ctx, subst);
+            }
+            NodeKind::TupleLiteral => {
+                const tl: TupleLiteralNode* = expr as TupleLiteralNode*;
+                for (mut i: i64 = 0; i < tl.elements.length; i++) {
+                    this.walk_expr(tl.elements[i], res_ctx, subst);
+                }
+            }
+            NodeKind::DeleteExpression => {
+                this.walk_expr((expr as DeleteExprNode*).operand, res_ctx, subst);
+            }
+            NodeKind::LambdaExpression => {
+                // A non-capturing lambda compiles to a function of its own
+                // body, which nothing else walks.  A capturing one's body is
+                // its closure struct's `__call__`, walked as that struct's
+                // method; walking it here as well would bind it twice.
+                const le: LambdaExprNode* = expr as LambdaExprNode*;
+                if (!le.is_capturing() && le.body != null) {
+                    this.walk_stmt(le.body, res_ctx, subst);
                 }
             }
             _ => {}

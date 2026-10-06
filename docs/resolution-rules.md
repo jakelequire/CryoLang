@@ -84,6 +84,53 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-05
+
+131. **A synthesizer that lays out a hidden struct records the pins of what
+     it builds.**  The async lowering (a future's state struct) and the
+     closure synthesizer (a closure's capture struct) give each field access,
+     struct-literal field and variant they build its position as they build
+     it, since a node built with its type is never walked again.  Where a
+     synthesizer only names a type that already exists, the type check
+     checks the lowered body as it checks ordinary code.
+
+132. **A generic function's destructure is checked for its shape on the
+     generic body**: a field bound twice, a field the type does not have and
+     a field left out are reported there, not only in a copy, so a broken
+     generic nothing instantiates is refused too.
+
+     ```cryo
+     function first<T>(p: Two<T>) -> T {
+         const {a, a}: Two<T> = p;   // refused on the generic body: `a` bound twice
+         return a;
+     }
+     ```
+
+133. **`&T == &T` compares the referents in every copy**, a primitive one
+     included, as Rust's `PartialEq for &A` does; no copy compares the
+     addresses.
+
+     ```cryo
+     function same<T>(a: &T, b: &T) -> boolean where T: Eq { return a == b; }
+     same::<i64>(&m, &n)   // true when m == n
+     ```
+
+134. **A float's `abs` clears the sign bit, as Rust's `f64::abs` does, and
+     `fabs` is removed**; its callers use `abs`.
+
+135. **An overloaded function used as a value is the overload the expected
+     function type selects.**
+
+     ```cryo
+     const f: (i32) -> i32 = Conv::conv;   // the `conv(i32) -> i32` overload
+     ```
+
+136. **Ruling 124's refusal keeps E0214.**
+
+137. **`make verify`'s `tests/started-passing` may name a unit test as well
+     as a negative test file**, extending ruling 129, so a change that
+     deliberately moves a unit test's object is verified in one run.
+
 ### 2026-10-04
 
 119. **`module_named` is private to `module_graph.cryo`.** Callers outside
