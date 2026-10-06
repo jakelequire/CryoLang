@@ -1494,8 +1494,33 @@ public:
             return;
         }
 
+        mut names: SymbolStr[] = [];
+        for (mut k: i64 = 0; k < fields_ptr.length; k++) { names.push(fields_ptr[k].name); }
+        const positions: i64[] = this.check_destructure_shape(node, &names,
+            this.intern.resolve(this.intern.intern(this.arena.format_display(ty))));
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
             mut b: DestructureBinding = node.bindings[i];
+            if (positions[i] < 0) {
+                this.scopes.register_local_with_mut(b.local_name, this.arena.get_void(), b.is_mutable);
+                continue;
+            }
+            const field_type: TypeRef = fields_ptr[positions[i]].field_type;
+            b.resolved_type = field_type;
+            node.bindings[i] = b;
+            this.scopes.register_local_with_mut(b.local_name, field_type, b.is_mutable);
+        }
+    }
+
+    /// Report a destructure whose bindings do not match the fields `names`
+    /// of the type it destructures (`ty_name` in the messages): a field bound
+    /// twice, a field the type does not have, a field left out.  Each
+    /// binding's field position in `names`, or -1 for one reported here.
+    ![allow(lookup_by_spelling, reason = "a destructure's bindings are written as field spellings, matched against the fields the type declares where the destructure is written")]
+    check_destructure_shape(mut &this, node: DestructureDeclNode*, names: &SymbolStr[],
+                            ty_name: string) -> i64[] {
+        mut positions: i64[] = [];
+        for (mut i: i64 = 0; i < node.bindings.length; i++) {
+            const b: DestructureBinding = node.bindings[i];
             mut dup: boolean = false;
             for (mut j: i64 = 0; j < i; j++) {
                 if (node.bindings[j].source_field.id == b.source_field.id) { dup = true; break; }
@@ -1511,66 +1536,70 @@ public:
                     diag = diag.suggest(Suggestion::machine_applicable(removal, Text::new(""), Text::new(fmt::format("remove the duplicate binding `%s`", dup_name))));
                 }
                 this.ctx.emit_diagnostic(diag);
-                this.scopes.register_local_with_mut(b.local_name, this.arena.get_void(), b.is_mutable);
+                positions.push(-1);
                 continue;
             }
-            mut field_type: TypeRef = TypeRef::invalid();
-            mut found: boolean = false;
-            for (mut k: i64 = 0; k < fields_ptr.length; k++) {
-                if (fields_ptr[k].name.id == b.source_field.id) { field_type = fields_ptr[k].field_type; found = true; break; }
+            mut pos: i64 = -1;
+            for (mut k: i64 = 0; k < names.length; k++) {
+                if (names[k].id == b.source_field.id) { pos = k; break; }
             }
-            if (!found) {
+            if (pos < 0) {
                 const field_name: string = this.intern.resolve(b.source_field);
-                const ty_name: string = this.intern.resolve(this.intern.intern(this.arena.format_display(ty)));
                 mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0350_STRUCT_FIELD_NOT_FOUND,
                     Text::new(fmt::format("no field `%s` on type `%s`", field_name, ty_name)));
                 diag = diag.at_with_label(b.span, Text::new("unknown field"));
                 mut cands: string[] = [];
-                for (mut k: i64 = 0; k < fields_ptr.length; k++) { cands.push(this.intern.resolve(fields_ptr[k].name)); }
+                for (mut k: i64 = 0; k < names.length; k++) { cands.push(this.intern.resolve(names[k])); }
                 diag = diag.did_you_mean(field_name, cands, "field", b.span);
                 this.ctx.emit_diagnostic(diag);
-                this.scopes.register_local_with_mut(b.local_name, this.arena.get_void(), b.is_mutable);
-                continue;
             }
-            b.resolved_type = field_type;
-            node.bindings[i] = b;
-            this.scopes.register_local_with_mut(b.local_name, field_type, b.is_mutable);
+            positions.push(pos);
         }
 
-        if (node.bindings.length < fields_ptr.length) {
+        if (node.bindings.length < names.length) {
             mut missing: string = "";
             mut count: i64 = 0;
-            for (mut k: i64 = 0; k < fields_ptr.length; k++) {
+            for (mut k: i64 = 0; k < names.length; k++) {
                 mut bound: boolean = false;
                 for (mut bi: i64 = 0; bi < node.bindings.length; bi++) {
-                    if (node.bindings[bi].source_field.id == fields_ptr[k].name.id) { bound = true; break; }
+                    if (node.bindings[bi].source_field.id == names[k].id) { bound = true; break; }
                 }
                 if (!bound) {
-                    if (count > 0) { missing = fmt::format("%s, %s", missing, this.intern.resolve(fields_ptr[k].name)); }
-                    else { missing = this.intern.resolve(fields_ptr[k].name); }
+                    if (count > 0) { missing = fmt::format("%s, %s", missing, this.intern.resolve(names[k])); }
+                    else { missing = this.intern.resolve(names[k]); }
                     count++;
                 }
             }
-            const ty_name: string = this.intern.resolve(this.intern.intern(this.arena.format_display(ty)));
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0362_DESTRUCTURE_INCOMPLETE,
-                Text::new(fmt::format("destructure of `%s` must bind all %lld field(s); missing: %s", ty_name, fields_ptr.length, missing)));
+                Text::new(fmt::format("destructure of `%s` must bind all %lld field(s); missing: %s", ty_name, names.length, missing)));
             diag = diag.at_with_label(node.span, Text::new(fmt::format("missing %lld field%s", count, if (count == 1) { "" } else { "s" })));
             this.ctx.emit_diagnostic(diag);
         }
+        return positions;
     }
 
     /// A destructure in a generic body whose type still names the body's
     /// parameters (`const { inner }: PathBuf<A> = this;`): each binding is
     /// typed as its field seen through that type, so a call on it is selected
-    /// before monomorphization as a call on `this.inner` is.  The shape checks
-    /// (every field bound, no field twice) are the specialization's, where
-    /// the fields are the minted type's own.  Each binding's type is
-    /// recorded on the template, which every copy substitutes.
+    /// before monomorphization as a call on `this.inner` is.  The shape is
+    /// checked here, against the fields the template declares - they are
+    /// every specialization's fields, in the same order - so a broken
+    /// destructure is refused whether or not anything instantiates the body.
+    /// A type with no field list on the generic body (a type parameter, a
+    /// projection) is not checked.  Each binding's type is recorded on the
+    /// template, which every copy substitutes.
     register_destructure_locals_abstract(mut &this, node: DestructureDeclNode*) -> void {
+        mut names: SymbolStr[] = [];
+        mut positions: i64[] = [];
+        if (node.has_resolved_type() && this.member.template_field_names(node.resolved_type, &names)) {
+            positions = this.check_destructure_shape(node, &names,
+                this.arena.resolve_display_name(node.resolved_type));
+        }
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
             const b: DestructureBinding = node.bindings[i];
             mut ty: TypeRef = TypeRef::invalid();
-            if (node.has_resolved_type()) {
+            const refused: boolean = positions.length > i && positions[i] < 0;
+            if (node.has_resolved_type() && !refused) {
                 ty = this.member.field_of(node.resolved_type, b.source_field).ty;
             }
             if (ty.is_valid()) { node.bindings[i].resolved_type = ty; }
