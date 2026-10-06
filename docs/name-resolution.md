@@ -59026,3 +59026,45 @@ P1-P6; P6 is the last).
   `TypeKind::GenericParam` 39 -> 38, each with its reason on the row; a
   new DELETED row for the check.  `lane-baseline.txt` re-pinned
   (ARENA_READ -2).
+
+### 8.521 A float's `abs` clears the sign bit, and `fabs` is removed - 2026-10-06
+
+## Why
+
+Ruling 134.  `f32::abs` and `f64::abs` compared with zero and negated, so
+`-0.0` (which does not compare below `0.0`) and a NaN carrying its sign
+came back with the sign still set, while `fabs` cleared it - two methods
+for one operation that disagreed at the edges.  Rust's `f64::abs` clears
+the sign bit.
+
+```cryo
+const neg_zero: f64 = mem::transmute::<u64, f64>(0x8000000000000000);
+neg_zero.abs()   // 0.0, sign bit clear (was -0.0)
+(0.0 - 3.5).abs()   // 3.5
+```
+
+## What changed
+
+* `core/primitives.cryo`: `f32::abs` / `f64::abs` are `intrinsics::fabs32`
+  / `fabs64`; the `fabs` methods are deleted.  `lib.cryo`'s and
+  `math/_module.cryo`'s module docs and `docs/cryo.md`'s `math` row say so.
+* Callers: `tests/stdlib/math.cryo`'s `within` helper and two tests,
+  renamed `float_abs_negative` and `float_abs_is_a_pure_sign_bit_op`
+  (roster: two renames).
+* The project `float_sqrt_fabs_methods` is `float_sqrt_abs_methods`
+  (ruling 20's project for a library behaviour change): it calls `abs`,
+  and checks the sign bit of `-0.0`'s `abs` at `f64` and `f32` and that a
+  negative NaN's `abs` is a NaN with its sign clear.
+
+## Evidence
+
+* The project built against HEAD's standard library (a `git archive`
+  copy) with this compiler returns 7 - `(-0.0).abs()` kept its sign - and
+  against this tree's returns 0.
+* `MathT`: 60 passed, 0 failed.
+* `make verify --baseline HEAD --require-identical`: all gates OK; 0 of
+  6,690 test and 0 of 1,126 example objects moved - both runs compile the
+  working tree's standard library, so a library change is invisible to it
+  (ruling 20); the project above is the evidence.
+* `make api-index-check` OK (the index does not list methods of the
+  primitive impls).
