@@ -131,6 +131,18 @@ yet is recorded with the change that builds it, not here.
      as a negative test file**, extending ruling 129, so a change that
      deliberately moves a unit test's object is verified in one run.
 
+138. **A field read through a type parameter is refused on the generic
+     body**, as Rust does and as ruling 1 refuses a method call: a bound
+     gives a parameter methods, never fields, so what a copy's type
+     argument declares is not consulted.
+
+     ```cryo
+     implement struct Cell<T, A> {
+         tagged(&this) -> i32 { return this.tag.n; }    // E0204: no field `n` on type `A`
+         tag_ref(&this) -> &A { return &this.tag; }     // fine; `c.tag_ref().n` reads it where `A` is known
+     }
+     ```
+
 ### 2026-10-04
 
 119. **`module_named` is private to `module_graph.cryo`.** Callers outside

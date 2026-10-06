@@ -353,6 +353,36 @@ PROJECTS = "tests/tests/projects"
 # program.
 DIAGNOSTIC = re.compile(r"error\[E\d{4}\]")
 PROJ_FAILED = re.compile(r"^test \(project\) (\S+) \.\.\. FAILED")
+NEG_FAILED = re.compile(r"^test \(negative\) (\S+) \.\.\. FAILED")
+# A started-passing line names a project by its directory, a negative test
+# file as `negative/<file>.cryo` (its report changes, so the baseline's census
+# fails it), or a unit-test file as its path under tests/tests (its object
+# moves, so it is left out of the comparison and must have moved).
+NEGATIVE = "negative/"
+UNIT_DIR = "tests/tests"
+
+
+def declared_kind(name):
+    if name.startswith(NEGATIVE):
+        return "negative"
+    if name.endswith(".cryo"):
+        return "unit"
+    return "project"
+
+
+def unit_object_suffix(name):
+    """The object path tail a unit-test file compiles to, from its namespace:
+    `namespace A::B::C;` is `.../deps/A/B/C.o`.  None when the file or its
+    namespace line is missing."""
+    path = os.path.join(ROOT, UNIT_DIR, name)
+    if not os.path.isfile(path):
+        return None
+    with io.open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            m = re.match(r"\s*namespace\s+([\w:]+)\s*;", line)
+            if m:
+                return "/deps/" + "/".join(m.group(1).split("::")) + ".o"
+    return None
 
 
 def parse_declared(text):
@@ -391,24 +421,32 @@ def census_failures(log):
         lines = fh.readlines()
     blocks, _, _, _ = census.parse(lines)
     accounted = any(l.startswith("test-census: OK") for l in lines)
-    failed = sorted({m.group(1) for m in map(PROJ_FAILED.match, lines) if m})
+    failed = sorted({m.group(1) for m in map(PROJ_FAILED.match, lines) if m}
+                    | {NEGATIVE + m.group(1) for m in map(NEG_FAILED.match, lines) if m})
     return (accounted, blocks.get("unit test", {}).get("failed", -1),
             blocks.get("compile-fail", {}).get("failed", -1), failed)
 
 
 def judge_baseline_census(declared, accounted, unit_failed, neg_failed, failed, fixed=()):
     """Problems with a baseline census that may fail on declared projects only:
-    `declared` the ones it refuses, `fixed` the ones it builds and runs wrong."""
+    `declared` the ones it refuses, `fixed` the ones it builds and runs wrong,
+    a negative file whose report changes, or a unit-test file whose object
+    moves (which the census does not fail)."""
     problems = []
     if not accounted:
         problems.append("the baseline census did not account for the pinned corpus")
-    if unit_failed != 0 or neg_failed != 0:
-        problems.append("the baseline failed %s unit and %s compile-fail test(s); only "
-                        "declared projects may fail there" % (unit_failed, neg_failed))
+    neg_names = [p for p in failed if declared_kind(p) == "negative"]
+    if unit_failed != 0:
+        problems.append("the baseline failed %s unit test(s); a unit test is declared "
+                        "for its object, never for a failure" % unit_failed)
+    if neg_failed != len(neg_names):
+        problems.append("the baseline failed %s compile-fail test(s) and named %d"
+                        % (neg_failed, len(neg_names)))
     for p in sorted(set(failed) - set(declared) - set(fixed)):
-        problems.append("the baseline fails project %s, which neither %s nor %s declares"
+        problems.append("the baseline fails %s, which neither %s nor %s declares"
                         % (p, DECLARED, FIXED))
-    for p in sorted((set(declared) | set(fixed)) - set(failed)):
+    judged = set(declared) | {p for p in fixed if declared_kind(p) != "unit"}
+    for p in sorted(judged - set(failed)):
         problems.append("%s is declared as changed by this change, but the baseline census "
                         "passes it; a program this change makes compile or corrects fails "
                         "the baseline's census" % p)
@@ -455,6 +493,17 @@ def check_declared(declared, base_exe, cryo, logdir, env, fixed=()):
     problems = []
     for name, is_fixed in sorted([(n, False) for n in declared] + [(n, True) for n in fixed]):
         rel = FIXED if is_fixed else DECLARED
+        kind = declared_kind(name)
+        if is_fixed and kind == "negative":
+            if not os.path.isfile(os.path.join(ROOT, UNIT_DIR, name)):
+                problems.append("%s: declared in %s but %s/%s does not exist"
+                                % (name, rel, UNIT_DIR, name))
+            continue
+        if is_fixed and kind == "unit":
+            if unit_object_suffix(name) is None:
+                problems.append("%s: declared in %s but %s/%s is not a unit-test file "
+                                "with a namespace" % (name, rel, UNIT_DIR, name))
+            continue
         if not os.path.isfile(os.path.join(ROOT, PROJECTS, name, "test.json")):
             problems.append("%s: declared in %s but %s/%s is not a test project"
                             % (name, rel, PROJECTS, name))
@@ -502,6 +551,24 @@ def selftest():
          judge_baseline_census({}, True, 0, 0, [], {"q"}), 1),
         ("census: one project declared as both kinds",
          judge_baseline_census({"q"}, True, 0, 0, ["q"], {"q"}), 1),
+        ("census: a declared negative file the baseline fails",
+         judge_baseline_census({}, True, 0, 1, ["negative/n.cryo"], {"negative/n.cryo"}), 0),
+        ("census: an undeclared negative file fails",
+         judge_baseline_census({}, True, 0, 1, ["negative/n.cryo"]), 1),
+        ("census: a declared negative file the baseline passes",
+         judge_baseline_census({}, True, 0, 0, [], {"negative/n.cryo"}), 1),
+        ("census: a failure count the named negatives do not cover",
+         judge_baseline_census({}, True, 0, 2, ["negative/n.cryo"], {"negative/n.cryo"}), 1),
+        ("census: a declared unit-test file is not a census failure",
+         judge_baseline_census({}, True, 0, 0, [], {"lang/u.cryo"}), 0),
+        ("census: a unit failure is never declarable, even beside a unit file",
+         judge_baseline_census({}, True, 1, 0, [], {"lang/u.cryo"}), 1),
+        ("units: a declared object that moved",
+         judge_unit_moves({"u": "/U.o"}, {"x/U.o": "1"}, {"x/U.o": "2"}), 0),
+        ("units: a declared object that did not move",
+         judge_unit_moves({"u": "/U.o"}, {"x/U.o": "1"}, {"x/U.o": "1"}), 1),
+        ("units: a declared object neither run compiled",
+         judge_unit_moves({"u": "/U.o"}, {}, {}), 1),
         ("declarations: parse skips comments and blanks",
          [] if parse_declared("# c\n\np why\nq\n") == {"p": "why", "q": ""} else ["bad"], 0),
     ]
@@ -515,8 +582,35 @@ def selftest():
     return 1 if bad else 0
 
 
-def compare(tag_a, a_path, b_path, limit, excluded=()):
+def judge_unit_moves(suffixes, a, b):
+    """Problems with declared unit-test objects (`suffixes`, each the tail of
+    the one object a file compiles to) over hash maps `a` and `b`: each must
+    be in both and must have moved.  The objects are removed from both."""
+    problems = []
+    for name, suffix in sorted(suffixes.items()):
+        ka = [p for p in a if p.endswith(suffix)]
+        kb = [p for p in b if p.endswith(suffix)]
+        if len(ka) != 1 or len(kb) != 1:
+            problems.append("%s: %d baseline and %d tree objects end in %s; one each is "
+                            "declared" % (name, len(ka), len(kb), suffix))
+        elif a[ka[0]] == b[kb[0]]:
+            problems.append("%s is declared as moving its object, but %s did not move"
+                            % (name, ka[0]))
+        for p in ka:
+            del a[p]
+        for p in kb:
+            del b[p]
+    return problems
+
+
+def compare(tag_a, a_path, b_path, limit, excluded=(), units=None, problems=None):
     a, b = read_hashes(a_path), read_hashes(b_path)
+    if units:
+        found = judge_unit_moves(units, a, b)
+        print("  %-9s declared unit-test objects left out: %d, %d problem(s)"
+              % (tag_a, len(units), len(found)))
+        problems.extend(found)
+    excluded = [n for n in excluded if declared_kind(n) == "project"]
     if excluded:
         prefixes = tuple("%s/%s/" % (PROJECTS, n) for n in excluded)
         drop_a = [p for p in a if p.startswith(prefixes)]
@@ -630,7 +724,9 @@ def main():
             # Cached only after the baseline census was judged, so its verdict
             # is recorded as the projects it failed on.
             with io.open(os.path.join(cached, "base.failed"), encoding="utf-8") as fh:
-                census = (True, 0, 0, fh.read().split())
+                recorded = fh.read().split()
+                census = (True, 0, sum(declared_kind(p) == "negative" for p in recorded),
+                          recorded)
         else:
             print("verify: baseline run (%s) over the working tree's population"
                   % ", ".join(POPULATION_GATES))
@@ -679,10 +775,17 @@ def main():
     if base_counts:
         print("verify: objects against %s" % args.baseline)
         diff = 0
+        units = {n: unit_object_suffix(n) for n in fixed if declared_kind(n) == "unit"}
+        unit_problems = []
         for base in ("tests", "examples"):
             diff += compare(base, os.path.join(base_counts, "base.%s.sha256" % base),
                             os.path.join(logdir, "tree.%s.sha256" % base), args.list_limit,
-                            excluded=set(declared) | set(fixed))
+                            excluded=set(declared) | set(fixed),
+                            units=units if base == "tests" else None,
+                            problems=unit_problems)
+        for p in unit_problems:
+            print("verify: FAIL -- %s" % p)
+            ok = False
         if diff and args.require_identical:
             ok = False
 

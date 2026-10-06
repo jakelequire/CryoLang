@@ -140,7 +140,11 @@ type struct MemberResolver {
         const unresolved: boolean = this.symbolic.symbolic_type_unresolved(obj_type);
         if (unresolved && !this.symbolic.symbolic_is_generic_owner_receiver(obj_type)) {
             const through: FieldAnswer = this.field_of(obj_type, member.member);
-            if (!through.found()) { return TypeRef::invalid(); }
+            if (!through.found()) {
+                const param: GenericParamType* = this.binding.receiver_type_param(obj_type);
+                if (param != null) { this.report_param_receiver_field(member, param); }
+                return TypeRef::invalid();
+            }
             this.pin_field(member, &through,
                 if (member.member_span.has_location()) { member.member_span } else { member.span });
             return through.ty;
@@ -244,6 +248,30 @@ type struct MemberResolver {
         }
 
         return TypeRef::invalid();
+    }
+
+    /// A field read whose receiver is a type parameter of the body being
+    /// walked: a bound gives a parameter methods, never fields, so the read
+    /// names nothing in the body that declares the parameter, whatever each
+    /// copy's type argument happens to declare.
+    report_param_receiver_field(mut &this, member: MemberAccessNode*, param: GenericParamType*) -> void {
+        const field_name: string = this.intern.resolve(member.member);
+        const param_display: string = this.intern.resolve(param.param_name);
+        const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0204_UNDEFINED_FIELD,
+            Text::new(fmt::format("no field `%s` on type `%s`", field_name, param_display)));
+        diag = diag.at_with_label(primary_span, Text::new("unknown field"));
+        if (this.binding.param_is_bounded(param)) {
+            diag = diag.with_note(Text::new(fmt::format(
+                "`%s` is a type parameter; its bounds give it methods, not fields", param_display)));
+        } else {
+            diag = diag.with_note(Text::new(fmt::format(
+                "`%s` is a type parameter with no bound, so it has no fields", param_display)));
+        }
+        diag = diag.help(Text::new(fmt::format(
+            "read the field through a method of a trait `%s` is bounded by", param_display)));
+        this.ctx.emit_diagnostic(diag);
     }
 
     /// Deref coercion: `member.object`'s type has no `member.member`.  If it
