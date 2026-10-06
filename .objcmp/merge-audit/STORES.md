@@ -31,7 +31,7 @@ never feeds a key.
 
 | store | key | plan |
 |---|---|---|
-| `SemaState.closure_spec_map` (`sema/state.cryo:132`) | `format("%lld", defs.slot(orig.def))` + `"|idx:typekey"` per argument (`sema/lambda_synth.cryo:663-666`): identities formatted into a string; the field's comment (`<orig_name_id>`) is stale | a structured (`DefId` slot, [(index, `TypeRef`)]) key. |
+| `SemaState.closure_spec_map` (`sema/state.cryo:132`) | `format("%lld", defs.slot(orig.def))` + `"|idx:typekey"` per argument (`sema/lambda_synth.cryo:663-666`): identities formatted into a string; the field's comment (`<orig_name_id>`) is stale | a structured (`DefId` slot, [(index, `TypeRef`)]) key. **Converted in 8.525** (`closure_specs`, `ClosureSpec::binds`). |
 | `func_type_refs` (`decl_index.cryo:129`) | the family slot (door-internal) - but last-writer-wins per family, so an overloaded family answers its last signature | readers ask `func_type_of_def`; retire the map. |
 
 ## C. Not names - position keys, dead stores
@@ -39,7 +39,7 @@ never feeds a key.
 | store | key | note |
 |---|---|---|
 | `ResolutionMap.singles` (`resolver/resolution_map.cryo:21`) | `hash_str(span.file)` + line + column | no lookup reader: `Resolver::resolve(span)` has no callers; dead_code iterates it |
-| `ResolutionMap.overloads` (`:24`) | same | **dead store**: written once (`resolver/name_resolution.cryo:2706`), never read |
+| `ResolutionMap.overloads` (`:24`) | same | **dead store**: written once (`resolver/name_resolution.cryo:2706`), never read. **Deleted in 8.525** with the by-spelling scope walk that fed it (`Resolver::lookup_overloads`) and the dead `Resolver::lookup_local`. |
 | `DeadCode.used` / `method_used` (`passes/dead_code.cryo:104,112`) | the same span key | lossy: a span copied onto a clone collides; key by the target's `DefId` |
 | `extern_symbol_first` (`decl_index.cryo:262`) | the C link symbol's text | W0011 evidence only; a C symbol is an external name, not a Cryo identity (not ruled) |
 
@@ -71,6 +71,7 @@ placeholder cache are gone (each creation allocates; no name cache).
 ## Count
 
 **10 rows break a rule (A)**, of which #1 is converted here (8.523), leaving
-**9**; 2 carry identity as text (B); 4 position/external/dead (C); 1 is
+**9**; of the rest, `closure_spec_map` (B) and the dead `ResolutionMap.overloads`
+(C) went in 8.525; 2 carry identity as text (B); 4 position/external/dead (C); 1 is
 ruling 126's (D), whose premise (keyed by linker symbol) the measurement does
 not bear out.

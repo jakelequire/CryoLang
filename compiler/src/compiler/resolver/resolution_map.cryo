@@ -20,13 +20,9 @@ type struct ResolutionMap {
     // Single-symbol resolutions
     singles:   HashMap<u64, SymbolID>;
 
-    // Overload set resolutions
-    overloads: HashMap<u64, SymbolID[]>;
-
     static new() -> ResolutionMap {
         return ResolutionMap {
             singles:   HashMap::<u64, SymbolID>::new(),
-            overloads: HashMap::<u64, SymbolID[]>::new(),
         };
     }
 
@@ -37,7 +33,7 @@ type struct ResolutionMap {
     /// (`& 0xFFFF`), and the file hash to its low 32 bits.  A source past line
     /// 65535 / column 65535, or a file-hash collision, can therefore alias two
     /// distinct spans onto one key - the later `record` overwrites the earlier
-    /// in `singles`/`overloads`.  Acceptable in practice (resolution is a
+    /// in `singles`.  Acceptable in practice (resolution is a
     /// best-effort span.symbol lookup, not a correctness gate, and real files
     /// stay well under 2^16 lines), but a hard cap to be aware of.
     static make_key(span: SourceSpan) -> u64 {
@@ -54,12 +50,6 @@ type struct ResolutionMap {
         this.singles.insert(key, sym_id);
     }
 
-    /// Record an overload set resolution: this span could refer to any of these symbols.
-    record_overloads(mut &this, span: SourceSpan, sym_ids: SymbolID[]) -> void {
-        const key: u64 = ResolutionMap::make_key(span);
-        this.overloads.insert(key, sym_ids);
-    }
-
     /// Look up the symbol for a span.  Returns invalid SymbolID if not found.
     resolve(&this, span: SourceSpan) -> SymbolID {
         const key: u64 = ResolutionMap::make_key(span);
@@ -68,27 +58,6 @@ type struct ResolutionMap {
             return opt.unwrap();
         }
         return SymbolID::invalid();
-    }
-
-    /// Look up the overload set for a span.  Returns a freshly-owned
-    /// copy of the stored set (empty array if not found).  We borrow the
-    /// stored `SymbolID[]` and clone its elements rather than copying it
-    /// out by value: `SymbolID[]` owns a heap buffer, so a bitwise copy
-    /// would alias the map's storage and double-free on drop.
-    resolve_overloads(&this, span: SourceSpan) -> SymbolID[] {
-        const key: u64 = ResolutionMap::make_key(span);
-        mut result: SymbolID[] = [];
-        match (this.overloads.get_ref(&key)) {
-            Option::Some(stored) => {
-                mut i: i64 = 0;
-                while (i < (*stored).length) {
-                    result.push(stored[i]);
-                    i = i + 1;
-                }
-            }
-            Option::None => { }
-        }
-        return result;
     }
 
     /// Total number of single-symbol resolutions recorded.
