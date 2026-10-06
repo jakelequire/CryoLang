@@ -58795,3 +58795,53 @@ function unknown_field<T>(p: Two<T>) -> T {
   the same (code, file) multiset.
 * §0: residue 212 -> 211, name-taking 680 -> 682, spelling flow 651 ->
   650, projects 186 -> 187.
+
+### 8.517 A call through a function value in a copy binds its arguments when it is copied - 2026-10-05
+
+## Why
+
+P6 census item C14, found by running the test suite with the pass after
+monomorphization off (8.515 compares builds only).  A call through a
+function value in a generic body - `pred(value)` in `FilterIter::next`,
+`pred: (&I::Item) -> boolean` - left its argument unclassified on the
+template, and only that pass classified it in each copy.  An unclassified
+argument reads as a move, so with the pass off the element `filter`
+rejects was never released, and was passed by value to a reference
+parameter.
+
+```cryo
+for (it in Three { n: 0 }.filter(is_odd)) { kept = kept + it.tag; }
+// Item 2 is rejected: with the pass off it was never dropped (2 drops, not 3)
+```
+
+## What changed
+
+* Monomorphization's `bind_call_arguments`, which bound a copy's call
+  pinned to a declaration, also binds a call through a function value - a
+  local, or a field - against the value's function type as the copy sees
+  it (`callee_is_value`): a reference parameter's argument is borrowed and
+  auto-referenced.  A call whose arguments are bound where it is written is
+  left as it is, as before.
+
+## Evidence
+
+* Repro (`.objcmp/s111/r2`, the unit test as a program returning
+  `kept * 10 + drops`): pass on 43; pass off 42 before, 43 after.
+* `cryo test` with the pass off over a copy of `tests/` with 8.515's
+  unbounded-field site neutralised: unit 2217/2218 before (the miss was
+  `iter_find_filter_release_once::filter_releases_each_element_once`),
+  after: OVERALL PASS - unit all, compile-fail 228/228, projects 183/183,
+  run outcomes.
+* The agreement probe, extended to every argument's binding at its call
+  (a call writes them after each argument's own walk returns, which the
+  probe's first form could not see): on the repro, the copies' remaining
+  differences are `Option::Some(..)` payloads (unclassified -> by value,
+  which the ownership passes read alike) and pointer or reference
+  arguments of calls pinned to a specialization's family (no destructor
+  either way); none auto-references.  A family lookup in monomorphization
+  to classify those as well was refused by the lane ratchet
+  (LOOKUP_OTHER 45 -> 46) and removed; the deletion's object comparison is
+  what has to show them inert.
+* `make verify --baseline HEAD --require-identical`: 0 of 6,636 test and 0
+  of 1,126 example objects moved.  Clean build: 330 warnings, the same
+  (code, file) multiset.

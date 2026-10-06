@@ -1475,19 +1475,38 @@ type struct MonoCallSpecializer {
         this.bind_call_arguments(call);
     }
 
-    /// Bind the arguments of a call pinned to a declaration to that
-    /// declaration's parameters (`CallExprNode::bind_arguments`): a method's
-    /// own parameters after its receiver for a call written on a receiver,
-    /// every parameter for a call through a path or a name.  A call whose
-    /// arguments are bound already - where it is written, outside a copy -
-    /// is left as it is.
+    /// Bind the arguments of a call to the parameters of what it calls
+    /// (`CallExprNode::bind_arguments`): for a call pinned to a declaration,
+    /// a method's own parameters after its receiver for a call written on a
+    /// receiver, every parameter for a call through a path or a name; for a
+    /// call through a function value, the parameters of the value's function
+    /// type as this copy sees it - a reference parameter there is borrowed
+    /// and its argument auto-referenced, which an unclassified argument,
+    /// read as a move, is not.  A call whose arguments are bound already -
+    /// where it is written, outside a copy - is left as it is.
     bind_call_arguments(&this, call: CallExprNode*) -> void {
-        const e: OverloadId = call.resolved_callee.decl_entry();
-        if (!e.is_valid() || call.arguments.length == 0) { return; }
+        if (call.arguments.length == 0) { return; }
         for (mut i: i64 = 0; i < call.arguments.length; i++) {
             const a: ExpressionNode* = call.arguments[i];
             if (a != null && a.arg_binding != ArgBinding::Unclassified) { return; }
         }
+        const e: OverloadId = call.resolved_callee.decl_entry();
+        match (call.resolved_callee) {
+            CalleePin::None => {
+                if (this.callee_is_value(call.callee)) {
+                    const vt: Type* = this.arena.lookup(call.callee.resolved_type);
+                    if (vt != null && vt.kind == TypeKind::Function) {
+                        mut vparams: TypeRef[] = [];
+                        const vfn: FunctionType* = vt as FunctionType*;
+                        for (mut i: i64 = 0; i < vfn.param_types.length; i++) { vparams.push(vfn.param_types[i]); }
+                        call.bind_arguments(this.arena, &vparams);
+                    }
+                }
+                return;
+            }
+            _ => { }
+        }
+        if (!e.is_valid()) { return; }
         const m: MethodNode* = this.decl_index.entry_method(e);
         mut params: TypeRef[] = [];
         if (m != null && m.func != null) {
@@ -1505,6 +1524,31 @@ type struct MonoCallSpecializer {
             for (mut i: i64 = 0; i < fn_t.param_types.length; i++) { params.push(fn_t.param_types[i]); }
         }
         call.bind_arguments(this.arena, &params);
+    }
+
+    /// Whether a call's callee is a value of function type rather than a
+    /// name of something declared: a local, or a field.
+    callee_is_value(&this, callee: ExpressionNode*) -> boolean {
+        if (callee == null) { return false; }
+        const k: NodeKind = (callee as ASTNode*).kind;
+        if (k == NodeKind::Identifier) {
+            return match ((callee as IdentifierNode*).res) {
+                ResSlot::Answered(r) => {
+                    match (r) {
+                        Res::Local(_) => { true }
+                        _             => { false }
+                    }
+                }
+                _ => { false }
+            };
+        }
+        if (k == NodeKind::MemberAccess) {
+            return match ((callee as MemberAccessNode*).resolved_member) {
+                MemberPin::Field(_, _) => { true }
+                _                      => { false }
+            };
+        }
+        return false;
     }
 
     /// Bind each queued call whose receiver or owner is now minted, by the
