@@ -51,6 +51,7 @@ import compiler::types::{
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name, resolver };
 import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResSlot, SourceLoc };
+import compiler::decl_index::{ OverloadId };
 import compiler::sema::{
     state, helpers, scope_manager, type_utils, literal_resolver, diagnostics,
     dispatch, symbolic_checker, method_binding, pattern_resolver,
@@ -1886,6 +1887,21 @@ public:
                 const tm: TemplateEntry* = this.ctx.generic_registry.template_of(def_id);
                 if (tm != null && tm.node_kind == NodeKind::FunctionDeclaration) { is_tmpl = true; }
                 if (!is_tmpl) {
+                    // An overloaded function as a value is the overload the
+                    // expected function type selects, pinned by its entry.
+                    const family: OverloadId[] = this.calls.family_entries(def_id);
+                    mut refused: boolean = false;
+                    const picked: TypeRef = this.calls.value_overload_signature(&family, name_str,
+                        ident.span, &refused);
+                    if (refused) { return TypeRef::invalid(); }
+                    if (picked.is_valid()) {
+                        for (mut i: i64 = 0; i < family.length; i++) {
+                            if (this.ctx.decl_index.entry_signature(family[i]).equals(picked)) {
+                                ident.set_resolved_callee(CalleePin::Decl(family[i]));
+                                return picked;
+                            }
+                        }
+                    }
                     ident.set_resolved_callee(CalleePin::Family(
                         FamilyOwner::Def(this.ctx.defs.parent_of(def_id)), this.ctx.defs.leaf_of(def_id)));
                 }

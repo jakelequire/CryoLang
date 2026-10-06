@@ -929,6 +929,10 @@ type struct CallResolver {
                 } else if (arg_node.kind == NodeKind::CallExpression
                         || arg_node.kind == NodeKind::ScopeResolution) {
                     push_expected = true;
+                } else if (arg_node.kind == NodeKind::Identifier && this.types.is_function_type(slot)) {
+                    // A function named as a value takes the overload a
+                    // function-typed parameter selects.
+                    push_expected = true;
                 // A constant numeric expression - negated, or arithmetic over
                 // literals - is width-polymorphic exactly like the bare literal
                 // handled below, so a concrete slot has to reach the whole
@@ -5104,6 +5108,48 @@ type struct CallResolver {
         this.ctx.emit_diagnostic(d);
     }
 
+    /// The signature an overloaded function taken as a VALUE names: the
+    /// overload whose signature is the expected function type.  Invalid when
+    /// there is nothing to choose - fewer than two signatures, or an expected
+    /// type that is no function type - and when no overload has the expected
+    /// one; the caller keeps the declaration's own signature, which the
+    /// binding it flows into then checks.  With no expected type at all
+    /// nothing chooses, and the value is refused as ambiguous (E0154) with
+    /// each overload named; `refused` says so.
+    value_overload_signature(mut &this, entries: &OverloadId[], shown: string, span: SourceSpan,
+                             refused: mut &boolean) -> TypeRef {
+        if (entries.length < 2) { return TypeRef::invalid(); }
+        const first: TypeRef = this.ctx.decl_index.entry_signature(entries[0]);
+        mut several: boolean = false;
+        for (mut i: i64 = 1; i < entries.length; i++) {
+            if (!this.ctx.decl_index.entry_signature(entries[i]).equals(first)) { several = true; }
+        }
+        if (!several) { return TypeRef::invalid(); }
+        const expected: TypeRef = this.state.expected_type;
+        if (expected.is_valid()) {
+            const et: Type* = this.arena.lookup(expected);
+            if (et == null || et.kind != TypeKind::Function) { return TypeRef::invalid(); }
+            for (mut i: i64 = 0; i < entries.length; i++) {
+                const sig: TypeRef = this.ctx.decl_index.entry_signature(entries[i]);
+                if (sig.equals(expected)) { return sig; }
+            }
+            return TypeRef::invalid();
+        }
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0154_AMBIGUOUS_CALL,
+            Text::new(fmt::format("`%s` is overloaded, and nothing here says which overload is meant", shown)));
+        d = d.at_with_label(span, Text::new(fmt::format("%lld overloads", entries.length)));
+        for (mut i: i64 = 0; i < entries.length; i++) {
+            const at: SourceSpan = this.ctx.decl_index.entry_span(entries[i]);
+            if (at.has_location()) {
+                d = d.with_note_at(Text::new(fmt::format("an overload of `%s`", shown)), at);
+            }
+        }
+        d = d.help(Text::new("give the value a function type, e.g. `const f: (i32) -> i32 = ...;`, and the overload of that type is taken"));
+        this.ctx.emit_diagnostic(d);
+        *refused = true;
+        return TypeRef::invalid();
+    }
+
     /// The entries of `owner`'s family `member`, through the member-function
     /// door: what a static path written against `owner` names.
     ![allow(lookup_by_spelling, reason = "a path's member leaf reaches the member-function door here, by its owner's identity")]
@@ -5453,22 +5499,27 @@ type struct CallResolver {
                 }
             }
         }
-        const entry: OverloadId = this.entry_of_signature(FamilyOwner::Type(owner), scope.member_name, method_ft, scope);
+        const family: OverloadId[] = this.ctx.decl_index.lookup_family_entries(FamilyOwner::Type(owner), scope.member_name);
+        mut refused: boolean = false;
+        const picked: TypeRef = this.value_overload_signature(&family,
+            fmt::format("%s::%s", this.intern.resolve(scope.scope_name), this.intern.resolve(scope.member_name)),
+            scope.span, &refused);
+        if (refused) { return TypeRef::invalid(); }
+        const value_ft: TypeRef = if (picked.is_valid()) { picked } else { method_ft };
+        const entry: OverloadId = this.entry_of_signature(&family, FamilyOwner::Type(owner), value_ft, scope);
         scope.set_resolved_callee(if (entry.is_valid()) {
             CalleePin::Decl(entry)
         } else {
             CalleePin::Family(FamilyOwner::Type(owner), scope.member_name)
         });
-        return method_ft;
+        return value_ft;
     }
 
-    /// The entry of the family `(owner, leaf)` with signature `ft` the
+    /// The entry of `owner`'s family `entries` with signature `ft` the
     /// `Type::method` path `path` names; invalid when there is none, or
     /// several the path cannot choose between (`choose_entry`).
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    entry_of_signature(mut &this, owner: FamilyOwner, leaf: SymbolStr, ft: TypeRef,
+    entry_of_signature(mut &this, entries: &OverloadId[], owner: FamilyOwner, ft: TypeRef,
                        path: ScopeResolutionNode*) -> OverloadId {
-        const entries: OverloadId[] = this.ctx.decl_index.lookup_family_entries(owner, leaf);
         mut fits: OverloadId[] = [];
         for (mut i: i64 = 0; i < entries.length; i++) {
             if (this.ctx.decl_index.entry_signature(entries[i]).equals(ft)) { fits.push(entries[i]); }
