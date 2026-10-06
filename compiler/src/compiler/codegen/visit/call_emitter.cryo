@@ -157,6 +157,45 @@ type struct CallEmitter {
         return slot;
     }
 
+    /// The function type of a callee that is a value - a local, a call's
+    /// result, any expression - through one pointer or reference (`&fn`);
+    /// null when the value is no function.
+    value_function_type(&this, ty: TypeRef) -> FunctionType* {
+        mut t: Type* = this.cg.arena_type(ty);
+        if (t != null && t.kind == TypeKind::Pointer) {
+            t = this.cg.arena_type((t as PointerType*).pointee);
+        } else if (t != null && t.kind == TypeKind::Reference) {
+            t = this.cg.arena_type((t as ReferenceType*).referent);
+        }
+        if (t == null || t.kind != TypeKind::Function) { return null; }
+        return t as FunctionType*;
+    }
+
+    /// Call the function pointer `fn_ptr` with the call's arguments.  The
+    /// pointer was computed, so it is no LLVM function: neither its type nor
+    /// the call site's sret/byval attributes can be read off it, and both
+    /// come from `plan`, classified from the value's Cryo function type.
+    call_through_value(mut &this, visitor: ASTVisitor*, node: CallExprNode*,
+                       fn_ptr: LValue, plan: SignaturePlan) -> void {
+        // The seam returns `void` when sret applies, else the Direct
+        // return slot's type; a void call gets no result name.
+        mut ret_ty: LType = LType::void_type();
+        if (!plan.sret_slot && plan.return_plan.llvm_slots.length > 0) {
+            ret_ty = plan.return_plan.llvm_slots[0];
+        }
+        mut call_args: Pair<LValue, TypeRef>[] = [];
+        for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
+            const av: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[ai]);
+            call_args.push(Pair::<LValue, TypeRef>::new(av, node.arguments[ai].resolved_type));
+        }
+        const void_ty: LType = LType::void_type();
+        const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
+        const fn_type: LType = plan.llvm_fn_type;
+        this.state.last_value = this.cg.expr_ops.codegen_call_with_plan(
+            fn_ptr, fn_type, plan, call_args, Text::new(call_name));
+        this.state.last_is_lvalue = false;
+    }
+
 
     // Main emit
 
@@ -307,29 +346,8 @@ type struct CallEmitter {
             if (!callee_val.is_valid()) {
                 const local: LValue = this.cg.values.get(id.name);
                 if (local.is_valid()) {
-                    // Build the LLVM function type from the Cryo FunctionType.
-                    // Unwrap Pointer/Reference if the param type is &fn(...).
-                    mut callee_type_ref: TypeRef = id.resolved_type;
-                    mut callee_t: Type* = this.cg.arena_type(callee_type_ref);
-                    if (callee_t != null && callee_t.kind == TypeKind::Pointer) {
-                        const pt: PointerType* = callee_t as PointerType*;
-                        callee_type_ref = pt.pointee;
-                        callee_t = this.cg.arena_type(callee_type_ref);
-                    } else if (callee_t != null && callee_t.kind == TypeKind::Reference) {
-                        const rt: ReferenceType* = callee_t as ReferenceType*;
-                        callee_type_ref = rt.referent;
-                        callee_t = this.cg.arena_type(callee_type_ref);
-                    }
-                    if (callee_t != null && callee_t.kind == TypeKind::Function) {
-                        const ft: FunctionType* = callee_t as FunctionType*;
-                        // Route the LLVM function type through the ABI seam
-                        // so sret/byval lowering matches the callee - the
-                        // callee here is a function pointer loaded from a
-                        // local, so `LLVMIsAFunction(callee)` is null and
-                        // the call-site attribute-query path can't recover
-                        // the ABI on its own.  We compute the plan from
-                        // the Cryo FunctionType and pass it explicitly via
-                        // `codegen_call_with_plan`.
+                    const ft: FunctionType* = this.value_function_type(id.resolved_type);
+                    if (ft != null) {
                         const plan: SignaturePlan = this.cg.abi.classify_signature(
                             ft.param_types, ft.return_type, false);
                         if (!plan.llvm_fn_type.is_valid()) {
@@ -337,34 +355,10 @@ type struct CallEmitter {
                             this.state.last_is_lvalue = false;
                             return;
                         }
-                        const fn_type: LType = plan.llvm_fn_type;
-                        // Map ret_ty for the void-name choice below; the
-                        // seam used `void` when sret applied, otherwise
-                        // the Direct return slot's type.
-                        mut ret_ty: LType = LType::void_type();
-                        if (!plan.sret_slot
-                                && plan.return_plan.llvm_slots.length > 0) {
-                            ret_ty = plan.return_plan.llvm_slots[0];
-                        }
                         // Load the function pointer from the alloca.
                         const fn_ptr_llvm: LType = LType::pointer_to(LType::i8());
                         const fn_ptr: LValue = this.cg.builder.build_load(fn_ptr_llvm, local, Text::new("fn.ptr.load"));
-                        // Codegen arguments.
-                        mut call_args: Pair<LValue, TypeRef>[] = [];
-                        for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
-                            const av: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[ai]);
-                            call_args.push(Pair::<LValue, TypeRef>::new(av, node.arguments[ai].resolved_type));
-                        }
-                        // Build the call via the plan-aware path so sret
-                        // is marshalled and byval/sret attributes land on
-                        // the call instruction.
-                        const void_ty: LType = LType::void_type();
-                        const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
-                        mut call_result: LValue = LValue::null();
-                        call_result = this.cg.expr_ops.codegen_call_with_plan(
-                            fn_ptr, fn_type, plan, call_args, Text::new(call_name));
-                        this.state.last_value = call_result;
-                        this.state.last_is_lvalue = false;
+                        this.call_through_value(visitor, node, fn_ptr, plan);
                         return;
                     }
                 }
@@ -464,11 +458,6 @@ type struct CallEmitter {
             }
             if (ma_fn_type != null) {
                 const ft: FunctionType* = ma_fn_type;
-                // Route the LLVM function type through the ABI seam so
-                // sret/byval lowering matches the callee.  See the
-                // sibling fn-pointer site higher in this file for the
-                // full rationale; same situation here - the callee is
-                // a function pointer loaded from a struct field.
                 const plan: SignaturePlan = this.cg.abi.classify_signature(
                     ft.param_types, ft.return_type, false);
                 if (!plan.llvm_fn_type.is_valid()) {
@@ -476,33 +465,16 @@ type struct CallEmitter {
                     this.state.last_is_lvalue = false;
                     return;
                 }
-                const llvm_fn_type: LType = plan.llvm_fn_type;
-                mut ret_ty: LType = LType::void_type();
-                if (!plan.sret_slot
-                        && plan.return_plan.llvm_slots.length > 0) {
-                    ret_ty = plan.return_plan.llvm_slots[0];
-                }
-                // Load the fn-pointer value from the field (rvalue).
+                // Load the fn-pointer value from the field (rvalue).  No
+                // implicit `this`: the field holds a plain function, not a
+                // bound method.
                 const fn_ptr: LValue = this.dispatch.codegen_rvalue(visitor,ma);
                 if (!fn_ptr.is_valid()) {
                     this.state.last_value = LValue::null();
                     this.state.last_is_lvalue = false;
                     return;
                 }
-                // Codegen user args (no implicit `this`; the fn-pointer field
-                // is a plain function, not a bound method).
-                mut fnp_args: Pair<LValue, TypeRef>[] = [];
-                for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
-                    const av: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[ai]);
-                    fnp_args.push(Pair::<LValue, TypeRef>::new(av, node.arguments[ai].resolved_type));
-                }
-                const void_ty: LType = LType::void_type();
-                const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
-                mut call_result: LValue = LValue::null();
-                call_result = this.cg.expr_ops.codegen_call_with_plan(
-                    fn_ptr, llvm_fn_type, plan, fnp_args, Text::new(call_name));
-                this.state.last_value = call_result;
-                this.state.last_is_lvalue = false;
+                this.call_through_value(visitor, node, fn_ptr, plan);
                 return;
             }
 
@@ -591,6 +563,27 @@ type struct CallEmitter {
             // user drop, which the Copy no-op and the drop glue below take.
 
         } else {
+            // Any other callee is a value of function type the program
+            // computes - a call's result (`pick()(2.0)`), an element, a
+            // parenthesized expression - and is called through.
+            const ft: FunctionType* = this.value_function_type(node.callee.resolved_type);
+            if (ft != null) {
+                const plan: SignaturePlan = this.cg.abi.classify_signature(
+                    ft.param_types, ft.return_type, false);
+                if (!plan.llvm_fn_type.is_valid()) {
+                    this.state.last_value = LValue::null();
+                    this.state.last_is_lvalue = false;
+                    return;
+                }
+                const fn_ptr: LValue = this.dispatch.codegen_rvalue(visitor,node.callee);
+                if (!fn_ptr.is_valid()) {
+                    this.state.last_value = LValue::null();
+                    this.state.last_is_lvalue = false;
+                    return;
+                }
+                this.call_through_value(visitor, node, fn_ptr, plan);
+                return;
+            }
             callee_val = this.dispatch.codegen_rvalue(visitor,node.callee);
         }
 

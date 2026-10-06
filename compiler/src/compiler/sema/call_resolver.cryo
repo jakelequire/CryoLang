@@ -852,6 +852,23 @@ type struct CallResolver {
                 }
             }
         }
+        // A callee that is no name, path or member is a value the program
+        // computes - a call's result, an element.  It is typed once, here,
+        // so its parameters hint the arguments and its return types the
+        // call below.
+        mut computed_type: TypeRef = TypeRef::invalid();
+        mut computed_fn: TypeRef = TypeRef::invalid();
+        if (!CallResolver::callee_is_named(call.callee)) {
+            computed_type = this.dispatch.resolve_expr(visitor, call.callee);
+            if (this.types.is_function_type(computed_type)) {
+                computed_fn = computed_type;
+            } else if (this.types.is_function_type(this.types.peel_indirection(computed_type))) {
+                computed_fn = this.types.peel_indirection(computed_type);
+            }
+            if (computed_fn.is_valid() && param_types.length == 0) {
+                param_types = sema_copy_type_refs(&(this.arena.lookup(computed_fn) as FunctionType*).param_types);
+            }
+        }
         if (param_types.length == 0) {
             const callee_node: ASTNode* = call.callee as ASTNode*;
             if (callee_node.kind == NodeKind::MemberAccess) {
@@ -1154,7 +1171,22 @@ type struct CallResolver {
             return scope_ret;
         }
 
-        return this.dispatch.resolve_expr(visitor, callee);
+        // A computed callee was typed above; a call through a function value
+        // has that function's return type, as a call through a local does.
+        if (computed_fn.is_valid()) {
+            return (this.arena.lookup(computed_fn) as FunctionType*).return_type;
+        }
+        return computed_type;
+    }
+
+    /// Whether a call's callee is a name, a path or a member - the callees
+    /// a declaration is selected for - rather than a value an expression
+    /// computes.
+    static callee_is_named(callee: ExpressionNode*) -> boolean {
+        const kind: NodeKind = (callee as ASTNode*).kind;
+        return kind == NodeKind::Identifier
+            || kind == NodeKind::ScopeResolution
+            || kind == NodeKind::MemberAccess;
     }
 
     /// Record how each argument binds to the parameter it lands on
