@@ -67,7 +67,6 @@ import compiler::diag::sink::{ DiagnosticSink };
 import compiler::passes::type_resolution;
 import compiler::passes::type_resolution::{ TypeResolutionPasses, TypeResolutionRunner };
 import compiler::ast::cloner::{ ASTCloner };
-import compiler::ast::postmono_writes::{ PostmonoWrites, g_postmono_writes };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, ClassDeclNode, DestructureBinding, DestructureDeclNode,
     EnumDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode, MethodNode,
@@ -349,7 +348,7 @@ public:
         }
         // After the bodies: an `async function`'s declaration is its lowered
         // one by now, the declaration that compiles.
-        if (this.ctx.options.emit_facts && !this.state.post_mono_verify) {
+        if (this.ctx.options.emit_facts) {
             CallFacts::record_declarations(this.ctx, this.arena, node);
         }
     }
@@ -826,12 +825,10 @@ public:
     /// resolved callee if the body was never walked, and lowering a generic
     /// `async function` builds its state machine out of these very types. So the
     /// walk before monomorphization is unconditional; it is not a diagnostic
-    /// add-on to be switched off.  After monomorphization a template body is
-    /// never emitted and nothing reads what a walk would leave on it - each
-    /// copy of it is walked in its own right - so it is not walked again.
+    /// add-on to be switched off.
     symbolic_check_body(mut &this, func: FunctionDeclNode*, this_type: TypeRef,
                         owner_type: TypeRef) -> void {
-        if (func == null || func.body == null || this.state.post_mono_verify) { return; }
+        if (func == null || func.body == null) { return; }
         const sink: DiagnosticSink* = this.ctx.diagnostics;
         if (sink == null) { return; }
         const snap: DiagnosticSnapshot = sink.snapshot();
@@ -1647,22 +1644,12 @@ public:
 
     // -- The authoritative expression dispatch --
 
-    /// Resolve a call, and under `--emit=facts` record what it bound.  Only
-    /// the check before monomorphization records: it walks every module on
-    /// every build, a module reused from the incremental cache included,
-    /// while the check after it skips a cached module.
+    /// Resolve a call, and under `--emit=facts` record what it bound.  The
+    /// check walks every module on every build, a module reused from the
+    /// incremental cache included.
     resolve_call_recorded(mut &this, call: CallExprNode*) -> TypeRef {
-        if (g_postmono_writes != null && this.state.post_mono_verify) {
-            const entry_pin: CalleePin = call.resolved_callee;
-            mut entry_args: ExpressionNode*[] = [];
-            for (mut i: i64 = 0; i < call.arguments.length; i++) { entry_args.push(call.arguments[i]); }
-            const entry_bindings: u64[] = PostmonoWrites::bindings_of(call);
-            const written: TypeRef = this.calls.resolve_call(this, call);
-            PostmonoWrites::record_call(call, &entry_pin, &entry_args, &entry_bindings);
-            return written;
-        }
         const t: TypeRef = this.calls.resolve_call(this, call);
-        if (this.ctx.options.emit_facts && !this.state.post_mono_verify) {
+        if (this.ctx.options.emit_facts) {
             const known: boolean = this.state.facts_call == call;
             CallFacts::record(&this.facts_scope(), call, &this.state.facts_params, known);
         }
@@ -1674,7 +1661,7 @@ public:
     /// condition as a call's record.
     resolve_binary_recorded(mut &this, bin: BinaryExprNode*) -> TypeRef {
         const t: TypeRef = this.resolve_binary(bin);
-        if (this.ctx.options.emit_facts && !this.state.post_mono_verify) {
+        if (this.ctx.options.emit_facts) {
             CallFacts::record_compare(&this.facts_scope(), bin);
             CallFacts::record_assign(&this.facts_scope(), bin);
         }
@@ -1682,10 +1669,10 @@ public:
     }
 
     /// Under `--emit=facts`, record a `match` whose subject is a spelling -
-    /// the same condition as a call's record, before monomorphization only.
+    /// the same condition as a call's record.
     record_match_facts(mut &this, subject: ExpressionNode*, arms: &MatchArmNode*[],
                        span: SourceSpan) -> void {
-        if (this.ctx.options.emit_facts && !this.state.post_mono_verify) {
+        if (this.ctx.options.emit_facts) {
             CallFacts::record_match(&this.facts_scope(), subject, arms, span);
         }
     }
@@ -1699,10 +1686,9 @@ public:
 
     resolve_expr(mut &this, expr: ExpressionNode*) -> TypeRef {
         if (expr == null) { return TypeRef::invalid(); }
-        if (expr.has_resolved_type() && !this.state.post_mono_verify) {
+        if (expr.has_resolved_type()) {
             return expr.resolved_type;
         }
-        const entry: TypeRef = expr.resolved_type;
         const n: ASTNode* = expr as ASTNode*;
         const result: TypeRef = match (n.kind) {
             NodeKind::Literal           => { this.literals.resolve_literal(expr as LiteralNode*) }
@@ -1754,9 +1740,6 @@ public:
             _ => { TypeRef::invalid() }
         };
         if (result.is_valid()) { expr.set_resolved_type(result); }
-        if (g_postmono_writes != null && this.state.post_mono_verify) {
-            PostmonoWrites::record_type(this.arena, expr, entry, result);
-        }
         return result;
     }
 
@@ -2325,10 +2308,7 @@ public:
         // into a trait-method call, return its type without re-running
         // `check_binary_op` (which would re-reject the user-typed operands and
         // emit a spurious E0229 the second time around).
-        // Post-mono the desugar is a clone the substituter left unbound: walk
-        // it again (see `resolve_array_access`).
         if (bin.desugared_call != null) {
-            if (this.state.post_mono_verify) { return this.resolve_expr(bin.desugared_call); }
             return bin.desugared_call.resolved_type;
         }
         const left_is_lit:  boolean = is_numeric_literal_expr(bin.left);
@@ -2625,7 +2605,6 @@ public:
         // Idempotent (see resolve_binary): a prior resolution may have rewritten
         // `-x` into `x.neg()`; return its type rather than re-rejecting.
         if (unary.desugared_call != null) {
-            if (this.state.post_mono_verify) { return this.resolve_expr(unary.desugared_call); }
             return unary.desugared_call.resolved_type;
         }
         // Address-of resolved against an expected `&T`: a numeric-literal
@@ -4444,8 +4423,7 @@ public:
 type struct SemanticPasses {
 
     /// Walk all function bodies and fill resolved_type on every ExpressionNode.
-    /// Runs AFTER monomorphization (post-mono authoritative pass when
-    /// MonomorphizationComplete is provisioned).
+    /// Runs once, before monomorphization; a copy carries what it decided.
     static run_sema(ctx: CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
         if (ctx.options.verbose) {
@@ -4466,7 +4444,6 @@ type struct SemanticPasses {
         // leaves `T` unbound - see codegen's `_box_gen` two-step).
         const _box_v: Box<SemaVisitor> = Box::<SemaVisitor>::new(SemaVisitor::build(ctx));
         const v: SemaVisitor* = _box_v.leak();
-        v.state.post_mono_verify = ctx.provisions.has(Provision::MonomorphizationComplete);
         v.wire();
         v.visit(root);
 

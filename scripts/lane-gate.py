@@ -381,10 +381,6 @@ EXCLUDED = {
                                   "rendered diagnostics deduplicated by their text"),
     "Runner":            Excluded("CLI/_module.cryo",
                                   "the CLI's command table, keyed by the subcommand typed"),
-    "PostmonoWrites":    Excluded("compiler/AST/postmono_writes.cryo",
-                                  "--emit=postmono-writes: a copy's origin keyed by the expression's ADDRESS"),
-    "Tally":             Excluded("compiler/AST/postmono_writes.cryo",
-                                  "--emit=postmono-writes: report rows keyed by their own LABEL text"),
 }
 
 # Rule 1b's table: every type that owns NO map, owns an array of names, and

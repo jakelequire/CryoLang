@@ -1111,13 +1111,7 @@ type struct CallResolver {
             this.lambda.reject_closure_struct_args_in_non_free_call(call,
                 Text::new("passing a capturing closure as a method-call argument"));
             const selected: Selection = this.resolve_method_overload(visitor, call, callee as MemberAccessNode*);
-            // After monomorphization a call the selection left unbound is the
-            // compiler's defect, reported as one; checking its arguments
-            // against the receiver's methods found by name would add a user
-            // error for it.
-            if (!this.state.post_mono_verify || selected.chosen != null) {
-                this.check_method_call_arg_types(visitor, call, callee as MemberAccessNode*, selected.chosen);
-            }
+            this.check_method_call_arg_types(visitor, call, callee as MemberAccessNode*, selected.chosen);
             const args_refused: boolean = this.ctx.diagnostics.errors_since(arg_snap) > 0;
             const mret: TypeRef = this.resolve_method_call(visitor, callee as MemberAccessNode*, call,
                                                            selected, args_refused);
@@ -2840,15 +2834,6 @@ type struct CallResolver {
         }
         const entries: OverloadId[] = this.family_entries(callee);
         if (entries.length == 0) { return TypeRef::invalid(); }
-        // After monomorphization a call names the declaration it was written
-        // against, carried into every copy of its body, or nothing; one that
-        // reaches the selection here was left unpinned, which is the
-        // compiler's defect.  A converter call that pass builds around an
-        // argument is written there, and selected there.
-        if (this.state.post_mono_verify && !this.state.in_implicit_conversion) {
-            this.report_unbound_after_mono(call, this.intern.resolve(this.ctx.defs.leaf_of(callee)), "function");
-            return TypeRef::invalid();
-        }
         mut overloads: TypeRef[] = [];
         for (mut ei: i64 = 0; ei < entries.length; ei++) {
             overloads.push(this.ctx.decl_index.entry_signature(entries[ei]));
@@ -3242,10 +3227,6 @@ type struct CallResolver {
             if (pinned_fn == null || !pinned_fn.is_generic()) {
                 return this.bind_template_method(visitor, call, base_ref);
             }
-            if (this.state.post_mono_verify) {
-                this.report_unbound_after_mono(call, this.intern.resolve(member.member), "method");
-                return Selection::none();
-            }
         }
         if (!member.resolved_trait.is_valid()) {
             mut copied: BoundDirection = BoundDirection::none();
@@ -3332,15 +3313,6 @@ type struct CallResolver {
                 return this.bind_trait_item(visitor, call, &items, &arg_types);
             }
         }
-        // After monomorphization a call is bound by the identity recorded
-        // where it is written - its template pin, its trait item, or the
-        // instance monomorphization made for it - or not at all.  A call
-        // that reaches selection here was left unrecorded, which is the
-        // compiler's defect; it is never selected again by its name.
-        if (this.state.post_mono_verify) {
-            this.report_unbound_after_mono(call, this.intern.resolve(member.member), "method");
-            return Selection::none();
-        }
         if (want_trait.is_valid() && this.select_in_set(visitor, call, member, base_ref, base_t, start_cls,
                 methods_ref, &arg_types, tmpl, want_trait, true, &sel)) {
             if (tmpl == null) { this.check_trait_item_table(member, base_ref, sel.chosen); }
@@ -3364,29 +3336,6 @@ type struct CallResolver {
             return this.commit_selection(visitor, call, sel);
         }
         return Selection::none();
-    }
-
-    /// The internal error for a call that reached selection after
-    /// monomorphization: it names the callee `leaf` - a `what`, method or
-    /// function - the function whose body holds the call - in a
-    /// specialization, the specialization - and the place the call is
-    /// written, which for a copied body is its template's.
-    report_unbound_after_mono(mut &this, call: CallExprNode*, leaf: string, what: string) -> void {
-        const func: FunctionDeclNode* = this.state.current_func;
-        mut where_fn: string = "<no function>";
-        if (func != null) {
-            where_fn = this.intern.resolve(func.name);
-            if (this.state.this_type.is_valid()) {
-                where_fn = fmt::format("%s::%s",
-                    this.arena.resolve_display_name_short(this.state.this_type), where_fn);
-            }
-        }
-        const file: string = call.span.file;
-        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-            Text::new(fmt::format("internal: call to `%s` in `%s` reached codegen with no resolved %s (written at %s:%u)",
-                leaf, where_fn, what, file.basename(), call.span.start_line)));
-        d = d.at(call.span);
-        this.ctx.emit_diagnostic(d);
     }
 
     /// Record on a call in a generic body the method selected for it, when
@@ -3775,11 +3724,10 @@ type struct CallResolver {
     /// declaration itself, or the one a copy stands for; monomorphization
     /// maps it to the receiver's method for that definition and to its
     /// instance, and nothing finds the method again by its member's name.
-    /// The pass after monomorphization records nothing: no copy is made
-    /// after it.  A call bound with no receiver in hand (`recv` invalid)
-    /// records nothing either.
+    /// A call bound with no receiver in hand (`recv` invalid) records
+    /// nothing.
     pin_instantiated_method(&this, call: CallExprNode*, mn: MethodNode*, recv: TypeRef) -> void {
-        if (this.state.post_mono_verify || mn.func == null || !recv.is_valid()) { return; }
+        if (mn.func == null || !recv.is_valid()) { return; }
         if (mn.func.generic_params.length == 0 && !mn.func.is_self_returning_default
                 && !mn.func.is_lazy_self_growing) { return; }
         const d: DefId = if (mn.func.def.is_valid()) { mn.func.def } else { mn.func.copy_of };
@@ -5000,13 +4948,6 @@ type struct CallResolver {
         }
         if (call.resolved_callee.is_some()) { return; }
         if (!scope_sym.is_valid() || !member_sym.is_valid()) { return; }
-        // A converter call the pass after monomorphization builds around an
-        // argument (`String::from_str("node")`'s `"node"` into a `Str`) is
-        // written there, and is resolved where it is written like any other.
-        if (this.state.post_mono_verify && !this.state.in_implicit_conversion) {
-            this.bind_static_after_mono(call, scope, owner);
-            return;
-        }
         if (this.scope_is_generic_template(owner, member_sym)) {
             this.record_template_static(call, scope, owner);
             return;
@@ -5047,8 +4988,8 @@ type struct CallResolver {
     /// trait's declared method; otherwise the method of the template's
     /// family the arguments' count admits, a tie between an inherent method
     /// and a trait's reported here as everywhere (`choose_entry`).  Every
-    /// copy of the body carries it, and the pass after monomorphization
-    /// binds it on the minted owner by identity (`bind_static_after_mono`).
+    /// copy of the body carries it, and monomorphization binds it on the
+    /// minted owner by identity.
     /// Records nothing for an owner with no template: its generic static
     /// method is a template of its own, which monomorphization specializes.
     record_template_static(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*, owner: TypeRef) -> void {
@@ -5086,48 +5027,6 @@ type struct CallResolver {
             return DefId::invalid();
         }
         return decl.methods[slot].def;
-    }
-
-    /// Bind, after monomorphization, a static call its template left
-    /// unpinned - an owner that was a generic type, a parameter a bound
-    /// directs, an impl head over either - to the method the call recorded
-    /// where it is written, on the minted owner, by identity: a trait's
-    /// declared method answers through the owner's implementations of that
-    /// trait at its position, the arguments choosing among several; any
-    /// other definition is the owner's entry for it.  A call that recorded
-    /// nothing, or whose owner has no such method, is the compiler's defect,
-    /// refused with E0900 and never selected by its member's name.
-    bind_static_after_mono(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*, written_owner: TypeRef) -> void {
-        const d: DefId = call.template_method;
-        // The owner monomorphization instantiated for the call - one whose
-        // arguments the call's arguments inferred is written bare - else
-        // the one written; an instantiation answers as the specialization
-        // it was built into.
-        mut owner: TypeRef = if (call.template_recv.is_valid()) { call.template_recv } else { written_owner };
-        const ot: Type* = this.arena.lookup(owner);
-        if (ot != null && ot.kind == TypeKind::InstantiatedType && (ot as InstantiatedType*).has_resolved_type()) {
-            owner = (ot as InstantiatedType*).resolved_type;
-        }
-        if (d.is_valid()) {
-            const pos: i64 = this.ctx.generic_registry.trait_item_position(d);
-            if (pos >= 0) {
-                const blocks: ImplBlockNode*[] = this.ctx.generic_registry.heads_for(
-                    this.ctx.defs.parent_of(d), owner, this.intern);
-                mut items: OverloadId[] = [];
-                for (mut i: i64 = 0; i < blocks.length; i++) {
-                    const m: MethodNode* = this.ctx.generic_registry.trait_item_method(blocks[i], pos);
-                    if (m != null && m.func != null && m.func.overload_entry.is_valid()) { items.push(m.func.overload_entry); }
-                }
-                if (items.length > 0 && this.pin_trait_delivered_call(call, scope, &items)) { return; }
-            } else {
-                const e: OverloadId = this.ctx.decl_index.method_entry_on(owner, d);
-                if (e.is_valid()) {
-                    this.pin_static_entry(call, scope, e);
-                    return;
-                }
-            }
-        }
-        this.report_unbound_after_mono(call, this.intern.resolve(scope.member_name), "method");
     }
 
     /// A call written through a TRAIT's path, `Beta::go(&p, ...)`: the
@@ -6801,17 +6700,6 @@ type struct CallResolver {
         // layout, so returning one would only move the failure downstream.
         for (mut p: i64 = 0; p < tmpl.param_count; p++) {
             if (!bindings[p].is_valid()) { return TypeRef::invalid(); }
-        }
-        // Minting an instantiation is only safe while monomorphization still
-        // has a worklist to put it on. Sema runs a second time AFTER mono to
-        // re-resolve these nodes, and a specialization first demanded there is
-        // never produced: it survives to the generic validator as an
-        // unresolved instantiation and fails the build as an ICE. So after
-        // mono, reuse only what the earlier pass already demanded - a pure
-        // lookup - and leave anything else on the generic-base path it was
-        // already taking.
-        if (this.state.post_mono_verify) {
-            return this.arena.find_instantiation(base_ref, &bindings);
         }
         // Register the instantiation so it is monomorphized for codegen;
         // `instantiate` stays arena-only under a symbolic no-demand walk.

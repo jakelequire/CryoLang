@@ -72,7 +72,6 @@ import compiler::diag::{ ErrorCode };
 import compiler::module_graph::{ ModuleInfo, ModuleOrigin };
 import compiler::module_loader::{ ModuleLoader };
 import compiler::sema::call_facts::{ CallFacts };
-import compiler::ast::postmono_writes::{ PostmonoWrites };
 import compiler::passes::pass_id::{ PassID, PassResult, Provision, ProvisionSet };
 import compiler::passes::pass_registry::{ PassRegistry };
 import compiler::passes::specialization::{ SpecializationPasses };
@@ -180,12 +179,6 @@ type struct CompilerConfig {
     /// up-to-date short-circuit, which would otherwise skip the pass that
     /// records.
     emit_facts:          boolean;
-    /// `--emit=postmono-writes`: also write `<output_dir>/<name>.postmono`,
-    /// what the type check after monomorphization wrote over what each
-    /// expression, call and argument held (`ast::postmono_writes`).  Like
-    /// `emit_facts`, a side output that bypasses the up-to-date
-    /// short-circuit.
-    emit_postmono_writes: boolean;
     /// `--no-std`: build without the standard library (no prelude, no
     /// stdlib module discovery, no libcryo.a at link time).  For project
     /// builds this is OR'd with the cryoconfig `no_std` key (the flag can
@@ -236,7 +229,6 @@ type struct CompilerConfig {
             incremental:         true,
             release_static:      false,
             emit_facts:          false,
-            emit_postmono_writes: false,
             no_std:              false,
             no_runtime:          false,
             panic:               PanicStrategy::Unspecified,
@@ -263,7 +255,6 @@ type struct CompilerConfig {
             incremental:         true,
             release_static:      false,
             emit_facts:          false,
-            emit_postmono_writes: false,
             no_std:              false,
             no_runtime:          false,
             panic:               PanicStrategy::Unspecified,
@@ -1072,7 +1063,6 @@ type struct CompilerInstance {
             Text::new(config.target_triple));
         options.static_link = this.config.release_static;
         options.emit_facts = this.config.emit_facts;
-        if (this.config.emit_postmono_writes) { PostmonoWrites::start(); }
         options.source_override = source_override;
 
         // An independent clone, so the local `config` stays usable below.
@@ -1661,7 +1651,7 @@ type struct CompilerInstance {
             const build_fp: u128 = manifest.compute_fingerprint(&mod_entries);
             build_fp_hex = compiler::build_manifest::Manifest::hex128(build_fp);
 
-            if (!this.config.emit_facts && !this.config.emit_postmono_writes
+            if (!this.config.emit_facts
                     && manifest.is_up_to_date(Text::new(build_fp_hex), &manifest_artifacts)) {
                 // Nothing changed and the artifact still exists: skip
                 // frontend, codegen, and linking entirely.
@@ -1979,14 +1969,14 @@ type struct CompilerInstance {
         // Codegen preparation.  Now that every module has been monomorphized and
         // specialized ASTs injected, GenericValidation can safely walk the
         // entire arena without false positives from not-yet-monomorphized
-        // modules.  FunctionBodyTypeCheck already ran in `typecheck_bodies`
-        // (before mono); this stage is post-mono validation only.
+        // modules.  Bodies are type-checked once, before monomorphization
+        // (`typecheck_bodies`), and a copy carries what that check and
+        // monomorphization decided; nothing types it again here.
         // BodiesTypeChecked is an INCOMING
         // provision here (sema provided it earlier) so MoveCheck's requirement
         // is satisfied.
         pipeline.set_passes([
             PassID::GenericValidation,
-            PassID::FunctionBodyTypeCheck,
             PassID::MoveCheck,
             PassID::DeadCodeAnalysis,
             PassID::DropInsertion,
@@ -2011,7 +2001,6 @@ type struct CompilerInstance {
             // produced the reusable .o.  Skip sema/lowering entirely; nothing
             // downstream (cross-module descriptors, other modules' codegen,
             // linking) reads a cached module's lowered AST.
-            PostmonoWrites::record_module(!(pm_active && pm_cached[order[i] as i64]));
             if (pm_active && pm_cached[order[i] as i64]) { continue; }
             CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
@@ -2034,14 +2023,6 @@ type struct CompilerInstance {
         }
 
         tm_sema_end = Instant::now().as_nanos();
-        if (this.config.emit_postmono_writes) {
-            const report_path: string = fmt::format("%s/%s.postmono",
-                ctx.project_config.output_dir, ctx.project_config.project_name);
-            if (!PostmonoWrites::write(Text::new(report_path))) {
-                fmt::eprintln(f"error: cannot write the post-monomorphization report to {report_path}");
-                return this.project_failure_release(ctx, ast_buf);
-            }
-        }
 
         // Dump ASTs if requested (even on errors, for debugging)
         if (this.config.show_ast) {
