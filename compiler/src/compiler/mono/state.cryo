@@ -126,8 +126,9 @@ type struct MonoState {
     pending:          MonomorphRequest[];
     pending_cursor:   i64;                  // Index cursor (avoids O(n) erase-from-front)
 
-    // Completed specialization entries (parallel to the orchestrator's
-    // string-keyed `spec_index`).  Shared so MonoCallSpecializer can read it.
+    // Completed specialization entries, indexed by the orchestrator's
+    // `spec_index` under each one's instantiation.  Shared so
+    // MonoCallSpecializer can read it.
     spec_entries:     SpecializationEntry[];
 
     // Visited set for request_nested_instantiations cycle detection.
@@ -137,23 +138,15 @@ type struct MonoState {
     // emit diagnostics both bump this; process_all returns error_count == 0).
     error_count:      i64;
 
-    // Specializations of generic STATIC methods on a generic owner
-    // (`finish_generic_static_method_spec`), keyed by the spec method's mangled
-    // symbol.  One is specialized once per (owner, method, bindings); the same
-    // spec can be requested again from several call sites, and without dedup
-    // the second request materializes a DUPLICATE spec method (double AST push
-    // + double DI entry), which corrupts the owner spec's method set.  This set
-    // persists across the batch (it is NOT cleared by `reset_worklist`): the
-    // spec, once emitted, is shared by every module.  Methods called on a
-    // receiver are kept in `method_instances` instead.
-    method_specs:     HashMap<string, OverloadId>;
-
     // The instances of methods with type parameters of their own: the
-    // receiver's method for a definition, at its own type arguments, minted
+    // owner's method for a definition, at its own type arguments, minted
     // once and shared by every call that asks for it, whichever body the
-    // call was copied into.  Keyed by identity - the receiver type and the
-    // definition - with the type arguments compared within a key's
-    // positions.  Persists across the batch, as `method_specs` does.
+    // call was copied into - a method called on a receiver and a static one
+    // called through its generic owner alike.  Keyed by identity - the
+    // owner type and the definition - with the type arguments compared
+    // within a key's positions.  Persists across the batch (it is not
+    // cleared by `reset_worklist`): an instance, once emitted, is shared by
+    // every module.
     method_instances: MethodInstance[];
     instance_keys:    HashMap<u64, i64[]>;
 
@@ -198,50 +191,10 @@ type struct MonoState {
             spec_entries:     [],
             nested_visited:   [],
             error_count:      0,
-            method_specs:     HashMap::<string, OverloadId>::new(),
             method_instances: [],
             instance_keys:    HashMap::<u64, i64[]>::new(),
             materialized_insts: HashMap::<u64, boolean>::new(),
             spec_owner_files: [],
-        };
-    }
-
-    /// True if a generic-method spec with this mangled symbol was already
-    /// materialized (AST-pushed + DI-registered) earlier in the build.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    method_spec_seen(&this, mangled: SymbolStr) -> boolean {
-        if (!mangled.is_valid()) { return false; }
-        const key: string = this.intern_table.resolve(mangled);
-        return this.method_specs.contains_key(&key);
-    }
-
-    /// Record that a generic-method spec with this mangled symbol has been
-    /// materialized, so later requests for the same spec reuse it.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    mark_method_spec(mut &this, mangled: SymbolStr) -> void {
-        if (!mangled.is_valid()) { return; }
-        const key: string = this.intern_table.resolve(mangled);
-        this.method_specs.insert(key, OverloadId::invalid());
-    }
-
-    /// Record the index entry the materialized spec was registered under,
-    /// so a later call to the same spec pins the same declaration.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    set_method_spec_entry(mut &this, mangled: SymbolStr, entry: OverloadId) -> void {
-        if (!mangled.is_valid()) { return; }
-        const key: string = this.intern_table.resolve(mangled);
-        this.method_specs.insert(key, entry);
-    }
-
-    /// The entry of the materialized spec with this mangled symbol; invalid
-    /// when none was materialized or registered.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    method_spec_entry(&this, mangled: SymbolStr) -> OverloadId {
-        if (!mangled.is_valid()) { return OverloadId::invalid(); }
-        const key: string = this.intern_table.resolve(mangled);
-        return match (this.method_specs.get(&key)) {
-            Option::Some(e) => { e }
-            Option::None    => { OverloadId::invalid() }
         };
     }
 

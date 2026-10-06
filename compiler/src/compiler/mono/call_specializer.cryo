@@ -1831,6 +1831,21 @@ type struct MonoCallSpecializer {
         }
         if (orig_method.func.generic_params.length != method_binds.length) { return false; }
 
+        // An instance is minted once per (owner, method definition, the
+        // method's type arguments), and a later call asking for the same one
+        // is pinned to it: a second mint would push the method onto the owner
+        // twice.  Asked by identity, in the table a receiver's generic method
+        // keeps its instances in; the type arguments are what tell apart two
+        // instances whose signatures do not mention them.
+        const def_of: DefId = if (orig_method.func.def.is_valid()) { orig_method.func.def } else { orig_method.func.copy_of };
+        if (!def_of.is_valid()) { return false; }
+        const def_slot: i64 = this.decl_index.defs.slot(def_of);
+        const made: OverloadId = this.state.method_instance(recv_type, def_slot, method_binds);
+        if (made.is_valid()) {
+            this.pin_spec_entry(call, made);
+            return true;
+        }
+
         mut copy_subst: TypeSubstitution* = null;
         const spec_method: MethodNode* = this.specialize_method(
             orig_method, &orig_method.func.generic_params, method_binds, recv_type, null, &copy_subst);
@@ -1876,15 +1891,6 @@ type struct MonoCallSpecializer {
             this.ast_resolver.resolve_func_and_body(spec_method.func, &body_ctx, recv_type);
         }
 
-        // Dedup: materialize once per (owner spec, method, bindings).
-        const pin_target: SymbolStr = this.arena.get_qualified_name(recv_type);
-        const spec_sym: SymbolStr = this.mangled_symbol_for_spec_method(spec_method, pin_target);
-        if (this.state.method_spec_seen(spec_sym)) {
-            this.pin_spec_entry(call, this.state.method_spec_entry(spec_sym));
-            return true;
-        }
-        this.state.mark_method_spec(spec_sym);
-
         // Route the spec'd method onto the owner spec entry's AST so codegen emits
         // it (the generic template AST is skipped by codegen - generic_params > 0).
         if (owner_ast.kind == NodeKind::StructDeclaration) {
@@ -1897,7 +1903,9 @@ type struct MonoCallSpecializer {
             return false;
         }
         this.register_spec_method_in_di_inherent(spec_method, recv_type, owner_ast);
-        this.state.set_method_spec_entry(spec_sym, spec_method.func.overload_entry);
+        mut inst_args: TypeRef[] = [];
+        for (mut ai: i64 = 0; ai < method_binds.length; ai++) { inst_args.push(method_binds[ai]); }
+        this.state.add_method_instance(recv_type, def_slot, inst_args, spec_method.func.overload_entry);
         this.pin_spec_entry(call, spec_method.func.overload_entry);
 
         // Re-walk the body for its own generic calls under the substitution
@@ -2378,30 +2386,6 @@ type struct MonoCallSpecializer {
         if (!entry.is_valid()) { return; }
         call.set_resolved_callee(CalleePin::Decl(entry));
     }
-
-    /// Compute the exact LLVM-mangled symbol a spec'd method will be emitted under,
-    /// which is the key its materialization is recorded under
-    /// (`mark_method_spec`), so a second request for the same spec reuses it.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    mangled_symbol_for_spec_method(mut &this, spec_method: MethodNode*,
-                                   qualified_target: SymbolStr) -> SymbolStr {
-        if (spec_method == null || spec_method.func == null) { return SymbolStr::empty(); }
-        if (!qualified_target.is_valid()) { return SymbolStr::empty(); }
-        const func: FunctionDeclNode* = spec_method.func;
-        const type_qname: QualifiedName = QualifiedName::from_symbol(qualified_target);
-        const method_param_refs: TypeRef[] = DeclarationIndex::method_non_receiver_params(func, this.intern_table);
-        const mangled: MangledName = MangledName::for_method_or_trait_impl(
-            this.intern_table, this.arena, type_qname, this.decl_index.defs.path_of(func.origin_trait), func.name,
-            DeclarationIndex::method_receiver_kind(func, spec_method.is_static, this.intern_table),
-            method_param_refs, func.resolved_return_type, func.is_variadic);
-        // Disambiguate generic-method specs whose signature doesn't depend on the
-        // method param (must match the codegen definition site, which folds the
-        // same `func.spec_type_args` in).
-        const disambig: MangledName = mangled.with_method_spec_args(
-            this.intern_table, this.arena, func.spec_type_args);
-        return this.intern_table.intern(disambig.as_string());
-    }
-
 
     // -- Small pure helpers (re-homed copies) --
 
