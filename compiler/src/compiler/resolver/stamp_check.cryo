@@ -1,0 +1,501 @@
+/// The name layer's exit check.
+///
+/// Every written name is resolved once, where it is written: the name layer
+/// stamps the node that carries it, or refuses it there (a refusal is an
+/// answer too).  This walks a module's whole tree after the name layer has
+/// run over it and counts every name-bearing slot still unanswered - an
+/// identifier, a path's scope segment, a struct literal's or `new`'s type
+/// name, an enum pattern's enum, a constant named by a pattern, a written
+/// type name, an impl's target, a class's base, a trait a bound names.
+///
+/// It is a walk of its own, not a tally the name layer keeps: a node the
+/// name layer never reached is exactly the defect, and a tally kept by the
+/// walker that missed it would miss it too.  Member names (`a.b`) and calls
+/// are not here; they are answered by the type check and by
+/// monomorphization.
+namespace compiler::resolver::stamp_check;
+
+import compiler::ast;
+import compiler::ast::{
+    declaration, expression, statement, pattern, node, NodeKind, NamedAnnotation,
+    PatternElement, PatternKind, PatternSub, TraitBound, TraitRef, TypeAnnotation
+};
+import compiler::ast::declaration::{
+    ClassDeclNode, DeclarationNode, DestructureDeclNode, EnumDeclNode, EnumVariantNode,
+    ExternBlockNode, FieldDeclNode, FunctionDeclNode, GenericParamNode, ImplBlockNode,
+    IntrinsicConstDeclNode, IntrinsicDeclNode, MethodNode, StructDeclNode, TraitDeclNode,
+    TypeAliasDeclNode, UnionDeclNode, VarDeclNode
+};
+import compiler::ast::expression::{
+    AlignofExprNode, ArrayAccessNode, ArrayLiteralNode, AwaitExprNode, BinaryExprNode,
+    CallExprNode, CastExprNode, DeleteExprNode, ExpressionNode, IdentifierNode, IfExprNode,
+    LambdaExprNode, MatchExprNode, MemberAccessNode, NewExprNode, ScopeResolutionNode,
+    SizeofExprNode, StaticMatchExprNode, StructLiteralNode, TernaryExprNode, TryExprNode,
+    TupleLiteralNode, TypeofExprNode, UnaryExprNode, YieldExprNode
+};
+import compiler::ast::node::{ ASTNode, ProgramNode };
+import compiler::ast::pattern::{ EnumPatternNode, MatchArmNode, PatternNode, StaticMatchArmNode };
+import compiler::ast::statement::{
+    AsmBlockStmtNode, BlockStmtNode, DeclStmtNode, DoWhileStmtNode, ExprStmtNode, ForStmtNode,
+    IfStmtNode, LoopStmtNode, MatchStmtNode, ReturnStmtNode, StatementNode, StaticMatchStmtNode,
+    UnsafeBlockStmtNode, WhileStmtNode
+};
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::resolver::res::{ ResSlot };
+import std::fmt;
+
+/// Which kind of name-bearing slot was left unanswered, for the report.
+type enum StampSite {
+    Identifier;
+    PathScope;
+    StructLiteral;
+    NewType;
+    EnumPattern;
+    ConstantPattern;
+    TypeName;
+    ImplTarget;
+    BaseClass;
+    TraitInBound;
+}
+
+implement enum StampSite {
+    label(&this) -> string {
+        return match (this) {
+            StampSite::Identifier      => { "identifier" }
+            StampSite::PathScope       => { "path scope" }
+            StampSite::StructLiteral   => { "struct literal type" }
+            StampSite::NewType         => { "type in `new`" }
+            StampSite::EnumPattern     => { "enum pattern" }
+            StampSite::ConstantPattern => { "constant pattern" }
+            StampSite::TypeName        => { "type name" }
+            StampSite::ImplTarget      => { "impl target" }
+            StampSite::BaseClass       => { "base class" }
+            StampSite::TraitInBound    => { "trait in a bound" }
+        };
+    }
+}
+
+type struct StampCheck {
+    /// Name-bearing slots found unanswered.
+    unanswered: u64;
+    /// Where the first one was written, and what it is.
+    first_site: string;
+
+    static new() -> StampCheck {
+        return StampCheck { unanswered: 0, first_site: "" };
+    }
+
+    /// A slot no resolver answered.  `Lang` is a claimed language item,
+    /// settled once the item is registered: an answer, not an absence.
+    static unanswered_slot(slot: &ResSlot) -> boolean {
+        return match (slot) {
+            ResSlot::Pending => { true }
+            _                => { false }
+        };
+    }
+
+    note(mut &this, slot: &ResSlot, what: StampSite, span: SourceSpan) -> void {
+        if (!StampCheck::unanswered_slot(slot)) { return; }
+        this.note_missing(what, span);
+    }
+
+    note_missing(mut &this, what: StampSite, span: SourceSpan) -> void {
+        if (this.unanswered == 0) {
+            this.first_site = fmt::format("%s at %s:%d:%d", what.label(), span.file,
+                span.start_line as i64, span.start_col as i64);
+        }
+        this.unanswered = this.unanswered + 1;
+    }
+
+    check_program(mut &this, program: ProgramNode*) -> void {
+        if (program == null) { return; }
+        for (mut i: i64 = 0; i < program.statements.length; i++) {
+            this.node(program.statements[i]);
+        }
+        for (mut i: i64 = 0; i < program.static_asserts.length; i++) {
+            this.expr(program.static_asserts[i].cond as ExpressionNode*);
+        }
+    }
+
+    // -- Type annotations --
+
+    annotation(mut &this, ann: TypeAnnotation*) -> void {
+        if (ann == null) { return; }
+        match (*ann) {
+            TypeAnnotation::Named(n) => {
+                if (n != null) { this.note(&n.res, StampSite::TypeName, n.span); }
+            }
+            TypeAnnotation::Pointer(p)   => { if (p != null) { this.annotation(p.inner); } }
+            TypeAnnotation::Reference(r) => { if (r != null) { this.annotation(r.inner); } }
+            TypeAnnotation::Array(a) => {
+                if (a != null) {
+                    this.annotation(a.element);
+                    this.expr(a.size_expr);
+                }
+            }
+            TypeAnnotation::Function(f) => {
+                if (f != null) {
+                    this.annotations(&f.parameters);
+                    this.annotation(f.return_type);
+                }
+            }
+            TypeAnnotation::Tuple(t) => { if (t != null) { this.annotations(&t.elements); } }
+            TypeAnnotation::Generic(g) => {
+                if (g != null) {
+                    this.annotation(g.base);
+                    this.annotations(&g.args);
+                }
+            }
+            TypeAnnotation::Typeof(t) => { if (t != null) { this.expr(t.operand as ExpressionNode*); } }
+            TypeAnnotation::ImplTrait(it) => { if (it != null) { this.annotations(&it.bounds); } }
+            TypeAnnotation::Projection(p) => { if (p != null) { this.annotation(p.base); } }
+            // A primitive and `This` carry no written name to answer.
+            _ => { }
+        }
+    }
+
+    annotations(mut &this, anns: &TypeAnnotation*[]) -> void {
+        for (mut i: i64 = 0; i < anns.length; i++) { this.annotation(anns[i]); }
+    }
+
+    trait_ref(mut &this, r: &TraitRef) -> void {
+        if (!r.resolved.is_valid() && !r.refused) { this.note_missing(StampSite::TraitInBound, r.span); }
+        this.annotations(&r.type_args);
+    }
+
+    trait_refs(mut &this, refs: &TraitRef[]) -> void {
+        for (mut i: i64 = 0; i < refs.length; i++) { this.trait_ref(&refs[i]); }
+    }
+
+    bounds(mut &this, bs: &TraitBound[]) -> void {
+        for (mut i: i64 = 0; i < bs.length; i++) {
+            this.annotation(bs[i].subject_type);
+            this.trait_refs(&bs[i].trait_refs);
+        }
+    }
+
+    generic_params(mut &this, ps: &GenericParamNode*[]) -> void {
+        for (mut i: i64 = 0; i < ps.length; i++) {
+            if (ps[i] != null) { this.annotation(ps[i].default_annotation); }
+        }
+    }
+
+    // -- Declarations, statements, expressions --
+
+    node(mut &this, n: ASTNode*) -> void {
+        if (n == null) { return; }
+        match (n.kind) {
+            NodeKind::VariableDeclaration => { this.var_decl(n as VarDeclNode*); }
+            NodeKind::DestructureDeclaration => {
+                const d: DestructureDeclNode* = n as DestructureDeclNode*;
+                this.annotation(d.type_annotation);
+                this.expr(d.initializer);
+            }
+            NodeKind::FunctionDeclaration => { this.function(n as FunctionDeclNode*); }
+            NodeKind::MethodDeclaration => { this.method(n as MethodNode*); }
+            NodeKind::IntrinsicDeclaration => {
+                const d: IntrinsicDeclNode* = n as IntrinsicDeclNode*;
+                for (mut i: i64 = 0; i < d.parameters.length; i++) { this.var_decl(d.parameters[i]); }
+                this.annotation(d.return_type_annotation);
+                this.node(d.body as ASTNode*);
+            }
+            NodeKind::IntrinsicConstDeclaration => {
+                this.annotation((n as IntrinsicConstDeclNode*).type_annotation);
+            }
+            NodeKind::StructDeclaration => {
+                const d: StructDeclNode* = n as StructDeclNode*;
+                this.generic_params(&d.generic_params);
+                this.fields(&d.fields);
+                this.methods(&d.methods);
+                this.bounds(&d.where_bounds);
+            }
+            NodeKind::UnionDeclaration => {
+                const d: UnionDeclNode* = n as UnionDeclNode*;
+                this.generic_params(&d.generic_params);
+                this.fields(&d.fields);
+                this.methods(&d.methods);
+                this.bounds(&d.where_bounds);
+            }
+            NodeKind::ClassDeclaration => {
+                const d: ClassDeclNode* = n as ClassDeclNode*;
+                if (d.base_class.is_valid()) { this.note(&d.base_res, StampSite::BaseClass, d.base_span); }
+                this.generic_params(&d.generic_params);
+                this.fields(&d.fields);
+                this.methods(&d.methods);
+                this.bounds(&d.where_bounds);
+            }
+            NodeKind::TraitDeclaration => {
+                const d: TraitDeclNode* = n as TraitDeclNode*;
+                this.generic_params(&d.generic_params);
+                for (mut i: i64 = 0; i < d.methods.length; i++) { this.function(d.methods[i]); }
+                this.trait_refs(&d.base_traits);
+                for (mut i: i64 = 0; i < d.assoc_types.length; i++) {
+                    if (d.assoc_types[i] != null) { this.trait_refs(&d.assoc_types[i].bounds); }
+                }
+            }
+            NodeKind::TypeAliasDeclaration => {
+                const d: TypeAliasDeclNode* = n as TypeAliasDeclNode*;
+                this.generic_params(&d.generic_params);
+                this.annotation(d.target_annotation);
+            }
+            NodeKind::EnumDeclaration => {
+                const d: EnumDeclNode* = n as EnumDeclNode*;
+                this.generic_params(&d.generic_params);
+                this.annotation(d.discriminant_annotation);
+                for (mut i: i64 = 0; i < d.variants.length; i++) {
+                    if (d.variants[i] != null) { this.annotations(&d.variants[i].associated_types); }
+                }
+                this.bounds(&d.where_bounds);
+            }
+            NodeKind::ImplementationBlock => {
+                const d: ImplBlockNode* = n as ImplBlockNode*;
+                this.note(&d.res, StampSite::ImplTarget, d.target_type_span);
+                this.generic_params(&d.generic_params);
+                this.annotations(&d.target_args);
+                this.annotation(d.trait_annotation);
+                this.bounds(&d.where_bounds);
+                this.annotations(&d.assoc_binding_annotations);
+                this.methods(&d.methods);
+            }
+            NodeKind::ExternBlock => {
+                const d: ExternBlockNode* = n as ExternBlockNode*;
+                for (mut i: i64 = 0; i < d.functions.length; i++) { this.function(d.functions[i]); }
+                for (mut i: i64 = 0; i < d.globals.length; i++) { this.var_decl(d.globals[i]); }
+            }
+            NodeKind::BlockStatement => {
+                const b: BlockStmtNode* = n as BlockStmtNode*;
+                for (mut i: i64 = 0; i < b.statements.length; i++) { this.node(b.statements[i] as ASTNode*); }
+            }
+            NodeKind::UnsafeBlockStatement => {
+                this.node((n as UnsafeBlockStmtNode*).block as ASTNode*);
+            }
+            NodeKind::AsmBlockStatement => {
+                const a: AsmBlockStmtNode* = n as AsmBlockStmtNode*;
+                for (mut i: i64 = 0; i < a.operands.length; i++) {
+                    if (a.operands[i] != null) { this.expr(a.operands[i].expr); }
+                }
+            }
+            NodeKind::ReturnStatement => { this.expr((n as ReturnStmtNode*).expression); }
+            NodeKind::IfStatement => {
+                const s: IfStmtNode* = n as IfStmtNode*;
+                this.expr(s.condition);
+                this.node(s.then_stmt as ASTNode*);
+                this.node(s.else_stmt as ASTNode*);
+            }
+            NodeKind::WhileStatement => {
+                const s: WhileStmtNode* = n as WhileStmtNode*;
+                this.expr(s.condition);
+                this.node(s.body as ASTNode*);
+            }
+            NodeKind::DoWhileStatement => {
+                const s: DoWhileStmtNode* = n as DoWhileStmtNode*;
+                this.node(s.body as ASTNode*);
+                this.expr(s.condition);
+            }
+            NodeKind::ForStatement => {
+                const s: ForStmtNode* = n as ForStmtNode*;
+                this.node(s.init);
+                this.expr(s.condition);
+                this.expr(s.update);
+                this.node(s.body as ASTNode*);
+            }
+            NodeKind::MatchStatement => {
+                const s: MatchStmtNode* = n as MatchStmtNode*;
+                this.expr(s.subject);
+                this.arms(&s.arms);
+            }
+            NodeKind::StaticMatchStatement => {
+                const s: StaticMatchStmtNode* = n as StaticMatchStmtNode*;
+                this.annotation(s.scrutinee);
+                this.static_arms(&s.arms);
+            }
+            NodeKind::ExpressionStatement => { this.expr((n as ExprStmtNode*).expression); }
+            NodeKind::DeclarationStatement => {
+                this.node((n as DeclStmtNode*).declaration as ASTNode*);
+            }
+            NodeKind::LoopStatement => { this.node((n as LoopStmtNode*).body as ASTNode*); }
+            _ => {
+                if (n.kind.is_expression()) { this.expr(n as ExpressionNode*); }
+            }
+        }
+    }
+
+    var_decl(mut &this, v: VarDeclNode*) -> void {
+        if (v == null) { return; }
+        this.annotation(v.type_annotation);
+        this.expr(v.initializer);
+    }
+
+    function(mut &this, f: FunctionDeclNode*) -> void {
+        if (f == null) { return; }
+        for (mut i: i64 = 0; i < f.parameters.length; i++) { this.var_decl(f.parameters[i]); }
+        this.generic_params(&f.generic_params);
+        this.bounds(&f.trait_bounds);
+        this.annotation(f.return_type_annotation);
+        this.node(f.body as ASTNode*);
+    }
+
+    method(mut &this, m: MethodNode*) -> void {
+        if (m == null) { return; }
+        this.function(m.func);
+        this.exprs(&m.base_ctor_args);
+    }
+
+    methods(mut &this, ms: &MethodNode*[]) -> void {
+        for (mut i: i64 = 0; i < ms.length; i++) { this.method(ms[i]); }
+    }
+
+    fields(mut &this, fs: &FieldDeclNode*[]) -> void {
+        for (mut i: i64 = 0; i < fs.length; i++) {
+            if (fs[i] == null) { continue; }
+            this.annotation(fs[i].type_annotation);
+            this.expr(fs[i].default_value);
+        }
+    }
+
+    arms(mut &this, arms: &MatchArmNode*[]) -> void {
+        for (mut i: i64 = 0; i < arms.length; i++) {
+            const arm: MatchArmNode* = arms[i];
+            if (arm == null) { continue; }
+            for (mut p: i64 = 0; p < arm.patterns.length; p++) { this.pattern(arm.patterns[p]); }
+            this.expr(arm.guard);
+            this.node(arm.body as ASTNode*);
+        }
+    }
+
+    static_arms(mut &this, arms: &StaticMatchArmNode*[]) -> void {
+        for (mut i: i64 = 0; i < arms.length; i++) {
+            const arm: StaticMatchArmNode* = arms[i];
+            if (arm == null) { continue; }
+            this.annotations(&arm.type_patterns);
+            this.node(arm.body as ASTNode*);
+        }
+    }
+
+    pattern(mut &this, p: PatternNode*) -> void {
+        if (p == null) { return; }
+        if ((p as ASTNode*).kind == NodeKind::EnumPattern) {
+            const ep: EnumPatternNode* = p as EnumPatternNode*;
+            this.note(&ep.res, StampSite::EnumPattern, ep.enum_span);
+            for (mut i: i64 = 0; i < ep.elements.length; i++) {
+                match (ep.elements[i]) {
+                    PatternElement::Sub(s) => {
+                        if (s != null) { this.pattern(s.pattern as PatternNode*); }
+                    }
+                    _ => { }
+                }
+            }
+            return;
+        }
+        // An identifier pattern that names a constant rather than binding one.
+        if (p.pattern_kind == PatternKind::Identifier && p.value.is_valid() && !p.binding_name.is_valid()) {
+            this.note(&p.const_res, StampSite::ConstantPattern, (p as ASTNode*).span);
+        }
+    }
+
+    exprs(mut &this, es: &ExpressionNode*[]) -> void {
+        for (mut i: i64 = 0; i < es.length; i++) { this.expr(es[i]); }
+    }
+
+    expr(mut &this, e: ExpressionNode*) -> void {
+        if (e == null) { return; }
+        const n: ASTNode* = e as ASTNode*;
+        match (n.kind) {
+            NodeKind::Identifier => {
+                const id: IdentifierNode* = e as IdentifierNode*;
+                this.note(&id.res, StampSite::Identifier, n.span);
+                this.annotations(&id.generic_args);
+            }
+            NodeKind::BinaryExpression => {
+                const b: BinaryExprNode* = e as BinaryExprNode*;
+                this.expr(b.left);
+                this.expr(b.right);
+            }
+            NodeKind::UnaryExpression => { this.expr((e as UnaryExprNode*).operand); }
+            NodeKind::TernaryExpression => {
+                const t: TernaryExprNode* = e as TernaryExprNode*;
+                this.expr(t.condition);
+                this.expr(t.true_expr);
+                this.expr(t.false_expr);
+            }
+            NodeKind::IfExpression => {
+                const t: IfExprNode* = e as IfExprNode*;
+                this.expr(t.condition);
+                this.expr(t.then_expr);
+                this.expr(t.else_expr);
+            }
+            NodeKind::MatchExpression => {
+                const m: MatchExprNode* = e as MatchExprNode*;
+                this.expr(m.subject);
+                this.arms(&m.arms);
+            }
+            NodeKind::StaticMatchExpression => {
+                const m: StaticMatchExprNode* = e as StaticMatchExprNode*;
+                this.annotation(m.scrutinee);
+                this.static_arms(&m.arms);
+            }
+            NodeKind::CallExpression => {
+                const c: CallExprNode* = e as CallExprNode*;
+                this.expr(c.callee);
+                this.exprs(&c.arguments);
+                this.annotations(&c.generic_args);
+            }
+            NodeKind::NewExpression => {
+                const ne: NewExprNode* = e as NewExprNode*;
+                this.note(&ne.res, StampSite::NewType, n.span);
+                this.annotations(&ne.generic_args);
+                this.exprs(&ne.arguments);
+                this.expr(ne.array_size);
+                this.expr(ne.struct_init as ExpressionNode*);
+            }
+            NodeKind::SizeofExpression => { this.annotation((e as SizeofExprNode*).type_ann); }
+            NodeKind::AlignofExpression => { this.annotation((e as AlignofExprNode*).type_ann); }
+            NodeKind::CastExpression => {
+                const c: CastExprNode* = e as CastExprNode*;
+                this.expr(c.expression);
+                this.annotation(c.target_annotation);
+            }
+            NodeKind::StructLiteral => {
+                const sl: StructLiteralNode* = e as StructLiteralNode*;
+                this.note(&sl.res, StampSite::StructLiteral, n.span);
+                this.annotations(&sl.generic_args);
+                for (mut i: i64 = 0; i < sl.field_inits.length; i++) { this.expr(sl.field_inits[i].value); }
+            }
+            NodeKind::ArrayLiteral => {
+                const a: ArrayLiteralNode* = e as ArrayLiteralNode*;
+                this.exprs(&a.elements);
+                this.expr(a.repeat_count_expr);
+            }
+            NodeKind::TupleLiteral => { this.exprs(&(e as TupleLiteralNode*).elements); }
+            NodeKind::LambdaExpression => {
+                const l: LambdaExprNode* = e as LambdaExprNode*;
+                for (mut i: i64 = 0; i < l.parameters.length; i++) { this.var_decl(l.parameters[i]); }
+                this.annotation(l.return_type_ann);
+                this.node(l.body as ASTNode*);
+            }
+            NodeKind::ArrayAccess => {
+                const a: ArrayAccessNode* = e as ArrayAccessNode*;
+                this.expr(a.array);
+                this.expr(a.index);
+            }
+            NodeKind::MemberAccess => {
+                const m: MemberAccessNode* = e as MemberAccessNode*;
+                this.expr(m.object);
+                this.annotations(&m.generic_args);
+            }
+            NodeKind::ScopeResolution => {
+                const s: ScopeResolutionNode* = e as ScopeResolutionNode*;
+                this.note(&s.scope_res, StampSite::PathScope, s.scope_span);
+                this.annotations(&s.generic_args);
+                this.annotations(&s.scope_generic_args);
+                this.annotation(s.impl_trait);
+            }
+            NodeKind::TypeofExpression => { this.expr((e as TypeofExprNode*).operand); }
+            NodeKind::DeleteExpression => { this.expr((e as DeleteExprNode*).operand); }
+            NodeKind::AwaitExpression => { this.expr((e as AwaitExprNode*).operand); }
+            NodeKind::YieldExpression => { this.expr((e as YieldExprNode*).operand); }
+            NodeKind::TryExpression => { this.expr((e as TryExprNode*).operand); }
+            _ => { }
+        }
+    }
+}

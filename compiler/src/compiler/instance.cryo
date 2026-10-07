@@ -22,6 +22,8 @@ import compiler::resolver::{
     intern_table, symbol_str, mangled_name
 };
 import compiler::resolver::res;
+import compiler::resolver::stamp_check;
+import compiler::resolver::stamp_check::{ StampCheck };
 import compiler::ast::{ node, declaration, dumper, NodeKind };
 import compiler::deps::dep_resolver;
 import compiler::deps::dep_resolver::{ DepResolver, ResolveMode, ResolveOutcome };
@@ -2832,6 +2834,7 @@ type struct CompilerInstance {
         }
 
         pipeline.set_passes([PassID::NameResolution]);
+        mut stamps: StampCheck = StampCheck::new();
         {
             mut initial3b: ProvisionSet = ProvisionSet::empty();
             initial3b.mark(Provision::ASTValidated);
@@ -2854,6 +2857,22 @@ type struct CompilerInstance {
                 return false;
             }
             pipeline.reset();
+            if (!ctx.diagnostics.has_errors()) {
+                stamps.check_program(ctx.artifacts.ast.root);
+            }
+        }
+        // Every written name leaves the name layer answered (stamped, or
+        // refused where it is written).  One left unanswered is the name
+        // layer's defect, and a later stage that met it would either stop
+        // with an error that blames the program or look the spelling up
+        // again; it is reported here, where it happened.  Checked only
+        // while the build is clean: a module that already failed may have
+        // stopped before stamping.
+        if (!ctx.diagnostics.has_errors() && stamps.unanswered > 0) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                Text::new(fmt::format("%llu written name(s) left name resolution with no answer; first: %s",
+                    stamps.unanswered, stamps.first_site)));
+            return false;
         }
         return true;
     }
