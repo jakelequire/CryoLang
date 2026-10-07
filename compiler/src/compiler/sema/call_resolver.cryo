@@ -732,9 +732,11 @@ type struct CallResolver {
     /// type: inside the body declaring it the parameter has only the
     /// methods its bounds give it, so the call names nothing - whether no
     /// bound names the parameter or none of those naming it declares the
-    /// method.
+    /// method.  An explicit destructor call (`(*p).drop()`) is not one a
+    /// bound licenses: its help names the function that runs a pointee's
+    /// destructor.
     report_param_receiver_call(mut &this, member: MemberAccessNode*, param: GenericParamType*,
-                               bounded: boolean) -> void {
+                               bounded: boolean, call: CallExprNode*) -> void {
         const method_name: string = this.intern.resolve(member.member);
         const param_display: string = this.arena.format_display(param as Type*);
         const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
@@ -746,8 +748,12 @@ type struct CallResolver {
             diag = diag.with_note(Text::new(fmt::format(
                 "`%s` is a type parameter with no bound, so it has no methods", param_display)));
         }
-        diag = diag.help(Text::new(fmt::format(
-            "add a `where %s: Trait` bound naming a trait that declares `%s`", param_display, method_name)));
+        if (this.is_explicit_drop_call(call)) {
+            diag = diag.help(Text::new("use `std::core::ptr::drop_in_place(p)`"));
+        } else {
+            diag = diag.help(Text::new(fmt::format(
+                "add a `where %s: Trait` bound naming a trait that declares `%s`", param_display, method_name)));
+        }
         this.ctx.emit_diagnostic(diag);
     }
 
@@ -4549,7 +4555,7 @@ type struct CallResolver {
             }
             const param: GenericParamType* = this.binding.receiver_type_param(obj_type);
             if (param != null) {
-                this.report_param_receiver_call(member, param, this.binding.param_is_bounded(param));
+                this.report_param_receiver_call(member, param, this.binding.param_is_bounded(param), call);
             }
             return TypeRef::invalid();
         }
