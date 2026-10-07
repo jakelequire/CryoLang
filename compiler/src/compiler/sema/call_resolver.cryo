@@ -1063,6 +1063,9 @@ type struct CallResolver {
                     CalleePin::Family(fam_owner, fam_leaf) => {
                         pinned_ft = this.ctx.decl_index.lookup_func_type(fam_owner, fam_leaf);
                     }
+                    CalleePin::Instance(i) => {
+                        pinned_ft = this.ctx.decl_index.entry_signature(this.ctx.decl_index.entry_of_instance(i));
+                    }
                     CalleePin::Decl(e) => {
                         pinned_ft = this.ctx.decl_index.entry_signature(e);
                     }
@@ -1091,21 +1094,28 @@ type struct CallResolver {
             }
             if (call.generic_args.length > 0) {
                 const spec_tmpl: TemplateEntry* = this.spelling_template(ident.res);
-                const spec_sym: SymbolStr = this.resolve_generic_scope_name(
-                    ident.name, call.generic_args, call.span, spec_tmpl);
-                if (spec_sym.is_valid()) {
-                    // A function specialization's family is its template's
-                    // definition; a type's is the module its name is placed in.
-                    mut spec_leaf: SymbolStr = spec_sym;
-                    const spec_owner: FamilyOwner =
-                        if (spec_tmpl != null && spec_tmpl.node_kind == NodeKind::FunctionDeclaration) {
-                            FamilyOwner::Def(spec_tmpl.def)
-                        } else {
-                            this.ctx.minted_family(spec_sym, &spec_leaf)
-                        };
-                    call.set_resolved_callee(CalleePin::Family(spec_owner, spec_leaf));
-                    const spec_ret: TypeRef = this.family_return_type(spec_owner, spec_leaf);
-                    if (spec_ret.is_valid()) { return spec_ret; }
+                if (spec_tmpl != null && spec_tmpl.node_kind == NodeKind::FunctionDeclaration) {
+                    // A function template's instance: its placeholder with
+                    // the written arguments.
+                    const inst: TypeRef = this.resolve_generic_scope_type(
+                        spec_tmpl.base_type, &call.generic_args, call.span);
+                    if (inst.is_valid()) {
+                        call.set_resolved_callee(CalleePin::Instance(inst));
+                        const spec_ret: TypeRef = this.instance_return_type(inst);
+                        if (spec_ret.is_valid()) { return spec_ret; }
+                    }
+                } else {
+                    const spec_sym: SymbolStr = this.resolve_generic_scope_name(
+                        ident.name, call.generic_args, call.span, spec_tmpl);
+                    if (spec_sym.is_valid()) {
+                        // A type's specialization's family is the module its
+                        // name is placed in.
+                        mut spec_leaf: SymbolStr = spec_sym;
+                        const spec_owner: FamilyOwner = this.ctx.minted_family(spec_sym, &spec_leaf);
+                        call.set_resolved_callee(CalleePin::Family(spec_owner, spec_leaf));
+                        const spec_ret: TypeRef = this.family_return_type(spec_owner, spec_leaf);
+                        if (spec_ret.is_valid()) { return spec_ret; }
+                    }
                 }
             }
             // A callee the name layer bound to a local is a value, not a
@@ -3083,6 +3093,14 @@ type struct CallResolver {
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     family_return_type(&this, owner: FamilyOwner, leaf: SymbolStr) -> TypeRef {
         return this.overload_return_type(this.types.lookup_func_type_exact(owner, leaf));
+    }
+
+    /// What a generic function's instance returns, read off the entry its
+    /// copy registered; invalid before the copy is registered.
+    instance_return_type(&this, inst: TypeRef) -> TypeRef {
+        const e: OverloadId = this.ctx.decl_index.entry_of_instance(inst);
+        if (!e.is_valid()) { return TypeRef::invalid(); }
+        return this.overload_return_type(this.ctx.decl_index.entry_signature(e));
     }
 
     overload_param_matches_arg(&this, param: TypeRef, arg: TypeRef) -> boolean {
@@ -7046,34 +7064,24 @@ type struct CallResolver {
         if (tmpl != null && tmpl.node_kind == NodeKind::FunctionDeclaration) { is_fn_template = true; }
         if (is_fn_template && call != null) {
             call.set_resolved_template(tmpl.base_type);
-            // GATED (R1): prefer mono's pin; recompute the spec return as fallback.
-            mut spec_owner: FamilyOwner = FamilyOwner::Def(DefId::invalid());
-            mut spec_leaf: SymbolStr = SymbolStr::empty();
+            // The instance the call is pinned to, else the one its turbofish
+            // writes: the template's placeholder with the arguments.
+            mut spec_inst: TypeRef = TypeRef::invalid();
             match (&call.resolved_callee) {
-                CalleePin::Family(o, l) => { spec_owner = o; spec_leaf = l; }
-                _                       => { }
+                CalleePin::Instance(i) => { spec_inst = i; }
+                _                      => { }
             }
-            if (!spec_leaf.is_valid()) {
-                const base: SymbolStr = tmpl.spec_base_name(this.intern);
-                // The template is already in hand - finding it is what selected
-                // this branch - so there is nothing left to look up for it.
-                mut spec_sym: SymbolStr = SymbolStr::empty();
+            if (!spec_inst.is_valid()) {
                 if (scope != null && scope.generic_args.length > 0) {
-                    spec_sym = this.resolve_generic_scope_name(base, scope.generic_args, scope.span, tmpl);
+                    spec_inst = this.resolve_generic_scope_type(tmpl.base_type, &scope.generic_args, scope.span);
                 } else if (call.generic_args.length > 0) {
-                    spec_sym = this.resolve_generic_scope_name(base, call.generic_args, call.span, tmpl);
-                }
-                if (spec_sym.is_valid()) {
-                    // A function specialization's family is its template's
-                    // definition, the one its clone registers in.
-                    spec_owner = FamilyOwner::Def(tmpl.def);
-                    spec_leaf = spec_sym;
+                    spec_inst = this.resolve_generic_scope_type(tmpl.base_type, &call.generic_args, call.span);
                 }
             }
-            if (spec_leaf.is_valid()) {
-                const spec_ret: TypeRef = this.family_return_type(spec_owner, spec_leaf);
+            if (spec_inst.is_valid()) {
+                const spec_ret: TypeRef = this.instance_return_type(spec_inst);
                 if (spec_ret.is_valid()) {
-                    call.set_resolved_callee(CalleePin::Family(spec_owner, spec_leaf));
+                    call.set_resolved_callee(CalleePin::Instance(spec_inst));
                     return spec_ret;
                 }
             }
