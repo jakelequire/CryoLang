@@ -109,9 +109,10 @@ type struct MonoCallSpecializer {
     // concrete owner spec).  This runs after the whole-spec type-resolution pass
     // that types a sibling like `Wrap::base`'s literal, which the late-added
     // method spec misses.  Cleared (recv invalid) outside that re-walk.
-    gsm_owner_leaf:   SymbolStr;
+    // `gsm_owner_def` is the owner template's definition, what a literal or
+    // annotation in the body that names the owner was stamped with.
+    gsm_owner_def:    DefId;
     gsm_owner_recv:   TypeRef;
-    gsm_owner_spec:   SymbolStr;
     /// Calls bound by identity to a method of a receiver or owner whose
     /// instantiation was not minted when the call was walked: a copy's body
     /// is walked once, when it is made, often before the instantiations it
@@ -140,9 +141,8 @@ type struct MonoCallSpecializer {
             trait_spec:       null,
             ast_resolver:     null,
             current_source_file: SymbolStr::empty(),
-            gsm_owner_leaf:   SymbolStr::empty(),
+            gsm_owner_def:    DefId::invalid(),
             gsm_owner_recv:   TypeRef::invalid(),
-            gsm_owner_spec:   SymbolStr::empty(),
             queued_binds:     [],
             current_fn:       null,
             unpinned_calls:   [],
@@ -328,10 +328,9 @@ type struct MonoCallSpecializer {
                     mut vd: VarDeclNode* = inner as VarDeclNode*;
                     // Inside a generic-static-method body re-walk: a local typed with
                     // the bare owner name (`mut s: String`) keeps the bare template
-                    // type; point it at the concrete owner spec (by name + type) so
-                    // it agrees with the concretized return and the post-mono sema
-                    // pass, exactly as owner materialization types a non-generic
-                    // sibling's local.
+                    // type; give it the concrete owner spec so it agrees with the
+                    // concretized return, exactly as owner materialization types a
+                    // non-generic sibling's local.
                     if (this.gsm_owner_recv.is_valid()) {
                         this.concretize_owner_local(vd);
                     }
@@ -539,14 +538,8 @@ type struct MonoCallSpecializer {
                 // bare/invalid.  Gated on `gsm_owner_recv` so the ordinary walk path
                 // is unaffected.
                 if (this.gsm_owner_recv.is_valid()) {
-                    if (sl.struct_type.equals(this.gsm_owner_leaf)) {
-                        // Point the literal at the concrete owner spec by NAME and
-                        // type so the post-mono sema pass (Phase 6b) re-resolves it to
-                        // the spec (not the bare template), regardless of context.
+                    if (this.names_gsm_owner(&sl.res)) {
                         sl.set_resolved_type(this.gsm_owner_recv);
-                        if (this.gsm_owner_spec.is_valid()) {
-                            sl.struct_type = this.gsm_owner_spec;
-                        }
                     } else if (subst != null && sl.resolved_type.is_valid()) {
                         // A different generic type built in the body (`Pair<T>{..}`):
                         // concretize via the active owner/method subst.
@@ -1905,26 +1898,32 @@ type struct MonoCallSpecializer {
         return binds;
     }
 
-    /// Re-point a local whose annotation is the BARE owner name (`mut s: String`
-    /// in a generic-static-method body) at the concrete owner spec - both the
-    /// annotation NAME (so the post-mono sema pass resolves it to the spec, not the
-    /// bare template) and the cached `resolved_type`.  Only fires inside the
-    /// generic-static-method body re-walk (`gsm_owner_*` set).  Mirrors the
-    /// struct-literal `struct_type` rewrite; together they make every bare
-    /// owner-name reference in the spec body resolve to the concrete owner, so a
+    /// Type a local whose annotation names the BARE owner (`mut s: String` in a
+    /// generic-static-method body) as the concrete owner spec.  Only fires
+    /// inside the generic-static-method body re-walk (`gsm_owner_*` set).
+    /// Together with the struct-literal case it types every bare owner
+    /// reference in the spec body as the concrete owner, so a
     /// `new()+push()+return-local` constructor body is internally consistent.
     concretize_owner_local(mut &this, vd: VarDeclNode*) -> void {
         if (vd == null || vd.type_annotation == null) { return; }
-        if (!this.gsm_owner_spec.is_valid()) { return; }
         match (*vd.type_annotation) {
             TypeAnnotation::Named(named) => {
-                if (named != null && named.name.equals(this.gsm_owner_leaf)) {
-                    named.name = this.gsm_owner_spec;
+                if (named != null && this.names_gsm_owner(&named.res)) {
                     vd.resolved_type = this.gsm_owner_recv;
                 }
             }
             _ => {}
         }
+    }
+
+    /// Whether a name in the re-walked generic-static-method body was bound
+    /// to the owner template.  An unanswered slot names nothing.
+    names_gsm_owner(&this, slot: &ResSlot) -> boolean {
+        if (!this.gsm_owner_def.is_valid()) { return false; }
+        return match (slot) {
+            ResSlot::Answered(r) => { r.def_id().equals(this.gsm_owner_def) }
+            _                    => { false }
+        };
     }
 
     /// Find the materialized owner spec entry for an owner instantiation
@@ -1983,9 +1982,9 @@ type struct MonoCallSpecializer {
 
         // A `-> Owner` (bare-template) return substitutes to the still-bare owner
         // template (0-field layout), while the body constructs the concrete owner
-        // spec - an ABI mismatch that returns garbage (and trips E0200 in the
-        // post-mono sema pass).  Remap a bare-owner return to the concrete owner
-        // spec, matching how a NON-generic sibling (`Wrap::base`) resolves.  Done
+        // spec - an ABI mismatch that returns garbage.  Remap a bare-owner
+        // return to the concrete owner spec, matching how a NON-generic
+        // sibling (`Wrap::base`) resolves.  Done
         // BEFORE the `$MG`/mangle step so the emitted symbol carries the right
         // return type.  (Nested owner returns like `Result<Owner, E>` are
         // concretized by the substituter and are unaffected.)
@@ -2046,16 +2045,13 @@ type struct MonoCallSpecializer {
             mut rw_ctx: ResolutionContext = ResolutionContext::new("");
             // Publish the owner context so walk_expr can stamp owner-constructing
             // struct literals whose type the symbolic walk left invalid.
-            const saved_leaf: SymbolStr = this.gsm_owner_leaf;
+            const saved_def: DefId = this.gsm_owner_def;
             const saved_recv: TypeRef = this.gsm_owner_recv;
-            const saved_spec: SymbolStr = this.gsm_owner_spec;
-            this.gsm_owner_leaf = if (owner_entry != null) { owner_entry.name } else { SymbolStr::empty() };
+            this.gsm_owner_def = if (owner_entry != null) { owner_entry.def } else { DefId::invalid() };
             this.gsm_owner_recv = recv_type;
-            this.gsm_owner_spec = this.arena.get_qualified_name(recv_type);
             this.walk_body(spec_method.func, &rw_ctx, copy_subst);
-            this.gsm_owner_leaf = saved_leaf;
+            this.gsm_owner_def = saved_def;
             this.gsm_owner_recv = saved_recv;
-            this.gsm_owner_spec = saved_spec;
         }
         return true;
     }
