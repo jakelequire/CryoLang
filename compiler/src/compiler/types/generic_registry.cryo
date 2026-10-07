@@ -322,16 +322,22 @@ type struct GenericRegistry {
     // -- Trait-impl coherence index --
     // Separate from `trait_heads` because that table holds every head a
     // subject may select among, including the monomorphizer's placed clones
-    // under their specializations.  This index is keyed on the
-    // interned CANONICAL impl-head signature (import-resolved trait + args,
-    // target + args, where-bounds; impl generic params normalized) and is
-    // written exactly once per source-level trait impl (see
-    // `register_coherence`), so a second distinct node under the same key
-    // is a true conflict - same file or across modules.  `.second` holds
-    // the first node seen; it is nulled after the conflict is reported to
-    // suppress duplicate diagnostics from a re-run of the pass.
-    coherence_records:  Pair<u64, ImplBlockNode*>[];
-    coherence_index:    HashMap<u64, i64>;
+    // under their specializations.  This index is keyed on the impl head's
+    // identities (`coherence_key_of`: trait and target with their type
+    // arguments, where-bounds, the impl's own parameters by position) and
+    // is written once per source-level trait impl, so a second distinct
+    // node under one key is a true conflict - same file or across modules.
+    // Every record's key is the run `coh_pool[coh_start[i] .. + coh_len[i]]`;
+    // records whose keys hash alike are chained through `coh_next` from
+    // `coh_heads`, and a key is matched by comparing it whole.  A record's
+    // node is nulled once its conflict is reported, so a re-run of the pass
+    // reports nothing more.
+    coh_pool:   u64[];
+    coh_start:  i64[];
+    coh_len:    i64[];
+    coh_node:   ImplBlockNode*[];
+    coh_next:   i64[];
+    coh_heads:  HashMap<u64, i64>;
 
     // -- Trait declarations --
     // Every trait's declaration (generic or not; a non-generic trait is no
@@ -408,8 +414,12 @@ type struct GenericRegistry {
             mono_set:          HashMap::<u64, boolean>::new(),
             trait_heads:       [],
             trait_head_index:  HashMap::<u64, i64[]>::new(),
-            coherence_records: [],
-            coherence_index:   HashMap::<u64, i64>::new(),
+            coh_pool:  [],
+            coh_start: [],
+            coh_len:   [],
+            coh_node:  [],
+            coh_next:  [],
+            coh_heads: HashMap::<u64, i64>::new(),
             trait_decl_slots:  [],
             trait_decl_nodes:  [],
             trait_decl_keys:   [],
@@ -576,43 +586,48 @@ type struct GenericRegistry {
     }
 
 
-    /// Trait-impl coherence: record the first source-level trait impl seen
-    /// for a canonical impl-head key and report a collision when a second,
-    /// distinct impl arrives.  Returns the PRIOR impl node on the first
-    /// conflict for a key (caller emits E0308), otherwise null (first
-    /// registration, same node re-seen, or an already-reported key).
-    ///
-    /// `key` is the interned canonical impl-head signature built by
-    /// `TypeResolutionPasses::coherence_key_for`: the import-resolved trait
-    /// reference (with type args), the import-resolved target type (with
-    /// type args), and the where-bounds, with the impl's own generic params
-    /// normalized to positional markers.  Two impls collide if their full
-    /// heads are structurally identical, so (a) same-leaf types in different
-    /// modules stay distinct, (b) an impl on an imported type collides with
-    /// the type's home-module impl, (c) `From<i8>` and `From<i16>` for one
-    /// type stay distinct, and (d) bound-differentiated impls stay distinct.
-    /// After the first conflict the stored node is nulled, so a re-run of
-    /// the registering pass - or a third impl of the same key - does not
-    /// double-report.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    register_coherence(mut &this, key_sym: SymbolStr,
-                       node: ImplBlockNode*) -> ImplBlockNode* {
-        if (node == null || !key_sym.is_valid()) { return null; }
-        const key: u64 = key_sym.id as u64;
-        const existing: Option<i64> = this.coherence_index.get(&key);
-        if (existing.is_none()) {
-            const idx: i64 = this.coherence_records.length;
-            this.coherence_records.push(Pair::new(key, node));
-            this.coherence_index.insert(key, idx);
-            return null;
+    /// Trait-impl coherence by the head's identity key: the first impl
+    /// filed under `key` is kept; a second, distinct one is the conflict,
+    /// answered with the first (the caller reports E0308) and the record
+    /// cleared so a re-run or a third impl reports nothing more.  Null for a
+    /// first filing and for the same node seen again.
+    register_coherence_head(mut &this, key: &u64[], node: ImplBlockNode*) -> ImplBlockNode* {
+        if (node == null) { return null; }
+        mut h: u64 = 1469598103934665603;
+        for (mut i: i64 = 0; i < key.length; i++) {
+            h = (h ^ key[i]) * 1099511628211;
         }
-        const idx: i64 = existing.unwrap();
-        const prior: ImplBlockNode* = this.coherence_records[idx].second;
-        if (prior == null || prior == node) { return null; }
-        // First genuine conflict for this key: hand the prior node back to
-        // the caller and clear the slot so later passes/impls stay quiet.
-        this.coherence_records[idx].second = null;
-        return prior;
+        mut at: i64 = match (this.coh_heads.get(&h)) {
+            Option::Some(first) => { first }
+            Option::None        => { -1 }
+        };
+        while (at >= 0) {
+            if (this.coh_len[at] == key.length) {
+                mut same: boolean = true;
+                const s: i64 = this.coh_start[at];
+                for (mut i: i64 = 0; i < key.length; i++) {
+                    if (this.coh_pool[s + i] != key[i]) { same = false; break; }
+                }
+                if (same) {
+                    const prior: ImplBlockNode* = this.coh_node[at];
+                    if (prior == null || prior == node) { return null; }
+                    this.coh_node[at] = null;
+                    return prior;
+                }
+            }
+            at = this.coh_next[at];
+        }
+        const idx: i64 = this.coh_node.length;
+        this.coh_start.push(this.coh_pool.length);
+        this.coh_len.push(key.length);
+        for (mut i: i64 = 0; i < key.length; i++) { this.coh_pool.push(key[i]); }
+        this.coh_node.push(node);
+        this.coh_next.push(match (this.coh_heads.get(&h)) {
+            Option::Some(first) => { first }
+            Option::None        => { -1 }
+        });
+        this.coh_heads.insert(h, idx);
+        return null;
     }
 
 

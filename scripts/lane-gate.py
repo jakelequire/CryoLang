@@ -547,8 +547,6 @@ SCANNED_ARRAYS = {
                                           "a trait's methods by leaf off the trait node in hand"),
     "ImplBlockNode.methods":      Scanned("compiler/AST/declaration.cryo", "MethodNode", TABLE,
                                           "an impl's methods by leaf off the impl node in hand"),
-    "ImplBlockNode.generic_params": Scanned("compiler/AST/declaration.cryo", "GenericParamNode", TABLE,
-                                            "an impl's generic parameters by leaf off the impl node in hand"),
     "StructDeclNode.fields":      Scanned("compiler/AST/declaration.cryo", "FieldDeclNode", TABLE,
                                           "a struct declaration's fields by leaf off the node in hand"),
     "UnionDeclNode.fields":       Scanned("compiler/AST/declaration.cryo", "FieldDeclNode", TABLE,

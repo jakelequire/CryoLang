@@ -129,8 +129,6 @@ CLASS_OF_METHOD = {
         ("J", "member: the trait's own method by its leaf off the trait node in hand, scanned inline (an `async` or a default-body predicate beside the leaf)"),
     "ImplBlockNode::methods[]":
         ("J", "member: the impl's own method by its leaf off the impl node in hand, scanned inline"),
-    "ImplBlockNode::generic_params[]":
-        ("J", "member: the impl's own generic parameter by its leaf off the impl node in hand, scanned inline"),
     "StructDeclNode::fields[]":
         ("J", "member: a struct declaration's field by its leaf off the node in hand, scanned inline"),
     "UnionDeclNode::fields[]":

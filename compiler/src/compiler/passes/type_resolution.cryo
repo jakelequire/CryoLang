@@ -94,6 +94,24 @@ import compiler::types::user_defined::{
 };
 import utils::text::{ Text };
 
+// The tags of a coherence key's parts (`coherence_key_of`).
+const COH_FOR: u64        = 1;
+const COH_ARGS: u64       = 2;
+const COH_WHERE: u64      = 3;
+const COH_PARAM: u64      = 4;
+const COH_PROJECTION: u64 = 5;
+const COH_DEF: u64        = 6;
+const COH_TYPE: u64       = 7;
+const COH_NONE: u64       = 8;
+const COH_GENERIC: u64    = 9;
+const COH_REF: u64        = 10;
+const COH_REF_MUT: u64    = 11;
+const COH_POINTER: u64    = 12;
+const COH_ARRAY: u64      = 13;
+const COH_TUPLE: u64      = 14;
+const COH_THIS: u64       = 15;
+const COH_OTHER: u64      = 16;
+
 
 // TypeResolutionRunner: holds shared resolution state for pass methods
 
@@ -1124,31 +1142,25 @@ type struct TypeResolutionPasses {
                     }
                 }
                 // Trait-impl coherence (same file AND across modules).  A
-                // trait may be implemented at most once per type.  TypeRes
-                // has stamped `canonical_target` (import-resolved,
-                // defining-module qualified), so the canonical impl-head
-                // signature built here is exact: same-leaf types in
-                // different modules stay distinct, an impl on an imported
+                // trait may be implemented at most once per type.  The head's
+                // key is its identities (`coherence_key_of`): same-leaf types
+                // in different modules stay distinct, an impl on an imported
                 // type collides with the type's home-module impl, and the
-                // trait's type args (`From<i8>` vs `From<i16>`), the
-                // target's type args, and the where-bounds all participate
-                // so only genuine duplicates collide.  This is the SOLE
-                // coherence check - `register_impl_block`'s earlier
-                // same-file-only check was removed in favor of it, so there
-                // is no double report.  Source decls only: monomorphizer-
-                // injected spec clones share canonical heads across the
-                // modules that instantiate them and would false-positive.
+                // trait's type args (`From<i8>` vs `From<i16>`), the target's
+                // type args, and the where-bounds all participate, the impl's
+                // own parameters by position, so only genuine duplicates
+                // collide.  This is the only coherence check, so there is no
+                // double report.  Source decls only: monomorphizer-injected
+                // spec clones share heads across the modules that instantiate
+                // them and would false-positive.
                 if (is_source_decl && node.is_trait_impl()
                         && canonical_target.is_valid()
 ) {
-                    const coh_key: string =
-                        TypeResolutionPasses::coherence_key_for(
-                            node, canonical_target, ctx);
-                    const coh_sym: SymbolStr =
-                        ctx.intern_table.intern(coh_key);
-                    const prior: ImplBlockNode* =
-                        ctx.generic_registry.register_coherence(
-                            coh_sym, node);
+                    mut coh_key: u64[] = [];
+                    const keyed: boolean = TypeResolutionPasses::coherence_key_of(node, ctx, &coh_key);
+                    const prior: ImplBlockNode* = if (keyed) {
+                        ctx.generic_registry.register_coherence_head(&coh_key, node)
+                    } else { null };
                     if (prior != null) {
                         const c_leaf: SymbolStr =
                             TypeResolutionPasses::extract_trait_leaf(
@@ -1166,7 +1178,7 @@ type struct TypeResolutionPasses {
                         // Not a second copy of one head, so ask whether an
                         // earlier head under the same (trait, target) key
                         // OVERLAPS it: some subject would select both.
-                        // Rust's rule, and refused here at the later
+                        // Refused here at the later
                         // declaration rather than at a use - the use is
                         // innocent, and a pick by declaration order or by
                         // bound would make the program's meaning depend on
@@ -1817,117 +1829,6 @@ type struct TypeResolutionPasses {
         return true;
     }
 
-    /// Positional index of `name` among `node`'s impl-head generic params,
-    /// or -1 when it is not one of them.  Used to normalize a generic param
-    /// to a position (`#0`) in the coherence key so that two otherwise
-    /// identical impls that merely spell the param differently
-    /// (`Box<T>` vs `Box<U>`) fold to the same key.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    static impl_param_index(node: ImplBlockNode*, name: SymbolStr) -> i64 {
-        if (node == null || !name.is_valid()) { return -1; }
-        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            const gp: GenericParamNode* = node.generic_params[i];
-            if (gp != null && gp.name.is_valid() && gp.name.equals(name)) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    /// Canonical key fragment for a type-position NAME.  Resolution order:
-    ///   1. an impl-head generic param -> positional `#n` marker;
-    ///   2. a name whose stamp names a declaration -> that type's canonical
-    ///      id (`#T<id>`), asked of the index by the id, which folds every
-    ///      spelling of one type to one key and keeps two same-leaf types of
-    ///      different modules apart - a leaf folded by its spelling could do
-    ///      neither once two modules declared it; a primitive by its
-    ///      definition, which the primitive table's answer is;
-    ///   3. otherwise the spelling itself: a projection (`I::Item`), a
-    ///      parameter, or a name nothing stamped.  The spelling is never
-    ///      looked up: a name the writer's module did not resolve is not one
-    ///      the module being compiled may resolve for it.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    static type_name_key(name: SymbolStr, res: Res, node: ImplBlockNode*,
-                         ctx: CompilationContext*) -> string {
-        const pidx: i64 = TypeResolutionPasses::impl_param_index(node, name);
-        if (pidx >= 0) { return fmt::format("#%lld", pidx); }
-        const tref: TypeRef = match (res) {
-            Res::Def(q)    => { ctx.decl_index.type_of_def(q) }
-            Res::PrimTy(n) => { ctx.decl_index.type_of_def(ctx.defs.primitive(n)) }
-            _              => { TypeRef::invalid() }
-        };
-        if (tref.is_valid()) {
-            return fmt::format("#T%llu", tref.key());
-        }
-        return ctx.intern_table.resolve(name);
-    }
-
-    /// Render a type annotation to a stable, canonical string for coherence
-    /// keying.  Type-position names fold to their resolved type identity
-    /// (see `type_name_key`); the impl's own generic params normalize to
-    /// positional `#n` markers; everything else renders structurally.
-    /// Purely a string identity - never type-checks - so it is safe to call
-    /// this early in TypeResolution.
-    static ann_canon_key(ann: TypeAnnotation*, node: ImplBlockNode*,
-                         ctx: CompilationContext*) -> string {
-        if (ann == null) { return "_"; }
-        return match (*ann) {
-            TypeAnnotation::Primitive(p) => {
-                // A keyword primitive carries no slot; its lexeme is read
-                // as the name layer would stamp it, an alias keyword
-                // (`Feed<int>`) under the primitive's own spelling, so
-                // `Feed<int>` and `Feed<i32>` render to one key.
-                mut prim: SymbolStr = p.name;
-                const canon: string = ResBase::primitive_of_alias(ctx.intern_table.resolve(p.name));
-                if (canon.length() > 0) { prim = ctx.intern_table.intern(canon); }
-                TypeResolutionPasses::type_name_key(prim, Res::PrimTy(prim), node, ctx)
-            }
-            TypeAnnotation::Named(n) => {
-                // Through the door: every written type-position name is
-                // answered - bound, or `Err` for one the name layer refused
-                // where it was written - and a slot with no answer is a
-                // defect to record, not a spelling to key by silently.
-                TypeResolutionPasses::type_name_key(n.name,
-                    n.res.require(Text::new("type_resolution: coherence key name")), node, ctx)
-            }
-            TypeAnnotation::Generic(g) => {
-                mut s: string =
-                    TypeResolutionPasses::ann_canon_key(g.base, node, ctx);
-                s = s + "<";
-                for (mut i: i64 = 0; i < g.args.length; i++) {
-                    if (i > 0) { s = s + ","; }
-                    s = s + TypeResolutionPasses::ann_canon_key(
-                        g.args[i], node, ctx);
-                }
-                s = s + ">";
-                s
-            }
-            TypeAnnotation::Reference(r) => {
-                const pre: string = if (r.is_mutable) { "&mut " } else { "&" };
-                pre + TypeResolutionPasses::ann_canon_key(r.inner, node, ctx)
-            }
-            TypeAnnotation::Pointer(p) => {
-                "*" + TypeResolutionPasses::ann_canon_key(p.inner, node, ctx)
-            }
-            TypeAnnotation::Array(a) => {
-                "[" + TypeResolutionPasses::ann_canon_key(a.element, node, ctx)
-                    + "]"
-            }
-            TypeAnnotation::Tuple(t) => {
-                mut s: string = "[";
-                for (mut i: i64 = 0; i < t.elements.length; i++) {
-                    if (i > 0) { s = s + ","; }
-                    s = s + TypeResolutionPasses::ann_canon_key(
-                        t.elements[i], node, ctx);
-                }
-                s = s + "]";
-                s
-            }
-            TypeAnnotation::ThisType(_) => { "This" }
-            _ => { "_" }
-        };
-    }
-
     /// An implement block's parameters bound to its OWNER's own parameters
     /// through the head (`U` in `implement<U> .. for Wrap<U>` to `Wrap`'s
     /// `T`): what a return written in the block's parameters is stored
@@ -1949,77 +1850,188 @@ type struct TypeResolutionPasses {
         return head;
     }
 
-    /// Build the canonical impl-head signature for a trait impl: the
-    /// import-resolved trait reference (with type args), the import-resolved
-    /// target type (`canonical_target`, with its type args), and the
-    /// where-bounds - with the impl's own generic params normalized.  Two
-    /// trait impls conflict for coherence if this string is identical.
-    /// Bounds are folded in so two impls that differ only by their bounds
-    /// (and may be non-overlapping) are NOT treated as duplicates.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    static coherence_key_for(node: ImplBlockNode*,
-                             canonical_target: SymbolStr,
-                             ctx: CompilationContext*) -> string {
-        mut key: string = TypeResolutionPasses::ann_canon_key(
-            node.trait_annotation, node, ctx);
-        key = key + " for ";
-        // Target base by resolved type identity, off the head's own answer.
-        // A source head with a key is a stamped head: the name layer answers
-        // every written target it can bind, a primitive by its own spelling
-        // (`for int` folds to `i32` there, so the two heads collide here),
-        // and only a clone - never a source declaration - carries a key
-        // with no stamp.
+    /// The coherence key of a trait impl's head, as identities: the trait's
+    /// definition and its type arguments, the target and its type
+    /// arguments, and the where-bounds, a type by its arena id and the
+    /// impl's own parameters by their position (read off their stamps), so
+    /// two heads are one key exactly when they are one head.  Each part is
+    /// a tag followed by its value.  False, with the key incomplete, when a
+    /// part of the head has no identity - a name the name layer refused,
+    /// reported where it is written - and the head then takes part in no
+    /// coherence check.
+    static coherence_key_of(node: ImplBlockNode*, ctx: CompilationContext*, key: mut &u64[]) -> boolean {
+        if (!TypeResolutionPasses::ann_key(node.trait_annotation, node, ctx, key)) { return false; }
+        key.push(COH_FOR);
         const head_res: Res = node.res.require(Text::new("type_resolution: coherence head"));
-        key = key + TypeResolutionPasses::type_name_key(
-            canonical_target, head_res, node, ctx);
-        if (node.target_args.length > 0) {
-            key = key + "<";
-            for (mut i: i64 = 0; i < node.target_args.length; i++) {
-                if (i > 0) { key = key + ","; }
-                key = key + TypeResolutionPasses::ann_canon_key(
-                    node.target_args[i], node, ctx);
-            }
-            key = key + ">";
+        if (!TypeResolutionPasses::res_key(head_res, node, ctx, key)) { return false; }
+        key.push(COH_ARGS);
+        key.push(node.target_args.length as u64);
+        for (mut i: i64 = 0; i < node.target_args.length; i++) {
+            if (!TypeResolutionPasses::ann_key(node.target_args[i], node, ctx, key)) { return false; }
         }
-        if (node.where_bounds.length > 0) {
-            key = key + " where ";
-            for (mut i: i64 = 0; i < node.where_bounds.length; i++) {
-                const wb: TraitBound* = &node.where_bounds[i];
-                const pidx: i64 = TypeResolutionPasses::impl_param_index(
-                    node, wb.type_parameter);
-                if (pidx >= 0) {
-                    key = key + fmt::format("#%lld:", pidx);
-                } else {
-                    key = key + ctx.intern_table.resolve(wb.type_parameter)
-                        + ":";
+        key.push(COH_WHERE);
+        key.push(node.where_bounds.length as u64);
+        for (mut i: i64 = 0; i < node.where_bounds.length; i++) {
+            const wb: TraitBound* = &node.where_bounds[i];
+            const pidx: i64 = TypeResolutionPasses::impl_param_position(node, wb.subject_sym);
+            if (pidx >= 0) {
+                key.push(COH_PARAM);
+                key.push(pidx as u64);
+            } else if (wb.subject_type != null) {
+                key.push(COH_PROJECTION);
+            } else {
+                return false;
+            }
+            key.push(wb.trait_refs.length as u64);
+            for (mut j: i64 = 0; j < wb.trait_refs.length; j++) {
+                const tr: TraitRef* = &wb.trait_refs[j];
+                key.push(COH_DEF);
+                key.push(if (tr.path.length > 0) { (ctx.defs.slot(tr.definition()) as u64) + 1 } else { 0 });
+                key.push(tr.type_args.length as u64);
+                for (mut k: i64 = 0; k < tr.type_args.length; k++) {
+                    if (!TypeResolutionPasses::ann_key(tr.type_args[k], node, ctx, key)) { return false; }
                 }
-                for (mut j: i64 = 0; j < wb.trait_refs.length; j++) {
-                    if (j > 0) { key = key + "+"; }
-                    const tr: TraitRef* = &wb.trait_refs[j];
-                    if (tr.path.length > 0) {
-                        // The bound's carried identity, never a search for its
-                        // leaf. Recovering the qualified name by searching the
-                        // program declines as soon as any unrelated
-                        // declaration shares the leaf, and two distinct traits
-                        // then fold to one key - so two impls differing only in
-                        // which module their bound came from rendered
-                        // identically and coherence rejected the second.
-                        key = key + ctx.intern_table.resolve(ctx.defs.path_of(tr.definition()));
-                    }
-                    if (tr.type_args.length > 0) {
-                        key = key + "<";
-                        for (mut k: i64 = 0; k < tr.type_args.length; k++) {
-                            if (k > 0) { key = key + ","; }
-                            key = key + TypeResolutionPasses::ann_canon_key(
-                                tr.type_args[k], node, ctx);
+            }
+        }
+        return true;
+    }
+
+    /// The position among `node`'s own generic parameters of the one the
+    /// symbol `sym` names; -1 for none.
+    static impl_param_position(node: ImplBlockNode*, sym: SymbolID) -> i64 {
+        if (node == null || !sym.is_valid()) { return -1; }
+        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
+            const gp: GenericParamNode* = node.generic_params[i];
+            if (gp != null && gp.sym_id.equals(sym)) { return i; }
+        }
+        return -1;
+    }
+
+    /// A projection through one of the impl's own parameters (`I::Item`)
+    /// as a coherence key's part: the parameter's position, then the trait a
+    /// where-bound on that parameter names whose declaration has the member,
+    /// and the member's position among that trait's associated types (the
+    /// `assoc-type` door, asked with the path's last segment).  False when
+    /// no bound's trait declares the member.
+    ![allow(lookup_by_spelling, reason = "a projection's member, the last segment of the written path, asked of the assoc-type door inside the trait a bound names")]
+    static projection_key(node: ImplBlockNode*, param: SymbolID, written: SymbolStr,
+                          ctx: CompilationContext*, key: mut &u64[]) -> boolean {
+        const pidx: i64 = TypeResolutionPasses::impl_param_position(node, param);
+        if (pidx < 0) { return false; }
+        const member: SymbolStr = QualifiedName::parse(ctx.intern_table, ctx.intern_table.resolve(written)).leaf();
+        for (mut i: i64 = 0; i < node.where_bounds.length; i++) {
+            const wb: TraitBound* = &node.where_bounds[i];
+            if (!wb.subject_sym.equals(param)) { continue; }
+            for (mut j: i64 = 0; j < wb.trait_refs.length; j++) {
+                const tr: TraitRef* = &wb.trait_refs[j];
+                if (tr.path.length == 0) { continue; }
+                const decl: TraitDeclNode* = ctx.generic_registry.get_trait_decl(tr.definition());
+                if (decl == null) { continue; }
+                const slot: i64 = decl.assoc_type_index(member);
+                if (slot < 0) { continue; }
+                key.push(COH_PROJECTION);
+                key.push(pidx as u64);
+                key.push((ctx.defs.slot(tr.definition()) as u64) + 1);
+                key.push(slot as u64);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// A stamped type-position name's part of a coherence key: an impl
+    /// parameter by its position, a declared type or a primitive by its
+    /// arena id.  False for any other answer.
+    static res_key(r: Res, node: ImplBlockNode*, ctx: CompilationContext*, key: mut &u64[]) -> boolean {
+        mut tref: TypeRef = TypeRef::invalid();
+        match (r) {
+            Res::GenericParam(s) => {
+                const pidx: i64 = TypeResolutionPasses::impl_param_position(node, s);
+                if (pidx < 0) { return false; }
+                key.push(COH_PARAM);
+                key.push(pidx as u64);
+                return true;
+            }
+            Res::Def(q)    => { tref = ctx.decl_index.type_of_def(q); }
+            Res::PrimTy(n) => { tref = ctx.decl_index.type_of_def(ctx.defs.primitive(n)); }
+            _              => { }
+        }
+        if (!tref.is_valid()) { return false; }
+        key.push(COH_TYPE);
+        key.push(tref.key());
+        return true;
+    }
+
+    /// A type annotation's part of a coherence key, structurally: each
+    /// shape's tag and arity, then its parts.
+    static ann_key(ann: TypeAnnotation*, node: ImplBlockNode*, ctx: CompilationContext*, key: mut &u64[]) -> boolean {
+        if (ann == null) {
+            key.push(COH_NONE);
+            return true;
+        }
+        match (*ann) {
+            TypeAnnotation::Primitive(p) => {
+                // An alias keyword (`int`) is the primitive it spells, as the
+                // name layer stamps it.
+                mut prim: SymbolStr = p.name;
+                const canon: string = ResBase::primitive_of_alias(ctx.intern_table.resolve(p.name));
+                if (canon.length() > 0) { prim = ctx.intern_table.intern(canon); }
+                return TypeResolutionPasses::res_key(Res::PrimTy(prim), node, ctx, key);
+            }
+            TypeAnnotation::Named(n) => {
+                const r: Res = n.res.require(Text::new("type_resolution: coherence key name"));
+                match (r) {
+                    Res::TypeRelative(b, trailing) => {
+                        if (trailing != 1) { return false; }
+                        match (b) {
+                            ResBase::GenericParam(s) => {
+                                return TypeResolutionPasses::projection_key(node, s, n.name, ctx, key);
+                            }
+                            _ => { return false; }
                         }
-                        key = key + ">";
                     }
+                    _ => { }
                 }
-                key = key + ";";
+                return TypeResolutionPasses::res_key(r, node, ctx, key);
+            }
+            TypeAnnotation::Generic(g) => {
+                key.push(COH_GENERIC);
+                key.push(g.args.length as u64);
+                if (!TypeResolutionPasses::ann_key(g.base, node, ctx, key)) { return false; }
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    if (!TypeResolutionPasses::ann_key(g.args[i], node, ctx, key)) { return false; }
+                }
+                return true;
+            }
+            TypeAnnotation::Reference(r) => {
+                key.push(if (r.is_mutable) { COH_REF_MUT } else { COH_REF });
+                return TypeResolutionPasses::ann_key(r.inner, node, ctx, key);
+            }
+            TypeAnnotation::Pointer(p) => {
+                key.push(COH_POINTER);
+                return TypeResolutionPasses::ann_key(p.inner, node, ctx, key);
+            }
+            TypeAnnotation::Array(a) => {
+                key.push(COH_ARRAY);
+                return TypeResolutionPasses::ann_key(a.element, node, ctx, key);
+            }
+            TypeAnnotation::Tuple(t) => {
+                key.push(COH_TUPLE);
+                key.push(t.elements.length as u64);
+                for (mut i: i64 = 0; i < t.elements.length; i++) {
+                    if (!TypeResolutionPasses::ann_key(t.elements[i], node, ctx, key)) { return false; }
+                }
+                return true;
+            }
+            TypeAnnotation::ThisType(_) => {
+                key.push(COH_THIS);
+                return true;
+            }
+            _ => {
+                key.push(COH_OTHER);
+                return true;
             }
         }
-        return key;
     }
 
     /// Peel a trait annotation down to its underlying GenericAnnotation
