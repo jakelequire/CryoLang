@@ -16,6 +16,7 @@ import compiler::resolver::res;
 import compiler::resolver::res::{ DefId, DefKind, Res, ResBase, ResSlot, SourceLoc };
 import compiler::resolver::namespace_kind;
 import compiler::resolver::namespace_kind::{ Namespace };
+import std::collections::pair::{ Pair };
 import compiler::const_table;
 import compiler::const_table::{ ConstantTable };
 import compiler::diag;
@@ -629,6 +630,42 @@ public:
         }
 
         this.refuse_module_type_collisions();
+        this.refuse_import_redeclarations();
+    }
+
+    /// A declaration in this module's scope and an explicit import - or a
+    /// module alias - of the same name in the same namespace is a
+    /// redeclaration (E0205): the scope can keep only one of the two, and
+    /// neither the declaration winning nor the import being dropped is
+    /// allowed to happen silently.  A glob's or the prelude's binding is not
+    /// one the writer named, and a declaration shadows it.  Modules and
+    /// types share the type namespace, so an alias meets a type.
+    refuse_import_redeclarations(&this) -> void {
+        const meets: Pair<SymbolID, SymbolID>[] =
+            this.resolver.import_meetings_in(this.resolver.get_current_scope_id());
+        for (mut i: i64 = 0; i < meets.length; i++) {
+            const imp: SymbolID = meets[i].first;
+            const target: SymbolID = this.resolver.declaration_of(imp);
+            const alias: boolean = target.equals(imp);
+            if (!alias && !this.resolver.is_explicit_import(imp)) { continue; }
+            const ds: Symbol = this.resolver.get_symbol(meets[i].second);
+            const decl_is_type: boolean = Namespace::Type.accepts(ds.kind);
+            const imp_is_type: boolean = alias || Namespace::Type.accepts(this.resolver.get_symbol(target).kind);
+            if (decl_is_type != imp_is_type) { continue; }
+            const is: Symbol = this.resolver.get_symbol(imp);
+            const name_str: string = this.resolver.intern_table.resolve(ds.name);
+            mut d: Diagnostic = Diagnostic::error(
+                ErrorCode::E0205_REDEFINED_SYMBOL,
+                Text::new(fmt::format("the name `%s` is already declared in this scope: %s",
+                    name_str, if (alias) { "it is a module's import alias" } else { "it is imported" })));
+            d = d.at_with_label(ds.declaring_span, Text::new("declared here"));
+            d = d.with_note_at(
+                Text::new(if (alias) { "the alias is bound here" } else { "imported here" }), is.declaring_span);
+            d = d.help(Text::new(
+                if (alias) { "rename the declaration or the alias" }
+                else { "rename the declaration, or import the item under another name with `as`" }));
+            this.ctx.emit_diagnostic(d);
+        }
     }
 
     /// Whether a bound symbol names a TYPE: declared as one, or an import
