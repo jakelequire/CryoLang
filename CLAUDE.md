@@ -11,7 +11,7 @@ grep -i "split" docs/stdlib-api.txt
 ```
 
 `docs/stdlib-api.txt` is a generated one-line-per-symbol index of the whole
-standard library — 154 namespaces, ~4,300 declarations. Most utility
+standard library, every namespace and declaration. Most utility
 operations already exist. **A near-duplicate is worse than an imperfect call**,
 because from then on there are two of them and they drift.
 
@@ -30,7 +30,8 @@ make verify              # build once; census, examples, lsp, cross, check-fast 
                          # a change that makes a refused program compile DECLARES its project in
                          # tests/started-compiling (refused before, builds now); one that corrects
                          # a program the baseline built, in tests/started-passing
-make roster-check        # roster golden: 2113 unit + 46 projects + 179 negative
+make roster-check        # every unit test, project and negative file against the roster
+                         # golden (tests/test-roster.txt); its OK line prints the current counts
 make lane-check          # resolution-lane surface ratchet; counts the compiler's facts,
                          # REFUSED when stale - never rebuilt by a gate
 make ns-status-check     # run every check docs/name-resolution.md §0 carries
@@ -48,7 +49,8 @@ make vendor-check        # every constant shape survives `cryo vendor`
 make api-index-check     # docs/stdlib-api.txt is not stale
 make verify-pin          # both pins match their sidecars AND each other
 make verify-freestanding # runtime/ tiers built by the compiler under test
-make examples            # smoke-build every examples/ project (floor: 14)
+make examples            # smoke-build every examples/ project (refuses a sweep below
+                         # scripts/examples-gate.py's --min)
 make examples-golden     # build AND run them, diff stdout (POSIX only)
 make incremental-check   # incremental build == clean build, per module
 make incremental-instance-check  # an edit asking a cached module for a new generic
@@ -71,8 +73,8 @@ So:
   never rebuilt - run `make facts` (a compiler build plus about 80 s) after
   any source change, deliberately; `make facts-selftest` shows the refusal.
   `make verify` refuses stale facts up front for the same reason.
-  check-fast builds nothing. About a minute: the ledger's ~400 status
-  rows run one shell each, concurrently, in Git's bash on Windows (never the
+  check-fast builds nothing. About a minute: the ledger's status rows run
+  one shell each, concurrently, in Git's bash on Windows (never the
   WSL launcher a bare `bash` resolves to there), and the rows that parse
   `compiler/src` share one parse per run (`scripts/parse_cache.py`). A short
   gate everybody runs beats a twenty-minute one nobody does.
@@ -99,8 +101,8 @@ So:
   commit.** The guard cannot do it for you: its third rule runs
   `ns-status-check` only when the commit STAGES §0, so a commit that moves a
   pinned number without touching the ledger goes straight through and leaves
-  the row wrong at HEAD. D11's `resolve_counter.cryo` line count stood at 1931
-  against a tree of 1643 that way. `make ns-status-check` names every drifted
+  the row wrong at HEAD; a pinned line count once stood hundreds of lines
+  away from its file that way. `make ns-status-check` names every drifted
   row and needs no build.
   The same rule bites from the other side in a SHARED checkout: a commit that
   does stage §0 is refused while anyone else's uncommitted edit has any row
@@ -115,8 +117,8 @@ not done. The remaining limits are here so nobody rediscovers them:
 - **A compiler warning total from an incremental build is not a count.** A
   module reused from cache skips the stage after monomorphization, and its
   warnings from that stage (unused variables, unused functions, unreachable
-  code among them) are not replayed: the same source reads 346 warnings
-  clean and 337 after a comment is added to a leaf file. Take a warning
+  code among them) are not replayed: the same source reads fewer warnings
+  after a comment is added to a leaf file than it does clean. Take a warning
   total only after `rm -rf compiler/build`, and compare two builds' warnings
   as SETS (code, file, line), never as totals. The skip is
   `if (pm_active && pm_cached[...]) { continue; }` in
@@ -137,11 +139,12 @@ not done. The remaining limits are here so nobody rediscovers them:
   OS-gated entries - it keeps a golden entry whose test is still
   `![target]`-gated elsewhere in the SOURCE, and drops one whose test is
   actually gone.
-- **`outcome: "collect"` ignores every `expect` field.** `dispatch_project`
-  checks the child's exit code and nothing else, so a `collect` project whose
-  `![test]` discovery broke runs zero tests, exits 0, and passes. Writing
-  assertions into such a `test.json` does not make them run. 11 projects use
-  this fixture.
+- **`outcome: "collect"` ignores every `expect` field.** `project_outcome`
+  (`compiler/src/CLI/commands.cryo`) checks the child's exit code and nothing
+  else, so a `collect` project whose `![test]` discovery broke runs zero
+  tests, exits 0, and passes. Writing assertions into such a `test.json` does
+  not make them run. `grep -l '"collect"' tests/tests/projects/*/test.json`
+  lists the projects that use this fixture.
 - **A compile-fail file with no `//~` annotation asserts a code and nothing
   else** - not the line, not the symbol, not the absence of a cascade. Write
   the annotations; `scripts/annotate-negative-tests.py` generates them from a
@@ -296,7 +299,7 @@ State it as a pair, because only the pair is evidence:
 Without the first half you have shown that a gate fails on a broken tree,
 which was never in doubt. Without the second you have shown nothing at all.
 Both halves go in the commit message, named concretely: *"the old gate printed
-`OK (2113 tests)` over a tree with a project's marker deleted"* is checkable;
+`OK (N tests)` over a tree with a project's marker deleted"* is checkable;
 *"now catches missing markers"* is a claim.
 
 This is the same discipline as predicting the measurement, applied to the
