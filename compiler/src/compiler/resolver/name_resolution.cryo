@@ -3576,21 +3576,20 @@ public:
         this.ctx.emit_diagnostic(d);
     }
 
-    /// E0244: `import A::B as C;` where `A` offers an item `B` and `A::B` is
-    /// a module too.  The path names both, and neither is chosen: the item
-    /// is written in braces, and the module is imported by its path.
+    /// E0244: an import entry - `import A::B as C;`, `import A::{ B }`,
+    /// `import A::{ B as C }` - where `A` offers an item `B` and `A::B` is a
+    /// module too.  The entry names both, and neither is chosen, so the
+    /// writer renames one of the two.  `import A::B;` imports the module.
     refuse_item_or_module_import(&this, node: ImportDeclNode*, i: int) -> void {
         const owner: string = node.module_path;
         const leaf: string = this.resolver.intern_table.resolve(node.specific_imports[i]);
-        const alias_str: string = this.resolver.intern_table.resolve(node.specific_aliases[i]);
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0244_IMPORT_ITEM_OR_MODULE,
             Text::new(fmt::format("`%s::%s` names both an item of `%s` and a module", owner, leaf, owner)));
         d = d.at_with_label(node.span,
             Text::new(fmt::format("`%s` is declared in `%s`, and `%s::%s` is a module", leaf, owner, owner, leaf)));
         d = d.help(Text::new(fmt::format(
-            "import the item with `import %s::{ %s as %s };`, or the module with `import %s::%s;`",
-            owner, leaf, alias_str, owner, leaf)));
+            "rename the item `%s` or the module `%s::%s`", leaf, owner, leaf)));
         this.ctx.emit_diagnostic(d);
     }
 
@@ -3741,14 +3740,10 @@ public:
                     }
                 }
                 // The sub-module `<resolved_module>::<name>`, when there is
-                // one: asked of an entry its module offers nothing under, and
-                // of a path entry, which names an item or a module and must
-                // not name both.
-                mut sub_idx: i64 = -1;
-                if (offered.length == 0 || node.path_entry) {
-                    sub_idx = this.sub_module_index(node, i);
-                }
-                if (node.path_entry && offered.length > 0 && sub_idx >= 0) {
+                // one: an entry names an item or a module and must not name
+                // both, braced or not, aliased or not.
+                const sub_idx: i64 = this.sub_module_index(node, i);
+                if (offered.length > 0 && sub_idx >= 0) {
                     this.refuse_item_or_module_import(node, i);
                     this.resolver.declare_refused(bind_as, node.span);
                     continue;
@@ -3778,10 +3773,11 @@ public:
                         mut import_sym: Symbol = Symbol::import_sym(
                             id, bind_as, this.resolver.current_scope,
                             node.span, src, osym.def);
-                        // `export M::{ printf as print }` offers the binding
-                        // itself: importers are offered `print`, naming the
-                        // declaration `printf` names.
-                        const offers_alias: boolean = node.is_export && !alias.is_empty();
+                        // `export M::{ printf }` offers the binding itself,
+                        // and nothing else of `M`; `export M::{ printf as
+                        // print }` offers `print`, naming the declaration
+                        // `printf` names.
+                        const offers_alias: boolean = node.is_export;
                         if (offers_alias) { import_sym.visibility = SymbolVisibility::Public; }
                         // A name an earlier explicit import already brought in,
                         // in this declaration's namespace, binds nothing and is

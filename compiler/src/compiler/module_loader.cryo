@@ -818,11 +818,13 @@ type struct ModuleLoader {
         // a module that re-exports a name can also use it without spelling the
         // same path a second time.
         //
-        // The brace and alias forms need no separate treatment: an item is
-        // either a name inside the path (reached through the path's own edge)
-        // or a submodule, and the loop below over `export_items` catches the
-        // latter the way the import-item loop does.
+        // The brace form, `export M::{ a }`, offers the entries it lists and
+        // nothing else of `M`: it gets the imported-namespace edge but no
+        // re-export edge, and the name layer offers each entry's binding.  An
+        // entry naming a submodule is caught by the loop below over
+        // `export_items`, the way the import-item loop does.
         for (mut ei: i64 = 0; ei < scan.export_count; ei++) {
+            const braced: boolean = scan.export_braced[ei];
             const exp_path: string = scan.export_paths[ei];
             mut exp_resolved: string = this.resolve_import_path(exp_path);
             if (exp_resolved.length() == 0) {
@@ -838,7 +840,7 @@ type struct ModuleLoader {
                 }
                 const exp_idx: i64 = graph.find_module_by_path(exp_resolved);
                 if (exp_idx >= 0) {
-                    info.add_reexport(graph.modules[exp_idx].name);
+                    if (!braced) { info.add_reexport(graph.modules[exp_idx].name); }
                     info.add_imported_namespace(graph.modules[exp_idx].name);
                     continue;
                 }
@@ -847,7 +849,7 @@ type struct ModuleLoader {
                 match (this.scanned_ns.get(&exp_resolved.to_ascii_lower())) {
                     Option::Some(ns) => {
                         const ns_sym: SymbolStr = intern.intern(ns);
-                        info.add_reexport(ns_sym);
+                        if (!braced) { info.add_reexport(ns_sym); }
                         info.add_imported_namespace(ns_sym);
                         continue;
                     }
@@ -859,7 +861,7 @@ type struct ModuleLoader {
             const exp_sym: SymbolStr = intern.intern(exp_path);
             const exp_gidx: i64 = graph.find_module_index(graph.module_of_written_path(exp_sym));
             if (exp_gidx >= 0) {
-                info.add_reexport(graph.modules[exp_gidx].name);
+                if (!braced) { info.add_reexport(graph.modules[exp_gidx].name); }
                 info.add_imported_namespace(graph.modules[exp_gidx].name);
                 continue;
             }
@@ -1046,6 +1048,7 @@ type struct ModuleLoader {
         mut import_items: string[] = [];
         mut exports: string[] = [];
         mut export_spans: SourceSpan[] = [];
+        mut export_braced: boolean[] = [];
         mut export_items: string[] = [];
         mut submodules: string[] = [];
         const len: i64 = tokens.length;
@@ -1106,6 +1109,7 @@ type struct ModuleLoader {
                     if (is_exp) {
                         exports.push(path);
                         export_spans.push(path_span);
+                        export_braced.push(i < len && tokens[i].kind == TokenType::LBrace);
                     } else {
                         imports.push(path);
                         import_spans.push(path_span);
@@ -1252,6 +1256,7 @@ type struct ModuleLoader {
             import_item_count: import_item_count_val,
             export_paths:      exports,
             export_spans:      export_spans,
+            export_braced:     export_braced,
             export_count:      export_count_val,
             export_items:      export_items,
             export_item_count: export_item_count_val,
@@ -1455,6 +1460,9 @@ type struct ModuleScanResult {
     /// an import constrains build order, an export never does.
     export_paths:    string[];
     export_spans:    SourceSpan[];
+    /// Whether each export is the brace form, `export M::{ a }`, which
+    /// offers the entries it lists and nothing else of `M`.
+    export_braced:   boolean[];
     export_count:    i64;
     export_items:    string[];
     export_item_count: i64;
