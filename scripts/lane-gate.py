@@ -687,8 +687,6 @@ SCANNED_ARRAYS = {
                                                      "the index's module-level globals by their leaf's id, scanned by the member-global door"),
     "DeclarationIndex.module_global_declared_in": Scanned("compiler/decl_index.cryo", "ModulePath", TABLE,
                                                           "the index's module-level globals by their declaring module, by identity"),
-    "DeclarationIndex.overload_func_owner": Scanned("compiler/decl_index.cryo", "SymbolStr", TABLE,
-                                                    "the index's overload entries by their owner's id"),
     "DeclarationIndex.overload_func_mangled": Scanned("compiler/decl_index.cryo", "SymbolStr", TABLE,
                                                       "the index's overload entries by their link symbol's id"),
     "DeclarationIndex.prelude_modules": Scanned("compiler/decl_index.cryo", "ModulePath", TABLE,

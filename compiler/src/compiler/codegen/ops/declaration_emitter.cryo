@@ -1249,15 +1249,12 @@ type struct DeclarationEmitter {
         // C linkage: use bare name.
         const fn_val: LValue = this.llvm_module.add_function(MangledName::new(name_str), fn_type);
 
-        // Register under bare name (for identifier lookups like `malloc(...)`)
-        this.functions.register(node.name, fn_val);
-
-        // Also register under qualified name (for cross-module resolution).
-        const ctx_ptr: CompilationContext* = this.ctx;
-        const qualified: SymbolStr = ctx_ptr.decl_fn_key(node.name, node.span.file);
-        if (!qualified.equals(node.name)) {
-            this.functions.register(qualified, fn_val);
-        }
+        // Held under the symbol its registered entry carries, the key every
+        // pin names it by.  A declaration no registration reached is named
+        // by no pin.
+        const di: DeclarationIndex* = this.get_decl_index();
+        const entry: OverloadId = di.entry_of_def(node.def);
+        if (entry.is_valid()) { this.functions.register(di.entry_symbol(entry), fn_val); }
     }
 
     /// Declare extern block functions.
@@ -1297,8 +1294,8 @@ type struct DeclarationEmitter {
 
             // Use the bare source name for C linkage, unless `![symbol("...")]`
             // overrode the linker symbol - then the LLVM declaration is
-            // named for the C library symbol while Cryo callers still
-            // resolve through `func.name` via the registry below.
+            // named for the C library symbol, which is also the symbol the
+            // function's registered entry carries.
             mut link_str: string = name_str;
             if (func.has_link_name) { link_str = func.link_name; }
             const fn_val: LValue = this.llvm_module.add_function(MangledName::new(link_str), fn_type);
@@ -1321,7 +1318,10 @@ type struct DeclarationEmitter {
                 }
             }
 
-            this.functions.register(func.name, fn_val);
+            // Held under the entry's symbol, the key every pin names it by.
+            if (func.overload_entry.is_valid()) {
+                this.functions.register(this.get_decl_index().entry_symbol(func.overload_entry), fn_val);
+            }
         }
     }
 
