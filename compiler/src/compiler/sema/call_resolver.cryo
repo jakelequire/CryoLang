@@ -1085,7 +1085,10 @@ type struct CallResolver {
                     }
                 }
             }
-            if (inferred_generic_ret.is_valid()) { return inferred_generic_ret; }
+            if (inferred_generic_ret.is_valid()) {
+                this.check_free_call_projection_args(visitor, call, ident);
+                return inferred_generic_ret;
+            }
             if (call.generic_args.length > 0) {
                 const spec_tmpl: TemplateEntry* = this.spelling_template(ident.res);
                 const spec_sym: SymbolStr = this.resolve_generic_scope_name(
@@ -2609,6 +2612,7 @@ type struct CallResolver {
         mut tie_spans: SourceSpan[] = [];
         mut variadic_ok: boolean = false;
         mut chosen:    TypeRef[] = [];
+        mut chosen_fn: FunctionDeclNode* = null;
         mut name_seen:  i64 = 0;
         mut uniq_arity: i64 = -1;
         // Every arity-matching candidate's parameter types, flat: each candidate
@@ -2672,6 +2676,8 @@ type struct CallResolver {
                         found = true;
                         chosen = [];
                         for (mut ci: i64 = 0; ci < m.param_types.length; ci++) { chosen.push(m.param_types[ci]); }
+                        const cmn: MethodNode* = m.ast_node as MethodNode*;
+                        chosen_fn = if (cmn != null) { cmn.func } else { null };
                         found_trait = m_origin;
                     } else {
                         if (found_trait.is_valid() && m_origin.is_valid() && !m_origin.equals(found_trait)) {
@@ -2726,6 +2732,7 @@ type struct CallResolver {
                         if (!found) {
                             found = true;
                             chosen = tparams;
+                            chosen_fn = fn_node;
                             found_trait = block.trait_def;
                         } else {
                             const same: boolean = this.types.same_param_sig(chosen.as_slice(), tparams.as_slice());
@@ -2765,7 +2772,8 @@ type struct CallResolver {
             return;
         }
         if (found) {
-            this.check_args_against_params(visitor, &call.arguments, chosen.as_slice());
+            const params: TypeRef[] = this.method_call_params(call, chosen_fn, &chosen);
+            this.check_args_against_params(visitor, &call.arguments, params.as_slice());
             return;
         }
         if (variadic_ok) { return; }
@@ -3813,6 +3821,105 @@ type struct CallResolver {
         mut full: TypeSubstitution = TypeSubstitution::from_params(&view.params, &view.replacements);
         this.bind_projections(ty, &full);
         return full.apply(ty, this.arena);
+    }
+
+    /// `params` with each one that holds a projection (`d: I::Item`) seen
+    /// through `subst`, when that settles it: the type the impl binds for
+    /// the base `subst` gives (`i32` for `I` bound to `Count`) is what an
+    /// argument is judged against.  A parameter with no projection, or one
+    /// `subst` leaves open, is as given.  `decl` is the parameters as
+    /// written, index-aligned with `params`.
+    params_seen_through(mut &this, subst: TypeSubstitution*, decl: &TypeRef[],
+                        params: &TypeRef[]) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        for (mut i: i64 = 0; i < params.length; i++) {
+            if (i >= decl.length || !this.types.contains_unresolved_projection(decl[i])) {
+                out.push(params[i]);
+                continue;
+            }
+            const seen: TypeRef = this.seen_through(subst, decl[i]);
+            const open: boolean = !seen.is_valid() || this.types.contains_generic_param(seen)
+                || this.types.contains_unresolved_projection(seen);
+            out.push(if (open) { params[i] } else { seen });
+        }
+        return out;
+    }
+
+    /// A generic free call's arguments bound to parameters that hold a
+    /// projection, checked against what the call's type arguments make of
+    /// those parameters.  Its other arguments decided the type arguments,
+    /// and a conflict among them is the inference's to report.
+    check_free_call_projection_args(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
+                                    ident: IdentifierNode*) -> void {
+        const entry: TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length);
+        if (entry == null) { return; }
+        const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
+        if (tmpl == null || tmpl.parameters.length != call.arguments.length) { return; }
+        mut decl: TypeRef[] = [];
+        mut unchecked: TypeRef[] = [];
+        for (mut i: i64 = 0; i < tmpl.parameters.length; i++) {
+            const p: VarDeclNode* = tmpl.parameters[i];
+            decl.push(if (p != null) { p.resolved_type } else { TypeRef::invalid() });
+            unchecked.push(TypeRef::invalid());
+        }
+        const params: TypeRef[] = this.free_call_params(entry, call, &decl, &unchecked);
+        this.check_args_against_params(visitor, &call.arguments, params.as_slice());
+    }
+
+    /// `params` of the generic function `entry` as `call` instantiates them,
+    /// through the type arguments the call carries; see
+    /// `params_seen_through`.  As given when `entry` is no template or the
+    /// call carries no type argument for each of its type parameters.
+    free_call_params(mut &this, entry: TemplateEntry*, call: CallExprNode*, decl: &TypeRef[],
+                     params: &TypeRef[]) -> TypeRef[] {
+        if (entry == null || entry.param_types.length == 0
+                || call.resolved_type_args.length != entry.param_types.length) {
+            return sema_copy_type_refs(params);
+        }
+        mut subst: TypeSubstitution = TypeSubstitution::from_params(&entry.param_types, &call.resolved_type_args);
+        return this.params_seen_through(&subst, decl, params);
+    }
+
+    /// The parameters of the method `func` as `call` instantiates its own
+    /// type parameters: each bound by the explicit turbofish, else by
+    /// unifying a parameter with its argument, as the selection binds them
+    /// (`method_args_bind`); see `params_seen_through`.  `params` are the
+    /// candidate's, index-aligned with `func`'s non-receiver parameters.
+    method_call_params(mut &this, call: CallExprNode*, func: FunctionDeclNode*,
+                       params: &TypeRef[]) -> TypeRef[] {
+        if (func == null || func.generic_params.length == 0) { return sema_copy_type_refs(params); }
+        mut decl: TypeRef[] = [];
+        for (mut pi: i64 = 0; pi < func.parameters.length; pi++) {
+            const pp: VarDeclNode* = func.parameters[pi];
+            if (pp == null || pp.is_receiver()) { continue; }
+            decl.push(pp.resolved_type);
+        }
+        if (decl.length != params.length) { return sema_copy_type_refs(params); }
+        mut pids: TypeRef[] = [];
+        for (mut i: i64 = 0; i < func.generic_params.length; i++) {
+            const gp: GenericParamNode* = func.generic_params[i];
+            if (gp == null) { return sema_copy_type_refs(params); }
+            pids.push(this.symbolic.symbolic_param_ref(gp, i as u64));
+        }
+        mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+        mut targs: &TypeAnnotation*[] = &call.generic_args;
+        const callee_node: ASTNode* = call.callee as ASTNode*;
+        if (targs.length == 0 && callee_node != null && callee_node.kind == NodeKind::MemberAccess) {
+            targs = &(call.callee as MemberAccessNode*).generic_args;
+        }
+        if (targs.length > 0) {
+            if (targs.length != func.generic_params.length) { return sema_copy_type_refs(params); }
+            const explicit: TypeRef[] = this.resolve_turbofish(targs);
+            if (explicit.length != targs.length) { return sema_copy_type_refs(params); }
+            for (mut i: i64 = 0; i < explicit.length; i++) { ictx.bind_slot(i, explicit[i]); }
+        }
+        for (mut i: i64 = 0; i < decl.length && i < call.arguments.length; i++) {
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null || !arg.resolved_type.is_valid()) { continue; }
+            ictx.unify(decl[i], arg.resolved_type);
+        }
+        mut subst: TypeSubstitution = TypeSubstitution::from_params(&ictx.params, &ictx.bindings);
+        return this.params_seen_through(&subst, &decl, params);
     }
 
     /// Add to `subst` every projection in `ty` whose base `subst` makes
@@ -7304,8 +7411,9 @@ type struct CallResolver {
         mut lookup_sym: SymbolStr = this.scope_owner_key(scope);
         mut owner: FamilyOwner = FamilyOwner::Def(DefId::invalid());
         mut leaf: SymbolStr = scope.member_name;
+        mut callee: DefId = DefId::invalid();
         if (names_module) {
-            const callee: DefId = this.resolve_module_qualified_def(scope);
+            callee = this.resolve_module_qualified_def(scope);
             if (!callee.is_valid()) { return; }
             owner = FamilyOwner::Def(this.ctx.defs.parent_of(callee));
             leaf = this.ctx.defs.leaf_of(callee);
@@ -7349,7 +7457,10 @@ type struct CallResolver {
                 const expected: i64 = ft.param_types.length;
                 const got: i64 = call.arguments.length;
                 if (got == expected || (ft.is_variadic && got > expected)) {
-                    this.check_args_against_params(visitor, &call.arguments, ft.param_types.as_slice());
+                    const params: TypeRef[] = this.free_call_params(
+                        if (callee.is_valid()) { this.ctx.generic_registry.template_of(callee) } else { null },
+                        call, &ft.param_types, &ft.param_types);
+                    this.check_args_against_params(visitor, &call.arguments, params.as_slice());
                 } else {
                     this.diag.emit_method_arity_error(call.span, scope.member_name, "function",
                         expected, got, ft.is_variadic);
