@@ -46,6 +46,9 @@ import std::collections::pair::{ Pair };
 import compiler::intrinsic_kind;
 import compiler::intrinsic_kind::{ IntrinsicKind };
 import utils::text::{ Text };
+import std::core::hash::{ Hash, Hasher };
+import std::core::cmp::{ Eq };
+import compiler::types::type_ref::{ TypeKey };
 
 
 /// One global's registration slot, read by value: the key the slot is
@@ -121,17 +124,85 @@ public:
     }
 }
 
+/// The key a family is stored under: the owner's definition and the member
+/// leaf, packed.  Made only by `family_slot`, the member-function door's
+/// key, so a family table is handed nothing a caller composed.  `none()`
+/// (0) is the key of no family: an owner this index never registered.
+type struct FamilySlot {
+private:
+    packed: u64;
+
+public:
+    static none() -> FamilySlot {
+        return FamilySlot { packed: 0 };
+    }
+
+    is_none(&this) -> boolean {
+        return this.packed == 0;
+    }
+}
+
+implement trait Hash for struct FamilySlot {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        this.packed.hash(hasher);
+    }
+}
+
+implement trait Eq for struct FamilySlot {
+    equals(&this, other: &FamilySlot) -> boolean {
+        return this.packed == other.packed;
+    }
+}
+
+/// The key of an owner's copy of a method definition: the owner type and
+/// the definition's slot, packed.  Made only by `copy_key`.
+type struct CopyKey {
+private:
+    packed: u64;
+}
+
+implement trait Hash for struct CopyKey {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        this.packed.hash(hasher);
+    }
+}
+
+implement trait Eq for struct CopyKey {
+    equals(&this, other: &CopyKey) -> boolean {
+        return this.packed == other.packed;
+    }
+}
+
+/// The key of an implicit conversion: the argument type and the return
+/// type, packed.  Made only by `converter_key`.
+type struct ConversionKey {
+private:
+    packed: u64;
+}
+
+implement trait Hash for struct ConversionKey {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        this.packed.hash(hasher);
+    }
+}
+
+implement trait Eq for struct ConversionKey {
+    equals(&this, other: &ConversionKey) -> boolean {
+        return this.packed == other.packed;
+    }
+}
+
 
 type struct DeclarationIndex {
     /// The compilation's definitions, for a definition's path.  Borrowed;
     /// set by `CompilationContext`, which owns it.
     defs: DefTable*;
     // Family slot (`family_slot`) -> the last signature registered in it
-    func_type_refs: HashMap<u64, TypeRef>;
+    func_type_refs: HashMap<FamilySlot, TypeRef>;
 
-    // Reverse: TypeRef.id -> the definition it was registered as, made by the
+    // Reverse: a type -> the definition it was registered as, made by the
     // registration; a type's name is read off the definition.
-    type_reverse:   HashMap<u64, DefId>;
+    type_reverse:   HashMap<TypeKey, DefId>;
 
     // The definition's slot in `defs` -> the type it was registered as;
     // invalid for a slot no type registration reached.
@@ -143,7 +214,7 @@ type struct DeclarationIndex {
 
     // A type definition's slot in `defs` -> the family its constructors
     // are registered in (`family_slot`); 0 for a type that registered none.
-    ctor_families:  u64[];
+    ctor_families:  FamilySlot[];
 
     // The definition's slot in `defs` -> the declaration the name layer
     // registered it for: a method's `MethodNode`, or a trait's declared
@@ -153,12 +224,12 @@ type struct DeclarationIndex {
     // (owner type << 32 | a method definition's slot in `defs`) -> the
     // entry of the owner's copy of that method: an instance's clone of its
     // template's method, a type's copy of a trait's default.
-    copy_entries:   HashMap<u64, OverloadId>;
+    copy_entries:   HashMap<CopyKey, OverloadId>;
 
     // A generic function's instance - the arena instantiation of its
     // template's placeholder with the type arguments - -> the entry its copy
     // registered.
-    instance_entries: HashMap<u64, OverloadId>;
+    instance_entries: HashMap<TypeKey, OverloadId>;
 
     // A global definition's slot in `defs` -> its registration slot in the
     // `module_global_*` arrays; -1 for a slot no global registration reached.
@@ -191,10 +262,10 @@ type struct DeclarationIndex {
                                       // a Cryo definition asks the linker for a
                                       // symbol nobody emits (`errno`).
 
-    // Array element TypeRef.id -> concrete Array_<T> qualified name SymbolStr.id.
+    // Array element type -> the concrete `Array<T>` instantiation.
     // Populated by the specialization pass so codegen can resolve T[].method()
     // to the monomorphized Array_T struct without name reconstruction.
-    array_elem_to_type:  HashMap<u64, TypeRef>;
+    array_elem_to_type:  HashMap<TypeKey, TypeRef>;
 
     // Implicit-conversion registry: Packed(arg_type_id, return_type_id) ->
     // the converter's definition.  Populated in DirectiveProcessing from
@@ -204,7 +275,7 @@ type struct DeclarationIndex {
     // that definition (e.g. `string` -> `Str` via `Str::new`) instead of
     // emitting E0214/E0200.  Keyed on the resolved canonical arena ids,
     // exactly the ids the use site sees.
-    implicit_converters: HashMap<u64, DefId>;
+    implicit_converters: HashMap<ConversionKey, DefId>;
 
     // Function registry: one entry per (family, signature, alias, symbol),
     // in parallel arrays; an entry's position is its `OverloadId`.  The
@@ -239,7 +310,7 @@ type struct DeclarationIndex {
                                       // the owner's arguments into it (a
                                       // receiver's, a turbofish on the owner).
                                       // The signature's own return otherwise.
-    overload_func_family: u64[];      // the family the entry is registered in
+    overload_func_family: FamilySlot[]; // the family the entry is registered in
                                       // (`family_slot`), so a definition's
                                       // overloads are read off its own entry.
     overload_func_intrinsic: IntrinsicKind[]; // how a call pinned to the entry
@@ -261,11 +332,12 @@ type struct DeclarationIndex {
     // in lockstep with each array push.
 
     // Family slot (`family_slot`) -> positions in the `overload_func_*` arrays.
-    overload_index:      HashMap<u64, u32[]>;
+    overload_index:      HashMap<FamilySlot, u32[]>;
 
     // C symbol -> (key, function type id) of the FIRST `extern "C"` block
     // declaration carrying it, for W0011: a later extern block declaring the
     // same symbol with another signature is reported against this one.
+    ![allow(lookup_by_spelling, reason = "a C symbol is the linker's name for an extern declaration, not a name in the program; two declarations of one symbol are compared by it")]
     extern_symbol_first: HashMap<u32, Pair<u32, u64>>;
 
     // --- Module reachability and declaration visibility --------------------
@@ -277,6 +349,7 @@ type struct DeclarationIndex {
     // A module's path id -> the path ids of the modules it can see through its
     // imports.  Populated once per module by the orchestrator (instance.cryo)
     // after module discovery.
+    ![allow(lookup_by_spelling, reason = "keyed by a module's path, which only the module graph makes and which names exactly one module")]
     module_imports:      HashMap<u32, u32[]>;
 
     // The modules `std::prelude` re-exports (those whose public types - Rc,
@@ -297,7 +370,7 @@ type struct DeclarationIndex {
     /// declaration that exists is a second report of the first, stated as
     /// something false.  A free function's refusal is recorded on its
     /// definition (`DefTable::signature_refused`).
-    refused_methods:     HashMap<u64, boolean>;
+    refused_methods:     HashMap<FamilySlot, boolean>;
 
 private:
     /// This index's tag, distinct from every other index the process made;
@@ -309,16 +382,16 @@ public:
         g_overload_index_tags = g_overload_index_tags + 1;
         return DeclarationIndex {
             defs: defs,
-            func_type_refs:      HashMap::<u64, TypeRef>::new(),
-            type_reverse:        HashMap::<u64, DefId>::new(),
+            func_type_refs:      HashMap::<FamilySlot, TypeRef>::new(),
+            type_reverse:        HashMap::<TypeKey, DefId>::new(),
             def_types:           [],
             def_entries:         [],
             ctor_families:       [],
             method_decls:        [],
-            copy_entries:        HashMap::<u64, OverloadId>::new(),
-            instance_entries:    HashMap::<u64, OverloadId>::new(),
-            array_elem_to_type:  HashMap::<u64, TypeRef>::new(),
-            implicit_converters: HashMap::<u64, DefId>::new(),
+            copy_entries:        HashMap::<CopyKey, OverloadId>::new(),
+            instance_entries:    HashMap::<TypeKey, OverloadId>::new(),
+            array_elem_to_type:  HashMap::<TypeKey, TypeRef>::new(),
+            implicit_converters: HashMap::<ConversionKey, DefId>::new(),
             def_globals:              [],
             module_global_leaves:     [],
             module_global_threadlocal: [],
@@ -334,11 +407,11 @@ public:
             overload_func_owner_return: [],
             overload_func_family: [],
             overload_func_intrinsic: [],
-            overload_index:     HashMap::<u64, u32[]>::new(),
+            overload_index:     HashMap::<FamilySlot, u32[]>::new(),
             extern_symbol_first: HashMap::<u32, Pair<u32, u64>>::new(),
             module_imports:     HashMap::<u32, u32[]>::new(),
             prelude_modules:    [],
-            refused_methods:    HashMap::<u64, boolean>::new(),
+            refused_methods:    HashMap::<FamilySlot, boolean>::new(),
             overload_tag:       g_overload_index_tags,
         };
     }
@@ -365,9 +438,9 @@ public:
     /// as the implicit conversion `(arg_ty) -> ret_ty`.  First-wins so a
     /// single converter per (arg, ret) pair is deterministic regardless of
     /// module load order.
-    register_implicit_converter(mut &this, arg_id: u64, ret_id: u64, converter: DefId) -> void {
+    register_implicit_converter(mut &this, arg_ty: TypeRef, ret_ty: TypeRef, converter: DefId) -> void {
         if (!converter.is_valid()) { return; }
-        const key: u64 = DeclarationIndex::pack_converter_key(arg_id, ret_id);
+        const key: ConversionKey = DeclarationIndex::converter_key(arg_ty, ret_ty);
         if (!this.implicit_converters.contains_key(&key)) {
             this.implicit_converters.insert(key, converter);
         }
@@ -382,17 +455,17 @@ public:
     /// which no family is stored under, for a type this index never
     /// registered: it owns no family here.
     ![allow(lookup_by_spelling, reason = "a family is a member leaf asked of an owner identity, the member-function door's own key")]
-    family_slot(&this, owner: FamilyOwner, leaf: SymbolStr) -> u64 {
+    family_slot(&this, owner: FamilyOwner, leaf: SymbolStr) -> FamilySlot {
         const d: DefId = match (owner) {
             FamilyOwner::Def(od) => { od }
             FamilyOwner::Type(t) => {
                 const td: DefId = this.registered_def(t);
-                if (!td.is_valid()) { return 0; }
+                if (!td.is_valid()) { return FamilySlot::none(); }
                 td
             }
         };
         const at: u64 = if (d.is_valid()) { (this.defs.slot(d) as u64) + 1 } else { 0 };
-        return (at << 32) | (leaf.id as u64);
+        return FamilySlot { packed: (at << 32) | (leaf.id as u64) };
     }
 
     /// The owner's path: a `Def`'s own, a `Type`'s the definition it was
@@ -415,8 +488,8 @@ public:
     /// `lookup_func_type_overloads`.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     reset_family(mut &this, owner: FamilyOwner, leaf: SymbolStr) -> void {
-        const slot: u64 = this.family_slot(owner, leaf);
-        if (slot == 0) { return; }
+        const slot: FamilySlot = this.family_slot(owner, leaf);
+        if (slot.is_none()) { return; }
         mut empty: u32[] = [];
         this.overload_index.insert(slot, empty);
     }
@@ -426,8 +499,8 @@ public:
     /// family by the entry it was registered as.
     reset_family_of_entry(mut &this, e: OverloadId) -> void {
         if (!e.is_valid()) { return; }
-        const slot: u64 = this.overload_func_family[this.slot_of(e)];
-        if (slot == 0) { return; }
+        const slot: FamilySlot = this.overload_func_family[this.slot_of(e)];
+        if (slot.is_none()) { return; }
         mut empty: u32[] = [];
         this.overload_index.insert(slot, empty);
     }
@@ -448,8 +521,8 @@ public:
     register_signature(mut &this, owner: FamilyOwner, leaf: SymbolStr, func_type_ref: TypeRef,
                        owner_return: TypeRef, symbol: SymbolStr, trait_sym: DefId,
                        span: SourceSpan, decl: ASTNode*) -> OverloadId {
-        const slot: u64 = this.family_slot(owner, leaf);
-        if (slot == 0) { return OverloadId::invalid(); }
+        const slot: FamilySlot = this.family_slot(owner, leaf);
+        if (slot.is_none()) { return OverloadId::invalid(); }
         this.func_type_refs.insert(slot, func_type_ref);
         match (this.overload_index.get_ref(&slot)) {
             Option::Some(positions) => {
@@ -470,9 +543,10 @@ public:
     }
 
     /// A new entry, recorded as belonging to the family stored under
-    /// `slot` (0 for none); the caller files it in that family.
+    /// `slot` (`FamilySlot::none()` for none); the caller files it in that
+    /// family.
     ![allow(lookup_by_spelling, reason = "the entry's linker symbol, stored with the entry; it keys no store")]
-    file_entry(mut &this, slot: u64, func_type_ref: TypeRef, owner_return: TypeRef,
+    file_entry(mut &this, slot: FamilySlot, func_type_ref: TypeRef, owner_return: TypeRef,
                symbol: SymbolStr, trait_sym: DefId, span: SourceSpan, decl: ASTNode*) -> OverloadId {
         const new_pos: u32 = this.overload_func_types.length as u32;
         this.overload_func_types.push(func_type_ref);
@@ -499,7 +573,7 @@ public:
                             intern: InternTable*, arena: TypeArena*,
                             span: SourceSpan, decl: ASTNode*) -> OverloadId {
         const symbol: SymbolStr = this.mangle_function_symbol(home, minted, return_type, func_type_ref, intern, arena);
-        return this.file_entry(0, func_type_ref, return_type, symbol, DefId::invalid(), span, decl);
+        return this.file_entry(FamilySlot::none(), func_type_ref, return_type, symbol, DefId::invalid(), span, decl);
     }
 
     /// The trait entry `id`'s declaration implements; empty for an inherent
@@ -563,7 +637,7 @@ public:
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     lookup_family_entries(&this, owner: FamilyOwner, leaf: SymbolStr) -> OverloadId[] {
         mut result: OverloadId[] = [];
-        const slot: u64 = this.family_slot(owner, leaf);
+        const slot: FamilySlot = this.family_slot(owner, leaf);
         match (this.overload_index.get_ref(&slot)) {
             Option::Some(positions) => {
                 for (mut k: i64 = 0; k < (*positions).length; k++) {
@@ -604,12 +678,12 @@ public:
     constructor_entries_of(&this, d: DefId) -> OverloadId[] {
         if (!d.is_valid()) { return []; }
         const slot: i64 = this.defs.slot(d);
-        if (slot >= this.ctor_families.length || this.ctor_families[slot] == 0) { return []; }
+        if (slot >= this.ctor_families.length || this.ctor_families[slot].is_none()) { return []; }
         return this.entries_in_family(this.ctor_families[slot]);
     }
 
     /// The entries registered in the family stored under `slot`.
-    entries_in_family(&this, slot: u64) -> OverloadId[] {
+    entries_in_family(&this, slot: FamilySlot) -> OverloadId[] {
         mut result: OverloadId[] = [];
         match (this.overload_index.get_ref(&slot)) {
             Option::Some(positions) => {
@@ -638,7 +712,7 @@ public:
     method_entry_on(&this, owner: TypeRef, d: DefId) -> OverloadId {
         if (!d.is_valid()) { return OverloadId::invalid(); }
         if (this.defs.parent_of(d).equals(this.registered_def(owner))) { return this.entry_of_def(d); }
-        return match (this.copy_entries.get(&DeclarationIndex::copy_key(owner, this.defs.slot(d)))) {
+        return match (this.copy_entries.get(&this.copy_key(owner, d))) {
             Option::Some(e) => { e }
             Option::None    => { OverloadId::invalid() }
         };
@@ -647,22 +721,22 @@ public:
     /// Record `e` as the entry of the generic function instance `inst`.
     record_instance(mut &this, inst: TypeRef, e: OverloadId) -> void {
         if (!inst.is_valid() || !e.is_valid()) { return; }
-        this.instance_entries.insert(inst.key(), e);
+        this.instance_entries.insert(inst.table_key(), e);
     }
 
     /// The entry the copy of the generic function instance `inst` registered;
     /// invalid before that copy is registered.
     entry_of_instance(&this, inst: TypeRef) -> OverloadId {
         if (!inst.is_valid()) { return OverloadId::invalid(); }
-        return match (this.instance_entries.get(&inst.key())) {
+        return match (this.instance_entries.get(&inst.table_key())) {
             Option::Some(e) => { e }
             Option::None    => { OverloadId::invalid() }
         };
     }
 
-    /// The key of `owner`'s copy of the definition at `def_slot`.
-    static copy_key(owner: TypeRef, def_slot: i64) -> u64 {
-        return (owner.key() << 32) | (def_slot as u64);
+    /// The key of `owner`'s copy of the method definition `d`.
+    copy_key(&this, owner: TypeRef, d: DefId) -> CopyKey {
+        return CopyKey { packed: (owner.key() << 32) | (this.defs.slot(d) as u64) };
     }
 
     /// The function of the method definition `d`: a type's or an
@@ -733,7 +807,7 @@ public:
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     lookup_func_type_overloads(&this, owner: FamilyOwner, leaf: SymbolStr) -> TypeRef[] {
         mut result: TypeRef[] = [];
-        const slot: u64 = this.family_slot(owner, leaf);
+        const slot: FamilySlot = this.family_slot(owner, leaf);
         match (this.overload_index.get_ref(&slot)) {
             Option::Some(positions) => {
                 mut k: i64 = 0;
@@ -805,7 +879,7 @@ public:
     /// The definition `ty` was registered as, or an invalid id when it was
     /// never registered here.
     registered_def(&this, ty: TypeRef) -> DefId {
-        return match (this.type_reverse.get(&ty.key())) {
+        return match (this.type_reverse.get(&ty.table_key())) {
             Option::Some(d) => { d }
             Option::None    => { DefId::invalid() }
         };
@@ -823,7 +897,7 @@ public:
     /// `type_of_def`, and nowhere else: a definition's path is display text,
     /// and two definitions written under one path are two types.
     register_type(mut &this, def: DefId, ty: TypeRef, is_public: boolean) -> void {
-        this.type_reverse.insert(ty.key(), def);
+        this.type_reverse.insert(ty.table_key(), def);
         this.defs.record_visibility(def, is_public);
         const slot: i64 = this.defs.slot(def);
         while (this.def_types.length <= slot) { this.def_types.push(TypeRef::invalid()); }
@@ -835,13 +909,13 @@ public:
     /// canonical (many TypeRefs describe one `T[]`) but its element is.
     /// Called by the specialization pass after monomorphizing `Array<T>`.
     register_array_element_type(mut &this, element: TypeRef, array_struct: TypeRef) -> void {
-        this.array_elem_to_type.insert(element.key(), array_struct);
+        this.array_elem_to_type.insert(element.table_key(), array_struct);
     }
 
     /// The concrete `Array<T>` specialization for a given element type; the
     /// owner a method call on `T[]` resolves against.
     lookup_array_type(&this, element: TypeRef) -> TypeRef {
-        return match (this.array_elem_to_type.get(&element.key())) {
+        return match (this.array_elem_to_type.get(&element.table_key())) {
             Option::Some(val) => { val }
             Option::None      => { TypeRef::invalid() }
         };
@@ -857,7 +931,7 @@ public:
     /// (e.g., InstantiatedType, ArrayType) resolvable to an already-
     /// registered concrete type's qualified name.
     register_type_reverse_only(mut &this, def: DefId, ty: TypeRef) -> void {
-        this.type_reverse.insert(ty.key(), def);
+        this.type_reverse.insert(ty.table_key(), def);
     }
 
     /// Register the global definition `def`, declared as `leaf` by the module
@@ -1093,7 +1167,7 @@ public:
                 const td: DefId = this.registered_def(owner);
                 if (td.is_valid()) {
                     const ts: i64 = this.defs.slot(td);
-                    while (this.ctor_families.length <= ts) { this.ctor_families.push(0); }
+                    while (this.ctor_families.length <= ts) { this.ctor_families.push(FamilySlot::none()); }
                     this.ctor_families[ts] = this.overload_func_family[this.slot_of(entry)];
                 }
             }
@@ -1104,7 +1178,7 @@ public:
             const instance: boolean = method.spec_of != null && method.spec_of.func != null
                 && method.spec_of.func.generic_params.length > 0;
             if (func.copy_of.is_valid() && func.spec_type_args.length == 0 && !instance && entry.is_valid()) {
-                this.copy_entries.insert(DeclarationIndex::copy_key(owner, this.defs.slot(func.copy_of)), entry);
+                this.copy_entries.insert(this.copy_key(owner, func.copy_of), entry);
             }
         }
     }
@@ -1117,7 +1191,7 @@ public:
     /// keyed by the same family that could answer differently.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     lookup_func_type(&this, owner: FamilyOwner, leaf: SymbolStr) -> TypeRef {
-        const slot: u64 = this.family_slot(owner, leaf);
+        const slot: FamilySlot = this.family_slot(owner, leaf);
         return match (this.func_type_refs.get(&slot)) {
             Option::Some(val) => { val }
             Option::None      => { TypeRef::invalid() }
@@ -1222,10 +1296,10 @@ public:
     }
 
     /// Look up an implicit converter for `(arg_ty) -> ret_ty` by their
-    /// canonical arena ids: the converter's definition, or an invalid id if
-    /// none is registered.
-    lookup_implicit_converter(&this, arg_id: u64, ret_id: u64) -> DefId {
-        const key: u64 = DeclarationIndex::pack_converter_key(arg_id, ret_id);
+    /// canonical arena types: the converter's definition, or an invalid id
+    /// if none is registered.
+    lookup_implicit_converter(&this, arg_ty: TypeRef, ret_ty: TypeRef) -> DefId {
+        const key: ConversionKey = DeclarationIndex::converter_key(arg_ty, ret_ty);
         return match (this.implicit_converters.get(&key)) {
             Option::Some(v) => { v }
             Option::None    => { DefId::invalid() }
@@ -1358,8 +1432,8 @@ public:
     /// family, and records nothing.
     ![allow(lookup_by_spelling, reason = "a family is a member leaf asked of an owner identity, the member-function door's own key")]
     mark_method_signature_refused(mut &this, owner: TypeRef, method: SymbolStr) -> void {
-        const slot: u64 = this.family_slot(FamilyOwner::Type(owner), method);
-        if (slot == 0) { return; }
+        const slot: FamilySlot = this.family_slot(FamilyOwner::Type(owner), method);
+        if (slot.is_none()) { return; }
         this.refused_methods.insert(slot, true);
     }
 
@@ -1367,8 +1441,8 @@ public:
     /// was refused.
     ![allow(lookup_by_spelling, reason = "a family is a member leaf asked of an owner identity, the member-function door's own key")]
     method_signature_refused(&this, owner: TypeRef, method: SymbolStr) -> boolean {
-        const slot: u64 = this.family_slot(FamilyOwner::Type(owner), method);
-        if (slot == 0) { return false; }
+        const slot: FamilySlot = this.family_slot(FamilyOwner::Type(owner), method);
+        if (slot.is_none()) { return false; }
         return this.refused_methods.contains_key(&slot);
     }
 
@@ -1451,11 +1525,11 @@ public:
         };
     }
 
-    /// Pack an implicit-converter registry key from the argument and return
-    /// TypeRef ids: the upper 32 bits the argument, the lower 32 the return.
-    /// Arena ids fit comfortably in 32 bits in practice.
-    static pack_converter_key(arg_id: u64, ret_id: u64) -> u64 {
-        return (arg_id << 32) | (ret_id & 0xFFFFFFFF);
+    /// The implicit-converter registry key of the argument and return
+    /// types: the upper 32 bits the argument's number, the lower 32 the
+    /// return's.
+    static converter_key(arg_ty: TypeRef, ret_ty: TypeRef) -> ConversionKey {
+        return ConversionKey { packed: (arg_ty.key() << 32) | (ret_ty.key() & 0xFFFFFFFF) };
     }
 
 

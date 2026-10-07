@@ -65,7 +65,7 @@ import utils::logger;
 import utils::logger::{ cdebug };
 import std::fmt;
 import compiler::ast::declaration::{
-    ClassDeclNode, DeclarationNode, EnumDeclNode, ExternBlockNode, FunctionDeclNode,
+    ClassDeclNode, DeclarationNode, EnumDeclNode, ExternBlockNode, FieldDeclNode, FunctionDeclNode,
     ImplBlockNode, MethodNode, StructDeclNode, UnionDeclNode, VarDeclNode
 };
 import compiler::ast::node::{ ASTNode, ProgramNode };
@@ -79,6 +79,10 @@ import compiler::types::arena::{ TypeArena };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ ClassType, EnumType, StructType };
+import compiler::types::generic::{ InstantiatedType };
+import compiler::types::generic_registry::{ GenericRegistry };
+import compiler::resolver::res::{ DefId };
+import compiler::resolver::lang_item::{ LangItem };
 import utils::keyword::{ Keyword };
 import utils::text::{ Text };
 
@@ -165,6 +169,7 @@ type enum DirectiveTarget {
     Module;       // top-level (no owning decl)
     Function;
     Method;       // a method inside a struct/class body or impl block
+    Field;        // a field of a struct, class or union
     Struct;
     Union;
     Class;
@@ -187,6 +192,7 @@ implement enum DirectiveTarget {
         return match (k) {
             NodeKind::FunctionDeclaration   => { DirectiveTarget::Function }
             NodeKind::MethodDeclaration     => { DirectiveTarget::Method   }
+            NodeKind::FieldDeclaration      => { DirectiveTarget::Field    }
             NodeKind::StructDeclaration     => { DirectiveTarget::Struct   }
             NodeKind::UnionDeclaration      => { DirectiveTarget::Union    }
             NodeKind::ClassDeclaration      => { DirectiveTarget::Class    }
@@ -208,6 +214,7 @@ implement enum DirectiveTarget {
             DirectiveTarget::Module    => { "module" }
             DirectiveTarget::Function  => { "function" }
             DirectiveTarget::Method    => { "method" }
+            DirectiveTarget::Field     => { "field" }
             DirectiveTarget::Struct    => { "struct" }
             DirectiveTarget::Union     => { "union" }
             DirectiveTarget::Class     => { "class" }
@@ -734,8 +741,9 @@ type struct DirectiveProcessingPasses {
             // `![allow(lint, ..., reason = "...")]`: lint names, and at most
             // one `reason`, a non-empty string literal.  `lookup_by_spelling`
             // is denied unless allowed, and allowing it takes a reason and a
-            // function or method: a wider allow would cover declarations
-            // written after it, which never had a reason of their own.
+            // function, method or field: a wider allow would cover
+            // declarations written after it, which never had a reason of
+            // their own.
             "allow" | "warn" | "deny" => {
                 if (argc == 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
@@ -788,8 +796,9 @@ type struct DirectiveProcessingPasses {
                     return;
                 }
                 if (!name.eq("allow")) { return; }
-                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("function or method"), target);
+                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method
+                        && target != DirectiveTarget::Field) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, Text::new("function, method or field"), target);
                 }
                 // A misspelt key is already refused; saying the reason is also
                 // missing would report one mistake twice.
@@ -1477,10 +1486,76 @@ type struct DirectiveProcessingPasses {
         }
     }
 
+    /// The root namespace whose modules keep the compiler's declaration
+    /// stores: the one the spelling types above are declared under.  A store
+    /// is a table the compiler answers names from, so the key lint covers
+    /// these modules and no program the compiler compiles.
+    static store_root() -> string {
+        return "compiler";
+    }
+
+    /// Whether the module this pass is linting is one of `store_root`'s.
+    static in_store_root(ctx: CompilationContext*) -> boolean {
+        const m: ModulePath = ctx.current_module();
+        if (!m.is_valid()) { return false; }
+        const path: string = ctx.intern_table.resolve(m.as_sym());
+        const root: string = DirectiveProcessingPasses::store_root();
+        return path.eq(root) || path.starts_with(root + "::");
+    }
+
+    /// The key of a field of type `ty`, spelled for a message, when `ty` is
+    /// a hash table (`HashMap` or `HashSet`) keyed by something other than
+    /// an identity: an integer, a `string`, or a spelling type.  "" for any
+    /// other field.  An identity reaches a table only through its key type
+    /// (`TypeKey`, `DefKey`, `SymbolKey`, a door's key), so a raw number in
+    /// the key position is one nothing stops a spelling's id from filling.
+    static raw_table_key_of(ctx: CompilationContext*, ty: TypeRef) -> string {
+        const t: Type* = ctx.type_arena.lookup(ty);
+        if (t == null || t.kind != TypeKind::InstantiatedType) { return ""; }
+        const inst: InstantiatedType* = t as InstantiatedType*;
+        if (inst.type_args.length == 0) { return ""; }
+        const base: DefId = ctx.decl_index.registered_def(inst.generic_base);
+        const reg: GenericRegistry* = ctx.get_generic_registry();
+        if (!base.is_valid() || reg == null) { return ""; }
+        if (!base.equals(reg.wellknown(LangItem::HashMap)) && !base.equals(reg.wellknown(LangItem::HashSet))) {
+            return "";
+        }
+        const key: TypeRef = inst.type_args[0];
+        const spelling: string = DirectiveProcessingPasses::spelling_type_of(ctx, key);
+        if (spelling.length() > 0) { return spelling; }
+        const kt: Type* = ctx.type_arena.lookup(key);
+        if (kt == null) { return ""; }
+        if (kt.kind == TypeKind::Int || kt.kind == TypeKind::String) {
+            return ctx.type_arena.resolve_display_name_short(key);
+        }
+        return "";
+    }
+
+    /// E0157 at every field of `fields` that keys a hash table by text or a
+    /// raw number, unless the field's own directives allow
+    /// `lookup_by_spelling`.
+    static lint_store_keys(ctx: CompilationContext*, owner: Text, fields: &FieldDeclNode*[]) -> void {
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            const f: FieldDeclNode* = fields[i];
+            if (f == null || !f.resolved_type.is_valid()) { continue; }
+            if (DirectiveProcessingPasses::allows_spelling(&f.attached_directives)) { continue; }
+            const key: string = DirectiveProcessingPasses::raw_table_key_of(ctx, f.resolved_type);
+            if (key.length() == 0) { continue; }
+            const msg: string = fmt::format("`%s.%s` keys a table by `%s`, not by an identity",
+                owner.as_string(), ctx.intern_table.resolve(f.name), key);
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0157_LOOKUP_BY_SPELLING, Text::new(msg));
+            diag = diag.at(f.span);
+            diag = diag.help(Text::new(
+                "key it by the identity's own key (`TypeRef::table_key`, `DefTable::table_key`, `SymbolID::table_key`), or say why it cannot: `![allow(lookup_by_spelling, reason = \"...\")]` on the field"));
+            ctx.emit_diagnostic(diag);
+        }
+    }
+
     /// Lint every function and method this module declares.  A method cloned
     /// from a trait's default body is skipped: its declaration is the
     /// trait's, which carries no directives of its own to allow it with.
     static run_spelling_lint(ctx: CompilationContext*, root: ProgramNode*) -> void {
+        const stores: boolean = DirectiveProcessingPasses::in_store_root(ctx);
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
@@ -1492,11 +1567,17 @@ type struct DirectiveProcessingPasses {
             const empty_methods: MethodNode*[] = [];
             mut methods: &MethodNode*[] = &empty_methods;
             if (stmt.kind == NodeKind::StructDeclaration) {
-                methods = &(stmt as StructDeclNode*).methods;
+                const sd: StructDeclNode* = stmt as StructDeclNode*;
+                methods = &sd.methods;
+                if (stores) { DirectiveProcessingPasses::lint_store_keys(ctx, Text::new(ctx.intern_table.resolve(sd.name)), &sd.fields); }
             } else if (stmt.kind == NodeKind::UnionDeclaration) {
-                methods = &(stmt as UnionDeclNode*).methods;
+                const ud: UnionDeclNode* = stmt as UnionDeclNode*;
+                methods = &ud.methods;
+                if (stores) { DirectiveProcessingPasses::lint_store_keys(ctx, Text::new(ctx.intern_table.resolve(ud.name)), &ud.fields); }
             } else if (stmt.kind == NodeKind::ClassDeclaration) {
-                methods = &(stmt as ClassDeclNode*).methods;
+                const cd: ClassDeclNode* = stmt as ClassDeclNode*;
+                methods = &cd.methods;
+                if (stores) { DirectiveProcessingPasses::lint_store_keys(ctx, Text::new(ctx.intern_table.resolve(cd.name)), &cd.fields); }
             } else if (stmt.kind == NodeKind::ImplementationBlock) {
                 methods = &(stmt as ImplBlockNode*).methods;
             }
@@ -1685,6 +1766,36 @@ type struct DirectiveProcessingPasses {
                 }
             }
 
+            // Descend into the fields of structs, classes and unions: a field
+            // carries the allow the store-key lint reads.
+            const empty_fields: FieldDeclNode*[] = [];
+            mut field_list: &FieldDeclNode*[] = &empty_fields;
+            if (decl.kind == NodeKind::StructDeclaration) {
+                field_list = &(decl as StructDeclNode*).fields;
+            } else if (decl.kind == NodeKind::UnionDeclaration) {
+                field_list = &(decl as UnionDeclNode*).fields;
+            } else if (decl.kind == NodeKind::ClassDeclaration) {
+                field_list = &(decl as ClassDeclNode*).fields;
+            }
+            for (mut fi: i64 = 0; fi < field_list.length; fi++) {
+                const fd: FieldDeclNode* = field_list[fi];
+                if (fd == null) { continue; }
+                for (mut fj: i64 = 0; fj < fd.attached_directives.length; fj++) {
+                    const fdir: DirectiveNode* = fd.attached_directives[fj];
+                    if (fdir == null) { continue; }
+                    DirectiveProcessingPasses::validate_builtin(ctx, fdir, DirectiveTarget::Field);
+                    const f_rec: DirectiveRecord = DirectiveRecord {
+                        kind: fdir.directive_kind,
+                        node: fdir,
+                        decl: fd as DeclarationNode*,
+                        qualified_name: SymbolStr::empty(),
+                        span: fdir.span,
+                    };
+                    registry.add(f_rec);
+                    count += 1;
+                }
+            }
+
             // Descend into extern-block functions so per-function directives
             // like `![symbol("sym")]` are validated + applied; the block is the
             // top-level statement, its functions aren't otherwise visited here.
@@ -1809,7 +1920,7 @@ type struct DirectiveProcessingPasses {
         const p: VarDeclNode* = fn.parameters[0];
         if (p == null || !p.resolved_type.is_valid()) { return; }
         ctx.decl_index.register_implicit_converter(
-            p.resolved_type.key(), fn.resolved_return_type.key(), fn.def);
+            p.resolved_type, fn.resolved_return_type, fn.def);
     }
 
     // Layout-attr propagation: AST -> Type

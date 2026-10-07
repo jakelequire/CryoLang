@@ -30,6 +30,7 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::ast::declaration;
 import compiler::ast::declaration::{ FunctionDeclNode, GenericParamNode, ImplBlockNode };
 import compiler::resolver::res;
+import compiler::resolver::res::{ DefKey };
 import compiler::decl_index::{ OverloadId };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
@@ -58,12 +59,15 @@ type struct ClosureSpec {
 
 type struct SemaState {
     // -- Per-function locals (reset via ScopeManager.enter_function) --
+    ![allow(lookup_by_spelling, reason = "a scope rib: a function's locals are bound by the names written for them")]
     locals:         HashMap<u32, TypeRef>;   // local variable scope (fast path)
+    ![allow(lookup_by_spelling, reason = "a scope rib: a function's locals are bound by the names written for them")]
     local_muts:     HashMap<u32, boolean>;   // mutability flag for each local
     // Span of the declaring `const`/`mut` keyword (top-level locals) or a
     // zero-width insertion anchor (params declared without `mut`).  E0218
     // reads this for a precise "replace `const` with `mut`" / "insert `mut`"
     // quickfix; a missing entry means the explanatory note only.
+    ![allow(lookup_by_spelling, reason = "a scope rib: a function's locals are bound by the names written for them")]
     local_kw_spans: HashMap<u32, SourceSpan>;
     undo_keys:      u32[];                    // scope undo log: keys modified
     undo_prev:      TypeRef[];                // scope undo log: previous values
@@ -136,8 +140,10 @@ type struct SemaState {
     facts_params: TypeRef[];
     // Every local declared with an initializer, by its symbol's key, to its
     // declaration; a record reads where a local's value came from here.
+    ![allow(lookup_by_spelling, reason = "the `--emit=facts` report's scratch, keyed by a binding's number; it is deleted with the report")]
     facts_inits:  HashMap<u64, u64>;
     // The loop depth each of those locals is declared at.
+    ![allow(lookup_by_spelling, reason = "the `--emit=facts` report's scratch, keyed by a binding's number; it is deleted with the report")]
     facts_depths: HashMap<u64, u64>;
 
     // -- Closure-capture detection (mutated by LambdaSynth, read by resolve_identifier) --
@@ -148,6 +154,7 @@ type struct SemaState {
     // here on a `locals` miss means "free variable, record a capture".
     // `current_lambda`: the lambda whose body we're walking - the capture sink.
     in_lambda_depth:     i32;
+    ![allow(lookup_by_spelling, reason = "a scope rib: the names visible from outside the lambda being checked")]
     lambda_outer_locals: HashMap<u32, TypeRef>;
     current_lambda:      LambdaExprNode*;
 
@@ -157,9 +164,9 @@ type struct SemaState {
     // A free function's copies specialized for capturing closures, one per
     // (function, the closures' positions and types), so every call passing
     // the same closures is pinned to one copy.  Keyed by the function's
-    // definition slot; a key's copies are told apart by `ClosureSpec::binds`.
+    // definition; a key's copies are told apart by `ClosureSpec::binds`.
     closure_specs:     ClosureSpec[];
-    closure_spec_keys: HashMap<i64, i64[]>;
+    closure_spec_keys: HashMap<DefKey, i64[]>;
 
     // Re-entrancy guard for implicit-conversion synthesis: set while re-resolving
     // a synthesized `converter(arg)` call so its own args don't re-trigger a
@@ -249,7 +256,7 @@ type struct SemaState {
             current_lambda:      null,
             closure_counter:  0,
             closure_specs:     [],
-            closure_spec_keys: HashMap::<i64, i64[]>::new(),
+            closure_spec_keys: HashMap::<DefKey, i64[]>::new(),
             in_implicit_conversion: false,
             try_counter: 0,
             in_symbolic_check:           false,
@@ -269,7 +276,7 @@ type struct SemaState {
 
     /// The entry of the copy of the function at `def_slot` specialized for
     /// closures of `types` at `positions`; invalid when none was made.
-    closure_spec(&this, def_slot: i64, positions: &i64[], types: &TypeRef[]) -> OverloadId {
+    closure_spec(&this, def_slot: DefKey, positions: &i64[], types: &TypeRef[]) -> OverloadId {
         match (this.closure_spec_keys.get_ref(&def_slot)) {
             Option::Some(at) => {
                 for (mut k: i64 = 0; k < (*at).length; k++) {
@@ -284,7 +291,7 @@ type struct SemaState {
 
     /// Record `entry` as the copy of the function at `def_slot` specialized
     /// for closures of `types` at `positions`.
-    add_closure_spec(mut &this, def_slot: i64, positions: i64[], types: TypeRef[], entry: OverloadId) -> void {
+    add_closure_spec(mut &this, def_slot: DefKey, positions: i64[], types: TypeRef[], entry: OverloadId) -> void {
         const at: i64[]* = this.closure_spec_keys.get_or_insert(def_slot, []);
         at.push(this.closure_specs.length);
         this.closure_specs.push(ClosureSpec { positions: positions, types: types, entry: entry });

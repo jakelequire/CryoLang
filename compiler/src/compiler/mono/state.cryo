@@ -41,11 +41,35 @@ import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::resolver::{ ResolutionContext, TypeResolver };
 import compiler::types::type_base::{ Type };
-import compiler::types::type_ref::{ TypeRef };
+import compiler::types::type_ref::{ TypeRef, TypeKey };
 import compiler::types::user_defined::{ ClassType, EnumType, StructType };
 import compiler::module_graph;
 import compiler::module_graph::{ ModulePath };
+import compiler::resolver::res::{ DefKey };
+import std::core::hash::{ Hash, Hasher };
+import std::core::cmp::{ Eq };
 
+
+/// The key of an owner's instances of a method definition: the owner type
+/// and the definition.  Made only by `MonoState::instance_key`.
+type struct InstanceKey {
+private:
+    owner: TypeKey;
+    def:   DefKey;
+}
+
+implement trait Hash for struct InstanceKey {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        this.owner.hash(hasher);
+        this.def.hash(hasher);
+    }
+}
+
+implement trait Eq for struct InstanceKey {
+    equals(&this, other: &InstanceKey) -> boolean {
+        return this.owner.equals(&other.owner) && this.def.equals(&other.def);
+    }
+}
 
 // MonomorphRequest: a pending instantiation to specialize
 
@@ -148,7 +172,7 @@ type struct MonoState {
     // cleared by `reset_worklist`): an instance, once emitted, is shared by
     // every module.
     method_instances: MethodInstance[];
-    instance_keys:    HashMap<u64, i64[]>;
+    instance_keys:    HashMap<InstanceKey, i64[]>;
 
     // Arena ids of InstantiatedTypes that have a REGISTERED spec entry.
     //
@@ -161,10 +185,10 @@ type struct MonoState {
     // spec it is currently inside - the `String<GlobalAlloc>` self-reference case).
     // During that window the slot still reads as an unresolved wrapper even though
     // the spec exists, so the slot kind cannot answer it and this set must.
-    // Keyed by the instantiation's arena id directly, so membership costs no
-    // allocation or string hash, and "same instantiation" is decided by the
-    // arena's interner rather than independently here.
-    materialized_insts: HashMap<u64, boolean>;
+    // Keyed by the instantiation itself, so membership costs no allocation
+    // or string hash, and "same instantiation" is decided by the arena's
+    // interner rather than independently here.
+    materialized_insts: HashMap<TypeKey, boolean>;
 
     // Owner modules of generic-METHOD specs (those attached to an impl block or a
     // fixed receiver's decl, NOT the `spec_entries` type/free-function specs).
@@ -192,16 +216,16 @@ type struct MonoState {
             nested_visited:   [],
             error_count:      0,
             method_instances: [],
-            instance_keys:    HashMap::<u64, i64[]>::new(),
-            materialized_insts: HashMap::<u64, boolean>::new(),
+            instance_keys:    HashMap::<InstanceKey, i64[]>::new(),
+            materialized_insts: HashMap::<TypeKey, boolean>::new(),
             spec_owner_files: [],
         };
     }
 
-    /// The entry of `owner`'s instance of the method definition at
-    /// `def_slot` at the type arguments `args`; invalid when none was minted.
-    method_instance(&this, owner: TypeRef, def_slot: i64, args: &TypeRef[]) -> OverloadId {
-        const key: u64 = MonoState::instance_key(owner, def_slot);
+    /// The entry of `owner`'s instance of the method definition `def` at
+    /// the type arguments `args`; invalid when none was minted.
+    method_instance(&this, owner: TypeRef, def: DefKey, args: &TypeRef[]) -> OverloadId {
+        const key: InstanceKey = MonoState::instance_key(owner, def);
         match (this.instance_keys.get_ref(&key)) {
             Option::Some(positions) => {
                 for (mut k: i64 = 0; k < (*positions).length; k++) {
@@ -214,17 +238,17 @@ type struct MonoState {
         return OverloadId::invalid();
     }
 
-    /// Record `entry` as `owner`'s instance of the method definition at
-    /// `def_slot` at the type arguments `args`.
-    add_method_instance(mut &this, owner: TypeRef, def_slot: i64, args: TypeRef[], entry: OverloadId) -> void {
-        const key: u64 = MonoState::instance_key(owner, def_slot);
+    /// Record `entry` as `owner`'s instance of the method definition `def`
+    /// at the type arguments `args`.
+    add_method_instance(mut &this, owner: TypeRef, def: DefKey, args: TypeRef[], entry: OverloadId) -> void {
+        const key: InstanceKey = MonoState::instance_key(owner, def);
         const positions: i64[]* = this.instance_keys.get_or_insert(key, []);
         positions.push(this.method_instances.length);
         this.method_instances.push(MethodInstance { args: args, entry: entry });
     }
 
-    static instance_key(owner: TypeRef, def_slot: i64) -> u64 {
-        return (owner.key() << 32) | (def_slot as u64);
+    static instance_key(owner: TypeRef, def: DefKey) -> InstanceKey {
+        return InstanceKey { owner: owner.table_key(), def: def };
     }
 
     /// True if a spec entry has been REGISTERED for this instantiation (see
@@ -233,16 +257,14 @@ type struct MonoState {
     /// latter is the instantiation itself.
     has_materialized_spec(&this, inst: TypeRef) -> boolean {
         if (!inst.is_valid()) { return false; }
-        const key: u64 = inst.key();
-        return this.materialized_insts.contains_key(&key);
+        return this.materialized_insts.contains_key(&inst.table_key());
     }
 
     /// Record that a spec entry has been registered for this instantiation.
     /// Called at spec-entry registration, before the wrapper->concrete swap.
     mark_materialized_spec(mut &this, inst: TypeRef) -> void {
         if (!inst.is_valid()) { return; }
-        const key: u64 = inst.key();
-        this.materialized_insts.insert(key, true);
+        this.materialized_insts.insert(inst.table_key(), true);
     }
 
     /// Record the source file of the unit that owns a just-materialized
@@ -320,7 +342,7 @@ type struct MonoState {
 
         // Double-check against the GenericRegistry; only enqueue types that were
         // actually registered as templates during TemplateRegistration.
-        if (!this.generic_registry.is_template(inst.generic_base.key())) {
+        if (!this.generic_registry.is_template(inst.generic_base)) {
             return;
         }
 

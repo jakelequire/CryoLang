@@ -46,7 +46,7 @@ import compiler::ast;
 import compiler::ast::{ declaration, expression, LiteralKind, node, NodeKind, TypeAnnotation };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::resolver::res;
-import compiler::resolver::res::{ Res, ResBase, ResSlot, DefTable, DefId };
+import compiler::resolver::res::{ Res, ResBase, ResSlot, DefTable, DefId, DefKey };
 import compiler::types::{ type_ref, arena };
 import compiler::types::type_base;
 import compiler::types::type_base::{ Type };
@@ -117,23 +117,23 @@ type struct ConstantTable {
     /// set by `CompilationContext`, which owns it.
     defs: DefTable*;
     entries: ConstEntry[];
-    /// The constant's definition's slot -> index into `entries`.
-    by_def: HashMap<i64, i64>;
+    /// The constant's definition -> index into `entries`.
+    by_def: HashMap<DefKey, i64>;
 
     /// Module-level `type enum` declarations, so `Enum::Variant` folds to its
     /// discriminant.  Keyed by the enum's definition: the resolver says which
     /// type a written scope names, so there is nothing here for a spelling to
     /// be matched against.
     enums: EnumDeclNode*[];
-    enums_by_def: HashMap<i64, i64>;
+    enums_by_def: HashMap<DefKey, i64>;
 
     static new(defs: DefTable*) -> ConstantTable {
         return ConstantTable {
             defs: defs,
             entries:      [],
-            by_def:       HashMap::<i64, i64>::new(),
+            by_def:       HashMap::<DefKey, i64>::new(),
             enums:        [],
-            enums_by_def: HashMap::<i64, i64>::new(),
+            enums_by_def: HashMap::<DefKey, i64>::new(),
         };
     }
 
@@ -145,7 +145,7 @@ type struct ConstantTable {
     register(mut &this, def: DefId, init: ExpressionNode*,
              int_typed: boolean) -> void {
         if (!def.is_valid()) { return; }
-        const key: i64 = this.defs.slot(def);
+        const key: DefKey = this.defs.table_key(def);
         match (this.by_def.get(&key)) {
             Option::Some(existing) => {
                 this.entries[existing].init       = init;
@@ -176,7 +176,7 @@ type struct ConstantTable {
     /// definition replaces the node.
     register_enum(mut &this, node: EnumDeclNode*) -> void {
         if (node == null || !node.def.is_valid()) { return; }
-        const key: i64 = this.defs.slot(node.def);
+        const key: DefKey = this.defs.table_key(node.def);
         match (this.enums_by_def.get(&key)) {
             Option::Some(existing) => { this.enums[existing] = node; return; }
             Option::None => { }
@@ -190,7 +190,7 @@ type struct ConstantTable {
     /// table holds.
     index_of(&this, d: DefId) -> i64 {
         if (!d.is_valid()) { return -1; }
-        return match (this.by_def.get(&this.defs.slot(d))) {
+        return match (this.by_def.get(&this.defs.table_key(d))) {
             Option::Some(i) => { i }
             Option::None    => { -1 }
         };
@@ -552,7 +552,7 @@ type struct ConstEval {
                 if (trailing != 1) { return false; }
                 return match (base) {
                     ResBase::Def(q) => {
-                        return match (this.table.enums_by_def.get(&this.table.defs.slot(q))) {
+                        return match (this.table.enums_by_def.get(&this.table.defs.table_key(q))) {
                             Option::Some(ei) => {
                                 ConstEval::variant_tag_of(
                                     this.table.enums[ei], sr.member_name, out)

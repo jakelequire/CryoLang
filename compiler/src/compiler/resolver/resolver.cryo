@@ -28,7 +28,7 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::resolution_map::{ ResolutionMap };
 import compiler::resolver::scope::{ Scope, ScopeID, ScopeKind };
 import compiler::resolver::symbol::{ Symbol, SymbolKind };
-import compiler::resolver::symbol_id::{ SymbolID, SymbolIds };
+import compiler::resolver::symbol_id::{ SymbolID, SymbolIds, SymbolKey };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::module_graph::{ ModulePath };
 import std::collections::hashmap::{ HashMap };
@@ -100,6 +100,7 @@ type struct Resolver {
     /// entering a module fourteen times produce fourteen scopes, only the
     /// third of them populated, and a save/restore mechanism necessary to
     /// paper over it.
+    ![allow(lookup_by_spelling, reason = "keyed by a module's path, which only the module graph makes and which names exactly one module")]
     module_scopes: HashMap<u32, u64>;
 
     /// The traits a `where` clause bounds each type parameter by: `.first`
@@ -112,12 +113,12 @@ type struct Resolver {
     /// import of a leaf binds every declaration the module offers under it,
     /// one binding each, so a type and a same-leaf function arrive as two
     /// bindings and each one's target is what a namespace chooses between.
-    import_targets: HashMap<u64, SymbolID>;
+    import_targets: HashMap<SymbolKey, SymbolID>;
 
     /// The import bindings an explicit entry - `import M::{ name }` - made,
     /// by binding.  A glob's bindings are not among them: a second explicit
     /// import of a name is refused against an explicit one only.
-    explicit_imports: HashMap<u64, boolean>;
+    explicit_imports: HashMap<SymbolKey, boolean>;
 
     /// Create a new Resolver with a global scope.
     /// Every pointer must outlive the Resolver (owned by CompilationContext).
@@ -144,8 +145,8 @@ type struct Resolver {
             prelude_modules:      [],
             module_scopes:        HashMap::<u32, u64>::new(),
             param_bounds:         [],
-            import_targets:       HashMap::<u64, SymbolID>::new(),
-            explicit_imports:     HashMap::<u64, boolean>::new(),
+            import_targets:       HashMap::<SymbolKey, SymbolID>::new(),
+            explicit_imports:     HashMap::<SymbolKey, boolean>::new(),
         };
     }
 
@@ -354,7 +355,7 @@ type struct Resolver {
         const new_module_sym: SymbolStr = sym.source_module.as_sym();
         const new_module_id: u32 = new_module_sym.id;
         this.symbols.push(sym);
-        this.import_targets.insert(id.key(), target);
+        this.import_targets.insert(id.table_key(), target);
 
         // Get the existing symbol's module ID (if any) so the scope
         // can detect cross-module name conflicts.
@@ -381,7 +382,7 @@ type struct Resolver {
                     this.scopes[this.current_scope.id - 1].add_overload(name, id);
                 }
                 if (explicit) {
-                    this.explicit_imports.insert(if (bound.is_valid()) { bound.key() } else { id.key() }, true);
+                    this.explicit_imports.insert(if (bound.is_valid()) { bound.table_key() } else { id.table_key() }, true);
                 }
                 return SymbolID::invalid();
             }
@@ -391,14 +392,14 @@ type struct Resolver {
             // namespace, as it does for one module's type and function.
             if (ex.kind == SymbolKind::Import && !rival.is_valid()) {
                 this.scopes[this.current_scope.id - 1].add_overload(name, id);
-                if (explicit) { this.explicit_imports.insert(id.key(), true); }
+                if (explicit) { this.explicit_imports.insert(id.table_key(), true); }
                 return SymbolID::invalid();
             }
         }
 
         this.scopes[this.current_scope.id - 1]
             .insert_import(name, id, new_module_id, existing_module_id, this.namespace_of(target));
-        if (explicit) { this.explicit_imports.insert(id.key(), true); }
+        if (explicit) { this.explicit_imports.insert(id.table_key(), true); }
         return SymbolID::invalid();
     }
 
@@ -406,7 +407,7 @@ type struct Resolver {
     /// `target`, or an invalid id.
     binding_to(&this, bindings: &SymbolID[], target: SymbolID) -> SymbolID {
         for (mut i: i64 = 0; i < bindings.length; i++) {
-            const t: Option<SymbolID> = this.import_targets.get(&bindings[i].key());
+            const t: Option<SymbolID> = this.import_targets.get(&bindings[i].table_key());
             if (t.is_some() && t.unwrap().equals(target)) { return bindings[i]; }
         }
         return SymbolID::invalid();
@@ -427,8 +428,8 @@ type struct Resolver {
     binding_beside(&this, bindings: &SymbolID[], target: SymbolID, explicit_only: boolean) -> SymbolID {
         const ns: Namespace = this.namespace_of(target);
         for (mut i: i64 = 0; i < bindings.length; i++) {
-            if (explicit_only && !this.explicit_imports.get(&bindings[i].key()).is_some()) { continue; }
-            const t: Option<SymbolID> = this.import_targets.get(&bindings[i].key());
+            if (explicit_only && !this.explicit_imports.get(&bindings[i].table_key()).is_some()) { continue; }
+            const t: Option<SymbolID> = this.import_targets.get(&bindings[i].table_key());
             if (t.is_some() && ns.accepts(this.symbols[this.symbol_ids.slot_of(t.unwrap())].kind)) {
                 return bindings[i];
             }
@@ -446,7 +447,7 @@ type struct Resolver {
         if (s.kind != SymbolKind::Import || !s.scope_id.is_valid()) { return SymbolID::invalid(); }
         const all: SymbolID[] = this.scopes[s.scope_id.id - 1].get_overloads(s.name);
         for (mut i: i64 = 0; i < all.length; i++) {
-            const t: Option<SymbolID> = this.import_targets.get(&all[i].key());
+            const t: Option<SymbolID> = this.import_targets.get(&all[i].table_key());
             if (!t.is_some()) { continue; }
             const target: SymbolID = t.unwrap();
             if (ns.accepts(this.symbols[this.symbol_ids.slot_of(target)].kind)) { return target; }
@@ -757,7 +758,7 @@ type struct Resolver {
     /// its binding under the alias, and a reader of a module's export list is
     /// handed what the binding names, never the binding.
     declaration_of(&this, id: SymbolID) -> SymbolID {
-        const t: Option<SymbolID> = this.import_targets.get(&id.key());
+        const t: Option<SymbolID> = this.import_targets.get(&id.table_key());
         return if (t.is_some()) { t.unwrap() } else { id };
     }
 

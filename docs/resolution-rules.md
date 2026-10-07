@@ -87,6 +87,19 @@ yet is recorded with the change that builds it, not here.
 
 ### 2026-10-07
 
+160. **The `()` unit type (ruling 103) is built after the merge, before the
+     v1.0 freeze.** `docs/cryo.md` already describes it.
+
+161. **The rule-2 self-check reuses E0157 and its allow-with-reason
+     marker**, `![allow(lookup_by_spelling, reason = "...")]`; it gets no
+     code of its own.
+
+162. **Rulings 4 and 65 are each built with their fallout fixed in the same
+     change**: standard-library code or tests that stop compiling are
+     corrected alongside, not left for later.
+
+163. **CI is out of scope until after the merge into `main`.**
+
 149. **Ruling 109 is narrowed: the spelling lint (E0157) is door-only for
      LOOKUPS.**  A declaration's own name - registering it, printing it,
      mangling it, passing it along - is carried by a separate sealed type
@@ -152,7 +165,7 @@ yet is recorded with the change that builds it, not here.
      ```
 
 148. **A projection through a trait resolves through the traits it
-     inherits**, as in Rust: `I::Item` under `I: DoubleEnded`, where
+     inherits**: `I::Item` under `I: DoubleEnded`, where
      `DoubleEnded` extends `Iterator`, is `Iterator`'s `Item`.  A projection
      nothing declares stays E0203.
 
@@ -179,7 +192,7 @@ yet is recorded with the change that builds it, not here.
      is re-keyed when the module-globals table is converted.
 
 142. **Calling a value that is not a function is refused with its own code
-     and rustc's wording**: "expected function, found `i32`".
+     and the wording** "expected function, found `i32`".
 
      ```cryo
      function one() -> i32 { return 1; }
@@ -223,16 +236,16 @@ yet is recorded with the change that builds it, not here.
      ```
 
 133. **`&T == &T` compares the referents in every copy**, a primitive one
-     included, as Rust's `PartialEq for &A` does; no copy compares the
-     addresses.
+     included: equality through a reference is the equality of what it
+     refers to, so no copy compares the addresses.
 
      ```cryo
      function same<T>(a: &T, b: &T) -> boolean where T: Eq { return a == b; }
      same::<i64>(&m, &n)   // true when m == n
      ```
 
-134. **A float's `abs` clears the sign bit, as Rust's `f64::abs` does, and
-     `fabs` is removed**; its callers use `abs`.
+134. **A float's `abs` clears the sign bit, so `-0.0` and a negative NaN
+     come back positive, and `fabs` is removed**; its callers use `abs`.
 
 135. **An overloaded function used as a value is the overload the expected
      function type selects.**
@@ -248,7 +261,7 @@ yet is recorded with the change that builds it, not here.
      deliberately moves a unit test's object is verified in one run.
 
 138. **A field read through a type parameter is refused on the generic
-     body**, as Rust does and as ruling 1 refuses a method call: a bound
+     body**, as ruling 1 refuses a method call: a bound
      gives a parameter methods, never fields, so what a copy's type
      argument declares is not consulted.
 
@@ -296,8 +309,8 @@ yet is recorded with the change that builds it, not here.
      ```
 
 125. **A generic function's instances are filed under the template's
-     definition**, keyed by that definition plus the type arguments, as
-     rustc keys an instance.
+     definition**, keyed by that definition plus the type arguments: an
+     instance is the template applied to its arguments, never a name.
 
 126. **Codegen's `GlobalRegistry`, keyed by linker symbol, stays as it is**;
      it is outside rule two.
@@ -339,12 +352,12 @@ yet is recorded with the change that builds it, not here.
     accepted with that explanation.
 
 97. **Ruling 85's demand comes after only reachable methods are emitted**,
-    as rustc's collector does: an instantiation that appears when
+    so emitting is driven by what is reached: an instantiation that appears when
     monomorphization substitutes types is demanded once emitting is driven
     by reachability, so it does not emit methods nothing calls.
 
 98. **A generic type's bare name inside its own body infers its type
-    arguments from the call**, as in Rust. `This::...` names the enclosing
+    arguments from the call**, as it does outside its body. `This::...` names the enclosing
     type.
 
     ```cryo
@@ -410,8 +423,8 @@ yet is recorded with the change that builds it, not here.
      name-resolution slice has landed**, and then shrinks to a short make
      target.
 
-112. **`abs`, `clamp` and `checked_abs` are per-primitive functions**, as
-     Rust's `i32::abs` is, not generic functions with trait bounds: no
+112. **`abs`, `clamp` and `checked_abs` are per-primitive functions**
+     (`i32::abs`, `f64::abs`), not generic functions with trait bounds: no
      trait says "a literal converts to `T`", which their bodies need. With
      them, ruling 82 applies to the standard library. Replaces ruling 95.
 
@@ -471,8 +484,8 @@ yet is recorded with the change that builds it, not here.
     compiles with `o: Option<String>`. It was refused with E0200.
 
 82. **An operator the trait bounds do not license is refused on the
-    generic template**, before monomorphization, as rustc does; it is not
-    checked per instance. `a + b` under a bound on a user trait that is
+    generic template**, before monomorphization, where the bounds are all
+    that is known; it is not checked per instance. `a + b` under a bound on a user trait that is
     merely named `Add` is an error in the generic body.
 
     ```cryo
@@ -505,8 +518,8 @@ yet is recorded with the change that builds it, not here.
     It gates the slices that remove the pass after monomorphization.
 
 85. **Instantiations that come into existence only when monomorphization
-    substitutes types into a copy are demanded and emitted**, as in rustc: a
-    type appearing in a body counts as a use.
+    substitutes types into a copy are demanded and emitted**: a type
+    appearing in a body counts as a use.
 
 86. **The internal check after monomorphization words a free function's
     unbound call like a method's**: "internal: call to `panic` in ...
@@ -641,7 +654,7 @@ yet is recorded with the change that builds it, not here.
     ```
 
 47. **A second import bringing in an already-imported name is refused at
-    the import line itself**, as in Rust, with an error of its own. The
+    the import line itself**, with an error of its own. The
     code is **E0243**, primary line "`parse` is imported twice", a label
     on the second import ("`parse` is imported again here") and a note on
     the first ("first imported here"), with the help "remove one of the
@@ -661,8 +674,8 @@ yet is recorded with the change that builds it, not here.
 
 49. **Methods get `DefId`s, registered by the name layer like other
     items.** Code the compiler generates names the methods it calls through
-    **method language items** (for example `FuturePoll`, `OptionTake`), as
-    rustc does; it never builds a name to look up.
+    **method language items** (for example `FuturePoll`, `OptionTake`); it
+    never builds a name to look up.
 
     ```cryo
     // what the async lowering writes at `x.await`, named by identity
@@ -674,7 +687,7 @@ yet is recorded with the change that builds it, not here.
     twice".
 
 51. **A method with a receiver, named by path, is a function value whose
-    type takes the receiver first**, as in Rust. Ruling 46's ambiguity
+    type takes the receiver first**. Ruling 46's ambiguity
     (E0156) applies to it when a trait implemented for the owner also
     provides the method.
 
@@ -693,7 +706,7 @@ yet is recorded with the change that builds it, not here.
     ```
 
 53. **After E0243, a bare use binds to the first import with no further
-    error**, as in Rust. This supersedes ruling 3's "the bare use is
+    error**, so one mistake is reported once. This supersedes ruling 3's "the bare use is
     refused".
 
 54. **A run project checks that a qualified path (`Toml::parse(...)`) calls
@@ -747,7 +760,7 @@ yet is recorded with the change that builds it, not here.
     select**, where it was E0900. Fixed on this branch.
 
 61. **An integer literal argument defaults to `i32` in overload
-    selection**, one fixed rule like Rust's literal default: with
+    selection**, one fixed rule for an unsuffixed literal: with
     `conv(i32)` and `conv(i64)`, `conv(1)` calls `conv(i32)`.
 
 62. **Under E0244's item-and-module tie there is no way to alias the
@@ -788,7 +801,7 @@ yet is recorded with the change that builds it, not here.
     differ in its type; write the type you mean with `as`".
 
 68. **A generic function or method used as a value infers its type
-    arguments from its use**, as in Rust: `const h = idf;`, `G::pick`, and
+    arguments from its use**: `const h = idf;`, `G::pick`, and
     a generic owner's `W::get`. Today `const h = idf;` fails LLVM
     verification.
 
@@ -804,7 +817,7 @@ yet is recorded with the change that builds it, not here.
 
 1. **A method call on a type parameter with no bound is an error.** Inside
    a generic body a parameter has no methods except those a trait bound
-   gives it, as in Rust. The standard library's calls that relied on the
+   gives it. The standard library's calls that relied on the
    opposite get bounds.
 
    ```cryo
@@ -866,7 +879,7 @@ yet is recorded with the change that builds it, not here.
    deleted.
 
 7. **Dropping a generic value in place goes through a compiler intrinsic**,
-   like Rust's `ptr::drop_in_place`, which emits each type's drop code
+   which emits each type's drop code
    after monomorphization: a user `drop`, the drop glue, or nothing for a
    `Copy` value. It is how the standard library releases a value of an
    unbounded type parameter behind a pointer, instead of calling `.drop()`
@@ -920,7 +933,7 @@ yet is recorded with the change that builds it, not here.
     ```
 
 14. **The drop-in-place intrinsic is `drop_in_place<T>(p: T*)` in a new
-    module `std::core::ptr`**, mirroring Rust's path. It does not go in
+    module `std::core::ptr`**, beside the pointer operations. It does not go in
     `std::core::intrinsics`. This names the intrinsic ruling 7 left
     unnamed.
 
@@ -996,9 +1009,8 @@ yet is recorded with the change that builds it, not here.
     ```
 
 23. **An unknown supertrait, or an unknown trait in a `where` clause, is
-    refused where it is written**, with wording that says trait, in the
-    style of Rust's "cannot find trait `Foo` in this scope" - not E0203's
-    "cannot find type". The code is E0242, new for this; an impl head's
+    refused where it is written**, with wording that says trait, "cannot
+    find trait `Foo` in this scope" - not E0203's "cannot find type". The code is E0242, new for this; an impl head's
     unknown trait, which already said "trait", takes it too.
 
     ```cryo
@@ -1019,7 +1031,7 @@ yet is recorded with the change that builds it, not here.
     ```
 
 25. **A call written on a bounded type parameter means the bound's method,
-    full stop**, as in Rust. Generic code sees only its bounds, so an
+    full stop**. Generic code sees only its bounds, so an
     instantiation never makes such a call ambiguous or redirects it to an
     inherent method the instantiated type also has.
 

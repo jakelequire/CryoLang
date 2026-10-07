@@ -71,7 +71,7 @@ import compiler::types::resolver::{ ResolutionContext, TypeResolver };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
-import compiler::types::type_ref::{ TypeRef };
+import compiler::types::type_ref::{ TypeRef, TypeKey };
 import compiler::types::user_defined::{ ClassType, EnumType, StructType };
 import utils::text::{ Text };
 
@@ -107,9 +107,8 @@ type struct Monomorphizer {
     call_specializer:   MonoCallSpecializer;     // sema-stash consumer: free/method per-call specialization
 
     // -- Specialization cache (orchestrator-private; spec_entries live on state) --
-    // Keyed by the CANONICAL INSTANTIATION ID for (base, args) - see `make_key`.
-    // (`spec_keys: string[]` used to sit here too; it was write-only and is gone.)
-    spec_index:        HashMap<u64, i64>;      // key -> index in state.spec_entries
+    // Keyed by the CANONICAL INSTANTIATION for (base, args) - see `make_key`.
+    spec_index:        HashMap<TypeKey, i64>;  // key -> index in state.spec_entries
 
     // -- Incremental injection tracking (for batch compilation) --
     injection_cursor:  i64;
@@ -143,7 +142,7 @@ type struct Monomorphizer {
             type_populator:        MonoTypePopulator::null(),
             ast_resolver:          MonoAstResolver::null(),
             call_specializer:      MonoCallSpecializer::null(),
-            spec_index:            HashMap::<u64, i64>::new(),
+            spec_index:            HashMap::<TypeKey, i64>::new(),
             injection_cursor:      0,
             current_source_file:   SymbolStr::empty(),
         };
@@ -269,7 +268,7 @@ type struct Monomorphizer {
             const request: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
             this.state.pending_cursor += 1;
 
-            const key: u64 = this.make_key(request);
+            const key: TypeKey = this.make_key(request);
 
             // Already cached; mark monomorphized + propagate the cached concrete
             // type to this module's fresh InstantiatedType.
@@ -315,7 +314,7 @@ type struct Monomorphizer {
             while (this.state.pending_cursor < this.state.pending.length) {
                 const req: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
                 this.state.pending_cursor += 1;
-                const rkey: u64 = this.make_key(req);
+                const rkey: TypeKey = this.make_key(req);
                 if (this.is_cached(rkey)) {
                     this.propagate_cached_resolution(rkey, req);
                     this.generic_registry.mark_monomorphized(req.base_type, req.type_args);
@@ -361,7 +360,7 @@ type struct Monomorphizer {
             }
             const request: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
             this.state.pending_cursor += 1;
-            const key: u64 = this.make_key(request);
+            const key: TypeKey = this.make_key(request);
             if (this.is_cached(key)) {
                 this.propagate_cached_resolution(key, request);
                 this.generic_registry.mark_monomorphized(request.base_type, request.type_args);
@@ -379,7 +378,7 @@ type struct Monomorphizer {
 
     // Single request specialization
 
-    specialize_request(mut &this, request: &MonomorphRequest, key: u64) -> boolean {
+    specialize_request(mut &this, request: &MonomorphRequest, key: TypeKey) -> boolean {
         cdebug(Text::new("[Monomorphizer::specialize_request] key=%llu base_type.id=%llu\n"), key, request.base_type.key());
         const _base_dbg: Type* = this.arena.lookup(request.base_type);
         if (_base_dbg != null) {
@@ -401,7 +400,7 @@ type struct Monomorphizer {
     // `request` is BORROWED, not taken by value: it carries an owning
     // `type_args: TypeRef[]`; a by-value parameter would bitwise-copy the struct
     // (aliasing the caller's buffer) and the copy's drop would double-free.
-    specialize_with_entry(mut &this, request: &MonomorphRequest, key: u64,
+    specialize_with_entry(mut &this, request: &MonomorphRequest, key: TypeKey,
                           entry: TemplateEntry*) -> boolean {
         // Validate arg count
         if (request.type_args.length != entry.param_count) {
@@ -565,7 +564,8 @@ type struct Monomorphizer {
                 }
                 this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                     Text::new(fmt::format("named generic `%s<%s>` (instantiation id %llu) reached monomorphization without an unresolved InstantiatedType wrapper, so its concrete type cannot reuse the wrapper's arena id (one id per semantic type)",
-                        tmpl_name, ice_args, key))));
+                        tmpl_name, ice_args,
+                        this.arena.create_instantiation(request.base_type, request.type_args).key()))));
                 this.state.error_count += 1;
                 concrete_type = this.create_concrete_type(entry, qualified_spec_sym, &subst);
                 if (concrete_type.is_valid() && display_name.length() > 0) {
@@ -1030,16 +1030,16 @@ type struct Monomorphizer {
     /// immutable COPY of each key and never re-derives it from the (mutated)
     /// node, so `(base, args)` still resolves to the same id after
     /// `swap_wrapper_to_concrete` installs the concrete in that slot.
-    make_key(&this, request: &MonomorphRequest) -> u64 {
+    make_key(&this, request: &MonomorphRequest) -> TypeKey {
         return this.make_key_for(request.base_type, request.type_args);
     }
 
-    make_key_for(&this, base: TypeRef, type_args: &TypeRef[]) -> u64 {
-        return this.arena.create_instantiation(base, type_args).key();
+    make_key_for(&this, base: TypeRef, type_args: &TypeRef[]) -> TypeKey {
+        return this.arena.create_instantiation(base, type_args).table_key();
     }
 
     /// Check if a key is already in the specialization cache.
-    is_cached(&this, key: u64) -> boolean {
+    is_cached(&this, key: TypeKey) -> boolean {
         return this.spec_index.get(&key).is_some();
     }
 
@@ -1047,7 +1047,7 @@ type struct Monomorphizer {
     /// concrete type.  Sema creates a fresh InstantiatedType per call site, so a
     /// later module revisiting an already-specialized pair stays unresolved unless
     /// we explicitly propagate.
-    propagate_cached_resolution(mut &this, key: u64, request: &MonomorphRequest) -> void {
+    propagate_cached_resolution(mut &this, key: TypeKey, request: &MonomorphRequest) -> void {
         const idx_opt: Option<i64> = this.spec_index.get(&key);
         if (!idx_opt.is_some()) { return; }
         const idx: i64 = idx_opt.unwrap();

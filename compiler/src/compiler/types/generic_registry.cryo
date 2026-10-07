@@ -27,7 +27,9 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::lang_item;
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::resolver::res;
-import compiler::resolver::res::{ DefId, DefTable };
+import compiler::resolver::res::{ DefId, DefKey, DefTable };
+import std::core::hash::{ Hash, Hasher };
+import std::core::cmp::{ Eq };
 import compiler::resolver::res::{ Res };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
@@ -46,7 +48,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::node::{ ASTNode };
 import compiler::types::arena::{ TypeArena };
-import compiler::types::type_ref::{ TypeRef };
+import compiler::types::type_ref::{ TypeRef, TypeKey };
 import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
 import compiler::module_graph;
@@ -253,6 +255,27 @@ type struct TemplateEntry {
 
 // GenericRegistry: Unified template + instantiation registry
 
+/// The key of a `(trait, target)` pair.  Made only by
+/// `GenericRegistry::trait_impl_key`.
+type struct TraitImplKey {
+private:
+    trait_def: DefKey;
+    target:    TypeKey;
+}
+
+implement trait Hash for struct TraitImplKey {
+    hash<H>(&this, hasher: mut &H) -> void where H: Hasher {
+        this.trait_def.hash(hasher);
+        this.target.hash(hasher);
+    }
+}
+
+implement trait Eq for struct TraitImplKey {
+    equals(&this, other: &TraitImplKey) -> boolean {
+        return this.trait_def.equals(&other.trait_def) && this.target.equals(&other.target);
+    }
+}
+
 /// One `implement trait Tr for Target<...>` head, under the key it was
 /// registered by.  See `GenericRegistry::trait_heads`.
 type struct TraitImplHead {
@@ -285,7 +308,7 @@ type struct GenericRegistry {
     // generic type and a generic function written under one path are two
     // definitions and two entries.
     def_entries: i64[];
-    type_index: HashMap<u64, i64>;      // TypeID -> entry index
+    type_index: HashMap<TypeKey, i64>;  // a template's own type -> entry index
 
     // -- Instantiation cache --
     //
@@ -296,12 +319,12 @@ type struct GenericRegistry {
     // own key - one of three byte-identical copies of that format.
     //
     // Kept as arrays for ordered iteration in collect_unmonomorphized
-    cache_keys: u64[];
+    cache_keys: TypeKey[];
     cache_refs: TypeRef[];
-    cache_index: HashMap<u64, i64>;     // canonical inst id -> index in cache_refs
+    cache_index: HashMap<TypeKey, i64>; // canonical instantiation -> index in cache_refs
 
     // -- Monomorphization tracking --
-    mono_set: HashMap<u64, boolean>;    // canonical inst id -> true
+    mono_set: HashMap<TypeKey, boolean>; // canonical instantiation -> true
 
     // -- Trait-impl heads, by (trait identity, target type) --
 
@@ -316,7 +339,7 @@ type struct GenericRegistry {
     trait_heads:      TraitImplHead[];
     /// `(trait_id, target)` -> indices into `trait_heads`, in
     /// registration order.
-    trait_head_index: HashMap<u64, i64[]>;
+    trait_head_index: HashMap<TraitImplKey, i64[]>;
 
 
     // -- Trait-impl coherence index --
@@ -337,6 +360,7 @@ type struct GenericRegistry {
     coh_len:    i64[];
     coh_node:   ImplBlockNode*[];
     coh_next:   i64[];
+    ![allow(lookup_by_spelling, reason = "keyed by a hash of a head's identity tokens; a hit is confirmed by comparing the whole key, so the hash only chains records")]
     coh_heads:  HashMap<u64, i64>;
 
     // -- Trait declarations --
@@ -364,7 +388,7 @@ type struct GenericRegistry {
     // themselves and therefore have no spec_entries row to walk.
     // Populated during TemplateRegistration for any non-generic
     // struct/class that has at least one generic method (static or not).
-    inherent_owner_index: HashMap<u64, i64>;
+    inherent_owner_index: HashMap<TypeKey, i64>;
     inherent_owner_nodes: ASTNode*[];
 
     // Inherent (non-trait) `implement T { ... }` blocks whose target `T`
@@ -407,13 +431,13 @@ type struct GenericRegistry {
             tmpl_type_ids:     [],
             tmpl_type_indices: [],
             def_entries:       [],
-            type_index:        HashMap::<u64, i64>::new(),
+            type_index:        HashMap::<TypeKey, i64>::new(),
             cache_keys:        [],
             cache_refs:        [],
-            cache_index:       HashMap::<u64, i64>::new(),
-            mono_set:          HashMap::<u64, boolean>::new(),
+            cache_index:       HashMap::<TypeKey, i64>::new(),
+            mono_set:          HashMap::<TypeKey, boolean>::new(),
             trait_heads:       [],
-            trait_head_index:  HashMap::<u64, i64[]>::new(),
+            trait_head_index:  HashMap::<TraitImplKey, i64[]>::new(),
             coh_pool:  [],
             coh_start: [],
             coh_len:   [],
@@ -423,7 +447,7 @@ type struct GenericRegistry {
             trait_decl_slots:  [],
             trait_decl_nodes:  [],
             trait_decl_keys:   [],
-            inherent_owner_index: HashMap::<u64, i64>::new(),
+            inherent_owner_index: HashMap::<TypeKey, i64>::new(),
             inherent_owner_nodes: [],
             inherent_impl_keys:   [],
             inherent_impl_nodes:  [],
@@ -497,7 +521,7 @@ type struct GenericRegistry {
         if (existing >= 0) {
             this.entries[existing] = entry;
             if (base_type.is_valid()) {
-                this.update_type_index(base_type.key(), existing);
+                this.update_type_index(base_type, existing);
             }
             return;
         }
@@ -514,7 +538,7 @@ type struct GenericRegistry {
         if (base_type.is_valid()) {
             this.tmpl_type_ids.push(base_type.key());
             this.tmpl_type_indices.push(idx);
-            this.type_index.insert(base_type.key(), idx);
+            this.type_index.insert(base_type.table_key(), idx);
         }
     }
 
@@ -577,12 +601,10 @@ type struct GenericRegistry {
         return out;
     }
 
-    /// Pack a `(trait, target)` pair into a single u64 key: the trait's
-    /// definition in the upper half - its position in the definition table,
-    /// not its path's text - and the target type's arena id in the lower, so
-    /// two pairs collide only when both identities do.
-    static trait_impl_key(defs: DefTable*, trait_def: DefId, target: TypeRef) -> u64 {
-        return ((defs.slot(trait_def) as u64) << 32) | (target.key() & 0xFFFFFFFF);
+    /// The key of a `(trait, target)` pair: the trait's definition and the
+    /// target type, so two pairs share a key only when both identities do.
+    static trait_impl_key(defs: DefTable*, trait_def: DefId, target: TypeRef) -> TraitImplKey {
+        return TraitImplKey { trait_def: defs.table_key(trait_def), target: target.table_key() };
     }
 
 
@@ -638,7 +660,7 @@ type struct GenericRegistry {
     register_trait_impl(mut &this, trait_id: DefId, target: TypeRef,
                         block: ImplBlockNode*) -> void {
         if (block == null || !trait_id.is_valid() || !target.is_valid()) { return; }
-        const key: u64 = GenericRegistry::trait_impl_key(this.arena.defs, trait_id, target);
+        const key: TraitImplKey = GenericRegistry::trait_impl_key(this.arena.defs, trait_id, target);
         const slot: i64[]* = this.trait_head_index.get_or_insert(key, []);
         for (mut i: i64 = 0; i < (*slot).length; i++) {
             if (this.trait_heads[(*slot)[i]].block == block) { return; }
@@ -651,7 +673,7 @@ type struct GenericRegistry {
     heads_under(&this, trait_id: DefId, target: TypeRef) -> ImplBlockNode*[] {
         mut out: ImplBlockNode*[] = [];
         if (!trait_id.is_valid() || !target.is_valid()) { return out; }
-        const key: u64 = GenericRegistry::trait_impl_key(this.arena.defs, trait_id, target);
+        const key: TraitImplKey = GenericRegistry::trait_impl_key(this.arena.defs, trait_id, target);
         match (this.trait_head_index.get_ref(&key)) {
             Option::Some(slot) => {
                 for (mut i: i64 = 0; i < (*slot).length; i++) {
@@ -1402,14 +1424,14 @@ type struct GenericRegistry {
     register_inherent_owner(mut &this, owner: TypeRef,
                              node: ASTNode*) -> void {
         if (node == null || !owner.is_valid()) { return; }
-        const existing: Option<i64> = this.inherent_owner_index.get(&owner.key());
+        const existing: Option<i64> = this.inherent_owner_index.get(&owner.table_key());
         if (existing.is_some()) {
             this.inherent_owner_nodes[existing.unwrap()] = node;
             return;
         }
         const idx: i64 = this.inherent_owner_nodes.length;
         this.inherent_owner_nodes.push(node);
-        this.inherent_owner_index.insert(owner.key(), idx);
+        this.inherent_owner_index.insert(owner.table_key(), idx);
     }
 
     /// Look up an inherent-owner AST by its type. Returns null
@@ -1418,7 +1440,7 @@ type struct GenericRegistry {
     /// has no inline generic methods to register.
     lookup_inherent_owner(&this, owner: TypeRef) -> ASTNode* {
         if (!owner.is_valid()) { return null; }
-        const opt: Option<i64> = this.inherent_owner_index.get(&owner.key());
+        const opt: Option<i64> = this.inherent_owner_index.get(&owner.table_key());
         if (opt.is_some()) {
             return this.inherent_owner_nodes[opt.unwrap()];
         }
@@ -1447,16 +1469,16 @@ type struct GenericRegistry {
     /// template: a caller that holds `Option<i32>` asks with its generic base.
     template_of_type(&this, ty: TypeRef) -> TemplateEntry* {
         if (!ty.is_valid()) { return null; }
-        const opt: Option<i64> = this.type_index.get(&ty.key());
+        const opt: Option<i64> = this.type_index.get(&ty.table_key());
         if (opt.is_some()) {
             return &this.entries[opt.unwrap()];
         }
         return null;
     }
 
-    /// Check whether a TypeID corresponds to a registered template.
-    is_template(&this, type_id: u64) -> boolean {
-        return this.type_index.contains_key(&type_id);
+    /// Whether `ty` is a registered template's own type.
+    is_template(&this, ty: TypeRef) -> boolean {
+        return this.type_index.contains_key(&ty.table_key());
     }
 
     /// Number of registered templates.
@@ -1480,7 +1502,7 @@ type struct GenericRegistry {
         // The arena interns by (base, args), so this both finds-or-creates the
         // canonical instantiation AND yields the key to record it under.
         const inst: TypeRef = this.arena.create_instantiation(base, args);
-        const key: u64 = inst.key();
+        const key: TypeKey = inst.table_key();
 
         const cached: Option<i64> = this.cache_index.get(&key);
         if (cached.is_some()) {
@@ -1508,8 +1530,8 @@ type struct GenericRegistry {
     /// drop the mark and leave the instantiation on the worklist forever.
     mark_monomorphized(mut &this, base: TypeRef, args: &TypeRef[]) -> void {
         const inst: TypeRef = this.arena.create_instantiation(base, args);
-        if (!this.mono_set.contains_key(&inst.key())) {
-            this.mono_set.insert(inst.key(), true);
+        if (!this.mono_set.contains_key(&inst.table_key())) {
+            this.mono_set.insert(inst.table_key(), true);
         }
     }
 
@@ -1526,10 +1548,11 @@ type struct GenericRegistry {
     }
 
 
-    /// Update the secondary TypeID index for an existing entry.
-    update_type_index(mut &this, type_id: u64, entry_idx: i64) -> void {
+    /// Update the secondary type index for an existing entry.
+    update_type_index(mut &this, ty: TypeRef, entry_idx: i64) -> void {
+        const type_id: u64 = ty.key();
         // Update or insert in HashMap
-        this.type_index.insert(type_id, entry_idx);
+        this.type_index.insert(ty.table_key(), entry_idx);
         // Also update parallel arrays for consistency
         for (mut i: i64 = 0; i < this.tmpl_type_ids.length; i++) {
             if (this.tmpl_type_ids[i] == type_id) {
