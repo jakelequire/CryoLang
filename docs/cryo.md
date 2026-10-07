@@ -1,7 +1,7 @@
 # The Cryo Language Reference
 
 > **Version:** 1.0.0 \
-> **Last revised:** September 2026
+> **Last revised:** October 2026
 
 Cryo is a statically-typed, compiled systems language. It targets native machine code through LLVM 20, has a self-hosted compiler, and ships a standard library written entirely in itself. Three principles shape the language:
 
@@ -224,8 +224,10 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
   is auto-imported into any module that uses one.
 
 For raw, untyped formatted output (C `printf` semantics, `%d`/`%s`
-specifiers, not type-checked), use `printf` - an intrinsic that is
-auto-imported into every module (no `import` needed). For typed,
+specifiers, not type-checked), use `printf` from `std::fmt`. It is an
+ordinary variadic function, not an intrinsic, and it is **not** in the
+prelude: write `import std::fmt;` and call `fmt::printf(...)`, or
+`import std::fmt::{ printf };` to call it bare. For typed,
 `Display`-formatted output, build a `String` (usually with an f-string) and
 pass it to `print` / `println` from `std::fmt`; both take a *single*
 already-formatted argument (`println(f"{x}")`), not a printf-style format
@@ -264,7 +266,7 @@ Every value in Cryo has a known type at compile time. A binding's type is either
 | `double`                      | Alias for `f64`.                                                                                                                                 | 8 bytes                  |
 | `usize` `isize`               | Pointer-width unsigned / signed integers - distinct types whose width tracks the target's pointer size (the natural type for sizes and indices). | 8 bytes on 64-bit        |
 | `never`                       | The type of an expression that does not return. Only valid as a return type, and written by functions that always panic, trap, or diverge.       | 0                        |
-| `()`                          | The unit type. A value of this type carries no information.                                                                                      | 0                        |
+| `()`                          | The unit type. A value of this type carries no information. See [section 2.7](#27-the-unit-type) for a current limit on the `()` value.           | 0                        |
 
 In performance-sensitive or cross-platform code, prefer the explicit-width forms (`i32`, `u64`, `f64`) so the layout is unambiguous. The shorthand aliases exist for ergonomics.
 
@@ -385,6 +387,40 @@ apply((x: i32) -> i32 { return x * 2; }, 21);     // 42 - non-capturing lambda
 apply(tentimes, 4);                               // 40 - named function pointer
 ```
 
+**Naming a function as a value.** A named function used without a call is a
+function value. When the name is overloaded ([section 4.6](#46-overloading)),
+the expected function type picks the overload; with no expected type the use is
+ambiguous (E0154), and the error's help shows the annotation that picks one:
+
+```cryo
+function twice(x: i32) -> i32 { return x * 2; }
+function twice(x: f64) -> f64 { return x * 2.0; }
+
+const f: (i32) -> i32 = twice;    // the `twice(i32)` overload
+const g = twice;                  // error[E0154]: `twice` is overloaded, and nothing here says which overload is meant
+                                  // help: give the variable a function type to pick one: `const g: (i32) -> i32 = twice;`
+```
+
+A **generic** function is not yet taken as a value by inference:
+`const h: (i32) -> i32 = identity;` is refused (E0200, "expected
+`(i32) -> i32`, found `(T) -> T`"). Wrap the call in a non-generic function or
+a lambda instead.
+
+**Calling something that is not a function.** A call whose callee has a
+non-function type is refused with E0213, whether the callee is a call's
+result, a local or a field:
+
+```cryo
+type struct H { n: i32; }
+function one() -> i32 { return 1; }
+
+const x: i32 = 3;
+const h: H = H { n: 1 };
+const a: i32 = one()(3);   // error[E0213]: expected function, found `i32`
+const b: i32 = x(3);       // error[E0213]: expected function, found `i32`
+const c: i32 = h.n(4);     // error[E0213]: expected function, found `i32` (`n` is a field)
+```
+
 #### Where a capturing closure may be passed
 
 The specialisation above happens per call site, and in 1.0 it is wired for
@@ -480,6 +516,16 @@ The unit type `()` represents "a value that carries no information." It is disti
 - `()`: a function produces a value, but the value has zero meaningful payload.
 
 `()` appears in generic positions where a type parameter is required but no data is needed. The canonical example is `Result<(), Error>` for an operation that either succeeds (with nothing to return) or fails with an error.
+
+> **Current limit.** The *type* `()` is a real zero-size type (`sizeof(()) == 0`), but the *expression* `()` is still typed `void*` by the type checker. Where a generic argument is inferred from it, the two meet and the code compiles: `Result::Ok(())` for a `Result<(), E>` works, and so does `return Result::Ok(());`. Where the `()` value meets the `()` type directly, it is refused (E0200, "expected `()`, found `void*`"):
+>
+> ```cryo
+> const r: Result<(), i32> = Result::Ok(());   // fine
+> const u: () = ();                            // error[E0200]
+> function f() -> () { return (); }            // error[E0200]
+> ```
+>
+> Write `-> void` for a function that returns nothing. Making `()` a real unit value is planned as separate work.
 
 ### 2.8 Type Aliases
 
@@ -707,8 +753,10 @@ function smaller<T>(a: T, b: T) -> T
 A trailing `...` marks a function as variadic. The signature mirrors C's variadic calling convention, so variadic functions stay ABI-compatible with the `printf`-family at the FFI boundary.
 
 ```cryo
-// FFI / intrinsic declarations: a bare `...` bucket, no body.
-intrinsic function printf(format: string, args...) -> i32;
+// An FFI declaration: a bare `...` bucket, no body.
+extern "C" {
+    function printf(fmt: u8*, ...) -> i32;
+}
 ```
 
 A user-defined variadic function names the bucket (`args...`). The compiler emits `va_start`/`va_end` around the body and binds `args` to the raw `va_list` pointer. Wrap it in a `VaArgs` (`std::core::varargs`, in the prelude) to read typed values without hand-rolling `va_arg`:
@@ -749,19 +797,19 @@ See [section 18](#18-foreign-function-interface) for full FFI semantics, includi
 
 ### 4.5 Intrinsic Functions
 
-`intrinsic function` declares a function that the compiler lowers directly to LLVM IR rather than emitting a real call. The standard library uses intrinsics for primitives such as memory operations, formatted printing, and the panic mechanism.
+`intrinsic function` declares a function that the compiler lowers directly to LLVM IR rather than emitting a real call. The standard library uses intrinsics for primitives such as heap allocation, bit operations, atomics, float operations, and the panic mechanism.
 
 ```cryo
 intrinsic function malloc(size: u64) -> void*;
 intrinsic function free(ptr: void*) -> void;
-intrinsic function memcpy(dest: void*, src: void*, count: u64) -> void*;
-intrinsic function strlen(str: string) -> u64;
-intrinsic function printf(format: string, args...) -> i32;
+intrinsic function popcount64(value: u64) -> u32;
+intrinsic function sqrt64(value: f64) -> f64;
+intrinsic function panic(message: string, file: string, line: u32) -> never;
 ```
 
-The user-facing `print` / `println` / `eprint` / `eprintln` are *not* intrinsics - they live in `std::fmt` and forward to the variadic `printf` family. Only the raw C-shaped primitives above are intrinsics.
+`printf`, `print`, `println`, `eprint` and `eprintln` are *not* intrinsics - they are ordinary functions in `std::fmt`. C library functions such as `memcpy` and `strlen` are `extern "C"` declarations in `std::ffi::libc`.
 
-The complete list of intrinsics is the file [`stdlib/core/intrinsics.cryo`](../stdlib/core/intrinsics.cryo). User code does not typically declare its own intrinsics; they are a contract between the standard library and the compiler.
+The intrinsics module, `std::core::intrinsics`, is not in the prelude. Reach an intrinsic by path after importing the module (`import std::core::intrinsics;`, then `intrinsics::malloc(64)`), or import it by name (`import std::core::intrinsics::{ malloc, free };`). The complete list is the file [`stdlib/core/intrinsics.cryo`](../stdlib/core/intrinsics.cryo). User code does not typically declare its own intrinsics; they are a contract between the standard library and the compiler.
 
 The compiler also expands two source-location pseudo-constants at the call site:
 
@@ -771,6 +819,27 @@ The compiler also expands two source-location pseudo-constants at the call site:
 | `LINE`   | The current line number (`i32`).         |
 
 These are used by `panic`, `assert`, and the testing framework to report failure locations without the caller passing them by hand.
+
+### 4.6 Overloading
+
+A function name may be declared more than once with different parameter types. A call selects the one overload its arguments fit; there is no ranking among overloads that fit equally, and no implicit conversion makes an argument fit.
+
+```cryo
+function conv(x: i32) -> i32 { return 32; }
+function conv(x: i64) -> i32 { return 64; }
+function conv(x: f64) -> i32 { return 2; }
+
+const a: i32 = conv(1);          // conv(i32): an integer literal is i32 here
+const b: i32 = conv(1 as i64);   // conv(i64)
+const c: i32 = conv(1.5);        // conv(f64): a float literal is f64 here
+
+const s: i16 = 1 as i16;
+const d: i32 = conv(s);          // error[E0214]: no overload of `conv` accepts these arguments
+```
+
+An untyped literal argument takes one fixed type where the overloads differ in that parameter: an integer literal is `i32` and a float literal is `f64`, as in Rust. Write the type you mean with `as` (`conv(1 as i64)`). A qualified call (`Json::conv(1)`) selects among that module's overloads the same way.
+
+An overloaded name used as a value without a call is picked by its expected function type ([section 2.5](#25-function-types)).
 
 ---
 
@@ -949,6 +1018,14 @@ if (x > 0) {
 ```cryo
 const is_even: boolean = if (n % 2 == 0) { true } else { false };
 ```
+
+The expression form has exactly two arms and no `else if` chain: `if (a) { 1 } else if (b) { 2 } else { 3 }` is a parse error in expression position. Nest the second `if` inside the `else` arm's braces, or use a `match`:
+
+```cryo
+const sign: i32 = if (n > 0) { 1 } else { if (n < 0) { -1 } else { 0 } };
+```
+
+`else if` is fine in the statement form above.
 
 ### 6.2 While Loops
 
@@ -1459,7 +1536,7 @@ const e: Either<i64, f64> = Either::<i64, f64> { a: 100 };
 
 **Matching.** A union value is not matched variant-wise the way an enum is (there is no discriminant). You `match` on a *member's value* - e.g. `match (v.i) { 0 => ..., _ => ... }` - and `static match (T)` works inside a generic union's methods.
 
-**Ownership.** A union is treated as a plain-data (`Copy`) value: its members are never auto-dropped, since the active member is unknown. If a union owns a resource, give it an explicit `drop` method and that is honoured.
+**Ownership.** A union's members are never auto-dropped, since the active member is unknown. If a union owns a resource, implement `Drop` for it (`implement trait Drop for Handle { drop(mut &this) -> void { ... } }`); an inherent method merely named `drop` is not a destructor ([section 16.2](#162-the-drop-trait)).
 
 ---
 
@@ -1819,6 +1896,21 @@ type struct Sink<W> {
 }
 ```
 
+The same holds for **operators** and **fields**, as in Rust. An operator applies to a parameter only when a bound licenses it - the language's own trait for that operator (`Add` for `+`, `Ord` for `<`, `Eq` for `==`; see [section 11.6](#116-operator-overloading)) - and a bound never gives a parameter fields, whatever the type it is later instantiated with declares. Both are refused on the generic body, whether or not anything instantiates it:
+
+```cryo
+function add<T>(a: T, b: T) -> T { return a + b; }                      // error[E0229]: the `+` operator cannot be applied to `T`: its bounds do not give it `std::core::ops::Add`
+function less<T>(a: T, b: T) -> boolean where T: Ord { return a < b; }  // fine: `Ord` licenses `<`
+
+type struct Cell<T, A> { v: T; tag: A; }
+implement struct Cell<T, A> {
+    tagged(&this) -> i32 { return this.tag.n; }    // error[E0204]: no field `n` on type `A`
+    tag_ref(&this) -> &A { return &this.tag; }     // fine; read `.n` where `A` is a concrete type
+}
+```
+
+A user trait that is merely *named* `Add` does not license `+`; the bound must name the language's trait (`std::core::ops::Add`, in the prelude).
+
 ### 11.4 Standard Library Traits
 
 | Trait                                                                                                         | Purpose                                                                                                           |
@@ -1863,7 +1955,19 @@ this implementation bound". Projections also work off a generic parameter - a
 generic adapter names its source's element as `I::Item`:
 
 ```cryo
-type struct MapIter<I, O> { inner: I; f: (I::Item) -> O; }
+type struct MapIter<I, O> where I: Iterator { inner: I; f: (I::Item) -> O; }
+```
+
+A projection is answered by the parameter's bounds, so `I::Item` needs a bound on `I` whose trait declares `Item`. Without one, or when no bound's trait declares the name, the projection is refused where it is written (E0203, "associated type `Item` not found for `I`"). A bound on a trait that *inherits* `Iterator` answers too: the projection resolves through the bound trait's supertraits, as in Rust.
+
+```cryo
+type trait DoubleEnded : Iterator { next_back(mut &this) -> Option<This::Item>; }
+
+function first<I>(it: mut &I) -> Option<I::Item> where I: DoubleEnded {   // Iterator's `Item`
+    return it.next();
+}
+
+type struct Loose<I> { f: () -> I::Item; }   // error[E0203]: associated type `Item` not found for `I`
 ```
 
 **Binding the associated type.** An implementation binds each associated type
@@ -2028,11 +2132,18 @@ the primitive** - `2 * v` calls `(2).mul(&v)` given `implement trait Mul<Vec2,
 Vec2> for i64`. This is the one case where the right operand's type pulls in the
 impl; `Eq`/`Ord` are excluded (their operands share `This`).
 
-Generic and bounded-param dispatch work throughout: a `T: Add` parameter
-overloads `a + b` in a generic body (Phase 2), and the desugar is carried through
-monomorphisation so `Container<i32>::index` (etc.) specialises correctly. When a
-type lacks the required impl, the compiler names the missing trait (e.g. *"`Vec2`
-does not implement `Mul`; add `implement trait Mul ... for Vec2`"*).
+**In generic code** an operator on a type parameter is licensed by its bounds
+alone, checked once on the generic body rather than per instantiation: under
+`where T: Add<T, T>`, `a + b` is `Add::add`, and with no such bound it is refused
+(E0229) even if every type the body is instantiated with implements `Add` (see
+[section 11.3](#113-trait-bounds-with-where)). The desugar is carried through
+monomorphisation, so `Container<i32>::index` (etc.) specialises correctly. On a
+concrete type that lacks the required impl, the compiler names the missing trait.
+
+```cryo
+function sum<T>(a: T, b: T) -> T where T: Add<T, T> { return a + b; }
+const v: Vec2 = sum::<Vec2>(a, b);   // Vec2 { 4, 6 }
+```
 
 ---
 
@@ -2047,6 +2158,9 @@ Type parameters are declared in angle brackets after the name. By convention the
 ### 12.2 Generic Structs
 
 ```cryo
+import std::core::ptr;
+import std::core::intrinsics::{ malloc, free };
+
 type struct Box<T> {
     ptr: T*;
 
@@ -2056,12 +2170,17 @@ type struct Box<T> {
         return Box { ptr: p };
     }
 
-    deref(&this) -> T {
-        return *this.ptr;
+    get(&this) -> &T {
+        return &*this.ptr;
     }
+}
 
+// The destructor. Only an `implement trait Drop` defines one; a method that is
+// merely named `drop` in the struct body would be an ordinary method.
+implement<T> trait Drop for Box<T> {
     drop(mut &this) -> void {
-        free(this.ptr);
+        ptr::drop_in_place::<T>(this.ptr);   // release the boxed value
+        free(this.ptr as void*);             // then its storage
     }
 }
 ```
@@ -2132,6 +2251,19 @@ implement enum Result<T, E> {
 
 `Result`'s parameters `<T, E>` are fixed by the type; `map` introduces an additional `<U>`.
 
+**Naming the enclosing type.** Inside an implement block or a type body, `This` is the enclosing type with its own parameters as arguments, so `This::of(..)` in `implement struct Pair<T>` means `Pair<T>::of(..)`. A generic type's bare name written there without arguments, `Pair::of(..)`, infers its arguments from the call, as in Rust:
+
+```cryo
+type struct Pair<T> { a: T; b: T; }
+
+implement struct Pair<T> {
+    static of(a: T, b: T) -> Pair<T> { return Pair { a: a, b: b }; }
+
+    swapped(&this) -> Pair<T> where T: Copy { return This::of(this.b, this.a); }   // the enclosing Pair<T>
+    copy(&this)    -> Pair<T> where T: Copy { return Pair::of(this.a, this.b); }   // arguments inferred from the call
+}
+```
+
 A parameter a method introduces must not spell one its owner already declares: `map<T>` inside `Result<T, E>` is refused at the method's `T` (`E0311`), as is a second `T` in one list, a trait method's `<T>` inside `trait Conv<T>`, and an impl method's `<T>` inside `implement<T>`. An enclosing generic parameter is in scope for every declaration nested in its owner, so an inner one of the same name could only be that parameter again - there is nothing for the inner declaration to mean. A method's parameter that shadows a *type* of the same spelling, or a value parameter spelled like a generic one, is ordinary shadowing and is allowed.
 
 ### 12.6 Monomorphisation
@@ -2145,7 +2277,7 @@ const b: Pair<string> = Pair::<string>::new("x", "y");
 
 it generates two independent types and two specialised function bodies, one for each instantiation. There is no shared dispatch; every call is a direct call to a fully-typed function. The trade-off is binary size: each instantiation produces its own code.
 
-The pipeline driver lives in [`compiler/src/compiler/types/monomorphizer.cryo`](../compiler/src/compiler/types/monomorphizer.cryo) (Phase 6a in `instance.cryo`), invoked after type resolution and trait-bound validation but before function-body type checking. The follow-on [`compiler/src/compiler/passes/specialization.cryo`](../compiler/src/compiler/passes/specialization.cryo) walks already-typed bodies and rewrites generic call sites to point at the monomorphised callees.
+Generic bodies are type-checked once, as templates, **before** monomorphisation: a body is checked against its parameters' bounds, never against the types it is later instantiated with, so an error in a generic body is reported whether or not anything instantiates it. Monomorphisation then copies each instantiated body with its type arguments substituted and binds every call in the copy to its concrete callee. The driver lives in [`compiler/src/compiler/mono/`](../compiler/src/compiler/mono/) (`monomorphizer.cryo`), run from `instance.cryo` after the function-body type check.
 
 ### 12.7 `static match` — Compile-Time Type Dispatch
 
@@ -2159,7 +2291,7 @@ static match (T) {
 }
 ```
 
-The subject is a **type**, not a value, and each arm is a type rather than a pattern. During monomorphisation the compiler knows what `T` is, keeps the one matching arm, and discards the rest — so there is no branch and no runtime cost in the emitted code.
+The subject is a **type**, not a value, and each arm is a type rather than a pattern. During monomorphisation the compiler knows what `T` is, keeps the one matching arm, and discards the rest — so there is no branch and no runtime cost in the emitted code. Every arm is still type-checked first, on the generic body (see below).
 
 **Arms may group types with `|`, and `_` is the wildcard:**
 
@@ -2191,7 +2323,23 @@ try_push<T>(mut &this, item: T) -> Result<(), AllocError> {
 
 **Statement and expression position both work.** As an expression, every arm's body yields the value of its final expression, and all arms must agree on a type — as in the `try_push` example above, where each arm yields `Result<(), AllocError>`.
 
-**Discarded arms are not type-checked against the wrong type.** Because pruning happens before the body is checked, an arm may use operations that are valid only for its own type — `item.as_str()` in the `String` arm above is not an error when `T` is `u8`, since that arm no longer exists in the `u8` instantiation. This is the property that makes the construct useful: without it, every arm would have to compile for every `T`.
+**Every arm is checked, each against its own type.** The arms are type-checked on the generic body, before monomorphisation, so a broken arm is an error even if no instantiation selects it:
+
+- A **single-type arm** narrows `T` to that type inside the arm: in `String => { ... }`, `item` is a `String`, so `item.as_str()` is fine.
+- A **multi-type arm** (`u8 | u16 | u32 | u64 => ...`) is checked once for each listed type, and must be valid for all of them.
+- The **wildcard arm** `_` knows only `T`'s declared bounds, like ordinary generic code: a method, operator or field its bounds do not give is refused (E0358, E0229, E0204).
+
+```cryo
+function show<T>(x: T) -> i32 {
+    return static match (T) {
+        string    => { x.length() as i32 }   // `x: string` here
+        i32 | i64 => { x as i32 }            // checked as i32, then as i64
+        _         => { 0 }                   // only `T`'s bounds; `x.length()` here would be E0358
+    };
+}
+```
+
+This is what makes the construct useful: an arm may use operations valid only for its own type, without every arm having to compile for every `T`.
 
 **The subject may be any type parameter in scope** — the enclosing type's parameter, or one introduced by the method itself:
 
@@ -2226,7 +2374,7 @@ implement struct Point {
     distance_to(&this, other: Point) -> f64 {
         const dx: f64 = (this.x - other.x) as f64;
         const dy: f64 = (this.y - other.y) as f64;
-        return sqrt(dx * dx + dy * dy);
+        return (dx * dx + dy * dy).sqrt();
     }
 }
 ```
@@ -2670,6 +2818,23 @@ become an error: the value is released at scope exit anyway, so the call is at
 best redundant and at worst a second release. To release **early**, use
 `mem::drop(x)`, which takes the value - so the move checker rejects any later
 use and the scope-exit drop is suppressed. A bare `x.drop()` does neither.
+
+**Only `implement trait Drop` defines a destructor.** A method merely named `drop` - declared in a struct body or an inherent `implement` block - is an ordinary method: it is not run at scope exit, it does not make the type satisfy `where T: Drop`, and calling it releases nothing else.
+
+**Releasing a value behind a pointer.** Code that owns a `T` through a raw `T*` (a container's storage, a box) releases it with the `drop_in_place` intrinsic from `std::core::ptr`, as in Rust. After monomorphisation it runs that type's destructor and field drop-glue, or nothing for a `Copy` type, so `T` needs no bound. Calling `.drop()` on an unbounded `T` is refused, and the error says what to write:
+
+```cryo
+import std::core::ptr;
+
+function release<T>(p: T*) -> void {
+    ptr::drop_in_place::<T>(p);   // fine for every T
+}
+
+function release_wrong<T>(p: T*) -> void {
+    (*p).drop();                  // error[E0358]: no method named `drop` found on type `T`
+                                  // help: use `std::core::ptr::drop_in_place(p)`
+}
+```
 
 ### 16.3 Move Checking
 
@@ -3450,12 +3615,12 @@ The prelude is auto-imported into every Cryo source file. Currently:
 
 | Module               | What it brings in                                                                                                     |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `core::panic`        | `panic(message: string, file: string, line: u32) -> void` (does not return; aborts the process)                       |
+| `core`               | `panic(message: string, file: string, line: u32) -> never` (does not return; aborts the process)                      |
 | `core::option`       | `Option<T>` (`Some` / `None`) and its methods                                                                         |
 | `core::result`       | `Result<T, E>` (`Ok` / `Err`) and its methods                                                                         |
-| `core::primitives`   | Methods on built-in types (`i32::max_value`, `char::is_digit`, ...)                                                   |
-| `core::intrinsics`   | Compiler intrinsics including `printf`, `malloc`, `free`, `memcpy` (the `print`/`println` family lives in `std::fmt`) |
+| `core::primitives`   | Methods on built-in types (`(-5 as i32).abs()`, `(2.0).sqrt()`, `x.clamp(lo, hi)`, `char::is_digit`, ...)             |
 | `core::varargs`      | `VaArgs`, the compiler-assigned type of a function's `args...` bucket                                                 |
+| `core::drop`, `core::marker`, `core::cmp`, `core::clone` | `Drop`, the marker traits (`Copy`, `Send`, `Sync`), `Eq` / `Ord` / `Ordering`, `Clone` |
 | `collections::array` | `Array<T>`, needed because `T[]` desugars to `Array<T>`                                                               |
 | `core::slice`        | `Slice<T>`, backing the for-in lowering over fixed-size arrays (`for (x in arr)` where `arr: T[N]`)                   |
 | `core::ops`          | `Range` / `RangeInclusive`, backing range literals (`a..b` desugars to `Range::new`)                                  |
@@ -3463,7 +3628,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `alloc::box`         | `Box<T>`                                                                                                              |
 | `alloc::rc`          | `Rc<T>`                                                                                                               |
 
-The prelude is deliberately small. Anything else is an explicit `import` - notably, the `print` / `println` / `eprint` / `eprintln` family lives in `std::fmt` and is **not** auto-imported. Examples in this document that use `println` assume `import std::fmt;` is in scope.
+The prelude is deliberately small. Anything else is an explicit `import` - notably, `printf` and the `print` / `println` / `eprint` / `eprintln` family live in `std::fmt` and are **not** auto-imported, and neither are the compiler intrinsics (`malloc`, `free`, ...) in `std::core::intrinsics`. Examples in this document that call `printf`, `println`, `malloc` or `free` bare assume `import std::fmt::{ printf, println };` and `import std::core::intrinsics::{ malloc, free };` are in scope.
 
 ### 20.2 Module Map
 
@@ -3478,7 +3643,7 @@ The prelude is deliberately small. Anything else is an explicit `import` - notab
 | **`fs`**          | `Path` (borrowed) and `PathBuf` (owned). `OpenOptions` builder, `File` (`Read + Write`), convenience `read(path)` / `write(path, bytes)` / `read_to_string(path)` / `copy(from, to)`. Whole-path operations: `remove_file`, `rename`, `create_dir` / `create_dir_all`, `remove_dir` / `remove_dir_all`, `read_dir` (a `ReadDir` iterator of `DirEntry`), `canonicalize`. Metadata: `metadata` / `symlink_metadata` (typed `Metadata` via `stat` / `lstat`), `exists`, `is_file`, `is_dir`. `O_*` and `SEEK_*` constants.                                                                                                                                                                                                                                                                                                                                               |
 | **`ffi`**         | The C ABI boundary. `libc` is the single home for every `extern "C"` the stdlib needs (POSIX I/O, sockets, math) and the named POSIX constants. `cstr` provides `CStr` (borrowed) and `CString` (owned), with a `NulError` for interior-NUL conversion failures.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | **`env`**         | `args() -> Array<String>`, `var(name) -> Option<String>`, `set_var`, `remove_var`, `process_exit(code: i32) -> void`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| **`math`**        | Thin libm wrappers: `sqrt`, `cbrt`, `pow`, `exp` / `exp2`, `ln`, `log2` / `log10`, `sin` / `cos` / `tan` (plus the `a*` inverses and `*h` hyperbolics), `floor`, `ceil`, `round`, `trunc`, integer `abs_i32` / `abs_i64`, `min` / `max` / `clamp`, `f32` variants (`sqrt_f32`, `fabs_f32`, ...), and the constants `PI`, `TAU`, `E`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| **`math`**        | `f64` functions: `cbrt`, `pow`, `powi`, `hypot`, `mul_add`, `exp` / `exp2` / `expm1`, `ln`, `log` / `log2` / `log10` / `log1p`, `sin` / `cos` / `tan` (plus the `a*` inverses, `atan2`, and the `*h` hyperbolics), `floor`, `ceil`, `round`, `trunc`, `fract`, `copysign`, `fmod`, `signum`, classification (`is_nan`, `is_finite`, `classify`, ...), integer `gcd` / `lcm` / `is_power_of_two`, generic `min` / `max` (`where T: Ord`), and constants (`PI`, `TAU`, `E`, `F64_EPSILON`, ...). `sqrt`, `abs`, `checked_abs` and `clamp` are **methods of each numeric primitive** in `core::primitives`, not `math` functions: `(16.0).sqrt()`, `(-5 as i32).abs()`, `x.clamp(lo, hi)`. A float's `abs` clears the sign bit; there is no `fabs`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | **`time`**        | `Duration` (normalized seconds + sub-second nanoseconds; `from_secs`/`from_millis`/`from_micros`/`from_nanos`, `as_secs`/`as_millis`/`as_micros`/`as_nanos`/`subsec_*`, `add`/`saturating_sub`/`is_zero`, `Eq` + `Ord`). `Instant` (monotonic `CLOCK_MONOTONIC`; `now`, `elapsed`, `duration_since`). `SystemTime` (wall `CLOCK_REALTIME`; `now`, `unix_epoch`, `duration_since_epoch`, `duration_since`). `sleep(Duration)` (EINTR-restarting). All clock differences saturate at zero.                                                                                                                                                                                                                                                                                                                                                                               |
 | **`random`**      | `Rng`, a fast non-cryptographic xoshiro256** generator seeded via `from_seed(u64)` (reproducible) or `from_os()`: `next_u64`/`next_u32`/`next_bool`/`next_f64`, unbiased `below(bound)` / `range_u64(lo, hi)` (rejection-sampled), `fill_bytes`. `secure_bytes(buf, len)` fills from the kernel CSPRNG (`getrandom`); use it for keys/tokens/nonces - `Rng` is not cryptographic.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | **`net`**         | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`AsyncTransport`), `TcpListener`. **Every operation that can wait is a future** driven by an `Executor` — there is no blocking socket surface. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, `Client::get`/`post` with `send(addr, req)`. **TLS** (`net::tls`, OpenSSL-backed `TlsStream`), **UDP** (`UdpSocket`, datagram send/receive futures), **DNS** (`net::dns`; `Resolve` runs `getaddrinfo` on the executor's blocking pool rather than stalling a worker), **HTTP/2** (`net::http2`, HPACK + single-stream framing), and **WebSocket** (`net::ws`, RFC 6455) all ship in 1.0. IPv6 addressing is parsed and represented but not yet dialable. |
@@ -3493,7 +3658,7 @@ The standard library follows a small set of conventions that user code is encour
 
 - **No NUL-terminated strings outside `ffi/`.** Every other module works in `Str` and `String`. The translation between Cryo strings and C strings happens at the boundary in `ffi::cstr`.
 - **`Result` for fallible operations, `panic` for broken invariants.** A function returns `Result<T, E>` whenever failure is part of its contract; it panics only when the contract truly cannot be preserved (e.g., an out-of-bounds index on a function whose contract excludes it).
-- **Explicit resource management.** Every owning type exposes a `drop(mut &this)` method, and its docstring identifies the ownership obligation. In practice the compiler synthesises these drops at scope exit (see [section 16.2](#162-the-drop-trait)); manual `.drop()` remains valid for early release.
+- **Explicit resource management.** Every owning type implements `Drop` (`implement trait Drop for ...`), and its docstring identifies the ownership obligation. The compiler runs these destructors at scope exit (see [section 16.2](#162-the-drop-trait)); to release a value early, call `mem::drop(x)`, not `x.drop()` (which warns, W0015).
 - **Allocator-generic containers.** `Array<T>`, `HashMap<K, V>`, `String`, etc. accept any `Allocator` implementation, defaulting to `GlobalAlloc`.
 
 ---
@@ -3626,7 +3791,7 @@ statement       = var_declaration | function_declaration | struct_declaration
                 | type_alias_declaration | implementation_block
                 | if_statement | while_statement | for_statement
                 | loop_statement | do_while_statement
-                | match_statement | switch_statement | static_match
+                | match_statement | static_match
                 | break_statement | continue_statement | return_statement
                 | unsafe_block | block | expression_statement
 
