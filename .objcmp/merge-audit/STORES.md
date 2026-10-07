@@ -22,7 +22,7 @@ never feeds a key.
 | 4 | function families written from text: `decl_fn_family` / `minted_family` (`compilation_context.cryo:701-731`) | the owner is **parsed out of the name's text** (`QualifiedName::parse` -> `display_parent` -> `module_family_named`) **(checked)** | 2 (a write) | a clone's owner is its template's (`copy_of`) or its module's `DefId`, handed in by whoever mints it. Dissolves `module_family_named` (and `module_of_minted_parent`). |
 | 5 | family readers through identity text: `call_resolver.cryo:773-774`, `:2118`; codegen `SymbolResolver::resolve_function` (`codegen/ops/symbol_resolver.cryo:271`) | `lookup_family_entries(Def(parent_of(d)), defs.leaf_of(d))` - the door asked with an identity's leaf **(checked :271)** | 4 | ask by the definition: `entry_of_def(d)` / `func_type_of_def(d)`. |
 | 6 | `GenericRegistry.coherence_index` (`types/generic_registry.cryo:334`) | `intern(coherence_key_for(..))` - text of the target's qualified name, the trait's annotation and the where-bounds' spellings (`passes/type_resolution.cryo:1975-2008`) | 2, 4 | a structural key: (trait `DefId`, target `TypeRef` with impl parameters positional, trait-argument `TypeRef`s, bound `DefId`s). |
-| 7 | the arena's projection intern key, `TypeArena::create_assoc_projection` (`types/arena.cryo:651`) | `aux0 = member.id` - the associated type's **leaf** **(checked)**; the slot the `assoc-type` door answered is passed in and unused for the key | 2, 4 | key by the slot when the door answered one; the `-1` case (no trait, or the trait declares no such type: `types/resolver.cryo:475`) needs a decision - see question in the handoff. |
+| 7 | the arena's projection intern key, `TypeArena::create_assoc_projection` (`types/arena.cryo:651`) | `aux0 = member.id` - the associated type's **leaf** **(checked)**; the slot the `assoc-type` door answered is passed in and unused for the key | 2, 4 | key by the slot when the door answered one; the `-1` case (no trait, or the trait declares no such type: `types/resolver.cryo:475`) needs a decision - see question in the handoff. **Ruling 143 refuses the `-1` case where it is written (8.526); the key is (base, slot, trait) since 8.527.** |
 | 8 | codegen `FunctionRegistry.by_name_index` (`codegen/state/function_registry.cryo:27`) | mostly the linker symbol; but `declaration_emitter.cryo:1253` and `:1324` register the bare source name and `:1259` the `decl_fn_key` qualified text **(checked)** | 4 (those 3 writes) | register only under the entry's symbol (the store then sits under ruling 126 with `GlobalRegistry`). |
 | 9 | `overload_func_owner` (`decl_index.cryo:214`) - not a key, a dedup discriminator inside `register_signature` (`:440`) | the `decl_fn_key` qualified-name text of a clone | 4 (soft) | compare `copy_of` (a `DefId`); goes with #2/#4. |
 | 10 | `GenericRegistry::find_inherent_impl_method` / `_generic_method` (`types/generic_registry.cryo:578,604`; callers `sema/method_binding.cryo:1163,1680`) - a scan, not a map | matches `m.func.name.equals(method_sym)` inside the owner's inherent blocks **(checked)** | 3 (a duplicate of the member-function door) | ask the member-function door, or by the method's `DefId`. |
@@ -70,8 +70,8 @@ placeholder cache are gone (each creation allocates; no name cache).
 
 ## Count
 
-**10 rows break a rule (A)**, of which #1 is converted here (8.523), leaving
-**9**; of the rest, `closure_spec_map` (B) and the dead `ResolutionMap.overloads`
-(C) went in 8.525; 2 carry identity as text (B); 4 position/external/dead (C); 1 is
-ruling 126's (D), whose premise (keyed by linker symbol) the measurement does
-not bear out.
+**10 rows break a rule (A)**, of which #1 is converted here (8.523) and #7
+in 8.527, leaving **8**; of the rest, `closure_spec_map` (B) and the dead
+`ResolutionMap.overloads` (C) went in 8.525; 2 carry identity as text (B); 4
+position/external/dead (C); 1 is rulings 126/141's (D), keyed by
+`namespace::name` text rather than the linker symbol, left until #3.
