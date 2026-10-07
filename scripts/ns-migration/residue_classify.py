@@ -192,10 +192,6 @@ CLASS_OF_METHOD = {
     "TypeUtils::lookup_func_type_exact":
         ("J", "member: the funnel's door onto `DeclarationIndex::lookup_func_type`, an overload family by its owner and leaf"),
     # -- the generic registry --
-    "GenericRegistry::find_inherent_impl_method":
-        ("J", "member: a method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand"),
-    "GenericRegistry::find_inherent_impl_generic_method":
-        ("J", "member: a generic method's leaf inside the owner's `implement` blocks, the owner the `TypeRef` in hand"),
     "GenericRegistry::member_template_key":
         ("N", "a name MINTED at the member template's declaration (`Owner::method`) for its registration: its display name and its placeholder type's, never a key it is found by"),
     "GenericRegistry::trait_item_slot":

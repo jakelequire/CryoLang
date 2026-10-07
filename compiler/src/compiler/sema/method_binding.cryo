@@ -1094,7 +1094,7 @@ type struct MethodBinding {
     /// annotation with the receiver's + the explicit args bound.  Hands back
     /// `fallback` (the bare-lookup return) on any miss.
     resolve_method_return_with_explicit_args(mut &this, recv_type: TypeRef,
-                                             member: MemberAccessNode*,
+                                             member: MemberAccessNode*, chosen: MethodNode*,
                                              fallback: TypeRef) -> TypeRef {
         if (member.generic_args.length == 0)   { return fallback; }
 
@@ -1154,12 +1154,17 @@ type struct MethodBinding {
         // Primitive / non-generic receiver whose generic method lives in an
         // inherent `implement T { ... }` block (e.g. `"42".parse_int<u64>()` on
         // `implement string`).  There is no Struct/Class/InstantiatedType AST to
-        // walk, but the inherent-impl registry holds the block.  Bind the
-        // method's OWN generic params from the explicit args and resolve its
-        // return annotation directly.
+        // walk; the method is the one the selection chose.  Bind the method's
+        // OWN generic params from the explicit args and resolve its return
+        // annotation directly.  A trait's method is not answered here: its
+        // annotation is written in the trait's or the impl's scope (`This`,
+        // the impl's parameters), which this context does not bind.
         if (owner_ast == null) {
-            const im: MethodNode* = this.ctx.generic_registry.find_inherent_impl_method(
-                owner_ref, member.member, member.generic_args.length);
+            const im: MethodNode* = if (chosen != null && chosen.func != null
+                    && !chosen.func.origin_trait.is_valid()
+                    && chosen.func.generic_params.length == member.generic_args.length) {
+                chosen
+            } else { null };
             if (im != null && im.func != null
                     && im.func.return_type_annotation != null) {
                 mut imp_ctx: ResolutionContext = ResolutionContext::new("");
@@ -1618,11 +1623,11 @@ type struct MethodBinding {
         // method of the call's name answers ahead of any trait impl's,
         // whatever order the blocks were written in.  Inherent: the
         // template's own methods and its inherent impl blocks, a non-generic
-        // owner's own methods, the inherent-impl registry
-        // (`"42".parse_int<u64>()` on `implement string`, or an `implement
-        // struct Driver { run<F,R> }` block, which is merged into no owner's
-        // method list).  Trait: the trait impls for the receiver, then a
-        // trait default.
+        // owner's own methods.  A generic method of an inherent block merged
+        // into no owner's method list (`"42".parse_int<u64>()` on `implement
+        // string`, `implement struct Driver { run<F,R> }`) is the selection's
+        // choice, found above by identity.  Trait: the trait impls for the
+        // receiver, then a trait default.
         mut trait_impl_block: ImplBlockNode* = null;
         if (!by_identity && member.resolved_trait.is_valid()) {
             found = this.find_generic_method_in_trait_impls(
@@ -1672,12 +1677,6 @@ type struct MethodBinding {
                         &(owner_ast as ClassDeclNode*).methods, member.member);
                 }
             }
-        }
-        if (!by_identity && found == null) {
-            mut impl_blk: ImplBlockNode* = null;
-            found = this.ctx.generic_registry.find_inherent_impl_generic_method(
-                recv_type, member.member, &impl_blk);
-            if (found != null && impl_blk != null) { owner_params = &impl_blk.generic_params; }
         }
         if (!by_identity && found == null) {
             found = this.find_generic_method_in_trait_impls(
