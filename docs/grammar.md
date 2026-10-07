@@ -75,7 +75,12 @@ ExportForm         ::= ModulePath "::" "{" ImportEntry ("," ImportEntry)* "}"
     `export M as V;` offers the module `M` under `V`.                    *)
 
 ModulePath         ::= Ident ("::" Ident)*
-QualName           ::= Ident ("::" Ident)*
+QualName           ::= PathHead ("::" Ident)*
+PathHead           ::= Ident | "This"
+                       (* `This` is a keyword, so a path that starts with it
+                          (`This::of(..)`, `This::Item`) is spelled out here: it
+                          names the enclosing type, with that type's own
+                          parameters as its arguments.                       *)
 
 (*  Directives use the bang-bracket form `![name(...)]`.  The leading
     `!` is part of a single `![` token produced by the lexer, so no
@@ -96,7 +101,7 @@ VarDecl            ::= ("const" | "mut") Ident ":" Type ("=" Expr)? ";"
     move fields out of a consumed value (see cryo.md S8.3).                *)
 StructDestructure  ::= "{" Ident ("," Ident)* "}"
 
-FunctionDecl       ::= Visibility? "function" Ident Generics?
+FunctionDecl       ::= Visibility? "async"? "function" Ident Generics?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)? Block
 
@@ -186,7 +191,7 @@ VisibilityBlock    ::= Visibility ":" (Field | Method | Constructor | Destructor
 MemberName         ::= Ident | Keyword
 
 Field              ::= MemberName ":" Type ("=" Expr)? ";"
-Method             ::= ("virtual" | "override")? MemberName Generics?
+Method             ::= ("virtual" | "override" | "async")? MemberName Generics?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)?
                        (Block | ";")
@@ -225,10 +230,16 @@ TraitDecl          ::= "type" "trait" Ident Generics?
                        (":" TraitBound ("," TraitBound)*)?  (* super-traits *)
                        "{" TraitMember* "}"
 TraitBound         ::= Ident GenericArgs?
-TraitMember        ::= Ident Generics?
+TraitMember        ::= "static"? "async"? Ident Generics?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)?
                        (Block | ";")     (* body = default impl    *)
+                     | AssocTypeDecl
+AssocTypeDecl      ::= "type" Ident (":" TraitBound ("+" TraitBound)*)? ";"
+                       (* `type Item;` or `type Item: Copy;`.  A projection
+                          `T::Item` is answered by `T`'s bounds, including
+                          the traits a bound's trait inherits; one no bound
+                          declares is an error (E0203).                     *)
 
 TypeAlias          ::= "type" Ident Generics? "=" Type ";"
 
@@ -250,10 +261,11 @@ TargetType         ::= QualName GenericArgs?
                      | Primitive
                      | "()"                              (* unit type *)
 
-MethodImpl         ::= ("virtual" | "override")? "static"?
+MethodImpl         ::= ("virtual" | "override")? "static"? "async"?
                        Ident Generics?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)? Block
+                     | "type" Ident "=" Type ";"   (* binds a trait's associated type *)
 
 Generics           ::= "<" GenericParam ("," GenericParam)* ">"
 GenericParam       ::= Ident ("=" Type)?
@@ -319,9 +331,9 @@ Primary            ::= Literal
                      | Match
                      | StaticMatch
                      | Lambda
-                     | "delete" Expr           (* parsed; see cryo.md section 21 *)
-                     | "await"  Expr           (* parsed; no async semantics yet *)
-                     | "yield"  Expr?          (* parsed; no generator semantics yet *)
+                     | "delete" Expr           (* frees a `new` allocation; see cryo.md section 15.2 *)
+                     | "await"  Expr           (* only inside an `async` body; see cryo.md section 19 *)
+                     | "yield"  Expr?          (* parsed; no generator semantics yet (cryo.md section 22) *)
                      | "(" Expr ")"
                      | ImplQualPath
 
@@ -353,6 +365,10 @@ NewExpr            ::= "new" Type ("(" ArgList? ")")?
                      | "new" Type "{" Ident ":" Expr
                                   ("," Ident ":" Expr)* ","? "}"
 IfExpr             ::= "if" Cond "{" Expr "}" "else" "{" Expr "}"
+                       (* exactly two arms: there is no `else if` chain in
+                          expression position.  Nest the second `if` inside
+                          the `else` braces.  The statement form (If) does
+                          take `else if`.                                    *)
 
 
 (*  Control Flow =============================================== *)
@@ -466,15 +482,16 @@ Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 (*   15   *  /  %                                        left       *)
 (*   16   as                                             left       *)
 (*   17   -  !  &  *  ~  ++  --  (prefix)  new  delete   right      *)
-(*   18   ()  []  .  ->  ::  ?  ++  --  (postfix)        left       *)
+(*   18   ()  []  .  ::  ?  ++  --  (postfix)            left       *)
 
 
 (*   Reserved Keywords =========================================    *)
 (*                                                                  *)
 (*  These names are reserved by the lexer and may not be used as    *)
-(*  identifiers.  Some (e.g. `from`, `async`, `await`, `yield`)     *)
-(*  are lexed but not yet wired into the parser - see section 21 of       *)
-(*  `cryo.md` for the reserved-syntax table.                        *)
+(*  identifiers.  Some (e.g. `from`, `yield`, `auto`, `tuple`)      *)
+(*  are lexed but have no semantics yet - see section 22 of         *)
+(*  `cryo.md` for the reserved-syntax table.  `async` and `await`   *)
+(*  are implemented (cryo.md section 19).                           *)
 (*                                                                  *)
 (*  alignof    as         asm        async     auto      await     *)
 (*  boolean    break      char       class     const     continue  *)
