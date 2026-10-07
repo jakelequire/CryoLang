@@ -322,7 +322,7 @@ three, and its row carries the count. Read each zero off its own row.
 | explicit-generic callee's template by ladder (`register_generic_fn_call`: `qualify_symbol_sym_home(leaf)`, then a resolver re-entry building `source_module::leaf`; and a `ScopeResolution` arm the parser never fed, a path callee's turbofish living on the path node) | **DELETED** — the identifier callee's stamp is the registry key (`template_of(res.def_id())`); shadow 0 over six halves, control 189 agreeing (116 stdlib templates the re-entry answered, 73 same-module ones HOME answered), 0 objects moved; the file's one `get_resolver()` went with it | — | `grep -c 'name_resolver' compiler/src/compiler/passes/type_resolution.cryo` → **0**; `grep -c 'require(Text::new("type_resolution:register_generic_fn_call"))' compiler/src/compiler/passes/type_resolution.cryo` → **1** (the stamp through a door since §8.211; `template_of(r.def_id())` until then) | §8.180, §8.182 |
 | struct-literal rungs 3 and 5 (`resolve_generic_scope_name(lit.struct_type, ..)`, `lookup_type_exact(lit.struct_type)`) | **DELETED** — rung 5: 2 lines over six halves, both C-imported literals whose stamp M1 had missed (above), 0 once stamped; rung 3: 0 over six halves including the `cryo test` half its comment named, and the instrument fires on a forced case; their two rows retired | — | `grep -c 'lookup_type_exact(lit.struct_type)' compiler/src/compiler/sema/sema.cryo` → **0** | §8.174 |
 | static-call unmangled tail (`pin_scope_callee_combined` pinning the bare `Owner::method` when the family selected no signature) | **DELETED** — 2 lines over six halves, one site: `T::try_from(this)` with `this` a value and the parameter `&T`; the static matcher admits the call site's auto-ref in a second pass and pins the symbol; a family that selects nothing stays unpinned | — | `grep -c 'select_static_overload' compiler/src/compiler/sema/call_resolver.cryo` → **5** (3 before §8.224: the trait-qualified call selects with the same two passes) | §8.174 |
-| unmangled pin family (`pin_scope_callee_qsym`'s qualified names, mono's `combined_sym` and spec-name pins) read by codegen's by-name lane (`resolve_function_by_mangled` → `resolve_function` → `resolve_function_with_arity`, and the vtable, prologue and constructor callers asking by name) | **DELETED** — 56,486 lines over six halves, every name pin a single-symbol family; the one plural (`BaseASTVisitor::visit`, 68 signatures, 5 vtable slots) bound its own signature by luck of registration order. `resolve_symbol` and `resolve_family` replace it: a name resolves only when its family names ONE symbol, several is E0900. The name pins themselves stay (written before their symbol exists), as `CalleePin::Family` since §8.195; codegen no longer chooses among signatures for them | — | `grep -c 'resolve_function_with_arity' compiler/src/compiler/codegen/ops/symbol_resolver.cryo` → **0**; `grep -rho 'register_with_arity' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'resolve_family(' compiler/src --include=*.cryo \| wc -l` → **6** (-1 in §8.528: `SymbolResolver::resolve_function` asks the definition's entry, `resolve_decl(entry_of_def(d))`; 7 before, -1 in §8.498: the AST arena's allocator is the language item `AstArenaAlloc`, resolved by its definition; 8 before, 6 before §8.360: `string::append` and the AST arena's allocator ask their family by owner and leaf) | §8.174, §8.175 |
+| unmangled pin family (`pin_scope_callee_qsym`'s qualified names, mono's `combined_sym` and spec-name pins) read by codegen's by-name lane (`resolve_function_by_mangled` → `resolve_function` → `resolve_function_with_arity`, and the vtable, prologue and constructor callers asking by name) | **DELETED** — 56,486 lines over six halves, every name pin a single-symbol family; the one plural (`BaseASTVisitor::visit`, 68 signatures, 5 vtable slots) bound its own signature by luck of registration order. `resolve_symbol` and `resolve_family` replace it: a name resolves only when its family names ONE symbol, several is E0900. The name pins themselves stay (written before their symbol exists), as `CalleePin::Family` since §8.195; codegen no longer chooses among signatures for them | — | `grep -c 'resolve_function_with_arity' compiler/src/compiler/codegen/ops/symbol_resolver.cryo` → **0**; `grep -rho 'register_with_arity' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -rho 'resolve_family(' compiler/src --include=*.cryo \| wc -l` → **3** (-3 in §8.531: codegen's three constructions ask `resolve_constructor` with the type's definition; 6 before, -1 in §8.528: `SymbolResolver::resolve_function` asks the definition's entry, `resolve_decl(entry_of_def(d))`; 7 before, -1 in §8.498: the AST arena's allocator is the language item `AstArenaAlloc`, resolved by its definition; 8 before, 6 before §8.360: `string::append` and the AST arena's allocator ask their family by owner and leaf) | §8.174, §8.175 |
 | codegen `$MG` reconstruction (`call_emitter` rebuilding a generic method spec's symbol from `resolved_type_args` when the pin missed) | **DELETED** — the pin missed because sema's `pin_method_callee_from_qname` mangled a specialization without its own type arguments; the writer folds them in now, 7 → 0 on the LSP, 308 → 0 over six halves. Since §8.216 no pin writer mangles at all - the spec's entry carries the symbol registration folded the arguments into - so `with_method_spec_args` is called by registration and by mono's dedup key alone | — | `grep -c 'with_method_spec_args' compiler/src/compiler/codegen/visit/call_emitter.cryo` → **0**; `grep -c 'with_method_spec_args' compiler/src/compiler/sema/call_resolver.cryo` → **0**; `grep -rho 'with_method_spec_args(' compiler/src --include=*.cryo \| wc -l` → **2** (the definition, `register_methods_with_module`; -1 in §8.523, `mangled_symbol_for_spec_method` deleted) | §8.176, §8.216, §8.523 |
 | method signatures under the BARE written target (`register_methods_with_module_aliased`: every method of `implement T` registered a second time as `<T as written>::<method>` in the function tables and under the written `T` in `method_returns`, beside the canonical key; 3 writers - type resolution's impl arm, mono's spec-method registration, the async repoint) and the ONE reader that asked by it, `lookup_callee_function_type`'s scope branch asking the WRITTEN `scope::member` ahead of the head's stamp | **DELETED** — the canonical key is the only registration and the callee hint asks the stamp's owner first, then the C-import alias spelling (a C import is declared whole under `alias::name`, the door `resolve_scope_call` opens last). Measured over six halves: 79,340 bare registrations; the bare-first hint read 6,448 bare keys (6,217 static calls written `Owner::method` where the stamp answered the same signature at 6,215 and a DIFFERENT one at **2** - `Beacon::make` in `leaf_scope_use_a`, handed another module's same-leaf `Beacon::make`; 231 the async repoint's own alias reset); 968 answered by the written spelling alone, every one a C-import alias call. With the stamp first: 231 bare reads (the repoint's reset, a writer) and **0** `method_returns` reads by a bare type, control 14,053 with the canonical type in the probe's set; 0 objects moved. Pinned by `static_call_hint_leaf_collision` (HEAD types an out-of-range literal by the other module's `(i64)` and refuses the call as an `i64` narrowing to `u8`, proposing a cast that would truncate it; E0010 at the literal now) | — | `grep -rho 'register_methods_with_module_aliased' compiler/src --include=*.cryo \| wc -l` → **0**; `grep -c 'bare_combined_sym' compiler/src/compiler/decl_index.cryo` → **0**; `grep -c 'lookup_func_type_exact(bare_sym)' compiler/src/compiler/sema/call_resolver.cryo` → **0** (the C-import door that stood after the stamp is deleted in §8.259: an alias segment is the module lane's); `ls -d tests/tests/projects/static_call_hint_leaf_collision*/test.json \| wc -l` → **1** | §8.180, §8.196, §8.197, §8.259 |
 | a trait method's return under the trait's BARE LEAF (the trait arm of `register_decl_in_index` wrote `method_returns` twice per method, under the canonical name and under the written leaf, "so bound-aware dispatch can find the method by leaf name" - audit 13's finding, audit 14's "still unmeasured"; a trait registers a RETURN and no signature, its parameters being checked against the selected implementation) | **DELETED** — measured over six halves under a probe that recorded every bare-leaf key and printed each `lookup_method_return` hitting one (`.objcmp/rc-lines.txt`): **25,374 bare writes, 0 reads**; control by inversion, one read by the leaf added at the write: 96 writes, 96 hits (`.objcmp/rc-ctl1.log`). Every reader holds a registered name (`resolve_method_owner`'s contract), and a bound's trait is its stamped identity. The canonical write stays; 0 objects moved | — | `grep -c 'register_method(node.name' compiler/src/compiler/passes/type_resolution.cryo` → **0**; `grep -rho 'register_method(' compiler/src --include=*.cryo \| wc -l` → **0** (the method return-type table is deleted in §8.491, with its definition, the trait arm's canonical write and the impl-method registrar's; 3 before) | §8.274 |
@@ -59650,3 +59650,51 @@ const n: i32 = LIMIT + other::LIMIT;   // `LIMIT` by its stamp; `other::LIMIT` t
   `pending` reasons 451 -> 442; doors 15 -> 16; lane exclusions 15 -> 14.
 * STORES.md: #3 converted, the GlobalRegistry row (D) updated; **6** rule-2/4
   rows left.
+
+### 8.531 Codegen finds a construction's constructor by the type's definition, not by the written name - 2026-10-06
+
+## Why
+
+Left by 8.528 (store #5): code generation's three constructions asked the
+member-function door with the type and a written name -
+`resolve_family(Type(t), id.name, arity)` for `Point(1, 2)`,
+`resolve_family(Type(t), node.type_name, arity)` for `new Point(1, 2)`, and
+`resolve_family(Def(base), node.base_ctor_name, arity)` for a derived
+class's base-constructor call.  The type's definition records the family
+its constructors register in (`constructor_entries_of`, 8.528), so the
+question needs no name.
+
+```cryo
+const p: Point = Point(1, 2);   // the constructor of `Point`'s definition taking 3 LLVM parameters
+const q: Point* = new Point(3, 4);
+```
+
+## What changed
+
+* `SymbolResolver::resolve_constructor(d, arity)`: the one non-template
+  constructor entry of the type definition `d` with `arity` LLVM parameters
+  (the receiver among them), resolved through `resolve_decl`; several is
+  an internal error (E0900), as for a family.
+* `call_emitter`, `new_delete_emitter` (with `registered_def(type_ref)`) and
+  `decl_visit_emitter` (the base's definition) call it.
+
+## Evidence
+
+* Agreement probe (`.objcmp/s115/u3probe/`): at each of the three sites,
+  the old `resolve_family` answer against the new one, compared as LLVM
+  values.  Full corpus `s115/cK2` (458 entries): 7,191 asks - 1,337
+  answered by both (32 call-syntax, 1,107 `new`, 198 base calls) and 5,854
+  by neither (constructions that take another path) - **0**
+  disagreements.  A first version that read the answer through
+  `family_answer`'s symbol loop (`s115/cK`) measured the same; it was
+  replaced because it added a symbol -> function-registry flow the
+  spelling-flow gate refused.
+* Control (env `S115CTL=ctormany`, the first version: a type with more than
+  one constructor answers nothing): `class_constructor_overloads_by_arity`
+  - 3 disagreements and the build fails.
+* Corpus `s115/cG` vs `s115/cK`, `s115/cK` vs `s115/cK2`: 0 status
+  changes.
+* `make verify --baseline HEAD --require-identical`: OK, 0 moved of 6,960
+  test and 1,126 example objects; every gate OK.
+* Clean build: 329 warnings, the same (code, file) multiset.
+* Lane, spelling flow, residue unchanged; §0 `resolve_family(` 6 -> 3.
