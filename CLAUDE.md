@@ -413,6 +413,15 @@ Write the reason it cannot be otherwise, not the reason someone changed it. If
 a decision genuinely needs its evidence recorded, that belongs in the spec or
 the commit message, not at the call site.
 
+**Describe Cryo on its own terms.** Never reference Rust, or any other
+language, in code comments, commit messages, docs, error messages or test
+names - no "as in Rust", "rustc-style", "like C++'s", "Cargo-style". State what
+Cryo does and why, so the point stands without the reader knowing another
+language, and so the text does not go wrong when Cryo's rule and the other
+language's diverge. Naming C where it is the actual interface - the C ABI, an
+`extern "C"` declaration, a C header, libc - is a fact about the boundary, not
+a comparison, and stays.
+
 **Commit a generator with what it generated.** Work that exists only as a diff,
 produced by tooling that exists only in a scratch directory, is not reproducible
 however mechanical it looks - and "it was script-generated" is exactly the
@@ -442,6 +451,11 @@ honest zeros here were measured over the wrong population entirely.
   `.claude/settings.json`. **`.claude/` is gitignored**, so that file is
   per-checkout and a fresh clone does NOT inherit it - set it again there. This
   line is the part that travels.
+- A commit message says what changed and why, in plain terms. It does not
+  cite internal bookkeeping: no ruling numbers ("Rulings 149-158"), ledger
+  entries ("8.540"), session numbers, `HANDOFF.md` sections, audit files or
+  store/slice labels. Those are dead references within months; state the
+  behaviour or rule itself instead.
 - Cryo has no `else if` in an if-**expression**; statements are fine.
 - Basic `grep` has no `\t` — use `grep -P` for tab-separated audit streams.
 

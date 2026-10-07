@@ -56,8 +56,10 @@ ImportEntry        ::= Ident ("as" Ident)?
     rest of the path names (`import Toml::parse as tp;` binds what
     `import Toml::{ parse as tp };` binds), or the module registered under
     the whole path when the rest offers no such item; when it names both,
-    the import is an error (E0244).  A module alias names the module
-    itself: `N::f`, `N::T`, `N::T::make` and `N::E::V` resolve in it.    *)
+    the import is an error (E0244).  A brace entry naming such a pair,
+    aliased or not, is the same error.  A module alias names the module
+    itself: `N::f`, `N::T`, `N::T::make`, `N::E::V` and its sub-modules'
+    paths (`N::Inner::f`) resolve in it.                                 *)
 
 (*  Symbol re-export.  `ExportForm` is `ImportForm` minus the wildcard:
     a glob re-export is the one form under which an importer's in-scope

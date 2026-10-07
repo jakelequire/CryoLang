@@ -82,7 +82,7 @@ A member position is never a declaration or an operator, so the keyword is unamb
 
 The exceptions are the keywords a member position reads *first*: `public`, `private` and `protected` open a visibility label, and `static`, `virtual`, `override` and `async` are member modifiers. A field with one of those seven names cannot be declared, and a C struct carrying one still needs a `![repr(C)]` shadow struct.
 
-A **binding** is the other way round. A statement that begins with a keyword opening a declaration is parsed as that declaration, so a local named by one could never be assigned or called through: `module = q;` is not an assignment. The 19 keywords that open a declaration - `function`, `const`, `mut`, `type`, `struct`, `class`, `enum`, `trait`, `import`, `module`, `extern`, `implement`, `public`, `private`, `protected`, `namespace`, `intrinsic`, `static`, `async` - therefore cannot name a variable, a parameter, a pattern binding or a destructured local (`E0100`), as keywords are not identifiers in Rust. Keywords that open nothing (`default`, `string`) remain legal names, and a destructuring shorthand over a field named by one of the 19 needs a rename: `const { type: t }: S = s;`.
+A **binding** is the other way round. A statement that begins with a keyword opening a declaration is parsed as that declaration, so a local named by one could never be assigned or called through: `module = q;` is not an assignment. The 19 keywords that open a declaration - `function`, `const`, `mut`, `type`, `struct`, `class`, `enum`, `trait`, `import`, `module`, `extern`, `implement`, `public`, `private`, `protected`, `namespace`, `intrinsic`, `static`, `async` - therefore cannot name a variable, a parameter, a pattern binding or a destructured local (`E0100`): a keyword is never an identifier. Keywords that open nothing (`default`, `string`) remain legal names, and a destructuring shorthand over a field named by one of the 19 needs a rename: `const { type: t }: S = s;`.
 
 ```cryo
 const module: i32 = 42;                  // E0100: expected a variable name, found `module`, which is a reserved word
@@ -194,7 +194,7 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
   ```
 
   Only a `"` outside every `{...}` closes the f-string.
-- A hole may carry a **format spec** after a colon, a subset of Rust's:
+- A hole may carry a **format spec** after a colon:
 
   ```
   {expr:[[fill]align][#][0][width][.precision][type]}
@@ -266,7 +266,7 @@ Every value in Cryo has a known type at compile time. A binding's type is either
 | `double`                      | Alias for `f64`.                                                                                                                                 | 8 bytes                  |
 | `usize` `isize`               | Pointer-width unsigned / signed integers - distinct types whose width tracks the target's pointer size (the natural type for sizes and indices). | 8 bytes on 64-bit        |
 | `never`                       | The type of an expression that does not return. Only valid as a return type, and written by functions that always panic, trap, or diverge.       | 0                        |
-| `()`                          | The unit type. A value of this type carries no information. See [section 2.7](#27-the-unit-type) for a current limit on the `()` value.           | 0                        |
+| `()`                          | The unit type. A value of this type carries no information.                                                                                      | 0                        |
 
 In performance-sensitive or cross-platform code, prefer the explicit-width forms (`i32`, `u64`, `f64`) so the layout is unambiguous. The shorthand aliases exist for ergonomics.
 
@@ -277,6 +277,8 @@ In performance-sensitive or cross-platform code, prefer the explicit-width forms
 A pointer holds a memory address. Pointer types are written by suffixing the pointee with `*`, mirroring the C convention.
 
 ```cryo
+import std::core::intrinsics::{ malloc };
+
 const p:  int*  = &x;          // pointer to int
 const pp: int** = &p;          // pointer to pointer
 const v:  void* = malloc(64);  // type-erased
@@ -401,10 +403,17 @@ const g = twice;                  // error[E0154]: `twice` is overloaded, and no
                                   // help: give the variable a function type to pick one: `const g: (i32) -> i32 = twice;`
 ```
 
-A **generic** function is not yet taken as a value by inference:
-`const h: (i32) -> i32 = identity;` is refused (E0200, "expected
-`(i32) -> i32`, found `(T) -> T`"). Wrap the call in a non-generic function or
-a lambda instead.
+A **generic** function used as a value infers its type arguments from its use,
+as a call infers them from its arguments. The expected function type supplies
+them, and the turbofish names them explicitly:
+
+```cryo
+function idf<T>(x: T) -> T { return x; }
+
+const h: (i32) -> i32 = idf;         // idf::<i32>
+const k = idf::<i64>;                // (i64) -> i64
+const n: i32 = h(3);                 // 3
+```
 
 **Calling something that is not a function.** A call whose callee has a
 non-function type is refused with E0213, whether the callee is a call's
@@ -517,15 +526,14 @@ The unit type `()` represents "a value that carries no information." It is disti
 
 `()` appears in generic positions where a type parameter is required but no data is needed. The canonical example is `Result<(), Error>` for an operation that either succeeds (with nothing to return) or fails with an error.
 
-> **Current limit.** The *type* `()` is a real zero-size type (`sizeof(()) == 0`), but the *expression* `()` is still typed `void*` by the type checker. Where a generic argument is inferred from it, the two meet and the code compiles: `Result::Ok(())` for a `Result<(), E>` works, and so does `return Result::Ok(());`. Where the `()` value meets the `()` type directly, it is refused (E0200, "expected `()`, found `void*`"):
->
-> ```cryo
-> const r: Result<(), i32> = Result::Ok(());   // fine
-> const u: () = ();                            // error[E0200]
-> function f() -> () { return (); }            // error[E0200]
-> ```
->
-> Write `-> void` for a function that returns nothing. Making `()` a real unit value is planned as separate work.
+The expression `()` is the one value of the unit type, and it has type `()`:
+
+```cryo
+function done() -> () { return (); }
+
+const u: () = done();
+const r: Result<(), i32> = Result::Ok(());
+```
 
 ### 2.8 Type Aliases
 
@@ -694,6 +702,8 @@ mut   g_counter:  u64    = 0;
 ### 4.1 Function Declarations
 
 ```cryo
+import std::fmt::{ printf };
+
 function add(a: int, b: int) -> int {
     return a + b;
 }
@@ -837,7 +847,7 @@ const s: i16 = 1 as i16;
 const d: i32 = conv(s);          // error[E0214]: no overload of `conv` accepts these arguments
 ```
 
-An untyped literal argument takes one fixed type where the overloads differ in that parameter: an integer literal is `i32` and a float literal is `f64`, as in Rust. Write the type you mean with `as` (`conv(1 as i64)`). A qualified call (`Json::conv(1)`) selects among that module's overloads the same way.
+An untyped literal argument takes one fixed type where the overloads differ in that parameter: an integer literal is `i32` and a float literal is `f64`, the same defaults a literal takes anywhere else. Write the type you mean with `as` (`conv(1 as i64)`). A qualified call (`Json::conv(1)`) selects among that module's overloads the same way.
 
 An overloaded name used as a value without a call is picked by its expected function type ([section 2.5](#25-function-types)).
 
@@ -1004,6 +1014,8 @@ The range operators `..` / `..=` bind looser than every arithmetic and compariso
 Conditions are parenthesised and bodies are always braced; there is no single-statement form.
 
 ```cryo
+import std::fmt::{ println };
+
 if (x > 0) {
     println("positive");
 } else if (x < 0) {
@@ -1030,6 +1042,8 @@ const sign: i32 = if (n > 0) { 1 } else { if (n < 0) { -1 } else { 0 } };
 ### 6.2 While Loops
 
 ```cryo
+import std::fmt::{ printf };
+
 mut i: int = 0;
 while (i < 10) {
     printf("%d\n", i);
@@ -1042,6 +1056,8 @@ while (i < 10) {
 A C-style `for` with three components: declare-initialiser, condition, post-update. The loop variable is scoped to the loop body.
 
 ```cryo
+import std::fmt::{ printf };
+
 for (mut i: int = 0; i < 10; i++) {
     printf("%d\n", i);
 }
@@ -1076,6 +1092,8 @@ Range literals are ordinary expressions and may appear anywhere, not only in a `
 `loop { ... }` is an unconditional infinite loop. Prefer it over `while (true)`; it communicates "this runs until something inside breaks out" without misdirection.
 
 ```cryo
+import std::fmt::{ printf };
+
 mut count: int = 0;
 loop {
     if (count >= 5) { break; }
@@ -1099,6 +1117,8 @@ The body executes at least once, then the condition is checked.
 `break` exits the innermost loop. `continue` skips to the next iteration.
 
 ```cryo
+import std::fmt::{ printf };
+
 for (mut i: int = 0; i < 20; i++) {
     if (i % 2 == 0) { continue; }
     if (i > 10)     { break; }
@@ -1111,6 +1131,8 @@ for (mut i: int = 0; i < 20; i++) {
 `match` is the language's primary discriminator. It branches on enum variants, integer values, and other patterns; the compiler enforces that every case is covered.
 
 ```cryo
+import std::fmt::{ println };
+
 match (color) {
     Color::Red   => { println("red"); }
     Color::Green => { println("green"); }
@@ -1155,6 +1177,8 @@ function add(a: int, b: int) -> int {
 `unsafe { ... }` is recognised at parse time and lowers identically to a plain block. It serves as a **documentation marker**: a visible signal that the enclosed code performs raw pointer arithmetic, calls `extern` functions, or otherwise sits at the edge of the language's safety story. The compiler does not currently impose any extra restriction outside an `unsafe` block, and does not relax any check inside one - every operation Cryo permits today is permitted everywhere.
 
 ```cryo
+import std::core::intrinsics::{ malloc };
+
 unsafe {
     const raw: void* = malloc(64);
     // raw pointer manipulation here
@@ -1254,6 +1278,8 @@ A pattern describes the shape of a value. When a value matches, any variables in
 ### 7.2 Enum Destructuring
 
 ```cryo
+import std::fmt::{ printf, println };
+
 type enum Shape {
     Circle(f64);
     Rectangle(f64, f64);
@@ -1278,6 +1304,8 @@ If you don't need a payload, use `_`: `Option::Some(_) => { ... }`.
 Range patterns match values within an inclusive range. They are most useful for character classification. Both spellings - `a..b` and the explicit `a..=b` - are **inclusive** in pattern position (note this differs from a range *expression*, where `a..b` is half-open). Bounds must be integer or char literals of the same kind.
 
 ```cryo
+import std::fmt::{ println };
+
 match (ch) {
     '0'..='9'                   => { println("digit"); }
     'a'..'z' | 'A'..'Z' | '_'   => { println("ident-start"); }
@@ -1549,6 +1577,8 @@ Classes are heap-allocated reference types with single inheritance, virtual disp
 A class is declared with `type class`. Members live inside visibility blocks (`public:`, `private:`, `protected:`).
 
 ```cryo
+import std::fmt::{ printf };
+
 type class Person {
 public:
     name: string;
@@ -1576,21 +1606,23 @@ p.greet();
 
 Constructors share the class name. They are real language constructs that `new` invokes, not a naming convention as on structs.
 
-A destructor is prefixed with `~`, takes no parameters, and runs when the instance is deallocated. It is the right place to release resources acquired in the constructor (heap memory, file handles, sockets), following the RAII pattern familiar from C++.
+A destructor is prefixed with `~`, takes no parameters, and runs when the instance is deallocated. It is the right place to release resources acquired in the constructor (heap memory, file handles, sockets), so the object's lifetime bounds the resource's.
 
 ```cryo
+import std::core::intrinsics::{ malloc, free };
+
 type class Buffer {
 public:
     data: u8*;
     size: u64;
 
     Buffer(_size: u64) {
-        this.data = malloc(_size);
+        this.data = malloc(_size) as u8*;
         this.size = _size;
     }
 
-    ~Buffer() -> void {
-        free(this.data);
+    ~Buffer() {
+        free(this.data as void*);
     }
 }
 ```
@@ -1600,6 +1632,8 @@ public:
 A class may extend exactly one base class. The derived constructor must chain to the base constructor with `: Base(args)`:
 
 ```cryo
+import std::fmt::{ printf };
+
 type class Animal {
 public:
     kind: string;
@@ -1666,6 +1700,8 @@ A `virtual` method without a body declares an interface point that derived class
 Code written against a base-class pointer dispatches automatically to the actual derived implementation:
 
 ```cryo
+import std::fmt::{ printf };
+
 function print_area(shape: Shape*) -> void {
     printf("%s: area = %f\n", shape.name(), shape.area());
 }
@@ -1896,7 +1932,7 @@ type struct Sink<W> {
 }
 ```
 
-The same holds for **operators** and **fields**, as in Rust. An operator applies to a parameter only when a bound licenses it - the language's own trait for that operator (`Add` for `+`, `Ord` for `<`, `Eq` for `==`; see [section 11.6](#116-operator-overloading)) - and a bound never gives a parameter fields, whatever the type it is later instantiated with declares. Both are refused on the generic body, whether or not anything instantiates it:
+The same holds for **operators** and **fields**. An operator applies to a parameter only when a bound licenses it - the language's own trait for that operator (`Add` for `+`, `Ord` for `<`, `Eq` for `==`; see [section 11.6](#116-operator-overloading)) - and a bound never gives a parameter fields, whatever the type it is later instantiated with declares. Both are refused on the generic body, whether or not anything instantiates it:
 
 ```cryo
 function add<T>(a: T, b: T) -> T { return a + b; }                      // error[E0229]: the `+` operator cannot be applied to `T`: its bounds do not give it `std::core::ops::Add`
@@ -1958,7 +1994,7 @@ generic adapter names its source's element as `I::Item`:
 type struct MapIter<I, O> where I: Iterator { inner: I; f: (I::Item) -> O; }
 ```
 
-A projection is answered by the parameter's bounds, so `I::Item` needs a bound on `I` whose trait declares `Item`. Without one, or when no bound's trait declares the name, the projection is refused where it is written (E0203, "associated type `Item` not found for `I`"). A bound on a trait that *inherits* `Iterator` answers too: the projection resolves through the bound trait's supertraits, as in Rust.
+A projection is answered by the parameter's bounds, so `I::Item` needs a bound on `I` whose trait declares `Item`. Without one, or when no bound's trait declares the name, the projection is refused where it is written (E0203, "associated type `Item` not found for `I`"). A bound on a trait that *inherits* `Iterator` answers too: the projection resolves through the bound trait's supertraits.
 
 ```cryo
 type trait DoubleEnded : Iterator { next_back(mut &this) -> Option<This::Item>; }
@@ -2251,7 +2287,7 @@ implement enum Result<T, E> {
 
 `Result`'s parameters `<T, E>` are fixed by the type; `map` introduces an additional `<U>`.
 
-**Naming the enclosing type.** Inside an implement block or a type body, `This` is the enclosing type with its own parameters as arguments, so `This::of(..)` in `implement struct Pair<T>` means `Pair<T>::of(..)`. A generic type's bare name written there without arguments, `Pair::of(..)`, infers its arguments from the call, as in Rust:
+**Naming the enclosing type.** Inside an implement block or a type body, `This` is the enclosing type with its own parameters as arguments, so `This::of(..)` in `implement struct Pair<T>` means `Pair<T>::of(..)`. A generic type's bare name written there without arguments, `Pair::of(..)`, infers its arguments from the call:
 
 ```cryo
 type struct Pair<T> { a: T; b: T; }
@@ -2426,7 +2462,20 @@ After the block is loaded, `my_bool.to_i32()` resolves like any other method cal
 
 ### 13.4 Which Method a Call Names
 
-A method call `recv.m(...)` names the one method `m` its arguments bind to, and no kind of method outranks another. A receiver with an **inherent** method `m` and a trait impl that also provides an `m` the arguments bind to makes the call ambiguous (E0156), whichever order the `implement` blocks were written in and whether the receiver or either method is generic. The path forms are the same call and the same tie: `T::m(recv, ...)`, `T::m()` for a static method, and `T::m` as a value. The caller writes the impl-qualified path `(Tr for T)::m(&recv, ...)` below, or renames one of them. A name two traits provide is an error as well (E0156), whether the call is written `recv.m(...)`, `T::m(recv, ...)`, `T::m()` for a static method, or `T::m` as a value, and never a pick by declaration or import order. The error names each candidate where it is declared and the spelling that chooses. A call made through a bound (`x.m()` where `x: &T` and `where T: Tr`, or the path `T::m(...)` and the value `T::m` under the same bound) names `Tr::m`, since `T` has no methods but its bounds' where the call is written — the concrete type it is later instantiated with does not change that, even when it has an inherent `m` or implements a second trait providing `m`. A parameter bounded by two traits that both provide `m` directs nothing, and the instantiation reports the tie. A call through a bound follows Rust's rule; on a concrete receiver Rust lets the inherent method win, and Cryo refuses the call instead.
+A method call `recv.m(...)` names the one method `m` its arguments bind to, and no kind of method outranks another. Two methods of one name that both fit the arguments make the call ambiguous, and it is an error; in particular, a non-generic method does not win over a generic one by being non-generic:
+
+```cryo
+type struct Box2 { v: i32; }
+implement struct Box2 {
+    put(&this, x: i32) -> i32 { return x; }
+    put<T>(&this, x: T) -> i32 { return 0; }
+}
+
+const b: Box2 = Box2 { v: 0 };
+const n: i32 = b.put(1);    // error: both `put`s apply
+```
+
+A receiver with an **inherent** method `m` and a trait impl that also provides an `m` the arguments bind to makes the call ambiguous (E0156), whichever order the `implement` blocks were written in and whether the receiver or either method is generic. The path forms are the same call and the same tie: `T::m(recv, ...)`, `T::m()` for a static method, and `T::m` as a value. The caller writes the impl-qualified path `(Tr for T)::m(&recv, ...)` below, or renames one of them. A name two traits provide is an error as well (E0156), whether the call is written `recv.m(...)`, `T::m(recv, ...)`, `T::m()` for a static method, or `T::m` as a value, and never a pick by declaration or import order. The error names each candidate where it is declared and the spelling that chooses. A call made through a bound (`x.m()` where `x: &T` and `where T: Tr`, or the path `T::m(...)` and the value `T::m` under the same bound) names `Tr::m`, since `T` has no methods but its bounds' where the call is written — the concrete type it is later instantiated with does not change that, even when it has an inherent `m` or implements a second trait providing `m`. A parameter bounded by two traits that both provide `m` directs nothing, and the instantiation reports the tie. On a concrete receiver there is no such direction, so an inherent method and a trait's method of one name that both fit are a tie, and the call is refused.
 
 ```cryo
 type trait Beta { go(&this, u: i32) -> i64; }
@@ -2443,7 +2492,7 @@ const b: i64 = (Beta for IgTn)::go(&ig, 7);  // 2
 const c: i64 = via::<IgTn>(&ig);             // 2: the bound names `Beta::go`
 ```
 
-**A method as a value.** A method named by path without a call is a function value. A static method's value has the method's own signature; a method with a receiver takes the receiver first, as in Rust: for `step(&this, u: i32) -> i64`, `Pt::step` is a `(&Pt, i32) -> i64`, called `f(&p, 7)`; `mut &this` gives `mut &Pt` and `this` gives `Pt`. The value names one method, so an inherent `m` beside a trait's `m` is the same tie (E0156) and `(Tr for T)::m` chooses. A method generic in its own parameters, or a generic owner's, is not taken as a value this way.
+**A method as a value.** A method named by path without a call is a function value. A static method's value has the method's own signature; a method with a receiver takes the receiver as its first parameter: for `step(&this, u: i32) -> i64`, `Pt::step` is a `(&Pt, i32) -> i64`, called `f(&p, 7)`; `mut &this` gives `mut &Pt` and `this` gives `Pt`. The value names one method, so an inherent `m` beside a trait's `m` is the same tie (E0156) and `(Tr for T)::m` chooses. A method generic in its own parameters, or a method of a generic owner, is taken as a value the same way, and its type arguments are inferred from the use, as a generic function's are ([section 2.5](#25-function-types)): `const g: (&Wrap<i32>) -> i32 = Wrap::get;`.
 
 ```cryo
 type struct Pt { v: i32; }
@@ -2490,7 +2539,7 @@ The namespace serves as the file's identity within the project. The compiler use
 
 ### 14.2 Module Aggregators
 
-A directory of related files uses a `_module.cryo` aggregator to declare which submodules exist and which are public, analogous to Rust's `mod.rs`.
+A directory of related files uses a `_module.cryo` aggregator to declare which submodules exist and which are public.
 
 ```cryo
 // stdlib/collections/_module.cryo
@@ -2519,21 +2568,39 @@ import Math::Vector::Vec3 as P3;      // the same, for one item
 
 An entry's `as` binds the declaration it names under another name, and only that name: `import Toml::{ parse as toml_parse };` makes `toml_parse` Toml's `parse`, and does not bring `parse` into scope. The alias is the declaration itself - its overloads, its generic parameters, a type's statics and methods - not a second spelling looked up later.
 
-A module alias names the module itself. `import Math::Vector as V;` makes `V::Vec2`, `V::Vec2::new(..)`, `V::length(..)`, `V::Axis::X` and the value `V::length` mean what the same paths through `Vector` mean; `Math` need not be a module. An alias is a module's name in its file, so an alias spelled like another module the file imports is refused (E0205). A path continues through an alias into the module's own names, not into its sub-modules: `V::Inner::f()` is refused, and `import Math::Vector::Inner as VI;` names that module.
+A module alias names the module itself. `import Math::Vector as V;` makes `V::Vec2`, `V::Vec2::new(..)`, `V::length(..)`, `V::Axis::X` and the value `V::length` mean what the same paths through `Vector` mean; `Math` need not be a module. An alias is a module's name in its file, so an alias spelled like another module the file imports is refused (E0205). A path continues through an alias into the module's sub-modules as well as its own names:
 
-`import A::B as C;` names the item `B` of the module `A`, or the module `A::B`. When `A` declares an item `B` and `A::B` is also a module, the path names both, and neither is chosen: the import is an error (E0244), and the fix says which one is meant:
+```cryo
+import Json as J;
+
+const n: i32 = J::twice(3);          // Json::twice
+const m: i32 = J::Inner::deep();     // Json::Inner::deep
+```
+
+`import A::B as C;` names the item `B` of the module `A`, or the module `A::B`. When `A` declares an item `B` and `A::B` is also a module, the path names both, and neither is chosen: the import is an error (E0244). The braced forms are the same error, aliased or not, so there is no import that picks the item out of the pair; the fix is to rename one of the two. The module stays reachable by its path:
 
 ```cryo
 import Shapes::Json as J;          // error[E0244]: `Shapes::Json` names both an item of `Shapes` and a module
-import Shapes::{ Json as J };      // the item
+import Shapes::{ Json };           // error[E0244]
+import Shapes::{ Json as J };      // error[E0244]
 import Shapes::Json;               // the module, as `Json::..`
+```
+
+A name a file declares and a name it imports are one scope. Declaring a local item with the name of an import, or with an import alias, is a redeclaration (E0205); neither the local declaration nor the import wins:
+
+```cryo
+import Shapes::{ Tag };
+type struct Tag { n: i32; }        // error[E0205]
+
+import Json as Loc;
+type struct Loc { n: i32; }        // error[E0205]
 ```
 
 Each `import` declaration imports from a single path. To bring two items from the same module into scope, use the selective brace form (`import M::{A, B};`) or write two separate `import` statements.
 
 Wildcard imports are convenient but can cause name collisions; prefer the brace form or using the module name directly.
 
-A brace entry brings its name in once. A second brace entry bringing in a name an earlier one already brought into the file, in the same namespace - another module's item of that name, or the same item again - is refused at the second import (E0243, "`parse` is imported twice"), as Rust refuses a second `use`. The first import stays the name's, and a qualified path still names its own module's item:
+A brace entry brings its name in once. A second brace entry bringing in a name an earlier one already brought into the file, in the same namespace - another module's item of that name, or the same item again - is refused at the second import (E0243, "`parse` is imported twice"). The first import stays the name's, and a qualified path still names its own module's item:
 
 ```cryo
 import Json::{ parse };
@@ -2626,7 +2693,7 @@ import App::Gpu::Vertex;
 type struct Vertex { v: i32; }         // E0205: `Vertex` spells the imported module
 ```
 
-A module may declare a type named like a *different* module, and a type may be reached through its module's path (`Buffer::Handle`) without being imported. The consequence is that a scope segment names exactly one owner, so `Buffer::make` is the module's function or nothing — there is no rule choosing between a module and a same-named type, because no scope holds both. This is Rust's model, where `mod x` beside `struct x` is an error.
+A module may declare a type named like a *different* module, and a type may be reached through its module's path (`Buffer::Handle`) without being imported. The consequence is that a scope segment names exactly one owner, so `Buffer::make` is the module's function or nothing — there is no rule choosing between a module and a same-named type, because no scope holds both.
 
 ---
 
@@ -2651,9 +2718,11 @@ Pointer indexing is supported: `ptr[0]` is `*ptr`, and `ptr[n]` accesses the n-t
 **Low level (`malloc` / `free`)** for raw byte buffers and FFI-shaped allocations:
 
 ```cryo
+import std::core::intrinsics::{ malloc, free };
+
 const buf: u8* = malloc(1024) as u8*;
 buf[0] = 0xFF;
-free(buf);
+free(buf as void*);
 ```
 
 A bare `malloc`, `free` or `realloc` means a declaration in scope, as any bare name does: the module's own `intrinsic function`, an `extern "C"` it declares, or an import. With no such declaration in the writing module the bare name is an **error**, and the fix is to say which one is meant - `libc::free` for the C allocator, `heap::free` for the Cryo one. There is no freestanding exception: under `no_std` the name is declared (extern or intrinsic), so the rule holds there as everywhere.
@@ -2680,6 +2749,8 @@ const arr: int* = new int[100];
 `null` is the null pointer literal, valid in any pointer context. The primitive `string` is pointer-shaped (a NUL-terminated `u8*`), so it counts as a pointer context: `null` assigns to, initializes, returns as, and compares with a `string` without a cast.
 
 ```cryo
+import std::fmt::{ println };
+
 const p: int* = null;
 if (p == null) { println("null"); }
 
@@ -2720,7 +2791,7 @@ const non_null: NonNull<u8> = NonNull::new(buf).unwrap();
 
 ## 16. Ownership, Copy, and Drop
 
-Cryo implements a static ownership model that is enforced at compile time. The model is **deliberately weaker than Rust's**: it is built around three notions (`Copy`, `Drop`, and a flow-sensitive move check). It has no borrow checker, no lifetimes, and does not track aliasing of raw pointers - but the move check is a *hard error*, not a warning: using a value after it has been moved is rejected at compile time (`E0452`, see [section 16.3](#163-move-checking)).
+Cryo implements a static ownership model that is enforced at compile time. The model is **deliberately small**: it is built around three notions (`Copy`, `Drop`, and a flow-sensitive move check). It has no borrow checker, no lifetimes, and does not track aliasing of raw pointers - but the move check is a *hard error*, not a warning: using a value after it has been moved is rejected at compile time (`E0452`, see [section 16.3](#163-move-checking)).
 
 ### 16.1 The `Copy` Trait
 
@@ -2737,13 +2808,19 @@ A type is `Copy` if it can be duplicated by a bitwise copy of its bytes. The com
 A type implements `Drop` to attach a destructor:
 
 ```cryo
-type trait Drop {
-    drop(mut &this) -> void;
-}
+import std::core::intrinsics::{ free };
+
+// The trait, as `std::core::drop` declares it:
+//
+//     type trait Drop {
+//         drop(mut &this) -> void;
+//     }
+
+type struct Buffer { data: u8*; }
 
 implement trait Drop for Buffer {
     drop(mut &this) -> void {
-        free(this.data);
+        free(this.data as void*);
     }
 }
 ```
@@ -2802,9 +2879,13 @@ implement trait Drop for Owner {
 > you free and guard on it:
 >
 > ```cryo
-> drop(mut &this) -> void {
->     if (this.data != null) { free(this.data); }
->     this.data = null;                       // REQUIRED, not defensive style
+> import std::core::intrinsics::{ free };
+>
+> implement trait Drop for Buffer {
+>     drop(mut &this) -> void {
+>         if (this.data != null) { free(this.data as void*); }
+>         this.data = null;                   // REQUIRED, not defensive style
+>     }
 > }
 > ```
 >
@@ -2821,7 +2902,7 @@ use and the scope-exit drop is suppressed. A bare `x.drop()` does neither.
 
 **Only `implement trait Drop` defines a destructor.** A method merely named `drop` - declared in a struct body or an inherent `implement` block - is an ordinary method: it is not run at scope exit, it does not make the type satisfy `where T: Drop`, and calling it releases nothing else.
 
-**Releasing a value behind a pointer.** Code that owns a `T` through a raw `T*` (a container's storage, a box) releases it with the `drop_in_place` intrinsic from `std::core::ptr`, as in Rust. After monomorphisation it runs that type's destructor and field drop-glue, or nothing for a `Copy` type, so `T` needs no bound. Calling `.drop()` on an unbounded `T` is refused, and the error says what to write:
+**Releasing a value behind a pointer.** Code that owns a `T` through a raw `T*` (a container's storage, a box) releases it with the `drop_in_place` intrinsic from `std::core::ptr`. After monomorphisation it runs that type's destructor and field drop-glue, or nothing for a `Copy` type, so `T` needs no bound. Calling `.drop()` on an unbounded `T` is refused, and the error says what to write:
 
 ```cryo
 import std::core::ptr;
@@ -2859,7 +2940,7 @@ Two move/ownership hazards that are unambiguous memory errors, called out as the
 - **Loop-carried move** (`E0452`) - a value moved inside a loop and re-read on the next iteration would be freed twice.
 - **Returning the address of a local** (`E0455`) - `return &local;` hands back a pointer into the stack frame that is freed when the function returns. (`return &this` / `return &param` is fine - those are caller-backed.)
 
-Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility, as in C++ (see [section 2](#2-type-system) and [section 15](#15-pointers-and-memory)). Move tracking enforces the moved-set above; it is not a full Rust-style soundness boundary.
+Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility (see [section 2](#2-type-system) and [section 15](#15-pointers-and-memory)). Move tracking enforces the moved-set above and nothing more: it does not prove that a reference or pointer outlives what it points to.
 
 ---
 
@@ -3095,10 +3176,13 @@ An ADT enum (variants with payloads) is laid out as a tag (`i32`) followed by a 
 `sizeof(T)` and `alignof(T)` return compile-time `u64` constants reflecting the type's chosen layout - including any `![repr]` or `![align]` directives applied to it. They are the recommended way to verify FFI struct layout against a C header in a test:
 
 ```cryo
+import std::test::assert::{ expect_eq };
+import std::test::error::{ TestError };
+
 ![test]
-function timespec_matches_c() -> void {
-    expect_eq(sizeof(timespec),  16);
-    expect_eq(alignof(timespec), 8);
+function timespec_matches_c() -> Result<(), TestError> {
+    expect_eq(sizeof(timespec), 16 as u64)?;
+    return expect_eq(alignof(timespec), 8 as u64);
 }
 ```
 
@@ -3285,7 +3369,7 @@ Cryo supports `async` / `await` as a first-class language feature. An `async` fu
 
 The model is **stackless**. A future is an ordinary struct with no hidden heap allocation, no separate stack, and no runtime machinery of its own - `async` is a compile-time transformation, and the executor that drives futures is an ordinary library (`std::future`), not part of the language.
 
-This section describes the surface. For how the lowering and the runtime are built - and why there is no `Pin` - see [`docs/async-internals.md`](./async-internals.md).
+This section describes the surface. For how the lowering and the runtime are built - and why futures are never pinned - see [`docs/async-internals.md`](./async-internals.md).
 
 ### 19.1 Async Functions
 
@@ -3388,7 +3472,7 @@ Each `async` function generates one struct - the state machine - plus a `Future`
 Two consequences are worth stating because they are guarantees, not implementation details:
 
 - **No hidden allocation.** The state machine is a value type. Its size is known at compile time, and a future is only heap-allocated if you put it somewhere that allocates (spawning it as a task, for example).
-- **Futures are freely movable.** Cryo futures are never self-referential, so no pinning discipline exists and none is needed - there is no `Pin` type. This is guaranteed by the restrictions in [section 19.7](#197-restrictions), which reject the constructs that would create a self-reference. Moving a future between polls, including polling it by hand, is well defined.
+- **Futures are freely movable.** Cryo futures are never self-referential, so no pinning discipline exists and none is needed. This is guaranteed by the restrictions in [section 19.7](#197-restrictions), which reject the constructs that would create a self-reference. Moving a future between polls, including polling it by hand, is well defined.
 
 ### 19.5 Async Methods
 
@@ -3628,8 +3712,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `alloc::box`         | `Box<T>`                                                                                                              |
 | `alloc::rc`          | `Rc<T>`                                                                                                               |
 
-The prelude is deliberately small. Anything else is an explicit `import` - notably, `printf` and the `print` / `println` / `eprint` / `eprintln` family live in `std::fmt` and are **not** auto-imported, and neither are the compiler intrinsics (`malloc`, `free`, ...) in `std::core::intrinsics`. Examples in this document that call `printf`, `println`, `malloc` or `free` bare assume `import std::fmt::{ printf, println };` and `import std::core::intrinsics::{ malloc, free };` are in scope.
-
+The prelude is deliberately small. Anything else is an explicit `import` - notably, `printf` and the `print` / `println` / `eprint` / `eprintln` family live in `std::fmt` and are **not** auto-imported, and neither are the compiler intrinsics (`malloc`, `free`, ...) in `std::core::intrinsics`.
 ### 20.2 Module Map
 
 | Module            | Highlights                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
@@ -3672,6 +3755,7 @@ Cryo ships a built-in unit-test framework. Tests live in `<project>/tests/` file
 namespace MyApp::Tests;
 
 import std::test::assert::{ expect_eq, expect, bail };
+import std::test::error::{ TestError };
 
 ![test]
 function addition_is_commutative() -> Result<(), TestError> {
@@ -3719,7 +3803,7 @@ The runner ships three output formats; `--format=<mode>` picks per-run:
 
 | Format    | Layout                                                                                                                                                  |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `plain`   | Cargo-style `test NAME ... ok` lines; CI-friendly. **Default.**                                                                                         |
+| `plain`   | One `test NAME ... ok` line per test; CI-friendly. **Default.**                                                                                         |
 | `pretty`  | Tests grouped under their namespace, indented leaves, `[PASS]` / `[FAIL]` / `[skip]` chips. Colored on a TTY.                                           |
 | `compact` | One line per namespace with a dot-stream of results (`.` pass, `F` fail, `s` skip, `P` did-not-panic, `E` runner error) and a trailing per-group tally. |
 
