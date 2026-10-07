@@ -47,7 +47,7 @@ never feeds a key.
 
 | store | why |
 |---|---|
-| codegen `GlobalRegistry.index` (`codegen/state/global_registry.cryo:22`) | **ruling 126.** Measured: the key is not the linker symbol but `format("%s::%s", ns, leaf)` interned (`codegen/ops/symbol_resolver.cryo:309`), the same information the linker symbol `MangledName::for_global(ns, leaf)` is built from. Question in the handoff. |
+| codegen `GlobalRegistry.index` (`codegen/state/global_registry.cryo:22`) | **rulings 126 and 141.** The key is not the linker symbol ruling 126 assumed but `format("%s::%s", ns, leaf)` interned (`codegen/ops/symbol_resolver.cryo:309`); ruling 141 leaves it as it is until the module-globals table (#3) is converted, and it is re-keyed then. |
 | `InternTable.lookup` (`resolver/intern_table.cryo:34`) | the `intern` door's own store |
 | `Scope.symbol_index` (`resolver/scope.cryo:147`) | the `scope-value` door's ribs |
 | `ModuleGraph.name_index`, `module_defs`; `Resolver.module_scopes`; `DeclarationIndex.module_imports` | keyed by `ModulePath`, the module's identity; `name_index` is the `module-by-path` door's own store |

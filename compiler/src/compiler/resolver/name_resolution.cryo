@@ -25,7 +25,7 @@ import compiler::diag::diagnostic;
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::ast;
 import compiler::ast::{
-    ImportStyle, NamedAnnotation, NodeKind, PatternBinding, PatternKind,
+    ImportStyle, NamedAnnotation, NodeKind, PatternBinding, PatternKind, ProjectionAnnotation,
     TraitBound, TraitRef, TypeAnnotation, Visibility, declaration, expression, node,
     pattern, statement, visitor
 };
@@ -75,6 +75,15 @@ import compiler::module_graph::{ ModulePath };
 import utils::text::{ Text };
 
 
+/// A projection written on a type parameter: the parameter, and the node
+/// carrying it - a qualified name (`ann`) or a projection node (`proj`),
+/// the other null.
+type struct ParamProjection {
+    param:  SymbolID;
+    ann:    NamedAnnotation*;
+    proj:   ProjectionAnnotation*;
+}
+
 type class NameResolver : BaseASTVisitor {
 public:
     resolver: Resolver*;
@@ -112,9 +121,15 @@ public:
     this_owner_sym:  SymbolID;
     /// The keyword `This` as a path segment spells it.
     this_type_spelling: SymbolStr;
+    /// Each projection written on a type parameter (`I::Item`) in the
+    /// module being walked, checked against the parameter's bounds once the
+    /// walk has recorded every bound (`check_param_projections`): a
+    /// declaration's `where` clause is stamped after its signature.
+    param_projections: ParamProjection[];
 
     NameResolver(resolver: Resolver*, ctx: CompilationContext*)
         : BaseASTVisitor() {
+        this.param_projections = [];
         this.resolver = resolver;
         this.ctx      = ctx;
         this.pending_base_ctor = null;
@@ -439,6 +454,10 @@ public:
                 trait_node.sym_id = sym_id;
                 trait_node.def = this.type_def_of(sym_id);
                 this.resolver.export_symbol(sym_id);
+                // Registered here, before any module's names are resolved, so
+                // a projection written in any of them can ask which
+                // associated types the trait declares.
+                this.ctx.generic_registry.register_trait_decl(trait_node.def, trait_node);
             }
             NodeKind::TypeAliasDeclaration => {
                 const alias_node: TypeAliasDeclNode* = node as TypeAliasDeclNode*;
@@ -2393,8 +2412,19 @@ public:
             TypeAnnotation::Projection(pj) => {
                 this.stamp_annotation(pj.base);
                 match (*pj.base) {
-                    TypeAnnotation::ThisType(_t) => { pj.owner_trait = this.this_trait; }
-                    _                            => { }
+                    TypeAnnotation::ThisType(_t) => {
+                        pj.owner_trait = this.this_trait;
+                        this.check_this_projection(pj);
+                    }
+                    TypeAnnotation::Named(bn) => {
+                        const p: SymbolID = bn.res.generic_param_sym();
+                        if (p.is_valid()) {
+                            this.param_projections.push(ParamProjection {
+                                param: p, ann: null, proj: pj,
+                            });
+                        }
+                    }
+                    _ => { }
                 }
             }
             TypeAnnotation::Function(f)    => {
@@ -2678,11 +2708,92 @@ public:
             _                    => { }
         }
         match (this.type_spelling_res(n.name, n.span)) {
-            ResSlot::Answered(r) => { n.res.answer(r); }
+            ResSlot::Answered(r) => {
+                n.res.answer(r);
+                // `I::Item`: which bound's associated type it is is asked
+                // once the declaration's bounds are in.
+                match (r) {
+                    Res::TypeRelative(ResBase::GenericParam(p), 1) => {
+                        this.param_projections.push(ParamProjection { param: p, ann: n, proj: null });
+                    }
+                    _ => {}
+                }
+            }
             _                    => {
                 if (this.refuse_unbound_type(n.name, n.span)) { n.res.answer(Res::Err); }
             }
         }
+    }
+
+    /// Refuse `This::Member` where `This` stands for no trait (an inherent
+    /// impl, a type's own body) or the trait it stands for declares no
+    /// associated type `Member` (E0203).
+    ![allow(lookup_by_spelling, reason = "a projection's written leaf reaches the assoc-type door here, by the trait `This` stands for")]
+    check_this_projection(&this, pj: ProjectionAnnotation*) -> void {
+        const tdecl: TraitDeclNode* = if (pj.owner_trait.is_valid()) {
+            this.ctx.generic_registry.get_trait_decl(pj.owner_trait)
+        } else {
+            null
+        };
+        if (tdecl != null && tdecl.assoc_type_index(pj.member) >= 0) { return; }
+        const member: string = this.resolver.intern_table.resolve(pj.member);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0203_UNDEFINED_TYPE,
+            Text::new(fmt::format("associated type `%s` not found for `This`", member)));
+        d = d.at_with_label(pj.span, Text::new(if (tdecl == null) {
+            "`This` stands for no trait here"
+        } else {
+            fmt::format("trait `%s` declares no associated type `%s`",
+                this.resolver.intern_table.resolve(tdecl.name), member)
+        }));
+        this.ctx.emit_diagnostic(d);
+        pj.refused = true;
+    }
+
+    /// Refuse each projection on a type parameter that no bound of the
+    /// parameter answers: none of its bounds declares the associated type
+    /// (E0203), or two different bounds do (E0221's case, E0203 here too).
+    /// A refused annotation is stamped `Err`, so no later pass resolves it
+    /// as a projection keyed by its written leaf.
+    ![allow(lookup_by_spelling, reason = "a projection's written leaf reaches the assoc-type door here, by each bound trait's declaration")]
+    check_param_projections(mut &this) -> void {
+        for (mut i: i64 = 0; i < this.param_projections.length; i++) {
+            const pp: ParamProjection = this.param_projections[i];
+            // The written leaf: a qualified name's last segment, or the
+            // projection node's member.
+            const member_sym: SymbolStr = if (pp.ann != null) {
+                this.resolver.intern_table.intern(QualifiedName::leaf_of(this.resolver.intern_table.resolve(pp.ann.name)))
+            } else {
+                pp.proj.member
+            };
+            const span: SourceSpan = if (pp.ann != null) { pp.ann.span } else { pp.proj.span };
+            const bounds: DefId[] = this.resolver.bounds_of_param(pp.param);
+            mut found: DefId = DefId::invalid();
+            mut ambiguous: boolean = false;
+            for (mut b: i64 = 0; b < bounds.length; b++) {
+                const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(bounds[b]);
+                if (tdecl == null || tdecl.assoc_type_index(member_sym) < 0) { continue; }
+                if (found.is_valid() && !found.equals(bounds[b])) { ambiguous = true; }
+                found = bounds[b];
+            }
+            if (found.is_valid() && !ambiguous) { continue; }
+            const member: string = this.resolver.intern_table.resolve(member_sym);
+            const param: string = this.resolver.intern_table.resolve(this.resolver.get_symbol(pp.param).name);
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0203_UNDEFINED_TYPE,
+                Text::new(if (ambiguous) {
+                    fmt::format("ambiguous associated type `%s` in bounds of `%s`", member, param)
+                } else {
+                    fmt::format("associated type `%s` not found for `%s`", member, param)
+                }));
+            d = d.at_with_label(span, Text::new(if (ambiguous) {
+                fmt::format("more than one bound of `%s` declares `%s`", param, member)
+            } else {
+                fmt::format("no bound of `%s` declares `%s`", param, member)
+            }));
+            this.ctx.emit_diagnostic(d);
+            if (pp.ann != null) { pp.ann.res = ResSlot::Answered(Res::Err); }
+            if (pp.proj != null) { pp.proj.refused = true; }
+        }
+        this.param_projections = [];
     }
 
     override visit(node: CallExprNode*) -> void {
@@ -3827,8 +3938,9 @@ type struct NameResolutionPass {
         }
 
         // Create and run the visitor
-        const visitor: NameResolver = NameResolver(ctx.resolver, ctx);
+        mut visitor: NameResolver = NameResolver(ctx.resolver, ctx);
         root.accept(&visitor as ASTVisitor*);
+        visitor.check_param_projections();
 
         LOG_DEBUG(LogComponent::General, "[NameResolution] Resolved %lld symbols in %lld scopes, %lld map entries",
             ctx.resolver.symbol_count(),

@@ -627,53 +627,12 @@ type struct CallEmitter {
                 }
             }
 
-            // Build a rich diagnostic that names the callee (when available)
-            // and labels the receiver for member/scope calls.
-            mut msg: string = "codegen: call expression: callee function not found";
-            mut diag: Diagnostic = Diagnostic::error(
-                ErrorCode::E0636_UNDEFINED_FUNCTION_CALL, Text::new(msg));
+            // An assertion, not a diagnosis: monomorphization reports every
+            // call nothing binds before code generation starts, and a call
+            // synthesized after it is bound by the pass that builds it.
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                Text::new("internal: code generation found nothing to call for this call; monomorphization reports an unbound call before code generation, so this should never happen"));
             diag = diag.at(node.span);
-
-            if (node.callee.kind == NodeKind::Identifier) {
-                const id: IdentifierNode* = node.callee as IdentifierNode*;
-                const id_str: string = this.cg.resolve(id.name);
-                diag = Diagnostic::error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                    Text::new(fmt::format("codegen: cannot resolve function '%s'", id_str)));
-                diag = diag.at(node.span);
-                diag = diag.also_at(node.callee.span, Text::new("no function with this name is in scope"));
-            } else if (node.callee.kind == NodeKind::ScopeResolution) {
-                const sr: ScopeResolutionNode* = node.callee as ScopeResolutionNode*;
-                const scope_str: string = intern.resolve(sr.scope_name);
-                const member_str: string = intern.resolve(sr.member_name);
-                diag = Diagnostic::error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                    Text::new(fmt::format("codegen: cannot resolve '%s::%s'", scope_str, member_str)));
-                diag = diag.at(node.span);
-                diag = diag.also_at(node.callee.span, Text::new("no such associated function"));
-            } else if (node.callee.kind == NodeKind::MemberAccess) {
-                const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
-                // Render via the arena's recursive resolver so a generic
-                // receiver prints as e.g. `Box<Thing, GlobalAlloc>` rather
-                // than the raw arena ids the InstantiatedType's own
-                // display_name() falls back to.
-                mut type_str: string = "<unknown>";
-                const dbg_arena: TypeArena* = this.cg.get_arena();
-                if (dbg_arena != null && ma.object.resolved_type.is_valid()) {
-                    type_str = dbg_arena.resolve_display_name(ma.object.resolved_type);
-                }
-                const member_str: string = intern.resolve(ma.member);
-                // Codegen calls the method the type check bound and searches
-                // for none of its own, so an unbound call says only that: the
-                // method may well exist.  A missing method or an argument no
-                // parameter accepts is refused before code generation, so a
-                // call reaching here unbound is the checker's defect.
-                diag = Diagnostic::error(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                    Text::new(fmt::format("codegen: the call to method '%s' on type '%s' was never bound to a method",
-                        member_str, type_str)));
-                diag = diag.at(node.span);
-                diag = diag.also_at(ma.object.span, Text::new(fmt::format("receiver has type '%s'", type_str)));
-                diag = diag.with_note(Text::new("the type check accepted this call without binding it; a missing method or a mismatched argument would have been reported there, so this is a compiler defect"));
-            }
-
             this.cg.diag.emit(diag);
             this.state.last_value = LValue::null();
             this.state.last_is_lvalue = false;

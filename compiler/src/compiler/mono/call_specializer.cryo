@@ -30,6 +30,8 @@ import compiler::decl_index;
 import compiler::decl_index::{ DeclarationIndex };
 import compiler::resolver::{ intern_table, symbol_str, qualified_name, mangled_name };
 import compiler::resolver::{ res };
+import compiler::resolver::lang_item;
+import compiler::resolver::lang_item::{ LangItem };
 import compiler::mono::{ state, trait_specializer, ast_resolver };
 import std::alloc::allocator;
 import compiler::ast::cloner;
@@ -83,6 +85,12 @@ import compiler::types::user_defined::{ ClassType, FieldInfo, StructType };
 import utils::text::{ Text };
 
 
+/// A walked call with no pin, and the function whose body holds it.
+type struct UnpinnedCall {
+    call: CallExprNode*;
+    func: FunctionDeclNode*;
+}
+
 type struct MonoCallSpecializer {
     arena:            TypeArena*;
     generic_registry: GenericRegistry*;
@@ -110,6 +118,15 @@ type struct MonoCallSpecializer {
     /// names are.  Each is bound once the instantiation is registered
     /// (`bind_queued_calls`).
     queued_binds:     CallExprNode*[];
+    /// The function whose body the walk is in, for the report of a call
+    /// left unbound.
+    current_fn:       FunctionDeclNode*;
+    /// Every walked call that had no pin when the walk left it, with the
+    /// function holding it.  A call is bound by a pin, or by what it calls
+    /// through (a local of function type, a variant, a function-typed field,
+    /// a release); one bound by nothing is reported once monomorphization
+    /// has bound everything it will (`report_unbound_calls`).
+    unpinned_calls:   UnpinnedCall[];
 
     static null() -> MonoCallSpecializer {
         return MonoCallSpecializer {
@@ -127,6 +144,8 @@ type struct MonoCallSpecializer {
             gsm_owner_recv:   TypeRef::invalid(),
             gsm_owner_spec:   SymbolStr::empty(),
             queued_binds:     [],
+            current_fn:       null,
+            unpinned_calls:   [],
         };
     }
 
@@ -216,10 +235,20 @@ type struct MonoCallSpecializer {
     }
 
     walk_func_body(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*) -> void {
-        if (func == null || func.body == null) { return; }
         // No local-variable table is built: sema typed every expression, so the
         // receiver/argument types come from `resolved_type`, not a mono mini-sema.
-        this.walk_block(func.body, res_ctx, null);
+        this.walk_body(func, res_ctx, null);
+    }
+
+    /// Walk `func`'s body under `subst`, as the function the calls in it
+    /// are reported in.
+    walk_body(mut &this, func: FunctionDeclNode*, res_ctx: ResolutionContext*,
+              subst: TypeSubstitution*) -> void {
+        if (func == null || func.body == null) { return; }
+        const outer: FunctionDeclNode* = this.current_fn;
+        this.current_fn = func;
+        this.walk_block(func.body, res_ctx, subst);
+        this.current_fn = outer;
     }
 
     /// Walk a freshly-specialized declaration's bodies and specialize the generic
@@ -240,7 +269,7 @@ type struct MonoCallSpecializer {
         match (decl.kind) {
             NodeKind::FunctionDeclaration => {
                 const f: FunctionDeclNode* = decl as FunctionDeclNode*;
-                if (f.body != null) { this.walk_block(f.body, &res_ctx, subst); }
+                this.walk_body(f, &res_ctx, subst);
             }
             NodeKind::StructDeclaration => {
                 this.walk_spec_methods((decl as StructDeclNode*).methods, &res_ctx, subst);
@@ -265,7 +294,7 @@ type struct MonoCallSpecializer {
             if (m == null || m.func == null) { continue; }
             if (m.func.is_generic()) { continue; }
             if (MonoCallSpecializer::body_is_lazy(m.func)) { continue; }
-            if (m.func.body != null) { this.walk_block(m.func.body, res_ctx, subst); }
+            this.walk_body(m.func, res_ctx, subst);
         }
     }
 
@@ -416,6 +445,9 @@ type struct MonoCallSpecializer {
                 this.specialize_free_call(call, res_ctx, subst);
                 this.specialize_method_call(call, subst);
                 this.bind_call_arguments(call);
+                if (!call.resolved_callee.is_some()) {
+                    this.unpinned_calls.push(UnpinnedCall { call: call, func: this.current_fn });
+                }
             }
             NodeKind::BinaryExpression => {
                 mut be: BinaryExprNode* = expr as BinaryExprNode*;
@@ -445,8 +477,14 @@ type struct MonoCallSpecializer {
             }
 
             NodeKind::TryExpression => {
+                // The desugared `match` is what is emitted - its subject is
+                // the operand, and its error arm builds the early return.
                 const te: TryExprNode* = expr as TryExprNode*;
-                this.walk_expr(te.operand, res_ctx, subst);
+                if (te.desugared != null) {
+                    this.walk_expr(te.desugared, res_ctx, subst);
+                } else {
+                    this.walk_expr(te.operand, res_ctx, subst);
+                }
             }
             NodeKind::IfExpression => {
                 const ie: IfExprNode* = expr as IfExprNode*;
@@ -956,8 +994,8 @@ type struct MonoCallSpecializer {
         // A path call names the generic method's definition, which is bound
         // where it is placed for the receiver.  A member call that reached
         // here carries neither a template pin nor a trait item and names
-        // nothing: it is left unbound, and the pass after monomorphization
-        // refuses it.  Nothing is found by the member's name.
+        // nothing: it is left unbound, and `report_unbound_calls` refuses it
+        // once monomorphization ends.  Nothing is found by the member's name.
         if (path_method == null) { return; }
         mut impl_node: ImplBlockNode* = null;
         mut inherent_owner_ast: ASTNode* = null;
@@ -1180,7 +1218,7 @@ type struct MonoCallSpecializer {
         // `implement<A, B> .. for Pair<A, B>`), which are not the owner's.
         if (spec_method.func != null && spec_method.func.body != null) {
             mut rw_ctx: ResolutionContext = ResolutionContext::new("");
-            this.walk_block(spec_method.func.body, &rw_ctx, copy_subst);
+            this.walk_body(spec_method.func, &rw_ctx, copy_subst);
         }
     }
 
@@ -1582,6 +1620,98 @@ type struct MonoCallSpecializer {
         this.queued_binds = still;
     }
 
+    /// Report every walked call nothing binds: E0900, an internal error,
+    /// since the type check binds or refuses each call it accepts and
+    /// monomorphization binds each copy's.  Run once the last module's
+    /// queued binds are drained; code generation emits only bound calls.
+    report_unbound_calls(mut &this) -> void {
+        for (mut i: i64 = 0; i < this.unpinned_calls.length; i++) {
+            const u: UnpinnedCall = this.unpinned_calls[i];
+            if (this.call_is_bound(u.call)) { continue; }
+            this.report_unbound_call(u.call, u.func);
+        }
+        this.unpinned_calls = [];
+    }
+
+    /// Whether code generation has something to call for `call`: its pin,
+    /// or - for a call with none - the value it calls through: a local of
+    /// function type, a class or struct's constructor, an enum variant, a
+    /// function-typed field, a release of the `Drop` language item, or a
+    /// computed function value.
+    call_is_bound(&this, call: CallExprNode*) -> boolean {
+        if (call.resolved_callee.is_some()) { return true; }
+        const callee: ASTNode* = call.callee as ASTNode*;
+        match (callee.kind) {
+            NodeKind::Identifier => {
+                const id: IdentifierNode* = call.callee as IdentifierNode*;
+                if (id.res.local_sym().is_valid() && this.is_function_value(id.resolved_type)) { return true; }
+                const rt: Type* = this.arena.lookup(call.resolved_type);
+                return rt != null && (rt.kind == TypeKind::Class || rt.kind == TypeKind::Struct);
+            }
+            NodeKind::ScopeResolution => {
+                const sr: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
+                match (sr.resolved_member) {
+                    MemberPin::Variant(_) => {}
+                    _                     => { return false; }
+                }
+                mut t: Type* = this.arena.lookup(call.resolved_type);
+                mut depth: i32 = 0;
+                while (t != null && t.kind == TypeKind::InstantiatedType && depth < 5) {
+                    const inst: InstantiatedType* = t as InstantiatedType*;
+                    if (!inst.has_resolved_type()) { break; }
+                    t = this.arena.lookup(inst.resolved_type);
+                    depth += 1;
+                }
+                return t != null && t.kind == TypeKind::Enum;
+            }
+            NodeKind::MemberAccess => {
+                const ma: MemberAccessNode* = call.callee as MemberAccessNode*;
+                if (this.is_function_value(ma.resolved_type)) { return true; }
+                return call.named_method.is_valid()
+                    && call.named_method.equals(this.generic_registry.wellknown(LangItem::DropDrop));
+            }
+            _ => {
+                return this.is_function_value(call.callee.resolved_type);
+            }
+        }
+    }
+
+    /// Whether `ty` is a function, through one pointer or reference.
+    is_function_value(&this, ty: TypeRef) -> boolean {
+        mut t: Type* = this.arena.lookup(ty);
+        if (t != null && t.kind == TypeKind::Pointer) {
+            t = this.arena.lookup((t as PointerType*).pointee);
+        } else if (t != null && t.kind == TypeKind::Reference) {
+            t = this.arena.lookup((t as ReferenceType*).referent);
+        }
+        return t != null && t.kind == TypeKind::Function;
+    }
+
+    /// The internal error for a call nothing binds: the callee's leaf, the
+    /// function whose body holds the call, and where the call is written,
+    /// which for a copied body is its template's.
+    report_unbound_call(mut &this, call: CallExprNode*, func: FunctionDeclNode*) -> void {
+        const callee: ASTNode* = call.callee as ASTNode*;
+        mut leaf: string = "<value>";
+        mut what: string = "function";
+        match (callee.kind) {
+            NodeKind::Identifier      => { leaf = this.intern_table.resolve((call.callee as IdentifierNode*).name); }
+            NodeKind::ScopeResolution => { leaf = this.intern_table.resolve((call.callee as ScopeResolutionNode*).member_name); }
+            NodeKind::MemberAccess    => {
+                leaf = this.intern_table.resolve((call.callee as MemberAccessNode*).member);
+                what = "method";
+            }
+            _ => {}
+        }
+        const where_fn: string = if (func != null) { this.intern_table.resolve(func.name) } else { "<no function>" };
+        const file: string = call.span.file;
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+            Text::new(fmt::format("internal: call to `%s` in `%s` reached codegen with no resolved %s (written at %s:%u)",
+                leaf, where_fn, what, file.basename(), call.span.start_line)));
+        d = d.at(call.span);
+        this.diagnostics.emit(d);
+    }
+
     /// Bind `call` to the receiver's instance of the deferred method `orig`
     /// of `impl_node`: `made` when an earlier call instantiated it, else an
     /// instance minted now, registered, and walked for the calls its body
@@ -1603,7 +1733,7 @@ type struct MonoCallSpecializer {
         this.pin_spec_entry(call, spec_method.func.overload_entry);
         if (spec_method.func.body != null) {
             mut rw_ctx: ResolutionContext = ResolutionContext::new("");
-            this.walk_block(spec_method.func.body, &rw_ctx, copy_subst);
+            this.walk_body(spec_method.func, &rw_ctx, copy_subst);
         }
         return true;
     }
@@ -1922,7 +2052,7 @@ type struct MonoCallSpecializer {
             this.gsm_owner_leaf = if (owner_entry != null) { owner_entry.name } else { SymbolStr::empty() };
             this.gsm_owner_recv = recv_type;
             this.gsm_owner_spec = this.arena.get_qualified_name(recv_type);
-            this.walk_block(spec_method.func.body, &rw_ctx, copy_subst);
+            this.walk_body(spec_method.func, &rw_ctx, copy_subst);
             this.gsm_owner_leaf = saved_leaf;
             this.gsm_owner_recv = saved_recv;
             this.gsm_owner_spec = saved_spec;

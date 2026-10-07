@@ -84,6 +84,47 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-06
+
+139. **E0154 on an overloaded function used as a value with no expected
+     type keeps its wording and gains a help line showing how to pick one**
+     by typing the variable, with the value's own name and one of its
+     overloads' signatures.
+
+     ```cryo
+     const f = twice;
+     // help: give the variable a function type to pick one: `const f: (i32) -> i32 = twice;`
+     ```
+
+140. **Ruling 138's refusal covers a field read through any type parameter,
+     bounded or not.**
+
+141. **Codegen's `GlobalRegistry` is keyed by `namespace::name` text, not by
+     the linker symbol ruling 126 assumed.** It stays as it is for now and
+     is re-keyed when the module-globals table is converted.
+
+142. **Calling a value that is not a function is refused with its own code
+     and rustc's wording**: "expected function, found `i32`".
+
+     ```cryo
+     function one() -> i32 { return 1; }
+     const a: i32 = one()(3);   // expected function, found `i32`
+     ```
+
+143. **A projection whose trait is unknown, or whose trait declares no such
+     associated type, is refused where it is written**, rather than kept as a
+     projection interned by its spelling.
+
+     ```cryo
+     function b<I>(it: &I) -> I::Nope where I: Seq { ... }   // `Seq` declares no `Nope`
+     function c<I>(it: &I) -> I::Item { ... }                // no bound of `I` declares `Item`
+     ```
+
+144. **No dedicated check after monomorphization for unbound calls.** The
+     monomorphizer visits every call in every copy and is the one place an
+     unbindable call is reported (E0900); code generation's own refusal is
+     an internal assertion.
+
 ### 2026-10-05
 
 131. **A synthesizer that lays out a hidden struct records the pins of what

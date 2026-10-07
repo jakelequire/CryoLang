@@ -1176,7 +1176,23 @@ type struct CallResolver {
         if (computed_fn.is_valid()) {
             return (this.arena.lookup(computed_fn) as FunctionType*).return_type;
         }
+        if (computed_type.is_valid()) {
+            this.refuse_call_of_non_function(call, computed_type);
+            return TypeRef::invalid();
+        }
         return computed_type;
+    }
+
+    /// E0213: a call whose callee is a value of `found`, which is no
+    /// function.  A callee already refused (an error type) is not reported
+    /// twice.
+    refuse_call_of_non_function(mut &this, call: CallExprNode*, found: TypeRef) -> void {
+        const ft: Type* = this.arena.lookup(found);
+        if (ft != null && ft.kind == TypeKind::Error) { return; }
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0213_NON_CALLABLE,
+            Text::new(fmt::format("expected function, found `%s`", this.types.type_display_name(found))));
+        d = d.at_with_label(call.callee.span, Text::new("call expression requires function"));
+        this.ctx.emit_diagnostic(d);
     }
 
     /// Whether a call's callee is a name, a path or a member - the callees
@@ -3255,7 +3271,7 @@ type struct CallResolver {
         // type parameters of its own, after monomorphization, to the instance
         // monomorphization made of it for the call and pinned, which the
         // guard above answers.  A copy with no instance pinned leaves the
-        // call unbound, which code generation refuses; nothing selects it
+        // call unbound, which monomorphization reports; nothing selects it
         // again by its member's name.
         const pinned_fn: FunctionDeclNode* = this.ctx.decl_index.method_func_of(call.template_method);
         if (call.template_method.is_valid() && !owner_inst.is_valid()
@@ -3425,7 +3441,7 @@ type struct CallResolver {
     /// pinned definition, by identity: the method itself when the receiver
     /// declares it, else the copy the receiver's specialization holds of
     /// it.  Nothing is selected by the member's name.  A receiver with
-    /// neither leaves the call unbound, which code generation refuses.
+    /// neither leaves the call unbound, which monomorphization reports.
     bind_template_method(mut &this, visitor: ASTVisitor*, call: CallExprNode*, recv: TypeRef) -> Selection {
         const chosen: MethodNode* = this.ctx.decl_index.entry_method(
             this.ctx.decl_index.method_entry_on(recv, call.template_method));
@@ -5147,9 +5163,11 @@ type struct CallResolver {
     /// one; the caller keeps the declaration's own signature, which the
     /// binding it flows into then checks.  With no expected type at all
     /// nothing chooses, and the value is refused as ambiguous (E0154) with
-    /// each overload named; `refused` says so.
+    /// each overload named and a help line that types the binding the value
+    /// initializes - `value` itself when it is a declaration's whole
+    /// initializer - with the first overload's signature; `refused` says so.
     value_overload_signature(mut &this, entries: &OverloadId[], shown: string, span: SourceSpan,
-                             refused: mut &boolean) -> TypeRef {
+                             value: ExpressionNode*, refused: mut &boolean) -> TypeRef {
         if (entries.length < 2) { return TypeRef::invalid(); }
         const first: TypeRef = this.ctx.decl_index.entry_signature(entries[0]);
         mut several: boolean = false;
@@ -5176,7 +5194,13 @@ type struct CallResolver {
                 d = d.with_note_at(Text::new(fmt::format("an overload of `%s`", shown)), at);
             }
         }
-        d = d.help(Text::new("give the value a function type, e.g. `const f: (i32) -> i32 = ...;`, and the overload of that type is taken"));
+        const binding: string = if (value != null && value == this.state.untyped_init && this.state.untyped_binding.is_valid()) {
+            this.intern.resolve(this.state.untyped_binding)
+        } else {
+            "f"
+        };
+        d = d.help(Text::new(fmt::format("give the variable a function type to pick one: `const %s: %s = %s;`",
+            binding, this.types.type_display_name(first), shown)));
         this.ctx.emit_diagnostic(d);
         *refused = true;
         return TypeRef::invalid();
@@ -5535,7 +5559,7 @@ type struct CallResolver {
         mut refused: boolean = false;
         const picked: TypeRef = this.value_overload_signature(&family,
             fmt::format("%s::%s", this.intern.resolve(scope.scope_name), this.intern.resolve(scope.member_name)),
-            scope.span, &refused);
+            scope.span, scope as ExpressionNode*, &refused);
         if (refused) { return TypeRef::invalid(); }
         const value_ft: TypeRef = if (picked.is_valid()) { picked } else { method_ft };
         const entry: OverloadId = this.entry_of_signature(&family, FamilyOwner::Type(owner), value_ft, scope);
