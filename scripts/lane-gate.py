@@ -1420,11 +1420,31 @@ def callee_of(text, symbol):
 TYPE_PATH_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)*")
 
 
+def param_list(text):
+    """A rendered callee's parameter list, `(...)` through its matching
+    parenthesis, so a function-typed parameter's own `-> R` stays inside it
+    and the callee's return is left out."""
+    if "(" not in text:
+        return ""
+    start = text.index("(")
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return text[start:]
+
+
 def mentions_key(text):
-    """Whether a rendered callee's signature - its parameters or its return,
-    generic arguments included - names a KEY TYPE.  Read by each type's last
+    """Whether a rendered callee's PARAMETERS - generic arguments included -
+    name a KEY TYPE: whether a spelling can drive the read.  A call that
+    passes only identities and hands text back (`path_of(DefId) -> SymbolStr`)
+    is a read by identity and is not counted.  Read by each type's last
     segment, so `std::collections::string::String` is not `string`."""
-    sig = text[text.index("("):] if "(" in text else ""
+    sig = param_list(text)
     return any(t.rsplit("::", 1)[-1] in KEY_TYPES for t in TYPE_PATH_RE.findall(sig))
 
 

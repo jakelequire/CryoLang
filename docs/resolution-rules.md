@@ -85,6 +85,53 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-10-07
+
+149. **Ruling 109 is narrowed: the spelling lint (E0157) is door-only for
+     LOOKUPS.**  A declaration's own name - registering it, printing it,
+     mangling it, passing it along - is carried by a separate sealed type
+     the lint accepts.  The pending allows go by converting each lookup to
+     a door and moving the rest onto that type.
+
+150. **The rule-3 self-check is enforced by making each store's name fields
+     `private` and moving its door into the store's own file**, so a
+     hand-written `.name` loop outside the door is refused.
+
+151. **Rulings 85 and 97 (instances that appear only through substitution)
+     come after the merge**, with a test that would catch a miss.
+
+152. **The calls recorded as "owner + name", which code generation looks
+     up again, are retired before the merge**, alongside ruling 125's last
+     slice.
+
+153. **The editor's (LSP's) by-name lookups are fixed on their own branch
+     after the merge.**
+
+154. **A test-only compiler switch gives the rule-1 self-check a committed
+     test** that plants an unresolved name in a correct program.
+
+155. **The lookup gate counts only spelling-driven reads**: a call that asks
+     by identity (a `DefId`, a `TypeRef`) and hands a name back is not
+     counted.
+
+156. **Ruling 73's help names the pointer as written**: `(*q).drop()` gets
+     "use `std::core::ptr::drop_in_place(q)`", not a literal `p`.
+
+157. **Store #2's leftover name-keyed instance registration is finished
+     together with store #4.**
+
+158. **`plain_opt(Option::Some(3))`, with the parameter `d: Option<T>`,
+     compiles**, as it does through a local; the internal error E0900 it
+     gave is a correct program refused.
+
+     ```cryo
+     function plain_opt<T>(d: Option<T>) -> Option<T> { return d; }
+     const p: Option<i32> = plain_opt(Option::Some(3));
+     ```
+
+159. **One CI run of this branch happens before the merge**, so its
+     surprises show early.
+
 ### 2026-10-06
 
 145. **Calling a value that is not a function keeps E0213**, declared as

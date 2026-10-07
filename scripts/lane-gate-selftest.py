@@ -419,10 +419,11 @@ _ID_ELEM = GATE_MOD.SCANNED_ARRAYS[FIRST_IDENTITY].elem
 
 # LOOKUP is 2: the caller's one, and the funnel's call INTO the index in
 # type_utils.cryo, which is counted - only a store's own file is excluded
-# from its own set.
+# from its own set.  ARENA_READ is 1: `lookup_by_name`; `get_qualified_name`
+# is asked by an identity and is not counted.
 BASELINE = {
     "LOOKUP": 2, "LOOKUP_OTHER": 0, "REGISTER": 0, "LOOKUP_ROUTED": 1,
-    "LOOKUP_LOCAL": 1, "ARENA_READ": 2, "ARENA_WRITE": 0,
+    "LOOKUP_LOCAL": 1, "ARENA_READ": 1, "ARENA_WRITE": 0,
     "REGISTRY_READ": 0, "REGISTRY_WRITE": 0, "GRAPH_READ": 0, "GRAPH_WRITE": 0,
     "CONST_READ": 0, "CONST_WRITE": 0,
     "REENTRY": 0, "HOME_WRITE": 0,
@@ -476,6 +477,7 @@ BASE_FACTS = [
     call(SEMA_FILE, 8, FUNNEL, "lookup_type_exact", "read", [SYM], TREF),
     call(SEMA_FILE, 9, SCOPES, "lookup_type", "read", [SYM], TREF),
     call(SEMA_FILE, 10, ARENA, "lookup_by_name", "read", [SYM], TREF),
+    # Asked by an identity, a name handed back: reaches the store, not counted.
     call(SEMA_FILE, 12, ARENA, "get_qualified_name", "read", [TREF], SYM),
     # A store method whose signature names no key: not counted.
     call(SEMA_FILE, 13, ARENA, "lookup", "read", ["u64"], "compiler::types::type_base::Type*"),
@@ -519,12 +521,19 @@ COUNT_CASES = [
     ("a reader keyed by `string` is inside the rule", None,
      facts_with([call(SEMA_FILE, 20, INDEX, "by_spelling", "read", ["string"], TREF)]),
      1, "LOOKUP_OTHER TOTAL 0 -> 1"),
-    ("a reader keyed only by what it returns is inside the rule", None,
+    ("a reader asked by an identity that hands a name back is a read by identity: accepted", None,
      facts_with([call(SEMA_FILE, 20, GRAPH, "name_of", "read", ["u32"], SYM)]),
+     0, "lane-gate: OK"),
+    ("the same store's reader asked BY a name is counted", None,
+     facts_with([call(SEMA_FILE, 20, GRAPH, "id_named", "read", [SYM], "u32")]),
      1, "GRAPH_READ TOTAL 0 -> 1"),
     ("a key inside a generic argument is a key", None,
-     facts_with([call(SEMA_FILE, 20, REGISTRY, "templates_named", "read", ["u32"],
-                      "std::core::option::Option<%s>" % SYM)]),
+     facts_with([call(SEMA_FILE, 20, REGISTRY, "templates_named", "read",
+                      ["std::core::option::Option<%s>" % SYM], "u32")]),
+     1, "REGISTRY_READ TOTAL 0 -> 1"),
+    ("a function-typed parameter's own return is inside the parameter list", None,
+     facts_with([call(SEMA_FILE, 20, REGISTRY, "visit_named", "read",
+                      ["(u32) -> %s" % SYM], "u32")]),
      1, "REGISTRY_READ TOTAL 0 -> 1"),
     ("a `std::collections::string::String` is text, not the key type `string`: accepted", None,
      facts_with([call(SEMA_FILE, 20, INDEX, "describe", "read", ["std::collections::string::String"])]),
@@ -888,7 +897,7 @@ def main():
         # --names lists each store's methods that calls reach, with the
         # receiver's kind, so what the rule swept up can be read.
         code, out = run_gate(base, golden, facts, "--names")
-        for want in ("GenericRegistry (1):", "ModuleGraph (1):", "write  register", "read   get_qualified_name"):
+        for want in ("GenericRegistry (1):", "ModuleGraph (1):", "write  register", "read   lookup_by_name"):
             if want not in out:
                 failures.append("--names did not list `%s`:\n%s" % (want, out))
         code, out = run_gate(base, os.path.join(work, "absent.txt"), facts)

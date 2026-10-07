@@ -749,12 +749,44 @@ type struct CallResolver {
                 "`%s` is a type parameter with no bound, so it has no methods", param_display)));
         }
         if (this.is_explicit_drop_call(call)) {
-            diag = diag.help(Text::new("use `std::core::ptr::drop_in_place(p)`"));
+            diag = diag.help(Text::new(fmt::format("use `std::core::ptr::drop_in_place(%s)`",
+                this.pointer_to_receiver_text(member.object))));
         } else {
             diag = diag.help(Text::new(fmt::format(
                 "add a `where %s: Trait` bound naming a trait that declares `%s`", param_display, method_name)));
         }
         this.ctx.emit_diagnostic(diag);
+    }
+
+    /// The pointer to a destructor call's receiver, as the writer would spell
+    /// it: the operand of `(*q).drop()`, the address of `x` in `x.drop()`.
+    /// A receiver that is not a name or a field path reads `p`.
+    pointer_to_receiver_text(&this, recv: ExpressionNode*) -> string {
+        if (recv != null && recv.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = recv as UnaryExprNode*;
+            if (u.op.kind == TokenType::Star) {
+                const inner: string = this.place_text(u.operand);
+                return if (inner.length() > 0) { inner } else { "p" };
+            }
+        }
+        const place: string = this.place_text(recv);
+        return if (place.length() > 0) { fmt::format("&%s", place) } else { "p" };
+    }
+
+    /// A name or a field path as written (`q`, `this.slot`); empty for any
+    /// other expression.
+    place_text(&this, e: ExpressionNode*) -> string {
+        if (e == null) { return ""; }
+        if (e.kind == NodeKind::Identifier) {
+            return this.intern.resolve((e as IdentifierNode*).name);
+        }
+        if (e.kind == NodeKind::MemberAccess) {
+            const ma: MemberAccessNode* = e as MemberAccessNode*;
+            const base: string = this.place_text(ma.object);
+            if (base.length() == 0) { return ""; }
+            return fmt::format("%s.%s", base, this.intern.resolve(ma.member));
+        }
+        return "";
     }
 
     /// The declaration a free-function call names - a bare call's stamp, or
@@ -934,6 +966,13 @@ type struct CallResolver {
             mut slot: TypeRef = TypeRef::invalid();
             if (i < param_types.length) { slot = param_types[i]; }
             if (i < owner_hints.length && owner_hints[i].is_valid()) { slot = owner_hints[i]; }
+            // A slot naming the callee's own parameters (`d: Option<T>`
+            // before `T` is inferred) is no type in this body; the argument
+            // types itself, and its type is what infers `T`.
+            if (slot.is_valid() && this.symbolic.names_param_out_of_scope(slot)) {
+                slot = TypeRef::invalid();
+                push_expected = false;
+            }
             if (arg != null && slot.is_valid()) {
                 const arg_node: ASTNode* = arg as ASTNode*;
                 if (arg_node.kind == NodeKind::ArrayLiteral) {
@@ -7310,6 +7349,18 @@ type struct CallResolver {
         // is demanded by the declared type this flows into, and adding a fresh
         // demand here perturbs the mono worklist.
         return this.arena.create_instantiation(base, &arg_refs);
+    }
+
+    /// The instantiation a path's written arguments name, as the type of a
+    /// value the path denotes (`Tagged::<i32>::Hi`).  Such a value may flow
+    /// into no declared type that would demand the instantiation - a cast,
+    /// an argument - so it is demanded here.
+    demanded_scope_type(mut &this, base: TypeRef, generic_args: &TypeAnnotation*[],
+                        use_span: SourceSpan) -> TypeRef {
+        const t: TypeRef = this.resolve_generic_scope_type(base, generic_args, use_span);
+        if (!t.is_valid() || t.equals(base)) { return t; }
+        const args: TypeRef[] = this.types.view_type_args_copy(t);
+        return this.ctx.generic_registry.instantiate(base, &args);
     }
 
     /// Resolve a generic scope-call return (`Result::ok`) to the concrete
