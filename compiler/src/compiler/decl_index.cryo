@@ -220,10 +220,6 @@ type struct DeclarationIndex {
     // not already hold appends rather than restamps.
     overload_func_types:   TypeRef[]; // FunctionType TypeRef of this entry
     overload_func_mangled: u32[];     // SymbolStr.id of the linker symbol
-    overload_func_alias_of: DefId[];  // the template a monomorphized clone
-                                      // copies, for an entry registered under
-                                      // a key that is not its own (the clone
-                                      // under its identifier), else invalid.
     overload_func_span:    SourceSpan[]; // where the entry's declaration is written
     overload_func_decl:    ASTNode*[];   // the declaration the entry was first
                                       // registered for: a method's MethodNode,
@@ -332,7 +328,6 @@ public:
             module_global_types:      [],
             overload_func_types:   [],
             overload_func_mangled: [],
-            overload_func_alias_of: [],
             overload_func_trait:   [],
             overload_func_span:    [],
             overload_func_decl:    [],
@@ -426,13 +421,22 @@ public:
         this.overload_index.insert(slot, empty);
     }
 
+    /// `reset_family` for the family entry `e` was registered in, read off
+    /// the entry: a declaration whose signature is rewritten names its own
+    /// family by the entry it was registered as.
+    reset_family_of_entry(mut &this, e: OverloadId) -> void {
+        if (!e.is_valid()) { return; }
+        const slot: u64 = this.overload_func_family[this.slot_of(e)];
+        if (slot == 0) { return; }
+        mut empty: u32[] = [];
+        this.overload_index.insert(slot, empty);
+    }
+
     /// Register one signature of a declaration: the entry in the family
     /// `(owner, leaf)` with signature `func_type_ref`, emitted under the
     /// linker `symbol`, implementing `trait_sym` (empty for anything but a
-    /// trait-impl method).  `alias_of` is the template a specialization's
-    /// clone copies when this family is not the clone's own (the clone
-    /// registered again under its minted identifier); else invalid.
-    /// Registering the same signature, `alias_of` and symbol in one family
+    /// trait-impl method).
+    /// Registering the same signature and symbol in one family
     /// again answers the existing entry; a different symbol under the same
     /// family and signature is a different definition and appends its own.
     /// The id is the declaration's identity for every later consumer: the
@@ -442,7 +446,7 @@ public:
     /// the owner's parameters (`entry_owner_return`), kept the same way.
     ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     register_signature(mut &this, owner: FamilyOwner, leaf: SymbolStr, func_type_ref: TypeRef,
-                       owner_return: TypeRef, alias_of: DefId, symbol: SymbolStr, trait_sym: DefId,
+                       owner_return: TypeRef, symbol: SymbolStr, trait_sym: DefId,
                        span: SourceSpan, decl: ASTNode*) -> OverloadId {
         const slot: u64 = this.family_slot(owner, leaf);
         if (slot == 0) { return OverloadId::invalid(); }
@@ -452,7 +456,6 @@ public:
                 for (mut k: i64 = 0; k < (*positions).length; k++) {
                     const pos: u32 = (*positions)[k];
                     if (this.overload_func_types[pos as i64].equals(func_type_ref)
-                            && this.overload_func_alias_of[pos as i64].equals(alias_of)
                             && this.overload_func_mangled[pos as i64] == symbol.id) {
                         return OverloadId::at_position(pos, this.overload_tag);
                     }
@@ -460,19 +463,43 @@ public:
             }
             Option::None => { }
         }
+        const id: OverloadId = this.file_entry(slot, func_type_ref, owner_return, symbol, trait_sym, span, decl);
+        const positions: u32[]* = this.overload_index.get_or_insert(slot, []);
+        (*positions).push(this.slot_of(id) as u32);
+        return id;
+    }
+
+    /// A new entry, recorded as belonging to the family stored under
+    /// `slot` (0 for none); the caller files it in that family.
+    ![allow(lookup_by_spelling, reason = "the entry's linker symbol, stored with the entry; it keys no store")]
+    file_entry(mut &this, slot: u64, func_type_ref: TypeRef, owner_return: TypeRef,
+               symbol: SymbolStr, trait_sym: DefId, span: SourceSpan, decl: ASTNode*) -> OverloadId {
         const new_pos: u32 = this.overload_func_types.length as u32;
         this.overload_func_types.push(func_type_ref);
         this.overload_func_mangled.push(symbol.id);
-        this.overload_func_alias_of.push(alias_of);
         this.overload_func_trait.push(trait_sym);
         this.overload_func_span.push(span);
         this.overload_func_decl.push(decl);
         this.overload_func_owner_return.push(owner_return);
         this.overload_func_family.push(slot);
         this.overload_func_intrinsic.push(IntrinsicKind::Call);
-        const positions: u32[]* = this.overload_index.get_or_insert(slot, []);
-        (*positions).push(new_pos);
         return OverloadId::at_position(new_pos, this.overload_tag);
+    }
+
+    /// Register a copy of a function - a monomorphized instance, a
+    /// closure-argument specialization - under no family.  Nothing looks a
+    /// copy up by owner and leaf: a call reaches it by the pin its minter
+    /// wrote (the entry, or the instance it is recorded under).  Its linker
+    /// symbol is mangled from `home`'s path - the module of what it copies -
+    /// and the name it was minted with, as a declaration's is from its
+    /// family's.
+    ![allow(lookup_by_spelling, reason = "the copy's own minted name, mangled into its symbol; it keys no store")]
+    register_copy_signature(mut &this, home: FamilyOwner, minted: SymbolStr,
+                            return_type: TypeRef, func_type_ref: TypeRef,
+                            intern: InternTable*, arena: TypeArena*,
+                            span: SourceSpan, decl: ASTNode*) -> OverloadId {
+        const symbol: SymbolStr = this.mangle_function_symbol(home, minted, return_type, func_type_ref, intern, arena);
+        return this.file_entry(0, func_type_ref, return_type, symbol, DefId::invalid(), span, decl);
     }
 
     /// The trait entry `id`'s declaration implements; empty for an inherent
@@ -698,20 +725,6 @@ public:
     entry_intrinsic_kind(&this, id: OverloadId) -> IntrinsicKind {
         if (!id.is_valid()) { return IntrinsicKind::Call; }
         return this.overload_func_intrinsic[this.slot_of(id)];
-    }
-
-    /// How a call pinned to the family `(owner, leaf)` lowers: the kind its
-    /// entries share, when every entry has the same one; `Call` otherwise,
-    /// and for a family with no entries.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    family_intrinsic_kind(&this, owner: FamilyOwner, leaf: SymbolStr) -> IntrinsicKind {
-        const entries: OverloadId[] = this.lookup_family_entries(owner, leaf);
-        if (entries.length == 0) { return IntrinsicKind::Call; }
-        const kind: IntrinsicKind = this.entry_intrinsic_kind(entries[0]);
-        for (mut k: i64 = 1; k < entries.length; k++) {
-            if (this.entry_intrinsic_kind(entries[k]) != kind) { return IntrinsicKind::Call; }
-        }
-        return kind;
     }
 
     /// The signature of every entry of the family `(owner, leaf)`, in
@@ -1071,7 +1084,7 @@ public:
             // a call sema or mono binds to it, a vtable slot - reads the
             // symbol and signature registration wrote, and mangles nothing.
             const entry: OverloadId = this.keep_def_entry(func.def, this.register_signature(
-                FamilyOwner::Type(owner), func.name, func_type_ref, ret, DefId::invalid(), eff_mangled, func.origin_trait,
+                FamilyOwner::Type(owner), func.name, func_type_ref, ret, eff_mangled, func.origin_trait,
                 if (func.has_name_span()) { func.name_span } else { func.span }, method as ASTNode*));
             func.set_overload_entry(entry);
             // A constructor's family is its type's: `Node(1)` and `new
@@ -1238,20 +1251,27 @@ public:
                                 intern: InternTable*, arena: TypeArena*,
                                 symbol: SymbolStr, span: SourceSpan, def: DefId,
                                 decl: ASTNode*) -> OverloadId {
-        // The qualified name the Cryo mangling encodes: the owner's path and
-        // the leaf, as the definition's own path is composed.
+        const sym: SymbolStr = if (symbol.is_valid()) {
+            symbol
+        } else {
+            this.mangle_function_symbol(owner, leaf, return_type, func_type_ref, intern, arena)
+        };
+        return this.keep_def_entry(def,
+            this.register_signature(owner, leaf, func_type_ref, return_type, sym, DefId::invalid(), span, decl));
+    }
+
+    /// The Cryo mangling of a free function named `leaf` under `owner`,
+    /// with signature `func_type_ref`: the qualified name it encodes is the
+    /// owner's path and the leaf, as a definition's own path is composed.
+    ![allow(lookup_by_spelling, reason = "a declaration's own name, mangled into its symbol; it keys no store")]
+    mangle_function_symbol(&this, owner: FamilyOwner, leaf: SymbolStr, return_type: TypeRef,
+                           func_type_ref: TypeRef, intern: InternTable*, arena: TypeArena*) -> SymbolStr {
         const owner_path: SymbolStr = this.family_owner_path(owner);
         const name: SymbolStr = if (owner_path.is_valid()) {
             intern.intern(intern.resolve(owner_path) + "::" + intern.resolve(leaf))
         } else {
             leaf
         };
-        if (symbol.is_valid()) {
-            return this.keep_def_entry(def,
-                this.register_signature(owner, leaf, func_type_ref, return_type, DefId::invalid(), symbol, DefId::invalid(), span, decl));
-        }
-
-        // Compute the mangled symbol name including the full signature.
         const qname: QualifiedName = QualifiedName::from_symbol(name);
         // Borrow the FunctionType's param list rather than aliasing it into an
         // owning local: a `mut params: TypeRef[] = ...; params = fn_ty.param_types`
@@ -1269,8 +1289,7 @@ public:
         }
         const mangled: MangledName = MangledName::for_free_function(
             intern, arena, qname, params, return_type, is_variadic);
-        return this.keep_def_entry(def,
-            this.register_signature(owner, leaf, func_type_ref, return_type, DefId::invalid(), intern.intern(mangled.as_string()), DefId::invalid(), span, decl));
+        return intern.intern(mangled.as_string());
     }
 
     /// Keep `entry` under the definition `def` for `entry_of_def`, and

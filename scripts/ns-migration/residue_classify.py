@@ -184,8 +184,6 @@ CLASS_OF_METHOD = {
         ("J", "module: a namespace asked whether it is the prelude's; a module's identity is its path"),
     "DeclarationIndex::ns_imports":
         ("J", "module: two namespaces asked whether one imports the other; module identities"),
-    "DeclarationIndex::family_intrinsic_kind":
-        ("J", "member: the intrinsic kind an overload family's entries share, asked as `lookup_family_entries` is (the `CalleePin::Family` arm; the `Decl` arm reads the kind off the entry)"),
     "DeclarationIndex::extern_symbol_conflict":
         ("J", "extern: a C symbol by its link name, the only identity a C symbol has"),
     # -- the funnel --
@@ -213,8 +211,6 @@ CLASS_OF_METHOD = {
         ("J", "module: an import or export path as written in source, to the module the graph registered under it - `module_named` behind a name for the one kind of text it takes, the door itself being private to the graph"),
     "ModuleGraph::module_beside_item":
         ("J", "module: whether a written module path and an item written beside it also name a module (an imported entry that is a sub-module, a type declared beside a module of its own path) - `module_named` on the joined path, behind a name for that question"),
-    "ModuleGraph::module_of_minted_parent":
-        ("J", "module: the module the parent of a name the compiler minted qualified names - `module_named` behind a name for that text, which goes when the minting carries the module's identity"),
     "ModuleGraph::module_of_file":
         ("N", "the module a source FILE declares, by its FILE PATH"),
     "ModuleGraph::find_module_by_path":

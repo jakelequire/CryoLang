@@ -1005,15 +1005,22 @@ type struct TypeResolutionPasses {
                     const func_type_ref: TypeRef = arena.get_function(
                         func.resolved_return_type, param_types, func.is_variadic);
 
-                    // In the declaration's own family - its module and its
-                    // leaf - so cross-module descriptors carry it whole.
-                    const q_name: SymbolStr = ctx.decl_fn_key(func.name, func.span.file);
-                    mut leaf: SymbolStr = SymbolStr::empty();
-                    const owner: FamilyOwner = ctx.decl_fn_family(func.name, func.span.file, &leaf);
-                    const entry: OverloadId = ctx.decl_index.register_function_signature(
-                        owner, leaf, func.resolved_return_type, func_type_ref, ctx.intern_table, arena,
-                        SymbolStr::empty(), if (func.has_name_span()) { func.name_span } else { func.span },
-                        if (is_source_decl) { func.def } else { DefId::invalid() }, func as ASTNode*);
+                    // A declaration is registered in its own family - its
+                    // module and the name it is written with.  A copy (a
+                    // monomorphized instance) is registered in none: a call
+                    // reaches it by its instance, and its symbol is mangled
+                    // under the module of the definition it copies.
+                    const decl_span: SourceSpan = if (func.has_name_span()) { func.name_span } else { func.span };
+                    const entry: OverloadId = if (!func.def.is_valid() && func.copy_of.is_valid()) {
+                        ctx.decl_index.register_copy_signature(
+                            ctx.copy_module_family(func.copy_of), func.name, func.resolved_return_type,
+                            func_type_ref, ctx.intern_table, arena, decl_span, func as ASTNode*)
+                    } else {
+                        ctx.decl_index.register_function_signature(
+                            ctx.fn_family_of(func.def), func.name, func.resolved_return_type, func_type_ref,
+                            ctx.intern_table, arena, SymbolStr::empty(), decl_span,
+                            if (is_source_decl) { func.def } else { DefId::invalid() }, func as ASTNode*)
+                    };
                     func.set_overload_entry(entry);
                     // A generic intrinsic's entries lower as its kind: the
                     // declaration's, and each specialization's, which is the
@@ -1035,29 +1042,8 @@ type struct TypeResolutionPasses {
                     ctx.generic_registry.claim_wellknown(func.def, ctx.intern_table);
 
                     ctx.decl_index.set_decl_visibility(func.def, func.is_public);
-                    // A monomorphized clone is pinned by the family of its
-                    // identifier - the mangling of its template's name and
-                    // arguments - under its TEMPLATE's definition, so the
-                    // clone registers there as well.  Two templates
-                    // overloading one name mint one identifier for the same
-                    // arguments, and are two families by their definitions.
-                    // A clone with no template it copies is the root's.
-                    // A written declaration's leaf is not
-                    // a key any store holds: a caller names it by its stamp,
-                    // and a leaf slot is last-writer-wins across every module
-                    // declaring the leaf.  A leaf an `intrinsic function`
-                    // owns keeps its single-slot bindings either way; the
-                    // index refuses non-intrinsic overwrites of them.
-                    if (!is_source_decl && !q_name.equals(func.name)) {
-                        const spec_entry: OverloadId = ctx.decl_index.register_signature(
-                            FamilyOwner::Def(func.copy_of), func.name, func_type_ref, func.resolved_return_type, func.copy_of,
-                            ctx.decl_index.entry_symbol(entry), DefId::invalid(),
-                            ctx.decl_index.entry_span(entry), func as ASTNode*);
-                        if (func.is_intrinsic) {
-                            ctx.decl_index.mark_intrinsic(spec_entry, ctx.decl_index.entry_intrinsic_kind(entry));
-                        }
-                        ctx.decl_index.record_instance(func.instance, spec_entry);
-                    }
+                    // A free function's instance is answered by its entry.
+                    ctx.decl_index.record_instance(func.instance, entry);
                 }
             }
             NodeKind::ImplementationBlock => {
@@ -2462,11 +2448,11 @@ type struct TypeResolutionPasses {
                             } else {
                                 ctx.decl_fn_key(fn_node.name, fn_node.span.file)
                             };
-                            mut ext_leaf: SymbolStr = fn_node.name;
+                            const ext_leaf: SymbolStr = fn_node.name;
                             const ext_owner: FamilyOwner = if (node.is_c_import()) {
                                 ctx.module_family(node.binding_namespace)
                             } else {
-                                ctx.decl_fn_family(fn_node.name, fn_node.span.file, &ext_leaf)
+                                ctx.fn_family_of(fn_node.def)
                             };
                             // Two extern blocks declaring one C name with
                             // DIFFERENT Cryo signatures is an ABI hazard the
@@ -2549,12 +2535,10 @@ type struct TypeResolutionPasses {
 
                         // Register in its module's family so cross-module
                         // externs pick up intrinsics.
-                        mut i_leaf: SymbolStr = SymbolStr::empty();
-                        const i_owner: FamilyOwner = ctx.decl_fn_family(node.name, node.span.file, &i_leaf);
                         // Intrinsics use C linkage; their LLVM symbol is the
                         // bare function name, not the qualified/mangled form.
                         const i_entry: OverloadId = ctx.decl_index.register_function_signature(
-                            i_owner, i_leaf, node.resolved_return_type, i_func_type_ref, ctx.intern_table, arena,
+                            ctx.fn_family_of(node.def), node.name, node.resolved_return_type, i_func_type_ref, ctx.intern_table, arena,
                             node.name, node.span, node.def, node as ASTNode*);
 
                         // The ENTRY carries the intrinsic's kind, read from
