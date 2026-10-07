@@ -3444,6 +3444,8 @@ type struct CallResolver {
             // An instantiation whose arguments are still a generic body's
             // parameters is asked again where it is instantiated.
             if (tmpl == null || !this.types.contains_generic_param(owner_inst)) {
+                this.report_generic_tie(visitor, call, member, base_ref, base_t, start_cls,
+                    methods_ref, &arg_types, tmpl, owner_inst, false, sel.chosen);
                 this.report_inherent_trait_tie(visitor, call, member, base_ref, base_t, start_cls,
                     methods_ref, &arg_types, tmpl, owner_inst, sel.chosen);
             }
@@ -3452,6 +3454,10 @@ type struct CallResolver {
         }
         if (this.select_in_set(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
                 &arg_types, tmpl, DefId::invalid(), true, &sel)) {
+            if (tmpl == null || !this.types.contains_generic_param(owner_inst)) {
+                this.report_generic_tie(visitor, call, member, base_ref, base_t, start_cls,
+                    methods_ref, &arg_types, tmpl, owner_inst, true, sel.chosen);
+            }
             this.pin_minted_method(call, sel, base_ref);
             return this.commit_selection(visitor, call, sel);
         }
@@ -3723,6 +3729,44 @@ type struct CallResolver {
             }
         }
         return false;
+    }
+
+    /// A non-generic method the arguments bind to (`chosen`) and a generic
+    /// method of the same name, in the same candidate set, that they bind
+    /// to as well: neither outranks the other for being non-generic, so the
+    /// call is ambiguous (E0154).  Silent when `chosen` is itself generic -
+    /// no non-generic method applied - or when no generic one applies.
+    report_generic_tie(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
+                       base_ref: TypeRef, base_t: Type*, start_cls: ClassType*,
+                       methods_ref: Slice<MethodInfo>, arg_types: &TypeRef[],
+                       tmpl: TemplateEntry*, owner_inst: TypeRef, from_trait: boolean,
+                       chosen: MethodNode*) -> void {
+        if (chosen == null || chosen.func == null || chosen.func.generic_params.length > 0) { return; }
+        mut alt: Selection = Selection::none();
+        alt.owner_inst = owner_inst;
+        alt.recv = if (owner_inst.is_valid()) { owner_inst } else { base_ref };
+        const bound: boolean = if (tmpl != null) {
+            this.select_on_template(visitor, call, member, tmpl, arg_types,
+                DefId::invalid(), from_trait, true, &alt)
+        } else {
+            this.select_method(visitor, call, member, base_ref, base_t, start_cls, methods_ref,
+                arg_types, DefId::invalid(), from_trait, true, &alt)
+        };
+        if (!bound || alt.chosen == null || alt.chosen == chosen || alt.chosen.func == null) { return; }
+        const subject: TypeRef = if (owner_inst.is_valid()) { owner_inst } else { base_ref };
+        const leaf: string = this.intern.resolve(member.member);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0154_AMBIGUOUS_CALL,
+            Text::new(fmt::format("`%s` is ambiguous: a non-generic and a generic method of `%s` both accept these arguments",
+                leaf, this.arena.resolve_display_name_short(subject))));
+        d = d.at_with_label(member.span, Text::new("both methods apply here"));
+        const f1: FunctionDeclNode* = chosen.func;
+        const f2: FunctionDeclNode* = alt.chosen.func;
+        d = d.with_note_at(Text::new(fmt::format("candidate #1: `%s`, not generic", leaf)),
+            if (f1.has_name_span()) { f1.name_span } else { f1.span });
+        d = d.with_note_at(Text::new(fmt::format("candidate #2: `%s`, generic", leaf)),
+            if (f2.has_name_span()) { f2.name_span } else { f2.span });
+        d = d.help(Text::new("a method is not preferred for being non-generic; rename one of them"));
+        this.ctx.emit_diagnostic(d);
     }
 
     /// An inherent method the arguments bind to (`inherent`) and a trait
@@ -5779,7 +5823,44 @@ type struct CallResolver {
             return inherent;
         }
         if (n == 0 && fits.length >= 2) { this.report_static_path_tie(fits, path, call, OverloadId::invalid(), owner); }
+        if (n >= 2) { return this.report_static_generic_tie(fits, path, call, owner); }
         return OverloadId::invalid();
+    }
+
+    /// Several inherent entries of `fits` accept the arguments, a
+    /// non-generic method and a generic one among them: neither outranks
+    /// the other for being non-generic, so the `Type::method` call is
+    /// ambiguous (E0154).  The non-generic entry is answered so the tie is
+    /// the one error the call reports; invalid when the entries are not
+    /// such a pair.
+    report_static_generic_tie(mut &this, fits: &OverloadId[], path: ScopeResolutionNode*,
+                              call: CallExprNode*, owner: FamilyOwner) -> OverloadId {
+        mut plain: OverloadId = OverloadId::invalid();
+        mut generic: OverloadId = OverloadId::invalid();
+        for (mut i: i64 = 0; i < fits.length; i++) {
+            if (this.ctx.decl_index.entry_trait(fits[i]).is_valid()) { continue; }
+            const m: MethodNode* = this.ctx.decl_index.entry_method(fits[i]);
+            if (m == null || m.func == null) { continue; }
+            if (m.func.generic_params.length > 0) { generic = fits[i]; } else { plain = fits[i]; }
+        }
+        if (!plain.is_valid() || !generic.is_valid()) { return OverloadId::invalid(); }
+        const leaf: string = if (path != null) { this.intern.resolve(path.member_name) } else { "" };
+        const owner_t: TypeRef = match (owner) {
+            FamilyOwner::Type(t) => { t }
+            FamilyOwner::Def(d)  => { this.ctx.decl_index.type_of_def(d) }
+        };
+        const at: SourceSpan = if (path != null) { path.span } else { call.span };
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0154_AMBIGUOUS_CALL,
+            Text::new(fmt::format("`%s` is ambiguous: a non-generic and a generic method of `%s` both accept these arguments",
+                leaf, this.arena.resolve_display_name_short(owner_t))));
+        d = d.at_with_label(at, Text::new("both methods apply here"));
+        d = d.with_note_at(Text::new(fmt::format("candidate #1: `%s`, not generic", leaf)),
+            this.ctx.decl_index.entry_span(plain));
+        d = d.with_note_at(Text::new(fmt::format("candidate #2: `%s`, generic", leaf)),
+            this.ctx.decl_index.entry_span(generic));
+        d = d.help(Text::new("a method is not preferred for being non-generic; rename one of them"));
+        this.ctx.emit_diagnostic(d);
+        return plain;
     }
 
     /// `path` names a method every trait entry of `fits` provides through a
