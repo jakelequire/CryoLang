@@ -170,8 +170,8 @@ CLASS_OF_METHOD = {
     "local::VTableSlot[]":
         ("J", "member: a class's vtable slots held in a local, by the method's leaf (the override walk)"),
     # -- the declaration index --
-    "DeclarationIndex::global_entry_in_module":
-        ("J", "member: a global's leaf inside the module the qualifier's stamp names (a `DefId`)"),
+    "DeclarationIndex::global_in_module":
+        ("J", "member: a global's leaf inside the module the qualifier's stamp names (a `DefId`), the member-global door"),
     "DeclarationIndex::lookup_family_entries":
         ("J", "member: an overload family's leaf asked inside the owner the caller holds by identity - a module's or a type's definition, or a type's arena id (`FamilyOwner`); the store is keyed by that owner's path and the leaf (`family_slot`), as a definition is its parent and its leaf. Overloading is kept, so a family is the SET one owner declares under one written leaf, and the leaf is the question asked, not a stand-in for an identity - Rust's resolver keys the same set by parent module, ident and namespace"),
     "DeclarationIndex::lookup_func_type_overloads":

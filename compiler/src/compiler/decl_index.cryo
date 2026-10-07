@@ -154,7 +154,10 @@ type struct DeclarationIndex {
     // template's method, a type's copy of a trait's default.
     copy_entries:   HashMap<u64, OverloadId>;
 
-    module_global_keys:      u32[];  // SymbolStr.id of global variable
+    // A global definition's slot in `defs` -> its registration slot in the
+    // `module_global_*` arrays; -1 for a slot no global registration reached.
+    def_globals:              i64[];
+    module_global_leaves:     u32[];  // SymbolStr.id of the global's own name
     module_global_files:      u32[];  // SymbolStr.id of the defining source file
     module_global_declared_in: ModulePath[];  // the defining module
                                       // (`std::collections::hashmap`).  Codegen
@@ -163,19 +166,15 @@ type struct DeclarationIndex {
                                       // modules can each declare the same
                                       // private `const NAME = ...` without
                                       // colliding at link time.
-    module_global_types:      TypeRef[];  // parallel to module_global_keys: the
-                                      // global's type AS DECLARED IN THAT module -
-                                      // a slot is `(leaf, namespace)`, so "the
-                                      // `FIONBIO` declared in `sys::syscall`" is
-                                      // answerable when another module declares
-                                      // that leaf too.
-    module_global_threadlocal: boolean[];  // parallel to module_global_keys:
+    module_global_types:      TypeRef[];  // parallel to module_global_leaves: the
+                                      // global's type as its declaration has it.
+    module_global_threadlocal: boolean[];  // parallel to module_global_leaves:
                                       // whether the global is `![thread_local]`,
                                       // so a cross-module extern reference is
                                       // marked thread-local too (else it would
                                       // reference a TLS symbol with a non-TLS
                                       // relocation and fail to link).
-    module_global_extern_syms: u32[];  // parallel to module_global_keys: the
+    module_global_extern_syms: u32[];  // parallel to module_global_leaves: the
                                       // linker symbol of a global whose storage
                                       // another object owns (an `extern` C
                                       // global), 0 for one Cryo defines.  An
@@ -318,7 +317,8 @@ public:
             copy_entries:        HashMap::<u64, OverloadId>::new(),
             array_elem_to_type:  HashMap::<u64, TypeRef>::new(),
             implicit_converters: HashMap::<u64, DefId>::new(),
-            module_global_keys:       [],
+            def_globals:              [],
+            module_global_leaves:     [],
             module_global_threadlocal: [],
             module_global_extern_syms: [],
             module_global_files:      [],
@@ -825,29 +825,28 @@ public:
         this.type_reverse.insert(ty.key(), def);
     }
 
-    /// Register a global with its defining source file and module so codegen
-    /// can walk the per-module list to emit cross-module externs.  The slot
-    /// is `(name, declared_in)`; codegen mangles the global as
-    /// `C$<module path>.<name>` so two modules with the same private
-    /// `const NAME = ...` don't collide.  `declared_in` is none for a unit
-    /// declaring no namespace (the global stays bare-mangled).
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    register_global_with_module(mut &this, name: SymbolStr, ty: TypeRef,
-                                 source_file: SymbolStr, declared_in: ModulePath,
-                                 thread_local: boolean) -> void {
-        // Dedup so re-processing doesn't grow the list unboundedly.
-        for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
-            if (this.module_global_keys[i] == name.id &&
-                this.module_global_files[i] == source_file.id) {
-                // Refresh recorded metadata in case the global was first
-                // registered before its module / thread-local flag was set.
-                this.module_global_declared_in[i] = declared_in;
-                this.module_global_threadlocal[i] = thread_local;
-                this.module_global_types[i] = ty;
-                return;
-            }
+    /// Register the global definition `def`, declared as `leaf` by the module
+    /// `declared_in` in `source_file`, under its definition: one slot per
+    /// definition, so a second registration of the same declaration refreshes
+    /// what the first recorded (its module, type and thread-local flag)
+    /// rather than adding a slot.  Codegen mangles the global as
+    /// `C$<module path>.<leaf>`; `declared_in` is none for a unit declaring
+    /// no namespace (the global stays bare-mangled).
+    ![allow(lookup_by_spelling, reason = "records the declaration's own leaf and source file as data for mangling and ownership; the slot is keyed by the definition")]
+    register_global(mut &this, def: DefId, leaf: SymbolStr, ty: TypeRef,
+                    source_file: SymbolStr, declared_in: ModulePath,
+                    thread_local: boolean) -> void {
+        const i: i64 = this.global_slot_of_def(def);
+        if (i >= 0) {
+            this.module_global_declared_in[i] = declared_in;
+            this.module_global_threadlocal[i] = thread_local;
+            this.module_global_types[i] = ty;
+            return;
         }
-        this.module_global_keys.push(name.id);
+        const ds: i64 = this.defs.slot(def);
+        while (this.def_globals.length <= ds) { this.def_globals.push(-1); }
+        this.def_globals[ds] = this.module_global_leaves.length;
+        this.module_global_leaves.push(leaf.id);
         this.module_global_files.push(source_file.id);
         this.module_global_declared_in.push(declared_in);
         this.module_global_threadlocal.push(thread_local);
@@ -855,19 +854,19 @@ public:
         this.module_global_types.push(ty);
     }
 
-    /// The registration slot of the global `name` declared by the module
-    /// `m`, or -1.  Exact on both: the leaf alone cannot answer, since two
-    /// modules may each declare it (`libc::FIONBIO`, `syscall::FIONBIO`).
-    /// No module is the root, which a unit with no `namespace` declaration
-    /// registers its globals under.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    global_slot(&this, name: SymbolStr, m: ModulePath) -> i64 {
-        for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
-            if (this.module_global_keys[i] != name.id) { continue; }
-            if (!this.module_global_declared_in[i].equals(m)) { continue; }
-            return i;
-        }
-        return -1;
+    /// The registration slot of the global definition `def`, or -1 when `def`
+    /// is invalid or no global registration reached it.
+    global_slot_of_def(&this, def: DefId) -> i64 {
+        if (!def.is_valid()) { return -1; }
+        const ds: i64 = this.defs.slot(def);
+        if (ds >= this.def_globals.length) { return -1; }
+        return this.def_globals[ds];
+    }
+
+    /// The global definition `def` is, from its registration slot, or an
+    /// entry that is not `valid`.
+    global_entry_of_def(&this, def: DefId) -> GlobalEntry {
+        return this.global_entry_at(this.global_slot_of_def(def));
     }
 
     /// The slot at position `i`, read by value.
@@ -876,7 +875,7 @@ public:
         return GlobalEntry {
             valid:         true,
             slot:          i,
-            leaf:          SymbolStr::from_id(this.module_global_keys[i]),
+            leaf:          SymbolStr::from_id(this.module_global_leaves[i]),
             declared_in:   this.module_global_declared_in[i],
             type_ref:      this.module_global_types[i],
             source_file:   SymbolStr::from_id(this.module_global_files[i]),
@@ -885,32 +884,38 @@ public:
         };
     }
 
-    /// The global `name` declared by the module `m` - the module a qualified
-    /// path's stamp names, beside the member leaf the path wrote
-    /// (`libc::FIONBIO`), or the module a global's definition is declared
-    /// in - or an entry that is not `valid`.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    global_entry_in_module(&this, name: SymbolStr, m: ModulePath) -> GlobalEntry {
-        return this.global_entry_at(this.global_slot(name, m));
+    /// Door `member-global`.  A qualified path's member is written as a leaf
+    /// after a module the name layer already bound (`libc::FIONBIO`), so the
+    /// question takes the module's identity and the leaf's text; the leaf
+    /// alone cannot answer, since two modules may each declare it.
+    ///
+    /// The global the module `m` declares as `leaf`, or an entry that is not
+    /// `valid`.  No module is the root, which a unit with no `namespace`
+    /// declaration registers its globals under.
+    ![allow(lookup_by_spelling, reason = "the member-global door: a written member leaf, asked of the module its qualifier names")]
+    global_in_module(&this, leaf: SymbolStr, m: ModulePath) -> GlobalEntry {
+        for (mut i: i64 = 0; i < this.module_global_leaves.length; i++) {
+            if (this.module_global_leaves[i] != leaf.id) { continue; }
+            if (!this.module_global_declared_in[i].equals(m)) { continue; }
+            return this.global_entry_at(i);
+        }
+        return GlobalEntry::none();
     }
 
-    /// Record that the global `name` of module `m` binds linker symbol
-    /// `sym`.  A global whose type never resolved has no slot; it was
-    /// diagnosed at the declaration and nothing references it.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    record_global_extern_symbol(mut &this, name: SymbolStr, m: ModulePath,
-                                sym: SymbolStr) -> void {
-        const i: i64 = this.global_slot(name, m);
+    /// Record that the global definition `def` binds linker symbol `sym`.
+    /// A global whose type never resolved has no slot; it was diagnosed at
+    /// the declaration and nothing references it.
+    ![allow(lookup_by_spelling, reason = "records a C library's linker symbol as data; the slot is keyed by the definition")]
+    record_global_extern_symbol(mut &this, def: DefId, sym: SymbolStr) -> void {
+        const i: i64 = this.global_slot_of_def(def);
         if (i >= 0) { this.module_global_extern_syms[i] = sym.id; }
     }
 
-    /// Mark the global `name` of module `m` thread-local.  The
-    /// `![thread_local]` directive is applied AFTER TypeResolution registered
-    /// the global with the flag false, so the registration is corrected
-    /// rather than made.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    mark_global_thread_local(mut &this, name: SymbolStr, m: ModulePath) -> void {
-        const i: i64 = this.global_slot(name, m);
+    /// Mark the global definition `def` thread-local.  The `![thread_local]`
+    /// directive is applied AFTER TypeResolution registered the global with
+    /// the flag false, so the registration is corrected rather than made.
+    mark_global_thread_local(mut &this, def: DefId) -> void {
+        const i: i64 = this.global_slot_of_def(def);
         if (i >= 0) { this.module_global_threadlocal[i] = true; }
     }
 

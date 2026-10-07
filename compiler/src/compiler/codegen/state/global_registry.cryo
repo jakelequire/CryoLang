@@ -1,50 +1,33 @@
 /// Global Registry
 ///
-/// Module-global variable map: `SymbolStr.id` -> `LLVMValueRef`.
+/// Module-global variable map: a global's registration slot (the index's
+/// `GlobalEntry.slot`) -> `LLVMValueRef`.
 /// Leaf component: owns its array, no back-pointers.
 
 namespace compiler::codegen::state::global_registry;
 
 import compiler::codegen::llvm_types;
 import compiler::codegen::llvm_types::{ LValue };
-import compiler::resolver::symbol_str;
-import compiler::resolver::symbol_str::{ SymbolStr };
-import std::core::option;
-import std::core::option::{ Option };
-import std::collections::{ pair, hashmap };
-import std::collections::hashmap::{ HashMap };
-import std::collections::pair::{ Pair };
 
 
 type struct GlobalRegistry {
-    entries: Pair<u32, void*>[];   // (SymbolStr.id, LLVMValueRef)
-    // name SymbolStr.id -> position in `entries`, replacing the linear scan.
-    index:   HashMap<u32, u32>;
+    // Indexed by registration slot; null where this module holds no value.
+    values: void*[];
 
     static new() -> GlobalRegistry {
-        return GlobalRegistry { entries: [], index: HashMap::<u32, u32>::new() };
+        return GlobalRegistry { values: [] };
     }
 
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    register(mut &this, name: SymbolStr, val: LValue) -> void {
-        const key: u32 = name.id;
-        match (this.index.get(&key)) {
-            Option::Some(pos) => {
-                this.entries[pos as i64].second = val.raw;
-                return;
-            }
-            Option::None => { }
-        }
-        const new_pos: u32 = this.entries.length as u32;
-        this.entries.push(Pair::new(key, val.raw));
-        this.index.insert(key, new_pos);
+    /// Record the value of the global registered at `slot`.
+    register(mut &this, slot: i64, val: LValue) -> void {
+        if (slot < 0) { return; }
+        while (this.values.length <= slot) { this.values.push(null); }
+        this.values[slot] = val.raw;
     }
 
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    get(&this, name: SymbolStr) -> LValue {
-        return match (this.index.get(&name.id)) {
-            Option::Some(pos) => { LValue { raw: this.entries[pos as i64].second } }
-            Option::None      => { LValue::null() }
-        };
+    /// The value of the global registered at `slot`, or null.
+    get(&this, slot: i64) -> LValue {
+        if (slot < 0 || slot >= this.values.length) { return LValue::null(); }
+        return LValue { raw: this.values[slot] };
     }
 }

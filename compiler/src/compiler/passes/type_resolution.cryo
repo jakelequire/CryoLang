@@ -301,21 +301,19 @@ type struct TypeResolutionRunner {
     }
 
 
-    /// Record, on the registration `(key, m)`, the linker symbol an IMPORTED
+    /// Record, on the global's registration, the linker symbol an IMPORTED
     /// global binds - its `![symbol("...")]` override when it has one, else
     /// its declared name.  A no-op for a global Cryo defines, which is mangled
     /// under its namespace.  The directive pass runs after this and re-records
     /// the override on the same slot.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    static record_extern_symbol(ctx: CompilationContext*, node: VarDeclNode*,
-                                key: SymbolStr, m: ModulePath) -> void {
+    static record_extern_symbol(ctx: CompilationContext*, node: VarDeclNode*) -> void {
         if (!node.is_extern_import) { return; }
         const sym: SymbolStr = if (node.link_name.length() > 0) {
             ctx.intern(node.link_name)
         } else {
             node.name
         };
-        ctx.decl_index.record_global_extern_symbol(key, m, sym);
+        ctx.decl_index.record_global_extern_symbol(node.def, sym);
     }
 
     /// Report an annotation the type layer could not resolve, at a
@@ -2586,8 +2584,8 @@ type struct TypeResolutionPasses {
                             mut ic_ns: ModulePath = ModulePath::none();
                             const ic_key: SymbolStr = ctx.decl_global_key(
                                 ic_node.name, ModulePath::none(), ic_node.span.file, &ic_ns);
-                            ctx.decl_index.register_global_with_module(
-                                ic_key, ic_type, ic_mod_sym, ic_ns, false);
+                            ctx.decl_index.register_global(
+                                ic_node.def, ic_key, ic_type, ic_mod_sym, ic_ns, false);
                         }
                     }
                 }
@@ -2971,22 +2969,18 @@ type struct TypeResolutionPasses {
                     }
                     if (var_node.resolved_type.is_valid()) {
                         const gmod_sym: SymbolStr = ctx.intern(ctx.source_file);
-                        // The declaration's own registration key: a C-imported
-                        // global (an anonymous-enum constant) is reachable ONLY
-                        // as `cit::NAME` under the alias namespace, never bare
-                        // (a bare key would shadow same-leaf globals in other
-                        // modules - the same rule as the struct/enum decls;
-                        // sema's scope-resolution visit probes the qualified
-                        // key and codegen mangles the symbol under the alias).
-                        // Any other is its leaf under the writing module's
-                        // namespace.
+                        // Registered under its definition.  The module recorded
+                        // with it is the one it is mangled under and the one a
+                        // qualified path names it through: a C-imported global
+                        // (an anonymous-enum constant) the alias's (`cit::NAME`),
+                        // any other the writing module's.
                         mut g_ns: ModulePath = ModulePath::none();
                         const g_key: SymbolStr = ctx.decl_global_key(
                             var_node.name, var_node.binding_namespace, var_node.span.file, &g_ns);
-                        ctx.decl_index.register_global_with_module(
-                            g_key, var_node.resolved_type, gmod_sym, g_ns,
+                        ctx.decl_index.register_global(
+                            var_node.def, g_key, var_node.resolved_type, gmod_sym, g_ns,
                             var_node.is_thread_local);
-                        TypeResolutionRunner::record_extern_symbol(ctx, var_node, g_key, g_ns);
+                        TypeResolutionRunner::record_extern_symbol(ctx, var_node);
                     }
                 }
                 _ => {}
