@@ -2735,15 +2735,37 @@ public:
         } else {
             null
         };
-        if (tdecl != null && tdecl.assoc_type_index(pj.member) >= 0) { return; }
+        // The trait `This` stands for answers through itself and every trait
+        // it inherits; two of them declaring the member is ambiguous.
+        mut found: DefId = DefId::invalid();
+        mut ambiguous: boolean = false;
+        if (tdecl != null) {
+            const traits: DefId[] = this.ctx.generic_registry.trait_and_supertraits(pj.owner_trait);
+            for (mut t: i64 = 0; t < traits.length; t++) {
+                const td: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(traits[t]);
+                if (td == null || td.assoc_type_index(pj.member) < 0) { continue; }
+                if (found.is_valid() && !found.equals(traits[t])) { ambiguous = true; }
+                found = traits[t];
+            }
+        }
+        if (found.is_valid() && !ambiguous) { return; }
         const member: string = this.resolver.intern_table.resolve(pj.member);
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0203_UNDEFINED_TYPE,
-            Text::new(fmt::format("associated type `%s` not found for `This`", member)));
+            Text::new(if (ambiguous) {
+                fmt::format("ambiguous associated type `%s` in bounds of `This`", member)
+            } else {
+                fmt::format("associated type `%s` not found for `This`", member)
+            }));
         d = d.at_with_label(pj.span, Text::new(if (tdecl == null) {
             "`This` stands for no trait here"
         } else {
-            fmt::format("trait `%s` declares no associated type `%s`",
-                this.resolver.intern_table.resolve(tdecl.name), member)
+            if (ambiguous) {
+                fmt::format("more than one of `%s` and the traits it inherits declares `%s`",
+                    this.resolver.intern_table.resolve(tdecl.name), member)
+            } else {
+                fmt::format("trait `%s` declares no associated type `%s`",
+                    this.resolver.intern_table.resolve(tdecl.name), member)
+            }
         }));
         this.ctx.emit_diagnostic(d);
         pj.refused = true;
@@ -2767,13 +2789,20 @@ public:
             };
             const span: SourceSpan = if (pp.ann != null) { pp.ann.span } else { pp.proj.span };
             const bounds: DefId[] = this.resolver.bounds_of_param(pp.param);
+            // Each bound answers through itself and every trait it inherits:
+            // `Item` under `I: DoubleEnded` is `Iterator`'s when `DoubleEnded`
+            // extends `Iterator`.  Two different traits declaring it is
+            // ambiguous, whether two bounds or a trait and its supertrait.
             mut found: DefId = DefId::invalid();
             mut ambiguous: boolean = false;
             for (mut b: i64 = 0; b < bounds.length; b++) {
-                const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(bounds[b]);
-                if (tdecl == null || tdecl.assoc_type_index(member_sym) < 0) { continue; }
-                if (found.is_valid() && !found.equals(bounds[b])) { ambiguous = true; }
-                found = bounds[b];
+                const traits: DefId[] = this.ctx.generic_registry.trait_and_supertraits(bounds[b]);
+                for (mut t: i64 = 0; t < traits.length; t++) {
+                    const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(traits[t]);
+                    if (tdecl == null || tdecl.assoc_type_index(member_sym) < 0) { continue; }
+                    if (found.is_valid() && !found.equals(traits[t])) { ambiguous = true; }
+                    found = traits[t];
+                }
             }
             if (found.is_valid() && !ambiguous) { continue; }
             const member: string = this.resolver.intern_table.resolve(member_sym);

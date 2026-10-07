@@ -86,6 +86,33 @@ yet is recorded with the change that builds it, not here.
 
 ### 2026-10-06
 
+145. **Calling a value that is not a function keeps E0213**, declared as
+     `NON_CALLABLE` and used by ruling 142, rather than a new number.
+
+146. **The two type displays rulings 139 and 142 print in diagnostic text
+     are accepted as name-keyed reads**: the lane's LOOKUP_ROUTED count
+     going from 25 to 27 for them stands.
+
+147. **A call through a local or a field whose type is no function is
+     E0213 too**, "expected function, found `i32`", rather than "cannot find
+     function" or "no method named".
+
+     ```cryo
+     const x: i32 = 3;
+     const a: i32 = x(3);     // expected function, found `i32`
+     const b: i32 = h.n(4);   // `n: i32` a field, no method `n`: the same
+     ```
+
+148. **A projection through a trait resolves through the traits it
+     inherits**, as in Rust: `I::Item` under `I: DoubleEnded`, where
+     `DoubleEnded` extends `Iterator`, is `Iterator`'s `Item`.  A projection
+     nothing declares stays E0203.
+
+     ```cryo
+     type trait DoubleEnded : Iterator { next_back(mut &this) -> Option<This::Item>; }
+     function last<I>(it: mut &I) -> Option<I::Item> where I: DoubleEnded { .. }
+     ```
+
 139. **E0154 on an overloaded function used as a value with no expected
      type keeps its wording and gains a help line showing how to pick one**
      by typing the variable, with the value's own name and one of its

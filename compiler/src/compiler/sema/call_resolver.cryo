@@ -1176,21 +1176,21 @@ type struct CallResolver {
             return (this.arena.lookup(computed_fn) as FunctionType*).return_type;
         }
         if (computed_type.is_valid()) {
-            this.refuse_call_of_non_function(call, computed_type);
+            this.refuse_call_of_non_function(call.callee.span, computed_type);
             return TypeRef::invalid();
         }
         return computed_type;
     }
 
-    /// E0213: a call whose callee is a value of `found`, which is no
-    /// function.  A callee already refused (an error type) is not reported
-    /// twice.
-    refuse_call_of_non_function(mut &this, call: CallExprNode*, found: TypeRef) -> void {
+    /// E0213: a call whose callee, written at `callee`, is a value of
+    /// `found`, which is no function.  A callee already refused (an error
+    /// type) is not reported twice.
+    refuse_call_of_non_function(mut &this, callee: SourceSpan, found: TypeRef) -> void {
         const ft: Type* = this.arena.lookup(found);
         if (ft != null && ft.kind == TypeKind::Error) { return; }
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0213_NON_CALLABLE,
             Text::new(fmt::format("expected function, found `%s`", this.types.type_display_name(found))));
-        d = d.at_with_label(call.callee.span, Text::new("call expression requires function"));
+        d = d.at_with_label(callee, Text::new("call expression requires function"));
         this.ctx.emit_diagnostic(d);
     }
 
@@ -3103,6 +3103,10 @@ type struct CallResolver {
                                 ident.set_resolved_type(fp_local);
                                 return (fp_t as FunctionType*).return_type;
                             }
+                            // A local is a value, and one of no function type is
+                            // not called: E0213 at the callee, as for a computed one.
+                            this.refuse_call_of_non_function(ident.span, fp_local);
+                            return TypeRef::invalid();
                         } else if (this.scopes.is_local_or_param(ident.name)) {
                             // Bound, with no type: reported at the declaration.
                             return TypeRef::invalid();
@@ -4578,6 +4582,14 @@ type struct CallResolver {
         // written; it registered none, and the call reports nothing more.
         if (this.ctx.decl_index.method_signature_refused(
                 this.types.method_owner_ref(lookup_ref), member.member)) {
+            return TypeRef::invalid();
+        }
+
+        // No method of the name, and a field of it that is no function: the
+        // field is a value, and a value of no function type is not called.
+        const nf: FieldAnswer = this.member.field_of(lookup_ref, member.member);
+        if (nf.found() && nf.index >= 0) {
+            this.refuse_call_of_non_function(member.span, nf.ty);
             return TypeRef::invalid();
         }
 
