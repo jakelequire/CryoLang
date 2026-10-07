@@ -140,6 +140,10 @@ type struct DeclarationIndex {
     // registered as; invalid for a slot no function registration reached.
     def_entries:    OverloadId[];
 
+    // A type definition's slot in `defs` -> the family its constructors
+    // are registered in (`family_slot`); 0 for a type that registered none.
+    ctor_families:  u64[];
+
     // The definition's slot in `defs` -> the declaration the name layer
     // registered it for: a method's `MethodNode`, or a trait's declared
     // method's `FunctionDeclNode`; null for a slot that is no method.
@@ -235,6 +239,9 @@ type struct DeclarationIndex {
                                       // the owner's arguments into it (a
                                       // receiver's, a turbofish on the owner).
                                       // The signature's own return otherwise.
+    overload_func_family: u64[];      // the family the entry is registered in
+                                      // (`family_slot`), so a definition's
+                                      // overloads are read off its own entry.
     overload_func_intrinsic: IntrinsicKind[]; // how a call pinned to the entry
                                       // lowers: an `intrinsic function` codegen
                                       // lowers inline (ptr_diff, panic, atomic_*,
@@ -306,6 +313,7 @@ public:
             type_reverse:        HashMap::<u64, DefId>::new(),
             def_types:           [],
             def_entries:         [],
+            ctor_families:       [],
             method_decls:        [],
             copy_entries:        HashMap::<u64, OverloadId>::new(),
             array_elem_to_type:  HashMap::<u64, TypeRef>::new(),
@@ -323,6 +331,7 @@ public:
             overload_func_span:    [],
             overload_func_decl:    [],
             overload_func_owner_return: [],
+            overload_func_family: [],
             overload_func_intrinsic: [],
             overload_index:     HashMap::<u64, u32[]>::new(),
             extern_symbol_first: HashMap::<u32, Pair<u32, u64>>::new(),
@@ -453,6 +462,7 @@ public:
         this.overload_func_span.push(span);
         this.overload_func_decl.push(decl);
         this.overload_func_owner_return.push(owner_return);
+        this.overload_func_family.push(slot);
         this.overload_func_intrinsic.push(IntrinsicKind::Call);
         const positions: u32[]* = this.overload_index.get_or_insert(slot, []);
         (*positions).push(new_pos);
@@ -543,6 +553,40 @@ public:
         const slot: i64 = this.defs.slot(d);
         if (slot >= this.def_entries.length) { return OverloadId::invalid(); }
         return this.def_entries[slot];
+    }
+
+    /// Every entry of the family the function or method definition `d` is
+    /// registered in - its overloads, `d`'s own among them - in
+    /// registration order; empty when no registration reached `d`.  The
+    /// family is the one `d`'s own entry was registered in, read off the
+    /// entry.
+    family_entries_of_def(&this, d: DefId) -> OverloadId[] {
+        const e: OverloadId = this.entry_of_def(d);
+        if (!e.is_valid()) { return []; }
+        return this.entries_in_family(this.overload_func_family[this.slot_of(e)]);
+    }
+
+    /// Every constructor entry of the type definition `d`, in registration
+    /// order; empty for a type that registered none.
+    constructor_entries_of(&this, d: DefId) -> OverloadId[] {
+        if (!d.is_valid()) { return []; }
+        const slot: i64 = this.defs.slot(d);
+        if (slot >= this.ctor_families.length || this.ctor_families[slot] == 0) { return []; }
+        return this.entries_in_family(this.ctor_families[slot]);
+    }
+
+    /// The entries registered in the family stored under `slot`.
+    entries_in_family(&this, slot: u64) -> OverloadId[] {
+        mut result: OverloadId[] = [];
+        match (this.overload_index.get_ref(&slot)) {
+            Option::Some(positions) => {
+                for (mut k: i64 = 0; k < (*positions).length; k++) {
+                    result.push(OverloadId::at_position((*positions)[k], this.overload_tag));
+                }
+            }
+            Option::None => { }
+        }
+        return result;
     }
 
     /// Keep `decl` as the declaration the method definition `d` was
@@ -1003,6 +1047,16 @@ public:
                 FamilyOwner::Type(owner), func.name, func_type_ref, ret, SymbolStr::empty(), eff_mangled, func.origin_trait,
                 if (func.has_name_span()) { func.name_span } else { func.span }, method as ASTNode*));
             func.set_overload_entry(entry);
+            // A constructor's family is its type's: `Node(1)` and `new
+            // Node(1)` name the type, and its constructors are asked by it.
+            if (method.is_constructor && entry.is_valid()) {
+                const td: DefId = this.registered_def(owner);
+                if (td.is_valid()) {
+                    const ts: i64 = this.defs.slot(td);
+                    while (this.ctor_families.length <= ts) { this.ctor_families.push(0); }
+                    this.ctor_families[ts] = this.overload_func_family[this.slot_of(entry)];
+                }
+            }
             // A copy is the owner's method for the definition it stands for.
             // A specialization of a generic method is that definition AND
             // its own type arguments, an instance this table does not hold,
