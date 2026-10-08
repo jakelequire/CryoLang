@@ -122,6 +122,39 @@ yet is recorded with the change that builds it, not here.
      scratch-script file is written with an editor, never through a
      redirect.
 
+174. **A module-level constant whose initializer calls something is
+     computed once, before `main`**, as `docs/cryo.md` §3 says.  The
+     start-up initialization the compiler has is kept.
+
+175. **Ruling 170 governs loading only.**  A module must be imported to be
+     loaded; a module that is already loaded can still be reached by its
+     full path without an import of its own.
+
+176. **`const c = Cell(4);` infers the class's type arguments from the
+     constructor's arguments**, as a call of a generic function infers its
+     own.
+
+177. **The rule-4 refusal's wording is accepted**: "`intern` is handed text
+     read off a definition, which is shown and never looked up by", with its
+     help line.
+
+178. **The compiler is re-pinned now**, so the allows on functions carrying
+     a door marker can be deleted.
+
+179. **The spelling lint (E0157) refuses a spelling only where it reaches a
+     lookup outside a door.**  A function that carries a written name toward
+     a door - a pass-along helper, a syntax-tree constructor or setter -
+     needs no allow, and its pending allow is deleted.  Rule three's
+     structural guarantee (a store's name fields private, its doors in the
+     store's own file) follows this.
+
+180. **Entering a closure does not forget the enclosing function's
+     parameters.**  `return &param` after a closure in the same function is
+     judged as it would be with no closure there.
+
+181. **The async lowering's pending allows are converted next**: the locals
+     it tracks and renames are keyed by their binding, not their spelling.
+
 ### 2026-10-07
 
 160. **The `()` unit type (ruling 103) is built after the merge, before the
