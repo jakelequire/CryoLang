@@ -214,6 +214,14 @@ type struct MonoCallSpecializer {
                     if (ib.generic_params.length > 0) { continue; }
                     this.walk_methods(ib.methods, &res_ctx);
                 }
+                NodeKind::VariableDeclaration => {
+                    // A module's global: its initializer is code like a
+                    // body's, computed at program start when no fold
+                    // answers it, so its calls and values are specialized
+                    // as a body's are.
+                    const vd: VarDeclNode* = stmt as VarDeclNode*;
+                    if (vd.initializer != null) { this.walk_expr(vd.initializer, &res_ctx, null); }
+                }
                 _ => {}
             }
         }
@@ -1669,8 +1677,8 @@ type struct MonoCallSpecializer {
     }
 
     /// Whether code generation has something to call for `call`: its pin,
-    /// or - for a call with none - the value it calls through: a local of
-    /// function type, a class or struct's constructor, an enum variant, a
+    /// or - for a call with none - the value it calls through: a local or a
+    /// module's global of function type, a class or struct's constructor, an enum variant, a
     /// function-typed field, a release of the `Drop` language item, or a
     /// computed function value.
     call_is_bound(&this, call: CallExprNode*) -> boolean {
@@ -1680,6 +1688,15 @@ type struct MonoCallSpecializer {
             NodeKind::Identifier => {
                 const id: IdentifierNode* = call.callee as IdentifierNode*;
                 if (id.res.local_sym().is_valid() && this.is_function_value(id.resolved_type)) { return true; }
+                // A module's global of function type is called through its
+                // storage, as a local is.
+                match (id.res) {
+                    ResSlot::Answered(r) => {
+                        if (this.decl_index.global_entry_of_def(r.def_id()).valid
+                            && this.is_function_value(id.resolved_type)) { return true; }
+                    }
+                    _ => { }
+                }
                 const rt: Type* = this.arena.lookup(call.resolved_type);
                 return rt != null && (rt.kind == TypeKind::Class || rt.kind == TypeKind::Struct);
             }

@@ -66,7 +66,7 @@ import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res;
-import compiler::resolver::res::{ FamilyOwner };
+import compiler::resolver::res::{ FamilyOwner, ResSlot };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{
     ArrayType, FunctionType, PointerType, ReferenceType, TupleType
@@ -191,9 +191,48 @@ type struct CallEmitter {
         const void_ty: LType = LType::void_type();
         const call_name: string = if (ret_ty.raw == void_ty.raw) { "" } else { "calltmp" };
         const fn_type: LType = plan.llvm_fn_type;
-        this.state.last_value = this.cg.expr_ops.codegen_call_with_plan(
-            fn_ptr, fn_type, plan, call_args, Text::new(call_name));
+        this.state.last_value = this.reshape_call_result(node,
+            this.cg.expr_ops.codegen_call_with_plan(fn_ptr, fn_type, plan, call_args, Text::new(call_name)));
         this.state.last_is_lvalue = false;
+    }
+
+    /// A call's result at its source type.  When the callee returns a
+    /// small aggregate register-shaped (Direct-with-coercion for <= 8 byte
+    /// aggregates, or DirectPair wrapped in an anonymous `{lo, hi}` literal
+    /// struct for 9-16 byte aggregates), the call instruction yields a
+    /// different LLVM type than the source struct.  The value is spilled
+    /// through a stack temp and re-loaded at the source struct type; both
+    /// layouts agree byte-for-byte by construction, so the store-then-load
+    /// round-trips (the inverse of the coercion the callee does on its
+    /// return).  An sret call already yields the struct loaded from its
+    /// slot, so the equal-types check leaves it alone.
+    reshape_call_result(mut &this, node: CallExprNode*, result: LValue) -> LValue {
+        if (!result.is_valid() || !node.resolved_type.is_valid()) { return result; }
+        const got_raw: void* = llvm::LLVMTypeOf(result.raw);
+        const expected_lty: LType = this.cg.type_mapper.map_type(node.resolved_type);
+        const got_kind: LTypeKind = LType::kind_of(got_raw);
+        const needs_coerce: boolean = expected_lty.is_valid()
+            && got_raw != expected_lty.raw
+            && (got_kind == LTypeKind::Integer
+                || got_kind == LTypeKind::Struct
+                || got_kind == LTypeKind::Float
+                || got_kind == LTypeKind::Double
+                || got_kind == LTypeKind::Vector)
+            && LType::kind_of(expected_lty.raw) == LTypeKind::Struct;
+        if (!needs_coerce) { return result; }
+        const cur_bb_c: LBasicBlock = this.cg.builder.get_insert_block();
+        if (!cur_bb_c.is_valid()) { return result; }
+        const fn_c: LValue = cur_bb_c.get_parent();
+        if (!fn_c.is_valid()) { return result; }
+        // Alloca at the call result's type: the store of a (possibly
+        // padded) DirectPair never writes past the slot, and padding rules
+        // differ between a named struct with field alignment and an
+        // anonymous `{i64, i32}` whose tail packs the leftover bytes only.
+        const got_lty: LType = LType { raw: got_raw };
+        const slot_c: LValue = this.cg.flow.create_entry_alloca(
+            fn_c, Text::new("ret.coerce"), got_lty);
+        this.cg.builder.build_store(result, slot_c);
+        return this.cg.builder.build_load(expected_lty, slot_c, Text::new("ret.coerced"));
     }
 
 
@@ -343,8 +382,18 @@ type struct CallEmitter {
             //    We must handle the call here because the loaded value is an
             //    instruction, not a GlobalValue; LLVMGlobalGetValueType
             //    would segfault on it.
+            //    A module's global of function type is called the same way,
+            //    through its storage, which the stamp names.
             if (!callee_val.is_valid()) {
-                const local: LValue = this.cg.values.get(id.name);
+                mut local: LValue = this.cg.values.get(id.name);
+                if (!local.is_valid()) {
+                    match (id.res) {
+                        ResSlot::Answered(r) => {
+                            if (r.def_id().is_valid()) { local = this.cg.resolver.resolve_global_of_def(r.def_id()); }
+                        }
+                        _ => { }
+                    }
+                }
                 if (local.is_valid()) {
                     const ft: FunctionType* = this.value_function_type(id.resolved_type);
                     if (ft != null) {
@@ -858,63 +907,7 @@ type struct CallEmitter {
             result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, Text::new(call_name));
         }
 
-        // Phase 3 - small-aggregate return coercion.  When the callee
-        // was declared with a register-shaped return (Direct-with-
-        // coercion for <= 8 byte aggregates, or DirectPair wrapped in
-        // an anonymous `{lo, hi}` literal struct for 9-16 byte
-        // aggregates), the call instruction yields a different LLVM
-        // type than the source struct.  Bridge the gap by spilling the
-        // value through a stack temp and re-loading it at the source
-        // struct type; both layouts agree byte-for-byte by
-        // construction, so the store-then-load round-trips correctly
-        // (this is the inverse of the coercion the callee will do on
-        // its return).  Phase 1 sret is already handled inside
-        // `codegen_call` (returns a struct value loaded from the sret
-        // slot whose type matches the expected struct), so the
-        // equal-types short-circuit below skips this path there.
-        if (result.is_valid() && node.resolved_type.is_valid()) {
-            const got_raw: void* = llvm::LLVMTypeOf(result.raw);
-            const expected_lty: LType = this.cg.type_mapper.map_type(node.resolved_type);
-            const got_kind: LTypeKind = LType::kind_of(got_raw);
-            // Detect a coercion-needed mismatch.  The call result type
-            // differs from the source-level expected type for any
-            // Direct-with-coercion or DirectPair return; reshape via
-            // spill-then-reload at the expected type.  Same-handle (no
-            // classification mismatch) returns skip the coerce.
-            const needs_coerce: boolean = expected_lty.is_valid()
-                && got_raw != expected_lty.raw
-                && (got_kind == LTypeKind::Integer
-                    || got_kind == LTypeKind::Struct
-                    || got_kind == LTypeKind::Float
-                    || got_kind == LTypeKind::Double
-                    || got_kind == LTypeKind::Vector)
-                && LType::kind_of(expected_lty.raw) == LTypeKind::Struct;
-            if (needs_coerce) {
-                const cur_bb_c: LBasicBlock = this.cg.builder.get_insert_block();
-                if (cur_bb_c.is_valid()) {
-                    const fn_c: LValue = cur_bb_c.get_parent();
-                    if (fn_c.is_valid()) {
-                        // Alloca with the LARGER of the two sizes so
-                        // the store of the (possibly padded) DirectPair
-                        // never writes past the slot.  Both shapes
-                        // describe the same source-level value so
-                        // their storage sizes agree in practice, but
-                        // padding rules differ between a named struct
-                        // with field alignment and an anonymous
-                        // `{i64, i32}` whose tail packs the leftover
-                        // bytes only - alloca'ing as the call-result
-                        // type and reloading as the source type
-                        // covers both directions safely.
-                        const got_lty: LType = LType { raw: got_raw };
-                        const slot_c: LValue = this.cg.flow.create_entry_alloca(
-                            fn_c, Text::new("ret.coerce"), got_lty);
-                        this.cg.builder.build_store(result, slot_c);
-                        result = this.cg.builder.build_load(
-                            expected_lty, slot_c, Text::new("ret.coerced"));
-                    }
-                }
-            }
-        }
+        result = this.reshape_call_result(node, result);
 
         // A user-written `drop` runs IN ADDITION to field glue, not instead of
         // it: the body releases what it names, and the type's own droppable

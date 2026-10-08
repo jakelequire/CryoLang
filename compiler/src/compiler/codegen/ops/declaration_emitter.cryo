@@ -100,6 +100,15 @@ type struct DebugInfoState {
     }
 }
 
+/// The module's globals whose initializer no constant fold answers, in
+/// declaration order, with the storage each was given.  Their values are
+/// computed when the program starts (`emit_global_initializers`).  Read by
+/// position only.
+type struct StartedGlobals {
+    nodes: VarDeclNode*[];
+    slots: LValue[];
+}
+
 type struct DeclarationEmitter {
     llvm_module: LModule*;
     builder:     LBuilder*;
@@ -116,9 +125,11 @@ type struct DeclarationEmitter {
     diag:        DiagSink*;
     debug_info:  DebugInfoState*;
     ctx:         CompilationContext*;
+    started:     StartedGlobals;
 
     static null() -> DeclarationEmitter {
         return DeclarationEmitter {
+            started:     StartedGlobals { nodes: [], slots: [] },
             llvm_module: null,
             builder:     null,
             type_mapper: null,
@@ -1390,8 +1401,7 @@ type struct DeclarationEmitter {
         // (e.g., `const BUCKET_OCCUPIED: u8 = 1`), emit it as the constant
         // initializer typed against the global's own type so consumers see
         // the right value.  LLVM globals require a constant initializer, so
-        // anything more complex than a literal falls back to zeroinitializer
-        // (more involved cases would need a runtime ctor, out of scope here).
+        // what no fold below answers is computed at program start instead.
         mut init: LValue = LValue::null();
         // Peel one layer of cast so initializers like
         // `const HEX_LOWER: u8* = "0123456789abcdef"` route to the
@@ -1494,12 +1504,22 @@ type struct DeclarationEmitter {
             && LType::kind_of(ty.raw) == LTypeKind::Array) {
             init = this.try_const_array(init_expr as ArrayLiteralNode*, ty);
         }
+        // An initializer none of the folds above answers - a call, a value
+        // read from another global - is computed when the program starts:
+        // the storage holds zero until then, and is never marked constant,
+        // since a store into a constant global is one the optimizer may
+        // read past.
+        const started: boolean = !init.is_valid() && init_expr != null;
         if (!init.is_valid()) {
             init = LType::const_null(ty);
         }
         global.set_initializer(init);
+        if (started) {
+            this.started.nodes.push(node);
+            this.started.slots.push(global);
+        }
 
-        if (!node.is_mutable) {
+        if (!node.is_mutable && !started) {
             global.set_global_constant(true);
         }
 
@@ -1510,6 +1530,69 @@ type struct DeclarationEmitter {
         }
 
         this.globals.register(this.global_cache_slot(node), global);
+    }
+
+    /// The function that computes the module's started globals, opened with
+    /// the builder at its entry, or an invalid value when the module has
+    /// none.  Internal: each module has its own, under the same name.
+    begin_global_initializer(mut &this) -> LValue {
+        if (this.started.nodes.length == 0) { return LValue::null(); }
+        const fn_ty: LType = LType::function_type(LType::void_type(), null, 0, false);
+        const fn_val: LValue = this.llvm_module.add_function(MangledName::new("__cryo.global_init"), fn_ty);
+        fn_val.set_linkage(LLinkage::Internal);
+        const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, Text::new("entry"));
+        this.builder.position_at_end(entry_bb);
+        // The function has no source of its own, so no debug location from
+        // the last body emitted may reach it.
+        if (this.debug_info.is_on()) {
+            llvm::LLVMSetCurrentDebugLocation2(this.builder.raw, null);
+        }
+        this.values.push_scope();
+        return fn_val;
+    }
+
+    /// Store `value`, a started global's computed initializer, into the
+    /// storage `codegen_global_var` gave it.
+    store_started_global(mut &this, k: i64, value: LValue) -> void {
+        if (!value.is_valid()) { return; }
+        const node: VarDeclNode* = this.started.nodes[k];
+        const ty: LType = this.type_mapper.map_type(node.resolved_type);
+        this.builder.build_store(this.expr_ops.init_store_value(value, ty, node.resolved_type),
+                                 this.started.slots[k]);
+    }
+
+    /// Close the initializer `begin_global_initializer` opened and have it
+    /// run before `main`.  Its priority is the module's place in the build
+    /// order, so a module's initializer runs after those of the modules it
+    /// depends on, whose globals its own initializers may read.
+    finish_global_initializer(mut &this, fn_val: LValue) -> void {
+        this.values.pop_scope();
+        this.builder.build_ret_void();
+        const pos: i64 = this.ctx.active_order_position;
+        const priority: u64 = 101 + (if (pos < 0) { 0 } else { pos }) as u64;
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const fields: void* = libc::malloc(3 * 8);
+        const field_tys: void** = fields as void**;
+        field_tys[0] = LType::i32().raw;
+        field_tys[1] = ptr_ty.raw;
+        field_tys[2] = ptr_ty.raw;
+        const entry_ty: LType = LType::literal_struct(fields, 3, false);
+        const vals: void* = libc::malloc(3 * 8);
+        const entry_vals: void** = vals as void**;
+        entry_vals[0] = LType::const_int(LType::i32(), priority, false).raw;
+        entry_vals[1] = fn_val.raw;
+        entry_vals[2] = LType::const_pointer_null(ptr_ty).raw;
+        const entry: LValue = LType::const_struct(vals, 3, false);
+        const one: void* = libc::malloc(8);
+        const entries: void** = one as void**;
+        entries[0] = entry.raw;
+        const ctors: LValue = this.llvm_module.add_global(LType::array_of(entry_ty, 1),
+                                                          MangledName::new("llvm.global_ctors"));
+        ctors.set_linkage(LLinkage::Appending);
+        ctors.set_initializer(LType::const_array(entry_ty, one, 1));
+        libc::free(fields);
+        libc::free(vals);
+        libc::free(one);
     }
 
     /// The slot a global is cached under for later reference resolution: its

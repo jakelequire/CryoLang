@@ -686,11 +686,12 @@ mut it         = arr.iter();   // inferred: the concrete iterator type
 mut y: int;                     // declared without an initialiser; assigned later
 ```
 
-**Globals.** Module-level `const` declares a true compile-time constant; module-level `mut` declares mutable global state. Use the latter sparingly.
+**Globals.** Module-level `const` declares an immutable global; module-level `mut` declares mutable global state. Use the latter sparingly. An initializer that is a constant expression is folded into the program; any other - a call, another global's value - is computed once, before `main` runs, a module's globals after those of the modules it imports, in the order they are declared.
 
 ```cryo
 const VERSION:    string = "1.0.0";
 mut   g_counter:  u64    = 0;
+const LIMIT:      i32    = Json::twice(3);   // 6, computed before `main`
 ```
 
 > **Local type inference.** The type annotation may be omitted when an initialiser is present; the binding adopts the initialiser's *concrete* type (`const x = 10;` infers `i32`, `mut p = Point { ... };` infers `Point`). Because the inferred type is the concrete one the initialiser produces - not an erased `implement Trait` - methods on it stay callable, so `mut it = arr.iter(); it.take(3)...` works without naming the iterator type. Inference is purely local: it reads only the initialiser of the same statement, never later uses. A binding with no initialiser therefore still needs an annotation (`mut y: int;`), and an initialiser that yields no value (`void`) cannot be inferred (both are `E0104`). There are still no implicit conversions and no flow- or program-level inference.

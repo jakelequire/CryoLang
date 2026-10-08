@@ -38,7 +38,7 @@ import std::ffi::libc;
 import std::fmt;
 import compiler::ast::declaration::{
     ClassDeclNode, FunctionDeclNode, ImplBlockNode, MethodNode, StructDeclNode,
-    UnionDeclNode
+    UnionDeclNode, VarDeclNode
 };
 import compiler::ast::expression::{ ExpressionNode };
 import compiler::ast::visitor::{ ASTVisitor };
@@ -194,6 +194,25 @@ type struct DeclVisitEmitter {
         if (!this.cg.diag.is_function_body_valid(fn_val)) {
             const fname: string = this.cg.resolve(node.name);
             this.cg.diag.report_invalid_function_body(fn_val, fname, node.span);
+        }
+    }
+
+    /// Compute the module's started globals - those whose initializer no
+    /// constant fold answers - in one function that runs before `main`,
+    /// each initializer evaluated as it is written and stored, in
+    /// declaration order.
+    emit_global_initializers(mut &this, visitor: ASTVisitor*) -> void {
+        const fn_val: LValue = this.cg.decl.begin_global_initializer();
+        if (!fn_val.is_valid()) { return; }
+        for (mut k: i64 = 0; k < this.cg.decl.started.nodes.length; k++) {
+            const node: VarDeclNode* = this.cg.decl.started.nodes[k];
+            const value: LValue = this.dispatch.codegen_rvalue(visitor, node.initializer);
+            this.cg.decl.store_started_global(k, value);
+        }
+        this.cg.decl.finish_global_initializer(fn_val);
+        if (!this.cg.diag.is_function_body_valid(fn_val)) {
+            this.cg.diag.report_invalid_function_body(fn_val, "__cryo.global_init",
+                this.cg.decl.started.nodes[0].span);
         }
     }
 
