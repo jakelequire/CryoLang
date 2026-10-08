@@ -825,22 +825,13 @@ type struct ModuleLoader {
             const owner_file: string =
                 if (scan.path_imports[bp] >= 0) { import_files[scan.path_imports[bp]] } else { item_files[scan.path_items[bp]] };
             if (owner_file.length() == 0) { continue; }
-            match (this.scanned_ns.get(&owner_file.to_ascii_lower())) {
-                Option::Some(owner_ns) => {
-                    const sub_ns: string = fmt::format("%s::%s", owner_ns, scan.path_rests[bp]);
-                    match (this.ns_map.get(&sub_ns)) {
-                        Option::Some(sub_file) => {
-                            if (debug) {
-                                cdebug(Text::new("[ModuleLoader]   path '%s' -> '%s'\n"), sub_ns, sub_file);
-                            }
-                            if (!this.discover_module(intern, graph, sink, sub_file, debug)) {
-                                success = false;
-                            }
-                        }
-                        Option::None => { }
-                    }
-                }
-                Option::None => { }
+            const sub_file: string = this.sub_module_file(owner_file, scan.path_rests[bp]);
+            if (sub_file.length() == 0) { continue; }
+            if (debug) {
+                cdebug(Text::new("[ModuleLoader]   path '%s' -> '%s'\n"), scan.path_rests[bp], sub_file);
+            }
+            if (!this.discover_module(intern, graph, sink, sub_file, debug)) {
+                success = false;
             }
         }
 
@@ -1374,6 +1365,11 @@ type struct ModuleLoader {
         };
     }
 
+    /// Door `loader-path`.  A path in a file's body is headed by a name one
+    /// of the file's imports binds, and the loader has to know which import
+    /// before any module exists to bind it - the only thing to match the
+    /// written head against is what each import binds, as written.
+    ///
     /// The position in `binds`, the names a file's imports bind, of the
     /// first that is `name`; -1 when none is.
     static binding_of(binds: &string[], name: string) -> i64 {
@@ -1381,6 +1377,29 @@ type struct ModuleLoader {
             if (binds[k].eq(name)) { return k; }
         }
         return -1;
+    }
+
+    /// Door `loader-path`.  A path that continues past an import's binding
+    /// names a sub-module of the bound module, and the loader is where it has
+    /// to be found: nothing loads that module otherwise, so no module exists
+    /// yet to be its identity.  The bound module is asked by its file, the
+    /// loader's identity for a module; its declared namespace and the written
+    /// continuation are matched against the namespaces the project's files
+    /// declare, here and nowhere else.
+    ///
+    /// The file declaring the namespace `rest` (`Inner`, `Inner::Deeper`)
+    /// continues the namespace `owner_file` declares into; "" when the owner
+    /// has not been scanned or no file declares that namespace.
+    sub_module_file(&this, owner_file: string, rest: string) -> string {
+        match (this.scanned_ns.get(&owner_file.to_ascii_lower())) {
+            Option::Some(owner_ns) => {
+                match (this.ns_map.get(&fmt::format("%s::%s", owner_ns, rest))) {
+                    Option::Some(sub_file) => { return sub_file; }
+                    Option::None => { return ""; }
+                }
+            }
+            Option::None => { return ""; }
+        }
     }
 
     /// Collect a qualified name like "Foo::Bar::Baz" from the token stream.

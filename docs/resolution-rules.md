@@ -42,7 +42,9 @@ The ruled kinds of door: the bare-identifier scope lookup and its
 type-namespace twin; one door per member kind, each taking an owner identity
 plus a leaf name; module-by-path (private to the module graph, which offers
 its callers methods each named for the one kind of text it turns into a
-module); the fixed
+module); the loader's path door, which matches a body path's head against
+the file's imports and its continuation against the namespaces files
+declare, before any module exists; the fixed
 primitive and language-item table; the interner; and diagnostic suggestions,
 whose result may flow only into message text.
 
@@ -63,6 +65,8 @@ function carries no marker.
 | `trait-method` | `GenericRegistry::trait_item_slot` | `compiler/src/compiler/types/generic_registry.cryo` | member: a trait's declared method, by trait identity and leaf, to its position in the trait |
 | `assoc-type` | `TraitDeclNode::assoc_type_index` | `compiler/src/compiler/AST/declaration.cryo` | member: a trait's associated type, by the trait's declaration and leaf, to its position among the trait's associated types |
 | `module-by-path` | `ModuleGraph::module_named` | `compiler/src/compiler/module_graph.cryo` | written module path to its module |
+| `loader-path` | `ModuleLoader::binding_of` | `compiler/src/compiler/module_loader.cryo` | a body path's head to the import of the file that binds it |
+| `loader-path` | `ModuleLoader::sub_module_file` | `compiler/src/compiler/module_loader.cryo` | a path's continuation past an import binding to the file of the sub-module it names |
 | `primitive` | `ResBase::is_primitive_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table |
 | `primitive` | `ResBase::primitive_of_alias` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table: alias keywords |
 | `primitive` | `ResBase::primitive_position` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table: a primitive's position, which its definition is kept under |
@@ -112,6 +116,25 @@ yet is recorded with the change that builds it, not here.
      E0205 "... it is imported"; E0154 "`put` is ambiguous: a non-generic and
      a generic method of `Box2` both accept these arguments"; E0244's help
      "rename the item `Json` or the module `A::Json`".
+
+167. **The loader matches a path's head against the file's imports through
+     a door of its own**, and the sub-module the path continues into
+     through the same door; the text matching the loader gained for ruling
+     165 is not left as outstanding lookups.
+
+168. **A plain import carries reachability into the imported module's
+     sub-modules**, as an alias does.  With `import A::Toml;`, the path
+     `Toml::Sub::f()` loads `A::Toml::Sub` and resolves to `f` in it,
+     rather than E0240.
+
+169. **The wording of E0307 is accepted**: "cannot infer `T` for `idf`
+     used as a value", labelled "generic, and nothing here says which
+     instance this names", with the help "write the type arguments,
+     `idf::<...>`, or give the binding a function type".
+
+170. **A fully spelled path that no import leads to loads nothing.**
+     `json::Inner::deep()` in a file with no `import json;` does not load
+     `json::Inner`; a module must be imported to be visible.
 
 149. **Ruling 109 is narrowed: the spelling lint (E0157) is door-only for
      LOOKUPS.**  A declaration's own name - registering it, printing it,

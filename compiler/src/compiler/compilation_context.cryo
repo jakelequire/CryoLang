@@ -503,15 +503,38 @@ public:
         const rooted: boolean = root.is_valid();
         const rooted_length: u64 =
             if (rooted) { this.intern_table.resolve(root.as_sym()).length() + 2 + spelling.length() } else { 0 };
+        // A spelling of more than one segment may continue a path from a
+        // module this file imports: `Toml::Sub` with `import A::Toml;` names
+        // `A::Toml::Sub`, whose head is the import's binding.  Such a module
+        // is reachable through the import, as the same path through an alias
+        // is.  The imported modules the head can name are gathered in the
+        // same walk, and the candidates are judged once it has seen them all.
+        const head: string = QualifiedName::head_of(spelling);
+        const continues: boolean = !rooted && head.length() < spelling.length();
+        const tail_length: u64 = spelling.length() - head.length();
+        mut heads: ModulePath[] = [];
+        mut head_lengths: u64[] = [];
+        mut cands: ModulePath[] = [];
+        mut cand_defs: DefId[] = [];
+        mut cand_lengths: u64[] = [];
+        mut cand_reach: boolean[] = [];
         const count: i64 = this.module_graph.module_count() as i64;
         for (mut i: i64 = 0; i < count; i++) {
             const cand: ModuleInfo* = this.module_graph.get_module(i);
             const cand_ns: SymbolStr = cand.namespace_name;
             if (!cand_ns.is_valid()) { continue; }
             const cand_str: string = this.intern_table.resolve(cand_ns);
-            if (!Resolver::ns_written_as(cand_str, spelling)) { continue; }
-            if (rooted && (cand_str.length() != rooted_length
-                           || !cand.path().is_within(root, this.intern_table))) { continue; }
+            const names_head: boolean = continues && Resolver::ns_written_as(cand_str, head);
+            const names_spelling: boolean = Resolver::ns_written_as(cand_str, spelling)
+                && !(rooted && (cand_str.length() != rooted_length
+                                || !cand.path().is_within(root, this.intern_table)));
+            if (!names_head && !names_spelling) { continue; }
+            const imported: boolean = this.decl_index.ns_imports(use_module, cand.path());
+            if (names_head && imported) {
+                heads.push(cand.path());
+                head_lengths.push(cand_str.length());
+            }
+            if (!names_spelling) { continue; }
             r.matched = r.matched + 1;
             if (r.matched == 1) { r.any = cand.path(); }
             // The same reachability relation same-leaf resolution uses: the
@@ -528,11 +551,22 @@ public:
                 || cand.path().equals(use_module)
                 || cand_str.eq(spelling)
                 || this.decl_index.is_prelude_ns(cand.path())
-                || this.decl_index.ns_imports(use_module, cand.path());
+                || imported;
+            cands.push(cand.path());
+            cand_defs.push(cand.def);
+            cand_lengths.push(cand_str.length());
+            cand_reach.push(reachable);
+        }
+        for (mut c: i64 = 0; c < cands.length; c++) {
+            mut reachable: boolean = cand_reach[c];
+            for (mut h: i64 = 0; !reachable && h < heads.length; h++) {
+                reachable = head_lengths[h] + tail_length == cand_lengths[c]
+                    && cands[c].is_within(heads[h], this.intern_table);
+            }
             if (!reachable) { continue; }
             r.visible = r.visible + 1;
-            if (r.visible == 1) { r.found = cand.path(); r.found_def = cand.def; }
-            if (r.visible == 2) { r.other = cand.path(); }
+            if (r.visible == 1) { r.found = cands[c]; r.found_def = cand_defs[c]; }
+            if (r.visible == 2) { r.other = cands[c]; }
         }
         return r;
     }

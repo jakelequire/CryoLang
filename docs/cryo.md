@@ -2577,6 +2577,8 @@ const n: i32 = J::twice(3);          // Json::twice
 const m: i32 = J::Inner::deep();     // Json::Inner::deep
 ```
 
+A plain import's name continues the same way: with `import A::Toml;`, `Toml::Sub::three()` names `A::Toml::Sub::three`, and the sub-module is loaded although nothing imports it.
+
 `import A::B as C;` names the item `B` of the module `A`, or the module `A::B`. When `A` declares an item `B` and `A::B` is also a module, the path names both, and neither is chosen: the import is an error (E0244). The braced forms are the same error, aliased or not, so there is no import that picks the item out of the pair; the fix is to rename one of the two. The module stays reachable by its path:
 
 ```cryo
