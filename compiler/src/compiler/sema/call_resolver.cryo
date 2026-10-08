@@ -1177,7 +1177,7 @@ type struct CallResolver {
                     return ovl_ret;
                 }
             }
-            return this.resolve_direct_call(ident);
+            return this.resolve_direct_call(call, ident);
         }
         if (callee_node.kind == NodeKind::MemberAccess) {
             const arg_snap: DiagnosticSnapshot = this.ctx.diagnostics.snapshot();
@@ -1744,8 +1744,62 @@ type struct CallResolver {
             mut stash: TypeRef[] = [];
             for (mut ci: i64 = 0; ci < bindings.length; ci++) { stash.push(bindings[ci]); }
             call.set_resolved_type_args(stash);
+            this.retype_variant_arguments(call, tmpl, entry, &bindings);
         }
         return this.subst_free_call_return(entry, &bindings, tmpl.resolved_return_type);
+    }
+
+    /// The type a construction by value (`Cell(4)`, `Cell::<i32>(4)`) makes:
+    /// for a generic type, the instance its written type arguments name, else
+    /// the one the expected type names.  The template itself is no value's
+    /// type - it has no constructor code generation can call.  Any other
+    /// type is `ty` itself.
+    construction_instance(mut &this, call: CallExprNode*, ty: TypeRef) -> TypeRef {
+        const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(ty);
+        if (tmpl == null || !tmpl.base_type.equals(ty)) { return ty; }
+        if (call.generic_args.length > 0) {
+            return this.demanded_scope_type(ty, &call.generic_args, call.span);
+        }
+        return this.promote_to_expected_instantiation(ty);
+    }
+
+    /// A variant written as an argument types itself from its own payload,
+    /// which binds only the parameters that variant carries:
+    /// `Result::Ok(4)` for `r: Result<T, T>` leaves `E` of the enum unbound
+    /// and stays the generic enum, which has no layout.  Once the call's
+    /// bindings are known the argument is the parameter's instance, and it
+    /// takes that type.  An argument some other source already typed as an
+    /// instance is left as it is.
+    retype_variant_arguments(mut &this, call: CallExprNode*, tmpl: FunctionDeclNode*,
+                             entry: TemplateEntry*, bindings: &TypeRef[]) -> void {
+        if (tmpl.parameters.length != call.arguments.length) { return; }
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const arg: ExpressionNode* = call.arguments[i];
+            const param: VarDeclNode* = tmpl.parameters[i];
+            if (arg == null || param == null || !arg.has_resolved_type()) { continue; }
+            mut scope: ScopeResolutionNode* = null;
+            if (arg.kind == NodeKind::ScopeResolution) {
+                scope = arg as ScopeResolutionNode*;
+            } else if (arg.kind == NodeKind::CallExpression) {
+                const callee: ExpressionNode* = (arg as CallExprNode*).callee;
+                if (callee != null && callee.kind == NodeKind::ScopeResolution) {
+                    scope = callee as ScopeResolutionNode*;
+                }
+            }
+            if (scope == null) { continue; }
+            match (scope.resolved_member) {
+                MemberPin::Variant(_) => { }
+                _                     => { continue; }
+            }
+            const arg_tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(arg.resolved_type);
+            if (arg_tmpl == null || !arg_tmpl.base_type.equals(arg.resolved_type)) { continue; }
+            const want: TypeRef = this.subst_free_call_return(entry, bindings, param.resolved_type);
+            if (!want.is_valid() || this.types.contains_generic_param(want)) { continue; }
+            if (!this.ctx.decl_index.def_of(want, this.ctx.type_arena)
+                    .equals(this.ctx.decl_index.def_of(arg.resolved_type, this.ctx.type_arena))) { continue; }
+            arg.set_resolved_type(want);
+            scope.set_resolved_type(want);
+        }
     }
 
     /// When `call` is an EXPLICIT generic free call (`f<i32>(...)` on a bare
@@ -3166,7 +3220,7 @@ type struct CallResolver {
         return false;
     }
 
-    resolve_direct_call(mut &this, ident: IdentifierNode*) -> TypeRef {
+    resolve_direct_call(mut &this, call: CallExprNode*, ident: IdentifierNode*) -> TypeRef {
         // The name layer's own answer for this callee, and the only one asked.
         // A local is a value: when its type is callable, the call's type is
         // that signature's return, whatever global shares the leaf.  A
@@ -3236,7 +3290,7 @@ type struct CallResolver {
         // name and so names one declaration; a slot it did not answer names
         // nothing the index holds a type for.
         const stamped_ty: TypeRef = this.types.spelling_type(ident.res);
-        if (stamped_ty.is_valid()) { return stamped_ty; }
+        if (stamped_ty.is_valid()) { return this.construction_instance(call, stamped_ty); }
 
         // Bound, and to nothing callable: a callee no rib bound was refused
         // where it was written (E0202, with the owners of the leaf and the
@@ -7173,6 +7227,13 @@ type struct CallResolver {
             if (inst.has_resolved_type()) { concrete_t = this.arena.lookup(inst.resolved_type); }
         }
         if (concrete_t == null || concrete_t.kind != TypeKind::Enum) { return TypeRef::invalid(); }
+        // Type arguments written on the variant (`Result::Ok::<i32, i32>(4)`)
+        // name the instantiation, as they do on a payload-less variant.
+        if (scope.generic_args.length > 0) {
+            const written: TypeRef = this.demanded_scope_type(type_ref, &scope.generic_args, scope.span);
+            scope.set_resolved_type(written);
+            return written;
+        }
         const promoted: TypeRef = this.promote_to_expected_instantiation(type_ref);
         // `promote` only specialises when an expected type supplies the args.
         // With none - an inline `Option::Some(<expr>)` standing as a `match`
