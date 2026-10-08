@@ -1889,13 +1889,23 @@ public:
         }
         if (func_ty.is_valid()) {
             this.calls.enforce_value_ref_visibility(def_id, ident.span);
+            // A generic function as a value is one instance of it: the
+            // template applied to the arguments the turbofish writes or the
+            // expected function type binds.  Its type is the signature with
+            // those arguments, and they are kept on the node, from which
+            // monomorphization pins the instance.
+            const tm: TemplateEntry* = this.ctx.generic_registry.template_of(def_id);
+            if (tm != null && tm.node_kind == NodeKind::FunctionDeclaration && !ident.resolved_callee.is_some()) {
+                mut args: TypeRef[] = [];
+                const inst_ty: TypeRef = this.calls.generic_value_type(tm, &tm.param_types, func_ty, &ident.generic_args,
+                    Text::new(name_str), Text::new(fmt::format("%s::<...>", name_str)), ident.span, &args);
+                if (inst_ty.is_valid()) { ident.set_value_type_args(args); }
+                return inst_ty;
+            }
             // The pin, as the scope form's: the definition's family, its
-            // parent and its leaf.  A TEMPLATE pins nothing - mono selects
-            // the instantiation for a turbofished value and refuses to when a
-            // pin is already there.
+            // parent and its leaf.
             if (!ident.resolved_callee.is_some() && !this.state.in_symbolic_check) {
                 mut is_tmpl: boolean = false;
-                const tm: TemplateEntry* = this.ctx.generic_registry.template_of(def_id);
                 if (tm != null && tm.node_kind == NodeKind::FunctionDeclaration) { is_tmpl = true; }
                 if (!is_tmpl) {
                     // An overloaded function as a value is the overload the
@@ -3616,12 +3626,12 @@ public:
     }
 
     /// The function type of a method WITH a receiver named `ty::member` as a
-    /// value: its signature with the receiver's type first, as Rust's method
-    /// paths are - `IgTn::go` for `go(&this, u: i32) -> i64` is
+    /// value: its signature with the receiver's type first - `IgTn::go` for
+    /// `go(&this, u: i32) -> i64` is
     /// `(&IgTn, i32) -> i64`.  Invalid for a static method, a member that is
     /// no method, a declaration whose receiver is not typed, and a signature
     /// still naming a generic parameter - a generic method's, or a generic
-    /// owner's - which a value cannot be taken of without its arguments.
+    /// owner's, whose value is one instance's (`generic_owner_method_value`).
     scope_receiver_method_type(mut &this, m: MethodInfo*) -> TypeRef {
         if (m == null || m.is_static || m.ast_node == null) { return TypeRef::invalid(); }
         const node: MethodNode* = m.ast_node as MethodNode*;
@@ -3672,6 +3682,10 @@ public:
             if (this.calls.scope_callee_signature_refused(scope, false)) { return TypeRef::invalid(); }
             return this.calls.pin_scope_value_static_method(scope, found, recv_ft);
         }
+        // A generic owner's method is one instance's method.
+        mut owner_method: boolean = false;
+        const owner_value: TypeRef = this.calls.generic_owner_method_value(scope, found, &owner_method);
+        if (owner_method) { return owner_value; }
         if (found.is_valid() && this.scope_member_binds_type(found, scope)) {
             this.validate_enum_scope_member(found, scope);
             // Type arguments written on the path (`Option::<i32>::None`,

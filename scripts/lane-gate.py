@@ -437,6 +437,8 @@ EXCLUDED_ARRAYS = {
                                    "the lambda's own captured names as WRITTEN; sema binds them"),
     "Lockfile":           Excluded("compiler/deps/lockfile.cryo",
                                    "the dependency lockfile's packages and vendored libraries by name: FILE-level records, FILE PATHS and hashes"),
+    "MonoCallSpecializer": Excluded("compiler/mono/call_specializer.cryo",
+                                   "a WORK QUEUE of path values whose owner instance is not minted yet, each bound by the identities recorded on it when its owner is; never searched"),
     "ModuleDeclNode":     Excluded("compiler/AST/declaration.cryo",
                                    "the module declaration's own WRITTEN SEGMENTS"),
     "ModuleInfo":         Excluded("compiler/module_graph.cryo",

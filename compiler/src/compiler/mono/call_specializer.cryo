@@ -119,6 +119,10 @@ type struct MonoCallSpecializer {
     /// names are.  Each is bound once the instantiation is registered
     /// (`bind_queued_calls`).
     queued_binds:     CallExprNode*[];
+    /// A generic owner's methods taken as values (`Wrap::get`) whose owner
+    /// instance was not minted when the value was walked; each is bound to
+    /// that instance's method once it is (`bind_queued_calls`).
+    queued_path_values: ScopeResolutionNode*[];
     /// The function whose body the walk is in, for the report of a call
     /// left unbound.
     current_fn:       FunctionDeclNode*;
@@ -144,6 +148,7 @@ type struct MonoCallSpecializer {
             gsm_owner_def:    DefId::invalid(),
             gsm_owner_recv:   TypeRef::invalid(),
             queued_binds:     [],
+            queued_path_values: [],
             current_fn:       null,
             unpinned_calls:   [],
         };
@@ -566,7 +571,8 @@ type struct MonoCallSpecializer {
                 this.specialize_fn_value_ref(expr as IdentifierNode*, res_ctx, subst);
             }
             NodeKind::ScopeResolution => {
-                this.bind_path_value(expr as ScopeResolutionNode*);
+                this.specialize_path_fn_value(expr as ScopeResolutionNode*, subst);
+                this.bind_path_value(expr as ScopeResolutionNode*, subst);
             }
             NodeKind::NewExpression => {
                 const ne: NewExprNode* = expr as NewExprNode*;
@@ -750,40 +756,48 @@ type struct MonoCallSpecializer {
         this.state.enqueue_from_type_ref(new_inst);
     }
 
-    /// Resolve a generic function-reference value `name<Args>` used as a
-    /// first-class value: resolve the explicit turbofish args, pin the specialized
-    /// callee symbol on the identifier, and queue the instantiation.  No-op for
-    /// ordinary identifiers (no turbofish).  This reads explicit turbofish args
-    /// directly (not a stash) - it is not inference.
+    /// A generic function used as a first-class value: pin the instance of
+    /// it sema chose - the template applied to the type arguments sema kept
+    /// on the node (`value_type_args`), concretized by the active
+    /// specialization - and queue the instantiation.  No-op for an identifier
+    /// with none.
     specialize_fn_value_ref(mut &this, ident: IdentifierNode*,
                             res_ctx: ResolutionContext*,
                             subst: TypeSubstitution*) -> void {
         if (ident == null) { return; }
-        if (ident.generic_args.length == 0) { return; }
+        if (ident.value_type_args.length == 0) { return; }
         if (ident.resolved_callee.is_some()) { return; }
-        if (this.type_resolver == null || res_ctx == null) { return; }
-        if (this.generic_registry == null) { return; }
-        // A first-class function-reference value (`f<i32>` not invoked) has no
-        // call arity; -1 leaves the lookup to disambiguate by module prefix.
-        const entry: TemplateEntry* = this.find_function_template_for_call(&ident.res);
-        if (entry == null) { return; }
-        if (entry.node_kind != NodeKind::FunctionDeclaration) { return; }
+        const inst: TypeRef = this.value_instance(
+            this.find_function_template_for_call(&ident.res), &ident.value_type_args, subst);
+        if (inst.is_valid()) { ident.set_resolved_callee(CalleePin::Instance(inst)); }
+    }
 
+    /// The path form of `specialize_fn_value_ref`: a module's generic
+    /// function taken as a value, `m::idf`, the template `member_def` names.
+    specialize_path_fn_value(mut &this, scope: ScopeResolutionNode*, subst: TypeSubstitution*) -> void {
+        if (scope.value_type_args.length == 0 || scope.resolved_callee.is_some()) { return; }
+        if (this.generic_registry == null || !scope.member_def.is_valid()) { return; }
+        const inst: TypeRef = this.value_instance(
+            this.generic_registry.template_of(scope.member_def), &scope.value_type_args, subst);
+        if (inst.is_valid()) { scope.set_resolved_callee(CalleePin::Instance(inst)); }
+    }
+
+    /// The instance of the function template `entry` a value names: the
+    /// template applied to `args`, concretized by the active
+    /// specialization, and queued.  Invalid when an argument stays abstract.
+    value_instance(mut &this, entry: TemplateEntry*, args: &TypeRef[], subst: TypeSubstitution*) -> TypeRef {
+        if (entry == null || this.generic_registry == null) { return TypeRef::invalid(); }
+        if (entry.node_kind != NodeKind::FunctionDeclaration) { return TypeRef::invalid(); }
+        if (args.length != entry.param_types.length) { return TypeRef::invalid(); }
         mut seeded: TypeRef[] = [];
-        for (mut i: i64 = 0; i < ident.generic_args.length; i++) {
-            mut tr: TypeRef = this.type_resolver.resolve(ident.generic_args[i], res_ctx);
-            if (!tr.is_valid()) { return; }
-            if (subst != null) { tr = subst.apply(tr, this.arena); }
+        for (mut i: i64 = 0; i < args.length; i++) {
+            const tr: TypeRef = this.concretize_stashed_arg(args[i], subst);
+            if (!tr.is_valid() || this.arena.contains_generic_param(tr)) { return TypeRef::invalid(); }
             seeded.push(tr);
         }
-        seeded = this.type_resolver.expand_default_type_args(entry, seeded, res_ctx);
-        if (seeded.length != entry.param_types.length) { return; }
-
-        const new_inst: TypeRef = this.generic_registry.instantiate(
-            entry.base_type, seeded);
-        if (!new_inst.is_valid()) { return; }
-        ident.set_resolved_callee(CalleePin::Instance(new_inst));
-        this.state.enqueue_from_type_ref(new_inst);
+        const new_inst: TypeRef = this.generic_registry.instantiate(entry.base_type, seeded);
+        if (new_inst.is_valid()) { this.state.enqueue_from_type_ref(new_inst); }
+        return new_inst;
     }
 
 
@@ -1398,12 +1412,31 @@ type struct MonoCallSpecializer {
     /// identity.  A method with type parameters of its own is not a value
     /// bound as written, and an owner not yet minted has no entries; both
     /// are left unpinned.
-    bind_path_value(mut &this, scope: ScopeResolutionNode*) -> void {
+    bind_path_value(mut &this, scope: ScopeResolutionNode*, subst: TypeSubstitution*) -> void {
         if (!scope.template_method.is_valid() || !scope.spec_owner.is_valid()
                 || scope.resolved_callee.is_some()) { return; }
+        if (this.arena.contains_generic_param(scope.spec_owner)) {
+            if (subst == null) { return; }
+            const concrete: TypeRef = this.concretize_stashed_arg(scope.spec_owner, subst);
+            if (!concrete.is_valid() || this.arena.contains_generic_param(concrete)) { return; }
+            const ct: Type* = this.arena.lookup(concrete);
+            if (ct != null && ct.kind == TypeKind::InstantiatedType) {
+                const ci: InstantiatedType* = ct as InstantiatedType*;
+                scope.spec_owner = this.generic_registry.instantiate(ci.generic_base, &ci.type_args);
+            } else {
+                scope.spec_owner = concrete;
+            }
+        }
         const owner: TypeRef = this.receiver_owner(scope.spec_owner);
         const ot: Type* = this.arena.lookup(owner);
-        if (ot == null || ot.kind == TypeKind::InstantiatedType) { return; }
+        if (ot == null) { return; }
+        // An owner instance not minted yet is queued for the drain, which
+        // materializes its methods, and the value is bound once it is.
+        if (ot.kind == TypeKind::InstantiatedType) {
+            this.state.enqueue_from_type_ref(scope.spec_owner);
+            this.queued_path_values.push(scope);
+            return;
+        }
         const m: MethodNode* = this.recorded_method_on(scope.template_method, owner);
         if (m == null || m.func == null || m.func.generic_params.length > 0
                 || !m.func.overload_entry.is_valid()) { return; }
@@ -1603,6 +1636,12 @@ type struct MonoCallSpecializer {
             }
         }
         this.queued_binds = still;
+        mut values: ScopeResolutionNode*[] = [];
+        for (mut i: i64 = 0; i < this.queued_path_values.length; i++) { values.push(this.queued_path_values[i]); }
+        this.queued_path_values = [];
+        for (mut i: i64 = 0; i < values.length; i++) {
+            this.bind_path_value(values[i], null);
+        }
     }
 
     /// Report every walked call nothing binds: E0900, an internal error,
@@ -1616,6 +1655,17 @@ type struct MonoCallSpecializer {
             this.report_unbound_call(u.call, u.func);
         }
         this.unpinned_calls = [];
+        for (mut i: i64 = 0; i < this.queued_path_values.length; i++) {
+            const v: ScopeResolutionNode* = this.queued_path_values[i];
+            if (v.resolved_callee.is_some()) { continue; }
+            const vfile: string = v.span.file;
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                Text::new(fmt::format("internal: the method `%s` taken as a value reached codegen with no instance (written at %s:%u)",
+                    this.intern_table.resolve(v.member_name), vfile.basename(), v.span.start_line)));
+            d = d.at(v.span);
+            this.diagnostics.emit(d);
+        }
+        this.queued_path_values = [];
     }
 
     /// Whether code generation has something to call for `call`: its pin,
