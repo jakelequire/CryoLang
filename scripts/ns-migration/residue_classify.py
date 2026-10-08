@@ -95,8 +95,6 @@ CLASS_OF_METHOD = {
         ("J", "member: a class's field position by its leaf off the `ClassType` in hand"),
     "ClassType::get_method":
         ("J", "member: a class's method by its leaf off the `ClassType` in hand"),
-    "EnumType::get_variant":
-        ("J", "member: an enum's variant by its leaf off the `EnumType` in hand"),
     "EnumType::variant_index":
         ("J", "member: an enum's variant ordinal by its leaf off the `EnumType` in hand - sema's one lookup, pinned on the node for codegen"),
     "EnumType::get_method":
@@ -232,7 +230,7 @@ SITE_OVERRIDES = {
         ("J", "member: the for-in protocol's `iter` off a collection that does not implement `Iterator`"),
     # The member tables asked with a leaf the LANGUAGE fixes rather than one
     # the program wrote: the protocols' own variant and method names.
-    ("compiler/sema/sema.cryo", "EnumType::get_variant", 'call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> compiler::resolver::symbol_str::SymbolStr of literal:"Ready"'):
+    ("compiler/sema/sema.cryo", "EnumType::variant_index", 'call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> compiler::resolver::symbol_str::SymbolStr of literal:"Ready"'):
         ("J", "lang: `Poll::Ready`, the variant the async protocol names, inside the enum a synthesized `poll` returns - the enum matched to the language's `Poll` by the identity its declaration claimed before the variant is read"),
     ("compiler/sema/lambda_synth.cryo", "StructType::get_method", 'call:compiler::resolver::intern_table::InternTable.intern(mut &this, string) -> compiler::resolver::symbol_str::SymbolStr of literal:"__call__"'):
         ("J", "lang: the call protocol's `__call__`, the method leaf the language fixes for a callable struct"),
