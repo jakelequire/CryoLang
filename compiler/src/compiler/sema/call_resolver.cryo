@@ -1753,16 +1753,77 @@ type struct CallResolver {
 
     /// The type a construction by value (`Cell(4)`, `Cell::<i32>(4)`) makes:
     /// for a generic type, the instance its written type arguments name, else
-    /// the one the expected type names.  The template itself is no value's
-    /// type - it has no constructor code generation can call.  Any other
-    /// type is `ty` itself.
+    /// the one the expected type names, else the one its constructor's
+    /// arguments bind.  The template itself is no value's type - it has no
+    /// constructor code generation can call.  Any other type is `ty` itself.
     construction_instance(mut &this, call: CallExprNode*, ty: TypeRef) -> TypeRef {
         const tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(ty);
         if (tmpl == null || !tmpl.base_type.equals(ty)) { return ty; }
         if (call.generic_args.length > 0) {
             return this.demanded_scope_type(ty, &call.generic_args, call.span);
         }
-        return this.promote_to_expected_instantiation(ty);
+        const expected: TypeRef = this.promote_to_expected_instantiation(ty);
+        if (!expected.equals(ty)) { return expected; }
+        return this.instance_from_constructor_args(call, tmpl, ty);
+    }
+
+    /// The instance of the generic class `ty` that a construction's arguments
+    /// bind, inferred as a generic function call's type arguments are: from
+    /// the arguments whose types are known first, then a literal's own type
+    /// for a parameter nothing else binds.  `ty` itself when the class has no
+    /// single constructor taking that many arguments, or a type parameter
+    /// stays unbound.
+    instance_from_constructor_args(mut &this, call: CallExprNode*, tmpl: TemplateEntry*, ty: TypeRef) -> TypeRef {
+        if (tmpl.node_kind != NodeKind::ClassDeclaration || tmpl.ast_node == null) { return ty; }
+        if (tmpl.param_types.length == 0) { return ty; }
+        const cd: ClassDeclNode* = tmpl.ast_node as ClassDeclNode*;
+        mut ctor: FunctionDeclNode* = null;
+        for (mut i: i64 = 0; i < cd.methods.length; i++) {
+            const m: MethodNode* = cd.methods[i];
+            if (m == null || !m.is_constructor || m.func == null) { continue; }
+            if (CallResolver::non_receiver_count(m.func) != call.arguments.length) { continue; }
+            if (ctor != null) { return ty; }
+            ctor = m.func;
+        }
+        if (ctor == null) { return ty; }
+        mut params: VarDeclNode*[] = [];
+        for (mut j: i64 = 0; j < ctor.parameters.length; j++) {
+            const p: VarDeclNode* = ctor.parameters[j];
+            if (p != null && !p.is_receiver()) { params.push(p); }
+        }
+        mut pids: TypeRef[] = [];
+        for (mut i: i64 = 0; i < tmpl.param_types.length; i++) { pids.push(tmpl.param_types[i]); }
+        mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+        for (mut i: i64 = 0; i < params.length; i++) {
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null || !params[i].resolved_type.is_valid() || !arg.resolved_type.is_valid()) { continue; }
+            if (this.sema_arg_is_polymorphic_literal(arg) || !this.free_infer_arg_reliable(arg)) { continue; }
+            ictx.unify(params[i].resolved_type, arg.resolved_type);
+        }
+        for (mut i: i64 = 0; i < params.length; i++) {
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null || !params[i].resolved_type.is_valid() || !arg.resolved_type.is_valid()) { continue; }
+            if (!this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+            const f_idx: i64 = ictx.binding_index(params[i].resolved_type);
+            if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) { continue; }
+            ictx.unify(params[i].resolved_type, arg.resolved_type);
+        }
+        mut bindings: TypeRef[] = [];
+        for (mut i: i64 = 0; i < ictx.bindings.length; i++) {
+            if (!ictx.bindings[i].is_valid()) { return ty; }
+            bindings.push(ictx.bindings[i]);
+        }
+        return this.ctx.generic_registry.instantiate(ty, &bindings);
+    }
+
+    /// How many parameters `f` takes besides its receiver.
+    static non_receiver_count(f: FunctionDeclNode*) -> i64 {
+        mut n: i64 = 0;
+        for (mut i: i64 = 0; i < f.parameters.length; i++) {
+            const p: VarDeclNode* = f.parameters[i];
+            if (p != null && !p.is_receiver()) { n += 1; }
+        }
+        return n;
     }
 
     /// The path naming a variant when `arg` is one - `E::V` or `E::V(..)` -

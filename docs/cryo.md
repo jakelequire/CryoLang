@@ -1607,6 +1607,14 @@ p.greet();
 
 Constructors share the class name. They are real language constructs that `new` invokes, not a naming convention as on structs.
 
+A generic class constructed by value is the instance its written type arguments name, else the one the expected type names, else the one its constructor's arguments bind - inferred as a generic function call infers its own, a literal by its own type when nothing else binds the parameter:
+
+```cryo
+const a = Cell::<i64>(5);      // Cell<i64>
+const b: Cell<i64> = Cell(6);  // Cell<i64>, from the annotation
+const c = Cell(4);             // Cell<i32>, from the argument
+```
+
 A destructor is prefixed with `~`, takes no parameters, and runs when the instance is deallocated. It is the right place to release resources acquired in the constructor (heap memory, file handles, sockets), so the object's lifetime bounds the resource's.
 
 ```cryo
