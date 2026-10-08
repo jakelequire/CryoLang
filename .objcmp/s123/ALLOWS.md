@@ -33,432 +33,100 @@ as the facts record it.
 
 | class | functions |
 |---|---|
-| door | 4 |
-| lookup | 82 |
-| lookup-via-callee | 46 |
-| register | 2 |
-| ast-carrier | 43 |
-| carry | 214 |
-| total | 391 |
+| lookup | 64 |
+| lookup-via-callee | 3 |
+| register | 1 |
+| carry | 3 |
+| total | 71 |
 
-## door (4)
+## lookup (64)
 
 | site | function | parameter uses | callers |
 |---|---|---|---|
-| `src/compiler/decl_index.cryo:638` | `lookup_family_entries` | leaf:SymbolStr=[DeclarationIndex.family_slot] | ast=2,literal=1,param=5 |
-| `src/compiler/module_graph.cryo:426` | `module_named` | ns:SymbolStr=[map-read,pass:of] | call=2,element=1,param=1 |
-| `src/compiler/resolver/name_resolution.cryo:2547` | `type_spelling_res` | name:SymbolStr=[CompilationContext.modules_written_as,NameResolver.alias_keyword_primitive,NameResolver.walk_module_rooted_type,head_of,parent_of,segment_count,Resolver.contains_separator,door:InternTable.intern,door:ResBase.is_primitive_spelling,pass:resolve,pass:leaf_in_module_scope,pass:lookup,store:PrimTy] | ast=9 |
-| `src/compiler/types/user_defined.cryo:529` | `variant_index` | name:SymbolStr=[compare] | ast=4,param=1 |
-
-## lookup (82)
-
-| site | function | parameter uses | callers |
-|---|---|---|---|
-| `src/compiler/AST/declaration.cryo:1287` | `lookup_method` | n:SymbolStr=[compare] | param=1 |
-| `src/compiler/AST/expression.cryo:967` | `add_capture` | name:SymbolStr=[compare,store:.push] | ast=3 |
+| `src/compiler/AST/declaration.cryo:1266` | `lookup_method` | n:SymbolStr=[compare] | param=1 |
+| `src/compiler/AST/expression.cryo:963` | `add_capture` | name:SymbolStr=[compare,store:.push] | ast=3 |
 | `src/compiler/AST/node_locator.cryo:923` | `method_by_name` | name:SymbolStr=[compare] | ast=2,param=3 |
 | `src/compiler/bindgen/importer.cryo:476` | `name_seen` | name:SymbolStr=[compare] | element=1,local=7,param=2 |
 | `src/compiler/bindgen/importer.cryo:485` | `find_struct` | name:SymbolStr=[compare] | call=1,local=1 |
-| `src/compiler/bindgen/importer.cryo:1863` | `find_function` | sym:SymbolStr=[compare] | local=1 |
-| `src/compiler/codegen/ops/declaration_emitter.cryo:805` | `find_vtable_slot_impl` | slot_name:SymbolStr=[compare] | field=1 |
-| `src/compiler/codegen/ops/declaration_emitter.cryo:874` | `vtable_slot_index` | method_name:SymbolStr=[compare] | ast=1 |
-| `src/compiler/codegen/ops/symbol_resolver.cryo:240` | `family_answer` | leaf:SymbolStr=[door:DeclarationIndex.lookup_family_entries] | param=1 |
+| `src/compiler/bindgen/importer.cryo:1854` | `find_function` | sym:SymbolStr=[compare] | local=1 |
+| `src/compiler/codegen/ops/declaration_emitter.cryo:804` | `find_vtable_slot_impl` | slot_name:SymbolStr=[compare] | field=1 |
+| `src/compiler/codegen/ops/declaration_emitter.cryo:873` | `vtable_slot_index` | method_name:SymbolStr=[compare] | ast=1 |
 | `src/compiler/codegen/state/function_registry.cryo:52` | `get` | name:SymbolStr=[map-read] | call=1,local=2,param=1 |
 | `src/compiler/codegen/state/value_table.cryo:49` | `set_persistent` | name:SymbolStr=[ValueTable.set_raw,compare,store:.push] | param=1 |
-| `src/compiler/const_table.cryo:224` | `keyword_primitive` | name:SymbolStr=[door:ResBase.primitive_of_alias,pass:resolve] | ast=2 |
-| `src/compiler/const_table.cryo:573` | `variant_tag_of` | member:SymbolStr=[compare] | ast=1 |
-| `src/compiler/decl_index.cryo:521` | `register_signature` | leaf:SymbolStr=[DeclarationIndex.family_slot]; symbol:SymbolStr=[DeclarationIndex.file_entry,compare] | ast=1,local=2,param=1 |
-| `src/compiler/decl_index.cryo:830` | `note_extern_symbol` | sym:SymbolStr=[map-read,map-write]; key:SymbolStr=[store:new] | local=2 |
-| `src/compiler/decl_index.cryo:842` | `extern_symbol_conflict` | sym:SymbolStr=[map-read] | local=1 |
-| `src/compiler/module_graph.cryo:247` | `add_dependency` | dep:SymbolStr=[compare,store:.push] | call=1,field=1 |
-| `src/compiler/module_graph.cryo:261` | `add_imported_namespace` | ns:SymbolStr=[compare,store:.push] | call=2,field=6,local=2 |
-| `src/compiler/module_graph.cryo:271` | `add_reexport` | ns:SymbolStr=[compare,store:.push] | field=4,local=2 |
-| `src/compiler/module_graph.cryo:282` | `add_submodule` | ns:SymbolStr=[compare,store:.push] | call=1,field=1 |
-| `src/compiler/module_graph.cryo:487` | `modules_of` | written:SymbolStr[]=[door:ModuleGraph.module_named,store:.push] | field=4 |
-| `src/compiler/module_graph.cryo:535` | `register_c_import_module` | ns:SymbolStr=[map-read,map-write,pass:of] | call=1 |
-| `src/compiler/passes/drop_insertion.cryo:3128` | `fresh_member_flag_name` | binding:SymbolStr=[format,door:InternTable.intern,pass:resolve] | param=1 |
-| `src/compiler/resolver/mangled_name.cryo:378` | `specialized_identifier` | base_qname:QualifiedName=[door:InternTable.intern,pass:encode_path_with_leaf_generics] | call=1,local=3 |
-| `src/compiler/resolver/name_resolution.cryo:1705` | `reaching_import_for` | decl_ns:SymbolStr=[path_precedes,compare,pass:resolve] | identity=1 |
-| `src/compiler/resolver/qualified_name.cryo:172` | `equals` | other:QualifiedName=[compare] | - |
-| `src/compiler/resolver/qualified_name.cryo:187` | `starts_with` | prefix:QualifiedName=[compare] | - |
-| `src/compiler/resolver/qualified_name.cryo:203` | `ends_with` | suffix:QualifiedName=[compare] | - |
-| `src/compiler/resolver/resolver.cryo:806` | `exports_named` | name:SymbolStr=[compare] | ast=2,param=4 |
-| `src/compiler/resolver/scope.cryo:193` | `find` | name:SymbolStr=[hash_int,LOG_DEBUG,map-read] | identity=1,local=2,param=4 |
-| `src/compiler/resolver/scope.cryo:221` | `insert` | name:SymbolStr=[map-read,pass:push_entry,pass:add_overload,pass:clear_ambiguity] | field=1,identity=1 |
-| `src/compiler/resolver/scope.cryo:267` | `insert_import` | name:SymbolStr=[map-read,pass:push_entry,store:.push] | local=1 |
-| `src/compiler/resolver/scope.cryo:313` | `clear_ambiguity` | name:SymbolStr=[compare] | param=1 |
-| `src/compiler/resolver/scope.cryo:333` | `is_ambiguous` | name:SymbolStr=[compare] | local=1,param=1 |
-| `src/compiler/resolver/scope.cryo:345` | `get_ambiguous_module_ids` | name:SymbolStr=[compare] | param=1 |
-| `src/compiler/resolver/scope.cryo:362` | `get_overloads` | name:SymbolStr=[compare,map-read] | field=1,local=1,param=2 |
-| `src/compiler/resolver/symbol_str.cryo:41` | `equals` | other:SymbolStr=[compare] | ast=24,element=3,field=7,identity=5,literal=13,local=17,param=46 |
+| `src/compiler/const_table.cryo:572` | `variant_tag_of` | member:SymbolStr=[compare] | ast=1 |
+| `src/compiler/decl_index.cryo:520` | `register_signature` | leaf:SymbolStr=[DeclarationIndex.family_slot]; symbol:SymbolStr=[DeclarationIndex.file_entry,compare] | ast=1,local=2,param=1 |
+| `src/compiler/decl_index.cryo:827` | `note_extern_symbol` | sym:SymbolStr=[map-read,map-write]; key:SymbolStr=[store:new] | local=2 |
+| `src/compiler/decl_index.cryo:839` | `extern_symbol_conflict` | sym:SymbolStr=[map-read] | local=1 |
+| `src/compiler/module_graph.cryo:244` | `add_dependency` | dep:SymbolStr=[compare,store:.push] | call=1,field=1 |
+| `src/compiler/module_graph.cryo:258` | `add_imported_namespace` | ns:SymbolStr=[compare,store:.push] | call=2,field=6,local=2 |
+| `src/compiler/module_graph.cryo:268` | `add_reexport` | ns:SymbolStr=[compare,store:.push] | field=4,local=2 |
+| `src/compiler/module_graph.cryo:279` | `add_submodule` | ns:SymbolStr=[compare,store:.push] | call=1,field=1 |
+| `src/compiler/module_graph.cryo:530` | `register_c_import_module` | ns:SymbolStr=[of,map-read,map-write] | call=1 |
+| `src/compiler/resolver/name_resolution.cryo:1702` | `reaching_import_for` | decl_ns:SymbolStr=[InternTable.resolve,path_precedes,compare] | identity=1 |
+| `src/compiler/resolver/qualified_name.cryo:169` | `equals` | other:QualifiedName=[compare] | - |
+| `src/compiler/resolver/qualified_name.cryo:184` | `starts_with` | prefix:QualifiedName=[compare] | - |
+| `src/compiler/resolver/qualified_name.cryo:200` | `ends_with` | suffix:QualifiedName=[compare] | - |
+| `src/compiler/resolver/resolver.cryo:788` | `exports_named` | name:SymbolStr=[compare] | ast=2,param=4 |
+| `src/compiler/resolver/scope.cryo:192` | `find` | name:SymbolStr=[hash_int,LOG_DEBUG,map-read] | identity=1,local=2,param=4 |
+| `src/compiler/resolver/scope.cryo:220` | `insert` | name:SymbolStr=[Scope.add_overload,map-read,pass:push_entry,pass:clear_ambiguity] | field=1,identity=1 |
+| `src/compiler/resolver/scope.cryo:266` | `insert_import` | name:SymbolStr=[map-read,pass:push_entry,store:.push] | local=1 |
+| `src/compiler/resolver/scope.cryo:312` | `clear_ambiguity` | name:SymbolStr=[compare] | param=1 |
+| `src/compiler/resolver/scope.cryo:332` | `is_ambiguous` | name:SymbolStr=[compare] | local=1,param=1 |
+| `src/compiler/resolver/scope.cryo:344` | `get_ambiguous_module_ids` | name:SymbolStr=[compare] | param=1 |
+| `src/compiler/resolver/scope.cryo:360` | `get_overloads` | name:SymbolStr=[compare,map-read] | field=1,local=1,param=2 |
+| `src/compiler/resolver/symbol_str.cryo:41` | `equals` | other:SymbolStr=[compare] | ast=24,element=3,field=7,identity=5,literal=13,local=17,param=44 |
 | `src/compiler/sema/async_lower.cryo:209` | `push_orig` | name:SymbolStr=[compare,store:.push] | ast=2 |
 | `src/compiler/sema/async_lower.cryo:217` | `index_of` | name:SymbolStr=[compare] | ast=2 |
 | `src/compiler/sema/async_lower.cryo:255` | `push_unique` | name:SymbolStr=[compare,store:.push] | ast=2 |
-| `src/compiler/sema/async_lower.cryo:1725` | `name_read_in_expr` | name:SymbolStr=[compare,pass:name_read_in_expr,pass:name_read_in_stmt] | local=1,param=35 |
-| `src/compiler/sema/async_lower.cryo:1979` | `name_is_whole_place` | name:SymbolStr=[compare] | param=1 |
-| `src/compiler/sema/async_lower.cryo:1992` | `subst_name_expr` | name:SymbolStr=[compare,pass:hoist_giveaway,pass:subst_name_expr,pass:subst_nested_stmt,pass:name_is_whole_place]; field:SymbolStr=[pass:subst_target,pass:subst_name_expr,pass:subst_nested_stmt] | literal=1,local=1,param=68 |
-| `src/compiler/sema/async_lower.cryo:4117` | `stmt_first_use` | name:SymbolStr=[compare,pass:expr_first_use,pass:stmt_first_use,pass:block_first_use,pass:name_read_in_stmt] | param=10 |
-| `src/compiler/sema/async_lower.cryo:4190` | `expr_first_use` | name:SymbolStr=[compare,pass:expr_first_use,pass:stmt_first_use,pass:name_read_in_expr] | param=15 |
-| `src/compiler/sema/async_lower.cryo:4438` | `mark_last_use_expr` | name:SymbolStr=[compare,pass:mark_last_use_arm,pass:name_read_in_expr,pass:mark_last_use_expr] | param=32 |
-| `src/compiler/sema/async_lower.cryo:4618` | `top_level_assignment_index` | name:SymbolStr=[compare] | local=2,param=2 |
-| `src/compiler/sema/async_lower.cryo:5077` | `is_frame_name` | name:SymbolStr=[compare] | ast=1 |
-| `src/compiler/sema/async_lower.cryo:5282` | `assigned_frame_addr_root` | name:SymbolStr=[compare] | param=1 |
-| `src/compiler/sema/async_lower.cryo:5341` | `strip_local_marker` | name:SymbolStr=[compare] | local=2,param=2 |
-| `src/compiler/sema/async_lower.cryo:6234` | `rc_lookup` | name:SymbolStr=[compare] | ast=2 |
-| `src/compiler/sema/async_lower.cryo:6697` | `rb_lookup` | name:SymbolStr=[compare] | ast=2 |
-| `src/compiler/sema/call_resolver.cryo:5352` | `pin_scope_callee_combined` | scope_sym:SymbolStr=[pass:pin_impl_qualified_call,pass:resolve]; member_sym:SymbolStr=[door:DeclarationIndex.lookup_family_entries,pass:pin_impl_qualified_call,pass:trait_delivered_entries,pass:pin_trait_qualified_call,pass:scope_is_generic_template,pass:try_pin_static_method_overload,pass:enforce_static_method_visibility,pass:resolve] | ast=1,param=1 |
-| `src/compiler/sema/call_resolver.cryo:6281` | `try_pin_static_method_overload` | leaf:SymbolStr=[door:DeclarationIndex.lookup_family_entries] | param=1 |
-| `src/compiler/sema/diagnostics.cryo:283` | `suggest_similar_method` | method_name:SymbolStr=[find_best_candidate,compare,door:InternTable.intern,pass:resolve] | ast=1 |
-| `src/compiler/sema/diagnostics.cryo:296` | `find_shadowed_type_candidates` | simple_name:SymbolStr=[compare,pass:resolve]; member_name:SymbolStr=[pass:get_method,pass:get_method,pass:get_variant,pass:get_method] | ast=3,local=1 |
-| `src/compiler/sema/diagnostics.cryo:363` | `attach_shadow_import_suggestions` | candidates:SymbolStr[]=[parent_of,format,compare,pass:resolve] | ast=1,local=1 |
+| `src/compiler/sema/async_lower.cryo:1718` | `name_read_in_expr` | name:SymbolStr=[AsyncLower.name_read_in_stmt,compare,pass:name_read_in_expr] | local=1,param=35 |
+| `src/compiler/sema/async_lower.cryo:1969` | `name_is_whole_place` | name:SymbolStr=[compare] | param=1 |
+| `src/compiler/sema/async_lower.cryo:1982` | `subst_name_expr` | name:SymbolStr=[AsyncLower.hoist_giveaway,AsyncLower.subst_nested_stmt,compare,pass:subst_name_expr,pass:name_is_whole_place]; field:SymbolStr=[AsyncLower.subst_nested_stmt,AsyncLower.subst_target,pass:subst_name_expr] | literal=1,local=1,param=68 |
+| `src/compiler/sema/async_lower.cryo:4102` | `stmt_first_use` | name:SymbolStr=[AsyncLower.block_first_use,AsyncLower.name_read_in_stmt,compare,pass:expr_first_use,pass:stmt_first_use] | param=10 |
+| `src/compiler/sema/async_lower.cryo:4175` | `expr_first_use` | name:SymbolStr=[compare,pass:expr_first_use,pass:stmt_first_use,pass:name_read_in_expr] | param=15 |
+| `src/compiler/sema/async_lower.cryo:4419` | `mark_last_use_expr` | name:SymbolStr=[AsyncLower.mark_last_use_arm,compare,pass:name_read_in_expr,pass:mark_last_use_expr] | param=32 |
+| `src/compiler/sema/async_lower.cryo:4597` | `top_level_assignment_index` | name:SymbolStr=[compare] | local=2,param=2 |
+| `src/compiler/sema/async_lower.cryo:5043` | `is_frame_name` | name:SymbolStr=[compare] | ast=1 |
+| `src/compiler/sema/async_lower.cryo:5248` | `assigned_frame_addr_root` | name:SymbolStr=[compare] | param=1 |
+| `src/compiler/sema/async_lower.cryo:5306` | `strip_local_marker` | name:SymbolStr=[compare] | local=2,param=2 |
+| `src/compiler/sema/async_lower.cryo:6195` | `rc_lookup` | name:SymbolStr=[compare] | ast=2 |
+| `src/compiler/sema/async_lower.cryo:6656` | `rb_lookup` | name:SymbolStr=[compare] | ast=2 |
+| `src/compiler/sema/diagnostics.cryo:294` | `find_shadowed_type_candidates` | simple_name:SymbolStr=[InternTable.resolve,compare]; member_name:SymbolStr=[door:EnumType.variant_index,pass:get_method,pass:get_method,pass:get_method] | ast=3,local=1 |
+| `src/compiler/sema/diagnostics.cryo:361` | `attach_shadow_import_suggestions` | candidates:SymbolStr[]=[InternTable.resolve,parent_of,format,compare] | ast=1,local=1 |
 | `src/compiler/sema/method_binding.cryo:172` | `resolve_method_return_via_template` | method_name:SymbolStr=[compare] | ast=1,param=1 |
-| `src/compiler/sema/method_binding.cryo:738` | `scan_param_bound_param_types` | method_name:SymbolStr=[compare] | param=2 |
-| `src/compiler/sema/method_binding.cryo:1011` | `projection_default_unavailable` | method_name:SymbolStr=[compare] | ast=1 |
-| `src/compiler/sema/method_binding.cryo:1262` | `find_method_in_trait_impls` | method_name:SymbolStr=[compare] | ast=1 |
-| `src/compiler/sema/method_binding.cryo:1281` | `find_generic_method_in` | name:SymbolStr=[compare] | ast=7,param=1 |
-| `src/compiler/sema/method_binding.cryo:1296` | `find_generic_trait_default` | method_name:SymbolStr=[compare] | ast=1 |
-| `src/compiler/sema/method_binding.cryo:2122` | `resolve_trait_impl_method_return` | method_name:SymbolStr=[compare] | ast=1 |
-| `src/compiler/sema/scope_manager.cryo:42` | `lookup_local` | name:SymbolStr=[map-read] | ast=5 |
-| `src/compiler/sema/scope_manager.cryo:51` | `is_local_or_param` | name:SymbolStr=[map-read] | ast=3 |
-| `src/compiler/sema/scope_manager.cryo:62` | `is_param` | name:SymbolStr=[compare] | ast=2 |
-| `src/compiler/sema/scope_manager.cryo:74` | `is_payload_binding` | name:SymbolStr=[compare] | ast=2 |
-| `src/compiler/sema/scope_manager.cryo:87` | `is_aliasing_binding` | name:SymbolStr=[compare] | ast=1 |
-| `src/compiler/sema/scope_manager.cryo:98` | `local_is_mutable` | name:SymbolStr=[map-read] | local=1 |
-| `src/compiler/sema/symbolic_checker.cryo:292` | `symbolic_find_owner_method` | method_name:SymbolStr=[compare] | ast=1,param=1 |
-| `src/compiler/types/resolver.cryo:466` | `project_member` | member:SymbolStr=[door:TraitDeclNode.assoc_type_index] | ast=1,literal=1,local=1 |
-| `src/compiler/types/resolver.cryo:738` | `trait_declaring` | member:SymbolStr=[door:TraitDeclNode.assoc_type_index] | ast=1,param=1 |
-| `src/compiler/types/resolver.cryo:1453` | `resolve_primitive` | name:SymbolStr=[LOG_DEBUG,door:ResBase.primitive_of_alias,match,pass:resolve] | ast=3,local=2,param=1 |
+| `src/compiler/sema/method_binding.cryo:733` | `scan_param_bound_param_types` | method_name:SymbolStr=[compare] | param=2 |
+| `src/compiler/sema/method_binding.cryo:1004` | `projection_default_unavailable` | method_name:SymbolStr=[compare] | ast=1 |
+| `src/compiler/sema/method_binding.cryo:1254` | `find_method_in_trait_impls` | method_name:SymbolStr=[compare] | ast=1 |
+| `src/compiler/sema/method_binding.cryo:1273` | `find_generic_method_in` | name:SymbolStr=[compare] | ast=7,param=1 |
+| `src/compiler/sema/method_binding.cryo:1288` | `find_generic_trait_default` | method_name:SymbolStr=[compare] | ast=1 |
+| `src/compiler/sema/method_binding.cryo:2113` | `resolve_trait_impl_method_return` | method_name:SymbolStr=[compare] | ast=1 |
+| `src/compiler/sema/symbolic_checker.cryo:291` | `symbolic_find_owner_method` | method_name:SymbolStr=[compare] | ast=1,param=1 |
+| `src/compiler/types/resolver.cryo:1449` | `resolve_primitive` | name:SymbolStr=[InternTable.resolve,LOG_DEBUG,door:ResBase.primitive_of_alias,match] | ast=3,local=2,param=1 |
 | `src/compiler/types/trait_checker.cryo:323` | `diagnose_method_bounds_failure` | method_name:SymbolStr=[compare] | ast=1 |
-| `src/compiler/types/user_defined.cryo:246` | `field_index` | name:SymbolStr=[compare] | param=1 |
-| `src/compiler/types/user_defined.cryo:256` | `get_method` | name:SymbolStr=[compare] | ast=2,literal=2,param=2 |
-| `src/compiler/types/user_defined.cryo:384` | `field_index` | name:SymbolStr=[compare] | param=1 |
-| `src/compiler/types/user_defined.cryo:394` | `get_method` | name:SymbolStr=[compare] | ast=2,param=2 |
-| `src/compiler/types/user_defined.cryo:512` | `get_variant` | name:SymbolStr=[compare] | literal=1,local=1,param=1 |
-| `src/compiler/types/user_defined.cryo:539` | `get_method` | name:SymbolStr=[compare] | ast=1,param=1 |
-| `src/compiler/types/user_defined.cryo:604` | `get_method` | name:SymbolStr=[compare] | - |
+| `src/compiler/types/user_defined.cryo:242` | `field_index` | name:SymbolStr=[compare] | param=1 |
+| `src/compiler/types/user_defined.cryo:252` | `get_method` | name:SymbolStr=[compare] | ast=1,literal=2,param=2 |
+| `src/compiler/types/user_defined.cryo:379` | `field_index` | name:SymbolStr=[compare] | param=1 |
+| `src/compiler/types/user_defined.cryo:389` | `get_method` | name:SymbolStr=[compare] | ast=1,param=2 |
+| `src/compiler/types/user_defined.cryo:522` | `get_method` | name:SymbolStr=[compare] | param=1 |
 
-## lookup-via-callee (46)
+## lookup-via-callee (3)
 
 | site | function | parameter uses | callers |
 |---|---|---|---|
-| `src/compiler/bindgen/importer.cryo:911` | `emit_opaque_tag` | name_sym:SymbolStr=[format,pass:name_seen,pass:resolve,store:.push] | local=1 |
-| `src/compiler/bindgen/importer.cryo:1713` | `bind_probed_macro` | name_sym:SymbolStr=[pass:emit_evaluated_const,pass:name_seen] | element=1 |
-| `src/compiler/codegen/ops/expr_ops.cryo:523` | `codegen_local_var` | name:SymbolStr=[IRFlowEmitter.create_entry_alloca,format,new,pass:resolve,pass:set_persistent,pass:set] | ast=2 |
-| `src/compiler/codegen/ops/symbol_resolver.cryo:180` | `held_symbol` | sym:SymbolStr=[new,pass:get,pass:resolve] | local=2 |
-| `src/compiler/codegen/ops/symbol_resolver.cryo:209` | `resolve_family` | leaf:SymbolStr=[pass:family_text,pass:family_answer] | call=1 |
-| `src/compiler/decl_index.cryo:1324` | `register_function_signature` | leaf:SymbolStr=[DeclarationIndex.mangle_function_symbol,pass:register_signature]; symbol:SymbolStr=[] | ast=4,call=1,local=1 |
-| `src/compiler/passes/drop_insertion.cryo:3078` | `attach_member_flags` | name:SymbolStr=[pass:make_drop_flag_decl,pass:fresh_member_flag_name,store:.push] | ast=1 |
-| `src/compiler/resolver/name_resolution.cryo:1531` | `module_declarers_of_leaf` | name:SymbolStr=[pass:resolve,pass:find,store:.push] | ast=1 |
-| `src/compiler/resolver/name_resolution.cryo:1631` | `type_declarers_of_leaf` | name:SymbolStr=[pass:find,store:.push] | param=1 |
-| `src/compiler/resolver/name_resolution.cryo:1751` | `refuse_unbound_type` | name:SymbolStr=[CompilationContext.modules_written_as,Diagnostic.did_you_mean,parent_of,Resolver.contains_separator,format,pass:resolve,pass:type_declarers_of_leaf,pass:exports_named] | ast=4 |
-| `src/compiler/resolver/name_resolution.cryo:2740` | `leaf_in_module_scope` | name:SymbolStr=[format,pass:resolve,pass:ambiguous_modules_from,store:.push] | param=2 |
-| `src/compiler/resolver/name_resolution.cryo:3413` | `reexport_offering` | name:SymbolStr=[pass:exports_named] | ast=1 |
-| `src/compiler/resolver/name_resolution.cryo:3443` | `module_offering` | name:SymbolStr=[pass:module_offerings] | ast=1 |
-| `src/compiler/resolver/name_resolution.cryo:3455` | `module_offerings` | name:SymbolStr=[pass:export_in] | local=1,param=1 |
-| `src/compiler/resolver/name_resolution.cryo:3487` | `private_in` | name:SymbolStr=[pass:private_declarations] | ast=1,local=1 |
-| `src/compiler/resolver/resolver.cryo:488` | `current_scope_has` | name:SymbolStr=[pass:find] | ast=1 |
-| `src/compiler/resolver/resolver.cryo:601` | `is_ambiguous` | name:SymbolStr=[pass:is_ambiguous] | ast=1 |
-| `src/compiler/resolver/resolver.cryo:615` | `get_ambiguous_modules` | name:SymbolStr=[pass:ambiguous_modules_from] | ast=1 |
-| `src/compiler/resolver/resolver.cryo:624` | `ambiguous_modules_from` | name:SymbolStr=[pass:get_ambiguous_module_ids] | param=2 |
-| `src/compiler/resolver/resolver.cryo:642` | `lookup` | name:SymbolStr=[pass:find,pass:lookup_prelude] | ast=9,call=2,param=1 |
-| `src/compiler/resolver/resolver.cryo:723` | `lookup_prelude` | name:SymbolStr=[pass:exports_named,pass:export_in] | local=1,param=2 |
-| `src/compiler/resolver/resolver.cryo:794` | `export_in` | name:SymbolStr=[pass:exports_named] | ast=1,call=1,param=3 |
-| `src/compiler/resolver/resolver.cryo:831` | `private_declarations` | name:SymbolStr=[pass:get_overloads] | ast=2,param=1 |
-| `src/compiler/resolver/resolver.cryo:956` | `resolve_path` | segments:SymbolStr[]=[pass:is_ambiguous,pass:find,pass:lookup_prelude] | local=2 |
-| `src/compiler/sema/async_lower.cryo:4108` | `block_first_use` | name:SymbolStr=[pass:stmt_first_use] | ast=1,local=3,param=3 |
-| `src/compiler/sema/async_lower.cryo:4255` | `needs_handback` | name:SymbolStr=[pass:last_use_consumes] | ast=1 |
-| `src/compiler/sema/async_lower.cryo:4288` | `borrowed_by_awaited_future` | name:SymbolStr=[pass:name_read_in_expr] | local=1 |
-| `src/compiler/sema/async_lower.cryo:4333` | `last_use_consumes` | name:SymbolStr=[pass:mark_last_use_stmt] | param=1 |
-| `src/compiler/sema/async_lower.cryo:4359` | `mark_last_use_stmt` | name:SymbolStr=[pass:mark_last_use_expr,pass:mark_last_use_stmt] | param=12 |
-| `src/compiler/sema/async_lower.cryo:4593` | `decl_at_first_assignment` | name:SymbolStr=[pass:mint_local,pass:var_decl_stmt,pass:subst_name_stmt,pass:strip_local_marker,pass:top_level_assignment_index] | ast=1,local=1 |
-| `src/compiler/sema/async_lower.cryo:4645` | `block_cond_write` | name:SymbolStr=[pass:block_first_use,pass:top_level_assignment_index] | ast=1,local=1 |
-| `src/compiler/sema/async_lower.cryo:4702` | `bind_carrier_ptr` | pnm:SymbolStr=[pass:block_first_use,pass:agg_bind_ptr_stmt]; field:SymbolStr=[pass:agg_bind_ptr_stmt] | literal=2,local=2 |
-| `src/compiler/sema/async_lower.cryo:5318` | `reject_frame_addr_carry` | nm:SymbolStr=[format,pass:strip_local_marker,pass:assigned_frame_addr_root,pass:resolve] | local=2 |
-| `src/compiler/sema/call_resolver.cryo:3237` | `enforce_static_method_visibility` | member_sym:SymbolStr=[pass:enforce_method_visibility] | param=1 |
-| `src/compiler/sema/call_resolver.cryo:4632` | `find_template_method` | name:SymbolStr=[pass:method_by_name] | ast=1,literal=1 |
-| `src/compiler/sema/lambda_synth.cryo:752` | `mint_closure_spec_name` | orig:SymbolStr=[pass:specialized_identifier,pass:from_symbol] | ast=1 |
-| `src/compiler/sema/member_resolver.cryo:833` | `enforce_method_visibility` | method_name:SymbolStr=[format,pass:get_method,pass:get_method,pass:resolve] | ast=3,param=1 |
-| `src/compiler/sema/method_binding.cryo:290` | `abstract_receiver_method_return` | method_name:SymbolStr=[pass:lookup_method_through_param_bounds,pass:resolve_method_return_via_template,pass:lookup_method_through_projection_bounds] | ast=2 |
-| `src/compiler/sema/method_binding.cryo:718` | `param_types_through_param_bounds` | method_name:SymbolStr=[pass:scan_param_bound_param_types] | ast=1 |
-| `src/compiler/sema/method_binding.cryo:1088` | `lookup_trait_defining_method` | method_name:SymbolStr=[pass:find_trait_defining_method] | ast=1 |
-| `src/compiler/sema/method_binding.cryo:1323` | `find_generic_method_in_trait_impls` | method_name:SymbolStr=[pass:find_generic_method_in] | ast=2 |
-| `src/compiler/sema/symbolic_checker.cryo:277` | `symbolic_resolve_owner_method_return` | method_name:SymbolStr=[pass:symbolic_find_owner_method] | ast=1 |
-| `src/compiler/types/checker.cryo:1053` | `check_field_access` | field_name:SymbolStr=[format,LOG_DEBUG,pass:field_index,pass:field_index,pass:resolve] | param=1 |
-| `src/compiler/types/generic_registry.cryo:1404` | `find_trait_defining_method` | method_name:SymbolStr=[pass:lookup_method] | param=1 |
-| `src/compiler/types/resolver.cryo:720` | `bound_declaring` | member:SymbolStr=[pass:trait_declaring] | ast=1,local=1 |
-| `src/compiler/types/resolver.cryo:1603` | `resolve_named` | name:SymbolStr=[LOG_DEBUG,pass:resolve_primitive,pass:resolve] | ast=2 |
+| `src/compiler/resolver/name_resolution.cryo:1748` | `refuse_unbound_type` | name:SymbolStr=[CompilationContext.modules_written_as,Diagnostic.did_you_mean,InternTable.resolve,NameResolver.type_declarers_of_leaf,parent_of,Resolver.contains_separator,format,pass:exports_named] | ast=4 |
+| `src/compiler/resolver/resolver.cryo:937` | `resolve_path` | segments:SymbolStr[]=[Resolver.lookup_prelude,pass:is_ambiguous,pass:find] | local=2 |
+| `src/compiler/types/checker.cryo:1053` | `check_field_access` | field_name:SymbolStr=[InternTable.resolve,format,LOG_DEBUG,pass:field_index,pass:field_index] | param=1 |
 
-## register (2)
+## register (1)
 
 | site | function | parameter uses | callers |
 |---|---|---|---|
-| `src/compiler/resolver/scope.cryo:301` | `push_entry` | name:SymbolStr=[map-write,pass:new] | param=2 |
-| `src/compiler/sema/scope_manager.cryo:155` | `record_local_kw_span` | name:SymbolStr=[map-write] | ast=2 |
+| `src/compiler/resolver/scope.cryo:300` | `push_entry` | name:SymbolStr=[new,map-write] | param=2 |
 
-## ast-carrier (43)
-
-| site | function | parameter uses | callers |
-|---|---|---|---|
-| `src/compiler/AST/cloner.cryo:90` | `for_specialization` | name:SymbolStr=[] | local=1 |
-| `src/compiler/AST/cloner.cryo:100` | `consume_spec_name` | original:SymbolStr=[] | ast=5 |
-| `src/compiler/AST/declaration.cryo:234` | `VarDeclNode` | name:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:281` | `set_name` | n:SymbolStr=[] | ast=1 |
-| `src/compiler/AST/declaration.cryo:329` | `new` | source_field:SymbolStr=[]; local_name:SymbolStr=[] | ast=2,local=2 |
-| `src/compiler/AST/declaration.cryo:536` | `FunctionDeclNode` | name:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:589` | `set_name` | n:SymbolStr=[] | ast=1,literal=1 |
-| `src/compiler/AST/declaration.cryo:670` | `set_base_ctor_name` | name:SymbolStr=[] | call=1 |
-| `src/compiler/AST/declaration.cryo:717` | `IntrinsicDeclNode` | name:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:755` | `IntrinsicConstDeclNode` | name:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:836` | `set_alias` | a:SymbolStr=[] | call=1 |
-| `src/compiler/AST/declaration.cryo:975` | `StructDeclNode` | name:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:1000` | `set_name` | n:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:1055` | `UnionDeclNode` | name:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:1074` | `set_name` | n:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:1131` | `ClassDeclNode` | name:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:1153` | `set_name` | n:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:1171` | `set_base_class` | name:SymbolStr=[] | call=1 |
-| `src/compiler/AST/declaration.cryo:1229` | `TraitDeclNode` | name:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:1317` | `TypeAliasDeclNode` | alias_name:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:1374` | `EnumDeclNode` | name:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:1391` | `set_name` | n:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:1444` | `EnumVariantNode` | name:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:1568` | `ImplBlockNode` | target_type:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:1605` | `set_target_type` | n:SymbolStr=[] | local=2 |
-| `src/compiler/AST/declaration.cryo:1843` | `set_namespace_alias` | alias:SymbolStr=[] | local=1,param=1 |
-| `src/compiler/AST/declaration.cryo:1880` | `FieldDeclNode` | name:SymbolStr=[] | - |
-| `src/compiler/AST/declaration.cryo:1918` | `GenericParamNode` | name:SymbolStr=[] | - |
-| `src/compiler/AST/expression.cryo:186` | `IdentifierNode` | name:SymbolStr=[] | - |
-| `src/compiler/AST/expression.cryo:653` | `NewExprNode` | type_name:SymbolStr=[] | - |
-| `src/compiler/AST/expression.cryo:699` | `set_variant_name` | name:SymbolStr=[] | ast=1 |
-| `src/compiler/AST/expression.cryo:814` | `StructLiteralNode` | struct_type:SymbolStr=[] | - |
-| `src/compiler/AST/expression.cryo:1068` | `MemberAccessNode` | member:SymbolStr=[] | - |
-| `src/compiler/AST/expression.cryo:1208` | `ScopeResolutionNode` | scope_name:SymbolStr=[]; member_name:SymbolStr=[] | - |
-| `src/compiler/AST/pattern.cryo:102` | `set_value` | v:SymbolStr=[] | ast=1,call=2,literal=1 |
-| `src/compiler/AST/pattern.cryo:104` | `set_binding_name` | n:SymbolStr=[] | call=2,element=1 |
-| `src/compiler/AST/pattern.cryo:107` | `set_high_value` | v:SymbolStr=[] | call=1 |
-| `src/compiler/AST/pattern.cryo:170` | `set_enum_name` | n:SymbolStr=[] | call=2,local=2 |
-| `src/compiler/AST/pattern.cryo:172` | `set_variant_name` | n:SymbolStr=[] | call=2,local=2 |
-| `src/compiler/AST/substituter.cryo:96` | `ASTTypeSubstituter` | spec_name:SymbolStr=[] | - |
-| `src/compiler/AST/substituter.cryo:1199` | `rewrite_to_primitive` | name:SymbolStr=[] | call=1 |
-| `src/compiler/AST/substituter.cryo:1212` | `rewrite_to_pointer` | inner_name:SymbolStr=[] | call=1 |
-| `src/compiler/AST/substituter.cryo:1234` | `rewrite_to_array` | inner_name:SymbolStr=[] | call=1 |
-
-## carry (214)
+## carry (3)
 
 | site | function | parameter uses | callers |
 |---|---|---|---|
-| `src/compiler/AST/declaration.cryo:839` | `add_specific_import` | name:SymbolStr=[store:.push]; alias:SymbolStr=[store:.push] | call=2,element=1,local=1 |
-| `src/compiler/AST/declaration.cryo:845` | `add_path_segment` | name:SymbolStr=[store:.push] | element=4 |
-| `src/compiler/AST/declaration.cryo:877` | `add_path_segment` | name:SymbolStr=[store:.push] | element=2 |
-| `src/compiler/AST/declaration.cryo:1692` | `add_derived_param` | name:SymbolStr=[store:.push] | ast=1,field=1 |
-| `src/compiler/AST/declaration.cryo:1733` | `add_assoc_binding` | name:SymbolStr=[store:.push] | call=1,literal=1 |
-| `src/compiler/AST/dumper.cryo:168` | `resolve` | sym:SymbolStr=[pass:resolve] | ast=36 |
-| `src/compiler/bindgen/importer.cryo:564` | `emit_alias_const` | name_sym:SymbolStr=[store:.push] | local=4,param=10 |
-| `src/compiler/bindgen/importer.cryo:1104` | `add_reinterpret_accessors` | blob_field:SymbolStr=[] | literal=1 |
-| `src/compiler/bindgen/importer.cryo:1142` | `emit_bitfield_accessors` | blob_field:SymbolStr=[] | literal=1 |
-| `src/compiler/bindgen/importer.cryo:1510` | `record_macro_const` | name:SymbolStr=[store:.push] | local=2,param=5 |
-| `src/compiler/bindgen/importer.cryo:1604` | `defer_probe` | name_sym:SymbolStr=[store:.push] | local=2 |
-| `src/compiler/bindgen/importer.cryo:1725` | `emit_evaluated_const` | name_sym:SymbolStr=[pass:emit_alias_const,pass:record_macro_const] | local=1,param=1 |
-| `src/compiler/bindgen/importer.cryo:1803` | `try_emit_identifier_alias` | name_sym:SymbolStr=[pass:emit_alias_const,pass:record_macro_const,pass:emit_forwarding_wrapper,store:.push] | local=1 |
-| `src/compiler/bindgen/importer.cryo:1881` | `emit_forwarding_wrapper` | alias_name:SymbolStr=[store:.push] | param=1 |
-| `src/compiler/bindgen/importer.cryo:1937` | `try_emit_compound_struct` | name_sym:SymbolStr=[pass:emit_alias_const] | local=1 |
-| `src/compiler/bindgen/importer.cryo:2003` | `try_emit_arith_macro` | name_sym:SymbolStr=[pass:fold_int_chain,pass:fold_float_chain] | local=1 |
-| `src/compiler/bindgen/importer.cryo:2040` | `fold_int_chain` | name_sym:SymbolStr=[pass:emit_alias_const,pass:record_macro_const] | param=1 |
-| `src/compiler/bindgen/importer.cryo:2075` | `fold_float_chain` | name_sym:SymbolStr=[pass:emit_alias_const,pass:record_macro_const] | param=1 |
-| `src/compiler/bindgen/importer.cryo:2183` | `emit_text_macro` | name_sym:SymbolStr=[pass:emit_alias_const] | local=1 |
-| `src/compiler/bindgen/type_map.cryo:106` | `named` | tag:SymbolStr=[pass:qualify_under_alias] | ast=1,local=5 |
-| `src/compiler/bindgen/type_map.cryo:177` | `qualify_under_alias` | tag:SymbolStr=[pass:resolve] | ast=1,param=1 |
-| `src/compiler/codegen/context.cryo:242` | `resolve` | sym:SymbolStr=[pass:resolve] | ast=8,element=1,field=2,param=2 |
-| `src/compiler/codegen/ops/declaration_emitter.cryo:197` | `resolve` | sym:SymbolStr=[pass:resolve] | ast=7 |
-| `src/compiler/codegen/ops/expr_ops.cryo:254` | `resolve` | sym:SymbolStr=[pass:resolve] | param=2 |
-| `src/compiler/codegen/ops/expr_ops.cryo:2521` | `emit_va_start_for_variadic` | args_name:SymbolStr=[IRFlowEmitter.create_entry_alloca,new,pass:resolve,pass:set] | call=1 |
-| `src/compiler/codegen/ops/expr_ops.cryo:2543` | `emit_va_end_if_variadic` | args_name:SymbolStr=[pass:get] | call=7 |
-| `src/compiler/codegen/ops/symbol_resolver.cryo:123` | `declare_extern_function_as` | symbol:SymbolStr=[new,pass:register,pass:resolve] | local=2 |
-| `src/compiler/codegen/ops/symbol_resolver.cryo:167` | `owned_by_current_module` | mod_sym:SymbolStr=[] | field=1 |
-| `src/compiler/codegen/ops/symbol_resolver.cryo:228` | `family_text` | leaf:SymbolStr=[format,pass:resolve] | param=1 |
+| `src/compiler/codegen/ops/symbol_resolver.cryo:166` | `owned_by_current_module` | mod_sym:SymbolStr=[] | field=1 |
 | `src/compiler/codegen/state/function_registry.cryo:37` | `register` | name:SymbolStr=[] | ast=2,literal=1,local=3,param=1 |
-| `src/compiler/codegen/state/value_table.cryo:94` | `set` | name:SymbolStr=[] | ast=9,literal=2,local=5,param=2 |
-| `src/compiler/codegen/state/value_table.cryo:102` | `get` | name:SymbolStr=[ValueTable.get_raw] | ast=3,param=1 |
-| `src/compiler/codegen/visit/ir_generator.cryo:1098` | `codegen_struct_literal` | field_names:SymbolStr[]=[format,pass:resolve] | local=1 |
-| `src/compiler/codegen/visit/place_emitter.cryo:85` | `codegen_member_access` | member:SymbolStr=[format,pass:resolve] | ast=1 |
-| `src/compiler/compilation_context.cryo:431` | `resolve_str` | sym:SymbolStr=[pass:resolve] | ast=25,element=1,local=5,param=1 |
-| `src/compiler/compilation_context.cryo:600` | `qualify_symbol_sym` | sym:SymbolStr=[segment_count,pass:resolve] | param=1 |
-| `src/compiler/compilation_context.cryo:627` | `qualify_symbol_sym_home` | sym:SymbolStr=[segment_count,pass:qualify_symbol_sym,pass:resolve] | param=2 |
-| `src/compiler/compilation_context.cryo:652` | `decl_type_key` | name:SymbolStr=[pass:qualify_binding_sym,pass:qualify_symbol_sym_home] | ast=6 |
-| `src/compiler/compilation_context.cryo:675` | `register_in_module` | leaf:SymbolStr=[pass:register_generated] | literal=3,local=1 |
-| `src/compiler/compilation_context.cryo:736` | `decl_fn_key` | name:SymbolStr=[pass:qualify_symbol_sym_home] | ast=3 |
-| `src/compiler/compilation_context.cryo:806` | `decl_global_key` | name:SymbolStr=[] | ast=2 |
-| `src/compiler/compilation_context.cryo:826` | `qualify_binding_sym` | sym:SymbolStr=[pass:resolve] | ast=1,param=1 |
-| `src/compiler/decl_index.cryo:490` | `reset_family` | leaf:SymbolStr=[DeclarationIndex.family_slot] | ast=1 |
-| `src/compiler/decl_index.cryo:808` | `lookup_func_type_overloads` | leaf:SymbolStr=[DeclarationIndex.family_slot] | ast=1 |
-| `src/compiler/decl_index.cryo:1194` | `lookup_func_type` | leaf:SymbolStr=[DeclarationIndex.family_slot] | param=1 |
-| `src/compiler/module_graph.cryo:58` | `of` | sym:SymbolStr=[] | element=2,field=2,param=2 |
-| `src/compiler/module_graph.cryo:168` | `new` | name:SymbolStr=[] | - |
-| `src/compiler/module_graph.cryo:191` | `with_namespace` | name:SymbolStr=[]; ns:SymbolStr=[] | local=2 |
-| `src/compiler/mono/call_specializer.cryo:173` | `set_current_source_file` | file:SymbolStr=[] | param=1 |
-| `src/compiler/mono/call_specializer.cryo:2688` | `emit_call_bound_failure` | trait_name:SymbolStr=[format,pass:resolve] | ast=1 |
-| `src/compiler/mono/monomorphizer.cryo:172` | `set_current_source_file` | file:SymbolStr=[pass:set_current_source_file] | local=3 |
-| `src/compiler/mono/monomorphizer.cryo:817` | `create_concrete_type` | spec_name:SymbolStr=[TypeArena.create_class,TypeArena.create_enum,TypeArena.create_struct,TypeArena.create_union] | local=1 |
-| `src/compiler/mono/specializer.cryo:240` | `impl_substituter` | spec_sym:SymbolStr=[] | local=1 |
-| `src/compiler/mono/state.cryo:274` | `record_spec_owner_file` | file:SymbolStr=[store:.push] | ast=1,local=1 |
-| `src/compiler/parser/expr_parser.cryo:1259` | `parse_generic_head` | name:SymbolStr=[pass:parse_scope_member,pass:parse_identifier_tail,pass:parse_struct_literal_body] | local=1 |
-| `src/compiler/parser/expr_parser.cryo:1299` | `parse_identifier_tail` | name:SymbolStr=[pass:parse_scope_member,pass:parse_struct_literal_body] | local=1,param=1 |
-| `src/compiler/parser/expr_parser.cryo:1373` | `parse_struct_literal_body` | name:SymbolStr=[] | literal=1,local=2,param=1 |
-| `src/compiler/parser/expr_parser.cryo:2577` | `parse_scope_member` | scope_name:SymbolStr=[] | local=2,param=2 |
-| `src/compiler/parser/parser.cryo:2561` | `finish_cimport_block` | alias:SymbolStr=[pass:set_namespace_alias] | local=1 |
-| `src/compiler/passes/drop_insertion.cryo:547` | `register_binding` | name:SymbolStr=[pass:require_identity,store:.push] | ast=2,literal=1 |
-| `src/compiler/passes/drop_insertion.cryo:580` | `register_param_type` | name:SymbolStr=[pass:require_identity] | ast=3 |
-| `src/compiler/passes/drop_insertion.cryo:593` | `require_identity` | name:SymbolStr=[format,pass:resolve] | ast=2,param=2 |
-| `src/compiler/passes/drop_insertion.cryo:2413` | `append_partial_drops` | name:SymbolStr=[pass:make_drop_call,pass:make_field_drop_call] | local=1 |
-| `src/compiler/passes/drop_insertion.cryo:2450` | `make_field_drop_call` | name:SymbolStr=[]; field_name:SymbolStr=[] | field=1,param=1 |
-| `src/compiler/passes/drop_insertion.cryo:2878` | `register_drop_flag` | flag:SymbolStr=[] | local=2 |
-| `src/compiler/passes/drop_insertion.cryo:2889` | `make_drop_flag_decl` | flag_name:SymbolStr=[] | local=4 |
-| `src/compiler/passes/drop_insertion.cryo:2905` | `make_drop_flag_set` | flag_name:SymbolStr=[pass:make_drop_flag_write] | ast=1,param=2 |
-| `src/compiler/passes/drop_insertion.cryo:2914` | `make_drop_flag_write` | flag_name:SymbolStr=[] | local=2,param=1 |
-| `src/compiler/passes/drop_insertion.cryo:2935` | `make_conditional_drop_call` | binding:SymbolStr=[pass:make_drop_call]; flag:SymbolStr=[] | local=2 |
-| `src/compiler/passes/drop_insertion.cryo:2964` | `splice_flag_set_into_branch` | flag_name:SymbolStr=[pass:make_drop_flag_set] | local=3 |
-| `src/compiler/passes/drop_insertion.cryo:2989` | `splice_flag_set_at_front` | flag_name:SymbolStr=[pass:make_drop_flag_set] | local=1 |
-| `src/compiler/passes/drop_insertion.cryo:3023` | `fresh_init_flag_name` | binding:SymbolStr=[format,pass:resolve] | param=1 |
-| `src/compiler/passes/drop_insertion.cryo:3037` | `attach_init_flag` | name:SymbolStr=[pass:fresh_init_flag_name] | ast=1 |
-| `src/compiler/passes/drop_insertion.cryo:3189` | `build_place_expr` | base:SymbolStr=[] | call=1,param=1 |
-| `src/compiler/passes/drop_insertion.cryo:3226` | `make_member_drop_call` | base:SymbolStr=[pass:build_place_expr] | local=1 |
-| `src/compiler/passes/drop_insertion.cryo:3808` | `wrap_in_init_guard` | flag:SymbolStr=[] | call=1,local=2 |
-| `src/compiler/passes/drop_insertion.cryo:3847` | `wrap_in_move_guard` | flag:SymbolStr=[] | local=2 |
-| `src/compiler/passes/drop_insertion.cryo:3966` | `make_drop_call` | name:SymbolStr=[] | literal=2,local=2,param=2 |
-| `src/compiler/passes/move_check.cryo:298` | `register_binding` | name:SymbolStr=[pass:require_identity] | ast=5 |
-| `src/compiler/passes/move_check.cryo:316` | `require_identity` | name:SymbolStr=[format,pass:resolve] | ast=2,param=1 |
-| `src/compiler/passes/move_check.cryo:509` | `emit_moved_after_poll` | name:SymbolStr=[format,pass:resolve] | ast=1 |
-| `src/compiler/passes/move_check.cryo:843` | `emit_loop_carried` | name:SymbolStr=[format,pass:resolve] | ast=1 |
-| `src/compiler/passes/specialization.cryo:790` | `register_generic_template` | name:SymbolStr=[LOG_DEBUG,pass:resolve_str,pass:new] | ast=7 |
-| `src/compiler/passes/specialization.cryo:858` | `register_static_method_templates` | owner_key:SymbolStr=[pass:member_template_key] | identity=3,local=1 |
-| `src/compiler/passes/type_resolution.cryo:1283` | `rewrite_this_type_annotation` | target:SymbolStr=[pass:rewrite_this_type_annotation] | param=10 |
-| `src/compiler/passes/type_resolution.cryo:1444` | `rewrite_default_method_signature` | target:SymbolStr=[pass:rewrite_this_type_annotation] | ast=1 |
-| `src/compiler/passes/type_resolution.cryo:1656` | `async_fut_assoc_name` | method:SymbolStr=[pass:resolve] | ast=1 |
-| `src/compiler/resolver/intern_table.cryo:96` | `resolve` | sym:SymbolStr=[] | ast=231,call=21,element=22,field=79,identity=27,local=58,param=76 |
-| `src/compiler/resolver/mangled_name.cryo:239` | `for_free_function` | qname:QualifiedName=[pass:mangle_function_like] | local=1 |
-| `src/compiler/resolver/mangled_name.cryo:253` | `for_method` | owner_qname:QualifiedName=[pass:mangle_function_like]; method:SymbolStr=[pass:mangle_function_like] | param=2 |
-| `src/compiler/resolver/mangled_name.cryo:267` | `for_trait_impl` | trait_qname:QualifiedName=[pass:encode_path]; owner_qname:QualifiedName=[pass:encode_path]; method:SymbolStr=[pass:encode_path] | local=1,param=2 |
-| `src/compiler/resolver/mangled_name.cryo:296` | `for_method_or_trait_impl` | owner_qname:QualifiedName=[pass:for_method,pass:for_trait_impl]; origin_trait:SymbolStr=[pass:for_trait_impl,pass:from_symbol]; method:SymbolStr=[pass:for_method,pass:for_trait_impl] | ast=1,identity=1,local=1 |
-| `src/compiler/resolver/mangled_name.cryo:319` | `for_vtable` | owner_qname:QualifiedName=[pass:encode_path] | local=4 |
-| `src/compiler/resolver/mangled_name.cryo:340` | `for_global` | namespace_sym:SymbolStr=[pass:resolve]; name:SymbolStr=[pass:resolve] | ast=1,field=1,identity=1,local=1 |
-| `src/compiler/resolver/mangled_name.cryo:357` | `for_struct_type` | qname:QualifiedName=[pass:encode_path] | call=2 |
-| `src/compiler/resolver/mangled_name.cryo:441` | `mangle_function_like` | owner_qname:QualifiedName=[pass:encode_path]; member:SymbolStr=[pass:encode_path] | call=1,param=3 |
-| `src/compiler/resolver/mangled_name.cryo:482` | `encode_path` | qname:QualifiedName=[]; member:SymbolStr=[encode_ident,pass:resolve] | call=4,local=1,param=7 |
-| `src/compiler/resolver/mangled_name.cryo:520` | `encode_path_with_leaf_generics` | qname:QualifiedName=[]; member:SymbolStr=[encode_ident,pass:resolve] | call=1,param=1 |
-| `src/compiler/resolver/mangled_name.cryo:830` | `encode_named_qname` | sym:SymbolStr=[encode_ident,pass:resolve] | field=6 |
-| `src/compiler/resolver/mangled_name.cryo:923` | `owner_qname_leaf_or_intern` | qname:QualifiedName=[] | - |
-| `src/compiler/resolver/name_resolution.cryo:261` | `declare_c_imported` | name:SymbolStr=[pass:declare_type] | ast=4 |
-| `src/compiler/resolver/qualified_name.cryo:43` | `from_symbol` | sym:SymbolStr=[store:.push] | field=5,local=6,param=2 |
-| `src/compiler/resolver/qualified_name.cryo:51` | `from_parts` | parts:SymbolStr[]=[] | local=3 |
-| `src/compiler/resolver/qualified_name.cryo:158` | `join` | other:QualifiedName=[store:.push] | - |
-| `src/compiler/resolver/res.cryo:271` | `register` | leaf:SymbolStr=[pass:append] | field=1,local=2,param=1 |
-| `src/compiler/resolver/res.cryo:282` | `register_generated` | leaf:SymbolStr=[pass:append] | param=1 |
-| `src/compiler/resolver/res.cryo:316` | `append` | leaf:SymbolStr=[pass:resolve,store:.push] | param=3 |
-| `src/compiler/resolver/resolver.cryo:493` | `declare_variable` | name:SymbolStr=[pass:variable] | ast=6 |
-| `src/compiler/resolver/resolver.cryo:506` | `declare_constant` | name:SymbolStr=[pass:constant] | ast=2 |
-| `src/compiler/resolver/resolver.cryo:514` | `declare_function` | name:SymbolStr=[pass:function] | ast=3 |
-| `src/compiler/resolver/resolver.cryo:522` | `declare_type` | name:SymbolStr=[pass:type_sym] | ast=6,param=1 |
-| `src/compiler/resolver/resolver.cryo:540` | `declare_parameter` | name:SymbolStr=[pass:parameter] | ast=2,local=1 |
-| `src/compiler/resolver/resolver.cryo:550` | `declare_refused` | name:SymbolStr=[pass:refused] | local=3 |
-| `src/compiler/resolver/resolver.cryo:556` | `declare_field` | name:SymbolStr=[pass:field] | ast=3 |
-| `src/compiler/resolver/resolver.cryo:564` | `declare_enum_variant` | name:SymbolStr=[pass:enum_variant] | ast=1 |
-| `src/compiler/resolver/resolver.cryo:572` | `declare_method` | name:SymbolStr=[pass:method] | ast=2 |
-| `src/compiler/resolver/resolver.cryo:586` | `declare_generic_param` | name:SymbolStr=[pass:generic_param] | ast=1 |
-| `src/compiler/resolver/scope.cryo:130` | `new` | name:SymbolStr=[] | param=1 |
-| `src/compiler/resolver/scope.cryo:356` | `add_overload` | name:SymbolStr=[store:new] | local=2,param=1 |
-| `src/compiler/resolver/symbol.cryo:139` | `variable` | name:SymbolStr=[] | param=1 |
-| `src/compiler/resolver/symbol.cryo:157` | `function` | name:SymbolStr=[] | param=1 |
-| `src/compiler/resolver/symbol.cryo:174` | `namespace_sym` | name:SymbolStr=[] | ast=1,identity=1 |
-| `src/compiler/resolver/symbol.cryo:191` | `type_sym` | name:SymbolStr=[] | param=1 |
-| `src/compiler/resolver/symbol.cryo:208` | `parameter` | name:SymbolStr=[] | param=1 |
-| `src/compiler/resolver/symbol.cryo:225` | `field` | name:SymbolStr=[] | param=1 |
-| `src/compiler/resolver/symbol.cryo:242` | `enum_variant` | name:SymbolStr=[] | param=1 |
-| `src/compiler/resolver/symbol.cryo:259` | `method` | name:SymbolStr=[] | param=1 |
-| `src/compiler/resolver/symbol.cryo:276` | `constant` | name:SymbolStr=[] | ast=1,param=1 |
-| `src/compiler/resolver/symbol.cryo:316` | `import_sym` | name:SymbolStr=[] | ast=2,field=3,local=1 |
-| `src/compiler/resolver/symbol.cryo:334` | `refused` | name:SymbolStr=[] | param=1 |
-| `src/compiler/resolver/symbol.cryo:351` | `generic_param` | name:SymbolStr=[] | param=1 |
-| `src/compiler/resolver/symbol.cryo:368` | `intrinsic` | name:SymbolStr=[] | ast=1 |
-| `src/compiler/sema/async_lower.cryo:703` | `named_ann_def` | name:SymbolStr=[] | field=1,literal=1,local=2 |
-| `src/compiler/sema/async_lower.cryo:916` | `variant_call1` | scope_name:SymbolStr=[] | call=2 |
-| `src/compiler/sema/async_lower.cryo:1421` | `ident` | name:SymbolStr=[pass:ident_bound] | ast=1,field=1,literal=3,local=9,param=4 |
-| `src/compiler/sema/async_lower.cryo:1433` | `ident_bound` | name:SymbolStr=[] | ast=1,field=3,literal=6,param=1 |
-| `src/compiler/sema/async_lower.cryo:1583` | `assign_member_stmt` | field:SymbolStr=[AsyncLower.own_field] | field=7,literal=4,local=1,param=2 |
-| `src/compiler/sema/async_lower.cryo:1637` | `var_decl_stmt` | name:SymbolStr=[pass:var_decl_stmt_bound] | literal=3,local=7,param=3 |
-| `src/compiler/sema/async_lower.cryo:1648` | `var_decl_stmt_bound` | name:SymbolStr=[] | ast=1,literal=4,param=1 |
-| `src/compiler/sema/async_lower.cryo:1817` | `name_read_in_stmt` | name:SymbolStr=[pass:name_read_in_expr,pass:name_read_in_stmt] | local=1,param=12 |
-| `src/compiler/sema/async_lower.cryo:1895` | `subst_target` | field:SymbolStr=[AsyncLower.own_field,pass:ident] | param=1 |
-| `src/compiler/sema/async_lower.cryo:1942` | `hoist_giveaway` | name:SymbolStr=[format,pass:resolve] | param=1 |
-| `src/compiler/sema/async_lower.cryo:2188` | `subst_nested_stmt` | name:SymbolStr=[pass:subst_name_stmt]; field:SymbolStr=[pass:subst_name_stmt] | param=16 |
-| `src/compiler/sema/async_lower.cryo:2215` | `subst_stmt_list` | name:SymbolStr=[pass:subst_name_stmt]; field:SymbolStr=[pass:subst_name_stmt] | param=4 |
-| `src/compiler/sema/async_lower.cryo:2252` | `subst_name_stmt` | name:SymbolStr=[pass:subst_name_expr,pass:subst_stmt_list,pass:subst_nested_stmt]; field:SymbolStr=[pass:subst_name_expr,pass:subst_stmt_list,pass:subst_nested_stmt] | field=1,literal=2,local=6,param=5 |
-| `src/compiler/sema/async_lower.cryo:4090` | `block_reads_name` | name:SymbolStr=[pass:name_read_in_stmt] | local=2 |
-| `src/compiler/sema/async_lower.cryo:4555` | `mark_last_use_arm` | name:SymbolStr=[pass:mark_last_use_expr,pass:mark_last_use_stmt] | param=1 |
-| `src/compiler/sema/async_lower.cryo:4654` | `agg_store_stmt` | field:SymbolStr=[pass:assign_member_stmt]; name:SymbolStr=[pass:ident] | ast=2,literal=1,local=5,param=2 |
-| `src/compiler/sema/async_lower.cryo:4666` | `agg_take_stmt` | name:SymbolStr=[pass:var_decl_stmt]; field:SymbolStr=[AsyncLower.own_field] | ast=2,param=2 |
-| `src/compiler/sema/async_lower.cryo:4684` | `agg_bind_ptr_stmt` | ptr_name:SymbolStr=[pass:var_decl_stmt]; field:SymbolStr=[AsyncLower.own_field] | param=2 |
-| `src/compiler/sema/async_lower.cryo:4722` | `agg_ptr_name` | nm:SymbolStr=[format,pass:resolve] | local=1 |
-| `src/compiler/sema/async_lower.cryo:4743` | `subst_carried_from` | nm:SymbolStr=[pass:subst_stmt_list]; ptr_name:SymbolStr=[pass:subst_stmt_list]; field:SymbolStr=[] | literal=2,local=4 |
-| `src/compiler/sema/async_lower.cryo:4786` | `prepend_agg_take` | name:SymbolStr=[pass:agg_take_stmt]; field:SymbolStr=[pass:agg_take_stmt] | ast=2,literal=1,local=3 |
-| `src/compiler/sema/async_lower.cryo:4801` | `store_before_suspends` | field:SymbolStr=[pass:agg_store_stmt,pass:store_before_suspends]; name:SymbolStr=[pass:agg_store_stmt,pass:store_before_suspends] | ast=2,param=16 |
-| `src/compiler/sema/async_lower.cryo:4901` | `agg_release_stmt` | field:SymbolStr=[AsyncLower.own_field] | element=2 |
-| `src/compiler/sema/async_lower.cryo:4933` | `release_before_ready` | fields:SymbolStr[]=[pass:agg_release_stmt,pass:release_before_ready] | local=1,param=8 |
-| `src/compiler/sema/async_lower.cryo:5027` | `prepend_load` | name:SymbolStr=[pass:var_decl_stmt]; field:SymbolStr=[AsyncLower.own_field] | literal=1,local=1 |
-| `src/compiler/sema/async_lower.cryo:5040` | `rewrite_mut_decl` | field:SymbolStr=[pass:assign_member_stmt] | literal=1 |
-| `src/compiler/sema/async_lower.cryo:5664` | `assign_local_stmt` | name:SymbolStr=[pass:ident] | local=1,param=3 |
-| `src/compiler/sema/async_lower.cryo:6059` | `arm_value_to_assign` | tv:SymbolStr=[pass:assign_local_stmt] | local=1 |
-| `src/compiler/sema/async_lower.cryo:6080` | `hoist_arm_block` | tv:SymbolStr=[pass:assign_local_stmt] | local=2 |
-| `src/compiler/sema/async_lower.cryo:6226` | `rc_bind` | name:SymbolStr=[store:.push]; fresh:SymbolStr=[store:.push] | ast=6,element=1,local=1 |
-| `src/compiler/sema/async_lower.cryo:6246` | `mint_local` | orig:SymbolStr=[format,pass:resolve,store:.push] | ast=2,call=1,element=1,literal=1 |
-| `src/compiler/sema/async_lower.cryo:6689` | `rb_bind` | name:SymbolStr=[store:.push] | ast=4,expr=1 |
-| `src/compiler/sema/async_lower.cryo:7652` | `add_future_field` | name:SymbolStr=[] | ast=1,element=2,local=1 |
-| `src/compiler/sema/call_resolver.cryo:2194` | `emit_free_call_bound_failure` | trait_name:SymbolStr=[format,pass:resolve] | ast=1 |
-| `src/compiler/sema/call_resolver.cryo:2211` | `emit_free_cannot_infer` | fn_name:SymbolStr=[format,pass:resolve] | ast=1 |
-| `src/compiler/sema/call_resolver.cryo:2223` | `emit_free_infer_conflict` | fn_name:SymbolStr=[format,pass:resolve] | ast=2 |
-| `src/compiler/sema/call_resolver.cryo:5322` | `scope_is_generic_template` | member_sym:SymbolStr=[CompilationContext.member_template] | ast=1,param=1 |
-| `src/compiler/sema/call_resolver.cryo:5455` | `pin_trait_qualified_call` | member_sym:SymbolStr=[pass:trait_delivered_entries,pass:report_impl_qualified_miss,pass:report_trait_qualified_unselected] | param=1 |
-| `src/compiler/sema/call_resolver.cryo:5507` | `report_trait_qualified_unselected` | member_sym:SymbolStr=[format,pass:resolve] | param=1 |
-| `src/compiler/sema/call_resolver.cryo:5735` | `trait_delivered_entries` | member_sym:SymbolStr=[CallResolver.member_entries] | ast=5,param=3 |
-| `src/compiler/sema/call_resolver.cryo:5974` | `pin_impl_qualified_call` | owner_sym:SymbolStr=[pass:report_impl_qualified_miss]; member_sym:SymbolStr=[pass:trait_delivered_entries,pass:report_impl_qualified_miss] | param=2 |
-| `src/compiler/sema/call_resolver.cryo:5991` | `report_impl_qualified_miss` | owner_sym:SymbolStr=[leaf_of,format,pass:resolve]; member_sym:SymbolStr=[format,pass:resolve] | ast=3,local=2,param=3 |
-| `src/compiler/sema/call_resolver.cryo:6219` | `report_trait_method_tie` | member:SymbolStr=[format,pass:resolve] | ast=2 |
-| `src/compiler/sema/call_resolver.cryo:6440` | `try_resolve_static_method` | lookup_sym:SymbolStr=[CallResolver.type_static_call] | local=1 |
-| `src/compiler/sema/call_resolver.cryo:7449` | `resolve_module_qualified_function` | scope_name:SymbolStr=[]; member_name:SymbolStr=[] | ast=2 |
-| `src/compiler/sema/call_resolver.cryo:7641` | `resolve_generic_scope_name` | base_name:SymbolStr=[] | ast=2 |
-| `src/compiler/sema/call_resolver.cryo:7738` | `try_resolve_generic_return` | scope_name:SymbolStr=[]; member_name:SymbolStr=[] | ast=2 |
-| `src/compiler/sema/diagnostics.cryo:229` | `emit_method_arity_error` | name:SymbolStr=[format,pass:resolve] | ast=6,identity=1 |
-| `src/compiler/sema/member_resolver.cryo:806` | `enforce_field_visibility` | field_name:SymbolStr=[format,pass:resolve] | ast=2,local=1 |
-| `src/compiler/sema/method_binding.cryo:257` | `lookup_method_through_projection_bounds` | method_name:SymbolStr=[pass:scan_projection_bounds] | param=1 |
-| `src/compiler/sema/method_binding.cryo:336` | `lookup_method_through_param_bounds` | method_name:SymbolStr=[MethodBinding.default_copy_bound_return,pass:scan_param_bounds] | param=1 |
-| `src/compiler/sema/method_binding.cryo:563` | `scan_param_bounds` | method_name:SymbolStr=[MethodBinding.trait_declared_return] | param=4 |
-| `src/compiler/sema/method_binding.cryo:778` | `scan_projection_bounds` | method_name:SymbolStr=[MethodBinding.bound_trait_declaring] | param=2 |
-| `src/compiler/sema/method_binding.cryo:832` | `subst_bound_trait_args` | trait_leaf:SymbolStr=[] | ast=3,local=1 |
-| `src/compiler/sema/pattern_resolver.cryo:116` | `note_alias_binding` | name:SymbolStr=[store:.push] | ast=3 |
-| `src/compiler/sema/scope_manager.cryo:117` | `register_local` | name:SymbolStr=[pass:register_local_with_mut] | ast=5 |
-| `src/compiler/sema/scope_manager.cryo:125` | `register_local_with_mut` | name:SymbolStr=[] | ast=11,field=1,local=1,param=1 |
-| `src/compiler/sema/sema.cryo:430` | `declare_async_methods` | written:SymbolStr=[pass:reject_undeclarable_async] | ast=4 |
-| `src/compiler/sema/sema.cryo:470` | `reject_undeclarable_async` | written:SymbolStr=[pass:resolve] | param=1 |
-| `src/compiler/sema/sema.cryo:2004` | `build_operator_call` | method:SymbolStr=[] | local=2 |
-| `src/compiler/sema/sema.cryo:3608` | `fill_field_default` | name:SymbolStr=[format,pass:resolve] | local=1 |
-| `src/compiler/sema/type_utils.cryo:195` | `lookup_func_type_exact` | leaf:SymbolStr=[pass:lookup_func_type] | ast=1 |
-| `src/compiler/types/arena.cryo:616` | `create_generic_param` | name:SymbolStr=[] | ast=14,element=1 |
-| `src/compiler/types/arena.cryo:633` | `this_placeholder` | name:SymbolStr=[] | literal=5 |
-| `src/compiler/types/arena.cryo:868` | `swap_wrapper_to_concrete` | qualified_spec:SymbolStr=[] | local=1 |
-| `src/compiler/types/generic.cryo:36` | `GenericParamType` | param_name:SymbolStr=[] | - |
-| `src/compiler/types/generic.cryo:199` | `AssocProjectionType` | member:SymbolStr=[] | - |
-| `src/compiler/types/generic_registry.cryo:96` | `new` | name:SymbolStr=[]; qualified_name:SymbolStr=[]; param_names:SymbolStr[]=[] | ast=1,identity=2,local=5,param=1 |
-| `src/compiler/types/generic_registry.cryo:150` | `spec_qualified_name` | spec:SymbolStr=[pass:resolve] | local=1 |
-| `src/compiler/types/generic_registry.cryo:1462` | `member_template_key` | owner:SymbolStr=[pass:resolve]; member:SymbolStr=[pass:resolve] | ast=1,param=1 |
-| `src/compiler/types/ownership.cryo:830` | `leaf_segment` | qname:SymbolStr=[pass:resolve] | field=1 |
-| `src/compiler/types/resolver.cryo:145` | `add_binding` | name:SymbolStr=[] | ast=24,element=2,field=1 |
-| `src/compiler/types/user_defined.cryo:43` | `new` | name:SymbolStr=[] | ast=8,element=2,local=1 |
-| `src/compiler/types/user_defined.cryo:90` | `new` | name:SymbolStr=[] | ast=1 |
-| `src/compiler/types/user_defined.cryo:114` | `new` | name:SymbolStr=[] | ast=1,field=1 |
-| `src/compiler/types/user_defined.cryo:174` | `StructType` | qualified_name:SymbolStr=[] | - |
-| `src/compiler/types/user_defined.cryo:320` | `ClassType` | qualified_name:SymbolStr=[] | - |
-| `src/compiler/types/user_defined.cryo:456` | `EnumType` | qualified_name:SymbolStr=[] | - |
-| `src/compiler/types/user_defined.cryo:583` | `TraitType` | qualified_name:SymbolStr=[] | - |
-| `src/compiler/types/user_defined.cryo:597` | `add_assoc_type` | name:SymbolStr=[store:.push] | ast=1 |
-| `src/compiler/types/user_defined.cryo:632` | `TypeAliasType` | alias_name:SymbolStr=[] | - |
-| `src/compiler/types/user_defined.cryo:677` | `FunctionTemplateType` | qualified_name:SymbolStr=[] | - |
+| `src/compiler/codegen/visit/ir_generator.cryo:1098` | `codegen_struct_literal` | field_names:SymbolStr[]=[CodegenContext.resolve,format] | local=1 |
 
