@@ -1,0 +1,323 @@
+/// The spelling-lookup check: a spelling is looked up only through a door.
+///
+/// A function handed a spelling - a parameter of type `SymbolStr` or
+/// `QualifiedName`, by value, behind a reference or as an array's element -
+/// may carry it: store it, return it, hand it to another function or to a
+/// door.  It may not look anything up by it itself, unless it is a door or
+/// its declaration says why with `![allow(lookup_by_spelling, reason =
+/// "...")]`.  A receiver is the method's owner, not a spelling it was
+/// handed, and is not followed.
+///
+/// Sema follows each such parameter through the function's body.  A value
+/// holds the parameter's spelling when it is the parameter, a local whose
+/// initializer or an assignment to it held it, or text computed from it:
+/// read through `&`, `*` or a cast, an element or a text member read off it,
+/// concatenated, chosen by a conditional, or the text a call other than a
+/// door's returns when it is handed it.  A `SymbolStr`'s number is its
+/// spelling, so a number read off one (`name.id`) holds it too; any other
+/// number - a length, a depth - does not.  The spelling is looked up where
+/// it is:
+///
+///   * the key handed to a hash table (`HashMap` or `HashSet`);
+///   * an operand of `==` or `!=`;
+///   * handed to a call that answers a `boolean` and is handed text besides
+///     it, when the call is an operation of text (its receiver is text) or
+///     is handed the spelling as plain text: an equality, a prefix test, a
+///     search of an array of names;
+///   * the subject of a `match`.
+///
+/// The check reaches as far as one function.  A spelling handed to another
+/// function is that function's to look up, and the refusal is there.
+namespace compiler::sema::spelling_lookup;
+
+import compiler::ast;
+import compiler::ast::{ NodeKind };
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::declaration::{ FunctionDeclNode, VarDeclNode };
+import compiler::ast::expression::{
+    ArrayAccessNode, BinaryExprNode, CallExprNode, CastExprNode, ExpressionNode, IdentifierNode,
+    IfExprNode, MemberAccessNode, TernaryExprNode, UnaryExprNode
+};
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::decl_index::{ OverloadId };
+import compiler::diag;
+import compiler::diag::{ ErrorCode };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::lex::{ TokenType };
+import compiler::passes::directive_processing::{ CompilerText, DirectiveProcessingPasses };
+import compiler::resolver::res::{ Res, ResSlot };
+import compiler::resolver::symbol_id::{ SymbolKey };
+import compiler::sema::call_facts::{ CallFacts };
+import compiler::sema::identity_text::{ IdentityTextCheck };
+import compiler::sema::state::{ SemaState };
+import compiler::types;
+import compiler::types::{ TypeKind };
+import compiler::types::compound::{ ArrayType, PointerType, ReferenceType };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import std::collections::hashmap;
+import std::collections::hashmap::{ HashMap };
+import std::core::option;
+import std::core::option::{ Option };
+import std::fmt;
+import utils::text::{ Text };
+
+/// How deep an expression is followed into its operands.
+const SPELLING_DEPTH: i32 = 24;
+
+type struct SpellingLookupCheck {}
+
+implement struct SpellingLookupCheck {
+    /// Start checking `func`'s body: each parameter carrying a spelling type
+    /// holds its own spelling, unless the function is a door or allowed.
+    static enter(ctx: CompilationContext*, state: SemaState*, func: FunctionDeclNode*) -> void {
+        state.spelling_on = false;
+        state.spelling_locals = HashMap::<SymbolKey, i64>::new();
+        state.spelling_refused = [];
+        if (func == null || func.is_synth_default) { return; }
+        if (IdentityTextCheck::function_is_exempt(ctx, func)) { return; }
+        for (mut i: i64 = 0; i < func.parameters.length; i++) {
+            state.spelling_refused.push(false);
+            const p: VarDeclNode* = func.parameters[i];
+            if (p == null || p.is_receiver() || !p.resolved_type.is_valid() || !p.sym_id.is_valid()) { continue; }
+            if (DirectiveProcessingPasses::spelling_type_of(ctx, p.resolved_type).length() == 0) { continue; }
+            state.spelling_locals.insert(p.sym_id.table_key(), i);
+            state.spelling_on = true;
+        }
+    }
+
+    /// Whether a value of type `ty` is text: a `string`, a `SymbolStr` or a
+    /// `QualifiedName`, directly or through a reference, a pointer or an
+    /// array.
+    static is_text(ctx: CompilationContext*, ty: TypeRef) -> boolean {
+        mut cur: TypeRef = ty;
+        for (mut depth: i32 = 0; depth < 8; depth++) {
+            if (!cur.is_valid()) { return false; }
+            const t: Type* = ctx.type_arena.lookup(cur);
+            if (t == null) { return false; }
+            match (t.kind) {
+                TypeKind::Reference => { cur = (t as ReferenceType*).referent; }
+                TypeKind::Pointer   => { cur = (t as PointerType*).pointee; }
+                TypeKind::Array     => { cur = (t as ArrayType*).element; }
+                TypeKind::String    => { return true; }
+                _                   => {
+                    return match (DirectiveProcessingPasses::compiler_text_of(ctx, cur)) {
+                        CompilerText::Symbol    => { true }
+                        CompilerText::Qualified => { true }
+                        _                       => { false }
+                    };
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Whether a value of type `ty` is a `SymbolStr`, directly or through a
+    /// reference or a pointer: the type whose number is its spelling.
+    static is_symbol(ctx: CompilationContext*, ty: TypeRef) -> boolean {
+        mut cur: TypeRef = ty;
+        for (mut depth: i32 = 0; depth < 8; depth++) {
+            if (!cur.is_valid()) { return false; }
+            const t: Type* = ctx.type_arena.lookup(cur);
+            if (t == null) { return false; }
+            match (t.kind) {
+                TypeKind::Reference => { cur = (t as ReferenceType*).referent; }
+                TypeKind::Pointer   => { cur = (t as PointerType*).pointee; }
+                _                   => {
+                    return match (DirectiveProcessingPasses::compiler_text_of(ctx, cur)) {
+                        CompilerText::Symbol => { true }
+                        _                    => { false }
+                    };
+                }
+            }
+        }
+        return false;
+    }
+
+    /// The position of the parameter whose spelling `e` holds, as the header
+    /// says, or -1 when it holds none.
+    static origin(ctx: CompilationContext*, state: SemaState*, e: ExpressionNode*, depth: i32) -> i64 {
+        if (e == null || depth > SPELLING_DEPTH) { return -1; }
+        const n: ASTNode* = e as ASTNode*;
+        if (n.kind == NodeKind::Identifier) {
+            match ((e as IdentifierNode*).res) {
+                ResSlot::Answered(r) => {
+                    match (r) {
+                        Res::Local(sym) => {
+                            return match (state.spelling_locals.get(&sym.table_key())) {
+                                Option::Some(i) => { i }
+                                Option::None    => { -1 }
+                            };
+                        }
+                        _ => { return -1; }
+                    }
+                }
+                _ => { return -1; }
+            }
+        }
+        if (n.kind == NodeKind::UnaryExpression) {
+            return SpellingLookupCheck::origin(ctx, state, (e as UnaryExprNode*).operand, depth + 1);
+        }
+        if (n.kind == NodeKind::CastExpression) {
+            return SpellingLookupCheck::origin(ctx, state, (e as CastExprNode*).expression, depth + 1);
+        }
+        if (n.kind == NodeKind::MemberAccess) {
+            const obj: ExpressionNode* = (e as MemberAccessNode*).object;
+            if (!SpellingLookupCheck::is_text(ctx, e.resolved_type)
+                    && !SpellingLookupCheck::is_symbol(ctx, obj.resolved_type)) {
+                return -1;
+            }
+            return SpellingLookupCheck::origin(ctx, state, obj, depth + 1);
+        }
+        if (!SpellingLookupCheck::is_text(ctx, e.resolved_type)) { return -1; }
+        if (n.kind == NodeKind::ArrayAccess) {
+            return SpellingLookupCheck::origin(ctx, state, (e as ArrayAccessNode*).array, depth + 1);
+        }
+        if (n.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = e as BinaryExprNode*;
+            const l: i64 = SpellingLookupCheck::origin(ctx, state, b.left, depth + 1);
+            if (l >= 0) { return l; }
+            return SpellingLookupCheck::origin(ctx, state, b.right, depth + 1);
+        }
+        if (n.kind == NodeKind::TernaryExpression) {
+            const t: TernaryExprNode* = e as TernaryExprNode*;
+            const a: i64 = SpellingLookupCheck::origin(ctx, state, t.true_expr, depth + 1);
+            if (a >= 0) { return a; }
+            return SpellingLookupCheck::origin(ctx, state, t.false_expr, depth + 1);
+        }
+        if (n.kind == NodeKind::IfExpression) {
+            const ie: IfExprNode* = e as IfExprNode*;
+            const a: i64 = SpellingLookupCheck::origin(ctx, state, ie.then_expr, depth + 1);
+            if (a >= 0) { return a; }
+            return SpellingLookupCheck::origin(ctx, state, ie.else_expr, depth + 1);
+        }
+        if (n.kind == NodeKind::CallExpression) {
+            const call: CallExprNode* = e as CallExprNode*;
+            if (SpellingLookupCheck::calls_door(ctx, call)) { return -1; }
+            const recv: ExpressionNode* = SpellingLookupCheck::receiver_of(call);
+            const r: i64 = SpellingLookupCheck::origin(ctx, state, recv, depth + 1);
+            if (r >= 0) { return r; }
+            for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                const a: i64 = SpellingLookupCheck::origin(ctx, state, call.arguments[i], depth + 1);
+                if (a >= 0) { return a; }
+            }
+        }
+        return -1;
+    }
+
+    /// The receiver `call` is made on, or null for a call that names no
+    /// receiver.
+    static receiver_of(call: CallExprNode*) -> ExpressionNode* {
+        const cn: ASTNode* = call.callee as ASTNode*;
+        if (cn == null || cn.kind != NodeKind::MemberAccess) { return null; }
+        return (call.callee as MemberAccessNode*).object;
+    }
+
+    /// Whether `call` is a door's.
+    static calls_door(ctx: CompilationContext*, call: CallExprNode*) -> boolean {
+        const entry: OverloadId = CallFacts::callee_entry(ctx, call).entry;
+        return DirectiveProcessingPasses::is_door(ctx.decl_index.entry_decl(entry));
+    }
+
+    /// Record the local `var_node` declares as holding a parameter's spelling
+    /// when its initializer does.
+    static note_local(ctx: CompilationContext*, state: SemaState*, var_node: VarDeclNode*) -> void {
+        if (!state.spelling_on || var_node == null || !var_node.sym_id.is_valid()) { return; }
+        const o: i64 = SpellingLookupCheck::origin(ctx, state, var_node.initializer, 0);
+        if (o >= 0) { state.spelling_locals.insert(var_node.sym_id.table_key(), o); }
+    }
+
+    /// Record the local an assignment writes as holding a parameter's
+    /// spelling when the value it is given does, and refuse a comparison of
+    /// one.  A local once holding it stays so.
+    static check_binary(ctx: CompilationContext*, state: SemaState*, bin: BinaryExprNode*) -> void {
+        if (!state.spelling_on || bin == null) { return; }
+        if (bin.op.kind == TokenType::EqualEqual || bin.op.kind == TokenType::ExclaimEqual) {
+            mut o: i64 = SpellingLookupCheck::origin(ctx, state, bin.left, 0);
+            if (o < 0) { o = SpellingLookupCheck::origin(ctx, state, bin.right, 0); }
+            if (o >= 0) { SpellingLookupCheck::refuse(ctx, state, o, (bin as ASTNode*).span, Text::new("compared")); }
+            return;
+        }
+        if (!bin.op.kind.is_assignment_op()) { return; }
+        const ln: ASTNode* = bin.left as ASTNode*;
+        if (ln == null || ln.kind != NodeKind::Identifier) { return; }
+        const o: i64 = SpellingLookupCheck::origin(ctx, state, bin.right, 0);
+        if (o < 0) { return; }
+        match ((bin.left as IdentifierNode*).res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Local(sym) => { state.spelling_locals.insert(sym.table_key(), o); }
+                    _               => { }
+                }
+            }
+            _ => { }
+        }
+    }
+
+    /// Refuse a parameter's spelling handed to a hash table as its key, or
+    /// to a call answering a `boolean` that is handed text besides it - an
+    /// operation of the text itself (its receiver is text), or one handed the
+    /// spelling as plain text.  A spelling handed as a spelling to some other
+    /// function is that function's to look up.  A door's call is what a
+    /// spelling is for.
+    static check_call(ctx: CompilationContext*, state: SemaState*, call: CallExprNode*, ty: TypeRef) -> void {
+        if (!state.spelling_on || call == null) { return; }
+        if (SpellingLookupCheck::calls_door(ctx, call)) { return; }
+        if (IdentityTextCheck::is_table_call(ctx, call)) {
+            const k: i64 = SpellingLookupCheck::origin(ctx, state, call.arguments[0], 0);
+            if (k >= 0) {
+                SpellingLookupCheck::refuse(ctx, state, k, call.arguments[0].span, Text::new("the key of a hash table"));
+            }
+            return;
+        }
+        const t: Type* = ctx.type_arena.lookup(ty);
+        if (t == null || t.kind != TypeKind::Bool) { return; }
+        mut operands: ExpressionNode*[] = [];
+        const recv: ExpressionNode* = SpellingLookupCheck::receiver_of(call);
+        if (recv != null) { operands.push(recv); }
+        for (mut i: i64 = 0; i < call.arguments.length; i++) { operands.push(call.arguments[i]); }
+        const text_op: boolean = recv != null && SpellingLookupCheck::is_text(ctx, recv.resolved_type);
+        for (mut i: i64 = 0; i < operands.length; i++) {
+            const o: i64 = SpellingLookupCheck::origin(ctx, state, operands[i], 0);
+            if (o < 0) { continue; }
+            if (!text_op && DirectiveProcessingPasses::spelling_type_of(ctx, operands[i].resolved_type).length() > 0) {
+                continue;
+            }
+            for (mut j: i64 = 0; j < operands.length; j++) {
+                if (j != i && operands[j] != null && SpellingLookupCheck::is_text(ctx, operands[j].resolved_type)) {
+                    SpellingLookupCheck::refuse(ctx, state, o, (call as ASTNode*).span, Text::new("compared"));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Refuse a parameter's spelling as a `match`'s subject.
+    static check_match(ctx: CompilationContext*, state: SemaState*, subject: ExpressionNode*) -> void {
+        if (!state.spelling_on || subject == null) { return; }
+        const o: i64 = SpellingLookupCheck::origin(ctx, state, subject, 0);
+        if (o >= 0) {
+            SpellingLookupCheck::refuse(ctx, state, o, subject.span, Text::new("the subject of a `match`"));
+        }
+    }
+
+    /// E0157 at parameter `index` of the function being checked, once per
+    /// parameter, naming `site` as where it is looked up.
+    static refuse(ctx: CompilationContext*, state: SemaState*, index: i64, site: SourceSpan, how: Text) -> void {
+        const f: FunctionDeclNode* = state.current_func;
+        if (f == null || index >= state.spelling_refused.length || state.spelling_refused[index]) { return; }
+        state.spelling_refused[index] = true;
+        const p: VarDeclNode* = f.parameters[index];
+        const msg: string = fmt::format("`%s` takes a spelling: parameter `%s` carries a `%s`",
+            ctx.intern_table.resolve(f.name), ctx.intern_table.resolve(p.name),
+            DirectiveProcessingPasses::spelling_type_of(ctx, p.resolved_type));
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0157_LOOKUP_BY_SPELLING, Text::new(msg));
+        diag = diag.at(p.span);
+        diag = diag.also_at(site, Text::new(fmt::format("looked up here, outside a door: %s", how.as_string())));
+        diag = diag.help(Text::new(
+            "take the identity the spelling names, or say why it cannot: `![allow(lookup_by_spelling, reason = \"...\")]` on the declaration"));
+        ctx.emit_diagnostic(diag);
+    }
+}

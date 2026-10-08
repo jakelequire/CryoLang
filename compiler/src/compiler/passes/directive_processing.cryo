@@ -33,9 +33,10 @@
 ///   ![allow(name)] / ![warn(name)] / ![deny(name)] : lint level; each
 ///                                 takes an optional `reason = "..."`
 ///   ![allow(lookup_by_spelling, reason = "...")] : function / method: it
-///                                 takes a spelling type; the reason says why
-///                                 (without it, a declaration that is not a
-///                                 door is E0157)
+///                                 looks up by a spelling it is handed; the
+///                                 reason says why (without it, a lookup
+///                                 outside a door is E0157, from sema's
+///                                 `SpellingLookupCheck`)
 ///   ![derive(Trait, ...)]     : struct/class/enum: traits to auto-derive
 ///
 /// Unknown directive names are accepted and recorded but otherwise inert.
@@ -98,8 +99,8 @@ const LOOKUP_BY_SPELLING: string = "lookup_by_spelling";
 const DOOR_MARKER: string = "/// Door `";
 
 /// The compiler's own text types, listed by the qualified names their
-/// declarations give them: two spellings, which the spelling lint refuses
-/// as a parameter, and a definition's name read off it, which the
+/// declarations give them: two spellings, which the spelling-lookup check
+/// follows from a parameter, and a definition's name read off it, which the
 /// identity-text check follows.
 type enum CompilerText {
     Other;
@@ -1434,7 +1435,7 @@ type struct DirectiveProcessingPasses {
     }
 
 
-    // The spelling lint
+    // The spelling types, and the store-key lint
 
     /// The name of the spelling type a parameter of type `ty` carries - by
     /// value, behind a reference, or as an array's element - or "" when it
@@ -1512,32 +1513,6 @@ type struct DirectiveProcessingPasses {
         return (decl as DeclarationNode*).documentation.starts_with(DOOR_MARKER);
     }
 
-    /// E0157 at every parameter of `f` that carries a spelling type, unless
-    /// `decl` - the declaration carrying `f`'s doc comment and directives - is
-    /// a door, or its directives allow `lookup_by_spelling`.  A receiver is
-    /// the method's owner, not an argument it was handed, and is never
-    /// linted.
-    static lint_spelling_params(ctx: CompilationContext*, f: FunctionDeclNode*,
-                                decl: ASTNode*, dirs: &DirectiveNode*[]) -> void {
-        if (f == null || DirectiveProcessingPasses::is_door(decl)
-                || DirectiveProcessingPasses::allows_spelling(dirs)) {
-            return;
-        }
-        for (mut i: i64 = 0; i < f.parameters.length; i++) {
-            const p: VarDeclNode* = f.parameters[i];
-            if (p == null || p.is_receiver() || !p.resolved_type.is_valid()) { continue; }
-            const spelling: string = DirectiveProcessingPasses::spelling_type_of(ctx, p.resolved_type);
-            if (spelling.length() == 0) { continue; }
-            const msg: string = fmt::format("`%s` takes a spelling: parameter `%s` carries a `%s`",
-                ctx.intern_table.resolve(f.name), ctx.intern_table.resolve(p.name), spelling);
-            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0157_LOOKUP_BY_SPELLING, Text::new(msg));
-            diag = diag.at(p.span);
-            diag = diag.help(Text::new(
-                "take the identity the spelling names, or say why it cannot: `![allow(lookup_by_spelling, reason = \"...\")]` on the declaration"));
-            ctx.emit_diagnostic(diag);
-        }
-    }
-
     /// The root namespace whose modules keep the compiler's declaration
     /// stores: the one the spelling types above are declared under.  A store
     /// is a table the compiler answers names from, so the key lint covers
@@ -1603,40 +1578,23 @@ type struct DirectiveProcessingPasses {
         }
     }
 
-    /// Lint every function and method this module declares.  A method cloned
-    /// from a trait's default body is skipped: its declaration is the
-    /// trait's, which carries no directives of its own to allow it with.
+    /// Lint the fields of every type this module declares, when it is one of
+    /// the compiler's own.  A spelling a function is handed is checked where
+    /// it is looked up, by sema's `SpellingLookupCheck`.
     static run_spelling_lint(ctx: CompilationContext*, root: ProgramNode*) -> void {
-        const stores: boolean = DirectiveProcessingPasses::in_store_root(ctx);
+        if (!DirectiveProcessingPasses::in_store_root(ctx)) { return; }
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
-            if (stmt.kind == NodeKind::FunctionDeclaration) {
-                const fd: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                DirectiveProcessingPasses::lint_spelling_params(ctx, fd, stmt, &fd.attached_directives);
-                continue;
-            }
-            const empty_methods: MethodNode*[] = [];
-            mut methods: &MethodNode*[] = &empty_methods;
             if (stmt.kind == NodeKind::StructDeclaration) {
                 const sd: StructDeclNode* = stmt as StructDeclNode*;
-                methods = &sd.methods;
-                if (stores) { DirectiveProcessingPasses::lint_store_keys(ctx, Text::new(ctx.intern_table.resolve(sd.name)), &sd.fields); }
+                DirectiveProcessingPasses::lint_store_keys(ctx, Text::new(ctx.intern_table.resolve(sd.name)), &sd.fields);
             } else if (stmt.kind == NodeKind::UnionDeclaration) {
                 const ud: UnionDeclNode* = stmt as UnionDeclNode*;
-                methods = &ud.methods;
-                if (stores) { DirectiveProcessingPasses::lint_store_keys(ctx, Text::new(ctx.intern_table.resolve(ud.name)), &ud.fields); }
+                DirectiveProcessingPasses::lint_store_keys(ctx, Text::new(ctx.intern_table.resolve(ud.name)), &ud.fields);
             } else if (stmt.kind == NodeKind::ClassDeclaration) {
                 const cd: ClassDeclNode* = stmt as ClassDeclNode*;
-                methods = &cd.methods;
-                if (stores) { DirectiveProcessingPasses::lint_store_keys(ctx, Text::new(ctx.intern_table.resolve(cd.name)), &cd.fields); }
-            } else if (stmt.kind == NodeKind::ImplementationBlock) {
-                methods = &(stmt as ImplBlockNode*).methods;
-            }
-            for (mut mi: i64 = 0; mi < methods.length; mi++) {
-                const m: MethodNode* = methods[mi];
-                if (m == null || m.func == null || m.func.is_synth_default) { continue; }
-                DirectiveProcessingPasses::lint_spelling_params(ctx, m.func, m as ASTNode*, &m.attached_directives);
+                DirectiveProcessingPasses::lint_store_keys(ctx, Text::new(ctx.intern_table.resolve(cd.name)), &cd.fields);
             }
         }
     }

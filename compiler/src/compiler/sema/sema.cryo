@@ -107,6 +107,7 @@ import compiler::resolver::symbol_id::{ SymbolID, SymbolKey };
 import compiler::sema::async_lower::{ AsyncLower, AsyncOwner };
 import compiler::sema::call_facts::{ CallFacts, FactsScope, LoopCounter };
 import compiler::sema::identity_text::{ IdentityTextCheck };
+import compiler::sema::spelling_lookup::{ SpellingLookupCheck };
 import compiler::sema::call_resolver::{ CallResolver };
 import compiler::sema::diagnostics::{ Diagnostics };
 import compiler::sema::dispatch::{ SemaDispatch };
@@ -958,6 +959,7 @@ public:
         this.state.current_func = func;
         this.state.identity_exempt = this.state.identity_text_on
             && IdentityTextCheck::function_is_exempt(this.ctx, func);
+        SpellingLookupCheck::enter(this.ctx, &this.state, func);
         this.state.in_lambda_depth     = 0;
         this.state.current_lambda      = null;
 
@@ -1175,6 +1177,7 @@ public:
     override visit(mut &this, node: MatchStmtNode*) -> void {
         const subject_type: TypeRef = this.resolve_expr(node.subject);
         this.record_match_facts(node.subject, &node.arms, (node as ASTNode*).span);
+        SpellingLookupCheck::check_match(this.ctx, &this.state, node.subject);
         const caller_backed: boolean = this.subject_is_caller_backed(node.subject);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
             const arm: MatchArmNode* = node.arms[i];
@@ -1447,6 +1450,7 @@ public:
                 }
             }
             IdentityTextCheck::note_local(this.ctx, &this.state, var_node);
+            SpellingLookupCheck::note_local(this.ctx, &this.state, var_node);
         }
 
     }
@@ -1684,6 +1688,7 @@ public:
     resolve_call_recorded(mut &this, call: CallExprNode*) -> TypeRef {
         const t: TypeRef = this.calls.resolve_call(this, call);
         IdentityTextCheck::check_call(this.ctx, &this.state, call);
+        SpellingLookupCheck::check_call(this.ctx, &this.state, call, t);
         if (this.ctx.options.emit_facts) {
             const known: boolean = this.state.facts_call == call;
             CallFacts::record(&this.facts_scope(), call, &this.state.facts_params, known);
@@ -1697,6 +1702,7 @@ public:
     resolve_binary_recorded(mut &this, bin: BinaryExprNode*) -> TypeRef {
         const t: TypeRef = this.resolve_binary(bin);
         IdentityTextCheck::note_assignment(this.ctx, &this.state, bin);
+        SpellingLookupCheck::check_binary(this.ctx, &this.state, bin);
         if (this.ctx.options.emit_facts) {
             CallFacts::record_compare(&this.facts_scope(), bin);
             CallFacts::record_assign(&this.facts_scope(), bin);
@@ -2920,6 +2926,7 @@ public:
     resolve_match_expr(mut &this, match_expr: MatchExprNode*) -> TypeRef {
         const subject_type: TypeRef = this.resolve_expr(match_expr.subject);
         this.record_match_facts(match_expr.subject, &match_expr.arms, (match_expr as ASTNode*).span);
+        SpellingLookupCheck::check_match(this.ctx, &this.state, match_expr.subject);
         const caller_backed: boolean = this.subject_is_caller_backed(match_expr.subject);
         this.patterns.check_duplicate_default_arm(match_expr.arms);
         const outer_expected: TypeRef = this.state.expected_type;

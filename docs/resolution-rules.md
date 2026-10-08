@@ -59,9 +59,19 @@ declare, before any module exists; the fixed
 primitive and language-item table; the interner; and diagnostic suggestions,
 whose result may flow only into message text.
 
-The compiler reads the same marker.  The spelling lint (E0157) accepts a
-door's spelling parameters without an allow, since the marker already says
-why the door takes one, and the rule-4 check does not check a door's body.
+The compiler reads the same marker, and checks rule three over every
+function handed a spelling (a parameter of type `SymbolStr` or
+`QualifiedName`).  Sema follows each such parameter through the body - into
+locals, through `&`, `*` and casts, element and text-member reads, a
+`SymbolStr`'s number, concatenation, conditionals, and the text a non-door
+call returns when handed it - and refuses it (E0157) where it is looked up:
+a hash table's key, an operand of `==` or `!=`, a boolean call that is an
+operation of text or is handed it as plain text, or a `match`'s subject.
+A function that only carries the spelling - stores it, returns it, hands it
+to another function or to a door - needs nothing.  A door's body is not
+checked, nor one whose declaration allows `lookup_by_spelling` with a
+reason; the rule-4 check skips the same bodies.  The check reaches one
+function: a spelling handed on is looked up, and refused, in the callee.
 
 `scripts/resolution-doors.py` (run by `make check-fast`) refuses the tree
 when this table and the doc-comment markers in `compiler/src` disagree in
