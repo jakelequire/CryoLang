@@ -484,8 +484,13 @@ public:
     /// because all of those are the same question about the same relation,
     /// and two copies of a reachability rule are two rules as soon as either
     /// is edited.
+    ///
+    /// With a `root`, the spelling continues a path that already named that
+    /// module - `J::Inner` once `J` named `Json` - and names a module whose
+    /// path is the root's followed by the spelling.  What the path reached
+    /// the root through makes it reachable, so such a module is visible.
     modules_written_as(&this, spelling: string,
-                       use_module: ModulePath) -> ModuleSpellingMatch {
+                       use_module: ModulePath, root: ModulePath) -> ModuleSpellingMatch {
         mut r: ModuleSpellingMatch = ModuleSpellingMatch {
             found:   ModulePath::none(),
             found_def: DefId::invalid(),
@@ -495,6 +500,9 @@ public:
             matched: 0,
         };
         if (this.module_graph == null || this.decl_index == null) { return r; }
+        const rooted: boolean = root.is_valid();
+        const rooted_length: u64 =
+            if (rooted) { this.intern_table.resolve(root.as_sym()).length() + 2 + spelling.length() } else { 0 };
         const count: i64 = this.module_graph.module_count() as i64;
         for (mut i: i64 = 0; i < count; i++) {
             const cand: ModuleInfo* = this.module_graph.get_module(i);
@@ -502,6 +510,8 @@ public:
             if (!cand_ns.is_valid()) { continue; }
             const cand_str: string = this.intern_table.resolve(cand_ns);
             if (!Resolver::ns_written_as(cand_str, spelling)) { continue; }
+            if (rooted && (cand_str.length() != rooted_length
+                           || !cand.path().is_within(root, this.intern_table))) { continue; }
             r.matched = r.matched + 1;
             if (r.matched == 1) { r.any = cand.path(); }
             // The same reachability relation same-leaf resolution uses: the
@@ -514,7 +524,8 @@ public:
             // the whole one - an abbreviation like `core::option` is a proper
             // suffix, its first segment is an interior segment binding nothing,
             // and it stays unreachable here.
-            const reachable: boolean = cand.path().equals(use_module)
+            const reachable: boolean = rooted
+                || cand.path().equals(use_module)
                 || cand_str.eq(spelling)
                 || this.decl_index.is_prelude_ns(cand.path())
                 || this.decl_index.ns_imports(use_module, cand.path());

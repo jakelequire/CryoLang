@@ -733,6 +733,24 @@ public:
         return r;
     }
 
+    /// The module a written path names through an import alias at its head:
+    /// `J::Inner` with `import Json as J;` is the module `Json::Inner`.  The
+    /// head is `bound`, the binding the caller already looked up, and each
+    /// later segment names a sub-module of the module before it.  A match
+    /// naming none when the head is no module alias or a segment names no
+    /// sub-module.
+    alias_path_match(&this, bound: SymbolID, path: string, use_module: ModulePath) -> ModuleSpellingMatch {
+        mut m: ModuleSpellingMatch = this.module_alias_match(bound);
+        if (m.visible != 1) { return m; }
+        const segs: QualifiedName = QualifiedName::parse(this.resolver.intern_table, path);
+        for (mut i: i64 = 1; i < segs.parts.length; i++) {
+            m = this.ctx.modules_written_as(
+                this.resolver.intern_table.resolve(segs.parts[i]), use_module, m.found);
+            if (m.visible != 1) { return m; }
+        }
+        return m;
+    }
+
     symbol_names_type(&this, s: &Symbol) -> boolean {
         if (s.kind == SymbolKind::Type || s.kind == SymbolKind::TypeAlias) { return true; }
         const tgt: SymbolID = this.resolver.import_target(s, Namespace::Type);
@@ -772,7 +790,7 @@ public:
             const aliased: ModuleSpellingMatch = this.module_alias_match(entry.sym);
             if (!this.symbol_names_type(&s) && aliased.visible != 1) { continue; }
             const name_str: string = this.resolver.intern_table.resolve(s.name);
-            const m: ModuleSpellingMatch = this.ctx.modules_written_as(name_str, unit);
+            const m: ModuleSpellingMatch = this.ctx.modules_written_as(name_str, unit, ModulePath::none());
             mut clash: ModulePath = if (m.visible >= 1) { m.found } else { ModulePath::none() };
             if (aliased.visible == 1 && m.visible >= 1 && m.found_def.equals(aliased.found_def)) {
                 clash = if (m.visible >= 2) { m.other } else { ModulePath::none() };
@@ -1739,7 +1757,7 @@ public:
 
         if (this.resolver.contains_separator(written)) {
             const prefix: string = QualifiedName::parent_of(written);
-            const mods: ModuleSpellingMatch = this.ctx.modules_written_as(prefix, use_module);
+            const mods: ModuleSpellingMatch = this.ctx.modules_written_as(prefix, use_module, ModulePath::none());
             if (mods.visible > 1) {
                 mut d: Diagnostic = Diagnostic::error(
                     ErrorCode::E0154_AMBIGUOUS_CALL,
@@ -1982,7 +2000,8 @@ public:
     /// binds in the writer's scope or spells a module path, never both, and
     /// which of the two it is has already been decided when this runs.
     walk_module_rooted_type(&this, written: string,
-                            use_module: ModulePath, span: SourceSpan) -> ResSlot {
+                            use_module: ModulePath, span: SourceSpan,
+                            out_module: ModuleSpellingMatch*) -> ResSlot {
         const prefix: string = QualifiedName::parent_of(written);
         if (prefix.length() == 0) { return ResSlot::Pending; }
         const leaf: string = QualifiedName::leaf_of(written);
@@ -1993,12 +2012,14 @@ public:
         // and its declarations are one segment deep - so the leaf is asked of
         // its export set and nothing else.  Asked of the current scope, which
         // is the writing scope for every caller.  A head bound to an import
-        // alias names the module the alias binds.
+        // alias names the module the alias binds, and the segments after it
+        // name that module's sub-modules; `out_module`, when given, receives
+        // the module the whole of `written` names that way.
         mut aliased: ModuleSpellingMatch = this.module_alias_match(SymbolID::invalid());
-        if (!this.resolver.contains_separator(prefix)) {
-            const head_bound: SymbolID = this.resolver.lookup(
-                this.resolver.intern_table.intern(prefix), this.resolver.current_scope);
-            if (head_bound.is_valid()) {
+        const head_bound: SymbolID = this.resolver.lookup(
+            this.resolver.intern_table.intern(QualifiedName::head_of(prefix)), this.resolver.current_scope);
+        if (head_bound.is_valid()) {
+            if (!this.resolver.contains_separator(prefix)) {
                 const hb: Symbol = this.resolver.get_symbol(head_bound);
                 const alias_ns: ModulePath = this.alias_module_of(&hb);
                 if (alias_ns.is_valid()) {
@@ -2007,14 +2028,15 @@ public:
                     if (!decl.is_valid()) { return ResSlot::Pending; }
                     return ResSlot::Answered(Res::Def(this.resolver.get_symbol(decl).def));
                 }
-                aliased = this.module_alias_match(head_bound);
             }
+            aliased = this.alias_path_match(head_bound, prefix, use_module);
+            if (out_module != null) { *out_module = this.alias_path_match(head_bound, written, use_module); }
         }
 
         // A spelling two reachable modules share names neither of them, so the
         // walk stops rather than picking one.
         const head: ModuleSpellingMatch =
-            if (aliased.visible == 1) { aliased } else { this.ctx.modules_written_as(prefix, use_module) };
+            if (aliased.visible == 1) { aliased } else { this.ctx.modules_written_as(prefix, use_module, ModulePath::none()) };
         if (head.visible != 1) { return ResSlot::Pending; }
 
         // The segment after the head resolves inside what the head named - the
@@ -2144,6 +2166,9 @@ public:
         const trailing: u32 = 1;
         mut base: ResBase = ResBase::PrimTy(node.scope_name);
         mut have_base: boolean = false;
+        // The module the segment names through an import alias at its head,
+        // which the walk below finds as it looks the head up.
+        mut through_alias: ModuleSpellingMatch = this.module_alias_match(SymbolID::invalid());
         if (binds_in_scope) {
             const s: Symbol = this.resolver.get_symbol(scope_sym);
             if (s.kind == SymbolKind::GenericParam) {
@@ -2156,7 +2181,7 @@ public:
             base = ResBase::PrimTy(node.scope_name);
             have_base = true;
         } else {
-            match (this.walk_module_rooted_type(written, use_module, node.scope_span)) {
+            match (this.walk_module_rooted_type(written, use_module, node.scope_span, &through_alias)) {
                 ResSlot::Answered(Res::Def(d)) => {
                     base = ResBase::Def(d);
                     have_base = true;
@@ -2203,10 +2228,12 @@ public:
             }
         }
         // A segment bound to an import alias names the module the alias
-        // binds; any other segment is asked as a module's spelling.
-        const aliased: ModuleSpellingMatch = this.module_alias_match(scope_sym);
+        // binds, and a path through one names a sub-module of it; any other
+        // segment is asked as a module's spelling.
+        const aliased: ModuleSpellingMatch =
+            if (binds_in_scope) { this.module_alias_match(scope_sym) } else { through_alias };
         const m: ModuleSpellingMatch =
-            if (aliased.visible == 1) { aliased } else { this.ctx.modules_written_as(written, use_module) };
+            if (aliased.visible == 1) { aliased } else { this.ctx.modules_written_as(written, use_module, ModulePath::none()) };
         const found:   ModulePath = m.found;
         const other:   ModulePath = m.other;
         const any:     ModulePath = m.any;
@@ -2604,12 +2631,12 @@ public:
                 // graph does not hold and the module lane below cannot see -
                 // so the path is module-rooted and the walk answers it.
                 if (this.alias_module_of(&hs).is_valid()) {
-                    return this.walk_module_rooted_type(written, ModulePath::none(), span);
+                    return this.walk_module_rooted_type(written, ModulePath::none(), span, null);
                 }
                 // The head names an import alias of a module: the path is
                 // rooted in that module.
                 if (this.module_alias_match(head_sym).visible == 1) {
-                    return this.walk_module_rooted_type(written, q_module, span);
+                    return this.walk_module_rooted_type(written, q_module, span, null);
                 }
             }
             // The head names neither a type nor a generic parameter, so the
@@ -2623,7 +2650,7 @@ public:
             if (q_module.is_valid()) {
                 const q_prefix: string = QualifiedName::parent_of(written);
                 const q_mods: ModuleSpellingMatch =
-                    this.ctx.modules_written_as(q_prefix, q_module);
+                    this.ctx.modules_written_as(q_prefix, q_module, ModulePath::none());
                 if (q_mods.matched > 0) {
                     // A module carries the written prefix, so the module lane
                     // owns this path: it answers, or the path is refused.  It
@@ -2633,7 +2660,7 @@ public:
                     // the writer cannot reach - recording a name the source may
                     // not legally spell as though it were fine.
                     const q_rooted: ResSlot =
-                        this.walk_module_rooted_type(written, q_module, span);
+                        this.walk_module_rooted_type(written, q_module, span, null);
                     if (!q_rooted.is_pending()) { return q_rooted; }
                 } else {
                     // No module in the program spells the prefix, so the head

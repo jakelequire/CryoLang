@@ -658,6 +658,13 @@ type struct ModuleLoader {
         // entry is a module, reports it when it is none.
         mut entry_owner_missing: i64[] = [];
         for (mut ii: i64 = 0; ii < scan.import_item_count; ii++) { entry_owner_missing.push(-1); }
+        // The file each import, and each brace entry, resolved to when it
+        // names a module; "" otherwise.  A body path through the binding
+        // reaches that module's sub-modules.
+        mut import_files: string[] = [];
+        for (mut fi: i64 = 0; fi < scan.import_count; fi++) { import_files.push(""); }
+        mut item_files: string[] = [];
+        for (mut fi: i64 = 0; fi < scan.import_item_count; fi++) { item_files.push(""); }
         for (mut i: i64 = 0; i < scan.import_count; i++) {
             const import_path: string = scan.import_paths[i];
 
@@ -699,6 +706,8 @@ type struct ModuleLoader {
                     continue;
                 }
             }
+
+            import_files[i] = resolved;
 
             // Vendor import: record the library so its native link metadata
             // is merged into the link command after discovery.
@@ -771,6 +780,7 @@ type struct ModuleLoader {
                 if (!this.discover_module(intern, graph, sink, item_resolved, debug)) {
                     success = false;
                 }
+                item_files[ii] = item_resolved;
                 const by_path: i64 = graph.find_module_by_path(item_resolved);
                 if (by_path >= 0) {
                     info.add_imported_namespace(graph.modules[by_path].name);
@@ -793,6 +803,7 @@ type struct ModuleLoader {
             const item_sym: SymbolStr = intern.intern(item_path);
             const item_idx: i64 = graph.find_module_index(graph.module_of_written_path(item_sym));
             if (item_idx >= 0) {
+                item_files[ii] = graph.modules[item_idx].file_path;
                 info.add_imported_namespace(graph.modules[item_idx].name);
                 continue;
             }
@@ -804,6 +815,32 @@ type struct ModuleLoader {
             if (entry_owner_missing[ii] >= 0) {
                 sink.emit(this.module_not_found(file_path, &scan, entry_owner_missing[ii], item_path));
                 success = false;
+            }
+        }
+
+        // Sub-modules a body path names through an import's binding.  Loading
+        // is all this does: the path is resolved where it is written, and a
+        // loaded module is reachable by its path without an edge from here.
+        for (mut bp: i64 = 0; bp < scan.path_rests.length; bp++) {
+            const owner_file: string =
+                if (scan.path_imports[bp] >= 0) { import_files[scan.path_imports[bp]] } else { item_files[scan.path_items[bp]] };
+            if (owner_file.length() == 0) { continue; }
+            match (this.scanned_ns.get(&owner_file.to_ascii_lower())) {
+                Option::Some(owner_ns) => {
+                    const sub_ns: string = fmt::format("%s::%s", owner_ns, scan.path_rests[bp]);
+                    match (this.ns_map.get(&sub_ns)) {
+                        Option::Some(sub_file) => {
+                            if (debug) {
+                                cdebug(Text::new("[ModuleLoader]   path '%s' -> '%s'\n"), sub_ns, sub_file);
+                            }
+                            if (!this.discover_module(intern, graph, sink, sub_file, debug)) {
+                                success = false;
+                            }
+                        }
+                        Option::None => { }
+                    }
+                }
+                Option::None => { }
             }
         }
 
@@ -1046,6 +1083,8 @@ type struct ModuleLoader {
         mut import_spans: SourceSpan[] = [];
         mut import_entry_items: i64[] = [];
         mut import_items: string[] = [];
+        mut import_binds: string[] = [];
+        mut import_item_binds: string[] = [];
         mut exports: string[] = [];
         mut export_spans: SourceSpan[] = [];
         mut export_braced: boolean[] = [];
@@ -1114,6 +1153,9 @@ type struct ModuleLoader {
                         imports.push(path);
                         import_spans.push(path_span);
                         import_entry_items.push(-1);
+                        // A brace list binds its entries, not the path.
+                        const braced_import: boolean = i < len && tokens[i].kind == TokenType::LBrace;
+                        import_binds.push(if (braced_import) { "" } else { QualifiedName::leaf_of(path) });
                     }
 
                     // Brace list: `import A::B::{ X, Y };`.  The qualified-name
@@ -1140,6 +1182,12 @@ type struct ModuleLoader {
                                         export_items.push(item_path);
                                     } else {
                                         import_items.push(item_path);
+                                        import_item_binds.push(
+                                            if ((i + 1) < len && tokens[i].kind == TokenType::KwAs) {
+                                                tokens[i + 1].lexeme
+                                            } else {
+                                                QualifiedName::leaf_of(item)
+                                            });
                                     }
                                     // `X as Y`: the alias names the same module,
                                     // so the visibility edge is already recorded.
@@ -1177,12 +1225,17 @@ type struct ModuleLoader {
                     if (i < len) {
                         if (tokens[i].kind == TokenType::KwAs) {
                             i += 1;
+                            const alias: string = if (i < len) { tokens[i].lexeme } else { "" };
                             if (i < len) { i += 1; }
                             const owner: string = QualifiedName::parent_of(path);
                             if (!is_exp && owner.length() > 0) {
                                 imports[imports.length - 1] = owner;
                                 import_entry_items[import_entry_items.length - 1] = import_items.length;
+                                import_binds[import_binds.length - 1] = "";
                                 import_items.push(path);
+                                import_item_binds.push(alias);
+                            } else if (!is_exp) {
+                                import_binds[import_binds.length - 1] = alias;
                             }
                         }
                     }
@@ -1229,6 +1282,58 @@ type struct ModuleLoader {
             i += 1;
         }
 
+        // A path headed by an import's binding continues into the bound
+        // module's sub-modules: `J::Inner::deep()` names the module
+        // `J::Inner` when there is one, and no import discovers it.  Each
+        // proper prefix past the head is recorded - the last segment is the
+        // member the path ends at, never a module it passes through.
+        mut binds: string[] = [];
+        mut bind_imports: i64[] = [];
+        mut bind_items: i64[] = [];
+        for (mut k: i64 = 0; k < import_binds.length; k++) {
+            binds.push(import_binds[k]);
+            bind_imports.push(k);
+            bind_items.push(-1);
+        }
+        for (mut k: i64 = 0; k < import_item_binds.length; k++) {
+            binds.push(import_item_binds[k]);
+            bind_imports.push(-1);
+            bind_items.push(k);
+        }
+        mut path_imports: i64[] = [];
+        mut path_items: i64[] = [];
+        mut path_rests: string[] = [];
+        mut bi: i64 = i;
+        while (bi < len) {
+            const bt: Token = tokens[bi];
+            const starts_path: boolean =
+                (bt.kind == TokenType::Identifier || bt.kind.is_keyword())
+                && (bi + 2) < len && tokens[bi + 1].kind == TokenType::ColonColon
+                && (bi == 0 || tokens[bi - 1].kind != TokenType::ColonColon);
+            const bound: i64 = if (starts_path) { ModuleLoader::binding_of(&binds, bt.lexeme) } else { -1 };
+            if (bound < 0) {
+                bi += 1;
+                continue;
+            }
+            const by_import: i64 = bind_imports[bound];
+            const by_item: i64 = bind_items[bound];
+            mut p: i64 = bi + 2;
+            mut rest: string = "";
+            while ((p + 2) < len) {
+                const seg: Token = tokens[p];
+                const next: Token = tokens[p + 2];
+                if (!(seg.kind == TokenType::Identifier || seg.kind.is_keyword())) { break; }
+                if (tokens[p + 1].kind != TokenType::ColonColon) { break; }
+                if (!(next.kind == TokenType::Identifier || next.kind.is_keyword())) { break; }
+                rest = if (rest.length() == 0) { seg.lexeme } else { fmt::format("%s::%s", rest, seg.lexeme) };
+                path_imports.push(by_import);
+                path_items.push(by_item);
+                path_rests.push(rest);
+                p += 2;
+            }
+            bi = p;
+        }
+
         // The import/namespace scan above stops at the first declaration, but
         // f-strings live in function bodies, so do a separate full-stream pass
         // to detect whether this module uses one (drives discovery of the
@@ -1254,6 +1359,9 @@ type struct ModuleLoader {
             import_count:      import_count_val,
             import_items:      import_items,
             import_item_count: import_item_count_val,
+            path_imports:      path_imports,
+            path_items:        path_items,
+            path_rests:        path_rests,
             export_paths:      exports,
             export_spans:      export_spans,
             export_braced:     export_braced,
@@ -1264,6 +1372,15 @@ type struct ModuleLoader {
             submodule_count:   submodule_count_val,
             uses_fstring:      uses_fstring_val,
         };
+    }
+
+    /// The position in `binds`, the names a file's imports bind, of the
+    /// first that is `name`; -1 when none is.
+    static binding_of(binds: &string[], name: string) -> i64 {
+        for (mut k: i64 = 0; k < binds.length; k++) {
+            if (binds[k].eq(name)) { return k; }
+        }
+        return -1;
     }
 
     /// Collect a qualified name like "Foo::Bar::Baz" from the token stream.
@@ -1454,6 +1571,14 @@ type struct ModuleScanResult {
     /// `ns_imports` reported 68% of its visibility answers wrong.
     import_items:    string[];
     import_item_count: i64;
+    /// Paths in the file's body whose head is a name an import binds - an
+    /// import's last segment or alias, or a brace entry's: the
+    /// import or brace entry the head binds (the other -1), and each proper
+    /// prefix of the rest (`J::Inner::deep` gives `J`'s import + `Inner`).
+    /// Parallel.
+    path_imports:    i64[];
+    path_items:      i64[];
+    path_rests:      string[];
     /// `export` statements: the ModulePath each one names, and (for the brace
     /// form) each item expanded to a full path, exactly as the import lists
     /// above.  Held apart from them because the two produce different edges -

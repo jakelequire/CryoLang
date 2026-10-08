@@ -100,6 +100,19 @@ yet is recorded with the change that builds it, not here.
 
 163. **CI is out of scope until after the merge into `main`.**
 
+164. **The rule-2 table-key check applies to the compiler's own modules
+     only**: those whose path starts with `compiler`.
+
+165. **A path loads the sub-module it names.** `json::Inner::deep()`, or
+     `J::Inner::deep()` through an alias, loads `json::Inner` when nothing
+     imports it; the loader does not wait for an import.
+
+166. **The wordings chosen for rulings 4, 65, 113 and the rule-2 check are
+     accepted**: E0157 "`S.f` keys a table by `u32`, not by an identity";
+     E0205 "... it is imported"; E0154 "`put` is ambiguous: a non-generic and
+     a generic method of `Box2` both accept these arguments"; E0244's help
+     "rename the item `Json` or the module `A::Json`".
+
 149. **Ruling 109 is narrowed: the spelling lint (E0157) is door-only for
      LOOKUPS.**  A declaration's own name - registering it, printing it,
      mangling it, passing it along - is carried by a separate sealed type
