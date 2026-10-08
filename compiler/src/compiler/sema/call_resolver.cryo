@@ -1666,6 +1666,7 @@ type struct CallResolver {
                 if (param == null || !param.resolved_type.is_valid()) { continue; }
                 const arg: ExpressionNode* = call.arguments[i];
                 if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+                if (this.bind_from_variant_payload(&ictx, param.resolved_type, arg)) { continue; }
                 if (!this.free_infer_arg_reliable(arg)) { continue; }
                 const actual: TypeRef = arg.resolved_type;
                 if (!actual.is_valid()) { continue; }
@@ -1764,6 +1765,70 @@ type struct CallResolver {
         return this.promote_to_expected_instantiation(ty);
     }
 
+    /// The path naming a variant when `arg` is one - `E::V` or `E::V(..)` -
+    /// and null for any other argument.
+    static variant_scope_of(arg: ExpressionNode*) -> ScopeResolutionNode* {
+        mut scope: ScopeResolutionNode* = null;
+        if (arg.kind == NodeKind::ScopeResolution) {
+            scope = arg as ScopeResolutionNode*;
+        } else if (arg.kind == NodeKind::CallExpression) {
+            const callee: ExpressionNode* = (arg as CallExprNode*).callee;
+            if (callee != null && callee.kind == NodeKind::ScopeResolution) {
+                scope = callee as ScopeResolutionNode*;
+            }
+        }
+        if (scope == null) { return null; }
+        return match (scope.resolved_member) {
+            MemberPin::Variant(_) => { scope }
+            _                     => { null }
+        };
+    }
+
+    /// Bind what a variant argument's payload says about a generic call's
+    /// parameters.  A variant call typed as its generic enum - its payload
+    /// binds only the parameters that variant carries, so `Result::Ok(1)`
+    /// stays `Result` - is no binding as a whole, but its payload is:
+    /// `Ok(1)` makes the enum's `T` an `i32`, so for `r: Result<T, E>` the
+    /// call's `T` is `i32` and its `E` is left to the other arguments.
+    /// True when `arg` is such a variant, whatever its payload bound: the
+    /// enum's own parameters, which its type still carries, are no binding.
+    bind_from_variant_payload(&this, ictx: mut &InferCtx, param_ty: TypeRef, arg: ExpressionNode*) -> boolean {
+        if (arg.kind != NodeKind::CallExpression || !arg.resolved_type.is_valid()) { return false; }
+        const scope: ScopeResolutionNode* = CallResolver::variant_scope_of(arg);
+        if (scope == null) { return false; }
+        const enum_tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(arg.resolved_type);
+        if (enum_tmpl == null || !enum_tmpl.base_type.equals(arg.resolved_type)) { return false; }
+        if (!this.arena.inst_generic_base(param_ty).equals(enum_tmpl.base_type)) { return false; }
+        const et: Type* = this.arena.lookup(enum_tmpl.base_type);
+        if (et == null || et.kind != TypeKind::Enum) { return false; }
+        const variant: i64 = match (scope.resolved_member) {
+            MemberPin::Variant(v) => { v }
+            _                     => { -1 }
+        };
+        const variants: &EnumVariantInfo[] = &(et as EnumType*).variants;
+        if (variant < 0 || variant >= variants.length) { return true; }
+        const payload: &TypeRef[] = &variants[variant].payload_types;
+        const call: CallExprNode* = arg as CallExprNode*;
+        if (payload.length != call.arguments.length) { return true; }
+        mut enum_params: TypeRef[] = [];
+        for (mut i: i64 = 0; i < enum_tmpl.param_types.length; i++) { enum_params.push(enum_tmpl.param_types[i]); }
+        mut ectx: InferCtx = InferCtx::for_template(this.arena, enum_params);
+        for (mut k: i64 = 0; k < payload.length; k++) {
+            const a: ExpressionNode* = call.arguments[k];
+            if (a == null || !a.resolved_type.is_valid() || this.types.contains_generic_param(a.resolved_type)) {
+                continue;
+            }
+            ectx.unify(payload[k], a.resolved_type);
+        }
+        if (this.arena.inst_type_arg_count(param_ty) != ectx.bindings.length) { return true; }
+        for (mut j: i64 = 0; j < ectx.bindings.length; j++) {
+            if (ectx.bindings[j].is_valid()) {
+                ictx.unify(this.arena.inst_type_arg_at(param_ty, j), ectx.bindings[j]);
+            }
+        }
+        return true;
+    }
+
     /// A variant written as an argument types itself from its own payload,
     /// which binds only the parameters that variant carries:
     /// `Result::Ok(4)` for `r: Result<T, T>` leaves `E` of the enum unbound
@@ -1778,20 +1843,8 @@ type struct CallResolver {
             const arg: ExpressionNode* = call.arguments[i];
             const param: VarDeclNode* = tmpl.parameters[i];
             if (arg == null || param == null || !arg.has_resolved_type()) { continue; }
-            mut scope: ScopeResolutionNode* = null;
-            if (arg.kind == NodeKind::ScopeResolution) {
-                scope = arg as ScopeResolutionNode*;
-            } else if (arg.kind == NodeKind::CallExpression) {
-                const callee: ExpressionNode* = (arg as CallExprNode*).callee;
-                if (callee != null && callee.kind == NodeKind::ScopeResolution) {
-                    scope = callee as ScopeResolutionNode*;
-                }
-            }
+            const scope: ScopeResolutionNode* = CallResolver::variant_scope_of(arg);
             if (scope == null) { continue; }
-            match (scope.resolved_member) {
-                MemberPin::Variant(_) => { }
-                _                     => { continue; }
-            }
             const arg_tmpl: TemplateEntry* = this.ctx.generic_registry.template_of_type(arg.resolved_type);
             if (arg_tmpl == null || !arg_tmpl.base_type.equals(arg.resolved_type)) { continue; }
             const want: TypeRef = this.subst_free_call_return(entry, bindings, param.resolved_type);
@@ -5394,7 +5447,7 @@ type struct CallResolver {
     /// implementation is the receiver's - the first argument's type, behind
     /// any reference or pointer - and the method is the one that trait
     /// delivers for it, so a name two traits provide is chosen by naming
-    /// the trait, as Rust's `Trait::method(recv)` does.  Answers false when
+    /// the trait, `Trait::method(recv)`.  Answers false when
     /// the scope is not a trait, and true once the scope is a trait whether
     /// or not an implementation was found: the path names a trait's method
     /// and no other selector applies to it.  A static trait method takes no
@@ -5722,8 +5775,8 @@ type struct CallResolver {
     /// A call through a trait's path that no entry accepts because an
     /// argument is a SHARED reference where the parameter is an EXCLUSIVE
     /// one - `Iterator::next(&r)` against `next(mut &this)`.  A path call
-    /// does not re-borrow its arguments, as Rust's `Iterator::next(&r)` does
-    /// not, so the argument is refused, naming the parameter; the help
+    /// does not re-borrow its arguments: `&r` is not made `mut &r`,
+    /// so the argument is refused, naming the parameter; the help
     /// gives the spelling that borrows exclusively.  Cryo writes no
     /// exclusive borrow as an expression: passing the value itself does,
     /// as the method form `r.next()` does.  Reported only when an entry

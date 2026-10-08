@@ -344,6 +344,7 @@ public:
     override visit(mut &this, node: ProgramNode*) -> void {
         this.state.identity_text_on = IdentityTextCheck::applies(this.ctx);
         this.declare_async_futures(node);
+        this.type_unwritten_globals(node);
         for (mut i: i64 = 0; i < node.statements.length; i++) {
             const stmt: ASTNode* = node.statements[i];
             if (stmt == null) { continue; }
@@ -1243,7 +1244,34 @@ public:
     /// a local; the statement form and the for-loop form own those.
     override visit(mut &this, node: VarDeclNode*) -> void {
         if (node == null || !node.is_global) { return; }
+        if (this.typed_before_bodies(node)) { return; }
         this.check_var_decl(node);
+    }
+
+    /// Whether `node` is a module-level variable with no written type and an
+    /// initializer, which `type_unwritten_globals` checked before any body.
+    typed_before_bodies(&this, node: VarDeclNode*) -> boolean {
+        return node.type_annotation == null && node.has_initializer();
+    }
+
+    /// Check and register, before any body is checked, every module-level
+    /// variable whose type is its initializer's.  Type resolution registers a
+    /// global whose type is written; one with no written type has none until
+    /// its initializer is typed, and a body that reads it - in this module,
+    /// above or below it, or in a module that imports this one - finds it
+    /// only through its registration.
+    type_unwritten_globals(mut &this, root: ProgramNode*) -> void {
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null || stmt.kind != NodeKind::VariableDeclaration) { continue; }
+            const var_node: VarDeclNode* = stmt as VarDeclNode*;
+            if (!var_node.is_global || !this.typed_before_bodies(var_node)) { continue; }
+            const registered: boolean = var_node.resolved_type.is_valid();
+            this.check_var_decl(var_node);
+            if (!registered && var_node.resolved_type.is_valid()) {
+                TypeResolutionRunner::register_module_global(this.ctx, var_node);
+            }
+        }
     }
 
     /// Resolve and type-check one variable declaration: its annotation, its
@@ -2075,7 +2103,7 @@ public:
                               || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType;
         if (!is_user) { return null; }
         // The operator's trait is the language's (`std::core::ops::Add` for
-        // `+`, as Rust's `+` is `core::ops::Add`), by the identity its
+        // `+`), by the identity its
         // declaration claimed; the table spells the leaf and nothing else.
         // A type overloads when it has an impl of that trait; a user trait
         // of the same spelling is not it.
