@@ -59,6 +59,10 @@ declare, before any module exists; the fixed
 primitive and language-item table; the interner; and diagnostic suggestions,
 whose result may flow only into message text.
 
+The compiler reads the same marker.  The spelling lint (E0157) accepts a
+door's spelling parameters without an allow, since the marker already says
+why the door takes one, and the rule-4 check does not check a door's body.
+
 `scripts/resolution-doors.py` (run by `make check-fast`) refuses the tree
 when this table and the doc-comment markers in `compiler/src` disagree in
 either direction: a marker whose door is not listed here, or a row here whose
@@ -99,6 +103,24 @@ caller of a door, or an identity lookup.
 Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
+
+### 2026-10-08
+
+171. *(amended)* **The `Text` type is not deleted yet.**  Deleting it now
+     would weaken the Python gates' counts of functions that take a name,
+     which read a `string` parameter as one; `Text` is how message text drops
+     out of those counts.  It is deleted together with those gates, once
+     nothing treats a `string` parameter as a name.
+
+172. **The rule-4 self-check honours `![allow(lookup_by_spelling, reason =
+     "...")]` for now**, as the rule-2 check does.  The pending allows that
+     also exempt a body from it go when ruling 149's conversion deletes
+     them.
+
+173. **A shell redirect writes a job's log and nothing else** (`> log`, as
+     the long-job pattern in `CLAUDE.md` does).  A source, test, ledger or
+     scratch-script file is written with an editor, never through a
+     redirect.
 
 ### 2026-10-07
 
@@ -147,8 +169,9 @@ yet is recorded with the change that builds it, not here.
      `json::Inner::deep()` in a file with no `import json;` does not load
      `json::Inner`; a module must be imported to be visible.
 
-171. **The `Text` type is deleted if that is safe.**  It wraps a string and
-     `to_string()` unwraps it, so it seals nothing.
+171. *Amended by ruling 171 of 2026-10-08.* **The `Text` type is deleted if
+     that is safe.**  It wraps a string and `to_string()` unwraps it, so it
+     seals nothing.
 
 149. **Ruling 109 is narrowed: the spelling lint (E0157) is door-only for
      LOOKUPS.**  A declaration's own name - registering it, printing it,

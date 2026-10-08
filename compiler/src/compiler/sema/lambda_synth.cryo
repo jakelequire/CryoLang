@@ -60,7 +60,10 @@ import compiler::module_graph::{ ModulePath };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::sema::dispatch::{ SemaDispatch };
 import compiler::sema::scope_manager::{ ScopeManager };
-import compiler::sema::state::{ SemaState };
+import compiler::sema::state::{ LocalBinding, SemaState };
+import compiler::resolver::symbol_id::{ SymbolKey };
+import std::collections::hashset;
+import std::collections::hashset::{ HashSet };
 import compiler::sema::symbolic_checker::{ SymbolicChecker };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ FunctionType };
@@ -146,54 +149,47 @@ type struct LambdaSynth {
             node.set_return_type(ret_ty);
         }
 
-        // Save the enclosing frame, install a fresh one for the lambda body.
-        // HashMaps alias-and-restore (no drop on reassign);
-        // owning undo/payload arrays start empty and are exchanged via `swap`.
-        const saved_locals:    HashMap<u32, TypeRef>    = this.state.locals;
-        const saved_muts:      HashMap<u32, boolean>    = this.state.local_muts;
-        const saved_kw:        HashMap<u32, SourceSpan> = this.state.local_kw_spans;
-        mut saved_undo_keys: u32[]        = [];
-        mut saved_undo_prev: TypeRef[]    = [];
-        mut saved_undo_muts: boolean[]    = [];
-        mut saved_undo_kw:   SourceSpan[] = [];
+        // Save the enclosing frame, install a fresh one for the lambda body:
+        // the owning tables start empty and are exchanged via `swap`.
         const saved_ret:       TypeRef         = this.state.return_type;
         const saved_ret_ann:   TypeAnnotation* = this.state.return_type_ann;
         const saved_this:      TypeRef         = this.state.this_type;
         const saved_this_mut:  boolean         = this.state.this_is_mut;
         const saved_this_byref: boolean        = this.state.this_is_by_ref;
-        mut saved_payload:   u32[]             = [];
-        mut saved_alias:     u32[]             = [];
         const saved_expected:  TypeRef         = this.state.expected_type;
         const saved_loop:      i32             = this.state.loop_depth;
-        const saved_outer_locals: HashMap<u32, TypeRef> = this.state.lambda_outer_locals;
         const saved_lambda_depth: i32                   = this.state.in_lambda_depth;
         const saved_current_lam:  LambdaExprNode*       = this.state.current_lambda;
+        mut saved_bindings: HashMap<SymbolKey, LocalBinding> = HashMap::<SymbolKey, LocalBinding>::new();
+        mut saved_binding_undo: SymbolKey[] = [];
+        mut saved_binding_prev: LocalBinding[] = [];
+        mut saved_payload: HashSet<SymbolKey> = HashSet::<SymbolKey>::new();
+        mut saved_alias:   HashSet<SymbolKey> = HashSet::<SymbolKey>::new();
+        mut saved_outer:   HashMap<SymbolKey, TypeRef> = HashMap::<SymbolKey, TypeRef>::new();
+        swap(&this.state.bindings, &saved_bindings);
+        swap(&this.state.binding_undo, &saved_binding_undo);
+        swap(&this.state.binding_prev, &saved_binding_prev);
+        swap(&this.state.payload_bindings, &saved_payload);
+        swap(&this.state.alias_bindings, &saved_alias);
+        swap(&this.state.outer_bindings, &saved_outer);
 
-        // Compose the body's view of out-of-scope bindings: further-out captures
-        // plus immediate enclosing locals (the latter shadows the former).
-        mut new_outer_locals: HashMap<u32, TypeRef> = HashMap::<u32, TypeRef>::new();
-        mut outer_it: HashMapIter<u32, TypeRef> = saved_outer_locals.iter();
+        // Compose the body's view of out-of-scope bindings: further-out
+        // captures plus the enclosing frame's bindings.
+        mut outer_it: HashMapIter<SymbolKey, TypeRef> = saved_outer.iter();
         loop {
             match (outer_it.next()) {
-                Option::Some(pair) => { new_outer_locals.insert(pair.first, pair.second); }
+                Option::Some(pair) => { this.state.outer_bindings.insert(pair.first, pair.second); }
                 Option::None => { break; }
             }
         }
-        mut local_it: HashMapIter<u32, TypeRef> = saved_locals.iter();
+        mut local_it: HashMapIter<SymbolKey, LocalBinding> = saved_bindings.iter();
         loop {
             match (local_it.next()) {
-                Option::Some(pair) => { new_outer_locals.insert(pair.first, pair.second); }
+                Option::Some(pair) => { this.state.outer_bindings.insert(pair.first, pair.second.ty); }
                 Option::None => { break; }
             }
         }
 
-        this.state.locals         = HashMap::<u32, TypeRef>::new();
-        this.state.local_muts     = HashMap::<u32, boolean>::new();
-        this.state.local_kw_spans = HashMap::<u32, SourceSpan>::new();
-        swap(&this.state.undo_keys,     &saved_undo_keys);
-        swap(&this.state.undo_prev,     &saved_undo_prev);
-        swap(&this.state.undo_muts,     &saved_undo_muts);
-        swap(&this.state.undo_kw_spans, &saved_undo_kw);
         this.state.return_type     = ret_ty;
         this.state.return_type_ann = node.return_type_ann;
         // A lambda returns for itself, not for an enclosing `poll`: a `?` in its
@@ -204,19 +200,16 @@ type struct LambdaSynth {
         this.state.this_type       = TypeRef::invalid();
         this.state.this_is_mut     = false;
         this.state.this_is_by_ref  = false;
-        swap(&this.state.payload_binding_ids, &saved_payload);
-        swap(&this.state.alias_binding_ids, &saved_alias);
-        this.state.param_ids = [];
+        this.state.param_bindings = HashSet::<SymbolKey>::new();
         this.state.expected_type   = TypeRef::invalid();
         this.state.loop_depth      = 0;
-        this.state.lambda_outer_locals = new_outer_locals;
         this.state.in_lambda_depth     = saved_lambda_depth + 1;
         this.state.current_lambda      = node;
 
         for (mut pi: i64 = 0; pi < node.parameters.length; pi++) {
             const p: VarDeclNode* = node.parameters[pi];
             if (p == null) { continue; }
-            this.scopes.register_local_with_mut(p.name, p.resolved_type, p.is_mutable);
+            this.scopes.declare(p.sym_id, p.resolved_type, p.is_mutable);
         }
 
         if (node.body != null) {
@@ -224,24 +217,20 @@ type struct LambdaSynth {
         }
 
         // Restore the enclosing frame.
-        this.state.locals         = saved_locals;
-        this.state.local_muts     = saved_muts;
-        this.state.local_kw_spans = saved_kw;
-        swap(&this.state.undo_keys,     &saved_undo_keys);
-        swap(&this.state.undo_prev,     &saved_undo_prev);
-        swap(&this.state.undo_muts,     &saved_undo_muts);
-        swap(&this.state.undo_kw_spans, &saved_undo_kw);
+        swap(&this.state.bindings, &saved_bindings);
+        swap(&this.state.binding_undo, &saved_binding_undo);
+        swap(&this.state.binding_prev, &saved_binding_prev);
+        swap(&this.state.payload_bindings, &saved_payload);
+        swap(&this.state.alias_bindings, &saved_alias);
+        swap(&this.state.outer_bindings, &saved_outer);
         this.state.return_type     = saved_ret;
         this.state.return_type_ann = saved_ret_ann;
         this.state.async_poll_output = saved_poll_out;
         this.state.this_type       = saved_this;
         this.state.this_is_mut     = saved_this_mut;
         this.state.this_is_by_ref  = saved_this_byref;
-        swap(&this.state.payload_binding_ids, &saved_payload);
-        swap(&this.state.alias_binding_ids, &saved_alias);
         this.state.expected_type   = saved_expected;
         this.state.loop_depth      = saved_loop;
-        this.state.lambda_outer_locals = saved_outer_locals;
         this.state.in_lambda_depth     = saved_lambda_depth;
         this.state.current_lambda      = saved_current_lam;
 
@@ -251,7 +240,7 @@ type struct LambdaSynth {
             const prop_registry: GenericRegistry* = this.ctx.get_generic_registry();
             for (mut ci: i64 = 0; ci < node.captured_names.length; ci++) {
                 const cap_name: SymbolStr = node.captured_names[ci];
-                if (!this.scopes.lookup_local(cap_name).is_valid()) {
+                if (!this.scopes.type_of(node.captured_syms[ci]).is_valid()) {
                     const cap_ty: TypeRef = node.captured_types[ci];
                     saved_current_lam.add_capture(cap_name, node.captured_syms[ci],
                                                   cap_ty, node.captured_spans[ci]);
@@ -277,7 +266,7 @@ type struct LambdaSynth {
         if (!is_copy && this.state.current_lambda != null) {
             this.state.current_lambda.is_move = true;
         }
-        this.scopes.register_local(ident.name, outer_ty);
+        this.scopes.declare(ident.res.local_sym(), outer_ty, false);
         if (this.state.current_lambda != null) {
             this.state.current_lambda.add_capture(ident.name, ident.res.local_sym(),
                                                   outer_ty, ident.span);
@@ -553,7 +542,7 @@ type struct LambdaSynth {
         const cn: ASTNode* = call.callee as ASTNode*;
         if (cn.kind != NodeKind::Identifier) { return; }
         const ident: IdentifierNode* = call.callee as IdentifierNode*;
-        const local_ty: TypeRef = this.scopes.lookup_local(ident.name);
+        const local_ty: TypeRef = this.scopes.type_of(ident.res.local_sym());
         if (!this.is_closure_struct_type(local_ty)) { return; }
         ident.set_resolved_type(local_ty);
         const call_sym: SymbolStr = this.intern.intern("__call__");

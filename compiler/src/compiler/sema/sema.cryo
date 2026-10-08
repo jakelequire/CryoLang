@@ -103,7 +103,7 @@ import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::module_graph::{ ModulePath };
 import compiler::resolver::symbol_id;
-import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::resolver::symbol_id::{ SymbolID, SymbolKey };
 import compiler::sema::async_lower::{ AsyncLower, AsyncOwner };
 import compiler::sema::call_facts::{ CallFacts, FactsScope, LoopCounter };
 import compiler::sema::identity_text::{ IdentityTextCheck };
@@ -120,7 +120,7 @@ import compiler::sema::member_resolver::{ FieldAnswer, MemberResolver };
 import compiler::sema::method_binding::{ MethodBinding };
 import compiler::sema::pattern_resolver::{ PatternResolver };
 import compiler::sema::scope_manager::{ ScopeManager };
-import compiler::sema::state::{ SemaState };
+import compiler::sema::state::{ LocalBinding, SemaState };
 import compiler::sema::symbolic_checker::{ SymbolicChecker };
 import compiler::sema::type_utils::{ TypeUtils };
 import compiler::types::arena::{ TypeArena };
@@ -945,13 +945,7 @@ public:
     }
 
     enter_function(mut &this, func: FunctionDeclNode*, fn_this_type: TypeRef) -> void {
-        this.state.locals         = HashMap::<u32, TypeRef>::new();
-        this.state.local_muts     = HashMap::<u32, boolean>::new();
-        this.state.local_kw_spans = HashMap::<u32, SourceSpan>::new();
-        this.state.undo_keys      = [];
-        this.state.undo_prev      = [];
-        this.state.undo_muts      = [];
-        this.state.undo_kw_spans  = [];
+        this.scopes.reset();
         this.state.return_type     = func.resolved_return_type;
         this.state.return_type_ann = func.return_type_annotation;
         // Provenance for the body's annotations, from the declaration's own
@@ -959,16 +953,12 @@ public:
         this.state.async_poll_output = this.async_poll_output_of(func);
         this.state.this_type       = fn_this_type;
         this.state.this_is_mut = false;
-        this.state.payload_binding_ids = [];
-        this.state.alias_binding_ids = [];
         this.state.this_is_by_ref = false;
         this.state.receiver_sym = SymbolID::invalid();
-        this.state.param_ids = [];
         this.state.current_func = func;
         this.state.identity_exempt = this.state.identity_text_on
             && IdentityTextCheck::function_is_exempt(this.ctx, func);
         this.state.in_lambda_depth     = 0;
-        this.state.lambda_outer_locals = HashMap::<u32, TypeRef>::new();
         this.state.current_lambda      = null;
 
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
@@ -989,14 +979,14 @@ public:
                 this.state.this_is_mut = param.is_mutable;
                 this.state.this_is_by_ref = true;
             } else {
-                this.scopes.register_local_with_mut(param.name, ty, param.is_mutable);
-                this.scopes.record_local_kw_span(param.name, param.kw_span);
-                this.state.param_ids.push(param.name.id);
+                this.scopes.declare(param.sym_id, ty, param.is_mutable);
+                this.scopes.set_kw_span(param.sym_id, param.kw_span);
+                if (param.sym_id.is_valid()) { this.state.param_bindings.insert(param.sym_id.table_key()); }
             }
         }
-        if (fn_this_type.is_valid()) {
-            this.scopes.register_local_with_mut(this.this_sym, fn_this_type, this.state.this_is_mut);
-            this.state.param_ids.push(this.this_sym.id);
+        if (fn_this_type.is_valid() && this.state.receiver_sym.is_valid()) {
+            this.scopes.declare(this.state.receiver_sym, fn_this_type, this.state.this_is_mut);
+            this.state.param_bindings.insert(this.state.receiver_sym.table_key());
         }
     }
 
@@ -1466,31 +1456,30 @@ public:
     /// global by an earlier pass, and binding it here would shadow that global
     /// with a local for the rest of the module.
     register_var_decl_local(mut &this, var_node: VarDeclNode*) -> void {
+        mut ty: TypeRef = this.arena.get_void();
+        mut is_mut: boolean = var_node.is_mutable;
         if (var_node.resolved_type.is_valid()) {
-            this.scopes.register_local_with_mut(var_node.name, var_node.resolved_type, var_node.is_mutable);
+            ty = var_node.resolved_type;
         } else if (var_node.type_annotation != null && TypeAnnotation::refused(var_node.type_annotation)) {
             // The declaration named a type the name layer refused, reported
             // where it was written; bound with NO type, as a parameter is,
             // so a use of it is silent rather than a second report against
             // the initializer's type or `void`.
-            this.scopes.register_local_with_mut(var_node.name, TypeRef::invalid(), var_node.is_mutable);
+            ty = TypeRef::invalid();
         } else if (var_node.is_auto) {
             // A `for` loop's iterator binding left untyped: its scrutinee was
             // refused, or failed, where it was written.  Bound with no type,
             // so the `next` call the loop makes on it is silent rather than
             // a second report against the scrutinee's type or `void`.
-            this.scopes.register_local_with_mut(var_node.name, TypeRef::invalid(), var_node.is_mutable);
+            ty = TypeRef::invalid();
         } else if (var_node.has_initializer()) {
             const init_type: TypeRef = var_node.initializer.resolved_type;
-            if (init_type.is_valid()) {
-                this.scopes.register_local_with_mut(var_node.name, init_type, var_node.is_mutable);
-            } else {
-                this.scopes.register_local_with_mut(var_node.name, this.arena.get_void(), var_node.is_mutable);
-            }
+            if (init_type.is_valid()) { ty = init_type; }
         } else {
-            this.scopes.register_local(var_node.name, this.arena.get_void());
+            is_mut = false;
         }
-        this.scopes.record_local_kw_span(var_node.name, var_node.kw_span);
+        this.scopes.declare(var_node.sym_id, ty, is_mut);
+        this.scopes.set_kw_span(var_node.sym_id, var_node.kw_span);
     }
 
     override visit(mut &this, node: DestructureDeclNode*) -> void {
@@ -1543,13 +1532,13 @@ public:
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
             mut b: DestructureBinding = node.bindings[i];
             if (positions[i] < 0) {
-                this.scopes.register_local_with_mut(b.local_name, this.arena.get_void(), b.is_mutable);
+                this.scopes.declare(b.sym_id, this.arena.get_void(), b.is_mutable);
                 continue;
             }
             const field_type: TypeRef = fields_ptr[positions[i]].field_type;
             b.resolved_type = field_type;
             node.bindings[i] = b;
-            this.scopes.register_local_with_mut(b.local_name, field_type, b.is_mutable);
+            this.scopes.declare(b.sym_id, field_type, b.is_mutable);
         }
     }
 
@@ -1646,14 +1635,14 @@ public:
             }
             if (ty.is_valid()) { node.bindings[i].resolved_type = ty; }
             if (!ty.is_valid()) { ty = this.arena.get_void(); }
-            this.scopes.register_local_with_mut(b.local_name, ty, b.is_mutable);
+            this.scopes.declare(b.sym_id, ty, b.is_mutable);
         }
     }
 
     register_destructure_locals_void(mut &this, node: DestructureDeclNode*) -> void {
         for (mut i: i64 = 0; i < node.bindings.length; i++) {
             const b: DestructureBinding = node.bindings[i];
-            this.scopes.register_local_with_mut(b.local_name, this.arena.get_void(), b.is_mutable);
+            this.scopes.declare(b.sym_id, this.arena.get_void(), b.is_mutable);
         }
     }
 
@@ -1884,12 +1873,13 @@ public:
             if (this.state.this_type.is_valid()) { return this.state.this_type; }
             if (ident.resolved_type.is_valid()) { return ident.resolved_type; }
         }
-        const local: TypeRef = this.scopes.lookup_local(ident.name);
+        const sym: SymbolID = ident.res.local_sym();
+        const local: TypeRef = this.scopes.type_of(sym);
         if (local.is_valid()) { return local; }
         // Bound, with no type: the declaration failed to type and said so.
-        if (this.scopes.is_local_or_param(ident.name)) { return TypeRef::invalid(); }
+        if (this.scopes.binds(sym)) { return TypeRef::invalid(); }
         if (this.state.in_lambda_depth > 0 && this.state.current_lambda != null) {
-            match (this.state.lambda_outer_locals.get(&ident.name.id)) {
+            match (this.scopes.outer_type_of(sym)) {
                 Option::Some(outer_ty) => { return this.lambda.record_lambda_capture(ident, outer_ty); }
                 Option::None => { /* fall through */ }
             }
@@ -2623,31 +2613,24 @@ public:
             NodeKind::Identifier => {
                 const id: IdentifierNode* = lhs as IdentifierNode*;
                 if (this.names_receiver(id)) { return; }
-                match (this.state.local_muts.get(&id.name.id)) {
-                    Option::Some(is_mut) => {
-                        if (!is_mut) {
-                            const name_str: string = this.intern.resolve(id.name);
-                            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0218_IMMUTABLE_ASSIGNMENT,
-                                Text::new(fmt::format("cannot assign to immutable variable `%s`", name_str)));
-                            diag = diag.at_with_label(lhs.span, Text::new("this binding is immutable"));
-                            match (this.state.local_kw_spans.get(&id.name.id)) {
-                                Option::Some(kw) => {
-                                    const kw_len: u32 = if (kw.end_col > kw.start_col) { kw.end_col - kw.start_col } else { 0 };
-                                    if (kw_len == 0) {
-                                        diag = diag.suggest(Suggestion::machine_applicable(kw, Text::new("mut "), Text::new(fmt::format("make `%s` mutable", name_str))));
-                                    } else {
-                                        diag = diag.suggest(Suggestion::machine_applicable(kw, Text::new("mut"), Text::new(fmt::format("make `%s` mutable", name_str))));
-                                    }
-                                }
-                                Option::None => {
-                                    diag = diag.with_note(Text::new("declare the binding with `mut` instead of `const` to allow reassignment"));
-                                }
-                            }
-                            this.ctx.diagnostics.emit(diag);
-                        }
+                const sym: SymbolID = id.res.local_sym();
+                if (this.scopes.is_mutable(sym)) { return; }
+                const name_str: string = this.intern.resolve(id.name);
+                mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0218_IMMUTABLE_ASSIGNMENT,
+                    Text::new(fmt::format("cannot assign to immutable variable `%s`", name_str)));
+                diag = diag.at_with_label(lhs.span, Text::new("this binding is immutable"));
+                const kw: SourceSpan = this.scopes.kw_span_of(sym);
+                if (kw.has_location()) {
+                    const kw_len: u32 = if (kw.end_col > kw.start_col) { kw.end_col - kw.start_col } else { 0 };
+                    if (kw_len == 0) {
+                        diag = diag.suggest(Suggestion::machine_applicable(kw, Text::new("mut "), Text::new(fmt::format("make `%s` mutable", name_str))));
+                    } else {
+                        diag = diag.suggest(Suggestion::machine_applicable(kw, Text::new("mut"), Text::new(fmt::format("make `%s` mutable", name_str))));
                     }
-                    Option::None => {}
+                } else {
+                    diag = diag.with_note(Text::new("declare the binding with `mut` instead of `const` to allow reassignment"));
                 }
+                this.ctx.diagnostics.emit(diag);
             }
             NodeKind::MemberAccess => {
                 const ma: MemberAccessNode* = lhs as MemberAccessNode*;
@@ -3086,39 +3069,37 @@ public:
         this.state.symbolic_narrow_types.push(arm_ref);
 
         // Collect the locals whose type names the scrutinee param first - `T`
-        // itself, or `&T`, `T*`, `Array<T>` - then rebind each to its type
-        // with the arm's type in the param's place: register_local_with_mut
-        // mutates `state.locals`, so it must not run while the entry iterator
-        // is live.
+        // itself, or `&T`, `T*`, `Array<T>` - then re-declare each with the
+        // arm's type in the param's place: `declare` mutates
+        // `state.bindings`, so it must not run while the entry iterator is
+        // live.
         mut params: TypeRef[] = [scrut_ref];
         mut args: TypeRef[] = [arm_ref];
         const narrowing: TypeSubstitution = TypeSubstitution::from_params(&params, &args);
-        mut keys: u32[] = [];
-        mut narrowed: TypeRef[] = [];
-        mut it: HashMapIter<u32, TypeRef> = this.state.locals.iter();
+        mut rebound: LocalBinding[] = [];
+        mut rebound_types: TypeRef[] = [];
+        mut bit: HashMapIter<SymbolKey, LocalBinding> = this.state.bindings.iter();
         loop {
-            match (it.next()) {
+            match (bit.next()) {
                 Option::Some(pair) => {
-                    if (pair.second.equals(scrut_ref)) {
-                        keys.push(pair.first);
-                        narrowed.push(arm_ref);
-                    } else if (this.arena.contains_generic_param(pair.second)) {
-                        const nt: TypeRef = narrowing.apply(pair.second, this.arena);
-                        if (nt.is_valid() && !nt.equals(pair.second)) {
-                            keys.push(pair.first);
-                            narrowed.push(nt);
+                    const b: LocalBinding = pair.second;
+                    if (b.ty.equals(scrut_ref)) {
+                        rebound.push(b);
+                        rebound_types.push(arm_ref);
+                    } else if (this.arena.contains_generic_param(b.ty)) {
+                        const nt: TypeRef = narrowing.apply(b.ty, this.arena);
+                        if (nt.is_valid() && !nt.equals(b.ty)) {
+                            rebound.push(b);
+                            rebound_types.push(nt);
                         }
                     }
                 }
                 Option::None => { break; }
             }
         }
-        for (mut i: i64 = 0; i < keys.length; i++) {
-            const nm: SymbolStr = SymbolStr::from_id(keys[i]);
-            const is_mut: boolean = this.scopes.local_is_mutable(nm);
-            this.scopes.register_local_with_mut(nm, narrowed[i], is_mut);
+        for (mut i: i64 = 0; i < rebound.length; i++) {
+            this.scopes.declare(rebound[i].sym, rebound_types[i], rebound[i].is_mut);
         }
-        keys.drop();
         return save;
     }
 
@@ -4249,7 +4230,7 @@ public:
         if (e == null) { return; }
         if (e.kind == NodeKind::Identifier) {
             const id: IdentifierNode* = e as IdentifierNode*;
-            if (this.scopes.is_payload_binding(id.name) && this.ret_carries_pointer_to(ret_ty, id.resolved_type)) {
+            if (this.scopes.names_payload(id.res.local_sym()) && this.ret_carries_pointer_to(ret_ty, id.resolved_type)) {
                 this.diag.emit_payload_escape(e.span);
             }
             return;
@@ -4259,7 +4240,7 @@ public:
             if (c.arguments.length == 1 && c.arguments[0] != null
                     && c.arguments[0].kind == NodeKind::Identifier && this.callee_names_ret_variant(c.callee, ret_ty)) {
                 const id: IdentifierNode* = c.arguments[0] as IdentifierNode*;
-                if (this.scopes.is_payload_binding(id.name) && this.ret_carries_pointer_to(ret_ty, id.resolved_type)) {
+                if (this.scopes.names_payload(id.res.local_sym()) && this.ret_carries_pointer_to(ret_ty, id.resolved_type)) {
                     this.diag.emit_payload_escape(c.arguments[0].span);
                 }
             }
@@ -4332,7 +4313,7 @@ public:
         if (k == NodeKind::Identifier) {
             const id: IdentifierNode* = e as IdentifierNode*;
             if (this.names_receiver(id)) { return this.state.this_is_by_ref; }
-            if (!this.scopes.is_param(id.name)) { return false; }
+            if (!this.scopes.names_param(id.res.local_sym())) { return false; }
             return this.type_is_indirect(id.resolved_type);
         }
         // `&subject` / `*subject` keep naming the same storage; a member or
@@ -4394,8 +4375,8 @@ public:
                 // A payload binding over a caller-backed subject names the
                 // caller's storage, not a copy in this frame, so its address
                 // survives the return — that is exactly an in-place accessor.
-                if (this.scopes.is_aliasing_binding(id.name)) { return; }
-                if (this.scopes.is_local_or_param(id.name) && !this.scopes.is_param(id.name)) {
+                if (this.scopes.names_alias(id.res.local_sym())) { return; }
+                if (this.scopes.binds(id.res.local_sym()) && !this.scopes.names_param(id.res.local_sym())) {
                     this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
                         Text::new("cannot return the address of a local variable: it lives on this function's stack frame and is freed when the function returns. Return the value by move, or a heap allocation, instead."),
                         e.span);

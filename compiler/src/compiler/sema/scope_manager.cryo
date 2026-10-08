@@ -1,14 +1,17 @@
 /// ScopeManager
 ///
-/// Owns the per-function local-variable scope and its undo log.  A lexical
-/// scope is entered by `save_scope()` (returns a checkpoint) and left by
-/// `restore_scope(checkpoint)`, which rolls every binding made since back to
-/// its prior value - restoring shadowed outer-scope bindings exactly.
+/// Owns the per-function local bindings and their undo log.  A local is
+/// asked by the binding the name layer stamped on its use (`Res::Local`),
+/// never by its spelling: two locals of one spelling in one function are two
+/// bindings, and the stamp already says which one a use names.
 ///
-/// All state lives on the shared `SemaState` (locals / local_muts /
-/// local_kw_spans + the four parallel undo logs + param_ids /
-/// payload_binding_ids); this collaborator is the single owner of the logic
-/// that reads and mutates it.  No env back-pointers are needed.
+/// A lexical scope is entered by `save_scope()` (returns a checkpoint) and
+/// left by `restore_scope(checkpoint)`, which rolls every binding made since
+/// back to its prior state: a binding the scope declared is dropped, and one
+/// a `static match` arm re-declared with a narrowed type gets its type back.
+///
+/// All state lives on the shared `SemaState`; this collaborator is the
+/// single owner of the logic that reads and mutates it.
 
 namespace compiler::sema::scope_manager;
 
@@ -16,11 +19,14 @@ import compiler::types::type_ref;
 import compiler::types::type_ref::{ TypeRef };
 import compiler::diag::source_span;
 import compiler::diag::source_span::{ SourceSpan };
-import compiler::resolver::symbol_str;
-import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::sema::state;
-import compiler::sema::state::{ SemaState };
+import compiler::sema::state::{ LocalBinding, SemaState };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID, SymbolKey };
 import std::collections::hashmap;
+import std::collections::hashmap::{ HashMap };
+import std::collections::hashset;
+import std::collections::hashset::{ HashSet };
 import std::core::option;
 import std::core::option::{ Option };
 
@@ -35,72 +41,85 @@ type struct ScopeManager {
         this.state = state;
     }
 
+    /// Forget every binding: a function's body starts with none.
+    reset(mut &this) -> void {
+        this.state.bindings         = HashMap::<SymbolKey, LocalBinding>::new();
+        this.state.binding_undo     = [];
+        this.state.binding_prev     = [];
+        this.state.payload_bindings = HashSet::<SymbolKey>::new();
+        this.state.alias_bindings   = HashSet::<SymbolKey>::new();
+        this.state.param_bindings   = HashSet::<SymbolKey>::new();
+        this.state.outer_bindings   = HashMap::<SymbolKey, TypeRef>::new();
+    }
+
 
     // -- Lookup --
 
-    /// The type bound to a local name, or invalid if not a local.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    lookup_local(&this, name: SymbolStr) -> TypeRef {
-        return match (this.state.locals.get(&name.id)) {
-            Option::Some(val) => { val }
-            Option::None      => { TypeRef::invalid() }
+    /// What is known of the local binding `sym`; `LocalBinding::none()` when
+    /// it is not one of this function's live locals.
+    binding(&this, sym: SymbolID) -> LocalBinding {
+        if (!sym.is_valid()) { return LocalBinding::none(); }
+        return match (this.state.bindings.get(&sym.table_key())) {
+            Option::Some(b) => { b }
+            Option::None    => { LocalBinding::none() }
         };
     }
 
-    /// Whether `name` is a local binding (or parameter) in the current scope.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    is_local_or_param(&this, name: SymbolStr) -> boolean {
-        return match (this.state.locals.get(&name.id)) {
-            Option::Some(_) => { true }
-            Option::None    => { false }
-        };
+    /// The type bound to the local `sym`, or invalid when it is not a live
+    /// local or its declaration failed to type.
+    type_of(&this, sym: SymbolID) -> TypeRef {
+        return this.binding(sym).ty;
     }
 
-    /// Whether `name` is one of the current function's parameters (or `this`).
-    /// Parameters are autoref'd (caller-backed), so `&param` re-borrows caller
-    /// storage rather than escaping a stack slot.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    is_param(&this, name: SymbolStr) -> boolean {
-        for (mut i: i64 = 0; i < this.state.param_ids.length; i++) {
-            if (this.state.param_ids[i] == name.id) { return true; }
-        }
-        return false;
+    /// Whether `sym` is a live local or parameter, typed or not.
+    binds(&this, sym: SymbolID) -> boolean {
+        return this.binding(sym).sym.is_valid();
     }
 
-    /// Whether `name` is a `match`-arm payload binding.  Over a by-value subject
-    /// such a binding aliases a stack temporary, so returning a pointer or
-    /// reference to it dangles - the return-escape check (E0455) consults this.
-    /// See `is_aliasing_binding` for the case where it does not.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    is_payload_binding(&this, name: SymbolStr) -> boolean {
-        if (!name.is_valid()) { return false; }
-        for (mut i: i64 = 0; i < this.state.payload_binding_ids.length; i++) {
-            if (this.state.payload_binding_ids[i] == name.id) { return true; }
-        }
-        return false;
+    /// The local `sym`'s mutability; true for a binding this function does
+    /// not hold, so a global or an untracked symbol is never reported as
+    /// assigned while immutable.
+    is_mutable(&this, sym: SymbolID) -> boolean {
+        const b: LocalBinding = this.binding(sym);
+        if (!b.sym.is_valid()) { return true; }
+        return b.is_mut;
     }
 
-    /// Whether `name` is a `match`-arm binding whose subject was reached through
-    /// a by-reference parameter.  The binding names the CALLER's storage, so
-    /// unlike an ordinary payload binding its address stays valid after this
-    /// function returns and `return &name` is sound.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    is_aliasing_binding(&this, name: SymbolStr) -> boolean {
-        if (!name.is_valid()) { return false; }
-        for (mut i: i64 = 0; i < this.state.alias_binding_ids.length; i++) {
-            if (this.state.alias_binding_ids[i] == name.id) { return true; }
-        }
-        return false;
+    /// The type of `sym` when it is a binding the lambda being checked can
+    /// see outside itself - a local of an enclosing frame or a further-out
+    /// capture - and so captures; none otherwise.
+    outer_type_of(&this, sym: SymbolID) -> Option<TypeRef> {
+        if (!sym.is_valid()) { return Option::None; }
+        return this.state.outer_bindings.get(&sym.table_key());
     }
 
-    /// A local binding's mutability.  Returns true for unknown names so callers
-    /// don't false-positive on globals or otherwise-tracked symbols.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    local_is_mutable(&this, name: SymbolStr) -> boolean {
-        return match (this.state.local_muts.get(&name.id)) {
-            Option::Some(v) => { v }
-            Option::None    => { true }
-        };
+    /// The `const`/`mut` keyword span of the local `sym`; no location when
+    /// none was recorded.
+    kw_span_of(&this, sym: SymbolID) -> SourceSpan {
+        return this.binding(sym).kw_span;
+    }
+
+    /// Whether `sym` is one of the current function's parameters (or its
+    /// receiver).  Parameters are caller-backed, so `&param` re-borrows the
+    /// caller's storage rather than escaping a stack slot.
+    names_param(&this, sym: SymbolID) -> boolean {
+        return sym.is_valid() && this.state.param_bindings.contains(&sym.table_key());
+    }
+
+    /// Whether `sym` is a `match`-arm payload binding.  Over a by-value
+    /// subject such a binding aliases a stack temporary, so returning a
+    /// pointer or reference to it dangles - the return-escape check (E0455)
+    /// consults this.  See `names_alias` for the case where it does not.
+    names_payload(&this, sym: SymbolID) -> boolean {
+        return sym.is_valid() && this.state.payload_bindings.contains(&sym.table_key());
+    }
+
+    /// Whether `sym` is a `match`-arm binding whose subject was reached
+    /// through a by-reference parameter.  It names the caller's storage, so
+    /// unlike an ordinary payload binding its address stays valid after
+    /// this function returns and `return &name` is sound.
+    names_alias(&this, sym: SymbolID) -> boolean {
+        return sym.is_valid() && this.state.alias_bindings.contains(&sym.table_key());
     }
 
 
@@ -109,95 +128,47 @@ type struct ScopeManager {
     /// Checkpoint the current scope: an index into the undo log that
     /// `restore_scope` rolls back to.
     save_scope(&this) -> i64 {
-        return this.state.undo_keys.length;
+        return this.state.binding_undo.length;
     }
 
-    /// Register an immutable (`const`) local, recording any prior binding in the
-    /// undo log so it is restored on scope exit.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    register_local(mut &this, name: SymbolStr, ty: TypeRef) -> void {
-        this.register_local_with_mut(name, ty, false);
+    /// Bind the local `sym` to `ty`, recording its previous state in the undo
+    /// log so leaving the scope restores it.  The keyword span starts empty;
+    /// the declaration attaches its own with `set_kw_span`.  A binding with
+    /// no identity holds nothing: no use can name it.
+    declare(mut &this, sym: SymbolID, ty: TypeRef, is_mut: boolean) -> void {
+        if (!sym.is_valid()) { return; }
+        const key: SymbolKey = sym.table_key();
+        this.state.binding_undo.push(key);
+        this.state.binding_prev.push(this.binding(sym));
+        this.state.bindings.insert(key, LocalBinding { sym: sym, ty: ty, is_mut: is_mut, kw_span: SourceSpan::none() });
     }
 
-
-    /// Register a local with an explicit mutability flag, pushing the previous
-    /// binding (type, mut flag, keyword span) onto the parallel undo logs.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    register_local_with_mut(mut &this, name: SymbolStr, ty: TypeRef,
-                            is_mut: boolean) -> void {
-        const key: u32 = name.id;
-
-        this.state.undo_keys.push(key);
-        match (this.state.locals.get(&key)) {
-            Option::Some(val) => { this.state.undo_prev.push(val); }
-            Option::None      => { this.state.undo_prev.push(TypeRef::invalid()); }
-        }
-        match (this.state.local_muts.get(&key)) {
-            Option::Some(prev) => { this.state.undo_muts.push(prev); }
-            Option::None       => { this.state.undo_muts.push(false); }
-        }
-        match (this.state.local_kw_spans.get(&key)) {
-            Option::Some(prev) => { this.state.undo_kw_spans.push(prev); }
-            Option::None       => { this.state.undo_kw_spans.push(SourceSpan::none()); }
-        }
-
-        this.state.locals.insert(key, ty);
-        this.state.local_muts.insert(key, is_mut);
-        // Drop any prior keyword anchor so a stale outer-scope binding's span
-        // doesn't leak into the inner shadowing one; the caller re-attaches via
-        // `record_local_kw_span` when it has a parser-derived span.
-        this.state.local_kw_spans.remove(&key);
-    }
-
-    /// Attach a `const`/`mut` keyword-span anchor to a just-registered local,
-    /// used by E0218 for a precise "replace `const` with `mut`" / "insert `mut`"
-    /// quickfix.  No-op when the span lacks a location.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    record_local_kw_span(mut &this, name: SymbolStr, kw_span: SourceSpan) -> void {
+    /// Attach the `const`/`mut` keyword span to the just-declared local
+    /// `sym`, for E0218's quickfix.  No-op when the span has no location.
+    set_kw_span(mut &this, sym: SymbolID, kw_span: SourceSpan) -> void {
         if (!kw_span.has_location()) { return; }
-        this.state.local_kw_spans.insert(name.id, kw_span);
+        mut b: LocalBinding = this.binding(sym);
+        if (!b.sym.is_valid()) { return; }
+        b.kw_span = kw_span;
+        this.state.bindings.insert(sym.table_key(), b);
     }
 
-    /// Roll local bindings back to a checkpoint, restoring shadowed outer-scope
-    /// bindings and truncating the undo log.
+    /// Roll bindings back to a checkpoint, restoring each one's previous
+    /// state, and truncate the undo log.
     restore_scope(mut &this, save_point: i64) -> void {
         // Undo in reverse order.
-        for (mut i: i64 = this.state.undo_keys.length - 1; i >= save_point; i -= 1) {
-            const key: u32 = this.state.undo_keys[i];
-            const prev: TypeRef = this.state.undo_prev[i];
-            const prev_mut: boolean = this.state.undo_muts[i];
-            const prev_kw: SourceSpan = this.state.undo_kw_spans[i];
-            if (prev.is_valid()) {
-                this.state.locals.insert(key, prev);
-                this.state.local_muts.insert(key, prev_mut);
-                if (prev_kw.has_location()) {
-                    this.state.local_kw_spans.insert(key, prev_kw);
-                } else {
-                    this.state.local_kw_spans.remove(&key);
-                }
+        for (mut i: i64 = this.state.binding_undo.length - 1; i >= save_point; i -= 1) {
+            const key: SymbolKey = this.state.binding_undo[i];
+            const prev: LocalBinding = this.state.binding_prev[i];
+            if (prev.ty.is_valid()) {
+                this.state.bindings.insert(key, prev);
             } else {
-                this.state.locals.remove(&key);
-                this.state.local_muts.remove(&key);
-                this.state.local_kw_spans.remove(&key);
+                this.state.bindings.remove(&key);
             }
         }
-
-        // Truncate the undo logs back to the save point.
-        if (save_point < this.state.undo_keys.length) {
-            mut new_keys: u32[] = [];
-            mut new_prev: TypeRef[] = [];
-            mut new_muts: boolean[] = [];
-            mut new_kw_spans: SourceSpan[] = [];
-            for (mut i: i64 = 0; i < save_point; i++) {
-                new_keys.push(this.state.undo_keys[i]);
-                new_prev.push(this.state.undo_prev[i]);
-                new_muts.push(this.state.undo_muts[i]);
-                new_kw_spans.push(this.state.undo_kw_spans[i]);
-            }
-            this.state.undo_keys     = new_keys;
-            this.state.undo_prev     = new_prev;
-            this.state.undo_muts     = new_muts;
-            this.state.undo_kw_spans = new_kw_spans;
+        while (this.state.binding_undo.length > save_point) {
+            this.state.binding_undo.pop();
+            this.state.binding_prev.pop();
         }
     }
 }

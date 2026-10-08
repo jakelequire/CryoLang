@@ -59,22 +59,35 @@ type struct ClosureSpec {
     }
 }
 
+/// What sema knows of one local binding (a parameter, a local, a pattern's
+/// binding): its type, whether it is `mut`, and the span of the keyword that
+/// declared it (`const`/`mut`, or a zero-width anchor for a parameter written
+/// without `mut`), which E0218's "replace `const` with `mut`" / "insert `mut`"
+/// quickfix reads; a span with no location means the explanatory note only.
+type struct LocalBinding {
+    sym:     SymbolID;
+    ty:      TypeRef;
+    is_mut:  boolean;
+    kw_span: SourceSpan;
+
+    /// No binding: what a scope's undo log records for a binding that did
+    /// not exist before the scope made it.
+    static none() -> LocalBinding {
+        return LocalBinding { sym: SymbolID::invalid(), ty: TypeRef::invalid(), is_mut: false,
+                              kw_span: SourceSpan::none() };
+    }
+}
+
 type struct SemaState {
-    // -- Per-function locals (reset via ScopeManager.enter_function) --
-    ![allow(lookup_by_spelling, reason = "a scope rib: a function's locals are bound by the names written for them")]
-    locals:         HashMap<u32, TypeRef>;   // local variable scope (fast path)
-    ![allow(lookup_by_spelling, reason = "a scope rib: a function's locals are bound by the names written for them")]
-    local_muts:     HashMap<u32, boolean>;   // mutability flag for each local
-    // Span of the declaring `const`/`mut` keyword (top-level locals) or a
-    // zero-width insertion anchor (params declared without `mut`).  E0218
-    // reads this for a precise "replace `const` with `mut`" / "insert `mut`"
-    // quickfix; a missing entry means the explanatory note only.
-    ![allow(lookup_by_spelling, reason = "a scope rib: a function's locals are bound by the names written for them")]
-    local_kw_spans: HashMap<u32, SourceSpan>;
-    undo_keys:      u32[];                    // scope undo log: keys modified
-    undo_prev:      TypeRef[];                // scope undo log: previous values
-    undo_muts:      boolean[];                // scope undo log: previous mut flags
-    undo_kw_spans:  SourceSpan[];             // scope undo log: previous kw_spans
+    // -- Per-function locals, by the binding the name layer stamped --
+    // A use of a local carries `Res::Local(sym)`, the binding its name was
+    // resolved to where it is written, so a local is asked by that binding
+    // and never again by its spelling.  A scope's undo log records each
+    // binding's previous state, so leaving the scope restores what a
+    // narrowing inside it changed and drops what the scope declared.
+    bindings:        HashMap<SymbolKey, LocalBinding>;
+    binding_undo:    SymbolKey[];
+    binding_prev:    LocalBinding[];
 
     // -- Per-function frame --
     return_type:     TypeRef;                 // current function return type
@@ -107,31 +120,32 @@ type struct SemaState {
     untyped_binding: SymbolStr;
     untyped_init:    ExpressionNode*;
 
-    // -- Match-arm payload binding names (intern ids), per function --
+    // -- Match-arm payload bindings, per function --
     // A `match` arm pattern `Variant(p)` binds `p` to a temporary copy of the
     // matched payload; returning a pointer/reference to `p` dangles once the
-    // function returns.  These ids let the return-escape check reject that
+    // function returns.  This set lets the return-escape check reject that
     // (E0455) instead of miscompiling into a use-after-free.
-    payload_binding_ids: u32[];
-    // The subset of the bindings above whose subject is reached through a
-    // by-reference parameter (`match (&this)`, `match (ptr_param)`).  Such a
-    // binding names the CALLER's storage rather than a copy in this frame, so
-    // `&binding` stays valid after the function returns and the escape check
-    // above must not reject it - that is what an in-place accessor
+    payload_bindings: HashSet<SymbolKey>;
+    // The arm bindings whose subject is reached through a by-reference
+    // parameter (`match (&this)`, `match (ptr_param)`).  Such a binding names
+    // the CALLER's storage rather than a copy in this frame, so `&binding`
+    // stays valid after the function returns and the escape check above must
+    // not reject it - that is what an in-place accessor
     // (`payload_ptr(&this) -> T*`) is.  Kept as a separate set rather than by
-    // suppressing the entry above, because the payload-escape check has its own
-    // reason to know a name is a payload binding.
-    alias_binding_ids: u32[];
+    // suppressing the entry above, because the payload-escape check has its
+    // own reason to know a binding is a payload.
+    alias_bindings:   HashSet<SymbolKey>;
+    // The current function's parameters (and its receiver).  Autoref'd /
+    // caller-backed, so `&param` re-borrows caller storage rather than
+    // escaping a stack slot - the return-escape check flags only
+    // `&<body-local>`.
+    param_bindings:   HashSet<SymbolKey>;
     // True while inside a method whose receiver is `&this` / `mut &this`.  A
     // by-value `this` receiver lives in THIS frame, so it is not caller-backed.
     this_is_by_ref: boolean;
     // The binding of the method's receiver parameter - what every use of
     // `this` in the body names.  Invalid outside a method.
     receiver_sym: SymbolID;
-    // The current function's parameter (and `this`) names.  Autoref'd /
-    // caller-backed, so `&param` re-borrows caller storage rather than escaping
-    // a stack slot - the return-escape check flags only `&<body-local>`.
-    param_ids: u32[];
     // The function whose body is being checked; null outside one.
     current_func: FunctionDeclNode*;
     // The last call whose arguments were classified, and the parameter types
@@ -160,13 +174,13 @@ type struct SemaState {
     // -- Closure-capture detection (mutated by LambdaSynth, read by resolve_identifier) --
     // `in_lambda_depth`: 0 outside any lambda, 1 inside the outermost, deeper
     // when nested; gates the capture-fallback path so non-lambda calls never pay.
-    // `lambda_outer_locals`: names visible from outside the lambda currently
-    // being checked (enclosing function locals + outer lambdas' captures); a hit
-    // here on a `locals` miss means "free variable, record a capture".
+    // `outer_bindings`: the bindings visible from outside the lambda currently
+    // being checked (enclosing function locals + outer lambdas' captures); a
+    // use naming one of them rather than a binding of the lambda's own is a
+    // free variable, and records a capture.
     // `current_lambda`: the lambda whose body we're walking - the capture sink.
     in_lambda_depth:     i32;
-    ![allow(lookup_by_spelling, reason = "a scope rib: the names visible from outside the lambda being checked")]
-    lambda_outer_locals: HashMap<u32, TypeRef>;
+    outer_bindings:      HashMap<SymbolKey, TypeRef>;
     current_lambda:      LambdaExprNode*;
 
     // Per-module monotonic counter for synthesised closure-struct names.
@@ -234,14 +248,10 @@ type struct SemaState {
 
     static new() -> SemaState {
         return SemaState {
-            locals:         HashMap::<u32, TypeRef>::new(),
-            local_muts:     HashMap::<u32, boolean>::new(),
-            local_kw_spans: HashMap::<u32, SourceSpan>::new(),
-            undo_keys:      [],
-            undo_prev:      [],
-            undo_muts:      [],
-            undo_kw_spans:  [],
-            return_type:       TypeRef::invalid(),
+            bindings:       HashMap::<SymbolKey, LocalBinding>::new(),
+            binding_undo:   [],
+            binding_prev:   [],
+            return_type:      TypeRef::invalid(),
             return_type_ann:   null,
             async_poll_output: TypeRef::invalid(),
             this_type:       TypeRef::invalid(),
@@ -252,11 +262,11 @@ type struct SemaState {
             expected_type: TypeRef::invalid(),
             untyped_binding: SymbolStr::empty(),
             untyped_init:    null,
-            payload_binding_ids: [],
-            alias_binding_ids: [],
+            payload_bindings: HashSet::<SymbolKey>::new(),
+            alias_bindings:   HashSet::<SymbolKey>::new(),
+            param_bindings:   HashSet::<SymbolKey>::new(),
             this_is_by_ref:  false,
             receiver_sym:    SymbolID::invalid(),
-            param_ids: [],
             current_func: null,
             facts_call:   null,
             facts_params: [],
@@ -266,7 +276,7 @@ type struct SemaState {
             identity_exempt:  false,
             identity_locals:  HashSet::<SymbolKey>::new(),
             in_lambda_depth:     0,
-            lambda_outer_locals: HashMap::<u32, TypeRef>::new(),
+            outer_bindings:      HashMap::<SymbolKey, TypeRef>::new(),
             current_lambda:      null,
             closure_counter:  0,
             closure_specs:     [],

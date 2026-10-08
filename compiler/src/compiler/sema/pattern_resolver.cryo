@@ -39,6 +39,8 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag::suggestion::{ Applicability };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::sema::helpers::{ sema_copy_type_refs, sema_decode_range_bound };
 import compiler::sema::scope_manager::{ ScopeManager };
 import compiler::sema::state::{ SemaState };
@@ -101,8 +103,7 @@ type struct PatternResolver {
             if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
                 pat.binding_type = subject_type;
                 if (subject_type.is_valid()) {
-                    this.scopes.register_local(pat.binding_name, subject_type);
-                    this.note_alias_binding(pat.binding_name, caller_backed);
+                    this.bind_arm_name(pat.binding_sym, subject_type, caller_backed);
                 }
                 continue;
             }
@@ -111,12 +112,21 @@ type struct PatternResolver {
         }
     }
 
-    /// Record that `name` aliases caller storage, so `return &name` is not a
+    /// Bind a pattern's name `sym` to `ty`, the whole subject it matched.
+    /// When the subject was reached through a by-reference parameter the
+    /// binding aliases the caller's storage, so `return &name` is not a
     /// dangling return.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    note_alias_binding(mut &this, name: SymbolStr, caller_backed: boolean) -> void {
-        if (!caller_backed || !name.is_valid()) { return; }
-        this.state.alias_binding_ids.push(name.id);
+    bind_arm_name(mut &this, sym: SymbolID, ty: TypeRef, caller_backed: boolean) -> void {
+        this.scopes.declare(sym, ty, false);
+        if (caller_backed && sym.is_valid()) { this.state.alias_bindings.insert(sym.table_key()); }
+    }
+
+    /// Bind a variant payload's name `sym` to `ty`, and remember it as a
+    /// payload: over a by-value subject it is a copy in this frame, and a
+    /// `return &payload` dangles (E0455).
+    bind_payload(mut &this, sym: SymbolID, ty: TypeRef, caller_backed: boolean) -> void {
+        if (sym.is_valid()) { this.state.payload_bindings.insert(sym.table_key()); }
+        this.bind_arm_name(sym, ty, caller_backed);
     }
 
     /// Resolve the positional payload types of `enum_pat`'s variant against a value
@@ -324,9 +334,7 @@ type struct PatternResolver {
             if (pb != null) {
                 pb.resolved_type = elem_ty;
                 // Remember the binding so a `return &payload` is caught (E0455).
-                if (pb.name.is_valid()) { this.state.payload_binding_ids.push(pb.name.id); }
-                this.scopes.register_local(pb.name, elem_ty);
-                this.note_alias_binding(pb.name, caller_backed);
+                this.bind_payload(pb.sym_id, elem_ty, caller_backed);
                 continue;
             }
             const sub: PatternNode* = enum_pat.sub_at(j);
@@ -342,8 +350,7 @@ type struct PatternResolver {
         if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
             pat.binding_type = value_type;
             if (value_type.is_valid()) {
-                this.scopes.register_local(pat.binding_name, value_type);
-                this.note_alias_binding(pat.binding_name, caller_backed);
+                this.bind_arm_name(pat.binding_sym, value_type, caller_backed);
             }
             return;
         }

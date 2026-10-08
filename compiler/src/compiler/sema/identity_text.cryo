@@ -32,7 +32,7 @@ namespace compiler::sema::identity_text;
 import compiler::ast;
 import compiler::ast::{ NodeKind };
 import compiler::ast::node::{ ASTNode };
-import compiler::ast::declaration::{ DeclarationNode, FunctionDeclNode, MethodNode, VarDeclNode };
+import compiler::ast::declaration::{ FunctionDeclNode, MethodNode, VarDeclNode };
 import compiler::ast::expression::{
     ArrayAccessNode, BinaryExprNode, CallExprNode, CastExprNode, ExpressionNode, IdentifierNode,
     IfExprNode, MemberAccessNode, TernaryExprNode, UnaryExprNode
@@ -64,9 +64,6 @@ import utils::text::{ Text };
 /// this in one expression is not followed.
 const IDENTITY_TEXT_DEPTH: i32 = 24;
 
-/// The door marker a doc comment opens with.
-const DOOR_MARKER: string = "/// Door `";
-
 type struct IdentityTextCheck {}
 
 implement struct IdentityTextCheck {
@@ -75,27 +72,18 @@ implement struct IdentityTextCheck {
         return DirectiveProcessingPasses::in_store_root(ctx);
     }
 
-    /// Whether `decl` is a door: its doc comment opens with the marker.
-    static is_door(decl: ASTNode*) -> boolean {
-        if (decl == null) { return false; }
-        if (decl.kind != NodeKind::FunctionDeclaration && decl.kind != NodeKind::MethodDeclaration) {
-            return false;
-        }
-        return (decl as DeclarationNode*).documentation.starts_with(DOOR_MARKER);
-    }
-
     /// Whether the body of `func`, about to be checked, is exempt: a door's,
     /// or one whose declaration allows `lookup_by_spelling` with a reason.
     /// A method's doc comment and directives are on its method node.
     static function_is_exempt(ctx: CompilationContext*, func: FunctionDeclNode*) -> boolean {
         if (func == null) { return false; }
-        if (IdentityTextCheck::is_door(func as ASTNode*)
+        if (DirectiveProcessingPasses::is_door(func as ASTNode*)
                 || DirectiveProcessingPasses::allows_spelling(&func.attached_directives)) {
             return true;
         }
         const decl: ASTNode* = ctx.decl_index.entry_decl(func.overload_entry);
         if (decl == null || decl.kind != NodeKind::MethodDeclaration) { return false; }
-        return IdentityTextCheck::is_door(decl)
+        return DirectiveProcessingPasses::is_door(decl)
             || DirectiveProcessingPasses::allows_spelling(&(decl as MethodNode*).attached_directives);
     }
 
@@ -237,7 +225,7 @@ implement struct IdentityTextCheck {
     static check_call(ctx: CompilationContext*, state: SemaState*, call: CallExprNode*) -> void {
         if (!state.identity_text_on || state.identity_exempt || call == null) { return; }
         const entry: OverloadId = CallFacts::callee_entry(ctx, call).entry;
-        if (IdentityTextCheck::is_door(ctx.decl_index.entry_decl(entry))) {
+        if (DirectiveProcessingPasses::is_door(ctx.decl_index.entry_decl(entry))) {
             for (mut i: i64 = 0; i < call.arguments.length; i++) {
                 IdentityTextCheck::refuse_if_identity_text(ctx, state, call, call.arguments[i], Text::new("argument of a door"));
             }

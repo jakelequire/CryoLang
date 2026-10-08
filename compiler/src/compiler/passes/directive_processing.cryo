@@ -34,7 +34,8 @@
 ///                                 takes an optional `reason = "..."`
 ///   ![allow(lookup_by_spelling, reason = "...")] : function / method: it
 ///                                 takes a spelling type; the reason says why
-///                                 (without it the declaration is E0157)
+///                                 (without it, a declaration that is not a
+///                                 door is E0157)
 ///   ![derive(Trait, ...)]     : struct/class/enum: traits to auto-derive
 ///
 /// Unknown directive names are accepted and recorded but otherwise inert.
@@ -87,9 +88,14 @@ import utils::keyword::{ Keyword };
 import utils::text::{ Text };
 
 /// The lint that refuses a declaration taking one of the compiler's spelling
-/// types (`DirectiveProcessingPasses::spelling_type_of`) unless an
-/// `![allow(lookup_by_spelling, reason = "...")]` on it says why.
+/// types (`DirectiveProcessingPasses::spelling_type_of`) unless it is a door
+/// or an `![allow(lookup_by_spelling, reason = "...")]` on it says why.
 const LOOKUP_BY_SPELLING: string = "lookup_by_spelling";
+
+/// The door marker a doc comment opens with.  A door is the one function
+/// where a spelling becomes a binding for its kind of question, and the
+/// marker's own text is the reason it takes one.
+const DOOR_MARKER: string = "/// Door `";
 
 /// The compiler's own text types, listed by the qualified names their
 /// declarations give them: two spellings, which the spelling lint refuses
@@ -1496,13 +1502,27 @@ type struct DirectiveProcessingPasses {
         return false;
     }
 
+    /// Whether `decl` is a door: its doc comment opens with the marker.  A
+    /// method's doc comment is on its method node, not on its function.
+    static is_door(decl: ASTNode*) -> boolean {
+        if (decl == null) { return false; }
+        if (decl.kind != NodeKind::FunctionDeclaration && decl.kind != NodeKind::MethodDeclaration) {
+            return false;
+        }
+        return (decl as DeclarationNode*).documentation.starts_with(DOOR_MARKER);
+    }
+
     /// E0157 at every parameter of `f` that carries a spelling type, unless
-    /// `dirs`, the declaration's own directives, allow `lookup_by_spelling`.
-    /// A receiver is the method's owner, not an argument it was handed, and is
-    /// never linted.
+    /// `decl` - the declaration carrying `f`'s doc comment and directives - is
+    /// a door, or its directives allow `lookup_by_spelling`.  A receiver is
+    /// the method's owner, not an argument it was handed, and is never
+    /// linted.
     static lint_spelling_params(ctx: CompilationContext*, f: FunctionDeclNode*,
-                                dirs: &DirectiveNode*[]) -> void {
-        if (f == null || DirectiveProcessingPasses::allows_spelling(dirs)) { return; }
+                                decl: ASTNode*, dirs: &DirectiveNode*[]) -> void {
+        if (f == null || DirectiveProcessingPasses::is_door(decl)
+                || DirectiveProcessingPasses::allows_spelling(dirs)) {
+            return;
+        }
         for (mut i: i64 = 0; i < f.parameters.length; i++) {
             const p: VarDeclNode* = f.parameters[i];
             if (p == null || p.is_receiver() || !p.resolved_type.is_valid()) { continue; }
@@ -1593,7 +1613,7 @@ type struct DirectiveProcessingPasses {
             if (stmt == null) { continue; }
             if (stmt.kind == NodeKind::FunctionDeclaration) {
                 const fd: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                DirectiveProcessingPasses::lint_spelling_params(ctx, fd, &fd.attached_directives);
+                DirectiveProcessingPasses::lint_spelling_params(ctx, fd, stmt, &fd.attached_directives);
                 continue;
             }
             const empty_methods: MethodNode*[] = [];
@@ -1616,7 +1636,7 @@ type struct DirectiveProcessingPasses {
             for (mut mi: i64 = 0; mi < methods.length; mi++) {
                 const m: MethodNode* = methods[mi];
                 if (m == null || m.func == null || m.func.is_synth_default) { continue; }
-                DirectiveProcessingPasses::lint_spelling_params(ctx, m.func, &m.attached_directives);
+                DirectiveProcessingPasses::lint_spelling_params(ctx, m.func, m as ASTNode*, &m.attached_directives);
             }
         }
     }
