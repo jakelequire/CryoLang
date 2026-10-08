@@ -999,6 +999,10 @@ type struct CallResolver {
                 } else if (arg_node.kind == NodeKind::CallExpression
                         || arg_node.kind == NodeKind::ScopeResolution) {
                     push_expected = true;
+                } else if (arg_node.kind == NodeKind::StructLiteral) {
+                    // A generic struct's literal written without arguments is
+                    // the instance the parameter names.
+                    push_expected = true;
                 } else if (arg_node.kind == NodeKind::Identifier && this.types.is_function_type(slot)) {
                     // A function named as a value takes the overload a
                     // function-typed parameter selects.
@@ -7662,6 +7666,26 @@ type struct CallResolver {
         if (!ret_inst.generic_base.equals(exp_base)) { return ret; }
         // The expected type IS the instantiation the return names.
         return this.state.expected_type;
+    }
+
+    /// The instance of the generic struct `tmpl` a literal written without
+    /// arguments builds, from its fields: each field's declared type, over
+    /// the template's parameters, unified with the type of the value given
+    /// for it.  Demanded, since the literal may flow where nothing else
+    /// names the instance (a generic function's argument).  Invalid unless
+    /// every parameter is bound to a concrete type.
+    instance_from_fields(mut &this, tmpl: TemplateEntry*, fields: &TypeRef[], values: &TypeRef[]) -> TypeRef {
+        mut pids: TypeRef[] = [];
+        for (mut i: i64 = 0; i < tmpl.param_types.length; i++) { pids.push(tmpl.param_types[i]); }
+        mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+        for (mut i: i64 = 0; i < fields.length && i < values.length; i++) { ictx.unify(fields[i], values[i]); }
+        mut args: TypeRef[] = [];
+        for (mut i: i64 = 0; i < ictx.bindings.length; i++) {
+            const b: TypeRef = ictx.bindings[i];
+            if (!b.is_valid() || this.types.contains_generic_param(b)) { return TypeRef::invalid(); }
+            args.push(b);
+        }
+        return this.ctx.generic_registry.instantiate(tmpl.base_type, &args);
     }
 
     /// Promote an enum-variant constructor's base-type return to the matching

@@ -3413,6 +3413,30 @@ public:
         mut lit_type: TypeRef = struct_ref;
         lit_type = this.ctx.type_resolver.canonicalize_default_generic_type(struct_ref);
 
+        // A generic struct's literal written without arguments, outside a
+        // generic body, is one instance of it: the one the expected type
+        // names (`const b: Boxy<i32> = Boxy { v: 3 };`), else the one its
+        // field values bind (`second(Pair { a: 1, b: 5 })`).  Its fields are
+        // that instance's; the template still answers the literal's shape.
+        mut field_owner: TypeRef = struct_ref;
+        mut infer_from: TemplateEntry* = null;
+        if (!this.state.in_symbolic_check && lit.generic_args.length == 0
+                && !lit.resolved_type.is_valid() && lit_type.equals(struct_ref) && struct_ref.is_valid()) {
+            const lt: TemplateEntry* = this.ctx.generic_registry.template_of_type(struct_ref);
+            if (lt != null && lt.param_types.length > 0
+                    && (lt.node_kind == NodeKind::StructDeclaration || lt.node_kind == NodeKind::ClassDeclaration)) {
+                const promoted: TypeRef = this.calls.promote_to_expected_instantiation(struct_ref);
+                if (!promoted.equals(struct_ref) && !this.types.contains_generic_param(promoted)) {
+                    lit_type = promoted;
+                    field_owner = promoted;
+                } else {
+                    infer_from = lt;
+                }
+            }
+        }
+        mut infer_fields: TypeRef[] = [];
+        mut infer_values: TypeRef[] = [];
+
         const saved_expected: TypeRef = this.state.expected_type;
         for (mut i: i64 = 0; i < lit.field_inits.length; i++) {
             const field_init: FieldInit = lit.field_inits[i];
@@ -3436,7 +3460,7 @@ public:
                 && (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class
                     || struct_t.kind == TypeKind::InstantiatedType
                     || this.symbolic.symbolic_is_generic_owner_receiver(struct_ref))) {
-                const fa: FieldAnswer = this.member.field_of(struct_ref, field_init.field_name);
+                const fa: FieldAnswer = this.member.field_of(field_owner, field_init.field_name);
                 field_type = fa.ty;
                 if (fa.index >= 0) {
                     lit.field_inits[i].pin = MemberPin::Field(fa.depth, fa.index);
@@ -3450,6 +3474,10 @@ public:
             if (field_type.is_valid()) { this.state.expected_type = field_type; }
             else { this.state.expected_type = TypeRef::invalid(); }
             const value_type: TypeRef = this.resolve_expr(value_expr);
+            if (infer_from != null && field_type.is_valid() && value_type.is_valid()) {
+                infer_fields.push(field_type);
+                infer_values.push(value_type);
+            }
             if (field_type.is_valid() && value_type.is_valid() && value_expr != null) {
                 const skip: boolean = this.types.contains_generic_param(value_type) || this.types.contains_generic_param(field_type);
                 if (!skip && !this.checker.can_assign(value_type, field_type)) {
@@ -3461,6 +3489,10 @@ public:
             }
         }
         this.state.expected_type = saved_expected;
+        if (infer_from != null) {
+            const bound: TypeRef = this.calls.instance_from_fields(infer_from, &infer_fields, &infer_values);
+            if (bound.is_valid()) { lit_type = bound; }
+        }
 
         // Union literal: exactly one field may be initialized (an untagged
         // union overlaps all fields, so a literal names the single active
