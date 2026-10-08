@@ -34,6 +34,7 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName, ReceiverKind };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::decl_name::{ DeclName };
 import compiler::module_graph;
 import compiler::module_graph::{ ModulePath };
 import compiler::types::arena::{ TypeArena };
@@ -472,7 +473,7 @@ public:
     /// registered as; empty for the root and for a type never registered.
     /// Text only: the mangled name a signature is emitted under, and a
     /// diagnostic that spells the family.  Never a key.
-    family_owner_path(&this, owner: FamilyOwner) -> SymbolStr {
+    family_owner_path(&this, owner: FamilyOwner) -> DeclName {
         return match (owner) {
             FamilyOwner::Def(d)  => { this.defs.path_of(d) }
             FamilyOwner::Type(t) => { this.defs.path_of(this.registered_def(t)) }
@@ -773,15 +774,15 @@ public:
         if (!d.is_valid()) { return; }
         if (this.defs.kind_of(d) == DefKind::Method
                 && this.defs.parent_of(d).equals(this.registered_def(owner))
-                && this.defs.leaf_of(d).equals(method.func.name)
+                && this.defs.leaf_of(d).spelling().equals(method.func.name)
                 && this.method_decl_of(d) == method as ASTNode*) {
             return;
         }
         panic(fmt::format(
             "internal compiler error: method `%s` is registered on `%s`, and its definition says it is `%s` of `%s`",
-            intern.resolve(method.func.name), intern.resolve(this.family_owner_path(FamilyOwner::Type(owner))),
-            intern.resolve(this.defs.leaf_of(d)),
-            intern.resolve(this.family_owner_path(FamilyOwner::Def(this.defs.parent_of(d))))), FILE, LINE);
+            intern.resolve(method.func.name), intern.shown(this.family_owner_path(FamilyOwner::Type(owner))),
+            intern.shown(this.defs.leaf_of(d)),
+            intern.shown(this.family_owner_path(FamilyOwner::Def(this.defs.parent_of(d))))), FILE, LINE);
     }
 
     /// Record the kind an `intrinsic function` declaration's entry `id`
@@ -1048,6 +1049,7 @@ public:
     /// with `head` applied - the block's parameters bound to the owner's
     /// through its head (`TraitChecker::add_head_param_bindings`).  Null or
     /// empty `head` stores the return as written.
+    ![allow(lookup_by_spelling, reason = "records each method's link symbol, mangled from its trait's path; the entry is keyed by the definition")]
     register_methods_through(mut &this, owner: TypeRef, methods: &MethodNode*[],
                              head: TypeSubstitution*, intern: InternTable*,
                              arena: TypeArena*, site: Text) -> void {
@@ -1132,7 +1134,7 @@ public:
                 func, intern);
             const method_sym: SymbolStr = func.name;
             const mangled_base: MangledName = MangledName::for_method_or_trait_impl(
-                intern, arena, type_qname, this.defs.path_of(func.origin_trait), method_sym, receiver_kind,
+                intern, arena, type_qname, this.defs.path_of(func.origin_trait).spelling(), method_sym, receiver_kind,
                 method_param_refs, func.resolved_return_type, func.is_variadic);
             // Fold in a generic-method spec's type args (`$MG...`) so the DI stores
             // the same disambiguated symbol the codegen definition + mono pin use;
@@ -1308,7 +1310,7 @@ public:
 
     /// Reverse-lookup: get the SymbolStr for a TypeRef.
     lookup_type_name(&this, ty: TypeRef) -> SymbolStr {
-        return this.defs.path_of(this.registered_def(ty));
+        return this.defs.path_of(this.registered_def(ty)).spelling();
     }
 
     /// Register a free function's signature under its key `name`, emitted
@@ -1340,9 +1342,9 @@ public:
     ![allow(lookup_by_spelling, reason = "a declaration's own name, mangled into its symbol; it keys no store")]
     mangle_function_symbol(&this, owner: FamilyOwner, leaf: SymbolStr, return_type: TypeRef,
                            func_type_ref: TypeRef, intern: InternTable*, arena: TypeArena*) -> SymbolStr {
-        const owner_path: SymbolStr = this.family_owner_path(owner);
+        const owner_path: DeclName = this.family_owner_path(owner);
         const name: SymbolStr = if (owner_path.is_valid()) {
-            intern.intern(intern.resolve(owner_path) + "::" + intern.resolve(leaf))
+            intern.intern(intern.shown(owner_path) + "::" + intern.resolve(leaf))
         } else {
             leaf
         };

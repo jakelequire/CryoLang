@@ -80,6 +80,7 @@ import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::decl_name::{ DeclName };
 import compiler::module_graph::{ ModulePath };
 import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
@@ -2305,7 +2306,7 @@ type struct CallResolver {
     /// is the type's family, `family_signatures_of(def)`.
     check_constructor_args(mut &this, visitor: ASTVisitor*, def: DefId, ctors: &TypeRef[],
                            args: mut &ExpressionNode*[], at: SourceSpan) -> void {
-        const leaf: SymbolStr = this.ctx.defs.leaf_of(def);
+        const leaf: SymbolStr = this.ctx.defs.leaf_of(def).spelling();
         const got: i64 = args.length;
         if (ctors.length == 0) {
             if (got == 0) { return; }
@@ -2408,7 +2409,7 @@ type struct CallResolver {
         mut callee: ExpressionNode* = null;
         mut conv_call: CallExprNode* = null;
         if (this.ctx.defs.kind_of(conv) != DefKind::Method) {
-            mut id: IdentifierNode* = new IdentifierNode(this.ctx.defs.leaf_of(conv), sp);
+            mut id: IdentifierNode* = new IdentifierNode(this.ctx.defs.leaf_of(conv).spelling(), sp);
             id.set_res(Res::Def(conv));
             callee = id as ExpressionNode*;
             conv_call = new CallExprNode(callee, sp);
@@ -2422,7 +2423,7 @@ type struct CallResolver {
                 this.ctx.decl_index.type_of_def(owner_def)
             };
             mut sr: ScopeResolutionNode* = new ScopeResolutionNode(
-                this.ctx.defs.leaf_of(owner_def), this.ctx.defs.leaf_of(conv), sp);
+                this.ctx.defs.leaf_of(owner_def).spelling(), this.ctx.defs.leaf_of(conv).spelling(), sp);
             sr.set_synthesized_ref(owner_ty, owner_def);
             // Generic-identity view: a post-mono concrete target still needs its
             // type_args stamped onto the synthesized scope, or the converter call
@@ -3048,7 +3049,7 @@ type struct CallResolver {
     refuse_unmatched_family_call(mut &this, call: CallExprNode*, callee: DefId,
                                  overloads: &TypeRef[], arg_types: &TypeRef[]) -> void {
         if (this.state.in_symbolic_check || overloads.length < 2) { return; }
-        const leaf: string = this.intern.resolve(this.ctx.defs.leaf_of(callee));
+        const leaf: string = this.intern.shown(this.ctx.defs.leaf_of(callee));
         const argc: i64 = arg_types.length;
         mut literal: boolean = false;
         for (mut i: i64 = 0; i < argc; i++) {
@@ -3113,7 +3114,7 @@ type struct CallResolver {
                               span: SourceSpan) -> void {
         if (this.state.in_symbolic_check) { return; }
         if (!this.ctx.decl_index.hidden_from(callee, this.ctx.module_def_of(use_module))) { return; }
-        const callee_str: string = this.intern.resolve(this.ctx.defs.path_of(callee));
+        const callee_str: string = this.intern.shown(this.ctx.defs.path_of(callee));
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
             Text::new(fmt::format("`%s` is private and cannot be called from `%s`",
@@ -3641,7 +3642,7 @@ type struct CallResolver {
         if (chosen == null) {
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 Text::new(fmt::format("code the compiler generated calls `%s` by its definition, and the receiver's type has no method for it",
-                    this.intern.resolve(this.ctx.defs.leaf_of(d)))));
+                    this.intern.shown(this.ctx.defs.leaf_of(d)))));
             diag = diag.at_with_label(member.span, Text::new("generated call"));
             this.ctx.emit_diagnostic(diag);
             return Selection::none();
@@ -4855,10 +4856,10 @@ type struct CallResolver {
         const type_display: string = if (recv_t != null) { this.arena.format_display(recv_t) } else { this.intern.resolve(type_sym) };
         const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
 
-        const failed_trait: SymbolStr = this.trait_checker().diagnose_method_bounds_failure(lookup_ref, member.member);
+        const failed_trait: DeclName = this.trait_checker().diagnose_method_bounds_failure(lookup_ref, member.member);
         if (failed_trait.is_valid()) {
             // The identity, rendered by its leaf as the tie report does.
-            const trait_str: string = QualifiedName::leaf_of(this.intern.resolve(failed_trait));
+            const trait_str: string = QualifiedName::leaf_of(this.intern.shown(failed_trait));
             mut diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
                 Text::new(fmt::format("the trait `%s` is not implemented for `%s`", trait_str, type_display)));
@@ -4892,9 +4893,9 @@ type struct CallResolver {
             ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
             Text::new(fmt::format("no method named `%s` found on type `%s`", method_name, type_display)));
         diag = diag.at(primary_span);
-        const owning_trait: SymbolStr = this.binding.lookup_trait_defining_method(member.member);
+        const owning_trait: DeclName = this.binding.lookup_trait_defining_method(member.member);
         if (owning_trait.is_valid()) {
-            const trait_str: string = this.intern.resolve(owning_trait);
+            const trait_str: string = this.intern.shown(owning_trait);
             diag = diag.with_note(Text::new(fmt::format("the method `%s` is defined on trait `%s`", method_name, trait_str)));
             diag = diag.help(Text::new(fmt::format("implement `%s` for `%s`, or change the receiver to a type that already does", trait_str, type_display)));
         } else {
@@ -5090,7 +5091,7 @@ type struct CallResolver {
         return match (scope.require_scope_res(Text::new("scope-call owner key"))) {
             Res::TypeRelative(b, _) => {
                 match (b) {
-                    ResBase::Def(d)          => { this.ctx.defs.path_of(d) }
+                    ResBase::Def(d)          => { this.ctx.defs.path_of(d).spelling() }
                     ResBase::PrimTy(n)       => { n }
                     ResBase::GenericParam(_) => { SymbolStr::empty() }
                 }
@@ -5454,7 +5455,7 @@ type struct CallResolver {
     report_trait_qualified_unselected(mut &this, scope: ScopeResolutionNode*, trait_sym: DefId,
                                       member_sym: SymbolStr, call: CallExprNode*) -> void {
         if (this.state.in_symbolic_check) { return; }
-        const trait_leaf: string = QualifiedName::leaf_of(this.intern.resolve(this.ctx.defs.path_of(trait_sym)));
+        const trait_leaf: string = QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(trait_sym)));
         const member_str: string = this.intern.resolve(member_sym);
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0233_UNDEFINED_SYMBOL,
             Text::new(fmt::format("`%s::%s()` selects no implementation: a call through a trait's path selects by its first argument's type, and there is none",
@@ -5939,7 +5940,7 @@ type struct CallResolver {
                                owner: TypeRef, trait_sym: DefId, member_sym: SymbolStr) -> void {
         if (this.state.in_symbolic_check) { return; }
         const owner_str: string = this.intern.resolve(owner_sym);
-        const trait_leaf: string = QualifiedName::leaf_of(this.intern.resolve(this.ctx.defs.path_of(trait_sym)));
+        const trait_leaf: string = QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(trait_sym)));
         const owner_ref: TypeRef = owner;
         if (owner_ref.is_valid()
                 && !this.trait_checker().type_implements_trait(owner_ref, trait_sym, 0)) {
@@ -6195,12 +6196,12 @@ type struct CallResolver {
         mut leaf_collides: boolean = false;
         for (mut a: i64 = 0; a < traits.length; a++) {
             for (mut b: i64 = a + 1; b < traits.length; b++) {
-                if (QualifiedName::leaf_of(this.intern.resolve(this.ctx.defs.path_of(traits[a]))) == QualifiedName::leaf_of(this.intern.resolve(this.ctx.defs.path_of(traits[b])))) { leaf_collides = true; }
+                if (QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(traits[a]))) == QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(traits[b])))) { leaf_collides = true; }
             }
         }
         mut help: string = "";
         for (mut i: i64 = 0; i < traits.length; i++) {
-            const trait_str: string = this.intern.resolve(this.ctx.defs.path_of(traits[i]));
+            const trait_str: string = this.intern.shown(this.ctx.defs.path_of(traits[i]));
             const leaf: string = if (leaf_collides) { trait_str } else { QualifiedName::leaf_of(trait_str) };
             const note: string = fmt::format("candidate #%d: `%s::%s`, from `implement trait %s for %s`",
                 (i as i32) + first_trait, leaf, member_str, trait_str, owner_display);
@@ -7806,14 +7807,15 @@ type struct CallResolver {
             _           => { }
         }
         mut lookup_sym: SymbolStr = this.scope_owner_key(scope);
-        mut owner: FamilyOwner = FamilyOwner::Def(DefId::invalid());
-        mut leaf: SymbolStr = scope.member_name;
         mut callee: DefId = DefId::invalid();
+        mut overloads: TypeRef[] = [];
         if (names_module) {
             callee = this.resolve_module_qualified_def(scope);
             if (!callee.is_valid()) { return; }
-            owner = FamilyOwner::Def(this.ctx.defs.parent_of(callee));
-            leaf = this.ctx.defs.leaf_of(callee);
+            const family: OverloadId[] = this.ctx.decl_index.family_entries_of_def(callee);
+            for (mut i: i64 = 0; i < family.length; i++) {
+                overloads.push(this.ctx.decl_index.entry_signature(family[i]));
+            }
         } else {
             if (scope.scope_generic_args.length > 0) {
                 const spec_sym: SymbolStr = this.resolve_generic_scope_name(
@@ -7842,9 +7844,8 @@ type struct CallResolver {
                 this.check_trait_qualified_args(visitor, this.ctx.decl_index.def_of(this.types.scope_qualifier_type(scope), this.ctx.type_arena), scope, call);
                 return;
             }
-            owner = FamilyOwner::Type(owner_ty);
+            overloads = this.ctx.decl_index.lookup_func_type_overloads(FamilyOwner::Type(owner_ty), scope.member_name);
         }
-        const overloads: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(owner, leaf);
         if (overloads.length == 1) {
             const ot: Type* = this.arena.lookup(overloads[0]);
             if (ot != null && ot.kind == TypeKind::Function) {

@@ -28,8 +28,19 @@ const t: TypeRef = types_by_name.get(&intern("Point"));
 const k: DefKind = defs.kind_of(node.def);
 
 // Rule 4, refused: identity text rebuilt into a key.
-const key: SymbolStr = intern(table.resolve(defs.path_of(d)) + "::new");
+const key: SymbolStr = intern(table.shown(defs.path_of(d)) + "::new");
 ```
+
+Rule four is checked by the compiler over its own modules.  A definition's
+path or leaf is read as a `DeclName`, whose text comes back only through
+`InternTable::shown` (for a message or a mangled symbol) and
+`DeclName::spelling` (for a node synthesized to carry the name).  Sema
+follows text computed from a `DeclName` through the function that reads it -
+concatenated, formatted, held in a local - and refuses it where it becomes a
+door's argument or a hash table's key (E0157).  A door's own body is not
+checked, nor a declaration allowed `lookup_by_spelling` with a reason.  Text
+handed on to another function as a `string` or `SymbolStr`, or returned as
+one, is not followed.
 
 ## The doors
 
@@ -135,6 +146,9 @@ yet is recorded with the change that builds it, not here.
 170. **A fully spelled path that no import leads to loads nothing.**
      `json::Inner::deep()` in a file with no `import json;` does not load
      `json::Inner`; a module must be imported to be visible.
+
+171. **The `Text` type is deleted if that is safe.**  It wraps a string and
+     `to_string()` unwraps it, so it seals nothing.
 
 149. **Ruling 109 is narrowed: the spelling lint (E0157) is door-only for
      LOOKUPS.**  A declaration's own name - registering it, printing it,

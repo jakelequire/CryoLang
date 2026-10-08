@@ -91,6 +91,17 @@ import utils::text::{ Text };
 /// `![allow(lookup_by_spelling, reason = "...")]` on it says why.
 const LOOKUP_BY_SPELLING: string = "lookup_by_spelling";
 
+/// The compiler's own text types, listed by the qualified names their
+/// declarations give them: two spellings, which the spelling lint refuses
+/// as a parameter, and a definition's name read off it, which the
+/// identity-text check follows.
+type enum CompilerText {
+    Other;
+    Symbol;
+    Qualified;
+    Decl;
+}
+
 
 // DirectiveRecord: one observed directive
 
@@ -1425,24 +1436,45 @@ type struct DirectiveProcessingPasses {
     /// by the qualified name their declarations give them, so a type not in
     /// the list is never linted however it is used.
     static spelling_type_of(ctx: CompilationContext*, ty: TypeRef) -> string {
+        return match (DirectiveProcessingPasses::compiler_text_of(ctx, ty)) {
+            CompilerText::Symbol    => { "SymbolStr" }
+            CompilerText::Qualified => { "QualifiedName" }
+            _                       => { "" }
+        };
+    }
+
+    /// Whether a value of type `ty` carries the identity-text type, a
+    /// definition's name read off it - by value, behind a reference, or as
+    /// an array's element.
+    static carries_identity_text(ctx: CompilationContext*, ty: TypeRef) -> boolean {
+        return match (DirectiveProcessingPasses::compiler_text_of(ctx, ty)) {
+            CompilerText::Decl => { true }
+            _                  => { false }
+        };
+    }
+
+    /// Which of the compiler's own text types a value of type `ty` carries,
+    /// by value, behind a reference, or as an array's element.
+    static compiler_text_of(ctx: CompilationContext*, ty: TypeRef) -> CompilerText {
         mut cur: TypeRef = ty;
         for (mut depth: i32 = 0; depth < 8; depth++) {
             const t: Type* = ctx.type_arena.lookup(cur);
-            if (t == null) { return ""; }
+            if (t == null) { return CompilerText::Other; }
             match (t.kind) {
                 TypeKind::Reference => { cur = (t as ReferenceType*).referent; }
                 TypeKind::Array     => { cur = (t as ArrayType*).element; }
                 TypeKind::Struct    => {
                     return match (ctx.intern_table.resolve((t as StructType*).qualified_name)) {
-                        "compiler::resolver::symbol_str::SymbolStr"         => { "SymbolStr" }
-                        "compiler::resolver::qualified_name::QualifiedName" => { "QualifiedName" }
-                        _ => { "" }
+                        "compiler::resolver::symbol_str::SymbolStr"         => { CompilerText::Symbol }
+                        "compiler::resolver::qualified_name::QualifiedName" => { CompilerText::Qualified }
+                        "compiler::resolver::decl_name::DeclName"           => { CompilerText::Decl }
+                        _ => { CompilerText::Other }
                     };
                 }
-                _ => { return ""; }
+                _ => { return CompilerText::Other; }
             }
         }
-        return "";
+        return CompilerText::Other;
     }
 
     /// Whether `dirs` - one declaration's own directives - lower

@@ -106,6 +106,7 @@ import compiler::resolver::symbol_id;
 import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::sema::async_lower::{ AsyncLower, AsyncOwner };
 import compiler::sema::call_facts::{ CallFacts, FactsScope, LoopCounter };
+import compiler::sema::identity_text::{ IdentityTextCheck };
 import compiler::sema::call_resolver::{ CallResolver };
 import compiler::sema::diagnostics::{ Diagnostics };
 import compiler::sema::dispatch::{ SemaDispatch };
@@ -341,6 +342,7 @@ public:
     // -- Top-level + statement recursion seams --
 
     override visit(mut &this, node: ProgramNode*) -> void {
+        this.state.identity_text_on = IdentityTextCheck::applies(this.ctx);
         this.declare_async_futures(node);
         for (mut i: i64 = 0; i < node.statements.length; i++) {
             const stmt: ASTNode* = node.statements[i];
@@ -787,7 +789,7 @@ public:
         const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
         if (tdecl == null) { return; }
         const span: SourceSpan = if (node.target_type_span.has_location()) { node.target_type_span } else { node.span };
-        const trait_str: string = this.intern.resolve(this.ctx.defs.path_of(trait_leaf));
+        const trait_str: string = this.intern.shown(this.ctx.defs.path_of(trait_leaf));
         for (mut i: i64 = 0; i < tdecl.assoc_types.length; i++) {
             const adecl: AssocTypeDeclNode* = tdecl.assoc_types[i];
             if (adecl == null || adecl.bounds.length == 0) { continue; }
@@ -962,6 +964,8 @@ public:
         this.state.receiver_sym = SymbolID::invalid();
         this.state.param_ids = [];
         this.state.current_func = func;
+        this.state.identity_exempt = this.state.identity_text_on
+            && IdentityTextCheck::function_is_exempt(this.ctx, func);
         this.state.in_lambda_depth     = 0;
         this.state.lambda_outer_locals = HashMap::<u32, TypeRef>::new();
         this.state.current_lambda      = null;
@@ -1424,6 +1428,7 @@ public:
                     }
                 }
             }
+            IdentityTextCheck::note_local(this.ctx, &this.state, var_node);
         }
 
     }
@@ -1656,11 +1661,12 @@ public:
 
     // -- The authoritative expression dispatch --
 
-    /// Resolve a call, and under `--emit=facts` record what it bound.  The
-    /// check walks every module on every build, a module reused from the
-    /// incremental cache included.
+    /// Resolve a call, check what it is handed for identity text, and under
+    /// `--emit=facts` record what it bound.  The check walks every module on
+    /// every build, a module reused from the incremental cache included.
     resolve_call_recorded(mut &this, call: CallExprNode*) -> TypeRef {
         const t: TypeRef = this.calls.resolve_call(this, call);
+        IdentityTextCheck::check_call(this.ctx, &this.state, call);
         if (this.ctx.options.emit_facts) {
             const known: boolean = this.state.facts_call == call;
             CallFacts::record(&this.facts_scope(), call, &this.state.facts_params, known);
@@ -1673,6 +1679,7 @@ public:
     /// condition as a call's record.
     resolve_binary_recorded(mut &this, bin: BinaryExprNode*) -> TypeRef {
         const t: TypeRef = this.resolve_binary(bin);
+        IdentityTextCheck::note_assignment(this.ctx, &this.state, bin);
         if (this.ctx.options.emit_facts) {
             CallFacts::record_compare(&this.facts_scope(), bin);
             CallFacts::record_assign(&this.facts_scope(), bin);
@@ -2294,11 +2301,11 @@ public:
         } else if (bounds.length == 1) {
             diag = diag.with_note(Text::new(fmt::format(
                 "`%s` is bounded by `%s`, which is not `%s` and does not have it as a supertrait",
-                shown, this.intern.resolve(this.ctx.defs.leaf_of(bounds[0])), trait_path)));
+                shown, this.intern.shown(this.ctx.defs.leaf_of(bounds[0])), trait_path)));
         } else {
             mut listed: string = "";
             for (mut i: i64 = 0; i < bounds.length; i++) {
-                const name: string = this.intern.resolve(this.ctx.defs.leaf_of(bounds[i]));
+                const name: string = this.intern.shown(this.ctx.defs.leaf_of(bounds[i]));
                 listed = if (i == 0) { fmt::format("`%s`", name) } else { fmt::format("%s, `%s`", listed, name) };
             }
             diag = diag.with_note(Text::new(fmt::format(
@@ -3161,9 +3168,9 @@ public:
             if (base != null && base.kind == TypeKind::Enum) { et = base as EnumType*; }
         }
         const result_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Result);
-        if (result_id.is_valid() && et.qualified_name.equals(this.ctx.defs.path_of(result_id))) { return 1; }
+        if (result_id.is_valid() && et.qualified_name.equals(this.ctx.defs.path_of(result_id).spelling())) { return 1; }
         const option_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Option);
-        if (option_id.is_valid() && et.qualified_name.equals(this.ctx.defs.path_of(option_id))) { return 2; }
+        if (option_id.is_valid() && et.qualified_name.equals(this.ctx.defs.path_of(option_id).spelling())) { return 2; }
         return 0;
     }
 
@@ -4443,7 +4450,7 @@ public:
         if (this.checker.check_compatibility(actual, expected) != TypeCompatibility::Incompatible) { return false; }
         *out_expected = expected;
         *out_actual   = actual;
-        *out_trait    = this.ctx.defs.path_of(trait_leaf);
+        *out_trait    = this.ctx.defs.path_of(trait_leaf).spelling();
         *out_item     = adecl.name;
         return true;
     }

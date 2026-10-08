@@ -1,0 +1,265 @@
+/// The identity-text check: an identity is opaque.
+///
+/// A `DeclName` is the text a definition is known by, read off the
+/// definition.  The definition already answers every question that text
+/// could be asked, so text computed from one is for showing - a message, a
+/// mangled symbol, the name a synthesized node prints as - and never the
+/// key of a lookup.  Asking again by the text is a second answering path,
+/// and the two disagree as soon as two definitions share a spelling.
+///
+/// Sema follows such text through the function that reads it.  A value is
+/// identity text when its type is `DeclName`, when it is a local whose
+/// initializer or an assignment to it was identity text, or when it is
+/// computed from identity text: concatenated, formatted, cast, indexed, a
+/// field read off it, or the result of a call that is handed it (as an
+/// argument or as the receiver) and returns something that can carry text.
+/// Identity text is refused where it is:
+///
+///   * an argument of a door - a function whose doc comment carries a door
+///     marker, the only places a spelling becomes a binding;
+///   * the key handed to a hash table (`HashMap` or `HashSet`).
+///
+/// A door's own body is not checked: comparing text is what a door is for.
+/// Nor is the body of a declaration that says why it may, with
+/// `![allow(lookup_by_spelling, reason = "...")]` - the marker the spelling
+/// lint reads, and the one a function that mangles a definition's path into
+/// its link symbol carries.  The check reaches as far as one function: identity text handed to a
+/// parameter of type `string` or `SymbolStr` and looked up by the callee,
+/// or returned as one, is not followed.  It runs over the compiler's own
+/// modules, the only ones a `DeclName` is declared in.
+namespace compiler::sema::identity_text;
+
+import compiler::ast;
+import compiler::ast::{ NodeKind };
+import compiler::ast::node::{ ASTNode };
+import compiler::ast::declaration::{ DeclarationNode, FunctionDeclNode, MethodNode, VarDeclNode };
+import compiler::ast::expression::{
+    ArrayAccessNode, BinaryExprNode, CallExprNode, CastExprNode, ExpressionNode, IdentifierNode,
+    IfExprNode, MemberAccessNode, TernaryExprNode, UnaryExprNode
+};
+import compiler::compilation_context;
+import compiler::compilation_context::{ CompilationContext };
+import compiler::decl_index::{ OverloadId };
+import compiler::diag;
+import compiler::diag::{ ErrorCode };
+import compiler::diag::diagnostic::{ Diagnostic };
+import compiler::passes::directive_processing::{ DirectiveProcessingPasses };
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::resolver::res::{ DefId, Res, ResSlot };
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::sema::call_facts::{ CallFacts };
+import compiler::sema::state::{ SemaState };
+import compiler::types;
+import compiler::types::{ TypeKind };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::compound::{ ArrayType, PointerType, ReferenceType };
+import compiler::types::generic::{ InstantiatedType };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::generic_registry::{ GenericRegistry };
+import std::fmt;
+import utils::text::{ Text };
+
+/// How deep an expression is followed into its operands.  Text deeper than
+/// this in one expression is not followed.
+const IDENTITY_TEXT_DEPTH: i32 = 24;
+
+/// The door marker a doc comment opens with.
+const DOOR_MARKER: string = "/// Door `";
+
+type struct IdentityTextCheck {}
+
+implement struct IdentityTextCheck {
+    /// Whether the module being checked is one the check runs over.
+    static applies(ctx: CompilationContext*) -> boolean {
+        return DirectiveProcessingPasses::in_store_root(ctx);
+    }
+
+    /// Whether `decl` is a door: its doc comment opens with the marker.
+    static is_door(decl: ASTNode*) -> boolean {
+        if (decl == null) { return false; }
+        if (decl.kind != NodeKind::FunctionDeclaration && decl.kind != NodeKind::MethodDeclaration) {
+            return false;
+        }
+        return (decl as DeclarationNode*).documentation.starts_with(DOOR_MARKER);
+    }
+
+    /// Whether the body of `func`, about to be checked, is exempt: a door's,
+    /// or one whose declaration allows `lookup_by_spelling` with a reason.
+    /// A method's doc comment and directives are on its method node.
+    static function_is_exempt(ctx: CompilationContext*, func: FunctionDeclNode*) -> boolean {
+        if (func == null) { return false; }
+        if (IdentityTextCheck::is_door(func as ASTNode*)
+                || DirectiveProcessingPasses::allows_spelling(&func.attached_directives)) {
+            return true;
+        }
+        const decl: ASTNode* = ctx.decl_index.entry_decl(func.overload_entry);
+        if (decl == null || decl.kind != NodeKind::MethodDeclaration) { return false; }
+        return IdentityTextCheck::is_door(decl)
+            || DirectiveProcessingPasses::allows_spelling(&(decl as MethodNode*).attached_directives);
+    }
+
+    /// Whether a value of type `ty` is a `DeclName`, directly or through a
+    /// reference, a pointer or an array.
+    static is_identity_text_type(ctx: CompilationContext*, ty: TypeRef) -> boolean {
+        return DirectiveProcessingPasses::carries_identity_text(ctx, ty);
+    }
+
+    /// Whether a value of type `ty` can carry text: anything but a scalar.
+    static can_carry_text(ctx: CompilationContext*, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = ctx.type_arena.lookup(ty);
+        if (t == null) { return false; }
+        return match (t.kind) {
+            TypeKind::Bool  => { false }
+            TypeKind::Int   => { false }
+            TypeKind::Float => { false }
+            TypeKind::Char  => { false }
+            TypeKind::Void  => { false }
+            TypeKind::Unit  => { false }
+            _               => { true }
+        };
+    }
+
+    /// Whether `e` is identity text, as the header says.
+    static is_identity_text(ctx: CompilationContext*, state: SemaState*, e: ExpressionNode*,
+                            depth: i32) -> boolean {
+        if (e == null || depth > IDENTITY_TEXT_DEPTH) { return false; }
+        if (e.resolved_type.is_valid() && IdentityTextCheck::is_identity_text_type(ctx, e.resolved_type)) {
+            return true;
+        }
+        const n: ASTNode* = e as ASTNode*;
+        if (n.kind == NodeKind::Identifier) {
+            const ident: IdentifierNode* = e as IdentifierNode*;
+            match (ident.res) {
+                ResSlot::Answered(r) => {
+                    match (r) {
+                        Res::Local(sym) => { return state.identity_locals.contains(&sym.table_key()); }
+                        _               => { return false; }
+                    }
+                }
+                _ => { return false; }
+            }
+        }
+        if (!IdentityTextCheck::can_carry_text(ctx, e.resolved_type)) { return false; }
+        if (n.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = e as BinaryExprNode*;
+            return IdentityTextCheck::is_identity_text(ctx, state, b.left, depth + 1)
+                || IdentityTextCheck::is_identity_text(ctx, state, b.right, depth + 1);
+        }
+        if (n.kind == NodeKind::UnaryExpression) {
+            return IdentityTextCheck::is_identity_text(ctx, state, (e as UnaryExprNode*).operand, depth + 1);
+        }
+        if (n.kind == NodeKind::CastExpression) {
+            return IdentityTextCheck::is_identity_text(ctx, state, (e as CastExprNode*).expression, depth + 1);
+        }
+        if (n.kind == NodeKind::ArrayAccess) {
+            return IdentityTextCheck::is_identity_text(ctx, state, (e as ArrayAccessNode*).array, depth + 1);
+        }
+        if (n.kind == NodeKind::TernaryExpression) {
+            const t: TernaryExprNode* = e as TernaryExprNode*;
+            return IdentityTextCheck::is_identity_text(ctx, state, t.true_expr, depth + 1)
+                || IdentityTextCheck::is_identity_text(ctx, state, t.false_expr, depth + 1);
+        }
+        if (n.kind == NodeKind::IfExpression) {
+            const ie: IfExprNode* = e as IfExprNode*;
+            return IdentityTextCheck::is_identity_text(ctx, state, ie.then_expr, depth + 1)
+                || IdentityTextCheck::is_identity_text(ctx, state, ie.else_expr, depth + 1);
+        }
+        if (n.kind == NodeKind::MemberAccess) {
+            return IdentityTextCheck::is_identity_text(ctx, state, (e as MemberAccessNode*).object, depth + 1);
+        }
+        if (n.kind == NodeKind::CallExpression) {
+            const call: CallExprNode* = e as CallExprNode*;
+            const cn: ASTNode* = call.callee as ASTNode*;
+            if (cn != null && cn.kind == NodeKind::MemberAccess
+                    && IdentityTextCheck::is_identity_text(ctx, state, (call.callee as MemberAccessNode*).object, depth + 1)) {
+                return true;
+            }
+            for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                if (IdentityTextCheck::is_identity_text(ctx, state, call.arguments[i], depth + 1)) { return true; }
+            }
+        }
+        return false;
+    }
+
+    /// Record the local `var_node` declares as identity text when its
+    /// initializer is.
+    static note_local(ctx: CompilationContext*, state: SemaState*, var_node: VarDeclNode*) -> void {
+        if (!state.identity_text_on || var_node == null || !var_node.sym_id.is_valid()) { return; }
+        if (IdentityTextCheck::is_identity_text(ctx, state, var_node.initializer, 0)) {
+            state.identity_locals.insert(var_node.sym_id.table_key());
+        }
+    }
+
+    /// Record the local an assignment writes as identity text when the
+    /// value it is given is.  A local once identity text stays so: the
+    /// check does not follow which assignment reaches which read.
+    static note_assignment(ctx: CompilationContext*, state: SemaState*, bin: BinaryExprNode*) -> void {
+        if (!state.identity_text_on || bin == null || !bin.op.kind.is_assignment_op()) { return; }
+        const ln: ASTNode* = bin.left as ASTNode*;
+        if (ln == null || ln.kind != NodeKind::Identifier) { return; }
+        if (!IdentityTextCheck::is_identity_text(ctx, state, bin.right, 0)) { return; }
+        match ((bin.left as IdentifierNode*).res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Local(sym) => { state.identity_locals.insert(sym.table_key()); }
+                    _               => { }
+                }
+            }
+            _ => { }
+        }
+    }
+
+    /// Whether `call` asks a hash table by a key: a method of `HashMap` or
+    /// `HashSet` handed at least one argument, the first of which is the key.
+    static is_table_call(ctx: CompilationContext*, call: CallExprNode*) -> boolean {
+        const cn: ASTNode* = call.callee as ASTNode*;
+        if (cn == null || cn.kind != NodeKind::MemberAccess || call.arguments.length == 0) { return false; }
+        mut ty: TypeRef = (call.callee as MemberAccessNode*).object.resolved_type;
+        for (mut depth: i32 = 0; depth < 4; depth++) {
+            const t: Type* = ctx.type_arena.lookup(ty);
+            if (t == null) { return false; }
+            if (t.kind == TypeKind::Reference) { ty = (t as ReferenceType*).referent; continue; }
+            if (t.kind == TypeKind::Pointer) { ty = (t as PointerType*).pointee; continue; }
+            break;
+        }
+        const base_ty: TypeRef = ctx.type_arena.inst_generic_base(ty);
+        if (!base_ty.is_valid()) { return false; }
+        const base: DefId = ctx.decl_index.registered_def(base_ty);
+        const reg: GenericRegistry* = ctx.get_generic_registry();
+        if (!base.is_valid() || reg == null) { return false; }
+        return base.equals(reg.wellknown(LangItem::HashMap)) || base.equals(reg.wellknown(LangItem::HashSet));
+    }
+
+    /// E0157 at each argument of `call` that is identity text, when the
+    /// call is a door's or a hash table's.
+    static check_call(ctx: CompilationContext*, state: SemaState*, call: CallExprNode*) -> void {
+        if (!state.identity_text_on || state.identity_exempt || call == null) { return; }
+        const entry: OverloadId = CallFacts::callee_entry(ctx, call).entry;
+        if (IdentityTextCheck::is_door(ctx.decl_index.entry_decl(entry))) {
+            for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                IdentityTextCheck::refuse_if_identity_text(ctx, state, call, call.arguments[i], Text::new("argument of a door"));
+            }
+            return;
+        }
+        if (IdentityTextCheck::is_table_call(ctx, call)) {
+            IdentityTextCheck::refuse_if_identity_text(ctx, state, call, call.arguments[0], Text::new("key of a hash table"));
+        }
+    }
+
+    static refuse_if_identity_text(ctx: CompilationContext*, state: SemaState*, call: CallExprNode*,
+                                   arg: ExpressionNode*, asked: Text) -> void {
+        if (!IdentityTextCheck::is_identity_text(ctx, state, arg, 0)) { return; }
+        mut callee: string = CallFacts::callee_spelled(ctx, call);
+        if (callee.starts_with(".")) { callee = callee.substr(1, callee.length() as i64 - 1); }
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0157_LOOKUP_BY_SPELLING, Text::new(fmt::format(
+            "`%s` is handed text read off a definition, which is shown and never looked up by",
+            callee)));
+        diag = diag.at_with_label(arg.span, Text::new(fmt::format(
+            "computed from a `DeclName`, and the %s", asked.as_string())));
+        diag = diag.help(Text::new(
+            "ask with the identity the text was read from: its `DefId`, or the `TypeRef` it declares"));
+        ctx.emit_diagnostic(diag);
+    }
+}

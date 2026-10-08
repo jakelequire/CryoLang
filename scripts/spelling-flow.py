@@ -89,6 +89,7 @@ NAME_TYPES = ("SymbolStr", "SymbolStr.id", "QualifiedName", "ModulePath")
 PASS_THROUGH = (
     "compiler::resolver::intern_table::InternTable.resolve(",
     "compiler::resolver::intern_table::InternTable.intern(",
+    "compiler::resolver::intern_table::InternTable.shown(",
     "compiler::compilation_context::CompilationContext.intern(",
     "compiler::compilation_context::CompilationContext.resolve_str(",
     "utils::text::Text::new(", "utils::text::Text.as_string(",
@@ -108,6 +109,10 @@ SAME_SPELLING_FIELDS = ("compiler::resolver::symbol_str::SymbolStr.id",)
 IDENTITY_TEXT = (
     ("call", "compiler::resolver::res::DefTable.path_of(", "a definition's path"),
     ("call", "compiler::resolver::res::DefTable.leaf_of(", "a definition's leaf"),
+    # A method call's provenance follows its first argument, not its
+    # receiver, so `defs.path_of(d).spelling()` reads as `spelling` of
+    # nothing: the unsealing call is identity text itself.
+    ("call", "compiler::resolver::decl_name::DeclName.spelling(", "a definition's name, as a node's"),
     ("call", "compiler::module_graph::ModulePath.as_sym(", "a module's path"),
     ("call", "compiler::decl_index::DeclarationIndex.family_owner_path(", "a family owner's path"),
     ("call", "compiler::sema::type_utils::TypeUtils.type_display_name(", "a type's display name"),
