@@ -19,6 +19,8 @@ build:
                                          the spelling-flow check reports its
                                          fixture's cases, and fails a case
                                          with each tracing rule removed
+    astdump    scripts/ast-dump-check.py `--ast` prints every node of its
+                                         fixture whole, in colour
     fast       make check-fast           lane surface, section 0, pin integrity
 
 They are independent: each writes its own build directory, and nothing here
@@ -111,6 +113,7 @@ GATES = {
                  r"^facts-blind-spots: "),
     "flow":     ([PY, "scripts/spelling-flow.py", "--selftest", "--cryo", "{cryo}"],
                  r"^spelling-flow: selftest "),
+    "astdump":  ([PY, "scripts/ast-dump-check.py", "--cryo", "{cryo}"], r"^ast-dump-check: "),
     # `ARGS=` on the command line: `make verify ARGS=...` exports ARGS to
     # child makes, and check-fast's lane-check would receive verify's flags.
     "fast":     (["make", "--no-print-directory", "check-fast", "ARGS="], r"check-fast: "),
