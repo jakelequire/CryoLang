@@ -1899,11 +1899,11 @@ A generic parameter is constrained to types that implement specific traits via a
 
 ```cryo
 function smallest<T>(xs: &Array<T>) -> Option<T>
-    where T: Ord + Clone {
+    where T: Ord + Copy {
     if (xs.length() == 0) { return Option::None; }
-    mut best: T = xs.get(0).clone();
+    mut best: T = xs.get(0).unwrap();
     for (mut i: u64 = 1; i < xs.length(); i++) {
-        const next: T = xs.get(i).clone();
+        const next: T = xs.get(i).unwrap();
         if (next.compare(&best) == Ordering::Less) {
             best = next;
         }
@@ -1964,6 +1964,22 @@ implement struct Cell<T, A> {
 ```
 
 A user trait that is merely *named* `Add` does not license `+`; the bound must name the language's trait (`std::core::ops::Add`, in the prelude).
+
+Inside the body, a parameter is **one type**: a binding, a `return`, an assignment or a branch that expects `T` takes a value of type `T` and nothing else, whatever `T` is later instantiated with. `Array::get` answers `Option<T>`, so it is matched or unwrapped before it is used as a `T`. Inside a `static match (T)` arm, `T` is the arm's type, and that includes the declared return type:
+
+```cryo
+function first<T>(xs: &Array<T>) -> T where T: Copy {
+    const v: T = xs.get(0);           // error[E0200]: expected `T`, found `Option<T>`
+    return v;
+}
+
+function halve<T>(x: T) -> T {
+    static match (T) {
+        f64 => { const h: f64 = x / 2.0; return h; }   // fine: in this arm `T` is `f64`
+        _   => { return x; }
+    }
+}
+```
 
 ### 11.4 Standard Library Traits
 

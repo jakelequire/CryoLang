@@ -185,6 +185,15 @@ yet is recorded with the change that builds it, not here.
      each other - is not a rule-three lookup.**  Each carries a written
      reason.
 
+201. **E0013 (`\0` followed by a digit) and E0407 (an arm's alternatives
+     binding differently) are the codes for rulings 192 and 194, with the
+     wording they were built with.**  E0013 may yet give way to real octal
+     escapes.
+
+202. **Order of work: the generic-body miscompile (a parameter accepted
+     where `Option` of it was written), then the method-binding scans,
+     then ruling 195's field-following lint.**
+
 ### 2026-10-08
 
 171. *(amended)* **The `Text` type is not deleted yet.**  Deleting it now

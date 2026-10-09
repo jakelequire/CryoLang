@@ -1009,21 +1009,22 @@ public:
     override visit(mut &this, node: ReturnStmtNode*) -> void {
         if (node.has_expression()) {
             const saved_expected: TypeRef = this.state.expected_type;
-            if (this.state.return_type.is_valid()) {
-                this.state.expected_type = this.state.return_type;
+            const declared: TypeRef = this.symbolic.symbolic_narrowed(this.state.return_type);
+            if (declared.is_valid()) {
+                this.state.expected_type = declared;
             }
             const expr_type: TypeRef = this.resolve_expr(node.expression);
             this.state.expected_type = saved_expected;
-            if (expr_type.is_valid() && this.state.return_type.is_valid()
-                    && !this.symbolic.type_has_unresolved_projection(this.state.return_type)
+            if (expr_type.is_valid() && declared.is_valid()
+                    && !this.symbolic.type_has_unresolved_projection(declared)
                     && !this.symbolic.type_has_unresolved_projection(expr_type)
-                    && !this.symbolic.symbolic_defer_type(this.state.return_type)
-                    && !this.symbolic.symbolic_defer_type(expr_type)) {
-                if (!this.checker.can_assign(expr_type, this.state.return_type)) {
+                    && this.symbolic.symbolic_judgeable(declared)
+                    && this.symbolic.symbolic_judgeable(expr_type)) {
+                if (!this.checker.can_assign(expr_type, declared)) {
                     const value_span: SourceSpan = if (node.expression != null) { node.expression.span } else { node.span };
                     const ann_span: SourceSpan = annotation_span(this.state.return_type_ann);
                     this.diag.emit_type_mismatch_with_value(
-                        ErrorCode::E0200_TYPE_MISMATCH, value_span, this.state.return_type, expr_type,
+                        ErrorCode::E0200_TYPE_MISMATCH, value_span, declared, expr_type,
                         Text::new("the function's declared return type doesn't match the value returned here"),
                         ann_span, node.expression);
                 }
@@ -1428,8 +1429,8 @@ public:
                 this.verify_impl_trait_bounds(imp_ann, init_type, var_node);
             }
             if (var_node.has_resolved_type() && init_type.is_valid() && imp_ann == null
-                    && !this.symbolic.symbolic_defer_type(init_type)
-                    && !this.symbolic.symbolic_defer_type(var_node.resolved_type)) {
+                    && this.symbolic.symbolic_judgeable(init_type)
+                    && this.symbolic.symbolic_judgeable(var_node.resolved_type)) {
                 if (!this.checker.can_assign(init_type, var_node.resolved_type)) {
                     const conv: ExpressionNode* = this.calls.build_implicit_conversion(
                         this, var_node.initializer, init_type, var_node.resolved_type);
@@ -2398,7 +2399,7 @@ public:
             }
             this.check_assignment_lvalue(bin.left);
             if (bin.op.kind == TokenType::Equal && lhs.is_valid() && rhs.is_valid()
-                && this.types.arg_type_is_concrete(lhs) && this.types.arg_type_is_concrete(rhs)
+                && this.assignment_judgeable(lhs) && this.assignment_judgeable(rhs)
                 && !this.checker.can_assign(rhs, lhs)
                 && !this.types.indirection_spelling_compatible(rhs, lhs)) {
                 const value_span: SourceSpan = if (bin.right != null) { bin.right.span } else { bin.span };
@@ -2608,6 +2609,17 @@ public:
     pointer_rule_operand(&this, ty: TypeRef, t: Type*) -> boolean {
         if (t.kind == TypeKind::Pointer || t.kind == TypeKind::Void) { return true; }
         return !this.symbolic.symbolic_type_unresolved(ty);
+    }
+
+    /// Whether one side of an `=` names a type a mismatch can be judged
+    /// against: a settled type, or - in a generic body - a type whose only
+    /// unsettled parts are that body's own parameters, each one opaque type.
+    assignment_judgeable(&this, ty: TypeRef) -> boolean {
+        if (this.types.arg_type_is_concrete(ty)) { return true; }
+        return this.state.in_symbolic_check
+            && this.arena.contains_generic_param(ty)
+            && this.symbolic.symbolic_judgeable(ty)
+            && this.symbolic.symbolic_type_concretizable(ty);
     }
 
     check_assignment_lvalue(mut &this, lhs: ExpressionNode*) -> void {
@@ -2883,13 +2895,12 @@ public:
                            context_msg: Text) -> void {
         if (!first.is_valid() || !second.is_valid()) { return; }
         if (first.equals(second)) { return; }
-        // Inside a generic template an arm's type can still be a bare parameter
-        // or an unresolved projection; agreement is only decidable per
-        // instantiation, so defer exactly as the return-type check does.
+        // An unresolved projection is not yet a type, so agreement with one is
+        // only decidable per instantiation; a bare parameter is a type.
         if (this.symbolic.type_has_unresolved_projection(first)
                 || this.symbolic.type_has_unresolved_projection(second)
-                || this.symbolic.symbolic_defer_type(first)
-                || this.symbolic.symbolic_defer_type(second)) { return; }
+                || !this.symbolic.symbolic_judgeable(first)
+                || !this.symbolic.symbolic_judgeable(second)) { return; }
         if (this.checker.check_compatibility(first, second) != TypeCompatibility::Incompatible) { return; }
         if (this.checker.check_compatibility(second, first) != TypeCompatibility::Incompatible) { return; }
         this.diag.emit_type_mismatch(ErrorCode::E0238_BRANCH_TYPE_MISMATCH,

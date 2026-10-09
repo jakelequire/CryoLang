@@ -55,6 +55,8 @@ import compiler::types::compound::{ ArrayType, FunctionType, OptionalType, Point
 import compiler::types::generic::{ AssocProjectionType, GenericParamType, InstantiatedType };
 import compiler::types::generic_registry::{ TemplateEntry };
 import compiler::types::resolver::{ ResolutionContext };
+import compiler::types::substitution;
+import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import utils::text::{ Text };
@@ -348,6 +350,24 @@ type struct SymbolicChecker {
         if (t.kind == TypeKind::Optional) {
             return this.type_has_unresolved_projection((t as OptionalType*).wrapped);
         }
+        if (t.kind == TypeKind::Array) {
+            return this.type_has_unresolved_projection((t as ArrayType*).element);
+        }
+        if (t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = t as TupleType*;
+            for (mut i: i64 = 0; i < tup.elements.length; i++) {
+                if (this.type_has_unresolved_projection(tup.elements[i])) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::Function) {
+            const func: FunctionType* = t as FunctionType*;
+            if (this.type_has_unresolved_projection(func.return_type)) { return true; }
+            for (mut i: i64 = 0; i < func.param_types.length; i++) {
+                if (this.type_has_unresolved_projection(func.param_types[i])) { return true; }
+            }
+            return false;
+        }
         return false;
     }
 
@@ -418,9 +438,57 @@ type struct SymbolicChecker {
         return true;
     }
 
-    /// During a symbolic walk, a concrete-only check against a type that still
-    /// carries an abstract param must be deferred (decided once monomorphized).
-    /// No-op outside symbolic mode.
+    /// Whether a mismatch involving `ty` can be judged in the body under
+    /// symbolic check.  A generic parameter is one opaque type there - `T` is
+    /// assignable from `T` and from nothing else, whatever `T` later becomes -
+    /// so a type that mentions one is judged like any other.  Only an
+    /// unreduced projection (`I::Item`) is not yet a type, and an invalid one
+    /// was already reported where it was made.  Copies are never re-checked,
+    /// so a pair this answers true for and leaves unchecked compiles wrong.
+    symbolic_judgeable(&this, ty: TypeRef) -> boolean {
+        if (!this.state.in_symbolic_check) { return true; }
+        if (!ty.is_valid()) { return false; }
+        return !this.type_has_unresolved_projection(ty);
+    }
+
+    /// `ty` as it reads where the walk is: each parameter an enclosing
+    /// `static match` arm narrowed replaced by the arm's type.  A declared
+    /// return type `T` is resolved once for the whole body, so inside an
+    /// `f64` arm it still says `T` while the locals typed `T` already say
+    /// `f64`.
+    symbolic_narrowed(&this, ty: TypeRef) -> TypeRef {
+        if (!this.state.in_symbolic_check) { return ty; }
+        if (this.state.symbolic_narrow_syms.length == 0 || !ty.is_valid()) { return ty; }
+        mut params: TypeRef[] = [];
+        mut args: TypeRef[] = [];
+        for (mut k: i64 = 0; k < this.state.symbolic_narrow_syms.length; k++) {
+            const p: TypeRef = this.symbolic_param_of(this.state.symbolic_narrow_syms[k]);
+            if (p.is_valid()) {
+                params.push(p);
+                args.push(this.state.symbolic_narrow_types[k]);
+            }
+        }
+        const narrowing: TypeSubstitution = TypeSubstitution::from_params(&params, &args);
+        return narrowing.apply(ty, this.arena);
+    }
+
+    /// The abstract type of the in-scope generic parameter `sym`; invalid
+    /// when no parameter of the body under check is `sym`.
+    symbolic_param_of(&this, sym: SymbolID) -> TypeRef {
+        for (mut i: i64 = 0; i < this.state.symbolic_owner_param_nodes.length; i++) {
+            const p: GenericParamNode* = this.state.symbolic_owner_param_nodes[i];
+            if (p != null && p.sym_id.equals(sym)) { return this.symbolic_param_ref(p, i as u64); }
+        }
+        for (mut j: i64 = 0; j < this.state.symbolic_method_param_nodes.length; j++) {
+            const p: GenericParamNode* = this.state.symbolic_method_param_nodes[j];
+            if (p != null && p.sym_id.equals(sym)) { return this.symbolic_param_ref(p, j as u64); }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// During a symbolic walk, a local whose type still carries an abstract
+    /// param cannot be destructured by field (no field list to read).  No-op
+    /// outside symbolic mode.
     symbolic_defer_type(&this, ty: TypeRef) -> boolean {
         if (!this.state.in_symbolic_check) { return false; }
         if (!ty.is_valid()) { return true; }
