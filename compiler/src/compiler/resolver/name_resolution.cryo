@@ -127,10 +127,15 @@ public:
     /// walk has recorded every bound (`check_param_projections`): a
     /// declaration's `where` clause is stamped after its signature.
     param_projections: ParamProjection[];
+    /// Whether the pattern being walked is a match arm's second or later
+    /// alternative (`A(v) | B(v)`), whose bindings are the ones the arm's
+    /// first alternative declared.
+    in_alternative: boolean;
 
     NameResolver(resolver: Resolver*, ctx: CompilationContext*)
         : BaseASTVisitor() {
         this.param_projections = [];
+        this.in_alternative    = false;
         this.resolver = resolver;
         this.ctx      = ctx;
         this.pending_base_ctor = null;
@@ -3223,8 +3228,10 @@ public:
 
         // Visit patterns (may introduce bindings)
         for (mut i: int = 0; i < node.patterns.length; i++) {
+            this.in_alternative = i > 0;
             node.patterns[i].accept(this);
         }
+        this.in_alternative = false;
 
         // The guard is an expression of this arm's scope: it reads the
         // pattern's bindings and anything the module can see, so it is
@@ -3287,10 +3294,25 @@ public:
                     _                    => { }
                 }
             } else {
-                node.binding_sym = this.resolver.declare_variable(
-                    node.binding_name, node.span, false, false);
+                node.binding_sym = this.declare_pattern_binding(node.binding_name, node.span);
             }
         }
+    }
+
+    /// The binding a pattern declares for `name`.  The alternatives of one arm
+    /// (`A(v) | B(v)`) bind ONE value under each name - whichever alternative
+    /// matched - so an alternative after the first answers with the binding
+    /// the arm's own scope already holds under the name rather than declaring
+    /// a second one that the arm's body could never name.
+    declare_pattern_binding(mut &this, name: SymbolStr, span: SourceSpan) -> SymbolID {
+        if (this.in_alternative) {
+            const held: SymbolID = this.resolver.lookup_value(name, this.resolver.current_scope);
+            if (held.is_valid()
+                    && this.resolver.get_symbol(held).scope_id.id == this.resolver.current_scope.id) {
+                return held;
+            }
+        }
+        return this.resolver.declare_variable(name, span, false, false);
     }
 
     override visit(node: EnumPatternNode*) -> void {
@@ -3316,7 +3338,7 @@ public:
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             mut pb: PatternBinding* = node.binding_at(i);
             if (pb != null) {
-                pb.sym_id = this.resolver.declare_variable(pb.name, pb.span, false, false);
+                pb.sym_id = this.declare_pattern_binding(pb.name, pb.span);
                 continue;
             }
             const sub: PatternNode* = node.sub_at(i);

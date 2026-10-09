@@ -165,6 +165,21 @@ yet is recorded with the change that builds it, not here.
 181. **The async lowering's pending allows are converted next**: the locals
      it tracks and renames are keyed by their binding, not their spelling.
 
+182. **The E0157 second label's wording is accepted**: "looked up here,
+     outside a door: compared" / "...: the key of a hash table" / "...: the
+     subject of a `match`".
+
+183. **The spelling lint keeps counting any comparison or hash-table insert
+     of a spelling as a lookup**, at least until rule three's structural
+     check lands.
+
+184. **The LSP's pending allows that the lint no longer needs are deleted
+     during the LSP's own work after the merge**, not before.
+
+185. **Dead code is deleted, not converted.**  A name-lookup function or
+     helper with no live callers is removed - not given an allow, not
+     routed through a door.  This holds for everything a change touches.
+
 ### 2026-10-07
 
 160. **The `()` unit type (ruling 103) is built after the merge, before the

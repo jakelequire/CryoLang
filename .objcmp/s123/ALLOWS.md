@@ -33,13 +33,13 @@ as the facts record it.
 
 | class | functions |
 |---|---|
-| lookup | 64 |
+| lookup | 49 |
 | lookup-via-callee | 3 |
 | register | 1 |
 | carry | 3 |
-| total | 71 |
+| total | 56 |
 
-## lookup (64)
+## lookup (49)
 
 | site | function | parameter uses | callers |
 |---|---|---|---|
@@ -62,7 +62,7 @@ as the facts record it.
 | `src/compiler/module_graph.cryo:268` | `add_reexport` | ns:SymbolStr=[compare,store:.push] | field=4,local=2 |
 | `src/compiler/module_graph.cryo:279` | `add_submodule` | ns:SymbolStr=[compare,store:.push] | call=1,field=1 |
 | `src/compiler/module_graph.cryo:530` | `register_c_import_module` | ns:SymbolStr=[of,map-read,map-write] | call=1 |
-| `src/compiler/resolver/name_resolution.cryo:1702` | `reaching_import_for` | decl_ns:SymbolStr=[InternTable.resolve,path_precedes,compare] | identity=1 |
+| `src/compiler/resolver/name_resolution.cryo:1707` | `reaching_import_for` | decl_ns:SymbolStr=[InternTable.resolve,path_precedes,compare] | identity=1 |
 | `src/compiler/resolver/qualified_name.cryo:169` | `equals` | other:QualifiedName=[compare] | - |
 | `src/compiler/resolver/qualified_name.cryo:184` | `starts_with` | prefix:QualifiedName=[compare] | - |
 | `src/compiler/resolver/qualified_name.cryo:200` | `ends_with` | suffix:QualifiedName=[compare] | - |
@@ -74,22 +74,7 @@ as the facts record it.
 | `src/compiler/resolver/scope.cryo:332` | `is_ambiguous` | name:SymbolStr=[compare] | local=1,param=1 |
 | `src/compiler/resolver/scope.cryo:344` | `get_ambiguous_module_ids` | name:SymbolStr=[compare] | param=1 |
 | `src/compiler/resolver/scope.cryo:360` | `get_overloads` | name:SymbolStr=[compare,map-read] | field=1,local=1,param=2 |
-| `src/compiler/resolver/symbol_str.cryo:41` | `equals` | other:SymbolStr=[compare] | ast=24,element=3,field=7,identity=5,literal=13,local=17,param=44 |
-| `src/compiler/sema/async_lower.cryo:209` | `push_orig` | name:SymbolStr=[compare,store:.push] | ast=2 |
-| `src/compiler/sema/async_lower.cryo:217` | `index_of` | name:SymbolStr=[compare] | ast=2 |
-| `src/compiler/sema/async_lower.cryo:255` | `push_unique` | name:SymbolStr=[compare,store:.push] | ast=2 |
-| `src/compiler/sema/async_lower.cryo:1718` | `name_read_in_expr` | name:SymbolStr=[AsyncLower.name_read_in_stmt,compare,pass:name_read_in_expr] | local=1,param=35 |
-| `src/compiler/sema/async_lower.cryo:1969` | `name_is_whole_place` | name:SymbolStr=[compare] | param=1 |
-| `src/compiler/sema/async_lower.cryo:1982` | `subst_name_expr` | name:SymbolStr=[AsyncLower.hoist_giveaway,AsyncLower.subst_nested_stmt,compare,pass:subst_name_expr,pass:name_is_whole_place]; field:SymbolStr=[AsyncLower.subst_nested_stmt,AsyncLower.subst_target,pass:subst_name_expr] | literal=1,local=1,param=68 |
-| `src/compiler/sema/async_lower.cryo:4102` | `stmt_first_use` | name:SymbolStr=[AsyncLower.block_first_use,AsyncLower.name_read_in_stmt,compare,pass:expr_first_use,pass:stmt_first_use] | param=10 |
-| `src/compiler/sema/async_lower.cryo:4175` | `expr_first_use` | name:SymbolStr=[compare,pass:expr_first_use,pass:stmt_first_use,pass:name_read_in_expr] | param=15 |
-| `src/compiler/sema/async_lower.cryo:4419` | `mark_last_use_expr` | name:SymbolStr=[AsyncLower.mark_last_use_arm,compare,pass:name_read_in_expr,pass:mark_last_use_expr] | param=32 |
-| `src/compiler/sema/async_lower.cryo:4597` | `top_level_assignment_index` | name:SymbolStr=[compare] | local=2,param=2 |
-| `src/compiler/sema/async_lower.cryo:5043` | `is_frame_name` | name:SymbolStr=[compare] | ast=1 |
-| `src/compiler/sema/async_lower.cryo:5248` | `assigned_frame_addr_root` | name:SymbolStr=[compare] | param=1 |
-| `src/compiler/sema/async_lower.cryo:5306` | `strip_local_marker` | name:SymbolStr=[compare] | local=2,param=2 |
-| `src/compiler/sema/async_lower.cryo:6195` | `rc_lookup` | name:SymbolStr=[compare] | ast=2 |
-| `src/compiler/sema/async_lower.cryo:6656` | `rb_lookup` | name:SymbolStr=[compare] | ast=2 |
+| `src/compiler/resolver/symbol_str.cryo:41` | `equals` | other:SymbolStr=[compare] | ast=24,element=3,field=7,identity=5,literal=13,local=15,param=28 |
 | `src/compiler/sema/diagnostics.cryo:294` | `find_shadowed_type_candidates` | simple_name:SymbolStr=[InternTable.resolve,compare]; member_name:SymbolStr=[door:EnumType.variant_index,pass:get_method,pass:get_method,pass:get_method] | ast=3,local=1 |
 | `src/compiler/sema/diagnostics.cryo:361` | `attach_shadow_import_suggestions` | candidates:SymbolStr[]=[InternTable.resolve,parent_of,format,compare] | ast=1,local=1 |
 | `src/compiler/sema/method_binding.cryo:172` | `resolve_method_return_via_template` | method_name:SymbolStr=[compare] | ast=1,param=1 |
@@ -112,7 +97,7 @@ as the facts record it.
 
 | site | function | parameter uses | callers |
 |---|---|---|---|
-| `src/compiler/resolver/name_resolution.cryo:1748` | `refuse_unbound_type` | name:SymbolStr=[CompilationContext.modules_written_as,Diagnostic.did_you_mean,InternTable.resolve,NameResolver.type_declarers_of_leaf,parent_of,Resolver.contains_separator,format,pass:exports_named] | ast=4 |
+| `src/compiler/resolver/name_resolution.cryo:1753` | `refuse_unbound_type` | name:SymbolStr=[CompilationContext.modules_written_as,Diagnostic.did_you_mean,InternTable.resolve,NameResolver.type_declarers_of_leaf,parent_of,Resolver.contains_separator,format,pass:exports_named] | ast=4 |
 | `src/compiler/resolver/resolver.cryo:937` | `resolve_path` | segments:SymbolStr[]=[Resolver.lookup_prelude,pass:is_ambiguous,pass:find] | local=2 |
 | `src/compiler/types/checker.cryo:1053` | `check_field_access` | field_name:SymbolStr=[InternTable.resolve,format,LOG_DEBUG,pass:field_index,pass:field_index] | param=1 |
 

@@ -149,14 +149,14 @@ type struct PollSm {
     loop_cont:  i64[];
     loop_brk:   i64[];
 
-    // Names whose storage lives in the poll frame: the body's locals and
+    // Bindings whose storage lives in the poll frame: the body's locals and
     // `match`-arm bindings (re-materialized on every poll) plus the parameters
     // (re-bound by the shadow prelude on every poll). An address rooted in one
     // of these is invalid once the poll that produced it returns, so it may not
     // be held across a suspend; an address rooted anywhere else (a global, the
     // future struct's own fields, a pointee in the caller's frame or on the
     // heap) is untouched by a suspend.
-    frame_names: SymbolStr[];
+    frame_keys:  SymbolID[];
 
     // The operand of every `await` the body suspends on — the expression that
     // BUILDS the sub-future, recorded as it is stashed. A future constructed
@@ -173,54 +173,59 @@ type struct PollSm {
     unit_output: boolean;
 }
 
-/// Lexical scope stack for `disambiguate_locals`, the pre-lowering alpha-rename
-/// that makes every local binding's name globally unique before the body is
-/// flattened into state blocks (so the by-name cross-state promotion cannot
-/// conflate a promoted local with a same-named parameter or a sibling-scope
-/// local). `orig`/`repl` are a flat binding stack (parallel arrays: an original
-/// local name and the fresh name it was renamed to); `marks` records each
-/// scope's start index so leaving a scope pops exactly its bindings. A use
-/// resolves by scanning `orig` from the top (innermost binding first); a name in
-/// no frame is a parameter/global/outer and is left unchanged.
-type struct RenameCtx {
-    orig:  SymbolStr[];
-    repl:  SymbolStr[];
-    marks: i64[];
+/// The alpha-rename `disambiguate_locals` makes before the body is flattened
+/// into state blocks: each local binding the body declares, beside the fresh,
+/// globally-unique spelling its declaration and every use of it take.  Codegen
+/// reads the flattened body by spelling, so two bindings spelled alike in
+/// different scopes would otherwise become one.  A use whose binding is not
+/// here - a parameter, a global, a capture of an outer function - keeps its
+/// spelling.
+type struct RenameMap {
+    syms:  SymbolID[];
+    fresh: SymbolStr[];
+
+    /// The fresh spelling of binding `sym`, or the empty symbol for a binding
+    /// the body does not declare.
+    fresh_of(&this, sym: SymbolID) -> SymbolStr {
+        if (!sym.is_valid()) { return SymbolStr::empty(); }
+        for (mut i: i64 = 0; i < this.syms.length; i++) {
+            if (this.syms[i].equals(sym)) { return this.fresh[i]; }
+        }
+        return SymbolStr::empty();
+    }
 }
 
 /// The scopes of a finished `poll` body, for `rebind_poll_locals`: each
-/// declaration's spelling beside the binding it declares, and each scope's
-/// start index, exactly as `RenameCtx` keeps them.  A use answers from the top
-/// (innermost declaration first); a spelling in no frame is left as it was.
+/// declaration's key beside the binding it declares, and each scope's start
+/// index.  A declaration's key is the binding it stands for (`stand_in_for`),
+/// or its own binding.  A use answers from the top (innermost declaration
+/// first); a key no scope declares is left as it was.
 type struct RebindCtx {
-    names: SymbolStr[];
+    keys:  SymbolID[];
     syms:  SymbolID[];
     marks: i64[];
 }
 
-/// The distinct binding names of one `match` arm paired with the fresh,
-/// globally-unique names they are alpha-renamed to (`disambiguate_locals`).
-/// OR-alternatives (`A(v) | B(v)`) contribute the name once and share one
-/// fresh name so the arm body's uses resolve consistently.
-type struct BindingRename {
-    orig:  SymbolStr[];
-    fresh: SymbolStr[];
+/// The bindings one `match` arm's patterns declare, each beside the source
+/// spelling its fresh name is derived from.  The alternatives of an arm
+/// (`A(v) | B(v)`) declare one binding per name, so it is collected once.
+type struct ArmBindings {
+    syms:  SymbolID[];
+    names: SymbolStr[];
 
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    push_orig(mut &this, name: SymbolStr) -> void {
-        for (mut i: i64 = 0; i < this.orig.length; i++) {
-            if (this.orig[i].equals(name)) { return; }
+    holds(&this, sym: SymbolID) -> boolean {
+        for (mut i: i64 = 0; i < this.syms.length; i++) {
+            if (this.syms[i].equals(sym)) { return true; }
         }
-        this.orig.push(name);
+        return false;
     }
+}
 
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    index_of(&this, name: SymbolStr) -> i64 {
-        for (mut i: i64 = 0; i < this.orig.length; i++) {
-            if (this.orig[i].equals(name)) { return i; }
-        }
-        return -1;
-    }
+/// A local this lowering minted: the spelling codegen reads it by, and the
+/// binding every use of it names.
+type struct MintedLocal {
+    name: SymbolStr;
+    sym:  SymbolID;
 }
 
 /// The statements one rewrite step lifted out of an expression, in the order
@@ -249,14 +254,15 @@ type struct HoistedExpr {
 /// payload types, collected by `lower_match_sm` to promote each scalar binding
 /// read across a suspend to a struct field.
 type struct BindingCapture {
+    syms:  SymbolID[];
     names: SymbolStr[];
     tys:   TypeRef[];
 
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    push_unique(mut &this, name: SymbolStr, ty: TypeRef) -> void {
-        for (mut i: i64 = 0; i < this.names.length; i++) {
-            if (this.names[i].equals(name)) { return; }
+    push_unique(mut &this, sym: SymbolID, name: SymbolStr, ty: TypeRef) -> void {
+        for (mut i: i64 = 0; i < this.syms.length; i++) {
+            if (this.syms[i].equals(sym)) { return; }
         }
+        this.syms.push(sym);
         this.names.push(name);
         this.tys.push(ty);
     }
@@ -393,18 +399,31 @@ type struct AsyncLower {
     // never walked again, so nothing after this lowering would pin them.
     own_accesses: MemberAccessNode*[];
     counter:  u64;
-    // Every name `mint_local` hands out for the async body currently being
-    // lowered — i.e. exactly the body's locals and `match`-arm bindings, which
-    // are the values that live in the poll frame rather than in the future
-    // struct. Reset per function by `disambiguate_locals`, the sole caller-side
-    // funnel; consumed by the address-of-across-suspend check, which must know
-    // whether a place is rooted in the frame (moves on every poll) or in a
-    // global (does not).
-    frame_locals: SymbolStr[];
+    // The binding of every local `mint_local` and `mint_temp` hand out for the
+    // async body currently being lowered — i.e. exactly the body's locals and
+    // `match`-arm bindings, which are the values that live in the poll frame
+    // rather than in the future struct. Reset per function by
+    // `disambiguate_locals`, the sole caller-side funnel; consumed by the
+    // address-of-across-suspend check, which must know whether a place is
+    // rooted in the frame (moves on every poll) or in a global (does not).
+    frame_locals: SymbolID[];
     // Parallel to `frame_locals`: the source spelling each minted name replaced,
     // so a diagnostic about a local can name it as the user wrote it instead of
     // showing the internal `$L` suffix.
     frame_local_src: SymbolStr[];
+    // Declarations that stand for a binding declared elsewhere, beside that
+    // binding.  A value that moves between the future and the poll frame is
+    // re-declared in every state that takes it out - a parameter's shadow, a
+    // carried value's take, a promoted value's reload, the pointer a carried
+    // aggregate is reached through - and a use names the binding it MEANS;
+    // `rebind_poll_locals` gives it the stand-in its scope holds.  Reset per
+    // function by `lower`.
+    stand_ins:     VarDeclNode*[];
+    stand_in_keys: SymbolID[];
+    // The bindings of the `poll` being built: its receiver, which every
+    // `this.<field>` this lowering writes reads, and its context parameter.
+    poll_self: SymbolID;
+    poll_cx:   SymbolID;
     // One record per `async function` this module has declared but not yet
     // lowered. Keyed by node identity rather than name: a name is not unique
     // across overloads, and the record has to reach exactly the visit that owns
@@ -428,6 +447,9 @@ type struct AsyncLower {
     // form and is restored to it after the one pass that needs another; see
     // `subst_target`.
     subst_mode: i64;
+    // In the two local forms, the binding the local a substituted use becomes
+    // is: the declaration's own, or the binding its stand-ins stand for.
+    subst_local_sym: SymbolID;
     // The carrier field `subst_carried_from` is currently rewriting a block
     // against, and empty outside such a rewrite. A mention that REBUILDS the
     // whole value republishes this field rather than writing through the
@@ -473,10 +495,14 @@ type struct AsyncLower {
         return AsyncLower { arena: null, intern: null, ctx: null, resolver: null,
                             patterns: null, literals: null, members: null,
                             own_accesses: [], counter: 0,
-                            frame_locals: [], frame_local_src: [], pending: [],
+                            frame_locals: [], frame_local_src: [],
+                            stand_ins: [], stand_in_keys: [],
+                            poll_self: SymbolID::invalid(), poll_cx: SymbolID::invalid(),
+                            pending: [],
                             edge_from: [], edge_to: [],
                             this_sym: SymbolStr::empty(), this_amp_sym: SymbolStr::empty(),
                             recv_sym: SymbolStr::empty(), subst_mode: 0,
+                            subst_local_sym: SymbolID::invalid(),
                             subst_carrier_field: SymbolStr::empty(),
                             subst_carrier_opt: TypeRef::invalid(),
                             subst_carrier_struct: TypeRef::invalid(),
@@ -930,7 +956,6 @@ type struct AsyncLower {
     /// so no walk reaches it afterwards: the ordinal is found here, through
     /// the variant door on the enum's declaration, and is the same in every
     /// instantiation.
-    ![allow(lookup_by_spelling, reason = "the variant this lowering builds is named by its leaf; the variant door finds it")]
     variant_pin(&this, ty: TypeRef, leaf: SymbolStr, span: SourceSpan) -> MemberPin {
         const decl_ty: TypeRef = this.ctx.decl_index.type_of_def(
             this.ctx.decl_index.def_of(ty, this.ctx.type_arena));
@@ -1407,32 +1432,57 @@ type struct AsyncLower {
 
     // ---- small typed-AST builders (shared by the poll-body synthesis) ----
 
+    /// `this` inside the `poll` being built: its receiver.
     this_ident(&this, struct_ref: TypeRef, span: SourceSpan) -> ExpressionNode* {
-        mut ti: IdentifierNode* = new IdentifierNode(this.intern.intern("this"), span);
-        ti.set_resolved_type(struct_ref);
-        return ti as ExpressionNode*;
+        return this.ident_bound(this.this_sym, this.poll_self, struct_ref, span);
     }
 
-    /// A use inside a `poll` body, placed under the declaration it means by
-    /// scope; `rebind_poll_locals` gives it that declaration's identity once
-    /// the body is finished.  A use written anywhere else takes `ident_bound`.
-    ident(&this, name: SymbolStr, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
-        return this.ident_bound(name, SymbolID::invalid(), ty, span);
-    }
-
-    /// A use of a binding THIS lowering declared, named by that binding.
+    /// A use of binding `sym`, spelled `name`.
     ///
-    /// The caller passes the symbol rather than looking one up by spelling,
-    /// because a spelling does not identify a synthesized binding either: a
-    /// carried local's per-state shadow is re-declared under one renamed
-    /// spelling in every resume block, so a table from spelling to binding
-    /// hands an earlier use the LAST declaration's identity.
+    /// The caller passes the binding rather than leaving the use to be placed
+    /// by its spelling, because a spelling does not identify a synthesized
+    /// binding: a carried local's per-state shadow is re-declared under one
+    /// renamed spelling in every resume block.  A use of a value that moves
+    /// between the future and the frame names the binding it stands for, and
+    /// `rebind_poll_locals` gives it the stand-in in its scope.
     ident_bound(&this, name: SymbolStr, sym: SymbolID, ty: TypeRef,
                 span: SourceSpan) -> ExpressionNode* {
         mut id: IdentifierNode* = new IdentifierNode(name, span);
         id.set_resolved_type(ty);
         if (sym.is_valid()) { id.set_res(Res::Local(sym)); }
         return id as ExpressionNode*;
+    }
+
+    /// The binding an identifier use names, or the invalid binding for any
+    /// other expression or a use that names no local.
+    local_key(&this, e: ExpressionNode*) -> SymbolID {
+        if (e == null || (e as ASTNode*).kind != NodeKind::Identifier) { return SymbolID::invalid(); }
+        return (e as IdentifierNode*).res.local_sym();
+    }
+
+    /// Whether `e` is a use of binding `key`.
+    names_binding(&this, e: ExpressionNode*, key: SymbolID) -> boolean {
+        return key.is_valid() && this.local_key(e).equals(key);
+    }
+
+    /// Record the declaration `s` makes as a stand-in for binding `key`, and
+    /// hand the statement back.
+    stand_in(mut &this, s: StatementNode*, key: SymbolID) -> StatementNode* {
+        const vd: VarDeclNode* = this.stmt_decl_var(s);
+        if (vd != null && key.is_valid()) {
+            this.stand_ins.push(vd);
+            this.stand_in_keys.push(key);
+        }
+        return s;
+    }
+
+    /// The binding declaration `vd` stands for: the one recorded by
+    /// `stand_in`, or its own.
+    decl_key(&this, vd: VarDeclNode*) -> SymbolID {
+        for (mut i: i64 = 0; i < this.stand_ins.length; i++) {
+            if (this.stand_ins[i] == vd) { return this.stand_in_keys[i]; }
+        }
+        return vd.sym_id;
     }
 
     /// `*(<e>)` typed `ty`. Marked synthetic: the address-of / deref checks
@@ -1465,7 +1515,6 @@ type struct AsyncLower {
     /// out, typed `ty`.  Its field position is not known yet - the struct's
     /// fields are settled only once the whole body is built - so the access
     /// is recorded and `pin_own_accesses` pins it then.
-    ![allow(lookup_by_spelling, reason = "the field is one this lowering minted under this leaf; the field door finds it once the struct is laid out")]
     own_field(mut &this, struct_ref: TypeRef, field: SymbolStr, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
         mut m: MemberAccessNode* = new MemberAccessNode(this.this_ident(struct_ref, span), field, span, span);
         m.set_resolved_type(ty);
@@ -1489,7 +1538,6 @@ type struct AsyncLower {
     /// The position of field `leaf` in the laid-out future struct `struct_ty`,
     /// by the field door.  A field the door cannot place is a defect in this
     /// lowering, reported here rather than left for codegen to meet unpinned.
-    ![allow(lookup_by_spelling, reason = "the field is one this lowering minted under this leaf; the field door finds it")]
     own_field_pin(&this, struct_ty: TypeRef, leaf: SymbolStr, span: SourceSpan) -> MemberPin {
         const fa: FieldAnswer = this.members.field_of(struct_ty, leaf);
         if (fa.index < 0) {
@@ -1672,8 +1720,9 @@ type struct AsyncLower {
             if (skip_carried && carried) { continue; }
             const fname: SymbolStr = this.param_field_name(p);
             if (carried) {
-                body.add_statement(this.agg_take_stmt(fname, fname, slot_ty,
-                    this.param_field_type(sm, slot_ty), sm.struct_ref, true, span));
+                body.add_statement(this.stand_in(this.agg_take_stmt(fname,
+                    this.resolver.alloc_synthetic_binding(), fname, slot_ty,
+                    this.param_field_type(sm, slot_ty), sm.struct_ref, true, span), p.sym_id));
                 continue;
             }
             const access: ExpressionNode* = this.own_field(sm.struct_ref, fname, slot_ty, span);
@@ -1683,7 +1732,7 @@ type struct AsyncLower {
             shadow.set_resolved_type(slot_ty);
             shadow.set_initializer(access as ExpressionNode*);
             const shadow_stmt: DeclStmtNode* = new DeclStmtNode(shadow as DeclarationNode*, span);
-            body.add_statement(shadow_stmt as StatementNode*);
+            body.add_statement(this.stand_in(shadow_stmt as StatementNode*, p.sym_id));
         }
     }
 
@@ -1710,59 +1759,58 @@ type struct AsyncLower {
 
     // ---- cross-await promotion analysis (Inc 3) ----
 
-    /// True if `name` is read (appears as an identifier) anywhere in `e`. Walks
-    /// the expression kinds an awaited body realistically nests names under; a
-    /// missed kind can only UNDER-report, which leaves a cross-await local
-    /// unpromoted and surfaces as a plain "not found" at its later use — a loud
-    /// compile error, never a silent miscompile.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    name_read_in_expr(&this, e: ExpressionNode*, name: SymbolStr) -> boolean {
+    /// True if binding `key` is read (a use of it appears) anywhere in `e`.
+    /// Walks the expression kinds an awaited body realistically nests names
+    /// under; a missed kind can only UNDER-report, which leaves a cross-await
+    /// local unpromoted and surfaces as a plain "not found" at its later use —
+    /// a loud compile error, never a silent miscompile.
+    name_read_in_expr(&this, e: ExpressionNode*, key: SymbolID) -> boolean {
         if (e == null) { return false; }
         const k: NodeKind = (e as ASTNode*).kind;
         if (k == NodeKind::Identifier) {
-            return (e as IdentifierNode*).name.equals(name);
+            return this.names_binding(e, key);
         }
         if (k == NodeKind::BinaryExpression) {
             const b: BinaryExprNode* = e as BinaryExprNode*;
-            return this.name_read_in_expr(b.left, name) || this.name_read_in_expr(b.right, name);
+            return this.name_read_in_expr(b.left, key) || this.name_read_in_expr(b.right, key);
         }
         if (k == NodeKind::UnaryExpression) {
-            return this.name_read_in_expr((e as UnaryExprNode*).operand, name);
+            return this.name_read_in_expr((e as UnaryExprNode*).operand, key);
         }
         if (k == NodeKind::CallExpression) {
             const c: CallExprNode* = e as CallExprNode*;
-            if (this.name_read_in_expr(c.callee, name)) { return true; }
+            if (this.name_read_in_expr(c.callee, key)) { return true; }
             for (mut i: i64 = 0; i < c.arguments.length; i++) {
-                if (this.name_read_in_expr(c.arguments[i], name)) { return true; }
+                if (this.name_read_in_expr(c.arguments[i], key)) { return true; }
             }
             return false;
         }
         if (k == NodeKind::MemberAccess) {
-            return this.name_read_in_expr((e as MemberAccessNode*).object, name);
+            return this.name_read_in_expr((e as MemberAccessNode*).object, key);
         }
         if (k == NodeKind::CastExpression) {
-            return this.name_read_in_expr((e as CastExprNode*).expression, name);
+            return this.name_read_in_expr((e as CastExprNode*).expression, key);
         }
         if (k == NodeKind::ArrayAccess) {
             const a: ArrayAccessNode* = e as ArrayAccessNode*;
-            return this.name_read_in_expr(a.array, name) || this.name_read_in_expr(a.index, name);
+            return this.name_read_in_expr(a.array, key) || this.name_read_in_expr(a.index, key);
         }
         if (k == NodeKind::TernaryExpression) {
             const t: TernaryExprNode* = e as TernaryExprNode*;
-            return this.name_read_in_expr(t.condition, name)
-                || this.name_read_in_expr(t.true_expr, name)
-                || this.name_read_in_expr(t.false_expr, name);
+            return this.name_read_in_expr(t.condition, key)
+                || this.name_read_in_expr(t.true_expr, key)
+                || this.name_read_in_expr(t.false_expr, key);
         }
         if (k == NodeKind::IfExpression) {
             const ife: IfExprNode* = e as IfExprNode*;
-            return this.name_read_in_expr(ife.condition, name)
-                || this.name_read_in_expr(ife.then_expr, name)
-                || this.name_read_in_expr(ife.else_expr, name);
+            return this.name_read_in_expr(ife.condition, key)
+                || this.name_read_in_expr(ife.then_expr, key)
+                || this.name_read_in_expr(ife.else_expr, key);
         }
         if (k == NodeKind::StructLiteral) {
             const sl: StructLiteralNode* = e as StructLiteralNode*;
             for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
-                if (this.name_read_in_expr(sl.field_inits[i].value, name)) { return true; }
+                if (this.name_read_in_expr(sl.field_inits[i].value, key)) { return true; }
             }
             return false;
         }
@@ -1772,33 +1820,33 @@ type struct AsyncLower {
         if (k == NodeKind::ArrayLiteral) {
             const al: ArrayLiteralNode* = e as ArrayLiteralNode*;
             for (mut i: i64 = 0; i < al.elements.length; i++) {
-                if (this.name_read_in_expr(al.elements[i], name)) { return true; }
+                if (this.name_read_in_expr(al.elements[i], key)) { return true; }
             }
             return false;
         }
         if (k == NodeKind::TupleLiteral) {
             const tl: TupleLiteralNode* = e as TupleLiteralNode*;
             for (mut i: i64 = 0; i < tl.elements.length; i++) {
-                if (this.name_read_in_expr(tl.elements[i], name)) { return true; }
+                if (this.name_read_in_expr(tl.elements[i], key)) { return true; }
             }
             return false;
         }
         if (k == NodeKind::DeleteExpression) {
-            return this.name_read_in_expr((e as DeleteExprNode*).operand, name);
+            return this.name_read_in_expr((e as DeleteExprNode*).operand, key);
         }
         if (k == NodeKind::AwaitExpression) {
-            return this.name_read_in_expr((e as AwaitExprNode*).operand, name);
+            return this.name_read_in_expr((e as AwaitExprNode*).operand, key);
         }
         if (k == NodeKind::TryExpression) {
-            return this.name_read_in_expr(this.try_live(e), name);
+            return this.name_read_in_expr(this.try_live(e), key);
         }
         if (k == NodeKind::MatchExpression) {
             const me: MatchExprNode* = e as MatchExprNode*;
-            if (this.name_read_in_expr(me.subject, name)) { return true; }
+            if (this.name_read_in_expr(me.subject, key)) { return true; }
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 if (me.arms[i] == null) { continue; }
-                if (this.name_read_in_expr(me.arms[i].guard, name)) { return true; }
-                if (this.name_read_in_stmt(me.arms[i].body, name)) { return true; }
+                if (this.name_read_in_expr(me.arms[i].guard, key)) { return true; }
+                if (this.name_read_in_stmt(me.arms[i].body, key)) { return true; }
             }
             return false;
         }
@@ -1807,54 +1855,54 @@ type struct AsyncLower {
 
     /// True if `name` is read anywhere in statement `s`, recursing through the
     /// (await-free) control-flow containers a straight-line segment may hold.
-    name_read_in_stmt(&this, s: StatementNode*, name: SymbolStr) -> boolean {
+    name_read_in_stmt(&this, s: StatementNode*, key: SymbolID) -> boolean {
         if (s == null) { return false; }
         const k: NodeKind = s.kind;
         if (k == NodeKind::ExpressionStatement) {
-            return this.name_read_in_expr((s as ExprStmtNode*).expression, name);
+            return this.name_read_in_expr((s as ExprStmtNode*).expression, key);
         }
         if (k == NodeKind::ReturnStatement) {
-            return this.name_read_in_expr((s as ReturnStmtNode*).expression, name);
+            return this.name_read_in_expr((s as ReturnStmtNode*).expression, key);
         }
         if (k == NodeKind::DeclarationStatement) {
-            return this.name_read_in_expr(this.decl_stmt_init(s as DeclStmtNode*), name);
+            return this.name_read_in_expr(this.decl_stmt_init(s as DeclStmtNode*), key);
         }
         if (k == NodeKind::BlockStatement) {
             const blk: BlockStmtNode* = s as BlockStmtNode*;
             for (mut i: i64 = 0; i < blk.statements.length; i++) {
-                if (this.name_read_in_stmt(blk.statements[i], name)) { return true; }
+                if (this.name_read_in_stmt(blk.statements[i], key)) { return true; }
             }
             return false;
         }
         if (k == NodeKind::IfStatement) {
             const iff: IfStmtNode* = s as IfStmtNode*;
-            return this.name_read_in_expr(iff.condition, name)
-                || this.name_read_in_stmt(iff.then_stmt, name)
-                || this.name_read_in_stmt(iff.else_stmt, name);
+            return this.name_read_in_expr(iff.condition, key)
+                || this.name_read_in_stmt(iff.then_stmt, key)
+                || this.name_read_in_stmt(iff.else_stmt, key);
         }
         if (k == NodeKind::WhileStatement) {
             const w: WhileStmtNode* = s as WhileStmtNode*;
-            return this.name_read_in_expr(w.condition, name) || this.name_read_in_stmt(w.body, name);
+            return this.name_read_in_expr(w.condition, key) || this.name_read_in_stmt(w.body, key);
         }
         if (k == NodeKind::DoWhileStatement) {
             const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
-            return this.name_read_in_expr(d.condition, name) || this.name_read_in_stmt(d.body, name);
+            return this.name_read_in_expr(d.condition, key) || this.name_read_in_stmt(d.body, key);
         }
         if (k == NodeKind::ForStatement) {
             const f: ForStmtNode* = s as ForStmtNode*;
-            if (f.init != null && this.name_read_in_stmt(f.init as StatementNode*, name)) { return true; }
-            return this.name_read_in_expr(f.condition, name)
-                || this.name_read_in_expr(f.update, name)
-                || this.name_read_in_stmt(f.body, name);
+            if (f.init != null && this.name_read_in_stmt(f.init as StatementNode*, key)) { return true; }
+            return this.name_read_in_expr(f.condition, key)
+                || this.name_read_in_expr(f.update, key)
+                || this.name_read_in_stmt(f.body, key);
         }
         if (k == NodeKind::LoopStatement) {
-            return this.name_read_in_stmt((s as LoopStmtNode*).body, name);
+            return this.name_read_in_stmt((s as LoopStmtNode*).body, key);
         }
         if (k == NodeKind::MatchStatement) {
             const m: MatchStmtNode* = s as MatchStmtNode*;
-            if (this.name_read_in_expr(m.subject, name)) { return true; }
+            if (this.name_read_in_expr(m.subject, key)) { return true; }
             for (mut i: i64 = 0; i < m.arms.length; i++) {
-                if (m.arms[i] != null && this.name_read_in_stmt(m.arms[i].body, name)) { return true; }
+                if (m.arms[i] != null && this.name_read_in_stmt(m.arms[i].body, key)) { return true; }
             }
             return false;
         }
@@ -1887,10 +1935,11 @@ type struct AsyncLower {
     subst_target(mut &this, field: SymbolStr, struct_ref: TypeRef, ty: TypeRef,
                  span: SourceSpan) -> ExpressionNode* {
         if (this.subst_mode == this.subst_to_local()) {
-            return this.ident(field, ty, span);
+            return this.ident_bound(field, this.subst_local_sym, ty, span);
         }
         if (this.subst_mode == this.subst_to_local_deref()) {
-            return this.deref(this.ident(field, this.arena.get_pointer_to(ty), span), ty, span);
+            return this.deref(this.ident_bound(field, this.subst_local_sym,
+                                               this.arena.get_pointer_to(ty), span), ty, span);
         }
         return this.own_field(struct_ref, field, ty, span);
     }
@@ -1966,11 +2015,8 @@ type struct AsyncLower {
     /// True when `e` names the WHOLE carried value rather than a part of it.
     /// `x = …` republishes the carrier; `x.f = …` and `x[i] = …` write into the
     /// payload that is already there and must keep going through the pointer.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    name_is_whole_place(&this, e: ExpressionNode*, name: SymbolStr) -> boolean {
-        if (e == null) { return false; }
-        if ((e as ASTNode*).kind != NodeKind::Identifier) { return false; }
-        return (e as IdentifierNode*).name.equals(name);
+    name_is_whole_place(&this, e: ExpressionNode*, key: SymbolID) -> boolean {
+        return this.names_binding(e, key);
     }
 
     /// `by_value` says whether a bare mention in THIS position hands the value
@@ -1979,14 +2025,13 @@ type struct AsyncLower {
     /// an address-of, an operand). The positions mirror `mark_last_use_expr`,
     /// which answers the same question for the eligibility walk — the two must
     /// agree, or a mention counted as a give-away there is aliased here.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    subst_name_expr(mut &this, e: ExpressionNode*, name: SymbolStr, field: SymbolStr,
+    subst_name_expr(mut &this, e: ExpressionNode*, key: SymbolID, field: SymbolStr,
                     struct_ref: TypeRef, ty: TypeRef, span: SourceSpan,
                     by_value: boolean) -> ExpressionNode* {
         if (e == null) { return null; }
         const k: NodeKind = (e as ASTNode*).kind;
         if (k == NodeKind::Identifier) {
-            if ((e as IdentifierNode*).name.equals(name)) {
+            if (this.names_binding(e, key)) {
                 // The mention's OWN span, so a later use is reported where the
                 // programmer wrote it rather than at the function header.
                 const use_span: SourceSpan = (e as ASTNode*).span;
@@ -2000,7 +2045,7 @@ type struct AsyncLower {
                     target = this.ident_bound(this.subst_hoist_name,
                                               this.subst_hoist_sym, ty, use_span);
                 } else if (by_value && this.subst_carrier_takes) {
-                    target = this.hoist_giveaway(name, ty, use_span, span);
+                    target = this.hoist_giveaway((e as IdentifierNode*).name, ty, use_span, span);
                 } else {
                     target = this.subst_target(field, struct_ref, ty, span);
                 }
@@ -2024,7 +2069,7 @@ type struct AsyncLower {
                 // The right-hand side is handed to the name; the left is the
                 // place being written, which reaches into the value rather
                 // than handing it over.
-                b.right = this.subst_name_expr(b.right, name, field, struct_ref, ty, span, true);
+                b.right = this.subst_name_expr(b.right, key, field, struct_ref, ty, span, true);
                 // Rebuilding the whole carried value republishes the field
                 // rather than writing through the pointer, because the field
                 // may be EMPTY here: a state that handed the value away and
@@ -2033,7 +2078,7 @@ type struct AsyncLower {
                 // assignment means — overwriting a binding does not run the old
                 // value's destructor, so publishing a second payload the same
                 // way keeps the lowered code faithful to it.
-                if (this.subst_carrier_armed() && this.name_is_whole_place(b.left, name)) {
+                if (this.subst_carrier_armed() && this.name_is_whole_place(b.left, key)) {
                     b.right = this.option_some(b.right, this.subst_carrier_opt, span);
                     b.left  = this.carrier_field_expr(span);
                     b.set_resolved_type(this.subst_carrier_opt);
@@ -2042,16 +2087,16 @@ type struct AsyncLower {
                     this.subst_hoist_name = SymbolStr::empty();
                     return e;
                 }
-                b.left  = this.subst_name_expr(b.left, name, field, struct_ref, ty, span, false);
+                b.left  = this.subst_name_expr(b.left, key, field, struct_ref, ty, span, false);
                 return e;
             }
-            b.left  = this.subst_name_expr(b.left, name, field, struct_ref, ty, span, false);
-            b.right = this.subst_name_expr(b.right, name, field, struct_ref, ty, span, false);
+            b.left  = this.subst_name_expr(b.left, key, field, struct_ref, ty, span, false);
+            b.right = this.subst_name_expr(b.right, key, field, struct_ref, ty, span, false);
             return e;
         }
         if (k == NodeKind::UnaryExpression) {
             const u: UnaryExprNode* = e as UnaryExprNode*;
-            u.operand = this.subst_name_expr(u.operand, name, field, struct_ref, ty, span, false);
+            u.operand = this.subst_name_expr(u.operand, key, field, struct_ref, ty, span, false);
             return e;
         }
         if (k == NodeKind::CallExpression) {
@@ -2063,49 +2108,49 @@ type struct AsyncLower {
             // every later `unwrap_ptr` on a `None`, whereas leaving an owning
             // argument aliased surfaces as `E0453` at compile time. That is the
             // opposite default from the move passes, and deliberately so.
-            c.callee = this.subst_name_expr(c.callee, name, field, struct_ref, ty, span, false);
+            c.callee = this.subst_name_expr(c.callee, key, field, struct_ref, ty, span, false);
             for (mut i: i64 = 0; i < c.arguments.length; i++) {
                 const owns: boolean = (c.arguments[i] != null &&
                                        c.arguments[i].arg_binding == ArgBinding::ByValue);
-                c.arguments[i] = this.subst_name_expr(c.arguments[i], name, field,
+                c.arguments[i] = this.subst_name_expr(c.arguments[i], key, field,
                                                      struct_ref, ty, span, owns);
             }
             return e;
         }
         if (k == NodeKind::MemberAccess) {
             const m: MemberAccessNode* = e as MemberAccessNode*;
-            m.object = this.subst_name_expr(m.object, name, field, struct_ref, ty, span, false);
+            m.object = this.subst_name_expr(m.object, key, field, struct_ref, ty, span, false);
             return e;
         }
         if (k == NodeKind::CastExpression) {
             const ce: CastExprNode* = e as CastExprNode*;
-            ce.expression = this.subst_name_expr(ce.expression, name, field, struct_ref, ty, span,
+            ce.expression = this.subst_name_expr(ce.expression, key, field, struct_ref, ty, span,
                                                  by_value);
             return e;
         }
         if (k == NodeKind::ArrayAccess) {
             const a: ArrayAccessNode* = e as ArrayAccessNode*;
-            a.array = this.subst_name_expr(a.array, name, field, struct_ref, ty, span, false);
-            a.index = this.subst_name_expr(a.index, name, field, struct_ref, ty, span, false);
+            a.array = this.subst_name_expr(a.array, key, field, struct_ref, ty, span, false);
+            a.index = this.subst_name_expr(a.index, key, field, struct_ref, ty, span, false);
             return e;
         }
         if (k == NodeKind::TernaryExpression) {
             const t: TernaryExprNode* = e as TernaryExprNode*;
-            t.condition  = this.subst_name_expr(t.condition, name, field, struct_ref, ty, span, false);
+            t.condition  = this.subst_name_expr(t.condition, key, field, struct_ref, ty, span, false);
             // Only one arm runs, so neither may hoist its take out to the
             // enclosing statement.
             this.subst_cond_depth = this.subst_cond_depth + 1;
-            t.true_expr  = this.subst_name_expr(t.true_expr, name, field, struct_ref, ty, span, by_value);
-            t.false_expr = this.subst_name_expr(t.false_expr, name, field, struct_ref, ty, span, by_value);
+            t.true_expr  = this.subst_name_expr(t.true_expr, key, field, struct_ref, ty, span, by_value);
+            t.false_expr = this.subst_name_expr(t.false_expr, key, field, struct_ref, ty, span, by_value);
             this.subst_cond_depth = this.subst_cond_depth - 1;
             return e;
         }
         if (k == NodeKind::IfExpression) {
             const ife: IfExprNode* = e as IfExprNode*;
-            ife.condition = this.subst_name_expr(ife.condition, name, field, struct_ref, ty, span, false);
+            ife.condition = this.subst_name_expr(ife.condition, key, field, struct_ref, ty, span, false);
             this.subst_cond_depth = this.subst_cond_depth + 1;
-            ife.then_expr = this.subst_name_expr(ife.then_expr, name, field, struct_ref, ty, span, by_value);
-            ife.else_expr = this.subst_name_expr(ife.else_expr, name, field, struct_ref, ty, span, by_value);
+            ife.then_expr = this.subst_name_expr(ife.then_expr, key, field, struct_ref, ty, span, by_value);
+            ife.else_expr = this.subst_name_expr(ife.else_expr, key, field, struct_ref, ty, span, by_value);
             this.subst_cond_depth = this.subst_cond_depth - 1;
             return e;
         }
@@ -2117,7 +2162,7 @@ type struct AsyncLower {
                 newf.push(FieldInit {
                     field_name: fi.field_name,
                     // A field initializer moves its operand into the aggregate.
-                    value: this.subst_name_expr(fi.value, name, field, struct_ref, ty, span, true),
+                    value: this.subst_name_expr(fi.value, key, field, struct_ref, ty, span, true),
                     span: fi.span,
                     pin: fi.pin, pin_carried: fi.pin_carried });
             }
@@ -2129,20 +2174,20 @@ type struct AsyncLower {
             // The operand is MOVED into the sub-future field the resume state
             // polls (`this.fut_N = Option::Some(<operand>)`), so awaiting a
             // future held in a local hands that future over.
-            aw.operand = this.subst_name_expr(aw.operand, name, field, struct_ref, ty, span, true);
+            aw.operand = this.subst_name_expr(aw.operand, key, field, struct_ref, ty, span, true);
             return e;
         }
         if (k == NodeKind::TryExpression) {
             mut tr: TryExprNode* = e as TryExprNode*;
             if (tr.desugared != null) {
-                tr.desugared = this.subst_name_expr(tr.desugared, name, field, struct_ref, ty, span,
+                tr.desugared = this.subst_name_expr(tr.desugared, key, field, struct_ref, ty, span,
                                                    by_value);
                 // A promoted name in the subject became `this.<field>`, and
                 // `operand` is the same slot: left alone it would keep naming
                 // the local whose declaration this pass has just removed.
                 tr.resync_operand();
             } else {
-                tr.operand = this.subst_name_expr(tr.operand, name, field, struct_ref, ty, span,
+                tr.operand = this.subst_name_expr(tr.operand, key, field, struct_ref, ty, span,
                                                  by_value);
             }
             return e;
@@ -2151,12 +2196,12 @@ type struct AsyncLower {
             const me: MatchExprNode* = e as MatchExprNode*;
             // A match-arm binding copies the payload out of the subject, so the
             // subject is consumed — the same reading `mark_last_use_expr` takes.
-            me.subject = this.subst_name_expr(me.subject, name, field, struct_ref, ty, span, true);
+            me.subject = this.subst_name_expr(me.subject, key, field, struct_ref, ty, span, true);
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 if (me.arms[i] == null) { continue; }
-                me.arms[i].guard = this.subst_name_expr(me.arms[i].guard, name, field,
+                me.arms[i].guard = this.subst_name_expr(me.arms[i].guard, key, field,
                                                        struct_ref, ty, span, false);
-                this.subst_nested_stmt(me.arms[i].body, name, field, struct_ref, ty, span);
+                this.subst_nested_stmt(me.arms[i].body, key, field, struct_ref, ty, span);
             }
             return e;
         }
@@ -2175,7 +2220,7 @@ type struct AsyncLower {
     /// would rewrite a node another state also reads while the declaration only
     /// ever reaches this state's block. At the join a give-away made inside is
     /// abandoned for the same reason, and because it may not have run.
-    subst_nested_stmt(mut &this, s: StatementNode*, name: SymbolStr, field: SymbolStr,
+    subst_nested_stmt(mut &this, s: StatementNode*, key: SymbolID, field: SymbolStr,
                       struct_ref: TypeRef, ty: TypeRef, span: SourceSpan) -> void {
         if (s == null) { return; }
         const absorbs: boolean = (s.kind == NodeKind::BlockStatement);
@@ -2183,7 +2228,7 @@ type struct AsyncLower {
         const saved_sym: SymbolID = this.subst_hoist_sym;
         this.subst_hoist_name = SymbolStr::empty();
         if (!absorbs) { this.subst_cond_depth = this.subst_cond_depth + 1; }
-        this.subst_name_stmt(s, name, field, struct_ref, ty, span);
+        this.subst_name_stmt(s, key, field, struct_ref, ty, span);
         if (!absorbs) { this.subst_cond_depth = this.subst_cond_depth - 1; }
         if (!this.subst_hoist_name.is_empty()) {
             this.subst_hoist_name = SymbolStr::empty();
@@ -2201,7 +2246,7 @@ type struct AsyncLower {
     /// function again for that block, and without the save the inner walk would
     /// clear the outer statement's pending declaration - which is then never
     /// spliced in, while the mention it feeds has already been rebound to it.
-    subst_stmt_list(mut &this, blk: BlockStmtNode*, from: i64, name: SymbolStr,
+    subst_stmt_list(mut &this, blk: BlockStmtNode*, from: i64, key: SymbolID,
                     field: SymbolStr, struct_ref: TypeRef, ty: TypeRef,
                     span: SourceSpan) -> void {
         const outer_pending: StatementNode* = this.subst_hoist_stmt;
@@ -2221,7 +2266,7 @@ type struct AsyncLower {
             }
             this.subst_hoist_stmt = null;
             this.subst_can_hoist  = true;
-            this.subst_name_stmt(st, name, field, struct_ref, ty, span);
+            this.subst_name_stmt(st, key, field, struct_ref, ty, span);
             this.subst_can_hoist  = saved_can;
             if (splits) { this.subst_cond_depth = this.subst_cond_depth - 1; }
             if (this.subst_hoist_stmt != null) {
@@ -2237,20 +2282,20 @@ type struct AsyncLower {
     /// Rewrite every read of `name` in statement `s` to `this.<field>`, recursing
     /// through control-flow containers (including await-free nested loops emitted
     /// wholesale). Mutates the statement's expression slots in place.
-    subst_name_stmt(mut &this, s: StatementNode*, name: SymbolStr, field: SymbolStr,
+    subst_name_stmt(mut &this, s: StatementNode*, key: SymbolID, field: SymbolStr,
                     struct_ref: TypeRef, ty: TypeRef, span: SourceSpan) -> void {
         if (s == null) { return; }
         const k: NodeKind = s.kind;
         if (k == NodeKind::ExpressionStatement) {
             const es: ExprStmtNode* = s as ExprStmtNode*;
-            es.expression = this.subst_name_expr(es.expression, name, field, struct_ref, ty, span,
+            es.expression = this.subst_name_expr(es.expression, key, field, struct_ref, ty, span,
                                                  false);
             return;
         }
         if (k == NodeKind::ReturnStatement) {
             const rs: ReturnStmtNode* = s as ReturnStmtNode*;
             // Returning the value hands it to the caller.
-            rs.expression = this.subst_name_expr(rs.expression, name, field, struct_ref, ty, span,
+            rs.expression = this.subst_name_expr(rs.expression, key, field, struct_ref, ty, span,
                                                  true);
             return;
         }
@@ -2259,33 +2304,33 @@ type struct AsyncLower {
             if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
                 const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
                 // Initializing another binding from it moves the value there.
-                vd.initializer = this.subst_name_expr(vd.initializer, name, field, struct_ref,
+                vd.initializer = this.subst_name_expr(vd.initializer, key, field, struct_ref,
                                                      ty, span, true);
             }
             return;
         }
         if (k == NodeKind::BlockStatement) {
-            this.subst_stmt_list(s as BlockStmtNode*, 0, name, field, struct_ref, ty, span);
+            this.subst_stmt_list(s as BlockStmtNode*, 0, key, field, struct_ref, ty, span);
             return;
         }
         if (k == NodeKind::IfStatement) {
             const iff: IfStmtNode* = s as IfStmtNode*;
-            iff.condition = this.subst_name_expr(iff.condition, name, field, struct_ref, ty, span,
+            iff.condition = this.subst_name_expr(iff.condition, key, field, struct_ref, ty, span,
                                                  false);
-            this.subst_nested_stmt(iff.then_stmt, name, field, struct_ref, ty, span);
-            this.subst_nested_stmt(iff.else_stmt, name, field, struct_ref, ty, span);
+            this.subst_nested_stmt(iff.then_stmt, key, field, struct_ref, ty, span);
+            this.subst_nested_stmt(iff.else_stmt, key, field, struct_ref, ty, span);
             return;
         }
         if (k == NodeKind::WhileStatement) {
             const w: WhileStmtNode* = s as WhileStmtNode*;
-            w.condition = this.subst_name_expr(w.condition, name, field, struct_ref, ty, span, false);
-            this.subst_nested_stmt(w.body, name, field, struct_ref, ty, span);
+            w.condition = this.subst_name_expr(w.condition, key, field, struct_ref, ty, span, false);
+            this.subst_nested_stmt(w.body, key, field, struct_ref, ty, span);
             return;
         }
         if (k == NodeKind::DoWhileStatement) {
             const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
-            d.condition = this.subst_name_expr(d.condition, name, field, struct_ref, ty, span, false);
-            this.subst_nested_stmt(d.body, name, field, struct_ref, ty, span);
+            d.condition = this.subst_name_expr(d.condition, key, field, struct_ref, ty, span, false);
+            this.subst_nested_stmt(d.body, key, field, struct_ref, ty, span);
             return;
         }
         if (k == NodeKind::ForStatement) {
@@ -2293,29 +2338,29 @@ type struct AsyncLower {
             if (f.init != null) {
                 if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
                     const vd: VarDeclNode* = f.init as VarDeclNode*;
-                    vd.initializer = this.subst_name_expr(vd.initializer, name, field, struct_ref,
+                    vd.initializer = this.subst_name_expr(vd.initializer, key, field, struct_ref,
                                                          ty, span, true);
                 } else {
-                    f.init = this.subst_name_expr(f.init as ExpressionNode*, name, field,
+                    f.init = this.subst_name_expr(f.init as ExpressionNode*, key, field,
                                                  struct_ref, ty, span, false) as ASTNode*;
                 }
             }
-            f.condition = this.subst_name_expr(f.condition, name, field, struct_ref, ty, span, false);
-            f.update    = this.subst_name_expr(f.update, name, field, struct_ref, ty, span, false);
-            this.subst_nested_stmt(f.body, name, field, struct_ref, ty, span);
+            f.condition = this.subst_name_expr(f.condition, key, field, struct_ref, ty, span, false);
+            f.update    = this.subst_name_expr(f.update, key, field, struct_ref, ty, span, false);
+            this.subst_nested_stmt(f.body, key, field, struct_ref, ty, span);
             return;
         }
         if (k == NodeKind::LoopStatement) {
-            this.subst_nested_stmt((s as LoopStmtNode*).body, name, field, struct_ref, ty, span);
+            this.subst_nested_stmt((s as LoopStmtNode*).body, key, field, struct_ref, ty, span);
             return;
         }
         if (k == NodeKind::MatchStatement) {
             const m: MatchStmtNode* = s as MatchStmtNode*;
             // As for a match EXPRESSION: an arm binding copies the payload out.
-            m.subject = this.subst_name_expr(m.subject, name, field, struct_ref, ty, span, true);
+            m.subject = this.subst_name_expr(m.subject, key, field, struct_ref, ty, span, true);
             for (mut i: i64 = 0; i < m.arms.length; i++) {
                 if (m.arms[i] != null) {
-                    this.subst_nested_stmt(m.arms[i].body, name, field, struct_ref, ty, span);
+                    this.subst_nested_stmt(m.arms[i].body, key, field, struct_ref, ty, span);
                 }
             }
             return;
@@ -2420,10 +2465,11 @@ type struct AsyncLower {
             const lty: TypeRef = this.param_slot_type(d, p);
             if (!this.param_is_carried(sm, lty)) { continue; }
             const pname: SymbolStr = this.param_field_name(p);
+            const pkey: SymbolID = p.sym_id;
             const opt_ty: TypeRef = this.param_field_type(sm, lty);
             if (!opt_ty.is_valid() || opt_ty.equals(lty)) { continue; }
             for (mut b: i64 = 0; b < sm.blocks.length; b++) {
-                const use_kind: i64 = this.block_first_use(sm.blocks[b], pname);
+                const use_kind: i64 = this.block_first_use(sm.blocks[b], pkey);
                 if (use_kind == 0) { continue; }
                 // Same reasoning as a local: a reassignment nested in a branch
                 // keeps the incoming value on the path the branch skips, so the
@@ -2431,7 +2477,7 @@ type struct AsyncLower {
                 // constructor always publishes a parameter into its field, so
                 // the take on entry has something to find.
                 mut carried_in: boolean = (use_kind == 1);
-                if (!carried_in && this.block_cond_write(sm.blocks[b], pname)) {
+                if (!carried_in && this.block_cond_write(sm.blocks[b], pkey)) {
                     carried_in = true;
                 }
                 // Read before this pass stores anything into the block: the store
@@ -2439,19 +2485,19 @@ type struct AsyncLower {
                 // by value and would otherwise be mistaken for the state's own
                 // last use, suppressing the tail hand-back. Same hazard, and same
                 // ordering rule, as a promoted local.
-                const handback: boolean = this.needs_handback(sm.blocks[b], pname, lty);
-                // The name the value lives under in THIS state: the carried name
-                // when the state took it, or the fresh binding a declaring state
-                // was given.
-                mut local: SymbolStr = pname;
+                const handback: boolean = this.needs_handback(sm.blocks[b], pkey, lty);
+                // The local the value lives in in THIS state: a take standing for
+                // the parameter when the state took it, or the fresh binding a
+                // declaring state was given.
+                mut local: MintedLocal = MintedLocal { name: pname, sym: pkey };
                 if (carried_in) {
-                    this.prepend_agg_take(sm.blocks[b], pname, pname, lty, opt_ty,
-                                          sm.struct_ref, true, span);
+                    this.prepend_agg_take(sm.blocks[b], pname, this.resolver.alloc_synthetic_binding(),
+                                          pkey, pname, lty, opt_ty, sm.struct_ref, true, span);
                     this.store_before_suspends(sm, sm.blocks[b] as StatementNode*,
-                                               pname, opt_ty, pname, lty, span);
+                                               pname, opt_ty, pname, pkey, lty, span);
                 } else {
-                    local = this.decl_at_first_assignment(sm.blocks[b], pname, lty, span);
-                    if (!local.is_valid()) {
+                    local = this.decl_at_first_assignment(sm.blocks[b], pkey, pname, lty, span);
+                    if (!local.name.is_valid()) {
                         this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                             Text::new("async: this parameter is reassigned after an `await` from inside a branch; assign it once at the top level of that step so the state machine can bind it there"),
                             p.span);
@@ -2460,7 +2506,7 @@ type struct AsyncLower {
                 }
                 if (handback) {
                     sm.blocks[b].add_statement(
-                        this.agg_store_stmt(sm, pname, opt_ty, local, lty, span));
+                        this.agg_store_stmt(sm, pname, opt_ty, local.name, local.sym, lty, span));
                 }
             }
         }
@@ -2883,7 +2929,7 @@ type struct AsyncLower {
         const ty: TypeRef = e.resolved_type;
         const span: SourceSpan = (e as ASTNode*).span;
         if (k == NodeKind::Identifier) {
-            return this.ident((e as IdentifierNode*).name, ty, span);
+            return this.ident_bound((e as IdentifierNode*).name, this.local_key(e), ty, span);
         }
         if (k == NodeKind::MemberAccess) {
             const ma: MemberAccessNode* = e as MemberAccessNode*;
@@ -3061,11 +3107,11 @@ type struct AsyncLower {
         // state's frame, so an address of the current frame handed to it is
         // dangling by the time the operation writes through it — and writes to a
         // dead frame slot corrupt silently instead of faulting.
-        const op_root: SymbolStr = this.frame_addr_root_expr(sm, aw.operand);
-        if (op_root.is_valid()) {
+        const op_root: IdentifierNode* = this.frame_addr_root_expr(sm, aw.operand);
+        if (op_root != null) {
             this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
                 Text::new(fmt::format("async: this `await` hands the address of the local or parameter `%s` to a future that outlives the current step; each poll runs on a fresh frame, so the address is dangling when the future resumes — have the caller own the storage and pass a pointer parameter, or use an operation that owns the buffer itself",
-                       this.intern.resolve(this.strip_local_marker(op_root)))),
+                       this.intern.resolve(this.source_name(this.local_key(op_root as ExpressionNode*), op_root.name)))),
                 aw.span);
             sm.ok = false; return cur;
         }
@@ -3152,7 +3198,7 @@ type struct AsyncLower {
         const poll_id:  SymbolID  = this.resolver.alloc_synthetic_binding();
         mut poll_call: ExpressionNode* = this.method_call1(
             this.ident_bound(subp_sym, subp_id, fi_ptr, span), LangItem::FuturePoll,
-            this.ident(sm.cx_sym, sm.ctx_ptr_ty, span), sub_poll_out, span);
+            this.ident_bound(sm.cx_sym, this.poll_cx, sm.ctx_ptr_ty, span), sub_poll_out, span);
         sm.blocks[resume].add_statement(
             this.var_decl_stmt_bound(poll_sym, poll_id, true, sub_poll_out, poll_call, span));
 
@@ -3330,12 +3376,13 @@ type struct AsyncLower {
                          entry: i64, cap: BlockStmtNode*, rewrite_guard: boolean,
                          no_move_out: boolean) -> void {
         const span: SourceSpan = sm.span;
-        mut bs: BindingCapture = BindingCapture { names: [], tys: [] };
+        mut bs: BindingCapture = BindingCapture { syms: [], names: [], tys: [] };
         this.collect_arm_bindings(arm, subject_type, &bs);
         for (mut bi: i64 = 0; bi < bs.names.length; bi++) {
             const bname: SymbolStr = bs.names[bi];
-            const in_guard: boolean = rewrite_guard && this.name_read_in_expr(arm.guard, bname);
-            if (!this.name_read_in_stmt(arm.body, bname) && !in_guard) { continue; }
+            const bkey: SymbolID = bs.syms[bi];
+            const in_guard: boolean = rewrite_guard && this.name_read_in_expr(arm.guard, bkey);
+            if (!this.name_read_in_stmt(arm.body, bkey) && !in_guard) { continue; }
             const bt: TypeRef = bs.tys[bi];
             const bt_t: Type* = this.arena.lookup(bt);
             const bk: TypeKind = if (bt_t != null) { bt_t.kind } else { TypeKind::Error };
@@ -3392,14 +3439,15 @@ type struct AsyncLower {
                 mut bopt_args: TypeRef[] = [bt];
                 const bopt_ty: TypeRef =
                     this.ctx.generic_registry.instantiate(sm.opt_base, &bopt_args);
-                const blocal: SymbolStr = this.mint_temp(
+                const blocal: MintedLocal = this.mint_temp(
                     fmt::format("%s$bind", this.intern.resolve(bname)));
                 this.subst_mode = this.subst_to_local();
-                this.subst_name_stmt(arm.body, bname, blocal, sm.struct_ref, bt, span);
+                this.subst_local_sym = blocal.sym;
+                this.subst_name_stmt(arm.body, bkey, blocal.name, sm.struct_ref, bt, span);
                 this.subst_mode = this.subst_to_field();
-                cap.add_statement(this.agg_store_stmt(sm, afield, bopt_ty, bname, bt, span));
-                this.prepend_agg_take(sm.blocks[entry], blocal, afield, bt, bopt_ty,
-                                      sm.struct_ref, false, span);
+                cap.add_statement(this.agg_store_stmt(sm, afield, bopt_ty, bname, bkey, bt, span));
+                this.prepend_agg_take(sm.blocks[entry], blocal.name, blocal.sym, SymbolID::invalid(),
+                                      afield, bt, bopt_ty, sm.struct_ref, false, span);
                 sm.prom_field.push(afield);
                 sm.prom_tys.push(bopt_ty);
                 sm.prom_opt.push(true);
@@ -3408,13 +3456,13 @@ type struct AsyncLower {
             }
             const field: SymbolStr = this.intern.intern(
                 fmt::format("__bind_%lld_%s", entry, this.intern.resolve(bname)));
-            this.subst_name_stmt(arm.body, bname, field, sm.struct_ref, bt, span);
+            this.subst_name_stmt(arm.body, bkey, field, sm.struct_ref, bt, span);
             if (in_guard) {
-                arm.guard = this.subst_name_expr(arm.guard, bname, field,
+                arm.guard = this.subst_name_expr(arm.guard, bkey, field,
                                                  sm.struct_ref, bt, span, false);
             }
             cap.add_statement(this.assign_member_stmt(
-                sm.struct_ref, field, bt, this.ident(bname, bt, span), span));
+                sm.struct_ref, field, bt, this.ident_bound(bname, bkey, bt, span), span));
             sm.prom_field.push(field);
             sm.prom_tys.push(bt);
             sm.prom_opt.push(false);
@@ -3480,7 +3528,7 @@ type struct AsyncLower {
         // Minted rather than derived from the state index: two chains that begin
         // in the same state would otherwise share a field and overwrite each
         // other's subject.
-        const subj_field: SymbolStr = this.mint_temp("__msubj");
+        const subj_field: SymbolStr = this.mint_temp("__msubj").name;
         mut subj_opt_ty: TypeRef = TypeRef::invalid();
         if (subj_scalar) {
             sm.blocks[at].add_statement(this.assign_member_stmt(
@@ -3497,11 +3545,12 @@ type struct AsyncLower {
                     span);
                 sm.ok = false; return cur;
             }
-            const seed: SymbolStr = this.mint_temp("match$subj");
+            const seed: MintedLocal = this.mint_temp("match$subj");
             sm.blocks[at].add_statement(
-                this.var_decl_stmt(seed, false, subject_type, hs.expr, span));
+                this.var_decl_stmt_bound(seed.name, seed.sym, false, subject_type, hs.expr, span));
             sm.blocks[at].add_statement(
-                this.agg_store_stmt(sm, subj_field, subj_opt_ty, seed, subject_type, span));
+                this.agg_store_stmt(sm, subj_field, subj_opt_ty, seed.name, seed.sym,
+                                    subject_type, span));
             sm.prom_field.push(subj_field);
             sm.prom_tys.push(subj_opt_ty);
             sm.prom_opt.push(true);
@@ -3567,16 +3616,18 @@ type struct AsyncLower {
             // form takes it into a local of THIS state — a fresh name per test,
             // so the cross-state promotion sees a local declared and used in one
             // block and leaves it alone — and hands it back below.
-            mut subj_local: SymbolStr = SymbolStr::empty();
+            mut subj_local: MintedLocal = MintedLocal { name: SymbolStr::empty(),
+                                                        sym: SymbolID::invalid() };
             mut subj_read: ExpressionNode* = null;
             if (subj_scalar) {
                 subj_read = this.own_field(sm.struct_ref,
                                         subj_field, subject_type, span);
             } else {
                 subj_local = this.mint_temp("match$subj");
-                this.prepend_agg_take(sm.blocks[tests[ai]], subj_local, subj_field,
+                this.prepend_agg_take(sm.blocks[tests[ai]], subj_local.name, subj_local.sym,
+                                      SymbolID::invalid(), subj_field,
                                       subject_type, subj_opt_ty, sm.struct_ref, false, span);
-                subj_read = this.ident(subj_local, subject_type, span);
+                subj_read = this.ident_bound(subj_local.name, subj_local.sym, subject_type, span);
             }
             mut test: MatchStmtNode* = new MatchStmtNode(subj_read, span);
             mut darm: MatchArmNode* = new MatchArmNode(span);
@@ -3611,8 +3662,8 @@ type struct AsyncLower {
             // runs, which is correct: nothing will look for it again.
             if (!subj_scalar) {
                 sm.blocks[tests[ai]].add_statement(
-                    this.agg_store_stmt(sm, subj_field, subj_opt_ty, subj_local,
-                                        subject_type, span));
+                    this.agg_store_stmt(sm, subj_field, subj_opt_ty, subj_local.name,
+                                        subj_local.sym, subject_type, span));
             }
         }
 
@@ -3647,7 +3698,7 @@ type struct AsyncLower {
                          bs: BindingCapture*) -> void {
         if (pat == null) { return; }
         if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
-            bs.push_unique(pat.binding_name, value_type);
+            bs.push_unique(pat.binding_sym, pat.binding_name, value_type);
             return;
         }
         if (pat.pattern_kind != PatternKind::Enum) { return; }
@@ -3657,7 +3708,7 @@ type struct AsyncLower {
             mut elem_ty: TypeRef = value_type;
             if (j < payloads.length && payloads[j].is_valid()) { elem_ty = payloads[j]; }
             const pb: PatternBinding* = epat.binding_at(j);
-            if (pb != null && pb.name.is_valid()) { bs.push_unique(pb.name, elem_ty); continue; }
+            if (pb != null && pb.name.is_valid()) { bs.push_unique(pb.sym_id, pb.name, elem_ty); continue; }
             const sub: PatternNode* = epat.sub_at(j);
             if (sub != null) { this.collect_pat_bindings(sub, elem_ty, bs); }
         }
@@ -4074,9 +4125,9 @@ type struct AsyncLower {
     // ---- cross-state local promotion (build-then-scan) ----
 
     /// True if `name` is read in any top-level statement of `blk`.
-    block_reads_name(&this, blk: BlockStmtNode*, name: SymbolStr) -> boolean {
+    block_reads_name(&this, blk: BlockStmtNode*, key: SymbolID) -> boolean {
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            if (this.name_read_in_stmt(blk.statements[i], name)) { return true; }
+            if (this.name_read_in_stmt(blk.statements[i], key)) { return true; }
         }
         return false;
     }
@@ -4091,93 +4142,91 @@ type struct AsyncLower {
     first_use_write(&this) -> i64 { return 2; }
 
     /// How `blk` first touches `name`, scanning in execution order.
-    block_first_use(&this, blk: BlockStmtNode*, name: SymbolStr) -> i64 {
+    block_first_use(&this, blk: BlockStmtNode*, key: SymbolID) -> i64 {
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            const r: i64 = this.stmt_first_use(blk.statements[i], name);
+            const r: i64 = this.stmt_first_use(blk.statements[i], key);
             if (r != 0) { return r; }
         }
         return 0;
     }
 
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    stmt_first_use(&this, s: StatementNode*, name: SymbolStr) -> i64 {
+    stmt_first_use(&this, s: StatementNode*, key: SymbolID) -> i64 {
         if (s == null) { return 0; }
         const k: NodeKind = s.kind;
         if (k == NodeKind::DeclarationStatement) {
             const ds: DeclStmtNode* = s as DeclStmtNode*;
-            // The initializer runs before the name exists, so a mention of
-            // the name in it refers to an outer binding and is a read.
-            const r: i64 = this.expr_first_use(this.decl_stmt_init(ds), name);
+            // The initializer runs before the binding exists, so a use of it
+            // there is a read.
+            const r: i64 = this.expr_first_use(this.decl_stmt_init(ds), key);
             if (r != 0) { return r; }
             if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                if ((ds.declaration as VarDeclNode*).name.equals(name)) { return 2; }
+                if (this.decl_key(ds.declaration as VarDeclNode*).equals(key)) { return 2; }
             }
             return 0;
         }
         if (k == NodeKind::ExpressionStatement) {
-            return this.expr_first_use((s as ExprStmtNode*).expression, name);
+            return this.expr_first_use((s as ExprStmtNode*).expression, key);
         }
         if (k == NodeKind::ReturnStatement) {
-            return this.expr_first_use((s as ReturnStmtNode*).expression, name);
+            return this.expr_first_use((s as ReturnStmtNode*).expression, key);
         }
         if (k == NodeKind::BlockStatement) {
-            return this.block_first_use(s as BlockStmtNode*, name);
+            return this.block_first_use(s as BlockStmtNode*, key);
         }
         if (k == NodeKind::IfStatement) {
             const iff: IfStmtNode* = s as IfStmtNode*;
-            mut r: i64 = this.expr_first_use(iff.condition, name);
+            mut r: i64 = this.expr_first_use(iff.condition, key);
             if (r != 0) { return r; }
-            r = this.stmt_first_use(iff.then_stmt, name);
+            r = this.stmt_first_use(iff.then_stmt, key);
             if (r != 0) { return r; }
-            return this.stmt_first_use(iff.else_stmt, name);
+            return this.stmt_first_use(iff.else_stmt, key);
         }
         if (k == NodeKind::WhileStatement) {
             const w: WhileStmtNode* = s as WhileStmtNode*;
-            const r: i64 = this.expr_first_use(w.condition, name);
+            const r: i64 = this.expr_first_use(w.condition, key);
             if (r != 0) { return r; }
-            return this.stmt_first_use(w.body, name);
+            return this.stmt_first_use(w.body, key);
         }
         if (k == NodeKind::DoWhileStatement) {
             const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
-            const r: i64 = this.stmt_first_use(d.body, name);
+            const r: i64 = this.stmt_first_use(d.body, key);
             if (r != 0) { return r; }
-            return this.expr_first_use(d.condition, name);
+            return this.expr_first_use(d.condition, key);
         }
         if (k == NodeKind::ForStatement) {
             const f: ForStmtNode* = s as ForStmtNode*;
             mut r: i64 = 0;
-            if (f.init != null) { r = this.stmt_first_use(f.init as StatementNode*, name); }
+            if (f.init != null) { r = this.stmt_first_use(f.init as StatementNode*, key); }
             if (r != 0) { return r; }
-            r = this.expr_first_use(f.condition, name);
+            r = this.expr_first_use(f.condition, key);
             if (r != 0) { return r; }
-            r = this.stmt_first_use(f.body, name);
+            r = this.stmt_first_use(f.body, key);
             if (r != 0) { return r; }
-            return this.expr_first_use(f.update, name);
+            return this.expr_first_use(f.update, key);
         }
         if (k == NodeKind::LoopStatement) {
-            return this.stmt_first_use((s as LoopStmtNode*).body, name);
+            return this.stmt_first_use((s as LoopStmtNode*).body, key);
         }
         if (k == NodeKind::MatchStatement) {
             const m: MatchStmtNode* = s as MatchStmtNode*;
-            const r: i64 = this.expr_first_use(m.subject, name);
+            const r: i64 = this.expr_first_use(m.subject, key);
             if (r != 0) { return r; }
             for (mut i: i64 = 0; i < m.arms.length; i++) {
-                const a: i64 = this.stmt_first_use(m.arms[i].body, name);
+                const a: i64 = this.stmt_first_use(m.arms[i].body, key);
                 if (a != 0) { return a; }
             }
             return 0;
         }
         // Anything else can only mention the name by reading it.
-        if (this.name_read_in_stmt(s, name)) { return 1; }
+        if (this.name_read_in_stmt(s, key)) { return 1; }
         return 0;
     }
 
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    expr_first_use(&this, e: ExpressionNode*, name: SymbolStr) -> i64 {
+    expr_first_use(&this, e: ExpressionNode*, key: SymbolID) -> i64 {
         if (e == null) { return 0; }
         const k: NodeKind = (e as ASTNode*).kind;
         if (k == NodeKind::Identifier) {
-            if ((e as IdentifierNode*).name.equals(name)) { return 1; }
+            if (this.names_binding(e, key)) { return 1; }
             return 0;
         }
         if (k == NodeKind::BinaryExpression) {
@@ -4185,17 +4234,16 @@ type struct AsyncLower {
             if (b.op.kind == TokenType::Equal) {
                 // The right side is evaluated first; only a bare `name = ...`
                 // is a write, while `name.f = ...` or `name[i] = ...` reads it.
-                const r: i64 = this.expr_first_use(b.right, name);
+                const r: i64 = this.expr_first_use(b.right, key);
                 if (r != 0) { return r; }
-                if (b.left != null && (b.left as ASTNode*).kind == NodeKind::Identifier
-                        && (b.left as IdentifierNode*).name.equals(name)) {
+                if (this.names_binding(b.left, key)) {
                     return 2;
                 }
-                return this.expr_first_use(b.left, name);
+                return this.expr_first_use(b.left, key);
             }
-            const l: i64 = this.expr_first_use(b.left, name);
+            const l: i64 = this.expr_first_use(b.left, key);
             if (l != 0) { return l; }
-            return this.expr_first_use(b.right, name);
+            return this.expr_first_use(b.right, key);
         }
         if (k == NodeKind::MatchExpression) {
             // Same shape as the statement form: the subject runs first, then the
@@ -4203,18 +4251,18 @@ type struct AsyncLower {
             // what lets `block_cond_write` see it as a branch-nested write, whose
             // skipped path still needs the previous state's value.
             const me: MatchExprNode* = e as MatchExprNode*;
-            const r: i64 = this.expr_first_use(me.subject, name);
+            const r: i64 = this.expr_first_use(me.subject, key);
             if (r != 0) { return r; }
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 if (me.arms[i] == null) { continue; }
-                const g: i64 = this.expr_first_use(me.arms[i].guard, name);
+                const g: i64 = this.expr_first_use(me.arms[i].guard, key);
                 if (g != 0) { return g; }
-                const a: i64 = this.stmt_first_use(me.arms[i].body, name);
+                const a: i64 = this.stmt_first_use(me.arms[i].body, key);
                 if (a != 0) { return a; }
             }
             return 0;
         }
-        if (this.name_read_in_expr(e, name)) { return 1; }
+        if (this.name_read_in_expr(e, key)) { return 1; }
         return 0;
     }
 
@@ -4237,8 +4285,8 @@ type struct AsyncLower {
     /// looks perfectly reachable. Suspends are handled separately by
     /// `store_before_suspends`, which stores BEFORE the `return Poll::Pending`,
     /// so skipping the trailing store loses nothing on that path.
-    needs_handback(&this, blk: BlockStmtNode*, name: SymbolStr, lty: TypeRef) -> boolean {
-        if (this.last_use_consumes(blk, name, lty)) { return false; }
+    needs_handback(&this, blk: BlockStmtNode*, key: SymbolID, lty: TypeRef) -> boolean {
+        if (this.last_use_consumes(blk, key, lty)) { return false; }
         return !this.stmt_diverges(blk as StatementNode*);
     }
 
@@ -4269,9 +4317,9 @@ type struct AsyncLower {
 
     /// True when some awaited operand was built from `name`, so the future it
     /// produced may hold a view into the storage `name` owns.
-    borrowed_by_awaited_future(&this, sm: PollSm*, name: SymbolStr) -> boolean {
+    borrowed_by_awaited_future(&this, sm: PollSm*, key: SymbolID) -> boolean {
         for (mut i: i64 = 0; i < sm.borrow_ops.length; i++) {
-            if (this.name_read_in_expr(sm.borrow_ops[i], name)) { return true; }
+            if (this.name_read_in_expr(sm.borrow_ops[i], key)) { return true; }
         }
         return false;
     }
@@ -4313,7 +4361,7 @@ type struct AsyncLower {
         return !(t as InstantiatedType*).has_resolved_type();
     }
 
-    last_use_consumes(&this, blk: BlockStmtNode*, name: SymbolStr, lty: TypeRef) -> boolean {
+    last_use_consumes(&this, blk: BlockStmtNode*, key: SymbolID, lty: TypeRef) -> boolean {
         // A copy is not a give-away. Reporting one as such suppresses the
         // hand-back, and the carrier the next state takes from is then empty —
         // `take().unwrap()` on a `None`. This is why the declaring state of
@@ -4322,7 +4370,7 @@ type struct AsyncLower {
         if (!this.carried_can_be_given_away(lty)) { return false; }
         mut kind: i64 = 0;
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            this.mark_last_use_stmt(blk.statements[i], name, &kind);
+            this.mark_last_use_stmt(blk.statements[i], key, &kind);
         }
         return kind == 2;
     }
@@ -4338,75 +4386,75 @@ type struct AsyncLower {
     /// is then omitted, the carrier field stays empty, and the next state's
     /// `take().unwrap()` finds a `None`. A branch that falls through is walked
     /// normally, since it does reach the tail.
-    mark_last_use_stmt(&this, s: StatementNode*, name: SymbolStr, out: i64*) -> void {
+    mark_last_use_stmt(&this, s: StatementNode*, key: SymbolID, out: i64*) -> void {
         if (s == null) { return; }
         const k: NodeKind = s.kind;
         if (k == NodeKind::DeclarationStatement) {
-            this.mark_last_use_expr(this.decl_stmt_init(s as DeclStmtNode*), name, true, out);
+            this.mark_last_use_expr(this.decl_stmt_init(s as DeclStmtNode*), key, true, out);
             return;
         }
         if (k == NodeKind::ExpressionStatement) {
-            this.mark_last_use_expr((s as ExprStmtNode*).expression, name, false, out);
+            this.mark_last_use_expr((s as ExprStmtNode*).expression, key, false, out);
             return;
         }
         if (k == NodeKind::ReturnStatement) {
-            this.mark_last_use_expr((s as ReturnStmtNode*).expression, name, true, out);
+            this.mark_last_use_expr((s as ReturnStmtNode*).expression, key, true, out);
             return;
         }
         if (k == NodeKind::BlockStatement) {
             const blk: BlockStmtNode* = s as BlockStmtNode*;
             for (mut i: i64 = 0; i < blk.statements.length; i++) {
-                this.mark_last_use_stmt(blk.statements[i], name, out);
+                this.mark_last_use_stmt(blk.statements[i], key, out);
             }
             return;
         }
         if (k == NodeKind::IfStatement) {
             const iff: IfStmtNode* = s as IfStmtNode*;
-            this.mark_last_use_expr(iff.condition, name, false, out);
+            this.mark_last_use_expr(iff.condition, key, false, out);
             // A branch that returns never reaches the state's tail, so it cannot
             // describe what the state still owns there.
             if (!this.stmt_returns(iff.then_stmt)) {
-                this.mark_last_use_stmt(iff.then_stmt, name, out);
+                this.mark_last_use_stmt(iff.then_stmt, key, out);
             }
             if (!this.stmt_returns(iff.else_stmt)) {
-                this.mark_last_use_stmt(iff.else_stmt, name, out);
+                this.mark_last_use_stmt(iff.else_stmt, key, out);
             }
             return;
         }
         if (k == NodeKind::WhileStatement) {
             const w: WhileStmtNode* = s as WhileStmtNode*;
-            this.mark_last_use_expr(w.condition, name, false, out);
-            this.mark_last_use_stmt(w.body, name, out);
+            this.mark_last_use_expr(w.condition, key, false, out);
+            this.mark_last_use_stmt(w.body, key, out);
             return;
         }
         if (k == NodeKind::DoWhileStatement) {
             const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
-            this.mark_last_use_stmt(d.body, name, out);
-            this.mark_last_use_expr(d.condition, name, false, out);
+            this.mark_last_use_stmt(d.body, key, out);
+            this.mark_last_use_expr(d.condition, key, false, out);
             return;
         }
         if (k == NodeKind::ForStatement) {
             const f: ForStmtNode* = s as ForStmtNode*;
-            if (f.init != null) { this.mark_last_use_stmt(f.init as StatementNode*, name, out); }
-            this.mark_last_use_expr(f.condition, name, false, out);
-            this.mark_last_use_stmt(f.body, name, out);
-            this.mark_last_use_expr(f.update, name, false, out);
+            if (f.init != null) { this.mark_last_use_stmt(f.init as StatementNode*, key, out); }
+            this.mark_last_use_expr(f.condition, key, false, out);
+            this.mark_last_use_stmt(f.body, key, out);
+            this.mark_last_use_expr(f.update, key, false, out);
             return;
         }
         if (k == NodeKind::LoopStatement) {
-            this.mark_last_use_stmt((s as LoopStmtNode*).body, name, out);
+            this.mark_last_use_stmt((s as LoopStmtNode*).body, key, out);
             return;
         }
         if (k == NodeKind::MatchStatement) {
             const m: MatchStmtNode* = s as MatchStmtNode*;
-            this.mark_last_use_expr(m.subject, name, true, out);
+            this.mark_last_use_expr(m.subject, key, true, out);
             for (mut i: i64 = 0; i < m.arms.length; i++) {
                 if (m.arms[i] == null) { continue; }
                 // A guard runs before its body and only reads, so a name last
                 // mentioned there is still owned by the state.
-                this.mark_last_use_expr(m.arms[i].guard, name, false, out);
+                this.mark_last_use_expr(m.arms[i].guard, key, false, out);
                 if (!this.stmt_returns(m.arms[i].body)) {
-                    this.mark_last_use_stmt(m.arms[i].body, name, out);
+                    this.mark_last_use_stmt(m.arms[i].body, key, out);
                 }
             }
             return;
@@ -4416,13 +4464,12 @@ type struct AsyncLower {
     /// `by_value` says whether a bare mention in THIS position hands the value
     /// over (a call argument, an initializer, a returned expression) or merely
     /// reaches into it (a receiver, a field access, an address-of).
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    mark_last_use_expr(&this, e: ExpressionNode*, name: SymbolStr,
+    mark_last_use_expr(&this, e: ExpressionNode*, key: SymbolID,
                        by_value: boolean, out: i64*) -> void {
         if (e == null) { return; }
         const k: NodeKind = (e as ASTNode*).kind;
         if (k == NodeKind::Identifier) {
-            if ((e as IdentifierNode*).name.equals(name)) {
+            if (this.names_binding(e, key)) {
                 if (by_value) { *out = 2; } else { *out = 1; }
             }
             return;
@@ -4430,14 +4477,14 @@ type struct AsyncLower {
         if (k == NodeKind::BinaryExpression) {
             const b: BinaryExprNode* = e as BinaryExprNode*;
             if (b.op.kind == TokenType::Equal) {
-                this.mark_last_use_expr(b.right, name, true, out);
+                this.mark_last_use_expr(b.right, key, true, out);
                 // Assigning to the name replaces whatever it held: the state
                 // owns the new value regardless of what happened before.
-                this.mark_last_use_expr(b.left, name, false, out);
+                this.mark_last_use_expr(b.left, key, false, out);
                 return;
             }
-            this.mark_last_use_expr(b.left, name, false, out);
-            this.mark_last_use_expr(b.right, name, false, out);
+            this.mark_last_use_expr(b.left, key, false, out);
+            this.mark_last_use_expr(b.right, key, false, out);
             return;
         }
         if (k == NodeKind::CallExpression) {
@@ -4457,50 +4504,50 @@ type struct AsyncLower {
             // borrow publishes a value the state may have given away, which
             // MoveCheck catches as E0453; erring the other way strands the
             // field, which nothing catches until a `None` is unwrapped.
-            this.mark_last_use_expr(c.callee, name, false, out);
+            this.mark_last_use_expr(c.callee, key, false, out);
             for (mut i: i64 = 0; i < c.arguments.length; i++) {
                 const owns: boolean = (c.arguments[i] != null &&
                                        c.arguments[i].arg_binding == ArgBinding::ByValue);
-                this.mark_last_use_expr(c.arguments[i], name, owns, out);
+                this.mark_last_use_expr(c.arguments[i], key, owns, out);
             }
             return;
         }
         if (k == NodeKind::MemberAccess) {
-            this.mark_last_use_expr((e as MemberAccessNode*).object, name, false, out);
+            this.mark_last_use_expr((e as MemberAccessNode*).object, key, false, out);
             return;
         }
         if (k == NodeKind::UnaryExpression) {
-            this.mark_last_use_expr((e as UnaryExprNode*).operand, name, false, out);
+            this.mark_last_use_expr((e as UnaryExprNode*).operand, key, false, out);
             return;
         }
         if (k == NodeKind::CastExpression) {
-            this.mark_last_use_expr((e as CastExprNode*).expression, name, by_value, out);
+            this.mark_last_use_expr((e as CastExprNode*).expression, key, by_value, out);
             return;
         }
         if (k == NodeKind::ArrayAccess) {
             const a: ArrayAccessNode* = e as ArrayAccessNode*;
-            this.mark_last_use_expr(a.array, name, false, out);
-            this.mark_last_use_expr(a.index, name, false, out);
+            this.mark_last_use_expr(a.array, key, false, out);
+            this.mark_last_use_expr(a.index, key, false, out);
             return;
         }
         if (k == NodeKind::TernaryExpression) {
             const t: TernaryExprNode* = e as TernaryExprNode*;
-            this.mark_last_use_expr(t.condition, name, false, out);
-            this.mark_last_use_expr(t.true_expr, name, by_value, out);
-            this.mark_last_use_expr(t.false_expr, name, by_value, out);
+            this.mark_last_use_expr(t.condition, key, false, out);
+            this.mark_last_use_expr(t.true_expr, key, by_value, out);
+            this.mark_last_use_expr(t.false_expr, key, by_value, out);
             return;
         }
         if (k == NodeKind::IfExpression) {
             const ife: IfExprNode* = e as IfExprNode*;
-            this.mark_last_use_expr(ife.condition, name, false, out);
-            this.mark_last_use_expr(ife.then_expr, name, by_value, out);
-            this.mark_last_use_expr(ife.else_expr, name, by_value, out);
+            this.mark_last_use_expr(ife.condition, key, false, out);
+            this.mark_last_use_expr(ife.then_expr, key, by_value, out);
+            this.mark_last_use_expr(ife.else_expr, key, by_value, out);
             return;
         }
         if (k == NodeKind::StructLiteral) {
             const sl: StructLiteralNode* = e as StructLiteralNode*;
             for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
-                this.mark_last_use_expr(sl.field_inits[i].value, name, true, out);
+                this.mark_last_use_expr(sl.field_inits[i].value, key, true, out);
             }
             return;
         }
@@ -4512,32 +4559,32 @@ type struct AsyncLower {
             // `name_read_in_expr`, which does walk the desugar) but record it as
             // a borrow, and the state would then hand a value it no longer owns
             // back to its carrier field.
-            this.mark_last_use_expr(this.try_live(e), name, by_value, out);
+            this.mark_last_use_expr(this.try_live(e), key, by_value, out);
             return;
         }
         if (k == NodeKind::MatchExpression) {
             const me: MatchExprNode* = e as MatchExprNode*;
-            this.mark_last_use_expr(me.subject, name, true, out);
+            this.mark_last_use_expr(me.subject, key, true, out);
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 if (me.arms[i] == null) { continue; }
-                this.mark_last_use_expr(me.arms[i].guard, name, false, out);
-                this.mark_last_use_arm(me.arms[i].body, name, by_value, out);
+                this.mark_last_use_expr(me.arms[i].guard, key, false, out);
+                this.mark_last_use_arm(me.arms[i].body, key, by_value, out);
             }
             return;
         }
         // Anything else: a mention can only be a read of the value in place.
-        if (this.name_read_in_expr(e, name)) { *out = 1; }
+        if (this.name_read_in_expr(e, key)) { *out = 1; }
     }
 
     /// Walk a match-EXPRESSION arm body. Its trailing expression is the arm's
     /// value, so that expression sits in the match's own position: when the match
     /// result is handed over, an arm yielding the name hands the name over too.
     /// Every other statement in the body is an ordinary statement.
-    mark_last_use_arm(&this, body: StatementNode*, name: SymbolStr,
+    mark_last_use_arm(&this, body: StatementNode*, key: SymbolID,
                       by_value: boolean, out: i64*) -> void {
         if (body == null) { return; }
         if (body.kind != NodeKind::BlockStatement) {
-            this.mark_last_use_stmt(body, name, out);
+            this.mark_last_use_stmt(body, key, out);
             return;
         }
         const blk: BlockStmtNode* = body as BlockStmtNode*;
@@ -4545,10 +4592,10 @@ type struct AsyncLower {
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
             const s: StatementNode* = blk.statements[i];
             if (i == last && s != null && s.kind == NodeKind::ExpressionStatement) {
-                this.mark_last_use_expr((s as ExprStmtNode*).expression, name, by_value, out);
+                this.mark_last_use_expr((s as ExprStmtNode*).expression, key, by_value, out);
                 continue;
             }
-            this.mark_last_use_stmt(s, name, out);
+            this.mark_last_use_stmt(s, key, out);
         }
     }
 
@@ -4567,35 +4614,40 @@ type struct AsyncLower {
     /// way down rather than several declarations spelled the same way sharing
     /// whatever downstream bookkeeping is keyed by name.
     ///
-    /// Returns the fresh name, or the empty symbol when the state has no
-    /// top-level assignment to convert. Callers must hand the value back under
-    /// the name returned here, not the one they passed in.
-    decl_at_first_assignment(mut &this, blk: BlockStmtNode*, name: SymbolStr,
-                             lty: TypeRef, span: SourceSpan) -> SymbolStr {
-        const i: i64 = this.top_level_assignment_index(blk, name);
-        if (i < 0) { return SymbolStr::empty(); }
+    /// Returns the fresh local, whose name is the empty symbol when the state
+    /// has no top-level assignment to convert. Callers must hand the value back
+    /// through the local returned here, not the binding they passed in.
+    /// `shown` is how the binding is spelled where it is written, which the
+    /// fresh name is derived from when the binding is not a renamed local.
+    decl_at_first_assignment(mut &this, blk: BlockStmtNode*, key: SymbolID, shown: SymbolStr,
+                             lty: TypeRef, span: SourceSpan) -> MintedLocal {
+        const i: i64 = this.top_level_assignment_index(blk, key);
+        if (i < 0) { return MintedLocal { name: SymbolStr::empty(), sym: SymbolID::invalid() }; }
         const b: BinaryExprNode* =
             ((blk.statements[i] as ExprStmtNode*).expression) as BinaryExprNode*;
-        const fresh: SymbolStr = this.mint_local(this.strip_local_marker(name));
-        blk.statements[i] = this.var_decl_stmt(fresh, true, lty, b.right, span);
+        const sym: SymbolID = this.resolver.alloc_synthetic_binding();
+        const fresh: SymbolStr = this.mint_local(this.source_name(key, shown), sym);
+        blk.statements[i] = this.var_decl_stmt_bound(fresh, sym, true, lty, b.right, span);
         // Only what FOLLOWS the declaration: this is the state's first mention of
         // the name, so nothing before it can refer to the binding.
         const saved: i64 = this.subst_mode;
+        const saved_sym: SymbolID = this.subst_local_sym;
         this.subst_mode = this.subst_to_local();
+        this.subst_local_sym = sym;
         for (mut j: i64 = i + 1; j < blk.statements.length; j++) {
-            this.subst_name_stmt(blk.statements[j], name, fresh,
+            this.subst_name_stmt(blk.statements[j], key, fresh,
                                  TypeRef::invalid(), lty, span);
         }
         this.subst_mode = saved;
-        return fresh;
+        this.subst_local_sym = saved_sym;
+        return MintedLocal { name: fresh, sym: sym };
     }
 
     /// Index of the state's first `<name> = <expr>;` written at the TOP level of
     /// the state, or -1. Top level is what makes the assignment unconditional:
     /// it runs on every path through the state, so the state really does produce
     /// its own value.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    top_level_assignment_index(&this, blk: BlockStmtNode*, name: SymbolStr) -> i64 {
+    top_level_assignment_index(&this, blk: BlockStmtNode*, key: SymbolID) -> i64 {
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
             const s: StatementNode* = blk.statements[i];
             if (s == null || s.kind != NodeKind::ExpressionStatement) { continue; }
@@ -4603,8 +4655,7 @@ type struct AsyncLower {
             if (e == null || (e as ASTNode*).kind != NodeKind::BinaryExpression) { continue; }
             const b: BinaryExprNode* = e as BinaryExprNode*;
             if (b.op.kind != TokenType::Equal) { continue; }
-            if (b.left == null || (b.left as ASTNode*).kind != NodeKind::Identifier) { continue; }
-            if (!(b.left as IdentifierNode*).name.equals(name)) { continue; }
+            if (!this.names_binding(b.left, key)) { continue; }
             return i;
         }
         return -1;
@@ -4621,32 +4672,33 @@ type struct AsyncLower {
     /// instead would give the state a binding nobody wrote on that path, and the
     /// hand-back at the end of the state would publish that garbage into the
     /// carrier field for the next state to take.
-    block_cond_write(&this, blk: BlockStmtNode*, name: SymbolStr) -> boolean {
-        if (this.block_first_use(blk, name) != this.first_use_write()) { return false; }
-        return this.top_level_assignment_index(blk, name) < 0;
+    block_cond_write(&this, blk: BlockStmtNode*, key: SymbolID) -> boolean {
+        if (this.block_first_use(blk, key) != this.first_use_write()) { return false; }
+        return this.top_level_assignment_index(blk, key) < 0;
     }
 
     /// `this.<field> = Option::Some(<name>);` — hand a promoted aggregate from
     /// the block-local holding it back to the field that survives the suspend.
     /// Built fresh per call: each insertion point needs its own nodes.
     agg_store_stmt(mut &this, sm: PollSm*, field: SymbolStr, opt_ty: TypeRef,
-                   name: SymbolStr, lty: TypeRef, span: SourceSpan) -> StatementNode* {
+                   name: SymbolStr, key: SymbolID, lty: TypeRef,
+                   span: SourceSpan) -> StatementNode* {
         return this.assign_member_stmt(sm.struct_ref, field, opt_ty,
-            this.option_some(this.ident(name, lty, span), opt_ty, span), span);
+            this.option_some(this.ident_bound(name, key, lty, span), opt_ty, span), span);
     }
 
     /// `mut <name> = this.<field>.take().unwrap();` — the value MOVES out of its
     /// carrier field into an ordinary local, leaving the field empty, so exactly
     /// one place owns it. Reading `this.<field>` directly would copy it instead
     /// and leave the future and the poll frame each believing they own it, which
-    /// runs the destructor twice.
-    agg_take_stmt(mut &this, name: SymbolStr, field: SymbolStr, lty: TypeRef,
+    /// runs the destructor twice.  The local declares binding `sym`.
+    agg_take_stmt(mut &this, name: SymbolStr, sym: SymbolID, field: SymbolStr, lty: TypeRef,
                   opt_ty: TypeRef, struct_ref: TypeRef, mutable: boolean,
                   span: SourceSpan) -> StatementNode* {
         mut fld: ExpressionNode* = this.own_field(struct_ref, field, opt_ty, span);
         mut take_call: ExpressionNode* = this.method_call0(fld, LangItem::OptionTake, opt_ty, span);
         mut unwrap_call: ExpressionNode* = this.method_call0(take_call, LangItem::OptionUnwrap, lty, span);
-        return this.var_decl_stmt(name, mutable, lty, unwrap_call, span);
+        return this.var_decl_stmt_bound(name, sym, mutable, lty, unwrap_call, span);
     }
 
     /// `mut <name>: T* = this.<field>.unwrap_ptr();` — bind a pointer to the
@@ -4674,13 +4726,16 @@ type struct AsyncLower {
     /// carries the async function's own span, so the dead-code lint would report
     /// it against the user's `async function`, naming source that declares
     /// nothing of the kind.
+    ///
+    /// Every state's pointer stands for one binding, `pkey`, which the
+    /// substitution's uses of the pointer name.
     bind_carrier_ptr(mut &this, sm: PollSm*, blk: BlockStmtNode*, at: i64, pnm: SymbolStr,
-                     field: SymbolStr, opt_ty: TypeRef, lty_ptr: TypeRef,
+                     pkey: SymbolID, field: SymbolStr, opt_ty: TypeRef, lty_ptr: TypeRef,
                      span: SourceSpan) -> void {
-        if (this.block_first_use(blk, pnm) == 0) { return; }
+        if (this.block_first_use(blk, pkey) == 0) { return; }
         mut opened: StatementNode*[] = [];
         for (mut i: i64 = 0; i < at; i++) { opened.push(blk.statements[i]); }
-        opened.push(this.agg_bind_ptr_stmt(sm, pnm, field, opt_ty, lty_ptr, span));
+        opened.push(this.stand_in(this.agg_bind_ptr_stmt(sm, pnm, field, opt_ty, lty_ptr, span), pkey));
         for (mut i: i64 = at; i < blk.statements.length; i++) { opened.push(blk.statements[i]); }
         blk.statements = opened;
     }
@@ -4713,15 +4768,17 @@ type struct AsyncLower {
     /// A carried value whose type has no destructor is COPIED by a by-value use,
     /// so the field must keep its payload and no take is armed: emptying it
     /// would leave every later state's `unwrap_ptr` looking at a `None`.
-    subst_carried_from(mut &this, sm: PollSm*, blk: BlockStmtNode*, from: i64, nm: SymbolStr,
-                       ptr_name: SymbolStr, field: SymbolStr, lty: TypeRef, opt_ty: TypeRef,
-                       span: SourceSpan) -> void {
+    subst_carried_from(mut &this, sm: PollSm*, blk: BlockStmtNode*, from: i64, key: SymbolID,
+                       ptr_name: SymbolStr, pkey: SymbolID, field: SymbolStr, lty: TypeRef,
+                       opt_ty: TypeRef, span: SourceSpan) -> void {
         const saved_mode:   i64       = this.subst_mode;
+        const saved_sym:    SymbolID  = this.subst_local_sym;
         const saved_field:  SymbolStr = this.subst_carrier_field;
         const saved_opt:    TypeRef   = this.subst_carrier_opt;
         const saved_struct: TypeRef   = this.subst_carrier_struct;
         const saved_takes:  boolean   = this.subst_carrier_takes;
         this.subst_mode            = this.subst_to_local_deref();
+        this.subst_local_sym       = pkey;
         this.subst_carrier_field   = field;
         this.subst_carrier_opt     = opt_ty;
         this.subst_carrier_struct  = sm.struct_ref;
@@ -4731,10 +4788,11 @@ type struct AsyncLower {
         this.subst_hoist_name = SymbolStr::empty();
         this.subst_hoist_stmt = null;
         this.subst_cond_depth = 0;
-        this.subst_stmt_list(blk, from, nm, ptr_name, TypeRef::invalid(), lty, span);
+        this.subst_stmt_list(blk, from, key, ptr_name, TypeRef::invalid(), lty, span);
         this.subst_hoist_name = SymbolStr::empty();
         this.subst_hoist_stmt = null;
         this.subst_mode           = saved_mode;
+        this.subst_local_sym      = saved_sym;
         this.subst_carrier_field  = saved_field;
         this.subst_carrier_opt    = saved_opt;
         this.subst_carrier_struct = saved_struct;
@@ -4755,11 +4813,16 @@ type struct AsyncLower {
     /// several states is one node list — so renaming per state rewrites a node
     /// another state also reads, leaving that state naming a binding outside
     /// its scope.
-    prepend_agg_take(mut &this, blk: BlockStmtNode*, name: SymbolStr, field: SymbolStr,
+    ///
+    /// The take declares binding `sym`; when it re-declares a carried value it
+    /// stands for that value's binding, `stands_for`.
+    prepend_agg_take(mut &this, blk: BlockStmtNode*, name: SymbolStr, sym: SymbolID,
+                     stands_for: SymbolID, field: SymbolStr,
                      lty: TypeRef, opt_ty: TypeRef, struct_ref: TypeRef,
                      mutable: boolean, span: SourceSpan) -> void {
-        mut rebuilt: StatementNode*[] = [this.agg_take_stmt(name, field, lty, opt_ty,
-                                                           struct_ref, mutable, span)];
+        mut rebuilt: StatementNode*[] = [this.stand_in(this.agg_take_stmt(name, sym, field, lty,
+                                                           opt_ty, struct_ref, mutable, span),
+                                                       stands_for)];
         for (mut i: i64 = 0; i < blk.statements.length; i++) { rebuilt.push(blk.statements[i]); }
         blk.statements = rebuilt;
     }
@@ -4770,7 +4833,7 @@ type struct AsyncLower {
     /// would take an empty field. Only ever applied to states that opened with a
     /// `take`, so the local is in scope at each suspend.
     store_before_suspends(mut &this, sm: PollSm*, s: StatementNode*, field: SymbolStr,
-                          opt_ty: TypeRef, name: SymbolStr, lty: TypeRef,
+                          opt_ty: TypeRef, name: SymbolStr, key: SymbolID, lty: TypeRef,
                           span: SourceSpan) -> void {
         if (s == null) { return; }
         const k: NodeKind = s.kind;
@@ -4780,10 +4843,10 @@ type struct AsyncLower {
             for (mut i: i64 = 0; i < blk.statements.length; i++) {
                 const st: StatementNode* = blk.statements[i];
                 if (this.is_pending_return(st)) {
-                    rebuilt.push(this.agg_store_stmt(sm, field, opt_ty, name, lty, span));
+                    rebuilt.push(this.agg_store_stmt(sm, field, opt_ty, name, key, lty, span));
                     rebuilt.push(st);
                 } else {
-                    this.store_before_suspends(sm, st, field, opt_ty, name, lty, span);
+                    this.store_before_suspends(sm, st, field, opt_ty, name, key, lty, span);
                     rebuilt.push(st);
                 }
             }
@@ -4792,30 +4855,30 @@ type struct AsyncLower {
         }
         if (k == NodeKind::IfStatement) {
             const iff: IfStmtNode* = s as IfStmtNode*;
-            this.store_before_suspends(sm, iff.then_stmt, field, opt_ty, name, lty, span);
-            this.store_before_suspends(sm, iff.else_stmt, field, opt_ty, name, lty, span);
+            this.store_before_suspends(sm, iff.then_stmt, field, opt_ty, name, key, lty, span);
+            this.store_before_suspends(sm, iff.else_stmt, field, opt_ty, name, key, lty, span);
             return;
         }
         if (k == NodeKind::WhileStatement) {
-            this.store_before_suspends(sm, (s as WhileStmtNode*).body, field, opt_ty, name, lty, span);
+            this.store_before_suspends(sm, (s as WhileStmtNode*).body, field, opt_ty, name, key, lty, span);
             return;
         }
         if (k == NodeKind::DoWhileStatement) {
-            this.store_before_suspends(sm, (s as DoWhileStmtNode*).body, field, opt_ty, name, lty, span);
+            this.store_before_suspends(sm, (s as DoWhileStmtNode*).body, field, opt_ty, name, key, lty, span);
             return;
         }
         if (k == NodeKind::ForStatement) {
-            this.store_before_suspends(sm, (s as ForStmtNode*).body, field, opt_ty, name, lty, span);
+            this.store_before_suspends(sm, (s as ForStmtNode*).body, field, opt_ty, name, key, lty, span);
             return;
         }
         if (k == NodeKind::LoopStatement) {
-            this.store_before_suspends(sm, (s as LoopStmtNode*).body, field, opt_ty, name, lty, span);
+            this.store_before_suspends(sm, (s as LoopStmtNode*).body, field, opt_ty, name, key, lty, span);
             return;
         }
         if (k == NodeKind::MatchStatement) {
             const m: MatchStmtNode* = s as MatchStmtNode*;
             for (mut i: i64 = 0; i < m.arms.length; i++) {
-                this.store_before_suspends(sm, m.arms[i].body, field, opt_ty, name, lty, span);
+                this.store_before_suspends(sm, m.arms[i].body, field, opt_ty, name, key, lty, span);
             }
             return;
         }
@@ -4949,13 +5012,14 @@ type struct AsyncLower {
                     rebuilt.push(st);
                     continue;
                 }
-                const rsym: SymbolStr = this.mint_local(this.intern.intern("__rv"));
-                rebuilt.push(this.var_decl_stmt(rsym, true, out_ty,
-                                                ready.arguments[0], span));
+                const rv_id: SymbolID = this.resolver.alloc_synthetic_binding();
+                const rsym: SymbolStr = this.mint_local(this.intern.intern("__rv"), rv_id);
+                rebuilt.push(this.var_decl_stmt_bound(rsym, rv_id, true, out_ty,
+                                                      ready.arguments[0], span));
                 for (mut f: i64 = 0; f < fields.length; f++) {
                     rebuilt.push(this.agg_release_stmt(sm, fields[f], opts[f], span));
                 }
-                ready.arguments[0] = this.ident(rsym, out_ty, span);
+                ready.arguments[0] = this.ident_bound(rsym, rv_id, out_ty, span);
                 rebuilt.push(st);
             }
             blk.statements = rebuilt;
@@ -4992,10 +5056,12 @@ type struct AsyncLower {
         }
     }
 
-    prepend_load(mut &this, blk: BlockStmtNode*, name: SymbolStr, field: SymbolStr,
-                 ty: TypeRef, struct_ref: TypeRef, span: SourceSpan) -> void {
+    /// Prepend `const <name> = this.<field>;`, a stand-in for binding `key`, so
+    /// the block's reads of a promoted local reach the reloaded value.
+    prepend_load(mut &this, blk: BlockStmtNode*, name: SymbolStr, key: SymbolID,
+                 field: SymbolStr, ty: TypeRef, struct_ref: TypeRef, span: SourceSpan) -> void {
         mut ld: ExpressionNode* = this.own_field(struct_ref, field, ty, span);
-        mut rebuilt: StatementNode*[] = [this.var_decl_stmt(name, false, ty, ld, span)];
+        mut rebuilt: StatementNode*[] = [this.stand_in(this.var_decl_stmt(name, false, ty, ld, span), key)];
         for (mut i: i64 = 0; i < blk.statements.length; i++) { rebuilt.push(blk.statements[i]); }
         blk.statements = rebuilt;
     }
@@ -5024,26 +5090,25 @@ type struct AsyncLower {
 
     // ---- address-of-across-a-suspend soundness ----
 
-    /// Record the names whose storage is the poll frame: the parameters (re-bound
-    /// by the shadow prelude on entry to every poll) and every local and
-    /// `match`-arm binding (renamed, and thereby recorded, by
-    /// `disambiguate_locals`). Must run after that rename, so the recorded names
-    /// are the ones the body now uses.
+    /// Record the bindings whose storage is the poll frame: the parameters
+    /// (re-bound by the shadow prelude on entry to every poll) and every local
+    /// and `match`-arm binding (recorded by `disambiguate_locals` as it renames
+    /// them).  Must run after that rename, which is what records them.
     collect_frame_names(mut &this, d: AsyncDecl*, sm: PollSm*, node: FunctionDeclNode*) -> void {
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const p: VarDeclNode* = node.parameters[i];
             if (!this.param_has_slot(d, p)) { continue; }
-            sm.frame_names.push(this.param_field_name(p));
+            sm.frame_keys.push(p.sym_id);
         }
         for (mut i: i64 = 0; i < this.frame_locals.length; i++) {
-            sm.frame_names.push(this.frame_locals[i]);
+            sm.frame_keys.push(this.frame_locals[i]);
         }
     }
 
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    is_frame_name(&this, sm: PollSm*, name: SymbolStr) -> boolean {
-        for (mut i: i64 = 0; i < sm.frame_names.length; i++) {
-            if (sm.frame_names[i].equals(name)) { return true; }
+    is_frame_key(&this, sm: PollSm*, key: SymbolID) -> boolean {
+        if (!key.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < sm.frame_keys.length; i++) {
+            if (sm.frame_keys[i].equals(key)) { return true; }
         }
         return false;
     }
@@ -5068,28 +5133,27 @@ type struct AsyncLower {
     /// names, or the empty symbol when `e` names storage elsewhere. Each step is
     /// tested against the type it indexes into, so a place stops being rooted in
     /// the frame at the first indirection it passes through.
-    addr_place_root(&this, sm: PollSm*, e: ExpressionNode*) -> SymbolStr {
-        if (e == null) { return SymbolStr::empty(); }
+    addr_place_root(&this, sm: PollSm*, e: ExpressionNode*) -> IdentifierNode* {
+        if (e == null) { return null; }
         const k: NodeKind = (e as ASTNode*).kind;
         if (k == NodeKind::Identifier) {
-            const nm: SymbolStr = (e as IdentifierNode*).name;
-            if (this.is_frame_name(sm, nm)) { return nm; }
-            return SymbolStr::empty();
+            if (this.is_frame_key(sm, this.local_key(e))) { return e as IdentifierNode*; }
+            return null;
         }
         if (k == NodeKind::MemberAccess) {
             const ma: MemberAccessNode* = e as MemberAccessNode*;
-            if (this.place_leaves_frame(ma.object)) { return SymbolStr::empty(); }
+            if (this.place_leaves_frame(ma.object)) { return null; }
             return this.addr_place_root(sm, ma.object);
         }
         if (k == NodeKind::ArrayAccess) {
             const aa: ArrayAccessNode* = e as ArrayAccessNode*;
-            if (this.place_leaves_frame(aa.array)) { return SymbolStr::empty(); }
+            if (this.place_leaves_frame(aa.array)) { return null; }
             return this.addr_place_root(sm, aa.array);
         }
         // A dereference (`&*p`), a call result, a cast: not frame storage a name
         // owns. `*p` in particular is the caller-owned-buffer idiom this check
         // steers users toward, so it must not be reported.
-        return SymbolStr::empty();
+        return null;
     }
 
     /// The frame-resident place a CALL hands out a pointer into, or the empty
@@ -5108,20 +5172,20 @@ type struct AsyncLower {
     /// dynamic array naming its heap block — stops the walk: the pointee does
     /// not move when a poll returns, so `arr.as_ptr()` and `this.conn.pending()`
     /// stay sound and must not be reported.
-    call_frame_addr_root(&this, sm: PollSm*, c: CallExprNode*) -> SymbolStr {
+    call_frame_addr_root(&this, sm: PollSm*, c: CallExprNode*) -> IdentifierNode* {
         const rt: TypeRef = (c as ExpressionNode*).resolved_type;
-        if (!rt.is_valid()) { return SymbolStr::empty(); }
+        if (!rt.is_valid()) { return null; }
         const t: Type* = this.arena.lookup(rt);
-        if (t == null) { return SymbolStr::empty(); }
+        if (t == null) { return null; }
         if (t.kind != TypeKind::Pointer && t.kind != TypeKind::Reference) {
-            return SymbolStr::empty();
+            return null;
         }
-        if (c.callee == null) { return SymbolStr::empty(); }
+        if (c.callee == null) { return null; }
         if ((c.callee as ASTNode*).kind != NodeKind::MemberAccess) {
-            return SymbolStr::empty();
+            return null;
         }
         const recv: ExpressionNode* = (c.callee as MemberAccessNode*).object;
-        if (this.place_leaves_frame(recv)) { return SymbolStr::empty(); }
+        if (this.place_leaves_frame(recv)) { return null; }
         return this.addr_place_root(sm, recv);
     }
 
@@ -5130,34 +5194,34 @@ type struct AsyncLower {
     /// skipped: the compiler materializes those for a receiver or a comparison
     /// temp that it consumes within the same expression, so they never outlive
     /// the state that built them.
-    frame_addr_root_expr(&this, sm: PollSm*, e: ExpressionNode*) -> SymbolStr {
-        if (e == null) { return SymbolStr::empty(); }
+    frame_addr_root_expr(&this, sm: PollSm*, e: ExpressionNode*) -> IdentifierNode* {
+        if (e == null) { return null; }
         const k: NodeKind = (e as ASTNode*).kind;
         if (k == NodeKind::UnaryExpression) {
             const u: UnaryExprNode* = e as UnaryExprNode*;
             if (u.op.kind == TokenType::Amp && !u.is_synthetic) {
-                const root: SymbolStr = this.addr_place_root(sm, u.operand);
-                if (root.is_valid()) { return root; }
+                const root: IdentifierNode* = this.addr_place_root(sm, u.operand);
+                if (root != null) { return root; }
             }
             return this.frame_addr_root_expr(sm, u.operand);
         }
         if (k == NodeKind::BinaryExpression) {
             const b: BinaryExprNode* = e as BinaryExprNode*;
-            const l: SymbolStr = this.frame_addr_root_expr(sm, b.left);
-            if (l.is_valid()) { return l; }
+            const l: IdentifierNode* = this.frame_addr_root_expr(sm, b.left);
+            if (l != null) { return l; }
             return this.frame_addr_root_expr(sm, b.right);
         }
         if (k == NodeKind::CallExpression) {
             const c: CallExprNode* = e as CallExprNode*;
-            const cr: SymbolStr = this.call_frame_addr_root(sm, c);
-            if (cr.is_valid()) { return cr; }
-            const cl: SymbolStr = this.frame_addr_root_expr(sm, c.callee);
-            if (cl.is_valid()) { return cl; }
+            const cr: IdentifierNode* = this.call_frame_addr_root(sm, c);
+            if (cr != null) { return cr; }
+            const cl: IdentifierNode* = this.frame_addr_root_expr(sm, c.callee);
+            if (cl != null) { return cl; }
             for (mut i: i64 = 0; i < c.arguments.length; i++) {
-                const a: SymbolStr = this.frame_addr_root_expr(sm, c.arguments[i]);
-                if (a.is_valid()) { return a; }
+                const a: IdentifierNode* = this.frame_addr_root_expr(sm, c.arguments[i]);
+                if (a != null) { return a; }
             }
-            return SymbolStr::empty();
+            return null;
         }
         if (k == NodeKind::MemberAccess) {
             return this.frame_addr_root_expr(sm, (e as MemberAccessNode*).object);
@@ -5167,33 +5231,33 @@ type struct AsyncLower {
         }
         if (k == NodeKind::ArrayAccess) {
             const aa: ArrayAccessNode* = e as ArrayAccessNode*;
-            const av: SymbolStr = this.frame_addr_root_expr(sm, aa.array);
-            if (av.is_valid()) { return av; }
+            const av: IdentifierNode* = this.frame_addr_root_expr(sm, aa.array);
+            if (av != null) { return av; }
             return this.frame_addr_root_expr(sm, aa.index);
         }
         if (k == NodeKind::TernaryExpression) {
             const t: TernaryExprNode* = e as TernaryExprNode*;
-            const c1: SymbolStr = this.frame_addr_root_expr(sm, t.condition);
-            if (c1.is_valid()) { return c1; }
-            const c2: SymbolStr = this.frame_addr_root_expr(sm, t.true_expr);
-            if (c2.is_valid()) { return c2; }
+            const c1: IdentifierNode* = this.frame_addr_root_expr(sm, t.condition);
+            if (c1 != null) { return c1; }
+            const c2: IdentifierNode* = this.frame_addr_root_expr(sm, t.true_expr);
+            if (c2 != null) { return c2; }
             return this.frame_addr_root_expr(sm, t.false_expr);
         }
         if (k == NodeKind::IfExpression) {
             const ife: IfExprNode* = e as IfExprNode*;
-            const i1: SymbolStr = this.frame_addr_root_expr(sm, ife.condition);
-            if (i1.is_valid()) { return i1; }
-            const i2: SymbolStr = this.frame_addr_root_expr(sm, ife.then_expr);
-            if (i2.is_valid()) { return i2; }
+            const i1: IdentifierNode* = this.frame_addr_root_expr(sm, ife.condition);
+            if (i1 != null) { return i1; }
+            const i2: IdentifierNode* = this.frame_addr_root_expr(sm, ife.then_expr);
+            if (i2 != null) { return i2; }
             return this.frame_addr_root_expr(sm, ife.else_expr);
         }
         if (k == NodeKind::StructLiteral) {
             const sl: StructLiteralNode* = e as StructLiteralNode*;
             for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
-                const f: SymbolStr = this.frame_addr_root_expr(sm, sl.field_inits[i].value);
-                if (f.is_valid()) { return f; }
+                const f: IdentifierNode* = this.frame_addr_root_expr(sm, sl.field_inits[i].value);
+                if (f != null) { return f; }
             }
-            return SymbolStr::empty();
+            return null;
         }
         if (k == NodeKind::AwaitExpression) {
             return this.frame_addr_root_expr(sm, (e as AwaitExprNode*).operand);
@@ -5203,24 +5267,24 @@ type struct AsyncLower {
         }
         if (k == NodeKind::MatchExpression) {
             const me: MatchExprNode* = e as MatchExprNode*;
-            const s: SymbolStr = this.frame_addr_root_expr(sm, me.subject);
-            if (s.is_valid()) { return s; }
+            const s: IdentifierNode* = this.frame_addr_root_expr(sm, me.subject);
+            if (s != null) { return s; }
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 if (me.arms[i] == null) { continue; }
-                const g: SymbolStr = this.frame_addr_root_expr(sm, me.arms[i].guard);
-                if (g.is_valid()) { return g; }
-                const b2: SymbolStr = this.frame_addr_root_stmt(sm, me.arms[i].body);
-                if (b2.is_valid()) { return b2; }
+                const g: IdentifierNode* = this.frame_addr_root_expr(sm, me.arms[i].guard);
+                if (g != null) { return g; }
+                const b2: IdentifierNode* = this.frame_addr_root_stmt(sm, me.arms[i].body);
+                if (b2 != null) { return b2; }
             }
-            return SymbolStr::empty();
+            return null;
         }
-        return SymbolStr::empty();
+        return null;
     }
 
     /// Statement twin of `frame_addr_root_expr`, for the value-block body of a
     /// `match` expression arm.
-    frame_addr_root_stmt(&this, sm: PollSm*, s: StatementNode*) -> SymbolStr {
-        if (s == null) { return SymbolStr::empty(); }
+    frame_addr_root_stmt(&this, sm: PollSm*, s: StatementNode*) -> IdentifierNode* {
+        if (s == null) { return null; }
         const k: NodeKind = s.kind;
         if (k == NodeKind::ExpressionStatement) {
             return this.frame_addr_root_expr(sm, (s as ExprStmtNode*).expression);
@@ -5234,19 +5298,18 @@ type struct AsyncLower {
         if (k == NodeKind::BlockStatement) {
             const blk: BlockStmtNode* = s as BlockStmtNode*;
             for (mut i: i64 = 0; i < blk.statements.length; i++) {
-                const r: SymbolStr = this.frame_addr_root_stmt(sm, blk.statements[i]);
-                if (r.is_valid()) { return r; }
+                const r: IdentifierNode* = this.frame_addr_root_stmt(sm, blk.statements[i]);
+                if (r != null) { return r; }
             }
-            return SymbolStr::empty();
+            return null;
         }
-        return SymbolStr::empty();
+        return null;
     }
 
     /// The frame-resident address root assigned into `name` by a `<name> = <expr>;`
     /// anywhere in `blk`, or the empty symbol. Complements the declaration
     /// initializer: a pointer may be declared null and filled in later.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    assigned_frame_addr_root(&this, sm: PollSm*, blk: BlockStmtNode*, name: SymbolStr) -> SymbolStr {
+    assigned_frame_addr_root(&this, sm: PollSm*, blk: BlockStmtNode*, key: SymbolID) -> IdentifierNode* {
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
             const s: StatementNode* = blk.statements[i];
             if (s == null || s.kind != NodeKind::ExpressionStatement) { continue; }
@@ -5254,12 +5317,11 @@ type struct AsyncLower {
             if (e == null || (e as ASTNode*).kind != NodeKind::BinaryExpression) { continue; }
             const b: BinaryExprNode* = e as BinaryExprNode*;
             if (b.op.kind != TokenType::Equal) { continue; }
-            if (b.left == null || (b.left as ASTNode*).kind != NodeKind::Identifier) { continue; }
-            if (!(b.left as IdentifierNode*).name.equals(name)) { continue; }
-            const r: SymbolStr = this.frame_addr_root_expr(sm, b.right);
-            if (r.is_valid()) { return r; }
+            if (!this.names_binding(b.left, key)) { continue; }
+            const r: IdentifierNode* = this.frame_addr_root_expr(sm, b.right);
+            if (r != null) { return r; }
         }
-        return SymbolStr::empty();
+        return null;
     }
 
     /// Reject a value that is about to be carried across a suspend when what it
@@ -5281,34 +5343,36 @@ type struct AsyncLower {
     /// nothing. A NUMBER, a `boolean` or a `char` has no room for a pointer, so
     /// for those the address provably died with the call that consumed it.
     /// Every other type stays conservative.
-    reject_frame_addr_carry(mut &this, sm: PollSm*, vd: VarDeclNode*, nm: SymbolStr) -> boolean {
+    reject_frame_addr_carry(mut &this, sm: PollSm*, vd: VarDeclNode*, key: SymbolID) -> boolean {
         if (this.type_cannot_hold_address(vd.resolved_type)) { return false; }
-        mut root: SymbolStr = this.frame_addr_root_expr(sm, vd.initializer);
-        if (!root.is_valid()) {
+        mut root: IdentifierNode* = this.frame_addr_root_expr(sm, vd.initializer);
+        if (root == null) {
             for (mut b: i64 = 0; b < sm.blocks.length; b++) {
-                if (root.is_valid()) { continue; }
-                root = this.assigned_frame_addr_root(sm, sm.blocks[b], nm);
+                if (root != null) { continue; }
+                root = this.assigned_frame_addr_root(sm, sm.blocks[b], key);
             }
         }
-        if (!root.is_valid()) { return false; }
+        if (root == null) { return false; }
         this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
             Text::new(fmt::format("async: `%s` holds the address of the local or parameter `%s` and is live across an `await`; each poll runs on a fresh frame, so that address is dangling by the time a later step uses it — have the caller own the storage and pass a pointer parameter, whose pointee the suspend does not move",
-                   this.intern.resolve(this.strip_local_marker(nm)),
-                   this.intern.resolve(this.strip_local_marker(root)))),
+                   this.intern.resolve(this.source_name(key, vd.name)),
+                   this.intern.resolve(this.source_name(this.local_key(root as ExpressionNode*), root.name)))),
             vd.span);
         sm.ok = false;
         return true;
     }
 
-    /// A local's source spelling, recovered from the rename `mint_local`
-    /// recorded, so a diagnostic never shows the internal `$L` suffix. A name
-    /// that was never renamed (a parameter, a global) passes through.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    strip_local_marker(&this, name: SymbolStr) -> SymbolStr {
-        for (mut i: i64 = 0; i < this.frame_locals.length; i++) {
-            if (this.frame_locals[i].equals(name)) { return this.frame_local_src[i]; }
+    /// The spelling binding `key` was written with, so a diagnostic never
+    /// shows the internal `$L` suffix: the source spelling `mint_local`
+    /// recorded for a renamed local, and `shown`, how the binding is spelled
+    /// where it is used, for one never renamed (a parameter).
+    source_name(&this, key: SymbolID, shown: SymbolStr) -> SymbolStr {
+        if (key.is_valid()) {
+            for (mut i: i64 = 0; i < this.frame_locals.length; i++) {
+                if (this.frame_locals[i].equals(key)) { return this.frame_local_src[i]; }
+            }
         }
-        return name;
+        return shown;
     }
 
     /// After the state blocks are built, promote every top-level local read in a
@@ -5320,32 +5384,32 @@ type struct AsyncLower {
     /// aggregate locals across a suspend are deferred with a loud diagnostic.
     promote_cross_state(mut &this, sm: PollSm*) -> void {
         const span: SourceSpan = sm.span;
-        mut d_names: SymbolStr[] = [];
+        mut d_keys: SymbolID[] = [];
         mut d_states: i64[] = [];
         mut d_nodes: VarDeclNode*[] = [];
         // Carriers that ended up living in their field, released together in one
         // pass once every carrier is known; see `release_before_ready`.
         mut inplace_fields: SymbolStr[] = [];
         mut inplace_opts: TypeRef[] = [];
-        mut inplace_ptrs: SymbolStr[] = [];
         for (mut b: i64 = 0; b < sm.blocks.length; b++) {
             const blk: BlockStmtNode* = sm.blocks[b];
             for (mut i: i64 = 0; i < blk.statements.length; i++) {
                 const vd: VarDeclNode* = this.stmt_decl_var(blk.statements[i]);
-                if (vd != null) { d_names.push(vd.name); d_states.push(b); d_nodes.push(vd); }
+                if (vd != null) { d_keys.push(this.decl_key(vd)); d_states.push(b); d_nodes.push(vd); }
             }
         }
 
-        for (mut d: i64 = 0; d < d_names.length; d++) {
-            const nm: SymbolStr = d_names[d];
+        for (mut d: i64 = 0; d < d_keys.length; d++) {
+            const key: SymbolID = d_keys[d];
             const ds: i64 = d_states[d];
             const vd: VarDeclNode* = d_nodes[d];
+            const nm: SymbolStr = vd.name;
 
             const lty: TypeRef = vd.resolved_type;
 
             mut cross: boolean = false;
             for (mut b: i64 = 0; b < sm.blocks.length; b++) {
-                if (b != ds && this.block_reads_name(sm.blocks[b], nm)) { cross = true; }
+                if (b != ds && this.block_reads_name(sm.blocks[b], key)) { cross = true; }
             }
             // "Read in a later state" is only a proxy for "still live there", and
             // it misses the local a future was BUILT from and that the body never
@@ -5355,7 +5419,7 @@ type struct AsyncLower {
             // borrow, so the value has to be kept alive on the strength of the
             // operand alone.
             const borrowed: boolean = this.borrow_outlives_suspend(lty)
-                                   && this.borrowed_by_awaited_future(sm, nm);
+                                   && this.borrowed_by_awaited_future(sm, key);
             if (borrowed) { cross = true; }
             if (!cross) { continue; }
 
@@ -5380,11 +5444,11 @@ type struct AsyncLower {
                 // the payload conditionally so the future needs no drop of its
                 // own.
                 //
-                // A by-name protocol needs the name to identify one value, so a
-                // name declared in two states is rejected rather than conflated.
+                // The carrier holds one value, so a binding declared in two
+                // states is rejected rather than conflated.
                 mut agg_decls: i64 = 0;
-                for (mut d2: i64 = 0; d2 < d_names.length; d2++) {
-                    if (d_names[d2].equals(nm)) { agg_decls += 1; }
+                for (mut d2: i64 = 0; d2 < d_keys.length; d2++) {
+                    if (d_keys[d2].equals(key)) { agg_decls += 1; }
                 }
                 if (agg_decls > 1) {
                     this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
@@ -5402,11 +5466,11 @@ type struct AsyncLower {
                 mut needs_carry: boolean = false;
                 for (mut b: i64 = 0; b < sm.blocks.length; b++) {
                     if (b == ds) { continue; }
-                    if (this.block_first_use(sm.blocks[b], nm) == 1) { needs_carry = true; }
+                    if (this.block_first_use(sm.blocks[b], key) == 1) { needs_carry = true; }
                     // A rebuild nested in a branch is not a self-produced value:
                     // the path that skips the branch keeps the previous one, so
                     // the value crosses the suspend either way.
-                    if (this.block_cond_write(sm.blocks[b], nm)) { needs_carry = true; }
+                    if (this.block_cond_write(sm.blocks[b], key)) { needs_carry = true; }
                 }
                 // A borrowed value has no later reader to detect — that is the
                 // whole defect. It is carried so that it stays owned, and dies
@@ -5419,8 +5483,8 @@ type struct AsyncLower {
                     // declare it at that assignment.
                     for (mut b: i64 = 0; b < sm.blocks.length; b++) {
                         if (b == ds) { continue; }
-                        if (this.block_first_use(sm.blocks[b], nm) == 0) { continue; }
-                        if (!this.decl_at_first_assignment(sm.blocks[b], nm, lty, span).is_valid()) {
+                        if (this.block_first_use(sm.blocks[b], key) == 0) { continue; }
+                        if (!this.decl_at_first_assignment(sm.blocks[b], key, nm, lty, span).name.is_valid()) {
                             this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                                 Text::new("async: this value is rebuilt after an `await` from inside a branch; assign it once at the top level of that step (`x = …;`) so the state machine can bind it there"),
                                 vd.span);
@@ -5430,7 +5494,7 @@ type struct AsyncLower {
                     continue;
                 }
 
-                if (this.reject_frame_addr_carry(sm, vd, nm)) { return; }
+                if (this.reject_frame_addr_carry(sm, vd, key)) { return; }
 
                 mut agg_args: TypeRef[] = [lty];
                 const opt_ty: TypeRef = this.ctx.generic_registry.instantiate(sm.opt_base, &agg_args);
@@ -5457,6 +5521,7 @@ type struct AsyncLower {
                 // one that rebuilds it republishes the field.
                 const lty_ptr: TypeRef = this.arena.get_pointer_to(lty);
                 const pnm: SymbolStr = this.agg_ptr_name(nm);
+                const pkey: SymbolID = this.resolver.alloc_synthetic_binding();
                 const di: i64 = this.decl_stmt_index(sm.blocks[ds], vd);
 
                 // The declaring state builds the value straight into the
@@ -5486,16 +5551,16 @@ type struct AsyncLower {
                 // assignment into the store.
                 mut ds_at: i64 = di + 1;
                 if (vd.initializer == null) {
-                    const dwi: i64 = this.top_level_assignment_index(sm.blocks[ds], nm);
+                    const dwi: i64 = this.top_level_assignment_index(sm.blocks[ds], key);
                     if (dwi >= 0) { ds_at = dwi + 1; }
                 }
                 // From past the store just inserted: its own operand is the
                 // initializer, which cannot mention the name it is
                 // initialising, and anything BEFORE the declaration refers
                 // to a different binding entirely.
-                this.subst_carried_from(sm, sm.blocks[ds], di + 1, nm, pnm,
+                this.subst_carried_from(sm, sm.blocks[ds], di + 1, key, pnm, pkey,
                                         afield, lty, opt_ty, span);
-                this.bind_carrier_ptr(sm, sm.blocks[ds], ds_at, pnm, afield,
+                this.bind_carrier_ptr(sm, sm.blocks[ds], ds_at, pnm, pkey, afield,
                                       opt_ty, lty_ptr, span);
 
                 // Every other state that touches it reaches the value
@@ -5503,7 +5568,7 @@ type struct AsyncLower {
                 // path: the value never left.
                 for (mut b: i64 = 0; b < sm.blocks.length; b++) {
                     if (b == ds) { continue; }
-                    const use_kind: i64 = this.block_first_use(sm.blocks[b], nm);
+                    const use_kind: i64 = this.block_first_use(sm.blocks[b], key);
                     if (use_kind == 0) { continue; }
                     // A state that REPUBLISHES the value before reading it
                     // may find the field empty on entry — it is the state
@@ -5514,18 +5579,17 @@ type struct AsyncLower {
                     // substitution rewrites the assignment into the store.
                     mut at: i64 = 0;
                     if (use_kind == this.first_use_write()) {
-                        const wi: i64 = this.top_level_assignment_index(sm.blocks[b], nm);
+                        const wi: i64 = this.top_level_assignment_index(sm.blocks[b], key);
                         if (wi >= 0) { at = wi + 1; }
                     }
-                    this.subst_carried_from(sm, sm.blocks[b], 0, nm, pnm,
+                    this.subst_carried_from(sm, sm.blocks[b], 0, key, pnm, pkey,
                                             afield, lty, opt_ty, span);
-                    this.bind_carrier_ptr(sm, sm.blocks[b], at, pnm, afield,
+                    this.bind_carrier_ptr(sm, sm.blocks[b], at, pnm, pkey, afield,
                                           opt_ty, lty_ptr, span);
                 }
 
                 inplace_fields.push(afield);
                 inplace_opts.push(opt_ty);
-                inplace_ptrs.push(pnm);
 
                 sm.prom_field.push(afield);
                 sm.prom_tys.push(opt_ty);
@@ -5537,7 +5601,7 @@ type struct AsyncLower {
             // Reaching here the value is a scalar that one of the two paths below
             // will carry, so an address of the frame inside it would outlive the
             // storage it names.
-            if (this.reject_frame_addr_carry(sm, vd, nm)) { return; }
+            if (this.reject_frame_addr_carry(sm, vd, key)) { return; }
 
             if (vd.is_mutable) {
                 // A `mut` value written across states cannot live on the native
@@ -5545,12 +5609,13 @@ type struct AsyncLower {
                 // store/load model would leave stale copies diverging from later
                 // writes. Promote to a field that is the SINGLE source of truth:
                 // replace the declaration with a field store and rewrite every
-                // read AND write of the name to `this.<field>` in place. A by-name
-                // rewrite is ambiguous if the name is re-declared in another state,
-                // so reject that (rare) case rather than conflate two live ranges.
+                // read AND write of the binding to `this.<field>` in place. The
+                // rewrite is ambiguous if the binding is declared in another
+                // state too, so reject that (rare) case rather than conflate two
+                // live ranges.
                 mut decl_sites: i64 = 0;
-                for (mut d2: i64 = 0; d2 < d_names.length; d2++) {
-                    if (d_names[d2].equals(nm)) { decl_sites += 1; }
+                for (mut d2: i64 = 0; d2 < d_keys.length; d2++) {
+                    if (d_keys[d2].equals(key)) { decl_sites += 1; }
                 }
                 if (decl_sites > 1) {
                     this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
@@ -5564,7 +5629,7 @@ type struct AsyncLower {
                 for (mut b: i64 = 0; b < sm.blocks.length; b++) {
                     const blk2: BlockStmtNode* = sm.blocks[b];
                     for (mut i: i64 = 0; i < blk2.statements.length; i++) {
-                        this.subst_name_stmt(blk2.statements[i], nm, mfield, sm.struct_ref, lty, span);
+                        this.subst_name_stmt(blk2.statements[i], key, mfield, sm.struct_ref, lty, span);
                     }
                 }
                 sm.prom_field.push(mfield);
@@ -5580,10 +5645,10 @@ type struct AsyncLower {
             const field: SymbolStr = this.intern.intern(
                 fmt::format("__cross_%lld_%s", ds, this.intern.resolve(nm)));
             sm.blocks[ds].add_statement(this.assign_member_stmt(
-                sm.struct_ref, field, lty, this.ident(nm, lty, span), span));
+                sm.struct_ref, field, lty, this.ident_bound(nm, key, lty, span), span));
             for (mut b: i64 = 0; b < sm.blocks.length; b++) {
-                if (b != ds && this.block_reads_name(sm.blocks[b], nm)) {
-                    this.prepend_load(sm.blocks[b], nm, field, lty, sm.struct_ref, span);
+                if (b != ds && this.block_reads_name(sm.blocks[b], key)) {
+                    this.prepend_load(sm.blocks[b], nm, key, field, lty, sm.struct_ref, span);
                 }
             }
             sm.prom_field.push(field);
@@ -5611,24 +5676,25 @@ type struct AsyncLower {
     /// the user's own locals, which is what registers them as frame locals — so
     /// every check downstream, the address-of-across-suspend one included,
     /// treats a temp exactly as it treats a local the user wrote.
-    mint_temp(mut &this, base: string) -> SymbolStr {
+    mint_temp(mut &this, base: string) -> MintedLocal {
         const idx: u64 = this.counter;
         this.counter += 1;
         const fresh: SymbolStr = this.intern.intern(fmt::format("%s$H%llu", base, idx));
+        const sym: SymbolID = this.resolver.alloc_synthetic_binding();
         // Registered as a frame local so the address-of-across-suspend check
         // sees a temp exactly as it sees a local. Harmless for the pre-rename
         // pass, whose registrations `disambiguate_locals` clears before making
         // its own; load-bearing for the temps minted during lowering itself,
         // which the rename has already run past.
-        this.frame_locals.push(fresh);
+        this.frame_locals.push(sym);
         this.frame_local_src.push(fresh);
-        return fresh;
+        return MintedLocal { name: fresh, sym: sym };
     }
 
-    /// `<name> = <rhs>;` against a local.
-    assign_local_stmt(&this, name: SymbolStr, ty: TypeRef, rhs: ExpressionNode*,
+    /// `<local> = <rhs>;`.
+    assign_local_stmt(&this, local: MintedLocal, ty: TypeRef, rhs: ExpressionNode*,
                       span: SourceSpan) -> StatementNode* {
-        return this.assign_stmt(this.ident(name, ty, span), rhs, span);
+        return this.assign_stmt(this.ident_bound(local.name, local.sym, ty, span), rhs, span);
     }
 
     /// `!(<e>)`. Marked synthetic for the same reason `deref`/`addr_of` are: the
@@ -5700,9 +5766,9 @@ type struct AsyncLower {
         // that produced it is already ill-typed, so leaving it in place lets the
         // real diagnostic stand instead of adding a confusing second one.
         if (!ty.is_valid()) { return r; }
-        const t: SymbolStr = this.mint_temp("__ord");
-        pre.push(this.var_decl_stmt(t, false, ty, r, (r as ASTNode*).span));
-        return this.ident(t, ty, (r as ASTNode*).span);
+        const t: MintedLocal = this.mint_temp("__ord");
+        pre.push(this.var_decl_stmt_bound(t.name, t.sym, false, ty, r, (r as ASTNode*).span));
+        return this.ident_bound(t.name, t.sym, ty, (r as ASTNode*).span);
     }
 
     /// True when any of `args[from..]` holds an `await`, i.e. whether evaluating
@@ -5757,9 +5823,9 @@ type struct AsyncLower {
             aw.operand = this.hoist_expr(aw.operand, pre);
             const ao: TypeRef = aw.resolved_type;
             if (!ao.is_valid()) { return e; }
-            const t: SymbolStr = this.mint_temp("__aw");
-            pre.push(this.var_decl_stmt(t, false, ao, e, span));
-            return this.ident(t, ao, span);
+            const t: MintedLocal = this.mint_temp("__aw");
+            pre.push(this.var_decl_stmt_bound(t.name, t.sym, false, ao, e, span));
+            return this.ident_bound(t.name, t.sym, ao, span);
         }
 
         if (k == NodeKind::BinaryExpression) {
@@ -5940,8 +6006,8 @@ type struct AsyncLower {
         const span: SourceSpan = (b as ASTNode*).span;
         const bool_ty: TypeRef = this.arena.get_bool();
         mut left: ExpressionNode* = this.hoist_expr(b.left, pre);
-        const t: SymbolStr = this.mint_temp("__sc");
-        pre.push(this.var_decl_stmt(t, true, bool_ty, left, span));
+        const t: MintedLocal = this.mint_temp("__sc");
+        pre.push(this.var_decl_stmt_bound(t.name, t.sym, true, bool_ty, left, span));
 
         mut inner: HoistPre = HoistPre { stmts: [] };
         mut right: ExpressionNode* = this.hoist_expr(b.right, &inner);
@@ -5949,10 +6015,10 @@ type struct AsyncLower {
         for (mut i: i64 = 0; i < inner.stmts.length; i++) { blk.add_statement(inner.stmts[i]); }
         blk.add_statement(this.assign_local_stmt(t, bool_ty, right, span));
 
-        mut test: ExpressionNode* = this.ident(t, bool_ty, span);
+        mut test: ExpressionNode* = this.ident_bound(t.name, t.sym, bool_ty, span);
         if (b.op.kind == TokenType::PipePipe) { test = this.not_expr(test, span); }
         pre.push(new IfStmtNode(test, blk as StatementNode*, null, span) as StatementNode*);
-        return this.ident(t, bool_ty, span);
+        return this.ident_bound(t.name, t.sym, bool_ty, span);
     }
 
     /// `C ? A : B` — and `if (C) { A } else { B }`, which means the same thing —
@@ -5971,14 +6037,14 @@ type struct AsyncLower {
         const vty: TypeRef = e.resolved_type;
         if (!vty.is_valid()) { return e; }
         mut cond: ExpressionNode* = this.hoist_expr(cond_in, pre);
-        const tv: SymbolStr = this.mint_temp("__tv");
-        pre.push(this.var_decl_stmt(tv, true, vty, null, span));
+        const tv: MintedLocal = this.mint_temp("__tv");
+        pre.push(this.var_decl_stmt_bound(tv.name, tv.sym, true, vty, null, span));
 
         mut then_blk: BlockStmtNode* = this.hoist_arm_block(then_in, tv, vty, span);
         mut else_blk: BlockStmtNode* = this.hoist_arm_block(else_in, tv, vty, span);
         pre.push(new IfStmtNode(cond, then_blk as StatementNode*,
                                 else_blk as StatementNode*, span) as StatementNode*);
-        return this.ident(tv, vty, span);
+        return this.ident_bound(tv.name, tv.sym, vty, span);
     }
 
     /// A `match` EXPRESSION whose arms suspend, as the `match` STATEMENT it
@@ -6001,8 +6067,8 @@ type struct AsyncLower {
         // `match`. One that suspends is why the statement this becomes may lower
         // to a decision chain instead of a dispatch (`lower_match_chain_sm`).
         mut subject: ExpressionNode* = this.hoist_expr(me.subject, pre);
-        const tv: SymbolStr = this.mint_temp("__mv");
-        pre.push(this.var_decl_stmt(tv, true, vty, null, span));
+        const tv: MintedLocal = this.mint_temp("__mv");
+        pre.push(this.var_decl_stmt_bound(tv.name, tv.sym, true, vty, null, span));
 
         mut ms: MatchStmtNode* = new MatchStmtNode(subject, span);
         for (mut i: i64 = 0; i < me.arms.length; i++) {
@@ -6013,14 +6079,14 @@ type struct AsyncLower {
             ms.add_arm(arm);
         }
         pre.push(ms as StatementNode*);
-        return this.ident(tv, vty, span);
+        return this.ident_bound(tv.name, tv.sym, vty, span);
     }
 
     /// Rewrite a `match`-expression arm body so it ASSIGNS the arm's value to
     /// `tv` instead of producing it. The value is the block's trailing
     /// expression statement, which is how an arm value is recorded; an arm that
     /// diverges instead has none and is returned untouched.
-    arm_value_to_assign(mut &this, body: StatementNode*, tv: SymbolStr,
+    arm_value_to_assign(mut &this, body: StatementNode*, tv: MintedLocal,
                         vty: TypeRef) -> StatementNode* {
         if (body == null) { return null; }
         if (body.kind == NodeKind::ExpressionStatement) {
@@ -6040,7 +6106,7 @@ type struct AsyncLower {
 
     /// `{ <lifted statements of `value`>; <tv> = <value>; }` — one arm of a
     /// lowered `?:`.
-    hoist_arm_block(mut &this, value: ExpressionNode*, tv: SymbolStr, vty: TypeRef,
+    hoist_arm_block(mut &this, value: ExpressionNode*, tv: MintedLocal, vty: TypeRef,
                     span: SourceSpan) -> BlockStmtNode* {
         mut inner: HoistPre = HoistPre { stmts: [] };
         mut v: ExpressionNode* = this.hoist_expr(value, &inner);
@@ -6174,70 +6240,47 @@ type struct AsyncLower {
         this.hoist_block(node.body as BlockStmtNode*);
     }
 
-    // ---- pre-lowering local disambiguation (scope-aware alpha-rename) ----
+    // ---- pre-lowering local disambiguation (alpha-rename by binding) ----
 
-    rc_enter(&this, ctx: RenameCtx*) -> void { ctx.marks.push(ctx.orig.length); }
-
-    rc_leave(&this, ctx: RenameCtx*) -> void {
-        if (ctx.marks.length == 0) { return; }
-        const m: i64 = ctx.marks[ctx.marks.length - 1];
-        ctx.marks.pop();
-        while (ctx.orig.length > m) { ctx.orig.pop(); ctx.repl.pop(); }
-    }
-
-    rc_bind(&this, ctx: RenameCtx*, name: SymbolStr, fresh: SymbolStr) -> void {
-        ctx.orig.push(name);
-        ctx.repl.push(fresh);
-    }
-
-    /// Resolve a use: the innermost binding of `name`, or `name` unchanged if it
-    /// is bound in no active scope (a parameter / global / outer capture).
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    rc_lookup(&this, ctx: RenameCtx*, name: SymbolStr) -> SymbolStr {
-        mut i: i64 = ctx.orig.length - 1;
-        while (i >= 0) {
-            if (ctx.orig[i].equals(name)) { return ctx.repl[i]; }
-            i -= 1;
-        }
-        return name;
+    /// Record that binding `sym` is renamed to `fresh`.
+    rn_bind(&this, map: RenameMap*, sym: SymbolID, fresh: SymbolStr) -> void {
+        map.syms.push(sym);
+        map.fresh.push(fresh);
     }
 
     /// A fresh, globally-unique local name derived from the original (kept as a
-    /// prefix for readable generated IR). The `$L` marker never appears in source.
-    mint_local(mut &this, orig: SymbolStr) -> SymbolStr {
+    /// prefix for readable generated IR), for the local that declares binding
+    /// `sym`. The `$L` marker never appears in source.
+    mint_local(mut &this, orig: SymbolStr, sym: SymbolID) -> SymbolStr {
         const idx: u64 = this.counter;
         this.counter += 1;
         const fresh: SymbolStr = this.intern.intern(fmt::format("%s$L%llu", this.intern.resolve(orig), idx));
-        this.frame_locals.push(fresh);
+        this.frame_locals.push(sym);
         this.frame_local_src.push(orig);
         return fresh;
     }
 
-    /// Rename a `const/mut <name> = <init>;` local: recurse into the initializer
-    /// FIRST (its identifiers resolve to the enclosing scope, so `const x = x`
-    /// reads the outer `x`), then mint a fresh name, rename the declaration in
-    /// place, and bind original->fresh so the rest of this scope sees the local.
-    rn_var_decl(mut &this, ctx: RenameCtx*, vd: VarDeclNode*) -> void {
+    /// Rename a `const/mut <name> = <init>;` local: its initializer first,
+    /// then the declaration, recording the binding's fresh name for its uses.
+    rn_var_decl(mut &this, map: RenameMap*, vd: VarDeclNode*) -> void {
         if (vd == null) { return; }
-        this.rn_expr(ctx, vd.initializer);
-        const orig: SymbolStr = vd.name;
-        const fresh: SymbolStr = this.mint_local(orig);
+        this.rn_expr(map, vd.initializer);
+        const fresh: SymbolStr = this.mint_local(vd.name, vd.sym_id);
         vd.set_name(fresh);
-        this.rc_bind(ctx, orig, fresh);
+        this.rn_bind(map, vd.sym_id, fresh);
     }
 
-    /// Rename a destructure: its initializer first, in the enclosing scope,
-    /// then each field's local, exactly as `rn_var_decl` renames one.
-    rn_destructure(mut &this, ctx: RenameCtx*, dd: DestructureDeclNode*) -> void {
+    /// Rename a destructure: its initializer first, then each field's local,
+    /// exactly as `rn_var_decl` renames one.
+    rn_destructure(mut &this, map: RenameMap*, dd: DestructureDeclNode*) -> void {
         if (dd == null) { return; }
-        this.rn_expr(ctx, dd.initializer);
+        this.rn_expr(map, dd.initializer);
         for (mut i: i64 = 0; i < dd.bindings.length; i++) {
             mut b: DestructureBinding = dd.bindings[i];
-            const orig: SymbolStr = b.local_name;
-            const fresh: SymbolStr = this.mint_local(orig);
+            const fresh: SymbolStr = this.mint_local(b.local_name, b.sym_id);
             b.local_name = fresh;
             dd.bindings[i] = b;
-            this.rc_bind(ctx, orig, fresh);
+            this.rn_bind(map, b.sym_id, fresh);
         }
     }
 
@@ -6270,18 +6313,21 @@ type struct AsyncLower {
             if (dd.initializer == null || !this.destructure_typed(dd)) { out.push(s); continue; }
             const span: SourceSpan = (s as ASTNode*).span;
             const src: SymbolStr = this.intern.intern("__ds");
-            out.push(this.var_decl_stmt(src, false, dd.resolved_type, dd.initializer, span));
-            dd.initializer = this.ident(src, dd.resolved_type, span);
+            const src_id: SymbolID = this.resolver.alloc_synthetic_binding();
+            out.push(this.var_decl_stmt_bound(src, src_id, false, dd.resolved_type,
+                                              dd.initializer, span));
+            dd.initializer = this.ident_bound(src, src_id, dd.resolved_type, span);
             mut fields: StatementNode*[] = [];
             for (mut j: i64 = 0; j < dd.bindings.length; j++) {
                 mut b: DestructureBinding = dd.bindings[j];
                 const tmp: SymbolStr = this.intern.intern(
                     fmt::format("%s$D", this.intern.resolve(b.local_name)));
+                const tmp_id: SymbolID = this.resolver.alloc_synthetic_binding();
                 fields.push(this.var_decl_stmt_bound(
                     b.local_name, b.sym_id, b.is_mutable || dd.is_mutable, b.resolved_type,
-                    this.ident(tmp, b.resolved_type, b.span), b.span));
+                    this.ident_bound(tmp, tmp_id, b.resolved_type, b.span), b.span));
                 b.local_name = tmp;
-                b.sym_id = SymbolID::invalid();
+                b.sym_id = tmp_id;
                 b.is_mutable = false;
                 dd.bindings[j] = b;
             }
@@ -6306,82 +6352,81 @@ type struct AsyncLower {
         return true;
     }
 
-    /// Walk a block in its own scope.
-    rn_block(mut &this, ctx: RenameCtx*, blk: BlockStmtNode*) -> void {
+    /// Walk a block.
+    rn_block(mut &this, map: RenameMap*, blk: BlockStmtNode*) -> void {
         if (blk == null) { return; }
         this.split_destructures(blk);
-        this.rc_enter(ctx);
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            this.rn_stmt(ctx, blk.statements[i]);
+            this.rn_stmt(map, blk.statements[i]);
         }
-        this.rc_leave(ctx);
     }
 
-    /// Walk a branch/loop body as a scope (a bare non-block statement still gets
-    /// its own frame, so a declaration in it does not leak to the enclosing scope).
-    rn_scoped(mut &this, ctx: RenameCtx*, s: StatementNode*) -> void {
+    /// Walk a branch/loop body.
+    rn_scoped(mut &this, map: RenameMap*, s: StatementNode*) -> void {
         if (s == null) { return; }
-        if (s.kind == NodeKind::BlockStatement) { this.rn_block(ctx, s as BlockStmtNode*); return; }
-        this.rc_enter(ctx);
-        this.rn_stmt(ctx, s);
-        this.rc_leave(ctx);
+        if (s.kind == NodeKind::BlockStatement) { this.rn_block(map, s as BlockStmtNode*); return; }
+        this.rn_stmt(map, s);
     }
 
     /// Walk a `match`/`match`-expression arm, alpha-renaming its pattern bindings
     /// to globally-unique names (exactly as `rn_var_decl` renames a `VarDecl`) so
-    /// the by-name cross-state promotion in `lower_match_sm` cannot conflate this
+    /// codegen, which reads the flattened body by spelling, cannot conflate this
     /// arm's binding with a same-named binding in a nested `match`, a sibling arm,
-    /// or an outer local/param. Bindings shadow outer locals within the arm; the
-    /// fresh name is bound into the scope so uses in the guard and body rewrite to
-    /// it. OR-alternatives (`A(v) | B(v)`) share one fresh name for `v`.
-    rn_arm(mut &this, ctx: RenameCtx*, arm: MatchArmNode*) -> void {
+    /// or an outer local/param. OR-alternatives (`A(v) | B(v)`) declare one
+    /// binding for `v`, so they share one fresh name.
+    rn_arm(mut &this, map: RenameMap*, arm: MatchArmNode*) -> void {
         if (arm == null) { return; }
-        this.rc_enter(ctx);
-        mut map: BindingRename = BindingRename { orig: [], fresh: [] };
+        mut binds: ArmBindings = ArmBindings { syms: [], names: [] };
         for (mut i: i64 = 0; i < arm.patterns.length; i++) {
-            this.collect_pat_binding_names(arm.patterns[i], &map);
+            this.collect_pat_binding_syms(arm.patterns[i], &binds);
         }
-        for (mut i: i64 = 0; i < map.orig.length; i++) {
-            const f: SymbolStr = this.mint_local(map.orig[i]);
-            map.fresh.push(f);
-            this.rc_bind(ctx, map.orig[i], f);
+        for (mut i: i64 = 0; i < binds.syms.length; i++) {
+            this.rn_bind(map, binds.syms[i], this.mint_local(binds.names[i], binds.syms[i]));
         }
         for (mut i: i64 = 0; i < arm.patterns.length; i++) {
-            this.rn_pat_apply(arm.patterns[i], &map);
+            this.rn_pat_apply(arm.patterns[i], map);
         }
-        this.rn_expr(ctx, arm.guard);
-        this.rn_stmt(ctx, arm.body);
-        this.rc_leave(ctx);
+        this.rn_expr(map, arm.guard);
+        this.rn_stmt(map, arm.body);
     }
 
-    /// Collect the distinct binding names introduced by `pat` (a top-level
+    /// Collect the distinct bindings introduced by `pat` (a top-level
     /// identifier binding, an enum-variant payload binding, or a nested
-    /// sub-pattern) into `map.orig`. A const-value identifier pattern (its
+    /// sub-pattern) into `binds`. A const-value identifier pattern (its
     /// `binding_name` was cleared by name resolution) introduces no binding.
-    collect_pat_binding_names(&this, pat: PatternNode*, map: BindingRename*) -> void {
+    collect_pat_binding_syms(&this, pat: PatternNode*, binds: ArmBindings*) -> void {
         if (pat == null) { return; }
         if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
-            map.push_orig(pat.binding_name);
+            if (!binds.holds(pat.binding_sym)) {
+                binds.syms.push(pat.binding_sym);
+                binds.names.push(pat.binding_name);
+            }
             return;
         }
         if (pat.pattern_kind != PatternKind::Enum) { return; }
         const epat: EnumPatternNode* = pat as EnumPatternNode*;
         for (mut j: i64 = 0; j < epat.elements.length; j++) {
             const pb: PatternBinding* = epat.binding_at(j);
-            if (pb != null && pb.name.is_valid()) { map.push_orig(pb.name); continue; }
+            if (pb != null && pb.name.is_valid()) {
+                if (!binds.holds(pb.sym_id)) {
+                    binds.syms.push(pb.sym_id);
+                    binds.names.push(pb.name);
+                }
+                continue;
+            }
             const sub: PatternNode* = epat.sub_at(j);
-            if (sub != null) { this.collect_pat_binding_names(sub, map); }
+            if (sub != null) { this.collect_pat_binding_syms(sub, binds); }
         }
     }
 
-    /// Rewrite each binding name in `pat` to its fresh name from `map`, in place
+    /// Rewrite each binding name in `pat` to its binding's fresh name, in place
     /// (mutating `PatternNode.binding_name` / `PatternBinding.name` through the
-    /// AST node). The mirror of `collect_pat_binding_names`.
-    rn_pat_apply(&this, pat: PatternNode*, map: BindingRename*) -> void {
+    /// AST node). The mirror of `collect_pat_binding_syms`.
+    rn_pat_apply(&this, pat: PatternNode*, map: RenameMap*) -> void {
         if (pat == null) { return; }
         if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
-            const idx: i64 = map.index_of(pat.binding_name);
-            if (idx >= 0) { pat.set_binding_name(map.fresh[idx]); }
+            const f: SymbolStr = map.fresh_of(pat.binding_sym);
+            if (f.is_valid()) { pat.set_binding_name(f); }
             return;
         }
         if (pat.pattern_kind != PatternKind::Enum) { return; }
@@ -6389,8 +6434,8 @@ type struct AsyncLower {
         for (mut j: i64 = 0; j < epat.elements.length; j++) {
             mut pb: PatternBinding* = epat.binding_at(j);
             if (pb != null && pb.name.is_valid()) {
-                const idx: i64 = map.index_of(pb.name);
-                if (idx >= 0) { pb.name = map.fresh[idx]; }
+                const f: SymbolStr = map.fresh_of(pb.sym_id);
+                if (f.is_valid()) { pb.name = f; }
                 continue;
             }
             const sub: PatternNode* = epat.sub_at(j);
@@ -6398,129 +6443,125 @@ type struct AsyncLower {
         }
     }
 
-    /// Walk a lambda: rename any capture that names a renamed outer local, then
-    /// walk the body in a new scope where the lambda's own parameters shadow.
-    rn_lambda(mut &this, ctx: RenameCtx*, lam: LambdaExprNode*) -> void {
+    /// Walk a lambda: rename any capture of a renamed local, then the body.
+    rn_lambda(mut &this, map: RenameMap*, lam: LambdaExprNode*) -> void {
         if (lam == null) { return; }
         for (mut i: i64 = 0; i < lam.captured_names.length; i++) {
-            lam.captured_names[i] = this.rc_lookup(ctx, lam.captured_names[i]);
+            if (i >= lam.captured_syms.length) { break; }
+            const f: SymbolStr = map.fresh_of(lam.captured_syms[i]);
+            if (f.is_valid()) { lam.captured_names[i] = f; }
         }
-        this.rc_enter(ctx);
-        for (mut i: i64 = 0; i < lam.parameters.length; i++) {
-            const p: VarDeclNode* = lam.parameters[i];
-            if (p != null) { this.rc_bind(ctx, p.name, p.name); }
-        }
-        this.rn_stmt(ctx, lam.body);
-        this.rc_leave(ctx);
+        this.rn_stmt(map, lam.body);
     }
 
     /// Rename identifier uses in an expression in place (mutating `IdentifierNode.
     /// name`), recursing through every expression form that can hold a local read.
-    /// A use bound in no active scope is left unchanged (parameter/global). An
-    /// unwalked form leaves a renamed local's use un-renamed, which surfaces as a
-    /// loud "not found" at that use — never a silent miscompile.
-    rn_expr(mut &this, ctx: RenameCtx*, e: ExpressionNode*) -> void {
+    /// A use of a binding the body does not declare is left unchanged
+    /// (parameter/global). An unwalked form leaves a renamed local's use
+    /// un-renamed, which surfaces as a loud "not found" at that use — never a
+    /// silent miscompile.
+    rn_expr(mut &this, map: RenameMap*, e: ExpressionNode*) -> void {
         if (e == null) { return; }
         const k: NodeKind = (e as ASTNode*).kind;
         if (k == NodeKind::Identifier) {
-            const id: IdentifierNode* = e as IdentifierNode*;
-            id.name = this.rc_lookup(ctx, id.name);
+            const f: SymbolStr = map.fresh_of(this.local_key(e));
+            if (f.is_valid()) { (e as IdentifierNode*).name = f; }
             return;
         }
         if (k == NodeKind::BinaryExpression) {
             const b: BinaryExprNode* = e as BinaryExprNode*;
-            this.rn_expr(ctx, b.left);
-            this.rn_expr(ctx, b.right);
-            this.rn_expr(ctx, b.desugared_call);
+            this.rn_expr(map, b.left);
+            this.rn_expr(map, b.right);
+            this.rn_expr(map, b.desugared_call);
             return;
         }
         if (k == NodeKind::UnaryExpression) {
             const u: UnaryExprNode* = e as UnaryExprNode*;
-            this.rn_expr(ctx, u.operand);
-            this.rn_expr(ctx, u.desugared_call);
+            this.rn_expr(map, u.operand);
+            this.rn_expr(map, u.desugared_call);
             return;
         }
         if (k == NodeKind::TernaryExpression) {
             const t: TernaryExprNode* = e as TernaryExprNode*;
-            this.rn_expr(ctx, t.condition);
-            this.rn_expr(ctx, t.true_expr);
-            this.rn_expr(ctx, t.false_expr);
+            this.rn_expr(map, t.condition);
+            this.rn_expr(map, t.true_expr);
+            this.rn_expr(map, t.false_expr);
             return;
         }
         if (k == NodeKind::IfExpression) {
             const ie: IfExprNode* = e as IfExprNode*;
-            this.rn_expr(ctx, ie.condition);
-            this.rn_expr(ctx, ie.then_expr);
-            this.rn_expr(ctx, ie.else_expr);
+            this.rn_expr(map, ie.condition);
+            this.rn_expr(map, ie.then_expr);
+            this.rn_expr(map, ie.else_expr);
             return;
         }
         if (k == NodeKind::CallExpression) {
             const c: CallExprNode* = e as CallExprNode*;
-            this.rn_expr(ctx, c.callee);
-            for (mut i: i64 = 0; i < c.arguments.length; i++) { this.rn_expr(ctx, c.arguments[i]); }
+            this.rn_expr(map, c.callee);
+            for (mut i: i64 = 0; i < c.arguments.length; i++) { this.rn_expr(map, c.arguments[i]); }
             return;
         }
         if (k == NodeKind::NewExpression) {
             const ne: NewExprNode* = e as NewExprNode*;
-            for (mut i: i64 = 0; i < ne.arguments.length; i++) { this.rn_expr(ctx, ne.arguments[i]); }
-            if (ne.has_array_size()) { this.rn_expr(ctx, ne.array_size); }
-            if (ne.has_struct_init()) { this.rn_expr(ctx, ne.struct_init as ExpressionNode*); }
+            for (mut i: i64 = 0; i < ne.arguments.length; i++) { this.rn_expr(map, ne.arguments[i]); }
+            if (ne.has_array_size()) { this.rn_expr(map, ne.array_size); }
+            if (ne.has_struct_init()) { this.rn_expr(map, ne.struct_init as ExpressionNode*); }
             return;
         }
         if (k == NodeKind::CastExpression) {
-            this.rn_expr(ctx, (e as CastExprNode*).expression); return;
+            this.rn_expr(map, (e as CastExprNode*).expression); return;
         }
         if (k == NodeKind::StructLiteral) {
             const sl: StructLiteralNode* = e as StructLiteralNode*;
             for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
-                this.rn_expr(ctx, sl.field_inits[i].value);
+                this.rn_expr(map, sl.field_inits[i].value);
             }
             return;
         }
         if (k == NodeKind::ArrayLiteral) {
             const al: ArrayLiteralNode* = e as ArrayLiteralNode*;
-            for (mut i: i64 = 0; i < al.elements.length; i++) { this.rn_expr(ctx, al.elements[i]); }
-            if (al.repeat_count_expr != null) { this.rn_expr(ctx, al.repeat_count_expr); }
+            for (mut i: i64 = 0; i < al.elements.length; i++) { this.rn_expr(map, al.elements[i]); }
+            if (al.repeat_count_expr != null) { this.rn_expr(map, al.repeat_count_expr); }
             return;
         }
         if (k == NodeKind::TupleLiteral) {
             const tl: TupleLiteralNode* = e as TupleLiteralNode*;
-            for (mut i: i64 = 0; i < tl.elements.length; i++) { this.rn_expr(ctx, tl.elements[i]); }
+            for (mut i: i64 = 0; i < tl.elements.length; i++) { this.rn_expr(map, tl.elements[i]); }
             return;
         }
         if (k == NodeKind::ArrayAccess) {
             const a: ArrayAccessNode* = e as ArrayAccessNode*;
-            this.rn_expr(ctx, a.array);
-            this.rn_expr(ctx, a.index);
-            this.rn_expr(ctx, a.desugared_call);
+            this.rn_expr(map, a.array);
+            this.rn_expr(map, a.index);
+            this.rn_expr(map, a.desugared_call);
             return;
         }
         if (k == NodeKind::MemberAccess) {
-            this.rn_expr(ctx, (e as MemberAccessNode*).object); return;
+            this.rn_expr(map, (e as MemberAccessNode*).object); return;
         }
         if (k == NodeKind::TypeofExpression) {
-            this.rn_expr(ctx, (e as TypeofExprNode*).operand); return;
+            this.rn_expr(map, (e as TypeofExprNode*).operand); return;
         }
         if (k == NodeKind::DeleteExpression) {
-            this.rn_expr(ctx, (e as DeleteExprNode*).operand); return;
+            this.rn_expr(map, (e as DeleteExprNode*).operand); return;
         }
         if (k == NodeKind::AwaitExpression) {
-            this.rn_expr(ctx, (e as AwaitExprNode*).operand); return;
+            this.rn_expr(map, (e as AwaitExprNode*).operand); return;
         }
         if (k == NodeKind::TryExpression) {
             // Only the live half: the desugared `match` holds the operand as its
             // subject, so renaming both would alpha-rename that subtree twice.
-            this.rn_expr(ctx, this.try_live(e));
+            this.rn_expr(map, this.try_live(e));
             return;
         }
         if (k == NodeKind::MatchExpression) {
             const me: MatchExprNode* = e as MatchExprNode*;
-            this.rn_expr(ctx, me.subject);
-            for (mut i: i64 = 0; i < me.arms.length; i++) { this.rn_arm(ctx, me.arms[i]); }
+            this.rn_expr(map, me.subject);
+            for (mut i: i64 = 0; i < me.arms.length; i++) { this.rn_arm(map, me.arms[i]); }
             return;
         }
         if (k == NodeKind::LambdaExpression) {
-            this.rn_lambda(ctx, e as LambdaExprNode*); return;
+            this.rn_lambda(map, e as LambdaExprNode*); return;
         }
         // Literal / ScopeResolution / Sizeof / Alignof / StaticMatch / Yield /
         // Async carry no local identifier read to rename.
@@ -6531,71 +6572,69 @@ type struct AsyncLower {
     /// and only within its scope. Covers the control-flow containers an async fn
     /// body uses; an unwalked container leaves a renamed local's use un-renamed
     /// (a loud "not found"), never a silent miscompile.
-    rn_stmt(mut &this, ctx: RenameCtx*, s: StatementNode*) -> void {
+    rn_stmt(mut &this, map: RenameMap*, s: StatementNode*) -> void {
         if (s == null) { return; }
         const k: NodeKind = s.kind;
         if (k == NodeKind::ExpressionStatement) {
-            this.rn_expr(ctx, (s as ExprStmtNode*).expression); return;
+            this.rn_expr(map, (s as ExprStmtNode*).expression); return;
         }
         if (k == NodeKind::ReturnStatement) {
-            this.rn_expr(ctx, (s as ReturnStmtNode*).expression); return;
+            this.rn_expr(map, (s as ReturnStmtNode*).expression); return;
         }
         if (k == NodeKind::DeclarationStatement) {
             const ds: DeclStmtNode* = s as DeclStmtNode*;
             if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
-                this.rn_var_decl(ctx, ds.declaration as VarDeclNode*);
+                this.rn_var_decl(map, ds.declaration as VarDeclNode*);
             } else if (ds.declaration != null &&
                        ds.declaration.kind == NodeKind::DestructureDeclaration) {
-                this.rn_destructure(ctx, ds.declaration as DestructureDeclNode*);
+                this.rn_destructure(map, ds.declaration as DestructureDeclNode*);
             }
             return;
         }
-        if (k == NodeKind::BlockStatement) { this.rn_block(ctx, s as BlockStmtNode*); return; }
+        if (k == NodeKind::BlockStatement) { this.rn_block(map, s as BlockStmtNode*); return; }
         if (k == NodeKind::UnsafeBlockStatement) {
-            this.rn_block(ctx, (s as UnsafeBlockStmtNode*).block); return;
+            this.rn_block(map, (s as UnsafeBlockStmtNode*).block); return;
         }
         if (k == NodeKind::IfStatement) {
             const iff: IfStmtNode* = s as IfStmtNode*;
-            this.rn_expr(ctx, iff.condition);
-            this.rn_scoped(ctx, iff.then_stmt);
-            this.rn_scoped(ctx, iff.else_stmt);
+            this.rn_expr(map, iff.condition);
+            this.rn_scoped(map, iff.then_stmt);
+            this.rn_scoped(map, iff.else_stmt);
             return;
         }
         if (k == NodeKind::WhileStatement) {
             const w: WhileStmtNode* = s as WhileStmtNode*;
-            this.rn_expr(ctx, w.condition);
-            this.rn_scoped(ctx, w.body);
+            this.rn_expr(map, w.condition);
+            this.rn_scoped(map, w.body);
             return;
         }
         if (k == NodeKind::DoWhileStatement) {
             const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
-            this.rn_scoped(ctx, d.body);
-            this.rn_expr(ctx, d.condition);
+            this.rn_scoped(map, d.body);
+            this.rn_expr(map, d.condition);
             return;
         }
         if (k == NodeKind::ForStatement) {
             const f: ForStmtNode* = s as ForStmtNode*;
-            this.rc_enter(ctx);   // the for-init scope encloses cond / update / body
             if (f.init != null) {
                 if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-                    this.rn_var_decl(ctx, f.init as VarDeclNode*);
+                    this.rn_var_decl(map, f.init as VarDeclNode*);
                 } else {
-                    this.rn_expr(ctx, f.init as ExpressionNode*);
+                    this.rn_expr(map, f.init as ExpressionNode*);
                 }
             }
-            this.rn_expr(ctx, f.condition);
-            this.rn_expr(ctx, f.update);
-            this.rn_scoped(ctx, f.body);
-            this.rc_leave(ctx);
+            this.rn_expr(map, f.condition);
+            this.rn_expr(map, f.update);
+            this.rn_scoped(map, f.body);
             return;
         }
         if (k == NodeKind::LoopStatement) {
-            this.rn_scoped(ctx, (s as LoopStmtNode*).body); return;
+            this.rn_scoped(map, (s as LoopStmtNode*).body); return;
         }
         if (k == NodeKind::MatchStatement) {
             const m: MatchStmtNode* = s as MatchStmtNode*;
-            this.rn_expr(ctx, m.subject);
-            for (mut i: i64 = 0; i < m.arms.length; i++) { this.rn_arm(ctx, m.arms[i]); }
+            this.rn_expr(map, m.subject);
+            for (mut i: i64 = 0; i < m.arms.length; i++) { this.rn_arm(map, m.arms[i]); }
             return;
         }
         // Break / Continue / Asm carry no local read or declaration.
@@ -6603,16 +6642,15 @@ type struct AsyncLower {
 
     /// Alpha-rename every local declaration in the async body to a globally-unique
     /// name before the body is flattened. Parameters are intentionally left
-    /// unbound: their uses fall through unchanged and resolve to the shadow
-    /// prelude (`const <param> = this.<param>`), so a local that shadows a
-    /// parameter no longer collides with it once the body is flattened and the
-    /// by-name cross-state promotion runs.
+    /// alone: their uses keep their spelling and reach the shadow prelude
+    /// (`const <param> = this.<param>`), so a local that shadows a parameter
+    /// no longer collides with it once the body is flattened.
     disambiguate_locals(mut &this, node: FunctionDeclNode*) -> void {
         this.frame_locals = [];
         this.frame_local_src = [];
         if (node.body == null || node.body.kind != NodeKind::BlockStatement) { return; }
-        mut ctx: RenameCtx = RenameCtx { orig: [], repl: [], marks: [] };
-        this.rn_block(&ctx, node.body as BlockStmtNode*);
+        mut map: RenameMap = RenameMap { syms: [], fresh: [] };
+        this.rn_block(&map, node.body as BlockStmtNode*);
     }
 
     // ---- post-lowering binding identities ----
@@ -6620,44 +6658,43 @@ type struct AsyncLower {
     // The lowering moves the body's code into `poll` and places it under
     // declarations it made itself: a parameter is read through the shadow the
     // prelude declares from the future's field, a carried value is re-declared
-    // in every state that takes it, a temporary is declared where an `await`
-    // was.  A moved use still carries the binding the name layer answered in
-    // the function it was written in, which is not a declaration of `poll`;
-    // a use the lowering wrote itself carries none.  Every pass after this one
-    // that keeps per-binding state - the move checker, drop insertion - asks
-    // by that identity, and a use naming no declaration of the body it lives
-    // in is invisible to both: a move nothing records, a value released twice.
+    // in every state that takes it.  A moved use still carries the binding the
+    // name layer answered in the function it was written in, and a use the
+    // lowering wrote itself names the binding it means; neither is a
+    // declaration of `poll` when that binding moved.  Every pass after this
+    // one that keeps per-binding state - the move checker, drop insertion -
+    // asks by that identity, and a use naming no declaration of the body it
+    // lives in is invisible to both: a move nothing records, a value released
+    // twice.
     //
-    // The lowering places every use under the declaration it means by
-    // SCOPE - codegen reads these bodies by name, and the rename that runs
-    // before flattening made every local's spelling unique so that it could -
-    // so the body's own scopes are what says which declaration a use names.
-    // This walk gives each use that identity, once the body is finished.
+    // Each such re-declaration is recorded as a stand-in for the binding it
+    // carries (`stand_in`), and the state blocks share statement nodes, so
+    // which stand-in a use reaches is a question of SCOPE.  This walk gives
+    // each use the innermost declaration of the binding it names, once the
+    // body is finished.
 
-    rb_enter(&this, ctx: RebindCtx*) -> void { ctx.marks.push(ctx.names.length); }
+    rb_enter(&this, ctx: RebindCtx*) -> void { ctx.marks.push(ctx.keys.length); }
 
     rb_leave(&this, ctx: RebindCtx*) -> void {
         if (ctx.marks.length == 0) { return; }
         const m: i64 = ctx.marks[ctx.marks.length - 1];
         ctx.marks.pop();
-        while (ctx.names.length > m) { ctx.names.pop(); ctx.syms.pop(); }
+        while (ctx.keys.length > m) { ctx.keys.pop(); ctx.syms.pop(); }
     }
 
-    /// Declare `name` in the innermost scope.  A declaration this lowering
-    /// minted with no identity is given one here, so every binding the body
-    /// holds is distinct.
-    rb_bind(mut &this, ctx: RebindCtx*, name: SymbolStr, sym: SymbolID) -> void {
-        ctx.names.push(name);
+    /// Declare, in the innermost scope, `sym` as what a use of binding `key`
+    /// names.
+    rb_bind(mut &this, ctx: RebindCtx*, key: SymbolID, sym: SymbolID) -> void {
+        ctx.keys.push(key);
         ctx.syms.push(sym);
     }
 
-    /// The binding the innermost declaration of `name` declares; `found` is
-    /// false for a spelling no scope of the body declares.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
-    rb_lookup(&this, ctx: RebindCtx*, name: SymbolStr, found: boolean*) -> SymbolID {
-        mut i: i64 = ctx.names.length - 1;
+    /// The binding the innermost declaration standing for `key` declares;
+    /// `found` is false for a binding no scope of the body declares.
+    rb_lookup(&this, ctx: RebindCtx*, key: SymbolID, found: boolean*) -> SymbolID {
+        mut i: i64 = ctx.keys.length - 1;
         while (i >= 0) {
-            if (ctx.names[i].equals(name)) { *found = true; return ctx.syms[i]; }
+            if (key.is_valid() && ctx.keys[i].equals(key)) { *found = true; return ctx.syms[i]; }
             i -= 1;
         }
         *found = false;
@@ -6668,7 +6705,7 @@ type struct AsyncLower {
         if (vd == null) { return; }
         this.rb_expr(ctx, vd.initializer);
         if (!vd.sym_id.is_valid()) { vd.set_sym_id(this.resolver.alloc_synthetic_binding()); }
-        this.rb_bind(ctx, vd.name, vd.sym_id);
+        this.rb_bind(ctx, this.decl_key(vd), vd.sym_id);
     }
 
     rb_block(mut &this, ctx: RebindCtx*, blk: BlockStmtNode*) -> void {
@@ -6692,7 +6729,7 @@ type struct AsyncLower {
         if (pat == null) { return; }
         if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
             if (!pat.binding_sym.is_valid()) { pat.binding_sym = this.resolver.alloc_synthetic_binding(); }
-            this.rb_bind(ctx, pat.binding_name, pat.binding_sym);
+            this.rb_bind(ctx, pat.binding_sym, pat.binding_sym);
             return;
         }
         if (pat.pattern_kind != PatternKind::Enum) { return; }
@@ -6701,7 +6738,7 @@ type struct AsyncLower {
             mut pb: PatternBinding* = epat.binding_at(j);
             if (pb != null && pb.name.is_valid()) {
                 if (!pb.sym_id.is_valid()) { pb.sym_id = this.resolver.alloc_synthetic_binding(); }
-                this.rb_bind(ctx, pb.name, pb.sym_id);
+                this.rb_bind(ctx, pb.sym_id, pb.sym_id);
                 continue;
             }
             const sub: PatternNode* = epat.sub_at(j);
@@ -6726,9 +6763,9 @@ type struct AsyncLower {
     /// shadows carry the identities the body's uses already name.
     rb_lambda(mut &this, ctx: RebindCtx*, lam: LambdaExprNode*) -> void {
         if (lam == null) { return; }
-        for (mut i: i64 = 0; i < lam.captured_names.length; i++) {
+        for (mut i: i64 = 0; i < lam.captured_syms.length; i++) {
             mut found: boolean = false;
-            const s: SymbolID = this.rb_lookup(ctx, lam.captured_names[i], &found);
+            const s: SymbolID = this.rb_lookup(ctx, lam.captured_syms[i], &found);
             if (found && s.is_valid()) { lam.captured_syms[i] = s; }
         }
     }
@@ -6739,7 +6776,7 @@ type struct AsyncLower {
         if (k == NodeKind::Identifier) {
             mut id: IdentifierNode* = e as IdentifierNode*;
             mut found: boolean = false;
-            const s: SymbolID = this.rb_lookup(ctx, id.name, &found);
+            const s: SymbolID = this.rb_lookup(ctx, this.local_key(e), &found);
             if (found && s.is_valid()) { id.rebind_local(s); }
             return;
         }
@@ -6859,7 +6896,7 @@ type struct AsyncLower {
                     if (!dd.bindings[i].sym_id.is_valid()) {
                         dd.bindings[i].sym_id = this.resolver.alloc_synthetic_binding();
                     }
-                    this.rb_bind(ctx, dd.bindings[i].local_name, dd.bindings[i].sym_id);
+                    this.rb_bind(ctx, dd.bindings[i].sym_id, dd.bindings[i].sym_id);
                 }
             }
             return;
@@ -6915,16 +6952,16 @@ type struct AsyncLower {
     }
 
     /// Give every local use in `poll_fn`'s finished body the binding its scope
-    /// declares.  The parameters (`cx`) are the outermost scope.
+    /// declares.  The parameters (the receiver and `cx`) are the outermost
+    /// scope.
     rebind_poll_locals(mut &this, poll_fn: FunctionDeclNode*) -> void {
         if (poll_fn == null || poll_fn.body == null) { return; }
-        mut ctx: RebindCtx = RebindCtx { names: [], syms: [], marks: [] };
+        mut ctx: RebindCtx = RebindCtx { keys: [], syms: [], marks: [] };
         this.rb_enter(&ctx);
         for (mut i: i64 = 0; i < poll_fn.parameters.length; i++) {
             const p: VarDeclNode* = poll_fn.parameters[i];
             if (p == null) { continue; }
-            // The receiver is bound as `this`, the spelling its uses carry.
-            this.rb_bind(&ctx, if (p.is_receiver()) { this.this_sym } else { p.name }, p.sym_id);
+            this.rb_bind(&ctx, p.sym_id, p.sym_id);
         }
         this.rb_stmt(&ctx, poll_fn.body);
         this.rb_leave(&ctx);
@@ -7664,24 +7701,36 @@ type struct AsyncLower {
         const recv_field:  SymbolStr   = this.pending[pi].recv_field;
         const span: SourceSpan = node.span;
 
+        this.stand_ins = [];
+        this.stand_in_keys = [];
+        this.poll_self = SymbolID::invalid();
+        this.poll_cx = SymbolID::invalid();
+        if (poll_fn.parameters.length == 2) {
+            this.poll_self = poll_fn.parameters[0].sym_id;
+            this.poll_cx = poll_fn.parameters[1].sym_id;
+        }
+
         // ---- 0. Receiver ----
         // A method's body reads its receiver as a bare `this`, which inside the
-        // generated `poll` would resolve to the FUTURE. Rewrite it to the frame
-        // binding the shadow prelude declares for the receiver field, restoring
-        // the by-value type the body was typed against when the receiver is held
-        // by pointer.
-        //
-        // This runs BEFORE the poll body is built, and so before every other
-        // rewrite: the shadow prelude, the cross-state promotion and the carry
-        // passes all synthesize `this.<field>` accesses of their own, and a
-        // receiver pass run after them would rewrite the `this` in those too.
+        // generated `poll` would be the FUTURE. Rewrite each use of the
+        // method's receiver to the frame binding the shadow prelude declares for
+        // the receiver field, restoring the by-value type the body was typed
+        // against when the receiver is held by pointer.  The `this` the
+        // lowering writes into `poll` names `poll`'s own receiver, which is a
+        // different binding, so this rewrite never reaches it.
+        mut recv_key: SymbolID = SymbolID::invalid();
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            if (this.is_receiver_param(node.parameters[i])) { recv_key = node.parameters[i].sym_id; }
+        }
         if (recv_field.is_valid() && node.body.kind == NodeKind::BlockStatement) {
             this.subst_mode = if (this.pending[pi].recv_ptr) {
                 this.subst_to_local_deref()
             } else { this.subst_to_local() };
-            this.subst_name_stmt(node.body as StatementNode*, this.this_sym, recv_field,
+            this.subst_local_sym = recv_key;
+            this.subst_name_stmt(node.body as StatementNode*, recv_key, recv_field,
                                  self_ty, this.pending[pi].recv_ty, span);
             this.subst_mode = this.subst_to_field();
+            this.subst_local_sym = SymbolID::invalid();
         }
 
         // ---- 0b. poll body ----
@@ -7710,7 +7759,7 @@ type struct AsyncLower {
             fut_syms: [], fut_opt: [], naw: 0,
             prom_field: [], prom_tys: [], prom_opt: [], nprom: 0,
             loop_cont: [], loop_brk: [],
-            frame_names: [], borrow_ops: [],
+            frame_keys: [], borrow_ops: [],
             unit_output: this.is_void_type(declared_ref),
         };
 
