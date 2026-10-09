@@ -61862,3 +61862,50 @@ parameter).
   -> 37; E0155/E0156/E0157 mentions each -1 (`ErrorCode::to_string`);
   `template_key_of` 12 -> 10; `TypeKind::GenericParam` 39 -> 38.  Pending
   allows unchanged at 88 (compiler 49): no deleted function carried one.
+
+### 8.564 The compiler's dead code, second sweep: four unreferenced types and sixteen write-only fields - 2026-10-09
+
+## Why
+
+* Ruling 185 holds for a type or a field as for a function: what nothing
+  reads is deleted.  The first sweep (§8.563) left types whose last user
+  it removed, `implement` blocks with no methods left in them, and fields
+  that are set in a struct literal and never read.
+
+## What changed
+
+* Types deleted (their name appears nowhere outside their own
+  declaration): `LVerifierAction`, `MoveState`, `OperatorKind` (the
+  operator codes the mangler never emits; the demangler's decode table's
+  comment no longer points at it) and `ConversionInfo`.
+* Fields deleted with their literal initializers - none is accessed as
+  `.name` anywhere in the compiler or the LSP: `Argument::aliases`,
+  `required`, `is_flag`; `BindingSerializer::ns`;
+  `RenderConfig::preserve_markup`; `Lexer::spot_content`,
+  `current_token`, `token_count`; `ModuleInfo::processed`,
+  `specializations`; `SpecializationEntry::specialized_name`;
+  `PassMetadata::order`; `AsyncDecl::owner_impl`; `LoggerConfig`'s three
+  output flags.  The libclang mirror structs keep their unread fields:
+  their layout is C's.
+* Five empty `implement` blocks and one empty access label removed.
+* The generators, `deadtypes.py`, `delete_fields.py` and
+  `empty_impls.py`, are in `.objcmp/s126/` with the list (`DEAD.md`).
+* A finding, not a change: `RenderConfig::preserve_markup` was documented
+  as keeping inline-code backticks for the LSP's virtual document and set
+  by one constructor, but `print_message` never read it, so that path has
+  always stripped them.
+
+## Measured
+
+* Predicted: nothing compiled changes, no warning moves (none of the
+  deleted lines carried one).  Clean build 325 warnings, the same set.
+* A second pass of each finder over the result: 0 types, 0 fields by the
+  same test, 0 functions.
+* Corpus (488 entries) against §8.563's run: status lines identical, every
+  log identical as a multiset but `compiler`, where only the source lines
+  quoted under the same warnings differ.
+* verify `--require-identical`: 0 objects moved (7,854 + 1,126), every
+  gate OK, `cross-check` included.
+* The field test is a text test and coarse: a field whose name another
+  type's field shares, and which is read through that name, is not found.
+  §0 unchanged.

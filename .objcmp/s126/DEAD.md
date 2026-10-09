@@ -222,3 +222,38 @@ drops a blank line beside some).  Held (not deleted): 1.
 | 1 | `Logger::fatal` | method | `compiler/src/utils/logger.cryo:198` | 6 |
 | 1 | `Logger::write_log` | method | `compiler/src/utils/logger.cryo:208` | 41 |
 | 1 | `logger::compiler_debug_enabled` | free | `compiler/src/utils/logger.cryo:291` | 3 |
+
+## Types and fields (second batch)
+
+From `deadtypes.py` over the tree the function sweep left: a type whose
+name appears nowhere outside its own declaration and `implement` blocks,
+and a field never accessed as `.name` anywhere in the compiler or the LSP
+(set only in struct literals).  Fields are removed with their literal
+initializers by `delete_fields.py`; three whose initializers share a line
+with other fields were edited by hand (`AsyncDecl::owner_impl`,
+`BindingSerializer::ns`, the three `LoggerConfig` flags).  The libclang
+mirror structs' fields are kept: their layout is C's.  `empty_impls.py`
+removed the `implement` blocks and access labels the sweep left empty.
+
+| kind | owner | name | file |
+|---|---|---|---|
+| type (enum) | | `compiler::codegen::llvm_types::LVerifierAction` | `compiler/src/compiler/codegen/llvm_types.cryo:131` |
+| type (enum) | | `compiler::passes::move_check::MoveState` | `compiler/src/compiler/passes/move_check.cryo:89` |
+| type (enum) | | `compiler::resolver::mangled_name::OperatorKind` | `compiler/src/compiler/resolver/mangled_name.cryo:119` |
+| type (struct) | | `compiler::types::checker::ConversionInfo` | `compiler/src/compiler/types/checker.cryo:86` |
+| field | `Argument` | `aliases` | `compiler/src/CLI/_module.cryo:25` |
+| field | `Argument` | `required` | `compiler/src/CLI/_module.cryo:26` |
+| field | `Argument` | `is_flag` | `compiler/src/CLI/_module.cryo:27` |
+| field | `BindingSerializer` | `ns` | `compiler/src/compiler/bindgen/generator.cryo:130` |
+| field | `RenderConfig` | `preserve_markup` | `compiler/src/compiler/diag/renderer.cryo:102` |
+| field | `Lexer` | `spot_content` | `compiler/src/compiler/lex/Lexer.cryo:32` |
+| field | `Lexer` | `current_token` | `compiler/src/compiler/lex/Lexer.cryo:34` |
+| field | `Lexer` | `token_count` | `compiler/src/compiler/lex/Lexer.cryo:36` |
+| field | `ModuleInfo` | `processed` | `compiler/src/compiler/module_graph.cryo:149` |
+| field | `ModuleInfo` | `specializations` | `compiler/src/compiler/module_graph.cryo:159` |
+| field | `SpecializationEntry` | `specialized_name` | `compiler/src/compiler/mono/State.cryo:112` |
+| field | `PassMetadata` | `order` | `compiler/src/compiler/passes/pass_id.cryo:674` |
+| field | `AsyncDecl` | `owner_impl` | `compiler/src/compiler/sema/async_lower.cryo:344` |
+| field | `LoggerConfig` | `enable_colors` | `compiler/src/utils/logger.cryo:59` |
+| field | `LoggerConfig` | `enable_timestamps` | `compiler/src/utils/logger.cryo:60` |
+| field | `LoggerConfig` | `enable_component_tags` | `compiler/src/utils/logger.cryo:61` |

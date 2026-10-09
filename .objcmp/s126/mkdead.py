@@ -23,6 +23,9 @@ with open(os.path.join(HERE, "keep.txt"), encoding="utf-8") as fh:
             keep[s] = why
             after_entry = True
 
+types_tsv = next((a[len("--types="):] for a in sys.argv if a.startswith("--types=")), None)
+sys.argv = [a for a in sys.argv if not a.startswith("--types=")]
+
 rows = []
 for i, path in enumerate(sys.argv[2:]):
     with open(path, encoding="utf-8") as fh:
@@ -84,6 +87,30 @@ out.append("|---|---|---|---|---|")
 for r in sorted(deleted, key=lambda r: (r["path"], int(r["decl"]))):
     out.append("| %d | `%s` | %s | `%s:%s` | %d |" % (r["round"], key(r), r["role"], r["path"], r["decl"],
                                                    int(r["last"]) - int(r["first"]) + 1))
+if types_tsv:
+    out.append("")
+    out.append("## Types and fields (second batch)")
+    out.append("")
+    out.append("From `deadtypes.py` over the tree the function sweep left: a type whose")
+    out.append("name appears nowhere outside its own declaration and `implement` blocks,")
+    out.append("and a field never accessed as `.name` anywhere in the compiler or the LSP")
+    out.append("(set only in struct literals).  Fields are removed with their literal")
+    out.append("initializers by `delete_fields.py`; three whose initializers share a line")
+    out.append("with other fields were edited by hand (`AsyncDecl::owner_impl`,")
+    out.append("`BindingSerializer::ns`, the three `LoggerConfig` flags).  The libclang")
+    out.append("mirror structs' fields are kept: their layout is C's.  `empty_impls.py`")
+    out.append("removed the `implement` blocks and access labels the sweep left empty.")
+    out.append("")
+    out.append("| kind | owner | name | file |")
+    out.append("|---|---|---|---|")
+    with open(types_tsv, encoding="utf-8") as fh:
+        head = fh.readline().rstrip("\n").split("\t")
+        for l in fh:
+            r = dict(zip(head, l.rstrip("\n").split("\t")))
+            if r["what"] == "type":
+                out.append("| type (%s) | | `%s` | `%s:%s` |" % (r["owner"], r["name"], r["file"], r["line"]))
+            elif "bindgen/clang.cryo" not in r["file"]:
+                out.append("| field | `%s` | `%s` | `%s:%s` |" % (r["owner"].split("::")[-1], r["name"], r["file"], r["line"]))
 with open(sys.argv[1], "w", encoding="utf-8") as fh:
     fh.write("\n".join(out) + "\n")
 print("deleted %d (%d lines), held %d" % (len(deleted), lines, len(held)))
