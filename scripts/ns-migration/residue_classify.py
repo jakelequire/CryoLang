@@ -186,6 +186,10 @@ CLASS_OF_METHOD = {
         ("N", "a name MINTED at the member template's declaration (`Owner::method`) for its registration: its display name and its placeholder type's, never a key it is found by"),
     "GenericRegistry::trait_item_slot":
         ("J", "member: a method's leaf inside the trait whose identity a bound stamped on the call, asked once where the call is written, for the position that maps it to an implementation's method with no name after that"),
+    "GenericRegistry::trait_method_by_leaf":
+        ("J", "member: a method's leaf inside the trait an impl block or a bound names by identity, through `trait_item_slot`, to the trait's declaration of it"),
+    "GenericRegistry::impl_method_by_leaf":
+        ("J", "member: a method's leaf inside the trait an impl block implements, through `trait_item_slot`, to the block's method at that position"),
     "GenericRegistry::find_trait_defining_method":
         ("J", "hint: the did-you-mean asks which trait declares a method of this leaf; the spelling is the question"),
     # -- the module graph and the resolver's module scopes --

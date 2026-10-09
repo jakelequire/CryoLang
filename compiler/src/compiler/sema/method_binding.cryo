@@ -1001,7 +1001,6 @@ type struct MethodBinding {
     /// leaving it to fail at codegen (E0636). Mirrors the synthesize-time
     /// default-filter applicability check, but on the CALL side. Returns false
     /// (do not block) for symbolic receivers or symbolic Item types.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     projection_default_unavailable(&this, recv_type: TypeRef, method_name: SymbolStr) -> boolean {
         if (!method_name.is_valid()) { return false; }
         // The WRITTEN heads: the Item is read off the head's positional trait
@@ -1012,12 +1011,8 @@ type struct MethodBinding {
             const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(dimpl.trait_def);
             if (tdecl == null) { continue; }
             // The trait's default-bodied method of this name, if projection-bounded.
-            mut mfunc: FunctionDeclNode* = null;
-            for (mut mi: i64 = 0; mi < tdecl.methods.length; mi++) {
-                const f: FunctionDeclNode* = tdecl.methods[mi];
-                if (f != null && f.name.equals(method_name) && f.has_body()) { mfunc = f; break; }
-            }
-            if (mfunc == null) { continue; }
+            const mfunc: FunctionDeclNode* = this.ctx.generic_registry.trait_method_by_leaf(dimpl.trait_def, method_name);
+            if (mfunc == null || !mfunc.has_body()) { continue; }
             if (this.projection_bound_fails(mfunc, dimpl, tdecl)) { return true; }
         }
         return false;
@@ -1246,25 +1241,21 @@ type struct MethodBinding {
         return refined;
     }
 
-    /// Search the trait impls selected for `owner_ref` for a method named
-    /// `method_name` whose own generic-param count matches `n_generic_args`;
-    /// writes the owning impl block through `out_impl`.  The impls are the
+    /// The method a trait impl selected for `owner_ref` provides under
+    /// `method_name`, when its own generic-param count matches
+    /// `n_generic_args`; writes the owning impl block through `out_impl`.
+    /// Each impl answers by the trait-method door.  The impls are the
     /// registry's candidates in registration order: a placed clone when the
     /// receiver is a specialization, else the written heads that unify.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     find_method_in_trait_impls(&this, owner_ref: TypeRef, method_name: SymbolStr,
                                n_generic_args: i64, out_impl: ImplBlockNode**) -> MethodNode* {
         const blocks: ImplBlockNode*[] = this.ctx.generic_registry.trait_impls_of(owner_ref, this.intern);
         for (mut i: i64 = 0; i < blocks.length; i++) {
-            const impl_node: ImplBlockNode* = blocks[i];
-            for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
-                const m: MethodNode* = impl_node.methods[k];
-                if (m == null || m.func == null) { continue; }
-                if (!m.func.name.equals(method_name)) { continue; }
-                if (m.func.generic_params.length != n_generic_args) { continue; }
-                *out_impl = impl_node;
-                return m;
-            }
+            const m: MethodNode* = this.ctx.generic_registry.impl_method_by_leaf(blocks[i], method_name);
+            if (m == null || m.func == null) { continue; }
+            if (m.func.generic_params.length != n_generic_args) { continue; }
+            *out_impl = blocks[i];
+            return m;
         }
         return null;
     }
@@ -1282,30 +1273,24 @@ type struct MethodBinding {
         return null;
     }
 
-    /// Generic trait DEFAULT method named `method_name` on any trait the receiver's
+    /// Generic trait DEFAULT method `method_name` of any trait the receiver's
     /// base implements (`map<B>`/`fold<Acc>` on `Iterator`), not yet cloned into
-    /// the impl block pre-mono.  Returns the trait decl's FunctionDeclNode, or null.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
+    /// the impl block pre-mono, answered by the trait-method door.  Returns
+    /// the trait decl's FunctionDeclNode, or null.
     find_generic_trait_default(mut &this, recv_type: TypeRef,
                                method_name: SymbolStr) -> FunctionDeclNode* {
         const blocks: ImplBlockNode*[] = this.ctx.generic_registry.template_trait_impls_of(recv_type, this.intern);
         for (mut i: i64 = 0; i < blocks.length; i++) {
-            const td: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(blocks[i].trait_def);
-            if (td == null) { continue; }
-            for (mut k: i64 = 0; k < td.methods.length; k++) {
-                const f: FunctionDeclNode* = td.methods[k];
-                if (f == null) { continue; }
-                if (!f.name.equals(method_name)) { continue; }
-                if (f.generic_params.length == 0) { continue; }
-                return f;
-            }
+            const f: FunctionDeclNode* = this.ctx.generic_registry.trait_method_by_leaf(blocks[i].trait_def, method_name);
+            if (f == null || f.generic_params.length == 0) { continue; }
+            return f;
         }
         return null;
     }
 
-    /// Like `find_method_in_trait_impls` but matches by name + has-own-generics
-    /// (the inferred no-turbofish path solves `<U>` from arguments), over the
-    /// same candidate set.  With
+    /// Like `find_method_in_trait_impls` but asks for a method with generics
+    /// of its own (the inferred no-turbofish path solves `<U>` from
+    /// arguments), over the same candidate set.  With
     /// `only_trait`, only that trait's impls are candidates.  Without one,
     /// what this answers is the method's SIGNATURE, for the call's bindings
     /// and return type: an unstamped call several traits provide is refused
@@ -1319,8 +1304,8 @@ type struct MethodBinding {
         for (mut i: i64 = 0; i < blocks.length; i++) {
             const impl_node: ImplBlockNode* = blocks[i];
             if (only_trait.is_valid() && !impl_node.trait_def.equals(only_trait)) { continue; }
-            const m: MethodNode* = this.find_generic_method_in(&impl_node.methods, method_name);
-            if (m == null) { continue; }
+            const m: MethodNode* = this.ctx.generic_registry.impl_method_by_leaf(impl_node, method_name);
+            if (m == null || m.func == null || m.func.generic_params.length == 0) { continue; }
             *out_impl = impl_node;
             return m;
         }
@@ -2110,7 +2095,6 @@ type struct MethodBinding {
     /// args + where-clause-derived params), resolving the return annotation, and
     /// reducing projections.  Invalid when not a concrete instantiation / no impl
     /// / still abstract.  `resolved_callee` stays UNPINNED.
-    ![allow(lookup_by_spelling, reason = "pending: this took a spelling before the lint existed, and why is not written yet")]
     resolve_trait_impl_method_return(mut &this, recv_type: TypeRef,
                                      method_name: SymbolStr) -> TypeRef {
         mut subject_ref: TypeRef = recv_type;
@@ -2140,16 +2124,11 @@ type struct MethodBinding {
         mut found_method: MethodNode* = null;
         const blocks: ImplBlockNode*[] = this.ctx.generic_registry.template_trait_impls_of(subject_ref, this.intern);
         for (mut i: i64 = 0; i < blocks.length; i++) {
-            const impl_node: ImplBlockNode* = blocks[i];
-            for (mut k: i64 = 0; k < impl_node.methods.length; k++) {
-                const m: MethodNode* = impl_node.methods[k];
-                if (m == null || m.func == null) { continue; }
-                if (!m.func.name.equals(method_name)) { continue; }
-                found_impl = impl_node;
-                found_method = m;
-                break;
-            }
-            if (found_method != null) { break; }
+            const m: MethodNode* = this.ctx.generic_registry.impl_method_by_leaf(blocks[i], method_name);
+            if (m == null || m.func == null) { continue; }
+            found_impl = blocks[i];
+            found_method = m;
+            break;
         }
         if (found_method == null || found_impl == null) { return TypeRef::invalid(); }
         const ret_ann: TypeAnnotation* = found_method.func.return_type_annotation;
