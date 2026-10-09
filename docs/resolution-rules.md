@@ -182,6 +182,15 @@ yet is recorded with the change that builds it, not here.
      helper with no live callers is removed - not given an allow, not
      routed through a door.  This holds for everything a change touches.
 
+186. **The dead-code sweep covers the compiler only.**  A standard-library
+     function is public API and is not swept, even when nothing in the
+     corpus calls it.
+
+187. **Under rule three's structural check (ruling 150), the worker places
+     each door with the store it reads most.**  A store and its doors move
+     to a file of their own only when one grows egregiously big; file size
+     is otherwise not a concern.
+
 ### 2026-10-07
 
 160. **The `()` unit type (ruling 103) is built after the merge, before the

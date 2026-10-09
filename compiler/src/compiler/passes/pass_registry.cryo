@@ -289,56 +289,6 @@ type struct PassRegistry {
         return !any_failed;
     }
 
-    /// Run passes until (and including) all passes in the given stage.
-    run_until(mut &this, ctx: CompilationContext*, until: PassStage) -> boolean {
-        if (!this.validated) {
-            cdebug(Text::new("[PassRegistry] Error: pipeline not validated before run_until\n"));
-            return false;
-        }
-
-        const until_int: u32 = until.to_int();
-
-        for (mut i: int = 0; i < this.passes.length; i++) {
-            const id: PassID = this.passes[i];
-            const meta: PassMetadata = id.metadata();
-
-            // Stop after the target stage
-            if (meta.stage.to_int() > until_int) {
-                break;
-            }
-
-            if (this.verbose) {
-                cdebug(Text::new("[Pass %d] %s (%s)\n"), i + 1, meta.name, meta.stage.label());
-            }
-
-            const result: PassResult = PassRegistry::run_pass(id, ctx);
-
-            this.stats[i].executed = true;
-            this.stats[i].success = result.success;
-            this.stats[i].skipped = result.skipped;
-            this.stats[i].errors_emitted = result.errors_emitted;
-            this.stats[i].warnings_emitted = result.warnings_emitted;
-
-            if (result.skipped && this.verbose) {
-                cdebug(Text::new("[Pass %d] %s SKIPPED (stub, not yet implemented)\n"),
-                    i + 1, meta.name);
-            }
-
-            if (!result.success && id.fatal_on_failure()) {
-                return false;
-            }
-
-            // Derive provisions from metadata, not from PassResult
-            if (result.success) {
-                for (mut j: int = 0; j < meta.provisions.length; j++) {
-                    ctx.provisions.mark(meta.provisions[j]);
-                }
-            }
-        }
-
-        return !ctx.diagnostics.has_errors();
-    }
-
     /// Reset stats for the next module in a batch.
     /// Provisions are tracked on CompilationContext and reset via
     /// CompilationContext::reset_for_next_module().
@@ -353,43 +303,6 @@ type struct PassRegistry {
     // PassRegistry::build_*().  Cross-module resolution of free functions
     // through imported namespaces is historically brittle at codegen time;
     // static methods resolve reliably.
-
-    /// Full compilation pipeline: lex -> parse -> analyze -> codegen -> link.
-    static build_standard_pipeline() -> PassRegistry {
-        LOG_DEBUG(LogComponent::General, "[PassRegistry] Building standard pipeline");
-        mut reg: PassRegistry = PassRegistry::new();
-        reg.set_passes([
-            PassID::Lexing,
-            PassID::Parsing,
-            PassID::ConfigGating,
-            PassID::ASTValidation,
-            PassID::CHeaderImport,
-            PassID::AutoImport,
-            PassID::ImportResolution,
-            PassID::NameDeclaration,
-            PassID::NameResolution,
-            PassID::TypeDeclaration,
-            PassID::FunctionSignature,
-            PassID::TemplateRegistration,
-            PassID::DefaultExpansion,
-            PassID::TypeResolution,
-            PassID::StructFieldTypeSync,
-            PassID::DirectiveProcessing,
-            PassID::FunctionBodyTypeCheck,
-            PassID::Monomorphization,
-            PassID::GenericExpressionResolution,
-            PassID::GenericValidation,
-            PassID::DeadCodeAnalysis,
-            PassID::MoveCheck,
-            PassID::DropInsertion,
-            PassID::TypeLowering,
-            PassID::IRGeneration,
-            PassID::Optimization,
-            PassID::ObjectEmission,
-            PassID::Linking,
-        ]);
-        return reg;
-    }
 
     /// Frontend-only pipeline for LSP: lex -> parse -> specialize -> analyze (no codegen).
     static build_frontend_pipeline() -> PassRegistry {
